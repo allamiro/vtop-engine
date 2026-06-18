@@ -1,4 +1,3 @@
-````markdown
 <div align="center">
 
 <img src="docs/assets/vtop-logo.png" alt="VTOP Engine logo" width="220" />
@@ -665,4 +664,4 @@ manifest
 ## License
 
 [MIT](LICENSE) © 2026 Tamir Suliman.
-````
+
