@@ -1,52 +1,112 @@
+````markdown
 <div align="center">
 
 <img src="docs/assets/vtop-logo.png" alt="VTOP Engine logo" width="220" />
 
 # VTOP Engine
 
-**Verified Telemetry Object Protocol Engine** — a replay-safe, manifest-driven telemetry object transfer engine.
+**Verified Telemetry Object Protocol Engine**
+
+Replay-safe, manifest-driven telemetry transfer from Kafka, files, and syslog spools into object storage.
+
+<br />
 
 [![CI](https://github.com/allamiro/vtop-engine/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/allamiro/vtop-engine/actions/workflows/ci.yml?query=branch%3Amain)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org)
-[![Status: prototype](https://img.shields.io/badge/status-prototype-blue.svg)](#status)
+[![Status: Prototype](https://img.shields.io/badge/status-prototype-blue.svg)](#status)
+[![Storage: S3 Compatible](https://img.shields.io/badge/storage-S3%20compatible-green.svg)](#upload-and-verification)
+[![Safety: Verify Before Commit](https://img.shields.io/badge/safety-verify%20before%20commit-brightgreen.svg)](#core-rule)
 
 </div>
 
-> [!NOTE]
-> <a name="status"></a>**Status:** prototype / reference implementation of a *proposed protocol* and *proposed method*. This repository is a candidate-invention disclosure support package. It is **not** patented or patent-pending. See [docs/INVENTION_DISCLOSURE_DRAFT.md](docs/INVENTION_DISCLOSURE_DRAFT.md).
+---
 
-VTOP ingests telemetry from **Kafka topics**, **log files**, and **syslog spool files**; forms adaptive batches; compresses them; computes SHA‑256 checksums; generates a **manifest** for every object; uploads both the telemetry object and its manifest to **S3‑compatible object storage**; verifies the uploaded object and manifest; and commits source progress **only after verification succeeds**.
+## Overview
+
+**VTOP Engine** moves telemetry into object storage while protecting the source commit point.
+
+It ingests telemetry from:
+
+- Kafka topics
+- append-only log files
+- syslog spool files
+
+For every batch, VTOP:
+
+1. reads records from a source
+2. forms a batch
+3. compresses the batch
+4. computes a checksum
+5. creates a manifest
+6. uploads the object and manifest
+7. verifies the uploaded data
+8. commits source progress only after verification succeeds
+
+> [!IMPORTANT]
+> VTOP does **not** commit Kafka offsets, file byte offsets, or syslog spool offsets until the destination object has been verified.
+
+---
+
+## Status
+
+> [!NOTE]
+> VTOP Engine is currently a **prototype / reference implementation** of a proposed protocol and proposed method.
+>
+> This repository is intended to support candidate-invention disclosure work. It is **not** patented or patent-pending.
+>
+> See [docs/INVENTION_DISCLOSURE_DRAFT.md](docs/INVENTION_DISCLOSURE_DRAFT.md).
+
+---
 
 ## Table of contents
 
-- [Why it exists](#why-it-exists)
+- [Overview](#overview)
+- [Status](#status)
+- [Why VTOP exists](#why-vtop-exists)
 - [Core rule](#core-rule)
+- [How it works](#how-it-works)
 - [State machine](#state-machine)
-- [Workspace layout](#workspace-layout)
-- [Source modes](#source-modes)
+- [Supported source modes](#supported-source-modes)
+- [Format detection](#format-detection)
+- [Architecture](#architecture)
 - [Quick start](#quick-start)
 - [Build and test](#build-and-test)
 - [CLI usage](#cli-usage)
 - [Docker lab](#docker-lab)
 - [Example manifest](#example-manifest)
-- [Metrics and efficiency](#metrics-and-efficiency)
-- [Verification before commit](#verification-before-commit)
-- [Replay after crash](#replay-after-crash)
+- [Metrics](#metrics)
+- [Upload and verification](#upload-and-verification)
+- [Replay and recovery](#replay-and-recovery)
 - [Known limitations](#known-limitations)
+- [Roadmap](#roadmap)
 - [Documentation](#documentation)
 - [License](#license)
 
-## Why it exists
+---
 
-Most log-to-object-storage tools move bytes into a bucket. They do **not** provide a single, source-agnostic *commit model* across Kafka, files, and syslog spools with **mandatory manifest verification before source progress is advanced**. VTOP makes the safety rule explicit and enforces it in code.
+## Why VTOP exists
 
-`gzip + upload` cannot answer: *did the object actually land intact, and is it safe to forget the source position now?* VTOP adds:
+Most log-to-object-storage pipelines can move bytes into a bucket.
 
-- a **manifest** that binds the source progress marker → object SHA‑256 → verification state (chain of custody);
-- a **strongly-typed state machine** that makes premature commit impossible;
-- a **replay-safe state store** so a crash never advances an unverified source;
-- **verification before commit**, across pluggable storage backends.
+The harder problem is knowing when it is safe to advance the source position.
+
+```text
+Did the object land intact,
+and is it safe to commit the source offset now?
+```
+
+VTOP addresses this with a source-agnostic safety model:
+
+| Capability | Purpose |
+|---|---|
+| **Manifest-bound transfer** | Binds source progress, object URI, checksum, format, compression, and verification state. |
+| **Verify before commit** | Prevents source progress from advancing before destination verification. |
+| **Replay-safe state store** | Allows recovery without silently losing unverified data. |
+| **Explicit state machine** | Makes unsafe transitions visible and testable. |
+| **Pluggable sources and backends** | Applies the same safety model to Kafka, files, syslog spools, and object storage backends. |
+
+---
 
 ## Core rule
 
@@ -54,78 +114,194 @@ Most log-to-object-storage tools move bytes into a bucket. They do **not** provi
 SOURCE_COMMITTED is forbidden until VERIFIED is true.
 ```
 
-A Kafka offset, file byte offset, or syslog spool offset is **never** committed until, in order:
+A source progress marker is never committed until the batch completes this lifecycle:
 
-1. the batch is sealed
-2. the compressed object is created
-3. the object checksum is calculated
-4. the object is uploaded
-5. the manifest is generated
-6. the manifest is uploaded
-7. the uploaded object is verified
-8. the manifest is verified
-9. **only then** source progress is committed
+```text
+DISCOVERED
+  → BATCHING
+  → SEALED
+  → COMPRESSED
+  → CHECKSUMMED
+  → OBJECT_UPLOADED
+  → MANIFEST_UPLOADED
+  → VERIFIED
+  → SOURCE_COMMITTED
+```
 
-This is enforced in [state_machine.rs](crates/vtop-core/src/state_machine.rs): the only legal predecessor of `SourceCommitted` is `Verified`, and the same guard is re-applied at the state-store layer.
+Failure can happen from any state:
+
+```text
+ANY_STATE
+  → FAILED
+  → REPLAY_REQUIRED
+  → BATCHING
+```
+
+> [!CAUTION]
+> Transitions such as `SEALED → SOURCE_COMMITTED` or `OBJECT_UPLOADED → SOURCE_COMMITTED` are invalid.
+
+---
+
+## How it works
+
+At a high level, VTOP separates source progress from destination durability.
+
+```text
+Source records
+  → batch
+  → compressed object
+  → checksum
+  → manifest
+  → upload object
+  → upload manifest
+  → verify object and manifest
+  → commit source progress
+```
+
+The manifest acts as the transfer evidence record.
+
+It links:
+
+- source type
+- source name
+- source progress marker
+- object URI
+- object checksum
+- compression type
+- detected format
+- batch metadata
+- manifest self-hash
+
+---
 
 ## State machine
 
 ![VTOP state machine](docs/assets/vtop-state-machine.png)
 
-The VTOP lifecycle advances through verified transfer states and only reaches `SOURCE_COMMITTED` after `VERIFIED`. Failure from any state transitions to `FAILED`, then `REPLAY_REQUIRED`, and finally returns to `BATCHING` for replay-safe recovery.
+The state machine is the enforcement point for safe progress.
 
-Illegal transitions (e.g. `SEALED → SOURCE_COMMITTED`) return `VtopError::IllegalStateTransition` / `CommitBeforeVerified`. See the `test_cannot_commit_from_*` tests in [state_machine.rs](crates/vtop-core/src/state_machine.rs). The full normative description is in [docs/VTOP_PROTOCOL_DRAFT.md](docs/VTOP_PROTOCOL_DRAFT.md).
+Only this final transition is valid:
 
-## Workspace layout
+```text
+VERIFIED → SOURCE_COMMITTED
+```
+
+Invalid examples:
+
+```text
+SEALED → SOURCE_COMMITTED
+COMPRESSED → SOURCE_COMMITTED
+CHECKSUMMED → SOURCE_COMMITTED
+OBJECT_UPLOADED → SOURCE_COMMITTED
+MANIFEST_UPLOADED → SOURCE_COMMITTED
+```
+
+Relevant implementation:
+
+- [crates/vtop-core/src/state_machine.rs](crates/vtop-core/src/state_machine.rs)
+- [docs/VTOP_PROTOCOL_DRAFT.md](docs/VTOP_PROTOCOL_DRAFT.md)
+
+---
+
+## Supported source modes
+
+| Source mode | Progress marker | Behavior |
+|---|---|---|
+| **Kafka** | topic, partition, offset range | Uses a Kafka consumer with auto-commit disabled. Each batch contains records from one topic and one partition. Offsets are committed only after verification. |
+| **File** | path, inode, byte range | Reads append-only files line by line. Partial trailing lines are not committed. Replay resumes from the last safe byte offset. |
+| **Syslog spool** | spool ID, byte range | Treats rsyslog or syslog-ng spool files as append-only inputs. External collectors own syslog delivery; VTOP owns batching, upload, verification, replay, and commit safety. |
+
+---
+
+## Format detection
+
+VTOP is not fixed to one telemetry format.
+
+When a stream does not explicitly define a format in [examples/streams.yaml](examples/streams.yaml), the engine detects the format per batch.
+
+Supported detected formats:
+
+| Format | Example output extension |
+|---|---|
+| CEF | `.cef.gz` |
+| JSON | `.json.gz` |
+| JSON Lines | `.jsonl.gz` |
+| Syslog | `.syslog.gz` |
+| Plain text | `.txt.gz` |
+
+A single engine can process different formats across different streams.
+
+For example:
+
+```text
+source A → CEF
+source B → JSON Lines
+source C → syslog
+source D → mixed batches
+```
+
+The detected format is recorded in the manifest.
+
+Relevant implementation:
+
+- [crates/vtop-core/src/detect.rs](crates/vtop-core/src/detect.rs)
+
+---
+
+## Architecture
+
+VTOP is organized as a Rust workspace.
 
 ```text
 crates/
-  vtop-core/       protocol-independent logic (state machine, batch, manifest,
-                   checksum, compression, partitioning, config, replay)
-  vtop-adapters/   source adapters: kafka_source, file_source, syslog_spool_source
-  vtop-upload/     upload backends: s3_native (primary) + s3cmd/awscli/minio + mock
-  vtop-state/      SQLite state store (sqlx) — the durable journal
-  vtop-cli/        the `vtopctl` binary + the engine runtime
-examples/          config.yaml, streams.yaml, sample logs
-docs/              protocol draft, invention disclosure, prior-art plan, etc.
-docker/            Dockerfile + entrypoint
-tests/             integration tests (wired into vtop-cli via [[test]] paths)
+  vtop-core/       protocol-independent logic:
+                   state machine, batching, manifests,
+                   checksums, compression, partitioning,
+                   config, replay
+
+  vtop-adapters/   source adapters:
+                   Kafka, file, syslog spool
+
+  vtop-upload/     upload backends:
+                   native S3, s3cmd, awscli, MinIO, mock
+
+  vtop-state/      durable SQLite state store
+
+  vtop-cli/        vtopctl CLI and engine runtime
+
+examples/          example config and sample streams
+docs/              protocol, architecture, security, invention notes
+docker/            container build files and seed scripts
+tests/             integration tests
+benchmarks/        benchmark and performance test support
 ```
 
-`vtop-core` has **no** dependency on Kafka, S3, or the CLI. A deeper tour is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+> [!TIP]
+> Keep detailed internals in `docs/`. The README should stay focused on orientation, quick start, and key guarantees.
 
-## Source modes
+Full architecture documentation:
 
-| Mode | Progress marker | Behavior |
-|------|-----------------|----------|
-| **Kafka** | offset per topic+partition | `rdkafka` consumer with **auto-commit always disabled**; one batch = one topic + one partition + one offset range (partitions never mixed); offsets committed only after `VERIFIED`. |
-| **File** | byte offset | Reads append-only files line by line, tracking `path`, `inode`, byte offsets, size, mtime; resumes from the last committed byte; a partial trailing line is never committed; replay rewinds to the start of the uncommitted range. |
-| **Syslog spool** | spool byte offset | Treats rsyslog / syslog-ng spool files as append-only with a `spool_id` and byte range. External collectors own delivery; VTOP owns batching, checksum, manifest, upload, verification, replay state, and the commit rule. |
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
-Every object gets a `*.manifest.json` written alongside it, binding the **source progress marker** to the object's **SHA‑256** plus a self-hash for tamper-evidence.
-
-### Format auto-detection (mixed formats)
-
-Format is **not** fixed to CEF. When a stream does not declare a `format` in
-[`streams.yaml`](examples/streams.yaml), the engine **auto-detects it per batch**
-from the content — CEF, JSON, JSON Lines, syslog (PRI header), or plain text.
-Because detection runs per batch, **different formats can flow through one engine
-at the same time**: source A can be CEF, source B JSON, source C syslog, and each
-batch gets the correct object extension (`.cef.gz`, `.jsonl.gz`, …) and records
-its detected `format` in the manifest. An explicit `format` in `streams.yaml`
-always overrides detection. See [detect.rs](crates/vtop-core/src/detect.rs).
+---
 
 ## Quick start
 
+Run the full Docker lab:
+
 ```bash
-# Run the full lab (Kafka + MinIO + engine) in containers:
 docker compose up -d
 docker compose logs -f vtop-engine
+```
 
-# Or build and run locally against the example config:
+Or build and run locally:
+
+```bash
 cargo build --release
 cargo run -p vtop-cli -- discover --config examples/config.yaml
 ```
+
+---
 
 ## Build and test
 
@@ -136,58 +312,159 @@ cargo test --workspace
 cargo build --release
 ```
 
-CI runs all four on every push and pull request — see [.github/workflows/ci.yml](.github/workflows/ci.yml).
+CI runs formatting, linting, tests, and release build on push and pull request.
+
+Workflow file:
+
+```text
+.github/workflows/ci.yml
+```
+
+---
 
 ## CLI usage
 
-The binary is `vtopctl`:
+The CLI binary is `vtopctl`.
 
 ```bash
-cargo run -p vtop-cli -- run             --config examples/config.yaml
-cargo run -p vtop-cli -- discover        --config examples/config.yaml
-cargo run -p vtop-cli -- process-once --source kafka --config examples/config.yaml
-cargo run -p vtop-cli -- process-once --source file  --config examples/config.yaml
-cargo run -p vtop-cli -- replay --batch-id <batch_id> --config examples/config.yaml
-cargo run -p vtop-cli -- status          --config examples/config.yaml
-cargo run -p vtop-cli -- list-batches    --config examples/config.yaml --json
-cargo run -p vtop-cli -- verify-manifest --manifest s3://telemetry-data/.../batch.manifest.json --config examples/config.yaml
+cargo run -p vtop-cli -- run \
+  --config examples/config.yaml
+
+cargo run -p vtop-cli -- discover \
+  --config examples/config.yaml
+
+cargo run -p vtop-cli -- process-once \
+  --source kafka \
+  --config examples/config.yaml
+
+cargo run -p vtop-cli -- process-once \
+  --source file \
+  --config examples/config.yaml
+
+cargo run -p vtop-cli -- replay \
+  --batch-id <batch_id> \
+  --config examples/config.yaml
+
+cargo run -p vtop-cli -- status \
+  --config examples/config.yaml
+
+cargo run -p vtop-cli -- list-batches \
+  --config examples/config.yaml \
+  --json
+
+cargo run -p vtop-cli -- verify-manifest \
+  --manifest s3://telemetry-data/.../batch.manifest.json \
+  --config examples/config.yaml
 ```
 
-Every command supports `--json` (machine-readable) and `--log-level`, exits non-zero on failure, and never prints secrets.
+Common CLI behavior:
+
+| Option | Purpose |
+|---|---|
+| `--json` | machine-readable output |
+| `--log-level` | runtime log level |
+| non-zero exit | command failure |
+| secret-safe output | commands should not print credentials |
+
+---
 
 ## Docker lab
+
+The Docker lab provides Kafka, MinIO, seeded telemetry, and the VTOP engine.
+
+| Service | Purpose |
+|---|---|
+| `kafka` | test Kafka broker |
+| `kafka-ui` | browser UI at `http://localhost:8080` |
+| `minio` | S3-compatible object storage |
+| `minio-init` | bucket initialization |
+| `kafka-init` | seeded test events |
+| `vtop-engine` | VTOP runtime |
+| `rsyslog` | optional syslog collector profile |
+
+MinIO endpoints:
+
+```text
+API:     http://localhost:9000
+Console: http://localhost:9001
+Bucket:  telemetry-data
+```
+
+Start the lab:
 
 ```bash
 docker compose up -d
 docker compose logs -f vtop-engine
 ```
 
-Each piece runs in its **own container**: `kafka`, `kafka-ui` (http://localhost:8080), `minio` (API `:9000`, console `:9001`, bucket `telemetry-data`), `minio-init`, `kafka-init`, `vtop-engine` (the engine), and an optional **separate** `rsyslog` collector (`--profile syslog`) that writes into the shared `./data/spool` volume the engine reads. The engine is never bundled with the collector.
+---
 
-`kafka-init` seeds **randomized** events in **multiple formats** (via [docker/seed-events.sh](docker/seed-events.sh)) into separate topics — `cef_events`, `json_events`, `syslog_events`, and `mixed_events` (random format per line) — so you can watch per-batch detection label each one.
+## Kafka to MinIO example
 
-**Kafka → MinIO:**
+Start Kafka, MinIO, and seed data:
 
 ```bash
 docker compose up -d kafka minio minio-init kafka-init
-docker compose up -d vtop-engine
-docker compose logs -f vtop-engine   # format_detected → object_uploaded → verification_passed → source_committed
-# Browse results at http://localhost:9001 → bucket telemetry-data
 ```
 
-**File → MinIO** (use the generator to make randomized data in any format):
+Start the engine:
 
 ```bash
-docker/seed-events.sh cef    200 > ./data/input/auth.cef.log     # CEF
-docker/seed-events.sh json   200 > ./data/input/app.json.log     # JSON Lines
-docker/seed-events.sh syslog 200 > ./data/input/sys.syslog.log   # syslog
-docker/seed-events.sh mixed  500 > ./data/input/mixed.log        # random per line
 docker compose up -d vtop-engine
+docker compose logs -f vtop-engine
 ```
 
-Generate ad-hoc test data anytime: `docker/seed-events.sh <cef|json|jsonl|syslog|mixed> [count]`.
+Expected lifecycle events:
 
-The file flow is also covered without any infrastructure by [tests/integration_file_to_minio.rs](tests/integration_file_to_minio.rs) (in-memory `mock` backend).
+```text
+format_detected
+object_uploaded
+manifest_uploaded
+verification_passed
+source_committed
+```
+
+Open the MinIO console:
+
+```text
+http://localhost:9001
+```
+
+Then inspect the `telemetry-data` bucket.
+
+---
+
+## File to MinIO example
+
+Generate test input files:
+
+```bash
+docker/seed-events.sh cef    200 > ./data/input/auth.cef.log
+docker/seed-events.sh json   200 > ./data/input/app.json.log
+docker/seed-events.sh syslog 200 > ./data/input/sys.syslog.log
+docker/seed-events.sh mixed  500 > ./data/input/mixed.log
+```
+
+Run the engine:
+
+```bash
+docker compose up -d vtop-engine
+docker compose logs -f vtop-engine
+```
+
+Generate additional test data at any time:
+
+```bash
+docker/seed-events.sh <cef|json|jsonl|syslog|mixed> [count]
+```
+
+Infrastructure-free file-flow test:
+
+```text
+tests/integration_file_to_minio.rs
+```
+
+---
 
 ## Example manifest
 
@@ -211,13 +488,13 @@ The file flow is also covered without any infrastructure by [tests/integration_f
     "consumer_group": "vtop-engine"
   },
   "object": {
-    "uri": "s3://telemetry-data/telemetry-data/tenant=default/source=app/format=cef/year=2026/month=06/day=18/hour=15/vtop-….cef.gz",
+    "uri": "s3://telemetry-data/tenant=default/source=app/format=cef/year=2026/month=06/day=18/hour=15/vtop-....cef.gz",
     "size_bytes": 924822,
-    "sha256": "abc123…"
+    "sha256": "abc123..."
   },
   "manifest": {
-    "uri": "s3://telemetry-data/…/vtop-….manifest.json",
-    "sha256": "def456…"
+    "uri": "s3://telemetry-data/.../vtop-....manifest.json",
+    "sha256": "def456..."
   },
   "state": "manifest_uploaded",
   "verification_status": "not_verified"
@@ -225,71 +502,167 @@ The file flow is also covered without any infrastructure by [tests/integration_f
 ```
 
 > [!NOTE]
-> The manifest is written at the `MANIFEST_UPLOADED` step — *before* the storage-side verification — so its embedded `state`/`verification_status` reflect that point in time and its hash stays stable. The **authoritative** post-verification state (`verified` → `source_committed`) lives in the state store, queryable via `vtopctl status` / `list-batches`. The `manifest.sha256` is computed over the manifest with that field blanked, so it is reproducible and tamper-evident (`verify_self_hash`).
+> The manifest is written at `MANIFEST_UPLOADED`, before storage-side verification.
+>
+> The authoritative post-verification state lives in the state store and can be queried with `vtopctl status` or `vtopctl list-batches --json`.
 
-## Metrics and efficiency
+The manifest self-hash is computed with the `manifest.sha256` field blanked, making the manifest reproducible and tamper-evident.
 
-The engine measures every batch end-to-end and emits a structured `batch_metrics`
-event (and a per-batch line under `vtopctl process-once`):
+---
+
+## Metrics
+
+VTOP emits structured per-batch metrics.
+
+Example:
 
 ```text
 3 records, 114 B->80 B (1.43x, 29.8% saved) in 6 ms | 500 rec/s, 0.00 MiB/s up |
 stages: compress=0ms checksum=0ms put_obj=0ms put_manifest=0ms verify=0ms commit=0ms
 ```
 
-Each batch records (see [metrics.rs](crates/vtop-core/src/metrics.rs)):
+Each batch records:
 
-- **Size / transfer:** uncompressed vs compressed bytes, **compression ratio**, **% space saved** — i.e. how much smaller the object on the wire is than the source data.
-- **Per-stage latency:** compress, checksum, object upload, manifest upload, verify, commit (ms). The `object_upload_ms` captures network cost (the "distance" to the bucket).
-- **Throughput:** records/sec, uncompressed MiB/sec, and **effective upload MiB/sec** of the compressed object.
+| Metric area | Examples |
+|---|---|
+| **Size and transfer** | uncompressed bytes, compressed bytes, compression ratio, percentage saved |
+| **Latency** | compression, checksum, object upload, manifest upload, verification, commit |
+| **Throughput** | records/sec, uncompressed MiB/sec, effective upload MiB/sec |
 
-`vtopctl process-once --json` includes the full `metrics` object per batch. These
-per-batch records are the raw input for the aggregate Prometheus-style counters
-described under [Known limitations](#known-limitations) (e.g.
-`bytes_uploaded_total`, `upload_latency_seconds`), which are designed but not yet
-exported.
+`vtopctl process-once --json` includes the full metrics object per batch.
 
-## Verification before commit
+Prometheus-style aggregate metrics are designed but not yet exported.
 
-The rule is enforced at three layers:
+Relevant implementation:
 
-1. The state machine permits `SourceCommitted` **only** from `Verified` (`transition()` returns `CommitBeforeVerified` otherwise).
-2. `SqliteStateStore::update_batch_state` routes **every** state change through `transition()`, so the rule holds even at the persistence layer.
-3. The engine pipeline ([engine.rs](crates/vtop-cli/src/engine.rs)) only calls `adapter.commit_progress(...)` *after* `mark_verified`. If verification fails, the batch is marked `FAILED` and `commit_progress` is never called. If the commit itself fails after verification, the batch stays `VERIFIED` (not lost) and recovery retries the commit.
+- [crates/vtop-core/src/metrics.rs](crates/vtop-core/src/metrics.rs)
 
-Proven by the `state_machine.rs` unit tests and [tests/integration_replay.rs](tests/integration_replay.rs) (`verification_failure_never_commits`).
+---
 
-## Replay after crash
+## Upload and verification
 
-If the engine dies after `VERIFIED` but before `SOURCE_COMMITTED`, the source offset was never advanced. On restart, `Engine::recover()`:
+VTOP supports multiple upload backends.
 
-- finds a `VERIFIED`-but-uncommitted batch and **retries the source commit** (the object is already durable and verified);
-- marks any **earlier** incomplete batch `REPLAY_REQUIRED` and re-reads it from the source — source progress is never advanced for unverified data.
+| Backend | Purpose | Verification level |
+|---|---|---|
+| native S3 | primary S3-compatible backend | object checksum verification |
+| AWS CLI | command-based backend | checksum verification where supported |
+| s3cmd | command-based backend | size and existence verification |
+| MinIO client | command-based backend | size and existence verification |
+| mock | tests and local integration flow | in-memory verification |
 
-Proven by [tests/integration_replay.rs](tests/integration_replay.rs) (`crash_before_commit_is_replayable_then_recovers`) and [tests/integration_state_recovery.rs](tests/integration_state_recovery.rs).
+> [!IMPORTANT]
+> The safest verification profile is the native backend with checksum verification.
+
+---
+
+## Replay and recovery
+
+VTOP recovery is designed around one rule:
+
+```text
+Unverified data must remain replayable.
+```
+
+Recovery behavior:
+
+| Crash point | Recovery action |
+|---|---|
+| before object upload | replay from source |
+| after object upload but before verification | replay from source |
+| after verification but before source commit | retry source commit |
+| after source commit | batch is complete |
+
+If verification fails:
+
+```text
+batch → FAILED
+source progress → not committed
+```
+
+If commit fails after verification:
+
+```text
+batch → VERIFIED
+recovery → retries source commit
+```
+
+Relevant tests:
+
+```text
+tests/integration_replay.rs
+tests/integration_state_recovery.rs
+```
+
+---
 
 ## Known limitations
 
-- **Single-part uploads.** The native S3 backend uses `put_object`; multipart upload for very large batches is a documented follow-up (`supports_multipart()` reports `false`).
-- **Recovery of partial uploads.** Batches that crashed *before* `VERIFIED` are replayed from the source rather than resumed from a half-written local object (the prototype persists progress markers, not record payloads).
-- **Command backends are size-limited verifiers.** `s3cmd` and `mc` verify size + existence only (reported as `backend_limited`); the native and `awscli` backends verify the stored SHA‑256.
-- **Syslog timestamp parsing** is not yet extracted into the spool marker (`received_time_*` are `None`).
-- **Manifest signing and S3 Object Lock** are designed for but not yet implemented (see [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md)).
-- **Metrics** are designed (Prometheus-style names) but not yet exported; the engine emits structured `tracing` events today.
-- The Kafka integration test requires a live broker and is `#[ignore]` by default.
+VTOP is currently a prototype. The following limits are known and intentional.
+
+| Area | Current behavior | Planned direction |
+|---|---|---|
+| Large objects | native S3 backend uses single-part `put_object` | add multipart upload |
+| Partial upload recovery | replays from source instead of resuming half-written local objects | add resumable local staging |
+| Command backend verification | `s3cmd` and `mc` verify size and existence only | prefer native checksum verification |
+| Syslog timestamps | `received_time_*` is not yet extracted into the spool marker | add timestamp extraction |
+| Manifest integrity | self-hash exists, signing not implemented | add manifest signing |
+| Object immutability | S3 Object Lock is designed but not implemented | add Object Lock profile |
+| Metrics export | structured events exist, Prometheus export not implemented | add metrics endpoint/exporter |
+| Kafka integration test | requires live broker and is ignored by default | add optional CI service profile |
+| Binary inputs | source adapters are line-oriented | add binary/pre-compressed framing |
+| Local backend | object storage is the main target | add local filesystem backend |
+
+---
+
+## Roadmap
+
+Planned implementation areas:
+
+- [ ] local filesystem upload backend
+- [ ] BLAKE3 checksum strategy
+- [ ] checksum-disabled conformance profile
+- [ ] Kafka feature gate for lighter builds
+- [ ] binary and pre-compressed input framing
+- [ ] multipart upload support
+- [ ] manifest signing
+- [ ] S3 Object Lock profile
+- [ ] Prometheus metrics exporter
+- [ ] million-file benchmark suite
+
+---
 
 ## Documentation
 
-Full doc set in [docs/](docs/) (index: [docs/README.md](docs/README.md)):
+| Document | Purpose |
+|---|---|
+| [docs/README.md](docs/README.md) | documentation index |
+| [docs/VTOP_PROTOCOL_DRAFT.md](docs/VTOP_PROTOCOL_DRAFT.md) | protocol draft and conformance profiles |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | architecture and runtime flow |
+| [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md) | security model and normative rules |
+| [docs/INVENTION_DISCLOSURE_DRAFT.md](docs/INVENTION_DISCLOSURE_DRAFT.md) | candidate-invention disclosure draft |
+| [docs/PRIOR_ART_SEARCH_PLAN.md](docs/PRIOR_ART_SEARCH_PLAN.md) | prior-art search plan |
 
-| Document | Contents |
-|----------|----------|
-| [VTOP_PROTOCOL_DRAFT.md](docs/VTOP_PROTOCOL_DRAFT.md) | Normative protocol draft + conformance profiles |
-| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Architecture, runtime flow, and data-flow diagram |
-| [SECURITY_MODEL.md](docs/SECURITY_MODEL.md) | Security model and normative rules |
-| [INVENTION_DISCLOSURE_DRAFT.md](docs/INVENTION_DISCLOSURE_DRAFT.md) | Candidate-invention disclosure draft |
-| [PRIOR_ART_SEARCH_PLAN.md](docs/PRIOR_ART_SEARCH_PLAN.md) | Prior-art search plan |
+---
+
+## Repository topics
+
+```text
+rust
+kafka
+s3
+minio
+telemetry
+siem
+object-storage
+observability
+replay
+manifest
+```
+
+---
 
 ## License
 
 [MIT](LICENSE) © 2026 Tamir Suliman.
+````
