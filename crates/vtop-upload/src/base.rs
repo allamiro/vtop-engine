@@ -76,6 +76,14 @@ pub trait UploadBackend: Send + Sync {
     /// Delete an object (used only for cleanup / explicit operations).
     async fn delete_object(&self, object_uri: &str) -> Result<(), VtopError>;
 
+    /// Ensure a bucket exists (idempotent). Default is a no-op; backends that
+    /// support it (native S3) override this. Only invoked when the engine is
+    /// configured with `upload.create_bucket = true` — used to provision
+    /// per-format buckets on demand.
+    async fn ensure_bucket(&self, _bucket: &str) -> Result<(), VtopError> {
+        Ok(())
+    }
+
     fn backend_name(&self) -> &'static str;
 
     fn supports_checksum_verification(&self) -> bool;

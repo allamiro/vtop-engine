@@ -56,6 +56,7 @@ impl std::fmt::Display for SourceType {
 #[serde(rename_all = "snake_case")]
 pub enum TelemetryFormat {
     Cef,
+    Leef,
     Json,
     Jsonl,
     Syslog,
@@ -67,6 +68,7 @@ impl TelemetryFormat {
     pub fn extension(&self) -> &'static str {
         match self {
             TelemetryFormat::Cef => "cef",
+            TelemetryFormat::Leef => "leef",
             TelemetryFormat::Json => "json",
             TelemetryFormat::Jsonl => "jsonl",
             TelemetryFormat::Syslog => "syslog",
@@ -84,6 +86,7 @@ impl std::str::FromStr for TelemetryFormat {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
             "cef" => Ok(TelemetryFormat::Cef),
+            "leef" => Ok(TelemetryFormat::Leef),
             "json" => Ok(TelemetryFormat::Json),
             "jsonl" | "ndjson" => Ok(TelemetryFormat::Jsonl),
             "syslog" => Ok(TelemetryFormat::Syslog),

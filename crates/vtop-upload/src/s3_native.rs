@@ -181,6 +181,30 @@ impl UploadBackend for S3NativeBackend {
         Ok(())
     }
 
+    async fn ensure_bucket(&self, bucket: &str) -> Result<(), VtopError> {
+        // Idempotent: treat "already exists / already owned by you" as success.
+        match self.client.create_bucket().bucket(bucket).send().await {
+            Ok(_) => {
+                tracing::info!(bucket, "bucket created");
+                Ok(())
+            }
+            Err(e) => {
+                let se = e.into_service_error();
+                let msg = se.to_string().to_lowercase();
+                if msg.contains("alreadyexists")
+                    || msg.contains("already exists")
+                    || msg.contains("alreadyownedbyyou")
+                    || msg.contains("already owned")
+                    || msg.contains("bucketalreadyownedbyyou")
+                {
+                    Ok(())
+                } else {
+                    Err(VtopError::Upload(format!("create_bucket {bucket}: {se}")))
+                }
+            }
+        }
+    }
+
     fn backend_name(&self) -> &'static str {
         "s3_native"
     }

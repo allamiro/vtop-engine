@@ -43,12 +43,15 @@ sources:
 
 upload:
   backend: s3_native            # s3_native | s3cmd | awscli | minio | mock
-  bucket: telemetry-data
-  prefix: telemetry-data
+  # One bucket per data format: "{format}" resolves to cef/leef/json/jsonl/
+  # syslog/raw. Use a plain name (e.g. "telemetry-data") for a single bucket.
+  bucket: "telemetry-{format}"
+  prefix: ""
   endpoint_url: http://minio:9000
   region: us-east-1
   force_path_style: true
   verify_tls: false
+  create_bucket: true           # auto-create per-format buckets on first use
 
 partitioning:
   template: "tenant={tenant}/source={source}/format={format}/year={yyyy}/month={mm}/day={dd}/hour={hh}/"

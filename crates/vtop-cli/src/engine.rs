@@ -211,8 +211,11 @@ impl<'a> Pipeline<'a> {
         };
         let resolved_prefix =
             partitioning::resolve_template(&self.config.partitioning.template, &ctx);
+        // Bucket may be templated (e.g. "telemetry-{format}") for one bucket
+        // per data format.
+        let bucket = partitioning::resolve_bucket(&self.config.upload.bucket, &ctx);
         let object_uri = partitioning::object_uri(
-            &self.config.upload.bucket,
+            &bucket,
             &self.config.upload.prefix,
             &resolved_prefix,
             &batch_id,
@@ -220,11 +223,18 @@ impl<'a> Pipeline<'a> {
             compressed.compression,
         );
         let manifest_uri = partitioning::manifest_uri(
-            &self.config.upload.bucket,
+            &bucket,
             &self.config.upload.prefix,
             &resolved_prefix,
             &batch_id,
         );
+
+        // Optionally provision the (per-format) bucket on demand.
+        if self.config.upload.create_bucket {
+            if let Err(e) = self.backend.ensure_bucket(&bucket).await {
+                fail!(format!("ensure_bucket {bucket} failed: {e}"));
+            }
+        }
 
         // ---- CHECKSUMMED -> OBJECT_UPLOADED -----------------------------
         let t = Instant::now();

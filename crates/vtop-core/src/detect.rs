@@ -11,17 +11,47 @@ use crate::types::TelemetryFormat;
 /// Number of leading records sampled when inferring a batch's format.
 const SAMPLE: usize = 32;
 
+// Index helpers so the counts array and the mapping never drift apart.
+const N_CLASSES: usize = 6;
+fn class_index(f: &TelemetryFormat) -> usize {
+    match f {
+        TelemetryFormat::Cef => 0,
+        TelemetryFormat::Leef => 1,
+        TelemetryFormat::Json => 2,
+        TelemetryFormat::Jsonl => 3,
+        TelemetryFormat::Syslog => 4,
+        TelemetryFormat::Raw => 5,
+    }
+}
+fn class_from_index(i: usize) -> TelemetryFormat {
+    match i {
+        0 => TelemetryFormat::Cef,
+        1 => TelemetryFormat::Leef,
+        2 => TelemetryFormat::Json,
+        3 => TelemetryFormat::Jsonl,
+        4 => TelemetryFormat::Syslog,
+        _ => TelemetryFormat::Raw,
+    }
+}
+
 /// Classify a single record (one line, no trailing newline) into a format.
+///
+/// CEF and LEEF are recognized even when wrapped in a syslog/timestamp header
+/// (real-world events often look like `<134>... CEF:0|...`), because the
+/// pipe-delimited `CEF:0|` / `LEEF:1.0|` token is a strong, specific signal.
 pub fn detect_record(record: &[u8]) -> TelemetryFormat {
-    // Work on a trimmed view; ignore leading whitespace.
     let s = trim_ascii_start(record);
     if s.is_empty() {
         return TelemetryFormat::Raw;
     }
 
-    // CEF: "CEF:0|Vendor|Product|..." (ArcSight Common Event Format).
-    if s.starts_with(b"CEF:") {
+    // CEF / LEEF — check the specific pipe-delimited token first so a syslog
+    // wrapper doesn't mask them.
+    if s.starts_with(b"CEF:") || contains(s, b"CEF:0|") {
         return TelemetryFormat::Cef;
+    }
+    if s.starts_with(b"LEEF:") || contains(s, b"LEEF:1.0|") || contains(s, b"LEEF:2.0|") {
+        return TelemetryFormat::Leef;
     }
 
     // Syslog with a PRI header: "<NNN>..." where NNN is 1-3 digits.
@@ -58,40 +88,36 @@ pub fn detect_batch(records: &[Vec<u8>]) -> TelemetryFormat {
         }
     }
 
-    let mut counts = [0usize; 5]; // Cef, Json, Jsonl, Syslog, Raw
+    let mut counts = [0usize; N_CLASSES];
     for rec in records.iter().take(SAMPLE) {
-        let idx = match detect_record(rec) {
-            TelemetryFormat::Cef => 0,
-            TelemetryFormat::Json => 1,
-            TelemetryFormat::Jsonl => 2,
-            TelemetryFormat::Syslog => 3,
-            TelemetryFormat::Raw => 4,
-        };
-        counts[idx] += 1;
+        counts[class_index(&detect_record(rec))] += 1;
     }
 
     // Pick the dominant non-Raw class if it covers a majority of the sample;
     // otherwise fall back to Raw (don't guess on noisy input).
     let sampled = records.len().min(SAMPLE);
+    let raw_idx = class_index(&TelemetryFormat::Raw);
     let (best_idx, best_count) = counts
         .iter()
         .enumerate()
-        .take(4) // ignore Raw when choosing a positive signal
+        .filter(|(i, _)| *i != raw_idx) // ignore Raw when choosing a positive signal
         .max_by_key(|(_, c)| **c)
         .map(|(i, c)| (i, *c))
-        .unwrap_or((4, 0));
+        .unwrap_or((raw_idx, 0));
 
     if best_count * 2 > sampled {
-        match best_idx {
-            0 => TelemetryFormat::Cef,
-            1 => TelemetryFormat::Json,
-            2 => TelemetryFormat::Jsonl,
-            3 => TelemetryFormat::Syslog,
-            _ => TelemetryFormat::Raw,
-        }
+        class_from_index(best_idx)
     } else {
         TelemetryFormat::Raw
     }
+}
+
+/// Naive substring search for byte slices.
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return needle.is_empty();
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 fn trim_ascii_start(b: &[u8]) -> &[u8] {
@@ -131,6 +157,25 @@ mod tests {
             "CEF:0|VTOP|Engine|1.0|101|Login|6|src=10.0.0.2",
         ]);
         assert_eq!(detect_batch(&b), TelemetryFormat::Cef);
+    }
+
+    #[test]
+    fn detects_syslog_wrapped_cef() {
+        // Real-world CEF is often syslog/timestamp-framed.
+        let b = recs(&[
+            "<134>Nov 23 18:50:00 host JATP: CEF:0|JATP|Cortex|3.6|email|Phish|7|src=1.2.3.4",
+            "2016-01-23 17:36:39.841+00 host CEF:0|JATP|Cortex|3.6|cnc|Trojan|7|src=5.6.7.8",
+        ]);
+        assert_eq!(detect_batch(&b), TelemetryFormat::Cef);
+    }
+
+    #[test]
+    fn detects_leef() {
+        let b = recs(&[
+            "<134>Sep 24 16:23:36 host LEEF:1.0|Cyphort|Cortex|5.0|http|src=1.1.1.1\tdst=2.2.2.2",
+            "<134>Sep 24 14:23:41 host LEEF:1.0|Cyphort|Cortex|5.0|third_party|usrName=admin",
+        ]);
+        assert_eq!(detect_batch(&b), TelemetryFormat::Leef);
     }
 
     #[test]

@@ -6,7 +6,7 @@
 # detection with realistic, varied data.
 #
 # Usage:
-#   seed-events.sh <cef|json|jsonl|syslog|mixed> [count]
+#   seed-events.sh <cef|leef|json|jsonl|syslog|logfmt|apache|text|mixed> [count]
 #
 # Examples:
 #   seed-events.sh cef 100 | kafka-console-producer.sh --topic cef_events ...
@@ -57,20 +57,60 @@ emit_syslog() {
     "$(pick "${ACTIONS[@]}")" "$(pick "${OUTCOMES[@]}")"
 }
 
+emit_leef() {
+  # LEEF 1.0, often syslog-framed (tab-delimited extensions).
+  local pri=$(( RANDOM % 191 + 1 ))
+  printf '<%d>%s %s LEEF:1.0|%s|%s|1.0|%s|src=%s\tdst=%s\tusrName=%s\tsev=%s\tcat=%s\toutcome=%s\n' \
+    "$pri" "$(now)" "$(pick "${HOSTS[@]}")" "$(pick "${VENDORS[@]}")" "$(pick "${PRODUCTS[@]}")" \
+    "$(pick "${EVENTS[@]}")" "$(rand_ip)" "$(rand_ip)" "$(pick "${USERS[@]}")" \
+    "$(pick "${SEVERITIES[@]}")" "$(pick "${EVENTS[@]}")" "$(pick "${OUTCOMES[@]}")"
+}
+
+emit_logfmt() {
+  # key=value (logfmt) — detected as text/raw, useful for varied structure.
+  printf 'ts=%s level=%s event=%s user=%s src=%s action=%s outcome=%s duration_ms=%d\n' \
+    "$(now)" "$(pick info warn error debug)" "$(pick "${EVENTS[@]}")" "$(pick "${USERS[@]}")" \
+    "$(rand_ip)" "$(pick "${ACTIONS[@]}")" "$(pick "${OUTCOMES[@]}")" "$(( RANDOM % 5000 ))"
+}
+
+emit_apache() {
+  # Apache/NGINX common log format.
+  local methods=(GET POST PUT DELETE HEAD) codes=(200 201 301 304 400 401 403 404 500 502)
+  printf '%s - %s [%s] "%s /path/%d HTTP/1.1" %s %d "-" "Mozilla/5.0"\n' \
+    "$(rand_ip)" "$(pick "${USERS[@]}")" "$(now)" \
+    "${methods[$((RANDOM % ${#methods[@]}))]}" "$(( RANDOM % 9999 ))" \
+    "${codes[$((RANDOM % ${#codes[@]}))]}" "$(( RANDOM % 100000 ))"
+}
+
+emit_text() {
+  # Free-form text log line.
+  printf '%s [%s] %s by %s from %s -> %s\n' \
+    "$(now)" "$(pick INFO WARN ERROR)" "$(pick "${EVENTS[@]}")" \
+    "$(pick "${USERS[@]}")" "$(rand_ip)" "$(pick "${OUTCOMES[@]}")"
+}
+
 for _ in $(seq 1 "$COUNT"); do
   case "$FORMAT" in
     cef) emit_cef ;;
+    leef) emit_leef ;;
     json | jsonl) emit_json ;;
     syslog) emit_syslog ;;
+    logfmt) emit_logfmt ;;
+    apache) emit_apache ;;
+    text) emit_text ;;
     mixed)
-      case $(( RANDOM % 3 )) in
+      case $(( RANDOM % 7 )) in
         0) emit_cef ;;
-        1) emit_json ;;
-        2) emit_syslog ;;
+        1) emit_leef ;;
+        2) emit_json ;;
+        3) emit_syslog ;;
+        4) emit_logfmt ;;
+        5) emit_apache ;;
+        6) emit_text ;;
       esac
       ;;
     *)
-      echo "unknown format: $FORMAT (use cef|json|jsonl|syslog|mixed)" >&2
+      echo "unknown format: $FORMAT (use cef|leef|json|jsonl|syslog|logfmt|apache|text|mixed)" >&2
       exit 2
       ;;
   esac

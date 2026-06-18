@@ -98,6 +98,60 @@ pub fn normalize_prefix(p: &str) -> String {
     parts.join("/")
 }
 
+/// Resolve a bucket name template against `ctx` and sanitize it to valid
+/// S3 bucket characters. Supports the same placeholders as [`resolve_template`]
+/// (`{format}`, `{tenant}`, `{source}`, ...), enabling **one bucket per data
+/// format** with e.g. `bucket: "telemetry-{format}"` → `telemetry-cef`,
+/// `telemetry-json`, `telemetry-syslog`, ...
+///
+/// Sanitization: lowercased; characters outside `[a-z0-9-]` become `-`;
+/// repeated/edge `-` are trimmed; empty falls back to `vtop`.
+pub fn resolve_bucket(template: &str, ctx: &PartitionContext) -> String {
+    let mut out = String::with_capacity(template.len() * 2);
+    let mut chars = template.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '{' {
+            let mut key = String::new();
+            for k in chars.by_ref() {
+                if k == '}' {
+                    break;
+                }
+                key.push(k);
+            }
+            if let Some(val) = ctx.lookup(&key) {
+                out.push_str(&val);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    sanitize_bucket(&out)
+}
+
+/// Lowercase + restrict to S3-safe bucket characters `[a-z0-9-]`.
+pub fn sanitize_bucket(name: &str) -> String {
+    let mut s = String::with_capacity(name.len());
+    let mut prev_dash = false;
+    for ch in name.to_ascii_lowercase().chars() {
+        let mapped = if ch.is_ascii_alphanumeric() { ch } else { '-' };
+        if mapped == '-' {
+            if prev_dash {
+                continue;
+            }
+            prev_dash = true;
+        } else {
+            prev_dash = false;
+        }
+        s.push(mapped);
+    }
+    let trimmed = s.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "vtop".to_string()
+    } else {
+        trimmed
+    }
+}
+
 /// The object file name: `{batch_id}.{format}.{compression_ext}` (compression
 /// extension omitted when [`CompressionType::None`]).
 pub fn object_file_name(
@@ -202,6 +256,27 @@ mod tests {
         let resolved = resolve_template(DEFAULT_TEMPLATE, &ctx());
         let m = manifest_uri("telemetry-data", "telemetry-data", &resolved, "vtop-b1");
         assert!(m.ends_with("vtop-b1.manifest.json"));
+    }
+
+    #[test]
+    fn resolves_per_format_bucket() {
+        assert_eq!(
+            resolve_bucket("telemetry-{format}", &ctx()),
+            "telemetry-cef"
+        );
+        assert_eq!(
+            resolve_bucket("{tenant}-{format}-archive", &ctx()),
+            "default-cef-archive"
+        );
+        // plain name passes through (lowercased)
+        assert_eq!(resolve_bucket("telemetry-data", &ctx()), "telemetry-data");
+    }
+
+    #[test]
+    fn sanitizes_bucket_names() {
+        assert_eq!(sanitize_bucket("Telemetry_CEF!!"), "telemetry-cef");
+        assert_eq!(sanitize_bucket("__weird__"), "weird");
+        assert_eq!(sanitize_bucket(""), "vtop");
     }
 
     #[test]

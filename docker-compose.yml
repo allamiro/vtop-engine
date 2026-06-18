@@ -99,9 +99,13 @@ services:
       - |
         set -e
         mc alias set local http://minio:9000 minioadmin minioadmin
-        mc mb --ignore-existing local/telemetry-data
+        # One bucket per data format (the engine also auto-creates missing ones
+        # when upload.create_bucket=true).
+        for b in telemetry-data telemetry-cef telemetry-leef telemetry-json telemetry-jsonl telemetry-syslog telemetry-raw; do
+          mc mb --ignore-existing "local/$$b"
+        done
         mc ls local
-        echo "bucket telemetry-data ready"
+        echo "per-format buckets ready"
 
   vtop-engine:
     build:
@@ -129,6 +133,31 @@ services:
       - ./data/spool:/data/spool
       - ./data/work:/data/work
       - ./data/state:/data/state
+
+  # Continuous, massive, multi-format load generator (its OWN container).
+  # Enable with:  docker compose --profile load up -d kafka-load
+  # Tune via env (FORMATS, TOPICS_PER_FORMAT, MIN_BATCH, MAX_BATCH, SLEEP_SECONDS,
+  # DURATION_SECONDS). Produces forever by default.
+  kafka-load:
+    image: bitnami/kafka:3.7
+    container_name: vtop-kafka-load
+    profiles: ["load"]
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      BOOTSTRAP: kafka:9092
+      FORMATS: "cef leef json jsonl syslog logfmt apache text"
+      TOPICS_PER_FORMAT: "3"
+      MIN_BATCH: "50"
+      MAX_BATCH: "500"
+      SLEEP_SECONDS: "1"
+      DURATION_SECONDS: "0"
+    volumes:
+      - ./docker/seed-events.sh:/seed-events.sh:ro
+      - ./docker/load-generator.sh:/load-generator.sh:ro
+    entrypoint: ["/bin/bash", "/load-generator.sh"]
 
   # Optional collector: an rsyslog instance writing into the spool directory.
   optional-rsyslog:

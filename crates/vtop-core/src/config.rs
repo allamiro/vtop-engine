@@ -159,6 +159,12 @@ pub struct UploadConfig {
     /// Optional named profile / alias for command-based backends.
     #[serde(default)]
     pub profile: Option<String>,
+    /// Create the target bucket if it does not exist (native S3 backend only).
+    /// Useful with a templated `bucket` like `telemetry-{format}` so per-format
+    /// buckets are provisioned automatically. Defaults to false (least
+    /// privilege — do not grant CreateBucket in production unless intended).
+    #[serde(default)]
+    pub create_bucket: bool,
 }
 
 fn default_backend() -> String {
