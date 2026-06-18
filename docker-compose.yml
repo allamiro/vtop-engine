@@ -44,23 +44,30 @@ services:
       kafka:
         condition: service_healthy
 
-  # Produces a sample topic + JSON Lines events once Kafka is healthy.
+  # Seeds three topics with RANDOMIZED events in three different formats once
+  # Kafka is healthy — exercises VTOP's per-batch format detection with mixed,
+  # varied data. The generator (docker/seed-events.sh) is mounted read-only.
   kafka-init:
     image: bitnami/kafka:3.7
     container_name: vtop-kafka-init
     depends_on:
       kafka:
         condition: service_healthy
+    volumes:
+      - ./docker/seed-events.sh:/seed-events.sh:ro
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
         set -e
-        kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists \
-          --topic app_events --partitions 1 --replication-factor 1
-        for i in $(seq 1 20); do
-          echo "{\"ts\":\"2026-06-18T15:00:$(printf %02d $i)Z\",\"event\":\"login\",\"seq\":$i,\"src\":\"10.0.0.$i\",\"outcome\":\"success\"}"
-        done | kafka-console-producer.sh --bootstrap-server kafka:9092 --topic app_events
-        echo "seeded topic app_events with sample JSON Lines events"
+        for t in cef_events json_events syslog_events mixed_events; do
+          kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists \
+            --topic "$$t" --partitions 1 --replication-factor 1
+        done
+        bash /seed-events.sh cef    60 | kafka-console-producer.sh --bootstrap-server kafka:9092 --topic cef_events
+        bash /seed-events.sh json   60 | kafka-console-producer.sh --bootstrap-server kafka:9092 --topic json_events
+        bash /seed-events.sh syslog 60 | kafka-console-producer.sh --bootstrap-server kafka:9092 --topic syslog_events
+        bash /seed-events.sh mixed  90 | kafka-console-producer.sh --bootstrap-server kafka:9092 --topic mixed_events
+        echo "seeded cef_events/json_events/syslog_events (per-format) + mixed_events (random per line)"
 
   minio:
     image: minio/minio:latest

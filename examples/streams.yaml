@@ -1,29 +1,27 @@
 # Stream mappings: bind a discovered source name to a tenant, telemetry format,
 # object-storage source name, and retention class. Source names are NEVER
 # hardcoded in the engine — these mappings are config-driven, and the names
-# below are just examples (use whatever topic / path names you have).
+# below match the topics seeded by the docker lab (docker-compose.yml).
 #
-# `format` is OPTIONAL: if you omit a stream mapping entirely, the engine
-# auto-detects the format (CEF / JSON / JSONL / syslog / text) from the data.
-# Provide a mapping only when you want to override detection or set a tenant,
-# storage rename, or retention class.
+# `format` is OPTIONAL. If a source has NO mapping here, the engine auto-detects
+# its format (CEF / JSON / JSONL / syslog / text) from the data — so different
+# formats can flow through the same engine at once. Add a mapping only to
+# override detection or to set a tenant, storage rename, or retention class.
+#
+# In the lab: cef_events is mapped explicitly below; json_events,
+# syslog_events, and mixed_events are intentionally left UNMAPPED so you can see
+# auto-detection label each batch correctly.
 
 streams:
-  - source_name: app_events            # e.g. a Kafka topic of application events
+  - source_name: cef_events          # Kafka topic of CEF security events (lab)
     source_type: kafka
-    format: jsonl
+    format: cef
     tenant: default
-    s3_source_name: app
+    s3_source_name: security
     retention_class: standard
 
-  - source_name: web_access            # e.g. a Kafka topic of web access logs
-    source_type: kafka
-    format: jsonl
-    tenant: default
-    s3_source_name: web
-    retention_class: standard
-
-  - source_name: /data/input/auth.cef.log   # a file source of CEF events
+  # Example file source (CEF). Drop a file at this path to archive it.
+  - source_name: /data/input/auth.cef.log
     source_type: file
     format: cef
     tenant: default

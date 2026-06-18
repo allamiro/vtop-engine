@@ -165,23 +165,30 @@ docker compose up -d
 docker compose logs -f vtop-engine
 ```
 
-Services: `kafka`, `kafka-ui` (http://localhost:8080), `minio` (API `:9000`, console `:9001`, bucket `telemetry-data`), `minio-init`, `kafka-init` (seeds topic `app_events` with sample CEF events), `vtop-engine`, and an optional `rsyslog` collector (`--profile syslog`).
+Each piece runs in its **own container**: `kafka`, `kafka-ui` (http://localhost:8080), `minio` (API `:9000`, console `:9001`, bucket `telemetry-data`), `minio-init`, `kafka-init`, `vtop-engine` (the engine), and an optional **separate** `rsyslog` collector (`--profile syslog`) that writes into the shared `./data/spool` volume the engine reads. The engine is never bundled with the collector.
+
+`kafka-init` seeds **randomized** events in **multiple formats** (via [docker/seed-events.sh](docker/seed-events.sh)) into separate topics — `cef_events`, `json_events`, `syslog_events`, and `mixed_events` (random format per line) — so you can watch per-batch detection label each one.
 
 **Kafka → MinIO:**
 
 ```bash
 docker compose up -d kafka minio minio-init kafka-init
 docker compose up -d vtop-engine
-docker compose logs -f vtop-engine   # object_uploaded → verification_passed → source_committed
+docker compose logs -f vtop-engine   # format_detected → object_uploaded → verification_passed → source_committed
 # Browse results at http://localhost:9001 → bucket telemetry-data
 ```
 
-**File → MinIO:**
+**File → MinIO** (use the generator to make randomized data in any format):
 
 ```bash
-cp examples/sample-cef.log ./data/input/auth.cef.log
+docker/seed-events.sh cef    200 > ./data/input/auth.cef.log     # CEF
+docker/seed-events.sh json   200 > ./data/input/app.json.log     # JSON Lines
+docker/seed-events.sh syslog 200 > ./data/input/sys.syslog.log   # syslog
+docker/seed-events.sh mixed  500 > ./data/input/mixed.log        # random per line
 docker compose up -d vtop-engine
 ```
+
+Generate ad-hoc test data anytime: `docker/seed-events.sh <cef|json|jsonl|syslog|mixed> [count]`.
 
 The file flow is also covered without any infrastructure by [tests/integration_file_to_minio.rs](tests/integration_file_to_minio.rs) (in-memory `mock` backend).
 
