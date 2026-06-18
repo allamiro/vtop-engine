@@ -166,8 +166,9 @@ A conformant implementation **MUST NOT** commit source progress in any other ord
 A conformant implementation:
 
 - **MUST** persist batch state durably such that, after a crash, every batch can be classified as committed or not-yet-committed.
-- **MUST** treat any batch that did not reach `SOURCE_COMMITTED` as eligible for replay.
-- On recovery, a batch in any non-committed state **MUST** be transitioned to `FAILED` and then `REPLAY_REQUIRED`, and re-entered at `BATCHING`.
+- **MUST** treat any batch that did not reach `SOURCE_COMMITTED` as eligible for recovery.
+- On recovery, a batch already in `VERIFIED` (object and manifest durably written and verified, but progress not yet committed) **MAY** complete by committing source progress (`VERIFIED → SOURCE_COMMITTED`); its object **MUST NOT** be discarded.
+- On recovery, a batch in any state *before* `VERIFIED` **MUST** be transitioned to `FAILED` and then `REPLAY_REQUIRED`, and re-entered at `BATCHING`; its uncommitted source range **MUST** remain replayable.
 - **MUST NOT** double-commit a source progress marker that was already committed.
 - **MUST** be safe to re-run from the last committed source progress marker without data loss; re-uploaded objects with identical content **SHOULD** be idempotent (same `batch_id` and naming yields the same object key).
 
@@ -215,7 +216,7 @@ s3://{bucket}/{prefix}/tenant={tenant}/source={source}/format={format}/year={yyy
 - Implementations **SHOULD** support optional manifest signing to strengthen chain-of-custody guarantees.
 - Verification (§9) protects against silent corruption but is not a substitute for transport security.
 
-See the accompanying `SECURITY_MODEL.md` for the full security model.
+See the accompanying [SECURITY_MODEL.md](SECURITY_MODEL.md) for the full security model.
 
 ---
 

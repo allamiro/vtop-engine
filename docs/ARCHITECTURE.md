@@ -99,10 +99,10 @@ The `state_machine` module rejects any transition not in this table.
 
 ## Crash Recovery / Replay
 
-On startup, the `replay` module inspects `vtop-state`:
+On startup, the `replay` module inspects `vtop-state` and maps each incomplete batch to a recovery action:
 
-- Any batch **not** in `SOURCE_COMMITTED` is treated as incomplete.
-- Incomplete batches are transitioned `... -> FAILED -> REPLAY_REQUIRED -> BATCHING` and re-driven from the last committed source progress marker.
+- A batch in **`VERIFIED`** but not yet committed (object and manifest durably stored and verified) has its **source commit retried** (`VERIFIED -> SOURCE_COMMITTED`). The verified object is never discarded.
+- A batch in any state **before `VERIFIED`** is transitioned `... -> FAILED -> REPLAY_REQUIRED -> BATCHING` and re-driven from the last committed source progress marker.
 - Because object naming is deterministic (`{batch_id}` and partition path), re-uploading identical content yields the same object key — replay is idempotent.
 - A state/storage mismatch (e.g., an object present but unverified) is resolved by re-verifying or re-uploading **before** any commit.
 
