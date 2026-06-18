@@ -642,22 +642,6 @@ Planned implementation areas:
 | [docs/INVENTION_DISCLOSURE_DRAFT.md](docs/INVENTION_DISCLOSURE_DRAFT.md) | candidate-invention disclosure draft |
 | [docs/PRIOR_ART_SEARCH_PLAN.md](docs/PRIOR_ART_SEARCH_PLAN.md) | prior-art search plan |
 
----
-
-## Repository topics
-
-```text
-rust
-kafka
-s3
-minio
-telemetry
-siem
-object-storage
-observability
-replay
-manifest
-```
 
 ---
 
