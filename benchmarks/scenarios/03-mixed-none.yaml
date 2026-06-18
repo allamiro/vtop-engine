@@ -1,0 +1,14 @@
+name: mixed-none
+description: 1k mixed-format files, no compression (baseline), sha256.
+volume: 1000
+file_size: small
+format: mixed
+compression: none
+checksum: sha256
+backend: mock
+batch_max_records: 10000
+batch_max_bytes: 104857600
+batch_max_age_seconds: 60
+duration_seconds: 0
+fault: none
+sys_sample_interval: 0.5

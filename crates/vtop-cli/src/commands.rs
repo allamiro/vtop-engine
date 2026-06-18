@@ -94,7 +94,11 @@ pub fn init_tracing(level: &str, json: bool) {
     use tracing_subscriber::EnvFilter;
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level.to_lowercase()));
-    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+    // Logs go to STDERR so they never collide with command output on STDOUT
+    // (notably the machine-readable `--json` payloads).
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr);
     if json {
         builder.json().with_current_span(false).init();
     } else {

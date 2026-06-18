@@ -70,12 +70,9 @@ This is enforced in [state_machine.rs](crates/vtop-core/src/state_machine.rs): t
 
 ## State machine
 
-```text
-DISCOVERED → BATCHING → SEALED → COMPRESSED → CHECKSUMMED
-   → OBJECT_UPLOADED → MANIFEST_UPLOADED → VERIFIED → SOURCE_COMMITTED
+![VTOP state machine](docs/assets/vtop-state-machine.png)
 
-ANY_STATE → FAILED        FAILED → REPLAY_REQUIRED → BATCHING
-```
+The VTOP lifecycle advances through verified transfer states and only reaches `SOURCE_COMMITTED` after `VERIFIED`. Failure from any state transitions to `FAILED`, then `REPLAY_REQUIRED`, and finally returns to `BATCHING` for replay-safe recovery.
 
 Illegal transitions (e.g. `SEALED → SOURCE_COMMITTED`) return `VtopError::IllegalStateTransition` / `CommitBeforeVerified`. See the `test_cannot_commit_from_*` tests in [state_machine.rs](crates/vtop-core/src/state_machine.rs). The full normative description is in [docs/VTOP_PROTOCOL_DRAFT.md](docs/VTOP_PROTOCOL_DRAFT.md).
 

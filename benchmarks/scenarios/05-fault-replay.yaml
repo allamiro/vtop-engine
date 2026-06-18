@@ -1,0 +1,14 @@
+name: fault-replay
+description: Verification always fails (mock_fail) -> failed batches -> replay/recovery measured.
+volume: 300
+file_size: small
+format: jsonl
+compression: gzip
+checksum: sha256
+backend: mock_fail
+batch_max_records: 10000
+batch_max_bytes: 104857600
+batch_max_age_seconds: 60
+duration_seconds: 0
+fault: replay
+sys_sample_interval: 0.5

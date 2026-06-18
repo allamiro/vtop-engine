@@ -1,0 +1,16 @@
+name: backend-minio-jsonl
+description: Real upload path to MinIO (requires benchmarks/docker-compose.benchmark.yml up).
+volume: 200
+file_size: small
+format: jsonl
+compression: gzip
+checksum: sha256
+backend: minio
+bucket: "telemetry-{format}"
+endpoint_url: http://localhost:9000
+batch_max_records: 10000
+batch_max_bytes: 104857600
+batch_max_age_seconds: 60
+duration_seconds: 0
+fault: none
+sys_sample_interval: 0.5

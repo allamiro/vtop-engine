@@ -37,9 +37,12 @@ pub async fn build_backend(cfg: &UploadConfig) -> Result<Arc<dyn UploadBackend>,
             cfg.profile.clone().unwrap_or_else(|| "local".to_string()),
         )),
         "mock" => Arc::new(MockBackend::new()),
+        // Benchmark/fault-injection backends.
+        "mock_fail" => Arc::new(MockBackend::failing()),
+        "mock_limited" => Arc::new(MockBackend::limited()),
         other => {
             return Err(VtopError::Config(format!(
-                "unknown upload backend: {other} (expected s3_native|s3cmd|awscli|minio|mock)"
+                "unknown upload backend: {other} (expected s3_native|s3cmd|awscli|minio|mock|mock_fail|mock_limited)"
             )))
         }
     };

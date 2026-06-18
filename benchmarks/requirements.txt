@@ -1,0 +1,5 @@
+# Optional but recommended. The framework runs without them (graceful fallback:
+# a minimal YAML parser for the flat scenario subset, and `ps`-based system
+# sampling), but installing these improves fidelity.
+PyYAML>=6.0
+psutil>=5.9

@@ -1,0 +1,14 @@
+name: longrun-5min
+description: Sustained 5-minute mixed-format load (re-seeds each cycle) for long-duration perf.
+volume: 400
+file_size: small
+format: mixed
+compression: gzip
+checksum: sha256
+backend: mock
+batch_max_records: 10000
+batch_max_bytes: 104857600
+batch_max_age_seconds: 30
+duration_seconds: 300
+fault: none
+sys_sample_interval: 2.0

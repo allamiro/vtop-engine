@@ -1,0 +1,14 @@
+name: batch-by-bytes
+description: Force many small batches via a tiny max_bytes to test batching adaptability.
+volume: 500
+file_size: small
+format: jsonl
+compression: gzip
+checksum: sha256
+backend: mock
+batch_max_records: 1000000
+batch_max_bytes: 8192
+batch_max_age_seconds: 60
+duration_seconds: 0
+fault: none
+sys_sample_interval: 0.5

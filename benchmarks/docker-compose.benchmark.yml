@@ -1,0 +1,42 @@
+# MinIO backend for the `backend: minio` benchmark scenarios.
+# The benchmark runner invokes the LOCAL vtopctl binary against this endpoint.
+#
+#   docker compose -f benchmarks/docker-compose.benchmark.yml up -d
+#   python3 benchmarks/run_benchmark.py benchmarks/scenarios/07-backend-minio-jsonl.yaml
+#   docker compose -f benchmarks/docker-compose.benchmark.yml down
+services:
+  minio:
+    image: minio/minio:latest
+    container_name: vtop-bench-minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - bench-minio-data:/data
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        mc alias set local http://minio:9000 minioadmin minioadmin
+        for b in telemetry-data telemetry-cef telemetry-leef telemetry-json telemetry-jsonl telemetry-syslog telemetry-raw; do
+          mc mb --ignore-existing "local/$$b"
+        done
+        echo "benchmark buckets ready"
+
+volumes:
+  bench-minio-data:

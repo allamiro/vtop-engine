@@ -1,0 +1,14 @@
+name: medium-cef-zstd
+description: 200 medium CEF files, zstd + sha256, in-memory backend.
+volume: 200
+file_size: medium
+format: cef
+compression: zstd
+checksum: sha256
+backend: mock
+batch_max_records: 100000
+batch_max_bytes: 1073741824
+batch_max_age_seconds: 60
+duration_seconds: 0
+fault: none
+sys_sample_interval: 0.5
