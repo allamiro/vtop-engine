@@ -4,7 +4,7 @@
 
 **Verified Telemetry Object Protocol Engine** — a replay-safe, manifest-driven telemetry object transfer engine.
 
-[![CI](https://github.com/allamiro/vtop-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/allamiro/vtop-engine/actions/workflows/ci.yml)
+[![CI](https://github.com/allamiro/vtop-engine/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/allamiro/vtop-engine/actions/workflows/ci.yml?query=branch%3Amain)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org)
 [![Status: prototype](https://img.shields.io/badge/status-prototype-blue.svg)](#status)
