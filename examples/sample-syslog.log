@@ -1,0 +1,5 @@
+<34>1 2026-06-18T15:00:01Z host01 sshd 1432 - - Accepted password for alice from 10.0.0.12 port 51234 ssh2
+<38>1 2026-06-18T15:00:02Z host01 sshd 1433 - - Failed password for bob from 10.0.0.55 port 51299 ssh2
+<86>1 2026-06-18T15:00:03Z host02 sudo 2201 - - alice : TTY=pts/0 ; PWD=/home/alice ; USER=root ; COMMAND=/bin/cat /etc/shadow
+<30>1 2026-06-18T15:00:04Z fw01 kernel - - - DENY IN=eth0 SRC=203.0.113.9 DST=10.0.0.1 PROTO=TCP SPT=44321 DPT=22
+<85>1 2026-06-18T15:00:05Z host02 sudo 2202 - - bob : TTY=pts/1 ; PWD=/home/bob ; USER=root ; COMMAND=/usr/bin/id

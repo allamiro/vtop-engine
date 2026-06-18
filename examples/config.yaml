@@ -1,0 +1,54 @@
+# VTOP Engine configuration (prototype / reference implementation).
+#
+# Secrets (access keys, passwords) are NEVER placed in this file. They are read
+# from environment variables or mounted secrets. See docs/SECURITY_MODEL.md.
+
+engine:
+  name: vtop-engine
+  tenant: default
+  state_store: "sqlite:///data/state/vtop-state.db"
+  work_dir: /data/work
+  log_level: INFO
+
+batching:
+  max_records: 10000
+  max_bytes: 104857600
+  max_batch_age_seconds: 60
+
+compression:
+  type: gzip          # gzip | zstd | none
+  level: 6
+
+sources:
+  kafka:
+    enabled: true
+    bootstrap_servers:
+      - kafka:9092
+    consumer_group: vtop-engine
+    topic_include_regex: ".*"
+    topic_exclude_regex: "^__.*"
+    auto_offset_reset: earliest
+    enable_auto_commit: false   # MUST be false — offsets commit only after VERIFIED
+
+  file:
+    enabled: true
+    paths:
+      - /data/input/*.log
+      - /data/input/*-cef
+
+  syslog_spool:
+    enabled: true
+    paths:
+      - /data/spool/*.log
+
+upload:
+  backend: s3_native            # s3_native | s3cmd | awscli | minio | mock
+  bucket: siem-data
+  prefix: siem-data
+  endpoint_url: http://minio:9000
+  region: us-east-1
+  force_path_style: true
+  verify_tls: false
+
+partitioning:
+  template: "tenant={tenant}/source={source}/format={format}/year={yyyy}/month={mm}/day={dd}/hour={hh}/"

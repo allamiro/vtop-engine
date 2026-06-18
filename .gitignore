@@ -1,0 +1,19 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# Engine runtime data (lab volumes) — keep the directories, ignore contents
+/data/work/*
+/data/state/*
+/data/input/*
+/data/spool/*
+!/data/**/.gitkeep
+
+# SQLite state files
+*.db
+*.db-shm
+*.db-wal
+
+# Local env / secrets — never commit
+.env
+*.local

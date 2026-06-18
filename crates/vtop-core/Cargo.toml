@@ -1,0 +1,23 @@
+[package]
+name = "vtop-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Protocol-independent engine logic for the VTOP Engine (state machine, batch, manifest, checksum, compression, partitioning, replay)."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+flate2 = { workspace = true }
+zstd = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

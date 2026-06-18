@@ -1,0 +1,135 @@
+# VTOP Engine local lab: Kafka -> VTOP -> MinIO, File -> VTOP -> MinIO,
+# Syslog spool -> VTOP -> MinIO.
+#
+# Bring up:    docker compose up -d
+# Engine logs: docker compose logs -f vtop-engine
+#
+# MinIO console: http://localhost:9001  (user: minioadmin / pass: minioadmin)
+# Kafka UI:      http://localhost:8080
+#
+# Credentials here are LAB-ONLY defaults. Never use them in production.
+
+services:
+  kafka:
+    image: bitnami/kafka:3.7
+    container_name: vtop-kafka
+    ports:
+      - "9092:9092"
+    environment:
+      # KRaft single-node (no ZooKeeper)
+      KAFKA_CFG_NODE_ID: "1"
+      KAFKA_CFG_PROCESS_ROLES: "broker,controller"
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_CFG_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093"
+      KAFKA_CFG_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092"
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: vtop-kafka-ui
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: vtop-lab
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  # Produces a sample topic + CEF events once Kafka is healthy.
+  kafka-init:
+    image: bitnami/kafka:3.7
+    container_name: vtop-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists \
+          --topic BLCT_1 --partitions 1 --replication-factor 1
+        for i in $(seq 1 20); do
+          echo "CEF:0|VTOP|Engine|1.0|100|Sample Event $i|3|src=10.0.0.$i act=login outcome=success"
+        done | kafka-console-producer.sh --bootstrap-server kafka:9092 --topic BLCT_1
+        echo "seeded topic BLCT_1 with sample CEF events"
+
+  minio:
+    image: minio/minio:latest
+    container_name: vtop-minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - minio-data:/data
+
+  # Creates the target bucket once MinIO is healthy.
+  minio-init:
+    image: minio/mc:latest
+    container_name: vtop-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        mc alias set local http://minio:9000 minioadmin minioadmin
+        mc mb --ignore-existing local/siem-data
+        mc ls local
+        echo "bucket siem-data ready"
+
+  vtop-engine:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: vtop-engine
+    depends_on:
+      kafka:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      # Lab-only credentials for the native S3 backend talking to MinIO.
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+      VTOP_S3_ENDPOINT_URL: http://minio:9000
+      VTOP_S3_FORCE_PATH_STYLE: "true"
+      VTOP_S3_VERIFY_TLS: "false"
+      VTOP_CONFIG: /app/examples/config.yaml
+      RUST_LOG: info
+    volumes:
+      - ./examples:/app/examples:ro
+      - ./data/input:/data/input
+      - ./data/spool:/data/spool
+      - ./data/work:/data/work
+      - ./data/state:/data/state
+
+  # Optional collector: an rsyslog instance writing into the spool directory.
+  optional-rsyslog:
+    image: rsyslog/syslog_appliance_alpine:latest
+    container_name: vtop-rsyslog
+    profiles: ["syslog"]
+    volumes:
+      - ./data/spool:/var/log/spool
+
+volumes:
+  minio-data:

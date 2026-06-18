@@ -1,0 +1,19 @@
+[package]
+name = "vtop-state"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Replay-safe state store for the VTOP Engine (SQLite via sqlx)."
+
+[dependencies]
+vtop-core = { workspace = true }
+sqlx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

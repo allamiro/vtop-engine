@@ -1,0 +1,570 @@
+//! VTOP Engine runtime.
+//!
+//! Drives a telemetry batch through the full state machine and enforces, in
+//! code, the core rule:
+//!
+//! ```text
+//! SOURCE_COMMITTED is forbidden until VERIFIED is true.
+//! ```
+//!
+//! The state store is updated after *every* transition so the engine is
+//! crash-recoverable, and `commit_progress` is invoked on the source adapter
+//! only after the batch reaches `VERIFIED`.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use chrono::Utc;
+use vtop_adapters::base::{DiscoveredSource, ReadResult, SourceAdapter};
+use vtop_adapters::{FileSource, KafkaSource, SyslogSpoolSource};
+use vtop_core::batch::TelemetryBatch;
+use vtop_core::compression::compress_batch;
+use vtop_core::config::{StreamConfig, StreamsConfig, VtopConfig};
+use vtop_core::errors::VtopError;
+use vtop_core::manifest::{ManifestBuilder, VerificationStatus};
+use vtop_core::partitioning::{self, PartitionContext};
+use vtop_core::replay::{next_recovery_action, RecoveryAction};
+use vtop_core::state_machine::BatchState;
+use vtop_core::types::{ProgressMarker, SourceType};
+use vtop_state::{BatchPatch, BatchRecord, SqliteStateStore};
+use vtop_upload::UploadBackend;
+
+/// Outcome of processing a single batch.
+#[derive(Debug, Clone)]
+pub struct BatchOutcome {
+    pub batch_id: String,
+    pub final_state: BatchState,
+    pub committed: bool,
+    pub record_count: usize,
+    pub object_uri: Option<String>,
+}
+
+/// Borrowed context shared by every pipeline step.
+pub struct Pipeline<'a> {
+    pub store: &'a SqliteStateStore,
+    pub backend: Arc<dyn UploadBackend>,
+    pub config: &'a VtopConfig,
+}
+
+impl<'a> Pipeline<'a> {
+    /// Run a [`ReadResult`] all the way through the state machine. Source
+    /// progress is committed only if (and after) verification passes.
+    pub async fn process(
+        &self,
+        adapter: &mut dyn SourceAdapter,
+        source: &DiscoveredSource,
+        read: ReadResult,
+        stream: Option<&StreamConfig>,
+    ) -> Result<BatchOutcome, VtopError> {
+        if read.is_empty() {
+            return Ok(BatchOutcome {
+                batch_id: String::new(),
+                final_state: BatchState::Discovered,
+                committed: false,
+                record_count: 0,
+                object_uri: None,
+            });
+        }
+
+        let tenant = stream
+            .map(|s| s.tenant.clone())
+            .unwrap_or_else(|| self.config.engine.tenant.clone());
+        let format = stream
+            .map(|s| s.format.clone())
+            .unwrap_or_else(|| source.format.clone());
+        // Optional path rename (e.g. BLCT_1 -> BLCT) for the object key.
+        let s3_source = stream
+            .and_then(|s| s.s3_source_name.clone())
+            .unwrap_or_else(|| source.source_name.clone());
+
+        let batch_id = vtop_core::batch::build_batch_id(&source.source_name, &read.progress_end);
+        let now = Utc::now().to_rfc3339();
+
+        // ---- DISCOVERED -> BATCHING (persisted) -------------------------
+        let mut batch = TelemetryBatch {
+            batch_id: batch_id.clone(),
+            tenant: tenant.clone(),
+            source_type: source.source_type.clone(),
+            source_name: source.source_name.clone(),
+            format: format.clone(),
+            records: read.records,
+            record_count: 0,
+            first_timestamp: read.first_timestamp.clone(),
+            last_timestamp: read.last_timestamp.clone(),
+            progress_start: read.progress_start.clone(),
+            progress_end: read.progress_end.clone(),
+            created_at: now.clone(),
+            sealed_at: None,
+            state: BatchState::Batching,
+        };
+
+        let record = BatchRecord {
+            batch_id: batch_id.clone(),
+            tenant: tenant.clone(),
+            source_type: source.source_type.clone(),
+            source_name: source.source_name.clone(),
+            format: format.clone(),
+            state: BatchState::Batching,
+            progress_start: read.progress_start.clone(),
+            progress_end: read.progress_end.clone(),
+            object_uri: None,
+            manifest_uri: None,
+            object_sha256: None,
+            manifest_sha256: None,
+            record_count: Some(batch.records.len() as i64),
+            error_message: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        self.store.save_batch_state(&record).await?;
+        tracing::info!(batch_id, source = %source.source_name, "batch_started");
+
+        // Helper to fail a batch and bail out.
+        macro_rules! fail {
+            ($msg:expr) => {{
+                let m: String = $msg;
+                self.store.mark_failed(&batch_id, &m).await?;
+                tracing::error!(batch_id, error = %m, "batch failed");
+                return Ok(BatchOutcome {
+                    batch_id: batch_id.clone(),
+                    final_state: BatchState::Failed,
+                    committed: false,
+                    record_count: batch.record_count,
+                    object_uri: None,
+                });
+            }};
+        }
+
+        // ---- BATCHING -> SEALED -----------------------------------------
+        batch.seal()?;
+        self.store
+            .update_batch_state(&batch_id, BatchState::Sealed, &BatchPatch::default())
+            .await?;
+        tracing::info!(batch_id, records = batch.record_count, "batch_sealed");
+
+        // ---- SEALED -> COMPRESSED ---------------------------------------
+        let work_dir = std::path::Path::new(&self.config.engine.work_dir);
+        let compressed = match compress_batch(
+            &batch,
+            self.config.compression.kind,
+            self.config.compression.level,
+            work_dir,
+        ) {
+            Ok(c) => c,
+            Err(e) => fail!(format!("compression failed: {e}")),
+        };
+        self.store
+            .update_batch_state(&batch_id, BatchState::Compressed, &BatchPatch::default())
+            .await?;
+        tracing::info!(batch_id, size = compressed.size_bytes, "object_compressed");
+
+        // ---- COMPRESSED -> CHECKSUMMED ----------------------------------
+        let object_sha = match vtop_core::checksum::sha256_file(&compressed.path).await {
+            Ok(s) => s,
+            Err(e) => fail!(format!("checksum failed: {e}")),
+        };
+        self.store
+            .update_batch_state(&batch_id, BatchState::Checksummed, &BatchPatch::default())
+            .await?;
+        tracing::info!(batch_id, sha256 = %object_sha, "checksum_calculated");
+
+        // ---- Resolve object / manifest URIs -----------------------------
+        let ctx = PartitionContext::new(&tenant, &s3_source, format.clone(), Utc::now());
+        let ctx = match &stream.and_then(|s| s.retention_class.clone()) {
+            Some(rc) => ctx.with("retention_class", rc.clone()),
+            None => ctx,
+        };
+        let resolved_prefix =
+            partitioning::resolve_template(&self.config.partitioning.template, &ctx);
+        let object_uri = partitioning::object_uri(
+            &self.config.upload.bucket,
+            &self.config.upload.prefix,
+            &resolved_prefix,
+            &batch_id,
+            format.clone(),
+            compressed.compression,
+        );
+        let manifest_uri = partitioning::manifest_uri(
+            &self.config.upload.bucket,
+            &self.config.upload.prefix,
+            &resolved_prefix,
+            &batch_id,
+        );
+
+        // ---- CHECKSUMMED -> OBJECT_UPLOADED -----------------------------
+        if let Err(e) = self.backend.put_object(&compressed.path, &object_uri).await {
+            fail!(format!("object upload failed: {e}"));
+        }
+        let obj_patch = BatchPatch {
+            object_uri: Some(object_uri.clone()),
+            object_sha256: Some(object_sha.clone()),
+            record_count: Some(batch.record_count as i64),
+            ..Default::default()
+        };
+        self.store
+            .update_batch_state(&batch_id, BatchState::ObjectUploaded, &obj_patch)
+            .await?;
+        tracing::info!(batch_id, uri = %object_uri, "object_uploaded");
+
+        // ---- Build + upload manifest ------------------------------------
+        let manifest = ManifestBuilder {
+            batch_id: batch_id.clone(),
+            tenant: tenant.clone(),
+            source_type: source.source_type.clone(),
+            source_name: source.source_name.clone(),
+            format: format.clone(),
+            compression: compressed.compression,
+            record_count: batch.record_count,
+            first_timestamp: batch.first_timestamp.clone(),
+            last_timestamp: batch.last_timestamp.clone(),
+            source_progress: read.progress_end.clone(),
+            object_uri: object_uri.clone(),
+            object_size: compressed.size_bytes,
+            object_sha256: object_sha.clone(),
+            manifest_uri: manifest_uri.clone(),
+            path_template: self.config.partitioning.template.clone(),
+            resolved_prefix: resolved_prefix.clone(),
+            upload_backend: self.backend.backend_name().to_string(),
+            created_at: now.clone(),
+        }
+        .build()?;
+
+        let manifest_path = manifest.write_to_file(work_dir)?;
+        let manifest_sha = vtop_core::checksum::sha256_file(&manifest_path).await?;
+        let manifest_size = std::fs::metadata(&manifest_path)?.len();
+
+        // ---- OBJECT_UPLOADED -> MANIFEST_UPLOADED -----------------------
+        if let Err(e) = self
+            .backend
+            .put_manifest(&manifest_path, &manifest_uri)
+            .await
+        {
+            fail!(format!("manifest upload failed: {e}"));
+        }
+        let man_patch = BatchPatch {
+            manifest_uri: Some(manifest_uri.clone()),
+            manifest_sha256: Some(manifest.manifest.sha256.clone()),
+            ..Default::default()
+        };
+        self.store
+            .update_batch_state(&batch_id, BatchState::ManifestUploaded, &man_patch)
+            .await?;
+        tracing::info!(batch_id, uri = %manifest_uri, "manifest_uploaded");
+
+        // ---- MANIFEST_UPLOADED -> VERIFIED (or FAILED) ------------------
+        // 1) the manifest is internally consistent (self-hash),
+        let mut manifest = manifest;
+        if let Err(e) = manifest.verify_self_hash() {
+            fail!(format!("manifest self-hash verification failed: {e}"));
+        }
+        // 2) the stored object matches size + sha256,
+        let obj_v = self
+            .backend
+            .verify_object(&object_uri, compressed.size_bytes, &object_sha)
+            .await?;
+        if !obj_v.passed {
+            fail!(format!("object verification failed: {}", obj_v.message));
+        }
+        // 3) the stored manifest matches size + sha256.
+        let man_v = self
+            .backend
+            .verify_object(&manifest_uri, manifest_size, &manifest_sha)
+            .await?;
+        if !man_v.passed {
+            fail!(format!("manifest verification failed: {}", man_v.message));
+        }
+        if obj_v.backend_limited || man_v.backend_limited {
+            tracing::warn!(batch_id, "verification_passed (backend_limited: size-only)");
+            manifest.set_verification(VerificationStatus::BackendLimited);
+        } else {
+            tracing::info!(batch_id, "verification_passed");
+            manifest.set_verification(VerificationStatus::Passed);
+        }
+        self.store.mark_verified(&batch_id).await?;
+
+        // ---- VERIFIED -> SOURCE_COMMITTED -------------------------------
+        // Only now is it legal to advance source progress.
+        if let Err(e) = adapter.commit_progress(&read.progress_end).await {
+            // Verified but commit failed: leave as VERIFIED so recovery retries
+            // the commit. NEVER lose the verified object.
+            tracing::error!(batch_id, error = %e, "source_commit_failed (will retry on recovery)");
+            return Ok(BatchOutcome {
+                batch_id,
+                final_state: BatchState::Verified,
+                committed: false,
+                record_count: batch.record_count,
+                object_uri: Some(object_uri),
+            });
+        }
+        self.store.mark_source_committed(&batch_id).await?;
+        tracing::info!(batch_id, "source_committed");
+
+        Ok(BatchOutcome {
+            batch_id,
+            final_state: BatchState::SourceCommitted,
+            committed: true,
+            record_count: batch.record_count,
+            object_uri: Some(object_uri),
+        })
+    }
+}
+
+/// The full engine: config, streams, state store, upload backend, adapters.
+pub struct Engine {
+    pub config: VtopConfig,
+    pub streams: StreamsConfig,
+    pub store: SqliteStateStore,
+    pub backend: Arc<dyn UploadBackend>,
+    pub adapters: HashMap<SourceType, Box<dyn SourceAdapter>>,
+}
+
+impl Engine {
+    /// Build the engine from parsed config + streams, initializing the state
+    /// store, the upload backend, and every enabled source adapter.
+    pub async fn new(config: VtopConfig, streams: StreamsConfig) -> Result<Self, VtopError> {
+        let store = SqliteStateStore::connect(&config.engine.state_store).await?;
+        let backend = vtop_upload::build_backend(&config.upload).await?;
+
+        let mut adapters: HashMap<SourceType, Box<dyn SourceAdapter>> = HashMap::new();
+        if let Some(k) = &config.sources.kafka {
+            if k.enabled {
+                let fmt = default_format_for(&streams, SourceType::Kafka);
+                adapters.insert(
+                    SourceType::Kafka,
+                    Box::new(KafkaSource::new(k.clone(), fmt)?),
+                );
+            }
+        }
+        if let Some(f) = &config.sources.file {
+            if f.enabled {
+                let fmt = default_format_for(&streams, SourceType::File);
+                adapters.insert(
+                    SourceType::File,
+                    Box::new(FileSource::new(f.paths.clone(), fmt, f.delete_after_commit)),
+                );
+            }
+        }
+        if let Some(s) = &config.sources.syslog_spool {
+            if s.enabled {
+                adapters.insert(
+                    SourceType::SyslogSpool,
+                    Box::new(SyslogSpoolSource::new(s.paths.clone())),
+                );
+            }
+        }
+
+        Ok(Self {
+            config,
+            streams,
+            store,
+            backend,
+            adapters,
+        })
+    }
+
+    fn pipeline(&self) -> Pipeline<'_> {
+        Pipeline {
+            store: &self.store,
+            backend: self.backend.clone(),
+            config: &self.config,
+        }
+    }
+
+    /// Enumerate all sources across all enabled adapters.
+    pub async fn discover(&self) -> Result<Vec<DiscoveredSource>, VtopError> {
+        let mut all = Vec::new();
+        for adapter in self.adapters.values() {
+            match adapter.discover_sources().await {
+                Ok(mut s) => all.append(&mut s),
+                Err(e) => tracing::warn!(error = %e, "source discovery failed for an adapter"),
+            }
+        }
+        Ok(all)
+    }
+
+    /// Process one batch from each source of the given type. Returns the
+    /// outcomes of any batch that produced records.
+    pub async fn process_once(
+        &mut self,
+        source_type: SourceType,
+    ) -> Result<Vec<BatchOutcome>, VtopError> {
+        let Some(mut adapter) = self.adapters.remove(&source_type) else {
+            return Err(VtopError::Source(format!(
+                "no enabled adapter for source type {source_type}"
+            )));
+        };
+        let result = self.process_once_with(adapter.as_mut()).await;
+        self.adapters.insert(source_type, adapter);
+        result
+    }
+
+    async fn process_once_with(
+        &self,
+        adapter: &mut dyn SourceAdapter,
+    ) -> Result<Vec<BatchOutcome>, VtopError> {
+        let sources = adapter.discover_sources().await?;
+        let mut outcomes = Vec::new();
+        let max_wait = Duration::from_secs(2);
+        for source in sources {
+            let read = adapter
+                .read_batch_candidates(
+                    &source,
+                    self.config.batching.max_records,
+                    self.config.batching.max_bytes,
+                    max_wait,
+                )
+                .await?;
+            if read.is_empty() {
+                continue;
+            }
+            let stream = self.streams.lookup(&source.source_name).cloned();
+            let outcome = self
+                .pipeline()
+                .process(adapter, &source, read, stream.as_ref())
+                .await?;
+            outcomes.push(outcome);
+        }
+        Ok(outcomes)
+    }
+
+    /// Recovery scan run at startup. Seeds adapters from committed batches and
+    /// resolves incomplete batches without ever advancing source progress for
+    /// unverified data.
+    pub async fn recover(&mut self) -> Result<RecoverySummary, VtopError> {
+        // Seed file/syslog committed offsets from previously committed batches.
+        self.seed_committed_offsets().await?;
+
+        let incomplete = self.store.list_incomplete_batches().await?;
+        let mut summary = RecoverySummary::default();
+        for rec in incomplete {
+            let action = next_recovery_action(rec.state);
+            tracing::info!(batch_id = %rec.batch_id, state = %rec.state, ?action, "recovery_scan");
+            match action {
+                RecoveryAction::RetrySourceCommit => {
+                    // Verified but not committed — safe to commit now.
+                    if let Some(adapter) = self.adapters.get_mut(&rec.source_type) {
+                        match adapter.commit_progress(&rec.progress_end).await {
+                            Ok(()) => {
+                                self.store.mark_source_committed(&rec.batch_id).await?;
+                                summary.committed += 1;
+                                tracing::info!(batch_id = %rec.batch_id, "recovered: source_committed");
+                            }
+                            Err(e) => {
+                                tracing::error!(batch_id = %rec.batch_id, error = %e, "recovery commit failed");
+                                summary.still_pending += 1;
+                            }
+                        }
+                    } else {
+                        summary.still_pending += 1;
+                    }
+                }
+                RecoveryAction::None => {}
+                _ => {
+                    // Any other incomplete state has no durable, replayable
+                    // object we can finish from in this prototype: mark for
+                    // replay so the *uncommitted* source range is re-read.
+                    // Source progress was never advanced, so this is safe.
+                    let _ = self
+                        .store
+                        .mark_failed(&rec.batch_id, "recovered: replay required")
+                        .await;
+                    self.store
+                        .update_batch_state(
+                            &rec.batch_id,
+                            BatchState::ReplayRequired,
+                            &BatchPatch::default(),
+                        )
+                        .await
+                        .ok();
+                    if let Some(adapter) = self.adapters.get_mut(&rec.source_type) {
+                        let _ = adapter.replay_from_marker(&rec.progress_start).await;
+                    }
+                    summary.replay_required += 1;
+                    tracing::warn!(batch_id = %rec.batch_id, "recovered: REPLAY_REQUIRED (source progress preserved)");
+                }
+            }
+        }
+        Ok(summary)
+    }
+
+    async fn seed_committed_offsets(&mut self) -> Result<(), VtopError> {
+        let all = self.store.list_batches().await?;
+        // path -> highest committed end_byte
+        let mut file_max: HashMap<String, u64> = HashMap::new();
+        let mut spool_max: HashMap<String, u64> = HashMap::new();
+        for rec in all
+            .into_iter()
+            .filter(|r| r.state == BatchState::SourceCommitted)
+        {
+            match &rec.progress_end {
+                ProgressMarker::File { path, end_byte, .. } => {
+                    let e = file_max.entry(path.clone()).or_default();
+                    *e = (*e).max(*end_byte);
+                }
+                ProgressMarker::SyslogSpool { path, end_byte, .. } => {
+                    let e = spool_max.entry(path.clone()).or_default();
+                    *e = (*e).max(*end_byte);
+                }
+                ProgressMarker::Kafka { .. } => { /* Kafka resumes from broker-side committed offset */
+                }
+            }
+        }
+        if let Some(a) = self.adapters.get_mut(&SourceType::File) {
+            if let Some(fs) = a.as_any_mut().downcast_mut::<FileSource>() {
+                for (p, b) in file_max {
+                    fs.seed_committed(&p, b);
+                }
+            }
+        }
+        if let Some(a) = self.adapters.get_mut(&SourceType::SyslogSpool) {
+            if let Some(ss) = a.as_any_mut().downcast_mut::<SyslogSpoolSource>() {
+                for (p, b) in spool_max {
+                    ss.seed_committed(&p, b);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Run the continuous processing loop until the shutdown signal fires.
+    pub async fn run(&mut self) -> Result<(), VtopError> {
+        self.recover().await?;
+        let types: Vec<SourceType> = self.adapters.keys().cloned().collect();
+        loop {
+            for st in &types {
+                if let Err(e) = self.process_once(st.clone()).await {
+                    tracing::error!(error = %e, source_type = %st, "process cycle error");
+                }
+            }
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!("shutdown signal received; flushing and exiting");
+                    return Ok(());
+                }
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+            }
+        }
+    }
+}
+
+/// Default format for an adapter, taken from the first matching stream of that
+/// source type, falling back to `Raw`.
+fn default_format_for(
+    streams: &StreamsConfig,
+    st: SourceType,
+) -> vtop_core::types::TelemetryFormat {
+    streams
+        .streams
+        .iter()
+        .find(|s| s.source_type == st)
+        .map(|s| s.format.clone())
+        .unwrap_or(vtop_core::types::TelemetryFormat::Raw)
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct RecoverySummary {
+    pub committed: usize,
+    pub replay_required: usize,
+    pub still_pending: usize,
+}

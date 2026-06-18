@@ -1,0 +1,25 @@
+# Stream mappings: bind a discovered source name to a tenant, telemetry format,
+# object-storage source name, and retention class. Source names are NEVER
+# hardcoded in the engine — these mappings are config-driven.
+
+streams:
+  - source_name: BLCT_1
+    source_type: kafka
+    format: cef
+    tenant: default
+    s3_source_name: BLCT
+    retention_class: standard
+
+  - source_name: WINC_1
+    source_type: kafka
+    format: cef
+    tenant: default
+    s3_source_name: WINC
+    retention_class: standard
+
+  - source_name: /data/input/BLCT-cef
+    source_type: file
+    format: cef
+    tenant: default
+    s3_source_name: BLCT
+    retention_class: standard

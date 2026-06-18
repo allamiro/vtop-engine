@@ -1,0 +1,5 @@
+{"ts":"2026-06-18T15:00:01Z","event":"login","user":"alice","src":"10.0.0.12","outcome":"success"}
+{"ts":"2026-06-18T15:00:02Z","event":"login","user":"bob","src":"10.0.0.55","outcome":"failure"}
+{"ts":"2026-06-18T15:00:03Z","event":"file_access","user":"alice","path":"/etc/passwd","outcome":"success"}
+{"ts":"2026-06-18T15:00:04Z","event":"firewall","src":"203.0.113.9","dst":"10.0.0.1","dpt":22,"action":"deny"}
+{"ts":"2026-06-18T15:00:05Z","event":"privilege_escalation","user":"bob","action":"sudo","outcome":"success"}

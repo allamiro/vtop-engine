@@ -1,0 +1,6 @@
+CEF:0|VTOP|Engine|1.0|100|User Login|3|src=10.0.0.12 suser=alice act=login outcome=success
+CEF:0|VTOP|Engine|1.0|101|User Login|6|src=10.0.0.55 suser=bob act=login outcome=failure
+CEF:0|VTOP|Engine|1.0|200|File Access|4|src=10.0.0.12 fname=/etc/passwd act=read outcome=success
+CEF:0|VTOP|Engine|1.0|300|Firewall Deny|8|src=203.0.113.9 dst=10.0.0.1 spt=44321 dpt=22 act=deny
+CEF:0|VTOP|Engine|1.0|101|User Login|6|src=198.51.100.7 suser=root act=login outcome=failure
+CEF:0|VTOP|Engine|1.0|400|Privilege Escalation|9|src=10.0.0.55 suser=bob act=sudo outcome=success

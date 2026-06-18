@@ -1,0 +1,51 @@
+[package]
+name = "vtop-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "VTOP Engine runtime and the `vtopctl` command-line interface."
+
+[lib]
+name = "vtop_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vtopctl"
+path = "src/main.rs"
+
+[dependencies]
+vtop-core = { workspace = true }
+vtop-adapters = { workspace = true }
+vtop-upload = { workspace = true }
+vtop-state = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+# Integration tests live in the repo-root tests/ directory and are compiled as
+# integration tests of this package.
+[[test]]
+name = "integration_file_to_minio"
+path = "../../tests/integration_file_to_minio.rs"
+
+[[test]]
+name = "integration_replay"
+path = "../../tests/integration_replay.rs"
+
+[[test]]
+name = "integration_state_recovery"
+path = "../../tests/integration_state_recovery.rs"
+
+[[test]]
+name = "integration_kafka_to_minio"
+path = "../../tests/integration_kafka_to_minio.rs"

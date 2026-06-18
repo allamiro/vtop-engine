@@ -1,0 +1,23 @@
+[package]
+name = "vtop-adapters"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Source adapters (Kafka, file, syslog spool) for the VTOP Engine."
+
+[dependencies]
+vtop-core = { workspace = true }
+rdkafka = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+glob = { workspace = true }
+regex = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

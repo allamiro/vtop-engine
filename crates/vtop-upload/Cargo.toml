@@ -1,0 +1,21 @@
+[package]
+name = "vtop-upload"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pluggable S3-compatible upload backends for the VTOP Engine with integrity verification before source acknowledgment."
+
+[dependencies]
+vtop-core = { workspace = true }
+aws-config = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
