@@ -1,3 +1,7 @@
 # Benchmark results are generated artifacts — never overwrite, never commit.
 results/*
 !results/.gitkeep
+
+# Python caches
+__pycache__/
+*.pyc
