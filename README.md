@@ -293,4 +293,4 @@ and `tests/integration_state_recovery.rs`.
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
