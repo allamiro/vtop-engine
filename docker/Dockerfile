@@ -2,7 +2,8 @@
 
 # ---- Build stage -----------------------------------------------------------
 # rdkafka with the "cmake-build" feature compiles librdkafka from source, so
-# the builder needs cmake + a C toolchain + SSL/SASL headers.
+# the builder needs cmake + a C toolchain, SSL/SASL/zlib headers, and libcurl
+# (the SASL OAUTHBEARER/OIDC path #includes <curl/curl.h>).
 FROM rust:1-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -10,6 +11,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         clang \
         libssl-dev \
         libsasl2-dev \
+        libcurl4-openssl-dev \
+        zlib1g-dev \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
@@ -24,6 +27,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         libssl3 \
         libsasl2-2 \
+        libcurl4 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --create-home vtop
 

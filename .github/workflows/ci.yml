@@ -10,10 +10,16 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-and-test:
     name: fmt + clippy + test + build
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -22,12 +28,14 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      # librdkafka (cmake-build feature) needs cmake + a C toolchain + SSL/SASL.
+      # librdkafka (cmake-build feature) builds from source. It needs cmake + a
+      # C toolchain, SSL + SASL, zlib, and libcurl (the SASL OAUTHBEARER/OIDC
+      # path #includes <curl/curl.h> even when WITH_CURL=0).
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake clang libssl-dev libsasl2-dev pkg-config
+            cmake clang libssl-dev libsasl2-dev libcurl4-openssl-dev zlib1g-dev pkg-config
 
       - name: Cache cargo registry and target
         uses: actions/cache@v4
@@ -54,6 +62,7 @@ jobs:
   docker:
     name: docker image build
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Build engine image
