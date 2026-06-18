@@ -185,6 +185,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                             "committed": o.committed,
                             "record_count": o.record_count,
                             "object_uri": o.object_uri,
+                            "metrics": o.metrics,
                         })
                     })
                     .collect();
@@ -197,6 +198,9 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                         "{}  state={}  committed={}  records={}",
                         o.batch_id, o.final_state, o.committed, o.record_count
                     );
+                    if let Some(m) = &o.metrics {
+                        println!("    metrics: {}", m.summary());
+                    }
                 }
             }
             Ok(())

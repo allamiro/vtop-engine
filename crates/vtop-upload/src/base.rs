@@ -103,8 +103,8 @@ mod tests {
 
     #[test]
     fn parses_s3_uri() {
-        let (b, k) = parse_s3_uri("s3://siem-data/tenant=default/x/batch.cef.gz").unwrap();
-        assert_eq!(b, "siem-data");
+        let (b, k) = parse_s3_uri("s3://telemetry-data/tenant=default/x/batch.cef.gz").unwrap();
+        assert_eq!(b, "telemetry-data");
         assert_eq!(k, "tenant=default/x/batch.cef.gz");
     }
 

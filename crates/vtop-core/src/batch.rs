@@ -244,7 +244,7 @@ mod tests {
 
     fn kafka_marker(start: i64, end: i64) -> ProgressMarker {
         ProgressMarker::Kafka {
-            topic: "BLCT_1".into(),
+            topic: "app_events".into(),
             partition: 0,
             start_offset: start,
             end_offset: end,
@@ -262,7 +262,7 @@ mod tests {
         let mut b = AdaptiveBatcher::new(
             "default",
             SourceType::Kafka,
-            "BLCT_1",
+            "app_events",
             TelemetryFormat::Cef,
             limits,
         );
@@ -286,7 +286,7 @@ mod tests {
         let mut b = AdaptiveBatcher::new(
             "default",
             SourceType::Kafka,
-            "BLCT_1",
+            "app_events",
             TelemetryFormat::Cef,
             limits,
         );
@@ -299,7 +299,7 @@ mod tests {
         let mut b = AdaptiveBatcher::new(
             "default",
             SourceType::Kafka,
-            "BLCT_1",
+            "app_events",
             TelemetryFormat::Cef,
             BatchLimits::default(),
         );
@@ -325,9 +325,9 @@ mod tests {
 
     #[test]
     fn batch_id_is_deterministic_in_shape() {
-        let id = build_batch_id("BLCT_1", &kafka_marker(481000, 482499));
+        let id = build_batch_id("app_events", &kafka_marker(481000, 482499));
         assert!(id.starts_with("vtop-"));
-        assert!(id.contains("BLCT_1"));
+        assert!(id.contains("app_events"));
         assert!(id.contains("p0-481000-482499"));
     }
 }

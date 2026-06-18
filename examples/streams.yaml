@@ -1,25 +1,31 @@
 # Stream mappings: bind a discovered source name to a tenant, telemetry format,
 # object-storage source name, and retention class. Source names are NEVER
-# hardcoded in the engine — these mappings are config-driven.
+# hardcoded in the engine — these mappings are config-driven, and the names
+# below are just examples (use whatever topic / path names you have).
+#
+# `format` is OPTIONAL: if you omit a stream mapping entirely, the engine
+# auto-detects the format (CEF / JSON / JSONL / syslog / text) from the data.
+# Provide a mapping only when you want to override detection or set a tenant,
+# storage rename, or retention class.
 
 streams:
-  - source_name: BLCT_1
+  - source_name: app_events            # e.g. a Kafka topic of application events
     source_type: kafka
-    format: cef
+    format: jsonl
     tenant: default
-    s3_source_name: BLCT
+    s3_source_name: app
     retention_class: standard
 
-  - source_name: WINC_1
+  - source_name: web_access            # e.g. a Kafka topic of web access logs
     source_type: kafka
-    format: cef
+    format: jsonl
     tenant: default
-    s3_source_name: WINC
+    s3_source_name: web
     retention_class: standard
 
-  - source_name: /data/input/BLCT-cef
+  - source_name: /data/input/auth.cef.log   # a file source of CEF events
     source_type: file
     format: cef
     tenant: default
-    s3_source_name: BLCT
+    s3_source_name: auth
     retention_class: standard

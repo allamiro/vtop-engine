@@ -52,8 +52,8 @@ pub fn file_config(
         },
         upload: UploadConfig {
             backend: backend.into(),
-            bucket: "siem-data".into(),
-            prefix: "siem-data".into(),
+            bucket: "telemetry-data".into(),
+            prefix: "telemetry-data".into(),
             endpoint_url: None,
             region: "us-east-1".into(),
             force_path_style: true,

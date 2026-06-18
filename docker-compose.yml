@@ -44,7 +44,7 @@ services:
       kafka:
         condition: service_healthy
 
-  # Produces a sample topic + CEF events once Kafka is healthy.
+  # Produces a sample topic + JSON Lines events once Kafka is healthy.
   kafka-init:
     image: bitnami/kafka:3.7
     container_name: vtop-kafka-init
@@ -56,11 +56,11 @@ services:
       - |
         set -e
         kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists \
-          --topic BLCT_1 --partitions 1 --replication-factor 1
+          --topic app_events --partitions 1 --replication-factor 1
         for i in $(seq 1 20); do
-          echo "CEF:0|VTOP|Engine|1.0|100|Sample Event $i|3|src=10.0.0.$i act=login outcome=success"
-        done | kafka-console-producer.sh --bootstrap-server kafka:9092 --topic BLCT_1
-        echo "seeded topic BLCT_1 with sample CEF events"
+          echo "{\"ts\":\"2026-06-18T15:00:$(printf %02d $i)Z\",\"event\":\"login\",\"seq\":$i,\"src\":\"10.0.0.$i\",\"outcome\":\"success\"}"
+        done | kafka-console-producer.sh --bootstrap-server kafka:9092 --topic app_events
+        echo "seeded topic app_events with sample JSON Lines events"
 
   minio:
     image: minio/minio:latest
@@ -92,9 +92,9 @@ services:
       - |
         set -e
         mc alias set local http://minio:9000 minioadmin minioadmin
-        mc mb --ignore-existing local/siem-data
+        mc mb --ignore-existing local/telemetry-data
         mc ls local
-        echo "bucket siem-data ready"
+        echo "bucket telemetry-data ready"
 
   vtop-engine:
     build:

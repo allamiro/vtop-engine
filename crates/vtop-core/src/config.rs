@@ -228,7 +228,7 @@ pub struct StreamConfig {
     pub format: TelemetryFormat,
     #[serde(default = "default_tenant")]
     pub tenant: String,
-    /// Optional rename used in the object storage path (e.g. BLCT_1 -> BLCT).
+    /// Optional rename used in the object storage path (e.g. app_events -> app).
     #[serde(default)]
     pub s3_source_name: Option<String>,
     #[serde(default)]
@@ -272,7 +272,7 @@ sources:
     bootstrap_servers: ["kafka:9092"]
     enable_auto_commit: true
 upload:
-  bucket: siem-data
+  bucket: telemetry-data
 "#;
         let cfg: VtopConfig = serde_yaml::from_str(yaml).unwrap();
         let err = cfg.validate().unwrap_err();
@@ -293,7 +293,7 @@ sources:
     enabled: true
     paths: ["/data/*.log"]
 upload:
-  bucket: siem-data
+  bucket: telemetry-data
   backend: s3_native
 "#;
         let cfg: VtopConfig = serde_yaml::from_str(yaml).unwrap();
@@ -306,16 +306,16 @@ upload:
     fn parses_streams() {
         let yaml = r#"
 streams:
-  - source_name: BLCT_1
+  - source_name: app_events
     source_type: kafka
     format: cef
     tenant: default
-    s3_source_name: BLCT
+    s3_source_name: app
     retention_class: standard
 "#;
         let s: StreamsConfig = serde_yaml::from_str(yaml).unwrap();
-        let m = s.lookup("BLCT_1").unwrap();
+        let m = s.lookup("app_events").unwrap();
         assert_eq!(m.source_type, SourceType::Kafka);
-        assert_eq!(m.s3_source_name.as_deref(), Some("BLCT"));
+        assert_eq!(m.s3_source_name.as_deref(), Some("app"));
     }
 }

@@ -110,7 +110,9 @@ This guarantees: no source progress marker is committed unless its object and ma
 
 ## Partitioning Scheme
 
-Objects are written with a deterministic, SIEM-aware partition path:
+Objects are written with a deterministic, telemetry-aware partition path
+(useful for log analytics, observability, audit, compliance, SIEM, and similar
+consumers — it is general-purpose, not tied to one domain):
 
 ```
 s3://{bucket}/{prefix}/tenant={tenant}/source={source}/format={format}/year={yyyy}/month={mm}/day={dd}/hour={hh}/{batch_id}.{format}.{compression_ext}

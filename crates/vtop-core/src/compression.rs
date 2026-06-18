@@ -21,6 +21,8 @@ use std::path::{Path, PathBuf};
 pub struct CompressedObject {
     pub path: PathBuf,
     pub size_bytes: u64,
+    /// Uncompressed payload size (bytes fed to the compressor).
+    pub uncompressed_bytes: u64,
     pub compression: CompressionType,
     /// File-name component, e.g. `cef.gz` or `jsonl.zst` or `raw`.
     pub extension: String,
@@ -44,6 +46,7 @@ pub fn compress_batch(
     }
 
     let payload = batch.to_record_bytes();
+    let uncompressed_bytes = payload.len() as u64;
 
     let format_ext = batch.format.extension();
     let (compressed, extension) = match compression {
@@ -71,6 +74,7 @@ pub fn compress_batch(
     Ok(CompressedObject {
         path,
         size_bytes: compressed.len() as u64,
+        uncompressed_bytes,
         compression,
         extension,
     })

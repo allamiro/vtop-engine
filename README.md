@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/assets/vtop-logo.png" alt="VTOP Engine logo" width="220" />
+
 # VTOP Engine
 
 **Verified Telemetry Object Protocol Engine** — a replay-safe, manifest-driven telemetry object transfer engine.
@@ -28,6 +30,7 @@ VTOP ingests telemetry from **Kafka topics**, **log files**, and **syslog spool 
 - [CLI usage](#cli-usage)
 - [Docker lab](#docker-lab)
 - [Example manifest](#example-manifest)
+- [Metrics and efficiency](#metrics-and-efficiency)
 - [Verification before commit](#verification-before-commit)
 - [Replay after crash](#replay-after-crash)
 - [Known limitations](#known-limitations)
@@ -104,6 +107,17 @@ tests/             integration tests (wired into vtop-cli via [[test]] paths)
 
 Every object gets a `*.manifest.json` written alongside it, binding the **source progress marker** to the object's **SHA‑256** plus a self-hash for tamper-evidence.
 
+### Format auto-detection (mixed formats)
+
+Format is **not** fixed to CEF. When a stream does not declare a `format` in
+[`streams.yaml`](examples/streams.yaml), the engine **auto-detects it per batch**
+from the content — CEF, JSON, JSON Lines, syslog (PRI header), or plain text.
+Because detection runs per batch, **different formats can flow through one engine
+at the same time**: source A can be CEF, source B JSON, source C syslog, and each
+batch gets the correct object extension (`.cef.gz`, `.jsonl.gz`, …) and records
+its detected `format` in the manifest. An explicit `format` in `streams.yaml`
+always overrides detection. See [detect.rs](crates/vtop-core/src/detect.rs).
+
 ## Quick start
 
 ```bash
@@ -139,7 +153,7 @@ cargo run -p vtop-cli -- process-once --source file  --config examples/config.ya
 cargo run -p vtop-cli -- replay --batch-id <batch_id> --config examples/config.yaml
 cargo run -p vtop-cli -- status          --config examples/config.yaml
 cargo run -p vtop-cli -- list-batches    --config examples/config.yaml --json
-cargo run -p vtop-cli -- verify-manifest --manifest s3://siem-data/.../batch.manifest.json --config examples/config.yaml
+cargo run -p vtop-cli -- verify-manifest --manifest s3://telemetry-data/.../batch.manifest.json --config examples/config.yaml
 ```
 
 Every command supports `--json` (machine-readable) and `--log-level`, exits non-zero on failure, and never prints secrets.
@@ -151,7 +165,7 @@ docker compose up -d
 docker compose logs -f vtop-engine
 ```
 
-Services: `kafka`, `kafka-ui` (http://localhost:8080), `minio` (API `:9000`, console `:9001`, bucket `siem-data`), `minio-init`, `kafka-init` (seeds topic `BLCT_1` with sample CEF events), `vtop-engine`, and an optional `rsyslog` collector (`--profile syslog`).
+Services: `kafka`, `kafka-ui` (http://localhost:8080), `minio` (API `:9000`, console `:9001`, bucket `telemetry-data`), `minio-init`, `kafka-init` (seeds topic `app_events` with sample CEF events), `vtop-engine`, and an optional `rsyslog` collector (`--profile syslog`).
 
 **Kafka → MinIO:**
 
@@ -159,13 +173,13 @@ Services: `kafka`, `kafka-ui` (http://localhost:8080), `minio` (API `:9000`, con
 docker compose up -d kafka minio minio-init kafka-init
 docker compose up -d vtop-engine
 docker compose logs -f vtop-engine   # object_uploaded → verification_passed → source_committed
-# Browse results at http://localhost:9001 → bucket siem-data
+# Browse results at http://localhost:9001 → bucket telemetry-data
 ```
 
 **File → MinIO:**
 
 ```bash
-cp examples/sample-cef.log ./data/input/BLCT.cef.log
+cp examples/sample-cef.log ./data/input/auth.cef.log
 docker compose up -d vtop-engine
 ```
 
@@ -177,28 +191,28 @@ The file flow is also covered without any infrastructure by [tests/integration_f
 {
   "protocol": "VTOP",
   "version": "0.1",
-  "batch_id": "vtop-20260618T150000Z-BLCT_1-p0-481000-482499-1a2b3c4d",
+  "batch_id": "vtop-20260618T150000Z-app_events-p0-481000-482499-1a2b3c4d",
   "tenant": "default",
   "source_type": "kafka",
-  "source_name": "BLCT_1",
+  "source_name": "app_events",
   "format": "cef",
   "compression": "gzip",
   "record_count": 1500,
   "source_progress": {
     "source_type": "kafka",
-    "topic": "BLCT_1",
+    "topic": "app_events",
     "partition": 0,
     "start_offset": 481000,
     "end_offset": 482499,
     "consumer_group": "vtop-engine"
   },
   "object": {
-    "uri": "s3://siem-data/siem-data/tenant=default/source=BLCT/format=cef/year=2026/month=06/day=18/hour=15/vtop-….cef.gz",
+    "uri": "s3://telemetry-data/telemetry-data/tenant=default/source=app/format=cef/year=2026/month=06/day=18/hour=15/vtop-….cef.gz",
     "size_bytes": 924822,
     "sha256": "abc123…"
   },
   "manifest": {
-    "uri": "s3://siem-data/…/vtop-….manifest.json",
+    "uri": "s3://telemetry-data/…/vtop-….manifest.json",
     "sha256": "def456…"
   },
   "state": "manifest_uploaded",
@@ -208,6 +222,28 @@ The file flow is also covered without any infrastructure by [tests/integration_f
 
 > [!NOTE]
 > The manifest is written at the `MANIFEST_UPLOADED` step — *before* the storage-side verification — so its embedded `state`/`verification_status` reflect that point in time and its hash stays stable. The **authoritative** post-verification state (`verified` → `source_committed`) lives in the state store, queryable via `vtopctl status` / `list-batches`. The `manifest.sha256` is computed over the manifest with that field blanked, so it is reproducible and tamper-evident (`verify_self_hash`).
+
+## Metrics and efficiency
+
+The engine measures every batch end-to-end and emits a structured `batch_metrics`
+event (and a per-batch line under `vtopctl process-once`):
+
+```text
+3 records, 114 B->80 B (1.43x, 29.8% saved) in 6 ms | 500 rec/s, 0.00 MiB/s up |
+stages: compress=0ms checksum=0ms put_obj=0ms put_manifest=0ms verify=0ms commit=0ms
+```
+
+Each batch records (see [metrics.rs](crates/vtop-core/src/metrics.rs)):
+
+- **Size / transfer:** uncompressed vs compressed bytes, **compression ratio**, **% space saved** — i.e. how much smaller the object on the wire is than the source data.
+- **Per-stage latency:** compress, checksum, object upload, manifest upload, verify, commit (ms). The `object_upload_ms` captures network cost (the "distance" to the bucket).
+- **Throughput:** records/sec, uncompressed MiB/sec, and **effective upload MiB/sec** of the compressed object.
+
+`vtopctl process-once --json` includes the full `metrics` object per batch. These
+per-batch records are the raw input for the aggregate Prometheus-style counters
+described under [Known limitations](#known-limitations) (e.g.
+`bytes_uploaded_total`, `upload_latency_seconds`), which are designed but not yet
+exported.
 
 ## Verification before commit
 

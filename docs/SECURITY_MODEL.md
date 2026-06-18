@@ -93,6 +93,24 @@ Additional guidance:
 - A software bill of materials (SBOM) **SHOULD** be produced for releases.
 - Third-party upload backends invoked as external tools (s3cmd, awscli, minio client) **SHOULD** be version-pinned and validated, since they execute outside the Rust dependency graph.
 
+### Dependency auditing (`cargo audit`)
+
+CI runs `cargo audit` (the `supply-chain` job) on every push and pull request. It
+**fails the build on any advisory** except those explicitly documented in
+[`.cargo/audit.toml`](../.cargo/audit.toml), so new or actionable vulnerabilities
+block merges while known, unfixable transitive advisories are still printed.
+
+Currently tracked (re-evaluate on every dependency bump):
+
+| Advisory | Crate | Why it is accepted for now |
+|----------|-------|----------------------------|
+| RUSTSEC-2023-0071 | `rsa` | Pulled only by sqlx's optional MySQL driver, which is **not enabled** (sqlite-only). Not compiled or executed in any VTOP build. No upstream fix exists. |
+| RUSTSEC-2026-0098 / -0099 / -0104 | `rustls-webpki 0.101.x` | Transitive via `aws-smithy-http-client`'s legacy `hyper-rustls 0.24` connector. Not removable by feature flags in the current AWS SDK; requires an upstream release. The modern `rustls 0.23` / `rustls-webpki 0.103` stack is also present and used by the default HTTPS path. |
+
+When the AWS SDK ships an `aws-smithy-http-client` release that drops
+`hyper-rustls 0.24`, the three `rustls-webpki` entries **MUST** be removed from
+the ignore list and the build re-audited.
+
 ## 12. Summary of Normative Rules
 
 | Rule | Level |

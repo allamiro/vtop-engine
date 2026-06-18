@@ -1,0 +1,25 @@
+# cargo-audit configuration (read by `cargo audit`).
+#
+# CI runs `cargo audit` and fails on any advisory NOT listed here, so new or
+# actionable vulnerabilities block the build. The advisories below are
+# unfixable transitive entries with documented justification; each MUST be
+# re-evaluated when its upstream ships a fix (see docs/SECURITY_MODEL.md §11).
+
+[advisories]
+ignore = [
+    # rsa — Marvin timing side-channel. No fixed upgrade exists upstream.
+    # `rsa` is pulled ONLY by sqlx's optional MySQL driver, which this project
+    # does not enable (sqlite-only). It is a Cargo.lock entry and is NOT
+    # compiled or executed in any VTOP build (`cargo tree -i rsa` is empty).
+    "RUSTSEC-2023-0071",
+
+    # rustls-webpki 0.101.x (3 advisories). Pulled transitively by
+    # aws-smithy-http-client 1.1.13, whose `__rustls` feature hard-depends on
+    # the legacy hyper-rustls 0.24 -> rustls 0.21 -> rustls-webpki 0.101 stack.
+    # No feature flag or `cargo update` removes it in the current AWS SDK; it
+    # requires an upstream aws-smithy-http-client release that drops
+    # hyper-rustls 0.24. Re-check and remove these on the next AWS SDK bump.
+    "RUSTSEC-2026-0098", # name constraints accepted for URI names
+    "RUSTSEC-2026-0099", # name constraints accepted for wildcard certs
+    "RUSTSEC-2026-0104", # reachable panic parsing a CRL
+]

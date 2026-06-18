@@ -67,3 +67,21 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build engine image
         run: docker build -f docker/Dockerfile -t vtop-engine:ci .
+
+  audit:
+    name: supply-chain (cargo audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      # Prebuilt cargo-audit binary (fast; no compile).
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # Reads .cargo/audit.toml: fails on any advisory NOT documented there,
+      # so new/actionable vulnerabilities block the build while known
+      # unfixable transitive ones (tracked in docs/SECURITY_MODEL.md) are
+      # still printed in the log as "ignored".
+      - name: Audit dependencies
+        run: cargo audit

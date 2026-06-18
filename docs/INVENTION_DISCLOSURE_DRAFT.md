@@ -29,7 +29,7 @@ The proposed method enforces a strict ordering in which a source progress marker
 - **Deterministic replay** — uncommitted batches can be reconstructed and re-driven without data loss or double-commit.
 - **Auditability** — every transferred object is described by a manifest recording its integrity metadata and covered source positions.
 - **Object-level chain of custody** — the manifest binds the object hash to the source progress markers it covers.
-- **SIEM-aware archival partitioning** — objects are partitioned by tenant, source, format, and time for downstream security analytics and retention.
+- **Telemetry-aware archival partitioning** — objects are partitioned by tenant, source, format, and time for downstream analytics and retention (log analytics, observability, audit, compliance, SIEM, and similar; not tied to any single domain).
 - **Multi-source progress abstraction** — Kafka offsets, file byte offsets, and syslog spool positions are handled under one uniform commit model.
 - **Backend-independent object storage support** — a pluggable backend interface supports multiple S3-compatible implementations behind one verification contract.
 
@@ -42,7 +42,7 @@ A method comprising discovering telemetry sources, forming adaptive batches, gen
 1. **Manifest-bound telemetry object archival.**
 2. **Replay-safe source progress commit.**
 3. **Multi-source progress abstraction for Kafka, file, and syslog spool sources.**
-4. **SIEM-aware object partitioning with retention metadata.**
+4. **Telemetry-aware object partitioning with retention metadata** (applicable to log analytics, observability, audit, compliance, and SIEM).
 5. **Recovery algorithm that reconstructs incomplete batches from manifest/state mismatch.**
 6. **Pluggable S3-compatible backend with integrity verification before source acknowledgment.**
 7. **Manifest/object hash binding for chain-of-custody verification.**

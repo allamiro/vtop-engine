@@ -43,8 +43,8 @@ sources:
 
 upload:
   backend: s3_native            # s3_native | s3cmd | awscli | minio | mock
-  bucket: siem-data
-  prefix: siem-data
+  bucket: telemetry-data
+  prefix: telemetry-data
   endpoint_url: http://minio:9000
   region: us-east-1
   force_path_style: true

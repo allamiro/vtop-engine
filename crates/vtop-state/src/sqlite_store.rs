@@ -286,7 +286,7 @@ mod tests {
 
     fn marker() -> ProgressMarker {
         ProgressMarker::Kafka {
-            topic: "BLCT_1".into(),
+            topic: "app_events".into(),
             partition: 0,
             start_offset: 0,
             end_offset: 10,
@@ -300,7 +300,7 @@ mod tests {
             batch_id: id.into(),
             tenant: "default".into(),
             source_type: SourceType::Kafka,
-            source_name: "BLCT_1".into(),
+            source_name: "app_events".into(),
             format: TelemetryFormat::Cef,
             state: BatchState::Batching,
             progress_start: marker(),
@@ -322,7 +322,7 @@ mod tests {
         store.save_batch_state(&new_record("b1")).await.unwrap();
         let got = store.get_batch("b1").await.unwrap().unwrap();
         assert_eq!(got.state, BatchState::Batching);
-        assert_eq!(got.source_name, "BLCT_1");
+        assert_eq!(got.source_name, "app_events");
     }
 
     #[tokio::test]

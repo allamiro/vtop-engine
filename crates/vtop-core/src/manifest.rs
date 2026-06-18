@@ -184,7 +184,7 @@ mod tests {
 
     fn kafka_marker() -> ProgressMarker {
         ProgressMarker::Kafka {
-            topic: "BLCT_1".into(),
+            topic: "app_events".into(),
             partition: 0,
             start_offset: 481000,
             end_offset: 482499,
@@ -197,19 +197,19 @@ mod tests {
             batch_id: "vtop-test".into(),
             tenant: "default".into(),
             source_type: SourceType::Kafka,
-            source_name: "BLCT_1".into(),
+            source_name: "app_events".into(),
             format: TelemetryFormat::Cef,
             compression: CompressionType::Gzip,
             record_count: 1500,
             first_timestamp: None,
             last_timestamp: None,
             source_progress: kafka_marker(),
-            object_uri: "s3://siem-data/x/batch.cef.gz".into(),
+            object_uri: "s3://telemetry-data/x/batch.cef.gz".into(),
             object_size: 924822,
             object_sha256: "abc123".into(),
-            manifest_uri: "s3://siem-data/x/batch.manifest.json".into(),
+            manifest_uri: "s3://telemetry-data/x/batch.manifest.json".into(),
             path_template: "tenant={tenant}/...".into(),
-            resolved_prefix: "tenant=default/source=BLCT_1/...".into(),
+            resolved_prefix: "tenant=default/source=app_events/...".into(),
             upload_backend: "s3_native".into(),
             created_at: "2026-06-18T15:00:00Z".into(),
         }

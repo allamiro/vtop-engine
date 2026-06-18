@@ -325,7 +325,7 @@ mod tests {
     #[test]
     fn topic_filters_apply() {
         let src = KafkaSource::new(cfg(), TelemetryFormat::Cef).unwrap();
-        assert!(src.topic_allowed("BLCT_1"));
+        assert!(src.topic_allowed("app_events"));
         assert!(!src.topic_allowed("__consumer_offsets"));
     }
 }

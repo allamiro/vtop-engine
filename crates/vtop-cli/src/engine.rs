@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use vtop_adapters::base::{DiscoveredSource, ReadResult, SourceAdapter};
@@ -23,6 +23,7 @@ use vtop_core::compression::compress_batch;
 use vtop_core::config::{StreamConfig, StreamsConfig, VtopConfig};
 use vtop_core::errors::VtopError;
 use vtop_core::manifest::{ManifestBuilder, VerificationStatus};
+use vtop_core::metrics::BatchMetrics;
 use vtop_core::partitioning::{self, PartitionContext};
 use vtop_core::replay::{next_recovery_action, RecoveryAction};
 use vtop_core::state_machine::BatchState;
@@ -38,6 +39,8 @@ pub struct BatchOutcome {
     pub committed: bool,
     pub record_count: usize,
     pub object_uri: Option<String>,
+    /// End-to-end timing / size / throughput metrics for this batch.
+    pub metrics: Option<BatchMetrics>,
 }
 
 /// Borrowed context shared by every pipeline step.
@@ -64,16 +67,32 @@ impl<'a> Pipeline<'a> {
                 committed: false,
                 record_count: 0,
                 object_uri: None,
+                metrics: None,
             });
         }
+
+        let started = Instant::now();
 
         let tenant = stream
             .map(|s| s.tenant.clone())
             .unwrap_or_else(|| self.config.engine.tenant.clone());
-        let format = stream
-            .map(|s| s.format.clone())
-            .unwrap_or_else(|| source.format.clone());
-        // Optional path rename (e.g. BLCT_1 -> BLCT) for the object key.
+        // Format precedence: explicit stream config > content detection.
+        // Detection lets one pipeline handle CEF/JSON/JSONL/syslog/text without
+        // per-source configuration and keeps the object extension + manifest
+        // `format` accurate.
+        let format = match stream.map(|s| s.format.clone()) {
+            Some(f) => f,
+            None => {
+                let detected = vtop_core::detect::detect_batch(&read.records);
+                tracing::info!(
+                    source = %source.source_name,
+                    format = %detected,
+                    "format_detected"
+                );
+                detected
+            }
+        };
+        // Optional path rename (e.g. app_events -> app) for the object key.
         let s3_source = stream
             .and_then(|s| s.s3_source_name.clone())
             .unwrap_or_else(|| source.source_name.clone());
@@ -132,6 +151,7 @@ impl<'a> Pipeline<'a> {
                     committed: false,
                     record_count: batch.record_count,
                     object_uri: None,
+                    metrics: None,
                 });
             }};
         }
@@ -143,8 +163,11 @@ impl<'a> Pipeline<'a> {
             .await?;
         tracing::info!(batch_id, records = batch.record_count, "batch_sealed");
 
+        let mut metrics = BatchMetrics::new(&batch_id, batch.record_count, 0);
+
         // ---- SEALED -> COMPRESSED ---------------------------------------
         let work_dir = std::path::Path::new(&self.config.engine.work_dir);
+        let t = Instant::now();
         let compressed = match compress_batch(
             &batch,
             self.config.compression.kind,
@@ -154,16 +177,27 @@ impl<'a> Pipeline<'a> {
             Ok(c) => c,
             Err(e) => fail!(format!("compression failed: {e}")),
         };
+        metrics.compress_ms = t.elapsed().as_millis() as u64;
+        metrics.uncompressed_bytes = compressed.uncompressed_bytes;
+        metrics.set_compression(compressed.size_bytes);
         self.store
             .update_batch_state(&batch_id, BatchState::Compressed, &BatchPatch::default())
             .await?;
-        tracing::info!(batch_id, size = compressed.size_bytes, "object_compressed");
+        tracing::info!(
+            batch_id,
+            size = compressed.size_bytes,
+            uncompressed = compressed.uncompressed_bytes,
+            ratio = format!("{:.2}", metrics.compression_ratio),
+            "object_compressed"
+        );
 
         // ---- COMPRESSED -> CHECKSUMMED ----------------------------------
+        let t = Instant::now();
         let object_sha = match vtop_core::checksum::sha256_file(&compressed.path).await {
             Ok(s) => s,
             Err(e) => fail!(format!("checksum failed: {e}")),
         };
+        metrics.checksum_ms = t.elapsed().as_millis() as u64;
         self.store
             .update_batch_state(&batch_id, BatchState::Checksummed, &BatchPatch::default())
             .await?;
@@ -193,9 +227,11 @@ impl<'a> Pipeline<'a> {
         );
 
         // ---- CHECKSUMMED -> OBJECT_UPLOADED -----------------------------
+        let t = Instant::now();
         if let Err(e) = self.backend.put_object(&compressed.path, &object_uri).await {
             fail!(format!("object upload failed: {e}"));
         }
+        metrics.object_upload_ms = t.elapsed().as_millis() as u64;
         let obj_patch = BatchPatch {
             object_uri: Some(object_uri.clone()),
             object_sha256: Some(object_sha.clone()),
@@ -235,6 +271,7 @@ impl<'a> Pipeline<'a> {
         let manifest_size = std::fs::metadata(&manifest_path)?.len();
 
         // ---- OBJECT_UPLOADED -> MANIFEST_UPLOADED -----------------------
+        let t = Instant::now();
         if let Err(e) = self
             .backend
             .put_manifest(&manifest_path, &manifest_uri)
@@ -242,6 +279,7 @@ impl<'a> Pipeline<'a> {
         {
             fail!(format!("manifest upload failed: {e}"));
         }
+        metrics.manifest_upload_ms = t.elapsed().as_millis() as u64;
         let man_patch = BatchPatch {
             manifest_uri: Some(manifest_uri.clone()),
             manifest_sha256: Some(manifest.manifest.sha256.clone()),
@@ -253,6 +291,7 @@ impl<'a> Pipeline<'a> {
         tracing::info!(batch_id, uri = %manifest_uri, "manifest_uploaded");
 
         // ---- MANIFEST_UPLOADED -> VERIFIED (or FAILED) ------------------
+        let t = Instant::now();
         // 1) the manifest is internally consistent (self-hash),
         let mut manifest = manifest;
         if let Err(e) = manifest.verify_self_hash() {
@@ -274,6 +313,7 @@ impl<'a> Pipeline<'a> {
         if !man_v.passed {
             fail!(format!("manifest verification failed: {}", man_v.message));
         }
+        metrics.verify_ms = t.elapsed().as_millis() as u64;
         if obj_v.backend_limited || man_v.backend_limited {
             tracing::warn!(batch_id, "verification_passed (backend_limited: size-only)");
             manifest.set_verification(VerificationStatus::BackendLimited);
@@ -285,20 +325,37 @@ impl<'a> Pipeline<'a> {
 
         // ---- VERIFIED -> SOURCE_COMMITTED -------------------------------
         // Only now is it legal to advance source progress.
+        let t = Instant::now();
         if let Err(e) = adapter.commit_progress(&read.progress_end).await {
             // Verified but commit failed: leave as VERIFIED so recovery retries
             // the commit. NEVER lose the verified object.
             tracing::error!(batch_id, error = %e, "source_commit_failed (will retry on recovery)");
+            metrics.finalize(started.elapsed().as_millis() as u64);
             return Ok(BatchOutcome {
                 batch_id,
                 final_state: BatchState::Verified,
                 committed: false,
                 record_count: batch.record_count,
                 object_uri: Some(object_uri),
+                metrics: Some(metrics),
             });
         }
+        metrics.commit_ms = t.elapsed().as_millis() as u64;
         self.store.mark_source_committed(&batch_id).await?;
         tracing::info!(batch_id, "source_committed");
+
+        metrics.finalize(started.elapsed().as_millis() as u64);
+        tracing::info!(
+            batch_id,
+            records = metrics.records,
+            uncompressed_bytes = metrics.uncompressed_bytes,
+            compressed_bytes = metrics.compressed_bytes,
+            compression_ratio = format!("{:.2}", metrics.compression_ratio),
+            total_ms = metrics.total_ms,
+            records_per_sec = format!("{:.0}", metrics.records_per_sec),
+            upload_mib_per_sec = format!("{:.2}", metrics.upload_mib_per_sec),
+            "batch_metrics"
+        );
 
         Ok(BatchOutcome {
             batch_id,
@@ -306,6 +363,7 @@ impl<'a> Pipeline<'a> {
             committed: true,
             record_count: batch.record_count,
             object_uri: Some(object_uri),
+            metrics: Some(metrics),
         })
     }
 }

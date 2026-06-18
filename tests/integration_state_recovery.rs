@@ -20,7 +20,7 @@ async fn state_persists_across_reopen() {
     let url = format!("sqlite://{}", db.display());
 
     let marker = vtop_core::types::ProgressMarker::Kafka {
-        topic: "BLCT_1".into(),
+        topic: "app_events".into(),
         partition: 0,
         start_offset: 0,
         end_offset: 9,
@@ -31,7 +31,7 @@ async fn state_persists_across_reopen() {
         batch_id: "b-survive".into(),
         tenant: "default".into(),
         source_type: SourceType::Kafka,
-        source_name: "BLCT_1".into(),
+        source_name: "app_events".into(),
         format: vtop_core::types::TelemetryFormat::Cef,
         state: BatchState::Batching,
         progress_start: marker.clone(),
@@ -108,8 +108,8 @@ async fn recovery_commits_verified_but_uncommitted_batch() {
         state: BatchState::Batching,
         progress_start: marker.clone(),
         progress_end: marker,
-        object_uri: Some("s3://siem-data/x/b-verified.raw.gz".into()),
-        manifest_uri: Some("s3://siem-data/x/b-verified.manifest.json".into()),
+        object_uri: Some("s3://telemetry-data/x/b-verified.raw.gz".into()),
+        manifest_uri: Some("s3://telemetry-data/x/b-verified.manifest.json".into()),
         object_sha256: Some("deadbeef".into()),
         manifest_sha256: Some("feedface".into()),
         record_count: Some(4),

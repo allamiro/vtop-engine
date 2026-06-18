@@ -21,7 +21,7 @@ use vtop_core::types::SourceType;
 async fn file_source_archives_and_commits() {
     let dir = tempfile::tempdir().unwrap();
     let work_dir = dir.path().join("work");
-    let input = dir.path().join("BLCT.cef.log");
+    let input = dir.path().join("auth.cef.log");
     let state_db = dir.path().join("state.db");
 
     // Write a sample CEF-style log with 3 records.

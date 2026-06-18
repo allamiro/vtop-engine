@@ -1,4 +1,9 @@
-//! SIEM-aware object partitioning.
+//! Telemetry-aware object partitioning.
+//!
+//! Objects are laid out by tenant, source, format, and time so the archive is
+//! useful for any downstream consumer (log analytics, observability, audit,
+//! compliance, SIEM, ...). The scheme is general-purpose, not tied to any one
+//! domain.
 //!
 //! Resolves a path template into a concrete storage prefix and builds object /
 //! manifest URIs. Source names are never hardcoded — everything is derived from
@@ -12,8 +17,8 @@ use std::collections::HashMap;
 pub const DEFAULT_TEMPLATE: &str =
     "tenant={tenant}/source={source}/format={format}/year={yyyy}/month={mm}/day={dd}/hour={hh}/";
 
-/// Context used to resolve a path template. Includes the required SIEM fields
-/// plus optional extension fields (environment, facility, severity,
+/// Context used to resolve a path template. Includes the required partition
+/// fields plus optional extension fields (environment, facility, severity,
 /// retention_class, region, site).
 #[derive(Debug, Clone)]
 pub struct PartitionContext {
@@ -151,7 +156,7 @@ mod tests {
 
     fn ctx() -> PartitionContext {
         let ts = Utc.with_ymd_and_hms(2026, 6, 18, 15, 0, 0).unwrap();
-        PartitionContext::new("default", "BLCT_1", TelemetryFormat::Cef, ts)
+        PartitionContext::new("default", "app_events", TelemetryFormat::Cef, ts)
     }
 
     #[test]
@@ -159,7 +164,7 @@ mod tests {
         let resolved = resolve_template(DEFAULT_TEMPLATE, &ctx());
         assert_eq!(
             resolved,
-            "tenant=default/source=BLCT_1/format=cef/year=2026/month=06/day=18/hour=15"
+            "tenant=default/source=app_events/format=cef/year=2026/month=06/day=18/hour=15"
         );
     }
 
@@ -180,22 +185,22 @@ mod tests {
     fn object_uri_has_compression_extension() {
         let resolved = resolve_template(DEFAULT_TEMPLATE, &ctx());
         let uri = object_uri(
-            "siem-data",
-            "siem-data",
+            "telemetry-data",
+            "telemetry-data",
             &resolved,
             "vtop-b1",
             TelemetryFormat::Cef,
             CompressionType::Gzip,
         );
         assert!(uri.ends_with("vtop-b1.cef.gz"));
-        assert!(uri.starts_with("s3://siem-data/siem-data/tenant=default/"));
+        assert!(uri.starts_with("s3://telemetry-data/telemetry-data/tenant=default/"));
         assert!(!uri.contains("//tenant")); // no doubled slash
     }
 
     #[test]
     fn manifest_uri_matches_object_prefix() {
         let resolved = resolve_template(DEFAULT_TEMPLATE, &ctx());
-        let m = manifest_uri("siem-data", "siem-data", &resolved, "vtop-b1");
+        let m = manifest_uri("telemetry-data", "telemetry-data", &resolved, "vtop-b1");
         assert!(m.ends_with("vtop-b1.manifest.json"));
     }
 
