@@ -295,6 +295,28 @@ mod tests {
     }
 
     #[test]
+    fn seals_on_max_age() {
+        let limits = BatchLimits {
+            max_records: usize::MAX,
+            max_bytes: usize::MAX,
+            max_batch_age_seconds: 30,
+        };
+        let mut b = AdaptiveBatcher::new(
+            "default",
+            SourceType::File,
+            "/x.log",
+            TelemetryFormat::Raw,
+            limits,
+        );
+        b.push(b"rec".to_vec(), &kafka_marker(0, 0), None);
+        // Fresh buffer: well within the age window.
+        assert_eq!(b.should_seal(Utc::now()), None);
+        // Past the age window: must seal on age (records/bytes never trip here).
+        let later = Utc::now() + chrono::Duration::seconds(31);
+        assert_eq!(b.should_seal(later), Some(SealReason::MaxAge));
+    }
+
+    #[test]
     fn preserves_record_order() {
         let mut b = AdaptiveBatcher::new(
             "default",
