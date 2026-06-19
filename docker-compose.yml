@@ -1,4 +1,6 @@
-# VTOP Engine local lab: Kafka -> VTOP -> MinIO, File -> VTOP -> MinIO,
+# VTOP Engine local lab: 
+# Kafka -> VTOP -> MinIO,
+# File -> VTOP -> MinIO,
 # Syslog spool -> VTOP -> MinIO.
 #
 # Bring up:    docker compose up -d
@@ -11,23 +13,27 @@
 
 services:
   kafka:
-    image: bitnami/kafka:3.7
+    image: apache/kafka:3.7.0
     container_name: vtop-kafka
     ports:
       - "9092:9092"
     environment:
-      # KRaft single-node (no ZooKeeper)
-      KAFKA_CFG_NODE_ID: "1"
-      KAFKA_CFG_PROCESS_ROLES: "broker,controller"
-      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
-      KAFKA_CFG_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093"
-      KAFKA_CFG_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092"
-      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
-      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
-      KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
-      ALLOW_PLAINTEXT_LISTENER: "yes"
+      # KRaft single-node (no ZooKeeper). The official Apache Kafka image uses
+      # KAFKA_* env vars (not the Bitnami KAFKA_CFG_* prefix) and ships the CLI
+      # tools under /opt/kafka/bin.
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
     healthcheck:
-      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
       interval: 10s
       timeout: 10s
       retries: 12
@@ -48,7 +54,7 @@ services:
   # Kafka is healthy — exercises VTOP's per-batch format detection with mixed,
   # varied data. The generator (docker/seed-events.sh) is mounted read-only.
   kafka-init:
-    image: bitnami/kafka:3.7
+    image: apache/kafka:3.7.0
     container_name: vtop-kafka-init
     depends_on:
       kafka:
@@ -59,14 +65,15 @@ services:
     command:
       - |
         set -e
+        BIN=/opt/kafka/bin
         for t in cef_events json_events syslog_events mixed_events; do
-          kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists \
+          "$$BIN"/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists \
             --topic "$$t" --partitions 1 --replication-factor 1
         done
-        bash /seed-events.sh cef    60 | kafka-console-producer.sh --bootstrap-server kafka:9092 --topic cef_events
-        bash /seed-events.sh json   60 | kafka-console-producer.sh --bootstrap-server kafka:9092 --topic json_events
-        bash /seed-events.sh syslog 60 | kafka-console-producer.sh --bootstrap-server kafka:9092 --topic syslog_events
-        bash /seed-events.sh mixed  90 | kafka-console-producer.sh --bootstrap-server kafka:9092 --topic mixed_events
+        bash /seed-events.sh cef    60 | "$$BIN"/kafka-console-producer.sh --bootstrap-server kafka:9092 --topic cef_events
+        bash /seed-events.sh json   60 | "$$BIN"/kafka-console-producer.sh --bootstrap-server kafka:9092 --topic json_events
+        bash /seed-events.sh syslog 60 | "$$BIN"/kafka-console-producer.sh --bootstrap-server kafka:9092 --topic syslog_events
+        bash /seed-events.sh mixed  90 | "$$BIN"/kafka-console-producer.sh --bootstrap-server kafka:9092 --topic mixed_events
         echo "seeded cef_events/json_events/syslog_events (per-format) + mixed_events (random per line)"
 
   minio:
@@ -145,7 +152,7 @@ services:
   # Tune via env (FORMATS, TOPICS_PER_FORMAT, MIN_BATCH, MAX_BATCH, SLEEP_SECONDS,
   # DURATION_SECONDS). Produces forever by default.
   kafka-load:
-    image: bitnami/kafka:3.7
+    image: apache/kafka:3.7.0
     container_name: vtop-kafka-load
     profiles: ["load"]
     restart: unless-stopped
@@ -163,7 +170,9 @@ services:
     volumes:
       - ./docker/seed-events.sh:/seed-events.sh:ro
       - ./docker/load-generator.sh:/load-generator.sh:ro
-    entrypoint: ["/bin/bash", "/load-generator.sh"]
+    # Put the Apache Kafka CLI tools on PATH so the generator's bare
+    # kafka-topics.sh / kafka-console-producer.sh calls resolve.
+    entrypoint: ["/bin/bash", "-c", "export PATH=/opt/kafka/bin:$PATH; exec /load-generator.sh"]
 
   # Optional collector: an rsyslog instance writing into the spool directory.
   optional-rsyslog:

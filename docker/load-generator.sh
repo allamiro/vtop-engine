@@ -42,6 +42,15 @@ if [ "$MAX_BATCH" -lt "$MIN_BATCH" ]; then
   echo "load-generator: MAX_BATCH ($MAX_BATCH) must be >= MIN_BATCH ($MIN_BATCH)" >&2
   exit 2
 fi
+# These must be >= 1: PARTITIONS=0 fails Kafka topic creation (partitions must be
+# >= 1) and TOPICS_PER_FORMAT=0 / MAX_BATCH=0 would create no topics / no records,
+# silently producing nothing. is_uint() alone accepts 0, so reject it here.
+for var in TOPICS_PER_FORMAT MAX_BATCH PARTITIONS; do
+  if [ "${!var}" -lt 1 ]; then
+    echo "load-generator: $var must be >= 1 (got '${!var}')" >&2
+    exit 2
+  fi
+done
 
 echo "load-generator: bootstrap=$BOOTSTRAP formats=[$FORMATS] topics/format=$TOPICS_PER_FORMAT batch=$MIN_BATCH..$MAX_BATCH sleep=${SLEEP_SECONDS}s duration=${DURATION_SECONDS}s"
 

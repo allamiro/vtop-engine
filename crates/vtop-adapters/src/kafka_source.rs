@@ -51,8 +51,10 @@ pub fn build_client_config(cfg: &KafkaSourceConfig) -> ClientConfig {
 
 #[derive(Debug, Clone, Default)]
 struct PartitionCursor {
-    last_read_offset: i64,
-    committed_offset: i64,
+    /// Highest offset read into memory this session (`None` = nothing read yet).
+    last_read_offset: Option<i64>,
+    /// Committed "next offset to read" (`None` = nothing committed yet).
+    committed_offset: Option<i64>,
 }
 
 pub struct KafkaSource {
@@ -131,10 +133,73 @@ impl SourceAdapter for KafkaSource {
     ) -> Result<ReadResult, VtopError> {
         let topic = source.source_name.clone();
         let group = self.cfg.consumer_group.clone();
+
+        // Discover the topic's partitions, then ASSIGN them at our tracked
+        // offsets. We deliberately use assign() rather than subscribe(): a
+        // subscribe() on every read triggers a consumer-group rebalance, and
+        // because the engine commits offsets only AFTER verification there is no
+        // committed offset to resume from — so each rebalance reseeks to the
+        // configured reset (earliest) and the short poll window is spent
+        // rebalancing instead of fetching. assign() is rebalance-free and lets
+        // us control the exact start offset per partition.
+        self.consumer()?;
+        let partitions: Vec<i32> = {
+            let consumer = self.consumer()?;
+            let md = consumer
+                .fetch_metadata(Some(&topic), Duration::from_secs(10))
+                .map_err(|e| VtopError::Source(format!("fetch_metadata {topic}: {e}")))?;
+            md.topics()
+                .iter()
+                .find(|t| t.name() == topic)
+                .map(|t| t.partitions().iter().map(|p| p.id()).collect())
+                .unwrap_or_default()
+        };
+        if partitions.is_empty() {
+            // Topic has no partitions (e.g. just deleted) — nothing to read.
+            self.active = Some((topic.clone(), 0));
+            return Ok(ReadResult {
+                progress_start: ProgressMarker::Kafka {
+                    topic: topic.clone(),
+                    partition: 0,
+                    start_offset: 0,
+                    end_offset: 0,
+                    consumer_group: group,
+                },
+                progress_end: ProgressMarker::Kafka {
+                    topic,
+                    partition: 0,
+                    start_offset: 0,
+                    end_offset: 0,
+                    consumer_group: self.cfg.consumer_group.clone(),
+                },
+                records: Vec::new(),
+                first_timestamp: None,
+                last_timestamp: None,
+                verbatim: false,
+            });
+        }
+
+        // Build the assignment from each partition's tracked position.
+        let mut tpl = TopicPartitionList::new();
+        for &p in &partitions {
+            let cur = self.cursors.entry((topic.clone(), p)).or_default();
+            let off = match cur.last_read_offset {
+                Some(lr) => Offset::Offset(lr + 1),
+                None => match cur.committed_offset {
+                    Some(c) => Offset::Offset(c),
+                    None => Offset::Beginning,
+                },
+            };
+            tpl.add_partition_offset(&topic, p, off)
+                .map_err(|e| VtopError::Source(format!("assign tpl {topic}-{p}: {e}")))?;
+        }
+        {
+            let consumer = self.consumer()?;
+            consumer
+                .assign(&tpl)
+                .map_err(|e| VtopError::Source(format!("assign {topic}: {e}")))?;
+        }
         let consumer = self.consumer()?;
-        consumer
-            .subscribe(&[&topic])
-            .map_err(|e| VtopError::Source(format!("subscribe {topic}: {e}")))?;
 
         let mut records: Vec<Vec<u8>> = Vec::new();
         let mut bytes: usize = 0;
@@ -200,7 +265,7 @@ impl SourceAdapter for KafkaSource {
         self.active = Some((topic.clone(), partition));
         let cur = self.cursors.entry((topic.clone(), partition)).or_default();
         if !records.is_empty() {
-            cur.last_read_offset = end_offset;
+            cur.last_read_offset = Some(end_offset);
         }
 
         let mk = |s: i64, e: i64| ProgressMarker::Kafka {
@@ -233,11 +298,12 @@ impl SourceAdapter for KafkaSource {
             .get(&(topic.clone(), partition))
             .cloned()
             .unwrap_or_default();
+        let start_offset = cur.committed_offset.unwrap_or(0);
         Ok(ProgressMarker::Kafka {
             topic,
             partition,
-            start_offset: cur.committed_offset,
-            end_offset: cur.last_read_offset,
+            start_offset,
+            end_offset: cur.last_read_offset.unwrap_or(start_offset),
             consumer_group: self.cfg.consumer_group.clone(),
         })
     }
@@ -266,7 +332,7 @@ impl SourceAdapter for KafkaSource {
             .map_err(|e| VtopError::Source(format!("kafka commit: {e}")))?;
 
         let cur = self.cursors.entry((topic.clone(), *partition)).or_default();
-        cur.committed_offset = commit_at;
+        cur.committed_offset = Some(commit_at);
         tracing::info!(
             topic,
             partition,
@@ -288,15 +354,12 @@ impl SourceAdapter for KafkaSource {
                 "kafka adapter given non-kafka marker".into(),
             ));
         };
-        let consumer = self.consumer()?;
-        consumer
-            .seek(
-                topic,
-                *partition,
-                Offset::Offset(*start_offset),
-                Duration::from_secs(10),
-            )
-            .map_err(|e| VtopError::Source(format!("kafka seek: {e}")))?;
+        // Reads assign() from the cursor, so rewinding means resetting the
+        // cursor: clear the in-memory read head and pin the resume position to
+        // start_offset. The next read assigns the partition at that offset.
+        let cur = self.cursors.entry((topic.clone(), *partition)).or_default();
+        cur.last_read_offset = None;
+        cur.committed_offset = Some(*start_offset);
         tracing::warn!(topic, partition, start_offset, "kafka rewound for replay");
         Ok(())
     }
