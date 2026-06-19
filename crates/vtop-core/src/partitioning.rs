@@ -82,13 +82,36 @@ pub fn resolve_template(template: &str, ctx: &PartitionContext) -> String {
                 key.push(k);
             }
             if let Some(val) = ctx.lookup(&key) {
-                out.push_str(&val);
+                // Sanitize each resolved VALUE so a hostile/odd tenant or source
+                // name can't inject path separators or `..` traversal into the
+                // object key (and, via the local-fs backend, escape the root).
+                out.push_str(&sanitize_segment(&val));
             }
         } else {
             out.push(c);
         }
     }
     normalize_prefix(&out)
+}
+
+/// Sanitize a single resolved template value for safe use inside an object key
+/// path segment: keep `[A-Za-z0-9._=-]`, replace everything else (incl. `/` and
+/// `\`) with `_`, and neutralize any `..` so it cannot traverse directories.
+pub fn sanitize_segment(s: &str) -> String {
+    let mut out: String = s
+        .chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '_' | '-' | '=' => c,
+            _ => '_',
+        })
+        .collect();
+    while out.contains("..") {
+        out = out.replace("..", "_");
+    }
+    if out.is_empty() {
+        out.push('_');
+    }
+    out
 }
 
 /// Collapse duplicate slashes and trim leading/trailing slashes.
@@ -270,6 +293,31 @@ mod tests {
         );
         // plain name passes through (lowercased)
         assert_eq!(resolve_bucket("telemetry-data", &ctx()), "telemetry-data");
+    }
+
+    #[test]
+    fn sanitizes_path_segment_values() {
+        assert_eq!(sanitize_segment("app_events"), "app_events");
+        // path separators become underscores; no traversal survives
+        assert_eq!(sanitize_segment("/data/in/x.log"), "_data_in_x.log");
+        let evil = sanitize_segment("../../etc/passwd");
+        assert!(!evil.contains(".."), "no traversal: {evil}");
+        assert!(!evil.contains('/'), "no separators: {evil}");
+        assert!(evil.ends_with("etc_passwd"));
+        assert!(!sanitize_segment("a/../b").contains(".."));
+        assert_eq!(sanitize_segment(""), "_");
+    }
+
+    #[test]
+    fn resolve_template_neutralizes_traversal_in_values() {
+        let ts = Utc.with_ymd_and_hms(2026, 6, 18, 15, 0, 0).unwrap();
+        let c = PartitionContext::new("default", "../../evil", TelemetryFormat::Cef, ts);
+        let resolved = resolve_template("tenant={tenant}/source={source}/", &c);
+        assert!(
+            !resolved.contains(".."),
+            "traversal must be neutralized: {resolved}"
+        );
+        assert!(resolved.starts_with("tenant=default/source="));
     }
 
     #[test]

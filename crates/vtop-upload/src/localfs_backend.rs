@@ -22,6 +22,21 @@ impl LocalFsBackend {
 
     fn object_path(&self, uri: &str) -> Result<PathBuf, VtopError> {
         let (bucket, key) = parse_s3_uri(uri)?;
+        // Defense in depth: reject any path-traversal / absolute segment so a
+        // crafted URI can never escape the configured root, even if the key was
+        // produced outside the normal (sanitized) partitioning path.
+        for seg in std::iter::once(bucket.as_str()).chain(key.split('/')) {
+            if seg == ".." || seg == "." {
+                return Err(VtopError::Upload(format!(
+                    "refusing path-traversal segment in object uri: {uri}"
+                )));
+            }
+        }
+        if key.starts_with('/') || bucket.starts_with('/') {
+            return Err(VtopError::Upload(format!(
+                "refusing absolute path in object uri: {uri}"
+            )));
+        }
         Ok(self.root.join(bucket).join(key))
     }
 
@@ -176,6 +191,18 @@ mod tests {
             .await
             .unwrap();
         assert!(!bad.passed);
+    }
+
+    #[tokio::test]
+    async fn rejects_path_traversal() {
+        let root = tempfile::tempdir().unwrap();
+        let b = LocalFsBackend::new(root.path());
+        let f = tmp(b"x");
+        let err = b
+            .put_object(f.path(), "s3://bucket/../../etc/evil", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, VtopError::Upload(_)));
     }
 
     #[tokio::test]

@@ -123,6 +123,8 @@ impl SourceAdapter for SyslogSpoolSource {
             records,
             first_timestamp: None,
             last_timestamp: None,
+            // Spool lines are re-framed with newlines on serialization.
+            verbatim: false,
         })
     }
 

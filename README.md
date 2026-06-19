@@ -602,6 +602,7 @@ VTOP is currently a prototype. The following limits are known and intentional.
 | Area | Current behavior | Planned direction |
 |---|---|---|
 | Large objects | native S3 backend uses single-part `put_object` | add multipart upload |
+| Large records / whole files | a whole-file record and an over-budget line are read fully into memory (soft `max_bytes`); a warning is logged | add bounded reads + streaming compression/upload |
 | Partial upload recovery | replays from source instead of resuming half-written local objects | add resumable local staging |
 | Command backend verification | `s3cmd` and `mc` verify size and existence only | prefer native checksum verification |
 | Syslog timestamps | `received_time_*` is not yet extracted into the spool marker | add timestamp extraction |
@@ -609,20 +610,25 @@ VTOP is currently a prototype. The following limits are known and intentional.
 | Object immutability | S3 Object Lock is designed but not implemented | add Object Lock profile |
 | Metrics export | structured events exist, Prometheus export not implemented | add metrics endpoint/exporter |
 | Kafka integration test | requires live broker and is ignored by default | add optional CI service profile |
-| Binary inputs | source adapters are line-oriented | add binary/pre-compressed framing |
-| Local backend | object storage is the main target | add local filesystem backend |
+| Binary / pre-compressed inputs | **supported** via the file source `whole_file` mode (archived verbatim, byte-exact) | streaming for very large files |
+| Local filesystem backend | **available** (`backend: localfs`, objects under `local_path/<bucket>/<key>` with a checksum sidecar) | — |
+| Checksums | **SHA-256 and BLAKE3**, or disabled (size-only); `require_strong_verification` rejects backend-limited results | — |
 
 ---
 
 ## Roadmap
 
+Completed:
+
+- [x] local filesystem upload backend (`backend: localfs`)
+- [x] BLAKE3 checksum strategy (and checksum-disabled mode)
+- [x] binary / pre-compressed input framing (file source `whole_file` mode)
+- [x] strong-verification gate (`require_strong_verification`)
+
 Planned implementation areas:
 
-- [ ] local filesystem upload backend
-- [ ] BLAKE3 checksum strategy
-- [ ] checksum-disabled conformance profile
 - [ ] Kafka feature gate for lighter builds
-- [ ] binary and pre-compressed input framing
+- [ ] bounded reads + streaming compression/upload for very large records
 - [ ] multipart upload support
 - [ ] manifest signing
 - [ ] S3 Object Lock profile

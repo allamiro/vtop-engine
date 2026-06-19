@@ -94,6 +94,10 @@ mod tests {
     use crate::types::{ProgressMarker, SourceType, TelemetryFormat};
 
     fn sealed_batch(records: Vec<&[u8]>) -> TelemetryBatch {
+        sealed_batch_framed(records, false)
+    }
+
+    fn sealed_batch_framed(records: Vec<&[u8]>, verbatim: bool) -> TelemetryBatch {
         let marker = ProgressMarker::File {
             path: "/x.log".into(),
             inode: None,
@@ -117,6 +121,7 @@ mod tests {
             created_at: "now".into(),
             sealed_at: Some("now".into()),
             state: BatchState::Sealed,
+            verbatim,
         }
     }
 
@@ -143,6 +148,23 @@ mod tests {
         let bytes = std::fs::read(&obj.path).unwrap();
         let out = zstd::decode_all(bytes.as_slice()).unwrap();
         assert_eq!(out, b"a\nb\n");
+    }
+
+    #[test]
+    fn single_line_batch_is_byte_exact() {
+        // One logical line (newline stripped on read) re-frames to "x\n", which
+        // is byte-exact with the covered source range.
+        let batch = sealed_batch(vec![b"x"]);
+        assert_eq!(batch.to_record_bytes(), b"x\n");
+    }
+
+    #[test]
+    fn verbatim_preserves_binary_bytes() {
+        // Whole-file / binary: a single record with no trailing newline must be
+        // emitted exactly, with nothing appended.
+        let raw: &[u8] = &[0x00, 0x01, 0xff, 0x42];
+        let batch = sealed_batch_framed(vec![raw], true);
+        assert_eq!(batch.to_record_bytes(), raw);
     }
 
     #[test]
