@@ -154,7 +154,23 @@ impl SourceAdapter for KafkaSource {
                     let p = msg.partition();
                     if let Some(lp) = locked_partition {
                         if p != lp {
-                            // Different partition — do not mix; stop this batch.
+                            // Different partition — do not mix into this batch.
+                            // The message was already returned by poll(), so the
+                            // consumer's position has advanced past it; rewind
+                            // that partition to this offset so the record is
+                            // redelivered on a later read instead of being lost.
+                            consumer
+                                .seek(
+                                    msg.topic(),
+                                    p,
+                                    Offset::Offset(msg.offset()),
+                                    Duration::from_secs(5),
+                                )
+                                .map_err(|e| {
+                                    VtopError::Source(format!(
+                                        "kafka seek (unmix partition {p}): {e}"
+                                    ))
+                                })?;
                             break;
                         }
                     } else {
