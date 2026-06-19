@@ -4,7 +4,60 @@
 
 The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are used as normative requirements for conformant behavior.
 
-## 1. Transport Security
+## Table of contents
+
+1. [Threat model](#1-threat-model)
+2. [Transport security](#2-transport-security)
+3. [Credential handling](#3-credential-handling)
+4. [Manifest confidentiality](#4-manifest-confidentiality)
+5. [Object storage permissions and least privilege](#5-object-storage-permissions-and-least-privilege)
+6. [Integrity verification and chain of custody](#6-integrity-verification-and-chain-of-custody)
+7. [Data at rest and object immutability](#7-data-at-rest-and-object-immutability)
+8. [Manifest signing (future)](#8-manifest-signing-future)
+9. [Audit and failure logging](#9-audit-and-failure-logging)
+10. [Secret redaction](#10-secret-redaction)
+11. [Container and runtime hardening](#11-container-and-runtime-hardening)
+12. [Supply-chain security](#12-supply-chain-security)
+13. [Security properties provided vs. not provided](#13-security-properties-provided-vs-not-provided)
+14. [Summary of normative rules](#14-summary-of-normative-rules)
+
+---
+
+## 1. Threat model
+
+### 1.1 Assets
+
+| Asset | Why it matters |
+|-------|----------------|
+| Telemetry data in flight | May contain sensitive logs (auth, audit, security events). |
+| Telemetry objects at rest | Long-lived archival; integrity and immutability matter for audit/compliance. |
+| Manifests | Bind object hash to source markers; the chain-of-custody record. |
+| Source progress markers / state store | Authoritative record of what has been safely committed. |
+| Credentials | Kafka SASL/mTLS material, object-storage keys, future signing keys. |
+
+### 1.2 Adversaries
+
+| Adversary | Capability assumed |
+|-----------|--------------------|
+| Network attacker | Can observe/modify traffic between engine and Kafka or object storage if unprotected. |
+| Storage tamperer | Can attempt to alter or overwrite stored objects/manifests after write. |
+| Curious/over-broad operator | Has more storage permissions than needed; may read or delete objects. |
+| Log/exfil observer | Reads logs, process arguments, or images hoping to recover secrets. |
+| Malicious/compromised dependency | Reaches the engine via the software supply chain. |
+
+### 1.3 Trust boundaries
+
+| Boundary | Control |
+|----------|---------|
+| Source ↔ engine | Transport security (TLS/SASL/mTLS); engine owns commit, source never self-commits. |
+| Engine ↔ object storage | TLS; integrity verification of stored object + manifest; least-privilege credentials. |
+| Engine ↔ external CLI backends | Version-pinned tools executing outside the Rust dependency graph; backend-limited verification flagged. |
+| Engine ↔ operator/logs | Secret redaction; manifests carry no secrets. |
+| Build ↔ runtime | Supply-chain auditing; container hardening. |
+
+---
+
+## 2. Transport Security
 
 ### TLS for Kafka
 
@@ -21,7 +74,7 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are used as normat
 - Kafka authentication **SHOULD** support **SASL/SCRAM** and **mTLS**.
 - The selected mechanism and identity **MAY** be logged, but associated secrets **MUST NOT** be logged.
 
-## 2. Credential Handling
+## 3. Credential Handling
 
 Normative rules:
 
@@ -35,58 +88,78 @@ Additional guidance:
 - Credentials **SHOULD NOT** be passed as plaintext command-line arguments where avoidable, since arguments may be visible to other processes.
 - The engine **SHOULD** support loading credentials from external secret managers without persisting them to disk.
 
-## 3. Manifest Confidentiality
+## 4. Manifest Confidentiality
 
 - Manifests describe object integrity and source progress only.
 - Manifests **MUST NOT** contain credentials, tokens, or other authentication material.
 - Manifests **SHOULD NOT** contain raw telemetry payload contents beyond the integrity metadata necessary for verification.
 
-## 4. Object Storage Permissions
+## 5. Object storage permissions and least privilege
 
 - Object storage credentials **SHOULD** follow **least privilege**: the minimum permissions required to put, get/head (for verification), and list within the configured prefix.
 - Delete permissions **SHOULD NOT** be granted unless an operational lifecycle policy explicitly requires them.
 - Separate read-only credentials **SHOULD** be used for downstream consumers.
 
-## 5. Integrity Verification
+### 5.1 Per-backend least privilege
 
-- The engine **MUST** compute a SHA-256 checksum over the compressed telemetry object.
-- The engine **MUST** verify the durably stored object against the manifest checksum before transitioning to `VERIFIED`.
+| Backend | Minimum permissions | Notes |
+|---------|---------------------|-------|
+| `s3_native` / `awscli` | `PutObject`, `GetObject`/`HeadObject` (verify), `ListBucket` within prefix | Strong checksum verification needs read-back. |
+| `s3cmd` / `minio mc` | Same as above | Verification is backend-limited (size/existence). |
+| LocalFS | Filesystem write/read on the object tree only | The object tree directory **SHOULD** have restrictive permissions; the engine **SHOULD NOT** require broader filesystem access. |
+
+### 5.2 On-demand bucket creation (`CreateBucket`) implications
+
+Per-format buckets (e.g. `telemetry-{format}`) with optional on-demand creation require `CreateBucket` (and possibly bucket-policy) permissions. Granting `CreateBucket`:
+
+- **SHOULD** be scoped to a dedicated provisioning identity, or buckets **SHOULD** be pre-created so the runtime identity does **not** hold `CreateBucket`.
+- **MUST NOT** be combined with broad delete permissions on the same identity without an explicit lifecycle justification.
+- Broadens blast radius (an over-broad identity could create unexpected buckets); operators **SHOULD** prefer pre-provisioned buckets in production.
+
+## 6. Integrity verification and chain of custody
+
+- The engine **MUST** compute a content checksum (SHA-256 or BLAKE3; or size-only when checksums are explicitly disabled) over the compressed telemetry object.
+- The engine **MUST** verify the durably stored object against the manifest before transitioning to `VERIFIED`.
 - The engine **MUST** verify the stored manifest before committing source progress.
 - A source progress marker **MUST NOT** be committed unless both object and manifest verification succeed (see the protocol commit rule).
+- The manifest binds the object hash to the covered source progress markers, providing object-level **chain of custody**; the manifest **self-hash** (computed with the self-hash field blanked) makes the manifest tamper-evident and reproducible.
+- Where the backend can only confirm size/existence, verification is **backend-limited** and the engine **MUST** report it as such rather than as cryptographic verification.
+- Optional manifest signing (§8) **MAY** further strengthen chain of custody when introduced.
 
-## 6. Manifest Signing (Future)
-
-- **Manifest signing SHOULD be supported later.**
-- When enabled, manifests **MAY** carry a detached or embedded signature to strengthen chain-of-custody and tamper-evidence guarantees.
-- Signing keys, when introduced, **MUST** be handled under the same credential rules in §2 and **MUST NOT** appear in manifests or logs.
-
-## 7. Object Immutability
+## 7. Data at rest and object immutability
 
 - **Object lock SHOULD be supported later.**
 - Where the backend supports it (e.g., S3 Object Lock / WORM), telemetry objects and manifests **SHOULD** be written as immutable for the configured retention period.
-- Immutability complements verification: it protects stored objects from post-write tampering or accidental overwrite.
+- Immutability complements verification: verification detects tampering, immutability prevents post-write tampering or accidental overwrite.
+- At-rest encryption (server-side or bucket-default) **MAY** be enabled at the storage layer; it is orthogonal to VTOP's integrity guarantees.
 
-## 8. Audit and Failure Logging
+## 8. Manifest Signing (Future)
+
+- **Manifest signing SHOULD be supported later.**
+- When enabled, manifests **MAY** carry a detached or embedded signature to strengthen chain-of-custody and tamper-evidence guarantees.
+- Signing keys, when introduced, **MUST** be handled under the same credential rules in §3 and **MUST NOT** appear in manifests or logs.
+
+## 9. Audit and Failure Logging
 
 - The engine **SHOULD** emit structured audit logs for batch lifecycle events (seal, upload, verify, commit) including `batch_id`, object key, and outcome.
 - Failures **SHOULD** be logged with enough context to support replay and forensic review, **without** including secrets or raw sensitive payloads.
 - Audit logs **SHOULD** be append-oriented and suitable for retention alongside the archived objects.
 
-## 9. Secret Redaction
+## 10. Secret Redaction
 
 - Any log path, error type, or diagnostic that could surface credentials **MUST** redact them.
 - Connection strings, headers, and configuration dumps **MUST** have secret fields masked before logging.
 - The redaction layer **SHOULD** default to redacting unknown sensitive-looking fields rather than printing them.
 
-## 10. Container and Runtime Hardening
+## 11. Container and Runtime Hardening
 
 - Container images **SHOULD** run as a non-root user.
 - Images **SHOULD** use minimal/distroless-style bases to reduce attack surface.
-- Filesystems **SHOULD** be mounted read-only except for required working/state directories.
+- Filesystems **SHOULD** be mounted read-only except for required working/state directories (e.g. the SQLite state store and any LocalFS object tree).
 - Linux capabilities **SHOULD** be dropped to the minimum required.
 - Secrets **SHOULD** be provided via mounted secrets or the orchestrator's secret store, never baked into images.
 
-## 11. Supply-Chain Security
+## 12. Supply-Chain Security
 
 - Dependencies **SHOULD** be pinned and audited (e.g., dependency vulnerability scanning).
 - Builds **SHOULD** be reproducible where practical, and release artifacts **SHOULD** be checksummed and **MAY** be signed.
@@ -111,7 +184,23 @@ When the AWS SDK ships an `aws-smithy-http-client` release that drops
 `hyper-rustls 0.24`, the three `rustls-webpki` entries **MUST** be removed from
 the ignore list and the build re-audited.
 
-## 12. Summary of Normative Rules
+## 13. Security properties provided vs. not provided
+
+| Property | Provided? | Notes |
+|----------|-----------|-------|
+| Object integrity (cryptographic) | Yes, with SHA-256/BLAKE3 | Stored object hash verified against manifest before commit. |
+| Manifest tamper-evidence | Yes | Reproducible self-hash. |
+| Chain of custody (object ↔ source markers) | Yes | Manifest binds object hash to covered markers. |
+| Replay safety / no premature commit | Yes | Enforced in state machine, state store, and pipeline. |
+| Transport confidentiality | Configurable | Via TLS/SASL/mTLS; not implemented in core. |
+| Backend-limited verification disclosure | Yes | `s3cmd`/`mc` flagged as size/existence-only. |
+| Data-at-rest encryption | Not by VTOP | Delegated to storage layer (SSE/bucket default). |
+| Object immutability (WORM) | Not yet | Designed; relies on backend object lock (future). |
+| Manifest signing | Not yet | Designed (future). |
+| Multipart upload integrity for very large objects | Not yet | Native backend uses single-part `put_object`. |
+| Authorization / multi-tenant isolation | Not by VTOP | Relies on storage-side IAM and least-privilege credentials. |
+
+## 14. Summary of Normative Rules
 
 | Rule | Level |
 |------|-------|
@@ -120,7 +209,9 @@ the ignore list and the build re-audited.
 | Credentials via env vars / mounted secrets / external secret managers | **SHOULD** |
 | TLS for Kafka and S3-compatible endpoints | **SHOULD** |
 | Least-privilege object storage permissions | **SHOULD** |
+| `CreateBucket` scoped/avoided in runtime identity (per-format auto-create) | **SHOULD** |
 | Verify object + manifest before commit | **MUST** |
+| Report backend-limited verification as such (not cryptographic) | **MUST** |
 | Manifest signing | **SHOULD** (later) |
 | Object lock / immutability | **SHOULD** (later) |
 | Secret redaction in logs | **MUST** |
