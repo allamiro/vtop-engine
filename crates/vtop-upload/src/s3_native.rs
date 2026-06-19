@@ -2,20 +2,47 @@
 //!
 //! Supports AWS S3, MinIO, and Ceph RGW via a custom endpoint and optional
 //! path-style addressing. Credentials are read from the environment by the SDK
-//! credential chain and are never logged. The object's SHA-256 is stored as
-//! user metadata (`x-amz-meta-vtop-sha256`) so verification via `head_object`
-//! can confirm integrity without re-downloading.
+//! credential chain and are never logged.
+//!
+//! Integrity is enforced with S3's **server-validated** SHA-256 checksum: the
+//! precomputed digest is sent on `PUT` (`x-amz-checksum-sha256`), so the store
+//! recomputes the body hash and rejects a corrupted upload, and verification
+//! reads that store-computed checksum back via `head_object`. The hex digest is
+//! also kept as user metadata (`x-amz-meta-vtop-sha256`) for tooling and for
+//! backward-compatible verification of objects written before this existed.
 
 use crate::base::{parse_s3_uri, ObjectHead, UploadBackend, VerificationResult};
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Region;
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::ChecksumMode;
 use aws_sdk_s3::Client;
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use std::path::Path;
 use vtop_core::errors::VtopError;
 
 const SHA256_META_KEY: &str = "vtop-sha256";
+
+/// Convert a lowercase-hex SHA-256 into the base64 form S3 uses for
+/// `x-amz-checksum-sha256` (base64 of the raw 32-byte digest).
+fn hex_to_b64_sha256(hex_sha: &str) -> Option<String> {
+    let raw = hex::decode(hex_sha).ok()?;
+    if raw.len() != 32 {
+        return None;
+    }
+    Some(B64.encode(raw))
+}
+
+/// Convert S3's base64 `x-amz-checksum-sha256` back into lowercase hex so it
+/// compares against the engine's hex SHA-256 representation.
+fn b64_to_hex_sha256(b64: &str) -> Option<String> {
+    let raw = B64.decode(b64).ok()?;
+    if raw.len() != 32 {
+        return None;
+    }
+    Some(hex::encode(raw))
+}
 
 /// Connection / addressing settings for the native S3 backend.
 #[derive(Debug, Clone)]
@@ -77,6 +104,14 @@ impl S3NativeBackend {
             .body(body);
 
         if let Some(h) = sha256 {
+            // Server-validated integrity: S3 recomputes SHA-256 over the body
+            // and rejects the upload (BadDigest) if it does not match this
+            // precomputed value, so corruption in transit fails the PUT itself.
+            if let Some(b64) = hex_to_b64_sha256(h) {
+                req = req.checksum_sha256(b64);
+            }
+            // Also retain the hex digest as user metadata for tooling and for
+            // backward-compatible verification of pre-existing objects.
             req = req.metadata(SHA256_META_KEY, h);
         }
 
@@ -114,6 +149,7 @@ impl UploadBackend for S3NativeBackend {
             .head_object()
             .bucket(&bucket)
             .key(&key)
+            .checksum_mode(ChecksumMode::Enabled)
             .send()
             .await
             .map_err(|e| {
@@ -123,7 +159,13 @@ impl UploadBackend for S3NativeBackend {
                 ))
             })?;
 
-        let checksum_sha256 = out.metadata().and_then(|m| m.get(SHA256_META_KEY)).cloned();
+        // Prefer the checksum S3 itself computed over the object body
+        // (base64, converted back to hex). Fall back to the self-asserted
+        // metadata only for objects written before server checksums existed.
+        let checksum_sha256 = out
+            .checksum_sha256()
+            .and_then(b64_to_hex_sha256)
+            .or_else(|| out.metadata().and_then(|m| m.get(SHA256_META_KEY)).cloned());
 
         Ok(ObjectHead {
             uri: object_uri.to_string(),
@@ -237,5 +279,39 @@ pub fn config_from_upload(upload: &vtop_core::config::UploadConfig) -> S3NativeC
         endpoint_url,
         force_path_style,
         verify_tls,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vtop_core::checksum::sha256_bytes;
+
+    #[test]
+    fn hex_b64_round_trips() {
+        let hex = sha256_bytes(b"vtop object body");
+        let b64 = hex_to_b64_sha256(&hex).expect("hex -> b64");
+        let back = b64_to_hex_sha256(&b64).expect("b64 -> hex");
+        assert_eq!(back, hex);
+    }
+
+    #[test]
+    fn known_empty_string_vector() {
+        // SHA-256("") in hex and the base64 S3 reports for it.
+        let hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        assert_eq!(
+            hex_to_b64_sha256(hex).unwrap(),
+            "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="
+        );
+    }
+
+    #[test]
+    fn rejects_non_sha256_lengths() {
+        // Not 32 bytes once decoded -> no conversion (avoids sending a bogus
+        // checksum that S3 would reject opaquely).
+        assert!(hex_to_b64_sha256("abcd").is_none());
+        assert!(hex_to_b64_sha256("zz").is_none()); // not valid hex
+        assert!(b64_to_hex_sha256("not-base64!!").is_none());
+        assert!(b64_to_hex_sha256(&B64.encode([0u8; 16])).is_none()); // 16 bytes
     }
 }
