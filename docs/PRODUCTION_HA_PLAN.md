@@ -191,7 +191,7 @@ binary; switching is one config line.
 | Dev / single appliance | `sqlite:///data/state/vtop-state.db` |
 | Production (Postgres) | `postgres://vtop@pg-host:5432/vtop` |
 | Production (Yugabyte) | `postgres://vtop@yb-host:5433/vtop` (same driver) |
-| Production (Cockroach) | `postgres://vtop@crdb-host:26257/vtop` (same driver) |
+
 
 ### 5.2 The trait (one source of truth for the invariant)
 - Abstracts: `save_batch_state`, `update_batch_state`, `mark_verified`,
