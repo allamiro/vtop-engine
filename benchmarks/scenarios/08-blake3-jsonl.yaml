@@ -1,0 +1,12 @@
+name: blake3-jsonl
+description: BLAKE3 checksum over JSONL objects (compare checksum cost vs sha256).
+volume: 1000
+file_size: small
+format: jsonl
+compression: gzip
+checksum: blake3
+backend: mock
+batch_max_records: 10000
+duration_seconds: 0
+fault: none
+sys_sample_interval: 0.5

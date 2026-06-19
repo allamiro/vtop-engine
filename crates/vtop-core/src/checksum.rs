@@ -7,6 +7,7 @@
 //!   succeeds.
 
 use crate::errors::VtopError;
+use crate::types::ChecksumAlgorithm;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use tokio::io::AsyncReadExt;
@@ -16,6 +17,48 @@ pub fn sha256_bytes(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     hex::encode(hasher.finalize())
+}
+
+/// Compute the lowercase hex BLAKE3 of an in-memory byte slice.
+pub fn blake3_bytes(data: &[u8]) -> String {
+    blake3::hash(data).to_hex().to_string()
+}
+
+/// Compute the lowercase hex BLAKE3 of a file, streaming in bounded chunks.
+pub async fn blake3_file(path: &Path) -> Result<String, VtopError> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// Compute a file digest with the requested algorithm. Returns `Ok(None)` when
+/// checksums are disabled ([`ChecksumAlgorithm::None`]).
+pub async fn digest_file(
+    algo: ChecksumAlgorithm,
+    path: &Path,
+) -> Result<Option<String>, VtopError> {
+    Ok(match algo {
+        ChecksumAlgorithm::Sha256 => Some(sha256_file(path).await?),
+        ChecksumAlgorithm::Blake3 => Some(blake3_file(path).await?),
+        ChecksumAlgorithm::None => None,
+    })
+}
+
+/// Compute an in-memory digest with the requested algorithm.
+pub fn digest_bytes(algo: ChecksumAlgorithm, data: &[u8]) -> Option<String> {
+    match algo {
+        ChecksumAlgorithm::Sha256 => Some(sha256_bytes(data)),
+        ChecksumAlgorithm::Blake3 => Some(blake3_bytes(data)),
+        ChecksumAlgorithm::None => None,
+    }
 }
 
 /// Compute the lowercase hex SHA-256 of a file, streaming it in bounded chunks
@@ -81,6 +124,34 @@ mod tests {
         let a = sha256_bytes(b"payload-A");
         let b = sha256_bytes(b"payload-B");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn blake3_known_vector() {
+        // BLAKE3 of the empty input.
+        assert_eq!(
+            blake3_bytes(b""),
+            "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+        );
+        assert_ne!(blake3_bytes(b"abc"), sha256_bytes(b"abc"));
+    }
+
+    #[tokio::test]
+    async fn digest_dispatch_and_disabled() {
+        use crate::types::ChecksumAlgorithm::*;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"data").unwrap();
+        f.flush().unwrap();
+        assert_eq!(
+            digest_file(Sha256, f.path()).await.unwrap(),
+            Some(sha256_bytes(b"data"))
+        );
+        assert_eq!(
+            digest_file(Blake3, f.path()).await.unwrap(),
+            Some(blake3_bytes(b"data"))
+        );
+        assert_eq!(digest_file(None, f.path()).await.unwrap(), Option::None);
+        assert_eq!(digest_bytes(None, b"x"), Option::None);
     }
 
     #[tokio::test]

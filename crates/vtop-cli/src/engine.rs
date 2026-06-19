@@ -29,7 +29,7 @@ use vtop_core::replay::{next_recovery_action, RecoveryAction};
 use vtop_core::state_machine::BatchState;
 use vtop_core::types::{ProgressMarker, SourceType};
 use vtop_state::{BatchPatch, BatchRecord, SqliteStateStore};
-use vtop_upload::UploadBackend;
+use vtop_upload::{ObjectChecksum, UploadBackend};
 
 /// Outcome of processing a single batch.
 #[derive(Debug, Clone)]
@@ -192,16 +192,23 @@ impl<'a> Pipeline<'a> {
         );
 
         // ---- COMPRESSED -> CHECKSUMMED ----------------------------------
+        // Algorithm is configurable: sha256, blake3, or disabled (None).
+        let algo = self.config.checksum.algorithm;
         let t = Instant::now();
-        let object_sha = match vtop_core::checksum::sha256_file(&compressed.path).await {
-            Ok(s) => s,
+        let object_checksum = match vtop_core::checksum::digest_file(algo, &compressed.path).await {
+            Ok(d) => d,
             Err(e) => fail!(format!("checksum failed: {e}")),
         };
         metrics.checksum_ms = t.elapsed().as_millis() as u64;
         self.store
             .update_batch_state(&batch_id, BatchState::Checksummed, &BatchPatch::default())
             .await?;
-        tracing::info!(batch_id, sha256 = %object_sha, "checksum_calculated");
+        tracing::info!(
+            batch_id,
+            algorithm = %algo,
+            checksum = object_checksum.as_deref().unwrap_or("(disabled)"),
+            "checksum_calculated"
+        );
 
         // ---- Resolve object / manifest URIs -----------------------------
         let ctx = PartitionContext::new(&tenant, &s3_source, format.clone(), Utc::now());
@@ -237,14 +244,23 @@ impl<'a> Pipeline<'a> {
         }
 
         // ---- CHECKSUMMED -> OBJECT_UPLOADED -----------------------------
+        // Engine-computed object checksum (algorithm + hex), if enabled.
+        let object_ck = object_checksum
+            .as_deref()
+            .map(|h| ObjectChecksum::new(algo.as_str(), h));
+
         let t = Instant::now();
-        if let Err(e) = self.backend.put_object(&compressed.path, &object_uri).await {
+        if let Err(e) = self
+            .backend
+            .put_object(&compressed.path, &object_uri, object_ck)
+            .await
+        {
             fail!(format!("object upload failed: {e}"));
         }
         metrics.object_upload_ms = t.elapsed().as_millis() as u64;
         let obj_patch = BatchPatch {
             object_uri: Some(object_uri.clone()),
-            object_sha256: Some(object_sha.clone()),
+            object_sha256: Some(object_checksum.clone().unwrap_or_default()),
             record_count: Some(batch.record_count as i64),
             ..Default::default()
         };
@@ -267,7 +283,8 @@ impl<'a> Pipeline<'a> {
             source_progress: read.progress_end.clone(),
             object_uri: object_uri.clone(),
             object_size: compressed.size_bytes,
-            object_sha256: object_sha.clone(),
+            object_checksum_algorithm: algo.as_str().to_string(),
+            object_checksum: object_checksum.clone().unwrap_or_default(),
             manifest_uri: manifest_uri.clone(),
             path_template: self.config.partitioning.template.clone(),
             resolved_prefix: resolved_prefix.clone(),
@@ -277,14 +294,20 @@ impl<'a> Pipeline<'a> {
         .build()?;
 
         let manifest_path = manifest.write_to_file(work_dir)?;
-        let manifest_sha = vtop_core::checksum::sha256_file(&manifest_path).await?;
+        // Storage-integrity digest of the manifest file (configured algorithm).
+        // The manifest's own self-hash (manifest.manifest.sha256) is the
+        // tamper-evidence record and is always SHA-256.
+        let manifest_checksum = vtop_core::checksum::digest_file(algo, &manifest_path).await?;
+        let manifest_ck = manifest_checksum
+            .as_deref()
+            .map(|h| ObjectChecksum::new(algo.as_str(), h));
         let manifest_size = std::fs::metadata(&manifest_path)?.len();
 
         // ---- OBJECT_UPLOADED -> MANIFEST_UPLOADED -----------------------
         let t = Instant::now();
         if let Err(e) = self
             .backend
-            .put_manifest(&manifest_path, &manifest_uri)
+            .put_manifest(&manifest_path, &manifest_uri, manifest_ck)
             .await
         {
             fail!(format!("manifest upload failed: {e}"));
@@ -307,18 +330,18 @@ impl<'a> Pipeline<'a> {
         if let Err(e) = manifest.verify_self_hash() {
             fail!(format!("manifest self-hash verification failed: {e}"));
         }
-        // 2) the stored object matches size + sha256,
+        // 2) the stored object matches size + checksum,
         let obj_v = self
             .backend
-            .verify_object(&object_uri, compressed.size_bytes, &object_sha)
+            .verify_object(&object_uri, compressed.size_bytes, object_ck)
             .await?;
         if !obj_v.passed {
             fail!(format!("object verification failed: {}", obj_v.message));
         }
-        // 3) the stored manifest matches size + sha256.
+        // 3) the stored manifest matches size + checksum.
         let man_v = self
             .backend
-            .verify_object(&manifest_uri, manifest_size, &manifest_sha)
+            .verify_object(&manifest_uri, manifest_size, manifest_ck)
             .await?;
         if !man_v.passed {
             fail!(format!("manifest verification failed: {}", man_v.message));
@@ -493,7 +516,12 @@ impl Engine {
                 let fmt = default_format_for(&streams, SourceType::File);
                 adapters.insert(
                     SourceType::File,
-                    Box::new(FileSource::new(f.paths.clone(), fmt, f.delete_after_commit)),
+                    Box::new(FileSource::with_mode(
+                        f.paths.clone(),
+                        fmt,
+                        f.delete_after_commit,
+                        f.whole_file,
+                    )),
                 );
             }
         }

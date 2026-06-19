@@ -3,7 +3,7 @@
 //! Compatibility mode only. Supports `--endpoint-url` and `AWS_PROFILE`.
 //! Credentials come from the environment / profile and are never printed.
 
-use crate::base::{parse_s3_uri, ObjectHead, UploadBackend, VerificationResult};
+use crate::base::{parse_s3_uri, ObjectChecksum, ObjectHead, UploadBackend, VerificationResult};
 use async_trait::async_trait;
 use std::path::Path;
 use tokio::process::Command;
@@ -38,30 +38,34 @@ impl AwsCliBackend {
 
 #[async_trait]
 impl UploadBackend for AwsCliBackend {
-    async fn put_object(&self, local_path: &Path, object_uri: &str) -> Result<(), VtopError> {
-        let sha = vtop_core::checksum::sha256_file(local_path).await?;
-        run(self
-            .base_cmd()
-            .arg("s3")
-            .arg("cp")
-            .arg(local_path)
-            .arg(object_uri)
-            .arg("--metadata")
-            .arg(format!("{SHA256_META_KEY}={sha}")))
-        .await
+    async fn put_object(
+        &self,
+        local_path: &Path,
+        object_uri: &str,
+        checksum: Option<ObjectChecksum<'_>>,
+    ) -> Result<(), VtopError> {
+        let mut cmd = self.base_cmd();
+        cmd.arg("s3").arg("cp").arg(local_path).arg(object_uri);
+        if let Some(c) = checksum {
+            cmd.arg("--metadata")
+                .arg(format!("{SHA256_META_KEY}={}", c.hex));
+        }
+        run(&mut cmd).await
     }
 
-    async fn put_manifest(&self, local_path: &Path, manifest_uri: &str) -> Result<(), VtopError> {
-        let sha = vtop_core::checksum::sha256_file(local_path).await?;
-        run(self
-            .base_cmd()
-            .arg("s3")
-            .arg("cp")
-            .arg(local_path)
-            .arg(manifest_uri)
-            .arg("--metadata")
-            .arg(format!("{SHA256_META_KEY}={sha}")))
-        .await
+    async fn put_manifest(
+        &self,
+        local_path: &Path,
+        manifest_uri: &str,
+        checksum: Option<ObjectChecksum<'_>>,
+    ) -> Result<(), VtopError> {
+        let mut cmd = self.base_cmd();
+        cmd.arg("s3").arg("cp").arg(local_path).arg(manifest_uri);
+        if let Some(c) = checksum {
+            cmd.arg("--metadata")
+                .arg(format!("{SHA256_META_KEY}={}", c.hex));
+        }
+        run(&mut cmd).await
     }
 
     async fn head_object(&self, object_uri: &str) -> Result<ObjectHead, VtopError> {
@@ -98,7 +102,7 @@ impl UploadBackend for AwsCliBackend {
         &self,
         object_uri: &str,
         expected_size: u64,
-        expected_sha256: &str,
+        expected: Option<ObjectChecksum<'_>>,
     ) -> Result<VerificationResult, VtopError> {
         let head = self.head_object(object_uri).await?;
         match head.size_bytes {
@@ -110,15 +114,21 @@ impl UploadBackend for AwsCliBackend {
             None => return Ok(VerificationResult::failed("object size unavailable")),
             _ => {}
         }
+        let Some(expected) = expected else {
+            return Ok(VerificationResult::limited(
+                "aws cli: size matches (checksums disabled)",
+            ));
+        };
         match head.checksum_sha256 {
-            Some(stored) if stored.eq_ignore_ascii_case(expected_sha256) => Ok(
-                VerificationResult::passed("aws cli: size + sha256 verified"),
+            Some(stored) if stored.eq_ignore_ascii_case(expected.hex) => Ok(
+                VerificationResult::passed("aws cli: size + checksum verified"),
             ),
             Some(stored) => Ok(VerificationResult::failed(format!(
-                "sha256 mismatch: expected {expected_sha256}, stored {stored}"
+                "checksum mismatch: expected {}, stored {stored}",
+                expected.hex
             ))),
             None => Ok(VerificationResult::limited(
-                "aws cli: size matches; no sha256 metadata returned",
+                "aws cli: size matches; no checksum metadata returned",
             )),
         }
     }

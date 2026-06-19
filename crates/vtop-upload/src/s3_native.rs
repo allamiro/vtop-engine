@@ -11,7 +11,7 @@
 //! also kept as user metadata (`x-amz-meta-vtop-sha256`) for tooling and for
 //! backward-compatible verification of objects written before this existed.
 
-use crate::base::{parse_s3_uri, ObjectHead, UploadBackend, VerificationResult};
+use crate::base::{parse_s3_uri, ObjectChecksum, ObjectHead, UploadBackend, VerificationResult};
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Region;
@@ -22,7 +22,7 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use std::path::Path;
 use vtop_core::errors::VtopError;
 
-const SHA256_META_KEY: &str = "vtop-sha256";
+const CHECKSUM_META_KEY: &str = "vtop-checksum";
 
 /// Convert a lowercase-hex SHA-256 into the base64 form S3 uses for
 /// `x-amz-checksum-sha256` (base64 of the raw 32-byte digest).
@@ -88,7 +88,7 @@ impl S3NativeBackend {
         local_path: &Path,
         uri: &str,
         content_type: &str,
-        sha256: Option<&str>,
+        checksum: Option<ObjectChecksum<'_>>,
     ) -> Result<(), VtopError> {
         let (bucket, key) = parse_s3_uri(uri)?;
         let body = ByteStream::from_path(local_path)
@@ -103,16 +103,20 @@ impl S3NativeBackend {
             .content_type(content_type)
             .body(body);
 
-        if let Some(h) = sha256 {
-            // Server-validated integrity: S3 recomputes SHA-256 over the body
-            // and rejects the upload (BadDigest) if it does not match this
-            // precomputed value, so corruption in transit fails the PUT itself.
-            if let Some(b64) = hex_to_b64_sha256(h) {
-                req = req.checksum_sha256(b64);
+        if let Some(c) = checksum {
+            // Always retain the hex digest as user metadata (any algorithm),
+            // for tooling and verification of objects from older writers.
+            req = req.metadata(CHECKSUM_META_KEY, c.hex);
+            // For SHA-256 only, also request server-validated integrity: S3
+            // recomputes SHA-256 over the body and rejects the upload
+            // (BadDigest) if it does not match, so in-transit corruption fails
+            // the PUT itself. (BLAKE3 is 32 bytes too, so it MUST NOT be sent
+            // here — S3 would recompute SHA-256 and reject it.)
+            if c.is_sha256() {
+                if let Some(b64) = hex_to_b64_sha256(c.hex) {
+                    req = req.checksum_sha256(b64);
+                }
             }
-            // Also retain the hex digest as user metadata for tooling and for
-            // backward-compatible verification of pre-existing objects.
-            req = req.metadata(SHA256_META_KEY, h);
         }
 
         req.send().await.map_err(|e| {
@@ -125,20 +129,23 @@ impl S3NativeBackend {
 
 #[async_trait]
 impl UploadBackend for S3NativeBackend {
-    async fn put_object(&self, local_path: &Path, object_uri: &str) -> Result<(), VtopError> {
-        let sha = vtop_core::checksum::sha256_file(local_path).await?;
-        self.put(
-            local_path,
-            object_uri,
-            "application/octet-stream",
-            Some(&sha),
-        )
-        .await
+    async fn put_object(
+        &self,
+        local_path: &Path,
+        object_uri: &str,
+        checksum: Option<ObjectChecksum<'_>>,
+    ) -> Result<(), VtopError> {
+        self.put(local_path, object_uri, "application/octet-stream", checksum)
+            .await
     }
 
-    async fn put_manifest(&self, local_path: &Path, manifest_uri: &str) -> Result<(), VtopError> {
-        let sha = vtop_core::checksum::sha256_file(local_path).await?;
-        self.put(local_path, manifest_uri, "application/json", Some(&sha))
+    async fn put_manifest(
+        &self,
+        local_path: &Path,
+        manifest_uri: &str,
+        checksum: Option<ObjectChecksum<'_>>,
+    ) -> Result<(), VtopError> {
+        self.put(local_path, manifest_uri, "application/json", checksum)
             .await
     }
 
@@ -159,13 +166,17 @@ impl UploadBackend for S3NativeBackend {
                 ))
             })?;
 
-        // Prefer the checksum S3 itself computed over the object body
-        // (base64, converted back to hex). Fall back to the self-asserted
-        // metadata only for objects written before server checksums existed.
+        // Prefer the checksum S3 itself computed over the object body (SHA-256,
+        // base64 -> hex) — that is server-validated. Fall back to the
+        // engine-asserted metadata digest (covers BLAKE3 and older objects).
         let checksum_sha256 = out
             .checksum_sha256()
             .and_then(b64_to_hex_sha256)
-            .or_else(|| out.metadata().and_then(|m| m.get(SHA256_META_KEY)).cloned());
+            .or_else(|| {
+                out.metadata()
+                    .and_then(|m| m.get(CHECKSUM_META_KEY))
+                    .cloned()
+            });
 
         Ok(ObjectHead {
             uri: object_uri.to_string(),
@@ -179,7 +190,7 @@ impl UploadBackend for S3NativeBackend {
         &self,
         object_uri: &str,
         expected_size: u64,
-        expected_sha256: &str,
+        expected: Option<ObjectChecksum<'_>>,
     ) -> Result<VerificationResult, VtopError> {
         let head = self.head_object(object_uri).await?;
 
@@ -193,15 +204,23 @@ impl UploadBackend for S3NativeBackend {
             return Ok(VerificationResult::failed("object size unavailable"));
         }
 
+        // Checksums disabled: size + existence is all we can confirm.
+        let Some(expected) = expected else {
+            return Ok(VerificationResult::limited(
+                "object present and size matches (checksums disabled)",
+            ));
+        };
+
         match head.checksum_sha256 {
-            Some(stored) if stored.eq_ignore_ascii_case(expected_sha256) => {
-                Ok(VerificationResult::passed("size + sha256 verified"))
+            Some(stored) if stored.eq_ignore_ascii_case(expected.hex) => {
+                Ok(VerificationResult::passed("size + checksum verified"))
             }
             Some(stored) => Ok(VerificationResult::failed(format!(
-                "sha256 mismatch: expected {expected_sha256}, stored {stored}"
+                "checksum mismatch: expected {}, stored {stored}",
+                expected.hex
             ))),
             None => Ok(VerificationResult::limited(
-                "object present and size matches; backend did not return sha256 metadata",
+                "object present and size matches; backend did not return checksum metadata",
             )),
         }
     }

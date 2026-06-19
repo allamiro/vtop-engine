@@ -9,6 +9,25 @@ use async_trait::async_trait;
 use std::path::Path;
 use vtop_core::errors::VtopError;
 
+/// An engine-computed object checksum: the algorithm name (`sha256`, `blake3`)
+/// plus the lowercase-hex digest. Carrying the algorithm lets a backend choose
+/// the strongest available verification — e.g. native S3 uses server-validated
+/// `x-amz-checksum-sha256` only for SHA-256, and metadata for other algorithms.
+#[derive(Debug, Clone, Copy)]
+pub struct ObjectChecksum<'a> {
+    pub algorithm: &'a str,
+    pub hex: &'a str,
+}
+
+impl<'a> ObjectChecksum<'a> {
+    pub fn new(algorithm: &'a str, hex: &'a str) -> Self {
+        Self { algorithm, hex }
+    }
+    pub fn is_sha256(&self) -> bool {
+        self.algorithm.eq_ignore_ascii_case("sha256")
+    }
+}
+
 /// Result of a HEAD/stat on a stored object.
 #[derive(Debug, Clone)]
 pub struct ObjectHead {
@@ -56,21 +75,37 @@ impl VerificationResult {
 /// Pluggable object-storage backend.
 #[async_trait]
 pub trait UploadBackend: Send + Sync {
-    /// Upload the compressed telemetry object.
-    async fn put_object(&self, local_path: &Path, object_uri: &str) -> Result<(), VtopError>;
+    /// Upload the compressed telemetry object. `checksum` is the engine-computed
+    /// object digest (algorithm + hex), or `None` when checksums are disabled.
+    /// Backends that can store it (native S3, awscli, localfs) record it for
+    /// verification; native S3 additionally requests server-side validation when
+    /// the algorithm is SHA-256.
+    async fn put_object(
+        &self,
+        local_path: &Path,
+        object_uri: &str,
+        checksum: Option<ObjectChecksum<'_>>,
+    ) -> Result<(), VtopError>;
 
-    /// Upload the manifest JSON.
-    async fn put_manifest(&self, local_path: &Path, manifest_uri: &str) -> Result<(), VtopError>;
+    /// Upload the manifest JSON (with its digest as the checksum).
+    async fn put_manifest(
+        &self,
+        local_path: &Path,
+        manifest_uri: &str,
+        checksum: Option<ObjectChecksum<'_>>,
+    ) -> Result<(), VtopError>;
 
     /// HEAD/stat an object.
     async fn head_object(&self, object_uri: &str) -> Result<ObjectHead, VtopError>;
 
-    /// Verify a stored object against an expected size and SHA-256.
+    /// Verify a stored object against an expected size and (when provided)
+    /// checksum. `expected = None` means checksums are disabled, so only
+    /// size/existence can be confirmed (a backend-limited result).
     async fn verify_object(
         &self,
         object_uri: &str,
         expected_size: u64,
-        expected_sha256: &str,
+        expected: Option<ObjectChecksum<'_>>,
     ) -> Result<VerificationResult, VtopError>;
 
     /// Delete an object (used only for cleanup / explicit operations).

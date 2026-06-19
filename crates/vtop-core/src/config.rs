@@ -4,7 +4,7 @@
 //! environment variables or mounted secrets and are never serialized.
 
 use crate::errors::VtopError;
-use crate::types::{CompressionType, SourceType, TelemetryFormat};
+use crate::types::{ChecksumAlgorithm, CompressionType, SourceType, TelemetryFormat};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -13,10 +13,31 @@ pub struct VtopConfig {
     pub engine: EngineConfig,
     pub batching: BatchingConfig,
     pub compression: CompressionConfig,
+    #[serde(default)]
+    pub checksum: ChecksumConfig,
     pub sources: SourcesConfig,
     pub upload: UploadConfig,
     #[serde(default)]
     pub partitioning: PartitioningConfig,
+}
+
+/// Object integrity checksum configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChecksumConfig {
+    #[serde(default = "default_checksum")]
+    pub algorithm: ChecksumAlgorithm,
+}
+
+impl Default for ChecksumConfig {
+    fn default() -> Self {
+        Self {
+            algorithm: default_checksum(),
+        }
+    }
+}
+
+fn default_checksum() -> ChecksumAlgorithm {
+    ChecksumAlgorithm::Sha256
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +153,11 @@ pub struct FileSourceConfig {
     /// If true, the source file may be deleted *after* the batch is committed.
     #[serde(default)]
     pub delete_after_commit: bool,
+    /// Read each file as a single whole-file record instead of line by line.
+    /// Required for binary / already-compressed source files (which have no
+    /// line structure). Default false (line-oriented).
+    #[serde(default)]
+    pub whole_file: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,6 +191,10 @@ pub struct UploadConfig {
     /// privilege — do not grant CreateBucket in production unless intended).
     #[serde(default)]
     pub create_bucket: bool,
+    /// Root directory for the `localfs` backend (objects are written under
+    /// `<local_path>/<bucket>/<key>`).
+    #[serde(default)]
+    pub local_path: Option<String>,
 }
 
 fn default_backend() -> String {

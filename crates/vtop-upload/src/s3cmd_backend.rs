@@ -4,7 +4,7 @@
 //! backend. Credentials live in the `s3cmd` config (`S3CMD_CONFIG`) and are
 //! never printed by this module.
 
-use crate::base::{ObjectHead, UploadBackend, VerificationResult};
+use crate::base::{ObjectChecksum, ObjectHead, UploadBackend, VerificationResult};
 use async_trait::async_trait;
 use std::path::Path;
 use tokio::process::Command;
@@ -33,11 +33,21 @@ impl S3cmdBackend {
 
 #[async_trait]
 impl UploadBackend for S3cmdBackend {
-    async fn put_object(&self, local_path: &Path, object_uri: &str) -> Result<(), VtopError> {
+    async fn put_object(
+        &self,
+        local_path: &Path,
+        object_uri: &str,
+        _checksum: Option<ObjectChecksum<'_>>,
+    ) -> Result<(), VtopError> {
         run(self.base_cmd().arg("put").arg(local_path).arg(object_uri)).await
     }
 
-    async fn put_manifest(&self, local_path: &Path, manifest_uri: &str) -> Result<(), VtopError> {
+    async fn put_manifest(
+        &self,
+        local_path: &Path,
+        manifest_uri: &str,
+        _checksum: Option<ObjectChecksum<'_>>,
+    ) -> Result<(), VtopError> {
         run(self.base_cmd().arg("put").arg(local_path).arg(manifest_uri)).await
     }
 
@@ -56,7 +66,7 @@ impl UploadBackend for S3cmdBackend {
         &self,
         object_uri: &str,
         expected_size: u64,
-        _expected_sha256: &str,
+        _expected_checksum: Option<ObjectChecksum<'_>>,
     ) -> Result<VerificationResult, VtopError> {
         let head = self.head_object(object_uri).await?;
         match head.size_bytes {

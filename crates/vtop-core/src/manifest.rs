@@ -29,7 +29,10 @@ pub enum VerificationStatus {
 pub struct ObjectMetadata {
     pub uri: String,
     pub size_bytes: u64,
-    pub sha256: String,
+    /// Checksum algorithm used for this object: `sha256`, `blake3`, or `none`.
+    pub checksum_algorithm: String,
+    /// Lowercase hex digest of the object (empty when checksums are disabled).
+    pub checksum: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,7 +86,8 @@ pub struct ManifestBuilder {
     pub source_progress: ProgressMarker,
     pub object_uri: String,
     pub object_size: u64,
-    pub object_sha256: String,
+    pub object_checksum_algorithm: String,
+    pub object_checksum: String,
     pub manifest_uri: String,
     pub path_template: String,
     pub resolved_prefix: String,
@@ -112,7 +116,8 @@ impl ManifestBuilder {
             object: ObjectMetadata {
                 uri: self.object_uri,
                 size_bytes: self.object_size,
-                sha256: self.object_sha256,
+                checksum_algorithm: self.object_checksum_algorithm,
+                checksum: self.object_checksum,
             },
             manifest: ManifestMetadata {
                 uri: self.manifest_uri,
@@ -206,7 +211,8 @@ mod tests {
             source_progress: kafka_marker(),
             object_uri: "s3://telemetry-data/x/batch.cef.gz".into(),
             object_size: 924822,
-            object_sha256: "abc123".into(),
+            object_checksum_algorithm: "sha256".into(),
+            object_checksum: "abc123".into(),
             manifest_uri: "s3://telemetry-data/x/batch.manifest.json".into(),
             path_template: "tenant={tenant}/...".into(),
             resolved_prefix: "tenant=default/source=app_events/...".into(),
@@ -221,7 +227,8 @@ mod tests {
         // The manifest carries the source progress marker.
         assert_eq!(m.source_progress, kafka_marker());
         // And the object hash.
-        assert_eq!(m.object.sha256, "abc123");
+        assert_eq!(m.object.checksum, "abc123");
+        assert_eq!(m.object.checksum_algorithm, "sha256");
         assert_eq!(m.protocol, "VTOP");
     }
 

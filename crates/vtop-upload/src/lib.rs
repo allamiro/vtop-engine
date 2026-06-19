@@ -8,12 +8,13 @@
 
 pub mod awscli_backend;
 pub mod base;
+pub mod localfs_backend;
 pub mod minio_backend;
 pub mod mock;
 pub mod s3_native;
 pub mod s3cmd_backend;
 
-pub use base::{ObjectHead, UploadBackend, VerificationResult};
+pub use base::{ObjectChecksum, ObjectHead, UploadBackend, VerificationResult};
 pub use mock::MockBackend;
 
 use std::sync::Arc;
@@ -36,13 +37,19 @@ pub async fn build_backend(cfg: &UploadConfig) -> Result<Arc<dyn UploadBackend>,
         "minio" => Arc::new(minio_backend::MinioBackend::new(
             cfg.profile.clone().unwrap_or_else(|| "local".to_string()),
         )),
+        "localfs" => {
+            let root = cfg.local_path.clone().ok_or_else(|| {
+                VtopError::Config("localfs backend requires upload.local_path".into())
+            })?;
+            Arc::new(localfs_backend::LocalFsBackend::new(root))
+        }
         "mock" => Arc::new(MockBackend::new()),
         // Benchmark/fault-injection backends.
         "mock_fail" => Arc::new(MockBackend::failing()),
         "mock_limited" => Arc::new(MockBackend::limited()),
         other => {
             return Err(VtopError::Config(format!(
-                "unknown upload backend: {other} (expected s3_native|s3cmd|awscli|minio|mock|mock_fail|mock_limited)"
+                "unknown upload backend: {other} (expected s3_native|s3cmd|awscli|minio|localfs|mock|mock_fail|mock_limited)"
             )))
         }
     };

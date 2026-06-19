@@ -4,7 +4,7 @@
 //! URI `s3://bucket/key` maps to `alias/bucket/key`. Credentials live in the
 //! `mc` config and are never printed.
 
-use crate::base::{parse_s3_uri, ObjectHead, UploadBackend, VerificationResult};
+use crate::base::{parse_s3_uri, ObjectChecksum, ObjectHead, UploadBackend, VerificationResult};
 use async_trait::async_trait;
 use std::path::Path;
 use tokio::process::Command;
@@ -31,12 +31,22 @@ impl MinioBackend {
 
 #[async_trait]
 impl UploadBackend for MinioBackend {
-    async fn put_object(&self, local_path: &Path, object_uri: &str) -> Result<(), VtopError> {
+    async fn put_object(
+        &self,
+        local_path: &Path,
+        object_uri: &str,
+        _checksum: Option<ObjectChecksum<'_>>,
+    ) -> Result<(), VtopError> {
         let target = self.mc_target(object_uri)?;
         run(Command::new("mc").arg("cp").arg(local_path).arg(target)).await
     }
 
-    async fn put_manifest(&self, local_path: &Path, manifest_uri: &str) -> Result<(), VtopError> {
+    async fn put_manifest(
+        &self,
+        local_path: &Path,
+        manifest_uri: &str,
+        _checksum: Option<ObjectChecksum<'_>>,
+    ) -> Result<(), VtopError> {
         let target = self.mc_target(manifest_uri)?;
         run(Command::new("mc").arg("cp").arg(local_path).arg(target)).await
     }
@@ -61,7 +71,7 @@ impl UploadBackend for MinioBackend {
         &self,
         object_uri: &str,
         expected_size: u64,
-        _expected_sha256: &str,
+        _expected_checksum: Option<ObjectChecksum<'_>>,
     ) -> Result<VerificationResult, VtopError> {
         let head = self.head_object(object_uri).await?;
         match head.size_bytes {

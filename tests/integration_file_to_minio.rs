@@ -62,7 +62,11 @@ async fn file_source_archives_and_commits() {
     let manifest: VtopManifest = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(manifest.protocol, "VTOP");
     assert_eq!(manifest.record_count, 3);
-    assert!(!manifest.object.sha256.is_empty(), "object sha256 present");
+    assert!(
+        !manifest.object.checksum.is_empty(),
+        "object checksum present"
+    );
+    assert_eq!(manifest.object.checksum_algorithm, "sha256");
     manifest
         .verify_self_hash()
         .expect("manifest self-hash verifies");

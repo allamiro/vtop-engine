@@ -34,6 +34,11 @@ def write_engine_config(scenario, work_dir: str, state_db: str,
     bucket = scenario.get("bucket", "telemetry-data")
     create_bucket = "true" if backend == "minio" else "false"
     endpoint = scenario.get("endpoint_url", "") or os.environ.get("VTOP_S3_ENDPOINT_URL", "")
+    whole_file = "true" if scenario.get("whole_file") or scenario.get("format") == "binary" else "false"
+    checksum = scenario.get("checksum", "sha256")
+    # The engine implements sha256 / blake3 / none; record the request as-is.
+    if checksum not in ("sha256", "blake3", "none", "disabled"):
+        checksum = "sha256"
     lines = [
         "engine:",
         "  name: vtop-bench",
@@ -48,9 +53,12 @@ def write_engine_config(scenario, work_dir: str, state_db: str,
         "compression:",
         f"  type: {scenario.get('compression', 'gzip')}",
         f"  level: {scenario.get('compression_level', 6)}",
+        "checksum:",
+        f"  algorithm: {checksum}",
         "sources:",
         "  file:",
         "    enabled: true",
+        f"    whole_file: {whole_file}",
         "    paths:",
         f'      - "{input_glob}"',
         "upload:",
@@ -62,6 +70,9 @@ def write_engine_config(scenario, work_dir: str, state_db: str,
         "  force_path_style: true",
         "  verify_tls: false",
     ]
+    if backend == "localfs":
+        root = scenario.get("local_path", "") or os.path.join(os.path.dirname(state_db), "objects")
+        lines.append(f'  local_path: "{root}"')
     if endpoint:
         lines.append(f"  endpoint_url: {endpoint}")
     with open(config_path, "w", encoding="utf-8") as fh:

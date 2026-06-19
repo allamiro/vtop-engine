@@ -27,16 +27,30 @@ pub struct FileSource {
     paths: Vec<String>,
     format: TelemetryFormat,
     delete_after_commit: bool,
+    /// Read each file as a single whole-file record (for binary / compressed
+    /// source files that have no line structure) instead of line by line.
+    whole_file: bool,
     cursors: HashMap<String, FileCursor>,
     active: Option<String>,
 }
 
 impl FileSource {
     pub fn new(paths: Vec<String>, format: TelemetryFormat, delete_after_commit: bool) -> Self {
+        Self::with_mode(paths, format, delete_after_commit, false)
+    }
+
+    /// Construct with an explicit whole-file mode.
+    pub fn with_mode(
+        paths: Vec<String>,
+        format: TelemetryFormat,
+        delete_after_commit: bool,
+        whole_file: bool,
+    ) -> Self {
         Self {
             paths,
             format,
             delete_after_commit,
+            whole_file,
             cursors: HashMap::new(),
             active: None,
         }
@@ -112,6 +126,27 @@ impl SourceAdapter for FileSource {
         let path = source.source_name.clone();
         self.active = Some(path.clone());
         let start = self.cursors.entry(path.clone()).or_default().read_byte;
+
+        // Whole-file mode: read the entire remaining file as one opaque record.
+        // Used for binary / already-compressed source files with no line
+        // structure. The whole file commits as a single byte range.
+        if self.whole_file {
+            let data = tokio::fs::read(&path).await?;
+            let end = data.len() as u64;
+            let records = if start >= end || data.is_empty() {
+                Vec::new()
+            } else {
+                vec![data[start as usize..].to_vec()]
+            };
+            self.cursors.get_mut(&path).unwrap().read_byte = end;
+            return Ok(ReadResult {
+                progress_start: self.marker(&path, start, start),
+                progress_end: self.marker(&path, start, end),
+                records,
+                first_timestamp: None,
+                last_timestamp: None,
+            });
+        }
 
         let file = tokio::fs::File::open(&path).await?;
         let mut reader = BufReader::new(file);

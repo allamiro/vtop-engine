@@ -37,6 +37,11 @@ impl TelemetryBatch {
     /// Serialize the records into a single contiguous buffer, one record per
     /// line (newline-terminated). Source order is preserved.
     pub fn to_record_bytes(&self) -> Vec<u8> {
+        // A single record (e.g. a whole-file / binary object) is emitted
+        // verbatim so its bytes are preserved exactly — no separator added.
+        if self.records.len() == 1 {
+            return self.records[0].clone();
+        }
         let total: usize = self.byte_size() + self.records.len();
         let mut buf = Vec::with_capacity(total);
         for rec in &self.records {

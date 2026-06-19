@@ -4,18 +4,18 @@
 //! fail verification — exercising the "verification fails -> source not
 //! committed" path without any external service.
 
-use crate::base::{ObjectHead, UploadBackend, VerificationResult};
+use crate::base::{ObjectChecksum, ObjectHead, UploadBackend, VerificationResult};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
-use vtop_core::checksum::sha256_bytes;
 use vtop_core::errors::VtopError;
 
 #[derive(Default)]
 struct Stored {
     size: u64,
-    sha256: String,
+    /// Engine-provided object checksum (None when checksums are disabled).
+    checksum: Option<String>,
 }
 
 /// A test double for [`UploadBackend`].
@@ -63,11 +63,16 @@ impl MockBackend {
         self.objects.lock().unwrap().contains_key(uri)
     }
 
-    async fn store(&self, local_path: &Path, uri: &str) -> Result<(), VtopError> {
+    async fn store(
+        &self,
+        local_path: &Path,
+        uri: &str,
+        checksum: Option<&str>,
+    ) -> Result<(), VtopError> {
         let data = tokio::fs::read(local_path).await?;
         let stored = Stored {
             size: data.len() as u64,
-            sha256: sha256_bytes(&data),
+            checksum: checksum.map(|s| s.to_string()),
         };
         self.objects.lock().unwrap().insert(uri.to_string(), stored);
         Ok(())
@@ -76,12 +81,24 @@ impl MockBackend {
 
 #[async_trait]
 impl UploadBackend for MockBackend {
-    async fn put_object(&self, local_path: &Path, object_uri: &str) -> Result<(), VtopError> {
-        self.store(local_path, object_uri).await
+    async fn put_object(
+        &self,
+        local_path: &Path,
+        object_uri: &str,
+        checksum: Option<ObjectChecksum<'_>>,
+    ) -> Result<(), VtopError> {
+        self.store(local_path, object_uri, checksum.map(|c| c.hex))
+            .await
     }
 
-    async fn put_manifest(&self, local_path: &Path, manifest_uri: &str) -> Result<(), VtopError> {
-        self.store(local_path, manifest_uri).await
+    async fn put_manifest(
+        &self,
+        local_path: &Path,
+        manifest_uri: &str,
+        checksum: Option<ObjectChecksum<'_>>,
+    ) -> Result<(), VtopError> {
+        self.store(local_path, manifest_uri, checksum.map(|c| c.hex))
+            .await
     }
 
     async fn head_object(&self, object_uri: &str) -> Result<ObjectHead, VtopError> {
@@ -92,11 +109,11 @@ impl UploadBackend for MockBackend {
         Ok(ObjectHead {
             uri: object_uri.to_string(),
             size_bytes: Some(s.size),
-            etag: Some(s.sha256.clone()),
+            etag: s.checksum.clone(),
             checksum_sha256: if self.backend_limited {
                 None
             } else {
-                Some(s.sha256.clone())
+                s.checksum.clone()
             },
         })
     }
@@ -105,7 +122,7 @@ impl UploadBackend for MockBackend {
         &self,
         object_uri: &str,
         expected_size: u64,
-        expected_sha256: &str,
+        expected: Option<ObjectChecksum<'_>>,
     ) -> Result<VerificationResult, VtopError> {
         if self.fail_verification {
             return Ok(VerificationResult::failed(
@@ -119,11 +136,16 @@ impl UploadBackend for MockBackend {
         if self.backend_limited {
             return Ok(VerificationResult::limited("mock: size-only verification"));
         }
+        let Some(expected) = expected else {
+            return Ok(VerificationResult::limited(
+                "mock: size-only (checksums disabled)",
+            ));
+        };
         match head.checksum_sha256 {
-            Some(s) if s.eq_ignore_ascii_case(expected_sha256) => {
-                Ok(VerificationResult::passed("mock: size + sha256 verified"))
+            Some(s) if s.eq_ignore_ascii_case(expected.hex) => {
+                Ok(VerificationResult::passed("mock: size + checksum verified"))
             }
-            _ => Ok(VerificationResult::failed("mock: sha256 mismatch")),
+            _ => Ok(VerificationResult::failed("mock: checksum mismatch")),
         }
     }
 
@@ -155,28 +177,39 @@ mod tests {
         f
     }
 
+    fn ck(hex: &str) -> ObjectChecksum<'_> {
+        ObjectChecksum::new("sha256", hex)
+    }
+
     #[tokio::test]
     async fn round_trip_and_verify() {
         let b = MockBackend::new();
         let f = tmp(b"payload");
         let uri = "s3://bucket/obj";
-        b.put_object(f.path(), uri).await.unwrap();
-        let res = b
-            .verify_object(uri, 7, &sha256_bytes(b"payload"))
+        b.put_object(f.path(), uri, Some(ck("abc123")))
             .await
             .unwrap();
+        let res = b.verify_object(uri, 7, Some(ck("abc123"))).await.unwrap();
         assert!(res.passed && !res.backend_limited);
+    }
+
+    #[tokio::test]
+    async fn disabled_checksum_is_backend_limited() {
+        let b = MockBackend::new();
+        let f = tmp(b"payload");
+        b.put_object(f.path(), "s3://b/o", None).await.unwrap();
+        let res = b.verify_object("s3://b/o", 7, None).await.unwrap();
+        assert!(res.passed && res.backend_limited);
     }
 
     #[tokio::test]
     async fn failing_mock_fails_verification() {
         let b = MockBackend::failing();
         let f = tmp(b"x");
-        b.put_object(f.path(), "s3://b/o").await.unwrap();
-        let res = b
-            .verify_object("s3://b/o", 1, &sha256_bytes(b"x"))
+        b.put_object(f.path(), "s3://b/o", Some(ck("x")))
             .await
             .unwrap();
+        let res = b.verify_object("s3://b/o", 1, Some(ck("x"))).await.unwrap();
         assert!(!res.passed);
     }
 }

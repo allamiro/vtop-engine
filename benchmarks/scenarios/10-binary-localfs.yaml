@@ -1,0 +1,14 @@
+name: binary-localfs
+description: Binary whole-file inputs archived to the local-filesystem backend (real disk I/O).
+volume: 200
+file_size: small
+format: binary
+whole_file: true
+compression: none
+checksum: sha256
+backend: localfs
+batch_max_records: 1
+batch_max_bytes: 1073741824
+duration_seconds: 0
+fault: none
+sys_sample_interval: 0.5

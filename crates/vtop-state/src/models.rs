@@ -53,7 +53,7 @@ impl BatchPatch {
         Self {
             object_uri: Some(m.object.uri.clone()),
             manifest_uri: Some(m.manifest.uri.clone()),
-            object_sha256: Some(m.object.sha256.clone()),
+            object_sha256: Some(m.object.checksum.clone()),
             manifest_sha256: Some(m.manifest.sha256.clone()),
             record_count: Some(m.record_count as i64),
             error_message: None,

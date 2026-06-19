@@ -10,12 +10,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use vtop_adapters::base::{DiscoveredSource, ReadResult, SourceAdapter};
 use vtop_core::config::{
-    BatchingConfig, CompressionConfig, EngineConfig, FileSourceConfig, PartitioningConfig,
-    SourcesConfig, UploadConfig, VtopConfig,
+    BatchingConfig, ChecksumConfig, CompressionConfig, EngineConfig, FileSourceConfig,
+    PartitioningConfig, SourcesConfig, UploadConfig, VtopConfig,
 };
 use vtop_core::errors::VtopError;
 use vtop_core::partitioning::DEFAULT_TEMPLATE;
-use vtop_core::types::{CompressionType, ProgressMarker, SourceType};
+use vtop_core::types::{ChecksumAlgorithm, CompressionType, ProgressMarker, SourceType};
 
 /// Build a minimal file-source config pointing at temp paths and a backend.
 pub fn file_config(
@@ -41,12 +41,16 @@ pub fn file_config(
             kind: CompressionType::Gzip,
             level: 6,
         },
+        checksum: ChecksumConfig {
+            algorithm: ChecksumAlgorithm::Sha256,
+        },
         sources: SourcesConfig {
             kafka: None,
             file: Some(FileSourceConfig {
                 enabled: true,
                 paths,
                 delete_after_commit: false,
+                whole_file: false,
             }),
             syslog_spool: None,
         },
@@ -60,6 +64,7 @@ pub fn file_config(
             verify_tls: false,
             profile: None,
             create_bucket: false,
+            local_path: None,
         },
         partitioning: PartitioningConfig {
             template: DEFAULT_TEMPLATE.into(),

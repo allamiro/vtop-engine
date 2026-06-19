@@ -143,6 +143,49 @@ impl std::str::FromStr for CompressionType {
     }
 }
 
+/// Checksum algorithm used for object integrity. `None` disables checksums
+/// (verification falls back to size + existence only — a comparison mode).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChecksumAlgorithm {
+    Sha256,
+    Blake3,
+    None,
+}
+
+impl ChecksumAlgorithm {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ChecksumAlgorithm::Sha256 => "sha256",
+            ChecksumAlgorithm::Blake3 => "blake3",
+            ChecksumAlgorithm::None => "none",
+        }
+    }
+
+    /// Whether this algorithm produces a digest (false when disabled).
+    pub fn is_enabled(&self) -> bool {
+        !matches!(self, ChecksumAlgorithm::None)
+    }
+}
+
+impl std::str::FromStr for ChecksumAlgorithm {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "sha256" | "sha-256" => Ok(ChecksumAlgorithm::Sha256),
+            "blake3" | "blake-3" => Ok(ChecksumAlgorithm::Blake3),
+            "none" | "disabled" | "off" => Ok(ChecksumAlgorithm::None),
+            other => Err(format!("unknown checksum algorithm: {other}")),
+        }
+    }
+}
+
+impl std::fmt::Display for ChecksumAlgorithm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Source-agnostic progress marker. This is the central object that binds a
 /// physical source position to a batch, and ultimately to a verified object.
 ///
