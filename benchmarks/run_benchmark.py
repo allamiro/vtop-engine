@@ -121,13 +121,15 @@ def main() -> int:
                     cycle_success += 1
                     out_objects += 1
                     out_bytes += cbytes
+                    # Count input bytes only for committed batches so failed and
+                    # re-read (sustained-mode) batches don't inflate throughput.
+                    in_bytes += ubytes
                     batch_total_ms.append(total_ms)
                     if m.get("compression_ratio"):
                         comp_ratios.append(m["compression_ratio"])
                 elif state == "failed":
                     failed += 1
                     cycle_fail += 1
-                in_bytes += ubytes
 
                 writer.row("batch_metrics.csv", {
                     "run_id": run_id, "batch_id": bid, "scenario_name": sc.name,
@@ -235,8 +237,7 @@ def main() -> int:
         "error_count": errors, "failed_batches": failed, "successful_batches": success,
         "backend": sc.get("backend", "mock"),
     }
-    # CPU/mem summary from system samples
-    cpu = [s["cpu_percent"] for s in []]  # filled below from writer? recompute
+    # CPU/mem summary from the system-metrics samples written during the run.
     summary.update(_sys_summary(writer.dir))
     summary["bottleneck_observations"] = _bottleneck(summary)
 

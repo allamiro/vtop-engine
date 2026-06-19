@@ -29,7 +29,7 @@ def _ps_tree_cpu_rss(root_pid: int) -> tuple[float, float]:
     """Sum %cpu and RSS(MB) for `root_pid` and its descendants via `ps`."""
     try:
         out = subprocess.check_output(
-            ["ps", "-Ao", "pid=,ppid=,%cpu=,rss="], text=True)
+            ["ps", "-Ao", "pid=,ppid=,%cpu=,rss="], text=True, timeout=5)
     except Exception:
         return 0.0, 0.0
     children: dict[int, list[int]] = {}
@@ -138,6 +138,10 @@ class SystemMonitor:
         while not self._stop.is_set():
             s = self._sample()
             self.samples.append(s)
+            # Don't emit if we were asked to stop while sampling — avoids
+            # writing to result files that __exit__'s caller may now close.
+            if self._stop.is_set():
+                break
             self.emit(s)
             self._stop.wait(self.interval)
 
@@ -147,6 +151,10 @@ class SystemMonitor:
         return self
 
     def __exit__(self, *exc) -> None:
+        # Join WITHOUT a timeout so the sampler thread is guaranteed finished
+        # before the caller closes the result files (no write-after-close). The
+        # loop wakes every `interval` and each sample is bounded (psutil is fast;
+        # the `ps` fallback has a 5s timeout), so this returns promptly.
         self._stop.set()
         if self._thread:
-            self._thread.join(timeout=self.interval * 2)
+            self._thread.join()

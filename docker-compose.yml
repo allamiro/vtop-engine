@@ -117,6 +117,12 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+      # Wait for the bucket + topic seeding to finish so the engine never
+      # uploads before the target bucket exists.
+      minio-init:
+        condition: service_completed_successfully
+      kafka-init:
+        condition: service_completed_successfully
     environment:
       # Lab-only credentials for the native S3 backend talking to MinIO.
       AWS_ACCESS_KEY_ID: minioadmin

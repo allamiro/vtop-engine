@@ -38,10 +38,17 @@ def run_one(scenario_path, results_dir):
         capture_output=True, text=True)
     sys.stdout.write(proc.stdout)
     sys.stderr.write(proc.stderr)
+    if proc.returncode != 0:
+        print(f"[matrix] WARNING: scenario {scenario_path} failed "
+              f"(exit {proc.returncode}); excluded from the matrix", file=sys.stderr)
+        return None
     run_dir = None
     for line in proc.stdout.splitlines():
         if "results ->" in line:
             run_dir = line.split("results ->", 1)[1].strip()
+    if run_dir is None:
+        print(f"[matrix] WARNING: could not locate results dir for {scenario_path}",
+              file=sys.stderr)
     return run_dir
 
 
@@ -86,13 +93,16 @@ def main() -> int:
         for r in rows:
             w.writerow([r.get(c, "") for c in COMPARE_COLS])
 
-    # matrix.md
+    # matrix.md (escape Markdown table cells: pipes and newlines)
+    def md_cell(v):
+        return str(v).replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ").replace("\r", " ")
+
     with open(os.path.join(matrix_dir, "matrix.md"), "w") as fh:
         fh.write(f"# Benchmark matrix ({stamp})\n\n")
         fh.write("| " + " | ".join(COMPARE_COLS) + " |\n")
         fh.write("|" + "|".join(["---"] * len(COMPARE_COLS)) + "|\n")
         for r in rows:
-            fh.write("| " + " | ".join(str(r.get(c, "")) for c in COMPARE_COLS) + " |\n")
+            fh.write("| " + " | ".join(md_cell(r.get(c, "")) for c in COMPARE_COLS) + " |\n")
 
     print(f"\n[matrix] {len(rows)} runs -> {matrix_dir}/matrix.csv, matrix.md")
     return 0

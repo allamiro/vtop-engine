@@ -103,8 +103,15 @@ def _write_text_file(path: str, target_bytes: int, fmt: str) -> int:
 def _write_binary_file(path: str, target_bytes: int) -> int:
     # Note: the engine is line-oriented; binary is supported for I/O load
     # measurement but archives as raw and yields few records. See README.
+    # Write in bounded chunks so a large (up to 1 GiB) file never allocates the
+    # whole payload in memory at once.
+    chunk = 8 * 1024 * 1024
+    remaining = target_bytes
     with open(path, "wb") as fh:
-        fh.write(os.urandom(target_bytes))
+        while remaining > 0:
+            n = min(chunk, remaining)
+            fh.write(os.urandom(n))
+            remaining -= n
     return target_bytes
 
 
@@ -119,8 +126,12 @@ def _pick_size(size_class: str) -> int:
 
 def generate_dataset(out_dir: str, fmt: str, volume: int, size_class: str,
                      seed: int = 0) -> Dict[str, int]:
-    """Generate `volume` files into `out_dir`. Returns totals."""
-    random.seed(seed or None)
+    """Generate `volume` files into `out_dir`. Returns totals.
+
+    `seed`: pass a NON-ZERO value for reproducible data (same bytes every run);
+    the default `0` means "seed from OS entropy" (fresh, non-reproducible data).
+    """
+    random.seed(seed if seed else None)
     os.makedirs(out_dir, exist_ok=True)
     ext = _ext(fmt)
     total_bytes = 0

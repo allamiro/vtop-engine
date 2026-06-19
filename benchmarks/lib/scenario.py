@@ -83,10 +83,13 @@ def load_scenario(path: str) -> Scenario:
     parsed: Dict[str, Any]
     try:
         import yaml  # type: ignore
-
-        parsed = yaml.safe_load(text) or {}
-    except Exception:
+    except ImportError:
+        # PyYAML not installed — use the minimal flat-subset parser.
         parsed = _fallback_parse(text)
+    else:
+        # PyYAML is available: a real syntax error should surface, not be
+        # silently mis-read by the fallback parser.
+        parsed = yaml.safe_load(text) or {}
 
     values = dict(DEFAULTS)
     values.update({k: v for k, v in parsed.items() if v is not None})

@@ -27,7 +27,7 @@ SEVERITIES=(1 2 3 4 5 6 7 8 9 10)
 PROTOS=(TCP UDP ICMP HTTP HTTPS DNS)
 HOSTS=(host01 host02 fw01 dc01 web03 db02)
 
-pick() { local n=$#; eval "echo \${$(( (RANDOM % n) + 1 ))}"; }
+pick() { local arr=("$@"); echo "${arr[$((RANDOM % $#))]}"; }
 rand_ip() { echo "$(( RANDOM % 223 + 1 )).$(( RANDOM % 256 )).$(( RANDOM % 256 )).$(( RANDOM % 256 ))"; }
 rand_hex() { head -c 20 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n' || echo "$RANDOM$RANDOM$RANDOM"; }
 now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -37,7 +37,7 @@ emit_cef() {
   printf 'CEF:0|%s|%s|1.%d|%d|%s|%s|src=%s dst=%s spt=%d dpt=%d suser=%s act=%s proto=%s outcome=%s fileHash=%s rt=%s\n' \
     "$(pick "${VENDORS[@]}")" "$(pick "${PRODUCTS[@]}")" "$(( RANDOM % 9 ))" "$sig" \
     "$(pick "${EVENTS[@]}")" "$(pick "${SEVERITIES[@]}")" \
-    "$(rand_ip)" "$(rand_ip)" "$(( RANDOM % 65535 ))" "$(( RANDOM % 1024 ))" \
+    "$(rand_ip)" "$(rand_ip)" "$(( RANDOM % 65536 ))" "$(( RANDOM % 1024 ))" \
     "$(pick "${USERS[@]}")" "$(pick "${ACTIONS[@]}")" "$(pick "${PROTOS[@]}")" \
     "$(pick "${OUTCOMES[@]}")" "$(rand_hex)" "$(now)"
 }
@@ -45,7 +45,7 @@ emit_cef() {
 emit_json() {
   printf '{"ts":"%s","event":"%s","user":"%s","src":"%s","dst":"%s","port":%d,"action":"%s","severity":%s,"outcome":"%s","bytes":%d}\n' \
     "$(now)" "$(pick "${EVENTS[@]}")" "$(pick "${USERS[@]}")" \
-    "$(rand_ip)" "$(rand_ip)" "$(( RANDOM % 65535 ))" "$(pick "${ACTIONS[@]}")" \
+    "$(rand_ip)" "$(rand_ip)" "$(( RANDOM % 65536 ))" "$(pick "${ACTIONS[@]}")" \
     "$(pick "${SEVERITIES[@]}")" "$(pick "${OUTCOMES[@]}")" "$(( RANDOM % 1000000 ))"
 }
 
