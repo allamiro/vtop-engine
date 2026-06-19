@@ -112,9 +112,20 @@ class ResultsWriter:
                 pass
 
 
+def _md_cell(v) -> str:
+    """Escape a value for safe inclusion in a Markdown table cell."""
+    return (
+        str(v)
+        .replace("\\", "\\\\")
+        .replace("|", "\\|")
+        .replace("\n", " ")
+        .replace("\r", " ")
+    )
+
+
 def _summary_md(s: Dict) -> str:
     def g(k):
-        return s.get(k, "")
+        return _md_cell(s.get(k, ""))
     lines = [
         f"# Benchmark summary — {g('scenario_name')}",
         "",
@@ -130,7 +141,7 @@ def _summary_md(s: Dict) -> str:
     for k in ("format", "file_size", "volume", "compression", "checksum",
               "backend", "batch_max_records", "batch_max_bytes",
               "batch_max_age_seconds", "duration_seconds", "fault"):
-        lines.append(f"| {k} | {s.get('scenario', {}).get(k, '')} |")
+        lines.append(f"| {k} | {_md_cell(s.get('scenario', {}).get(k, ''))} |")
     lines += [
         "",
         "## Results",

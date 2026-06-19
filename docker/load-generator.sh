@@ -29,6 +29,20 @@ SLEEP_SECONDS="${SLEEP_SECONDS:-1}"
 DURATION_SECONDS="${DURATION_SECONDS:-0}"
 PARTITIONS="${PARTITIONS:-1}"
 
+# Validate numeric envs and the batch range so a misconfiguration fails fast
+# instead of producing a negative/zero modulus later.
+is_uint() { [[ "$1" =~ ^[0-9]+$ ]]; }
+for var in TOPICS_PER_FORMAT MIN_BATCH MAX_BATCH SLEEP_SECONDS DURATION_SECONDS PARTITIONS; do
+  if ! is_uint "${!var}"; then
+    echo "load-generator: $var must be a non-negative integer (got '${!var}')" >&2
+    exit 2
+  fi
+done
+if [ "$MAX_BATCH" -lt "$MIN_BATCH" ]; then
+  echo "load-generator: MAX_BATCH ($MAX_BATCH) must be >= MIN_BATCH ($MIN_BATCH)" >&2
+  exit 2
+fi
+
 echo "load-generator: bootstrap=$BOOTSTRAP formats=[$FORMATS] topics/format=$TOPICS_PER_FORMAT batch=$MIN_BATCH..$MAX_BATCH sleep=${SLEEP_SECONDS}s duration=${DURATION_SECONDS}s"
 
 # Create topics: <format>_events_<n>

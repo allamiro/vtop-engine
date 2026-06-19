@@ -22,7 +22,7 @@ use vtop_core::batch::{AdaptiveBatcher, BatchLimits, SealReason, TelemetryBatch}
 use vtop_core::compression::compress_batch;
 use vtop_core::config::{StreamConfig, StreamsConfig, VtopConfig};
 use vtop_core::errors::VtopError;
-use vtop_core::manifest::{ManifestBuilder, VerificationStatus};
+use vtop_core::manifest::ManifestBuilder;
 use vtop_core::metrics::BatchMetrics;
 use vtop_core::partitioning::{self, PartitionContext};
 use vtop_core::replay::{next_recovery_action, RecoveryAction};
@@ -326,7 +326,6 @@ impl<'a> Pipeline<'a> {
         // ---- MANIFEST_UPLOADED -> VERIFIED (or FAILED) ------------------
         let t = Instant::now();
         // 1) the manifest is internally consistent (self-hash),
-        let mut manifest = manifest;
         if let Err(e) = manifest.verify_self_hash() {
             fail!(format!("manifest self-hash verification failed: {e}"));
         }
@@ -347,12 +346,14 @@ impl<'a> Pipeline<'a> {
             fail!(format!("manifest verification failed: {}", man_v.message));
         }
         metrics.verify_ms = t.elapsed().as_millis() as u64;
+        // The authoritative post-verification status lives in the state store
+        // (VERIFIED -> SOURCE_COMMITTED below). The on-disk manifest was written
+        // and uploaded *before* this step (its hash must be stable), so we do
+        // not re-stamp it here — querying the store is the source of truth.
         if obj_v.backend_limited || man_v.backend_limited {
             tracing::warn!(batch_id, "verification_passed (backend_limited: size-only)");
-            manifest.set_verification(VerificationStatus::BackendLimited);
         } else {
             tracing::info!(batch_id, "verification_passed");
-            manifest.set_verification(VerificationStatus::Passed);
         }
         self.store.mark_verified(&batch_id).await?;
 
@@ -617,21 +618,36 @@ impl Engine {
 
         // ---- Read + accumulate -----------------------------------------
         for source in sources {
-            let read = adapter
+            // A single source read failing must not abort reading/flushing the
+            // other sources this cycle — log and skip it.
+            let read = match adapter
                 .read_batch_candidates(
                     &source,
                     self.config.batching.max_records,
                     self.config.batching.max_bytes,
                     max_wait,
                 )
-                .await?;
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(source = %source.source_name, error = %e, "source read failed; skipping this cycle");
+                    continue;
+                }
+            };
             if read.is_empty() {
                 continue;
             }
             let limits = self.batch_limits();
             let tenant = self.config.engine.tenant.clone();
+            // Key the buffer by the source PLUS partition so a multi-partition
+            // Kafka topic never coalesces records from different partitions into
+            // one batch (one read is single-partition; without this, consecutive
+            // reads of different partitions would mix under a single topic key
+            // and the bound commit marker would describe only one of them).
+            let key = buffer_key(&source, &read.progress_start);
             self.pending
-                .entry((source.source_type.clone(), source.source_name.clone()))
+                .entry(key)
                 .or_insert_with(|| PendingBuffer::new(&tenant, source.clone(), limits))
                 .append(read);
         }
@@ -796,6 +812,20 @@ impl Engine {
     }
 }
 
+/// Buffer key that isolates accumulation per source AND per Kafka partition, so
+/// a multi-partition topic never coalesces records from different partitions
+/// into one batch. File/syslog sources have no partition and key by name only.
+fn buffer_key(source: &DiscoveredSource, marker: &ProgressMarker) -> (SourceType, String) {
+    let suffix = match marker {
+        ProgressMarker::Kafka { partition, .. } => format!("#p{partition}"),
+        _ => String::new(),
+    };
+    (
+        source.source_type.clone(),
+        format!("{}{}", source.source_name, suffix),
+    )
+}
+
 /// Default format for an adapter, taken from the first matching stream of that
 /// source type, falling back to `Raw`.
 fn default_format_for(
@@ -823,6 +853,42 @@ mod tests {
     use crate::testkit::file_config;
     use std::io::Write;
     use vtop_core::config::StreamsConfig;
+
+    #[test]
+    fn buffer_key_isolates_kafka_partitions() {
+        use vtop_core::types::{ProgressMarker, TelemetryFormat};
+        let topic = DiscoveredSource {
+            source_type: SourceType::Kafka,
+            source_name: "events".into(),
+            format: TelemetryFormat::Cef,
+        };
+        let mk = |p: i32| ProgressMarker::Kafka {
+            topic: "events".into(),
+            partition: p,
+            start_offset: 0,
+            end_offset: 0,
+            consumer_group: "g".into(),
+        };
+        // Same topic, different partitions -> distinct buffer keys (no mixing).
+        assert_ne!(buffer_key(&topic, &mk(0)), buffer_key(&topic, &mk(1)));
+        // Same partition -> same key (accumulates together).
+        assert_eq!(buffer_key(&topic, &mk(0)), buffer_key(&topic, &mk(0)));
+        // File sources key by name only (no partition suffix).
+        let file = DiscoveredSource {
+            source_type: SourceType::File,
+            source_name: "/a.log".into(),
+            format: TelemetryFormat::Raw,
+        };
+        let fm = ProgressMarker::File {
+            path: "/a.log".into(),
+            inode: None,
+            start_byte: 0,
+            end_byte: 0,
+            file_size: 0,
+            mtime: String::new(),
+        };
+        assert_eq!(buffer_key(&file, &fm).1, "/a.log");
+    }
 
     /// A sub-threshold read must be buffered (not flushed) on a non-forced
     /// cycle, then sealed and committed when the cycle forces a flush — proving
