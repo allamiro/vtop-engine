@@ -4,12 +4,13 @@
 //! path-style addressing. Credentials are read from the environment by the SDK
 //! credential chain and are never logged.
 //!
-//! Integrity is enforced with S3's **server-validated** SHA-256 checksum: the
-//! precomputed digest is sent on `PUT` (`x-amz-checksum-sha256`), so the store
-//! recomputes the body hash and rejects a corrupted upload, and verification
-//! reads that store-computed checksum back via `head_object`. The hex digest is
-//! also kept as user metadata (`x-amz-meta-vtop-sha256`) for tooling and for
-//! backward-compatible verification of objects written before this existed.
+//! Integrity: for **SHA-256** the precomputed digest is sent on `PUT`
+//! (`x-amz-checksum-sha256`), so the store recomputes the body hash and rejects
+//! a corrupted upload (server-validated), and verification reads that
+//! store-computed checksum back via `head_object`. For any algorithm (including
+//! **BLAKE3**) the hex digest is also kept as user metadata
+//! (`x-amz-meta-vtop-checksum`) for tooling and verification. When checksums are
+//! disabled, verification falls back to size + existence (backend-limited).
 
 use crate::base::{parse_s3_uri, ObjectChecksum, ObjectHead, UploadBackend, VerificationResult};
 use async_trait::async_trait;
