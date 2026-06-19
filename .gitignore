@@ -17,3 +17,6 @@
 # Local env / secrets — never commit
 .env
 *.local
+
+# Local AI assistant guidance (not part of the project)
+/prompt/
