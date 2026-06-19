@@ -836,6 +836,9 @@ mod tests {
         let flushed = engine.run_source(SourceType::File, true).await.unwrap();
         assert_eq!(flushed.len(), 1, "force flush seals the buffered batch");
         assert_eq!(flushed[0].record_count, 1);
-        assert!(flushed[0].committed, "flushed batch must commit after verify");
+        assert!(
+            flushed[0].committed,
+            "flushed batch must commit after verify"
+        );
     }
 }
