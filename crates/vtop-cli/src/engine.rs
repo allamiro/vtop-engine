@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use vtop_adapters::base::{DiscoveredSource, ReadResult, SourceAdapter};
 use vtop_adapters::{FileSource, KafkaSource, SyslogSpoolSource};
-use vtop_core::batch::TelemetryBatch;
+use vtop_core::batch::{AdaptiveBatcher, BatchLimits, SealReason, TelemetryBatch};
 use vtop_core::compression::compress_batch;
 use vtop_core::config::{StreamConfig, StreamsConfig, VtopConfig};
 use vtop_core::errors::VtopError;
@@ -378,6 +378,88 @@ impl<'a> Pipeline<'a> {
     }
 }
 
+/// Per-source accumulation buffer that coalesces records read across multiple
+/// poll cycles into one adaptive batch.
+///
+/// This is what wires [`AdaptiveBatcher`] (and therefore the
+/// `max_batch_age_seconds` threshold) into the running engine: records are held
+/// until a size/record/age threshold trips, instead of being flushed eagerly on
+/// every read. Holding data here is replay-safe because nothing is persisted to
+/// the state store or committed to the source until the buffer is flushed
+/// through the pipeline; an unflushed buffer simply re-reads from the last
+/// committed source position after a crash.
+struct PendingBuffer {
+    source: DiscoveredSource,
+    batcher: AdaptiveBatcher,
+    /// Progress marker covering the most recent read — the candidate commit
+    /// point for the whole accumulated window.
+    latest_end: Option<ProgressMarker>,
+    first_timestamp: Option<String>,
+    last_timestamp: Option<String>,
+}
+
+impl PendingBuffer {
+    fn new(tenant: &str, source: DiscoveredSource, limits: BatchLimits) -> Self {
+        let batcher = AdaptiveBatcher::new(
+            tenant,
+            source.source_type.clone(),
+            source.source_name.clone(),
+            source.format.clone(),
+            limits,
+        );
+        Self {
+            source,
+            batcher,
+            latest_end: None,
+            first_timestamp: None,
+            last_timestamp: None,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.batcher.is_empty()
+    }
+
+    /// Append a non-empty read into the buffer. The first read's
+    /// `progress_start` becomes the window start (the replayable position); the
+    /// latest read's `progress_end` becomes the candidate commit point.
+    fn append(&mut self, read: ReadResult) {
+        let start = read.progress_start.clone();
+        for record in read.records {
+            // Only the first marker observed sets the window start; the rest are
+            // ignored by the batcher.
+            self.batcher.push(record, &start, None);
+        }
+        if self.first_timestamp.is_none() {
+            self.first_timestamp = read.first_timestamp;
+        }
+        if read.last_timestamp.is_some() {
+            self.last_timestamp = read.last_timestamp;
+        }
+        self.latest_end = Some(read.progress_end);
+    }
+
+    /// Whether an accumulated buffer has tripped a sealing threshold
+    /// (`max_records`, `max_bytes`, or `max_batch_age_seconds`).
+    fn should_seal(&self, now: chrono::DateTime<Utc>) -> Option<SealReason> {
+        self.batcher.should_seal(now)
+    }
+
+    /// Drain the buffer into a single [`ReadResult`] spanning the whole window,
+    /// resetting the underlying batcher for reuse. Returns `None` if empty.
+    fn drain(&mut self) -> Option<ReadResult> {
+        let end = self.latest_end.take()?;
+        let batch = self.batcher.seal(end).ok()?;
+        Some(ReadResult {
+            records: batch.records,
+            progress_start: batch.progress_start,
+            progress_end: batch.progress_end,
+            first_timestamp: self.first_timestamp.take(),
+            last_timestamp: self.last_timestamp.take(),
+        })
+    }
+}
+
 /// The full engine: config, streams, state store, upload backend, adapters.
 pub struct Engine {
     pub config: VtopConfig,
@@ -385,6 +467,8 @@ pub struct Engine {
     pub store: SqliteStateStore,
     pub backend: Arc<dyn UploadBackend>,
     pub adapters: HashMap<SourceType, Box<dyn SourceAdapter>>,
+    /// Per-source accumulation buffers, keyed by `(source_type, source_name)`.
+    pending: HashMap<(SourceType, String), PendingBuffer>,
 }
 
 impl Engine {
@@ -428,7 +512,17 @@ impl Engine {
             store,
             backend,
             adapters,
+            pending: HashMap::new(),
         })
+    }
+
+    /// Batching thresholds (records / bytes / age) from config.
+    fn batch_limits(&self) -> BatchLimits {
+        BatchLimits {
+            max_records: self.config.batching.max_records,
+            max_bytes: self.config.batching.max_bytes,
+            max_batch_age_seconds: self.config.batching.max_batch_age_seconds,
+        }
     }
 
     fn pipeline(&self) -> Pipeline<'_> {
@@ -451,29 +545,49 @@ impl Engine {
         Ok(all)
     }
 
-    /// Process one batch from each source of the given type. Returns the
-    /// outcomes of any batch that produced records.
+    /// Process one cycle for the given source type, flushing every buffer that
+    /// has records. This is the single-shot entry point used by the
+    /// `process-once` CLI command and the integration tests: whatever is read
+    /// (plus anything already buffered) is sealed and pushed through the
+    /// pipeline immediately.
     pub async fn process_once(
         &mut self,
         source_type: SourceType,
+    ) -> Result<Vec<BatchOutcome>, VtopError> {
+        self.run_source(source_type, true).await
+    }
+
+    /// Run one read+accumulate(+flush) cycle for a source type. When
+    /// `force_flush` is false, only buffers that have tripped a sealing
+    /// threshold (`max_records`, `max_bytes`, or `max_batch_age_seconds`) are
+    /// flushed; the rest keep accumulating across cycles.
+    async fn run_source(
+        &mut self,
+        source_type: SourceType,
+        force_flush: bool,
     ) -> Result<Vec<BatchOutcome>, VtopError> {
         let Some(mut adapter) = self.adapters.remove(&source_type) else {
             return Err(VtopError::Source(format!(
                 "no enabled adapter for source type {source_type}"
             )));
         };
-        let result = self.process_once_with(adapter.as_mut()).await;
+        let result = self
+            .run_cycle(adapter.as_mut(), &source_type, force_flush)
+            .await;
         self.adapters.insert(source_type, adapter);
         result
     }
 
-    async fn process_once_with(
-        &self,
+    async fn run_cycle(
+        &mut self,
         adapter: &mut dyn SourceAdapter,
+        source_type: &SourceType,
+        force_flush: bool,
     ) -> Result<Vec<BatchOutcome>, VtopError> {
         let sources = adapter.discover_sources().await?;
-        let mut outcomes = Vec::new();
         let max_wait = Duration::from_secs(2);
+
+        // ---- Read + accumulate -----------------------------------------
         for source in sources {
             let read = adapter
                 .read_batch_candidates(
@@ -486,10 +600,40 @@ impl Engine {
             if read.is_empty() {
                 continue;
             }
-            let stream = self.streams.lookup(&source.source_name).cloned();
+            let limits = self.batch_limits();
+            let tenant = self.config.engine.tenant.clone();
+            self.pending
+                .entry((source.source_type.clone(), source.source_name.clone()))
+                .or_insert_with(|| PendingBuffer::new(&tenant, source.clone(), limits))
+                .append(read);
+        }
+
+        // ---- Decide which buffers to flush -----------------------------
+        let now = Utc::now();
+        let mut flush_keys: Vec<(SourceType, String)> = Vec::new();
+        for (key, buf) in self.pending.iter() {
+            if &buf.source.source_type != source_type || buf.is_empty() {
+                continue;
+            }
+            if let Some(reason) = buf.should_seal(now) {
+                tracing::info!(source = %buf.source.source_name, ?reason, "batch_seal_threshold");
+                flush_keys.push(key.clone());
+            } else if force_flush {
+                flush_keys.push(key.clone());
+            }
+        }
+
+        // ---- Flush through the pipeline --------------------------------
+        let mut outcomes = Vec::new();
+        for key in flush_keys {
+            let Some(mut buf) = self.pending.remove(&key) else {
+                continue;
+            };
+            let Some(read) = buf.drain() else { continue };
+            let stream = self.streams.lookup(&buf.source.source_name).cloned();
             let outcome = self
                 .pipeline()
-                .process(adapter, &source, read, stream.as_ref())
+                .process(adapter, &buf.source, read, stream.as_ref())
                 .await?;
             outcomes.push(outcome);
         }
@@ -600,14 +744,22 @@ impl Engine {
         self.recover().await?;
         let types: Vec<SourceType> = self.adapters.keys().cloned().collect();
         loop {
+            // Accumulate across cycles; only threshold-tripped buffers flush.
             for st in &types {
-                if let Err(e) = self.process_once(st.clone()).await {
+                if let Err(e) = self.run_source(st.clone(), false).await {
                     tracing::error!(error = %e, source_type = %st, "process cycle error");
                 }
             }
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
                     tracing::info!("shutdown signal received; flushing and exiting");
+                    // Force-flush any buffered-but-unsealed data so it is not
+                    // left for the next start to re-read.
+                    for st in &types {
+                        if let Err(e) = self.run_source(st.clone(), true).await {
+                            tracing::error!(error = %e, source_type = %st, "shutdown flush error");
+                        }
+                    }
                     return Ok(());
                 }
                 _ = tokio::time::sleep(Duration::from_secs(2)) => {}
@@ -635,4 +787,55 @@ pub struct RecoverySummary {
     pub committed: usize,
     pub replay_required: usize,
     pub still_pending: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testkit::file_config;
+    use std::io::Write;
+    use vtop_core::config::StreamsConfig;
+
+    /// A sub-threshold read must be buffered (not flushed) on a non-forced
+    /// cycle, then sealed and committed when the cycle forces a flush — proving
+    /// `AdaptiveBatcher`/`BatchLimits` is actually driving runtime batching.
+    #[tokio::test]
+    async fn run_source_holds_subthreshold_data_until_forced() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        let input = dir.path().join("in.log");
+        {
+            let mut f = std::fs::File::create(&input).unwrap();
+            writeln!(f, "only-one-line").unwrap();
+        }
+
+        let mut cfg = file_config(
+            work.to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        // Thresholds high enough that one short line trips none of them during
+        // the test (records, bytes, and a long age window).
+        cfg.batching.max_records = 10_000;
+        cfg.batching.max_bytes = 104_857_600;
+        cfg.batching.max_batch_age_seconds = 3_600;
+
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+
+        // Non-forced cycle: the lone record is buffered, not flushed.
+        let held = engine.run_source(SourceType::File, false).await.unwrap();
+        assert!(
+            held.is_empty(),
+            "sub-threshold data must be held, not flushed eagerly"
+        );
+
+        // Forced cycle (e.g. process-once / shutdown): the buffer is sealed.
+        let flushed = engine.run_source(SourceType::File, true).await.unwrap();
+        assert_eq!(flushed.len(), 1, "force flush seals the buffered batch");
+        assert_eq!(flushed[0].record_count, 1);
+        assert!(flushed[0].committed, "flushed batch must commit after verify");
+    }
 }
