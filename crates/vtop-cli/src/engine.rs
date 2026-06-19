@@ -116,6 +116,7 @@ impl<'a> Pipeline<'a> {
             created_at: now.clone(),
             sealed_at: None,
             state: BatchState::Batching,
+            verbatim: read.verbatim,
         };
 
         let record = BatchRecord {
@@ -346,11 +347,21 @@ impl<'a> Pipeline<'a> {
             fail!(format!("manifest verification failed: {}", man_v.message));
         }
         metrics.verify_ms = t.elapsed().as_millis() as u64;
+        let backend_limited = obj_v.backend_limited || man_v.backend_limited;
+        // Optional strict mode: refuse to commit on size-only (backend-limited)
+        // verification, so only cryptographically verified objects advance.
+        if backend_limited && self.config.upload.require_strong_verification {
+            fail!(format!(
+                "strong verification required but backend only confirmed size/existence \
+                 (object: {}; manifest: {})",
+                obj_v.message, man_v.message
+            ));
+        }
         // The authoritative post-verification status lives in the state store
         // (VERIFIED -> SOURCE_COMMITTED below). The on-disk manifest was written
         // and uploaded *before* this step (its hash must be stable), so we do
         // not re-stamp it here — querying the store is the source of truth.
-        if obj_v.backend_limited || man_v.backend_limited {
+        if backend_limited {
             tracing::warn!(batch_id, "verification_passed (backend_limited: size-only)");
         } else {
             tracing::info!(batch_id, "verification_passed");
@@ -420,6 +431,9 @@ struct PendingBuffer {
     latest_end: Option<ProgressMarker>,
     first_timestamp: Option<String>,
     last_timestamp: Option<String>,
+    /// Record framing for this source (whole-file/binary = verbatim). All reads
+    /// for a given source share the same framing.
+    verbatim: bool,
 }
 
 impl PendingBuffer {
@@ -437,6 +451,7 @@ impl PendingBuffer {
             latest_end: None,
             first_timestamp: None,
             last_timestamp: None,
+            verbatim: false,
         }
     }
 
@@ -448,6 +463,7 @@ impl PendingBuffer {
     /// `progress_start` becomes the window start (the replayable position); the
     /// latest read's `progress_end` becomes the candidate commit point.
     fn append(&mut self, read: ReadResult) {
+        self.verbatim = read.verbatim;
         let start = read.progress_start.clone();
         for record in read.records {
             // Only the first marker observed sets the window start; the rest are
@@ -480,6 +496,7 @@ impl PendingBuffer {
             progress_end: batch.progress_end,
             first_timestamp: self.first_timestamp.take(),
             last_timestamp: self.last_timestamp.take(),
+            verbatim: self.verbatim,
         })
     }
 }

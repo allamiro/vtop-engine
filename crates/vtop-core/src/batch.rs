@@ -26,6 +26,12 @@ pub struct TelemetryBatch {
     pub created_at: String,
     pub sealed_at: Option<String>,
     pub state: BatchState,
+    /// When true, records are concatenated verbatim (whole-file / binary). When
+    /// false, records are logical lines re-framed with a trailing newline so the
+    /// object is byte-exact with the covered source byte range. See
+    /// [`TelemetryBatch::to_record_bytes`].
+    #[serde(default)]
+    pub verbatim: bool,
 }
 
 impl TelemetryBatch {
@@ -37,11 +43,15 @@ impl TelemetryBatch {
     /// Serialize the records into a single contiguous buffer, one record per
     /// line (newline-terminated). Source order is preserved.
     pub fn to_record_bytes(&self) -> Vec<u8> {
-        // A single record (e.g. a whole-file / binary object) is emitted
-        // verbatim so its bytes are preserved exactly — no separator added.
-        if self.records.len() == 1 {
-            return self.records[0].clone();
+        // Verbatim (whole-file / binary): concatenate raw bytes, add nothing —
+        // the records ARE the object bytes.
+        if self.verbatim {
+            return self.records.concat();
         }
+        // Line-framed: each logical record had its trailing newline stripped on
+        // read, so re-add exactly one newline per record. This holds for a
+        // single-record batch too, keeping the object byte-exact with the
+        // covered source range.
         let total: usize = self.byte_size() + self.records.len();
         let mut buf = Vec::with_capacity(total);
         for rec in &self.records {
@@ -207,6 +217,9 @@ impl AdaptiveBatcher {
             sealed_at: None,
             // The batcher hands over a batch already past BATCHING.
             state: BatchState::Batching,
+            // Framing is tracked by the engine's PendingBuffer and applied to
+            // the final batch; the batcher's value is not propagated.
+            verbatim: false,
         };
 
         // reset counters

@@ -217,6 +217,9 @@ impl SourceAdapter for KafkaSource {
             records,
             first_timestamp: None,
             last_timestamp: None,
+            // Kafka messages are newline-framed into the object (offset-based,
+            // not byte-exact), so records are re-framed on serialization.
+            verbatim: false,
         })
     }
 

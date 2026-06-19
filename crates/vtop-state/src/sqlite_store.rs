@@ -82,8 +82,11 @@ impl SqliteStateStore {
     pub async fn save_batch_state(&self, rec: &BatchRecord) -> Result<(), VtopError> {
         let ps = serde_json::to_string(&rec.progress_start)?;
         let pe = serde_json::to_string(&rec.progress_end)?;
+        // Plain INSERT (not INSERT OR REPLACE): a batch_id is created once. A
+        // duplicate id must fail loudly rather than silently overwrite an
+        // existing — possibly already-committed — row.
         sqlx::query(
-            r#"INSERT OR REPLACE INTO batches
+            r#"INSERT INTO batches
                (batch_id, tenant, source_type, source_name, format, state,
                 progress_start_json, progress_end_json, object_uri, manifest_uri,
                 object_sha256, manifest_sha256, record_count, error_message,

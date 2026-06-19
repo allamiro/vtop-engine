@@ -65,6 +65,7 @@ pub fn file_config(
             profile: None,
             create_bucket: false,
             local_path: None,
+            require_strong_verification: false,
         },
         partitioning: PartitioningConfig {
             template: DEFAULT_TEMPLATE.into(),

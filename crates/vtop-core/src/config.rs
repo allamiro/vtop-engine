@@ -195,6 +195,12 @@ pub struct UploadConfig {
     /// `<local_path>/<bucket>/<key>`).
     #[serde(default)]
     pub local_path: Option<String>,
+    /// If true, a batch is only committed when the backend can perform STRONG
+    /// (checksum) verification. Backend-limited (size/existence-only) results
+    /// then fail the batch instead of committing. Default false (backend-limited
+    /// is accepted, as documented). Production should enable this.
+    #[serde(default)]
+    pub require_strong_verification: bool,
 }
 
 fn default_backend() -> String {
@@ -251,6 +257,31 @@ impl VtopConfig {
         }
         if self.upload.bucket.trim().is_empty() {
             return Err(VtopError::Config("upload.bucket must not be empty".into()));
+        }
+
+        // Batching limits must be positive, or the engine would seal degenerate
+        // (empty/one-record) batches or never bound memory sensibly.
+        if self.batching.max_records == 0 {
+            return Err(VtopError::Config("batching.max_records must be > 0".into()));
+        }
+        if self.batching.max_bytes == 0 {
+            return Err(VtopError::Config("batching.max_bytes must be > 0".into()));
+        }
+
+        // An enabled file/syslog source with no paths silently does nothing.
+        if let Some(f) = &self.sources.file {
+            if f.enabled && f.paths.iter().all(|p| p.trim().is_empty()) {
+                return Err(VtopError::Config(
+                    "sources.file is enabled but has no (non-empty) paths".into(),
+                ));
+            }
+        }
+        if let Some(s) = &self.sources.syslog_spool {
+            if s.enabled && s.paths.iter().all(|p| p.trim().is_empty()) {
+                return Err(VtopError::Config(
+                    "sources.syslog_spool is enabled but has no (non-empty) paths".into(),
+                ));
+            }
         }
         Ok(())
     }

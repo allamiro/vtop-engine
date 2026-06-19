@@ -27,6 +27,11 @@ pub struct ReadResult {
     pub progress_end: ProgressMarker,
     pub first_timestamp: Option<String>,
     pub last_timestamp: Option<String>,
+    /// When true, the records are raw object bytes that MUST be concatenated
+    /// verbatim (whole-file / binary mode). When false, records are logical
+    /// lines and are re-framed with a trailing newline on serialization, so the
+    /// stored object is byte-exact with the covered source range.
+    pub verbatim: bool,
 }
 
 impl ReadResult {

@@ -131,6 +131,19 @@ impl SourceAdapter for FileSource {
         // Used for binary / already-compressed source files with no line
         // structure. The whole file commits as a single byte range.
         if self.whole_file {
+            // Whole-file mode loads the entire remaining file into memory. Warn
+            // when it exceeds the batch byte budget so operators know a single
+            // large file can dominate memory (streaming is a documented
+            // follow-up; see README known limitations).
+            let (_, fsize, _) = Self::file_identity(Path::new(&path));
+            if fsize.saturating_sub(start) as usize > max_bytes {
+                tracing::warn!(
+                    path,
+                    file_bytes = fsize,
+                    max_bytes,
+                    "whole-file source exceeds max_bytes; loading entire file into memory"
+                );
+            }
             let data = tokio::fs::read(&path).await?;
             let end = data.len() as u64;
             let records = if start >= end || data.is_empty() {
@@ -145,6 +158,8 @@ impl SourceAdapter for FileSource {
                 records,
                 first_timestamp: None,
                 last_timestamp: None,
+                // Whole-file: the record is raw object bytes — emit verbatim.
+                verbatim: true,
             });
         }
 
@@ -170,6 +185,16 @@ impl SourceAdapter for FileSource {
             if !line.ends_with(b"\n") {
                 break;
             }
+            if n > max_bytes {
+                // A single line larger than the whole batch budget is a soft-
+                // limit overrun (read_until already buffered it); surface it.
+                tracing::warn!(
+                    path,
+                    line_bytes = n,
+                    max_bytes,
+                    "single record exceeds max_bytes"
+                );
+            }
             pos += n as u64;
             bytes_read += n as u64;
             // Strip trailing newline for the stored record.
@@ -188,6 +213,9 @@ impl SourceAdapter for FileSource {
             records,
             first_timestamp: None,
             last_timestamp: None,
+            // Line mode: records are logical lines (newline stripped); re-framed
+            // on serialization to stay byte-exact with the source range.
+            verbatim: false,
         })
     }
 
@@ -201,7 +229,13 @@ impl SourceAdapter for FileSource {
     }
 
     async fn commit_progress(&mut self, marker: &ProgressMarker) -> Result<(), VtopError> {
-        let ProgressMarker::File { path, end_byte, .. } = marker else {
+        let ProgressMarker::File {
+            path,
+            end_byte,
+            inode: marker_inode,
+            ..
+        } = marker
+        else {
             return Err(VtopError::Source(
                 "file adapter given non-file marker".into(),
             ));
@@ -214,9 +248,21 @@ impl SourceAdapter for FileSource {
         tracing::info!(path, end_byte, "file source progress committed");
 
         if self.delete_after_commit {
-            // Only safe because we are past VERIFIED + commit.
-            let (_, size, _) = Self::file_identity(Path::new(path));
-            if *end_byte >= size {
+            // Validate file identity before the irreversible delete: if the path
+            // now points to a different inode than the batch's marker (rotation
+            // / replacement), deleting would destroy an unrelated/newer file.
+            let (cur_inode, size, _) = Self::file_identity(Path::new(path));
+            let identity_ok = match (marker_inode, cur_inode) {
+                (Some(m), Some(cur)) => *m == cur,
+                (None, None) => true, // platform without inode support: size-only
+                _ => false,
+            };
+            if !identity_ok {
+                tracing::warn!(
+                    path,
+                    "skipping delete-after-commit: file identity changed (possible rotation/replacement)"
+                );
+            } else if *end_byte >= size {
                 let _ = std::fs::remove_file(path);
             }
         }
@@ -364,5 +410,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.records, vec![b"complete".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn delete_after_commit_skips_on_identity_mismatch() {
+        let f = write_log(&["a"]);
+        let path = f.path().to_string_lossy().into_owned();
+        let mut fs = FileSource::with_mode(vec![path.clone()], TelemetryFormat::Raw, true, false);
+        // Marker carries a stale inode (as if the file rotated since the read);
+        // committing must NOT delete the now-different file on disk.
+        let marker = ProgressMarker::File {
+            path: path.clone(),
+            inode: Some(u64::MAX),
+            start_byte: 0,
+            end_byte: 2,
+            file_size: 2,
+            mtime: String::new(),
+        };
+        fs.commit_progress(&marker).await.unwrap();
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "must not delete when the file identity no longer matches the marker"
+        );
     }
 }

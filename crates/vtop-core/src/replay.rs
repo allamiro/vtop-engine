@@ -1,9 +1,18 @@
 //! Replay / crash-recovery decision logic.
 //!
 //! This module is protocol-independent: it maps a persisted [`BatchState`] to
-//! the recovery action the engine must take. The engine (in `vtop-cli`) reads
-//! incomplete batches from the state store and drives them through these
-//! actions.
+//! the recovery action the engine *could* take.
+//!
+//! NOTE on current engine behavior: the fine-grained `Retry*` actions
+//! ([`RecoveryAction::RetryCompression`], `RetryChecksum`, `RetryObjectUpload`,
+//! `RetryManifestUpload`, `RetryVerification`) describe the ideal incremental
+//! resume for each intermediate state, but `Engine::recover()` does **not**
+//! resume from a half-produced local object today. It handles only two cases
+//! specially — `Verified` → retry the source commit, and `SourceCommitted` →
+//! nothing — and treats **every other** non-committed state as
+//! [`RecoveryAction::ReplayFromSource`] (mark `REPLAY_REQUIRED` and re-read from
+//! the last committed source position). The `Retry*` variants are therefore
+//! reserved for future granular recovery. Either way the invariant holds.
 //!
 //! Invariant: source progress is NEVER advanced for an unverified batch.
 
