@@ -249,6 +249,47 @@ Relevant implementation:
 
 ## Architecture
 
+<div align="center">
+
+<img src="https://cdn.simpleicons.org/rust/000000/FFFFFF" alt="Rust" height="34" />&nbsp;&nbsp;&nbsp;
+<img src="https://cdn.simpleicons.org/apachekafka/231F20/FFFFFF" alt="Apache Kafka" height="34" />&nbsp;&nbsp;&nbsp;
+<img src="https://cdn.simpleicons.org/minio/C72E49" alt="MinIO" height="34" />&nbsp;&nbsp;&nbsp;
+<img src="https://cdn.simpleicons.org/sqlite/003B57/FFFFFF" alt="SQLite" height="34" />&nbsp;&nbsp;&nbsp;
+<img src="https://cdn.simpleicons.org/docker/2496ED" alt="Docker" height="34" />
+
+</div>
+
+The engine reads from a source, writes a **compressed object plus a manifest** to
+object storage, **verifies** what it wrote, and only then advances the source
+commit point. Verification failure means the source is never committed, so the
+data stays replayable.
+
+```mermaid
+flowchart LR
+    S["Kafka · Files · Syslog spool"]
+    E(["VTOP engine"])
+    O[("S3 / MinIO")]
+    D[("State store")]
+
+    S -->|"read batch"| E
+    E -->|"1 · upload object + manifest"| O
+    O -->|"2 · verify size + checksum"| E
+    E ==>|"3 · commit progress<br/>ONLY after VERIFIED"| S
+    E <-.->|"batch state · replay ledger"| D
+
+    classDef src fill:#eef4ff,stroke:#4a72b8,stroke-width:1px,color:#12263f
+    classDef eng fill:#e8f7ee,stroke:#2e8b57,stroke-width:2px,color:#12263f
+    classDef store fill:#fff6e5,stroke:#c07f19,stroke-width:1px,color:#12263f
+    class S src
+    class E eng
+    class O,D store
+```
+
+Steps **1 → 2 → 3** are the whole protocol: the thick arrow is the one rule that
+must never break — see [Core rule](#core-rule).
+
+### Workspace layout
+
 VTOP is organized as a Rust workspace.
 
 ```text
