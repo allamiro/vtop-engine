@@ -25,5 +25,7 @@ tempfile = { workspace = true }
 # async KAT tests hash from files (the path uploads actually use)
 tokio = { workspace = true }
 proptest = { workspace = true }
+# snapshot tests pin the manifest's on-disk contract
+insta = { workspace = true }
 # integration tests decompress objects to assert byte-exact round trips
 flate2 = { workspace = true }
