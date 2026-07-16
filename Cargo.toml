@@ -41,6 +41,7 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono", "uuid
 glob = "0.3"
 notify = "8"
 tempfile = "3"
+proptest = "1"
 bytes = "1"
 futures = "0.3"
 regex = "1"
