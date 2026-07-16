@@ -1,0 +1,63 @@
+# Dependabot keeps dependencies current so advisories are fixed proactively,
+# rather than only being reported after the fact by the `cargo audit` CI job.
+#
+# Grouping strategy: patch/minor bumps are grouped into a single PR per ecosystem
+# to keep review noise low; major bumps are raised individually because they are
+# the ones that need a human decision.
+version: 2
+
+updates:
+  # ---- Rust workspace -----------------------------------------------------
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - security
+    commit-message:
+      prefix: "deps"
+    groups:
+      cargo-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    # No `ignore` entries: majors are intentionally NOT grouped above, so each
+    # major bump arrives as its own PR and gets a deliberate review.
+
+  # ---- GitHub Actions (pinned action versions) ----------------------------
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - ci
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  # ---- Container base images (docker/Dockerfile) --------------------------
+  - package-ecosystem: docker
+    directory: "/docker"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+      - ci
+    commit-message:
+      prefix: "docker"
