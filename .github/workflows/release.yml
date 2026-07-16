@@ -186,7 +186,13 @@ jobs:
   # ---------------------------------------------------------------------------
   docker:
     name: image (multi-arch -> GHCR)
-    needs: verify
+    # Depends on binaries + sbom, not just verify: a GHCR push is effectively
+    # irreversible (a consumer can pull `:latest` immediately), so the image must
+    # not be published until every other release artifact has succeeded.
+    # Otherwise a failing macOS/ARM leg would skip the `release` job while
+    # leaving an image published for a version that has no GitHub Release.
+    # This costs wall-clock time; releases are rare and consistency matters more.
+    needs: [verify, binaries, sbom]
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
