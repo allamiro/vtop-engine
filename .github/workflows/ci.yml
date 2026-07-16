@@ -292,3 +292,39 @@ jobs:
             tail -25 /tmp/coverage.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+  # The benchmark harness had zero tests while accumulating real defects
+  # (double-counted input bytes, silently dropped child runs, unescaped Markdown
+  # tables, a write-after-close race, a large-binary OOM, swallowed YAML errors).
+  # Only manual review was protecting it.
+  benchmarks:
+    name: benchmarks (ruff + pytest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: benchmarks
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test tooling
+        run: pip install --disable-pip-version-check pytest pyyaml ruff
+
+      - name: ruff
+        run: ruff check .
+
+      - name: pytest
+        run: python -m pytest
+
+      # The harness must keep working where PyYAML is absent - that fallback is
+      # the whole reason load_scenario() has two code paths - so prove the suite
+      # passes without it too, rather than assuming. The PyYAML-specific tests
+      # live in their own module and skip themselves; everything else must still
+      # run and pass.
+      - name: pytest without PyYAML (fallback parser path)
+        run: |
+          pip uninstall -y pyyaml
+          python -m pytest

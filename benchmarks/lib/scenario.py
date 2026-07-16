@@ -8,10 +8,10 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Any, Dict
+from typing import Any
 
 # Defaults for every tunable knob. Scenario files override a subset.
-DEFAULTS: Dict[str, Any] = {
+DEFAULTS: dict[str, Any] = {
     "name": "scenario",
     "description": "",
     "volume": 1000,                 # number of input files
@@ -34,7 +34,7 @@ DEFAULTS: Dict[str, Any] = {
 
 @dataclass
 class Scenario:
-    values: Dict[str, Any] = field(default_factory=dict)
+    values: dict[str, Any] = field(default_factory=dict)
 
     def __getattr__(self, key: str) -> Any:
         try:
@@ -64,8 +64,8 @@ def _coerce(value: str) -> Any:
     return v
 
 
-def _fallback_parse(text: str) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
+def _fallback_parse(text: str) -> dict[str, Any]:
+    out: dict[str, Any] = {}
     for raw in text.splitlines():
         line = raw.split("#", 1)[0].rstrip()
         if not line.strip():
@@ -78,9 +78,9 @@ def _fallback_parse(text: str) -> Dict[str, Any]:
 
 
 def load_scenario(path: str) -> Scenario:
-    with open(path, "r", encoding="utf-8") as fh:
+    with open(path, encoding="utf-8") as fh:
         text = fh.read()
-    parsed: Dict[str, Any]
+    parsed: dict[str, Any]
     try:
         import yaml  # type: ignore
     except ImportError:
@@ -93,6 +93,10 @@ def load_scenario(path: str) -> Scenario:
 
     values = dict(DEFAULTS)
     values.update({k: v for k, v in parsed.items() if v is not None})
-    if not values.get("name"):
+    # Derive the name from the FILE, not from `values`: DEFAULTS already carries
+    # name="scenario", so checking values here was always truthy and this branch
+    # was dead. Every unnamed scenario was therefore called "scenario", which
+    # collides in run ids and makes matrix results indistinguishable.
+    if not parsed.get("name"):
         values["name"] = os.path.splitext(os.path.basename(path))[0]
     return Scenario(values)

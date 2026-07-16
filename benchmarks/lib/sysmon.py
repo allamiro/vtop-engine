@@ -9,9 +9,8 @@ from __future__ import annotations
 import os
 import subprocess
 import threading
-import time
+from collections.abc import Callable
 from datetime import datetime, timezone
-from typing import Callable, List, Optional
 
 try:  # optional dependency
     import psutil  # type: ignore
@@ -63,13 +62,13 @@ class SystemMonitor:
     """Background sampler. `emit` receives a dict per sample."""
 
     def __init__(self, emit: Callable[[dict], None], interval: float = 1.0,
-                 root_pid: Optional[int] = None) -> None:
+                 root_pid: int | None = None) -> None:
         self.emit = emit
         self.interval = max(0.1, float(interval))
         self.root_pid = root_pid or os.getpid()
         self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-        self.samples: List[dict] = []
+        self._thread: threading.Thread | None = None
+        self.samples: list[dict] = []
         self._base_disk = None
         self._base_net = None
 
@@ -145,7 +144,7 @@ class SystemMonitor:
             self.emit(s)
             self._stop.wait(self.interval)
 
-    def __enter__(self) -> "SystemMonitor":
+    def __enter__(self) -> SystemMonitor:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
         return self

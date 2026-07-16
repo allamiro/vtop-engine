@@ -1,0 +1,25 @@
+# Lint config for the benchmark harness.
+#
+# The harness is dependency-light on purpose (it must run where pytest/PyYAML may
+# be absent), so the rule set stays close to the defaults rather than pulling in
+# opinionated plugins.
+# 120, not 88/100: the seed generators are single-line CEF/LEEF/syslog format
+# templates where wrapping actively hurts readability, and the longest line in
+# the harness is 119. Chosen to fit the code as written rather than to force a
+# reformat of files this lint was added to protect.
+line-length = 120
+
+[lint]
+# E/F: pycodestyle errors + pyflakes (unused imports, undefined names).
+# I: import sorting. B: common bug patterns (bugbear).
+select = ["E", "F", "I", "B", "UP"]
+
+[lint.per-file-ignores]
+# The event generators are single-line CEF/LEEF format templates (up to ~156
+# chars). Wrapping a wire-format template makes it harder to read and to compare
+# against the spec, so the length rule is waived HERE ONLY rather than globally.
+"lib/seed.py" = ["E501"]
+# The runner scripts must adjust sys.path before importing `lib`, so their
+# imports legitimately follow statements.
+"run_benchmark.py" = ["E402"]
+"run_matrix.py" = ["E402"]
