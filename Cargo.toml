@@ -17,7 +17,7 @@ description = "Verified Telemetry Object Protocol Engine — a replay-safe, mani
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
-rdkafka = { version = "0.37", features = ["cmake-build", "ssl", "sasl"] }
+rdkafka = { version = "0.39", features = ["cmake-build", "ssl", "sasl"] }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1"
 serde = { version = "1", features = ["derive"] }
