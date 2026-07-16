@@ -51,13 +51,17 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Clippy (deny warnings)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        # --locked: a Cargo.lock that does not match Cargo.toml must FAIL
+        # rather than be silently regenerated. Without it a dependency can be
+        # added with no lockfile entry and builds then resolve versions that were
+        # never tested - which had already happened before this guard existed.
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Test workspace
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       - name: Release build
-        run: cargo build --release --bin vtopctl
+        run: cargo build --release --bin vtopctl --locked
 
   docker:
     name: docker image build

@@ -1,0 +1,43 @@
+---
+source: crates/vtop-core/tests/snapshot_manifest.rs
+expression: json
+---
+{
+  "protocol": "VTOP",
+  "version": "0.1",
+  "batch_id": "vtop-20260101T000000Z-app_events-p0-0-99-deadbeef",
+  "tenant": "default",
+  "source_type": "kafka",
+  "source_name": "app_events",
+  "format": "cef",
+  "compression": "gzip",
+  "record_count": 100,
+  "first_timestamp": "2026-01-01T00:00:00Z",
+  "last_timestamp": "2026-01-01T00:00:59Z",
+  "source_progress": {
+    "source_type": "kafka",
+    "topic": "app_events",
+    "partition": 0,
+    "start_offset": 0,
+    "end_offset": 99,
+    "consumer_group": "vtop-engine"
+  },
+  "object": {
+    "uri": "s3://telemetry-cef/tenant=default/source=app_events/format=cef/year=2026/month=01/day=01/hour=00/vtop-20260101T000000Z-app_events-p0-0-99-deadbeef.cef.gz",
+    "size_bytes": 4096,
+    "checksum_algorithm": "sha256",
+    "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "manifest": {
+    "uri": "s3://telemetry-cef/tenant=default/source=app_events/format=cef/year=2026/month=01/day=01/hour=00/vtop-20260101T000000Z-app_events-p0-0-99-deadbeef.manifest.json",
+    "sha256": "9e2c72ecc55fdb0dc623f93611a6195eaa055f8bab993f8fb4238a6d985e80d4"
+  },
+  "partitioning": {
+    "path_template": "tenant={tenant}/source={source}/format={format}/year={yyyy}/month={mm}/day={dd}/hour={hh}/",
+    "resolved_prefix": "tenant=default/source=app_events/format=cef/year=2026/month=01/day=01/hour=00"
+  },
+  "upload_backend": "s3_native",
+  "state": "manifest_uploaded",
+  "verification_status": "not_verified",
+  "created_at": "2026-01-01T00:01:00Z"
+}

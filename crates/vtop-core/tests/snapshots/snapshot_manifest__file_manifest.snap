@@ -1,0 +1,44 @@
+---
+source: crates/vtop-core/tests/snapshot_manifest.rs
+expression: json
+---
+{
+  "protocol": "VTOP",
+  "version": "0.1",
+  "batch_id": "vtop-20260101T000000Z-_data_input_app_log-b0-2048-cafebabe",
+  "tenant": "default",
+  "source_type": "file",
+  "source_name": "/data/input/app.log",
+  "format": "jsonl",
+  "compression": "gzip",
+  "record_count": 100,
+  "first_timestamp": "2026-01-01T00:00:00Z",
+  "last_timestamp": "2026-01-01T00:00:59Z",
+  "source_progress": {
+    "source_type": "file",
+    "path": "/data/input/app.log",
+    "inode": 877,
+    "start_byte": 0,
+    "end_byte": 2048,
+    "file_size": 2048,
+    "mtime": "2026-01-01T00:00:30Z"
+  },
+  "object": {
+    "uri": "s3://telemetry-jsonl/tenant=default/source=_data_input_app.log/format=jsonl/year=2026/month=01/day=01/hour=00/obj.jsonl.gz",
+    "size_bytes": 4096,
+    "checksum_algorithm": "sha256",
+    "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "manifest": {
+    "uri": "s3://telemetry-jsonl/tenant=default/source=_data_input_app.log/format=jsonl/year=2026/month=01/day=01/hour=00/obj.manifest.json",
+    "sha256": "ca5167abe321fcf3e6743e80c8f645f07616a4eb3d9c336a6eb4cf2bd30441b4"
+  },
+  "partitioning": {
+    "path_template": "tenant={tenant}/source={source}/format={format}/year={yyyy}/month={mm}/day={dd}/hour={hh}/",
+    "resolved_prefix": "tenant=default/source=_data_input_app.log/format=jsonl/year=2026/month=01/day=01/hour=00"
+  },
+  "upload_backend": "s3_native",
+  "state": "manifest_uploaded",
+  "verification_status": "not_verified",
+  "created_at": "2026-01-01T00:01:00Z"
+}
