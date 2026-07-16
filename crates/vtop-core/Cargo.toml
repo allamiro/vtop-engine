@@ -2,6 +2,7 @@
 name = "vtop-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Protocol-independent engine logic for the VTOP Engine (state machine, batch, manifest, checksum, compression, partitioning, replay)."
 
