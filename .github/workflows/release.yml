@@ -1,0 +1,355 @@
+# Release pipeline: cut binaries, a multi-arch container image, an SBOM, and a
+# GitHub Release from a `v*` tag.
+#
+#   git tag -a v0.1.0 -m "v0.1.0" && git push origin v0.1.0
+#
+# CI (ci.yml) only runs on pushes/PRs to `main`, NOT on tags, so this workflow
+# re-runs fmt/clippy/test itself as a gate before publishing anything.
+#
+# Scope note: 0.x tags publish as GitHub **pre-releases**. VTOP is a prototype;
+# see docs/PRODUCTION_HA_PLAN.md §21 (Known limitations) before depending on it.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build (dry-run; no release is published)"
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  BIN_NAME: vtopctl
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false # never cancel a half-published release
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Gate: nothing is published unless the workspace is clean and green.
+  # ---------------------------------------------------------------------------
+  verify:
+    name: verify (fmt + clippy + test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # On workflow_dispatch, build the requested tag rather than the
+          # default branch, so a dry-run validates the real release ref.
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-release-${{ hashFiles('**/Cargo.lock') }}
+
+      # librdkafka (cmake-build feature) compiles from source: it needs cmake +
+      # a C toolchain, SSL + SASL, zlib, and libcurl (SASL OAUTHBEARER/OIDC
+      # #includes <curl/curl.h>).
+      - name: Install librdkafka build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake clang libssl-dev libsasl2-dev libcurl4-openssl-dev zlib1g-dev pkg-config
+
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+      - name: Derive version + release channel
+        id: meta
+        # The tag / dispatch input is attacker-influenced text. Pass it through the
+        # environment instead of interpolating `${{ }}` straight into the script,
+        # which would let a crafted tag name inject shell commands (the Cargo
+        # version cross-check below happens too late to prevent that).
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          ref="${INPUT_TAG:-$REF_NAME}"
+          version="${ref#v}"
+          # Cross-check the tag against the workspace version so a mistagged
+          # release fails loudly instead of shipping mislabeled artifacts.
+          cargo_version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          if [ "$version" != "$cargo_version" ]; then
+            echo "::error::tag version ($version) != workspace Cargo.toml version ($cargo_version)"
+            exit 1
+          fi
+          # 0.x or any pre-release suffix (-alpha/-rc.1/...) publishes as a pre-release.
+          if [[ "$version" == 0.* || "$version" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Releasing $version (prerelease=$( [[ "$version" == 0.* || "$version" == *-* ]] && echo true || echo false ))"
+
+  # ---------------------------------------------------------------------------
+  # Binaries. Each target builds on its native runner: librdkafka is compiled
+  # from source via cmake, so cross-compiling is unreliable. Windows is
+  # deliberately NOT built (rdkafka + cmake there is not validated) — shipping
+  # nothing beats shipping a broken binary.
+  # ---------------------------------------------------------------------------
+  binaries:
+    name: build ${{ matrix.target }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+          # macos-13 was retired by GitHub; macos-15-intel is the current x86_64 runner.
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # On workflow_dispatch, build the requested tag rather than the
+          # default branch, so a dry-run validates the real release ref.
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake clang libssl-dev libsasl2-dev libcurl4-openssl-dev zlib1g-dev pkg-config
+
+      - name: Install build dependencies (macOS)
+        if: runner.os == 'macOS'
+        # rdkafka is built with features ["cmake-build", "ssl", "sasl"], so
+        # librdkafka needs BOTH OpenSSL and Cyrus SASL headers here, mirroring
+        # libssl-dev + libsasl2-dev on the Linux legs. Without cyrus-sasl the
+        # librdkafka cmake configure step can fail and block the release.
+        run: |
+          brew install cmake openssl@3 cyrus-sasl
+          # Homebrew prefix differs by arch (/opt/homebrew on arm64,
+          # /usr/local on x86_64), so resolve it rather than hardcoding.
+          echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+          # cyrus-sasl is keg-only: expose it to pkg-config/cmake explicitly.
+          echo "PKG_CONFIG_PATH=$(brew --prefix cyrus-sasl)/lib/pkgconfig:$(brew --prefix openssl@3)/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: cargo build --release --bin ${{ env.BIN_NAME }} --target ${{ matrix.target }}
+
+      - name: Package
+        id: pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="${BIN_NAME}-${{ needs.verify.outputs.version }}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/${BIN_NAME}" "dist/$name/"
+          cp README.md LICENSE "dist/$name/" 2>/dev/null || true
+          tar -czf "dist/$name.tar.gz" -C dist "$name"
+          echo "artifact=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BIN_NAME }}-${{ matrix.target }}
+          path: ${{ steps.pkg.outputs.artifact }}
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Multi-arch container image -> GHCR, with build-time SBOM + provenance
+  # attestations, then keyless-signed with cosign.
+  # ---------------------------------------------------------------------------
+  docker:
+    name: image (multi-arch -> GHCR)
+    # Depends on binaries + sbom, not just verify: a GHCR push is effectively
+    # irreversible (a consumer can pull `:latest` immediately), so the image must
+    # not be published until every other release artifact has succeeded.
+    # Otherwise a failing macOS/ARM leg would skip the `release` job while
+    # leaving an image published for a version that has no GitHub Release.
+    # This costs wall-clock time; releases are rare and consistency matters more.
+    needs: [verify, binaries, sbom]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # keyless cosign signing
+    env:
+      # Don't upload the `*.dockerbuild` build record: it is not a release
+      # artifact and must not end up in the published release (see the release
+      # job's artifact pattern).
+      DOCKER_BUILD_RECORD_UPLOAD: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # On workflow_dispatch, build the requested tag rather than the
+          # default branch, so a dry-run validates the real release ref.
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          # `latest` only for stable releases; 0.x/pre-releases must not claim it.
+          tags: |
+            type=semver,pattern={{version}},value=v${{ needs.verify.outputs.version }}
+            type=raw,value=latest,enable=${{ needs.verify.outputs.prerelease == 'false' }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'workflow_dispatch' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          sbom: true
+          provenance: mode=max
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Install cosign
+        if: github.event_name != 'workflow_dispatch'
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image (keyless)
+        if: github.event_name != 'workflow_dispatch'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "${IMAGE_NAME}@${DIGEST}"
+
+  # ---------------------------------------------------------------------------
+  # Source SBOM (SPDX) attached to the release.
+  # ---------------------------------------------------------------------------
+  sbom:
+    name: sbom (spdx)
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # On workflow_dispatch, build the requested tag rather than the
+          # default branch, so a dry-run validates the real release ref.
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          artifact-name: vtop-engine-sbom.spdx.json
+          output-file: vtop-engine-sbom.spdx.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: vtop-engine-sbom.spdx.json
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Publish: collect artifacts, checksum them, create the GitHub Release.
+  # ---------------------------------------------------------------------------
+  release:
+    name: publish release
+    needs: [verify, binaries, docker, sbom]
+    if: github.event_name != 'workflow_dispatch' # dispatch = dry-run build only
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # On workflow_dispatch, build the requested tag rather than the
+          # default branch, so a dry-run validates the real release ref.
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      # Only pull the artifacts we intend to publish. build-push-action uploads a
+      # `*.dockerbuild` build record by default, and an unfiltered download would
+      # sweep it into artifacts/ where it would be checksummed and attached to the
+      # release. (Belt-and-braces: the docker job also disables that upload.)
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "{vtopctl-*,sbom}"
+          path: artifacts
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd artifacts
+          ls -la
+          sha256sum -- ./* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: v${{ needs.verify.outputs.version }}
+          tag_name: ${{ github.ref_name }}
+          prerelease: ${{ needs.verify.outputs.prerelease == 'true' }}
+          generate_release_notes: true
+          files: artifacts/*
+          body: |
+            ## VTOP Engine v${{ needs.verify.outputs.version }}
+
+            > **Maturity:** VTOP is a **prototype / reference implementation**. 0.x tags
+            > are published as pre-releases. Read
+            > [Known limitations](https://github.com/${{ github.repository }}/blob/main/docs/PRODUCTION_HA_PLAN.md)
+            > (§21) before depending on this in production.
+
+            ### Container image
+            ```
+            docker pull ${{ env.IMAGE_NAME }}:${{ needs.verify.outputs.version }}
+            ```
+            Multi-arch (`linux/amd64`, `linux/arm64`), published with SBOM + provenance
+            attestations and signed with cosign (keyless). Verify with:
+            ```
+            cosign verify ${{ env.IMAGE_NAME }}:${{ needs.verify.outputs.version }} \
+              --certificate-identity-regexp='https://github.com/${{ github.repository }}/.*' \
+              --certificate-oidc-issuer='https://token.actions.githubusercontent.com'
+            ```
+
+            ### Binaries
+            `linux` (x86_64, aarch64) and `macOS` (arm64, x86_64). Windows is not built:
+            librdkafka is compiled from source via cmake and the Windows path is not
+            validated.
+
+            Verify downloads against `SHA256SUMS`. An SPDX SBOM is attached.
