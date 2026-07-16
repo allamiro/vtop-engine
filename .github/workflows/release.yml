@@ -75,9 +75,16 @@ jobs:
 
       - name: Derive version + release channel
         id: meta
+        # The tag / dispatch input is attacker-influenced text. Pass it through the
+        # environment instead of interpolating `${{ }}` straight into the script,
+        # which would let a crafted tag name inject shell commands (the Cargo
+        # version cross-check below happens too late to prevent that).
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          ref="${{ github.event.inputs.tag || github.ref_name }}"
+          ref="${INPUT_TAG:-$REF_NAME}"
           version="${ref#v}"
           # Cross-check the tag against the workspace version so a mistagged
           # release fails loudly instead of shipping mislabeled artifacts.
@@ -140,11 +147,17 @@ jobs:
 
       - name: Install build dependencies (macOS)
         if: runner.os == 'macOS'
+        # rdkafka is built with features ["cmake-build", "ssl", "sasl"], so
+        # librdkafka needs BOTH OpenSSL and Cyrus SASL headers here, mirroring
+        # libssl-dev + libsasl2-dev on the Linux legs. Without cyrus-sasl the
+        # librdkafka cmake configure step can fail and block the release.
         run: |
-          brew install cmake openssl@3
+          brew install cmake openssl@3 cyrus-sasl
           # Homebrew prefix differs by arch (/opt/homebrew on arm64,
           # /usr/local on x86_64), so resolve it rather than hardcoding.
           echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+          # cyrus-sasl is keg-only: expose it to pkg-config/cmake explicitly.
+          echo "PKG_CONFIG_PATH=$(brew --prefix cyrus-sasl)/lib/pkgconfig:$(brew --prefix openssl@3)/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
 
       - name: Build
         run: cargo build --release --bin ${{ env.BIN_NAME }} --target ${{ matrix.target }}
@@ -180,6 +193,11 @@ jobs:
       contents: read
       packages: write
       id-token: write # keyless cosign signing
+    env:
+      # Don't upload the `*.dockerbuild` build record: it is not a release
+      # artifact and must not end up in the published release (see the release
+      # job's artifact pattern).
+      DOCKER_BUILD_RECORD_UPLOAD: false
     steps:
       - uses: actions/checkout@v4
         with:
@@ -277,8 +295,13 @@ jobs:
           # default branch, so a dry-run validates the real release ref.
           ref: ${{ github.event.inputs.tag || github.ref }}
 
+      # Only pull the artifacts we intend to publish. build-push-action uploads a
+      # `*.dockerbuild` build record by default, and an unfiltered download would
+      # sweep it into artifacts/ where it would be checksummed and attached to the
+      # release. (Belt-and-braces: the docker job also disables that upload.)
       - uses: actions/download-artifact@v4
         with:
+          pattern: "{vtopctl-*,sbom}"
           path: artifacts
           merge-multiple: true
 
