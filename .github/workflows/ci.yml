@@ -179,6 +179,22 @@ jobs:
           docker exec "$cid" /opt/kafka/bin/kafka-get-offsets.sh \
             --bootstrap-server localhost:9092 --topic it_events
 
+          # Warm up the group coordinator before the tests run. The adapter
+          # assigns Offset::Stored, which asks the broker for the consumer
+          # group's committed offsets; that needs the group coordinator and the
+          # __consumer_offsets topic, which a FRESH broker creates only lazily on
+          # the first group operation. Until it exists, consumers get
+          # "NotCoordinator" and every read fails. Consuming once under a
+          # throwaway group forces it into existence.
+          #
+          # This is why the job failed on its first run but passed locally: a
+          # long-lived local broker already had __consumer_offsets.
+          docker exec "$cid" /opt/kafka/bin/kafka-console-consumer.sh \
+            --bootstrap-server localhost:9092 --topic it_events \
+            --group ci-warmup --from-beginning --max-messages 1 --timeout-ms 30000
+          docker exec "$cid" /opt/kafka/bin/kafka-consumer-groups.sh \
+            --bootstrap-server localhost:9092 --list
+
       - name: Run live-broker integration tests
         env:
           VTOP_TEST_KAFKA: localhost:9092
