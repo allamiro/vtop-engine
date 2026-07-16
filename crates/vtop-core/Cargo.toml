@@ -22,3 +22,6 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+proptest = { workspace = true }
+# integration tests decompress objects to assert byte-exact round trips
+flate2 = { workspace = true }
