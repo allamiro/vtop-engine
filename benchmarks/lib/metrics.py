@@ -12,9 +12,8 @@ import os
 import random
 import string
 from datetime import datetime, timezone
-from typing import Dict, List
 
-CSV_HEADERS: Dict[str, List[str]] = {
+CSV_HEADERS: dict[str, list[str]] = {
     "metrics.csv": [
         "run_id", "scenario_name", "start_time", "end_time", "duration_seconds",
         "total_input_files", "total_input_bytes", "total_output_objects",
@@ -66,7 +65,7 @@ def new_run_id(scenario_name: str) -> str:
     return f"{safe}-{stamp}-{rnd}"
 
 
-def percentile(values: List[float], pct: float) -> float:
+def percentile(values: list[float], pct: float) -> float:
     if not values:
         return 0.0
     s = sorted(values)
@@ -93,12 +92,12 @@ class ResultsWriter:
             self._files[fname] = fh
             self._writers[fname] = w
 
-    def row(self, fname: str, data: Dict) -> None:
+    def row(self, fname: str, data: dict) -> None:
         header = CSV_HEADERS[fname]
         self._writers[fname].writerow([data.get(col, "") for col in header])
         self._files[fname].flush()
 
-    def write_summary(self, summary: Dict) -> None:
+    def write_summary(self, summary: dict) -> None:
         with open(os.path.join(self.dir, "summary.json"), "w", encoding="utf-8") as fh:
             json.dump(summary, fh, indent=2, default=str)
         with open(os.path.join(self.dir, "summary.md"), "w", encoding="utf-8") as fh:
@@ -123,7 +122,7 @@ def _md_cell(v) -> str:
     )
 
 
-def _summary_md(s: Dict) -> str:
+def _summary_md(s: dict) -> str:
     def g(k):
         return _md_cell(s.get(k, ""))
     lines = [

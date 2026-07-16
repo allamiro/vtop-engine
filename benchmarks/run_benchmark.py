@@ -19,7 +19,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from lib import engine, metrics, seed  # noqa: E402
+from lib import engine, seed  # noqa: E402
 from lib.metrics import ResultsWriter, iso_now, new_run_id, percentile  # noqa: E402
 from lib.scenario import load_scenario  # noqa: E402
 from lib.sysmon import SystemMonitor  # noqa: E402
@@ -277,8 +277,12 @@ def _sys_summary(result_dir):
                 nrx.append(float(r.get("network_rx_mb") or 0))
     except FileNotFoundError:
         pass
-    avg = lambda xs: round(sum(xs) / len(xs), 2) if xs else 0
-    mx = lambda xs: round(max(xs), 2) if xs else 0
+    def avg(xs):
+        return round(sum(xs) / len(xs), 2) if xs else 0
+
+    def mx(xs):
+        return round(max(xs), 2) if xs else 0
+
     return {
         "cpu_avg_percent": avg(cpu), "cpu_max_percent": mx(cpu),
         "memory_avg_mb": avg(mem), "memory_max_mb": mx(mem),

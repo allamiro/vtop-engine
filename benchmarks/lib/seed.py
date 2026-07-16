@@ -10,10 +10,10 @@ import json
 import os
 import random
 import string
-from typing import Callable, Dict, List, Tuple
+from collections.abc import Callable
 
 # Size classes in bytes (min, max).
-SIZE_CLASSES: Dict[str, Tuple[int, int]] = {
+SIZE_CLASSES: dict[str, tuple[int, int]] = {
     "small": (1 * 1024, 64 * 1024),
     "medium": (1 * 1024 * 1024, 10 * 1024 * 1024),
     "large": (100 * 1024 * 1024, 1024 * 1024 * 1024),
@@ -33,8 +33,11 @@ def _ip() -> str:
 
 
 def _ts() -> str:
-    return "2026-06-18T%02d:%02d:%02dZ" % (
-        random.randint(0, 23), random.randint(0, 59), random.randint(0, 59))
+    return (
+        f"2026-06-18T{random.randint(0, 23):02d}"
+        f":{random.randint(0, 59):02d}"
+        f":{random.randint(0, 59):02d}Z"
+    )
 
 
 def line_jsonl() -> str:
@@ -73,7 +76,7 @@ def line_syslog() -> str:
             f"event={random.choice(EVENTS)} user={random.choice(USERS)} src={_ip()} outcome={random.choice(OUTCOMES)}")
 
 
-LINE_GENERATORS: Dict[str, Callable[[], str]] = {
+LINE_GENERATORS: dict[str, Callable[[], str]] = {
     "jsonl": line_jsonl, "json": line_jsonl, "csv": line_csv, "txt": line_txt,
     "log": line_txt, "cef": line_cef, "leef": line_leef, "syslog": line_syslog,
 }
@@ -86,7 +89,7 @@ def _ext(fmt: str) -> str:
 
 
 def _write_text_file(path: str, target_bytes: int, fmt: str) -> int:
-    gens: List[Callable[[], str]]
+    gens: list[Callable[[], str]]
     if fmt == "mixed":
         gens = [line_jsonl, line_csv, line_txt, line_cef, line_leef, line_syslog]
     else:
@@ -125,7 +128,7 @@ def _pick_size(size_class: str) -> int:
 
 
 def generate_dataset(out_dir: str, fmt: str, volume: int, size_class: str,
-                     seed: int = 0) -> Dict[str, int]:
+                     seed: int = 0) -> dict[str, int]:
     """Generate `volume` files into `out_dir`. Returns totals.
 
     `seed`: pass a NON-ZERO value for reproducible data (same bytes every run);

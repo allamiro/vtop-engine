@@ -8,7 +8,6 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-from typing import Dict, List, Optional, Tuple
 
 
 def repo_root() -> str:
@@ -80,7 +79,7 @@ def write_engine_config(scenario, work_dir: str, state_db: str,
     return config_path
 
 
-def _backend_env(scenario) -> Dict[str, str]:
+def _backend_env(scenario) -> dict[str, str]:
     env = dict(os.environ)
     if scenario.get("backend") == "minio":
         env.setdefault("AWS_ACCESS_KEY_ID", "minioadmin")
@@ -94,12 +93,12 @@ def _backend_env(scenario) -> Dict[str, str]:
 
 
 def process_once(binary: str, config_path: str, scenario,
-                 source: str = "file") -> Tuple[int, List[dict], str]:
+                 source: str = "file") -> tuple[int, list[dict], str]:
     """Run `vtopctl process-once --json` and parse the batch outcomes."""
     proc = subprocess.run(
         [binary, "--json", "process-once", "--source", source, "--config", config_path],
         capture_output=True, text=True, env=_backend_env(scenario))
-    outcomes: List[dict] = []
+    outcomes: list[dict] = []
     try:
         outcomes = json.loads(proc.stdout) if proc.stdout.strip() else []
     except json.JSONDecodeError:
@@ -107,7 +106,7 @@ def process_once(binary: str, config_path: str, scenario,
     return proc.returncode, outcomes, proc.stderr
 
 
-def replay(binary: str, config_path: str, scenario) -> Tuple[int, str]:
+def replay(binary: str, config_path: str, scenario) -> tuple[int, str]:
     proc = subprocess.run(
         [binary, "replay", "--config", config_path],
         capture_output=True, text=True, env=_backend_env(scenario))
