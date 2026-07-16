@@ -2,6 +2,7 @@
 name = "vtop-upload"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Pluggable S3-compatible upload backends for the VTOP Engine with integrity verification before source acknowledgment."
 

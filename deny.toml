@@ -1,0 +1,83 @@
+# cargo-deny configuration.
+#
+# Complements `cargo audit` (which only reports advisories) with three checks it
+# does not perform: license compliance, dependency bans, and source provenance.
+#
+# Run locally:  cargo deny check
+[graph]
+all-features = true
+
+# ---------------------------------------------------------------------------
+# Licenses
+# ---------------------------------------------------------------------------
+# Allow-list, not a deny-list: an unrecognised licence must fail the build so a
+# copyleft or non-commercial dependency cannot arrive unnoticed. Every entry
+# below was observed in the current tree (`cargo tree --format {l}`).
+[licenses]
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",   # unicode-ident and friends
+    "Unlicense",     # dual-licensed with MIT in practice
+    "Zlib",
+    "CC0-1.0",
+    "BSL-1.0",
+    "MPL-2.0",       # file-level copyleft only; no static-link obligation
+    "OpenSSL",       # ring's licence expression
+]
+confidence-threshold = 0.9
+
+# ---------------------------------------------------------------------------
+# Advisories
+# ---------------------------------------------------------------------------
+# `.cargo/audit.toml` is the SINGLE SOURCE OF TRUTH for advisory decisions and
+# carries the full justification for each entry; this list mirrors it so the two
+# tools cannot silently disagree. Any change must be made in BOTH, and each entry
+# re-evaluated when upstream ships a fix (docs/SECURITY_MODEL.md §11).
+[advisories]
+yanked = "warn"
+ignore = [
+    # rustls-webpki 0.101.x, pulled transitively by aws-smithy-http-client,
+    # whose `__rustls` feature hard-depends on the legacy
+    # hyper-rustls 0.24 -> rustls 0.21 -> rustls-webpki 0.101 stack. No feature
+    # flag or `cargo update` removes it; it needs an upstream SDK release.
+    # Re-check and remove on the next AWS SDK bump.
+    "RUSTSEC-2026-0098", # name constraints accepted for URI names
+    "RUSTSEC-2026-0099", # name constraints accepted for wildcard certs
+    "RUSTSEC-2026-0104", # reachable panic parsing a CRL
+    # NOTE: RUSTSEC-2023-0071 (rsa) is ignored in .cargo/audit.toml but is NOT
+    # listed here on purpose. cargo-audit reads Cargo.lock, so it sees `rsa`;
+    # cargo-deny builds a feature-aware graph and does not, because `rsa` is
+    # reachable only through sqlx's MySQL driver, which this project never
+    # enables. That difference is independent corroboration of the audit.toml
+    # justification: the crate is a lockfile entry that is never compiled.
+]
+
+# ---------------------------------------------------------------------------
+# Bans
+# ---------------------------------------------------------------------------
+[bans]
+multiple-versions = "warn"   # informational: a large async tree always has some
+# No allow-wildcard-paths exception is needed: the workspace's internal path
+# dependencies now carry explicit versions (see Cargo.toml), so nothing in the
+# graph is a wildcard and this rule applies without exception.
+wildcards = "deny"           # a wildcard version is unreviewable
+deny = [
+    # Unmaintained/superseded; also flagged by the advisory DB.
+    { name = "openssl", reason = "prefer rustls/native TLS via the aws-sdk and rdkafka features" },
+]
+
+# ---------------------------------------------------------------------------
+# Sources
+# ---------------------------------------------------------------------------
+# Everything must come from crates.io. A git or unknown-registry dependency in a
+# release artifact is a supply-chain risk and must be a deliberate decision.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

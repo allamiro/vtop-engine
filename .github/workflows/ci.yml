@@ -199,3 +199,92 @@ jobs:
         env:
           VTOP_TEST_KAFKA: localhost:9092
         run: cargo test -p vtop-cli --test integration_kafka_to_minio -- --ignored
+  # cargo-deny covers what cargo-audit does not: license compliance, dependency
+  # bans, and source provenance. Advisory decisions are mirrored from
+  # .cargo/audit.toml (the single source of truth) so the two cannot disagree.
+  deny:
+    name: supply-chain (cargo deny)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: cargo deny check
+
+  # The MSRV is a tested promise, not a number in a file: this builds on exactly
+  # the declared toolchain. The floor is set by the aws-sdk crates (rust-version
+  # 1.91.1), so lowering it means dropping or pinning those.
+  msrv:
+    name: msrv (build on declared rust-version)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: |
+          set -euo pipefail
+          v=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "declared MSRV: $v"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-msrv-${{ steps.msrv.outputs.version }}-${{ hashFiles('**/Cargo.lock') }}
+      - name: Install librdkafka build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake clang libssl-dev libsasl2-dev libcurl4-openssl-dev zlib1g-dev pkg-config
+      - run: cargo check --workspace --all-targets
+
+  # Coverage is reported, NOT gated: a threshold invites tests written to move a
+  # number. The summary makes gaps visible on each PR so they can be judged.
+  coverage:
+    name: coverage (report only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-coverage-${{ hashFiles('**/Cargo.lock') }}
+      - name: Install librdkafka build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake clang libssl-dev libsasl2-dev libcurl4-openssl-dev zlib1g-dev pkg-config
+      # Run the instrumented suite ONCE and reuse its output. Calling
+      # cargo llvm-cov again just to format the summary would recompile and
+      # re-run every workspace test for no new information.
+      - name: Collect coverage
+        run: |
+          cargo llvm-cov --workspace --summary-only \
+            --ignore-filename-regex '(tests?/|benchmarks/)' | tee /tmp/coverage.txt
+      - name: Publish summary
+        if: always()
+        run: |
+          {
+            echo '## Coverage'
+            echo '```'
+            tail -25 /tmp/coverage.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
