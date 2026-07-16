@@ -85,3 +85,24 @@ jobs:
       # still printed in the log as "ignored".
       - name: Audit dependencies
         run: cargo audit
+
+  # The lab shell scripts have already produced real defects (broken pick()
+  # array indexing, a port off-by-one, and PARTITIONS=0 passing validation only
+  # to fail Kafka topic creation silently), so they are linted and tested like
+  # any other code.
+  shell:
+    name: shellcheck + bats
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck
+        run: |
+          docker run --rm -v "$PWD:/mnt" -w /mnt \
+            koalaman/shellcheck:stable docker/*.sh
+
+      - name: bats
+        run: |
+          docker run --rm -v "$PWD:/code" -w /code \
+            bats/bats:latest docker/tests/
