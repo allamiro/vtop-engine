@@ -97,12 +97,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Pinned to reviewed versions rather than the mutable `stable`/`latest`
+      # tags, so a tool update cannot change CI results without a commit.
+      # Dependabot's docker ecosystem does not scan workflow `docker run` lines,
+      # so these are bumped deliberately.
       - name: shellcheck
         run: |
           docker run --rm -v "$PWD:/mnt" -w /mnt \
-            koalaman/shellcheck:stable docker/*.sh
+            koalaman/shellcheck:v0.11.0 docker/*.sh
 
       - name: bats
         run: |
           docker run --rm -v "$PWD:/code" -w /code \
-            bats/bats:latest docker/tests/
+            bats/bats:1.13.0 docker/tests/

@@ -34,10 +34,16 @@ setup() {
     # LEEF is deliberately emitted syslog-framed (<pri> ts host LEEF:1.0|...),
     # which is what real collectors send and what the engine's syslog-wrapped
     # LEEF detection expects. Assert both halves of that contract.
+    #
+    # The pattern lives in a variable: inside [[ =~ ]] a bare `<` is a parse
+    # error, and escaping it as `\<` is implementation-defined (literal under
+    # musl, a word-boundary assertion under GNU regex). A quoted variable is
+    # unambiguous on both.
+    local re='^<[0-9]+>'
     run bash "$SEED" leef 5
     [ "$status" -eq 0 ]
     for l in "${lines[@]}"; do
-        [[ "$l" =~ ^\<[0-9]+\> ]]
+        [[ "$l" =~ $re ]]
         [[ "$l" == *"LEEF:1.0|"* ]]
     done
 }
@@ -56,10 +62,12 @@ setup() {
 }
 
 @test "syslog output starts with a priority value" {
+    # See the LEEF test above for why the pattern is held in a variable.
+    local re='^<[0-9]+>'
     run bash "$SEED" syslog 5
     [ "$status" -eq 0 ]
     for l in "${lines[@]}"; do
-        [[ "$l" =~ ^\<[0-9]+\> ]]
+        [[ "$l" =~ $re ]]
     done
 }
 
