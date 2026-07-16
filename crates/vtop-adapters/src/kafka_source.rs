@@ -184,10 +184,22 @@ impl SourceAdapter for KafkaSource {
         for &p in &partitions {
             let cur = self.cursors.entry((topic.clone(), p)).or_default();
             let off = match cur.last_read_offset {
+                // Continue from our in-session read head.
                 Some(lr) => Offset::Offset(lr + 1),
                 None => match cur.committed_offset {
+                    // Resume from a position we committed this session.
                     Some(c) => Offset::Offset(c),
-                    None => Offset::Beginning,
+                    // Nothing in memory (fresh process / first read for this
+                    // partition): resolve the GROUP'S COMMITTED offset from the
+                    // broker, falling back to `auto.offset.reset` when the group
+                    // has never committed.
+                    //
+                    // This must not be Offset::Beginning: subscribe() used to
+                    // resume from the committed offset implicitly, and assign()
+                    // does not. Starting at Beginning would make every engine
+                    // restart re-read the topic from the start and re-archive
+                    // already-committed records.
+                    None => Offset::Stored,
                 },
             };
             tpl.add_partition_offset(&topic, p, off)

@@ -110,3 +110,92 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/code" -w /code \
             bats/bats:1.13.0 docker/tests/
+
+  # Kafka was entirely untested in CI, which is how a P0 shipped: every read
+  # returned zero records (a subscribe() per read forced a rebalance that
+  # reseeked to earliest and ate the poll window), so no batch ever sealed - and
+  # CI stayed green because nothing here talked to a broker.
+  #
+  # The broker advertises localhost so the host-run test connects over the mapped
+  # port without an /etc/hosts entry.
+  kafka-integration:
+    name: kafka integration (live broker)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      kafka:
+        image: apache/kafka:4.3.1
+        ports:
+          - 9092:9092
+        env:
+          KAFKA_NODE_ID: 1
+          KAFKA_PROCESS_ROLES: broker,controller
+          KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+          KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+          KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+          KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+        options: >-
+          --health-cmd "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 12
+          --health-start-period 20s
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-kafka-it-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install librdkafka build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake clang libssl-dev libsasl2-dev libcurl4-openssl-dev zlib1g-dev pkg-config
+
+      # Seed a topic with real records. The tests assert a NON-EMPTY read, so an
+      # empty topic would make them fail rather than pass vacuously.
+      - name: Seed the it_events topic
+        run: |
+          set -euo pipefail
+          cid=$(docker ps --filter "ancestor=apache/kafka:4.3.1" --format '{{.ID}}' | head -1)
+          docker exec "$cid" /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+            --create --if-not-exists --topic it_events --partitions 1 --replication-factor 1
+          bash docker/seed-events.sh cef 40 \
+            | docker exec -i "$cid" /opt/kafka/bin/kafka-console-producer.sh \
+                --bootstrap-server localhost:9092 --topic it_events
+          docker exec "$cid" /opt/kafka/bin/kafka-get-offsets.sh \
+            --bootstrap-server localhost:9092 --topic it_events
+
+          # Warm up the group coordinator before the tests run. The adapter
+          # assigns Offset::Stored, which asks the broker for the consumer
+          # group's committed offsets; that needs the group coordinator and the
+          # __consumer_offsets topic, which a FRESH broker creates only lazily on
+          # the first group operation. Until it exists, consumers get
+          # "NotCoordinator" and every read fails. Consuming once under a
+          # throwaway group forces it into existence.
+          #
+          # This is why the job failed on its first run but passed locally: a
+          # long-lived local broker already had __consumer_offsets.
+          docker exec "$cid" /opt/kafka/bin/kafka-console-consumer.sh \
+            --bootstrap-server localhost:9092 --topic it_events \
+            --group ci-warmup --from-beginning --max-messages 1 --timeout-ms 30000
+          docker exec "$cid" /opt/kafka/bin/kafka-consumer-groups.sh \
+            --bootstrap-server localhost:9092 --list
+
+      - name: Run live-broker integration tests
+        env:
+          VTOP_TEST_KAFKA: localhost:9092
+        run: cargo test -p vtop-cli --test integration_kafka_to_minio -- --ignored
