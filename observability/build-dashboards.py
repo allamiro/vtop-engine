@@ -299,11 +299,11 @@ logs = dashboard(
               logql(f'{{service="vtop-engine", event=~"source_committed|object_uploaded"}} | json'),
               LOKI, kind="logs",
               extra={"options": {"showTime": True, "wrapLogMessage": True, "sortOrder": "Descending"}},
-              desc="The high-cardinality detail metrics deliberately omit. Two "
-                   "correlated events per batch_id: object_uploaded carries the "
-                   "object `uri` (where it landed); source_committed marks the "
-                   "commit that only happens after VERIFIED. The audit trail "
-                   "behind the committed-count stat."),
+              desc="The high-cardinality detail metrics deliberately omit — batch "
+                   "ids and object URIs. Two correlated events per batch_id: "
+                   "object_uploaded carries the object `uri` (where it landed); "
+                   "source_committed marks the commit that only happens after "
+                   "VERIFIED. The audit trail behind the committed-count stat."),
         row("All components", 17),
         panel("All lab logs", {"h": 10, "w": 24, "x": 0, "y": 18},
               logql('{job="docker"}'),
