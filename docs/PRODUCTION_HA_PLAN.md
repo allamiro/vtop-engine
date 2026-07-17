@@ -520,15 +520,15 @@ roadmap detail (dependencies, test plans, rollback) is in §12.
   **after** VERIFIED but before source commit → safe; duplicate-object behavior
   measured and documented.
 
-### Phase 1 — Extract the `StateStore` trait
+### Phase 1 — Extract the `StateStore` trait  ✅ DONE
 - Trait + SQLite impl; engine holds `Box<dyn StateStore>`; scheme factory (SQLite).
 - **Exit:** all existing tests pass; behavior identical; `sqlite://` works.
 
-### Phase 2 — Centralize invariant + shared test battery
+### Phase 2 — Centralize invariant + shared test battery  ✅ DONE
 - Move verify-before-commit guard into `vtop-core`; backend-agnostic test battery.
 - **Exit:** one invariant implementation; battery green on SQLite.
 
-### Phase 3 — Postgres backend + DB constraints (`--features postgres`)
+### Phase 3 — Postgres backend + DB constraints (`--features postgres`)  ✅ DONE
 - `PgStateStore` (PgPool, `$N`, Postgres DDL); **schema constraints from §5.5**;
   **retry-on-`40001`**; run the battery against Postgres.
 - **Exit:** identical behavior SQLite/Postgres; `postgres://` selectable; DB

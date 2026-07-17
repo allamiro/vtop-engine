@@ -26,10 +26,17 @@ use vtop_core::state_machine::BatchState;
 ///   `postgres` feature; an unhelpful build without it returns a clear error)
 pub async fn connect_state_store(conn_str: &str) -> Result<Box<dyn StateStore>, VtopError> {
     if conn_str.starts_with("postgres://") || conn_str.starts_with("postgresql://") {
-        return Err(VtopError::State(
-            "postgres:// state store requires a build with --features postgres (Phase 3)"
-                .to_string(),
-        ));
+        #[cfg(feature = "postgres")]
+        {
+            let store = crate::pg_store::PgStateStore::connect(conn_str).await?;
+            return Ok(Box::new(store));
+        }
+        #[cfg(not(feature = "postgres"))]
+        {
+            return Err(VtopError::State(
+                "postgres:// state store requires a build with --features postgres".to_string(),
+            ));
+        }
     }
     // Everything else is treated as SQLite (including a bare filesystem path),
     // matching the existing single-node default.
@@ -107,11 +114,15 @@ mod tests {
         assert!(path.exists(), "the db file should have been created");
     }
 
+    // Only meaningful WITHOUT the postgres feature: with it, a postgres:// URI
+    // is dispatched to PgStateStore and tries to connect (covered by the pg
+    // battery instead), so this would no longer see the "needs feature" error.
+    #[cfg(not(feature = "postgres"))]
     #[tokio::test]
     async fn factory_rejects_postgres_without_the_feature() {
-        // Until Phase 3 ships the postgres feature, a postgres:// URI must fail
-        // with a clear, actionable error rather than being silently treated as
-        // a SQLite path named "postgres:" (which would create a junk file).
+        // Without the postgres feature, a postgres:// URI must fail with a clear,
+        // actionable error rather than being silently treated as a SQLite path
+        // named "postgres:" (which would create a junk file).
         for conn in [
             "postgres://vtop@pg:5432/vtop",
             "postgresql://vtop@pg:5432/vtop",

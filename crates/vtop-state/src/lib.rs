@@ -7,6 +7,8 @@
 //! depends only on the trait.
 
 pub mod models;
+#[cfg(feature = "postgres")]
+pub mod pg_store;
 pub mod sqlite_store;
 pub mod store;
 
@@ -17,5 +19,7 @@ pub mod store;
 pub mod test_battery;
 
 pub use models::{BatchPatch, BatchRecord};
+#[cfg(feature = "postgres")]
+pub use pg_store::PgStateStore;
 pub use sqlite_store::SqliteStateStore;
 pub use store::{connect_state_store, StateStore};
