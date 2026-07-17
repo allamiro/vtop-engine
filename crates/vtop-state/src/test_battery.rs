@@ -110,16 +110,42 @@ async fn rejects_commit_before_verified(store: &dyn StateStore) {
         .save_batch_state(&sample_record("early-1"))
         .await
         .unwrap();
-    // Batching -> SourceCommitted is the invariant violation the whole protocol
-    // exists to prevent; the store MUST refuse it.
-    let err = store.mark_source_committed("early-1").await.unwrap_err();
-    assert!(
-        matches!(err, VtopError::CommitBeforeVerified { .. }),
-        "expected CommitBeforeVerified, got {err:?}"
+    let p = BatchPatch::default();
+    // SOURCE_COMMITTED is reachable ONLY from VERIFIED, so commit must be refused
+    // from EVERY state that precedes it - not just the initial one. A backend
+    // that guards Batching but slips on, say, ManifestUploaded would still be a
+    // data-loss bug. Walk through each pre-verified state and assert refusal at
+    // each, confirming the state is left unchanged.
+    let pre_verified = [
+        BatchState::Batching, // the initial state (no advance needed)
+        BatchState::Sealed,
+        BatchState::Compressed,
+        BatchState::Checksummed,
+        BatchState::ObjectUploaded,
+        BatchState::ManifestUploaded,
+    ];
+    for st in pre_verified {
+        if st != BatchState::Batching {
+            store.update_batch_state("early-1", st, &p).await.unwrap();
+        }
+        let err = store.mark_source_committed("early-1").await.unwrap_err();
+        assert!(
+            matches!(err, VtopError::CommitBeforeVerified { .. }),
+            "commit must be refused from {st:?}, got {err:?}"
+        );
+        let cur = store.get_batch("early-1").await.unwrap().unwrap().state;
+        assert_eq!(cur, st, "a rejected commit must leave the state unchanged");
+    }
+    // From VERIFIED - and only from VERIFIED - the commit is finally allowed.
+    store
+        .update_batch_state("early-1", BatchState::Verified, &p)
+        .await
+        .unwrap();
+    store.mark_source_committed("early-1").await.unwrap();
+    assert_eq!(
+        store.get_batch("early-1").await.unwrap().unwrap().state,
+        BatchState::SourceCommitted
     );
-    // And the state must be unchanged by the rejected transition.
-    let got = store.get_batch("early-1").await.unwrap().unwrap();
-    assert_eq!(got.state, BatchState::Batching);
 }
 
 async fn full_legal_walk_commits(store: &dyn StateStore) {
