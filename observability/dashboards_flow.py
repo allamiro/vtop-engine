@@ -38,6 +38,10 @@ TARGETS = [
                  'and (sum(rate(vtop_stage_duration_seconds_bucket[5m])) > 0) or vector(0)'),
     ("recs",     'sum(rate(vtop_records_total[1m])) or vector(0)'),
     ("commits",  'sum(vtop_commits_total) or vector(0)'),
+    # commit THROUGHPUT for the verify connector animation (the cumulative
+    # commits counter above is for the label; driving an animation from it
+    # would never go quiet and its speed would grow with process lifetime).
+    ("commits_rate", 'sum(rate(vtop_commits_total[1m])) or vector(0)'),
     ("failed",   'sum(increase(vtop_failed_total[1h])) or vector(0)'),
     ("lag",      'sum(kafka_consumergroup_lag{consumergroup="vtop-engine"}) or vector(0)'),
     ("inflight", 'vtop_inflight_batches or vector(0)'),

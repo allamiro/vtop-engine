@@ -18,10 +18,10 @@ cells:
   # ---- SOURCES -> ENGINE ----
   flow-msgin:
     dataRef: "msgin"
-    label: {separator: "space", units: "none", decimalPoints: 0}
+    label: {separator: "replace", units: "none", decimalPoints: 0}
   flow-bytesin:
     dataRef: "bytesin"
-    label: {separator: "space", units: "none", decimalPoints: 0}
+    label: {separator: "replace", units: "none", decimalPoints: 0}
   flow-conn-in:
     dataRef: "bytesin"
     flowAnimation: *flow
@@ -29,10 +29,10 @@ cells:
   # ---- ENGINE ----
   flow-ratio:
     dataRef: "ratio"
-    label: {separator: "space", units: "none", decimalPoints: 1}
+    label: {separator: "replace", units: "none", decimalPoints: 1}
   flow-p95:
     dataRef: "p95"
-    label: {separator: "space", units: "s", decimalPoints: 3}
+    label: {separator: "replace", units: "s", decimalPoints: 3}
     labelColor:
       thresholds:
         - {color: "green",  level: 0}
@@ -40,12 +40,12 @@ cells:
         - {color: "red",    level: 0.2}
   flow-recs:
     dataRef: "recs"
-    label: {separator: "space", units: "none", decimalPoints: 0}
+    label: {separator: "replace", units: "none", decimalPoints: 0}
 
   # ---- ENGINE -> OBJECT STORAGE ----
   flow-bytesout:
     dataRef: "bytesout"
-    label: {separator: "space", units: "none", decimalPoints: 0}
+    label: {separator: "replace", units: "none", decimalPoints: 0}
   flow-conn-out:
     dataRef: "bytesout"
     flowAnimation: *flow
@@ -53,10 +53,10 @@ cells:
   # ---- VERIFY / COMMIT (the invariant) ----
   flow-commits:
     dataRef: "commits"
-    label: {separator: "space", units: "none", decimalPoints: 0}
+    label: {separator: "replace", units: "none", decimalPoints: 0}
   flow-failed:
     dataRef: "failed"
-    label: {separator: "space", units: "none", decimalPoints: 0}
+    label: {separator: "replace", units: "none", decimalPoints: 0}
     labelColor:
       thresholds:
         - {color: "green", level: 0}
@@ -69,7 +69,10 @@ cells:
         - {color: "#12331e", level: 0}
         - {color: "#3a1410", level: 1}
   flow-conn-verify:
-    dataRef: "commits"
+    # commit THROUGHPUT (per-sec), not the cumulative counter: a cumulative
+    # total keeps the connector animated forever and its speed would grow with
+    # process lifetime. commits_rate goes quiet when nothing is committing.
+    dataRef: "commits_rate"
     flowAnimation: *flow
 
   # ---- READ-BACK + STATE STORE ----
@@ -78,7 +81,7 @@ cells:
     flowAnimation: *flow
   flow-lag:
     dataRef: "lag"
-    label: {separator: "space", units: "none", decimalPoints: 0}
+    label: {separator: "replace", units: "none", decimalPoints: 0}
     labelColor:
       thresholds:
         - {color: "green",  level: 0}
@@ -86,4 +89,4 @@ cells:
         - {color: "red",    level: 10000}
   flow-inflight:
     dataRef: "inflight"
-    label: {separator: "space", units: "none", decimalPoints: 0}
+    label: {separator: "replace", units: "none", decimalPoints: 0}
