@@ -19,9 +19,11 @@ See PIPELINE_DIAGRAM.md for the ASCII design this renders.
 MIMIR = {"type": "prometheus", "uid": "mimir"}
 
 # Logos are mounted into Grafana's public path (see docker-compose.observability.yml)
-# so the icons resolve offline, not from a CDN.
+# so the icons resolve offline, not from a CDN. The path MUST be server-root
+# absolute (leading "/"): a relative "public/..." resolves against the dashboard
+# URL (/d/<uid>/public/...) and 404s, so no icon renders.
 def _logo(name):
-    return f"public/img/vtop/{name}.svg"
+    return f"/public/img/vtop/{name}.svg"
 
 
 # --- Canvas element builders ------------------------------------------------

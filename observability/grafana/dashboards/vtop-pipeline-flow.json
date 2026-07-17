@@ -206,7 +206,7 @@
               "name": "kafka-logo",
               "config": {
                 "path": {
-                  "fixed": "public/img/vtop/apachekafka.svg"
+                  "fixed": "/public/img/vtop/apachekafka.svg"
                 },
                 "fill": {
                   "fixed": "#ffffff00"
@@ -446,7 +446,7 @@
               "name": "rust-logo",
               "config": {
                 "path": {
-                  "fixed": "public/img/vtop/rust.svg"
+                  "fixed": "/public/img/vtop/rust.svg"
                 },
                 "fill": {
                   "fixed": "#ffffff00"
@@ -742,7 +742,7 @@
               "name": "minio-logo",
               "config": {
                 "path": {
-                  "fixed": "public/img/vtop/minio.svg"
+                  "fixed": "/public/img/vtop/minio.svg"
                 },
                 "fill": {
                   "fixed": "#ffffff00"
@@ -1039,7 +1039,7 @@
               "name": "sqlite-logo",
               "config": {
                 "path": {
-                  "fixed": "public/img/vtop/sqlite.svg"
+                  "fixed": "/public/img/vtop/sqlite.svg"
                 },
                 "fill": {
                   "fixed": "#ffffff00"
