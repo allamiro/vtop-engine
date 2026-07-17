@@ -48,14 +48,20 @@ loki.source.docker "containers" {
   forward_to = [loki.process.vtop.receiver]
 }
 
-// The engine logs `key=value` structured events on stderr, e.g.
-//   INFO vtop_cli::engine: batch_metrics batch_id="..." records=200 total_ms=20
-// Extract the event name into a label so LogQL can count by event cheaply. The
-// high-cardinality fields (batch_id, uris) are deliberately NOT promoted to
-// labels — that would explode Loki's index.
+// The engine emits structured JSON logs on stderr (VTOP_LOG_FORMAT=json), e.g.
+//   {"level":"INFO","fields":{"message":"batch_metrics","records":200,...}}
+// Promote the level and the event name (the tracing message) to labels so LogQL
+// can filter and count by them cheaply. Both are bounded sets. The high-
+// cardinality fields (batch_id, object URIs) are deliberately NOT promoted —
+// that would explode Loki's index; they stay queryable via `| json` at read
+// time. Non-JSON container logs (kafka, minio, ...) simply don't match the JSON
+// stage and pass through unlabelled.
 loki.process "vtop" {
-  stage.regex {
-    expression = "(?P<level>INFO|WARN|ERROR|DEBUG)\\s+(?P<module>[\\w:]+):\\s+(?P<event>[a-z_]+)"
+  stage.json {
+    expressions = {
+      level = "level",
+      event = "fields.message",
+    }
   }
   stage.labels {
     values = {

@@ -859,7 +859,7 @@
             "type": "loki",
             "uid": "loki"
           },
-          "expr": "{service=\"vtop-engine\"} | level=~\"WARN|ERROR\"",
+          "expr": "{service=\"vtop-engine\"} | json | level=~\"WARN|ERROR\"",
           "queryType": "range"
         }
       ],
