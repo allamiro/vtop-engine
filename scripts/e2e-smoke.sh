@@ -53,6 +53,12 @@ info "1/6  Starting from a clean slate"
 "${COMPOSE[@]}" down -v >/dev/null 2>&1 || true
 rm -rf data/state data/work data/input data/spool
 mkdir -p data/state data/work data/input data/spool
+# The engine runs as uid 10001 (see docker/Dockerfile) and its entrypoint refuses
+# to start on a non-writable volume. Directories created here are owned by the
+# invoking user - uid 1001 on a GitHub runner - so the container cannot write to
+# them. Docker Desktop on macOS masks this by remapping ownership, which is why
+# this passed locally and failed in CI on the first run.
+chmod -R 0777 data
 
 # Seed the file and syslog sources BEFORE start-up so the first cycle sees them.
 bash docker/seed-events.sh json   200 > data/input/smoke.log
