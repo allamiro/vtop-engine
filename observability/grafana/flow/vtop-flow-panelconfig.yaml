@@ -1,0 +1,103 @@
+---
+
+# Flow panel config for the VTOP telemetry pipeline SVG.
+# Cell ids in the SVG are authored directly as flow-*, so there is no draw.io
+# "cell-" preamble to strip.
+cellIdPreamble: ""
+gradientMode: "hue"
+
+anchorLinks:
+  # Byte-rate connectors (bytes/sec in the hundreds..thousands). Off below
+  # 1 B/s (idle), fastest by a few KB/s.
+  - flowAnimation: &flow-bytes
+      thresholdOffValue: 1
+      thresholdLwrValue: 100
+      thresholdLwrDurationSecs: 1.5
+      thresholdUprValue: 5000
+      thresholdUprDurationSecs: 0.2
+  # Event-rate connectors (records/sec, commits/sec — often well below 1/s).
+  # Off ONLY when truly idle (rate <= 0), so a low but non-zero commit rate
+  # still animates; fastest around 50/s.
+  - flowAnimation: &flow-rate
+      thresholdOffValue: 0
+      thresholdLwrValue: 0.1
+      thresholdLwrDurationSecs: 2
+      thresholdUprValue: 50
+      thresholdUprDurationSecs: 0.3
+
+cells:
+  # ---- SOURCES -> ENGINE ----
+  flow-msgin:
+    dataRef: "msgin"
+    label: {separator: "replace", units: "none", decimalPoints: 0}
+  flow-bytesin:
+    dataRef: "bytesin"
+    label: {separator: "replace", units: "none", decimalPoints: 0}
+  flow-conn-in:
+    dataRef: "bytesin"
+    flowAnimation: *flow-bytes
+
+  # ---- ENGINE ----
+  flow-ratio:
+    dataRef: "ratio"
+    label: {separator: "replace", units: "none", decimalPoints: 1}
+  flow-p95:
+    dataRef: "p95"
+    label: {separator: "replace", units: "s", decimalPoints: 3}
+    labelColor:
+      thresholds:
+        - {color: "green",  level: 0}
+        - {color: "orange", level: 0.05}
+        - {color: "red",    level: 0.2}
+  flow-recs:
+    dataRef: "recs"
+    label: {separator: "replace", units: "none", decimalPoints: 0}
+
+  # ---- ENGINE -> OBJECT STORAGE ----
+  flow-bytesout:
+    dataRef: "bytesout"
+    label: {separator: "replace", units: "none", decimalPoints: 0}
+  flow-conn-out:
+    dataRef: "bytesout"
+    flowAnimation: *flow-bytes
+
+  # ---- VERIFY / COMMIT (the invariant) ----
+  flow-commits:
+    dataRef: "commits"
+    label: {separator: "replace", units: "none", decimalPoints: 0}
+  flow-failed:
+    dataRef: "failed"
+    label: {separator: "replace", units: "none", decimalPoints: 0}
+    labelColor:
+      thresholds:
+        - {color: "green", level: 0}
+        - {color: "red",   level: 1}
+  flow-verifybox:
+    # box turns red the moment a batch fails, green while failed == 0
+    dataRef: "failed"
+    fillColor:
+      thresholds:
+        - {color: "#12331e", level: 0}
+        - {color: "#3a1410", level: 1}
+  flow-conn-verify:
+    # commit THROUGHPUT (per-sec), not the cumulative counter: a cumulative
+    # total keeps the connector animated forever and its speed would grow with
+    # process lifetime. commits_rate goes quiet when nothing is committing.
+    dataRef: "commits_rate"
+    flowAnimation: *flow-rate
+
+  # ---- READ-BACK + STATE STORE ----
+  flow-conn-back:
+    dataRef: "recs"
+    flowAnimation: *flow-rate
+  flow-lag:
+    dataRef: "lag"
+    label: {separator: "replace", units: "none", decimalPoints: 0}
+    labelColor:
+      thresholds:
+        - {color: "green",  level: 0}
+        - {color: "orange", level: 1000}
+        - {color: "red",    level: 10000}
+  flow-inflight:
+    dataRef: "inflight"
+    label: {separator: "replace", units: "none", decimalPoints: 0}

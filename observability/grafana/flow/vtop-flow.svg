@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="440" viewBox="0 0 920 440" font-family="Helvetica, Arial, sans-serif">
+  <!-- VTOP telemetry pipeline, authored for the andrewbmchugh Flow panel.
+       Driven cells use id="flow-*" and cellIdPreamble:"" in the panelConfig.
+       Each driven number is a <text> the plugin overwrites with the live value;
+       the static <text> captions beside them are plain SVG. Connectors carry a
+       native dash-flow animation so the pipeline always reads as "flowing", and
+       the panelConfig also wires flowAnimation so the plugin drives their speed. -->
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#5b9bd5"/>
+    </marker>
+    <style>
+      .cap   { fill:#9aa0a6; font-size:11px; }
+      .title { font-size:14px; font-weight:bold; }
+      .val   { font-size:18px; font-weight:bold; fill:#d8d9da; }
+      .box   { fill:#1b1b1f; stroke:#ffffff30; stroke-width:1; rx:8; }
+      .flow  { stroke:#5b9bd5; stroke-width:4; fill:none; stroke-dasharray:10 8;
+               marker-end:url(#arrow); animation:dash 1s linear infinite; }
+      @keyframes dash { to { stroke-dashoffset:-18; } }
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="920" height="440" fill="#0f0f12"/>
+
+  <!-- ================= SOURCES ================= -->
+  <rect class="box" x="20" y="70" width="180" height="210"/>
+  <text class="title" x="110" y="94" text-anchor="middle" fill="#8ab4f8">SOURCES</text>
+  <text x="110" y="122" text-anchor="middle" fill="#e8e8e8" font-size="13">Kafka</text>
+  <text x="110" y="144" text-anchor="middle" fill="#9aa0a6" font-size="12">Files &#183; Syslog</text>
+  <text class="cap" x="110" y="180" text-anchor="middle">messages / sec</text>
+  <g id="flow-msgin"><text class="val" x="110" y="202" text-anchor="middle" fill="#8ab4f8">0</text></g>
+  <text class="cap" x="110" y="234" text-anchor="middle">bytes / sec in</text>
+  <g id="flow-bytesin"><text class="val" x="110" y="256" text-anchor="middle" fill="#8ab4f8">0</text></g>
+
+  <!-- connector SOURCES -> ENGINE -->
+  <g id="flow-conn-in"><path class="flow" d="M 205 175 L 320 175"/></g>
+
+  <!-- ================= ENGINE ================= -->
+  <rect class="box" x="325" y="50" width="270" height="230" stroke="#73bf6955"/>
+  <text class="title" x="460" y="74" text-anchor="middle" fill="#73bf69">VTOP ENGINE</text>
+  <text x="460" y="98" text-anchor="middle" fill="#c8c8c8" font-size="11">seal &#8594; compress &#8594; checksum &#8594; upload</text>
+  <text x="460" y="118" text-anchor="middle" fill="#8a8f96" font-size="11">verify before commit</text>
+  <text class="cap" x="395" y="158" text-anchor="middle">compression</text>
+  <g id="flow-ratio"><text class="val" x="395" y="182" text-anchor="middle" fill="#73bf69">0</text></g>
+  <text class="cap" x="525" y="158" text-anchor="middle">stage p95</text>
+  <g id="flow-p95"><text class="val" x="525" y="182" text-anchor="middle" fill="#f2cc0c">0</text></g>
+  <text class="cap" x="460" y="224" text-anchor="middle">records / sec archived</text>
+  <g id="flow-recs"><text class="val" x="460" y="248" text-anchor="middle" fill="#73bf69">0</text></g>
+
+  <!-- connector ENGINE -> MINIO -->
+  <g id="flow-conn-out"><path class="flow" d="M 600 150 L 695 150" stroke="#f2a600"/></g>
+
+  <!-- ================= OBJECT STORAGE ================= -->
+  <rect class="box" x="700" y="70" width="200" height="170" stroke="#f2a60055"/>
+  <text class="title" x="800" y="94" text-anchor="middle" fill="#f2a600">OBJECT STORAGE</text>
+  <text x="800" y="118" text-anchor="middle" fill="#e8e8e8" font-size="13">MinIO / S3</text>
+  <text class="cap" x="800" y="152" text-anchor="middle">bytes / sec out</text>
+  <g id="flow-bytesout"><text class="val" x="800" y="176" text-anchor="middle" fill="#f2a600">0</text></g>
+  <text class="cap" x="800" y="208" text-anchor="middle">object + manifest</text>
+
+  <!-- connector ENGINE -> VERIFY (downward) -->
+  <g id="flow-conn-verify"><path class="flow" d="M 460 282 L 460 315" stroke="#73bf69"/></g>
+
+  <!-- ================= VERIFY / COMMIT ================= -->
+  <rect id="flow-verifybox" class="box" x="325" y="318" width="270" height="100" stroke="#73bf6955"/>
+  <text class="title" x="460" y="342" text-anchor="middle" fill="#73bf69">VERIFIED?  commit only if true</text>
+  <text class="cap" x="395" y="372" text-anchor="middle">commits</text>
+  <g id="flow-commits"><text class="val" x="395" y="398" text-anchor="middle" fill="#73bf69">0</text></g>
+  <text class="cap" x="525" y="372" text-anchor="middle">failed</text>
+  <g id="flow-failed"><text class="val" x="525" y="398" text-anchor="middle" fill="#e0533d">0</text></g>
+
+  <!-- connector MINIO -> STATESTORE (read-back + verify) -->
+  <g id="flow-conn-back"><path class="flow" d="M 800 242 L 800 300" stroke="#a78bfa"/></g>
+
+  <!-- ================= STATE STORE ================= -->
+  <rect class="box" x="700" y="300" width="200" height="120" stroke="#a78bfa55"/>
+  <text class="title" x="800" y="324" text-anchor="middle" fill="#a78bfa">STATE STORE</text>
+  <text x="800" y="346" text-anchor="middle" fill="#9aa0a6" font-size="11">SQLite &#183; source offsets</text>
+  <text class="cap" x="758" y="378" text-anchor="middle">kafka lag</text>
+  <g id="flow-lag"><text class="val" x="758" y="402" text-anchor="middle" fill="#f2cc0c">0</text></g>
+  <text class="cap" x="845" y="378" text-anchor="middle">in-flight</text>
+  <g id="flow-inflight"><text class="val" x="845" y="402" text-anchor="middle" fill="#a78bfa">0</text></g>
+</svg>
