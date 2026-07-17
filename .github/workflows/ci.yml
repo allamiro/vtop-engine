@@ -276,8 +276,9 @@ jobs:
       - run: cargo deny check
 
   # The MSRV is a tested promise, not a number in a file: this builds on exactly
-  # the declared toolchain. The floor is set by the aws-sdk crates (rust-version
-  # 1.91.1), so lowering it means dropping or pinning those.
+  # the declared toolchain. The floor is set by sqlx 0.9 (rust-version 1.94.0),
+  # which raised the aws-sdk crates' previous 1.91.1 floor; lowering it means
+  # pinning sqlx back to 0.8.
   msrv:
     name: msrv (build on declared rust-version)
     needs: changes
