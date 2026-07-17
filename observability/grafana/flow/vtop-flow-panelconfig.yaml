@@ -7,12 +7,23 @@ cellIdPreamble: ""
 gradientMode: "hue"
 
 anchorLinks:
-  - flowAnimation: &flow
+  # Byte-rate connectors (bytes/sec in the hundreds..thousands). Off below
+  # 1 B/s (idle), fastest by a few KB/s.
+  - flowAnimation: &flow-bytes
       thresholdOffValue: 1
       thresholdLwrValue: 100
       thresholdLwrDurationSecs: 1.5
       thresholdUprValue: 5000
       thresholdUprDurationSecs: 0.2
+  # Event-rate connectors (records/sec, commits/sec — often well below 1/s).
+  # Off ONLY when truly idle (rate <= 0), so a low but non-zero commit rate
+  # still animates; fastest around 50/s.
+  - flowAnimation: &flow-rate
+      thresholdOffValue: 0
+      thresholdLwrValue: 0.1
+      thresholdLwrDurationSecs: 2
+      thresholdUprValue: 50
+      thresholdUprDurationSecs: 0.3
 
 cells:
   # ---- SOURCES -> ENGINE ----
@@ -24,7 +35,7 @@ cells:
     label: {separator: "replace", units: "none", decimalPoints: 0}
   flow-conn-in:
     dataRef: "bytesin"
-    flowAnimation: *flow
+    flowAnimation: *flow-bytes
 
   # ---- ENGINE ----
   flow-ratio:
@@ -48,7 +59,7 @@ cells:
     label: {separator: "replace", units: "none", decimalPoints: 0}
   flow-conn-out:
     dataRef: "bytesout"
-    flowAnimation: *flow
+    flowAnimation: *flow-bytes
 
   # ---- VERIFY / COMMIT (the invariant) ----
   flow-commits:
@@ -73,12 +84,12 @@ cells:
     # total keeps the connector animated forever and its speed would grow with
     # process lifetime. commits_rate goes quiet when nothing is committing.
     dataRef: "commits_rate"
-    flowAnimation: *flow
+    flowAnimation: *flow-rate
 
   # ---- READ-BACK + STATE STORE ----
   flow-conn-back:
     dataRef: "recs"
-    flowAnimation: *flow
+    flowAnimation: *flow-rate
   flow-lag:
     dataRef: "lag"
     label: {separator: "replace", units: "none", decimalPoints: 0}

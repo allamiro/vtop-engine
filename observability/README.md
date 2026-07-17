@@ -31,7 +31,7 @@ Start with **VTOP Engine** — it is the only one about the thing that matters.
 | VTOP — Overview | One screen: is data flowing end to end? |
 | VTOP — Pipeline performance | Throughput, compression, per-stage latency. |
 | VTOP — Pipeline flow (live) | SCADA-style diagram of the whole path with live numbers on the arrows, built with the core **Canvas** panel. |
-| VTOP — Pipeline flow (draw.io) | The same path as a draw.io SVG driven by the **Flow** panel (`andrewbmchugh-flow-panel`) — the maintained, React successor to the AngularJS flowcharting plugin, which does not load on Grafana 11+. Auto-installed via `GF_INSTALL_PLUGINS`. |
+| VTOP — Pipeline flow (draw.io) | The same path as a draw.io SVG driven by the **Flow** panel (`andrewbmchugh-flow-panel`) — the maintained, React successor to the AngularJS flowcharting plugin (AngularJS is disabled by default in Grafana 11 and removed in Grafana 12+, so the old plugin will not load on the lab's Grafana 13). Auto-installed via `GF_INSTALL_PLUGINS`. |
 | VTOP — Kafka source | Consumer lag (the invariant seen from Kafka), topics. |
 | VTOP — Object storage | Objects/bytes stored, S3 request and error rates. |
 | VTOP — Logs | Raw structured events; where the high-cardinality detail lives. |

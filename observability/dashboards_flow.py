@@ -9,9 +9,9 @@ cell ids, and drive labels / colours / connector flow-animations from queries
 via a YAML panelConfig.
 
 Why this plugin and not agenty-flowcharting-panel: the older flowcharting plugin
-is AngularJS, which Grafana 11+ removed, so it does not load on Grafana 13. Flow
-is React, signed, and requires Grafana >= 10 — it is the maintained successor and
-renders on the lab's Grafana 13.1.
+is AngularJS, which Grafana 11 disables by default and Grafana 12+ removes
+entirely, so it does not load on the lab's Grafana 13. Flow is React, signed, and
+requires Grafana >= 10 — it is the maintained successor.
 
 The SVG and panelConfig live next to this file as editable source and are inlined
 into the dashboard JSON so the dashboard is self-contained (no external URLs to
