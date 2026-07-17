@@ -237,7 +237,7 @@ engine = dash(
                     "panel beside this one. (No $format filter: a read fails "
                     "before the format is known.)"),
         _panel("Recent engine warnings and errors", {"h": 7, "w": 12, "x": 12, "y": 41},
-               [{"datasource": LOKI, "expr": '{service="vtop-engine"} | level=~"WARN|ERROR"', "queryType": "range"}],
+               [{"datasource": LOKI, "expr": '{service="vtop-engine"} | json | level=~"WARN|ERROR"', "queryType": "range"}],
                ds=LOKI, kind="logs",
                extra={"options": {"showTime": True, "wrapLogMessage": True, "sortOrder": "Descending"}},
                desc="Logs carry the high-cardinality detail (batch_id, object "

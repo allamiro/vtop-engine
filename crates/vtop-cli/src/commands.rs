@@ -90,8 +90,21 @@ impl From<SourceKind> for SourceType {
 }
 
 /// Initialize structured logging. Honors `--log-level`, then config, then env.
+///
+/// JSON is selected by `--json` OR `VTOP_LOG_FORMAT=json`. The env form lets a
+/// container opt into structured logs without changing the entrypoint, so a log
+/// pipeline (Alloy -> Loki) gets parseable `{"level":...,"records":...}` lines
+/// instead of pretty text. In pretty mode ANSI colour is emitted ONLY to a real
+/// terminal: writing escape codes to a pipe (a container's captured stderr)
+/// corrupts every downstream parser — a `level=~"WARN"` filter or `| logfmt`
+/// then matches nothing because the field names are wrapped in `\e[3m…\e[0m`.
 pub fn init_tracing(level: &str, json: bool) {
+    use std::io::IsTerminal;
     use tracing_subscriber::EnvFilter;
+    let json = json
+        || std::env::var("VTOP_LOG_FORMAT")
+            .map(|v| v.eq_ignore_ascii_case("json"))
+            .unwrap_or(false);
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level.to_lowercase()));
     // Logs go to STDERR so they never collide with command output on STDOUT
@@ -102,7 +115,7 @@ pub fn init_tracing(level: &str, json: bool) {
     if json {
         builder.json().with_current_span(false).init();
     } else {
-        builder.init();
+        builder.with_ansi(std::io::stderr().is_terminal()).init();
     }
 }
 

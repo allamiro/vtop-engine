@@ -193,39 +193,50 @@ safety = dashboard(
 # ---------------------------------------------------------------------------
 pipeline = dashboard(
     "vtop-pipeline", "VTOP — Pipeline performance",
-    "Throughput, compression and per-stage latency, parsed out of the engine's "
-    "batch_metrics log events. After #46 these become native histograms.",
+    "Throughput, compression and per-stage latency from the engine's own "
+    "Prometheus metrics (#46). These were previously reconstructed from "
+    "batch_metrics log events; they are now native counters and histograms, so "
+    "there is no log-parsing fragility and the numbers survive log rotation.",
     [
         row("Throughput", 0),
         panel("Records/sec", {"h": 7, "w": 8, "x": 0, "y": 1},
-              logql(f'sum(rate({ENGINE} | event="batch_metrics" | logfmt | unwrap records [1m]))', "records/sec"),
-              LOKI, desc="After #46: sum(rate(vtop_records_total[1m]))"),
+              promql('sum(rate(vtop_records_total[1m])) or vector(0)', "records/sec"),
+              MIMIR, desc="Records leaving the engine into archived objects."),
         panel("Bytes in vs out", {"h": 7, "w": 8, "x": 8, "y": 1},
               [
-                  {"datasource": LOKI, "expr": f'sum(rate({ENGINE} | event="batch_metrics" | logfmt | unwrap uncompressed_bytes [1m]))', "legendFormat": "uncompressed in"},
-                  {"datasource": LOKI, "expr": f'sum(rate({ENGINE} | event="batch_metrics" | logfmt | unwrap compressed_bytes [1m]))', "legendFormat": "compressed out"},
+                  {"datasource": MIMIR, "expr": 'sum(rate(vtop_bytes_in_total[1m])) or vector(0)', "legendFormat": "uncompressed in"},
+                  {"datasource": MIMIR, "expr": 'sum(rate(vtop_bytes_out_total[1m])) or vector(0)', "legendFormat": "compressed out (on the wire)"},
               ],
-              LOKI, unit="Bps",
+              MIMIR, unit="Bps",
               desc="The gap between the two lines is what compression is "
                    "saving on the wire."),
         panel("Compression ratio", {"h": 7, "w": 8, "x": 16, "y": 1},
-              logql(f'avg_over_time({ENGINE} | event="batch_metrics" | logfmt | unwrap compression_ratio [1m])', "ratio"),
-              LOKI, desc="uncompressed/compressed; higher is better. A sudden "
-                         "drop toward 1.0 suggests the data shape changed or "
-                         "compression is effectively off."),
-        row("Latency by stage", 8),
-        panel("Per-stage duration (avg)", {"h": 8, "w": 12, "x": 0, "y": 9},
               [
-                  {"datasource": LOKI, "expr": f'avg_over_time({ENGINE} | event="batch_metrics" | logfmt | unwrap {s}_ms [1m])', "legendFormat": s}
-                  for s in ("compress", "checksum", "object_upload", "manifest_upload", "verify", "commit")
+                  {"datasource": MIMIR, "expr": 'histogram_quantile(0.5, sum by (le) (rate(vtop_compression_ratio_bucket[5m]))) and (sum(rate(vtop_compression_ratio_bucket[5m])) > 0) or vector(0)', "legendFormat": "p50"},
+                  {"datasource": MIMIR, "expr": 'histogram_quantile(0.95, sum by (le) (rate(vtop_compression_ratio_bucket[5m]))) and (sum(rate(vtop_compression_ratio_bucket[5m])) > 0) or vector(0)', "legendFormat": "p95"},
               ],
-              LOKI, unit="ms",
+              MIMIR, desc="uncompressed/compressed; higher is better. A sudden "
+                          "drop toward 1.0 suggests the data shape changed or "
+                          "compression is effectively off. Guarded so an idle "
+                          "histogram reads 0, not NaN."),
+        row("Latency by stage", 8),
+        panel("Per-stage duration (p95)", {"h": 8, "w": 12, "x": 0, "y": 9},
+              [
+                  {"datasource": MIMIR, "expr": 'histogram_quantile(0.95, sum by (le, stage) (rate(vtop_stage_duration_seconds_bucket[5m]))) and (sum by (stage) (rate(vtop_stage_duration_seconds_bucket[5m])) > 0)', "legendFormat": "{{stage}}"},
+              ],
+              MIMIR, unit="s",
               desc="Which stage owns the time. Upload usually dominates - it is "
-                   "the documented bottleneck, not the state store.\n"
-                   "After #46: histogram_quantile(0.95, sum by (le,stage) (rate(vtop_stage_duration_seconds_bucket[5m])))"),
+                   "the documented bottleneck, not the state store. No vector(0) "
+                   "fallback here: this series is grouped by stage, and vector(0)'s "
+                   "empty labelset never matches a {stage=...} series, so it would "
+                   "add a phantom 0 line that is always on. An idle per-stage "
+                   "breakdown reading No data is the honest rendering."),
         panel("Total batch latency", {"h": 8, "w": 12, "x": 12, "y": 9},
-              logql(f'avg_over_time({ENGINE} | event="batch_metrics" | logfmt | unwrap total_ms [1m])', "total_ms"),
-              LOKI, unit="ms",
+              [
+                  {"datasource": MIMIR, "expr": 'histogram_quantile(0.5, sum by (le) (rate(vtop_batch_duration_seconds_bucket[5m]))) and (sum(rate(vtop_batch_duration_seconds_bucket[5m])) > 0) or vector(0)', "legendFormat": "p50"},
+                  {"datasource": MIMIR, "expr": 'histogram_quantile(0.95, sum by (le) (rate(vtop_batch_duration_seconds_bucket[5m]))) and (sum(rate(vtop_batch_duration_seconds_bucket[5m])) > 0) or vector(0)', "legendFormat": "p95"},
+              ],
+              MIMIR, unit="s",
               desc="Batch start to source-committed. NOTE: batches seal on "
                    "max_batch_age (60s by default), so an idle lab shows a "
                    "sawtooth - that is the timer, not slowness."),
@@ -278,12 +289,23 @@ logs = dashboard(
     [
         row("Engine", 0),
         panel("Errors and warnings", {"h": 8, "w": 24, "x": 0, "y": 1},
-              logql(f'{{service="vtop-engine"}} | level=~"WARN|ERROR"'),
+              logql(f'{{service="vtop-engine"}} | json | level=~"WARN|ERROR"'),
               LOKI, kind="logs",
               extra={"options": {"showTime": True, "wrapLogMessage": True, "sortOrder": "Descending"}},
-              desc="Look here first when a stat panel goes red."),
-        row("All components", 9),
-        panel("All lab logs", {"h": 10, "w": 24, "x": 0, "y": 10},
+              desc="Look here first when a stat panel goes red. The engine emits "
+                   "JSON logs (VTOP_LOG_FORMAT=json), so `| json` exposes `level` "
+                   "and the structured fields as filterable labels."),
+        panel("Committed batches — commit + object URI", {"h": 8, "w": 24, "x": 0, "y": 9},
+              logql(f'{{service="vtop-engine", event=~"source_committed|object_uploaded"}} | json'),
+              LOKI, kind="logs",
+              extra={"options": {"showTime": True, "wrapLogMessage": True, "sortOrder": "Descending"}},
+              desc="The high-cardinality detail metrics deliberately omit — batch "
+                   "ids and object URIs. Two correlated events per batch_id: "
+                   "object_uploaded carries the object `uri` (where it landed); "
+                   "source_committed marks the commit that only happens after "
+                   "VERIFIED. The audit trail behind the committed-count stat."),
+        row("All components", 17),
+        panel("All lab logs", {"h": 10, "w": 24, "x": 0, "y": 18},
               logql('{job="docker"}'),
               LOKI, kind="logs",
               extra={"options": {"showTime": True, "wrapLogMessage": True, "sortOrder": "Descending"}},

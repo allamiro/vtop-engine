@@ -30,7 +30,7 @@
     {
       "type": "logs",
       "title": "Errors and warnings",
-      "description": "Look here first when a stat panel goes red.",
+      "description": "Look here first when a stat panel goes red. The engine emits JSON logs (VTOP_LOG_FORMAT=json), so `| json` exposes `level` and the structured fields as filterable labels.",
       "datasource": {
         "type": "loki",
         "uid": "loki"
@@ -47,7 +47,44 @@
             "type": "loki",
             "uid": "loki"
           },
-          "expr": "{service=\"vtop-engine\"} | level=~\"WARN|ERROR\"",
+          "expr": "{service=\"vtop-engine\"} | json | level=~\"WARN|ERROR\"",
+          "legendFormat": "",
+          "queryType": "range"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "showTime": true,
+        "wrapLogMessage": true,
+        "sortOrder": "Descending"
+      }
+    },
+    {
+      "type": "logs",
+      "title": "Committed batches \u2014 commit + object URI",
+      "description": "The high-cardinality detail metrics deliberately omit. Two correlated events per batch_id: object_uploaded carries the object `uri` (where it landed); source_committed marks the commit that only happens after VERIFIED. The audit trail behind the committed-count stat.",
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "expr": "{service=\"vtop-engine\", event=~\"source_committed|object_uploaded\"} | json",
           "legendFormat": "",
           "queryType": "range"
         }
@@ -71,7 +108,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 9
+        "y": 17
       },
       "collapsed": false,
       "panels": []
@@ -88,7 +125,7 @@
         "h": 10,
         "w": 24,
         "x": 0,
-        "y": 10
+        "y": 18
       },
       "targets": [
         {
