@@ -16,8 +16,56 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Detect what actually changed so heavy Rust jobs don't run for a docs- or
+  # dashboard-only PR. Each downstream job gates on these outputs. This job is
+  # seconds; the jobs it can skip are tens of minutes.
+  changes:
+    name: detect changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      dashboards: ${{ steps.filter.outputs.dashboards }}
+      benchmarks: ${{ steps.filter.outputs.benchmarks }}
+      scripts: ${{ steps.filter.outputs.scripts }}
+      shell: ${{ steps.filter.outputs.shell }}
+    steps:
+      - uses: actions/checkout@v4
+      # Pinned to a full commit SHA (v3), not the mutable tag, so an upstream
+      # tag move cannot change CI behaviour without a reviewed commit here.
+      - uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # v3
+        id: filter
+        with:
+          filters: |
+            rust:
+              - 'crates/**'
+              - 'tests/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'deny.toml'
+              - 'fuzz/**'
+              - 'docker/**'
+              - '.dockerignore'
+              - '.cargo/**'
+              - 'rust-toolchain*'
+              - '.github/workflows/ci.yml'
+            dashboards:
+              - 'observability/**'
+            benchmarks:
+              - 'benchmarks/**'
+            scripts:
+              - 'scripts/**'
+              - 'docker-compose*.yml'
+              - 'docker/**'
+              - '.dockerignore'
+              - 'examples/**'
+            shell:
+              - 'docker/*.sh'
+              - 'docker/tests/**'
   build-and-test:
     name: fmt + clippy + test + build
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -65,6 +113,8 @@ jobs:
 
   docker:
     name: docker image build
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -74,6 +124,8 @@ jobs:
 
   audit:
     name: supply-chain (cargo audit)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -96,6 +148,8 @@ jobs:
   # any other code.
   shell:
     name: shellcheck + bats
+    needs: changes
+    if: needs.changes.outputs.shell == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -124,6 +178,8 @@ jobs:
   # port without an /etc/hosts entry.
   kafka-integration:
     name: kafka integration (live broker)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     services:
@@ -208,6 +264,8 @@ jobs:
   # .cargo/audit.toml (the single source of truth) so the two cannot disagree.
   deny:
     name: supply-chain (cargo deny)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -222,6 +280,8 @@ jobs:
   # 1.91.1), so lowering it means dropping or pinning those.
   msrv:
     name: msrv (build on declared rust-version)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -254,6 +314,8 @@ jobs:
   # number. The summary makes gaps visible on each PR so they can be judged.
   coverage:
     name: coverage (report only)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -298,6 +360,8 @@ jobs:
   # Only manual review was protecting it.
   benchmarks:
     name: benchmarks (ruff + pytest)
+    needs: changes
+    if: needs.changes.outputs.benchmarks == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     defaults:
@@ -336,6 +400,8 @@ jobs:
   # while file/syslog still pass - the precise signature of the original defect.
   e2e-smoke:
     name: e2e smoke (full compose lab)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.scripts == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -367,6 +433,8 @@ jobs:
   # catches regressions on every PR. cargo-fuzz needs nightly + libFuzzer.
   fuzz:
     name: fuzz smoke (detect + manifest)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -402,6 +470,8 @@ jobs:
   # and scoped to the highest-value modules so a run finishes in CI time.
   mutants:
     name: mutation testing (report only)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     continue-on-error: true
@@ -432,3 +502,41 @@ jobs:
             tail -40 /tmp/mutants.txt 2>/dev/null || echo "no output"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # The fast path for observability changes: dashboards are generated Python +
+  # JSON, not engine code, so they don't need the Rust workspace, Docker, Kafka,
+  # or the e2e lab. This job lints the generators, re-runs them and fails if the
+  # committed JSON is stale (the exact drift that shipped once), and checks the
+  # JSON parses. Seconds, not tens of minutes.
+  dashboards:
+    name: dashboards (generators + no drift)
+    needs: changes
+    if: needs.changes.outputs.dashboards == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Syntax-check the dashboard generators
+        run: python -m compileall -q observability/*.py
+      - name: Regenerate dashboards and fail on drift
+        run: |
+          python3 observability/build-dashboards.py
+          # --porcelain reports MODIFIED and UNTRACKED files, so a newly added
+          # dashboard whose JSON was never committed also fails - `git diff`
+          # alone would ignore the untracked output and pass.
+          drift="$(git status --porcelain -- observability/grafana/dashboards/)"
+          if [ -n "$drift" ]; then
+            echo "::error::Committed dashboard JSON is out of date or missing. Run 'python3 observability/build-dashboards.py' and commit the result."
+            echo "$drift"
+            exit 1
+          fi
+      - name: Validate every dashboard JSON parses
+        run: |
+          set -e
+          for f in observability/grafana/dashboards/*.json; do
+            python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$f"
+          done
+          echo "all dashboard JSON valid"
