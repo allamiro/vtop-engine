@@ -6,6 +6,7 @@
 
 pub mod commands;
 pub mod engine;
+pub mod metrics_server;
 pub mod testkit;
 
 pub use engine::{BatchOutcome, Engine, Pipeline, RecoverySummary};

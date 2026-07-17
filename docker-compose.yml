@@ -140,6 +140,9 @@ services:
       VTOP_S3_VERIFY_TLS: "false"
       VTOP_CONFIG: /app/examples/config.yaml
       RUST_LOG: info
+      # Expose the engine's own Prometheus metrics. Opt-in: nothing listens
+      # unless this is set. Alloy scrapes vtop-engine:9090/metrics.
+      VTOP_METRICS_ADDR: "0.0.0.0:9090"
     volumes:
       - ./examples:/app/examples:ro
       - ./data/input:/data/input

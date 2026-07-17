@@ -15,6 +15,9 @@ name = "vtopctl"
 path = "src/main.rs"
 
 [dependencies]
+http-body-util = { workspace = true }
+hyper-util = { workspace = true }
+hyper = { workspace = true }
 vtop-core = { workspace = true }
 vtop-adapters = { workspace = true }
 vtop-upload = { workspace = true }
@@ -50,3 +53,7 @@ path = "../../tests/integration_state_recovery.rs"
 [[test]]
 name = "integration_kafka_to_minio"
 path = "../../tests/integration_kafka_to_minio.rs"
+
+[[test]]
+name = "integration_metrics_endpoint"
+path = "tests/integration_metrics_endpoint.rs"

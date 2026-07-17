@@ -25,6 +25,7 @@ pub mod metrics;
 pub mod partitioning;
 pub mod replay;
 pub mod state_machine;
+pub mod telemetry;
 pub mod types;
 
 pub use errors::{VtopError, VtopResult};

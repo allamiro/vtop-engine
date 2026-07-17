@@ -1,0 +1,257 @@
+{
+  "uid": "vtop-pipeline",
+  "title": "VTOP \u2014 Pipeline performance",
+  "description": "Throughput, compression and per-stage latency, parsed out of the engine's batch_metrics log events. After #46 these become native histograms.",
+  "tags": [
+    "vtop",
+    "performance"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Throughput",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Records/sec",
+      "description": "After #46: sum(rate(vtop_records_total[1m]))",
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "expr": "sum(rate({service=\"vtop-engine\"} | event=\"batch_metrics\" | logfmt | unwrap records [1m]))",
+          "legendFormat": "records/sec",
+          "queryType": "range"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "timeseries",
+      "title": "Bytes in vs out",
+      "description": "The gap between the two lines is what compression is saving on the wire.",
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "expr": "sum(rate({service=\"vtop-engine\"} | event=\"batch_metrics\" | logfmt | unwrap uncompressed_bytes [1m]))",
+          "legendFormat": "uncompressed in"
+        },
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "expr": "sum(rate({service=\"vtop-engine\"} | event=\"batch_metrics\" | logfmt | unwrap compressed_bytes [1m]))",
+          "legendFormat": "compressed out"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {},
+          "unit": "Bps"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "timeseries",
+      "title": "Compression ratio",
+      "description": "uncompressed/compressed; higher is better. A sudden drop toward 1.0 suggests the data shape changed or compression is effectively off.",
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "expr": "avg_over_time({service=\"vtop-engine\"} | event=\"batch_metrics\" | logfmt | unwrap compression_ratio [1m])",
+          "legendFormat": "ratio",
+          "queryType": "range"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "row",
+      "title": "Latency by stage",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 8
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Per-stage duration (avg)",
+      "description": "Which stage owns the time. Upload usually dominates - it is the documented bottleneck, not the state store.\nAfter #46: histogram_quantile(0.95, sum by (le,stage) (rate(vtop_stage_duration_seconds_bucket[5m])))",
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "expr": "avg_over_time({service=\"vtop-engine\"} | event=\"batch_metrics\" | logfmt | unwrap compress_ms [1m])",
+          "legendFormat": "compress"
+        },
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "expr": "avg_over_time({service=\"vtop-engine\"} | event=\"batch_metrics\" | logfmt | unwrap checksum_ms [1m])",
+          "legendFormat": "checksum"
+        },
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "expr": "avg_over_time({service=\"vtop-engine\"} | event=\"batch_metrics\" | logfmt | unwrap object_upload_ms [1m])",
+          "legendFormat": "object_upload"
+        },
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "expr": "avg_over_time({service=\"vtop-engine\"} | event=\"batch_metrics\" | logfmt | unwrap manifest_upload_ms [1m])",
+          "legendFormat": "manifest_upload"
+        },
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "expr": "avg_over_time({service=\"vtop-engine\"} | event=\"batch_metrics\" | logfmt | unwrap verify_ms [1m])",
+          "legendFormat": "verify"
+        },
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "expr": "avg_over_time({service=\"vtop-engine\"} | event=\"batch_metrics\" | logfmt | unwrap commit_ms [1m])",
+          "legendFormat": "commit"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {},
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "timeseries",
+      "title": "Total batch latency",
+      "description": "Batch start to source-committed. NOTE: batches seal on max_batch_age (60s by default), so an idle lab shows a sawtooth - that is the timer, not slowness.",
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "expr": "avg_over_time({service=\"vtop-engine\"} | event=\"batch_metrics\" | logfmt | unwrap total_ms [1m])",
+          "legendFormat": "total_ms",
+          "queryType": "range"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {},
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {}
+    }
+  ]
+}

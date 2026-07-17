@@ -1,0 +1,136 @@
+# VTOP Engine — OPTIONAL observability stack.
+#
+# Grafana LGTM: Alloy (collect) -> Mimir (metrics) / Loki (logs) / Tempo (traces),
+# with Grafana on top. Kept in a separate file so the default lab stays light;
+# nothing here is required to run VTOP.
+#
+# Bring up (alongside the lab):
+#   docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d
+#
+# Grafana:  http://localhost:3400   (admin / admin, anonymous viewing enabled)
+# Alloy UI: http://localhost:12345  (shows which scrape targets are actually UP)
+#
+# Ports are deliberately off the defaults (3400 not 3000): 3000/8080 are common
+# and collide with other local stacks.
+#
+# HONEST SCOPE — read before trusting a panel:
+#   * The VTOP engine exposes its OWN Prometheus metrics (issue #46) at
+#     VTOP_METRICS_ADDR, so it is scraped directly. Logs remain the place for the
+#     high-cardinality detail (batch_id, object URIs) that must never be a label.
+#   * MinIO exposes Prometheus natively (auth disabled below - LAB ONLY).
+#   * Kafka exposes no Prometheus endpoint, hence the exporter sidecar.
+#   * Every backend here is single-node with filesystem storage and lab
+#     credentials. This is NOT a production topology.
+
+services:
+  # --- MinIO: enable public metrics scraping (LAB ONLY) ---------------------
+  # MinIO's /minio/v2/metrics/cluster requires a bearer token by default; this
+  # makes it scrapeable without one. Never do this outside a lab.
+  minio:
+    environment:
+      MINIO_PROMETHEUS_AUTH_TYPE: public
+
+  # --- Kafka -> Prometheus --------------------------------------------------
+  # The apache/kafka image exposes no Prometheus endpoint. This exporter talks
+  # to the broker over the KAFKA PROTOCOL (not JMX) and exposes consumer-group
+  # lag and topic offsets - which is exactly what the invariant story needs.
+  # Without it the Kafka dashboard shows its target as DOWN rather than silently
+  # graphing nothing.
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.9.0
+    container_name: vtop-kafka-exporter
+    command:
+      - "--kafka.server=kafka:9092"
+      - "--web.listen-address=:9308"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # --- Metrics store --------------------------------------------------------
+  mimir:
+    image: grafana/mimir:3.1.3
+    container_name: vtop-mimir
+    command: ["-config.file=/etc/mimir/mimir.yaml"]
+    volumes:
+      - ./observability/mimir/mimir.yaml:/etc/mimir/mimir.yaml:ro
+      - mimir-data:/data
+    restart: unless-stopped
+
+  # --- Log store ------------------------------------------------------------
+  loki:
+    image: grafana/loki:3.7.3
+    container_name: vtop-loki
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    volumes:
+      - ./observability/loki/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki-data:/loki
+    restart: unless-stopped
+
+  # --- Trace store ----------------------------------------------------------
+  tempo:
+    image: grafana/tempo:3.0.2
+    container_name: vtop-tempo
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ./observability/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    restart: unless-stopped
+
+  # --- Collector ------------------------------------------------------------
+  # Needs the docker socket to discover containers and read their logs. Mounted
+  # read-only; still a privileged handle, which is another reason this stack is
+  # lab-only.
+  alloy:
+    image: grafana/alloy:v1.17.1
+    container_name: vtop-alloy
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    ports:
+      - "12345:12345"   # Alloy UI: shows which targets are actually UP
+    volumes:
+      - ./observability/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - alloy-data:/var/lib/alloy/data
+    depends_on:
+      - mimir
+      - loki
+      - tempo
+    restart: unless-stopped
+
+  # --- Dashboards -----------------------------------------------------------
+  grafana:
+    image: grafana/grafana:13.1.0
+    container_name: vtop-grafana
+    ports:
+      - "3400:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      # Anonymous viewing: the lab is for looking at dashboards, not managing
+      # users. LAB ONLY.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_DEFAULT_THEME: dark
+      # Datasources + dashboards are provisioned as code, so the stack is useful
+      # on first `up` with no clicking.
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/vtop-overview.json
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - mimir
+      - loki
+      - tempo
+    restart: unless-stopped
+
+volumes:
+  mimir-data:
+  loki-data:
+  tempo-data:
+  alloy-data:
+  grafana-data:
