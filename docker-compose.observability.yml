@@ -24,11 +24,8 @@
 
 services:
   # --- MinIO: enable public metrics scraping (LAB ONLY) ---------------------
-  # MinIO's /minio/v2/metrics/cluster requires a bearer token by default; this
-  # makes it scrapeable without one. Never do this outside a lab.
-  minio:
-    environment:
-      MINIO_PROMETHEUS_AUTH_TYPE: public
+  # MinIO metrics are made public in the BASE docker-compose.yml (so the
+  # endpoint is scrapeable regardless of how the lab is started), not here.
 
   # --- Kafka -> Prometheus --------------------------------------------------
   # The apache/kafka image exposes no Prometheus endpoint. This exporter talks
