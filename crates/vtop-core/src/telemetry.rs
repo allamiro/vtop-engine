@@ -87,6 +87,12 @@ pub struct Metrics {
     pub inflight_batches: IntGauge,
     /// Cycles where a source read failed and was skipped (the engine retries
     /// next cycle). A steady rate means a source is unhealthy.
+    ///
+    /// Labelled by source_type ONLY, never by source name. File and syslog
+    /// adapters set `source_name` to the full matched path, and the lab globs
+    /// `/data/input/*.log`, so a rotated or dated file set would mint a new
+    /// series per file and grow without bound. The failing path is in the log
+    /// line beside this counter, where unbounded detail belongs.
     pub source_read_errors_total: IntCounterVec,
 }
 
@@ -161,8 +167,8 @@ impl Metrics {
         )?;
         let source_read_errors_total = cv(
             "source_read_errors_total",
-            "Source reads that failed and were skipped for this cycle",
-            vec!["tenant", "source_type", "source"],
+            "Source reads that failed and were skipped for this cycle (see logs for the path)",
+            vec!["tenant", "source_type"],
         )?;
 
         // Buckets span 1ms..~30s: compression is sub-millisecond on small

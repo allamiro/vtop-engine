@@ -745,11 +745,13 @@ impl Engine {
                 Ok(r) => r,
                 Err(e) => {
                     if let Some(mx) = telemetry::metrics() {
+                        // No source_name label: file/syslog source names are
+                        // full paths, so a rotated file set would mint a series
+                        // per file. The path is in the warning below instead.
                         mx.source_read_errors_total
                             .with_label_values(&[
                                 self.config.engine.tenant.as_str(),
                                 source.source_type.as_str(),
-                                source.source_name.as_str(),
                             ])
                             .inc();
                     }

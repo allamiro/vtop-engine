@@ -6,8 +6,17 @@
 //!
 //! These tests pin the contract and the endpoint's behavior.
 
+use std::sync::{Mutex, OnceLock};
 use vtop_cli::metrics_server;
 use vtop_core::telemetry;
+
+/// VTOP_METRICS_ADDR is PROCESS-wide, but Rust runs the tests in this binary
+/// concurrently, so one test removing the variable can race another that just
+/// set it. Serialize every test that touches it.
+fn env_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 /// Metric names the Grafana dashboards query. Renaming one without updating
 /// `observability/` turns a panel into a blank rectangle.
@@ -100,17 +109,60 @@ fn expected_labels_are_present() {
     }
 }
 
-/// Cardinality guard. batch_id is unbounded — one series per batch would grow
-/// the TSDB without limit and eventually take the monitoring stack down.
+/// Cardinality guard. These identifiers are unbounded — one series per batch (or
+/// per rotated file) would grow the TSDB without limit and eventually take the
+/// monitoring stack down.
+///
+/// `source=` is on this list because file/syslog adapters set `source_name` to
+/// the full matched path and the lab globs `/data/input/*.log`: a dated or
+/// rotated file set would mint a new series per file. An earlier version of
+/// this suite only checked `batch_id` and missed exactly that.
 #[test]
 fn unbounded_identifiers_are_never_labels() {
     let text = populated();
-    for forbidden in ["batch_id=", "object_uri=", "manifest_uri=", "checksum="] {
+    for forbidden in [
+        "batch_id=",
+        "object_uri=",
+        "manifest_uri=",
+        "checksum=",
+        "source=",
+        "path=",
+    ] {
         assert!(
             !text.contains(forbidden),
             "{forbidden} is unbounded and must stay in logs, never a metric label"
         );
     }
+}
+
+/// Every label actually exported must come from a known-bounded set. This is the
+/// generic form of the rule: a new metric with a free-form label fails here even
+/// if nobody remembers to add it to the deny-list above.
+#[test]
+fn every_exported_label_is_from_a_bounded_set() {
+    // "le" is Prometheus's own histogram bucket label. It is bounded by the
+    // bucket list defined in telemetry.rs, not free-form, so it is legitimate.
+    const BOUNDED: [&str; 6] = ["tenant", "source_type", "format", "state", "stage", "le"];
+    let text = populated();
+    let mut seen = std::collections::BTreeSet::new();
+    for line in text.lines().filter(|l| !l.starts_with('#')) {
+        if let (Some(a), Some(b)) = (line.find('{'), line.find('}')) {
+            for pair in line[a + 1..b].split(',') {
+                if let Some((k, _)) = pair.split_once('=') {
+                    seen.insert(k.trim().to_string());
+                }
+            }
+        }
+    }
+    let unexpected: Vec<_> = seen
+        .iter()
+        .filter(|k| !BOUNDED.contains(&k.as_str()) && !k.is_empty())
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "labels {unexpected:?} are not in the bounded set {BOUNDED:?}; if one is \
+         genuinely low-cardinality add it there, otherwise it belongs in logs"
+    );
 }
 
 /// The invariant, expressed in metrics: a commit is only ever recorded after a
@@ -136,6 +188,8 @@ fn commits_never_exceed_verified_in_the_metric_contract() {
 /// often a single binary in a lab and must not open a port nobody asked for.
 #[tokio::test]
 async fn endpoint_is_disabled_without_the_env_var() {
+    // Serialized: see env_lock(). Poisoning is irrelevant here.
+    let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     std::env::remove_var(metrics_server::ADDR_ENV);
     assert!(
         metrics_server::maybe_start().await.is_none(),
@@ -147,6 +201,8 @@ async fn endpoint_is_disabled_without_the_env_var() {
 /// engine from archiving telemetry.
 #[tokio::test]
 async fn a_malformed_address_disables_metrics_without_panicking() {
+    // Serialized: see env_lock(). Poisoning is irrelevant here.
+    let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     std::env::set_var(metrics_server::ADDR_ENV, "not-a-socket-addr");
     let bound = metrics_server::maybe_start().await;
     std::env::remove_var(metrics_server::ADDR_ENV);
@@ -159,6 +215,8 @@ async fn a_malformed_address_disables_metrics_without_panicking() {
 /// End-to-end: bind, scrape, and check the three routes behave.
 #[tokio::test]
 async fn serves_metrics_health_and_readiness() {
+    // Serialized: see env_lock(). Poisoning is irrelevant here.
+    let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     // Port 0 = let the OS pick a free one, so the test cannot collide with a
     // developer's running lab.
     std::env::set_var(metrics_server::ADDR_ENV, "127.0.0.1:0");
