@@ -6,6 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 description = "Replay-safe state store for the VTOP Engine (SQLite via sqlx)."
 
+[features]
+# Exposes the backend-agnostic `test_battery` module to other crates (e.g. a
+# Postgres integration test). In-crate tests get it automatically via cfg(test).
+test-support = []
+
 [dependencies]
 vtop-core = { workspace = true }
 sqlx = { workspace = true }
