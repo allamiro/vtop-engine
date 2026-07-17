@@ -155,10 +155,18 @@ else
   pass "every object has a manifest"
 fi
 
-# Per-format buckets prove the format detection actually routed data.
+# Per-format buckets prove format detection routed the data - AND that the
+# verified pair landed. "any entry" is not enough: a bucket with an object but no
+# manifest (or vice versa) is a broken archive, so count both.
 for b in telemetry-cef telemetry-jsonl telemetry-syslog; do
-  n=$(grep -c "$b" <<<"$listing" || true)
-  if [ "${n:-0}" -gt 0 ]; then pass "bucket $b: $n files"; else fail "bucket $b is empty"; fi
+  bucket_lines=$(grep -F "$b" <<<"$listing" || true)
+  bobj=$(grep -vc 'manifest\.json' <<<"$bucket_lines" || true)
+  bman=$(grep -c 'manifest\.json' <<<"$bucket_lines" || true)
+  if [ "${bobj:-0}" -gt 0 ] && [ "${bman:-0}" -gt 0 ] && [ "${bobj:-0}" -eq "${bman:-0}" ]; then
+    pass "bucket $b: $bobj object(s) each with a manifest"
+  else
+    fail "bucket $b: objects=$bobj manifests=$bman (need >0 and equal)"
+  fi
 done
 
 # ---------------------------------------------------------------------------
@@ -169,7 +177,9 @@ info "5/6  Asserting Kafka offsets advanced (only happens post-verify)"
 groups=$("${COMPOSE[@]}" exec -T kafka /opt/kafka/bin/kafka-consumer-groups.sh \
   --bootstrap-server localhost:9092 --describe --group vtop-engine 2>/dev/null || true)
 if grep -qE '^vtop-engine' <<<"$groups"; then
-  lag=$(awk '/^vtop-engine/ {print $6}' <<<"$groups" | grep -E '^[0-9]+$' | awk '{s+=$1} END {print s+0}')
+  # `|| true`: with pipefail, a grep that matches nothing (all partitions at 0
+  # lag can render as "-") fails the pipe and set -e aborts mid-assertion.
+  lag=$(awk '/^vtop-engine/ {print $6}' <<<"$groups" | { grep -E '^[0-9]+$' || true; } | awk '{s+=$1} END {print s+0}')
   committed=$(awk '/^vtop-engine/ {print $4}' <<<"$groups" | grep -cE '^[0-9]+$' || true)
   if [ "${committed:-0}" -gt 0 ]; then pass "kafka: $committed partition(s) have committed offsets"; else fail "kafka: no committed offsets"; fi
   if [ "${lag:-1}" -eq 0 ]; then pass "kafka: total lag = 0"; else fail "kafka: total lag = $lag (expected 0)"; fi
@@ -237,6 +247,8 @@ if [ "$FAILED" -eq 0 ]; then
   exit 0
 fi
 printf '\033[31mE2E SMOKE FAILED\033[0m — %d assertion(s)\n' "$FAILED"
+# Dump logs HERE, before the exit trap tears the stack down - otherwise the
+# CI "logs on failure" step finds no container. This is the real diagnostic.
 echo "--- engine log (tail) ---"
-"${COMPOSE[@]}" logs --tail=40 vtop-engine 2>&1 || true
+"${COMPOSE[@]}" logs --tail=60 vtop-engine 2>&1 || true
 exit 1

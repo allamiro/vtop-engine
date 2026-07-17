@@ -352,7 +352,10 @@ jobs:
           TIMEOUT: "300"
         run: bash scripts/e2e-smoke.sh
 
-      # Compose logs are the only way to diagnose a failure after the fact.
-      - name: Engine logs on failure
+      # The script itself dumps engine logs on failure BEFORE its exit trap tears
+      # the stack down, so the real diagnostics are already in the job output
+      # above. This is a best-effort fallback; the container is usually gone by
+      # now, which is expected.
+      - name: Engine logs on failure (best effort)
         if: failure()
-        run: docker compose logs --tail=100 vtop-engine || true
+        run: docker compose logs --tail=100 vtop-engine 2>/dev/null || echo "stack already torn down; see the smoke output above"
