@@ -27,7 +27,6 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-sqlx = { workspace = true, features = ["postgres"] }
 
 # The Postgres battery test needs the postgres backend AND the shared battery.
 [[test]]

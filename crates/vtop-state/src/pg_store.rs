@@ -134,6 +134,22 @@ impl PgStateStore {
         Ok(store)
     }
 
+    /// Execute a raw SQL string against the pool. TEST-ONLY: the battery uses it
+    /// to reset the table and to exercise the invariant trigger by writing an
+    /// illegal transition straight to the DB (bypassing `update_batch_state`).
+    /// Gated so it never exists in a production build, and so the Postgres
+    /// driver stays out of the default SQLite-only test build.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn execute_raw(&self, sql: &'static str) -> Result<(), VtopError> {
+        // `&'static str` both satisfies sqlx 0.9's SqlSafeStr and avoids the
+        // borrowed-data-escapes error; test callers pass string literals.
+        sqlx::raw_sql(sql)
+            .execute(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        Ok(())
+    }
+
     async fn migrate(&self) -> Result<(), VtopError> {
         // raw_sql uses the simple query protocol, which runs a string containing
         // MULTIPLE statements. A prepared statement (sqlx::query) cannot, and the
