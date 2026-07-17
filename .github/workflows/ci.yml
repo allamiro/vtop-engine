@@ -31,16 +31,21 @@ jobs:
       shell: ${{ steps.filter.outputs.shell }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
+      # Pinned to a full commit SHA (v3), not the mutable tag, so an upstream
+      # tag move cannot change CI behaviour without a reviewed commit here.
+      - uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # v3
         id: filter
         with:
           filters: |
             rust:
               - 'crates/**'
+              - 'tests/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
+              - 'deny.toml'
               - 'fuzz/**'
               - 'docker/**'
+              - '.dockerignore'
               - '.cargo/**'
               - 'rust-toolchain*'
               - '.github/workflows/ci.yml'
@@ -52,6 +57,8 @@ jobs:
               - 'scripts/**'
               - 'docker-compose*.yml'
               - 'docker/**'
+              - '.dockerignore'
+              - 'examples/**'
             shell:
               - 'docker/*.sh'
               - 'docker/tests/**'
@@ -517,9 +524,13 @@ jobs:
       - name: Regenerate dashboards and fail on drift
         run: |
           python3 observability/build-dashboards.py
-          if ! git diff --quiet -- observability/grafana/dashboards/; then
-            echo "::error::Committed dashboard JSON is out of date. Run 'python3 observability/build-dashboards.py' and commit the result."
-            git --no-pager diff --stat -- observability/grafana/dashboards/
+          # --porcelain reports MODIFIED and UNTRACKED files, so a newly added
+          # dashboard whose JSON was never committed also fails - `git diff`
+          # alone would ignore the untracked output and pass.
+          drift="$(git status --porcelain -- observability/grafana/dashboards/)"
+          if [ -n "$drift" ]; then
+            echo "::error::Committed dashboard JSON is out of date or missing. Run 'python3 observability/build-dashboards.py' and commit the result."
+            echo "$drift"
             exit 1
           fi
       - name: Validate every dashboard JSON parses
