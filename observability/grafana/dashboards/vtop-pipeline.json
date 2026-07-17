@@ -155,7 +155,7 @@
     {
       "type": "timeseries",
       "title": "Per-stage duration (p95)",
-      "description": "Which stage owns the time. Upload usually dominates - it is the documented bottleneck, not the state store.",
+      "description": "Which stage owns the time. Upload usually dominates - it is the documented bottleneck, not the state store. No vector(0) fallback here: this series is grouped by stage, and vector(0)'s empty labelset never matches a {stage=...} series, so it would add a phantom 0 line that is always on. An idle per-stage breakdown reading No data is the honest rendering.",
       "datasource": {
         "type": "prometheus",
         "uid": "mimir"
@@ -205,7 +205,7 @@
             "type": "prometheus",
             "uid": "mimir"
           },
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(vtop_batch_duration_seconds_bucket[5m]))) and (sum(rate(vtop_batch_duration_seconds_bucket[5m])) > 0)",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(vtop_batch_duration_seconds_bucket[5m]))) and (sum(rate(vtop_batch_duration_seconds_bucket[5m])) > 0) or vector(0)",
           "legendFormat": "p50"
         },
         {
@@ -213,7 +213,7 @@
             "type": "prometheus",
             "uid": "mimir"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(vtop_batch_duration_seconds_bucket[5m]))) and (sum(rate(vtop_batch_duration_seconds_bucket[5m])) > 0)",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(vtop_batch_duration_seconds_bucket[5m]))) and (sum(rate(vtop_batch_duration_seconds_bucket[5m])) > 0) or vector(0)",
           "legendFormat": "p95"
         }
       ],

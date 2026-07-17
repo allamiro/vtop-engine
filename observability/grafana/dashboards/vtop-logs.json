@@ -66,8 +66,8 @@
     },
     {
       "type": "logs",
-      "title": "Committed batches (batch_id + object URI)",
-      "description": "The high-cardinality detail metrics deliberately omit: which batch committed, and where its object landed. This is the audit trail behind the committed-count stat.",
+      "title": "Committed batches \u2014 commit + object URI",
+      "description": "The high-cardinality detail metrics deliberately omit. Two correlated events per batch_id: object_uploaded carries the object `uri` (where it landed); source_committed marks the commit that only happens after VERIFIED. The audit trail behind the committed-count stat.",
       "datasource": {
         "type": "loki",
         "uid": "loki"
@@ -84,7 +84,7 @@
             "type": "loki",
             "uid": "loki"
           },
-          "expr": "{service=\"vtop-engine\"} | json | fields_message=\"source_committed\"",
+          "expr": "{service=\"vtop-engine\", event=~\"source_committed|object_uploaded\"} | json",
           "legendFormat": "",
           "queryType": "range"
         }

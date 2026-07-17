@@ -226,11 +226,15 @@ pipeline = dashboard(
               ],
               MIMIR, unit="s",
               desc="Which stage owns the time. Upload usually dominates - it is "
-                   "the documented bottleneck, not the state store."),
+                   "the documented bottleneck, not the state store. No vector(0) "
+                   "fallback here: this series is grouped by stage, and vector(0)'s "
+                   "empty labelset never matches a {stage=...} series, so it would "
+                   "add a phantom 0 line that is always on. An idle per-stage "
+                   "breakdown reading No data is the honest rendering."),
         panel("Total batch latency", {"h": 8, "w": 12, "x": 12, "y": 9},
               [
-                  {"datasource": MIMIR, "expr": 'histogram_quantile(0.5, sum by (le) (rate(vtop_batch_duration_seconds_bucket[5m]))) and (sum(rate(vtop_batch_duration_seconds_bucket[5m])) > 0)', "legendFormat": "p50"},
-                  {"datasource": MIMIR, "expr": 'histogram_quantile(0.95, sum by (le) (rate(vtop_batch_duration_seconds_bucket[5m]))) and (sum(rate(vtop_batch_duration_seconds_bucket[5m])) > 0)', "legendFormat": "p95"},
+                  {"datasource": MIMIR, "expr": 'histogram_quantile(0.5, sum by (le) (rate(vtop_batch_duration_seconds_bucket[5m]))) and (sum(rate(vtop_batch_duration_seconds_bucket[5m])) > 0) or vector(0)', "legendFormat": "p50"},
+                  {"datasource": MIMIR, "expr": 'histogram_quantile(0.95, sum by (le) (rate(vtop_batch_duration_seconds_bucket[5m]))) and (sum(rate(vtop_batch_duration_seconds_bucket[5m])) > 0) or vector(0)', "legendFormat": "p95"},
               ],
               MIMIR, unit="s",
               desc="Batch start to source-committed. NOTE: batches seal on "
@@ -291,13 +295,15 @@ logs = dashboard(
               desc="Look here first when a stat panel goes red. The engine emits "
                    "JSON logs (VTOP_LOG_FORMAT=json), so `| json` exposes `level` "
                    "and the structured fields as filterable labels."),
-        panel("Committed batches (batch_id + object URI)", {"h": 8, "w": 24, "x": 0, "y": 9},
-              logql(f'{{service="vtop-engine"}} | json | fields_message="source_committed"'),
+        panel("Committed batches — commit + object URI", {"h": 8, "w": 24, "x": 0, "y": 9},
+              logql(f'{{service="vtop-engine", event=~"source_committed|object_uploaded"}} | json'),
               LOKI, kind="logs",
               extra={"options": {"showTime": True, "wrapLogMessage": True, "sortOrder": "Descending"}},
-              desc="The high-cardinality detail metrics deliberately omit: which "
-                   "batch committed, and where its object landed. This is the "
-                   "audit trail behind the committed-count stat."),
+              desc="The high-cardinality detail metrics deliberately omit. Two "
+                   "correlated events per batch_id: object_uploaded carries the "
+                   "object `uri` (where it landed); source_committed marks the "
+                   "commit that only happens after VERIFIED. The audit trail "
+                   "behind the committed-count stat."),
         row("All components", 17),
         panel("All lab logs", {"h": 10, "w": 24, "x": 0, "y": 18},
               logql('{job="docker"}'),
