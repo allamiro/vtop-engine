@@ -372,6 +372,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
+        with:
+          # ASAN (which libFuzzer builds with) is incompatible with a statically
+          # linked libc, so the fuzz build must target the GNU (dynamic-libc)
+          # triple explicitly - otherwise a musl default fails with
+          # "sanitizer is incompatible with statically linked libc".
+          targets: x86_64-unknown-linux-gnu
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
@@ -386,7 +392,8 @@ jobs:
         run: |
           for t in detect_record detect_batch manifest_parse; do
             echo "::group::fuzz $t"
-            cargo +nightly fuzz run "$t" -- -max_total_time=60 -print_final_stats=1
+            cargo +nightly fuzz run "$t" --target x86_64-unknown-linux-gnu -- \
+              -max_total_time=60 -print_final_stats=1
             echo "::endgroup::"
           done
 
