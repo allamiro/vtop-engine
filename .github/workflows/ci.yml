@@ -541,3 +541,42 @@ jobs:
             python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$f"
           done
           echo "all dashboard JSON valid"
+
+  # The Postgres backend (Phase 3) must pass the SAME behavioural battery as
+  # SQLite, and its DB-level invariant trigger must reject a bypass. Runs against
+  # a real Postgres service. Gated on rust changes like the other Rust jobs.
+  postgres:
+    name: postgres backend (battery)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: vtop
+          POSTGRES_PASSWORD: vtop
+          POSTGRES_DB: vtop
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U vtop"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-pg-${{ hashFiles('**/Cargo.lock') }}
+      # vtop-state depends only on vtop-core (no librdkafka), so no system deps.
+      - name: Run the Postgres StateStore battery
+        env:
+          VTOP_TEST_POSTGRES: postgres://vtop:vtop@localhost:5432/vtop
+        run: cargo test -p vtop-state --features postgres,test-support --test pg_battery

@@ -26,10 +26,17 @@ use vtop_core::state_machine::BatchState;
 ///   `postgres` feature; an unhelpful build without it returns a clear error)
 pub async fn connect_state_store(conn_str: &str) -> Result<Box<dyn StateStore>, VtopError> {
     if conn_str.starts_with("postgres://") || conn_str.starts_with("postgresql://") {
-        return Err(VtopError::State(
-            "postgres:// state store requires a build with --features postgres (Phase 3)"
-                .to_string(),
-        ));
+        #[cfg(feature = "postgres")]
+        {
+            let store = crate::pg_store::PgStateStore::connect(conn_str).await?;
+            return Ok(Box::new(store));
+        }
+        #[cfg(not(feature = "postgres"))]
+        {
+            return Err(VtopError::State(
+                "postgres:// state store requires a build with --features postgres".to_string(),
+            ));
+        }
     }
     // Everything else is treated as SQLite (including a bare filesystem path),
     // matching the existing single-node default.

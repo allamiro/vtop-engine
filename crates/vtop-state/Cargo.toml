@@ -10,6 +10,9 @@ description = "Replay-safe state store for the VTOP Engine (SQLite via sqlx)."
 # Exposes the backend-agnostic `test_battery` module to other crates (e.g. a
 # Postgres integration test). In-crate tests get it automatically via cfg(test).
 test-support = []
+# The Postgres-compatible backend (Phase 3), for an HA fleet sharing one durable
+# ledger. Off by default so the single-node SQLite build pulls no Postgres deps.
+postgres = ["sqlx/postgres"]
 
 [dependencies]
 vtop-core = { workspace = true }
@@ -24,3 +27,9 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+sqlx = { workspace = true, features = ["postgres"] }
+
+# The Postgres battery test needs the postgres backend AND the shared battery.
+[[test]]
+name = "pg_battery"
+required-features = ["postgres", "test-support"]
