@@ -48,3 +48,8 @@ limits:
   ingestion_rate: 100000
   ingestion_burst_size: 200000
   max_global_series_per_user: 0
+
+# No outbound usage reporting from a local lab (Loki and Tempo are disabled the
+# same way).
+usage_stats:
+  enabled: false

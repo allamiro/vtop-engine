@@ -168,11 +168,31 @@ impl<'a> Pipeline<'a> {
             }};
         }
 
+        // Record every state the batch enters, not just terminal ones: the
+        // dashboards claim `sum by (state)` shows WHERE batches stop, which is
+        // only true if the intermediate states are counted too.
+        macro_rules! mark_state {
+            ($state:expr) => {
+                if let Some(mx) = telemetry::metrics() {
+                    mx.batches_total
+                        .with_label_values(&[
+                            tenant.as_str(),
+                            source.source_type.as_str(),
+                            format.extension(),
+                            $state.as_str(),
+                        ])
+                        .inc();
+                }
+            };
+        }
+        mark_state!(BatchState::Batching);
+
         // ---- BATCHING -> SEALED -----------------------------------------
         batch.seal()?;
         self.store
             .update_batch_state(&batch_id, BatchState::Sealed, &BatchPatch::default())
             .await?;
+        mark_state!(BatchState::Sealed);
         tracing::info!(batch_id, records = batch.record_count, "batch_sealed");
 
         let mut metrics = BatchMetrics::new(&batch_id, batch.record_count, 0);
@@ -195,6 +215,7 @@ impl<'a> Pipeline<'a> {
         self.store
             .update_batch_state(&batch_id, BatchState::Compressed, &BatchPatch::default())
             .await?;
+        mark_state!(BatchState::Compressed);
         tracing::info!(
             batch_id,
             size = compressed.size_bytes,
@@ -215,6 +236,7 @@ impl<'a> Pipeline<'a> {
         self.store
             .update_batch_state(&batch_id, BatchState::Checksummed, &BatchPatch::default())
             .await?;
+        mark_state!(BatchState::Checksummed);
         tracing::info!(
             batch_id,
             algorithm = %algo,
@@ -279,6 +301,7 @@ impl<'a> Pipeline<'a> {
         self.store
             .update_batch_state(&batch_id, BatchState::ObjectUploaded, &obj_patch)
             .await?;
+        mark_state!(BatchState::ObjectUploaded);
         tracing::info!(batch_id, uri = %object_uri, "object_uploaded");
 
         // ---- Build + upload manifest ------------------------------------
@@ -333,6 +356,7 @@ impl<'a> Pipeline<'a> {
         self.store
             .update_batch_state(&batch_id, BatchState::ManifestUploaded, &man_patch)
             .await?;
+        mark_state!(BatchState::ManifestUploaded);
         tracing::info!(batch_id, uri = %manifest_uri, "manifest_uploaded");
 
         // ---- MANIFEST_UPLOADED -> VERIFIED (or FAILED) ------------------
@@ -390,6 +414,16 @@ impl<'a> Pipeline<'a> {
         // (VERIFIED -> SOURCE_COMMITTED below). The on-disk manifest was written
         // and uploaded *before* this step (its hash must be stable), so we do
         // not re-stamp it here — querying the store is the source of truth.
+        if backend_limited {
+            tracing::warn!(batch_id, "verification_passed (backend_limited: size-only)");
+        } else {
+            tracing::info!(batch_id, "verification_passed");
+        }
+        self.store.mark_verified(&batch_id).await?;
+        // Counted only AFTER the store has persisted ManifestUploaded ->
+        // Verified. Incrementing first would let a failed state write leave
+        // verified_total claiming a verification the ledger never recorded -
+        // and this counter is one half of how the invariant is checked.
         if let Some(mx) = telemetry::metrics() {
             let l = [
                 tenant.as_str(),
@@ -409,12 +443,6 @@ impl<'a> Pipeline<'a> {
                     .inc();
             }
         }
-        if backend_limited {
-            tracing::warn!(batch_id, "verification_passed (backend_limited: size-only)");
-        } else {
-            tracing::info!(batch_id, "verification_passed");
-        }
-        self.store.mark_verified(&batch_id).await?;
 
         // ---- VERIFIED -> SOURCE_COMMITTED -------------------------------
         // Only now is it legal to advance source progress.
@@ -748,11 +776,18 @@ impl Engine {
                         // No source_name label: file/syslog source names are
                         // full paths, so a rotated file set would mint a series
                         // per file. The path is in the warning below instead.
+                        // Resolve tenant the same way the pipeline does
+                        // (stream override first, engine default second) so read
+                        // errors line up with the batch metrics for the same
+                        // source instead of always landing on the engine
+                        // default.
+                        let t = self
+                            .streams
+                            .lookup(&source.source_name)
+                            .map(|s| s.tenant.clone())
+                            .unwrap_or_else(|| self.config.engine.tenant.clone());
                         mx.source_read_errors_total
-                            .with_label_values(&[
-                                self.config.engine.tenant.as_str(),
-                                source.source_type.as_str(),
-                            ])
+                            .with_label_values(&[t.as_str(), source.source_type.as_str()])
                             .inc();
                     }
                     tracing::warn!(source = %source.source_name, error = %e, "source read failed; skipping this cycle");
@@ -833,6 +868,28 @@ impl Engine {
                         match adapter.commit_progress(&rec.progress_end).await {
                             Ok(()) => {
                                 self.store.mark_source_committed(&rec.batch_id).await?;
+                                // A restart-recovery commit is still a commit.
+                                // Without this, commits_total under-counts on
+                                // exactly the path where the invariant is most
+                                // delicate (VERIFIED but not yet committed), and
+                                // the verified-vs-committed panel would show a
+                                // phantom gap after every restart.
+                                if let Some(mx) = telemetry::metrics() {
+                                    let l = [
+                                        rec.tenant.as_str(),
+                                        rec.source_type.as_str(),
+                                        rec.format.extension(),
+                                    ];
+                                    mx.commits_total.with_label_values(&l).inc();
+                                    mx.batches_total
+                                        .with_label_values(&[
+                                            l[0],
+                                            l[1],
+                                            l[2],
+                                            BatchState::SourceCommitted.as_str(),
+                                        ])
+                                        .inc();
+                                }
                                 summary.committed += 1;
                                 tracing::info!(batch_id = %rec.batch_id, "recovered: source_committed");
                             }

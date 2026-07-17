@@ -304,9 +304,11 @@ minio = dashboard(
 # ---------------------------------------------------------------------------
 logs = dashboard(
     "vtop-logs", "VTOP — Logs",
-    "Raw structured events from every lab component. Until issue #46 lands, "
-    "this is the engine's real source of truth — the other dashboards are "
-    "derived from exactly these lines.",
+    "Raw structured events from every lab component. The engine's metrics now "
+    "come from its own /metrics endpoint, so logs are where the "
+    "high-cardinality detail lives: batch_id, object URIs, error text — the "
+    "things that must never become metric labels. When a stat panel goes red, "
+    "the reason is here.",
     [
         row("Engine", 0),
         panel("Errors and warnings", {"h": 8, "w": 24, "x": 0, "y": 1},

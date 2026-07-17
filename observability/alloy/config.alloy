@@ -88,10 +88,10 @@ prometheus.scrape "minio" {
   forward_to      = [prometheus.remote_write.mimir.receiver]
 }
 
-// Kafka: the apache/kafka image exposes JMX, NOT Prometheus. The lab runs a
-// jmx-exporter sidecar that translates it; without that sidecar this target is
-// simply down, which the Kafka dashboard will show honestly rather than
-// silently graphing nothing.
+// Kafka: the apache/kafka image exposes no Prometheus endpoint. The lab runs
+// kafka-exporter, which talks to the broker over the Kafka protocol (not JMX)
+// and exposes consumer-group lag. Without that sidecar this target is simply
+// down, which the dashboard shows honestly rather than graphing nothing.
 prometheus.scrape "kafka" {
   targets = [
     { __address__ = "kafka-exporter:9308", job = "kafka", instance = "kafka" },

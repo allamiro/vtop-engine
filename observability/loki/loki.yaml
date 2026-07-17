@@ -38,3 +38,9 @@ limits_config:
 compactor:
   working_directory: /loki/compactor
   retention_enabled: false
+
+# Loki reports usage statistics to Grafana Labs by default. A local lab should
+# not make outbound requests nobody asked for; Mimir and Tempo are disabled the
+# same way.
+analytics:
+  reporting_enabled: false

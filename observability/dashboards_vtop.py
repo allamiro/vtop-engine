@@ -75,7 +75,11 @@ def _templating():
             "label": label,
             "type": "query",
             "datasource": MIMIR,
-            "query": {"query": f"label_values(vtop_commits_total, {name})", "refId": name},
+            # Sourced from batches_total, NOT commits_total: a stream that has
+            # never successfully committed - precisely the one being debugged -
+            # would otherwise be unselectable, because its label values would
+            # not exist on a commit counter.
+            "query": {"query": f"label_values(vtop_batches_total, {name})", "refId": name},
             "refresh": 2,
             "includeAll": True,
             "allValue": ".*",
@@ -221,11 +225,16 @@ engine = dash(
         # ---- Sources ---------------------------------------------------------
         _row("Sources", 40),
         _panel("Source read errors/sec", {"h": 7, "w": 12, "x": 0, "y": 41},
-               _q('sum by (source_type, source) (rate(vtop_source_read_errors_total[5m]))',
-                  "{{source_type}} {{source}}"),
+               _q('sum by (source_type) (rate(vtop_source_read_errors_total'
+                  '{tenant=~"$tenant", source_type=~"$source_type"}[5m]))',
+                  "{{source_type}}"),
                desc="A failed read is skipped and retried next cycle, so it is "
                     "survivable - but a steady rate means a source is unhealthy "
-                    "and nobody would otherwise notice."),
+                    "and nobody would otherwise notice. Not labelled by source "
+                    "name: file/syslog names are full paths and a rotated file "
+                    "set would mint a series per file - the path is in the log "
+                    "panel beside this one. (No $format filter: a read fails "
+                    "before the format is known.)"),
         _panel("Recent engine warnings and errors", {"h": 7, "w": 12, "x": 12, "y": 41},
                [{"datasource": LOKI, "expr": '{service="vtop-engine"} | level=~"WARN|ERROR"', "queryType": "range"}],
                ds=LOKI, kind="logs",

@@ -14,12 +14,11 @@
 # and collide with other local stacks.
 #
 # HONEST SCOPE — read before trusting a panel:
-#   * The VTOP engine exposes NO metrics endpoint yet (issue #46). Its data is
-#     emitted as structured LOG events, so the engine dashboards are built on
-#     Loki/LogQL. That is a bridge, not a substitute: log-derived metrics are
-#     lossy and cardinality-limited, and are not a sound alerting base.
+#   * The VTOP engine exposes its OWN Prometheus metrics (issue #46) at
+#     VTOP_METRICS_ADDR, so it is scraped directly. Logs remain the place for the
+#     high-cardinality detail (batch_id, object URIs) that must never be a label.
 #   * MinIO exposes Prometheus natively (auth disabled below - LAB ONLY).
-#   * Kafka exposes JMX, not Prometheus, hence the exporter sidecar.
+#   * Kafka exposes no Prometheus endpoint, hence the exporter sidecar.
 #   * Every backend here is single-node with filesystem storage and lab
 #     credentials. This is NOT a production topology.
 
@@ -31,10 +30,12 @@ services:
     environment:
       MINIO_PROMETHEUS_AUTH_TYPE: public
 
-  # --- Kafka JMX -> Prometheus ---------------------------------------------
-  # The apache/kafka image has no Prometheus endpoint, only JMX. This exporter
-  # translates it. Without it, the Kafka dashboard shows the target as DOWN
-  # rather than silently graphing nothing.
+  # --- Kafka -> Prometheus --------------------------------------------------
+  # The apache/kafka image exposes no Prometheus endpoint. This exporter talks
+  # to the broker over the KAFKA PROTOCOL (not JMX) and exposes consumer-group
+  # lag and topic offsets - which is exactly what the invariant story needs.
+  # Without it the Kafka dashboard shows its target as DOWN rather than silently
+  # graphing nothing.
   kafka-exporter:
     image: danielqsj/kafka-exporter:v1.9.0
     container_name: vtop-kafka-exporter

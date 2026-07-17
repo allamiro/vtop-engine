@@ -1,7 +1,7 @@
 {
   "uid": "vtop-logs",
   "title": "VTOP \u2014 Logs",
-  "description": "Raw structured events from every lab component. Until issue #46 lands, this is the engine's real source of truth \u2014 the other dashboards are derived from exactly these lines.",
+  "description": "Raw structured events from every lab component. The engine's metrics now come from its own /metrics endpoint, so logs are where the high-cardinality detail lives: batch_id, object URIs, error text \u2014 the things that must never become metric labels. When a stat panel goes red, the reason is here.",
   "tags": [
     "vtop",
     "logs"
