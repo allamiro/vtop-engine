@@ -93,6 +93,11 @@ CREATE TRIGGER trg_commit_after_verify BEFORE INSERT OR UPDATE ON batches
 /// never hits this, a distributed store occasionally does.
 const MAX_SERIALIZATION_RETRIES: u32 = 5;
 
+/// Retry budget for a lost update (the optimistic `AND state = …` guard matched
+/// zero rows because another writer moved the row first). Bounded so a genuine
+/// livelock cannot spin forever.
+const MAX_CONFLICT_RETRIES: u32 = 5;
+
 /// Handle to the persistent Postgres-compatible state store.
 #[derive(Clone)]
 pub struct PgStateStore {
@@ -244,57 +249,65 @@ impl StateStore for PgStateStore {
         to: BatchState,
         patch: &BatchPatch,
     ) -> Result<(), VtopError> {
-        // Application-level guard first: read the current state and validate the
-        // transition through the single source of truth. The DB trigger is the
-        // backstop, not the primary check.
-        let current = self.get_state(batch_id).await?;
-        let validated = transition(current, to)?;
-        let now = chrono::Utc::now().to_rfc3339();
+        // Read -> validate -> conditional write, retried on a lost update.
+        //
+        // The UPDATE only applies if the row is STILL in the state we validated
+        // against (`AND state = $10`). In an HA fleet two instances could both
+        // read the same state, both validate, and both write; the guard makes
+        // the loser's UPDATE affect zero rows. Rather than surface that as a hard
+        // error to the orchestrator (which does not retry), re-read and
+        // re-validate: if the batch's new state still permits the intended
+        // transition, retry the write transparently; if it no longer does (e.g.
+        // another writer already advanced it), `transition` returns the correct
+        // error on the next pass. A genuinely illegal transition therefore still
+        // fails immediately - only a lost update loops. The 40001 serialization
+        // retry sits inside, on the write itself.
+        let mut attempt = 0;
+        loop {
+            let current = self.get_state(batch_id).await?;
+            let validated = transition(current, to)?;
+            let now = chrono::Utc::now().to_rfc3339();
+            let expected = current.as_str();
+            let rows = with_retry(|| {
+                sqlx::query(
+                    r#"UPDATE batches SET
+                         state = $1,
+                         object_uri = COALESCE($2, object_uri),
+                         manifest_uri = COALESCE($3, manifest_uri),
+                         object_sha256 = COALESCE($4, object_sha256),
+                         manifest_sha256 = COALESCE($5, manifest_sha256),
+                         record_count = COALESCE($6, record_count),
+                         error_message = COALESCE($7, error_message),
+                         updated_at = $8
+                       WHERE batch_id = $9 AND state = $10"#,
+                )
+                .bind(validated.as_str())
+                .bind(&patch.object_uri)
+                .bind(&patch.manifest_uri)
+                .bind(&patch.object_sha256)
+                .bind(&patch.manifest_sha256)
+                .bind(patch.record_count)
+                .bind(&patch.error_message)
+                .bind(&now)
+                .bind(batch_id)
+                .bind(expected)
+                .execute(&self.pool)
+            })
+            .await?
+            .rows_affected();
 
-        // Optimistic concurrency: the UPDATE only applies if the row is STILL in
-        // the state we validated against (`AND state = $10`). In an HA fleet two
-        // instances could both read the same state, both validate, and both
-        // write - the guard makes the loser's UPDATE affect zero rows so it can
-        // be reported as a conflict rather than silently clobbering a transition
-        // that happened in between (e.g. another writer moving verified ->
-        // source_committed).
-        let expected = current.as_str();
-        let rows = with_retry(|| {
-            sqlx::query(
-                r#"UPDATE batches SET
-                     state = $1,
-                     object_uri = COALESCE($2, object_uri),
-                     manifest_uri = COALESCE($3, manifest_uri),
-                     object_sha256 = COALESCE($4, object_sha256),
-                     manifest_sha256 = COALESCE($5, manifest_sha256),
-                     record_count = COALESCE($6, record_count),
-                     error_message = COALESCE($7, error_message),
-                     updated_at = $8
-                   WHERE batch_id = $9 AND state = $10"#,
-            )
-            .bind(validated.as_str())
-            .bind(&patch.object_uri)
-            .bind(&patch.manifest_uri)
-            .bind(&patch.object_sha256)
-            .bind(&patch.manifest_sha256)
-            .bind(patch.record_count)
-            .bind(&patch.error_message)
-            .bind(&now)
-            .bind(batch_id)
-            .bind(expected)
-            .execute(&self.pool)
-        })
-        .await?
-        .rows_affected();
-
-        if rows == 0 {
-            // The row's state changed between our read and our write, so the
-            // transition we validated is stale. Recovery re-reads and retries.
-            return Err(VtopError::State(format!(
-                "concurrent state change for batch {batch_id}: it was no longer {expected} at write time"
-            )));
+            if rows >= 1 {
+                return Ok(());
+            }
+            // Lost update: the row's state changed between our read and write.
+            attempt += 1;
+            if attempt > MAX_CONFLICT_RETRIES {
+                return Err(VtopError::State(format!(
+                    "persistent concurrent state change for batch {batch_id} after {attempt} attempts"
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(5 * attempt as u64)).await;
         }
-        Ok(())
     }
 
     async fn get_batch(&self, batch_id: &str) -> Result<Option<BatchRecord>, VtopError> {
