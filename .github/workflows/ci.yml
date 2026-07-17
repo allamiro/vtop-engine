@@ -328,3 +328,31 @@ jobs:
         run: |
           pip uninstall -y pyyaml
           python -m pytest
+
+  # The whole stack, assembled and asserted end to end. Unit and integration
+  # tests never run the real compose lab, which is exactly how the Kafka
+  # ingestion P0 shipped with CI fully green. Verified this job catches it:
+  # re-introducing that bug fails "no committed batch for source type: kafka"
+  # while file/syslog still pass - the precise signature of the original defect.
+  e2e-smoke:
+    name: e2e smoke (full compose lab)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build the engine image once, up front: the script's `compose up` would
+      # otherwise build it inside the timed wait loop and could time out on a
+      # cold cache rather than on a real failure.
+      - name: Build the engine image
+        run: docker compose build vtop-engine
+
+      - name: Run the end-to-end smoke test
+        env:
+          TIMEOUT: "300"
+        run: bash scripts/e2e-smoke.sh
+
+      # Compose logs are the only way to diagnose a failure after the fact.
+      - name: Engine logs on failure
+        if: failure()
+        run: docker compose logs --tail=100 vtop-engine || true
