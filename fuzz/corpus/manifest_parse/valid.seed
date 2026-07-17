@@ -1,0 +1,39 @@
+{
+  "protocol": "VTOP",
+  "version": "0.1",
+  "batch_id": "vtop-20260717T192522Z-json_events_3-p0-80145-80336-7b7cfd32",
+  "tenant": "default",
+  "source_type": "kafka",
+  "source_name": "json_events_3",
+  "format": "jsonl",
+  "compression": "gzip",
+  "record_count": 684,
+  "first_timestamp": null,
+  "last_timestamp": null,
+  "source_progress": {
+    "source_type": "kafka",
+    "topic": "json_events_3",
+    "partition": 0,
+    "start_offset": 80145,
+    "end_offset": 80336,
+    "consumer_group": "vtop-engine"
+  },
+  "object": {
+    "uri": "s3://telemetry-jsonl/tenant=default/source=json_events_3/format=jsonl/year=2026/month=07/day=17/hour=19/vtop-20260717T192522Z-json_events_3-p0-80145-80336-7b7cfd32.jsonl.gz",
+    "size_bytes": 20808,
+    "checksum_algorithm": "sha256",
+    "checksum": "044eabaf7eb619811e604fdf3df7de35d7f781f035e21ee7de5f49511ebc0b4a"
+  },
+  "manifest": {
+    "uri": "s3://telemetry-jsonl/tenant=default/source=json_events_3/format=jsonl/year=2026/month=07/day=17/hour=19/vtop-20260717T192522Z-json_events_3-p0-80145-80336-7b7cfd32.manifest.json",
+    "sha256": "8c0386247cc5c0960ff91974694997d1df244efa88eec1cc40547c1c53cab4fe"
+  },
+  "partitioning": {
+    "path_template": "tenant={tenant}/source={source}/format={format}/year={yyyy}/month={mm}/day={dd}/hour={hh}/",
+    "resolved_prefix": "tenant=default/source=json_events_3/format=jsonl/year=2026/month=07/day=17/hour=19"
+  },
+  "upload_backend": "s3_native",
+  "state": "manifest_uploaded",
+  "verification_status": "not_verified",
+  "created_at": "2026-07-17T19:25:22.262370513+00:00"
+}

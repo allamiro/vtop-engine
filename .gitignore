@@ -20,3 +20,7 @@
 
 # Local AI assistant guidance (not part of the project)
 /prompt/
+
+# cargo-mutants output
+mutants.out/
+mutants.out.old/

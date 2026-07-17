@@ -1,0 +1,6 @@
+/target
+/artifacts
+Cargo.lock
+# Keep only the named seed inputs; ignore fuzzer-generated corpus growth.
+/corpus/*/*
+!/corpus/*/*.seed
