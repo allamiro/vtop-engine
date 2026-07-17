@@ -294,6 +294,7 @@ logs = dashboard(
 )
 
 from dashboards_kafka import kafka  # noqa: E402
+from dashboards_pipeline import pipeline as pipeline_flow  # noqa: E402
 from dashboards_vtop import engine as vtop_engine  # noqa: E402
 
 if __name__ == "__main__":
@@ -302,6 +303,7 @@ if __name__ == "__main__":
     for name, d in [
         # The engine's own dashboard first: it is the one that matters.
         ("vtop-engine", vtop_engine),
+        ("vtop-pipeline-flow", pipeline_flow),
         ("vtop-overview", overview),
         ("vtop-safety", safety),
         ("vtop-pipeline", pipeline),

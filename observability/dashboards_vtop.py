@@ -55,7 +55,8 @@ def _stat(title, gp, targets, desc="", unit=None, thresholds=None, ds=MIMIR):
         "reduceOptions": {"calcs": ["lastNonNull"], "fields": "", "values": False},
         "colorMode": "background" if thresholds else "value",
         "graphMode": "area",
-        "textMode": "auto",
+        "textMode": "value_and_name",
+        "justifyMode": "center",
     }
     if thresholds:
         p["fieldConfig"]["defaults"]["thresholds"] = {"mode": "absolute", "steps": thresholds}

@@ -85,7 +85,8 @@
         },
         "colorMode": "background",
         "graphMode": "area",
-        "textMode": "auto"
+        "textMode": "value_and_name",
+        "justifyMode": "center"
       }
     },
     {
@@ -130,7 +131,8 @@
         },
         "colorMode": "value",
         "graphMode": "area",
-        "textMode": "auto"
+        "textMode": "value_and_name",
+        "justifyMode": "center"
       }
     },
     {
@@ -175,7 +177,8 @@
         },
         "colorMode": "value",
         "graphMode": "area",
-        "textMode": "auto"
+        "textMode": "value_and_name",
+        "justifyMode": "center"
       }
     },
     {
@@ -221,7 +224,8 @@
         },
         "colorMode": "value",
         "graphMode": "area",
-        "textMode": "auto"
+        "textMode": "value_and_name",
+        "justifyMode": "center"
       }
     },
     {
@@ -267,7 +271,8 @@
         },
         "colorMode": "value",
         "graphMode": "area",
-        "textMode": "auto"
+        "textMode": "value_and_name",
+        "justifyMode": "center"
       }
     },
     {
@@ -332,7 +337,8 @@
         },
         "colorMode": "background",
         "graphMode": "area",
-        "textMode": "auto"
+        "textMode": "value_and_name",
+        "justifyMode": "center"
       }
     },
     {
