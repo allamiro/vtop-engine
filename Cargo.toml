@@ -21,6 +21,13 @@ description = "Verified Telemetry Object Protocol Engine — a replay-safe, mani
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
+# Metrics: the `prometheus` crate is a pure-Rust registry/encoder with no C
+# deps, and `hyper` already sits in the tree via the aws-sdk, so exposing
+# /metrics costs no new heavy dependency.
+prometheus = { version = "0.13", default-features = false }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 rdkafka = { version = "0.39", features = ["cmake-build", "ssl", "sasl"] }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1"

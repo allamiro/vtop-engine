@@ -20,6 +20,7 @@ flate2 = { workspace = true }
 zstd = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+prometheus = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

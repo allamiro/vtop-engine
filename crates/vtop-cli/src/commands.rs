@@ -139,6 +139,11 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 cli.log_level.as_deref().unwrap_or(&cfg.engine.log_level),
                 cli.json,
             );
+            // Metrics are opt-in via VTOP_METRICS_ADDR and only for the
+            // long-running `run` action: one-shot commands would expose a port
+            // for a few milliseconds and never be scraped. Failure to start is
+            // logged, never fatal - telemetry must not block archiving.
+            crate::metrics_server::maybe_start().await;
             let mut engine = Engine::new(cfg, streams).await?;
             engine.run().await
         }

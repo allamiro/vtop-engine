@@ -27,6 +27,7 @@ use vtop_core::metrics::BatchMetrics;
 use vtop_core::partitioning::{self, PartitionContext};
 use vtop_core::replay::{next_recovery_action, RecoveryAction};
 use vtop_core::state_machine::BatchState;
+use vtop_core::telemetry;
 use vtop_core::types::{ProgressMarker, SourceType};
 use vtop_state::{BatchPatch, BatchRecord, SqliteStateStore};
 use vtop_upload::{ObjectChecksum, UploadBackend};
@@ -145,6 +146,16 @@ impl<'a> Pipeline<'a> {
             ($msg:expr) => {{
                 let m: String = $msg;
                 self.store.mark_failed(&batch_id, &m).await?;
+                // Failure accounting. Deliberately label-free of batch_id: the
+                // identifier is unbounded and belongs in the log line below,
+                // not in a metric label.
+                if let Some(mx) = telemetry::metrics() {
+                    let l = [tenant.as_str(), source.source_type.as_str(), format.extension()];
+                    mx.failed_total.with_label_values(&l).inc();
+                    mx.batches_total
+                        .with_label_values(&[l[0], l[1], l[2], BatchState::Failed.as_str()])
+                        .inc();
+                }
                 tracing::error!(batch_id, error = %m, "batch failed");
                 return Ok(BatchOutcome {
                     batch_id: batch_id.clone(),
@@ -336,6 +347,15 @@ impl<'a> Pipeline<'a> {
             .verify_object(&object_uri, compressed.size_bytes, object_ck)
             .await?;
         if !obj_v.passed {
+            if let Some(mx) = telemetry::metrics() {
+                mx.verification_failures_total
+                    .with_label_values(&[
+                        tenant.as_str(),
+                        source.source_type.as_str(),
+                        format.extension(),
+                    ])
+                    .inc();
+            }
             fail!(format!("object verification failed: {}", obj_v.message));
         }
         // 3) the stored manifest matches size + checksum.
@@ -344,6 +364,15 @@ impl<'a> Pipeline<'a> {
             .verify_object(&manifest_uri, manifest_size, manifest_ck)
             .await?;
         if !man_v.passed {
+            if let Some(mx) = telemetry::metrics() {
+                mx.verification_failures_total
+                    .with_label_values(&[
+                        tenant.as_str(),
+                        source.source_type.as_str(),
+                        format.extension(),
+                    ])
+                    .inc();
+            }
             fail!(format!("manifest verification failed: {}", man_v.message));
         }
         metrics.verify_ms = t.elapsed().as_millis() as u64;
@@ -361,6 +390,25 @@ impl<'a> Pipeline<'a> {
         // (VERIFIED -> SOURCE_COMMITTED below). The on-disk manifest was written
         // and uploaded *before* this step (its hash must be stable), so we do
         // not re-stamp it here — querying the store is the source of truth.
+        if let Some(mx) = telemetry::metrics() {
+            let l = [
+                tenant.as_str(),
+                source.source_type.as_str(),
+                format.extension(),
+            ];
+            mx.verified_total.with_label_values(&l).inc();
+            mx.batches_total
+                .with_label_values(&[l[0], l[1], l[2], BatchState::Verified.as_str()])
+                .inc();
+            if backend_limited {
+                // Verified by size/existence only. Committing on this is weaker
+                // than the protocol intends, so it is counted separately rather
+                // than folded into verified_total.
+                mx.verification_backend_limited_total
+                    .with_label_values(&l)
+                    .inc();
+            }
+        }
         if backend_limited {
             tracing::warn!(batch_id, "verification_passed (backend_limited: size-only)");
         } else {
@@ -390,6 +438,54 @@ impl<'a> Pipeline<'a> {
         tracing::info!(batch_id, "source_committed");
 
         metrics.finalize(started.elapsed().as_millis() as u64);
+
+        // Export what the batch actually measured. Recorded only on the
+        // committed path: commits_total must never exceed verified_total, which
+        // is how the core invariant becomes observable rather than merely
+        // asserted in tests.
+        if let Some(mx) = telemetry::metrics() {
+            let l = [
+                tenant.as_str(),
+                source.source_type.as_str(),
+                format.extension(),
+            ];
+            mx.commits_total.with_label_values(&l).inc();
+            mx.batches_total
+                .with_label_values(&[l[0], l[1], l[2], BatchState::SourceCommitted.as_str()])
+                .inc();
+            mx.records_total
+                .with_label_values(&l)
+                .inc_by(metrics.records as u64);
+            mx.bytes_in_total
+                .with_label_values(&l)
+                .inc_by(metrics.uncompressed_bytes);
+            mx.bytes_out_total
+                .with_label_values(&l)
+                .inc_by(metrics.compressed_bytes);
+            mx.batch_duration_seconds
+                .with_label_values(&l)
+                .observe(metrics.total_ms as f64 / 1000.0);
+            if metrics.compression_ratio.is_finite() && metrics.compression_ratio > 0.0 {
+                mx.compression_ratio
+                    .with_label_values(&l)
+                    .observe(metrics.compression_ratio);
+            }
+            // Per-stage latency as histograms, so p95/p99 are answerable; an
+            // average would hide the tail that actually pages someone.
+            for (stage, ms) in [
+                ("compress", metrics.compress_ms),
+                ("checksum", metrics.checksum_ms),
+                ("object_upload", metrics.object_upload_ms),
+                ("manifest_upload", metrics.manifest_upload_ms),
+                ("verify", metrics.verify_ms),
+                ("commit", metrics.commit_ms),
+            ] {
+                mx.stage_duration_seconds
+                    .with_label_values(&[l[0], l[1], l[2], stage])
+                    .observe(ms as f64 / 1000.0);
+            }
+        }
+
         tracing::info!(
             batch_id,
             records = metrics.records,
@@ -648,6 +744,15 @@ impl Engine {
             {
                 Ok(r) => r,
                 Err(e) => {
+                    if let Some(mx) = telemetry::metrics() {
+                        mx.source_read_errors_total
+                            .with_label_values(&[
+                                self.config.engine.tenant.as_str(),
+                                source.source_type.as_str(),
+                                source.source_name.as_str(),
+                            ])
+                            .inc();
+                    }
                     tracing::warn!(source = %source.source_name, error = %e, "source read failed; skipping this cycle");
                     continue;
                 }
@@ -667,6 +772,12 @@ impl Engine {
                 .entry(key)
                 .or_insert_with(|| PendingBuffer::new(&tenant, source.clone(), limits))
                 .append(read);
+        }
+
+        // Buffers accumulated but not yet sealed. A gauge that climbs without
+        // bound means sealing has stalled.
+        if let Some(mx) = telemetry::metrics() {
+            mx.inflight_batches.set(self.pending.len() as i64);
         }
 
         // ---- Decide which buffers to flush -----------------------------
@@ -752,6 +863,25 @@ impl Engine {
                         .ok();
                     if let Some(adapter) = self.adapters.get_mut(&rec.source_type) {
                         let _ = adapter.replay_from_marker(&rec.progress_start).await;
+                    }
+                    if let Some(mx) = telemetry::metrics() {
+                        // Replay is safe by design, but a sustained rate means
+                        // work is being repeated - worth seeing on a dashboard.
+                        mx.replay_required_total
+                            .with_label_values(&[
+                                rec.tenant.as_str(),
+                                rec.source_type.as_str(),
+                                rec.format.extension(),
+                            ])
+                            .inc();
+                        mx.batches_total
+                            .with_label_values(&[
+                                rec.tenant.as_str(),
+                                rec.source_type.as_str(),
+                                rec.format.extension(),
+                                BatchState::ReplayRequired.as_str(),
+                            ])
+                            .inc();
                     }
                     summary.replay_required += 1;
                     tracing::warn!(batch_id = %rec.batch_id, "recovered: REPLAY_REQUIRED (source progress preserved)");

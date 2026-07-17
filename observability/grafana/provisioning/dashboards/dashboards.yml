@@ -1,0 +1,15 @@
+apiVersion: 1
+
+providers:
+  - name: vtop
+    orgId: 1
+    folder: VTOP
+    type: file
+    disableDeletion: false
+    # Dashboards are code in this repo, not clicked-together state. Editing in
+    # the UI is allowed for exploration but is not the source of truth.
+    allowUiUpdates: true
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

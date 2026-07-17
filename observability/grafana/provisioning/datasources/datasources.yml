@@ -1,0 +1,39 @@
+# Datasources as code: the stack must be useful on first `up`, with no clicking.
+apiVersion: 1
+
+datasources:
+  - name: Mimir
+    type: prometheus
+    uid: mimir
+    access: proxy
+    url: http://mimir:9009/prometheus
+    isDefault: true
+    jsonData:
+      timeInterval: 15s
+
+  - name: Loki
+    type: loki
+    uid: loki
+    access: proxy
+    url: http://loki:3100
+    jsonData:
+      # Jump from a log line straight to its trace once the engine emits them
+      # (issue #46). Harmless until then.
+      derivedFields:
+        - datasourceUid: tempo
+          matcherRegex: 'trace_id=(\w+)'
+          name: TraceID
+          url: '$${__value.raw}'
+
+  - name: Tempo
+    type: tempo
+    uid: tempo
+    access: proxy
+    url: http://tempo:3200
+    jsonData:
+      tracesToLogsV2:
+        datasourceUid: loki
+        spanStartTimeShift: '-5m'
+        spanEndTimeShift: '5m'
+      lokiSearch:
+        datasourceUid: loki
