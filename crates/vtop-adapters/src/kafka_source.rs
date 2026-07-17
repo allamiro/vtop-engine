@@ -13,7 +13,7 @@ use rdkafka::topic_partition_list::TopicPartitionList;
 use rdkafka::Offset;
 use regex::Regex;
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use vtop_core::config::KafkaSourceConfig;
 use vtop_core::errors::VtopError;
 use vtop_core::types::{ProgressMarker, SourceType, TelemetryFormat};
@@ -66,7 +66,20 @@ pub struct KafkaSource {
     // key: (topic, partition)
     cursors: HashMap<(String, i32), PartitionCursor>,
     active: Option<(String, i32)>,
+    /// Partition ids per topic, cached with a TTL.
+    ///
+    /// assign() needs the partition list, but fetching metadata on EVERY read
+    /// costs a broker round trip per topic per cycle. With a few topics that is
+    /// invisible; with 28 topics under load it dominated the cycle and the
+    /// engine appeared to stall for minutes at ~0% CPU. A topic's partition
+    /// count changes rarely, so cache it and re-check on the TTL.
+    partitions: HashMap<String, (Vec<i32>, Instant)>,
 }
+
+/// How long a cached partition list is trusted. Short enough that adding
+/// partitions to a live topic is picked up promptly, long enough that the read
+/// path is not a metadata storm.
+const PARTITION_CACHE_TTL: Duration = Duration::from_secs(60);
 
 impl KafkaSource {
     pub fn new(cfg: KafkaSourceConfig, format: TelemetryFormat) -> Result<Self, VtopError> {
@@ -82,6 +95,7 @@ impl KafkaSource {
             consumer: None,
             cursors: HashMap::new(),
             active: None,
+            partitions: HashMap::new(),
         })
     }
 
@@ -97,6 +111,33 @@ impl KafkaSource {
 
     fn topic_allowed(&self, topic: &str) -> bool {
         self.include.is_match(topic) && !self.exclude.is_match(topic)
+    }
+
+    /// Partition ids for `topic`, served from cache when fresh.
+    ///
+    /// The read path runs once per topic per cycle, so an uncached metadata
+    /// round trip here is multiplied by the topic count: with 28 topics it made
+    /// each cycle take minutes and looked exactly like a hang.
+    fn partitions_for(&mut self, topic: &str) -> Result<Vec<i32>, VtopError> {
+        if let Some((ids, at)) = self.partitions.get(topic) {
+            if at.elapsed() < PARTITION_CACHE_TTL {
+                return Ok(ids.clone());
+            }
+        }
+        let ids: Vec<i32> = {
+            let consumer = self.consumer()?;
+            let md = consumer
+                .fetch_metadata(Some(topic), Duration::from_secs(10))
+                .map_err(|e| VtopError::Source(format!("fetch_metadata {topic}: {e}")))?;
+            md.topics()
+                .iter()
+                .find(|t| t.name() == topic)
+                .map(|t| t.partitions().iter().map(|p| p.id()).collect())
+                .unwrap_or_default()
+        };
+        self.partitions
+            .insert(topic.to_string(), (ids.clone(), Instant::now()));
+        Ok(ids)
     }
 }
 
@@ -143,17 +184,7 @@ impl SourceAdapter for KafkaSource {
         // rebalancing instead of fetching. assign() is rebalance-free and lets
         // us control the exact start offset per partition.
         self.consumer()?;
-        let partitions: Vec<i32> = {
-            let consumer = self.consumer()?;
-            let md = consumer
-                .fetch_metadata(Some(&topic), Duration::from_secs(10))
-                .map_err(|e| VtopError::Source(format!("fetch_metadata {topic}: {e}")))?;
-            md.topics()
-                .iter()
-                .find(|t| t.name() == topic)
-                .map(|t| t.partitions().iter().map(|p| p.id()).collect())
-                .unwrap_or_default()
-        };
+        let partitions: Vec<i32> = self.partitions_for(&topic)?;
         if partitions.is_empty() {
             // Topic has no partitions (e.g. just deleted) — nothing to read.
             self.active = Some((topic.clone(), 0));
