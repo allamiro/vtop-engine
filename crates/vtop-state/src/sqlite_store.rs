@@ -1,12 +1,18 @@
-//! SQLite-backed state store using `sqlx`.
+//! SQLite-backed [`StateStore`] using `sqlx`.
 //!
 //! The state store is the durable journal that makes the engine
 //! crash-recoverable. Every state transition is persisted here, and the
 //! transition itself is validated through [`vtop_core::state_machine`] so the
 //! verification-before-commit rule cannot be violated even at the storage
 //! layer.
+//!
+//! This is the SQLite implementation of the backend-agnostic [`StateStore`]
+//! trait (Phase 1 of the HA plan). The Postgres implementation (Phase 3) lives
+//! behind a Cargo feature and implements the same trait.
 
 use crate::models::{BatchPatch, BatchRecord};
+use crate::store::StateStore;
+use async_trait::async_trait;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use std::str::FromStr;
@@ -37,7 +43,7 @@ CREATE INDEX IF NOT EXISTS idx_batches_state ON batches(state);
 CREATE INDEX IF NOT EXISTS idx_batches_source ON batches(source_type, source_name);
 "#;
 
-/// Handle to the persistent state store.
+/// Handle to the persistent SQLite state store.
 #[derive(Clone)]
 pub struct SqliteStateStore {
     pool: SqlitePool,
@@ -77,14 +83,42 @@ impl SqliteStateStore {
         Ok(())
     }
 
-    /// Insert a new batch (idempotent on `batch_id` via REPLACE semantics for
-    /// the initial save). Used when a batch first enters the store.
-    pub async fn save_batch_state(&self, rec: &BatchRecord) -> Result<(), VtopError> {
+    async fn get_state(&self, batch_id: &str) -> Result<BatchState, VtopError> {
+        let row = sqlx::query("SELECT state FROM batches WHERE batch_id = ?")
+            .bind(batch_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx)?
+            .ok_or_else(|| VtopError::NotFound(format!("batch {batch_id}")))?;
+        let s: String = row.get("state");
+        BatchState::from_str(&s)
+    }
+
+    /// Shared read helper for the `list_*` queries. `sql` is `'static` because
+    /// every caller passes a string literal; sqlx 0.9 ties the query lifetime to
+    /// the SQL, so a borrowed `&str` here would escape the executor call.
+    async fn query_records(
+        &self,
+        sql: &'static str,
+        bind: Option<String>,
+    ) -> Result<Vec<BatchRecord>, VtopError> {
+        let mut q = sqlx::query(sql);
+        if let Some(b) = bind {
+            q = q.bind(b);
+        }
+        let rows = q.fetch_all(&self.pool).await.map_err(map_sqlx)?;
+        rows.into_iter().map(row_to_record).collect()
+    }
+}
+
+#[async_trait]
+impl StateStore for SqliteStateStore {
+    /// Insert a new batch. Plain INSERT (not INSERT OR REPLACE): a `batch_id` is
+    /// created once. A duplicate id must fail loudly rather than silently
+    /// overwrite an existing — possibly already-committed — row.
+    async fn save_batch_state(&self, rec: &BatchRecord) -> Result<(), VtopError> {
         let ps = serde_json::to_string(&rec.progress_start)?;
         let pe = serde_json::to_string(&rec.progress_end)?;
-        // Plain INSERT (not INSERT OR REPLACE): a batch_id is created once. A
-        // duplicate id must fail loudly rather than silently overwrite an
-        // existing — possibly already-committed — row.
         sqlx::query(
             r#"INSERT INTO batches
                (batch_id, tenant, source_type, source_name, format, state,
@@ -115,11 +149,11 @@ impl SqliteStateStore {
         Ok(())
     }
 
-    /// Validate and persist a state transition. The new state is checked
-    /// against [`vtop_core::state_machine::transition`]; an illegal transition
-    /// (including any non-VERIFIED -> SOURCE_COMMITTED) is rejected and the
-    /// store is left unchanged.
-    pub async fn update_batch_state(
+    /// Validate and persist a state transition. The new state is checked against
+    /// [`vtop_core::state_machine::transition`]; an illegal transition (including
+    /// any non-VERIFIED -> SOURCE_COMMITTED) is rejected and the store is left
+    /// unchanged.
+    async fn update_batch_state(
         &self,
         batch_id: &str,
         to: BatchState,
@@ -156,18 +190,7 @@ impl SqliteStateStore {
         Ok(())
     }
 
-    async fn get_state(&self, batch_id: &str) -> Result<BatchState, VtopError> {
-        let row = sqlx::query("SELECT state FROM batches WHERE batch_id = ?")
-            .bind(batch_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(map_sqlx)?
-            .ok_or_else(|| VtopError::NotFound(format!("batch {batch_id}")))?;
-        let s: String = row.get("state");
-        BatchState::from_str(&s)
-    }
-
-    pub async fn get_batch(&self, batch_id: &str) -> Result<Option<BatchRecord>, VtopError> {
+    async fn get_batch(&self, batch_id: &str) -> Result<Option<BatchRecord>, VtopError> {
         let row = sqlx::query("SELECT * FROM batches WHERE batch_id = ?")
             .bind(batch_id)
             .fetch_optional(&self.pool)
@@ -176,14 +199,12 @@ impl SqliteStateStore {
         row.map(row_to_record).transpose()
     }
 
-    pub async fn list_batches(&self) -> Result<Vec<BatchRecord>, VtopError> {
+    async fn list_batches(&self) -> Result<Vec<BatchRecord>, VtopError> {
         self.query_records("SELECT * FROM batches ORDER BY created_at DESC", None)
             .await
     }
 
-    /// Batches that have entered the store but not yet reached
-    /// `SOURCE_COMMITTED` — the recovery work-list.
-    pub async fn list_incomplete_batches(&self) -> Result<Vec<BatchRecord>, VtopError> {
+    async fn list_incomplete_batches(&self) -> Result<Vec<BatchRecord>, VtopError> {
         self.query_records(
             "SELECT * FROM batches WHERE state != ? ORDER BY created_at ASC",
             Some(BatchState::SourceCommitted.as_str().to_string()),
@@ -191,7 +212,7 @@ impl SqliteStateStore {
         .await
     }
 
-    pub async fn list_failed_batches(&self) -> Result<Vec<BatchRecord>, VtopError> {
+    async fn list_failed_batches(&self) -> Result<Vec<BatchRecord>, VtopError> {
         self.query_records(
             "SELECT * FROM batches WHERE state = ? ORDER BY created_at ASC",
             Some(BatchState::Failed.as_str().to_string()),
@@ -199,21 +220,7 @@ impl SqliteStateStore {
         .await
     }
 
-    async fn query_records(
-        &self,
-        sql: &str,
-        bind: Option<String>,
-    ) -> Result<Vec<BatchRecord>, VtopError> {
-        let mut q = sqlx::query(sql);
-        if let Some(b) = bind {
-            q = q.bind(b);
-        }
-        let rows = q.fetch_all(&self.pool).await.map_err(map_sqlx)?;
-        rows.into_iter().map(row_to_record).collect()
-    }
-
-    /// Mark a batch FAILED with an error message (legal from any state).
-    pub async fn mark_failed(&self, batch_id: &str, message: &str) -> Result<(), VtopError> {
+    async fn mark_failed(&self, batch_id: &str, message: &str) -> Result<(), VtopError> {
         let patch = BatchPatch {
             error_message: Some(message.to_string()),
             ..Default::default()
@@ -222,15 +229,12 @@ impl SqliteStateStore {
             .await
     }
 
-    /// Mark a batch VERIFIED (legal only from MANIFEST_UPLOADED).
-    pub async fn mark_verified(&self, batch_id: &str) -> Result<(), VtopError> {
+    async fn mark_verified(&self, batch_id: &str) -> Result<(), VtopError> {
         self.update_batch_state(batch_id, BatchState::Verified, &BatchPatch::default())
             .await
     }
 
-    /// Commit source progress (legal only from VERIFIED — enforced by the
-    /// state machine inside `update_batch_state`).
-    pub async fn mark_source_committed(&self, batch_id: &str) -> Result<(), VtopError> {
+    async fn mark_source_committed(&self, batch_id: &str) -> Result<(), VtopError> {
         self.update_batch_state(
             batch_id,
             BatchState::SourceCommitted,

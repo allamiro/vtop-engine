@@ -11,10 +11,11 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-# MSRV: the floor is set by the aws-sdk crates, which declare rust-version
-# 1.91.1. Verified by a CI job that builds on exactly this toolchain, so the
-# number is a tested promise rather than an aspiration.
-rust-version = "1.91.1"
+# MSRV: the floor is now set by sqlx 0.9, which declares rust-version 1.94.0
+# (it raised the previous 1.91.1 floor that the aws-sdk crates set). Verified by
+# a CI job that builds on exactly this toolchain, so the number is a tested
+# promise rather than an aspiration.
+rust-version = "1.94.0"
 license = "MIT"
 authors = ["VTOP Engine contributors"]
 description = "Verified Telemetry Object Protocol Engine — a replay-safe, manifest-driven telemetry object transfer engine (prototype / reference implementation)."
@@ -48,7 +49,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 flate2 = "1"
 zstd = "0.13"
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono", "uuid"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "chrono", "uuid"] }
 glob = "0.3"
 notify = "8"
 tempfile = "3"

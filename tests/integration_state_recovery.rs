@@ -11,7 +11,7 @@ use vtop_cli::Engine;
 use vtop_core::config::StreamsConfig;
 use vtop_core::state_machine::BatchState;
 use vtop_core::types::SourceType;
-use vtop_state::{BatchPatch, BatchRecord, SqliteStateStore};
+use vtop_state::{BatchPatch, BatchRecord, SqliteStateStore, StateStore};
 
 #[tokio::test]
 async fn state_persists_across_reopen() {

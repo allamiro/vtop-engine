@@ -11,7 +11,7 @@ use vtop_adapters::FileSource;
 use vtop_cli::testkit::{file_config, pipeline, FailCommitAdapter};
 use vtop_core::state_machine::BatchState;
 use vtop_core::types::TelemetryFormat;
-use vtop_state::SqliteStateStore;
+use vtop_state::{SqliteStateStore, StateStore};
 use vtop_upload::MockBackend;
 
 fn sample(dir: &std::path::Path) -> String {
