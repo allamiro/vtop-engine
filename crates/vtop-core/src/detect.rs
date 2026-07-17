@@ -219,4 +219,87 @@ mod tests {
         // Only 1/4 is CEF → no majority → Raw.
         assert_eq!(detect_batch(&b), TelemetryFormat::Raw);
     }
+
+    // A stable-toolchain no-panic smoke test over adversarial byte strings. The
+    // exhaustive version is the `detect_record` fuzz target (see fuzz/), which
+    // needs nightly; this guards the never-panic contract on every normal test
+    // run. detect.rs slices and inspects raw bytes, so boundary inputs (empty,
+    // lone prefix bytes, invalid UTF-8, truncated markers) are the risk.
+    #[test]
+    fn detect_record_never_panics_on_adversarial_bytes() {
+        let cases: &[&[u8]] = &[
+            b"",
+            b"C",
+            b"CEF:",
+            b"CEF:0|",
+            b"LEEF:",
+            b"<",
+            b"<9999999999999999>",
+            b"{",
+            b"{\"",
+            b"[",
+            &[0x00],
+            &[0xff, 0xfe, 0xfd],
+            &[0x80, 0x80, 0x80], // invalid UTF-8 continuation bytes
+            &[b'<', 0xff, b'>'], // syslog-ish prefix with invalid UTF-8
+            &[b'C', b'E', b'F', b':', 0xff],
+        ];
+        for c in cases {
+            // The only assertion is that this returns rather than panics.
+            let _ = detect_record(c);
+        }
+        // Also hammer detect_batch with ragged/empty records.
+        let batch: Vec<Vec<u8>> = vec![vec![], vec![0xff], b"CEF:0|".to_vec(), vec![]];
+        let _ = detect_batch(&batch);
+    }
+
+    // The following tests were added to kill specific surviving mutants that
+    // cargo-mutants reported in detect.rs (issue #25) — each pins a boundary the
+    // earlier tests left unconstrained.
+
+    #[test]
+    fn json_shape_needs_both_delimiters() {
+        // json_shaped requires the FIRST byte to open and the LAST to close.
+        // A record with only one side is not JSON-shaped → Raw (kills the
+        // `&&`→`||` and `==`→`!=` mutants on the shape check).
+        assert_eq!(detect_record(b"{\"a\":1"), TelemetryFormat::Raw); // no closing }
+        assert_eq!(detect_record(b"\"a\":1}"), TelemetryFormat::Raw); // no opening {
+        assert_eq!(detect_record(b"[1,2"), TelemetryFormat::Raw); // no closing ]
+        assert_eq!(detect_record(b"1,2]"), TelemetryFormat::Raw); // no opening [
+        assert_eq!(detect_record(b"{\"a\":1}"), TelemetryFormat::Jsonl); // both → JSONL
+    }
+
+    #[test]
+    fn exactly_half_is_not_a_majority() {
+        // 2 of 4 CEF: best_count*2 == sampled, which is NOT a majority (`>`, not
+        // `>=`) → Raw. Kills the `>`→`>=` mutant on the majority threshold.
+        let b = recs(&["CEF:0|a", "CEF:0|b", "plain one", "plain two"]);
+        assert_eq!(detect_batch(&b), TelemetryFormat::Raw);
+    }
+
+    #[test]
+    fn three_of_five_is_a_majority() {
+        // best_count=3, sampled=5: 3*2=6 > 5 (majority) but 3+2=5 is NOT > 5.
+        // Kills the `*`→`+` mutant on the majority threshold.
+        let b = recs(&["CEF:0|a", "CEF:0|b", "CEF:0|c", "plain one", "plain two"]);
+        assert_eq!(detect_batch(&b), TelemetryFormat::Cef);
+    }
+
+    #[test]
+    fn syslog_pri_must_be_well_formed() {
+        // A PRI must be 1-3 digits AND immediately closed by '>'. These pin the
+        // `&&`→`||` and digit-bound mutants in looks_like_syslog_pri.
+        assert_eq!(detect_record(b"<12x> not syslog"), TelemetryFormat::Raw); // no '>' after digits
+        assert_eq!(detect_record(b"<9999> too many"), TelemetryFormat::Raw); // 4 digits
+        assert_eq!(detect_record(b"<> empty pri"), TelemetryFormat::Raw); // 0 digits
+        assert_eq!(detect_record(b"<134>real syslog"), TelemetryFormat::Syslog);
+    }
+
+    #[test]
+    fn leading_whitespace_is_trimmed_before_classifying() {
+        // The format markers are only found after trim_ascii_start advances past
+        // leading whitespace. Kills the loop-bound / `+=` mutants there.
+        assert_eq!(detect_record(b"   CEF:0|x"), TelemetryFormat::Cef);
+        assert_eq!(detect_record(b"\t\n <134>msg"), TelemetryFormat::Syslog);
+    }
 }

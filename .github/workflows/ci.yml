@@ -359,3 +359,69 @@ jobs:
       - name: Engine logs on failure (best effort)
         if: failure()
         run: docker compose logs --tail=100 vtop-engine 2>/dev/null || echo "stack already torn down; see the smoke output above"
+
+  # Fuzzing (issue #25): detect.rs and manifest deserialization both parse
+  # UNTRUSTED bytes, so they must never panic. This is a bounded SMOKE run - a
+  # short campaign from the committed seed corpus that fails the build if any
+  # target crashes. It is not a substitute for long out-of-band fuzzing, but it
+  # catches regressions on every PR. cargo-fuzz needs nightly + libFuzzer.
+  fuzz:
+    name: fuzz smoke (detect + manifest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fuzz/target
+          key: ${{ runner.os }}-fuzz-${{ hashFiles('**/Cargo.lock', 'fuzz/Cargo.toml') }}
+      - name: Smoke-fuzz each target (fails on any crash)
+        run: |
+          for t in detect_record detect_batch manifest_parse; do
+            echo "::group::fuzz $t"
+            cargo +nightly fuzz run "$t" -- -max_total_time=60 -print_final_stats=1
+            echo "::endgroup::"
+          done
+
+  # Mutation testing (issue #25): measure whether the suite actually catches
+  # injected faults. REPORT ONLY - never gates the build (continue-on-error) -
+  # and scoped to the highest-value modules so a run finishes in CI time.
+  mutants:
+    name: mutation testing (report only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+      - name: Install librdkafka build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake clang libssl-dev libsasl2-dev libcurl4-openssl-dev zlib1g-dev pkg-config
+      - name: Run cargo-mutants on the core logic
+        run: |
+          cargo mutants --package vtop-core \
+            --file 'crates/vtop-core/src/detect.rs' \
+            --file 'crates/vtop-core/src/state_machine.rs' \
+            --file 'crates/vtop-core/src/batch.rs' \
+            --timeout 120 --no-shuffle | tee /tmp/mutants.txt || true
+      - name: Publish summary
+        if: always()
+        run: |
+          {
+            echo '## Mutation testing (report only)'
+            echo '```'
+            tail -40 /tmp/mutants.txt 2>/dev/null || echo "no output"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
