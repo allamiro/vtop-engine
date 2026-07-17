@@ -6,10 +6,15 @@ providers:
     folder: VTOP
     type: file
     disableDeletion: false
-    # Dashboards are code in this repo, not clicked-together state. Editing in
-    # the UI is allowed for exploration but is not the source of truth.
-    allowUiUpdates: true
-    updateIntervalSeconds: 30
+    # Dashboards are code in this repo, the disk files are the SINGLE source of
+    # truth. allowUiUpdates:false makes provisioning authoritative: Grafana
+    # overwrites its stored copy from disk on every sync, so a stale DB copy
+    # (e.g. left over from an earlier branch or an API import) cannot linger and
+    # keep serving an old panel model. You can still edit in the UI to explore;
+    # the change simply is not saved. This is what makes the committed JSON the
+    # thing that renders - not whatever Grafana happened to cache.
+    allowUiUpdates: false
+    updateIntervalSeconds: 15
     options:
       path: /var/lib/grafana/dashboards
       foldersFromFilesStructure: false
