@@ -6,13 +6,18 @@
 //!
 //! These tests pin the contract and the endpoint's behavior.
 
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
+use tokio::sync::Mutex;
 use vtop_cli::metrics_server;
 use vtop_core::telemetry;
 
 /// VTOP_METRICS_ADDR is PROCESS-wide, but Rust runs the tests in this binary
 /// concurrently, so one test removing the variable can race another that just
 /// set it. Serialize every test that touches it.
+///
+/// tokio's Mutex, not std's: these are async tests and the guard is held across
+/// `.await`, which a std guard must never be (it would block the runtime thread
+/// and can deadlock).
 fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -188,8 +193,8 @@ fn commits_never_exceed_verified_in_the_metric_contract() {
 /// often a single binary in a lab and must not open a port nobody asked for.
 #[tokio::test]
 async fn endpoint_is_disabled_without_the_env_var() {
-    // Serialized: see env_lock(). Poisoning is irrelevant here.
-    let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    // Serialized: see env_lock().
+    let _g = env_lock().lock().await;
     std::env::remove_var(metrics_server::ADDR_ENV);
     assert!(
         metrics_server::maybe_start().await.is_none(),
@@ -201,8 +206,8 @@ async fn endpoint_is_disabled_without_the_env_var() {
 /// engine from archiving telemetry.
 #[tokio::test]
 async fn a_malformed_address_disables_metrics_without_panicking() {
-    // Serialized: see env_lock(). Poisoning is irrelevant here.
-    let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    // Serialized: see env_lock().
+    let _g = env_lock().lock().await;
     std::env::set_var(metrics_server::ADDR_ENV, "not-a-socket-addr");
     let bound = metrics_server::maybe_start().await;
     std::env::remove_var(metrics_server::ADDR_ENV);
@@ -215,8 +220,8 @@ async fn a_malformed_address_disables_metrics_without_panicking() {
 /// End-to-end: bind, scrape, and check the three routes behave.
 #[tokio::test]
 async fn serves_metrics_health_and_readiness() {
-    // Serialized: see env_lock(). Poisoning is irrelevant here.
-    let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    // Serialized: see env_lock().
+    let _g = env_lock().lock().await;
     // Port 0 = let the OS pick a free one, so the test cannot collide with a
     // developer's running lab.
     std::env::set_var(metrics_server::ADDR_ENV, "127.0.0.1:0");
