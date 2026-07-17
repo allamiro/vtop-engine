@@ -234,40 +234,6 @@ pipeline = dashboard(
 )
 
 # ---------------------------------------------------------------------------
-# 4. Kafka
-# ---------------------------------------------------------------------------
-kafka = dashboard(
-    "vtop-kafka", "VTOP — Kafka source",
-    "Kafka exposes JMX, not Prometheus; these come from the kafka-exporter "
-    "sidecar. If every panel is empty, check that target in the Alloy UI "
-    "(:12345) — an absent exporter looks identical to zero traffic.",
-    [
-        row("Consumer lag (the invariant, seen from Kafka)", 0),
-        panel("Lag by topic", {"h": 8, "w": 12, "x": 0, "y": 1},
-              promql('sum by (topic) (kafka_consumergroup_lag{consumergroup="vtop-engine"})', "{{topic}}"),
-              MIMIR,
-              desc="VTOP commits offsets ONLY after VERIFIED, so lag is the "
-                   "backlog of records not yet safely archived. Lag reaching 0 "
-                   "is the end-to-end proof."),
-        panel("Lag by partition", {"h": 8, "w": 12, "x": 12, "y": 1},
-              promql('sum by (topic, partition) (kafka_consumergroup_lag{consumergroup="vtop-engine"})',
-                     "{{topic}}-p{{partition}}"),
-              MIMIR,
-              desc="Useful when scaling: engine replicas are bounded by "
-                   "partition count, so more replicas than partitions adds "
-                   "nothing."),
-        row("Topics", 9),
-        panel("Messages in/sec by topic", {"h": 7, "w": 12, "x": 0, "y": 10},
-              promql('sum by (topic) (rate(kafka_topic_partition_current_offset[1m]))', "{{topic}}"),
-              MIMIR, desc="Production rate — the load side of the picture."),
-        panel("Partitions per topic", {"h": 7, "w": 12, "x": 12, "y": 10},
-              promql('count by (topic) (kafka_topic_partition_current_offset)', "{{topic}}"),
-              MIMIR, desc="The ceiling on useful engine replicas for that topic."),
-    ],
-    ["vtop", "kafka"],
-)
-
-# ---------------------------------------------------------------------------
 # 5. MinIO
 # ---------------------------------------------------------------------------
 minio = dashboard(
@@ -327,6 +293,7 @@ logs = dashboard(
     ["vtop", "logs"],
 )
 
+from dashboards_kafka import kafka  # noqa: E402
 from dashboards_vtop import engine as vtop_engine  # noqa: E402
 
 if __name__ == "__main__":

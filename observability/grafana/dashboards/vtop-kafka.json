@@ -1,7 +1,7 @@
 {
   "uid": "vtop-kafka",
   "title": "VTOP \u2014 Kafka source",
-  "description": "Kafka exposes JMX, not Prometheus; these come from the kafka-exporter sidecar. If every panel is empty, check that target in the Alloy UI (:12345) \u2014 an absent exporter looks identical to zero traffic.",
+  "description": "Kafka throughput and lag. Message rates come from kafka-exporter offset deltas; BYTES come from the engine's own counters, because kafka-exporter exposes offsets only and broker BytesInPerSec lives in JMX. If every panel is empty, check the target in the Alloy UI (:12345) - an absent exporter looks exactly like zero traffic.",
   "tags": [
     "vtop",
     "kafka"
@@ -17,7 +17,7 @@
   "panels": [
     {
       "type": "row",
-      "title": "Consumer lag (the invariant, seen from Kafka)",
+      "title": "Throughput at a glance",
       "gridPos": {
         "h": 1,
         "w": 24,
@@ -28,9 +28,268 @@
       "panels": []
     },
     {
+      "type": "stat",
+      "title": "Messages/sec (produced)",
+      "description": "Offsets advance once per message, so the rate of the current offset IS the produce rate. Excludes internal __consumer_offsets.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 5,
+        "x": 0,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "sum(rate(kafka_topic_partition_current_offset{topic!~\"__.*\"}[1m])) or vector(0)",
+          "legendFormat": "msg/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNonNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Messages/sec (archived by VTOP)",
+      "description": "What the engine actually committed. Persistently below the produce rate means VTOP is falling behind - watch lag.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 5,
+        "x": 5,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "sum(rate(vtop_records_total{source_type=\"kafka\"}[1m])) or vector(0)",
+          "legendFormat": "rec/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNonNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Bytes/sec in (uncompressed)",
+      "description": "Kafka payload bytes read into batches, measured by the engine. NOT from kafka-exporter, which exposes offsets only.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 5,
+        "x": 10,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "sum(rate(vtop_bytes_in_total{source_type=\"kafka\"}[1m])) or vector(0)",
+          "legendFormat": "B/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10
+          },
+          "unit": "Bps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNonNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Bytes/sec out (compressed)",
+      "description": "Bytes actually written to object storage. The gap to bytes-in is what compression saves on the wire.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 5,
+        "x": 15,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "sum(rate(vtop_bytes_out_total{source_type=\"kafka\"}[1m])) or vector(0)",
+          "legendFormat": "B/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10
+          },
+          "unit": "Bps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNonNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Total lag",
+      "description": "Records produced but not yet COMMITTED by VTOP. Offsets advance only after VERIFIED, so lag returning to 0 is proof the whole verified path is keeping up.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "sum(kafka_consumergroup_lag{consumergroup=\"vtop-engine\"}) or vector(0)",
+          "legendFormat": "lag"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1000
+              },
+              {
+                "color": "red",
+                "value": 100000
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNonNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto"
+      }
+    },
+    {
+      "type": "row",
+      "title": "Rates",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 5
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
       "type": "timeseries",
-      "title": "Lag by topic",
-      "description": "VTOP commits offsets ONLY after VERIFIED, so lag is the backlog of records not yet safely archived. Lag reaching 0 is the end-to-end proof.",
+      "title": "Messages/sec by topic",
+      "description": "Produce rate per topic, from offset deltas.",
       "datasource": {
         "type": "prometheus",
         "uid": "mimir"
@@ -39,7 +298,185 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 1
+        "y": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "sum by (topic) (rate(kafka_topic_partition_current_offset{topic!~\"__.*\"}[1m]))",
+          "legendFormat": "{{topic}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "timeseries",
+      "title": "Produced vs archived (messages/sec)",
+      "description": "The two lines should track. A sustained gap means the engine cannot keep up and lag will grow - note reads are sequential per topic, so many topics cost wall-clock (see the HA plan).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "sum(rate(kafka_topic_partition_current_offset{topic!~\"__.*\"}[1m]))",
+          "legendFormat": "produced into Kafka"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "sum(rate(vtop_records_total{source_type=\"kafka\"}[1m]))",
+          "legendFormat": "archived by VTOP"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "row",
+      "title": "Bytes (measured by the engine, not the broker)",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 14
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Bytes/sec in vs out",
+      "description": "Kafka-sourced volume through the engine. Upload is the documented bottleneck, so the 'out' line is the one that meets the network.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 15
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "sum(rate(vtop_bytes_in_total{source_type=\"kafka\"}[1m]))",
+          "legendFormat": "uncompressed in"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "sum(rate(vtop_bytes_out_total{source_type=\"kafka\"}[1m]))",
+          "legendFormat": "compressed out"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10
+          },
+          "unit": "Bps"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "timeseries",
+      "title": "Bytes/sec by format",
+      "description": "Which telemetry format dominates the Kafka volume - the engine detects this per batch.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 15
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "sum by (format) (rate(vtop_bytes_in_total{source_type=\"kafka\"}[1m]))",
+          "legendFormat": "{{format}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10
+          },
+          "unit": "Bps"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "row",
+      "title": "Lag (the invariant, seen from Kafka)",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 23
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Lag by topic",
+      "description": "A topic whose lag only grows is not being drained. VTOP commits offsets ONLY after VERIFIED, so lag is the backlog of records not yet safely archived.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 24
       },
       "targets": [
         {
@@ -53,7 +490,9 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "custom": {}
+          "custom": {
+            "fillOpacity": 10
+          }
         },
         "overrides": []
       },
@@ -71,7 +510,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 1
+        "y": 24
       },
       "targets": [
         {
@@ -85,7 +524,9 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "custom": {}
+          "custom": {
+            "fillOpacity": 10
+          }
         },
         "overrides": []
       },
@@ -93,29 +534,29 @@
     },
     {
       "type": "row",
-      "title": "Topics",
+      "title": "Topics and retention",
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 9
+        "y": 32
       },
       "collapsed": false,
       "panels": []
     },
     {
       "type": "timeseries",
-      "title": "Messages in/sec by topic",
-      "description": "Production rate \u2014 the load side of the picture.",
+      "title": "Messages retained per topic",
+      "description": "current - oldest offset = messages still on the broker. This is the replay window: VTOP can only re-read what Kafka still holds.",
       "datasource": {
         "type": "prometheus",
         "uid": "mimir"
       },
       "gridPos": {
         "h": 7,
-        "w": 12,
+        "w": 8,
         "x": 0,
-        "y": 10
+        "y": 33
       },
       "targets": [
         {
@@ -123,13 +564,15 @@
             "type": "prometheus",
             "uid": "mimir"
           },
-          "expr": "sum by (topic) (rate(kafka_topic_partition_current_offset[1m]))",
+          "expr": "sum by (topic) (kafka_topic_partition_current_offset{topic!~\"__.*\"} - kafka_topic_partition_oldest_offset{topic!~\"__.*\"})",
           "legendFormat": "{{topic}}"
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "custom": {}
+          "custom": {
+            "fillOpacity": 10
+          }
         },
         "overrides": []
       },
@@ -145,9 +588,9 @@
       },
       "gridPos": {
         "h": 7,
-        "w": 12,
-        "x": 12,
-        "y": 10
+        "w": 8,
+        "x": 8,
+        "y": 33
       },
       "targets": [
         {
@@ -155,13 +598,49 @@
             "type": "prometheus",
             "uid": "mimir"
           },
-          "expr": "count by (topic) (kafka_topic_partition_current_offset)",
+          "expr": "count by (topic) (kafka_topic_partition_current_offset{topic!~\"__.*\"})",
           "legendFormat": "{{topic}}"
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "custom": {}
+          "custom": {
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "timeseries",
+      "title": "Committed offset per topic",
+      "description": "How far VTOP has safely committed. This number only ever advances after a batch is VERIFIED.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 33
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "sum by (topic) (kafka_consumergroup_current_offset{consumergroup=\"vtop-engine\"})",
+          "legendFormat": "{{topic}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10
+          }
         },
         "overrides": []
       },
