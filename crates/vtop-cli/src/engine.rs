@@ -757,6 +757,20 @@ impl Engine {
         let sources = adapter.discover_sources().await?;
         let max_wait = Duration::from_secs(2);
 
+        // Bound the Kafka partition-metadata cache: drop entries for topics that
+        // no longer exist, so a broker that churns through short-lived topics
+        // does not grow the cache without limit. `sources` is the full live set
+        // this cycle, which is exactly what pruning needs.
+        if *source_type == SourceType::Kafka {
+            if let Some(k) = adapter
+                .as_any_mut()
+                .downcast_mut::<vtop_adapters::KafkaSource>()
+            {
+                let live: Vec<String> = sources.iter().map(|s| s.source_name.clone()).collect();
+                k.prune_partition_cache(&live);
+            }
+        }
+
         // ---- Read + accumulate -----------------------------------------
         for source in sources {
             // A single source read failing must not abort reading/flushing the

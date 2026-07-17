@@ -91,26 +91,32 @@ kafka = {
     "panels": [
         # ---- Headline numbers ------------------------------------------------
         _row("Throughput at a glance", 0),
-        _stat("Messages/sec (produced)", {"h": 4, "w": 5, "x": 0, "y": 1},
+        _stat("Exporter up", {"h": 4, "w": 3, "x": 0, "y": 1},
+              _q('up{job="kafka"}', "up"),
+              thresholds=[{"color": "red", "value": None}, {"color": "green", "value": 1}],
+              desc="kafka-exporter scrape health. If this is 0, every Kafka "
+                   "metric below is STALE - and 0 lag would then be a lie, not a "
+                   "drained group. Check this before trusting anything else."),
+        _stat("Messages/sec (produced)", {"h": 4, "w": 4, "x": 3, "y": 1},
               _q('sum(rate(kafka_topic_partition_current_offset{topic!~"__.*"}[1m])) or vector(0)', "msg/s"),
               desc="Offsets advance once per message, so the rate of the "
                    "current offset IS the produce rate. Excludes internal "
                    "__consumer_offsets."),
-        _stat("Messages/sec (archived by VTOP)", {"h": 4, "w": 5, "x": 5, "y": 1},
+        _stat("Messages/sec (archived by VTOP)", {"h": 4, "w": 4, "x": 7, "y": 1},
               _q(f'sum(rate(vtop_records_total{ENG_KAFKA}[1m])) or vector(0)', "rec/s"),
               desc="What the engine actually committed. Persistently below the "
                    "produce rate means VTOP is falling behind - watch lag."),
-        _stat("Bytes/sec in (uncompressed)", {"h": 4, "w": 5, "x": 10, "y": 1},
+        _stat("Bytes/sec in (uncompressed)", {"h": 4, "w": 4, "x": 11, "y": 1},
               _q(f'sum(rate(vtop_bytes_in_total{ENG_KAFKA}[1m])) or vector(0)', "B/s"),
               unit="Bps",
               desc="Kafka payload bytes read into batches, measured by the "
                    "engine. NOT from kafka-exporter, which exposes offsets only."),
-        _stat("Bytes/sec out (compressed)", {"h": 4, "w": 5, "x": 15, "y": 1},
+        _stat("Bytes/sec out (compressed)", {"h": 4, "w": 4, "x": 15, "y": 1},
               _q(f'sum(rate(vtop_bytes_out_total{ENG_KAFKA}[1m])) or vector(0)', "B/s"),
               unit="Bps",
               desc="Bytes actually written to object storage. The gap to "
                    "bytes-in is what compression saves on the wire."),
-        _stat("Total lag", {"h": 4, "w": 4, "x": 20, "y": 1},
+        _stat("Total lag", {"h": 4, "w": 5, "x": 19, "y": 1},
               _q(f'sum(kafka_consumergroup_lag{{{GROUP}}}) or vector(0)', "lag"),
               thresholds=OK_ZERO,
               desc="Records produced but not yet COMMITTED by VTOP. Offsets "

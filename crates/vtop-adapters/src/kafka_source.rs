@@ -76,10 +76,15 @@ pub struct KafkaSource {
     partitions: HashMap<String, (Vec<i32>, Instant)>,
 }
 
-/// How long a cached partition list is trusted. Short enough that adding
-/// partitions to a live topic is picked up promptly, long enough that the read
-/// path is not a metadata storm.
-const PARTITION_CACHE_TTL: Duration = Duration::from_secs(60);
+/// How long a cached partition list is trusted.
+///
+/// Must comfortably exceed a full engine cycle, or the cache expires before it
+/// is reused and the metadata storm returns. A cycle reads sources sequentially
+/// with a 2s poll each, so ~28 topics is already ~56s - a 60s TTL would expire
+/// every entry mid-cycle under exactly the load this cache exists for. Five
+/// minutes leaves generous headroom while still picking up a repartitioned topic
+/// promptly.
+const PARTITION_CACHE_TTL: Duration = Duration::from_secs(300);
 
 impl KafkaSource {
     pub fn new(cfg: KafkaSourceConfig, format: TelemetryFormat) -> Result<Self, VtopError> {
@@ -111,6 +116,16 @@ impl KafkaSource {
 
     fn topic_allowed(&self, topic: &str) -> bool {
         self.include.is_match(topic) && !self.exclude.is_match(topic)
+    }
+
+    /// Drop cached partition lists for topics that no longer exist, so a broker
+    /// that churns through many short-lived topics does not grow the cache
+    /// without bound.
+    pub fn prune_partition_cache(&mut self, live_topics: &[String]) {
+        let live: std::collections::HashSet<&str> =
+            live_topics.iter().map(|s| s.as_str()).collect();
+        self.partitions
+            .retain(|topic, _| live.contains(topic.as_str()));
     }
 
     /// Partition ids for `topic`, served from cache when fresh.
@@ -439,6 +454,19 @@ mod tests {
             sasl_password_env: None,
             ssl_ca_location: None,
         }
+    }
+
+    #[test]
+    fn prune_drops_dead_topics_and_keeps_live_ones() {
+        let mut src = KafkaSource::new(cfg(), TelemetryFormat::Cef).unwrap();
+        // Seed the cache directly - partitions_for would need a broker.
+        src.partitions
+            .insert("live".into(), (vec![0], std::time::Instant::now()));
+        src.partitions
+            .insert("dead".into(), (vec![0], std::time::Instant::now()));
+        src.prune_partition_cache(&["live".to_string()]);
+        assert!(src.partitions.contains_key("live"), "live topic kept");
+        assert!(!src.partitions.contains_key("dead"), "dead topic dropped");
     }
 
     #[test]

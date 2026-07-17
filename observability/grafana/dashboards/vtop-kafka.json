@@ -29,6 +29,67 @@
     },
     {
       "type": "stat",
+      "title": "Exporter up",
+      "description": "kafka-exporter scrape health. If this is 0, every Kafka metric below is STALE - and 0 lag would then be a lie, not a drained group. Check this before trusting anything else.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 0,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "up{job=\"kafka\"}",
+          "legendFormat": "up"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNonNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto"
+      }
+    },
+    {
+      "type": "stat",
       "title": "Messages/sec (produced)",
       "description": "Offsets advance once per message, so the rate of the current offset IS the produce rate. Excludes internal __consumer_offsets.",
       "datasource": {
@@ -37,8 +98,8 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 5,
-        "x": 0,
+        "w": 4,
+        "x": 3,
         "y": 1
       },
       "targets": [
@@ -82,8 +143,8 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 5,
-        "x": 5,
+        "w": 4,
+        "x": 7,
         "y": 1
       },
       "targets": [
@@ -127,8 +188,8 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 5,
-        "x": 10,
+        "w": 4,
+        "x": 11,
         "y": 1
       },
       "targets": [
@@ -173,7 +234,7 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 5,
+        "w": 4,
         "x": 15,
         "y": 1
       },
@@ -219,8 +280,8 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 4,
-        "x": 20,
+        "w": 5,
+        "x": 19,
         "y": 1
       },
       "targets": [
