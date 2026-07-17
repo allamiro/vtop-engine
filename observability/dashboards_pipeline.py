@@ -97,8 +97,15 @@ TARGETS = [
     ("msgin",    'sum(rate(kafka_topic_partition_current_offset{topic!~"__.*"}[1m])) or vector(0)'),
     ("bytesin",  'sum(rate(vtop_bytes_in_total[1m])) or vector(0)'),
     ("bytesout", 'sum(rate(vtop_bytes_out_total[1m])) or vector(0)'),
-    ("ratio",    'histogram_quantile(0.5, sum by (le) (rate(vtop_compression_ratio_bucket[5m]))) or vector(0)'),
-    ("p95",      'histogram_quantile(0.95, sum by (le) (rate(vtop_stage_duration_seconds_bucket[5m]))) or vector(0)'),
+    # histogram_quantile over a histogram that has series but zero observations
+    # in the window returns NaN, and NaN is still a series, so `or vector(0)`
+    # would NOT replace it - the field would render blank once the lab goes idle.
+    # Guard with `and (sum(rate) > 0)` so the quantile is kept ONLY when there
+    # were observations; otherwise it drops out and the fallback shows 0.
+    ("ratio",    'histogram_quantile(0.5, sum by (le) (rate(vtop_compression_ratio_bucket[5m]))) '
+                 'and (sum(rate(vtop_compression_ratio_bucket[5m])) > 0) or vector(0)'),
+    ("p95",      'histogram_quantile(0.95, sum by (le) (rate(vtop_stage_duration_seconds_bucket[5m]))) '
+                 'and (sum(rate(vtop_stage_duration_seconds_bucket[5m])) > 0) or vector(0)'),
     ("commits",  'sum(vtop_commits_total) or vector(0)'),
     ("failed",   'sum(increase(vtop_failed_total[1h])) or vector(0)'),
     ("lag",      'sum(kafka_consumergroup_lag{consumergroup="vtop-engine"}) or vector(0)'),

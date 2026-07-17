@@ -77,7 +77,7 @@
             "uid": "mimir"
           },
           "refId": "D",
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(vtop_compression_ratio_bucket[5m]))) or vector(0)",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(vtop_compression_ratio_bucket[5m]))) and (sum(rate(vtop_compression_ratio_bucket[5m])) > 0) or vector(0)",
           "instant": true,
           "legendFormat": "ratio"
         },
@@ -87,7 +87,7 @@
             "uid": "mimir"
           },
           "refId": "E",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(vtop_stage_duration_seconds_bucket[5m]))) or vector(0)",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(vtop_stage_duration_seconds_bucket[5m]))) and (sum(rate(vtop_stage_duration_seconds_bucket[5m])) > 0) or vector(0)",
           "instant": true,
           "legendFormat": "p95"
         },
