@@ -140,6 +140,10 @@ services:
       VTOP_S3_VERIFY_TLS: "false"
       VTOP_CONFIG: /app/examples/config.yaml
       RUST_LOG: info
+      # Structured JSON logs so Alloy -> Loki ships parseable events (level,
+      # records, *_ms, byte counts) instead of ANSI-coloured pretty text. The
+      # log-derived Grafana panels depend on this.
+      VTOP_LOG_FORMAT: json
       # Expose the engine's own Prometheus metrics. Opt-in: nothing listens
       # unless this is set. Alloy scrapes vtop-engine:9090/metrics.
       VTOP_METRICS_ADDR: "0.0.0.0:9090"
