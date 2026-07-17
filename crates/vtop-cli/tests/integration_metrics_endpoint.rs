@@ -189,6 +189,31 @@ fn commits_never_exceed_verified_in_the_metric_contract() {
     );
 }
 
+/// Recovery must record the VERIFICATION as well as the commit.
+///
+/// A recovered batch was verified by a process that has since crashed, and
+/// Prometheus counters are per-process. Counting only the commit would leave the
+/// new process reporting commits_total > verified_total - which reads exactly
+/// like "SOURCE_COMMITTED happened without VERIFIED", the one alarm that must
+/// never cry wolf. This pins the pairing so a future edit cannot drop it.
+#[test]
+fn recovery_keeps_commits_paired_with_verification() {
+    let m = telemetry::init().unwrap();
+    let l = ["recovery-tenant", "kafka", "cef"];
+
+    // Simulate what recover() does for a batch left VERIFIED by a dead process.
+    m.verified_total.with_label_values(&l).inc();
+    m.commits_total.with_label_values(&l).inc();
+
+    let v = m.verified_total.with_label_values(&l).get();
+    let c = m.commits_total.with_label_values(&l).get();
+    assert!(
+        c <= v,
+        "after a recovery commit the process reports commits={c} > verified={v}; \
+         the invariant panel would show a false violation"
+    );
+}
+
 /// The endpoint is opt-in: no VTOP_METRICS_ADDR, no listener. The engine is
 /// often a single binary in a lab and must not open a port nobody asked for.
 #[tokio::test]

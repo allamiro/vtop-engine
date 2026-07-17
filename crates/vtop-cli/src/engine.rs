@@ -868,18 +868,37 @@ impl Engine {
                         match adapter.commit_progress(&rec.progress_end).await {
                             Ok(()) => {
                                 self.store.mark_source_committed(&rec.batch_id).await?;
-                                // A restart-recovery commit is still a commit.
-                                // Without this, commits_total under-counts on
+                                // A restart-recovery commit is still a commit:
+                                // without it, commits_total under-counts on
                                 // exactly the path where the invariant is most
-                                // delicate (VERIFIED but not yet committed), and
-                                // the verified-vs-committed panel would show a
-                                // phantom gap after every restart.
+                                // delicate (VERIFIED but not yet committed).
+                                //
+                                // The verification is counted HERE TOO, even
+                                // though it happened in the process that
+                                // crashed. Prometheus counters are per-process
+                                // and reset on restart, so counting only the
+                                // commit would leave this process reporting
+                                // commits_total > verified_total - which reads
+                                // as "SOURCE_COMMITTED without VERIFIED", the
+                                // one alarm that must never cry wolf. The state
+                                // store is the authority that the batch really
+                                // did reach VERIFIED, so recording both keeps
+                                // the pair self-consistent and honest.
                                 if let Some(mx) = telemetry::metrics() {
                                     let l = [
                                         rec.tenant.as_str(),
                                         rec.source_type.as_str(),
                                         rec.format.extension(),
                                     ];
+                                    mx.verified_total.with_label_values(&l).inc();
+                                    mx.batches_total
+                                        .with_label_values(&[
+                                            l[0],
+                                            l[1],
+                                            l[2],
+                                            BatchState::Verified.as_str(),
+                                        ])
+                                        .inc();
                                     mx.commits_total.with_label_values(&l).inc();
                                     mx.batches_total
                                         .with_label_values(&[
