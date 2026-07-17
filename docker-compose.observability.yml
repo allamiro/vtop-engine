@@ -121,6 +121,10 @@ services:
     volumes:
       - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      # Tech logos for the Canvas pipeline diagram, served from Grafana's public
+      # path so the Canvas icons use stable local URLs (public/img/vtop/*.svg)
+      # and render with no internet.
+      - ./observability/grafana/assets:/usr/share/grafana/public/img/vtop:ro
       - grafana-data:/var/lib/grafana
     depends_on:
       - mimir

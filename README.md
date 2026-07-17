@@ -571,7 +571,7 @@ Each batch records:
 
 `vtopctl process-once --json` includes the full metrics object per batch.
 
-Prometheus-style aggregate metrics are designed but not yet exported.
+Prometheus metrics are exported by the engine at `/metrics` when `VTOP_METRICS_ADDR` is set. See [observability/](observability/) for the optional Grafana LGTM stack (Alloy + Mimir/Loki/Tempo) and dashboards.
 
 Relevant implementation:
 
@@ -649,7 +649,7 @@ VTOP is currently a prototype. The following limits are known and intentional.
 | Syslog timestamps | `received_time_*` is not yet extracted into the spool marker | add timestamp extraction |
 | Manifest integrity | self-hash exists, signing not implemented | add manifest signing |
 | Object immutability | S3 Object Lock is designed but not implemented | add Object Lock profile |
-| Metrics export | structured events exist, Prometheus export not implemented | add metrics endpoint/exporter |
+| Metrics export | **Prometheus `/metrics` implemented** (opt-in via `VTOP_METRICS_ADDR`); OpenTelemetry trace export not yet | add OTLP span export |
 | Kafka integration test | requires live broker and is ignored by default | add optional CI service profile |
 | Binary / pre-compressed inputs | **supported** via the file source `whole_file` mode (archived verbatim, byte-exact) | streaming for very large files |
 | Local filesystem backend | **available** (`backend: localfs`, objects under `local_path/<bucket>/<key>` with a checksum sidecar) | — |
@@ -665,6 +665,10 @@ Completed:
 - [x] BLAKE3 checksum strategy (and checksum-disabled mode)
 - [x] binary / pre-compressed input framing (file source `whole_file` mode)
 - [x] strong-verification gate (`require_strong_verification`)
+- [x] **Prometheus metrics exporter** — the engine serves `/metrics` (`/healthz`,
+      `/readyz`) behind `VTOP_METRICS_ADDR`; see [observability/](observability/)
+      for the optional Grafana LGTM stack and dashboards
+- [x] **end-to-end smoke + live-broker Kafka CI** over the full compose lab
 
 Planned implementation areas:
 
@@ -673,7 +677,7 @@ Planned implementation areas:
 - [ ] multipart upload support
 - [ ] manifest signing
 - [ ] S3 Object Lock profile
-- [ ] Prometheus metrics exporter
+- [ ] OpenTelemetry trace export (the metrics endpoint exists; spans do not yet)
 - [ ] million-file benchmark suite
 
 ---

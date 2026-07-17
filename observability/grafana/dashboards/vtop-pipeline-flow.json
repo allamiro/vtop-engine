@@ -1,0 +1,1182 @@
+{
+  "uid": "vtop-pipeline-flow",
+  "title": "VTOP \u2014 Pipeline flow (live)",
+  "description": "SCADA-style live diagram of the telemetry path, built with Canvas.",
+  "tags": [
+    "vtop",
+    "pipeline",
+    "flow"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Live pipeline",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      }
+    },
+    {
+      "type": "canvas",
+      "title": "VTOP telemetry pipeline (live)",
+      "description": "The telemetry path with a logo at each stage and live numbers on the arrows. Verify-before-commit is the centre: nothing reaches the committed count until it is VERIFIED. Built with the core Canvas panel - the flowchart plugin is AngularJS and does not load on Grafana 13.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 18,
+        "w": 24,
+        "x": 0,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "refId": "A",
+          "expr": "sum(rate(kafka_topic_partition_current_offset{topic!~\"__.*\"}[1m])) or vector(0)",
+          "instant": true,
+          "legendFormat": "msgin"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "refId": "B",
+          "expr": "sum(rate(vtop_bytes_in_total[1m])) or vector(0)",
+          "instant": true,
+          "legendFormat": "bytesin"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "refId": "C",
+          "expr": "sum(rate(vtop_bytes_out_total[1m])) or vector(0)",
+          "instant": true,
+          "legendFormat": "bytesout"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "refId": "D",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(vtop_compression_ratio_bucket[5m]))) and (sum(rate(vtop_compression_ratio_bucket[5m])) > 0) or vector(0)",
+          "instant": true,
+          "legendFormat": "ratio"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "refId": "E",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(vtop_stage_duration_seconds_bucket[5m]))) and (sum(rate(vtop_stage_duration_seconds_bucket[5m])) > 0) or vector(0)",
+          "instant": true,
+          "legendFormat": "p95"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "refId": "F",
+          "expr": "sum(vtop_commits_total) or vector(0)",
+          "instant": true,
+          "legendFormat": "commits"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "refId": "G",
+          "expr": "sum(increase(vtop_failed_total[1h])) or vector(0)",
+          "instant": true,
+          "legendFormat": "failed"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "refId": "H",
+          "expr": "sum(kafka_consumergroup_lag{consumergroup=\"vtop-engine\"}) or vector(0)",
+          "instant": true,
+          "legendFormat": "lag"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "refId": "I",
+          "expr": "vtop_inflight_batches or vector(0)",
+          "instant": true,
+          "legendFormat": "inflight"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "refId": "J",
+          "expr": "sum(rate(vtop_records_total[1m])) or vector(0)",
+          "instant": true,
+          "legendFormat": "recsout"
+        }
+      ],
+      "options": {
+        "inlineEditing": true,
+        "showAdvancedTypes": true,
+        "panZoom": false,
+        "root": {
+          "elements": [
+            {
+              "type": "rectangle",
+              "name": "src-box",
+              "config": {
+                "backgroundColor": {
+                  "fixed": "#1f2a4022"
+                },
+                "radius": 6
+              },
+              "background": {
+                "color": {
+                  "fixed": "#1f2a4022"
+                }
+              },
+              "border": {
+                "color": {
+                  "fixed": "#ffffff44"
+                },
+                "width": 1
+              },
+              "placement": {
+                "top": 40,
+                "left": 20,
+                "width": 200,
+                "height": 260
+              }
+            },
+            {
+              "type": "text",
+              "name": "src-title",
+              "config": {
+                "text": {
+                  "fixed": "SOURCES"
+                },
+                "color": {
+                  "fixed": "#8ab4f8"
+                },
+                "size": 16,
+                "align": "center",
+                "valign": "middle"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 45,
+                "left": 20,
+                "width": 200,
+                "height": 24
+              }
+            },
+            {
+              "type": "icon",
+              "name": "kafka-logo",
+              "config": {
+                "path": {
+                  "fixed": "/public/img/vtop/apachekafka.svg"
+                },
+                "fill": {
+                  "fixed": "#ffffff00"
+                }
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 80,
+                "left": 70,
+                "width": 44,
+                "height": 44
+              }
+            },
+            {
+              "type": "text",
+              "name": "kafka-l",
+              "config": {
+                "text": {
+                  "fixed": "Kafka"
+                },
+                "color": {
+                  "fixed": "#d8d9da"
+                },
+                "size": 13,
+                "align": "center",
+                "valign": "middle"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 128,
+                "left": 20,
+                "width": 200,
+                "height": 20
+              }
+            },
+            {
+              "type": "text",
+              "name": "files-l",
+              "config": {
+                "text": {
+                  "fixed": "Files"
+                },
+                "color": {
+                  "fixed": "#9aa0a6"
+                },
+                "size": 13,
+                "align": "center",
+                "valign": "middle"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 170,
+                "left": 20,
+                "width": 200,
+                "height": 20
+              }
+            },
+            {
+              "type": "text",
+              "name": "syslog-l",
+              "config": {
+                "text": {
+                  "fixed": "Syslog spool"
+                },
+                "color": {
+                  "fixed": "#9aa0a6"
+                },
+                "size": 13,
+                "align": "center",
+                "valign": "middle"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 210,
+                "left": 20,
+                "width": 200,
+                "height": 20
+              }
+            },
+            {
+              "type": "text",
+              "name": "arr1",
+              "config": {
+                "text": {
+                  "fixed": "\u2500\u2500\u25b6"
+                },
+                "color": {
+                  "fixed": "#8ab4f8"
+                },
+                "size": 22,
+                "align": "center",
+                "valign": "middle"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 150,
+                "left": 230,
+                "width": 120,
+                "height": 24
+              }
+            },
+            {
+              "type": "metric-value",
+              "name": "m-msgin",
+              "config": {
+                "text": {
+                  "mode": "field",
+                  "field": "msgin",
+                  "fixed": ""
+                },
+                "color": {
+                  "fixed": "#8ab4f8"
+                },
+                "size": 16,
+                "align": "center",
+                "valign": "middle",
+                "prefix": "",
+                "suffix": " msg/s"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 100,
+                "left": 228,
+                "width": 130,
+                "height": 26
+              }
+            },
+            {
+              "type": "metric-value",
+              "name": "m-bytesin",
+              "config": {
+                "text": {
+                  "mode": "field",
+                  "field": "bytesin",
+                  "fixed": ""
+                },
+                "color": {
+                  "fixed": "#8ab4f8"
+                },
+                "size": 15,
+                "align": "center",
+                "valign": "middle",
+                "prefix": "",
+                "suffix": " B/s in"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 190,
+                "left": 228,
+                "width": 130,
+                "height": 26
+              }
+            },
+            {
+              "type": "rectangle",
+              "name": "eng-box",
+              "config": {
+                "backgroundColor": {
+                  "fixed": "#12331e22"
+                },
+                "radius": 6
+              },
+              "background": {
+                "color": {
+                  "fixed": "#12331e22"
+                }
+              },
+              "border": {
+                "color": {
+                  "fixed": "#ffffff44"
+                },
+                "width": 1
+              },
+              "placement": {
+                "top": 30,
+                "left": 360,
+                "width": 300,
+                "height": 300
+              }
+            },
+            {
+              "type": "text",
+              "name": "eng-title",
+              "config": {
+                "text": {
+                  "fixed": "VTOP ENGINE \u2014 verify before commit"
+                },
+                "color": {
+                  "fixed": "#73bf69"
+                },
+                "size": 14,
+                "align": "center",
+                "valign": "middle"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 36,
+                "left": 360,
+                "width": 300,
+                "height": 22
+              }
+            },
+            {
+              "type": "icon",
+              "name": "rust-logo",
+              "config": {
+                "path": {
+                  "fixed": "/public/img/vtop/rust.svg"
+                },
+                "fill": {
+                  "fixed": "#ffffff00"
+                }
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 66,
+                "left": 480,
+                "width": 56,
+                "height": 56
+              }
+            },
+            {
+              "type": "text",
+              "name": "eng-stages",
+              "config": {
+                "text": {
+                  "fixed": "seal \u2192 compress \u2192 checksum \u2192 upload"
+                },
+                "color": {
+                  "fixed": "#c8c8c8"
+                },
+                "size": 12,
+                "align": "center",
+                "valign": "middle"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 130,
+                "left": 360,
+                "width": 300,
+                "height": 20
+              }
+            },
+            {
+              "type": "text",
+              "name": "ratio-l",
+              "config": {
+                "text": {
+                  "fixed": "compression"
+                },
+                "color": {
+                  "fixed": "#9aa0a6"
+                },
+                "size": 11,
+                "align": "center",
+                "valign": "middle"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 168,
+                "left": 375,
+                "width": 130,
+                "height": 18
+              }
+            },
+            {
+              "type": "metric-value",
+              "name": "m-ratio",
+              "config": {
+                "text": {
+                  "mode": "field",
+                  "field": "ratio",
+                  "fixed": ""
+                },
+                "color": {
+                  "fixed": "#73bf69"
+                },
+                "size": 20,
+                "align": "center",
+                "valign": "middle",
+                "prefix": "",
+                "suffix": "x"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 186,
+                "left": 375,
+                "width": 130,
+                "height": 26
+              }
+            },
+            {
+              "type": "text",
+              "name": "p95-l",
+              "config": {
+                "text": {
+                  "fixed": "stage p95"
+                },
+                "color": {
+                  "fixed": "#9aa0a6"
+                },
+                "size": 11,
+                "align": "center",
+                "valign": "middle"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 168,
+                "left": 520,
+                "width": 130,
+                "height": 18
+              }
+            },
+            {
+              "type": "metric-value",
+              "name": "m-p95",
+              "config": {
+                "text": {
+                  "mode": "field",
+                  "field": "p95",
+                  "fixed": ""
+                },
+                "color": {
+                  "fixed": "#f2cc0c"
+                },
+                "size": 20,
+                "align": "center",
+                "valign": "middle",
+                "prefix": "",
+                "suffix": " s"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 186,
+                "left": 520,
+                "width": 130,
+                "height": 26
+              }
+            },
+            {
+              "type": "text",
+              "name": "arr2",
+              "config": {
+                "text": {
+                  "fixed": "\u2500\u2500\u25b6"
+                },
+                "color": {
+                  "fixed": "#f2a600"
+                },
+                "size": 22,
+                "align": "center",
+                "valign": "middle"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 150,
+                "left": 670,
+                "width": 120,
+                "height": 24
+              }
+            },
+            {
+              "type": "metric-value",
+              "name": "m-bytesout",
+              "config": {
+                "text": {
+                  "mode": "field",
+                  "field": "bytesout",
+                  "fixed": ""
+                },
+                "color": {
+                  "fixed": "#f2a600"
+                },
+                "size": 15,
+                "align": "center",
+                "valign": "middle",
+                "prefix": "",
+                "suffix": " B/s out"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 100,
+                "left": 668,
+                "width": 140,
+                "height": 26
+              }
+            },
+            {
+              "type": "text",
+              "name": "arr2-l",
+              "config": {
+                "text": {
+                  "fixed": "object + manifest"
+                },
+                "color": {
+                  "fixed": "#9aa0a6"
+                },
+                "size": 11,
+                "align": "center",
+                "valign": "middle"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 200,
+                "left": 668,
+                "width": 140,
+                "height": 20
+              }
+            },
+            {
+              "type": "rectangle",
+              "name": "arc-box",
+              "config": {
+                "backgroundColor": {
+                  "fixed": "#33240022"
+                },
+                "radius": 6
+              },
+              "background": {
+                "color": {
+                  "fixed": "#33240022"
+                }
+              },
+              "border": {
+                "color": {
+                  "fixed": "#ffffff44"
+                },
+                "width": 1
+              },
+              "placement": {
+                "top": 40,
+                "left": 810,
+                "width": 190,
+                "height": 200
+              }
+            },
+            {
+              "type": "text",
+              "name": "arc-title",
+              "config": {
+                "text": {
+                  "fixed": "OBJECT STORAGE"
+                },
+                "color": {
+                  "fixed": "#f2a600"
+                },
+                "size": 14,
+                "align": "center",
+                "valign": "middle"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 46,
+                "left": 810,
+                "width": 190,
+                "height": 22
+              }
+            },
+            {
+              "type": "icon",
+              "name": "minio-logo",
+              "config": {
+                "path": {
+                  "fixed": "/public/img/vtop/minio.svg"
+                },
+                "fill": {
+                  "fixed": "#ffffff00"
+                }
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 84,
+                "left": 870,
+                "width": 60,
+                "height": 60
+              }
+            },
+            {
+              "type": "text",
+              "name": "arc-l",
+              "config": {
+                "text": {
+                  "fixed": "MinIO / S3"
+                },
+                "color": {
+                  "fixed": "#d8d9da"
+                },
+                "size": 13,
+                "align": "center",
+                "valign": "middle"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 156,
+                "left": 810,
+                "width": 190,
+                "height": 20
+              }
+            },
+            {
+              "type": "metric-value",
+              "name": "m-recs",
+              "config": {
+                "text": {
+                  "mode": "field",
+                  "field": "recsout",
+                  "fixed": ""
+                },
+                "color": {
+                  "fixed": "#f2a600"
+                },
+                "size": 13,
+                "align": "center",
+                "valign": "middle",
+                "prefix": "",
+                "suffix": " rec/s archived"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 190,
+                "left": 810,
+                "width": 190,
+                "height": 24
+              }
+            },
+            {
+              "type": "rectangle",
+              "name": "ver-box",
+              "config": {
+                "backgroundColor": {
+                  "fixed": "#12331e22"
+                },
+                "radius": 6
+              },
+              "background": {
+                "color": {
+                  "fixed": "#12331e22"
+                }
+              },
+              "border": {
+                "color": {
+                  "fixed": "#ffffff44"
+                },
+                "width": 1
+              },
+              "placement": {
+                "top": 350,
+                "left": 360,
+                "width": 300,
+                "height": 110
+              }
+            },
+            {
+              "type": "text",
+              "name": "ver-title",
+              "config": {
+                "text": {
+                  "fixed": "VERIFIED?  (commit ONLY if true)"
+                },
+                "color": {
+                  "fixed": "#73bf69"
+                },
+                "size": 13,
+                "align": "center",
+                "valign": "middle"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 356,
+                "left": 360,
+                "width": 300,
+                "height": 22
+              }
+            },
+            {
+              "type": "text",
+              "name": "commits-l",
+              "config": {
+                "text": {
+                  "fixed": "commits"
+                },
+                "color": {
+                  "fixed": "#9aa0a6"
+                },
+                "size": 11,
+                "align": "center",
+                "valign": "middle"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 392,
+                "left": 375,
+                "width": 130,
+                "height": 18
+              }
+            },
+            {
+              "type": "metric-value",
+              "name": "m-commits",
+              "config": {
+                "text": {
+                  "mode": "field",
+                  "field": "commits",
+                  "fixed": ""
+                },
+                "color": {
+                  "fixed": "#73bf69"
+                },
+                "size": 20,
+                "align": "center",
+                "valign": "middle",
+                "prefix": "",
+                "suffix": ""
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 410,
+                "left": 375,
+                "width": 130,
+                "height": 26
+              }
+            },
+            {
+              "type": "text",
+              "name": "failed-l",
+              "config": {
+                "text": {
+                  "fixed": "failed"
+                },
+                "color": {
+                  "fixed": "#9aa0a6"
+                },
+                "size": 11,
+                "align": "center",
+                "valign": "middle"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 392,
+                "left": 520,
+                "width": 130,
+                "height": 18
+              }
+            },
+            {
+              "type": "metric-value",
+              "name": "m-failed",
+              "config": {
+                "text": {
+                  "mode": "field",
+                  "field": "failed",
+                  "fixed": ""
+                },
+                "color": {
+                  "fixed": "#e0533d"
+                },
+                "size": 20,
+                "align": "center",
+                "valign": "middle",
+                "prefix": "",
+                "suffix": ""
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 410,
+                "left": 520,
+                "width": 130,
+                "height": 26
+              }
+            },
+            {
+              "type": "rectangle",
+              "name": "st-box",
+              "config": {
+                "backgroundColor": {
+                  "fixed": "#20203022"
+                },
+                "radius": 6
+              },
+              "background": {
+                "color": {
+                  "fixed": "#20203022"
+                }
+              },
+              "border": {
+                "color": {
+                  "fixed": "#ffffff44"
+                },
+                "width": 1
+              },
+              "placement": {
+                "top": 300,
+                "left": 810,
+                "width": 190,
+                "height": 150
+              }
+            },
+            {
+              "type": "text",
+              "name": "st-title",
+              "config": {
+                "text": {
+                  "fixed": "STATE STORE"
+                },
+                "color": {
+                  "fixed": "#a78bfa"
+                },
+                "size": 13,
+                "align": "center",
+                "valign": "middle"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 306,
+                "left": 810,
+                "width": 190,
+                "height": 22
+              }
+            },
+            {
+              "type": "icon",
+              "name": "sqlite-logo",
+              "config": {
+                "path": {
+                  "fixed": "/public/img/vtop/sqlite.svg"
+                },
+                "fill": {
+                  "fixed": "#ffffff00"
+                }
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 336,
+                "left": 875,
+                "width": 50,
+                "height": 50
+              }
+            },
+            {
+              "type": "text",
+              "name": "lag-l",
+              "config": {
+                "text": {
+                  "fixed": "kafka lag"
+                },
+                "color": {
+                  "fixed": "#9aa0a6"
+                },
+                "size": 11,
+                "align": "center",
+                "valign": "middle"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 392,
+                "left": 810,
+                "width": 95,
+                "height": 18
+              }
+            },
+            {
+              "type": "metric-value",
+              "name": "m-lag",
+              "config": {
+                "text": {
+                  "mode": "field",
+                  "field": "lag",
+                  "fixed": ""
+                },
+                "color": {
+                  "fixed": "#f2cc0c"
+                },
+                "size": 18,
+                "align": "center",
+                "valign": "middle",
+                "prefix": "",
+                "suffix": ""
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 408,
+                "left": 810,
+                "width": 95,
+                "height": 26
+              }
+            },
+            {
+              "type": "text",
+              "name": "inflight-l",
+              "config": {
+                "text": {
+                  "fixed": "in-flight"
+                },
+                "color": {
+                  "fixed": "#9aa0a6"
+                },
+                "size": 11,
+                "align": "center",
+                "valign": "middle"
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 392,
+                "left": 905,
+                "width": 95,
+                "height": 18
+              }
+            },
+            {
+              "type": "metric-value",
+              "name": "m-inflight",
+              "config": {
+                "text": {
+                  "mode": "field",
+                  "field": "inflight",
+                  "fixed": ""
+                },
+                "color": {
+                  "fixed": "#a78bfa"
+                },
+                "size": 18,
+                "align": "center",
+                "valign": "middle",
+                "prefix": "",
+                "suffix": ""
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "placement": {
+                "top": 408,
+                "left": 905,
+                "width": 95,
+                "height": 26
+              }
+            }
+          ],
+          "background": {
+            "color": {
+              "fixed": "transparent"
+            }
+          }
+        }
+      }
+    }
+  ]
+}
