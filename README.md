@@ -669,11 +669,14 @@ Completed:
       `/readyz`) behind `VTOP_METRICS_ADDR`; see [observability/](observability/)
       for the optional Grafana LGTM stack and dashboards
 - [x] **end-to-end smoke + live-broker Kafka CI** over the full compose lab
+- [x] bounded per-read batching — every source honours `max_records` / `max_bytes`
+      so one read cannot pull an unbounded amount into memory
 
 Planned implementation areas:
 
 - [ ] Kafka feature gate for lighter builds
-- [ ] bounded reads + streaming compression/upload for very large records
+- [ ] streaming compression/upload for very large *single* records (`whole_file`
+      currently loads the whole record into memory before sealing)
 - [ ] multipart upload support
 - [ ] manifest signing
 - [ ] S3 Object Lock profile
