@@ -81,7 +81,7 @@
           "fields": "",
           "values": false
         },
-        "textMode": "auto",
+        "textMode": "value",
         "colorMode": "background",
         "graphMode": "area"
       }
@@ -140,7 +140,7 @@
           "fields": "",
           "values": false
         },
-        "textMode": "auto",
+        "textMode": "value",
         "colorMode": "background",
         "graphMode": "area"
       }
@@ -199,7 +199,7 @@
           "fields": "",
           "values": false
         },
-        "textMode": "auto",
+        "textMode": "value",
         "colorMode": "background",
         "graphMode": "area"
       }
@@ -242,7 +242,7 @@
           "fields": "",
           "values": false
         },
-        "textMode": "auto",
+        "textMode": "value",
         "colorMode": "value",
         "graphMode": "area"
       }

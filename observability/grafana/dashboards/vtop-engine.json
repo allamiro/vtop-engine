@@ -152,7 +152,7 @@
         },
         "colorMode": "background",
         "graphMode": "area",
-        "textMode": "value_and_name",
+        "textMode": "value",
         "justifyMode": "center"
       }
     },
@@ -214,7 +214,7 @@
         },
         "colorMode": "background",
         "graphMode": "area",
-        "textMode": "value_and_name",
+        "textMode": "value",
         "justifyMode": "center"
       }
     },
@@ -276,7 +276,7 @@
         },
         "colorMode": "background",
         "graphMode": "area",
-        "textMode": "value_and_name",
+        "textMode": "value",
         "justifyMode": "center"
       }
     },
@@ -338,7 +338,7 @@
         },
         "colorMode": "background",
         "graphMode": "area",
-        "textMode": "value_and_name",
+        "textMode": "value",
         "justifyMode": "center"
       }
     },
@@ -384,7 +384,7 @@
         },
         "colorMode": "value",
         "graphMode": "area",
-        "textMode": "value_and_name",
+        "textMode": "value",
         "justifyMode": "center"
       }
     },

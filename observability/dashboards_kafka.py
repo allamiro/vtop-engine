@@ -57,7 +57,7 @@ def _stat(title, gp, targets, desc="", unit=None, thresholds=None):
         "reduceOptions": {"calcs": ["lastNonNull"], "fields": "", "values": False},
         "colorMode": "background" if thresholds else "value",
         "graphMode": "area",
-        "textMode": "value_and_name",
+        "textMode": "value",
         "justifyMode": "center",
     }
     if thresholds:
