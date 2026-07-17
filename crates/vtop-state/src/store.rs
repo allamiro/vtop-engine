@@ -114,11 +114,15 @@ mod tests {
         assert!(path.exists(), "the db file should have been created");
     }
 
+    // Only meaningful WITHOUT the postgres feature: with it, a postgres:// URI
+    // is dispatched to PgStateStore and tries to connect (covered by the pg
+    // battery instead), so this would no longer see the "needs feature" error.
+    #[cfg(not(feature = "postgres"))]
     #[tokio::test]
     async fn factory_rejects_postgres_without_the_feature() {
-        // Until Phase 3 ships the postgres feature, a postgres:// URI must fail
-        // with a clear, actionable error rather than being silently treated as
-        // a SQLite path named "postgres:" (which would create a junk file).
+        // Without the postgres feature, a postgres:// URI must fail with a clear,
+        // actionable error rather than being silently treated as a SQLite path
+        // named "postgres:" (which would create a junk file).
         for conn in [
             "postgres://vtop@pg:5432/vtop",
             "postgresql://vtop@pg:5432/vtop",

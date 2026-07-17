@@ -59,23 +59,32 @@ CREATE INDEX IF NOT EXISTS idx_batches_state ON batches(state);
 CREATE INDEX IF NOT EXISTS idx_batches_source ON batches(source_type, source_name);
 "#;
 
-/// The database-level backstop for THE invariant: a row may only move INTO
-/// `source_committed` from `verified`. `vtop_core` already refuses this before
-/// the UPDATE runs, so this fires only if that check is ever bypassed — which is
-/// precisely why it exists.
+/// The database-level backstop for THE invariant: a row may only ARRIVE at
+/// `source_committed` by an UPDATE from `verified`. `vtop_core` already refuses
+/// this before the write runs, so the trigger fires only if that check is ever
+/// bypassed — which is precisely why it exists. It guards BOTH statements:
+///   - UPDATE -> source_committed is legal only from verified;
+///   - INSERT of a source_committed row is never legal (a batch cannot be born
+///     committed; it must walk through verified), which closes the hole where a
+///     direct insert would skip an UPDATE-only trigger entirely.
 const INVARIANT_TRIGGER: &str = r#"
 CREATE OR REPLACE FUNCTION vtop_enforce_commit_after_verify() RETURNS trigger AS $fn$
 BEGIN
-    IF NEW.state = 'source_committed' AND OLD.state <> 'verified' THEN
-        RAISE EXCEPTION 'commit before verified: batch % is %', OLD.batch_id, OLD.state
-            USING ERRCODE = 'check_violation';
+    IF NEW.state = 'source_committed' THEN
+        IF TG_OP = 'INSERT' THEN
+            RAISE EXCEPTION 'commit before verified: batch % inserted directly as source_committed', NEW.batch_id
+                USING ERRCODE = 'check_violation';
+        ELSIF OLD.state <> 'verified' THEN
+            RAISE EXCEPTION 'commit before verified: batch % is %', OLD.batch_id, OLD.state
+                USING ERRCODE = 'check_violation';
+        END IF;
     END IF;
     RETURN NEW;
 END;
 $fn$ LANGUAGE plpgsql;
 
 DROP TRIGGER IF EXISTS trg_commit_after_verify ON batches;
-CREATE TRIGGER trg_commit_after_verify BEFORE UPDATE ON batches
+CREATE TRIGGER trg_commit_after_verify BEFORE INSERT OR UPDATE ON batches
     FOR EACH ROW EXECUTE FUNCTION vtop_enforce_commit_after_verify();
 "#;
 
@@ -242,7 +251,15 @@ impl StateStore for PgStateStore {
         let validated = transition(current, to)?;
         let now = chrono::Utc::now().to_rfc3339();
 
-        with_retry(|| {
+        // Optimistic concurrency: the UPDATE only applies if the row is STILL in
+        // the state we validated against (`AND state = $10`). In an HA fleet two
+        // instances could both read the same state, both validate, and both
+        // write - the guard makes the loser's UPDATE affect zero rows so it can
+        // be reported as a conflict rather than silently clobbering a transition
+        // that happened in between (e.g. another writer moving verified ->
+        // source_committed).
+        let expected = current.as_str();
+        let rows = with_retry(|| {
             sqlx::query(
                 r#"UPDATE batches SET
                      state = $1,
@@ -253,7 +270,7 @@ impl StateStore for PgStateStore {
                      record_count = COALESCE($6, record_count),
                      error_message = COALESCE($7, error_message),
                      updated_at = $8
-                   WHERE batch_id = $9"#,
+                   WHERE batch_id = $9 AND state = $10"#,
             )
             .bind(validated.as_str())
             .bind(&patch.object_uri)
@@ -264,9 +281,19 @@ impl StateStore for PgStateStore {
             .bind(&patch.error_message)
             .bind(&now)
             .bind(batch_id)
+            .bind(expected)
             .execute(&self.pool)
         })
-        .await?;
+        .await?
+        .rows_affected();
+
+        if rows == 0 {
+            // The row's state changed between our read and our write, so the
+            // transition we validated is stale. Recovery re-reads and retries.
+            return Err(VtopError::State(format!(
+                "concurrent state change for batch {batch_id}: it was no longer {expected} at write time"
+            )));
+        }
         Ok(())
     }
 

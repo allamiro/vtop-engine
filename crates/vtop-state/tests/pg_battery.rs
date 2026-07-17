@@ -61,4 +61,21 @@ async fn postgres_backend_passes_battery_and_enforces_invariant_at_db() {
         .execute_raw("UPDATE batches SET state = 'source_committed' WHERE batch_id = 'trig-1'")
         .await
         .expect("commit from verified must be allowed");
+
+    // ---- 3. The trigger fires on INSERT too, not just UPDATE ----
+    // A batch cannot be born committed; a direct INSERT of a source_committed row
+    // would otherwise slip past an UPDATE-only trigger.
+    let err = store
+        .execute_raw(
+            "INSERT INTO batches \
+             (batch_id, tenant, source_type, source_name, format, state, \
+              progress_start_json, progress_end_json, created_at, updated_at) \
+             VALUES ('born-committed','default','kafka','app','cef','source_committed','{}','{}','t','t')",
+        )
+        .await
+        .expect_err("inserting a source_committed row must be rejected");
+    assert!(
+        err.to_string().contains("commit before verified"),
+        "expected the trigger to reject a born-committed insert, got: {err}"
+    );
 }
