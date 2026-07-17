@@ -673,7 +673,10 @@ Completed:
 Planned implementation areas:
 
 - [ ] Kafka feature gate for lighter builds
-- [ ] bounded reads + streaming compression/upload for very large records
+- [ ] bounded reads + streaming compression/upload for very large records —
+      `max_records` / `max_bytes` bound a *batch*, but a single oversized record
+      (a long line, a large Kafka message, or `whole_file`) is still buffered
+      whole before the budget is checked
 - [ ] multipart upload support
 - [ ] manifest signing
 - [ ] S3 Object Lock profile

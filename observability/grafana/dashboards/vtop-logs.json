@@ -67,7 +67,7 @@
     {
       "type": "logs",
       "title": "Committed batches \u2014 commit + object URI",
-      "description": "The high-cardinality detail metrics deliberately omit. Two correlated events per batch_id: object_uploaded carries the object `uri` (where it landed); source_committed marks the commit that only happens after VERIFIED. The audit trail behind the committed-count stat.",
+      "description": "The high-cardinality detail metrics deliberately omit \u2014 batch ids and object URIs. Two correlated events per batch_id: object_uploaded carries the object `uri` (where it landed); source_committed marks the commit that only happens after VERIFIED. The audit trail behind the committed-count stat.",
       "datasource": {
         "type": "loki",
         "uid": "loki"
