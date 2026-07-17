@@ -1,0 +1,89 @@
+---
+
+# Flow panel config for the VTOP telemetry pipeline SVG.
+# Cell ids in the SVG are authored directly as flow-*, so there is no draw.io
+# "cell-" preamble to strip.
+cellIdPreamble: ""
+gradientMode: "hue"
+
+anchorLinks:
+  - flowAnimation: &flow
+      thresholdOffValue: 1
+      thresholdLwrValue: 100
+      thresholdLwrDurationSecs: 1.5
+      thresholdUprValue: 5000
+      thresholdUprDurationSecs: 0.2
+
+cells:
+  # ---- SOURCES -> ENGINE ----
+  flow-msgin:
+    dataRef: "msgin"
+    label: {separator: "space", units: "none", decimalPoints: 0}
+  flow-bytesin:
+    dataRef: "bytesin"
+    label: {separator: "space", units: "none", decimalPoints: 0}
+  flow-conn-in:
+    dataRef: "bytesin"
+    flowAnimation: *flow
+
+  # ---- ENGINE ----
+  flow-ratio:
+    dataRef: "ratio"
+    label: {separator: "space", units: "none", decimalPoints: 1}
+  flow-p95:
+    dataRef: "p95"
+    label: {separator: "space", units: "s", decimalPoints: 3}
+    labelColor:
+      thresholds:
+        - {color: "green",  level: 0}
+        - {color: "orange", level: 0.05}
+        - {color: "red",    level: 0.2}
+  flow-recs:
+    dataRef: "recs"
+    label: {separator: "space", units: "none", decimalPoints: 0}
+
+  # ---- ENGINE -> OBJECT STORAGE ----
+  flow-bytesout:
+    dataRef: "bytesout"
+    label: {separator: "space", units: "none", decimalPoints: 0}
+  flow-conn-out:
+    dataRef: "bytesout"
+    flowAnimation: *flow
+
+  # ---- VERIFY / COMMIT (the invariant) ----
+  flow-commits:
+    dataRef: "commits"
+    label: {separator: "space", units: "none", decimalPoints: 0}
+  flow-failed:
+    dataRef: "failed"
+    label: {separator: "space", units: "none", decimalPoints: 0}
+    labelColor:
+      thresholds:
+        - {color: "green", level: 0}
+        - {color: "red",   level: 1}
+  flow-verifybox:
+    # box turns red the moment a batch fails, green while failed == 0
+    dataRef: "failed"
+    fillColor:
+      thresholds:
+        - {color: "#12331e", level: 0}
+        - {color: "#3a1410", level: 1}
+  flow-conn-verify:
+    dataRef: "commits"
+    flowAnimation: *flow
+
+  # ---- READ-BACK + STATE STORE ----
+  flow-conn-back:
+    dataRef: "recs"
+    flowAnimation: *flow
+  flow-lag:
+    dataRef: "lag"
+    label: {separator: "space", units: "none", decimalPoints: 0}
+    labelColor:
+      thresholds:
+        - {color: "green",  level: 0}
+        - {color: "orange", level: 1000}
+        - {color: "red",    level: 10000}
+  flow-inflight:
+    dataRef: "inflight"
+    label: {separator: "space", units: "none", decimalPoints: 0}
