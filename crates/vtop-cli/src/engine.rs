@@ -29,7 +29,7 @@ use vtop_core::replay::{next_recovery_action, RecoveryAction};
 use vtop_core::state_machine::BatchState;
 use vtop_core::telemetry;
 use vtop_core::types::{ProgressMarker, SourceType};
-use vtop_state::{BatchPatch, BatchRecord, SqliteStateStore};
+use vtop_state::{connect_state_store, BatchPatch, BatchRecord, StateStore};
 use vtop_upload::{ObjectChecksum, UploadBackend};
 
 /// Outcome of processing a single batch.
@@ -46,7 +46,7 @@ pub struct BatchOutcome {
 
 /// Borrowed context shared by every pipeline step.
 pub struct Pipeline<'a> {
-    pub store: &'a SqliteStateStore,
+    pub store: &'a dyn StateStore,
     pub backend: Arc<dyn UploadBackend>,
     pub config: &'a VtopConfig,
 }
@@ -629,7 +629,7 @@ impl PendingBuffer {
 pub struct Engine {
     pub config: VtopConfig,
     pub streams: StreamsConfig,
-    pub store: SqliteStateStore,
+    pub store: Box<dyn StateStore>,
     pub backend: Arc<dyn UploadBackend>,
     pub adapters: HashMap<SourceType, Box<dyn SourceAdapter>>,
     /// Per-source accumulation buffers, keyed by `(source_type, source_name)`.
@@ -640,7 +640,7 @@ impl Engine {
     /// Build the engine from parsed config + streams, initializing the state
     /// store, the upload backend, and every enabled source adapter.
     pub async fn new(config: VtopConfig, streams: StreamsConfig) -> Result<Self, VtopError> {
-        let store = SqliteStateStore::connect(&config.engine.state_store).await?;
+        let store = connect_state_store(&config.engine.state_store).await?;
         let backend = vtop_upload::build_backend(&config.upload).await?;
 
         let mut adapters: HashMap<SourceType, Box<dyn SourceAdapter>> = HashMap::new();
@@ -697,7 +697,7 @@ impl Engine {
 
     fn pipeline(&self) -> Pipeline<'_> {
         Pipeline {
-            store: &self.store,
+            store: self.store.as_ref(),
             backend: self.backend.clone(),
             config: &self.config,
         }
