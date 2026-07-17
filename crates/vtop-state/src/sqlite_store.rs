@@ -290,89 +290,15 @@ fn row_to_record(row: sqlx::sqlite::SqliteRow) -> Result<BatchRecord, VtopError>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_battery;
 
-    fn marker() -> ProgressMarker {
-        ProgressMarker::Kafka {
-            topic: "app_events".into(),
-            partition: 0,
-            start_offset: 0,
-            end_offset: 10,
-            consumer_group: "vtop-engine".into(),
-        }
-    }
-
-    fn new_record(id: &str) -> BatchRecord {
-        let now = chrono::Utc::now().to_rfc3339();
-        BatchRecord {
-            batch_id: id.into(),
-            tenant: "default".into(),
-            source_type: SourceType::Kafka,
-            source_name: "app_events".into(),
-            format: TelemetryFormat::Cef,
-            state: BatchState::Batching,
-            progress_start: marker(),
-            progress_end: marker(),
-            object_uri: None,
-            manifest_uri: None,
-            object_sha256: None,
-            manifest_sha256: None,
-            record_count: None,
-            error_message: None,
-            created_at: now.clone(),
-            updated_at: now,
-        }
-    }
-
+    // The SQLite backend must pass the same behavioural contract every backend
+    // passes. Individual scenarios (save/reload, duplicate rejection, commit-
+    // before-verified refusal, the full legal walk, incomplete/failed listing)
+    // live once in test_battery::run_all so SQLite and Postgres cannot diverge.
     #[tokio::test]
-    async fn persists_and_reloads() {
+    async fn sqlite_passes_the_state_store_battery() {
         let store = SqliteStateStore::connect("sqlite::memory:").await.unwrap();
-        store.save_batch_state(&new_record("b1")).await.unwrap();
-        let got = store.get_batch("b1").await.unwrap().unwrap();
-        assert_eq!(got.state, BatchState::Batching);
-        assert_eq!(got.source_name, "app_events");
-    }
-
-    #[tokio::test]
-    async fn rejects_commit_before_verified_at_store_layer() {
-        let store = SqliteStateStore::connect("sqlite::memory:").await.unwrap();
-        store.save_batch_state(&new_record("b1")).await.unwrap();
-        // Batching -> SourceCommitted must be refused.
-        let err = store.mark_source_committed("b1").await.unwrap_err();
-        assert!(matches!(err, VtopError::CommitBeforeVerified { .. }));
-    }
-
-    #[tokio::test]
-    async fn full_legal_walk_commits() {
-        let store = SqliteStateStore::connect("sqlite::memory:").await.unwrap();
-        store.save_batch_state(&new_record("b1")).await.unwrap();
-        let p = BatchPatch::default();
-        for st in [
-            BatchState::Sealed,
-            BatchState::Compressed,
-            BatchState::Checksummed,
-            BatchState::ObjectUploaded,
-            BatchState::ManifestUploaded,
-            BatchState::Verified,
-            BatchState::SourceCommitted,
-        ] {
-            store.update_batch_state("b1", st, &p).await.unwrap();
-        }
-        let got = store.get_batch("b1").await.unwrap().unwrap();
-        assert_eq!(got.state, BatchState::SourceCommitted);
-        assert!(!got.is_incomplete());
-    }
-
-    #[tokio::test]
-    async fn lists_incomplete_and_failed() {
-        let store = SqliteStateStore::connect("sqlite::memory:").await.unwrap();
-        store.save_batch_state(&new_record("b1")).await.unwrap();
-        store.save_batch_state(&new_record("b2")).await.unwrap();
-        store.mark_failed("b2", "boom").await.unwrap();
-
-        let incomplete = store.list_incomplete_batches().await.unwrap();
-        assert_eq!(incomplete.len(), 2);
-        let failed = store.list_failed_batches().await.unwrap();
-        assert_eq!(failed.len(), 1);
-        assert_eq!(failed[0].error_message.as_deref(), Some("boom"));
+        test_battery::run_all(&store).await;
     }
 }
