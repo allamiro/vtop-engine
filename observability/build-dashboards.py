@@ -55,7 +55,7 @@ def promql(expr, legend=""):
     return [{"datasource": MIMIR, "expr": expr, "legendFormat": legend}]
 
 
-def stat(title, gp, targets, ds, desc="", unit=None, thresholds=None, text_mode="auto"):
+def stat(title, gp, targets, ds, desc="", unit=None, thresholds=None, text_mode="value"):
     p = panel(title, gp, targets, ds, unit=unit, kind="stat", desc=desc)
     p["options"] = {
         "reduceOptions": {"calcs": ["lastNonNull"], "fields": "", "values": False},
