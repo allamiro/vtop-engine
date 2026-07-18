@@ -22,6 +22,7 @@ vtop-core = { workspace = true }
 vtop-adapters = { workspace = true }
 vtop-upload = { workspace = true }
 vtop-state = { workspace = true }
+futures = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }

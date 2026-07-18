@@ -38,6 +38,7 @@ pub fn file_config(
             max_batch_age_seconds: 60,
             source_poll_wait_ms: 250,
             idle_poll_interval_ms: 2_000,
+            max_concurrent_batches: 8,
         },
         compression: CompressionConfig {
             kind: CompressionType::Gzip,
