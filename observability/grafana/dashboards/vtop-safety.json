@@ -54,7 +54,6 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "custom": {},
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -87,8 +86,14 @@
         "graphMode": "none",
         "text": {
           "valueSize": 22
-        }
+        },
+        "justifyMode": "center",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "showPercentChange": false,
+        "wideLayout": true
       },
+      "pluginVersion": "13.1.0",
       "id": 2
     },
     {
@@ -117,7 +122,6 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "custom": {},
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -150,8 +154,14 @@
         "graphMode": "none",
         "text": {
           "valueSize": 22
-        }
+        },
+        "justifyMode": "center",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "showPercentChange": false,
+        "wideLayout": true
       },
+      "pluginVersion": "13.1.0",
       "id": 3
     },
     {
@@ -180,7 +190,6 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "custom": {},
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -213,8 +222,14 @@
         "graphMode": "none",
         "text": {
           "valueSize": 22
-        }
+        },
+        "justifyMode": "center",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "showPercentChange": false,
+        "wideLayout": true
       },
+      "pluginVersion": "13.1.0",
       "id": 4
     },
     {

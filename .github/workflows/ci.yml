@@ -522,6 +522,11 @@ jobs:
           python-version: "3.12"
       - name: Syntax-check the dashboard generators
         run: python -m compileall -q observability/*.py
+      # Catches the class of bug drift detection structurally cannot: a panel
+      # that matches its generator exactly and still renders blank (stat panel
+      # missing pluginVersion, duplicate/missing panel id, no targets).
+      - name: Validate dashboard structure
+        run: python3 observability/validate-dashboards.py
       - name: Regenerate dashboards and fail on drift
         run: |
           python3 observability/build-dashboards.py

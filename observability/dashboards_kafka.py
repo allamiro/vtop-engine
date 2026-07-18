@@ -24,6 +24,8 @@ consumed bytes), that requires adding a JMX exporter alongside the broker; it is
 not obtainable from kafka-exporter.
 """
 
+from dashboards_common import GRAFANA_PLUGIN_VERSION
+
 MIMIR = {"type": "prometheus", "uid": "mimir"}
 
 GROUP = 'consumergroup="vtop-engine"'

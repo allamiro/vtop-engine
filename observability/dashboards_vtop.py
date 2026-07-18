@@ -20,7 +20,7 @@ Conventions:
 """
 
 # Must match the Grafana in docker-compose.observability.yml.
-GRAFANA_PLUGIN_VERSION = "13.1.0"
+from dashboards_common import GRAFANA_PLUGIN_VERSION
 
 MIMIR = {"type": "prometheus", "uid": "mimir"}
 LOKI = {"type": "loki", "uid": "loki"}

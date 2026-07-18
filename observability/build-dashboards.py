@@ -21,6 +21,8 @@ a gauge of a rate is a snapshot that lies between scrapes.
 import json
 import os
 
+from dashboards_common import GRAFANA_PLUGIN_VERSION
+
 LOKI = {"type": "loki", "uid": "loki"}
 MIMIR = {"type": "prometheus", "uid": "mimir"}
 
