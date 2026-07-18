@@ -21,7 +21,12 @@ use vtop_core::types::{ProgressMarker, SourceType, TelemetryFormat};
 /// Build the rdkafka [`ClientConfig`]. Auto-commit is forced to `false`
 /// regardless of the input config. Secrets are read from the environment, not
 /// logged.
-pub fn build_client_config(cfg: &KafkaSourceConfig) -> ClientConfig {
+///
+/// Fails if the config NAMES a password environment variable that is not set.
+/// Silently skipping it would start the engine unauthenticated when the operator
+/// explicitly asked for SASL - a downgrade that looks like a working connection
+/// until the broker rejects it, or worse, accepts it.
+pub fn build_client_config(cfg: &KafkaSourceConfig) -> Result<ClientConfig, VtopError> {
     let mut cc = ClientConfig::new();
     cc.set("bootstrap.servers", cfg.bootstrap_servers.join(","));
     cc.set("group.id", &cfg.consumer_group);
@@ -39,14 +44,21 @@ pub fn build_client_config(cfg: &KafkaSourceConfig) -> ClientConfig {
         cc.set("sasl.username", u);
     }
     if let Some(env_name) = &cfg.sasl_password_env {
-        if let Ok(pw) = std::env::var(env_name) {
-            cc.set("sasl.password", pw); // value never logged
-        }
+        // A referenced-but-missing secret is a configuration error, never a
+        // silent fallback to no password. Only the variable NAME is reported;
+        // the value is never read into a message.
+        let pw = std::env::var(env_name).map_err(|_| {
+            VtopError::Config(format!(
+                "sasl_password_env names ${env_name}, but that environment \
+                 variable is not set; refusing to connect without the password"
+            ))
+        })?;
+        cc.set("sasl.password", pw); // value never logged
     }
     if let Some(ca) = &cfg.ssl_ca_location {
         cc.set("ssl.ca.location", ca);
     }
-    cc
+    Ok(cc)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -106,7 +118,7 @@ impl KafkaSource {
 
     fn consumer(&mut self) -> Result<&BaseConsumer, VtopError> {
         if self.consumer.is_none() {
-            let c: BaseConsumer = build_client_config(&self.cfg)
+            let c: BaseConsumer = build_client_config(&self.cfg)?
                 .create()
                 .map_err(|e| VtopError::Source(format!("creating kafka consumer: {e}")))?;
             self.consumer = Some(c);
@@ -160,7 +172,7 @@ impl KafkaSource {
 impl SourceAdapter for KafkaSource {
     async fn discover_sources(&self) -> Result<Vec<DiscoveredSource>, VtopError> {
         // Build a throwaway consumer to fetch metadata.
-        let consumer: BaseConsumer = build_client_config(&self.cfg)
+        let consumer: BaseConsumer = build_client_config(&self.cfg)?
             .create()
             .map_err(|e| VtopError::Source(format!("creating kafka consumer: {e}")))?;
         let metadata = consumer
@@ -471,8 +483,36 @@ mod tests {
 
     #[test]
     fn never_enables_auto_commit() {
-        let cc = build_client_config(&cfg());
+        let cc = build_client_config(&cfg()).expect("config without secrets builds");
         assert_eq!(cc.get("enable.auto.commit"), Some("false"));
+    }
+
+    #[test]
+    fn missing_password_env_is_a_config_error_not_a_silent_downgrade() {
+        // The operator asked for SASL by naming an env var. If that var is not
+        // set we must REFUSE, not connect without a password.
+        let mut c = cfg();
+        c.sasl_password_env = Some("VTOP_TEST_ABSENT_KAFKA_PASSWORD".into());
+        let err = build_client_config(&c).expect_err("missing secret must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("VTOP_TEST_ABSENT_KAFKA_PASSWORD"),
+            "error should name the missing variable: {msg}"
+        );
+        // The message must never carry a secret value - only the variable name.
+        assert!(!msg.contains("hunter2"), "error must not echo a secret");
+    }
+
+    #[test]
+    fn password_env_that_is_set_is_applied() {
+        let var = "VTOP_TEST_PRESENT_KAFKA_PASSWORD";
+        // SAFETY: single-threaded test process; the var is unique to this test.
+        unsafe { std::env::set_var(var, "hunter2") };
+        let mut c = cfg();
+        c.sasl_password_env = Some(var.into());
+        let cc = build_client_config(&c).expect("present secret builds");
+        assert_eq!(cc.get("sasl.password"), Some("hunter2"));
+        unsafe { std::env::remove_var(var) };
     }
 
     #[test]
