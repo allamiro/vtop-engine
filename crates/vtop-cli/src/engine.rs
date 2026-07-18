@@ -897,8 +897,10 @@ impl Engine {
         let cycle_started = Instant::now();
         let mut productive_read_ms: u64 = 0;
         let mut empty_read_ms: u64 = 0;
+        let mut failed_read_ms: u64 = 0;
         let mut productive_sources: usize = 0;
         let mut empty_sources: usize = 0;
+        let mut failed_sources: usize = 0;
         let mut records_read: usize = 0;
 
         for source in sources {
@@ -935,6 +937,13 @@ impl Engine {
                             .with_label_values(&[t.as_str(), source_type.as_str()])
                             .inc();
                     }
+                    // Count the time a FAILED read consumed. Without this the
+                    // buckets silently fail to sum to read_phase_ms, and a
+                    // source timing out — which can burn the full window — would
+                    // look like the cycle lost time to nothing at all. The point
+                    // of this accounting is that it reconciles.
+                    failed_read_ms += read_started.elapsed().as_millis() as u64;
+                    failed_sources += 1;
                     tracing::warn!(source = %source.source_name, error = %e, "source read failed; skipping this cycle");
                     continue;
                 }
@@ -989,8 +998,10 @@ impl Engine {
                 read_phase_ms,
                 productive_read_ms,
                 empty_read_ms,
+                failed_read_ms,
                 productive_sources,
                 empty_sources,
+                failed_sources,
                 records_read,
                 empty_wait_pct = format!(
                     "{:.1}",
