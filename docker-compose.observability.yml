@@ -103,22 +103,29 @@ services:
     image: grafana/grafana:13.1.0
     container_name: vtop-grafana
     ports:
-      - "3400:3000"
+      # Bound to LOOPBACK deliberately. Anonymous access below grants Editor
+      # rights with no sign-in, so a 0.0.0.0 bind would let anyone routable to
+      # this host modify or delete every dashboard. Publishing the port and
+      # granting anonymous Editor are only jointly safe if the port is not
+      # reachable off-box. Change this only if you also disable anonymous auth.
+      - "127.0.0.1:3400:3000"
     environment:
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: admin
-      # Anonymous viewing: the lab is for looking at dashboards, not managing
-      # users. LAB ONLY.
+      # Anonymous access with EDITOR rights: this is a local lab, so anyone who
+      # opens it can edit AND save dashboards without signing in. LAB ONLY -
+      # never expose this stack on a shared network (see issue #81).
       GF_AUTH_ANONYMOUS_ENABLED: "true"
-      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Editor
       GF_USERS_DEFAULT_THEME: dark
       # The draw.io pipeline dashboard uses the Flow panel (React, signed,
       # Grafana >= 10) - the maintained successor to the AngularJS flowcharting
       # plugin, which does not load on Grafana 11+. Installed on first boot.
       GF_INSTALL_PLUGINS: andrewbmchugh-flow-panel
-      # Datasources + dashboards are provisioned as code, so the stack is useful
-      # on first `up` with no clicking.
-      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/vtop-overview.json
+      # Datasources are provisioned as code. Dashboards are SEEDED VIA THE API
+      # by the grafana-seed service below, because Grafana 13 makes
+      # file-provisioned dashboards read-only in the UI and this lab is meant to
+      # be explored and edited.
     volumes:
       - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
@@ -132,6 +139,34 @@ services:
       - loki
       - tempo
     restart: unless-stopped
+
+  # Seeds the dashboards through the Grafana API once Grafana is healthy.
+  #
+  # Deliberately NOT file-provisioning: Grafana 13 refuses "Save" on a
+  # file-provisioned dashboard ("Cannot save provisioned dashboard"), and
+  # allowUiUpdates no longer changes that. Seeded dashboards are ordinary ones -
+  # fully editable and saveable - which is what a lab wants.
+  #
+  # Re-run to reset the lab to the repo's dashboards:
+  #   docker compose -f docker-compose.yml -f docker-compose.observability.yml \
+  #       up --force-recreate grafana-seed
+  grafana-seed:
+    image: curlimages/curl:8.11.1
+    container_name: vtop-grafana-seed
+    depends_on:
+      - grafana
+    entrypoint: ["/bin/sh", "/seed-dashboards.sh"]
+    environment:
+      GRAFANA_URL: http://grafana:3000
+      GRAFANA_USER: admin
+      GRAFANA_PASSWORD: admin
+      DASHBOARD_DIR: /dashboards
+      GRAFANA_FOLDER: VTOP
+    volumes:
+      - ./observability/seed-dashboards.sh:/seed-dashboards.sh:ro
+      - ./observability/grafana/dashboards:/dashboards:ro
+    restart: "no"
+
 
 volumes:
   mimir-data:

@@ -15,7 +15,9 @@ docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d
 | **Grafana** | http://localhost:3400 | `admin` / `admin` (anonymous viewing enabled) |
 | **Alloy** (which targets are actually UP) | http://localhost:12345 | — |
 
-Datasources and dashboards are **provisioned as code** — nothing to click.
+Datasources are **provisioned as code**; dashboards are **seeded via the API**
+(so they stay editable — see [Editing dashboards](#editing-dashboards)). Nothing
+to click either way.
 
 > Ports are deliberately off the defaults (3400, not 3000): 3000/8080 collide
 > with almost every other local stack.
@@ -95,6 +97,37 @@ GET /readyz    readiness
   clash, or a registry failure logs an error and the engine keeps archiving.
 
 ## Editing dashboards
+
+Dashboards are **seeded through the Grafana API**, not file-provisioned, so they
+are ordinary dashboards you can edit and **Save** in the UI.
+
+> Grafana 13 makes a *file-provisioned* dashboard read-only: pressing Save is
+> refused with *"Cannot save provisioned dashboard"*, and `allowUiUpdates: true`
+> no longer changes that (it was honoured by the legacy provisioning path). A lab
+> you cannot poke at is not much of a lab, hence API seeding.
+
+The generated JSON under `observability/grafana/dashboards/` remains the source
+of truth for what ships, and CI fails if it drifts from the generators.
+
+Seeding is **non-destructive**: a dashboard that already exists is left alone.
+That matters because `docker compose up -d` *starts* an exited service, so the
+seeder re-runs every time you bring the lab up — if it overwrote, the edit you
+just saved would vanish on the next start.
+
+```bash
+# Reset the lab's dashboards back to the repo version (DISCARDS UI edits):
+docker compose -f docker-compose.yml -f docker-compose.observability.yml \
+    run --rm -e FORCE_RESEED=true grafana-seed
+```
+
+> Grafana is published on **127.0.0.1** only. Anonymous access is granted
+> `Editor`, so anyone who can reach the port can change or delete any dashboard
+> without signing in; a loopback bind is what keeps that from being a network
+> exposure. Do not widen the bind without also disabling anonymous auth.
+
+To make a UI change permanent: edit in the UI, export the JSON, fold the change
+into the generator in `observability/`, then regenerate.
+
 
 Dashboard JSON is unreviewable by hand, so the **queries** are written in Python
 and the JSON is generated:
