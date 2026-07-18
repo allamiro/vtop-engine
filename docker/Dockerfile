@@ -4,7 +4,11 @@
 # rdkafka with the "cmake-build" feature compiles librdkafka from source, so
 # the builder needs cmake + a C toolchain, SSL/SASL/zlib headers, and libcurl
 # (the SASL OAUTHBEARER/OIDC path #includes <curl/curl.h>).
-FROM rust:1-bookworm AS builder
+# Pinned by digest so a rebuild cannot silently pick up a different base than
+# was tested (#80). To refresh: `docker buildx imagetools inspect rust:1-bookworm`
+# (and the same for debian:bookworm-slim below), update BOTH digest and the
+# comment date, and let CI rebuild. Digests captured 2026-07-18.
+FROM rust:1-bookworm@sha256:77fac8b98f9f46062bb680b6d25d5bcaabfc400143952ebc572e924bcbedc3fa AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake \
@@ -18,10 +22,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 COPY . .
-RUN cargo build --release --bin vtopctl
+# --locked: the image must build exactly the dependency set in Cargo.lock; a
+# lockfile drift is a build FAILURE here, never a silent re-resolution.
+RUN cargo build --release --locked --bin vtopctl
 
 # ---- Runtime stage ---------------------------------------------------------
-FROM debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
