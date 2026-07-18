@@ -5,6 +5,10 @@ Usage:
   python3 benchmarks/run_benchmark.py benchmarks/scenarios/<scenario>.yaml \
       [--results-dir DIR] [--seed-dir DIR] [--keep-seed]
 
+A generated seed directory is removed on exit unless --keep-seed is given.
+A seed directory passed with --seed-dir is NEVER removed - it may contain
+real data the benchmark did not create.
+
 Outputs results/<run_id>/ with the six CSV files + summary.json + summary.md.
 Never overwrites a prior run.
 """
@@ -46,6 +50,17 @@ def parse_bucket_key(uri):
     return b, k
 
 
+def should_remove_seed_dir(seed_dir_is_ours: bool, keep_seed: bool) -> bool:
+    """Whether the benchmark may recursively delete the seed directory.
+
+    A directory the benchmark GENERATED is temporary scratch and is removed
+    unless --keep-seed asks to inspect it. A directory supplied by the caller
+    with --seed-dir is NEVER removed: it may hold real data the benchmark did
+    not create, and `shutil.rmtree` on it would be silent data loss.
+    """
+    return seed_dir_is_ours and not keep_seed
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("scenario")
@@ -66,6 +81,15 @@ def main() -> int:
 
     binary = engine.vtopctl_path(build_if_missing=True)
 
+    # Only a seed directory the benchmark CREATED may be deleted afterwards.
+    # A caller-supplied --seed-dir can point at real data, so it is never
+    # recursively removed no matter what --keep-seed says.
+    #
+    # Ownership is decided by the SAME truthiness test that allocates the path,
+    # so the two can never disagree: `--seed-dir ""` (easy to produce with
+    # `--seed-dir "$UNSET_VAR"`) falls through to mkdtemp, and must therefore be
+    # owned by us - otherwise we would create a directory and then leak it.
+    seed_dir_is_ours = not args.seed_dir
     seed_dir = args.seed_dir or tempfile.mkdtemp(prefix=f"vtop-seed-{sc.name}-")
     work_dir = tempfile.mkdtemp(prefix="vtop-work-")
     state_db = os.path.join(tempfile.mkdtemp(prefix="vtop-state-"), "state.db")
@@ -253,8 +277,10 @@ def main() -> int:
     writer.write_summary(summary)
     writer.close()
 
-    if not args.keep_seed:
+    if should_remove_seed_dir(seed_dir_is_ours, args.keep_seed):
         shutil.rmtree(seed_dir, ignore_errors=True)
+    elif not seed_dir_is_ours:
+        print(f"[bench] leaving caller-supplied seed dir untouched: {seed_dir}")
     shutil.rmtree(work_dir, ignore_errors=True)
 
     print(f"[bench] done: {success} ok, {failed} failed, {replayed} replayed in {duration_s}s")
