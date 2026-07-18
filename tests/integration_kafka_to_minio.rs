@@ -46,7 +46,8 @@ fn kafka_cfg(bootstrap: &str, group: &str) -> KafkaSourceConfig {
 /// independent of any broker. Runs even without Kafka.
 #[test]
 fn kafka_client_never_auto_commits() {
-    let cc = build_client_config(&kafka_cfg("localhost:9092", "vtop-engine-it"));
+    let cc = build_client_config(&kafka_cfg("localhost:9092", "vtop-engine-it"))
+        .expect("config without secrets builds");
     assert_eq!(cc.get("enable.auto.commit"), Some("false"));
 }
 

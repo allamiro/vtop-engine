@@ -18,10 +18,43 @@ use vtop_core::config::KafkaSourceConfig;
 use vtop_core::errors::VtopError;
 use vtop_core::types::{ProgressMarker, SourceType, TelemetryFormat};
 
+/// Turn the lookup of the password environment variable into either the password
+/// or a precise configuration error.
+///
+/// A referenced-but-missing secret is a configuration error, never a silent
+/// fallback to no password. The two failure modes are distinguished so an
+/// operator is not told "not set" when the variable IS set but unreadable.
+/// Only the variable NAME ever appears in a message - never the value.
+///
+/// Kept pure (the lookup is passed in) so both branches are unit-testable
+/// without mutating the process environment: `std::env::set_var` is unsound
+/// while other tests and Tokio runtimes run concurrently in the same binary.
+fn require_password_env(
+    env_name: &str,
+    looked_up: Result<String, std::env::VarError>,
+) -> Result<String, VtopError> {
+    match looked_up {
+        Ok(pw) => Ok(pw),
+        Err(std::env::VarError::NotPresent) => Err(VtopError::Config(format!(
+            "sasl_password_env names ${env_name}, but that environment variable is not set; \
+             refusing to connect without the password"
+        ))),
+        Err(std::env::VarError::NotUnicode(_)) => Err(VtopError::Config(format!(
+            "sasl_password_env names ${env_name}, but its value is not valid Unicode; \
+             refusing to connect without a usable password"
+        ))),
+    }
+}
+
 /// Build the rdkafka [`ClientConfig`]. Auto-commit is forced to `false`
 /// regardless of the input config. Secrets are read from the environment, not
 /// logged.
-pub fn build_client_config(cfg: &KafkaSourceConfig) -> ClientConfig {
+///
+/// Fails if the config NAMES a password environment variable that is not set.
+/// Silently skipping it would start the engine unauthenticated when the operator
+/// explicitly asked for SASL - a downgrade that looks like a working connection
+/// until the broker rejects it, or worse, accepts it.
+pub fn build_client_config(cfg: &KafkaSourceConfig) -> Result<ClientConfig, VtopError> {
     let mut cc = ClientConfig::new();
     cc.set("bootstrap.servers", cfg.bootstrap_servers.join(","));
     cc.set("group.id", &cfg.consumer_group);
@@ -39,14 +72,13 @@ pub fn build_client_config(cfg: &KafkaSourceConfig) -> ClientConfig {
         cc.set("sasl.username", u);
     }
     if let Some(env_name) = &cfg.sasl_password_env {
-        if let Ok(pw) = std::env::var(env_name) {
-            cc.set("sasl.password", pw); // value never logged
-        }
+        let pw = require_password_env(env_name, std::env::var(env_name))?;
+        cc.set("sasl.password", pw); // value never logged
     }
     if let Some(ca) = &cfg.ssl_ca_location {
         cc.set("ssl.ca.location", ca);
     }
-    cc
+    Ok(cc)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -106,7 +138,7 @@ impl KafkaSource {
 
     fn consumer(&mut self) -> Result<&BaseConsumer, VtopError> {
         if self.consumer.is_none() {
-            let c: BaseConsumer = build_client_config(&self.cfg)
+            let c: BaseConsumer = build_client_config(&self.cfg)?
                 .create()
                 .map_err(|e| VtopError::Source(format!("creating kafka consumer: {e}")))?;
             self.consumer = Some(c);
@@ -160,7 +192,7 @@ impl KafkaSource {
 impl SourceAdapter for KafkaSource {
     async fn discover_sources(&self) -> Result<Vec<DiscoveredSource>, VtopError> {
         // Build a throwaway consumer to fetch metadata.
-        let consumer: BaseConsumer = build_client_config(&self.cfg)
+        let consumer: BaseConsumer = build_client_config(&self.cfg)?
             .create()
             .map_err(|e| VtopError::Source(format!("creating kafka consumer: {e}")))?;
         let metadata = consumer
@@ -471,8 +503,49 @@ mod tests {
 
     #[test]
     fn never_enables_auto_commit() {
-        let cc = build_client_config(&cfg());
+        let cc = build_client_config(&cfg()).expect("config without secrets builds");
         assert_eq!(cc.get("enable.auto.commit"), Some("false"));
+    }
+
+    #[test]
+    fn missing_password_env_is_a_config_error_not_a_silent_downgrade() {
+        // The operator asked for SASL by naming an env var. If that var is not
+        // set we must REFUSE, not connect without a password.
+        let err = require_password_env("VTOP_PW_VAR", Err(std::env::VarError::NotPresent))
+            .expect_err("missing secret must fail");
+        assert!(
+            matches!(err, VtopError::Config(_)),
+            "must be a Config error, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("VTOP_PW_VAR"),
+            "should name the variable: {msg}"
+        );
+        assert!(msg.contains("not set"), "should say it is not set: {msg}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn non_unicode_password_env_is_reported_as_such_not_as_missing() {
+        use std::os::unix::ffi::OsStringExt;
+        let bad = std::ffi::OsString::from_vec(vec![0xff, 0xfe]);
+        let err = require_password_env("VTOP_PW_VAR", Err(std::env::VarError::NotUnicode(bad)))
+            .expect_err("unreadable secret must fail");
+        assert!(matches!(err, VtopError::Config(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("VTOP_PW_VAR"));
+        assert!(
+            msg.contains("Unicode"),
+            "a set-but-unreadable value must not be reported as 'not set': {msg}"
+        );
+    }
+
+    #[test]
+    fn password_env_that_is_set_is_applied() {
+        let pw = require_password_env("VTOP_PW_VAR", Ok("hunter2".to_string()))
+            .expect("present secret resolves");
+        assert_eq!(pw, "hunter2");
     }
 
     #[test]
