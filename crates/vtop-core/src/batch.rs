@@ -370,4 +370,76 @@ mod tests {
         assert!(id.contains("app_events"));
         assert!(id.contains("p0-481000-482499"));
     }
+
+    // The tests below kill specific surviving mutants reported by cargo-mutants
+    // (issue #103) — each pins a return value the earlier tests only used
+    // indirectly.
+
+    fn batch_with_records(records: Vec<Vec<u8>>, verbatim: bool) -> TelemetryBatch {
+        let record_count = records.len();
+        TelemetryBatch {
+            batch_id: "b".into(),
+            tenant: "default".into(),
+            source_type: SourceType::Kafka,
+            source_name: "app_events".into(),
+            format: TelemetryFormat::Raw,
+            records,
+            record_count,
+            first_timestamp: None,
+            last_timestamp: None,
+            progress_start: kafka_marker(0, 0),
+            progress_end: kafka_marker(0, 0),
+            created_at: Utc::now().to_rfc3339(),
+            sealed_at: None,
+            state: BatchState::Batching,
+            verbatim,
+        }
+    }
+
+    #[test]
+    fn byte_size_sums_record_lengths() {
+        // 3 + 4 = 7 — kills the `-> 0` and `-> 1` mutants on byte_size.
+        let batch = batch_with_records(vec![b"abc".to_vec(), b"defg".to_vec()], false);
+        assert_eq!(batch.byte_size(), 7);
+        assert_eq!(batch_with_records(vec![], false).byte_size(), 0);
+    }
+
+    #[test]
+    fn to_record_bytes_line_framed_appends_newlines() {
+        let batch = batch_with_records(
+            vec![b"aaaa".to_vec(), b"bbbb".to_vec(), b"cccc".to_vec()],
+            false,
+        );
+        let buf = batch.to_record_bytes();
+        assert_eq!(buf, b"aaaa\nbbbb\ncccc\n");
+        // The buffer is preallocated to exactly byte_size + record_count (one
+        // newline per record). Sum vs product diverge here (12+3=15 vs 12*3=36),
+        // so an over-allocation pins the `+`→`*` mutant on the capacity math.
+        assert!(buf.capacity() <= batch.byte_size() + batch.records.len());
+    }
+
+    #[test]
+    fn to_record_bytes_verbatim_concatenates_without_framing() {
+        let batch = batch_with_records(vec![b"aa".to_vec(), b"bb".to_vec()], true);
+        assert_eq!(batch.to_record_bytes(), b"aabb");
+    }
+
+    #[test]
+    fn len_and_is_empty_track_pushes() {
+        let mut b = AdaptiveBatcher::new(
+            "default",
+            SourceType::Kafka,
+            "app_events",
+            TelemetryFormat::Raw,
+            BatchLimits::default(),
+        );
+        // Kills `is_empty -> false` and `len -> 1`.
+        assert!(b.is_empty());
+        assert_eq!(b.len(), 0);
+        b.push(b"one".to_vec(), &kafka_marker(0, 0), None);
+        b.push(b"two".to_vec(), &kafka_marker(1, 1), None);
+        // Kills `is_empty -> true` and `len -> 0` / `-> 1`.
+        assert!(!b.is_empty());
+        assert_eq!(b.len(), 2);
+    }
 }
