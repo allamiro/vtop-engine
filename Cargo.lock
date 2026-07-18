@@ -3561,6 +3561,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "clap",
+ "futures",
  "http-body-util",
  "hyper 1.10.1",
  "hyper-util",

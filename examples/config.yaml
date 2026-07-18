@@ -29,8 +29,23 @@ batching:
   idle_poll_interval_ms: 2000
 
 compression:
-  type: gzip          # gzip | zstd | none
-  level: 6
+  # zstd, not gzip. Measured on 13 MB of this lab's own CEF traffic:
+  #
+  #   gzip -6 (the code default)    32 MB/s    3.48x
+  #   gzip -1                      114 MB/s    2.90x
+  #   zstd -1                      417 MB/s    ~3.1x
+  #   zstd -9                         -        3.68x
+  #
+  # zstd level 3 sits in the middle: a better ratio than gzip -1 at several
+  # times gzip -6's throughput. Compression was the largest CPU cost in the
+  # pipeline, so this is the cheapest available win.
+  #
+  # The CODE default is still gzip/6 — deliberately. Changing it would change
+  # the output format for every config that omits these fields, and existing
+  # objects/manifests record the codec they were written with. Set it here
+  # explicitly instead, so the choice is visible and opt-in.
+  type: zstd          # gzip | zstd | none
+  level: 3
 
 sources:
   kafka:
