@@ -173,6 +173,107 @@ async fn reading_alone_does_not_advance_progress() {
     );
 }
 
+/// #96 A1: ONE multiplexed pass over MANY topics must return every topic's
+/// records, demuxed so each unit's marker names the topic it actually came
+/// from. This is the behaviour the serial per-topic loop was replaced with;
+/// mis-demuxing here means topic B's records get archived (and B's offsets
+/// committed) under topic A.
+#[tokio::test]
+#[ignore = "requires a running Kafka broker"]
+async fn one_pass_reads_many_topics_and_demuxes_by_marker_topic() {
+    use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
+    use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
+
+    let mut adapter = KafkaSource::new(
+        kafka_cfg(&bootstrap(), &unique_group("multiplex")),
+        TelemetryFormat::Cef,
+    )
+    .unwrap();
+    let seeded = seeded_topic(&mut adapter).await;
+
+    // A second topic, unique per run so stale offsets from a previous run can
+    // never mask a broken demux. Created explicitly — auto-creation is broker
+    // configuration this test must not depend on.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let topic_b = format!("it_multiplex_{nanos}");
+    let admin: AdminClient<_> = build_client_config(&kafka_cfg(&bootstrap(), "vtop-it-admin"))
+        .unwrap()
+        .create()
+        .expect("admin client");
+    admin
+        .create_topics(
+            &[NewTopic::new(&topic_b, 1, TopicReplication::Fixed(1))],
+            &AdminOptions::new(),
+        )
+        .await
+        .expect("create_topics call failed")
+        .pop()
+        .expect("one topic result")
+        .expect("topic creation failed");
+
+    let producer: BaseProducer = build_client_config(&kafka_cfg(&bootstrap(), "vtop-it-producer"))
+        .unwrap()
+        .create()
+        .expect("producer");
+    for i in 0..10 {
+        let payload = format!("CEF:0|VTOP|IT|1.0|{i}|Multiplex|3|src=10.0.0.{i}");
+        producer
+            .send(BaseRecord::<(), str>::to(&topic_b).payload(&payload))
+            .expect("enqueue produce");
+    }
+    producer
+        .flush(std::time::Duration::from_secs(10))
+        .expect("flush produce");
+
+    let sources = vec![
+        seeded.clone(),
+        DiscoveredSource {
+            source_type: seeded.source_type.clone(),
+            source_name: topic_b.clone(),
+            format: seeded.format.clone(),
+        },
+    ];
+    let report = adapter
+        .read_all_batch_candidates(&sources, 1000, 1 << 20, std::time::Duration::from_secs(10))
+        .await
+        .expect("multiplexed read failed");
+
+    assert_eq!(
+        report.outcomes.len(),
+        sources.len(),
+        "one outcome per source"
+    );
+    assert_eq!(report.failed_ms, 0, "no failure bucket on a healthy pass");
+    let mut totals = vec![0usize; sources.len()];
+    for outcome in &report.outcomes {
+        let src = &sources[outcome.source_index];
+        let reads = outcome.result.as_ref().expect("per-source result ok");
+        for read in reads {
+            let ProgressMarker::Kafka { topic, .. } = &read.progress_end else {
+                panic!("expected a Kafka marker");
+            };
+            // THE demux invariant: every unit routed to a source carries a
+            // marker for that source's topic, never another topic's.
+            assert_eq!(topic, &src.source_name, "unit demuxed to the wrong source");
+            totals[outcome.source_index] += read.records.len();
+        }
+    }
+    // Both topics have data; ONE pass must have fetched from BOTH — a pass
+    // that only serves one topic is the serial starvation this replaces.
+    assert!(
+        totals.iter().all(|&t| t > 0),
+        "every seeded topic must yield records in a single pass, got {totals:?}"
+    );
+
+    // Best-effort cleanup; a leaked topic only clutters a long-lived local lab.
+    let _ = admin
+        .delete_topics(&[topic_b.as_str()], &AdminOptions::new())
+        .await;
+}
+
 /// After an explicit commit (what the engine does only once VERIFIED), a new
 /// consumer in the same group must resume past the committed offsets rather than
 /// re-reading them, or verified batches would be archived twice.

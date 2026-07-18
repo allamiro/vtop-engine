@@ -903,88 +903,109 @@ impl Engine {
         let mut failed_sources: usize = 0;
         let mut records_read: usize = 0;
 
-        for source in sources {
-            let read_started = Instant::now();
-
-            // A single source read failing must not abort reading/flushing the
-            // other sources this cycle — log and skip it.
-            let reads = match adapter
-                .read_batch_candidates(
-                    &source,
-                    self.config.batching.max_records,
-                    self.config.batching.max_bytes,
-                    max_wait,
-                )
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    if let Some(mx) = telemetry::metrics() {
-                        // No source_name label: file/syslog source names are
-                        // full paths, so a rotated file set would mint a series
-                        // per file. The path is in the warning below instead.
-                        // Resolve tenant the same way the pipeline does
-                        // (stream override first, engine default second) so read
-                        // errors line up with the batch metrics for the same
-                        // source instead of always landing on the engine
-                        // default.
-                        let t = self
-                            .streams
-                            .lookup(&source.source_name)
-                            .map(|s| s.tenant.clone())
-                            .unwrap_or_else(|| self.config.engine.tenant.clone());
-                        mx.source_read_errors_total
-                            .with_label_values(&[t.as_str(), source_type.as_str()])
-                            .inc();
-                    }
-                    // Count the time a FAILED read consumed. Without this the
-                    // buckets silently fail to sum to read_phase_ms, and a
-                    // source timing out — which can burn the full window — would
-                    // look like the cycle lost time to nothing at all. The point
-                    // of this accounting is that it reconciles.
-                    failed_read_ms += read_started.elapsed().as_millis() as u64;
-                    failed_sources += 1;
-                    tracing::warn!(source = %source.source_name, error = %e, "source read failed; skipping this cycle");
-                    continue;
+        // ONE call reads every source: the default trait impl walks them
+        // serially (file, syslog — independent handles), while Kafka overrides
+        // it to assign all topic-partitions once and pay a single poll wait for
+        // the whole topic set instead of one per topic (#96 A1). The adapter
+        // reports how the pass's wall-clock divided between the buckets; the
+        // per-source outcomes drive the counts and the buffer routing.
+        let read_started = Instant::now();
+        match adapter
+            .read_all_batch_candidates(
+                &sources,
+                self.config.batching.max_records,
+                self.config.batching.max_bytes,
+                max_wait,
+            )
+            .await
+        {
+            Err(e) => {
+                // The whole pass failed before any source progressed (e.g. the
+                // shared consumer could not assign). One error event — the
+                // metric counts error events, not sources multiplied by them.
+                if let Some(mx) = telemetry::metrics() {
+                    let t = self.config.engine.tenant.clone();
+                    mx.source_read_errors_total
+                        .with_label_values(&[t.as_str(), source_type.as_str()])
+                        .inc();
                 }
-            };
-            let read_ms = read_started.elapsed().as_millis() as u64;
-            let got: usize = reads.iter().map(|r| r.records.len()).sum();
-            if got > 0 {
-                productive_read_ms += read_ms;
-                productive_sources += 1;
-                records_read += got;
-            } else {
-                // A source that yielded nothing still consumed its full poll
-                // window. Summed across sources this is the serial-polling cost.
-                empty_read_ms += read_ms;
-                empty_sources += 1;
+                failed_read_ms += read_started.elapsed().as_millis() as u64;
+                failed_sources += sources.len();
+                tracing::warn!(source_type = %source_type, error = %e, "adapter read pass failed; skipping this cycle");
             }
+            Ok(report) => {
+                productive_read_ms = report.productive_ms;
+                empty_read_ms = report.empty_ms;
+                failed_read_ms = report.failed_ms;
+                for outcome in report.outcomes {
+                    let Some(source) = sources.get(outcome.source_index) else {
+                        debug_assert!(false, "adapter returned out-of-range source index");
+                        continue;
+                    };
+                    // A single source failing must not abort the other sources'
+                    // results — log and skip it.
+                    let reads = match outcome.result {
+                        Ok(r) => r,
+                        Err(e) => {
+                            if let Some(mx) = telemetry::metrics() {
+                                // No source_name label: file/syslog source names
+                                // are full paths, so a rotated file set would
+                                // mint a series per file. The path is in the
+                                // warning below instead. Resolve tenant the same
+                                // way the pipeline does (stream override first,
+                                // engine default second) so read errors line up
+                                // with the batch metrics for the same source
+                                // instead of always landing on the engine
+                                // default.
+                                let t = self
+                                    .streams
+                                    .lookup(&source.source_name)
+                                    .map(|s| s.tenant.clone())
+                                    .unwrap_or_else(|| self.config.engine.tenant.clone());
+                                mx.source_read_errors_total
+                                    .with_label_values(&[t.as_str(), source_type.as_str()])
+                                    .inc();
+                            }
+                            failed_sources += 1;
+                            tracing::warn!(source = %source.source_name, error = %e, "source read failed; skipping this cycle");
+                            continue;
+                        }
+                    };
+                    let got: usize = reads.iter().map(|r| r.records.len()).sum();
+                    if got > 0 {
+                        productive_sources += 1;
+                        records_read += got;
+                    } else {
+                        empty_sources += 1;
+                    }
 
-            // One read can return SEVERAL independently committable units: a
-            // Kafka topic yields one per partition it saw. Each gets routed to
-            // its own buffer, so a single read now feeds every partition rather
-            // than the one it happened to lock onto.
-            for read in reads {
-                if read.is_empty() {
-                    continue;
+                    // One source can return SEVERAL independently committable
+                    // units: a Kafka topic yields one per partition it saw.
+                    // Each gets routed to its own buffer.
+                    for read in reads {
+                        if read.is_empty() {
+                            continue;
+                        }
+                        // Any data at all means the loop should come straight
+                        // back rather than sleeping out the idle interval — a
+                        // backlog must be drained at read speed, not at timer
+                        // speed.
+                        self.cycle_had_data = true;
+                        let limits = self.batch_limits();
+                        let tenant = self.config.engine.tenant.clone();
+                        // Key the buffer by the MARKER (topic + partition for
+                        // Kafka) so a multiplexed read pass routes each unit to
+                        // the buffer of the topic it was actually read from,
+                        // and a multi-partition topic never coalesces records
+                        // from different partitions into one batch.
+                        let key = buffer_key(source, &read.progress_start);
+                        let buf_source = source_for_marker(source, &read.progress_start);
+                        self.pending
+                            .entry(key)
+                            .or_insert_with(|| PendingBuffer::new(&tenant, buf_source, limits))
+                            .append(read);
+                    }
                 }
-                // Any data at all means the loop should come straight back
-                // rather than sleeping out the idle interval — a backlog must be
-                // drained at read speed, not at timer speed.
-                self.cycle_had_data = true;
-                let limits = self.batch_limits();
-                let tenant = self.config.engine.tenant.clone();
-                // Key the buffer by the source PLUS partition so a multi-partition
-                // Kafka topic never coalesces records from different partitions into
-                // one batch (one read is single-partition; without this, consecutive
-                // reads of different partitions would mix under a single topic key
-                // and the bound commit marker would describe only one of them).
-                let key = buffer_key(&source, &read.progress_start);
-                self.pending
-                    .entry(key)
-                    .or_insert_with(|| PendingBuffer::new(&tenant, source.clone(), limits))
-                    .append(read);
             }
         }
 
@@ -1318,15 +1339,37 @@ impl Engine {
 /// Buffer key that isolates accumulation per source AND per Kafka partition, so
 /// a multi-partition topic never coalesces records from different partitions
 /// into one batch. File/syslog sources have no partition and key by name only.
+///
+/// For Kafka the key is derived from the MARKER's topic, not the requested
+/// source: a multiplexed read pass (#96 A1) reads every topic in one call, so
+/// the marker is the authority on which topic a unit actually came from. Keying
+/// by the requested source would file another topic's records under the wrong
+/// buffer — and its commit marker would then commit offsets for a topic the
+/// buffer's records did not come from.
 fn buffer_key(source: &DiscoveredSource, marker: &ProgressMarker) -> (SourceType, String) {
-    let suffix = match marker {
-        ProgressMarker::Kafka { partition, .. } => format!("#p{partition}"),
-        _ => String::new(),
-    };
-    (
-        source.source_type.clone(),
-        format!("{}{}", source.source_name, suffix),
-    )
+    match marker {
+        ProgressMarker::Kafka {
+            topic, partition, ..
+        } => (source.source_type.clone(), format!("{topic}#p{partition}")),
+        _ => (source.source_type.clone(), source.source_name.clone()),
+    }
+}
+
+/// The source a read actually belongs to. Like [`buffer_key`], the marker is
+/// authoritative for Kafka: the buffer's source drives stream lookup (tenant,
+/// format) and batch metadata, so it must name the topic the records came
+/// from, not the source the read was requested for.
+fn source_for_marker(requested: &DiscoveredSource, marker: &ProgressMarker) -> DiscoveredSource {
+    match marker {
+        ProgressMarker::Kafka { topic, .. } if *topic != requested.source_name => {
+            DiscoveredSource {
+                source_type: requested.source_type.clone(),
+                source_name: topic.clone(),
+                format: requested.format.clone(),
+            }
+        }
+        _ => requested.clone(),
+    }
 }
 
 /// Default format for an adapter, taken from the first matching stream of that
@@ -1391,6 +1434,47 @@ mod tests {
             mtime: String::new(),
         };
         assert_eq!(buffer_key(&file, &fm).1, "/a.log");
+    }
+
+    /// #96 A2: a multiplexed Kafka read pass can return units for a topic other
+    /// than the source the read was requested for. The MARKER must drive both
+    /// the buffer key and the buffer's source — otherwise topic B's records
+    /// land in topic A's buffer and B's offsets get committed against A's data.
+    #[test]
+    fn buffer_routing_follows_the_marker_topic_not_the_requested_source() {
+        use vtop_core::types::{ProgressMarker, TelemetryFormat};
+        let requested = DiscoveredSource {
+            source_type: SourceType::Kafka,
+            source_name: "topic_a".into(),
+            format: TelemetryFormat::Cef,
+        };
+        let marker_for_b = ProgressMarker::Kafka {
+            topic: "topic_b".into(),
+            partition: 3,
+            start_offset: 0,
+            end_offset: 0,
+            consumer_group: "g".into(),
+        };
+        // Key names the marker's topic and partition, not the requested source.
+        assert_eq!(buffer_key(&requested, &marker_for_b).1, "topic_b#p3");
+        // The buffer's source follows the marker too (drives stream lookup and
+        // batch metadata), keeping everything else from the requested source.
+        let routed = source_for_marker(&requested, &marker_for_b);
+        assert_eq!(routed.source_name, "topic_b");
+        assert_eq!(routed.source_type, SourceType::Kafka);
+        assert_eq!(routed.format, TelemetryFormat::Cef);
+        // Marker topic == requested source: unchanged.
+        let marker_for_a = ProgressMarker::Kafka {
+            topic: "topic_a".into(),
+            partition: 0,
+            start_offset: 0,
+            end_offset: 0,
+            consumer_group: "g".into(),
+        };
+        assert_eq!(
+            source_for_marker(&requested, &marker_for_a).source_name,
+            "topic_a"
+        );
     }
 
     /// A sub-threshold read must be buffered (not flushed) on a non-forced

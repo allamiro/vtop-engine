@@ -4,7 +4,9 @@
 //! batch reaches `VERIFIED`. By default a batch never mixes partitions: one
 //! batch = one topic + one partition + one offset range.
 
-use crate::base::{DiscoveredSource, ReadResult, SourceAdapter};
+use crate::base::{
+    AdapterReadReport, DiscoveredSource, ReadResult, SourceAdapter, SourceReadOutcome,
+};
 use async_trait::async_trait;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer};
@@ -87,6 +89,59 @@ struct PartitionCursor {
     last_read_offset: Option<i64>,
     /// Committed "next offset to read" (`None` = nothing committed yet).
     committed_offset: Option<i64>,
+}
+
+/// Records accumulated for one (topic, partition) during a poll pass.
+#[derive(Debug)]
+struct PartAcc {
+    records: Vec<Vec<u8>>,
+    start_offset: i64,
+    end_offset: i64,
+}
+
+/// Demultiplexes one poll pass over MANY topics into per-(topic, partition)
+/// accumulators, with budgets applied across the whole pass so one busy
+/// partition cannot starve memory bounds.
+///
+/// Kept free of rdkafka types so the demux/budget logic is unit-testable
+/// without a broker.
+#[derive(Debug, Default)]
+struct MultiTopicAcc {
+    parts: HashMap<(String, i32), PartAcc>,
+    bytes: usize,
+    total_records: usize,
+}
+
+impl MultiTopicAcc {
+    fn push(&mut self, topic: &str, partition: i32, offset: i64, payload: Vec<u8>) {
+        self.bytes += payload.len();
+        self.total_records += 1;
+        let acc = self
+            .parts
+            .entry((topic.to_string(), partition))
+            .or_insert_with(|| PartAcc {
+                records: Vec::new(),
+                start_offset: offset,
+                end_offset: offset,
+            });
+        acc.end_offset = offset;
+        acc.records.push(payload);
+    }
+
+    fn is_full(&self, budget_records: usize, budget_bytes: usize) -> bool {
+        self.total_records >= budget_records || self.bytes >= budget_bytes
+    }
+
+    /// Drain into `(topic, partition, acc)` tuples, ordered for determinism.
+    fn into_sorted(self) -> Vec<(String, i32, PartAcc)> {
+        let mut out: Vec<(String, i32, PartAcc)> = self
+            .parts
+            .into_iter()
+            .map(|((t, p), acc)| (t, p, acc))
+            .collect();
+        out.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+        out
+    }
 }
 
 pub struct KafkaSource {
@@ -219,122 +274,155 @@ impl SourceAdapter for KafkaSource {
         max_bytes: usize,
         max_wait: Duration,
     ) -> Result<Vec<ReadResult>, VtopError> {
-        let topic = source.source_name.clone();
+        // One topic is the degenerate case of the multiplexed pass; a single
+        // code path keeps the offset-seeding and demux semantics identical.
+        let report = self
+            .read_all_batch_candidates(
+                std::slice::from_ref(source),
+                max_records,
+                max_bytes,
+                max_wait,
+            )
+            .await?;
+        report
+            .outcomes
+            .into_iter()
+            .next()
+            .map(|o| o.result)
+            .unwrap_or_else(|| Ok(Vec::new()))
+    }
+
+    /// Read EVERY topic in one pass: assign all (topic, partition) pairs once,
+    /// then run a SINGLE poll loop and demultiplex messages by (topic,
+    /// partition).
+    ///
+    /// This replaces per-topic reads on the shared consumer, which paid up to
+    /// `max_wait` PER TOPIC serially — measured at 87-92% of the read cycle
+    /// waiting on empty topics (~61k rec/s while reading vs ~12.7k observed,
+    /// #96). One pass pays the wait once for the whole topic set, which is how
+    /// a Kafka consumer is designed to be used.
+    async fn read_all_batch_candidates(
+        &mut self,
+        sources: &[DiscoveredSource],
+        max_records: usize,
+        max_bytes: usize,
+        max_wait: Duration,
+    ) -> Result<AdapterReadReport, VtopError> {
         let group = self.cfg.consumer_group.clone();
+        let started = std::time::Instant::now();
 
-        // Discover the topic's partitions, then ASSIGN them at our tracked
-        // offsets. We deliberately use assign() rather than subscribe(): a
-        // subscribe() on every read triggers a consumer-group rebalance, and
-        // because the engine commits offsets only AFTER verification there is no
-        // committed offset to resume from — so each rebalance reseeks to the
-        // configured reset (earliest) and the short poll window is spent
-        // rebalancing instead of fetching. assign() is rebalance-free and lets
-        // us control the exact start offset per partition.
+        // Demux target: topic name -> index into `sources`.
+        let topic_index: HashMap<&str, usize> = sources
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.source_name.as_str(), i))
+            .collect();
+
+        // ASSIGN every topic's partitions at our tracked offsets. We
+        // deliberately use assign() rather than subscribe(): a subscribe() on
+        // every read triggers a consumer-group rebalance, and because the
+        // engine commits offsets only AFTER verification there is no committed
+        // offset to resume from — so each rebalance reseeks to the configured
+        // reset (earliest) and the short poll window is spent rebalancing
+        // instead of fetching. assign() is rebalance-free and lets us control
+        // the exact start offset per partition.
         self.consumer()?;
-        let partitions: Vec<i32> = self.partitions_for(&topic)?;
-        if partitions.is_empty() {
-            // Topic has no partitions (e.g. just deleted) — nothing to read.
-            self.active = Some((topic.clone(), 0));
-            return Ok(vec![ReadResult {
-                progress_start: ProgressMarker::Kafka {
-                    topic: topic.clone(),
-                    partition: 0,
-                    start_offset: 0,
-                    end_offset: 0,
-                    consumer_group: group,
-                },
-                progress_end: ProgressMarker::Kafka {
-                    topic,
-                    partition: 0,
-                    start_offset: 0,
-                    end_offset: 0,
-                    consumer_group: self.cfg.consumer_group.clone(),
-                },
-                records: Vec::new(),
-                first_timestamp: None,
-                last_timestamp: None,
-                verbatim: false,
-            }]);
-        }
-
-        // Build the assignment from each partition's tracked position.
+        // A metadata failure for ONE topic must not abort the pass for the
+        // others — the serial loop isolated it per source, and so does this:
+        // the failing topic is skipped and its outcome carries the error.
+        let mut source_errors: Vec<Option<VtopError>> = Vec::with_capacity(sources.len());
         let mut tpl = TopicPartitionList::new();
-        for &p in &partitions {
-            let cur = self.cursors.entry((topic.clone(), p)).or_default();
-            let off = match cur.last_read_offset {
-                // Continue from our in-session read head.
-                Some(lr) => Offset::Offset(lr + 1),
-                None => match cur.committed_offset {
-                    // Resume from a position we committed this session.
-                    Some(c) => Offset::Offset(c),
-                    // Nothing in memory (fresh process / first read for this
-                    // partition): resolve the GROUP'S COMMITTED offset from the
-                    // broker, falling back to `auto.offset.reset` when the group
-                    // has never committed.
-                    //
-                    // This must not be Offset::Beginning: subscribe() used to
-                    // resume from the committed offset implicitly, and assign()
-                    // does not. Starting at Beginning would make every engine
-                    // restart re-read the topic from the start and re-archive
-                    // already-committed records.
-                    None => Offset::Stored,
-                },
+        for source in sources {
+            let topic = &source.source_name;
+            // A topic with no partitions (e.g. just deleted) simply contributes
+            // nothing to the assignment; its outcome will be empty.
+            let partitions = match self.partitions_for(topic) {
+                Ok(p) => {
+                    source_errors.push(None);
+                    p
+                }
+                Err(e) => {
+                    source_errors.push(Some(e));
+                    continue;
+                }
             };
-            tpl.add_partition_offset(&topic, p, off)
-                .map_err(|e| VtopError::Source(format!("assign tpl {topic}-{p}: {e}")))?;
+            for p in partitions {
+                let cur = self.cursors.entry((topic.clone(), p)).or_default();
+                let off = match cur.last_read_offset {
+                    // Continue from our in-session read head.
+                    Some(lr) => Offset::Offset(lr + 1),
+                    None => match cur.committed_offset {
+                        // Resume from a position we committed this session.
+                        Some(c) => Offset::Offset(c),
+                        // Nothing in memory (fresh process / first read for
+                        // this partition): resolve the GROUP'S COMMITTED offset
+                        // from the broker, falling back to `auto.offset.reset`
+                        // when the group has never committed.
+                        //
+                        // This must not be Offset::Beginning: subscribe() used
+                        // to resume from the committed offset implicitly, and
+                        // assign() does not. Starting at Beginning would make
+                        // every engine restart re-read the topic from the start
+                        // and re-archive already-committed records.
+                        None => Offset::Stored,
+                    },
+                };
+                tpl.add_partition_offset(topic, p, off)
+                    .map_err(|e| VtopError::Source(format!("assign tpl {topic}-{p}: {e}")))?;
+            }
         }
-        {
-            let consumer = self.consumer()?;
-            consumer
-                .assign(&tpl)
-                .map_err(|e| VtopError::Source(format!("assign {topic}: {e}")))?;
+        // Nothing to assign (no sources, or every topic is partitionless):
+        // return without polling. The serial path never waited in this case,
+        // and blocking `max_wait` on an empty assignment would turn an idle
+        // adapter into a fixed per-cycle stall.
+        if tpl.count() == 0 {
+            return Ok(AdapterReadReport {
+                outcomes: source_errors
+                    .into_iter()
+                    .enumerate()
+                    .map(|(source_index, err)| SourceReadOutcome {
+                        source_index,
+                        result: match err {
+                            Some(e) => Err(e),
+                            None => Ok(Vec::new()),
+                        },
+                    })
+                    .collect(),
+                productive_ms: 0,
+                empty_ms: started.elapsed().as_millis() as u64,
+                failed_ms: 0,
+            });
         }
         let consumer = self.consumer()?;
+        consumer
+            .assign(&tpl)
+            .map_err(|e| VtopError::Source(format!("assign ({} topics): {e}", sources.len())))?;
 
-        // Accumulate PER PARTITION. Kafka interleaves partitions within one
-        // consumer, so the old code locked onto the first partition seen, and
-        // on any other partition it rewound with seek() and broke out of the
-        // read entirely. On a 24-partition topic that ended most reads after a
-        // handful of records — batches never filled, every switch cost a broker
-        // seek round-trip, and a cycle touched a fraction of the topic.
-        //
-        // Nothing needs the lock: the ENGINE already isolates batches per
-        // partition (`buffer_key` appends `#p{partition}`), so mixed-partition
-        // reads are safe as long as records are handed back grouped. Returning
-        // one ReadResult per partition does exactly that, and lets a single read
-        // feed every partition's buffer at once.
-        struct PartAcc {
-            records: Vec<Vec<u8>>,
-            start_offset: i64,
-            end_offset: i64,
-        }
-        let mut parts: std::collections::HashMap<i32, PartAcc> = std::collections::HashMap::new();
-        let mut bytes: usize = 0;
-        let mut total_records: usize = 0;
+        // The budgets are PER SOURCE (that is the trait contract), and this
+        // pass covers every source at once, so the pass-wide budget scales
+        // with the topic count — the same aggregate the serial loop allowed.
+        let budget_records = max_records.saturating_mul(sources.len().max(1));
+        let budget_bytes = max_bytes.saturating_mul(sources.len().max(1));
 
+        let mut acc = MultiTopicAcc::default();
         let deadline = std::time::Instant::now() + max_wait;
         loop {
-            // Budgets are across the whole read, not per partition, so one busy
-            // partition cannot starve memory bounds.
-            if total_records >= max_records || bytes >= max_bytes {
+            if acc.is_full(budget_records, budget_bytes) {
                 break;
             }
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             match consumer.poll(remaining) {
                 Some(Ok(msg)) => {
-                    let p = msg.partition();
-                    let off = msg.offset();
-                    let payload = msg.payload().unwrap_or_default().to_vec();
-                    bytes += payload.len();
-                    total_records += 1;
-                    let acc = parts.entry(p).or_insert_with(|| PartAcc {
-                        records: Vec::new(),
-                        start_offset: off,
-                        end_offset: off,
-                    });
-                    acc.end_offset = off;
-                    acc.records.push(payload);
+                    acc.push(
+                        msg.topic(),
+                        msg.partition(),
+                        msg.offset(),
+                        msg.payload().unwrap_or_default().to_vec(),
+                    );
                 }
+                // Cursors are only advanced AFTER the loop, so failing the
+                // whole pass here abandons nothing: every accumulated offset is
+                // re-read on the next cycle.
                 Some(Err(e)) => {
                     return Err(VtopError::Source(format!("kafka poll error: {e}")));
                 }
@@ -344,20 +432,30 @@ impl SourceAdapter for KafkaSource {
                 break;
             }
         }
+        let total_records = acc.total_records;
 
-        // Record the last partition touched so `get_progress_marker` keeps
-        // working. Single-slot `active` is a known wart with many partitions in
-        // play; it is not on the commit path (commit_progress takes an explicit
-        // marker) and is tracked separately.
-        let mut out: Vec<ReadResult> = Vec::with_capacity(parts.len());
-        let mut partitions: Vec<i32> = parts.keys().copied().collect();
-        partitions.sort_unstable();
-        for p in partitions {
-            let acc = &parts[&p];
+        // Demux into one ReadResult per (topic, partition), routed to the
+        // outcome of the source that owns the topic. The ENGINE isolates
+        // batches per topic and partition (`buffer_key`), so mixed reads are
+        // safe as long as records are handed back grouped.
+        let mut per_source: Vec<Vec<ReadResult>> = vec![Vec::new(); sources.len()];
+        for (topic, p, part) in acc.into_sorted() {
+            let Some(&idx) = topic_index.get(topic.as_str()) else {
+                // A message for a topic we did not assign should be impossible;
+                // dropping it silently would lose data, so fail loudly.
+                return Err(VtopError::Source(format!(
+                    "kafka poll returned unassigned topic {topic}"
+                )));
+            };
+            // Record the last partition touched so `get_progress_marker` keeps
+            // working. Single-slot `active` is a known wart with many
+            // partitions in play; it is not on the commit path
+            // (commit_progress takes an explicit marker) and is tracked
+            // separately (#96 B1).
             self.active = Some((topic.clone(), p));
             let cur = self.cursors.entry((topic.clone(), p)).or_default();
-            if !acc.records.is_empty() {
-                cur.last_read_offset = Some(acc.end_offset);
+            if !part.records.is_empty() {
+                cur.last_read_offset = Some(part.end_offset);
             }
             let mk = |s: i64, e: i64| ProgressMarker::Kafka {
                 topic: topic.clone(),
@@ -366,18 +464,46 @@ impl SourceAdapter for KafkaSource {
                 end_offset: e,
                 consumer_group: group.clone(),
             };
-            out.push(ReadResult {
-                progress_start: mk(acc.start_offset, acc.start_offset),
-                progress_end: mk(acc.start_offset, acc.end_offset.max(acc.start_offset)),
-                records: acc.records.clone(),
+            per_source[idx].push(ReadResult {
+                progress_start: mk(part.start_offset, part.start_offset),
+                progress_end: mk(part.start_offset, part.end_offset.max(part.start_offset)),
+                records: part.records,
                 first_timestamp: None,
                 last_timestamp: None,
-                // Kafka messages are newline-framed into the object (offset-based,
-                // not byte-exact), so records are re-framed on serialization.
+                // Kafka messages are newline-framed into the object
+                // (offset-based, not byte-exact), so records are re-framed on
+                // serialization.
                 verbatim: false,
             });
         }
-        Ok(out)
+
+        // One shared wait covered every topic, so the pass's wall-clock is one
+        // bucket: productive if ANY topic yielded, otherwise empty. Splitting
+        // it per topic would double-count the shared wait and break the
+        // engine's reconciliation of buckets against the phase total.
+        let elapsed = started.elapsed().as_millis() as u64;
+        let (productive_ms, empty_ms) = if total_records > 0 {
+            (elapsed, 0)
+        } else {
+            (0, elapsed)
+        };
+        Ok(AdapterReadReport {
+            outcomes: per_source
+                .into_iter()
+                .zip(source_errors)
+                .enumerate()
+                .map(|(source_index, (reads, err))| SourceReadOutcome {
+                    source_index,
+                    result: match err {
+                        Some(e) => Err(e),
+                        None => Ok(reads),
+                    },
+                })
+                .collect(),
+            productive_ms,
+            empty_ms,
+            failed_ms: 0,
+        })
     }
 
     async fn get_progress_marker(&self) -> Result<ProgressMarker, VtopError> {
@@ -555,5 +681,55 @@ mod tests {
         let src = KafkaSource::new(cfg(), TelemetryFormat::Cef).unwrap();
         assert!(src.topic_allowed("app_events"));
         assert!(!src.topic_allowed("__consumer_offsets"));
+    }
+
+    // The single poll loop (#96 A1) interleaves messages from EVERY topic and
+    // partition; MultiTopicAcc is the demux that turns that stream back into
+    // per-(topic, partition) units. These tests pin the demux and budget logic
+    // without a broker.
+
+    #[test]
+    fn multi_topic_acc_demuxes_by_topic_and_partition() {
+        let mut acc = MultiTopicAcc::default();
+        // Interleaved arrival order across two topics and two partitions.
+        acc.push("t_a", 0, 10, b"a0".to_vec());
+        acc.push("t_b", 0, 5, b"b0".to_vec());
+        acc.push("t_a", 1, 20, b"a1".to_vec());
+        acc.push("t_a", 0, 11, b"a0b".to_vec());
+        assert_eq!(acc.total_records, 4);
+        assert_eq!(acc.bytes, 2 + 2 + 2 + 3);
+
+        let sorted = acc.into_sorted();
+        let keys: Vec<(String, i32)> = sorted.iter().map(|(t, p, _)| (t.clone(), *p)).collect();
+        // Deterministic order: by topic, then partition.
+        assert_eq!(
+            keys,
+            vec![
+                ("t_a".to_string(), 0),
+                ("t_a".to_string(), 1),
+                ("t_b".to_string(), 0)
+            ]
+        );
+        // Same partition accumulates in arrival order and tracks the offset range.
+        let (_, _, a0) = &sorted[0];
+        assert_eq!(a0.records, vec![b"a0".to_vec(), b"a0b".to_vec()]);
+        assert_eq!((a0.start_offset, a0.end_offset), (10, 11));
+        // Different partitions of the same topic never mix.
+        let (_, _, a1) = &sorted[1];
+        assert_eq!(a1.records, vec![b"a1".to_vec()]);
+        assert_eq!((a1.start_offset, a1.end_offset), (20, 20));
+    }
+
+    #[test]
+    fn multi_topic_acc_budgets_apply_across_the_whole_pass() {
+        let mut acc = MultiTopicAcc::default();
+        acc.push("t_a", 0, 0, vec![0u8; 6]);
+        acc.push("t_b", 0, 0, vec![0u8; 6]);
+        // Record budget: 2 records across DIFFERENT topics still count together.
+        assert!(acc.is_full(2, usize::MAX));
+        assert!(!acc.is_full(3, usize::MAX));
+        // Byte budget: 12 bytes across topics count together.
+        assert!(acc.is_full(usize::MAX, 12));
+        assert!(!acc.is_full(usize::MAX, 13));
     }
 }
