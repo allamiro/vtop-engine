@@ -5,7 +5,9 @@
 //! never deletes source files unless explicitly configured and only after the
 //! batch is committed.
 
-use crate::base::{DiscoveredSource, ReadResult, SourceAdapter};
+use crate::base::{
+    AdapterReadReport, DiscoveredSource, ReadResult, SourceAdapter, SourceReadOutcome,
+};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::Path;
@@ -91,43 +93,25 @@ impl FileSource {
             mtime,
         }
     }
-}
 
-#[async_trait]
-impl SourceAdapter for FileSource {
-    async fn discover_sources(&self) -> Result<Vec<DiscoveredSource>, VtopError> {
-        let mut out = Vec::new();
-        for pattern in &self.paths {
-            for entry in glob::glob(pattern)
-                .map_err(|e| VtopError::Source(format!("bad glob {pattern}: {e}")))?
-            {
-                match entry {
-                    Ok(p) if p.is_file() => out.push(DiscoveredSource {
-                        source_type: SourceType::File,
-                        source_name: p.to_string_lossy().into_owned(),
-                        format: self.format.clone(),
-                    }),
-                    _ => {}
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    async fn read_batch_candidates(
-        &mut self,
-        source: &DiscoveredSource,
+    /// Read one file from `start`, honouring the budgets. Pure with respect to
+    /// the adapter (no `&self`): takes everything it needs by value so many
+    /// files can be read CONCURRENTLY in one pass (#96 B2) — each file's
+    /// cursor is snapshotted before and applied after, so concurrent reads
+    /// never touch shared state.
+    ///
+    /// Returns `(records, end_pos, verbatim)`.
+    async fn read_slice(
+        path: String,
+        start: u64,
         max_records: usize,
         max_bytes: usize,
-        _max_wait: Duration,
-    ) -> Result<Vec<ReadResult>, VtopError> {
-        let path = source.source_name.clone();
-        let start = self.cursors.entry(path.clone()).or_default().read_byte;
-
+        whole_file: bool,
+    ) -> Result<(Vec<Vec<u8>>, u64, bool), VtopError> {
         // Whole-file mode: read the entire remaining file as one opaque record.
         // Used for binary / already-compressed source files with no line
         // structure. The whole file commits as a single byte range.
-        if self.whole_file {
+        if whole_file {
             // Whole-file mode loads the entire remaining file into memory. Warn
             // when it exceeds the batch byte budget so operators know a single
             // large file can dominate memory (streaming is a documented
@@ -148,16 +132,7 @@ impl SourceAdapter for FileSource {
             } else {
                 vec![data[start as usize..].to_vec()]
             };
-            self.cursors.get_mut(&path).unwrap().read_byte = end;
-            return Ok(vec![ReadResult {
-                progress_start: self.marker(&path, start, start),
-                progress_end: self.marker(&path, start, end),
-                records,
-                first_timestamp: None,
-                last_timestamp: None,
-                // Whole-file: the record is raw object bytes — emit verbatim.
-                verbatim: true,
-            }]);
+            return Ok((records, end, true));
         }
 
         let file = tokio::fs::File::open(&path).await?;
@@ -200,20 +175,146 @@ impl SourceAdapter for FileSource {
             }
             records.push(line);
         }
+        Ok((records, pos, false))
+    }
+}
 
-        // Advance the (uncommitted) read head.
-        self.cursors.get_mut(&path).unwrap().read_byte = pos;
+/// How many files are read concurrently in one pass. Bounded so a glob that
+/// matches thousands of files does not open them all at once.
+const FILE_READ_CONCURRENCY: usize = 8;
 
+#[async_trait]
+impl SourceAdapter for FileSource {
+    async fn discover_sources(&self) -> Result<Vec<DiscoveredSource>, VtopError> {
+        let mut out = Vec::new();
+        for pattern in &self.paths {
+            for entry in glob::glob(pattern)
+                .map_err(|e| VtopError::Source(format!("bad glob {pattern}: {e}")))?
+            {
+                match entry {
+                    Ok(p) if p.is_file() => out.push(DiscoveredSource {
+                        source_type: SourceType::File,
+                        source_name: p.to_string_lossy().into_owned(),
+                        format: self.format.clone(),
+                    }),
+                    _ => {}
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn read_batch_candidates(
+        &mut self,
+        source: &DiscoveredSource,
+        max_records: usize,
+        max_bytes: usize,
+        _max_wait: Duration,
+    ) -> Result<Vec<ReadResult>, VtopError> {
+        let path = source.source_name.clone();
+        let start = self.cursors.entry(path.clone()).or_default().read_byte;
+        let (records, end, verbatim) =
+            Self::read_slice(path.clone(), start, max_records, max_bytes, self.whole_file).await?;
+        self.cursors.get_mut(&path).unwrap().read_byte = end;
         Ok(vec![ReadResult {
             progress_start: self.marker(&path, start, start),
-            progress_end: self.marker(&path, start, pos),
+            progress_end: self.marker(&path, start, end),
             records,
             first_timestamp: None,
             last_timestamp: None,
-            // Line mode: records are logical lines (newline stripped); re-framed
-            // on serialization to stay byte-exact with the source range.
-            verbatim: false,
+            verbatim,
         }])
+    }
+
+    /// Read every file CONCURRENTLY (#96 B2). Each file's read is independent
+    /// — its own handle, its own snapshotted cursor — so disk I/O overlaps
+    /// instead of queueing behind the slowest file. Cursor updates are applied
+    /// serially after the joins, keeping all shared state on this thread.
+    async fn read_all_batch_candidates(
+        &mut self,
+        sources: &[DiscoveredSource],
+        max_records: usize,
+        max_bytes: usize,
+        _max_wait: Duration,
+    ) -> Result<AdapterReadReport, VtopError> {
+        use futures::StreamExt;
+        let started = std::time::Instant::now();
+
+        let whole_file = self.whole_file;
+        let jobs: Vec<(usize, String, u64)> = sources
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let start = self
+                    .cursors
+                    .entry(s.source_name.clone())
+                    .or_default()
+                    .read_byte;
+                (i, s.source_name.clone(), start)
+            })
+            .collect();
+
+        let mut results: Vec<(
+            usize,
+            String,
+            u64,
+            Result<(Vec<Vec<u8>>, u64, bool), VtopError>,
+        )> = futures::stream::iter(jobs.into_iter().map(|(i, path, start)| async move {
+            let res =
+                Self::read_slice(path.clone(), start, max_records, max_bytes, whole_file).await;
+            (i, path, start, res)
+        }))
+        .buffer_unordered(FILE_READ_CONCURRENCY)
+        .collect()
+        .await;
+        // buffer_unordered completes in I/O order; report in source order.
+        results.sort_by_key(|(i, ..)| *i);
+
+        let mut report = AdapterReadReport {
+            outcomes: Vec::with_capacity(results.len()),
+            productive_ms: 0,
+            empty_ms: 0,
+            failed_ms: 0,
+        };
+        let mut any_records = false;
+        let mut any_failed = false;
+        for (source_index, path, start, res) in results {
+            let result = match res {
+                Ok((records, end, verbatim)) => {
+                    self.cursors.get_mut(&path).unwrap().read_byte = end;
+                    any_records |= !records.is_empty();
+                    Ok(vec![ReadResult {
+                        progress_start: self.marker(&path, start, start),
+                        progress_end: self.marker(&path, start, end),
+                        records,
+                        first_timestamp: None,
+                        last_timestamp: None,
+                        verbatim,
+                    }])
+                }
+                Err(e) => {
+                    any_failed = true;
+                    Err(e)
+                }
+            };
+            report.outcomes.push(SourceReadOutcome {
+                source_index,
+                result,
+            });
+        }
+        // The reads overlapped, so the pass's wall-clock is one shared bucket
+        // (splitting per source would double-count it): productive if ANY file
+        // yielded, else failed if ANY file errored, else empty. File reads
+        // never block on a poll window, so this is microseconds either way.
+        let elapsed = started.elapsed().as_millis() as u64;
+        if any_records {
+            report.productive_ms = elapsed;
+        } else if any_failed {
+            report.failed_ms = elapsed;
+        } else {
+            report.empty_ms = elapsed;
+        }
+        Ok(report)
     }
 
     async fn commit_progress(&mut self, marker: &ProgressMarker) -> Result<(), VtopError> {
@@ -436,5 +537,53 @@ mod tests {
             std::path::Path::new(&path).exists(),
             "must not delete when the file identity no longer matches the marker"
         );
+    }
+
+    /// #96 B2: one pass reads MANY files concurrently. Every file's records
+    /// must land in its own outcome with its own marker, cursors must advance
+    /// per file, and a missing file must fail only its own outcome.
+    #[tokio::test]
+    async fn read_all_reads_many_files_concurrently_with_isolated_outcomes() {
+        let f1 = write_log(&["one-a", "one-b"]);
+        let f2 = write_log(&["two-a"]);
+        let p1 = f1.path().to_string_lossy().into_owned();
+        let p2 = f2.path().to_string_lossy().into_owned();
+        let missing = format!("{p1}.does-not-exist");
+        let mut fs = FileSource::new(vec![p1.clone(), p2.clone()], TelemetryFormat::Raw, false);
+
+        let sources = vec![src(&p1), src(&p2), src(&missing)];
+        let report = fs
+            .read_all_batch_candidates(&sources, 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert_eq!(report.outcomes.len(), 3);
+        // Outcomes come back in source order regardless of I/O completion order.
+        let r1 = report.outcomes[0].result.as_ref().unwrap();
+        assert_eq!(r1[0].records, vec![b"one-a".to_vec(), b"one-b".to_vec()]);
+        let ProgressMarker::File { path, .. } = &r1[0].progress_end else {
+            panic!("expected file marker")
+        };
+        assert_eq!(path, &p1, "marker names the outcome's own file");
+        let r2 = report.outcomes[1].result.as_ref().unwrap();
+        assert_eq!(r2[0].records, vec![b"two-a".to_vec()]);
+        // The missing file fails ITS outcome only; the others are unaffected.
+        assert!(report.outcomes[2].result.is_err());
+        // Any data => the shared wall-clock bucket is productive.
+        assert_eq!(report.empty_ms, 0);
+        assert_eq!(report.failed_ms, 0);
+
+        // Cursors advanced: a second pass over the good files reads nothing new.
+        let report2 = fs
+            .read_all_batch_candidates(&sources[..2], 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        for o in &report2.outcomes {
+            let reads = o.result.as_ref().unwrap();
+            assert!(
+                reads[0].records.is_empty(),
+                "no re-read after cursor advance"
+            );
+        }
     }
 }
