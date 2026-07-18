@@ -18,6 +18,34 @@ use vtop_core::config::KafkaSourceConfig;
 use vtop_core::errors::VtopError;
 use vtop_core::types::{ProgressMarker, SourceType, TelemetryFormat};
 
+/// Turn the lookup of the password environment variable into either the password
+/// or a precise configuration error.
+///
+/// A referenced-but-missing secret is a configuration error, never a silent
+/// fallback to no password. The two failure modes are distinguished so an
+/// operator is not told "not set" when the variable IS set but unreadable.
+/// Only the variable NAME ever appears in a message - never the value.
+///
+/// Kept pure (the lookup is passed in) so both branches are unit-testable
+/// without mutating the process environment: `std::env::set_var` is unsound
+/// while other tests and Tokio runtimes run concurrently in the same binary.
+fn require_password_env(
+    env_name: &str,
+    looked_up: Result<String, std::env::VarError>,
+) -> Result<String, VtopError> {
+    match looked_up {
+        Ok(pw) => Ok(pw),
+        Err(std::env::VarError::NotPresent) => Err(VtopError::Config(format!(
+            "sasl_password_env names ${env_name}, but that environment variable is not set; \
+             refusing to connect without the password"
+        ))),
+        Err(std::env::VarError::NotUnicode(_)) => Err(VtopError::Config(format!(
+            "sasl_password_env names ${env_name}, but its value is not valid Unicode; \
+             refusing to connect without a usable password"
+        ))),
+    }
+}
+
 /// Build the rdkafka [`ClientConfig`]. Auto-commit is forced to `false`
 /// regardless of the input config. Secrets are read from the environment, not
 /// logged.
@@ -44,15 +72,7 @@ pub fn build_client_config(cfg: &KafkaSourceConfig) -> Result<ClientConfig, Vtop
         cc.set("sasl.username", u);
     }
     if let Some(env_name) = &cfg.sasl_password_env {
-        // A referenced-but-missing secret is a configuration error, never a
-        // silent fallback to no password. Only the variable NAME is reported;
-        // the value is never read into a message.
-        let pw = std::env::var(env_name).map_err(|_| {
-            VtopError::Config(format!(
-                "sasl_password_env names ${env_name}, but that environment \
-                 variable is not set; refusing to connect without the password"
-            ))
-        })?;
+        let pw = require_password_env(env_name, std::env::var(env_name))?;
         cc.set("sasl.password", pw); // value never logged
     }
     if let Some(ca) = &cfg.ssl_ca_location {
@@ -491,28 +511,41 @@ mod tests {
     fn missing_password_env_is_a_config_error_not_a_silent_downgrade() {
         // The operator asked for SASL by naming an env var. If that var is not
         // set we must REFUSE, not connect without a password.
-        let mut c = cfg();
-        c.sasl_password_env = Some("VTOP_TEST_ABSENT_KAFKA_PASSWORD".into());
-        let err = build_client_config(&c).expect_err("missing secret must fail");
+        let err = require_password_env("VTOP_PW_VAR", Err(std::env::VarError::NotPresent))
+            .expect_err("missing secret must fail");
+        assert!(
+            matches!(err, VtopError::Config(_)),
+            "must be a Config error, got {err:?}"
+        );
         let msg = err.to_string();
         assert!(
-            msg.contains("VTOP_TEST_ABSENT_KAFKA_PASSWORD"),
-            "error should name the missing variable: {msg}"
+            msg.contains("VTOP_PW_VAR"),
+            "should name the variable: {msg}"
         );
-        // The message must never carry a secret value - only the variable name.
-        assert!(!msg.contains("hunter2"), "error must not echo a secret");
+        assert!(msg.contains("not set"), "should say it is not set: {msg}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn non_unicode_password_env_is_reported_as_such_not_as_missing() {
+        use std::os::unix::ffi::OsStringExt;
+        let bad = std::ffi::OsString::from_vec(vec![0xff, 0xfe]);
+        let err = require_password_env("VTOP_PW_VAR", Err(std::env::VarError::NotUnicode(bad)))
+            .expect_err("unreadable secret must fail");
+        assert!(matches!(err, VtopError::Config(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("VTOP_PW_VAR"));
+        assert!(
+            msg.contains("Unicode"),
+            "a set-but-unreadable value must not be reported as 'not set': {msg}"
+        );
     }
 
     #[test]
     fn password_env_that_is_set_is_applied() {
-        let var = "VTOP_TEST_PRESENT_KAFKA_PASSWORD";
-        // SAFETY: single-threaded test process; the var is unique to this test.
-        unsafe { std::env::set_var(var, "hunter2") };
-        let mut c = cfg();
-        c.sasl_password_env = Some(var.into());
-        let cc = build_client_config(&c).expect("present secret builds");
-        assert_eq!(cc.get("sasl.password"), Some("hunter2"));
-        unsafe { std::env::remove_var(var) };
+        let pw = require_password_env("VTOP_PW_VAR", Ok("hunter2".to_string()))
+            .expect("present secret resolves");
+        assert_eq!(pw, "hunter2");
     }
 
     #[test]
