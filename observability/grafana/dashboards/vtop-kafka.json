@@ -25,7 +25,8 @@
         "y": 0
       },
       "collapsed": false,
-      "panels": []
+      "panels": [],
+      "id": 1
     },
     {
       "type": "stat",
@@ -84,10 +85,14 @@
           "values": false
         },
         "colorMode": "background",
-        "graphMode": "area",
+        "graphMode": "none",
+        "text": {
+          "valueSize": 22
+        },
         "textMode": "value",
         "justifyMode": "center"
-      }
+      },
+      "id": 2
     },
     {
       "type": "stat",
@@ -130,10 +135,14 @@
           "values": false
         },
         "colorMode": "value",
-        "graphMode": "area",
+        "graphMode": "none",
+        "text": {
+          "valueSize": 22
+        },
         "textMode": "value",
         "justifyMode": "center"
-      }
+      },
+      "id": 3
     },
     {
       "type": "stat",
@@ -176,10 +185,14 @@
           "values": false
         },
         "colorMode": "value",
-        "graphMode": "area",
+        "graphMode": "none",
+        "text": {
+          "valueSize": 22
+        },
         "textMode": "value",
         "justifyMode": "center"
-      }
+      },
+      "id": 4
     },
     {
       "type": "stat",
@@ -223,10 +236,14 @@
           "values": false
         },
         "colorMode": "value",
-        "graphMode": "area",
+        "graphMode": "none",
+        "text": {
+          "valueSize": 22
+        },
         "textMode": "value",
         "justifyMode": "center"
-      }
+      },
+      "id": 5
     },
     {
       "type": "stat",
@@ -270,10 +287,14 @@
           "values": false
         },
         "colorMode": "value",
-        "graphMode": "area",
+        "graphMode": "none",
+        "text": {
+          "valueSize": 22
+        },
         "textMode": "value",
         "justifyMode": "center"
-      }
+      },
+      "id": 6
     },
     {
       "type": "stat",
@@ -336,10 +357,14 @@
           "values": false
         },
         "colorMode": "background",
-        "graphMode": "area",
+        "graphMode": "none",
+        "text": {
+          "valueSize": 22
+        },
         "textMode": "value",
         "justifyMode": "center"
-      }
+      },
+      "id": 7
     },
     {
       "type": "row",
@@ -351,7 +376,8 @@
         "y": 5
       },
       "collapsed": false,
-      "panels": []
+      "panels": [],
+      "id": 8
     },
     {
       "type": "timeseries",
@@ -385,7 +411,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "id": 9
     },
     {
       "type": "timeseries",
@@ -427,7 +454,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "id": 10
     },
     {
       "type": "row",
@@ -439,7 +467,8 @@
         "y": 14
       },
       "collapsed": false,
-      "panels": []
+      "panels": [],
+      "id": 11
     },
     {
       "type": "timeseries",
@@ -482,7 +511,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "id": 12
     },
     {
       "type": "timeseries",
@@ -517,7 +547,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "id": 13
     },
     {
       "type": "row",
@@ -529,7 +560,8 @@
         "y": 23
       },
       "collapsed": false,
-      "panels": []
+      "panels": [],
+      "id": 14
     },
     {
       "type": "timeseries",
@@ -563,7 +595,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "id": 15
     },
     {
       "type": "timeseries",
@@ -597,7 +630,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "id": 16
     },
     {
       "type": "row",
@@ -609,7 +643,8 @@
         "y": 32
       },
       "collapsed": false,
-      "panels": []
+      "panels": [],
+      "id": 17
     },
     {
       "type": "timeseries",
@@ -643,7 +678,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "id": 18
     },
     {
       "type": "timeseries",
@@ -677,7 +713,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "id": 19
     },
     {
       "type": "timeseries",
@@ -711,7 +748,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "id": 20
     }
   ]
 }

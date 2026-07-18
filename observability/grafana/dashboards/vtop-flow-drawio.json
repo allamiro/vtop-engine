@@ -25,7 +25,8 @@
         "w": 24,
         "x": 0,
         "y": 0
-      }
+      },
+      "id": 1
     },
     {
       "type": "andrewbmchugh-flow-panel",
@@ -170,7 +171,8 @@
           "mappingsCtr": 0,
           "timingsCtr": 0
         }
-      }
+      },
+      "id": 2
     }
   ]
 }

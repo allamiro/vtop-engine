@@ -54,7 +54,13 @@ def _stat(title, gp, targets, desc="", unit=None, thresholds=None, ds=MIMIR):
     p["options"] = {
         "reduceOptions": {"calcs": ["lastNonNull"], "fields": "", "values": False},
         "colorMode": "background" if thresholds else "value",
-        "graphMode": "area",
+        # No sparkline and an explicit value size: these tiles are only 4
+        # rows tall, and with graphMode "area" competing for the space
+        # Grafana auto-shrank the number until it vanished - the tile
+        # rendered as a bare colour and the value reappeared only in the
+        # (much larger) edit view.
+        "graphMode": "none",
+        "text": {"valueSize": 22},
         "textMode": "value",
         "justifyMode": "center",
     }
