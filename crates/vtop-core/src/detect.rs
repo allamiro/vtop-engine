@@ -302,4 +302,68 @@ mod tests {
         assert_eq!(detect_record(b"   CEF:0|x"), TelemetryFormat::Cef);
         assert_eq!(detect_record(b"\t\n <134>msg"), TelemetryFormat::Syslog);
     }
+
+    // The tests below kill the mutants that survived the #25 round (issue
+    // #103). The earlier shape-check tests used inputs that fail JSON parsing
+    // anyway, so mutating the shape check changed nothing; these use inputs
+    // that PARSE as JSON but are not shaped, and vice versa.
+
+    #[test]
+    fn class_index_roundtrips_through_class_from_index() {
+        // detect_record never returns Json, so counts[Json] can never win the
+        // majority vote and `class_from_index(2)` is unreachable through the
+        // public API. Pin the mapping directly (kills `delete match arm 2`).
+        for f in [
+            TelemetryFormat::Cef,
+            TelemetryFormat::Leef,
+            TelemetryFormat::Json,
+            TelemetryFormat::Jsonl,
+            TelemetryFormat::Syslog,
+            TelemetryFormat::Raw,
+        ] {
+            assert_eq!(class_from_index(class_index(&f)), f);
+        }
+    }
+
+    #[test]
+    fn json_array_line_is_jsonl() {
+        // Arrays were never tested; this needs BOTH `[` first and `]` last
+        // (kills the `==`→`!=` mutants on the array clause).
+        assert_eq!(detect_record(b"[1,2,3]"), TelemetryFormat::Jsonl);
+    }
+
+    #[test]
+    fn valid_json_that_is_not_object_or_array_shaped_is_raw() {
+        // Bare scalars parse as JSON but are not `{...}`/`[...]` shaped, so the
+        // shape check must gate the parse (kills `&&`→`||` between shape and
+        // parse).
+        assert_eq!(detect_record(b"123"), TelemetryFormat::Raw);
+        assert_eq!(detect_record(b"\"quoted string\""), TelemetryFormat::Raw);
+        assert_eq!(detect_record(b"true"), TelemetryFormat::Raw);
+    }
+
+    #[test]
+    fn trailing_whitespace_defeats_the_shape_check() {
+        // serde_json accepts trailing whitespace, but the shape check requires
+        // the LAST byte to be the closing delimiter (only leading whitespace is
+        // trimmed). Kills the `&&`→`||` mutants inside each shape clause: under
+        // the mutation the opening delimiter alone marks these as JSON-shaped
+        // and the (successful) parse would flip them to Jsonl.
+        assert_eq!(detect_record(b"{\"a\":1}\t"), TelemetryFormat::Raw);
+        assert_eq!(detect_record(b"[1,2]\t"), TelemetryFormat::Raw);
+    }
+
+    #[test]
+    fn contains_handles_degenerate_needles() {
+        // The call sites only pass non-empty literals, so the guard's edge
+        // cases need direct tests. Empty needle: trivially true (the `||`→`&&`
+        // mutant falls through to `windows(0)`, which panics). Equal length:
+        // an exact match must be found (the `>`→`>=`/`==` mutants make the
+        // guard reject it).
+        assert!(contains(b"abc", b""));
+        assert!(contains(b"CEF:0|", b"CEF:0|"));
+        assert!(!contains(b"ab", b"abc"));
+        assert!(contains(b"x CEF:0| y", b"CEF:0|"));
+        assert!(!contains(b"x CEF y", b"CEF:0|"));
+    }
 }

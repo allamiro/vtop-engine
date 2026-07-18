@@ -256,4 +256,59 @@ mod tests {
         // Once committed, the batch is done; it should not be marked failed.
         assert!(!can_transition(SourceCommitted, Failed));
     }
+
+    // The tests below kill surviving mutants reported by cargo-mutants (issue
+    // #103): as_str, Display, is_committable, and is_committed were exercised
+    // but their return values were never pinned.
+
+    const ALL_STATES: [BatchState; 11] = [
+        Discovered,
+        Batching,
+        Sealed,
+        Compressed,
+        Checksummed,
+        ObjectUploaded,
+        ManifestUploaded,
+        Verified,
+        SourceCommitted,
+        Failed,
+        ReplayRequired,
+    ];
+
+    #[test]
+    fn as_str_roundtrips_through_from_str() {
+        // Kills `as_str -> ""` and `-> "xyzzy"`: neither parses back.
+        for s in ALL_STATES {
+            let parsed: BatchState = s.as_str().parse().expect("as_str must parse back");
+            assert_eq!(parsed, s);
+        }
+        // And pin the store/manifest wire format for the invariant-critical
+        // states so a rename can't slip through the roundtrip.
+        assert_eq!(Verified.as_str(), "verified");
+        assert_eq!(SourceCommitted.as_str(), "source_committed");
+    }
+
+    #[test]
+    fn display_matches_as_str() {
+        // Kills the `fmt -> Ok(Default::default())` mutant, which writes
+        // nothing and would Display every state as "".
+        for s in ALL_STATES {
+            assert_eq!(s.to_string(), s.as_str());
+        }
+    }
+
+    #[test]
+    fn only_verified_is_committable() {
+        // Both polarities: Verified must be committable, everything else not.
+        for s in ALL_STATES {
+            assert_eq!(s.is_committable(), s == Verified, "{s:?}");
+        }
+    }
+
+    #[test]
+    fn only_source_committed_is_committed() {
+        for s in ALL_STATES {
+            assert_eq!(s.is_committed(), s == SourceCommitted, "{s:?}");
+        }
+    }
 }
