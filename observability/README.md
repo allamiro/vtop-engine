@@ -109,11 +109,21 @@ are ordinary dashboards you can edit and **Save** in the UI.
 The generated JSON under `observability/grafana/dashboards/` remains the source
 of truth for what ships, and CI fails if it drifts from the generators.
 
+Seeding is **non-destructive**: a dashboard that already exists is left alone.
+That matters because `docker compose up -d` *starts* an exited service, so the
+seeder re-runs every time you bring the lab up — if it overwrote, the edit you
+just saved would vanish on the next start.
+
 ```bash
-# Reset the lab's dashboards back to the repo version (discards UI edits):
+# Reset the lab's dashboards back to the repo version (DISCARDS UI edits):
 docker compose -f docker-compose.yml -f docker-compose.observability.yml \
-    up --force-recreate grafana-seed
+    run --rm -e FORCE_RESEED=true grafana-seed
 ```
+
+> Grafana is published on **127.0.0.1** only. Anonymous access is granted
+> `Editor`, so anyone who can reach the port can change or delete any dashboard
+> without signing in; a loopback bind is what keeps that from being a network
+> exposure. Do not widen the bind without also disabling anonymous auth.
 
 To make a UI change permanent: edit in the UI, export the JSON, fold the change
 into the generator in `observability/`, then regenerate.

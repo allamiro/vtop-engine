@@ -103,7 +103,12 @@ services:
     image: grafana/grafana:13.1.0
     container_name: vtop-grafana
     ports:
-      - "3400:3000"
+      # Bound to LOOPBACK deliberately. Anonymous access below grants Editor
+      # rights with no sign-in, so a 0.0.0.0 bind would let anyone routable to
+      # this host modify or delete every dashboard. Publishing the port and
+      # granting anonymous Editor are only jointly safe if the port is not
+      # reachable off-box. Change this only if you also disable anonymous auth.
+      - "127.0.0.1:3400:3000"
     environment:
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: admin

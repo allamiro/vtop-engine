@@ -5,8 +5,15 @@
 # in the UI (Save is refused), and this lab is meant to be poked at. Seeded
 # dashboards are ordinary, fully editable ones.
 #
-# Idempotent: re-running re-applies the repo version (discarding local edits),
-# which is exactly how you reset the lab after experimenting.
+# NON-DESTRUCTIVE by default. `docker compose up -d` STARTS an exited service,
+# so this seeder re-runs on every bring-up of the lab. If it blindly overwrote,
+# a dashboard you edited and saved would be silently reverted the next time you
+# ran the documented start command - which would defeat the entire point of
+# seeding editable dashboards. So an already-present dashboard is left alone.
+#
+# To deliberately reset the lab to the repo's dashboards, set FORCE_RESEED:
+#   docker compose -f docker-compose.yml -f docker-compose.observability.yml \
+#       run --rm -e FORCE_RESEED=true grafana-seed
 set -eu
 
 GRAFANA_URL="${GRAFANA_URL:-http://grafana:3000}"
@@ -39,9 +46,24 @@ if ! curl -sf -u "$GRAFANA_USER:$GRAFANA_PASSWORD" \
   echo "[seed] could not create or find folder uid=$FOLDER_UID"; exit 1
 fi
 
+FORCE_RESEED="${FORCE_RESEED:-false}"
+
 count=0
+skipped=0
 for f in "$DASHBOARD_DIR"/*.json; do
   [ -e "$f" ] || continue
+
+  # Preserve local edits unless explicitly told not to. The uid is stable and
+  # generated into each dashboard, so presence is a reliable existence check.
+  uid=$(sed -n 's/.*"uid"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -n 1)
+  if [ "$FORCE_RESEED" != "true" ] && [ -n "$uid" ] && \
+     curl -sf -u "$GRAFANA_USER:$GRAFANA_PASSWORD" \
+       -o /dev/null "$GRAFANA_URL/api/dashboards/uid/$uid"; then
+    skipped=$((skipped + 1))
+    echo "[seed] kept existing $(basename "$f") (uid=$uid; FORCE_RESEED=true to reset)"
+    continue
+  fi
+
   # Wrap the dashboard, drop any id so Grafana assigns its own, and overwrite.
   payload=$(sed 's/^/  /' "$f" | awk -v folder="$FOLDER_UID" '
     BEGIN { print "{\"overwrite\":true,\"folderUid\":\"" folder "\",\"dashboard\":" }
@@ -56,4 +78,4 @@ for f in "$DASHBOARD_DIR"/*.json; do
     echo "[seed] FAILED $(basename "$f")"; exit 1
   fi
 done
-echo "[seed] seeded $count dashboards into folder '$FOLDER' (editable + saveable)"
+echo "[seed] applied $count, kept $skipped existing, folder '$FOLDER' (editable + saveable)"
