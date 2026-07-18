@@ -885,7 +885,25 @@ impl Engine {
         }
 
         // ---- Read + accumulate -----------------------------------------
+        //
+        // Cycle-level accounting. Three optimisations (#94, #97) each targeted a
+        // stage that turned out not to be the constraint, because the evidence
+        // available was per-BATCH timing — which says nothing about how the
+        // CYCLE divides between reading and waiting. These counters answer that
+        // directly: how much wall-clock goes into reads that returned data
+        // versus reads that returned nothing, and how many sources are in each
+        // group. A cycle that is mostly `empty_read_ms` is starved by serial
+        // polling, not by any downstream stage.
+        let cycle_started = Instant::now();
+        let mut productive_read_ms: u64 = 0;
+        let mut empty_read_ms: u64 = 0;
+        let mut productive_sources: usize = 0;
+        let mut empty_sources: usize = 0;
+        let mut records_read: usize = 0;
+
         for source in sources {
+            let read_started = Instant::now();
+
             // A single source read failing must not abort reading/flushing the
             // other sources this cycle — log and skip it.
             let reads = match adapter
@@ -921,6 +939,19 @@ impl Engine {
                     continue;
                 }
             };
+            let read_ms = read_started.elapsed().as_millis() as u64;
+            let got: usize = reads.iter().map(|r| r.records.len()).sum();
+            if got > 0 {
+                productive_read_ms += read_ms;
+                productive_sources += 1;
+                records_read += got;
+            } else {
+                // A source that yielded nothing still consumed its full poll
+                // window. Summed across sources this is the serial-polling cost.
+                empty_read_ms += read_ms;
+                empty_sources += 1;
+            }
+
             // One read can return SEVERAL independently committable units: a
             // Kafka topic yields one per partition it saw. Each gets routed to
             // its own buffer, so a single read now feeds every partition rather
@@ -946,6 +977,27 @@ impl Engine {
                     .or_insert_with(|| PendingBuffer::new(&tenant, source.clone(), limits))
                     .append(read);
             }
+        }
+
+        let read_phase_ms = cycle_started.elapsed().as_millis() as u64;
+        // Logged once per cycle per source type. The ratio that matters is
+        // empty_read_ms / read_phase_ms: how much of the cycle is spent waiting
+        // on sources that had nothing, which is time no downstream fix recovers.
+        if read_phase_ms > 0 {
+            tracing::info!(
+                source_type = %source_type,
+                read_phase_ms,
+                productive_read_ms,
+                empty_read_ms,
+                productive_sources,
+                empty_sources,
+                records_read,
+                empty_wait_pct = format!(
+                    "{:.1}",
+                    (empty_read_ms as f64 / read_phase_ms as f64) * 100.0
+                ),
+                "read_cycle_profile"
+            );
         }
 
         // Buffers accumulated but not yet sealed. A gauge that climbs without
@@ -996,25 +1048,60 @@ impl Engine {
         let pipeline = self.pipeline();
         // buffer_unordered keeps `limit` verifies in flight and yields each as
         // it finishes, so a slow upload never holds up the ones behind it.
-        let verified: Vec<Result<VerifyStep, VtopError>> = futures::stream::iter(
-            work.iter()
-                .map(|(source, read, stream)| {
-                    pipeline.process_until_verified(source, read.clone(), stream.as_ref())
-                })
-                .collect::<Vec<_>>(),
-        )
-        .buffer_unordered(limit)
-        .collect()
-        .await;
+        // `work` is MOVED into the futures rather than iterated by reference.
+        // Cloning each ReadResult here would duplicate every payload before
+        // buffer_unordered bounds anything, so with max_bytes at 100 MiB and a
+        // concurrency of 8 the queue alone could hold ~800 MiB of avoidable
+        // copies — the clone is not bounded by the concurrency limit, only the
+        // execution is.
+        let verified: Vec<Result<VerifyStep, VtopError>> =
+            futures::stream::iter(work.into_iter().map(|(source, read, stream)| {
+                let pipeline = &pipeline;
+                async move {
+                    pipeline
+                        .process_until_verified(&source, read, stream.as_ref())
+                        .await
+                }
+            }))
+            .buffer_unordered(limit)
+            .collect()
+            .await;
 
+        // Do NOT bail on the first error. Verify runs concurrently, so by the
+        // time one batch fails, others may already be persisted as VERIFIED —
+        // and their buffers have been drained from `pending`. Returning early
+        // would drop those VerifiedBatch values without committing source
+        // progress, leaving them verified-but-uncommitted. The next cycle would
+        // re-read the same records, build the same batch_id, and fail the state
+        // store INSERT as a duplicate, wedging that source until a restart ran
+        // recovery.
+        //
+        // So: commit every batch that succeeded, then report the first error.
+        // Nothing verified is abandoned, and the caller still sees the failure.
         let mut outcomes = Vec::new();
+        let mut first_err: Option<VtopError> = None;
         for step in verified {
-            match step? {
-                VerifyStep::Finished(outcome) => outcomes.push(outcome),
-                VerifyStep::Verified(v) => {
-                    outcomes.push(self.pipeline().commit_verified(adapter, v).await?)
+            match step {
+                Ok(VerifyStep::Finished(outcome)) => outcomes.push(outcome),
+                Ok(VerifyStep::Verified(v)) => {
+                    let batch_id = v.batch_id.clone();
+                    match self.pipeline().commit_verified(adapter, v).await {
+                        Ok(outcome) => outcomes.push(outcome),
+                        Err(e) => {
+                            // Already VERIFIED and durable; recovery retries the
+                            // commit. Keep going so siblings still commit.
+                            tracing::error!(batch_id, error = %e, "commit failed after verify");
+                            first_err.get_or_insert(e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    first_err.get_or_insert(e);
                 }
             }
+        }
+        if let Some(e) = first_err {
+            return Err(e);
         }
         Ok(outcomes)
     }
