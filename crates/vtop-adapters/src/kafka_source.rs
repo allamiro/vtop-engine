@@ -218,7 +218,7 @@ impl SourceAdapter for KafkaSource {
         max_records: usize,
         max_bytes: usize,
         max_wait: Duration,
-    ) -> Result<ReadResult, VtopError> {
+    ) -> Result<Vec<ReadResult>, VtopError> {
         let topic = source.source_name.clone();
         let group = self.cfg.consumer_group.clone();
 
@@ -235,7 +235,7 @@ impl SourceAdapter for KafkaSource {
         if partitions.is_empty() {
             // Topic has no partitions (e.g. just deleted) — nothing to read.
             self.active = Some((topic.clone(), 0));
-            return Ok(ReadResult {
+            return Ok(vec![ReadResult {
                 progress_start: ProgressMarker::Kafka {
                     topic: topic.clone(),
                     partition: 0,
@@ -254,7 +254,7 @@ impl SourceAdapter for KafkaSource {
                 first_timestamp: None,
                 last_timestamp: None,
                 verbatim: false,
-            });
+            }]);
         }
 
         // Build the assignment from each partition's tracked position.
@@ -291,54 +291,49 @@ impl SourceAdapter for KafkaSource {
         }
         let consumer = self.consumer()?;
 
-        let mut records: Vec<Vec<u8>> = Vec::new();
+        // Accumulate PER PARTITION. Kafka interleaves partitions within one
+        // consumer, so the old code locked onto the first partition seen, and
+        // on any other partition it rewound with seek() and broke out of the
+        // read entirely. On a 24-partition topic that ended most reads after a
+        // handful of records — batches never filled, every switch cost a broker
+        // seek round-trip, and a cycle touched a fraction of the topic.
+        //
+        // Nothing needs the lock: the ENGINE already isolates batches per
+        // partition (`buffer_key` appends `#p{partition}`), so mixed-partition
+        // reads are safe as long as records are handed back grouped. Returning
+        // one ReadResult per partition does exactly that, and lets a single read
+        // feed every partition's buffer at once.
+        struct PartAcc {
+            records: Vec<Vec<u8>>,
+            start_offset: i64,
+            end_offset: i64,
+        }
+        let mut parts: std::collections::HashMap<i32, PartAcc> = std::collections::HashMap::new();
         let mut bytes: usize = 0;
-        // To avoid mixing partitions, lock onto the first partition we see.
-        let mut locked_partition: Option<i32> = None;
-        let mut start_offset: Option<i64> = None;
-        let mut end_offset: i64 = -1;
+        let mut total_records: usize = 0;
 
         let deadline = std::time::Instant::now() + max_wait;
         loop {
-            if records.len() >= max_records || bytes >= max_bytes {
+            // Budgets are across the whole read, not per partition, so one busy
+            // partition cannot starve memory bounds.
+            if total_records >= max_records || bytes >= max_bytes {
                 break;
             }
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             match consumer.poll(remaining) {
                 Some(Ok(msg)) => {
                     let p = msg.partition();
-                    if let Some(lp) = locked_partition {
-                        if p != lp {
-                            // Different partition — do not mix into this batch.
-                            // The message was already returned by poll(), so the
-                            // consumer's position has advanced past it; rewind
-                            // that partition to this offset so the record is
-                            // redelivered on a later read instead of being lost.
-                            consumer
-                                .seek(
-                                    msg.topic(),
-                                    p,
-                                    Offset::Offset(msg.offset()),
-                                    Duration::from_secs(5),
-                                )
-                                .map_err(|e| {
-                                    VtopError::Source(format!(
-                                        "kafka seek (unmix partition {p}): {e}"
-                                    ))
-                                })?;
-                            break;
-                        }
-                    } else {
-                        locked_partition = Some(p);
-                    }
                     let off = msg.offset();
-                    if start_offset.is_none() {
-                        start_offset = Some(off);
-                    }
-                    end_offset = off;
                     let payload = msg.payload().unwrap_or_default().to_vec();
                     bytes += payload.len();
-                    records.push(payload);
+                    total_records += 1;
+                    let acc = parts.entry(p).or_insert_with(|| PartAcc {
+                        records: Vec::new(),
+                        start_offset: off,
+                        end_offset: off,
+                    });
+                    acc.end_offset = off;
+                    acc.records.push(payload);
                 }
                 Some(Err(e)) => {
                     return Err(VtopError::Source(format!("kafka poll error: {e}")));
@@ -350,32 +345,39 @@ impl SourceAdapter for KafkaSource {
             }
         }
 
-        let partition = locked_partition.unwrap_or(0);
-        let start = start_offset.unwrap_or(0);
-        self.active = Some((topic.clone(), partition));
-        let cur = self.cursors.entry((topic.clone(), partition)).or_default();
-        if !records.is_empty() {
-            cur.last_read_offset = Some(end_offset);
+        // Record the last partition touched so `get_progress_marker` keeps
+        // working. Single-slot `active` is a known wart with many partitions in
+        // play; it is not on the commit path (commit_progress takes an explicit
+        // marker) and is tracked separately.
+        let mut out: Vec<ReadResult> = Vec::with_capacity(parts.len());
+        let mut partitions: Vec<i32> = parts.keys().copied().collect();
+        partitions.sort_unstable();
+        for p in partitions {
+            let acc = &parts[&p];
+            self.active = Some((topic.clone(), p));
+            let cur = self.cursors.entry((topic.clone(), p)).or_default();
+            if !acc.records.is_empty() {
+                cur.last_read_offset = Some(acc.end_offset);
+            }
+            let mk = |s: i64, e: i64| ProgressMarker::Kafka {
+                topic: topic.clone(),
+                partition: p,
+                start_offset: s,
+                end_offset: e,
+                consumer_group: group.clone(),
+            };
+            out.push(ReadResult {
+                progress_start: mk(acc.start_offset, acc.start_offset),
+                progress_end: mk(acc.start_offset, acc.end_offset.max(acc.start_offset)),
+                records: acc.records.clone(),
+                first_timestamp: None,
+                last_timestamp: None,
+                // Kafka messages are newline-framed into the object (offset-based,
+                // not byte-exact), so records are re-framed on serialization.
+                verbatim: false,
+            });
         }
-
-        let mk = |s: i64, e: i64| ProgressMarker::Kafka {
-            topic: topic.clone(),
-            partition,
-            start_offset: s,
-            end_offset: e,
-            consumer_group: group.clone(),
-        };
-
-        Ok(ReadResult {
-            progress_start: mk(start, start),
-            progress_end: mk(start, end_offset.max(start)),
-            records,
-            first_timestamp: None,
-            last_timestamp: None,
-            // Kafka messages are newline-framed into the object (offset-based,
-            // not byte-exact), so records are re-framed on serialization.
-            verbatim: false,
-        })
+        Ok(out)
     }
 
     async fn get_progress_marker(&self) -> Result<ProgressMarker, VtopError> {

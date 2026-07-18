@@ -101,31 +101,41 @@ async fn read_returns_records_from_a_non_empty_topic() {
     .unwrap();
     let src = seeded_topic(&mut adapter).await;
 
-    let read = adapter
+    // One read yields one ReadResult per partition it saw. CI seeds a
+    // single-partition topic, but a local lab topic may have more, so assert on
+    // the AGGREGATE: the stall this test guards against is "no records at all",
+    // which is partition-count independent. Testing only reads[0] would let a
+    // regression that starves every partition but the first slip through.
+    let reads = adapter
         .read_batch_candidates(&src, 100, 1 << 20, std::time::Duration::from_secs(10))
         .await
         .expect("read failed");
 
+    let total: usize = reads.iter().map(|r| r.records.len()).sum();
     assert!(
-        !read.records.is_empty(),
+        total > 0,
         "read returned ZERO records from a seeded topic - this is exactly the stall \
          the assign()/subscribe() fix addressed"
     );
 
-    match read.progress_end {
-        ProgressMarker::Kafka {
-            partition,
-            start_offset,
-            end_offset,
-            ..
-        } => {
-            assert!(partition >= 0);
-            assert!(
-                end_offset >= start_offset,
-                "end_offset {end_offset} must not precede start_offset {start_offset}"
-            );
+    // Every returned unit must carry a well-formed Kafka marker, not just the
+    // first: each one is independently committed by the engine.
+    for read in &reads {
+        match &read.progress_end {
+            ProgressMarker::Kafka {
+                partition,
+                start_offset,
+                end_offset,
+                ..
+            } => {
+                assert!(*partition >= 0);
+                assert!(
+                    end_offset >= start_offset,
+                    "end_offset {end_offset} must not precede start_offset {start_offset}"
+                );
+            }
+            other => panic!("expected a Kafka marker, got {other:?}"),
         }
-        other => panic!("expected a Kafka marker, got {other:?}"),
     }
 }
 
@@ -142,7 +152,10 @@ async fn reading_alone_does_not_advance_progress() {
         .read_batch_candidates(&src, 100, 1 << 20, std::time::Duration::from_secs(10))
         .await
         .unwrap();
-    assert!(!first.records.is_empty(), "precondition: topic has records");
+    // Aggregate over partitions: the invariant is about data being re-readable
+    // anywhere in the topic, not about which partition it landed in.
+    let first_total: usize = first.iter().map(|r| r.records.len()).sum();
+    assert!(first_total > 0, "precondition: topic has records");
     // Deliberately do NOT commit - the batch never reached VERIFIED.
     drop(a);
 
@@ -153,8 +166,9 @@ async fn reading_alone_does_not_advance_progress() {
         .read_batch_candidates(&src, 100, 1 << 20, std::time::Duration::from_secs(10))
         .await
         .unwrap();
+    let replay_total: usize = replay.iter().map(|r| r.records.len()).sum();
     assert!(
-        !replay.records.is_empty(),
+        replay_total > 0,
         "uncommitted data MUST remain replayable - progress advanced without a commit"
     );
 }
@@ -173,12 +187,18 @@ async fn commit_advances_progress_for_a_new_consumer() {
         .read_batch_candidates(&src, 1000, 1 << 20, std::time::Duration::from_secs(10))
         .await
         .unwrap();
-    assert!(!read.records.is_empty(), "precondition: topic has records");
+    let read_total: usize = read.iter().map(|r| r.records.len()).sum();
+    assert!(read_total > 0, "precondition: topic has records");
 
-    // The step the engine performs ONLY after VERIFIED.
-    a.commit_progress(&read.progress_end)
-        .await
-        .expect("commit_progress failed");
+    // The step the engine performs ONLY after VERIFIED — once per independently
+    // committable unit, since each partition carries its own marker. Committing
+    // only the first would leave the rest replayable and the assertion below
+    // would (correctly) fail.
+    for r in &read {
+        a.commit_progress(&r.progress_end)
+            .await
+            .expect("commit_progress failed");
+    }
     drop(a);
 
     let mut b = KafkaSource::new(kafka_cfg(&bootstrap(), &group), TelemetryFormat::Cef).unwrap();
@@ -186,10 +206,10 @@ async fn commit_advances_progress_for_a_new_consumer() {
         .read_batch_candidates(&src, 1000, 1 << 20, std::time::Duration::from_secs(5))
         .await
         .unwrap();
+    let after_total: usize = after.iter().map(|r| r.records.len()).sum();
     assert!(
-        after.records.is_empty(),
-        "committed records were re-delivered ({} records) - the commit did not take \
-         effect, which would mean duplicate archiving",
-        after.records.len()
+        after_total == 0,
+        "committed records were re-delivered ({after_total} records) - the commit did not \
+         take effect, which would mean duplicate archiving"
     );
 }

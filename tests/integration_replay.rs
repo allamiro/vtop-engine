@@ -45,10 +45,15 @@ async fn crash_before_commit_is_replayable_then_recovers() {
     let mut adapter = FailCommitAdapter::new(inner, 1);
 
     let source = adapter.discover_sources().await.unwrap().pop().unwrap();
-    let read = adapter
+    let mut reads = adapter
         .read_batch_candidates(&source, 1000, 1 << 20, std::time::Duration::ZERO)
         .await
         .unwrap();
+    // A file source is a single committable unit, so the Vec is always length 1
+    // (only Kafka splits a read per partition). Assert it before indexing so a
+    // regression that returns 0 or 2 fails loudly here.
+    assert_eq!(reads.len(), 1);
+    let read = reads.remove(0);
     assert_eq!(read.records.len(), 5);
 
     let outcome = pipeline(&store, backend.clone(), &cfg)
@@ -72,8 +77,9 @@ async fn crash_before_commit_is_replayable_then_recovers() {
         .read_batch_candidates(&source, 1000, 1 << 20, std::time::Duration::ZERO)
         .await
         .unwrap();
+    assert_eq!(read2.len(), 1);
     assert_eq!(
-        read2.records.len(),
+        read2[0].records.len(),
         0,
         "read head advanced, but commit point did not"
     );
@@ -86,7 +92,12 @@ async fn crash_before_commit_is_replayable_then_recovers() {
         .read_batch_candidates(&source, 1000, 1 << 20, std::time::Duration::ZERO)
         .await
         .unwrap();
-    assert_eq!(replayed.records.len(), 5, "uncommitted data is replayable");
+    assert_eq!(replayed.len(), 1);
+    assert_eq!(
+        replayed[0].records.len(),
+        5,
+        "uncommitted data is replayable"
+    );
 
     // Recovery action for VERIFIED is to retry the source commit; the second
     // commit attempt now succeeds.
@@ -116,10 +127,13 @@ async fn verification_failure_never_commits() {
 
     let mut adapter = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
     let source = adapter.discover_sources().await.unwrap().pop().unwrap();
-    let read = adapter
+    let mut reads = adapter
         .read_batch_candidates(&source, 1000, 1 << 20, std::time::Duration::ZERO)
         .await
         .unwrap();
+    // File source: exactly one committable unit per read.
+    assert_eq!(reads.len(), 1);
+    let read = reads.remove(0);
 
     let outcome = pipeline(&store, backend, &cfg)
         .process(&mut adapter, &source, read, None)
@@ -145,5 +159,6 @@ async fn verification_failure_never_commits() {
         .read_batch_candidates(&source, 1000, 1 << 20, std::time::Duration::ZERO)
         .await
         .unwrap();
-    assert_eq!(replay.records.len(), 5, "data replayable after failure");
+    assert_eq!(replay.len(), 1);
+    assert_eq!(replay[0].records.len(), 5, "data replayable after failure");
 }

@@ -48,13 +48,28 @@ pub trait SourceAdapter: Send + Sync {
 
     /// Read up to `max_records` / `max_bytes` from `source`, waiting at most
     /// `max_wait` for data. Does NOT advance committed progress.
+    /// Read up to the given budgets from one source.
+    ///
+    /// Returns a Vec because a single source can yield SEVERAL independently
+    /// committable units: a Kafka topic interleaves partitions, and each
+    /// partition needs its own progress marker and its own batch. Adapters with
+    /// only one unit per source (file, syslog spool) return exactly one entry.
+    /// The budgets apply across the whole call, not per returned entry.
+    ///
+    /// "Nothing to read" may be signalled EITHER as an empty Vec or as entries
+    /// whose `records` are empty — Kafka returns the former (no partition
+    /// yielded anything), file and syslog the latter (one unit, no new bytes).
+    /// Callers must tolerate both; `Engine::run_cycle` does, by skipping any
+    /// entry for which `ReadResult::is_empty()` holds. Adapters are not required
+    /// to normalise, because doing so would mean inventing a progress marker for
+    /// a partition that was never read.
     async fn read_batch_candidates(
         &mut self,
         source: &DiscoveredSource,
         max_records: usize,
         max_bytes: usize,
         max_wait: Duration,
-    ) -> Result<ReadResult, VtopError>;
+    ) -> Result<Vec<ReadResult>, VtopError>;
 
     /// The current resumable progress marker for the adapter's active source.
     async fn get_progress_marker(&self) -> Result<ProgressMarker, VtopError>;
