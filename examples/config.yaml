@@ -78,6 +78,10 @@ upload:
   endpoint_url: http://minio:9000
   region: us-east-1
   force_path_style: true
+  # verify_tls: true (the default) REQUIRES an https:// endpoint — a plaintext
+  # endpoint is then a startup error. false is the explicit lab opt-out that
+  # permits plaintext (this lab's MinIO). It does NOT disable certificate
+  # verification on https endpoints; private CAs go in the system trust store.
   verify_tls: false
   create_bucket: true           # auto-create per-format buckets on first use
 
