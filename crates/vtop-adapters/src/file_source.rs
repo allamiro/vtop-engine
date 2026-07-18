@@ -31,7 +31,6 @@ pub struct FileSource {
     /// source files that have no line structure) instead of line by line.
     whole_file: bool,
     cursors: HashMap<String, FileCursor>,
-    active: Option<String>,
 }
 
 impl FileSource {
@@ -52,7 +51,6 @@ impl FileSource {
             delete_after_commit,
             whole_file,
             cursors: HashMap::new(),
-            active: None,
         }
     }
 
@@ -124,7 +122,6 @@ impl SourceAdapter for FileSource {
         _max_wait: Duration,
     ) -> Result<Vec<ReadResult>, VtopError> {
         let path = source.source_name.clone();
-        self.active = Some(path.clone());
         let start = self.cursors.entry(path.clone()).or_default().read_byte;
 
         // Whole-file mode: read the entire remaining file as one opaque record.
@@ -219,15 +216,6 @@ impl SourceAdapter for FileSource {
         }])
     }
 
-    async fn get_progress_marker(&self) -> Result<ProgressMarker, VtopError> {
-        let path = self
-            .active
-            .clone()
-            .ok_or_else(|| VtopError::Source("no active file source".into()))?;
-        let c = self.cursors.get(&path).cloned().unwrap_or_default();
-        Ok(self.marker(&path, c.committed_byte, c.read_byte))
-    }
-
     async fn commit_progress(&mut self, marker: &ProgressMarker) -> Result<(), VtopError> {
         let ProgressMarker::File {
             path,
@@ -292,10 +280,6 @@ impl SourceAdapter for FileSource {
 
     fn source_type(&self) -> SourceType {
         SourceType::File
-    }
-
-    fn source_name(&self) -> String {
-        self.active.clone().unwrap_or_default()
     }
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {

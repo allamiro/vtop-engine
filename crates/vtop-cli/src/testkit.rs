@@ -108,9 +108,6 @@ impl<A: SourceAdapter + 'static> SourceAdapter for FailCommitAdapter<A> {
             .read_batch_candidates(source, max_records, max_bytes, max_wait)
             .await
     }
-    async fn get_progress_marker(&self) -> Result<ProgressMarker, VtopError> {
-        self.inner.get_progress_marker().await
-    }
     async fn commit_progress(&mut self, marker: &ProgressMarker) -> Result<(), VtopError> {
         if self.fail_remaining.load(Ordering::SeqCst) > 0 {
             self.fail_remaining.fetch_sub(1, Ordering::SeqCst);
@@ -123,9 +120,6 @@ impl<A: SourceAdapter + 'static> SourceAdapter for FailCommitAdapter<A> {
     }
     fn source_type(&self) -> SourceType {
         self.inner.source_type()
-    }
-    fn source_name(&self) -> String {
-        self.inner.source_name()
     }
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self

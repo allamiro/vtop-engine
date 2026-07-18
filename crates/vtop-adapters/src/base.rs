@@ -137,19 +137,21 @@ pub trait SourceAdapter: Send + Sync {
         Ok(report)
     }
 
-    /// The current resumable progress marker for the adapter's active source.
-    async fn get_progress_marker(&self) -> Result<ProgressMarker, VtopError>;
-
     /// Commit source progress. MUST only be invoked by the engine after the
     /// batch reaches `VERIFIED`.
+    ///
+    /// Progress is ONLY ever expressed through the explicit `marker` (taken
+    /// from a VERIFIED batch). There is deliberately no "current source"
+    /// accessor on this trait: a single-slot notion of the active source is
+    /// meaningless once one read pass serves many sources and partitions, and
+    /// carrying one invites committing against whatever was touched last
+    /// (#96 B1).
     async fn commit_progress(&mut self, marker: &ProgressMarker) -> Result<(), VtopError>;
 
     /// Rewind the read position to a marker so uncommitted data is replayed.
     async fn replay_from_marker(&mut self, marker: &ProgressMarker) -> Result<(), VtopError>;
 
     fn source_type(&self) -> SourceType;
-
-    fn source_name(&self) -> String;
 
     /// Downcast hook so the engine can seed concrete adapters (e.g. file /
     /// syslog committed byte offsets) during recovery.

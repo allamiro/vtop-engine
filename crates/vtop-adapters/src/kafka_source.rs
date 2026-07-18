@@ -209,7 +209,6 @@ pub struct KafkaSource {
     consumer: Option<BaseConsumer>,
     // key: (topic, partition)
     cursors: HashMap<(String, i32), PartitionCursor>,
-    active: Option<(String, i32)>,
     /// Partition ids per topic, cached with a TTL.
     ///
     /// assign() needs the partition list, but fetching metadata on EVERY read
@@ -243,7 +242,6 @@ impl KafkaSource {
             exclude,
             consumer: None,
             cursors: HashMap::new(),
-            active: None,
             partitions: HashMap::new(),
         })
     }
@@ -553,12 +551,6 @@ impl SourceAdapter for KafkaSource {
         let mut per_source: Vec<Vec<ReadResult>> = vec![Vec::new(); sources.len()];
         for (idx, p, part) in acc.into_sorted() {
             let topic = &sources[idx].source_name;
-            // Record the last partition touched so `get_progress_marker` keeps
-            // working. Single-slot `active` is a known wart with many
-            // partitions in play; it is not on the commit path
-            // (commit_progress takes an explicit marker) and is tracked
-            // separately (#96 B1).
-            self.active = Some((topic.clone(), p));
             let cur = self.cursors.entry((topic.clone(), p)).or_default();
             if !part.records.is_empty() {
                 cur.last_read_offset = Some(part.end_offset);
@@ -611,26 +603,6 @@ impl SourceAdapter for KafkaSource {
             productive_ms,
             empty_ms,
             failed_ms: meta_failed_ms,
-        })
-    }
-
-    async fn get_progress_marker(&self) -> Result<ProgressMarker, VtopError> {
-        let (topic, partition) = self
-            .active
-            .clone()
-            .ok_or_else(|| VtopError::Source("no active kafka partition".into()))?;
-        let cur = self
-            .cursors
-            .get(&(topic.clone(), partition))
-            .cloned()
-            .unwrap_or_default();
-        let start_offset = cur.committed_offset.unwrap_or(0);
-        Ok(ProgressMarker::Kafka {
-            topic,
-            partition,
-            start_offset,
-            end_offset: cur.last_read_offset.unwrap_or(start_offset),
-            consumer_group: self.cfg.consumer_group.clone(),
         })
     }
 
@@ -692,10 +664,6 @@ impl SourceAdapter for KafkaSource {
 
     fn source_type(&self) -> SourceType {
         SourceType::Kafka
-    }
-
-    fn source_name(&self) -> String {
-        self.active.clone().map(|(t, _)| t).unwrap_or_default()
     }
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
