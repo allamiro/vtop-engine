@@ -65,7 +65,21 @@ def _stat(title, gp, targets, desc="", unit=None, thresholds=None):
         "text": {"valueSize": 22},
         "textMode": "value",
         "justifyMode": "center",
+        # Grafana normalises a stat panel to this exact option set. Emitting it
+        # in full - and, critically, emitting `pluginVersion` - stops Grafana
+        # running the stat panel's schema-MIGRATION handler on load, which
+        # rewrites `options` and was silently clobbering reduceOptions.calcs.
+        # That is why a tile rendered as a bare colour until the panel was opened
+        # in the editor and saved: saving writes back the normalised model.
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "showPercentChange": False,
+        "wideLayout": True,
     }
+    p["pluginVersion"] = GRAFANA_PLUGIN_VERSION
+    # `custom` holds TIMESERIES-only field options (fillOpacity); on a stat panel
+    # it is meaningless and contributes to the migration rewrite above.
+    p["fieldConfig"]["defaults"].pop("custom", None)
     if thresholds:
         p["fieldConfig"]["defaults"]["thresholds"] = {"mode": "absolute", "steps": thresholds}
         p["fieldConfig"]["defaults"]["color"] = {"mode": "thresholds"}

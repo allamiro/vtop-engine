@@ -121,9 +121,6 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "custom": {
-            "fillOpacity": 10
-          },
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -157,8 +154,13 @@
           "valueSize": 22
         },
         "textMode": "value",
-        "justifyMode": "center"
+        "justifyMode": "center",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "showPercentChange": false,
+        "wideLayout": true
       },
+      "pluginVersion": "13.1.0",
       "id": 2
     },
     {
@@ -187,9 +189,6 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "custom": {
-            "fillOpacity": 10
-          },
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -223,8 +222,13 @@
           "valueSize": 22
         },
         "textMode": "value",
-        "justifyMode": "center"
+        "justifyMode": "center",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "showPercentChange": false,
+        "wideLayout": true
       },
+      "pluginVersion": "13.1.0",
       "id": 3
     },
     {
@@ -253,9 +257,6 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "custom": {
-            "fillOpacity": 10
-          },
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -289,8 +290,13 @@
           "valueSize": 22
         },
         "textMode": "value",
-        "justifyMode": "center"
+        "justifyMode": "center",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "showPercentChange": false,
+        "wideLayout": true
       },
+      "pluginVersion": "13.1.0",
       "id": 4
     },
     {
@@ -319,9 +325,6 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "custom": {
-            "fillOpacity": 10
-          },
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -355,8 +358,13 @@
           "valueSize": 22
         },
         "textMode": "value",
-        "justifyMode": "center"
+        "justifyMode": "center",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "showPercentChange": false,
+        "wideLayout": true
       },
+      "pluginVersion": "13.1.0",
       "id": 5
     },
     {
@@ -384,11 +392,7 @@
         }
       ],
       "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "fillOpacity": 10
-          }
-        },
+        "defaults": {},
         "overrides": []
       },
       "options": {
@@ -405,8 +409,13 @@
           "valueSize": 22
         },
         "textMode": "value",
-        "justifyMode": "center"
+        "justifyMode": "center",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "showPercentChange": false,
+        "wideLayout": true
       },
+      "pluginVersion": "13.1.0",
       "id": 6
     },
     {

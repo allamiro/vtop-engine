@@ -107,10 +107,11 @@ services:
     environment:
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: admin
-      # Anonymous viewing: the lab is for looking at dashboards, not managing
-      # users. LAB ONLY.
+      # Anonymous access with EDITOR rights: this is a local lab, so anyone who
+      # opens it can edit AND save dashboards without signing in. LAB ONLY -
+      # never expose this stack on a shared network (see issue #81).
       GF_AUTH_ANONYMOUS_ENABLED: "true"
-      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Editor
       GF_USERS_DEFAULT_THEME: dark
       # The draw.io pipeline dashboard uses the Flow panel (React, signed,
       # Grafana >= 10) - the maintained successor to the AngularJS flowcharting
