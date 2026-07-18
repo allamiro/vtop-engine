@@ -66,6 +66,23 @@ pub struct BatchingConfig {
     pub max_bytes: usize,
     #[serde(default = "default_max_age")]
     pub max_batch_age_seconds: u64,
+    /// How long a single source read may block waiting for data.
+    ///
+    /// This is paid PER SOURCE, serially: with N Kafka topics, a cycle costs up
+    /// to `N * source_poll_wait_ms` even when every topic is empty, because an
+    /// empty topic burns the whole window before returning nothing. It used to
+    /// be a hard-coded 2s, which put ~28 topics at ~56s per cycle. Kafka
+    /// prefetches into a local queue, so a backlogged topic returns
+    /// immediately regardless of this value — it only bounds the idle case.
+    #[serde(default = "default_source_poll_wait_ms")]
+    pub source_poll_wait_ms: u64,
+    /// Pause between cycles when the previous cycle read nothing at all.
+    ///
+    /// A cycle that DID read data skips this entirely and loops straight into
+    /// the next one, so a backlog is drained at full speed instead of being
+    /// throttled by a fixed timer.
+    #[serde(default = "default_idle_poll_interval_ms")]
+    pub idle_poll_interval_ms: u64,
 }
 
 fn default_max_records() -> usize {
@@ -76,6 +93,12 @@ fn default_max_bytes() -> usize {
 }
 fn default_max_age() -> u64 {
     60
+}
+fn default_source_poll_wait_ms() -> u64 {
+    250
+}
+fn default_idle_poll_interval_ms() -> u64 {
+    2_000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -261,6 +284,19 @@ impl VtopConfig {
 
         // Batching limits must be positive, or the engine would seal degenerate
         // (empty/one-record) batches or never bound memory sensibly.
+        // A zero idle interval is a busy-wait, not a fast engine. With no data
+        // available, `cycle_had_data` stays false and the loop takes a
+        // Duration::ZERO backoff every iteration — re-running source discovery
+        // and reads as fast as the CPU allows, pinning a core for no throughput.
+        // File and syslog adapters return immediately at EOF, so they hit this
+        // even without a broker involved.
+        if self.batching.idle_poll_interval_ms == 0 {
+            return Err(VtopError::Config(
+                "batching.idle_poll_interval_ms must be > 0: zero busy-waits on an idle source \
+                 instead of backing off"
+                    .into(),
+            ));
+        }
         if self.batching.max_records == 0 {
             return Err(VtopError::Config("batching.max_records must be > 0".into()));
         }
@@ -367,6 +403,60 @@ upload:
         cfg.validate().unwrap();
         assert_eq!(cfg.batching.max_records, 10_000);
         assert_eq!(cfg.compression.kind, CompressionType::Gzip);
+    }
+
+    #[test]
+    fn polling_knobs_default_when_absent() {
+        // Back-compat: every config written before these fields existed must
+        // still parse, and must get the tuned defaults rather than 0 (which
+        // would busy-spin) or the old hard-coded 2s-per-source.
+        let cfg: BatchingConfig = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(cfg.source_poll_wait_ms, 250);
+        assert_eq!(cfg.idle_poll_interval_ms, 2_000);
+    }
+
+    #[test]
+    fn zero_idle_poll_interval_is_rejected() {
+        // Zero would busy-wait: an idle cycle takes a Duration::ZERO backoff and
+        // re-runs discovery/reads as fast as the CPU allows. A poll wait of zero
+        // is fine by contrast (a non-blocking poll), so only the idle interval
+        // is constrained.
+        let yaml = r#"
+engine:
+  name: vtop-engine
+  state_store: "sqlite::memory:"
+  work_dir: /tmp/work
+batching:
+  idle_poll_interval_ms: 0
+compression: {}
+sources:
+  file:
+    enabled: true
+    paths: ["/data/*.log"]
+upload:
+  bucket: telemetry-data
+  backend: s3_native
+"#;
+        let cfg: VtopConfig = serde_yaml::from_str(yaml).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("idle_poll_interval_ms"),
+            "unexpected error: {err}"
+        );
+
+        // A zero poll wait must still be accepted.
+        let ok = yaml.replace("idle_poll_interval_ms: 0", "source_poll_wait_ms: 0");
+        let cfg: VtopConfig = serde_yaml::from_str(&ok).unwrap();
+        cfg.validate()
+            .expect("source_poll_wait_ms: 0 is legitimate");
+    }
+
+    #[test]
+    fn polling_knobs_are_overridable() {
+        let cfg: BatchingConfig =
+            serde_yaml::from_str("source_poll_wait_ms: 50\nidle_poll_interval_ms: 100").unwrap();
+        assert_eq!(cfg.source_poll_wait_ms, 50);
+        assert_eq!(cfg.idle_poll_interval_ms, 100);
     }
 
     #[test]

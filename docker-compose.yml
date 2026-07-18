@@ -140,21 +140,21 @@ services:
         condition: service_completed_successfully
     environment:
       # Lab-only credentials for the native S3 backend talking to MinIO.
-      AWS_ACCESS_KEY_ID: minioadmin
-      AWS_SECRET_ACCESS_KEY: minioadmin
-      AWS_REGION: us-east-1
-      VTOP_S3_ENDPOINT_URL: http://minio:9000
-      VTOP_S3_FORCE_PATH_STYLE: "true"
-      VTOP_S3_VERIFY_TLS: "false"
-      VTOP_CONFIG: /app/examples/config.yaml
-      RUST_LOG: info
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-minioadmin}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      VTOP_S3_ENDPOINT_URL: ${VTOP_S3_ENDPOINT_URL:-http://minio:9000}
+      VTOP_S3_FORCE_PATH_STYLE: "${VTOP_S3_FORCE_PATH_STYLE:-true}"
+      VTOP_S3_VERIFY_TLS: "${VTOP_S3_VERIFY_TLS:-false}"
+      VTOP_CONFIG: ${VTOP_CONFIG:-/app/examples/config.yaml}
+      RUST_LOG: ${RUST_LOG:-info}
       # Structured JSON logs so Alloy -> Loki ships parseable events (level,
       # records, *_ms, byte counts) instead of ANSI-coloured pretty text. The
       # log-derived Grafana panels depend on this.
-      VTOP_LOG_FORMAT: json
+      VTOP_LOG_FORMAT: ${VTOP_LOG_FORMAT:-json}
       # Expose the engine's own Prometheus metrics. Opt-in: nothing listens
       # unless this is set. Alloy scrapes vtop-engine:9090/metrics.
-      VTOP_METRICS_ADDR: "0.0.0.0:9090"
+      VTOP_METRICS_ADDR: "${VTOP_METRICS_ADDR:-0.0.0.0:9090}"
     volumes:
       - ./examples:/app/examples:ro
       - ./data/input:/data/input
@@ -175,13 +175,13 @@ services:
       kafka:
         condition: service_healthy
     environment:
-      BOOTSTRAP: kafka:9092
-      FORMATS: "cef leef json jsonl syslog logfmt apache text"
-      TOPICS_PER_FORMAT: "3"
-      MIN_BATCH: "50"
-      MAX_BATCH: "500"
-      SLEEP_SECONDS: "1"
-      DURATION_SECONDS: "0"
+      BOOTSTRAP: ${BOOTSTRAP:-kafka:9092}
+      FORMATS: "${FORMATS:-cef leef json jsonl syslog logfmt apache text}"
+      TOPICS_PER_FORMAT: "${TOPICS_PER_FORMAT:-3}"
+      MIN_BATCH: "${MIN_BATCH:-50}"
+      MAX_BATCH: "${MAX_BATCH:-500}"
+      SLEEP_SECONDS: "${SLEEP_SECONDS:-1}"
+      DURATION_SECONDS: "${DURATION_SECONDS:-0}"
     volumes:
       - ./docker/seed-events.sh:/seed-events.sh:ro
       - ./docker/load-generator.sh:/load-generator.sh:ro

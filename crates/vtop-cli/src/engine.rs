@@ -141,6 +141,14 @@ impl<'a> Pipeline<'a> {
         self.store.save_batch_state(&record).await?;
         tracing::info!(batch_id, source = %source.source_name, "batch_started");
 
+        // The record count `fail!` reports. Declared here, before the macro,
+        // because macro hygiene only exposes bindings that already exist at the
+        // macro's definition site — and `fail!` cannot read `batch` directly,
+        // since compression moves it into a blocking task. `seal()` sets
+        // record_count to exactly `records.len()`, so this is the sealed count
+        // without having to wait for (or mutate after) the seal.
+        let sealed_record_count = batch.records.len();
+
         // Helper to fail a batch and bail out.
         macro_rules! fail {
             ($msg:expr) => {{
@@ -161,7 +169,11 @@ impl<'a> Pipeline<'a> {
                     batch_id: batch_id.clone(),
                     final_state: BatchState::Failed,
                     committed: false,
-                    record_count: batch.record_count,
+                    // Read from the sealed count captured before compression
+                    // rather than from `batch`: compression moves the batch into
+                    // a blocking task, so a macro that touched `batch` directly
+                    // would not compile at any call site after that point.
+                    record_count: sealed_record_count,
                     object_uri: None,
                     metrics: None,
                 });
@@ -198,14 +210,28 @@ impl<'a> Pipeline<'a> {
         let mut metrics = BatchMetrics::new(&batch_id, batch.record_count, 0);
 
         // ---- SEALED -> COMPRESSED ---------------------------------------
-        let work_dir = std::path::Path::new(&self.config.engine.work_dir);
+        let work_dir = std::path::PathBuf::from(&self.config.engine.work_dir);
         let t = Instant::now();
-        let compressed = match compress_batch(
-            &batch,
-            self.config.compression.kind,
-            self.config.compression.level,
-            work_dir,
-        ) {
+        // Compression is CPU-bound AND writes the object to disk, so running it
+        // inline would block this tokio worker for the whole stage (80ms p95 —
+        // the largest stage in the pipeline). That stalls everything else
+        // sharing the runtime: the metrics server, signal handling, and every
+        // other batch once batches run concurrently. spawn_blocking moves it to
+        // the blocking pool where stalling is expected and harmless.
+        //
+        // `batch` is moved in and handed back out because compress_batch borrows
+        // it and later stages still need it; the alternative (cloning every
+        // record) would cost more than the stage itself.
+        let kind = self.config.compression.kind;
+        let level = self.config.compression.level;
+        let wd = work_dir.clone();
+        let (batch, compress_result) = tokio::task::spawn_blocking(move || {
+            let r = compress_batch(&batch, kind, level, &wd);
+            (batch, r)
+        })
+        .await
+        .map_err(|e| VtopError::Config(format!("compression task panicked: {e}")))?;
+        let compressed = match compress_result {
             Ok(c) => c,
             Err(e) => fail!(format!("compression failed: {e}")),
         };
@@ -328,7 +354,7 @@ impl<'a> Pipeline<'a> {
         }
         .build()?;
 
-        let manifest_path = manifest.write_to_file(work_dir)?;
+        let manifest_path = manifest.write_to_file(&work_dir)?;
         // Storage-integrity digest of the manifest file (configured algorithm).
         // The manifest's own self-hash (manifest.manifest.sha256) is the
         // tamper-evidence record and is always SHA-256.
@@ -634,6 +660,9 @@ pub struct Engine {
     pub adapters: HashMap<SourceType, Box<dyn SourceAdapter>>,
     /// Per-source accumulation buffers, keyed by `(source_type, source_name)`.
     pending: HashMap<(SourceType, String), PendingBuffer>,
+    /// Set by a read cycle that returned any records; drives the adaptive
+    /// inter-cycle sleep in [`Engine::run`]. Reset at the top of each cycle.
+    cycle_had_data: bool,
 }
 
 impl Engine {
@@ -683,6 +712,7 @@ impl Engine {
             backend,
             adapters,
             pending: HashMap::new(),
+            cycle_had_data: false,
         })
     }
 
@@ -755,7 +785,8 @@ impl Engine {
         force_flush: bool,
     ) -> Result<Vec<BatchOutcome>, VtopError> {
         let sources = adapter.discover_sources().await?;
-        let max_wait = Duration::from_secs(2);
+        // Paid per source, serially — see `BatchingConfig::source_poll_wait_ms`.
+        let max_wait = Duration::from_millis(self.config.batching.source_poll_wait_ms);
 
         // Bound the Kafka partition-metadata cache: drop entries for topics that
         // no longer exist, so a broker that churns through short-lived topics
@@ -811,6 +842,10 @@ impl Engine {
             if read.is_empty() {
                 continue;
             }
+            // Any data at all means the loop should come straight back rather
+            // than sleeping out the idle interval — a backlog must be drained
+            // at read speed, not at timer speed.
+            self.cycle_had_data = true;
             let limits = self.batch_limits();
             let tenant = self.config.engine.tenant.clone();
             // Key the buffer by the source PLUS partition so a multi-partition
@@ -1026,13 +1061,23 @@ impl Engine {
     pub async fn run(&mut self) -> Result<(), VtopError> {
         self.recover().await?;
         let types: Vec<SourceType> = self.adapters.keys().cloned().collect();
+        let idle = Duration::from_millis(self.config.batching.idle_poll_interval_ms);
         loop {
             // Accumulate across cycles; only threshold-tripped buffers flush.
+            self.cycle_had_data = false;
             for st in &types {
                 if let Err(e) = self.run_source(st.clone(), false).await {
                     tracing::error!(error = %e, source_type = %st, "process cycle error");
                 }
             }
+            // Productive cycle: loop again immediately. Idle cycle: back off.
+            // `Duration::ZERO` still yields to the runtime through `select!`,
+            // so Ctrl-C stays responsive and this never starves the executor.
+            let backoff = if self.cycle_had_data {
+                Duration::ZERO
+            } else {
+                idle
+            };
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
                     tracing::info!("shutdown signal received; flushing and exiting");
@@ -1045,7 +1090,7 @@ impl Engine {
                     }
                     return Ok(());
                 }
-                _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                _ = tokio::time::sleep(backoff) => {}
             }
         }
     }
