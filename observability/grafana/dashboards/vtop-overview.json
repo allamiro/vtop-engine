@@ -25,7 +25,8 @@
         "y": 0
       },
       "collapsed": false,
-      "panels": []
+      "panels": [],
+      "id": 1
     },
     {
       "type": "stat",
@@ -83,8 +84,12 @@
         },
         "textMode": "value",
         "colorMode": "background",
-        "graphMode": "area"
-      }
+        "graphMode": "none",
+        "text": {
+          "valueSize": 22
+        }
+      },
+      "id": 2
     },
     {
       "type": "stat",
@@ -142,8 +147,12 @@
         },
         "textMode": "value",
         "colorMode": "background",
-        "graphMode": "area"
-      }
+        "graphMode": "none",
+        "text": {
+          "valueSize": 22
+        }
+      },
+      "id": 3
     },
     {
       "type": "stat",
@@ -201,8 +210,12 @@
         },
         "textMode": "value",
         "colorMode": "background",
-        "graphMode": "area"
-      }
+        "graphMode": "none",
+        "text": {
+          "valueSize": 22
+        }
+      },
+      "id": 4
     },
     {
       "type": "stat",
@@ -244,8 +257,12 @@
         },
         "textMode": "value",
         "colorMode": "value",
-        "graphMode": "area"
-      }
+        "graphMode": "none",
+        "text": {
+          "valueSize": 22
+        }
+      },
+      "id": 5
     },
     {
       "type": "row",
@@ -257,7 +274,8 @@
         "y": 6
       },
       "collapsed": false,
-      "panels": []
+      "panels": [],
+      "id": 6
     },
     {
       "type": "timeseries",
@@ -289,7 +307,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "id": 7
     },
     {
       "type": "timeseries",
@@ -321,7 +340,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "id": 8
     }
   ]
 }

@@ -61,7 +61,12 @@ def stat(title, gp, targets, ds, desc="", unit=None, thresholds=None, text_mode=
         "reduceOptions": {"calcs": ["lastNonNull"], "fields": "", "values": False},
         "textMode": text_mode,
         "colorMode": "background" if thresholds else "value",
-        "graphMode": "area",
+        # No sparkline and an explicit value size: these tiles are only 4 rows
+        # tall, and with graphMode "area" competing for the space Grafana
+        # auto-shrank the number until it vanished — the tile rendered as a bare
+        # colour and the value only reappeared in the (much larger) edit view.
+        "graphMode": "none",
+        "text": {"valueSize": 22},
     }
     if thresholds:
         p["fieldConfig"]["defaults"]["thresholds"] = {"mode": "absolute", "steps": thresholds}
@@ -320,6 +325,27 @@ from dashboards_pipeline import pipeline as pipeline_flow  # noqa: E402
 from dashboards_flow import flow as flow_drawio  # noqa: E402
 from dashboards_vtop import engine as vtop_engine  # noqa: E402
 
+
+def assign_panel_ids(dash):
+    """Give every panel a unique numeric `id`.
+
+    Grafana REQUIRES this. Without it the grid is mis-laid-out (panels render
+    full-width and stacked, ignoring gridPos) and query results are not bound
+    back to their panel, so a stat tile shows its threshold colour but no value.
+    Opening the panel in the editor forces Grafana to mint an id, which is why
+    the number appeared only on edit. Generated dashboards had no ids at all.
+    """
+    next_id = 1
+    for p in dash.get("panels", []):
+        p["id"] = next_id
+        next_id += 1
+        # Panels nested inside a collapsed row need ids too.
+        for sub in p.get("panels", []) or []:
+            sub["id"] = next_id
+            next_id += 1
+    return dash
+
+
 if __name__ == "__main__":
     out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "grafana", "dashboards")
     os.makedirs(out, exist_ok=True)
@@ -336,6 +362,7 @@ if __name__ == "__main__":
         ("vtop-logs", logs),
     ]:
         path = os.path.join(out, f"{name}.json")
+        assign_panel_ids(d)
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(d, fh, indent=2)
             fh.write("\n")

@@ -25,7 +25,8 @@
         "y": 0
       },
       "collapsed": false,
-      "panels": []
+      "panels": [],
+      "id": 1
     },
     {
       "type": "logs",
@@ -62,7 +63,8 @@
         "showTime": true,
         "wrapLogMessage": true,
         "sortOrder": "Descending"
-      }
+      },
+      "id": 2
     },
     {
       "type": "logs",
@@ -99,7 +101,8 @@
         "showTime": true,
         "wrapLogMessage": true,
         "sortOrder": "Descending"
-      }
+      },
+      "id": 3
     },
     {
       "type": "row",
@@ -111,7 +114,8 @@
         "y": 17
       },
       "collapsed": false,
-      "panels": []
+      "panels": [],
+      "id": 4
     },
     {
       "type": "logs",
@@ -148,7 +152,8 @@
         "showTime": true,
         "wrapLogMessage": true,
         "sortOrder": "Descending"
-      }
+      },
+      "id": 5
     }
   ]
 }

@@ -25,7 +25,8 @@
         "y": 0
       },
       "collapsed": false,
-      "panels": []
+      "panels": [],
+      "id": 1
     },
     {
       "type": "timeseries",
@@ -57,7 +58,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "id": 2
     },
     {
       "type": "timeseries",
@@ -98,7 +100,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "id": 3
     },
     {
       "type": "timeseries",
@@ -138,7 +141,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "id": 4
     },
     {
       "type": "row",
@@ -150,7 +154,8 @@
         "y": 8
       },
       "collapsed": false,
-      "panels": []
+      "panels": [],
+      "id": 5
     },
     {
       "type": "timeseries",
@@ -183,7 +188,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "id": 6
     },
     {
       "type": "timeseries",
@@ -224,7 +230,8 @@
         },
         "overrides": []
       },
-      "options": {}
+      "options": {},
+      "id": 7
     }
   ]
 }
