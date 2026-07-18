@@ -84,7 +84,12 @@ def main() -> int:
     # Only a seed directory the benchmark CREATED may be deleted afterwards.
     # A caller-supplied --seed-dir can point at real data, so it is never
     # recursively removed no matter what --keep-seed says.
-    seed_dir_is_ours = args.seed_dir is None
+    #
+    # Ownership is decided by the SAME truthiness test that allocates the path,
+    # so the two can never disagree: `--seed-dir ""` (easy to produce with
+    # `--seed-dir "$UNSET_VAR"`) falls through to mkdtemp, and must therefore be
+    # owned by us - otherwise we would create a directory and then leak it.
+    seed_dir_is_ours = not args.seed_dir
     seed_dir = args.seed_dir or tempfile.mkdtemp(prefix=f"vtop-seed-{sc.name}-")
     work_dir = tempfile.mkdtemp(prefix="vtop-work-")
     state_db = os.path.join(tempfile.mkdtemp(prefix="vtop-state-"), "state.db")

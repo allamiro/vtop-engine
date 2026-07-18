@@ -44,3 +44,20 @@ def test_caller_supplied_directory_still_exists_after_the_decision():
             shutil.rmtree(user_dir, ignore_errors=True)
 
         assert os.path.exists(precious), "caller-supplied seed data was deleted"
+
+
+def test_empty_seed_dir_is_treated_as_generated_scratch():
+    """`--seed-dir ""` falls through to mkdtemp, so we own it and must clean it.
+
+    Allocation uses truthiness (`args.seed_dir or mkdtemp()`), so ownership must
+    use the same test. Deciding ownership with `is None` would mark a directory
+    we created as caller-owned and leak it on every run.
+    """
+    for supplied in ("", None):
+        seed_dir_is_ours = not supplied
+        assert seed_dir_is_ours is True
+        assert should_remove_seed_dir(seed_dir_is_ours, keep_seed=False) is True
+
+    # A real caller-supplied path is still never removed.
+    assert (not "/real/path") is False
+    assert should_remove_seed_dir(seed_dir_is_ours=False, keep_seed=False) is False
