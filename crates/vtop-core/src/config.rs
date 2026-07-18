@@ -66,6 +66,23 @@ pub struct BatchingConfig {
     pub max_bytes: usize,
     #[serde(default = "default_max_age")]
     pub max_batch_age_seconds: u64,
+    /// How long a single source read may block waiting for data.
+    ///
+    /// This is paid PER SOURCE, serially: with N Kafka topics, a cycle costs up
+    /// to `N * source_poll_wait_ms` even when every topic is empty, because an
+    /// empty topic burns the whole window before returning nothing. It used to
+    /// be a hard-coded 2s, which put ~28 topics at ~56s per cycle. Kafka
+    /// prefetches into a local queue, so a backlogged topic returns
+    /// immediately regardless of this value — it only bounds the idle case.
+    #[serde(default = "default_source_poll_wait_ms")]
+    pub source_poll_wait_ms: u64,
+    /// Pause between cycles when the previous cycle read nothing at all.
+    ///
+    /// A cycle that DID read data skips this entirely and loops straight into
+    /// the next one, so a backlog is drained at full speed instead of being
+    /// throttled by a fixed timer.
+    #[serde(default = "default_idle_poll_interval_ms")]
+    pub idle_poll_interval_ms: u64,
 }
 
 fn default_max_records() -> usize {
@@ -76,6 +93,12 @@ fn default_max_bytes() -> usize {
 }
 fn default_max_age() -> u64 {
     60
+}
+fn default_source_poll_wait_ms() -> u64 {
+    250
+}
+fn default_idle_poll_interval_ms() -> u64 {
+    2_000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -367,6 +390,24 @@ upload:
         cfg.validate().unwrap();
         assert_eq!(cfg.batching.max_records, 10_000);
         assert_eq!(cfg.compression.kind, CompressionType::Gzip);
+    }
+
+    #[test]
+    fn polling_knobs_default_when_absent() {
+        // Back-compat: every config written before these fields existed must
+        // still parse, and must get the tuned defaults rather than 0 (which
+        // would busy-spin) or the old hard-coded 2s-per-source.
+        let cfg: BatchingConfig = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(cfg.source_poll_wait_ms, 250);
+        assert_eq!(cfg.idle_poll_interval_ms, 2_000);
+    }
+
+    #[test]
+    fn polling_knobs_are_overridable() {
+        let cfg: BatchingConfig =
+            serde_yaml::from_str("source_poll_wait_ms: 50\nidle_poll_interval_ms: 100").unwrap();
+        assert_eq!(cfg.source_poll_wait_ms, 50);
+        assert_eq!(cfg.idle_poll_interval_ms, 100);
     }
 
     #[test]

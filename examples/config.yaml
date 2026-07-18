@@ -14,6 +14,19 @@ batching:
   max_records: 10000
   max_bytes: 104857600
   max_batch_age_seconds: 60
+  # Polling. Both are optional; these are the defaults.
+  #
+  # source_poll_wait_ms is paid PER SOURCE, serially: an EMPTY source burns the
+  # whole window before returning nothing, so a cycle over N idle Kafka topics
+  # costs up to N * this. A backlogged topic returns immediately (Kafka
+  # prefetches), so lowering this speeds up idle scanning without hurting
+  # throughput. Raise it if a broker is slow enough that reads come back empty
+  # when data is in fact available.
+  source_poll_wait_ms: 250
+  # Pause between cycles ONLY when the previous cycle read nothing. A cycle
+  # that read data loops straight into the next one, so a backlog drains at
+  # read speed rather than being throttled by this timer.
+  idle_poll_interval_ms: 2000
 
 compression:
   type: gzip          # gzip | zstd | none
