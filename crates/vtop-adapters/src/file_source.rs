@@ -122,7 +122,7 @@ impl SourceAdapter for FileSource {
         max_records: usize,
         max_bytes: usize,
         _max_wait: Duration,
-    ) -> Result<ReadResult, VtopError> {
+    ) -> Result<Vec<ReadResult>, VtopError> {
         let path = source.source_name.clone();
         self.active = Some(path.clone());
         let start = self.cursors.entry(path.clone()).or_default().read_byte;
@@ -152,7 +152,7 @@ impl SourceAdapter for FileSource {
                 vec![data[start as usize..].to_vec()]
             };
             self.cursors.get_mut(&path).unwrap().read_byte = end;
-            return Ok(ReadResult {
+            return Ok(vec![ReadResult {
                 progress_start: self.marker(&path, start, start),
                 progress_end: self.marker(&path, start, end),
                 records,
@@ -160,7 +160,7 @@ impl SourceAdapter for FileSource {
                 last_timestamp: None,
                 // Whole-file: the record is raw object bytes — emit verbatim.
                 verbatim: true,
-            });
+            }]);
         }
 
         let file = tokio::fs::File::open(&path).await?;
@@ -207,7 +207,7 @@ impl SourceAdapter for FileSource {
         // Advance the (uncommitted) read head.
         self.cursors.get_mut(&path).unwrap().read_byte = pos;
 
-        Ok(ReadResult {
+        Ok(vec![ReadResult {
             progress_start: self.marker(&path, start, start),
             progress_end: self.marker(&path, start, pos),
             records,
@@ -216,7 +216,7 @@ impl SourceAdapter for FileSource {
             // Line mode: records are logical lines (newline stripped); re-framed
             // on serialization to stay byte-exact with the source range.
             verbatim: false,
-        })
+        }])
     }
 
     async fn get_progress_marker(&self) -> Result<ProgressMarker, VtopError> {
@@ -341,15 +341,20 @@ mod tests {
         let f = write_log(&["a", "b", "c"]);
         let path = f.path().to_string_lossy().into_owned();
         let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
-        let r = fs
+        let reads = fs
             .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
             .await
             .unwrap();
+        // A file is a single committable unit, so the Vec is always length 1;
+        // assert it rather than indexing blind, so a regression that returns 0
+        // or 2 fails here instead of panicking on the index.
+        assert_eq!(reads.len(), 1);
+        let r = &reads[0];
         assert_eq!(r.records.len(), 3);
         assert_eq!(r.records[0], b"a");
         // end marker byte offset is past the data.
-        if let ProgressMarker::File { end_byte, .. } = r.progress_end {
-            assert_eq!(end_byte, 6); // "a\nb\nc\n"
+        if let ProgressMarker::File { end_byte, .. } = &r.progress_end {
+            assert_eq!(*end_byte, 6); // "a\nb\nc\n"
         } else {
             panic!("expected file marker");
         }
@@ -361,21 +366,25 @@ mod tests {
         let path = f.path().to_string_lossy().into_owned();
         let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
 
-        let r1 = fs
+        let reads1 = fs
             .read_batch_candidates(&src(&path), 1, 1 << 20, Duration::ZERO)
             .await
             .unwrap();
+        // One file == one committable unit; see `reads_lines_and_tracks_offset`.
+        assert_eq!(reads1.len(), 1);
+        let r1 = &reads1[0];
         assert_eq!(r1.records, vec![b"one".to_vec()]);
 
         // Commit only the first record.
         fs.commit_progress(&r1.progress_end).await.unwrap();
 
         // Next read resumes after "one\n".
-        let r2 = fs
+        let reads2 = fs
             .read_batch_candidates(&src(&path), 10, 1 << 20, Duration::ZERO)
             .await
             .unwrap();
-        assert_eq!(r2.records, vec![b"two".to_vec(), b"three".to_vec()]);
+        assert_eq!(reads2.len(), 1);
+        assert_eq!(reads2[0].records, vec![b"two".to_vec(), b"three".to_vec()]);
     }
 
     #[tokio::test]
@@ -384,18 +393,27 @@ mod tests {
         let path = f.path().to_string_lossy().into_owned();
         let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
 
-        let r1 = fs
+        let reads1 = fs
             .read_batch_candidates(&src(&path), 10, 1 << 20, Duration::ZERO)
             .await
             .unwrap();
-        assert_eq!(r1.records.len(), 3);
+        // One file == one committable unit; see `reads_lines_and_tracks_offset`.
+        assert_eq!(reads1.len(), 1);
+        assert_eq!(reads1[0].records.len(), 3);
         // No commit. Simulate crash + replay from start of range.
-        fs.replay_from_marker(&r1.progress_start).await.unwrap();
-        let r2 = fs
+        fs.replay_from_marker(&reads1[0].progress_start)
+            .await
+            .unwrap();
+        let reads2 = fs
             .read_batch_candidates(&src(&path), 10, 1 << 20, Duration::ZERO)
             .await
             .unwrap();
-        assert_eq!(r2.records.len(), 3, "uncommitted data must be replayable");
+        assert_eq!(reads2.len(), 1);
+        assert_eq!(
+            reads2[0].records.len(),
+            3,
+            "uncommitted data must be replayable"
+        );
     }
 
     #[tokio::test]
@@ -405,11 +423,13 @@ mod tests {
         f.flush().unwrap();
         let path = f.path().to_string_lossy().into_owned();
         let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
-        let r = fs
+        let reads = fs
             .read_batch_candidates(&src(&path), 10, 1 << 20, Duration::ZERO)
             .await
             .unwrap();
-        assert_eq!(r.records, vec![b"complete".to_vec()]);
+        // One file == one committable unit; see `reads_lines_and_tracks_offset`.
+        assert_eq!(reads.len(), 1);
+        assert_eq!(reads[0].records, vec![b"complete".to_vec()]);
     }
 
     #[tokio::test]

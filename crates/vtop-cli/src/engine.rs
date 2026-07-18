@@ -888,7 +888,7 @@ impl Engine {
         for source in sources {
             // A single source read failing must not abort reading/flushing the
             // other sources this cycle — log and skip it.
-            let read = match adapter
+            let reads = match adapter
                 .read_batch_candidates(
                     &source,
                     self.config.batching.max_records,
@@ -921,25 +921,31 @@ impl Engine {
                     continue;
                 }
             };
-            if read.is_empty() {
-                continue;
+            // One read can return SEVERAL independently committable units: a
+            // Kafka topic yields one per partition it saw. Each gets routed to
+            // its own buffer, so a single read now feeds every partition rather
+            // than the one it happened to lock onto.
+            for read in reads {
+                if read.is_empty() {
+                    continue;
+                }
+                // Any data at all means the loop should come straight back
+                // rather than sleeping out the idle interval — a backlog must be
+                // drained at read speed, not at timer speed.
+                self.cycle_had_data = true;
+                let limits = self.batch_limits();
+                let tenant = self.config.engine.tenant.clone();
+                // Key the buffer by the source PLUS partition so a multi-partition
+                // Kafka topic never coalesces records from different partitions into
+                // one batch (one read is single-partition; without this, consecutive
+                // reads of different partitions would mix under a single topic key
+                // and the bound commit marker would describe only one of them).
+                let key = buffer_key(&source, &read.progress_start);
+                self.pending
+                    .entry(key)
+                    .or_insert_with(|| PendingBuffer::new(&tenant, source.clone(), limits))
+                    .append(read);
             }
-            // Any data at all means the loop should come straight back rather
-            // than sleeping out the idle interval — a backlog must be drained
-            // at read speed, not at timer speed.
-            self.cycle_had_data = true;
-            let limits = self.batch_limits();
-            let tenant = self.config.engine.tenant.clone();
-            // Key the buffer by the source PLUS partition so a multi-partition
-            // Kafka topic never coalesces records from different partitions into
-            // one batch (one read is single-partition; without this, consecutive
-            // reads of different partitions would mix under a single topic key
-            // and the bound commit marker would describe only one of them).
-            let key = buffer_key(&source, &read.progress_start);
-            self.pending
-                .entry(key)
-                .or_insert_with(|| PendingBuffer::new(&tenant, source.clone(), limits))
-                .append(read);
         }
 
         // Buffers accumulated but not yet sealed. A gauge that climbs without

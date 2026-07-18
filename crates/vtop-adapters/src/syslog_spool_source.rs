@@ -87,7 +87,7 @@ impl SourceAdapter for SyslogSpoolSource {
         max_records: usize,
         max_bytes: usize,
         _max_wait: Duration,
-    ) -> Result<ReadResult, VtopError> {
+    ) -> Result<Vec<ReadResult>, VtopError> {
         let path = source.source_name.clone();
         self.active = Some(path.clone());
         let start = self.cursors.entry(path.clone()).or_default().read_byte;
@@ -117,7 +117,7 @@ impl SourceAdapter for SyslogSpoolSource {
 
         self.cursors.get_mut(&path).unwrap().read_byte = pos;
 
-        Ok(ReadResult {
+        Ok(vec![ReadResult {
             progress_start: Self::marker(&path, start, start),
             progress_end: Self::marker(&path, start, pos),
             records,
@@ -125,7 +125,7 @@ impl SourceAdapter for SyslogSpoolSource {
             last_timestamp: None,
             // Spool lines are re-framed with newlines on serialization.
             verbatim: false,
-        })
+        }])
     }
 
     async fn get_progress_marker(&self) -> Result<ProgressMarker, VtopError> {
@@ -198,10 +198,15 @@ mod tests {
             source_name: path.clone(),
             format: TelemetryFormat::Syslog,
         };
-        let r = s
+        let reads = s
             .read_batch_candidates(&src, 1, 1 << 20, Duration::ZERO)
             .await
             .unwrap();
+        // A spool file is a single committable unit, so the Vec is always
+        // length 1; assert it rather than indexing blind, so a regression that
+        // returns 0 or 2 fails here instead of panicking on the index.
+        assert_eq!(reads.len(), 1);
+        let r = &reads[0];
         assert_eq!(r.records.len(), 1);
         if let ProgressMarker::SyslogSpool { spool_id, .. } = &r.progress_end {
             assert!(!spool_id.is_empty());
@@ -209,11 +214,12 @@ mod tests {
             panic!("expected spool marker");
         }
         s.commit_progress(&r.progress_end).await.unwrap();
-        let r2 = s
+        let reads2 = s
             .read_batch_candidates(&src, 10, 1 << 20, Duration::ZERO)
             .await
             .unwrap();
-        assert_eq!(r2.records.len(), 1);
-        assert_eq!(r2.records[0], b"<13>msg two");
+        assert_eq!(reads2.len(), 1);
+        assert_eq!(reads2[0].records.len(), 1);
+        assert_eq!(reads2[0].records[0], b"<13>msg two");
     }
 }

@@ -103,7 +103,7 @@ impl<A: SourceAdapter + 'static> SourceAdapter for FailCommitAdapter<A> {
         max_records: usize,
         max_bytes: usize,
         max_wait: Duration,
-    ) -> Result<ReadResult, VtopError> {
+    ) -> Result<Vec<ReadResult>, VtopError> {
         self.inner
             .read_batch_candidates(source, max_records, max_bytes, max_wait)
             .await
