@@ -8,6 +8,7 @@
 use async_trait::async_trait;
 use std::path::Path;
 use std::process::Stdio;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use vtop_core::checksum::digest_reader;
@@ -174,6 +175,7 @@ pub(crate) async fn verify_command_content(
     expected_size: u64,
     expected: ObjectChecksum<'_>,
     backend: &str,
+    timeout: Duration,
 ) -> Result<VerificationResult, VtopError> {
     let mut child = cmd
         .stdout(Stdio::piped())
@@ -184,28 +186,40 @@ pub(crate) async fn verify_command_content(
         .stdout
         .take()
         .ok_or_else(|| VtopError::Upload(format!("{backend} verification stdout unavailable")))?;
-    let (result, oversized) =
-        match verify_reader_content(stdout, expected_size, expected, backend).await {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                return Err(e);
-            }
-        };
-    if oversized {
-        let _ = child.kill().await;
+    let completed = tokio::time::timeout(timeout, async {
+        let (result, oversized) =
+            verify_reader_content(stdout, expected_size, expected, backend).await?;
+        if oversized {
+            let _ = child.kill().await;
+        }
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| VtopError::Upload(format!("waiting for {backend} verification: {e}")))?;
+        if !status.success() && !oversized {
+            return Err(VtopError::Upload(format!(
+                "{backend} verification command exited with {status}"
+            )));
+        }
+        Ok::<_, VtopError>(result)
+    })
+    .await;
+    match completed {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(error)) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            Err(error)
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            Err(VtopError::Upload(format!(
+                "{backend} verification exceeded the {}s timeout",
+                timeout.as_secs()
+            )))
+        }
     }
-    let status = child
-        .wait()
-        .await
-        .map_err(|e| VtopError::Upload(format!("waiting for {backend} verification: {e}")))?;
-    if !status.success() && !oversized {
-        return Err(VtopError::Upload(format!(
-            "{backend} verification command exited with {status}"
-        )));
-    }
-    Ok(result)
 }
 
 /// Read a small object with a hard in-memory cap.
@@ -235,6 +249,7 @@ pub(crate) async fn read_command_bounded(
     max_bytes: usize,
     object_uri: &str,
     backend: &str,
+    timeout: Duration,
 ) -> Result<Vec<u8>, VtopError> {
     let mut child = cmd
         .stdout(Stdio::piped())
@@ -245,24 +260,36 @@ pub(crate) async fn read_command_bounded(
         .stdout
         .take()
         .ok_or_else(|| VtopError::Upload(format!("{backend} download stdout unavailable")))?;
-    let bytes = match read_bounded(stdout, max_bytes, object_uri).await {
-        Ok(bytes) => bytes,
-        Err(e) => {
+    let completed = tokio::time::timeout(timeout, async {
+        let bytes = read_bounded(stdout, max_bytes, object_uri).await?;
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| VtopError::Upload(format!("waiting for {backend} download: {e}")))?;
+        if !status.success() {
+            return Err(VtopError::Upload(format!(
+                "{backend} download command exited with {status}"
+            )));
+        }
+        Ok::<_, VtopError>(bytes)
+    })
+    .await;
+    match completed {
+        Ok(Ok(bytes)) => Ok(bytes),
+        Ok(Err(error)) => {
             let _ = child.kill().await;
             let _ = child.wait().await;
-            return Err(e);
+            Err(error)
         }
-    };
-    let status = child
-        .wait()
-        .await
-        .map_err(|e| VtopError::Upload(format!("waiting for {backend} download: {e}")))?;
-    if !status.success() {
-        return Err(VtopError::Upload(format!(
-            "{backend} download command exited with {status}"
-        )));
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            Err(VtopError::Upload(format!(
+                "{backend} download exceeded the {}s timeout",
+                timeout.as_secs()
+            )))
+        }
     }
-    Ok(bytes)
 }
 
 /// Pluggable object-storage backend.
@@ -394,5 +421,28 @@ mod tests {
         assert!(!result.passed);
         assert!(oversized);
         assert!(result.message.contains("read 4 stored bytes"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_download_timeout_kills_a_hung_producer() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("exec /bin/sleep 5")
+            .env_clear()
+            .kill_on_drop(true);
+        let started = std::time::Instant::now();
+        let error = read_command_bounded(
+            &mut command,
+            8,
+            "s3://bucket/object",
+            "test",
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("timeout"));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

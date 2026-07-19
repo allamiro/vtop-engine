@@ -97,6 +97,15 @@ upload:
   # permits plaintext (this lab's MinIO). It does NOT disable certificate
   # verification on https endpoints; private CAs go in the system trust store.
   verify_tls: false
+  # Required only for the awscli/s3cmd/minio compatibility backends. PATH is
+  # never searched. The binary is identity-checked with --version at startup;
+  # every invocation has bounded time/output and an otherwise empty environment.
+  # command_binary: /usr/local/bin/aws
+  # command_timeout_seconds: 300
+  # command_max_output_bytes: 1048576
+  # command_env_allowlist:
+  #   - AWS_CONFIG_FILE
+  #   - AWS_SHARED_CREDENTIALS_FILE
   create_bucket: true           # auto-create per-format buckets on first use
   # Default true: VERIFIED requires a digest derived from stored content (or a
   # storage-service-computed digest). Set false only for explicit size-only

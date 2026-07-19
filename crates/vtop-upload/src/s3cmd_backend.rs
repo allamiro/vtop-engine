@@ -8,25 +8,28 @@ use crate::base::{
     read_command_bounded, verify_command_content, ObjectChecksum, ObjectHead, UploadBackend,
     VerificationResult,
 };
+use crate::command::CommandPolicy;
 use async_trait::async_trait;
 use std::path::Path;
 use tokio::process::Command;
 use vtop_core::errors::VtopError;
 
 pub struct S3cmdBackend {
+    command: CommandPolicy,
     /// Optional path to an s3cmd config file (maps to `--config`).
     pub config_file: Option<String>,
 }
 
 impl S3cmdBackend {
-    pub fn new(config_file: Option<String>) -> Self {
+    pub(crate) fn new(command: CommandPolicy, config_file: Option<String>) -> Self {
         Self {
-            config_file: config_file.or_else(|| std::env::var("S3CMD_CONFIG").ok()),
+            command,
+            config_file,
         }
     }
 
     fn base_cmd(&self) -> Command {
-        let mut c = Command::new("s3cmd");
+        let mut c = self.command.command();
         if let Some(cfg) = &self.config_file {
             c.arg("--config").arg(cfg);
         }
@@ -42,7 +45,9 @@ impl UploadBackend for S3cmdBackend {
         object_uri: &str,
         _checksum: Option<ObjectChecksum<'_>>,
     ) -> Result<(), VtopError> {
-        run(self.base_cmd().arg("put").arg(local_path).arg(object_uri)).await
+        let mut command = self.base_cmd();
+        command.arg("put").arg(local_path).arg(object_uri);
+        self.command.run(&mut command, "object upload").await
     }
 
     async fn put_manifest(
@@ -51,20 +56,22 @@ impl UploadBackend for S3cmdBackend {
         manifest_uri: &str,
         _checksum: Option<ObjectChecksum<'_>>,
     ) -> Result<(), VtopError> {
-        run(self.base_cmd().arg("put").arg(local_path).arg(manifest_uri)).await
+        let mut command = self.base_cmd();
+        command.arg("put").arg(local_path).arg(manifest_uri);
+        self.command.run(&mut command, "manifest upload").await
     }
 
     async fn get_object(&self, object_uri: &str) -> Result<Vec<u8>, VtopError> {
         let tmp = tempfile::NamedTempFile::new()
             .map_err(|e| VtopError::Upload(format!("temp file for download: {e}")))?;
         // --force: the temp file already exists (NamedTempFile creates it).
-        run(self
-            .base_cmd()
+        let mut command = self.base_cmd();
+        command
             .arg("get")
             .arg("--force")
             .arg(object_uri)
-            .arg(tmp.path()))
-        .await?;
+            .arg(tmp.path());
+        self.command.run(&mut command, "object download").await?;
         tokio::fs::read(tmp.path())
             .await
             .map_err(|e| VtopError::Upload(format!("reading downloaded {object_uri}: {e}")))
@@ -77,11 +84,20 @@ impl UploadBackend for S3cmdBackend {
     ) -> Result<Vec<u8>, VtopError> {
         let mut cmd = self.base_cmd();
         cmd.arg("get").arg(object_uri).arg("-");
-        read_command_bounded(&mut cmd, max_bytes, object_uri, "s3cmd").await
+        read_command_bounded(
+            &mut cmd,
+            max_bytes,
+            object_uri,
+            "s3cmd",
+            self.command.timeout(),
+        )
+        .await
     }
 
     async fn head_object(&self, object_uri: &str) -> Result<ObjectHead, VtopError> {
-        let out = output(self.base_cmd().arg("info").arg(object_uri)).await?;
+        let mut command = self.base_cmd();
+        command.arg("info").arg(object_uri);
+        let out = self.command.output(&mut command, "object metadata").await?;
         let size = parse_size(&out);
         Ok(ObjectHead {
             uri: object_uri.to_string(),
@@ -111,11 +127,20 @@ impl UploadBackend for S3cmdBackend {
         };
         let mut cmd = self.base_cmd();
         cmd.arg("get").arg(object_uri).arg("-");
-        verify_command_content(&mut cmd, expected_size, expected, "s3cmd").await
+        verify_command_content(
+            &mut cmd,
+            expected_size,
+            expected,
+            "s3cmd",
+            self.command.timeout(),
+        )
+        .await
     }
 
     async fn delete_object(&self, object_uri: &str) -> Result<(), VtopError> {
-        run(self.base_cmd().arg("del").arg(object_uri)).await
+        let mut command = self.base_cmd();
+        command.arg("del").arg(object_uri);
+        self.command.run(&mut command, "object delete").await
     }
 
     fn backend_name(&self) -> &'static str {
@@ -127,32 +152,6 @@ impl UploadBackend for S3cmdBackend {
     fn supports_multipart(&self) -> bool {
         true
     }
-}
-
-async fn run(cmd: &mut Command) -> Result<(), VtopError> {
-    let status = cmd
-        .status()
-        .await
-        .map_err(|e| VtopError::Upload(format!("spawning command failed: {e}")))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(VtopError::Upload(format!("command exited with {status}")))
-    }
-}
-
-async fn output(cmd: &mut Command) -> Result<String, VtopError> {
-    let out = cmd
-        .output()
-        .await
-        .map_err(|e| VtopError::Upload(format!("spawning command failed: {e}")))?;
-    if !out.status.success() {
-        return Err(VtopError::Upload(format!(
-            "command exited with {}",
-            out.status
-        )));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Parse a `File size: <n>` line from `s3cmd info` output.

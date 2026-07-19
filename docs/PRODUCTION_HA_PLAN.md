@@ -629,6 +629,8 @@ once, and **requires validation** under your write rate.
 | `upload.backend` | `s3_native` \| `s3cmd` \| `awscli` \| `minio` \| `localfs` \| `mock` |
 | `upload.bucket` | bucket (supports `telemetry-{format}`) |
 | `upload.endpoint_url` / `region` / `force_path_style` / `verify_tls` | S3 endpoint |
+| `upload.command_binary` / `command_timeout_seconds` / `command_max_output_bytes` | hardened external-tool path and invocation bounds (compatibility backends only) |
+| `upload.command_env_allowlist` | exact runtime environment names copied into an otherwise empty command environment |
 | `upload.create_bucket` | auto-create per-format buckets |
 | `upload.require_strong_verification` | defaults true — false explicitly permits size-only commit |
 | `partitioning.template` | object key layout |

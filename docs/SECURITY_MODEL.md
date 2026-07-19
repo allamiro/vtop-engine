@@ -120,6 +120,14 @@ Additional guidance:
 | `awscli` / `s3cmd` / `minio mc` | Same as above | Strong verification downloads and hashes the stored body. |
 | LocalFS | Filesystem write/read on the object tree only | The object tree directory **SHOULD** have restrictive permissions; the engine **SHOULD NOT** require broader filesystem access. |
 
+Command compatibility backends (`awscli`, `s3cmd`, `minio mc`) **MUST** use an
+explicit absolute executable path; PATH lookup is forbidden. VTOP resolves the
+path and verifies the expected `--version` identity at startup. Each child
+starts with an empty environment plus `LC_ALL=C`; only exact names declared in
+`upload.command_env_allowlist` are copied from the runtime environment.
+Invocations are killed and reaped after `upload.command_timeout_seconds`, and
+captured stdout/stderr is bounded by `upload.command_max_output_bytes`.
+
 ### 5.2 On-demand bucket creation (`CreateBucket`) implications
 
 Per-format buckets (e.g. `telemetry-{format}`) with optional on-demand creation require `CreateBucket` (and possibly bucket-policy) permissions. Granting `CreateBucket`:
@@ -181,7 +189,7 @@ Per-format buckets (e.g. `telemetry-{format}`) with optional on-demand creation 
 - Dependencies **SHOULD** be pinned and audited (e.g., dependency vulnerability scanning).
 - Builds **SHOULD** be reproducible where practical, and release artifacts **SHOULD** be checksummed and **MAY** be signed.
 - A software bill of materials (SBOM) **SHOULD** be produced for releases.
-- Third-party upload backends invoked as external tools (s3cmd, awscli, minio client) **SHOULD** be version-pinned and validated, since they execute outside the Rust dependency graph.
+- Third-party upload backends invoked as external tools (s3cmd, awscli, minio client) **MUST** be selected by absolute path and pass VTOP's startup identity check; operators **SHOULD** additionally pin/package the approved version because it executes outside the Rust dependency graph.
 
 ### Dependency auditing (`cargo audit`)
 

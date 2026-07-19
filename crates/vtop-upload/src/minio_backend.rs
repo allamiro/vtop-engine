@@ -8,19 +8,22 @@ use crate::base::{
     parse_s3_uri, read_command_bounded, verify_command_content, ObjectChecksum, ObjectHead,
     UploadBackend, VerificationResult,
 };
+use crate::command::CommandPolicy;
 use async_trait::async_trait;
 use std::path::Path;
 use tokio::process::Command;
 use vtop_core::errors::VtopError;
 
 pub struct MinioBackend {
+    command: CommandPolicy,
     /// The `mc` alias that points at the target endpoint + credentials.
     pub alias: String,
 }
 
 impl MinioBackend {
-    pub fn new(alias: impl Into<String>) -> Self {
+    pub(crate) fn new(command: CommandPolicy, alias: impl Into<String>) -> Self {
         Self {
+            command,
             alias: alias.into(),
         }
     }
@@ -29,6 +32,10 @@ impl MinioBackend {
     fn mc_target(&self, uri: &str) -> Result<String, VtopError> {
         let (bucket, key) = parse_s3_uri(uri)?;
         Ok(format!("{}/{}/{}", self.alias, bucket, key))
+    }
+
+    fn base_cmd(&self) -> Command {
+        self.command.command()
     }
 }
 
@@ -41,7 +48,9 @@ impl UploadBackend for MinioBackend {
         _checksum: Option<ObjectChecksum<'_>>,
     ) -> Result<(), VtopError> {
         let target = self.mc_target(object_uri)?;
-        run(Command::new("mc").arg("cp").arg(local_path).arg(target)).await
+        let mut command = self.base_cmd();
+        command.arg("cp").arg(local_path).arg(target);
+        self.command.run(&mut command, "object upload").await
     }
 
     async fn put_manifest(
@@ -51,14 +60,18 @@ impl UploadBackend for MinioBackend {
         _checksum: Option<ObjectChecksum<'_>>,
     ) -> Result<(), VtopError> {
         let target = self.mc_target(manifest_uri)?;
-        run(Command::new("mc").arg("cp").arg(local_path).arg(target)).await
+        let mut command = self.base_cmd();
+        command.arg("cp").arg(local_path).arg(target);
+        self.command.run(&mut command, "manifest upload").await
     }
 
     async fn get_object(&self, object_uri: &str) -> Result<Vec<u8>, VtopError> {
         let target = self.mc_target(object_uri)?;
         let tmp = tempfile::NamedTempFile::new()
             .map_err(|e| VtopError::Upload(format!("temp file for download: {e}")))?;
-        run(Command::new("mc").arg("cp").arg(target).arg(tmp.path())).await?;
+        let mut command = self.base_cmd();
+        command.arg("cp").arg(target).arg(tmp.path());
+        self.command.run(&mut command, "object download").await?;
         tokio::fs::read(tmp.path())
             .await
             .map_err(|e| VtopError::Upload(format!("reading downloaded {object_uri}: {e}")))
@@ -70,14 +83,23 @@ impl UploadBackend for MinioBackend {
         max_bytes: usize,
     ) -> Result<Vec<u8>, VtopError> {
         let target = self.mc_target(object_uri)?;
-        let mut cmd = Command::new("mc");
+        let mut cmd = self.base_cmd();
         cmd.arg("cat").arg(target);
-        read_command_bounded(&mut cmd, max_bytes, object_uri, "mc").await
+        read_command_bounded(
+            &mut cmd,
+            max_bytes,
+            object_uri,
+            "mc",
+            self.command.timeout(),
+        )
+        .await
     }
 
     async fn head_object(&self, object_uri: &str) -> Result<ObjectHead, VtopError> {
         let target = self.mc_target(object_uri)?;
-        let out = output(Command::new("mc").arg("stat").arg("--json").arg(target)).await?;
+        let mut command = self.base_cmd();
+        command.arg("stat").arg("--json").arg(target);
+        let out = self.command.output(&mut command, "object metadata").await?;
         let json: serde_json::Value = serde_json::from_str(&out).unwrap_or(serde_json::Value::Null);
         let size = json.get("size").and_then(|v| v.as_u64());
         Ok(ObjectHead {
@@ -110,14 +132,23 @@ impl UploadBackend for MinioBackend {
             };
         };
         let target = self.mc_target(object_uri)?;
-        let mut cmd = Command::new("mc");
+        let mut cmd = self.base_cmd();
         cmd.arg("cat").arg(target);
-        verify_command_content(&mut cmd, expected_size, expected, "mc").await
+        verify_command_content(
+            &mut cmd,
+            expected_size,
+            expected,
+            "mc",
+            self.command.timeout(),
+        )
+        .await
     }
 
     async fn delete_object(&self, object_uri: &str) -> Result<(), VtopError> {
         let target = self.mc_target(object_uri)?;
-        run(Command::new("mc").arg("rm").arg(target)).await
+        let mut command = self.base_cmd();
+        command.arg("rm").arg(target);
+        self.command.run(&mut command, "object delete").await
     }
 
     fn backend_name(&self) -> &'static str {
@@ -129,30 +160,4 @@ impl UploadBackend for MinioBackend {
     fn supports_multipart(&self) -> bool {
         true
     }
-}
-
-async fn run(cmd: &mut Command) -> Result<(), VtopError> {
-    let status = cmd
-        .status()
-        .await
-        .map_err(|e| VtopError::Upload(format!("spawning command failed: {e}")))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(VtopError::Upload(format!("command exited with {status}")))
-    }
-}
-
-async fn output(cmd: &mut Command) -> Result<String, VtopError> {
-    let out = cmd
-        .output()
-        .await
-        .map_err(|e| VtopError::Upload(format!("spawning command failed: {e}")))?;
-    if !out.status.success() {
-        return Err(VtopError::Upload(format!(
-            "command exited with {}",
-            out.status
-        )));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
