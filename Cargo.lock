@@ -3565,6 +3565,7 @@ dependencies = [
  "http-body-util",
  "hyper 1.10.1",
  "hyper-util",
+ "rdkafka",
  "serde",
  "serde_json",
  "serde_yaml",

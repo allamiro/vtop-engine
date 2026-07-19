@@ -36,6 +36,8 @@ async-trait = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Live-broker integration tests create and seed their own topics.
+rdkafka = { workspace = true }
 
 # Integration tests live in the repo-root tests/ directory and are compiled as
 # integration tests of this package.

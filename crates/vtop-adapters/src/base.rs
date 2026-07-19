@@ -40,6 +40,25 @@ impl ReadResult {
     }
 }
 
+/// Result of reading one source during a whole-adapter read pass.
+pub struct SourceReadOutcome {
+    /// Index into the `sources` slice passed to `read_all_batch_candidates`.
+    pub source_index: usize,
+    pub result: Result<Vec<ReadResult>, VtopError>,
+}
+
+/// Everything an adapter read across all its sources in one pass, plus how the
+/// pass's wall-clock divided between reads that produced data, reads that
+/// waited on nothing, and reads that failed. The buckets MUST sum to the time
+/// the pass took: the engine's `read_cycle_profile` reconciles them against the
+/// phase total, and unattributed time is indistinguishable from a hang.
+pub struct AdapterReadReport {
+    pub outcomes: Vec<SourceReadOutcome>,
+    pub productive_ms: u64,
+    pub empty_ms: u64,
+    pub failed_ms: u64,
+}
+
 /// A telemetry source adapter.
 #[async_trait]
 pub trait SourceAdapter: Send + Sync {
@@ -70,6 +89,53 @@ pub trait SourceAdapter: Send + Sync {
         max_bytes: usize,
         max_wait: Duration,
     ) -> Result<Vec<ReadResult>, VtopError>;
+
+    /// Read from EVERY source in one pass. `max_records` / `max_bytes` are
+    /// per-source budgets, exactly as passed to [`Self::read_batch_candidates`].
+    ///
+    /// The default walks the sources serially, paying up to `max_wait` per
+    /// source — correct for adapters whose sources are independent handles
+    /// (file, syslog spool). An adapter whose sources share ONE underlying
+    /// consumer (Kafka: 29 topics, one `BaseConsumer`) must override this to
+    /// multiplex a single wait across all of them: serial per-source polling on
+    /// a shared consumer was measured at 87-92% of the read cycle waiting on
+    /// empty sources (#96).
+    ///
+    /// A returned `Err` means the whole pass failed and NO source progressed
+    /// (per-source failures are reported inside `outcomes`).
+    async fn read_all_batch_candidates(
+        &mut self,
+        sources: &[DiscoveredSource],
+        max_records: usize,
+        max_bytes: usize,
+        max_wait: Duration,
+    ) -> Result<AdapterReadReport, VtopError> {
+        let mut report = AdapterReadReport {
+            outcomes: Vec::with_capacity(sources.len()),
+            productive_ms: 0,
+            empty_ms: 0,
+            failed_ms: 0,
+        };
+        for (source_index, source) in sources.iter().enumerate() {
+            let started = std::time::Instant::now();
+            let result = self
+                .read_batch_candidates(source, max_records, max_bytes, max_wait)
+                .await;
+            let elapsed = started.elapsed().as_millis() as u64;
+            match &result {
+                Err(_) => report.failed_ms += elapsed,
+                Ok(reads) if reads.iter().any(|r| !r.records.is_empty()) => {
+                    report.productive_ms += elapsed
+                }
+                Ok(_) => report.empty_ms += elapsed,
+            }
+            report.outcomes.push(SourceReadOutcome {
+                source_index,
+                result,
+            });
+        }
+        Ok(report)
+    }
 
     /// The current resumable progress marker for the adapter's active source.
     async fn get_progress_marker(&self) -> Result<ProgressMarker, VtopError>;
