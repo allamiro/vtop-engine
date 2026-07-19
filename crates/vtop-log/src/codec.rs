@@ -310,6 +310,37 @@ mod tests {
     use super::*;
     use std::io::{Cursor, Error, ErrorKind};
 
+    fn golden_header() -> SegmentHeader {
+        SegmentHeader::new(
+            SegmentDescriptor {
+                segment_id: uuid::Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap(),
+                topic: "audit.v1".to_owned(),
+                topic_epoch: 3,
+                lineage: crate::RangeLineage::root(
+                    uuid::Uuid::parse_str("ffeeddcc-bbaa-9988-7766-554433221100").unwrap(),
+                ),
+                base_offset: 42,
+            },
+            SegmentConfig {
+                max_record_bytes: 1024,
+                max_group_bytes: 4096,
+                max_segment_bytes: 16_384,
+                max_segment_records: 100,
+                index_stride: 2,
+            },
+        )
+    }
+
+    fn to_hex(bytes: &[u8]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut encoded = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        encoded
+    }
+
     struct FailingReader;
 
     impl Read for FailingReader {
@@ -358,6 +389,133 @@ mod tests {
         assert!(matches!(
             read_frame(&mut invalid, 123, 1024),
             Err(LogError::Corrupt { position: 123, .. })
+        ));
+    }
+
+    #[test]
+    fn v1_segment_header_matches_golden_vector() {
+        let encoded = encode_header(&golden_header()).unwrap();
+        assert_eq!(
+            to_hex(&encoded),
+            concat!(
+                "56544f5053454731000001987b22666f726d6174223a2276746f702d6e61746976652d7365676d656e7422",
+                "2c2276657273696f6e223a312c2264657363726970746f72223a7b227365676d656e745f6964223a223030",
+                "3131323233332d343435352d363637372d383839392d616162626363646465656666222c22746f70696322",
+                "3a2261756469742e7631222c22746f7069635f65706f6368223a332c226c696e65616765223a7b2272616e",
+                "67655f6964223a2266666565646463632d626261612d393938382d373736362d3535343433333232313130",
+                "30222c2267656e65726174696f6e223a302c226b65795f72616e6765223a7b22707265666978223a302c22",
+                "7072656669785f62697473223a307d7d2c22626173655f6f6666736574223a34327d2c22636f6e66696722",
+                "3a7b226d61785f7265636f72645f6279746573223a313032342c226d61785f67726f75705f627974657322",
+                "3a343039362c226d61785f7365676d656e745f6279746573223a31363338342c226d61785f7365676d656e",
+                "745f7265636f726473223a3130302c22696e6465785f737472696465223a327d7d9635f1e071d009753a44",
+                "126f4ea31b10525c890d2f6ee46ed14722fdac29e97a"
+            )
+        );
+    }
+
+    #[test]
+    fn v1_record_frame_matches_golden_vector() {
+        let record = LogRecord {
+            producer_id: uuid::Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap(),
+            sequence: 0x0102_0304_0506_0708,
+            timestamp_millis: -2,
+            key: b"k".to_vec(),
+            value: b"value".to_vec(),
+        };
+        let encoded = encode_record(&record, 9, 1024).unwrap();
+        assert_eq!(
+            to_hex(&encoded),
+            concat!(
+                "56544f505245433100000056000000000000000900112233445566778899aabbccddeeff0102030405060708",
+                "fffffffffffffffe00000001000000056b76616c7565ef3974965bf3cbf7b4b1e10ef15253c40e667430aca",
+                "62a68b9b9162cc67d8627"
+            )
+        );
+    }
+
+    #[test]
+    fn v1_header_rejects_magic_checksum_version_and_oversize_mutations() {
+        let encoded = encode_header(&golden_header()).unwrap();
+
+        let mut bad_magic = encoded.clone();
+        bad_magic[0] ^= 0xff;
+        assert!(matches!(
+            read_header(&mut Cursor::new(bad_magic)),
+            Err(LogError::Corrupt { position: 0, .. })
+        ));
+
+        let mut bad_checksum = encoded;
+        *bad_checksum.last_mut().unwrap() ^= 0xff;
+        assert!(matches!(
+            read_header(&mut Cursor::new(bad_checksum)),
+            Err(LogError::Corrupt { position: 0, .. })
+        ));
+
+        let mut future = golden_header();
+        future.version = FORMAT_VERSION + 1;
+        assert!(matches!(
+            read_header(&mut Cursor::new(encode_header(&future).unwrap())),
+            Err(LogError::UnsupportedVersion(version)) if version == FORMAT_VERSION + 1
+        ));
+
+        let mut oversized = HEADER_MAGIC.to_vec();
+        oversized.extend_from_slice(&(MAX_HEADER_BYTES + 1).to_be_bytes());
+        assert!(matches!(
+            read_header(&mut Cursor::new(oversized)),
+            Err(LogError::Corrupt { position: 8, .. })
+        ));
+    }
+
+    #[test]
+    fn v1_record_rejects_magic_checksum_length_trailing_and_over_limit_mutations() {
+        let record = LogRecord {
+            producer_id: uuid::Uuid::from_u128(9),
+            sequence: 0,
+            timestamp_millis: 1,
+            key: b"key".to_vec(),
+            value: b"value".to_vec(),
+        };
+        let encoded = encode_record(&record, 0, 1024).unwrap();
+
+        let mut bad_magic = encoded.clone();
+        bad_magic[0] ^= 0xff;
+        assert!(matches!(
+            read_frame(&mut Cursor::new(bad_magic), 7, 1024),
+            Err(LogError::Corrupt { position: 7, .. })
+        ));
+
+        let mut bad_checksum = encoded.clone();
+        *bad_checksum.last_mut().unwrap() ^= 0xff;
+        assert!(matches!(
+            read_frame(&mut Cursor::new(bad_checksum), 8, 1024),
+            Err(LogError::Corrupt { position: 8, .. })
+        ));
+
+        let mut bad_length = encoded.clone();
+        bad_length[8..12].copy_from_slice(&((RECORD_FIXED_BODY_LEN - 1) as u32).to_be_bytes());
+        assert!(matches!(
+            read_frame(&mut Cursor::new(bad_length), 9, 1024),
+            Err(LogError::Corrupt { position: 9, .. })
+        ));
+
+        let mut oversized = RECORD_MAGIC.to_vec();
+        oversized.extend_from_slice(&((RECORD_FIXED_BODY_LEN + 1025) as u32).to_be_bytes());
+        assert!(matches!(
+            read_frame(&mut Cursor::new(oversized), 10, 1024),
+            Err(LogError::Corrupt { position: 10, .. })
+        ));
+
+        let mut trailing = encoded;
+        trailing.push(b'X');
+        let mut reader = Cursor::new(trailing);
+        assert!(matches!(
+            read_frame(&mut reader, 11, 1024).unwrap(),
+            FrameRead::Complete(_)
+        ));
+        let trailing_position = reader.position();
+        assert!(matches!(
+            read_frame(&mut reader, trailing_position, 1024),
+            Err(LogError::Corrupt { .. })
         ));
     }
 }

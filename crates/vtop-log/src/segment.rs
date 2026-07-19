@@ -1032,6 +1032,10 @@ fn write_manifest_atomic(path: &Path, manifest: &SegmentManifest) -> VtopLogResu
 }
 
 fn write_commit_boundary_atomic(path: &Path, boundary: CommitBoundary) -> VtopLogResult<()> {
+    write_atomic(path, &encode_commit_boundary(boundary))
+}
+
+fn encode_commit_boundary(boundary: CommitBoundary) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(COMMIT_BOUNDARY_LEN);
     bytes.extend_from_slice(COMMIT_MAGIC);
     bytes.extend_from_slice(&COMMIT_VERSION.to_be_bytes());
@@ -1041,7 +1045,7 @@ fn write_commit_boundary_atomic(path: &Path, boundary: CommitBoundary) -> VtopLo
     let checksum = blake3::hash(&bytes);
     bytes.extend_from_slice(checksum.as_bytes());
     debug_assert_eq!(bytes.len(), COMMIT_BOUNDARY_LEN);
-    write_atomic(path, &bytes)
+    bytes
 }
 
 fn read_commit_boundary(path: &Path) -> VtopLogResult<CommitBoundary> {
@@ -1915,5 +1919,116 @@ mod tests {
         too_small.max_group_bytes =
             u64::from(too_small.max_record_bytes) + crate::types::RECORD_FRAME_OVERHEAD_BYTES;
         too_small.validate().unwrap();
+    }
+
+    #[test]
+    fn v1_commit_boundary_matches_golden_vector() {
+        let encoded = encode_commit_boundary(CommitBoundary {
+            segment_id: Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap(),
+            committed_offset: 43,
+            content_bytes: 97,
+        });
+        assert_eq!(
+            hex(&encoded),
+            concat!(
+                "56544f50434d5431000100112233445566778899aabbccddeeff000000000000002b0000000000000061",
+                "ffcea3ae94b0a0d03671c2444bedf54ac68b306f03a4caeb34789ae36b6a827f"
+            )
+        );
+    }
+
+    #[test]
+    fn v1_manifest_matches_canonical_golden_json() {
+        let manifest = SegmentManifest {
+            format: FORMAT_NAME.to_owned(),
+            version: FORMAT_VERSION,
+            descriptor: descriptor(),
+            record_count: 2,
+            first_offset: Some(40),
+            next_offset: 42,
+            content_bytes: 200,
+            blake3_root: "00".repeat(32),
+            index_stride: 2,
+        };
+        let encoded = canonical_manifest_bytes(&manifest).unwrap();
+        assert_eq!(
+            String::from_utf8(encoded).unwrap(),
+            concat!(
+                "{\"format\":\"vtop-native-segment\",\"version\":1,\"descriptor\":{",
+                "\"segment_id\":\"00000000-0000-0000-0000-000000000001\",",
+                "\"topic\":\"events.v1\",\"topic_epoch\":7,\"lineage\":{",
+                "\"range_id\":\"00000000-0000-0000-0000-000000000002\",",
+                "\"generation\":0,\"key_range\":{\"prefix\":0,\"prefix_bits\":0}},",
+                "\"base_offset\":40},\"record_count\":2,\"first_offset\":40,",
+                "\"next_offset\":42,\"content_bytes\":200,",
+                "\"blake3_root\":\"0000000000000000000000000000000000000000000000000000000000000000\",",
+                "\"index_stride\":2}\n"
+            )
+        );
+    }
+
+    #[test]
+    fn v1_commit_boundary_rejects_magic_version_checksum_and_trailing_bytes() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("marker.commit");
+        let golden = encode_commit_boundary(CommitBoundary {
+            segment_id: Uuid::from_u128(1),
+            committed_offset: 41,
+            content_bytes: 100,
+        });
+
+        for mutation in 0..4 {
+            let mut bytes = golden.clone();
+            match mutation {
+                0 => bytes[0] ^= 0xff,
+                1 => bytes[8..10].copy_from_slice(&(COMMIT_VERSION + 1).to_be_bytes()),
+                2 => *bytes.last_mut().unwrap() ^= 0xff,
+                3 => bytes.push(0),
+                _ => unreachable!(),
+            }
+            fs::write(&path, bytes).unwrap();
+            assert!(matches!(
+                read_commit_boundary(&path),
+                Err(LogError::CommitBoundaryMismatch(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn v1_manifest_rejects_trailing_bytes() {
+        let directory = tempdir().unwrap();
+        let active_path = directory.path().join("trailing-manifest.active");
+        let mut active = ActiveSegment::create(&active_path, descriptor(), config()).unwrap();
+        active
+            .append(
+                record(Uuid::from_u128(29), 0, b"manifest"),
+                Durability::Fsync,
+            )
+            .unwrap();
+        let sealed = active.seal().unwrap();
+        let segment_path = sealed.path.clone();
+        drop(sealed);
+        let paths = SegmentPaths::from_segment(&segment_path).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&paths.manifest)
+            .unwrap()
+            .write_all(b"\n")
+            .unwrap();
+
+        assert!(matches!(
+            SegmentReader::open(&segment_path),
+            Err(LogError::ManifestMismatch(_))
+        ));
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut encoded = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        encoded
     }
 }
