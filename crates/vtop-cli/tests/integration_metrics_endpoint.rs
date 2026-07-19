@@ -284,3 +284,63 @@ async fn serves_metrics_health_and_readiness() {
         "unknown paths must 404"
     );
 }
+
+/// #78: an unauthenticated client must not be able to spawn unbounded work.
+/// Beyond MAX_CONNECTIONS concurrent connections the server closes new ones
+/// immediately, and once capacity frees the endpoint serves again.
+#[tokio::test]
+async fn connection_cap_rejects_excess_and_recovers() {
+    use tokio::io::AsyncReadExt;
+
+    // Serialized: see env_lock().
+    let _g = env_lock().lock().await;
+    std::env::set_var(metrics_server::ADDR_ENV, "127.0.0.1:0");
+    let addr = metrics_server::maybe_start()
+        .await
+        .expect("endpoint must start");
+    std::env::remove_var(metrics_server::ADDR_ENV);
+
+    // Fill every permit with idle connections that send nothing.
+    let mut parked = Vec::new();
+    for _ in 0..metrics_server::MAX_CONNECTIONS {
+        parked.push(
+            tokio::net::TcpStream::connect(addr)
+                .await
+                .expect("parked connect"),
+        );
+    }
+    // Give the accept loop a beat to take the permits.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // The connection over the cap is accepted by the OS but closed by the
+    // server without being served: the read must hit EOF fast, NOT wait out
+    // the 10s connection deadline (which would mean it held a task).
+    let mut over = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("over-cap connect");
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(3), over.read(&mut buf))
+        .await
+        .expect("over-cap connection must be closed promptly, not parked")
+        .expect("read after server close");
+    assert_eq!(n, 0, "server must close the over-cap connection unserved");
+
+    // Free the permits: the endpoint must serve again.
+    drop(parked);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let out = tokio::process::Command::new("curl")
+        .args([
+            "-s",
+            "-w",
+            "\n%{http_code}",
+            &format!("http://{addr}/healthz"),
+        ])
+        .output()
+        .await
+        .expect("curl must run");
+    let body = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        body.trim_end().ends_with("200"),
+        "endpoint must recover once capacity frees: {body}"
+    );
+}
