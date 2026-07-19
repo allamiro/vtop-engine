@@ -1303,6 +1303,39 @@ impl Engine {
         Ok(outcomes)
     }
 
+    /// Whether a batch the ledger calls VERIFIED still checks out against
+    /// storage RIGHT NOW (#69): the object exists, and — when both sides have
+    /// a digest — the store's digest matches the ledger's. When no strong
+    /// comparison is possible, `require_strong_verification` decides whether
+    /// existence alone is acceptable, mirroring the pipeline's own policy.
+    async fn storage_still_verified(&self, rec: &BatchRecord) -> bool {
+        let Some(uri) = rec.object_uri.as_deref() else {
+            // A VERIFIED row without an object URI is corrupt bookkeeping;
+            // never commit source progress on it.
+            return false;
+        };
+        let head = match self.backend.head_object(uri).await {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(uri, error = %e, "recovery re-check: head_object failed");
+                return false;
+            }
+        };
+        if head.size_bytes.is_none() {
+            return false; // gone
+        }
+        match (
+            rec.object_sha256.as_deref(),
+            head.checksum_sha256.as_deref(),
+        ) {
+            (Some(want), Some(got)) if !want.is_empty() => want.eq_ignore_ascii_case(got),
+            // No digest to compare (checksums disabled, or a backend that
+            // cannot return one): existence-only, accepted exactly when the
+            // pipeline itself would accept a backend-limited verification.
+            _ => !self.config.upload.require_strong_verification,
+        }
+    }
+
     /// Recovery scan run at startup. Seeds adapters from committed batches and
     /// resolves incomplete batches without ever advancing source progress for
     /// unverified data.
@@ -1328,7 +1361,41 @@ impl Engine {
             tracing::info!(batch_id = %rec.batch_id, state = %rec.state, ?action, "recovery_scan");
             match action {
                 RecoveryAction::RetrySourceCommit => {
-                    // Verified but not committed — safe to commit now.
+                    // The ledger says VERIFIED, but that was true of STORAGE at
+                    // verification time — an object deleted or replaced while
+                    // the engine was down would still get its source progress
+                    // committed, advancing past data that no longer exists as
+                    // verified (#69). Re-check the store before committing;
+                    // anything less trusts a stale claim about a system this
+                    // process has never observed.
+                    if !self.storage_still_verified(&rec).await {
+                        tracing::warn!(
+                            batch_id = %rec.batch_id,
+                            object_uri = rec.object_uri.as_deref().unwrap_or(""),
+                            "recovery: VERIFIED batch failed storage re-check; replaying instead of committing"
+                        );
+                        let _ = self
+                            .store
+                            .mark_failed(
+                                &rec.batch_id,
+                                "recovery: stale VERIFIED (storage re-check failed)",
+                            )
+                            .await;
+                        self.store
+                            .update_batch_state(
+                                &rec.batch_id,
+                                BatchState::ReplayRequired,
+                                &BatchPatch::default(),
+                            )
+                            .await
+                            .ok();
+                        if let Some(adapter) = self.adapters.get_mut(&rec.source_type) {
+                            let _ = adapter.replay_from_marker(&rec.progress_start).await;
+                        }
+                        summary.replay_required += 1;
+                        continue;
+                    }
+                    // Verified — and just re-verified against storage — commit.
                     if let Some(adapter) = self.adapters.get_mut(&rec.source_type) {
                         match adapter.commit_progress(&rec.progress_end).await {
                             Ok(()) => {
