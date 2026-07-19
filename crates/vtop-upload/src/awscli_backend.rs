@@ -3,7 +3,10 @@
 //! Compatibility mode only. Supports `--endpoint-url` and `AWS_PROFILE`.
 //! Credentials come from the environment / profile and are never printed.
 
-use crate::base::{parse_s3_uri, ObjectChecksum, ObjectHead, UploadBackend, VerificationResult};
+use crate::base::{
+    parse_s3_uri, verify_file_content, ObjectChecksum, ObjectHead, UploadBackend,
+    VerificationResult,
+};
 use async_trait::async_trait;
 use std::path::Path;
 use tokio::process::Command;
@@ -97,11 +100,6 @@ impl UploadBackend for AwsCliBackend {
         .await?;
         let json: serde_json::Value = serde_json::from_str(&out).unwrap_or(serde_json::Value::Null);
         let size = json.get("ContentLength").and_then(|v| v.as_u64());
-        let checksum_sha256 = json
-            .get("Metadata")
-            .and_then(|m| m.get(SHA256_META_KEY))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
         Ok(ObjectHead {
             uri: object_uri.to_string(),
             size_bytes: size,
@@ -109,7 +107,9 @@ impl UploadBackend for AwsCliBackend {
                 .get("ETag")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            checksum_sha256,
+            // vtop-sha256 is uploader-controlled user metadata, not a digest
+            // computed by S3 over the stored body.
+            checksum_sha256: None,
         })
     }
 
@@ -119,33 +119,16 @@ impl UploadBackend for AwsCliBackend {
         expected_size: u64,
         expected: Option<ObjectChecksum<'_>>,
     ) -> Result<VerificationResult, VtopError> {
-        let head = self.head_object(object_uri).await?;
-        match head.size_bytes {
-            Some(sz) if sz != expected_size => {
-                return Ok(VerificationResult::failed(format!(
-                    "size mismatch: expected {expected_size}, got {sz}"
-                )))
-            }
-            None => return Ok(VerificationResult::failed("object size unavailable")),
-            _ => {}
-        }
-        let Some(expected) = expected else {
-            return Ok(VerificationResult::limited(
-                "aws cli: size matches (checksums disabled)",
-            ));
-        };
-        match head.checksum_sha256 {
-            Some(stored) if stored.eq_ignore_ascii_case(expected.hex) => Ok(
-                VerificationResult::passed("aws cli: size + checksum verified"),
-            ),
-            Some(stored) => Ok(VerificationResult::failed(format!(
-                "checksum mismatch: expected {}, stored {stored}",
-                expected.hex
-            ))),
-            None => Ok(VerificationResult::limited(
-                "aws cli: size matches; no checksum metadata returned",
-            )),
-        }
+        let tmp = tempfile::NamedTempFile::new()
+            .map_err(|e| VtopError::Upload(format!("temp file for verification: {e}")))?;
+        run(self
+            .base_cmd()
+            .arg("s3")
+            .arg("cp")
+            .arg(object_uri)
+            .arg(tmp.path()))
+        .await?;
+        verify_file_content(tmp.path(), expected_size, expected, "aws cli").await
     }
 
     async fn delete_object(&self, object_uri: &str) -> Result<(), VtopError> {

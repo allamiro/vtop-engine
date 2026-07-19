@@ -29,7 +29,7 @@ use vtop_core::partitioning::{self, PartitionContext};
 use vtop_core::replay::{next_recovery_action, RecoveryAction};
 use vtop_core::state_machine::BatchState;
 use vtop_core::telemetry;
-use vtop_core::types::{ProgressMarker, SourceType};
+use vtop_core::types::{ChecksumAlgorithm, ProgressMarker, SourceType};
 use vtop_state::{connect_state_store, BatchPatch, BatchRecord, StateStore};
 use vtop_upload::{ObjectChecksum, UploadBackend};
 
@@ -536,8 +536,8 @@ impl<'a> Pipeline<'a> {
         }
         metrics.verify_ms = t.elapsed().as_millis() as u64;
         let backend_limited = obj_v.backend_limited || man_v.backend_limited;
-        // Optional strict mode: refuse to commit on size-only (backend-limited)
-        // verification, so only cryptographically verified objects advance.
+        // Strict by default: refuse to commit on size-only (backend-limited)
+        // verification. `false` is an explicit compatibility/lab opt-out.
         if backend_limited && self.config.upload.require_strong_verification {
             fail!(format!(
                 "strong verification required but backend only confirmed size/existence \
@@ -572,9 +572,8 @@ impl<'a> Pipeline<'a> {
                 .with_label_values(&[l[0], l[1], l[2], BatchState::Verified.as_str()])
                 .inc();
             if backend_limited {
-                // Verified by size/existence only. Committing on this is weaker
-                // than the protocol intends, so it is counted separately rather
-                // than folded into verified_total.
+                // Verified by size/existence under an explicit weak-mode
+                // opt-out, so count it separately from strong verification.
                 mx.verification_backend_limited_total
                     .with_label_values(&l)
                     .inc();
@@ -1344,93 +1343,107 @@ impl Engine {
         Ok(outcomes)
     }
 
-    /// Whether a batch the ledger calls VERIFIED still checks out against
-    /// storage RIGHT NOW (#69): the object exists, and — when both sides have
-    /// a digest — the store's digest matches the ledger's. When no strong
-    /// comparison is possible, `require_strong_verification` decides whether
-    /// existence alone is acceptable, mirroring the pipeline's own policy.
+    /// Whether a batch the ledger calls VERIFIED still checks out against the
+    /// stored bytes RIGHT NOW (#64, #69). Recovery authenticates the downloaded
+    /// manifest, binds it to the ledger, then asks the backend to verify the
+    /// stored object content using the manifest's algorithm. HEAD metadata and
+    /// uploader-written sidecars are never sufficient for a strong result.
     async fn storage_still_verified(&self, rec: &BatchRecord) -> bool {
         let Some(uri) = rec.object_uri.as_deref() else {
             // A VERIFIED row without an object URI is corrupt bookkeeping;
             // never commit source progress on it.
             return false;
         };
-        let head = match self.backend.head_object(uri).await {
-            Ok(h) => h,
+        let Some(muri) = rec.manifest_uri.as_deref() else {
+            // VERIFIED covers both the object and its manifest. A row that
+            // cannot identify the manifest cannot safely advance its source.
+            return false;
+        };
+        let bytes = match self.backend.get_object(muri).await {
+            Ok(bytes) => bytes,
             Err(e) => {
-                tracing::warn!(uri, error = %e, "recovery re-check: head_object failed");
+                tracing::warn!(muri, error = %e, "recovery re-check: manifest download failed");
                 return false;
             }
         };
-        let Some(stored_size) = head.size_bytes else {
-            return false; // gone
-        };
-        // Size must match the recorded upload when we have it (#125): a
-        // same-URI replacement with a different size fails here even when no
-        // digest comparison is possible below.
-        if let Some(want) = rec.object_size_bytes {
-            if want >= 0 && stored_size != want as u64 {
+        let manifest: VtopManifest = match serde_json::from_slice(&bytes) {
+            Ok(manifest) => manifest,
+            Err(e) => {
+                tracing::warn!(muri, error = %e, "recovery re-check: manifest parse failed");
                 return false;
             }
-        }
-        // The manifest is half of what VERIFIED means; a batch whose manifest
-        // vanished is not verified either (#123 review).
-        if let Some(muri) = rec.manifest_uri.as_deref() {
-            match self.backend.head_object(muri).await {
-                Ok(mh) if mh.size_bytes.is_some() => {}
-                Ok(_) => return false,
-                Err(e) => {
-                    tracing::warn!(muri, error = %e, "recovery re-check: manifest head failed");
-                    return false;
-                }
-            }
-            // When authentication is enabled, recovery must inspect the
-            // stored manifest bytes — HEAD metadata cannot prove a MAC. This
-            // intentionally rejects unsigned pre-cutover manifests rather
-            // than silently weakening the newly configured policy.
-            if let Some(key) = self.manifest_mac_key.as_ref() {
-                let bytes = match self.backend.get_object(muri).await {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        tracing::warn!(muri, error = %e, "recovery re-check: manifest download failed");
-                        return false;
-                    }
-                };
-                let manifest: VtopManifest = match serde_json::from_slice(&bytes) {
-                    Ok(manifest) => manifest,
-                    Err(e) => {
-                        tracing::warn!(muri, error = %e, "recovery re-check: manifest parse failed");
-                        return false;
-                    }
-                };
-                if manifest.verify_authentication(Some(key)).is_err()
-                    || manifest.batch_id != rec.batch_id
-                    || manifest.manifest.uri != muri
-                    || manifest.object.uri != uri
-                {
-                    tracing::warn!(
-                        muri,
-                        batch_id = %rec.batch_id,
-                        "recovery re-check: manifest authentication or ledger binding failed"
-                    );
-                    return false;
-                }
-            }
-        } else if self.manifest_mac_key.is_some() {
-            // A keyed policy cannot authenticate a manifest the ledger does
-            // not identify.
+        };
+
+        if manifest
+            .verify_authentication(self.manifest_mac_key.as_ref())
+            .is_err()
+            || manifest.batch_id != rec.batch_id
+            || manifest.manifest.uri != muri
+            || manifest.object.uri != uri
+        {
+            tracing::warn!(
+                muri,
+                batch_id = %rec.batch_id,
+                "recovery re-check: manifest authentication or ledger binding failed"
+            );
             return false;
         }
-        match (
-            rec.object_sha256.as_deref(),
-            head.checksum_sha256.as_deref(),
-        ) {
-            (Some(want), Some(got)) if !want.is_empty() => want.eq_ignore_ascii_case(got),
-            // No digest to compare (checksums disabled, or a backend that
-            // cannot return one): existence-only, accepted exactly when the
-            // pipeline itself would accept a backend-limited verification.
-            _ => !self.config.upload.require_strong_verification,
+
+        // Bind the manifest back to the durable ledger before trusting it as
+        // recovery input. The column retains its historical object_sha256 name
+        // but may contain a BLAKE3 digest.
+        if rec
+            .object_size_bytes
+            .is_some_and(|want| want < 0 || want as u64 != manifest.object.size_bytes)
+            || rec.object_sha256.as_deref().is_some_and(|want| {
+                !want.is_empty() && !want.eq_ignore_ascii_case(&manifest.object.checksum)
+            })
+        {
+            tracing::warn!(
+                batch_id = %rec.batch_id,
+                "recovery re-check: manifest and ledger object metadata disagree"
+            );
+            return false;
         }
+
+        let algo = match manifest
+            .object
+            .checksum_algorithm
+            .parse::<ChecksumAlgorithm>()
+        {
+            Ok(algo) => algo,
+            Err(e) => {
+                tracing::warn!(batch_id = %rec.batch_id, error = %e, "recovery re-check: unsupported checksum");
+                return false;
+            }
+        };
+        let expected = if algo.is_enabled() {
+            if manifest.object.checksum.is_empty() {
+                return false;
+            }
+            Some(ObjectChecksum::new(
+                algo.as_str(),
+                &manifest.object.checksum,
+            ))
+        } else {
+            None
+        };
+        let result = match self
+            .backend
+            .verify_object(uri, manifest.object.size_bytes, expected)
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::warn!(uri, error = %e, "recovery re-check: content verification failed");
+                return false;
+            }
+        };
+        if !result.passed {
+            tracing::warn!(uri, reason = %result.message, "recovery re-check: stored content mismatch");
+            return false;
+        }
+        !result.backend_limited || !self.config.upload.require_strong_verification
     }
 
     /// Recovery scan run at startup. Seeds adapters from committed batches and

@@ -10,7 +10,54 @@ use crate::errors::VtopError;
 use crate::types::ChecksumAlgorithm;
 use sha2::{Digest, Sha256};
 use std::path::Path;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
+
+/// Hash an asynchronous byte stream in bounded chunks and return both its
+/// lowercase-hex digest and the number of bytes actually read.
+///
+/// Storage backends use this for read-back verification. Counting the stream
+/// itself avoids treating a prior HEAD/stat as proof about bytes that may have
+/// changed before the read began.
+pub async fn digest_reader<R>(
+    algo: ChecksumAlgorithm,
+    mut reader: R,
+) -> Result<Option<(String, u64)>, VtopError>
+where
+    R: AsyncRead + Unpin,
+{
+    enum Hasher {
+        Sha256(Sha256),
+        Blake3(Box<blake3::Hasher>),
+    }
+
+    let mut hasher = match algo {
+        ChecksumAlgorithm::Sha256 => Hasher::Sha256(Sha256::new()),
+        ChecksumAlgorithm::Blake3 => Hasher::Blake3(Box::new(blake3::Hasher::new())),
+        ChecksumAlgorithm::None => return Ok(None),
+    };
+    let mut total = 0u64;
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        total = total.checked_add(n as u64).ok_or_else(|| {
+            VtopError::Other("content length overflow while computing checksum".into())
+        })?;
+        match &mut hasher {
+            Hasher::Sha256(h) => h.update(&buf[..n]),
+            Hasher::Blake3(h) => {
+                h.update(&buf[..n]);
+            }
+        }
+    }
+    let hex = match hasher {
+        Hasher::Sha256(h) => hex::encode(h.finalize()),
+        Hasher::Blake3(h) => h.finalize().to_hex().to_string(),
+    };
+    Ok(Some((hex, total)))
+}
 
 /// Compute the lowercase hex SHA-256 of an in-memory byte slice.
 pub fn sha256_bytes(data: &[u8]) -> String {
@@ -45,11 +92,8 @@ pub async fn digest_file(
     algo: ChecksumAlgorithm,
     path: &Path,
 ) -> Result<Option<String>, VtopError> {
-    Ok(match algo {
-        ChecksumAlgorithm::Sha256 => Some(sha256_file(path).await?),
-        ChecksumAlgorithm::Blake3 => Some(blake3_file(path).await?),
-        ChecksumAlgorithm::None => None,
-    })
+    let file = tokio::fs::File::open(path).await?;
+    Ok(digest_reader(algo, file).await?.map(|(hex, _)| hex))
 }
 
 /// Compute an in-memory digest with the requested algorithm.
@@ -152,6 +196,20 @@ mod tests {
         );
         assert_eq!(digest_file(None, f.path()).await.unwrap(), Option::None);
         assert_eq!(digest_bytes(None, b"x"), Option::None);
+    }
+
+    #[tokio::test]
+    async fn digest_reader_counts_the_hashed_bytes() {
+        use crate::types::ChecksumAlgorithm::*;
+        let data = b"streamed content";
+        let (sha, size) = digest_reader(Sha256, &data[..]).await.unwrap().unwrap();
+        assert_eq!(sha, sha256_bytes(data));
+        assert_eq!(size, data.len() as u64);
+
+        let (b3, size) = digest_reader(Blake3, &data[..]).await.unwrap().unwrap();
+        assert_eq!(b3, blake3_bytes(data));
+        assert_eq!(size, data.len() as u64);
+        assert!(digest_reader(None, &data[..]).await.unwrap().is_none());
     }
 
     #[tokio::test]

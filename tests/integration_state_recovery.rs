@@ -6,12 +6,53 @@
 //! and commits it — never advancing source progress for unverified batches.
 
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use vtop_cli::testkit::file_config;
 use vtop_cli::Engine;
 use vtop_core::config::StreamsConfig;
+use vtop_core::manifest::{ManifestBuilder, VtopManifest};
 use vtop_core::state_machine::BatchState;
-use vtop_core::types::SourceType;
+use vtop_core::types::{CompressionType, ProgressMarker, SourceType, TelemetryFormat};
 use vtop_state::{BatchPatch, BatchRecord, SqliteStateStore, StateStore};
+
+#[allow(clippy::too_many_arguments)]
+fn write_recovery_manifest(
+    work_dir: &Path,
+    batch_id: &str,
+    source_name: &str,
+    progress: ProgressMarker,
+    object_uri: &str,
+    manifest_uri: &str,
+    object_size: u64,
+    checksum_algorithm: &str,
+    checksum: &str,
+) -> (VtopManifest, PathBuf) {
+    let manifest = ManifestBuilder {
+        batch_id: batch_id.into(),
+        tenant: "default".into(),
+        source_type: SourceType::File,
+        source_name: source_name.into(),
+        format: TelemetryFormat::Raw,
+        compression: CompressionType::None,
+        record_count: 1,
+        first_timestamp: None,
+        last_timestamp: None,
+        source_progress: progress,
+        object_uri: object_uri.into(),
+        object_size,
+        object_checksum_algorithm: checksum_algorithm.into(),
+        object_checksum: checksum.into(),
+        manifest_uri: manifest_uri.into(),
+        path_template: "test".into(),
+        resolved_prefix: "x".into(),
+        upload_backend: "mock".into(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+    }
+    .build()
+    .unwrap();
+    let path = manifest.write_to_file(work_dir).unwrap();
+    (manifest, path)
+}
 
 #[tokio::test]
 async fn state_persists_across_reopen() {
@@ -101,6 +142,21 @@ async fn recovery_commits_verified_but_uncommitted_batch() {
         file_size: 28,
         mtime: String::new(),
     };
+    let object_uri = "s3://telemetry-data/x/b-verified.raw.gz";
+    let manifest_uri = "s3://telemetry-data/x/b-verified.manifest.json";
+    let object_bytes = b"archived-bytes";
+    let object_digest = vtop_core::checksum::sha256_bytes(object_bytes);
+    let (manifest, manifest_path) = write_recovery_manifest(
+        &work,
+        "b-verified",
+        &input.to_string_lossy(),
+        marker.clone(),
+        object_uri,
+        manifest_uri,
+        object_bytes.len() as u64,
+        "sha256",
+        &object_digest,
+    );
     let now = chrono::Utc::now().to_rfc3339();
     let rec = BatchRecord {
         batch_id: "b-verified".into(),
@@ -111,11 +167,11 @@ async fn recovery_commits_verified_but_uncommitted_batch() {
         state: BatchState::Batching,
         progress_start: marker.clone(),
         progress_end: marker,
-        object_uri: Some("s3://telemetry-data/x/b-verified.raw.gz".into()),
-        manifest_uri: Some("s3://telemetry-data/x/b-verified.manifest.json".into()),
-        object_sha256: Some("deadbeef".into()),
-        manifest_sha256: Some("feedface".into()),
-        object_size_bytes: None,
+        object_uri: Some(object_uri.into()),
+        manifest_uri: Some(manifest_uri.into()),
+        object_sha256: Some(object_digest.clone()),
+        manifest_sha256: Some(manifest.manifest.sha256.clone()),
+        object_size_bytes: Some(object_bytes.len() as i64),
         record_count: Some(4),
         error_message: None,
         owner: None,
@@ -156,13 +212,13 @@ async fn recovery_commits_verified_but_uncommitted_batch() {
     // ledger points at must actually EXIST in the backend with the recorded
     // digest — exactly what a real crash-restart would find.
     let staged = dir.path().join("staged-object");
-    std::fs::write(&staged, b"archived-bytes").unwrap();
+    std::fs::write(&staged, object_bytes).unwrap();
     engine
         .backend
         .put_object(
             &staged,
-            "s3://telemetry-data/x/b-verified.raw.gz",
-            Some(vtop_upload::ObjectChecksum::new("sha256", "deadbeef")),
+            object_uri,
+            Some(vtop_upload::ObjectChecksum::new("sha256", &object_digest)),
         )
         .await
         .unwrap();
@@ -170,9 +226,12 @@ async fn recovery_commits_verified_but_uncommitted_batch() {
     engine
         .backend
         .put_manifest(
-            &staged,
-            "s3://telemetry-data/x/b-verified.manifest.json",
-            Some(vtop_upload::ObjectChecksum::new("sha256", "feedface")),
+            &manifest_path,
+            manifest_uri,
+            Some(vtop_upload::ObjectChecksum::new(
+                "sha256",
+                &manifest.manifest.sha256,
+            )),
         )
         .await
         .unwrap();
@@ -182,6 +241,122 @@ async fn recovery_commits_verified_but_uncommitted_batch() {
 
     let got = engine.store.get_batch("b-verified").await.unwrap().unwrap();
     assert_eq!(got.state, BatchState::SourceCommitted);
+}
+
+/// #64: recovery must hash the stored body, not accept the checksum value that
+/// accompanied the upload. This simulates a same-size object replacement while
+/// the manifest, ledger, and uploader metadata all retain the original digest.
+#[tokio::test]
+async fn recovery_rejects_same_size_replacement_with_matching_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work-content-recovery");
+    let input = dir.path().join("content-recovery.log");
+    std::fs::write(&input, b"line-0\n").unwrap();
+    let db = dir.path().join("content-recovery.db");
+    let url = format!("sqlite://{}", db.display());
+    let batch_id = "b-content-replaced";
+    let object_uri = "s3://telemetry-data/x/b-content-replaced.raw.gz";
+    let manifest_uri = "s3://telemetry-data/x/b-content-replaced.manifest.json";
+    let expected_bytes = b"payload-A";
+    let replacement_bytes = b"payload-B";
+    assert_eq!(expected_bytes.len(), replacement_bytes.len());
+    let expected_digest = vtop_core::checksum::sha256_bytes(expected_bytes);
+    let marker = ProgressMarker::File {
+        path: input.to_string_lossy().into_owned(),
+        inode: None,
+        start_byte: 0,
+        end_byte: 7,
+        file_size: 7,
+        mtime: String::new(),
+    };
+    let (manifest, manifest_path) = write_recovery_manifest(
+        &work,
+        batch_id,
+        &input.to_string_lossy(),
+        marker.clone(),
+        object_uri,
+        manifest_uri,
+        expected_bytes.len() as u64,
+        "sha256",
+        &expected_digest,
+    );
+    let now = chrono::Utc::now().to_rfc3339();
+    let rec = BatchRecord {
+        batch_id: batch_id.into(),
+        tenant: "default".into(),
+        source_type: SourceType::File,
+        source_name: input.to_string_lossy().into_owned(),
+        format: TelemetryFormat::Raw,
+        state: BatchState::Batching,
+        progress_start: marker.clone(),
+        progress_end: marker,
+        object_uri: Some(object_uri.into()),
+        manifest_uri: Some(manifest_uri.into()),
+        object_sha256: Some(expected_digest.clone()),
+        manifest_sha256: Some(manifest.manifest.sha256.clone()),
+        object_size_bytes: Some(expected_bytes.len() as i64),
+        record_count: Some(1),
+        error_message: None,
+        owner: None,
+        lease_expires_at: None,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    let store = SqliteStateStore::connect(&url).await.unwrap();
+    store.save_batch_state(&rec).await.unwrap();
+    for state in [
+        BatchState::Sealed,
+        BatchState::Compressed,
+        BatchState::Checksummed,
+        BatchState::ObjectUploaded,
+        BatchState::ManifestUploaded,
+        BatchState::Verified,
+    ] {
+        store
+            .update_batch_state(batch_id, state, &BatchPatch::default())
+            .await
+            .unwrap();
+    }
+    drop(store);
+
+    let cfg = file_config(
+        work.to_str().unwrap(),
+        &url,
+        vec![input.to_string_lossy().into_owned()],
+        "mock",
+    );
+    let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+        .await
+        .unwrap();
+    let staged = dir.path().join("replacement-object");
+    std::fs::write(&staged, replacement_bytes).unwrap();
+    engine
+        .backend
+        .put_object(
+            &staged,
+            object_uri,
+            Some(vtop_upload::ObjectChecksum::new("sha256", &expected_digest)),
+        )
+        .await
+        .unwrap();
+    engine
+        .backend
+        .put_manifest(
+            &manifest_path,
+            manifest_uri,
+            Some(vtop_upload::ObjectChecksum::new(
+                "sha256",
+                &manifest.manifest.sha256,
+            )),
+        )
+        .await
+        .unwrap();
+
+    let summary = engine.recover().await.unwrap();
+    assert_eq!(summary.committed, 0);
+    assert_eq!(summary.replay_required, 1);
+    let got = engine.store.get_batch(batch_id).await.unwrap().unwrap();
+    assert_eq!(got.state, BatchState::ReplayRequired);
 }
 
 /// #69: a VERIFIED ledger row whose object is GONE (deleted/modified while the
@@ -425,6 +600,19 @@ async fn recovery_size_check_rejects_replaced_object_without_checksums() {
         file_size: 7,
         mtime: String::new(),
     };
+    let object_uri = "s3://telemetry-data/x/b-size.raw.gz";
+    let manifest_uri = "s3://telemetry-data/x/b-size.manifest.json";
+    let (manifest, manifest_path) = write_recovery_manifest(
+        &work,
+        "b-size",
+        &input.to_string_lossy(),
+        marker.clone(),
+        object_uri,
+        manifest_uri,
+        100,
+        "none",
+        "",
+    );
     let now = chrono::Utc::now().to_rfc3339();
     let mut rec = BatchRecord {
         batch_id: "b-size".into(),
@@ -435,11 +623,11 @@ async fn recovery_size_check_rejects_replaced_object_without_checksums() {
         state: BatchState::Batching,
         progress_start: marker.clone(),
         progress_end: marker,
-        object_uri: Some("s3://telemetry-data/x/b-size.raw.gz".into()),
-        manifest_uri: Some("s3://telemetry-data/x/b-size.manifest.json".into()),
+        object_uri: Some(object_uri.into()),
+        manifest_uri: Some(manifest_uri.into()),
         // Checksums disabled: the ledger recorded an empty digest…
         object_sha256: Some(String::new()),
-        manifest_sha256: Some(String::new()),
+        manifest_sha256: Some(manifest.manifest.sha256.clone()),
         // …but it DID record the uploaded size.
         object_size_bytes: Some(100),
         record_count: Some(1),
@@ -482,12 +670,12 @@ async fn recovery_size_check_rejects_replaced_object_without_checksums() {
     std::fs::write(&staged, b"replaced-bytes").unwrap();
     engine
         .backend
-        .put_object(&staged, "s3://telemetry-data/x/b-size.raw.gz", None)
+        .put_object(&staged, object_uri, None)
         .await
         .unwrap();
     engine
         .backend
-        .put_manifest(&staged, "s3://telemetry-data/x/b-size.manifest.json", None)
+        .put_manifest(&manifest_path, manifest_uri, None)
         .await
         .unwrap();
 
@@ -500,8 +688,22 @@ async fn recovery_size_check_rejects_replaced_object_without_checksums() {
     // above was the SIZE gate.
     rec.batch_id = "b-size-ok".into();
     rec.object_size_bytes = Some(14);
-    rec.object_uri = Some("s3://telemetry-data/x/b-size-ok.raw.gz".into());
-    rec.manifest_uri = Some("s3://telemetry-data/x/b-size-ok.manifest.json".into());
+    let object_uri_ok = "s3://telemetry-data/x/b-size-ok.raw.gz";
+    let manifest_uri_ok = "s3://telemetry-data/x/b-size-ok.manifest.json";
+    let (manifest_ok, manifest_path_ok) = write_recovery_manifest(
+        &work,
+        "b-size-ok",
+        &input.to_string_lossy(),
+        rec.progress_end.clone(),
+        object_uri_ok,
+        manifest_uri_ok,
+        14,
+        "none",
+        "",
+    );
+    rec.object_uri = Some(object_uri_ok.into());
+    rec.manifest_uri = Some(manifest_uri_ok.into());
+    rec.manifest_sha256 = Some(manifest_ok.manifest.sha256.clone());
     engine.store.save_batch_state(&rec).await.unwrap();
     for st in [
         BatchState::Sealed,
@@ -519,16 +721,12 @@ async fn recovery_size_check_rejects_replaced_object_without_checksums() {
     }
     engine
         .backend
-        .put_object(&staged, "s3://telemetry-data/x/b-size-ok.raw.gz", None)
+        .put_object(&staged, object_uri_ok, None)
         .await
         .unwrap();
     engine
         .backend
-        .put_manifest(
-            &staged,
-            "s3://telemetry-data/x/b-size-ok.manifest.json",
-            None,
-        )
+        .put_manifest(&manifest_path_ok, manifest_uri_ok, None)
         .await
         .unwrap();
     let summary = engine.recover().await.unwrap();

@@ -135,8 +135,8 @@ The whole invariant hinges on `VERIFIED`, so it must be unambiguous.
 1. the **object exists** in object storage;
 2. the **manifest exists** in object storage;
 3. the **object size matches** the manifest's recorded size;
-4. the object **checksum** (SHA-256 or BLAKE3) recomputed/served **matches the
-   manifest checksum** (strong check, when available / required);
+4. the object **checksum** (SHA-256 or BLAKE3), derived from stored bytes or
+   computed by the storage service, **matches the manifest checksum**;
 5. the **state store has persisted** `object_key`, `manifest_key`, checksum,
    checksum algorithm, compression type, source range, and `batch_id` **before**
    the VERIFIED transition;
@@ -145,10 +145,11 @@ The whole invariant hinges on `VERIFIED`, so it must be unambiguous.
 7. **verification failure prevents source commit** — the batch never advances to
    SOURCE_COMMITTED.
 
-**Verification strength (current code):** the engine supports **strong** (checksum)
-and **backend-limited** (size / existence only) verification.
-`upload.require_strong_verification: true` **rejects** a backend-limited result
-instead of committing. **Production must set this to `true`.**
+**Verification strength (current code):** the engine supports **strong**
+(stored-content/service-computed checksum) and **backend-limited** (size /
+existence only) verification. Strong verification defaults on.
+`upload.require_strong_verification: false` is an explicit compatibility/lab
+opt-out that allows a backend-limited result to commit.
 
 **ETag caveat:** S3 multipart ETags are **not** reliable MD5 checksums. The
 authoritative integrity value is VTOP's own **SHA-256/BLAKE3 manifest checksum**,
@@ -625,7 +626,7 @@ once, and **requires validation** under your write rate.
 | `upload.bucket` | bucket (supports `telemetry-{format}`) |
 | `upload.endpoint_url` / `region` / `force_path_style` / `verify_tls` | S3 endpoint |
 | `upload.create_bucket` | auto-create per-format buckets |
-| `upload.require_strong_verification` | **set true in prod** — refuse size-only commit |
+| `upload.require_strong_verification` | defaults true — false explicitly permits size-only commit |
 | `partitioning.template` | object key layout |
 
 ### 14.2 Current environment variables — implemented
@@ -786,7 +787,7 @@ Short procedures now; expand into a full ops runbook before go-live (Phase 8/10)
 ## 22. Production-readiness checklist
 ```text
 Correctness & invariant
-  [ ] require_strong_verification: true
+  [ ] require_strong_verification remains true
   [ ] deterministic or content-addressed object keys enabled
   [ ] Object Lock behavior tested (retry never overwrites a locked object)
   [ ] crash before VERIFIED → replay; crash after VERIFIED/before COMMIT → safe
@@ -854,8 +855,8 @@ Resilience / DR
   **deterministic keys (Phase 4)** for idempotency + Object Lock safety.
   (b) file/syslog cursors live **only in the state store** → **migrate/drain** on
   backend switch (Kafka is broker-side and safe).
-- **VERIFIED is defined precisely (§3); set `require_strong_verification: true` in
-  prod.**
+- **VERIFIED is defined precisely (§3); strong content-derived verification is
+  the default and production must not opt out.**
 - **Kafka consumer groups + k8s + Prometheus** deliver HA for the Kafka path with
   minimal new infrastructure (fleet mode is **[PROPOSED]**, Phase 5).
 - **Correctness and backend portability are fully Docker-Compose-testable on one

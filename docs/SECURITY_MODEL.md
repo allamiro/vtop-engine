@@ -51,7 +51,7 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are used as normat
 |----------|---------|
 | Source ↔ engine | Transport security (TLS/SASL/mTLS); engine owns commit, source never self-commits. |
 | Engine ↔ object storage | TLS; integrity verification of stored object + manifest; least-privilege credentials. |
-| Engine ↔ external CLI backends | Version-pinned tools executing outside the Rust dependency graph; backend-limited verification flagged. |
+| Engine ↔ external CLI backends | Version-pinned tools executing outside the Rust dependency graph; stored objects are downloaded and hashed. |
 | Engine ↔ operator/logs | Secret redaction; manifests carry no secrets. |
 | Build ↔ runtime | Supply-chain auditing; container hardening. |
 
@@ -104,8 +104,8 @@ Additional guidance:
 
 | Backend | Minimum permissions | Notes |
 |---------|---------------------|-------|
-| `s3_native` / `awscli` | `PutObject`, `GetObject`/`HeadObject` (verify), `ListBucket` within prefix | Strong checksum verification needs read-back. |
-| `s3cmd` / `minio mc` | Same as above | Verification is backend-limited (size/existence). |
+| `s3_native` | `PutObject`, `GetObject`/`HeadObject` (verify), `ListBucket` within prefix | SHA-256 uses a service-computed checksum; BLAKE3 requires read-back. |
+| `awscli` / `s3cmd` / `minio mc` | Same as above | Strong verification downloads and hashes the stored body. |
 | LocalFS | Filesystem write/read on the object tree only | The object tree directory **SHOULD** have restrictive permissions; the engine **SHOULD NOT** require broader filesystem access. |
 
 ### 5.2 On-demand bucket creation (`CreateBucket`) implications
@@ -121,10 +121,11 @@ Per-format buckets (e.g. `telemetry-{format}`) with optional on-demand creation 
 - The engine **MUST** compute a content checksum (SHA-256 or BLAKE3; or size-only when checksums are explicitly disabled) over the compressed telemetry object.
 - The engine **MUST** verify the durably stored object against the manifest before transitioning to `VERIFIED`.
 - The engine **MUST** verify the stored manifest before committing source progress.
+- Strong verification **MUST** be derived from stored content or a checksum the storage service computed over that content. Engine-written sidecars, ETags, and user metadata **MUST NOT** be classified as strong.
 - A source progress marker **MUST NOT** be committed unless both object and manifest verification succeed (see the protocol commit rule).
 - The manifest binds the object hash to the covered source progress markers. Its unkeyed **self-hash** is reproducible corruption detection, not authenticity: a writer who can replace the document can recompute it.
 - When `manifest_mac_key_env` is configured, the stored manifest **MUST** carry a valid keyed BLAKE3 `manifest.mac`; missing or invalid MACs fail pipeline, CLI, and recovery verification.
-- Where the backend can only confirm size/existence, verification is **backend-limited** and the engine **MUST** report it as such rather than as cryptographic verification.
+- Where only size/existence can be confirmed, verification is **backend-limited** and the engine **MUST** report it as such rather than as cryptographic verification. The engine defaults to rejecting this result; accepting it requires the explicit `require_strong_verification: false` compatibility opt-out.
 - A keyed MAC authenticates data among key holders but does not provide public verification or non-repudiation.
 
 ## 7. Data at rest and object immutability
@@ -197,7 +198,7 @@ the ignore list and the build re-audited.
 | Chain of custody (object ↔ source markers) | Yes | Manifest binds object hash to covered markers. |
 | Replay safety / no premature commit | Yes | Enforced in state machine, state store, and pipeline. |
 | Transport confidentiality | Configurable | Via TLS/SASL/mTLS; not implemented in core. |
-| Backend-limited verification disclosure | Yes | `s3cmd`/`mc` flagged as size/existence-only. |
+| Backend-limited verification disclosure | Yes | Size-only mode is labeled and rejected by default. |
 | Data-at-rest encryption | Not by VTOP | Delegated to storage layer (SSE/bucket default). |
 | Object immutability (WORM) | Not yet | Designed; relies on backend object lock (future). |
 | Public-key manifest signing / MAC rotation | Not yet | One shared MAC key is supported. |

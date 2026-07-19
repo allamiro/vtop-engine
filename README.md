@@ -592,14 +592,16 @@ VTOP supports multiple upload backends.
 
 | Backend | Purpose | Verification level |
 |---|---|---|
-| native S3 | primary S3-compatible backend | object checksum verification |
-| AWS CLI | command-based backend | checksum verification where supported |
-| s3cmd | command-based backend | size and existence verification |
-| MinIO client | command-based backend | size and existence verification |
-| mock | tests and local integration flow | in-memory verification |
+| native S3 | primary S3-compatible backend | service-computed SHA-256 or streamed BLAKE3 |
+| AWS CLI | command-based backend | downloads and hashes stored content |
+| s3cmd | command-based backend | downloads and hashes stored content |
+| MinIO client | command-based backend | downloads and hashes stored content |
+| LocalFS | local/air-gapped backend | streams stored files through the configured digest |
+| mock | tests and local integration flow | hashes stored in-memory content |
 
 > [!IMPORTANT]
-> The safest verification profile is the native backend with checksum verification.
+> Strong verification is the default. A sidecar, ETag, or uploader-written user
+> metadata is never accepted as proof of stored content.
 
 ---
 
@@ -652,15 +654,15 @@ VTOP is currently a prototype. The following limits are known and intentional.
 | Large objects | native S3 backend uses single-part `put_object` | add multipart upload |
 | Large records / whole files | a whole-file record and an over-budget line are read fully into memory (soft `max_bytes`); a warning is logged | add bounded reads + streaming compression/upload |
 | Partial upload recovery | replays from source instead of resuming half-written local objects | add resumable local staging |
-| Command backend verification | `s3cmd` and `mc` verify size and existence only | prefer native checksum verification |
+| Command backend verification cost | `aws`, `s3cmd`, and `mc` download each stored object to hash it | prefer native S3 SHA-256 when read-back bandwidth is costly |
 | Syslog timestamps | `received_time_*` is not yet extracted into the spool marker | add timestamp extraction |
 | Manifest integrity | self-hash plus optional keyed-BLAKE3 authentication; key rotation not implemented | add multi-key rotation and public-key signatures if required |
 | Object immutability | S3 Object Lock is designed but not implemented | add Object Lock profile |
 | Metrics export | **Prometheus `/metrics` implemented** (opt-in via `VTOP_METRICS_ADDR`); OpenTelemetry trace export not yet | add OTLP span export |
 | Kafka integration test | requires live broker and is ignored by default | add optional CI service profile |
 | Binary / pre-compressed inputs | **supported** via the file source `whole_file` mode (archived verbatim, byte-exact) | streaming for very large files |
-| Local filesystem backend | **available** (`backend: localfs`, objects under `local_path/<bucket>/<key>` with a checksum sidecar) | — |
-| Checksums | **SHA-256 and BLAKE3**, or disabled (size-only); `require_strong_verification` rejects backend-limited results | — |
+| Local filesystem backend | **available** (`backend: localfs`, objects under `local_path/<bucket>/<key>`; sidecars are inventory hints only) | — |
+| Checksums | **SHA-256 and BLAKE3**, or disabled (size-only); strong verification defaults on and `require_strong_verification: false` is an explicit weak-mode opt-out | — |
 
 ---
 

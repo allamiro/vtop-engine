@@ -560,7 +560,7 @@
     {
       "type": "timeseries",
       "title": "Verification strength",
-      "description": "Backend-limited means verified by SIZE/EXISTENCE only, with no checksum - a weaker guarantee than the protocol intends. In production set upload.require_strong_verification: true so these are refused rather than committed.",
+      "description": "Backend-limited means verified by SIZE/EXISTENCE only, with no checksum. The default policy refuses this; any non-zero rate means require_strong_verification: false was explicitly configured.",
       "datasource": {
         "type": "prometheus",
         "uid": "mimir"

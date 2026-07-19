@@ -99,7 +99,7 @@
     {
       "type": "stat",
       "title": "Backend-limited verifications (1h)",
-      "description": "Verified by SIZE ONLY, not checksum \u2014 the backend could not do better. Committing on this is weaker than the protocol intends. Set upload.require_strong_verification: true in production to refuse it.",
+      "description": "Verified by SIZE ONLY, not checksum. The default policy refuses this result; any non-zero value means an explicit require_strong_verification: false compatibility/lab opt-out is active.",
       "datasource": {
         "type": "prometheus",
         "uid": "mimir"

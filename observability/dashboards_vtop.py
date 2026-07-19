@@ -199,10 +199,9 @@ engine = dash(
                    {"datasource": MIMIR, "expr": f'sum(rate(vtop_verification_backend_limited_total{SEL}[5m]))', "legendFormat": "backend-limited (size only)"},
                ],
                desc="Backend-limited means verified by SIZE/EXISTENCE only, "
-                    "with no checksum - a weaker guarantee than the protocol "
-                    "intends. In production set "
-                    "upload.require_strong_verification: true so these are "
-                    "refused rather than committed."),
+                    "with no checksum. The default policy refuses this; any "
+                    "non-zero rate means require_strong_verification: false "
+                    "was explicitly configured."),
 
         # ---- Throughput -----------------------------------------------------
         _row("Throughput", 23),

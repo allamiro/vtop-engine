@@ -4,7 +4,9 @@
 //! backend. Credentials live in the `s3cmd` config (`S3CMD_CONFIG`) and are
 //! never printed by this module.
 
-use crate::base::{ObjectChecksum, ObjectHead, UploadBackend, VerificationResult};
+use crate::base::{
+    verify_file_content, ObjectChecksum, ObjectHead, UploadBackend, VerificationResult,
+};
 use async_trait::async_trait;
 use std::path::Path;
 use tokio::process::Command;
@@ -82,18 +84,18 @@ impl UploadBackend for S3cmdBackend {
         &self,
         object_uri: &str,
         expected_size: u64,
-        _expected_checksum: Option<ObjectChecksum<'_>>,
+        expected_checksum: Option<ObjectChecksum<'_>>,
     ) -> Result<VerificationResult, VtopError> {
-        let head = self.head_object(object_uri).await?;
-        match head.size_bytes {
-            Some(sz) if sz == expected_size => Ok(VerificationResult::limited(
-                "s3cmd: object present and size matches (no sha256 from backend)",
-            )),
-            Some(sz) => Ok(VerificationResult::failed(format!(
-                "size mismatch: expected {expected_size}, got {sz}"
-            ))),
-            None => Ok(VerificationResult::failed("could not read object size")),
-        }
+        let tmp = tempfile::NamedTempFile::new()
+            .map_err(|e| VtopError::Upload(format!("temp file for verification: {e}")))?;
+        run(self
+            .base_cmd()
+            .arg("get")
+            .arg("--force")
+            .arg(object_uri)
+            .arg(tmp.path()))
+        .await?;
+        verify_file_content(tmp.path(), expected_size, expected_checksum, "s3cmd").await
     }
 
     async fn delete_object(&self, object_uri: &str) -> Result<(), VtopError> {
@@ -104,7 +106,7 @@ impl UploadBackend for S3cmdBackend {
         "s3cmd"
     }
     fn supports_checksum_verification(&self) -> bool {
-        false
+        true
     }
     fn supports_multipart(&self) -> bool {
         true

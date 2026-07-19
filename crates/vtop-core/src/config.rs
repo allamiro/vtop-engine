@@ -237,11 +237,11 @@ pub struct UploadConfig {
     /// `<local_path>/<bucket>/<key>`).
     #[serde(default)]
     pub local_path: Option<String>,
-    /// If true, a batch is only committed when the backend can perform STRONG
-    /// (checksum) verification. Backend-limited (size/existence-only) results
-    /// then fail the batch instead of committing. Default false (backend-limited
-    /// is accepted, as documented). Production should enable this.
-    #[serde(default)]
+    /// If true, a batch is only committed when verification is derived from
+    /// stored content (or a storage-service-computed digest). Backend-limited
+    /// size/existence results fail the batch. Defaults to true; setting false
+    /// is an explicit compatibility/lab opt-out.
+    #[serde(default = "default_true")]
     pub require_strong_verification: bool,
 }
 
@@ -457,6 +457,7 @@ upload:
         cfg.validate().unwrap();
         assert_eq!(cfg.batching.max_records, 10_000);
         assert_eq!(cfg.compression.kind, CompressionType::Gzip);
+        assert!(cfg.upload.require_strong_verification);
         assert!(cfg.resolve_manifest_mac_key().unwrap().is_none());
     }
 

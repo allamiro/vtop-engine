@@ -27,6 +27,9 @@ pub struct MockBackend {
     fail_verification: bool,
     /// When true, `verify_object` reports backend-limited (size-only) success.
     backend_limited: bool,
+    /// Test-only attack model: alter the stored body immediately before
+    /// verification while leaving uploader-provided checksum metadata intact.
+    corrupt_on_verify: bool,
 }
 
 impl Default for MockBackend {
@@ -41,6 +44,7 @@ impl MockBackend {
             objects: Mutex::new(HashMap::new()),
             fail_verification: false,
             backend_limited: false,
+            corrupt_on_verify: false,
         }
     }
 
@@ -56,6 +60,15 @@ impl MockBackend {
     pub fn limited() -> Self {
         Self {
             backend_limited: true,
+            ..Self::new()
+        }
+    }
+
+    /// A mock storage service that replaces stored bytes after upload but
+    /// leaves size and uploader metadata unchanged.
+    pub fn corrupting() -> Self {
+        Self {
+            corrupt_on_verify: true,
             ..Self::new()
         }
     }
@@ -133,11 +146,9 @@ impl UploadBackend for MockBackend {
             uri: object_uri.to_string(),
             size_bytes: Some(s.size),
             etag: s.checksum.clone(),
-            checksum_sha256: if self.backend_limited {
-                None
-            } else {
-                s.checksum.clone()
-            },
+            // The stored checksum is uploader-provided test metadata. Strong
+            // verification below hashes `data` instead.
+            checksum_sha256: None,
         })
     }
 
@@ -152,8 +163,16 @@ impl UploadBackend for MockBackend {
                 "mock: forced verification failure",
             ));
         }
-        let head = self.head_object(object_uri).await?;
-        if head.size_bytes != Some(expected_size) {
+        let mut map = self.objects.lock().unwrap();
+        let stored = map
+            .get_mut(object_uri)
+            .ok_or_else(|| VtopError::NotFound(object_uri.to_string()))?;
+        if self.corrupt_on_verify {
+            if let Some(first) = stored.data.first_mut() {
+                *first ^= 0xff;
+            }
+        }
+        if stored.data.len() as u64 != expected_size {
             return Ok(VerificationResult::failed("mock: size mismatch"));
         }
         if self.backend_limited {
@@ -164,11 +183,26 @@ impl UploadBackend for MockBackend {
                 "mock: size-only (checksums disabled)",
             ));
         };
-        match head.checksum_sha256 {
-            Some(s) if s.eq_ignore_ascii_case(expected.hex) => {
-                Ok(VerificationResult::passed("mock: size + checksum verified"))
+        let algo = match expected
+            .algorithm
+            .parse::<vtop_core::types::ChecksumAlgorithm>()
+        {
+            Ok(algo) if algo.is_enabled() => algo,
+            Ok(_) => {
+                return Ok(VerificationResult::failed(
+                    "mock: checksum supplied with disabled algorithm",
+                ))
             }
-            _ => Ok(VerificationResult::failed("mock: checksum mismatch")),
+            Err(e) => return Ok(VerificationResult::failed(e)),
+        };
+        let actual = vtop_core::checksum::digest_bytes(algo, &stored.data)
+            .expect("enabled checksum algorithm has a digest");
+        if actual.eq_ignore_ascii_case(expected.hex) {
+            Ok(VerificationResult::passed(
+                "mock: stored content checksum verified",
+            ))
+        } else {
+            Ok(VerificationResult::failed("mock: checksum mismatch"))
         }
     }
 
@@ -209,11 +243,28 @@ mod tests {
         let b = MockBackend::new();
         let f = tmp(b"payload");
         let uri = "s3://bucket/obj";
-        b.put_object(f.path(), uri, Some(ck("abc123")))
+        let digest = vtop_core::checksum::sha256_bytes(b"payload");
+        b.put_object(f.path(), uri, Some(ck(&digest)))
             .await
             .unwrap();
-        let res = b.verify_object(uri, 7, Some(ck("abc123"))).await.unwrap();
+        let res = b.verify_object(uri, 7, Some(ck(&digest))).await.unwrap();
         assert!(res.passed && !res.backend_limited);
+    }
+
+    #[tokio::test]
+    async fn same_size_corruption_fails_with_uploader_metadata_unchanged() {
+        let b = MockBackend::new();
+        let f = tmp(b"payload");
+        let uri = "s3://bucket/obj";
+        let digest = vtop_core::checksum::sha256_bytes(b"payload");
+        b.put_object(f.path(), uri, Some(ck(&digest)))
+            .await
+            .unwrap();
+        b.corrupt(uri);
+
+        let res = b.verify_object(uri, 7, Some(ck(&digest))).await.unwrap();
+        assert!(!res.passed);
+        assert!(!res.backend_limited);
     }
 
     #[tokio::test]

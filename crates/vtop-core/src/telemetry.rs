@@ -60,9 +60,8 @@ pub struct Metrics {
     /// stuck.
     pub verification_failures_total: IntCounterVec,
 
-    /// Verified by size/existence only because the backend could not do better.
-    /// Committing on this is weaker than the protocol intends; production sets
-    /// `upload.require_strong_verification` to refuse it.
+    /// Verified by size/existence only. The default policy refuses to commit;
+    /// this counter records explicit compatibility/lab opt-outs.
     pub verification_backend_limited_total: IntCounterVec,
 
     /// Batches sent back to be re-read from source. Safe by design, but a

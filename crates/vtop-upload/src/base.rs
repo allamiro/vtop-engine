@@ -7,12 +7,15 @@
 
 use async_trait::async_trait;
 use std::path::Path;
+use vtop_core::checksum::digest_reader;
 use vtop_core::errors::VtopError;
+use vtop_core::types::ChecksumAlgorithm;
 
 /// An engine-computed object checksum: the algorithm name (`sha256`, `blake3`)
 /// plus the lowercase-hex digest. Carrying the algorithm lets a backend choose
-/// the strongest available verification — e.g. native S3 uses server-validated
-/// `x-amz-checksum-sha256` only for SHA-256, and metadata for other algorithms.
+/// the correct content-derived verification — e.g. native S3 uses a
+/// server-computed `x-amz-checksum-sha256` for SHA-256 and streams the stored
+/// body for BLAKE3.
 #[derive(Debug, Clone, Copy)]
 pub struct ObjectChecksum<'a> {
     pub algorithm: &'a str,
@@ -34,6 +37,10 @@ pub struct ObjectHead {
     pub uri: String,
     pub size_bytes: Option<u64>,
     pub etag: Option<String>,
+    /// SHA-256 computed by the storage service over the stored body.
+    ///
+    /// Engine-written user metadata and local sidecars MUST NOT populate this
+    /// field: they describe what the uploader claimed, not what is stored.
     pub checksum_sha256: Option<String>,
 }
 
@@ -69,6 +76,60 @@ impl VerificationResult {
             backend_limited: false,
             message: message.into(),
         }
+    }
+}
+
+/// Verify a downloaded/local file by hashing the bytes read from its open file
+/// handle. This is intentionally independent of sidecars and user metadata.
+pub(crate) async fn verify_file_content(
+    path: &Path,
+    expected_size: u64,
+    expected: Option<ObjectChecksum<'_>>,
+    backend: &str,
+) -> Result<VerificationResult, VtopError> {
+    let Some(expected) = expected else {
+        let size = tokio::fs::metadata(path).await?.len();
+        return if size == expected_size {
+            Ok(VerificationResult::limited(format!(
+                "{backend}: stored content size matches (checksums disabled)"
+            )))
+        } else {
+            Ok(VerificationResult::failed(format!(
+                "size mismatch: expected {expected_size}, read {size} stored bytes"
+            )))
+        };
+    };
+
+    let algo = match expected.algorithm.parse::<ChecksumAlgorithm>() {
+        Ok(ChecksumAlgorithm::None) => {
+            return Ok(VerificationResult::failed(
+                "checksum value supplied with disabled algorithm",
+            ))
+        }
+        Ok(algo) => algo,
+        Err(e) => return Ok(VerificationResult::failed(e)),
+    };
+    let file = tokio::fs::File::open(path).await?;
+    let Some((actual, bytes_read)) = digest_reader(algo, file).await? else {
+        return Ok(VerificationResult::failed(
+            "content digest was not computed",
+        ));
+    };
+    if bytes_read != expected_size {
+        return Ok(VerificationResult::failed(format!(
+            "size mismatch: expected {expected_size}, read {bytes_read} stored bytes"
+        )));
+    }
+    if actual.eq_ignore_ascii_case(expected.hex) {
+        Ok(VerificationResult::passed(format!(
+            "{backend}: stored content {algorithm} verified",
+            algorithm = algo.as_str()
+        )))
+    } else {
+        Ok(VerificationResult::failed(format!(
+            "stored content checksum mismatch for {}",
+            algo.as_str()
+        )))
     }
 }
 
@@ -108,8 +169,11 @@ pub trait UploadBackend: Send + Sync {
     async fn get_object(&self, object_uri: &str) -> Result<Vec<u8>, VtopError>;
 
     /// Verify a stored object against an expected size and (when provided)
-    /// checksum. `expected = None` means checksums are disabled, so only
-    /// size/existence can be confirmed (a backend-limited result).
+    /// checksum. A non-limited success MUST be derived from the stored body or
+    /// from a checksum the storage service computed over that body. Uploader
+    /// metadata and sidecars are never strong evidence. `expected = None`
+    /// means checksums are disabled, so only size/existence can be confirmed
+    /// (a backend-limited result).
     async fn verify_object(
         &self,
         object_uri: &str,
