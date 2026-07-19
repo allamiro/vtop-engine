@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Replay-safe state store for the VTOP Engine (SQLite via sqlx)."
+description = "Replay-safe SQLite and feature-gated PostgreSQL state stores for the VTOP Engine."
 
 [features]
 # Exposes the backend-agnostic `test_battery` module to other crates (e.g. a
@@ -12,7 +12,7 @@ description = "Replay-safe state store for the VTOP Engine (SQLite via sqlx)."
 test-support = []
 # The Postgres-compatible backend (Phase 3), for an HA fleet sharing one durable
 # ledger. Off by default so the single-node SQLite build pulls no Postgres deps.
-postgres = ["sqlx/postgres"]
+postgres = ["sqlx/postgres", "sqlx/tls-rustls-ring-webpki"]
 
 [dependencies]
 vtop-core = { workspace = true }

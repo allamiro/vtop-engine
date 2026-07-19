@@ -183,15 +183,16 @@ The honest, minimal set — **one** durable store, not a zoo.
 
 ## 5. The `StateStore` abstraction (the one piece of real work)
 
-### 5.1 Backend selection = a config string
-The engine reads `engine.state_store`; a factory dispatches on the scheme. Same
-binary; switching is one config line.
+### 5.1 Backend selection = a config or secret reference
+The engine reads `engine.state_store`; a factory dispatches on the resolved
+scheme. SQLite paths may be inline. PostgreSQL URLs must come from an env/file
+secret reference so credentials never enter serializable config.
 
 | Deployment | `engine.state_store` |
 |---|---|
 | Dev / single appliance | `sqlite:///data/state/vtop-state.db` |
-| Production (Postgres) | `postgres://vtop@pg-host:5432/vtop` |
-| Production (Yugabyte) | `postgres://vtop@yb-host:5433/vtop` (same driver) |
+| Production (Postgres) | `{ env: VTOP_STATE_STORE }` → `postgres://…?sslmode=verify-full` |
+| Production (Yugabyte) | `{ file: /run/secrets/vtop-state-store }` → `postgres://…?sslmode=verify-full` |
 
 
 ### 5.2 The trait (one source of truth for the invariant)
@@ -613,7 +614,7 @@ once, and **requires validation** under your write rate.
 | Key | Meaning |
 |---|---|
 | `engine.name` / `engine.tenant` | identity; default tenant |
-| `engine.state_store` | **backend selector** (`sqlite://…`; `postgres://…` after Phase 3) |
+| `engine.state_store` | backend selector: inline `sqlite://…`, or `{ env: … }` / `{ file: … }` secret reference for PostgreSQL |
 | `engine.work_dir` / `log_level` | scratch dir; verbosity |
 | `batching.max_records` / `max_bytes` / `max_batch_age_seconds` | seal thresholds |
 | `compression.type` / `level` | `gzip` \| `zstd` \| `none` |
@@ -634,6 +635,7 @@ once, and **requires validation** under your write rate.
 |---|---|
 | `VTOP_CONFIG` | path to `config.yaml` |
 | `RUST_LOG` | log filter |
+| `VTOP_STATE_STORE` | PostgreSQL URL when named by `engine.state_store.env`; remote URLs require `sslmode=verify-full` |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | S3 credentials |
 | `AWS_REGION` | S3 region |
 | `VTOP_S3_ENDPOINT_URL` | S3/MinIO endpoint |
@@ -644,11 +646,9 @@ once, and **requires validation** under your write rate.
 ### 14.3 Proposed environment variables (HA phases) **[PROPOSED]**
 | Variable | Phase | Purpose |
 |---|---|---|
-| `VTOP_STATE_STORE` | 1 | override `engine.state_store` from a secret/env |
 | `VTOP_PG_MAX_CONNECTIONS` | 3 | Postgres pool size per replica |
 | `VTOP_PG_STATEMENT_TIMEOUT_MS` | 3 | guard stuck statements |
 | `VTOP_STATE_RETRY_MAX` | 3 | max retries on SQLSTATE `40001` |
-| `PGPASSWORD` / conn-string secret | 3 | DB password via secret manager |
 | `VTOP_OBJECT_KEY_MODE` | 4 | `legacy` \| `deterministic` \| `content-addressed` |
 | `VTOP_KAFKA_GROUP_MODE` | 5 | `assign` (single-node) \| `subscribe` (fleet) |
 | `VTOP_METRICS_ADDR` | 6 | Prometheus endpoint (e.g. `0.0.0.0:9090`) |

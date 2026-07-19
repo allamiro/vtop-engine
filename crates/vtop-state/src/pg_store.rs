@@ -15,14 +15,18 @@
 //! 2. **Serialization-failure retry.** Distributed Postgres-compatible stores
 //!    can abort a transaction with SQLSTATE `40001`; those are transient, so the
 //!    write is retried a bounded number of times.
+//! 3. **Transport and credential boundary.** Parsed connection options keep the
+//!    URL out of errors, and every non-loopback connection requires
+//!    `sslmode=verify-full` using rustls.
 //!
 //! Compiled only with `--features postgres`.
 
 use crate::models::{BatchPatch, BatchRecord};
 use crate::store::StateStore;
 use async_trait::async_trait;
-use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
 use sqlx::Row;
+use std::net::IpAddr;
 use std::str::FromStr;
 use std::time::Duration;
 use vtop_core::errors::VtopError;
@@ -108,7 +112,46 @@ pub struct PgStateStore {
 }
 
 fn map_sqlx(e: sqlx::Error) -> VtopError {
-    VtopError::State(e.to_string())
+    VtopError::State(redact_postgres_urls(&e.to_string()))
+}
+
+/// Remove complete PostgreSQL URLs from any error before it can reach logs or
+/// CLI output. `connect_with(PgConnectOptions)` means sqlx normally has no URL
+/// string to print, but this is a defense-in-depth boundary for future errors.
+fn redact_postgres_urls(message: &str) -> String {
+    let mut out = message.to_owned();
+    for scheme in ["postgres://", "postgresql://"] {
+        while let Some(start) = out.to_ascii_lowercase().find(scheme) {
+            let end = out[start..]
+                .find(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | ')' | ']' | '}'))
+                .map(|offset| start + offset)
+                .unwrap_or(out.len());
+            out.replace_range(start..end, "[REDACTED POSTGRES URL]");
+        }
+    }
+    out
+}
+
+fn is_local_postgres(options: &PgConnectOptions) -> bool {
+    if options.get_socket().is_some() || options.get_host().starts_with('/') {
+        return true;
+    }
+    let host = options.get_host().trim_matches(|c| matches!(c, '[' | ']'));
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
+fn enforce_tls_policy(options: &PgConnectOptions) -> Result<(), VtopError> {
+    if is_local_postgres(options) || matches!(options.get_ssl_mode(), PgSslMode::VerifyFull) {
+        return Ok(());
+    }
+    Err(VtopError::Config(
+        "remote PostgreSQL state stores require verified TLS with sslmode=verify-full; configure a trusted root with sslrootcert when the bundled public roots do not contain the database CA"
+            .into(),
+    ))
 }
 
 /// True if the error is a transient serialization failure worth retrying.
@@ -141,9 +184,15 @@ where
 impl PgStateStore {
     /// Open a connection pool and apply the schema + invariant trigger.
     pub async fn connect(conn_str: &str) -> Result<Self, VtopError> {
+        let options = PgConnectOptions::from_str(conn_str).map_err(|_| {
+            VtopError::Config(
+                "invalid PostgreSQL state-store connection (connection details redacted)".into(),
+            )
+        })?;
+        enforce_tls_policy(&options)?;
         let pool = PgPoolOptions::new()
             .max_connections(10)
-            .connect(conn_str)
+            .connect_with(options)
             .await
             .map_err(map_sqlx)?;
         let store = Self { pool };
@@ -474,4 +523,55 @@ fn row_to_record(row: sqlx::postgres::PgRow) -> Result<BatchRecord, VtopError> {
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     })
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+
+    fn options(url: &str) -> PgConnectOptions {
+        PgConnectOptions::from_str(url).unwrap()
+    }
+
+    #[test]
+    fn remote_postgres_requires_hostname_verified_tls() {
+        for url in [
+            "postgres://vtop:secret@db.example/vtop",
+            "postgres://vtop:secret@db.example/vtop?sslmode=disable",
+            "postgres://vtop:secret@db.example/vtop?sslmode=require",
+            "postgres://vtop:secret@db.example/vtop?sslmode=verify-ca",
+        ] {
+            let err = enforce_tls_policy(&options(url)).unwrap_err().to_string();
+            assert!(err.contains("sslmode=verify-full"), "{url}: {err}");
+            assert!(!err.contains("secret"));
+        }
+
+        enforce_tls_policy(&options(
+            "postgres://vtop:secret@db.example/vtop?sslmode=verify-full",
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn loopback_postgres_may_use_plaintext_for_local_development() {
+        for url in [
+            "postgres://vtop:secret@localhost/vtop?sslmode=disable",
+            "postgres://vtop:secret@127.0.0.1/vtop?sslmode=disable",
+            "postgres://vtop:secret@[::1]/vtop?sslmode=disable",
+        ] {
+            enforce_tls_policy(&options(url)).unwrap();
+        }
+    }
+
+    #[test]
+    fn postgres_urls_are_removed_from_errors() {
+        let secret = "highly-sensitive-password";
+        let message = format!(
+            "connection to postgres://vtop:{secret}@db.example/vtop?sslmode=disable failed; fallback postgresql://other:{secret}@db2/vtop refused"
+        );
+        let redacted = redact_postgres_urls(&message);
+        assert!(!redacted.contains(secret));
+        assert!(!redacted.contains("vtop:"));
+        assert_eq!(redacted.matches("[REDACTED POSTGRES URL]").count(), 2);
+    }
 }

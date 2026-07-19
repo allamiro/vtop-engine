@@ -26,6 +26,8 @@ allow = [
     "Unlicense",     # dual-licensed with MIT in practice
     "Zlib",
     "CC0-1.0",
+    # Public CA certificate data in webpki-roots, used by SQLx's rustls path.
+    "CDLA-Permissive-2.0",
     "BSL-1.0",
     "MPL-2.0",       # file-level copyleft only; no static-link obligation
     "OpenSSL",       # ring's licence expression

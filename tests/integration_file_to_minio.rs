@@ -200,7 +200,8 @@ async fn verify_manifest_checks_content_not_just_existence() {
         vec![input.to_string_lossy().into_owned()],
         "mock",
     );
-    let store = SqliteStateStore::connect(&cfg.engine.state_store)
+    let state_store = cfg.engine.state_store.resolve().unwrap();
+    let store = SqliteStateStore::connect(state_store.expose_secret())
         .await
         .unwrap();
     // Keep a concrete handle so the test can corrupt stored content later.
