@@ -293,7 +293,8 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
-  # Publish: collect artifacts, checksum them, create the GitHub Release.
+  # Publish: collect artifacts, keyless-sign binaries, checksum everything,
+  # and create the GitHub Release.
   # ---------------------------------------------------------------------------
   release:
     name: publish release
@@ -303,6 +304,7 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: write
+      id-token: write # keyless cosign signing for binary archives
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -319,6 +321,25 @@ jobs:
           pattern: "{vtopctl-*,sbom}"
           path: artifacts
           merge-multiple: true
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+
+      - name: Sign binary archives (keyless)
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          archives=(artifacts/vtopctl-*.tar.gz)
+          if (( ${#archives[@]} == 0 )); then
+            echo "::error::no binary archives found to sign"
+            exit 1
+          fi
+          for archive in "${archives[@]}"; do
+            bundle="${archive}.sigstore.json"
+            cosign sign-blob --yes --bundle "$bundle" "$archive"
+            test -s "$bundle"
+          done
 
       - name: Checksums
         run: |
@@ -361,4 +382,14 @@ jobs:
             librdkafka is compiled from source via cmake and the Windows path is not
             validated.
 
-            Verify downloads against `SHA256SUMS`. An SPDX SBOM is attached.
+            Every binary archive has a keyless Sigstore bundle with the same name plus
+            `.sigstore.json`. Verify an archive with:
+            ```
+            archive=vtopctl-${{ needs.verify.outputs.version }}-TARGET.tar.gz
+            cosign verify-blob "$archive" \
+              --bundle "${archive}.sigstore.json" \
+              --certificate-identity "https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/${{ github.ref_name }}" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+            ```
+
+            Also verify downloads against `SHA256SUMS`. An SPDX SBOM is attached.

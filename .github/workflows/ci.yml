@@ -71,6 +71,7 @@ jobs:
             shell:
               - 'docker/*.sh'
               - 'docker/tests/**'
+              - '.github/workflows/**'
   build-and-test:
     name: fmt + clippy + test + build
     needs: changes
@@ -169,6 +170,11 @@ jobs:
       # tags, so a tool update cannot change CI results without a commit.
       # Dependabot's docker ecosystem does not scan workflow `docker run` lines,
       # so these are bumped deliberately.
+      - name: actionlint
+        run: |
+          docker run --rm -v "$PWD:/repo:ro" -w /repo \
+            rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+
       - name: shellcheck
         run: |
           docker run --rm -v "$PWD:/mnt" -w /mnt \
