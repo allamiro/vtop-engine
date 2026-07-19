@@ -13,6 +13,15 @@
 //!   GET /metrics  Prometheus text format
 //!   GET /healthz  process liveness
 //!   GET /readyz   readiness (metrics registry initialized)
+//!
+//! # Security posture (#78)
+//!
+//! The endpoint is **unauthenticated** — anyone who can reach the port can
+//! scrape it. Bind it to a private interface (e.g. `127.0.0.1:9090` or a
+//! management network), never a public one. The server enforces a concurrent
+//! connection cap and a per-connection deadline so an unauthenticated client
+//! that CAN reach the port can tie up at most [`MAX_CONNECTIONS`] tasks for
+//! [`CONNECTION_DEADLINE`] rather than spawning unbounded work.
 
 use http_body_util::Full;
 use hyper::body::Bytes;
@@ -21,11 +30,29 @@ use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use vtop_core::telemetry;
 
 /// Environment variable holding the listen address, e.g. `0.0.0.0:9090`.
 pub const ADDR_ENV: &str = "VTOP_METRICS_ADDR";
+
+/// Maximum concurrent connections. A scrape stack is a handful of pollers;
+/// far beyond that is either a misconfiguration or an exhaustion attempt, and
+/// both are better served by refusing than by queueing unbounded tasks.
+pub const MAX_CONNECTIONS: usize = 16;
+
+/// Hard per-connection deadline. Serving the registry takes milliseconds, so
+/// anything alive this long is a stuck or hostile peer holding a permit.
+/// Keep-alive is disabled (one request per connection), so the deadline can be
+/// this blunt without cutting off a healthy poller mid-scrape.
+pub const CONNECTION_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Minimum interval between at-capacity WARN lines; rejections in between are
+/// counted and reported in the next line.
+const REJECTION_WARN_EVERY: Duration = Duration::from_secs(10);
 
 fn text(status: StatusCode, body: impl Into<Bytes>) -> Response<Full<Bytes>> {
     Response::builder()
@@ -100,16 +127,51 @@ pub async fn maybe_start() -> Option<SocketAddr> {
     tracing::info!(%bound, "metrics endpoint listening (/metrics, /healthz, /readyz)");
 
     tokio::spawn(async move {
+        let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        // Rejection logging is rate-limited: at capacity, a flooding client
+        // triggers one rejection per accepted connection, and a synchronous
+        // WARN per rejection would turn the cap into a log-flood/CPU path —
+        // the exhaustion vector this endpoint hardening exists to close.
+        let mut rejected_since_warn: u64 = 0;
+        let mut last_warn = std::time::Instant::now() - REJECTION_WARN_EVERY;
         loop {
             match listener.accept().await {
-                Ok((stream, _)) => {
-                    tokio::spawn(async move {
-                        if let Err(e) = hyper::server::conn::http1::Builder::new()
-                            .serve_connection(TokioIo::new(stream), service_fn(route))
-                            .await
-                        {
-                            tracing::debug!(error = %e, "metrics connection closed");
+                Ok((stream, peer)) => {
+                    // At capacity: close immediately rather than queue. The
+                    // permit is taken BEFORE spawning, so an attacker can hold
+                    // at most MAX_CONNECTIONS tasks, not one per SYN.
+                    let Ok(permit) = permits.clone().try_acquire_owned() else {
+                        rejected_since_warn += 1;
+                        if last_warn.elapsed() >= REJECTION_WARN_EVERY {
+                            tracing::warn!(
+                                %peer,
+                                rejected = rejected_since_warn,
+                                "metrics connections rejected: at capacity \
+                                 (count since last report; further rejections \
+                                 are aggregated)"
+                            );
+                            rejected_since_warn = 0;
+                            last_warn = std::time::Instant::now();
                         }
+                        drop(stream);
+                        continue;
+                    };
+                    tokio::spawn(async move {
+                        let conn = hyper::server::conn::http1::Builder::new()
+                            // One request per connection: a keep-alive poller
+                            // would otherwise park on a permit between scrapes
+                            // and MAX_CONNECTIONS idle pollers would starve the
+                            // endpoint. Prometheus reconnects per scrape fine.
+                            .keep_alive(false)
+                            .serve_connection(TokioIo::new(stream), service_fn(route));
+                        match tokio::time::timeout(CONNECTION_DEADLINE, conn).await {
+                            Err(_) => {
+                                tracing::debug!(%peer, "metrics connection hit deadline; closed")
+                            }
+                            Ok(Err(e)) => tracing::debug!(error = %e, "metrics connection closed"),
+                            Ok(Ok(())) => {}
+                        }
+                        drop(permit);
                     });
                 }
                 Err(e) => {
