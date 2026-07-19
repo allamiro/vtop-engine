@@ -209,6 +209,21 @@ pub struct KafkaSource {
     consumer: Option<BaseConsumer>,
     // key: (topic, partition)
     cursors: HashMap<(String, i32), PartitionCursor>,
+    /// The (topic, partition) set currently assigned on the consumer, sorted.
+    ///
+    /// Assignment is STICKY: calling assign() resets librdkafka's fetchers,
+    /// and with a short poll window the fetch restart eats most of the pass —
+    /// measured at ~300 records per 250ms pass against a 3M-record backlog.
+    /// While the set is unchanged the consumer stays assigned and fetchers
+    /// stay warm; only diverged partitions get an explicit seek().
+    assigned: Vec<(String, i32)>,
+    /// Next offset librdkafka will deliver per partition (last polled + 1),
+    /// including messages the accumulator REJECTED. Where this diverges from
+    /// the cursor's desired offset, the pass seeks that partition back.
+    delivered: HashMap<(String, i32), i64>,
+    /// Partitions paused mid-pass (topic hit its budget); resumed at the
+    /// start of the next pass.
+    paused: Vec<(String, i32)>,
     /// Partition ids per topic, cached with a TTL.
     ///
     /// assign() needs the partition list, but fetching metadata on EVERY read
@@ -242,6 +257,9 @@ impl KafkaSource {
             exclude,
             consumer: None,
             cursors: HashMap::new(),
+            assigned: Vec::new(),
+            delivered: HashMap::new(),
+            paused: Vec::new(),
             partitions: HashMap::new(),
         })
     }
@@ -393,7 +411,10 @@ impl SourceAdapter for KafkaSource {
         // Partition lists aligned with `sources`, kept so a topic that fills
         // its budget mid-pass can be pause()d without refetching metadata.
         let mut partitions_by_source: Vec<Vec<i32>> = Vec::with_capacity(sources.len());
-        let mut tpl = TopicPartitionList::new();
+        // (topic, partition, desired next offset) for every readable partition,
+        // plus the sorted set for the sticky-assignment comparison.
+        let mut desired: Vec<(String, i32, Offset)> = Vec::new();
+        let mut assignment_set: Vec<(String, i32)> = Vec::new();
         for source in sources {
             let topic = &source.source_name;
             // A topic with no partitions (e.g. just deleted) simply contributes
@@ -434,10 +455,11 @@ impl SourceAdapter for KafkaSource {
                         None => Offset::Stored,
                     },
                 };
-                tpl.add_partition_offset(topic, p, off)
-                    .map_err(|e| VtopError::Source(format!("assign tpl {topic}-{p}: {e}")))?;
+                desired.push((topic.clone(), p, off));
+                assignment_set.push((topic.clone(), p));
             }
         }
+        assignment_set.sort();
         // Time spent resolving metadata is FAILED time when any topic errored:
         // a broker that times out metadata fetches is exactly the wait
         // `read_cycle_profile` exists to expose, and classifying it as
@@ -453,7 +475,7 @@ impl SourceAdapter for KafkaSource {
         // return without polling. The serial path never waited in this case,
         // and blocking `max_wait` on an empty assignment would turn an idle
         // adapter into a fixed per-cycle stall.
-        if tpl.count() == 0 {
+        if assignment_set.is_empty() {
             let elapsed = started.elapsed().as_millis() as u64;
             return Ok(AdapterReadReport {
                 outcomes: source_errors
@@ -472,10 +494,67 @@ impl SourceAdapter for KafkaSource {
                 failed_ms: meta_failed_ms,
             });
         }
-        let consumer = self.consumer()?;
-        consumer
-            .assign(&tpl)
-            .map_err(|e| VtopError::Source(format!("assign ({} topics): {e}", sources.len())))?;
+        let consumer = self.consumer.as_ref().expect("consumer built above");
+
+        // STICKY ASSIGNMENT. assign() tears down librdkafka's fetchers; with a
+        // short poll window the restart eats the pass (measured: ~300 records
+        // per 250ms pass against a 3M-record backlog when re-assigning every
+        // pass). While the (topic, partition) set is unchanged, the consumer
+        // stays assigned and fetchers stay warm:
+        //   - partitions paused by a previous pass's budget stop are resumed;
+        //   - a partition is seek()ed ONLY where the desired offset diverges
+        //     from what librdkafka would deliver next (i.e. after rejected
+        //     messages or an explicit replay rewind).
+        if self.assigned != assignment_set {
+            let mut tpl = TopicPartitionList::new();
+            for (topic, p, off) in &desired {
+                tpl.add_partition_offset(topic, *p, *off)
+                    .map_err(|e| VtopError::Source(format!("assign tpl {topic}-{p}: {e}")))?;
+            }
+            consumer.assign(&tpl).map_err(|e| {
+                VtopError::Source(format!("assign ({} topics): {e}", sources.len()))
+            })?;
+            // Defensively clear any pause state a retained toppar might carry
+            // across the re-assign; a silently-paused partition reads as an
+            // empty topic forever.
+            let _ = consumer.resume(&tpl);
+            self.assigned = assignment_set;
+            self.delivered.clear();
+            // Seed delivered with the offsets just assigned, so idle
+            // partitions (which deliver nothing) are not seek-reset on every
+            // subsequent pass — that would re-create the fetcher-restart cost
+            // for exactly the partitions that never have data.
+            for (topic, p, off) in &desired {
+                if let Offset::Offset(want) = off {
+                    self.delivered.insert((topic.clone(), *p), *want);
+                }
+            }
+            self.paused.clear();
+        } else {
+            if !self.paused.is_empty() {
+                let mut rtpl = TopicPartitionList::new();
+                for (topic, p) in &self.paused {
+                    rtpl.add_partition(topic, *p);
+                }
+                consumer
+                    .resume(&rtpl)
+                    .map_err(|e| VtopError::Source(format!("resume paused: {e}")))?;
+                self.paused.clear();
+            }
+            for (topic, p, off) in &desired {
+                // Only a concrete offset can diverge; Stored means "nothing
+                // read or committed this session", which on an unchanged
+                // assignment is exactly where the consumer already is.
+                let Offset::Offset(want) = off else { continue };
+                let at = self.delivered.get(&(topic.clone(), *p)).copied();
+                if at != Some(*want) {
+                    consumer
+                        .seek(topic, *p, *off, Duration::from_secs(5))
+                        .map_err(|e| VtopError::Source(format!("seek {topic}-{p}: {e}")))?;
+                    self.delivered.insert((topic.clone(), *p), *want);
+                }
+            }
+        }
 
         // Budgets are PER TOPIC (the trait contract's per-source budgets),
         // enforced inside the accumulator. An aggregate budget would let one
@@ -484,6 +563,9 @@ impl SourceAdapter for KafkaSource {
         // next pass; the loop stops early once every assigned topic is full.
         let mut acc = MultiTopicAcc::new(sources.len(), max_records, max_bytes);
         let mut paused = vec![false; sources.len()];
+        // Delivery positions touched THIS pass, keyed by index (no per-message
+        // allocation); merged into self.delivered after the loop.
+        let mut delivered_local: HashMap<(usize, i32), i64> = HashMap::new();
         let deadline = std::time::Instant::now() + max_wait;
         loop {
             if acc.all_full(assigned_topics) {
@@ -502,6 +584,9 @@ impl SourceAdapter for KafkaSource {
                             msg.topic()
                         )));
                     };
+                    // Track what librdkafka delivered — kept OR rejected — so
+                    // the next pass seeks only genuinely diverged partitions.
+                    delivered_local.insert((idx, msg.partition()), msg.offset() + 1);
                     // push() rejects messages for topics at budget; rejected
                     // offsets are re-read next pass because cursors advance
                     // only over kept records.
@@ -515,7 +600,7 @@ impl SourceAdapter for KafkaSource {
                     // go on fetching its tail, and every discarded message is
                     // bandwidth spent on data the next pass refetches anyway.
                     // Pausing its partitions stops the fetcher for the rest of
-                    // the pass; the next pass's assign() resets the state.
+                    // the pass; the next pass resumes them.
                     if acc.is_full(idx) && !paused[idx] {
                         let topic = &sources[idx].source_name;
                         let mut ptpl = TopicPartitionList::new();
@@ -543,6 +628,20 @@ impl SourceAdapter for KafkaSource {
             }
         }
         let total_records = acc.total_records;
+
+        // Persist the pass's delivery positions and pause state for the next
+        // pass's sticky-assignment decisions.
+        for ((idx, p), next) in delivered_local {
+            self.delivered
+                .insert((sources[idx].source_name.clone(), p), next);
+        }
+        for (idx, was_paused) in paused.iter().enumerate() {
+            if *was_paused {
+                for &p in &partitions_by_source[idx] {
+                    self.paused.push((sources[idx].source_name.clone(), p));
+                }
+            }
+        }
 
         // Demux into one ReadResult per (topic, partition), routed to the
         // outcome of the source that owns the topic. The ENGINE isolates

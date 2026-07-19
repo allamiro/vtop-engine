@@ -268,6 +268,41 @@ async fn one_pass_reads_many_topics_and_demuxes_by_marker_topic() {
         "every seeded topic must yield records in a single pass, got {totals:?}"
     );
 
+    // STICKY-ASSIGNMENT path: a SECOND pass on the same adapter (unchanged
+    // topic set) must not re-assign — and must still deliver new data
+    // produced after the first pass. This is the pass shape the engine runs
+    // in steady state, and the shape that starved when every pass re-assigned
+    // (fetcher restart ate the poll window).
+    for i in 10..20 {
+        let payload = format!("CEF:0|VTOP|IT|1.0|{i}|Multiplex2|3|src=10.0.1.{i}");
+        producer
+            .send(BaseRecord::<(), str>::to(&topic_b).payload(&payload))
+            .expect("enqueue produce (second round)");
+    }
+    producer
+        .flush(std::time::Duration::from_secs(10))
+        .expect("flush second round");
+    let report2 = adapter
+        .read_all_batch_candidates(&sources, 1000, 1 << 20, std::time::Duration::from_secs(10))
+        .await
+        .expect("second multiplexed read failed");
+    let b_idx = sources
+        .iter()
+        .position(|s| s.source_name == topic_b)
+        .unwrap();
+    let second_b: usize = report2.outcomes[b_idx]
+        .result
+        .as_ref()
+        .expect("second-pass outcome ok")
+        .iter()
+        .map(|r| r.records.len())
+        .sum();
+    assert!(
+        second_b >= 10,
+        "second pass on an unchanged assignment must deliver newly produced \
+         records (sticky assignment), got {second_b}"
+    );
+
     // Best-effort cleanup; a leaked topic only clutters a long-lived local lab.
     let _ = admin
         .delete_topics(&[topic_b.as_str()], &AdminOptions::new())
