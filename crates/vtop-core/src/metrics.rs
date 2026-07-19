@@ -31,6 +31,10 @@ pub struct BatchMetrics {
     pub manifest_upload_ms: u64,
     pub verify_ms: u64,
     pub commit_ms: u64,
+    /// Cumulative time in ledger writes across the whole pipeline (~8 writes
+    /// per batch: initial save + 6 transitions + commit). Previously the
+    /// unmeasured gap between staged time and `total_ms` (#87).
+    pub state_write_ms: u64,
     /// Total time from batch start to source-committed.
     pub total_ms: u64,
 
