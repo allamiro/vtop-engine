@@ -60,6 +60,8 @@ pub enum LogError {
     WriterPoisoned,
     #[error("manifest does not match the segment: {0}")]
     ManifestMismatch(String),
+    #[error("commit boundary does not match the segment: {0}")]
+    CommitBoundaryMismatch(String),
     #[error("invalid segment cursor: {0}")]
     InvalidCursor(String),
 }
@@ -310,7 +312,7 @@ pub struct LogRecord {
 pub enum Durability {
     /// Return after the bytes have been written to the operating system.
     Buffered,
-    /// Flush file data and metadata to durable storage before acknowledging.
+    /// Flush file data and a checksummed commit boundary before acknowledging.
     Fsync,
 }
 

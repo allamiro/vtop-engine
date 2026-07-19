@@ -12,6 +12,17 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+const COMMIT_MAGIC: &[u8; 8] = b"VTOPCMT1";
+const COMMIT_VERSION: u16 = 1;
+const COMMIT_BOUNDARY_LEN: usize = 8 + 2 + 16 + 8 + 8 + 32;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CommitBoundary {
+    segment_id: Uuid,
+    committed_offset: u64,
+    content_bytes: u64,
+}
+
 #[derive(Clone)]
 struct ProducerState {
     latest_sequence: u64,
@@ -76,13 +87,22 @@ impl ActiveSegment {
             .map_err(|source| io_error(&path, source))?;
         if let Err(source) = file
             .write_all(&encoded_header)
-            .and_then(|()| file.sync_all())
+            .and_then(|()| file.sync_data())
         {
             return Err(io_error(&path, source));
         }
         sync_parent(&path)?;
         let header_len = encoded_header.len() as u64;
         let base_offset = header.descriptor.base_offset;
+        let paths = SegmentPaths::from_active(&path)?;
+        write_commit_boundary_atomic(
+            &paths.commit,
+            CommitBoundary {
+                segment_id: header.descriptor.segment_id,
+                committed_offset: base_offset,
+                content_bytes: 0,
+            },
+        )?;
         Ok(Self {
             path,
             file,
@@ -119,12 +139,64 @@ impl ActiveSegment {
             .open(&path)
             .map_err(|source| io_error(&path, source))?;
         let (header, header_len) = read_header_with_path(&mut file, &path)?;
-        let scan = scan_records(&mut file, &path, &header, header_len, true)?;
+        let paths = SegmentPaths::from_active(&path)?;
+        let boundary = match read_commit_boundary(&paths.commit) {
+            Ok(boundary) => boundary,
+            Err(LogError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                // Pre-boundary active files are recovered conservatively: no
+                // record is promoted merely because its complete bytes happen
+                // to have survived a restart.
+                let boundary = CommitBoundary {
+                    segment_id: header.descriptor.segment_id,
+                    committed_offset: header.descriptor.base_offset,
+                    content_bytes: 0,
+                };
+                write_commit_boundary_atomic(&paths.commit, boundary)?;
+                boundary
+            }
+            Err(error) => return Err(error),
+        };
+        if boundary.segment_id != header.descriptor.segment_id {
+            return Err(LogError::CommitBoundaryMismatch(
+                "segment id differs from the active segment header".to_owned(),
+            ));
+        }
+        let committed_end = header_len
+            .checked_add(boundary.content_bytes)
+            .ok_or_else(|| {
+                LogError::CommitBoundaryMismatch("committed byte length overflows".to_owned())
+            })?;
+        let actual_len = file
+            .metadata()
+            .map_err(|source| io_error(&path, source))?
+            .len();
+        if committed_end > actual_len {
+            return Err(LogError::CommitBoundaryMismatch(format!(
+                "committed byte end {committed_end} exceeds file length {actual_len}"
+            )));
+        }
+        let mut scan = scan_records(
+            &mut file,
+            &path,
+            &header,
+            header_len,
+            Some(committed_end),
+            false,
+        )?;
+        if scan.next_offset != boundary.committed_offset
+            || scan.valid_end != committed_end
+            || scan.valid_end - header_len != boundary.content_bytes
+        {
+            return Err(LogError::CommitBoundaryMismatch(
+                "offset or byte boundary does not end on the validated record frontier".to_owned(),
+            ));
+        }
+        scan.truncated_bytes = actual_len.saturating_sub(scan.valid_end);
         if scan.truncated_bytes > 0 {
             file.set_len(scan.valid_end)
                 .map_err(|source| io_error(&path, source))?;
         }
-        file.sync_all().map_err(|source| io_error(&path, source))?;
+        file.sync_data().map_err(|source| io_error(&path, source))?;
         file.seek(SeekFrom::Start(scan.valid_end))
             .map_err(|source| io_error(&path, source))?;
         let report = RecoveryReport {
@@ -171,10 +243,7 @@ impl ActiveSegment {
     /// Durably commit every accepted append with one storage barrier.
     pub fn commit(&mut self) -> VtopLogResult<u64> {
         self.ensure_writable()?;
-        if let Err(source) = self.file.sync_all() {
-            self.poisoned = true;
-            return Err(io_error(&self.path, source));
-        }
+        self.persist_commit_boundary(self.next_offset, self.content_bytes)?;
         self.committed_offset = self.next_offset;
         Ok(self.committed_offset)
     }
@@ -298,10 +367,7 @@ impl ActiveSegment {
             position += encoded.len() as u64;
         }
         if matches!(durability, Durability::Fsync) {
-            if let Err(source) = self.file.sync_all() {
-                self.poisoned = true;
-                return Err(io_error(&self.path, source));
-            }
+            self.persist_commit_boundary(prospective_next, attempted_bytes)?;
         }
         for (_, encoded) in &pending {
             self.content_hasher.update(encoded);
@@ -345,9 +411,10 @@ impl ActiveSegment {
     /// The record bodies stay in one file; no WAL or second data copy is made.
     pub fn seal(mut self) -> VtopLogResult<SegmentReader> {
         self.ensure_writable()?;
-        self.file
-            .sync_all()
-            .map_err(|source| io_error(&self.path, source))?;
+        // A sealed reader exposes its complete contents. Advance a durable
+        // commit boundary first so sealing can never publish buffered records
+        // that were not committed on this node.
+        self.commit()?;
         let actual_content_bytes = self
             .file
             .metadata()
@@ -386,6 +453,30 @@ impl ActiveSegment {
         SegmentReader::open(paths.segment)
     }
 
+    fn persist_commit_boundary(
+        &mut self,
+        committed_offset: u64,
+        content_bytes: u64,
+    ) -> VtopLogResult<()> {
+        if let Err(source) = self.file.sync_data() {
+            self.poisoned = true;
+            return Err(io_error(&self.path, source));
+        }
+        let paths = SegmentPaths::from_active(&self.path)?;
+        if let Err(error) = write_commit_boundary_atomic(
+            &paths.commit,
+            CommitBoundary {
+                segment_id: self.header.descriptor.segment_id,
+                committed_offset,
+                content_bytes,
+            },
+        ) {
+            self.poisoned = true;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     fn ensure_writable(&self) -> VtopLogResult<()> {
         if self.sealed {
             return Err(LogError::AlreadySealed);
@@ -414,7 +505,7 @@ impl SegmentReader {
             .open(&path)
             .map_err(|source| io_error(&path, source))?;
         let (header, header_len) = read_header_with_path(&mut file, &path)?;
-        let scan = scan_records(&mut file, &path, &header, header_len, false)?;
+        let scan = scan_records(&mut file, &path, &header, header_len, None, false)?;
         let paths = SegmentPaths::from_segment(&path)?;
         let manifest_bytes =
             fs::read(&paths.manifest).map_err(|source| io_error(&paths.manifest, source))?;
@@ -492,7 +583,7 @@ pub fn rebuild_index(path: impl AsRef<Path>) -> VtopLogResult<()> {
     let path = path.as_ref();
     let mut file = File::open(path).map_err(|source| io_error(path, source))?;
     let (header, header_len) = read_header_with_path(&mut file, path)?;
-    let scan = scan_records(&mut file, path, &header, header_len, false)?;
+    let scan = scan_records(&mut file, path, &header, header_len, None, false)?;
     let paths = SegmentPaths::from_segment(path)?;
     write_index_atomic(&paths.index, &scan.index)
 }
@@ -550,14 +641,21 @@ fn scan_records(
     path: &Path,
     header: &SegmentHeader,
     header_len: u64,
+    logical_end: Option<u64>,
     permit_torn_tail: bool,
 ) -> VtopLogResult<ScanResult> {
     file.seek(SeekFrom::Start(header_len))
         .map_err(|source| io_error(path, source))?;
-    let file_len = file
+    let actual_file_len = file
         .metadata()
         .map_err(|source| io_error(path, source))?
         .len();
+    let file_len = logical_end.unwrap_or(actual_file_len);
+    if file_len < header_len || file_len > actual_file_len {
+        return Err(LogError::CommitBoundaryMismatch(format!(
+            "logical file end {file_len} is outside {header_len}..={actual_file_len}"
+        )));
+    }
     let mut position = header_len;
     let mut next_offset = header.descriptor.base_offset;
     let mut records = 0_u64;
@@ -566,6 +664,14 @@ fn scan_records(
     let mut content_hasher = blake3::Hasher::new();
 
     loop {
+        if position == file_len {
+            break;
+        }
+        if position > file_len {
+            return Err(LogError::CommitBoundaryMismatch(
+                "commit boundary splits a record frame".to_owned(),
+            ));
+        }
         match read_frame(file, position, header.config.max_record_bytes)
             .map_err(|error| with_path(error, path))?
         {
@@ -578,6 +684,11 @@ fn scan_records(
                 });
             }
             FrameRead::Complete(frame) => {
+                if position.saturating_add(frame.encoded_len as u64) > file_len {
+                    return Err(LogError::CommitBoundaryMismatch(
+                        "commit boundary splits a record frame".to_owned(),
+                    ));
+                }
                 let attempted_bytes = position
                     .saturating_sub(header_len)
                     .saturating_add(frame.encoded_len as u64);
@@ -645,7 +756,7 @@ fn scan_records(
     Ok(ScanResult {
         records,
         valid_end: position,
-        truncated_bytes: file_len.saturating_sub(position),
+        truncated_bytes: actual_file_len.saturating_sub(position),
         next_offset,
         producer_states,
         index,
@@ -800,6 +911,54 @@ fn write_manifest_atomic(path: &Path, manifest: &SegmentManifest) -> VtopLogResu
     write_atomic(path, &bytes)
 }
 
+fn write_commit_boundary_atomic(path: &Path, boundary: CommitBoundary) -> VtopLogResult<()> {
+    let mut bytes = Vec::with_capacity(COMMIT_BOUNDARY_LEN);
+    bytes.extend_from_slice(COMMIT_MAGIC);
+    bytes.extend_from_slice(&COMMIT_VERSION.to_be_bytes());
+    bytes.extend_from_slice(boundary.segment_id.as_bytes());
+    bytes.extend_from_slice(&boundary.committed_offset.to_be_bytes());
+    bytes.extend_from_slice(&boundary.content_bytes.to_be_bytes());
+    let checksum = blake3::hash(&bytes);
+    bytes.extend_from_slice(checksum.as_bytes());
+    debug_assert_eq!(bytes.len(), COMMIT_BOUNDARY_LEN);
+    write_atomic(path, &bytes)
+}
+
+fn read_commit_boundary(path: &Path) -> VtopLogResult<CommitBoundary> {
+    let bytes = fs::read(path).map_err(|source| io_error(path, source))?;
+    if bytes.len() != COMMIT_BOUNDARY_LEN {
+        return Err(LogError::CommitBoundaryMismatch(format!(
+            "expected {COMMIT_BOUNDARY_LEN} bytes, found {}",
+            bytes.len()
+        )));
+    }
+    if &bytes[..8] != COMMIT_MAGIC {
+        return Err(LogError::CommitBoundaryMismatch(
+            "invalid commit marker magic".to_owned(),
+        ));
+    }
+    let version = u16::from_be_bytes(bytes[8..10].try_into().expect("fixed slice"));
+    if version != COMMIT_VERSION {
+        return Err(LogError::CommitBoundaryMismatch(format!(
+            "unsupported commit marker version {version}"
+        )));
+    }
+    let checksum_start = COMMIT_BOUNDARY_LEN - 32;
+    if blake3::hash(&bytes[..checksum_start]).as_bytes() != &bytes[checksum_start..] {
+        return Err(LogError::CommitBoundaryMismatch(
+            "commit marker checksum mismatch".to_owned(),
+        ));
+    }
+    let segment_id = Uuid::from_slice(&bytes[10..26]).map_err(|error| {
+        LogError::CommitBoundaryMismatch(format!("invalid segment id: {error}"))
+    })?;
+    Ok(CommitBoundary {
+        segment_id,
+        committed_offset: u64::from_be_bytes(bytes[26..34].try_into().expect("fixed slice")),
+        content_bytes: u64::from_be_bytes(bytes[34..42].try_into().expect("fixed slice")),
+    })
+}
+
 fn canonical_manifest_bytes(manifest: &SegmentManifest) -> VtopLogResult<Vec<u8>> {
     let mut bytes = serde_json::to_vec(manifest)
         .map_err(|error| LogError::ManifestMismatch(format!("cannot encode manifest: {error}")))?;
@@ -863,7 +1022,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> VtopLogResult<()> {
         .create_new(true)
         .open(&temporary)
         .map_err(|source| io_error(&temporary, source))?;
-    let result = file.write_all(bytes).and_then(|()| file.sync_all());
+    let result = file.write_all(bytes).and_then(|()| file.sync_data());
     if let Err(source) = result {
         let _ = fs::remove_file(&temporary);
         return Err(io_error(&temporary, source));
@@ -905,6 +1064,7 @@ struct SegmentPaths {
     segment: PathBuf,
     index: PathBuf,
     manifest: PathBuf,
+    commit: PathBuf,
 }
 
 impl SegmentPaths {
@@ -938,6 +1098,7 @@ impl SegmentPaths {
             segment: parent.join(format!("{stem}.segment")),
             index: parent.join(format!("{stem}.index")),
             manifest: parent.join(format!("{stem}.manifest.json")),
+            commit: parent.join(format!("{stem}.commit")),
         })
     }
 }
@@ -1077,6 +1238,113 @@ mod tests {
         let after_commit = segment.fetch(40, usize::MAX, 10).unwrap();
         assert_eq!(after_commit.records.len(), 1);
         assert_eq!(after_commit.high_watermark, 41);
+    }
+
+    #[test]
+    fn recovery_discards_a_complete_uncommitted_tail() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("uncommitted-tail.active");
+        let producer = Uuid::from_u128(18);
+        let mut segment = ActiveSegment::create(&path, descriptor(), config()).unwrap();
+        segment
+            .append(record(producer, 0, b"committed"), Durability::Fsync)
+            .unwrap();
+        let committed_len = fs::metadata(&path).unwrap().len();
+        segment
+            .append(record(producer, 1, b"buffered"), Durability::Buffered)
+            .unwrap();
+        let accepted_len = fs::metadata(&path).unwrap().len();
+        assert!(accepted_len > committed_len);
+        drop(segment);
+
+        let mut recovered = ActiveSegment::recover(&path).unwrap();
+        assert_eq!(recovered.next_offset(), 41);
+        assert_eq!(recovered.committed_offset(), 41);
+        assert_eq!(
+            recovered.recovery_report().truncated_bytes,
+            accepted_len - committed_len
+        );
+        assert_eq!(fs::metadata(&path).unwrap().len(), committed_len);
+        let visible = recovered.fetch(40, usize::MAX, 10).unwrap();
+        assert_eq!(visible.records.len(), 1);
+        assert_eq!(visible.records[0].record.value, b"committed");
+        assert_eq!(visible.high_watermark, 41);
+
+        assert_eq!(
+            recovered
+                .append(record(producer, 1, b"buffered"), Durability::Fsync)
+                .unwrap(),
+            AppendOutcome::Appended { offset: 41 }
+        );
+    }
+
+    #[test]
+    fn recovery_never_promotes_a_buffered_only_segment() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("buffered-only.active");
+        let mut segment = ActiveSegment::create(&path, descriptor(), config()).unwrap();
+        segment
+            .append(
+                record(Uuid::from_u128(19), 0, b"not committed"),
+                Durability::Buffered,
+            )
+            .unwrap();
+        drop(segment);
+
+        let mut recovered = ActiveSegment::recover(&path).unwrap();
+        assert_eq!(recovered.next_offset(), 40);
+        assert_eq!(recovered.committed_offset(), 40);
+        assert!(recovered
+            .fetch(40, usize::MAX, 10)
+            .unwrap()
+            .records
+            .is_empty());
+    }
+
+    #[test]
+    fn seal_commits_buffered_records_before_publication() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("seal-commit.active");
+        let mut segment = ActiveSegment::create(&path, descriptor(), config()).unwrap();
+        segment
+            .append(
+                record(Uuid::from_u128(20), 0, b"seal me"),
+                Durability::Buffered,
+            )
+            .unwrap();
+        assert_eq!(segment.committed_offset(), 40);
+
+        let mut sealed = segment.seal().unwrap();
+        let paths = SegmentPaths::from_segment(&sealed.path).unwrap();
+        let boundary = read_commit_boundary(&paths.commit).unwrap();
+        assert_eq!(boundary.committed_offset, 41);
+        assert_eq!(sealed.fetch(40, usize::MAX, 10).unwrap().records.len(), 1);
+    }
+
+    #[test]
+    fn recovery_rejects_a_corrupt_commit_boundary_without_changing_data() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("corrupt-commit.active");
+        let mut segment = ActiveSegment::create(&path, descriptor(), config()).unwrap();
+        segment
+            .append(
+                record(Uuid::from_u128(21), 0, b"committed"),
+                Durability::Fsync,
+            )
+            .unwrap();
+        drop(segment);
+        let data_len = fs::metadata(&path).unwrap().len();
+        let paths = SegmentPaths::from_active(&path).unwrap();
+        let mut bytes = fs::read(&paths.commit).unwrap();
+        *bytes.last_mut().unwrap() ^= 0xff;
+        fs::write(&paths.commit, bytes).unwrap();
+
+        let error = match ActiveSegment::recover(&path) {
+            Ok(_) => panic!("corrupt commit boundary should fail recovery"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, LogError::CommitBoundaryMismatch(_)));
+        assert_eq!(fs::metadata(&path).unwrap().len(), data_len);
     }
 
     #[test]
