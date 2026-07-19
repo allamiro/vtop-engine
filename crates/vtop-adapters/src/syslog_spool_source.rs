@@ -23,7 +23,6 @@ struct SpoolCursor {
 pub struct SyslogSpoolSource {
     paths: Vec<String>,
     cursors: HashMap<String, SpoolCursor>,
-    active: Option<String>,
 }
 
 impl SyslogSpoolSource {
@@ -31,7 +30,6 @@ impl SyslogSpoolSource {
         Self {
             paths,
             cursors: HashMap::new(),
-            active: None,
         }
     }
 
@@ -89,7 +87,6 @@ impl SourceAdapter for SyslogSpoolSource {
         _max_wait: Duration,
     ) -> Result<Vec<ReadResult>, VtopError> {
         let path = source.source_name.clone();
-        self.active = Some(path.clone());
         let start = self.cursors.entry(path.clone()).or_default().read_byte;
 
         let file = tokio::fs::File::open(&path).await?;
@@ -128,15 +125,6 @@ impl SourceAdapter for SyslogSpoolSource {
         }])
     }
 
-    async fn get_progress_marker(&self) -> Result<ProgressMarker, VtopError> {
-        let path = self
-            .active
-            .clone()
-            .ok_or_else(|| VtopError::Source("no active spool source".into()))?;
-        let c = self.cursors.get(&path).cloned().unwrap_or_default();
-        Ok(Self::marker(&path, c.committed_byte, c.read_byte))
-    }
-
     async fn commit_progress(&mut self, marker: &ProgressMarker) -> Result<(), VtopError> {
         let ProgressMarker::SyslogSpool { path, end_byte, .. } = marker else {
             return Err(VtopError::Source(
@@ -168,10 +156,6 @@ impl SourceAdapter for SyslogSpoolSource {
 
     fn source_type(&self) -> SourceType {
         SourceType::SyslogSpool
-    }
-
-    fn source_name(&self) -> String {
-        self.active.clone().unwrap_or_default()
     }
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
