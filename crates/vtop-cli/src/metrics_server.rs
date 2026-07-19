@@ -50,6 +50,10 @@ pub const MAX_CONNECTIONS: usize = 16;
 /// this blunt without cutting off a healthy poller mid-scrape.
 pub const CONNECTION_DEADLINE: Duration = Duration::from_secs(10);
 
+/// Minimum interval between at-capacity WARN lines; rejections in between are
+/// counted and reported in the next line.
+const REJECTION_WARN_EVERY: Duration = Duration::from_secs(10);
+
 fn text(status: StatusCode, body: impl Into<Bytes>) -> Response<Full<Bytes>> {
     Response::builder()
         .status(status)
@@ -124,6 +128,12 @@ pub async fn maybe_start() -> Option<SocketAddr> {
 
     tokio::spawn(async move {
         let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        // Rejection logging is rate-limited: at capacity, a flooding client
+        // triggers one rejection per accepted connection, and a synchronous
+        // WARN per rejection would turn the cap into a log-flood/CPU path —
+        // the exhaustion vector this endpoint hardening exists to close.
+        let mut rejected_since_warn: u64 = 0;
+        let mut last_warn = std::time::Instant::now() - REJECTION_WARN_EVERY;
         loop {
             match listener.accept().await {
                 Ok((stream, peer)) => {
@@ -131,7 +141,18 @@ pub async fn maybe_start() -> Option<SocketAddr> {
                     // permit is taken BEFORE spawning, so an attacker can hold
                     // at most MAX_CONNECTIONS tasks, not one per SYN.
                     let Ok(permit) = permits.clone().try_acquire_owned() else {
-                        tracing::warn!(%peer, "metrics connection rejected: at capacity");
+                        rejected_since_warn += 1;
+                        if last_warn.elapsed() >= REJECTION_WARN_EVERY {
+                            tracing::warn!(
+                                %peer,
+                                rejected = rejected_since_warn,
+                                "metrics connections rejected: at capacity \
+                                 (count since last report; further rejections \
+                                 are aggregated)"
+                            );
+                            rejected_since_warn = 0;
+                            last_warn = std::time::Instant::now();
+                        }
                         drop(stream);
                         continue;
                     };
