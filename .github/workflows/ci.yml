@@ -608,4 +608,5 @@ jobs:
       - name: Run the Postgres StateStore battery
         env:
           VTOP_TEST_POSTGRES: postgres://vtop:vtop@localhost:5432/vtop
+          VTOP_TEST_POSTGRES_RUNTIME: postgres://vtop_runtime_test:vtop-runtime-test@localhost:5432/vtop
         run: cargo test -p vtop-state --features postgres,test-support --test pg_battery

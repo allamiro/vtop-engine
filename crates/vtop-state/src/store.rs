@@ -45,6 +45,32 @@ pub async fn connect_state_store(conn_str: &str) -> Result<Box<dyn StateStore>, 
     Ok(Box::new(store))
 }
 
+/// Apply state-store schema migrations explicitly.
+///
+/// SQLite retains its embedded single-node behavior and initializes when it is
+/// opened. PostgreSQL migrations are intentionally separate from runtime
+/// connection setup so the engine identity never needs DDL privileges.
+pub async fn migrate_state_store(conn_str: &str) -> Result<(), VtopError> {
+    let lower = conn_str.trim().to_ascii_lowercase();
+    if lower.starts_with("postgres://") || lower.starts_with("postgresql://") {
+        #[cfg(feature = "postgres")]
+        {
+            return crate::pg_store::PgStateStore::migrate(conn_str).await;
+        }
+        #[cfg(not(feature = "postgres"))]
+        {
+            return Err(VtopError::Config(
+                "PostgreSQL state store requested, but this build lacks the `postgres` feature"
+                    .into(),
+            ));
+        }
+    }
+
+    // `SqliteStateStore::connect` owns SQLite's local schema initialization.
+    SqliteStateStore::connect(conn_str).await?;
+    Ok(())
+}
+
 /// Normalize a caller-supplied RFC3339 instant to canonical UTC text, so the
 /// stores' lexicographic lease comparisons are sound regardless of the offset
 /// spelling the caller used (`Z`, `+00:00`, `+02:00`, ...). Rejecting invalid
@@ -155,6 +181,16 @@ mod tests {
         let store = connect_state_store(&conn).await.unwrap();
         assert!(store.list_batches().await.unwrap().is_empty());
         assert!(path.exists(), "the db file should have been created");
+    }
+
+    #[tokio::test]
+    async fn explicit_migration_keeps_sqlite_compatible() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let conn = format!("sqlite://{}", path.display());
+        migrate_state_store(&conn).await.unwrap();
+        let store = connect_state_store(&conn).await.unwrap();
+        assert!(store.list_batches().await.unwrap().is_empty());
     }
 
     // Only meaningful WITHOUT the postgres feature: with it, a postgres:// URI

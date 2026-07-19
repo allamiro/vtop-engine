@@ -245,7 +245,7 @@ backend; the **database also enforces it** via constraints (§8).
 | Driver | `sqlx` `SqlitePool` | `sqlx` `PgPool` (pure-Rust, no libpq) |
 | Placeholders | `?` | `$1, $2, …` |
 | Insert | plain `INSERT` | plain `INSERT` |
-| Migrations | SQLite DDL | Postgres DDL (separate file) |
+| Migrations | SQLite initializes locally | `vtopctl migrate` under a separate privileged identity; runtime executes no DDL |
 | Conflict retry | none | **retry on SQLSTATE `40001`** (distributed serialization) |
 | Build | default | behind Cargo `--features postgres` |
 
@@ -637,6 +637,10 @@ zero-behavior-change groundwork.
 - **Tasks:** implement `PgStateStore` (PgPool, `$N`, Postgres DDL with §8
   constraints); connection-pool settings; **retry-on-`40001`**; config/env support;
   run the shared battery against Postgres (testcontainers / CI service).
+- **Migration boundary:** apply DDL with `vtopctl migrate` under a deployment
+  identity; grant the engine role only schema `USAGE` and ledger
+  `SELECT, INSERT, UPDATE`. Runtime startup checks readiness but never repairs
+  schema.
 - **Dependencies:** Phases 1–2.
 - **Config changes:** `engine.state_store: { env: VTOP_STATE_STORE }` or a mounted-file reference; remote URLs require `sslmode=verify-full`.
 - **Test plan:** shared battery on Postgres; conflict-retry test; constraint-
