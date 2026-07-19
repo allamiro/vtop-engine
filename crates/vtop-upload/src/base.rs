@@ -35,6 +35,14 @@ impl<'a> ObjectChecksum<'a> {
     }
 }
 
+/// Result of a manifest upload.
+#[derive(Debug, Clone, Default)]
+pub struct StoredManifest {
+    /// Immutable object version assigned by the store (S3 `x-amz-version-id`).
+    /// `None` when the backend or bucket does not expose versions.
+    pub version_id: Option<String>,
+}
+
 /// Result of a HEAD/stat on a stored object.
 #[derive(Debug, Clone)]
 pub struct ObjectHead {
@@ -308,12 +316,49 @@ pub trait UploadBackend: Send + Sync {
     ) -> Result<(), VtopError>;
 
     /// Upload the manifest JSON (with its digest as the checksum).
+    ///
+    /// Returns the immutable object version the store assigned, when the
+    /// backend exposes one. The engine persists it so recovery can read the
+    /// exact stored version instead of an overwritable current key (#135).
     async fn put_manifest(
         &self,
         local_path: &Path,
         manifest_uri: &str,
         checksum: Option<ObjectChecksum<'_>>,
-    ) -> Result<(), VtopError>;
+    ) -> Result<StoredManifest, VtopError>;
+
+    /// Download a specific immutable version of a manifest, bounded like
+    /// `get_object_bounded`. The default fails closed: a backend that cannot
+    /// address stored versions must not silently substitute the current key,
+    /// because that is exactly the rollback surface version pinning removes.
+    async fn get_manifest_pinned(
+        &self,
+        manifest_uri: &str,
+        _version_id: &str,
+        _max_bytes: usize,
+    ) -> Result<Vec<u8>, VtopError> {
+        Err(VtopError::Upload(format!(
+            "backend {} cannot read a pinned object version of {manifest_uri}",
+            self.backend_name()
+        )))
+    }
+
+    /// Whether this backend can return and re-address immutable object
+    /// versions. `false` means `put_manifest` never yields a version and
+    /// `get_manifest_pinned`/`verify_bucket_versioning` fail closed.
+    fn supports_object_versions(&self) -> bool {
+        false
+    }
+
+    /// Preflight for the hardened profile: confirm the bucket keeps immutable
+    /// versions of overwritten objects. Default fails closed for backends
+    /// without versioning.
+    async fn verify_bucket_versioning(&self, bucket: &str) -> Result<(), VtopError> {
+        Err(VtopError::Upload(format!(
+            "backend {} cannot confirm object versioning on bucket {bucket}",
+            self.backend_name()
+        )))
+    }
 
     /// HEAD/stat an object.
     async fn head_object(&self, object_uri: &str) -> Result<ObjectHead, VtopError>;

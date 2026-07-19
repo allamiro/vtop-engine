@@ -183,7 +183,39 @@ Per-format buckets (e.g. `telemetry-{format}`) with optional on-demand creation 
 - Config stores only the environment-variable name (`manifest_mac_key_env`); the 32-byte hex key **MUST NOT** appear in config serialization, manifests, or logs.
 - Naming an absent or malformed key **MUST** fail startup rather than silently emit unsigned manifests.
 - Enabling a key deliberately rejects unsigned pre-cutover manifests. Operators **MUST** verify or explicitly migrate their backlog before enabling it.
-- One active key is supported. Rotation and public-key signatures are not implemented; object versioning/lock remains necessary to resist deletion and rollback to an older valid manifest.
+- One active key is supported. Rotation and public-key signatures are not implemented.
+
+### 8.1 Freshness: version pinning and the hardened profile (#135)
+
+The MAC establishes *authenticity* (these bytes were produced by a key
+holder); it cannot establish *freshness* — a writer can delete a signed
+manifest or replay an older, still-validly-signed one over the current key.
+Version pinning plus storage retention closes that gap; the controls are
+complementary.
+
+- When the backend assigns an immutable object version on manifest upload
+  (S3 `x-amz-version-id`), the engine records it in the durable ledger
+  (`manifest_version_id`), and every later read — the pre-commit stored-bytes
+  authentication and the recovery re-check — **MUST** address that exact
+  version, never the mutable current key.
+- A recorded version that can no longer be read **MUST** fail closed: the
+  batch is flagged `replay_required`, and source progress is not committed.
+  Recovery **MUST NOT** fall back from a pinned version to the current key.
+- With `upload.require_object_versioning = true` (the hardened profile), the
+  backend **MUST** expose immutable object versions, bucket versioning
+  **MUST** be preflighted before the first upload to each bucket, and a
+  manifest upload that returns no immutable version (including S3's literal
+  `null` version from a suspended bucket) **MUST** fail the batch.
+- Retention is the storage layer's half of the guarantee: bucket versioning
+  keeps overwritten versions, and S3 **Object Lock** (compliance or
+  governance retention covering the archive's audit window) **SHOULD** be
+  configured so a privileged deleter cannot remove the pinned version itself.
+  VTOP validates versioning; object-lock configuration is deployment policy.
+- Backends without object versions (`localfs`, the `awscli`/`s3cmd`/`minio`
+  command backends) record no version and keep today's current-key behavior
+  with ledger hash binding; the hardened profile refuses to run on them.
+  Rows written before this feature (no recorded version) are verified the
+  same legacy way.
 
 ## 9. Resource Exhaustion Controls
 
@@ -282,6 +314,9 @@ the ignore list and the build re-audited.
 | Verify object + manifest before commit | **MUST** |
 | Report backend-limited verification as such (not cryptographic) | **MUST** |
 | Configured manifest MAC verifies without downgrade | **MUST** |
+| Pinned manifest version unreadable → fail closed (`replay_required`) | **MUST** |
+| Hardened profile: versioned bucket preflight + version on every manifest upload | **MUST** (when `require_object_versioning`) |
+| Object Lock retention on versioned manifest buckets | **SHOULD** |
 | Object lock / immutability | **SHOULD** (later) |
 | Secret redaction in logs | **MUST** |
 | Native broker transport restricted to TLS 1.3 with client certificates | **MUST** |

@@ -5,8 +5,8 @@
 //! never printed by this module.
 
 use crate::base::{
-    read_command_bounded, verify_command_content, ObjectChecksum, ObjectHead, UploadBackend,
-    VerificationResult,
+    read_command_bounded, verify_command_content, ObjectChecksum, ObjectHead, StoredManifest,
+    UploadBackend, VerificationResult,
 };
 use crate::command::CommandPolicy;
 use async_trait::async_trait;
@@ -55,10 +55,11 @@ impl UploadBackend for S3cmdBackend {
         local_path: &Path,
         manifest_uri: &str,
         _checksum: Option<ObjectChecksum<'_>>,
-    ) -> Result<(), VtopError> {
+    ) -> Result<StoredManifest, VtopError> {
         let mut command = self.base_cmd();
         command.arg("put").arg(local_path).arg(manifest_uri);
-        self.command.run(&mut command, "manifest upload").await
+        self.command.run(&mut command, "manifest upload").await?;
+        Ok(StoredManifest::default())
     }
 
     async fn get_object(&self, object_uri: &str) -> Result<Vec<u8>, VtopError> {

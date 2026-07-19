@@ -76,6 +76,7 @@ pub fn file_config(
             create_bucket: false,
             local_path: None,
             require_strong_verification: false,
+            require_object_versioning: false,
         },
         partitioning: PartitioningConfig {
             template: DEFAULT_TEMPLATE.into(),
@@ -144,5 +145,6 @@ pub fn pipeline<'a>(
         backend,
         config,
         manifest_mac_key: config.resolve_manifest_mac_key().unwrap(),
+        versioned_buckets: std::sync::Arc::default(),
     }
 }

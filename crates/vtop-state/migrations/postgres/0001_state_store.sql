@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS batches (
     manifest_uri TEXT,
     object_sha256 TEXT,
     manifest_sha256 TEXT,
+    manifest_version_id TEXT,
     object_size_bytes BIGINT,
     record_count BIGINT,
     error_message TEXT,
@@ -30,6 +31,7 @@ CREATE TABLE IF NOT EXISTS batches (
 ALTER TABLE batches ADD COLUMN IF NOT EXISTS owner TEXT;
 ALTER TABLE batches ADD COLUMN IF NOT EXISTS lease_expires_at TEXT;
 ALTER TABLE batches ADD COLUMN IF NOT EXISTS object_size_bytes BIGINT;
+ALTER TABLE batches ADD COLUMN IF NOT EXISTS manifest_version_id TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_batches_state ON batches(state);
 CREATE INDEX IF NOT EXISTS idx_batches_source ON batches(source_type, source_name);

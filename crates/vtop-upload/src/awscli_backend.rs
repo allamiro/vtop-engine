@@ -5,7 +5,7 @@
 
 use crate::base::{
     parse_s3_uri, read_command_bounded, verify_command_content, ObjectChecksum, ObjectHead,
-    UploadBackend, VerificationResult,
+    StoredManifest, UploadBackend, VerificationResult,
 };
 use crate::command::CommandPolicy;
 use async_trait::async_trait;
@@ -68,14 +68,16 @@ impl UploadBackend for AwsCliBackend {
         local_path: &Path,
         manifest_uri: &str,
         checksum: Option<ObjectChecksum<'_>>,
-    ) -> Result<(), VtopError> {
+    ) -> Result<StoredManifest, VtopError> {
         let mut cmd = self.base_cmd();
         cmd.arg("s3").arg("cp").arg(local_path).arg(manifest_uri);
         if let Some(c) = checksum {
             cmd.arg("--metadata")
                 .arg(format!("{SHA256_META_KEY}={}", c.hex));
         }
-        self.command.run(&mut cmd, "manifest upload").await
+        self.command.run(&mut cmd, "manifest upload").await?;
+        // The CLI does not surface x-amz-version-id; no version to pin.
+        Ok(StoredManifest::default())
     }
 
     async fn get_object(&self, object_uri: &str) -> Result<Vec<u8>, VtopError> {

@@ -285,6 +285,7 @@ mod tests {
             create_bucket: false,
             local_path: None,
             require_strong_verification: true,
+            require_object_versioning: false,
         }
     }
 
