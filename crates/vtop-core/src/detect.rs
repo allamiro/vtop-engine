@@ -59,10 +59,14 @@ pub fn detect_record(record: &[u8]) -> TelemetryFormat {
         return TelemetryFormat::Syslog;
     }
 
-    // JSON object / array per line → JSON Lines candidate.
-    let json_shaped = (s.first() == Some(&b'{') && s.last() == Some(&b'}'))
-        || (s.first() == Some(&b'[') && s.last() == Some(&b']'));
-    if json_shaped && serde_json::from_slice::<serde_json::Value>(s).is_ok() {
+    // JSON object / array per line → JSON Lines candidate. Readers normally
+    // strip `\n`, but CRLF leaves `\r` behind and callers can supply other
+    // framing whitespace. Trim only for the JSON check so CEF/LEEF/syslog
+    // detection retains its existing byte-level behavior (#105).
+    let json = trim_ascii_end(s);
+    let json_shaped = (json.first() == Some(&b'{') && json.last() == Some(&b'}'))
+        || (json.first() == Some(&b'[') && json.last() == Some(&b']'));
+    if json_shaped && serde_json::from_slice::<serde_json::Value>(json).is_ok() {
         return TelemetryFormat::Jsonl;
     }
 
@@ -126,6 +130,14 @@ fn trim_ascii_start(b: &[u8]) -> &[u8] {
         i += 1;
     }
     &b[i..]
+}
+
+fn trim_ascii_end(b: &[u8]) -> &[u8] {
+    let mut end = b.len();
+    while end > 0 && b[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    &b[..end]
 }
 
 /// True if the slice begins with a syslog PRI header `<N>` / `<NN>` / `<NNN>`.
@@ -343,14 +355,56 @@ mod tests {
     }
 
     #[test]
-    fn trailing_whitespace_defeats_the_shape_check() {
-        // serde_json accepts trailing whitespace, but the shape check requires
-        // the LAST byte to be the closing delimiter (only leading whitespace is
-        // trimmed). Kills the `&&`→`||` mutants inside each shape clause: under
-        // the mutation the opening delimiter alone marks these as JSON-shaped
-        // and the (successful) parse would flip them to Jsonl.
-        assert_eq!(detect_record(b"{\"a\":1}\t"), TelemetryFormat::Raw);
-        assert_eq!(detect_record(b"[1,2]\t"), TelemetryFormat::Raw);
+    fn json_framing_whitespace_is_ignored() {
+        // Line readers commonly leave `\r` from CRLF framing. JSON permits
+        // surrounding whitespace, so all ASCII framing variants classify as
+        // JSONL after the shape check trims the record end (#105).
+        for record in [
+            b"{\"a\":1}\t".as_slice(),
+            b"{\"a\":1}\r".as_slice(),
+            b"{\"a\":1}\r\n".as_slice(),
+            b"  {\"a\":1}  ".as_slice(),
+            b"[1,2]\t".as_slice(),
+            b"[1,2]\r\n".as_slice(),
+        ] {
+            assert_eq!(detect_record(record), TelemetryFormat::Jsonl);
+        }
+    }
+
+    #[test]
+    fn trimming_json_framing_does_not_widen_the_shape_or_parse_gate() {
+        // Trailing framing whitespace must not turn malformed structures or
+        // valid JSON scalars into object/array JSONL records.
+        for record in [
+            b"{\"a\":1\r\n".as_slice(),
+            b"{\"a\":}\r\n".as_slice(),
+            b"[1,]\t".as_slice(),
+            b"123\r\n".as_slice(),
+            b"true\t".as_slice(),
+            b"\"quoted\" \r".as_slice(),
+        ] {
+            assert_eq!(detect_record(record), TelemetryFormat::Raw);
+        }
+    }
+
+    #[test]
+    fn crlf_json_batch_detection_preserves_json_vs_jsonl() {
+        let jsonl = vec![b"{\"a\":1}\r".to_vec(), b"{\"a\":2}\r".to_vec()];
+        assert_eq!(detect_batch(&jsonl), TelemetryFormat::Jsonl);
+
+        // A single valid JSON record remains a whole JSON document, including
+        // surrounding whitespace; #105 changes only per-line classification.
+        let document = vec![b" \t{\"a\":1}\r\n".to_vec()];
+        assert_eq!(detect_batch(&document), TelemetryFormat::Json);
+    }
+
+    #[test]
+    fn json_end_trimming_does_not_change_other_format_families() {
+        assert_eq!(detect_record(b"CEF:0|x\r"), TelemetryFormat::Cef);
+        assert_eq!(detect_record(b"LEEF:1.0|x\t"), TelemetryFormat::Leef);
+        assert_eq!(detect_record(b"<134>message\r"), TelemetryFormat::Syslog);
+        assert_eq!(detect_record(b"plain text\r"), TelemetryFormat::Raw);
+        assert_eq!(detect_record(b" \t\r\n"), TelemetryFormat::Raw);
     }
 
     #[test]
