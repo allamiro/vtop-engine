@@ -477,7 +477,7 @@ Replayability differs by source — design accordingly:
 | Postgres backend + retry-on-`40001` | ✅ (single Postgres) | |
 | Yugabyte/Cockroach **wire** compatibility | ✅ (single container) | |
 | Distributed-store **HA** (survive DB node loss) | ⚠️ partial | ✅ (≥3 DB nodes) |
-| Multi-engine Kafka consumer-group distribution | ✅ (scale replicas) | recommended on k8s |
+| Multi-engine Kafka consumer-group distribution | ❌ **not until Phase 5** — single instance per state store, enforced at startup (#66/#93) | ✅ (after Phase 5, on k8s) |
 | Engine failover / rebalance under node loss | ⚠️ (kill a container) | ✅ (k8s, ≥3 nodes) |
 | KEDA lag autoscaling | | ✅ (k8s) |
 | etcd file-lease ownership + takeover | ⚠️ (rehearsal) | ✅ (k8s, ≥3 nodes) |
@@ -763,9 +763,16 @@ Short procedures now; expand into a full ops runbook before go-live (Phase 8/10)
 ---
 
 ## 21. Known limitations (current code)
+- **SINGLE-INSTANCE ONLY — enforced at startup (#66).** The engine takes an
+  exclusive OS lock on its work directory and refuses to start beside another
+  engine on the same host. There is no claim/lease/fencing in the state store
+  yet (#93, Phase 5), so two engines over the same store would both recover the
+  same incomplete batches and both commit source progress — duplicate ingestion
+  at best, double-commit at worst. The work-dir lock CANNOT see an engine on a
+  different host pointed at the same Postgres; that configuration is
+  unsupported and warned about at startup. Do not scale replicas.
 - **Non-deterministic object keys** — replay can create **duplicate objects** (no
   loss). Fixed by deterministic/content-addressed keys (Phase 4).
-- **State backend is SQLite only** — no shared/HA store until Phase 3.
 - **Engine loop is single-process / sequential** — no horizontal scale until
   Phase 5 (Kafka consumer-group mode).
 - **File/syslog HA is not solved without leases** — single-owner only until Phase 7.

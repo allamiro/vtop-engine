@@ -745,12 +745,58 @@ pub struct Engine {
     /// Set by a read cycle that returned any records; drives the adaptive
     /// inter-cycle sleep in [`Engine::run`]. Reset at the top of each cycle.
     cycle_had_data: bool,
+    /// Exclusive work-dir lock held for the engine's lifetime (#66).
+    _instance_lock: InstanceLock,
+}
+
+/// An OS-level exclusive lock on the work directory, held for the engine's
+/// lifetime and released automatically on drop or process death (#66).
+///
+/// The engine is SINGLE-INSTANCE per state store: without claim/lease/fencing
+/// (#93, HA plan Phase 5), two engines over the same store would both list the
+/// same incomplete batches, both recover them, and both commit source
+/// progress — duplicate ingestion at best, double-commit at worst. This lock
+/// enforces that on one host. It CANNOT see a second engine on another host
+/// pointed at the same Postgres — that configuration is warned about at
+/// startup and remains unsupported until #93.
+struct InstanceLock {
+    _file: std::fs::File,
+}
+
+fn acquire_instance_lock(work_dir: &std::path::Path) -> Result<InstanceLock, VtopError> {
+    std::fs::create_dir_all(work_dir)?;
+    let path = work_dir.join(".vtop.instance.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(InstanceLock { _file: file }),
+        Err(std::fs::TryLockError::WouldBlock) => Err(VtopError::Config(format!(
+            "another VTOP engine already holds {} — multi-instance operation is \
+             UNSUPPORTED (single engine per state store; see #66, HA plan Phase 5/#93)",
+            path.display()
+        ))),
+        Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
+    }
 }
 
 impl Engine {
     /// Build the engine from parsed config + streams, initializing the state
     /// store, the upload backend, and every enabled source adapter.
     pub async fn new(config: VtopConfig, streams: StreamsConfig) -> Result<Self, VtopError> {
+        // Refuse to start beside another engine on this host (#66). A shared
+        // NETWORK store (Postgres) on other hosts is invisible to a file lock:
+        // say so loudly until #93 adds real claim/lease semantics.
+        let instance_lock = acquire_instance_lock(std::path::Path::new(&config.engine.work_dir))?;
+        if config.engine.state_store.starts_with("postgres") {
+            tracing::warn!(
+                "state store is Postgres: the engine is SINGLE-INSTANCE per state \
+                 store, and the work-dir lock cannot see engines on OTHER hosts. \
+                 Do not run replicas against this database (see #66/#93)"
+            );
+        }
         let store = connect_state_store(&config.engine.state_store).await?;
         let backend = vtop_upload::build_backend(&config.upload).await?;
 
@@ -795,6 +841,7 @@ impl Engine {
             adapters,
             pending: HashMap::new(),
             cycle_had_data: false,
+            _instance_lock: instance_lock,
         })
     }
 
@@ -1388,6 +1435,40 @@ mod tests {
     use crate::testkit::file_config;
     use std::io::Write;
     use vtop_core::config::StreamsConfig;
+
+    /// #66: the engine is single-instance per state store; a second engine on
+    /// the same work dir must be refused at startup, and the lock must free
+    /// when the first engine goes away.
+    #[tokio::test]
+    async fn second_engine_on_same_work_dir_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        let input = dir.path().join("in.log");
+        std::fs::write(&input, "one\n").unwrap();
+        let cfg = || {
+            crate::testkit::file_config(
+                work.to_str().unwrap(),
+                "sqlite::memory:",
+                vec![input.to_string_lossy().into_owned()],
+                "mock",
+            )
+        };
+        let first = Engine::new(cfg(), StreamsConfig { streams: vec![] })
+            .await
+            .expect("first engine starts");
+        let second = Engine::new(cfg(), StreamsConfig { streams: vec![] }).await;
+        let err = second.err().expect("second engine must be refused");
+        assert!(
+            matches!(err, VtopError::Config(_)),
+            "refusal must be a Config error naming the lock: {err:?}"
+        );
+        assert!(err.to_string().contains("another VTOP engine"));
+        // Lock releases with the engine: a successor can start.
+        drop(first);
+        Engine::new(cfg(), StreamsConfig { streams: vec![] })
+            .await
+            .expect("engine restarts after the previous one is gone");
+    }
 
     #[test]
     fn buffer_key_isolates_kafka_partitions() {
