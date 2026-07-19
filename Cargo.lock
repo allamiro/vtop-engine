@@ -3606,6 +3606,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "vtop-log"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "vtop-state"
 version = "0.1.0"
 dependencies = [

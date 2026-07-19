@@ -15,6 +15,9 @@ name = "vtopctl"
 path = "src/main.rs"
 
 [features]
+default = ["kafka"]
+# Kafka is a compatibility/source adapter, not a native broker dependency.
+kafka = ["vtop-adapters/kafka", "dep:rdkafka"]
 # Keep PostgreSQL optional in the CLI while providing a discoverable feature
 # for production builds and the separate `vtopctl migrate` deployment step.
 postgres = ["vtop-state/postgres"]
@@ -24,7 +27,7 @@ http-body-util = { workspace = true }
 hyper-util = { workspace = true }
 hyper = { workspace = true }
 vtop-core = { workspace = true }
-vtop-adapters = { workspace = true }
+vtop-adapters = { workspace = true, default-features = false }
 vtop-upload = { workspace = true }
 vtop-state = { workspace = true }
 futures = { workspace = true }
@@ -38,11 +41,10 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 async-trait = { workspace = true }
+rdkafka = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-# Live-broker integration tests create and seed their own topics.
-rdkafka = { workspace = true }
 
 # Integration tests live in the repo-root tests/ directory and are compiled as
 # integration tests of this package.
@@ -61,6 +63,7 @@ path = "../../tests/integration_state_recovery.rs"
 [[test]]
 name = "integration_kafka_to_minio"
 path = "../../tests/integration_kafka_to_minio.rs"
+required-features = ["kafka"]
 
 [[test]]
 name = "integration_metrics_endpoint"

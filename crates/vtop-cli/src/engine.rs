@@ -18,7 +18,9 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use futures::StreamExt;
 use vtop_adapters::base::{DiscoveredSource, ReadResult, SourceAdapter};
-use vtop_adapters::{FileSource, KafkaSource, SyslogSpoolSource};
+#[cfg(feature = "kafka")]
+use vtop_adapters::KafkaSource;
+use vtop_adapters::{FileSource, SyslogSpoolSource};
 use vtop_core::batch::{AdaptiveBatcher, BatchLimits, SealReason, TelemetryBatch};
 use vtop_core::compression::compress_batch;
 use vtop_core::config::{ResolvedStateStore, StreamConfig, StreamsConfig, VtopConfig};
@@ -971,11 +973,18 @@ impl Engine {
         let mut adapters: HashMap<SourceType, Box<dyn SourceAdapter>> = HashMap::new();
         if let Some(k) = &config.sources.kafka {
             if k.enabled {
-                let fmt = default_format_for(&streams, SourceType::Kafka);
-                adapters.insert(
-                    SourceType::Kafka,
-                    Box::new(KafkaSource::new(k.clone(), fmt)?),
-                );
+                #[cfg(feature = "kafka")]
+                {
+                    let fmt = default_format_for(&streams, SourceType::Kafka);
+                    adapters.insert(
+                        SourceType::Kafka,
+                        Box::new(KafkaSource::new(k.clone(), fmt)?),
+                    );
+                }
+                #[cfg(not(feature = "kafka"))]
+                return Err(VtopError::Config(
+                    "Kafka source is enabled, but this build omits the `kafka` feature".to_owned(),
+                ));
             }
         }
         if let Some(f) = &config.sources.file {
@@ -1097,6 +1106,7 @@ impl Engine {
         // no longer exist, so a broker that churns through short-lived topics
         // does not grow the cache without limit. `sources` is the full live set
         // this cycle, which is exactly what pruning needs.
+        #[cfg(feature = "kafka")]
         if *source_type == SourceType::Kafka {
             if let Some(k) = adapter
                 .as_any_mut()
