@@ -48,10 +48,11 @@ impl SyslogSpoolSource {
             .unwrap_or_else(|| path.to_string())
     }
 
-    fn marker(path: &str, start: u64, end: u64) -> ProgressMarker {
+    fn marker(path: &str, inode: Option<u64>, start: u64, end: u64) -> ProgressMarker {
         ProgressMarker::SyslogSpool {
             spool_id: Self::spool_id(path),
             path: path.to_string(),
+            inode,
             start_byte: start,
             end_byte: end,
             received_time_start: None,
@@ -68,7 +69,7 @@ impl SyslogSpoolSource {
         start: u64,
         max_records: usize,
         max_bytes: usize,
-    ) -> Result<(Vec<Vec<u8>>, u64), VtopError> {
+    ) -> Result<(Vec<Vec<u8>>, u64, Option<u64>), VtopError> {
         let file = tokio::fs::File::open(&path).await?;
         let mut reader = BufReader::new(file);
         reader.seek(std::io::SeekFrom::Start(start)).await?;
@@ -91,7 +92,11 @@ impl SyslogSpoolSource {
             line.pop();
             records.push(line);
         }
-        Ok((records, pos))
+        // Fingerprint the descriptor whose bytes were actually consumed. A
+        // path lookup here could instead describe a replacement installed by
+        // a concurrent spool rotation (#127).
+        let inode = inode_of(&reader.get_ref().metadata().await?);
+        Ok((records, pos, inode))
     }
 }
 
@@ -128,12 +133,13 @@ impl SourceAdapter for SyslogSpoolSource {
     ) -> Result<Vec<ReadResult>, VtopError> {
         let path = source.source_name.clone();
         let start = self.cursors.entry(path.clone()).or_default().read_byte;
-        let (records, pos) = Self::read_slice(path.clone(), start, max_records, max_bytes).await?;
+        let (records, pos, inode) =
+            Self::read_slice(path.clone(), start, max_records, max_bytes).await?;
         self.cursors.get_mut(&path).unwrap().read_byte = pos;
 
         Ok(vec![ReadResult {
-            progress_start: Self::marker(&path, start, start),
-            progress_end: Self::marker(&path, start, pos),
+            progress_start: Self::marker(&path, inode, start, start),
+            progress_end: Self::marker(&path, inode, start, pos),
             records,
             first_timestamp: None,
             last_timestamp: None,
@@ -168,14 +174,18 @@ impl SourceAdapter for SyslogSpoolSource {
             })
             .collect();
 
-        let mut results: Vec<(usize, String, u64, Result<(Vec<Vec<u8>>, u64), VtopError>)> =
-            futures::stream::iter(jobs.into_iter().map(|(i, path, start)| async move {
-                let res = Self::read_slice(path.clone(), start, max_records, max_bytes).await;
-                (i, path, start, res)
-            }))
-            .buffer_unordered(SPOOL_READ_CONCURRENCY)
-            .collect()
-            .await;
+        let mut results: Vec<(
+            usize,
+            String,
+            u64,
+            Result<(Vec<Vec<u8>>, u64, Option<u64>), VtopError>,
+        )> = futures::stream::iter(jobs.into_iter().map(|(i, path, start)| async move {
+            let res = Self::read_slice(path.clone(), start, max_records, max_bytes).await;
+            (i, path, start, res)
+        }))
+        .buffer_unordered(SPOOL_READ_CONCURRENCY)
+        .collect()
+        .await;
         results.sort_by_key(|(i, ..)| *i);
 
         let mut report = AdapterReadReport {
@@ -188,12 +198,12 @@ impl SourceAdapter for SyslogSpoolSource {
         let mut any_failed = false;
         for (source_index, path, start, res) in results {
             let result = match res {
-                Ok((records, pos)) => {
+                Ok((records, pos, inode)) => {
                     self.cursors.get_mut(&path).unwrap().read_byte = pos;
                     any_records |= !records.is_empty();
                     Ok(vec![ReadResult {
-                        progress_start: Self::marker(&path, start, start),
-                        progress_end: Self::marker(&path, start, pos),
+                        progress_start: Self::marker(&path, inode, start, start),
+                        progress_end: Self::marker(&path, inode, start, pos),
                         records,
                         first_timestamp: None,
                         last_timestamp: None,
@@ -240,15 +250,37 @@ impl SourceAdapter for SyslogSpoolSource {
 
     async fn replay_from_marker(&mut self, marker: &ProgressMarker) -> Result<(), VtopError> {
         let ProgressMarker::SyslogSpool {
-            path, start_byte, ..
+            path,
+            inode: marker_inode,
+            start_byte,
+            ..
         } = marker
         else {
             return Err(VtopError::Source(
                 "spool adapter given non-spool marker".into(),
             ));
         };
+        // Open once and validate the descriptor, not a path-stat result: the
+        // same descriptor supplies both identity and length even if rotation
+        // races this check. Old markers have no inode and retain their former
+        // size-only behavior; `None` never means identity was verified.
+        let file = tokio::fs::File::open(path).await?;
+        let metadata = file.metadata().await?;
+        let current_inode = inode_of(&metadata);
+        if marker_inode.is_some() && marker_inode != &current_inode {
+            return Err(VtopError::Source(format!(
+                "cannot replay syslog spool {path}: file identity changed (rotation/replacement)"
+            )));
+        }
         let c = self.cursors.entry(path.clone()).or_default();
-        c.read_byte = (*start_byte).max(c.committed_byte);
+        let replay_byte = (*start_byte).max(c.committed_byte);
+        if replay_byte > metadata.len() {
+            return Err(VtopError::Source(format!(
+                "cannot replay syslog spool {path} at byte {replay_byte}: file length is {} (truncated)",
+                metadata.len()
+            )));
+        }
+        c.read_byte = replay_byte;
         Ok(())
     }
 
@@ -259,6 +291,17 @@ impl SourceAdapter for SyslogSpoolSource {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }
+}
+
+#[cfg(unix)]
+fn inode_of(md: &std::fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Some(md.ino())
+}
+
+#[cfg(not(unix))]
+fn inode_of(_md: &std::fs::Metadata) -> Option<u64> {
+    None
 }
 
 #[cfg(test)]
@@ -303,5 +346,111 @@ mod tests {
         assert_eq!(reads2.len(), 1);
         assert_eq!(reads2[0].records.len(), 1);
         assert_eq!(reads2[0].records[0], b"<13>msg two");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn marker_fingerprints_the_open_spool_descriptor() {
+        use std::os::unix::fs::MetadataExt;
+
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "<13>old message").unwrap();
+        f.flush().unwrap();
+        let path = f.path().to_string_lossy().into_owned();
+        let expected_inode = std::fs::metadata(&path).unwrap().ino();
+        let source = DiscoveredSource {
+            source_type: SourceType::SyslogSpool,
+            source_name: path.clone(),
+            format: TelemetryFormat::Syslog,
+        };
+
+        let mut spool = SyslogSpoolSource::new(vec![path]);
+        let reads = spool
+            .read_batch_candidates(&source, 10, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        let ProgressMarker::SyslogSpool { inode, .. } = reads[0].progress_end else {
+            panic!("expected syslog-spool marker");
+        };
+        assert_eq!(inode, Some(expected_inode));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replay_rejects_a_rotated_spool() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.log");
+        std::fs::write(&path, "old message\n").unwrap();
+        let path_string = path.to_string_lossy().into_owned();
+        let source = DiscoveredSource {
+            source_type: SourceType::SyslogSpool,
+            source_name: path_string.clone(),
+            format: TelemetryFormat::Syslog,
+        };
+        let mut spool = SyslogSpoolSource::new(vec![path_string]);
+        let reads = spool
+            .read_batch_candidates(&source, 10, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+
+        // Keep both files allocated until the atomic replacement. Removing
+        // first lets Linux reuse the freed inode and makes this test flaky.
+        let replacement = dir.path().join("replacement.log");
+        std::fs::write(&replacement, "new message\n").unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        let error = spool
+            .replay_from_marker(&reads[0].progress_start)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("identity changed"));
+    }
+
+    #[tokio::test]
+    async fn replay_rejects_a_truncated_spool() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "first").unwrap();
+        writeln!(f, "second").unwrap();
+        f.flush().unwrap();
+        let path = f.path().to_string_lossy().into_owned();
+        let source = DiscoveredSource {
+            source_type: SourceType::SyslogSpool,
+            source_name: path.clone(),
+            format: TelemetryFormat::Syslog,
+        };
+        let mut spool = SyslogSpoolSource::new(vec![path.clone()]);
+        let first = spool
+            .read_batch_candidates(&source, 1, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        spool.commit_progress(&first[0].progress_end).await.unwrap();
+        let second = spool
+            .read_batch_candidates(&source, 1, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+
+        f.as_file_mut().set_len(0).unwrap();
+        let error = spool
+            .replay_from_marker(&second[0].progress_start)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("truncated"));
+    }
+
+    #[test]
+    fn legacy_marker_without_inode_remains_deserializable() {
+        let json = r#"{
+            "source_type":"syslog_spool",
+            "spool_id":"legacy.log",
+            "path":"/var/spool/legacy.log",
+            "start_byte":10,
+            "end_byte":20,
+            "received_time_start":null,
+            "received_time_end":null
+        }"#;
+        let marker: ProgressMarker = serde_json::from_str(json).unwrap();
+        let ProgressMarker::SyslogSpool { inode, .. } = marker else {
+            panic!("expected syslog-spool marker");
+        };
+        assert_eq!(inode, None);
     }
 }

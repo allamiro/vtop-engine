@@ -577,11 +577,14 @@ mod tests {
             "marker carries the READ file's inode"
         );
 
-        // Rotate: replace the path with a NEW file (new inode, same size so a
-        // size-only check would be fooled).
-        std::fs::remove_file(&path).unwrap();
-        std::fs::write(&path, "new-1\nnew-2\n").unwrap();
-        assert_ne!(std::fs::metadata(&path).unwrap().ino(), read_inode);
+        // Rotate atomically with a replacement that exists at the same time as
+        // the original. Unlink-then-create can immediately reuse the freed
+        // inode on Linux, making a real replacement look identical (#132 CI).
+        let replacement = dir.path().join("replacement.log");
+        std::fs::write(&replacement, "new-1\nnew-2\n").unwrap();
+        let replacement_inode = std::fs::metadata(&replacement).unwrap().ino();
+        assert_ne!(replacement_inode, read_inode);
+        std::fs::rename(&replacement, &path).unwrap();
 
         // Committing the OLD read with delete_after_commit=true must not
         // delete the replacement: the recorded identity disagrees with what

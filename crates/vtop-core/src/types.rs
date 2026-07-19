@@ -212,6 +212,11 @@ pub enum ProgressMarker {
     SyslogSpool {
         spool_id: String,
         path: String,
+        /// Identity of the spool file the bytes were read from (fstat on the
+        /// open descriptor, #127). `serde(default)` keeps pre-fingerprint
+        /// markers deserializable; `None` means "unknown", never "checked".
+        #[serde(default)]
+        inode: Option<u64>,
         start_byte: u64,
         end_byte: u64,
         received_time_start: Option<String>,
