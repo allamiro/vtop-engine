@@ -7,8 +7,13 @@ on:
     branches: [main]
 
 # Least privilege by default; no CI job needs write access to the repo.
+# pull-requests: read is required by dorny/paths-filter in the `changes` job —
+# it lists a PR's changed files via the pulls API, and an unspecified scope
+# under an explicit permissions block is `none`, which would fail detection
+# and silently skip every downstream job.
 permissions:
   contents: read
+  pull-requests: read
 
 env:
   CARGO_TERM_COLOR: always
