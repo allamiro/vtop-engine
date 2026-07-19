@@ -104,12 +104,30 @@ impl S3NativeBackend {
             );
         }
 
+        // The SDK resolves endpoints from its OWN configuration too —
+        // AWS_ENDPOINT_URL / AWS_ENDPOINT_URL_S3 and the shared config file —
+        // and those must not bypass the policy the explicit config obeys.
+        // The service-specific variable is checked here because it is applied
+        // at service-config construction, where no resolved value is
+        // observable; the globally-resolved endpoint is checked on the loaded
+        // SdkConfig below.
+        for var in ["AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL"] {
+            if let Ok(ep) = std::env::var(var) {
+                validate_endpoint_scheme(Some(&ep), cfg.verify_tls)
+                    .map_err(|e| VtopError::Config(format!("{var}: {e}")))?;
+            }
+        }
+
         let mut loader =
             aws_config::defaults(BehaviorVersion::latest()).region(Region::new(cfg.region.clone()));
         if let Some(ep) = &cfg.endpoint_url {
             loader = loader.endpoint_url(ep.clone());
         }
         let shared = loader.load().await;
+        // Whatever endpoint actually resolved (explicit config, env, or the
+        // shared config file) is what the client will talk to — validate THAT,
+        // not only the value we passed in.
+        validate_endpoint_scheme(shared.endpoint_url(), cfg.verify_tls)?;
 
         let s3_conf = aws_sdk_s3::config::Builder::from(&shared)
             .force_path_style(cfg.force_path_style)
