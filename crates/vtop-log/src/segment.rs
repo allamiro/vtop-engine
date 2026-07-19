@@ -56,6 +56,28 @@ struct ScanResult {
     content_hasher: blake3::Hasher,
 }
 
+pub(crate) struct SegmentInspection {
+    pub descriptor: SegmentDescriptor,
+    pub record_count: u64,
+    pub next_offset: u64,
+    pub content_bytes: u64,
+    pub sealed_content_root: Option<String>,
+}
+
+struct ActiveFileInspection {
+    header: SegmentHeader,
+    header_len: u64,
+    actual_len: u64,
+    scan: ScanResult,
+}
+
+struct SealedFileInspection {
+    header: SegmentHeader,
+    header_len: u64,
+    scan: ScanResult,
+    manifest: SegmentManifest,
+}
+
 pub struct ActiveSegment {
     path: PathBuf,
     file: File,
@@ -138,54 +160,16 @@ impl ActiveSegment {
     /// silently discarded.
     pub fn recover(path: impl AsRef<Path>) -> VtopLogResult<Self> {
         let path = path.as_ref().to_path_buf();
-        let paths = SegmentPaths::from_active(&path)?;
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(&path)
             .map_err(|source| io_error(&path, source))?;
-        let (header, header_len) = read_header_with_path(&mut file, &path)?;
-        // A missing marker is ambiguous: the file may contain acknowledged
-        // Fsync appends whose boundary sidecar was deleted. Never manufacture
-        // an empty boundary and truncate possibly committed data; leave the
-        // segment untouched for quarantine/operator recovery.
-        let boundary = read_commit_boundary(&paths.commit)?;
-        if boundary.segment_id != header.descriptor.segment_id {
-            return Err(LogError::CommitBoundaryMismatch(
-                "segment id differs from the active segment header".to_owned(),
-            ));
-        }
-        let committed_end = header_len
-            .checked_add(boundary.content_bytes)
-            .ok_or_else(|| {
-                LogError::CommitBoundaryMismatch("committed byte length overflows".to_owned())
-            })?;
-        let actual_len = file
-            .metadata()
-            .map_err(|source| io_error(&path, source))?
-            .len();
-        if committed_end > actual_len {
-            return Err(LogError::CommitBoundaryMismatch(format!(
-                "committed byte end {committed_end} exceeds file length {actual_len}"
-            )));
-        }
-        let mut scan = scan_records(
-            &mut file,
-            &path,
-            &header,
-            header_len,
-            Some(committed_end),
-            false,
-        )?;
-        if scan.next_offset != boundary.committed_offset
-            || scan.valid_end != committed_end
-            || scan.valid_end - header_len != boundary.content_bytes
-        {
-            return Err(LogError::CommitBoundaryMismatch(
-                "offset or byte boundary does not end on the validated record frontier".to_owned(),
-            ));
-        }
-        scan.truncated_bytes = actual_len.saturating_sub(scan.valid_end);
+        let inspection = inspect_active_file(&mut file, &path)?;
+        let header = inspection.header;
+        let header_len = inspection.header_len;
+        let mut scan = inspection.scan;
+        scan.truncated_bytes = inspection.actual_len.saturating_sub(scan.valid_end);
         if scan.truncated_bytes > 0 {
             file.set_len(scan.valid_end)
                 .map_err(|source| io_error(&path, source))?;
@@ -513,20 +497,11 @@ impl SegmentReader {
             .read(true)
             .open(&path)
             .map_err(|source| io_error(&path, source))?;
-        let (header, header_len) = read_header_with_path(&mut file, &path)?;
-        let scan = scan_records(&mut file, &path, &header, header_len, None, false)?;
-        let manifest_bytes =
-            fs::read(&paths.manifest).map_err(|source| io_error(&paths.manifest, source))?;
-        let manifest: SegmentManifest =
-            serde_json::from_slice(&manifest_bytes).map_err(|error| {
-                LogError::ManifestMismatch(format!("cannot decode manifest: {error}"))
-            })?;
-        if manifest_bytes != canonical_manifest_bytes(&manifest)? {
-            return Err(LogError::ManifestMismatch(
-                "manifest is not in canonical VTOP JSON encoding".to_owned(),
-            ));
-        }
-        validate_manifest(&manifest, &header, &scan, header_len)?;
+        let inspection = inspect_sealed_file(&mut file, &path)?;
+        let header = inspection.header;
+        let header_len = inspection.header_len;
+        let scan = inspection.scan;
+        let manifest = inspection.manifest;
 
         let index = match read_index(&paths.index) {
             Ok(index) if index == scan.index => index,
@@ -594,6 +569,97 @@ pub fn rebuild_index(path: impl AsRef<Path>) -> VtopLogResult<()> {
     let (header, header_len) = read_header_with_path(&mut file, path)?;
     let scan = scan_records(&mut file, path, &header, header_len, None, false)?;
     write_index_atomic(&paths.index, &scan.index)
+}
+
+pub(crate) fn inspect_active_segment(path: &Path) -> VtopLogResult<SegmentInspection> {
+    SegmentPaths::from_active(path)?;
+    let mut file = File::open(path).map_err(|source| io_error(path, source))?;
+    let inspection = inspect_active_file(&mut file, path)?;
+    Ok(SegmentInspection {
+        descriptor: inspection.header.descriptor,
+        record_count: inspection.scan.records,
+        next_offset: inspection.scan.next_offset,
+        content_bytes: inspection.scan.valid_end - inspection.header_len,
+        sealed_content_root: None,
+    })
+}
+
+pub(crate) fn inspect_sealed_segment(path: &Path) -> VtopLogResult<SegmentInspection> {
+    SegmentPaths::from_segment(path)?;
+    let mut file = File::open(path).map_err(|source| io_error(path, source))?;
+    let inspection = inspect_sealed_file(&mut file, path)?;
+    Ok(SegmentInspection {
+        descriptor: inspection.header.descriptor,
+        record_count: inspection.scan.records,
+        next_offset: inspection.scan.next_offset,
+        content_bytes: inspection.scan.valid_end - inspection.header_len,
+        sealed_content_root: Some(inspection.manifest.blake3_root),
+    })
+}
+
+fn inspect_active_file(file: &mut File, path: &Path) -> VtopLogResult<ActiveFileInspection> {
+    let paths = SegmentPaths::from_active(path)?;
+    let (header, header_len) = read_header_with_path(file, path)?;
+    // A missing marker is ambiguous: the file may contain acknowledged Fsync
+    // appends whose boundary sidecar was deleted. Inspection and recovery must
+    // never manufacture a boundary or promote the surviving bytes.
+    let boundary = read_commit_boundary(&paths.commit)?;
+    if boundary.segment_id != header.descriptor.segment_id {
+        return Err(LogError::CommitBoundaryMismatch(
+            "segment id differs from the active segment header".to_owned(),
+        ));
+    }
+    let committed_end = header_len
+        .checked_add(boundary.content_bytes)
+        .ok_or_else(|| {
+            LogError::CommitBoundaryMismatch("committed byte length overflows".to_owned())
+        })?;
+    let actual_len = file
+        .metadata()
+        .map_err(|source| io_error(path, source))?
+        .len();
+    if committed_end > actual_len {
+        return Err(LogError::CommitBoundaryMismatch(format!(
+            "committed byte end {committed_end} exceeds file length {actual_len}"
+        )));
+    }
+    let scan = scan_records(file, path, &header, header_len, Some(committed_end), false)?;
+    if scan.next_offset != boundary.committed_offset
+        || scan.valid_end != committed_end
+        || scan.valid_end - header_len != boundary.content_bytes
+    {
+        return Err(LogError::CommitBoundaryMismatch(
+            "offset or byte boundary does not end on the validated record frontier".to_owned(),
+        ));
+    }
+    Ok(ActiveFileInspection {
+        header,
+        header_len,
+        actual_len,
+        scan,
+    })
+}
+
+fn inspect_sealed_file(file: &mut File, path: &Path) -> VtopLogResult<SealedFileInspection> {
+    let paths = SegmentPaths::from_segment(path)?;
+    let (header, header_len) = read_header_with_path(file, path)?;
+    let scan = scan_records(file, path, &header, header_len, None, false)?;
+    let manifest_bytes =
+        fs::read(&paths.manifest).map_err(|source| io_error(&paths.manifest, source))?;
+    let manifest: SegmentManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|error| LogError::ManifestMismatch(format!("cannot decode manifest: {error}")))?;
+    if manifest_bytes != canonical_manifest_bytes(&manifest)? {
+        return Err(LogError::ManifestMismatch(
+            "manifest is not in canonical VTOP JSON encoding".to_owned(),
+        ));
+    }
+    validate_manifest(&manifest, &header, &scan, header_len)?;
+    Ok(SealedFileInspection {
+        header,
+        header_len,
+        scan,
+        manifest,
+    })
 }
 
 enum SequenceDecision {
