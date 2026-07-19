@@ -112,6 +112,11 @@ struct TopicUsage {
 /// bounds memory: an aggregate budget would let one busy topic consume the
 /// whole topic-count multiple (29 topics x 100 MiB = ~2.9 GiB in one unit).
 ///
+/// Topics are identified by their INDEX into the pass's source slice, not by
+/// name: the poll loop handles every message, and a `String` key would mean an
+/// allocation per message on the read-throughput path. The caller resolves
+/// names to indices once via its topic map and back again during demux.
+///
 /// A message pushed to a topic that is already at budget is REJECTED, not
 /// truncated: cursors advance only over kept records, so rejected offsets are
 /// simply re-read on the next pass. Rejection is monotonic within a pass (a
@@ -122,8 +127,9 @@ struct TopicUsage {
 /// without a broker.
 #[derive(Debug)]
 struct MultiTopicAcc {
-    parts: HashMap<(String, i32), PartAcc>,
-    topics: HashMap<String, TopicUsage>,
+    parts: HashMap<(usize, i32), PartAcc>,
+    usage: Vec<TopicUsage>,
+    full: Vec<bool>,
     full_topics: usize,
     total_records: usize,
     max_records: usize,
@@ -131,10 +137,11 @@ struct MultiTopicAcc {
 }
 
 impl MultiTopicAcc {
-    fn new(max_records: usize, max_bytes: usize) -> Self {
+    fn new(n_topics: usize, max_records: usize, max_bytes: usize) -> Self {
         Self {
             parts: HashMap::new(),
-            topics: HashMap::new(),
+            usage: (0..n_topics).map(|_| TopicUsage::default()).collect(),
+            full: vec![false; n_topics],
             full_topics: 0,
             total_records: 0,
             max_records,
@@ -142,26 +149,23 @@ impl MultiTopicAcc {
         }
     }
 
-    fn topic_full(usage: &TopicUsage, max_records: usize, max_bytes: usize) -> bool {
-        usage.records >= max_records || usage.bytes >= max_bytes
-    }
-
-    /// Keep `payload` for `(topic, partition)` unless the topic is at budget.
-    /// Returns whether the message was kept.
-    fn push(&mut self, topic: &str, partition: i32, offset: i64, payload: Vec<u8>) -> bool {
-        let usage = self.topics.entry(topic.to_string()).or_default();
-        if Self::topic_full(usage, self.max_records, self.max_bytes) {
+    /// Keep `payload` for `(topic_idx, partition)` unless the topic is at
+    /// budget. Returns whether the message was kept.
+    fn push(&mut self, topic_idx: usize, partition: i32, offset: i64, payload: Vec<u8>) -> bool {
+        if self.full[topic_idx] {
             return false;
         }
+        let usage = &mut self.usage[topic_idx];
         usage.records += 1;
         usage.bytes += payload.len();
-        if Self::topic_full(usage, self.max_records, self.max_bytes) {
+        if usage.records >= self.max_records || usage.bytes >= self.max_bytes {
+            self.full[topic_idx] = true;
             self.full_topics += 1;
         }
         self.total_records += 1;
         let acc = self
             .parts
-            .entry((topic.to_string(), partition))
+            .entry((topic_idx, partition))
             .or_insert_with(|| PartAcc {
                 records: Vec::new(),
                 start_offset: offset,
@@ -172,6 +176,11 @@ impl MultiTopicAcc {
         true
     }
 
+    /// Whether this topic has reached its budget for the pass.
+    fn is_full(&self, topic_idx: usize) -> bool {
+        self.full[topic_idx]
+    }
+
     /// True once every one of the `assigned_topics` topics that can receive
     /// messages has reached its budget — the pass has nothing left to gain
     /// from polling.
@@ -179,14 +188,15 @@ impl MultiTopicAcc {
         assigned_topics > 0 && self.full_topics >= assigned_topics
     }
 
-    /// Drain into `(topic, partition, acc)` tuples, ordered for determinism.
-    fn into_sorted(self) -> Vec<(String, i32, PartAcc)> {
-        let mut out: Vec<(String, i32, PartAcc)> = self
+    /// Drain into `(topic_idx, partition, acc)` tuples, ordered for
+    /// determinism.
+    fn into_sorted(self) -> Vec<(usize, i32, PartAcc)> {
+        let mut out: Vec<(usize, i32, PartAcc)> = self
             .parts
             .into_iter()
             .map(|((t, p), acc)| (t, p, acc))
             .collect();
-        out.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+        out.sort_by_key(|&(t, p, _)| (t, p));
         out
     }
 }
@@ -382,6 +392,9 @@ impl SourceAdapter for KafkaSource {
         // the only topics that can ever fill up, so the count the poll loop's
         // all-full early exit must compare against.
         let mut assigned_topics: usize = 0;
+        // Partition lists aligned with `sources`, kept so a topic that fills
+        // its budget mid-pass can be pause()d without refetching metadata.
+        let mut partitions_by_source: Vec<Vec<i32>> = Vec::with_capacity(sources.len());
         let mut tpl = TopicPartitionList::new();
         for source in sources {
             let topic = &source.source_name;
@@ -394,12 +407,14 @@ impl SourceAdapter for KafkaSource {
                 }
                 Err(e) => {
                     source_errors.push(Some(e));
+                    partitions_by_source.push(Vec::new());
                     continue;
                 }
             };
             if !partitions.is_empty() {
                 assigned_topics += 1;
             }
+            partitions_by_source.push(partitions.clone());
             for p in partitions {
                 let cur = self.cursors.entry((topic.clone(), p)).or_default();
                 let off = match cur.last_read_offset {
@@ -469,7 +484,8 @@ impl SourceAdapter for KafkaSource {
         // busy topic monopolise the whole topic-count multiple in a single
         // in-memory unit. Messages for a full topic are skipped and re-read
         // next pass; the loop stops early once every assigned topic is full.
-        let mut acc = MultiTopicAcc::new(max_records, max_bytes);
+        let mut acc = MultiTopicAcc::new(sources.len(), max_records, max_bytes);
+        let mut paused = vec![false; sources.len()];
         let deadline = std::time::Instant::now() + max_wait;
         loop {
             if acc.all_full(assigned_topics) {
@@ -478,15 +494,43 @@ impl SourceAdapter for KafkaSource {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             match consumer.poll(remaining) {
                 Some(Ok(msg)) => {
+                    // A message for a topic we did not assign should be
+                    // impossible; dropping it silently would lose data, so
+                    // fail loudly (cursors have not advanced — nothing is
+                    // abandoned).
+                    let Some(&idx) = topic_index.get(msg.topic()) else {
+                        return Err(VtopError::Source(format!(
+                            "kafka poll returned unassigned topic {}",
+                            msg.topic()
+                        )));
+                    };
                     // push() rejects messages for topics at budget; rejected
                     // offsets are re-read next pass because cursors advance
                     // only over kept records.
                     let _ = acc.push(
-                        msg.topic(),
+                        idx,
                         msg.partition(),
                         msg.offset(),
                         msg.payload().unwrap_or_default().to_vec(),
                     );
+                    // A full topic keeps DELIVERING otherwise: rdkafka would
+                    // go on fetching its tail, and every discarded message is
+                    // bandwidth spent on data the next pass refetches anyway.
+                    // Pausing its partitions stops the fetcher for the rest of
+                    // the pass; the next pass's assign() resets the state.
+                    if acc.is_full(idx) && !paused[idx] {
+                        let topic = &sources[idx].source_name;
+                        let mut ptpl = TopicPartitionList::new();
+                        for &p in &partitions_by_source[idx] {
+                            ptpl.add_partition(topic, p);
+                        }
+                        if let Err(e) = consumer.pause(&ptpl) {
+                            // Fetching a discarded tail is waste, not danger —
+                            // never fail the pass over pause.
+                            tracing::debug!(topic, error = %e, "pause of full topic failed");
+                        }
+                        paused[idx] = true;
+                    }
                 }
                 // Cursors are only advanced AFTER the loop, so failing the
                 // whole pass here abandons nothing: every accumulated offset is
@@ -507,14 +551,8 @@ impl SourceAdapter for KafkaSource {
         // batches per topic and partition (`buffer_key`), so mixed reads are
         // safe as long as records are handed back grouped.
         let mut per_source: Vec<Vec<ReadResult>> = vec![Vec::new(); sources.len()];
-        for (topic, p, part) in acc.into_sorted() {
-            let Some(&idx) = topic_index.get(topic.as_str()) else {
-                // A message for a topic we did not assign should be impossible;
-                // dropping it silently would lose data, so fail loudly.
-                return Err(VtopError::Source(format!(
-                    "kafka poll returned unassigned topic {topic}"
-                )));
-            };
+        for (idx, p, part) in acc.into_sorted() {
+            let topic = &sources[idx].source_name;
             // Record the last partition touched so `get_progress_marker` keeps
             // working. Single-slot `active` is a known wart with many
             // partitions in play; it is not on the commit path
@@ -760,25 +798,19 @@ mod tests {
 
     #[test]
     fn multi_topic_acc_demuxes_by_topic_and_partition() {
-        let mut acc = MultiTopicAcc::new(usize::MAX, usize::MAX);
+        // Topic indices: 0 = "t_a", 1 = "t_b" (the caller maps names once).
+        let mut acc = MultiTopicAcc::new(2, usize::MAX, usize::MAX);
         // Interleaved arrival order across two topics and two partitions.
-        assert!(acc.push("t_a", 0, 10, b"a0".to_vec()));
-        assert!(acc.push("t_b", 0, 5, b"b0".to_vec()));
-        assert!(acc.push("t_a", 1, 20, b"a1".to_vec()));
-        assert!(acc.push("t_a", 0, 11, b"a0b".to_vec()));
+        assert!(acc.push(0, 0, 10, b"a0".to_vec()));
+        assert!(acc.push(1, 0, 5, b"b0".to_vec()));
+        assert!(acc.push(0, 1, 20, b"a1".to_vec()));
+        assert!(acc.push(0, 0, 11, b"a0b".to_vec()));
         assert_eq!(acc.total_records, 4);
 
         let sorted = acc.into_sorted();
-        let keys: Vec<(String, i32)> = sorted.iter().map(|(t, p, _)| (t.clone(), *p)).collect();
-        // Deterministic order: by topic, then partition.
-        assert_eq!(
-            keys,
-            vec![
-                ("t_a".to_string(), 0),
-                ("t_a".to_string(), 1),
-                ("t_b".to_string(), 0)
-            ]
-        );
+        let keys: Vec<(usize, i32)> = sorted.iter().map(|&(t, p, _)| (t, p)).collect();
+        // Deterministic order: by topic index, then partition.
+        assert_eq!(keys, vec![(0, 0), (0, 1), (1, 0)]);
         // Same partition accumulates in arrival order and tracks the offset range.
         let (_, _, a0) = &sorted[0];
         assert_eq!(a0.records, vec![b"a0".to_vec(), b"a0b".to_vec()]);
@@ -791,29 +823,32 @@ mod tests {
 
     #[test]
     fn multi_topic_acc_enforces_record_budget_per_topic() {
-        // Budget of 2 records PER TOPIC: a busy topic must not eat another
-        // topic's allowance (an aggregate budget would let one topic take
-        // topic_count x max_bytes in a single unit — the codex P1 on #106).
-        let mut acc = MultiTopicAcc::new(2, usize::MAX);
-        assert!(acc.push("busy", 0, 0, b"r".to_vec()));
-        assert!(acc.push("busy", 0, 1, b"r".to_vec()));
+        // Budget of 2 records PER TOPIC: a busy topic (idx 0) must not eat
+        // another topic's allowance (an aggregate budget would let one topic
+        // take topic_count x max_bytes in a single unit — codex P1 on #106).
+        let (busy, quiet) = (0usize, 1usize);
+        let mut acc = MultiTopicAcc::new(2, 2, usize::MAX);
+        assert!(acc.push(busy, 0, 0, b"r".to_vec()));
+        assert!(!acc.is_full(busy));
+        assert!(acc.push(busy, 0, 1, b"r".to_vec()));
+        assert!(acc.is_full(busy), "at budget after the second record");
         // busy is now at budget: further messages are REJECTED, not kept.
-        assert!(!acc.push("busy", 0, 2, b"r".to_vec()));
+        assert!(!acc.push(busy, 0, 2, b"r".to_vec()));
         assert!(
-            !acc.push("busy", 1, 0, b"r".to_vec()),
+            !acc.push(busy, 1, 0, b"r".to_vec()),
             "budget spans the topic's partitions"
         );
         // The quiet topic still has its own full allowance.
-        assert!(acc.push("quiet", 0, 0, b"r".to_vec()));
+        assert!(acc.push(quiet, 0, 0, b"r".to_vec()));
         assert!(!acc.all_full(2), "quiet topic below budget");
-        assert!(acc.push("quiet", 0, 1, b"r".to_vec()));
+        assert!(acc.push(quiet, 0, 1, b"r".to_vec()));
         assert!(acc.all_full(2), "both topics at budget ends the pass");
         // The rejected offset 2 was never recorded: busy p0 ends at offset 1,
         // so the cursor advance re-reads offset 2 next pass (no gap, no loss).
         let sorted = acc.into_sorted();
         let busy_p0 = sorted
             .iter()
-            .find(|(t, p, _)| t == "busy" && *p == 0)
+            .find(|&&(t, p, _)| t == busy && p == 0)
             .unwrap();
         assert_eq!(busy_p0.2.end_offset, 1);
         assert_eq!(busy_p0.2.records.len(), 2);
@@ -821,15 +856,16 @@ mod tests {
 
     #[test]
     fn multi_topic_acc_enforces_byte_budget_per_topic() {
-        let mut acc = MultiTopicAcc::new(usize::MAX, 10);
+        let (t_a, t_b) = (0usize, 1usize);
+        let mut acc = MultiTopicAcc::new(2, usize::MAX, 10);
         // 6 bytes accepted; the next push crosses the 10-byte budget and is
         // accepted (budgets are checked before, not truncated mid-record)...
-        assert!(acc.push("t_a", 0, 0, vec![0u8; 6]));
-        assert!(acc.push("t_a", 0, 1, vec![0u8; 6]));
+        assert!(acc.push(t_a, 0, 0, vec![0u8; 6]));
+        assert!(acc.push(t_a, 0, 1, vec![0u8; 6]));
         // ...after which the topic is full and rejects.
-        assert!(!acc.push("t_a", 0, 2, vec![0u8; 1]));
+        assert!(!acc.push(t_a, 0, 2, vec![0u8; 1]));
         // Other topics are unaffected by t_a's bytes.
-        assert!(acc.push("t_b", 0, 0, vec![0u8; 6]));
+        assert!(acc.push(t_b, 0, 0, vec![0u8; 6]));
         assert_eq!(acc.full_topics, 1, "only t_a is at its byte budget");
         assert!(!acc.all_full(2), "t_b still has allowance");
     }
