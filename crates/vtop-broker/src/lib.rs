@@ -582,15 +582,22 @@ impl NativeServer {
         config: ServerConfig,
     ) -> BrokerResult<Self> {
         config.validate()?;
-        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(tls.client_roots))
-            .build()
-            .map_err(|error| {
-                BrokerError::InvalidConfig(format!("client certificate roots: {error}"))
-            })?;
-        let tls_config =
-            rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-                .with_client_cert_verifier(verifier)
-                .with_single_cert(tls.certificate_chain, tls.private_key)?;
+        // Pin the provider: workspace feature unification can enable more
+        // than one rustls backend, and process-level auto-detection then
+        // aborts instead of choosing.
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(tls.client_roots),
+            Arc::clone(&provider),
+        )
+        .build()
+        .map_err(|error| {
+            BrokerError::InvalidConfig(format!("client certificate roots: {error}"))
+        })?;
+        let tls_config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])?
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(tls.certificate_chain, tls.private_key)?;
         Ok(Self {
             broker,
             authorizer,
@@ -1213,14 +1220,17 @@ mod tests {
         server_roots
             .add(server_identity.cert.der().clone())
             .unwrap();
-        let client_tls =
-            rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-                .with_root_certificates(server_roots)
-                .with_client_auth_cert(
-                    vec![client_identity.cert.der().clone()],
-                    private_key(&client_identity),
-                )
-                .unwrap();
+        let client_tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_root_certificates(server_roots)
+        .with_client_auth_cert(
+            vec![client_identity.cert.der().clone()],
+            private_key(&client_identity),
+        )
+        .unwrap();
         let connector = TlsConnector::from(Arc::new(client_tls));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
