@@ -7,7 +7,6 @@
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -20,6 +19,7 @@ use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
+use vtop_log::env::{Env, OpenMode, Storage, StorageFile};
 use vtop_log::{ActiveSegment, AppendOutcome, Durability, LogRecord};
 use vtop_protocol::{
     encode_frame, read_frame, write_frame, ClientHello, Durability as WireDurability, ErrorCode,
@@ -69,25 +69,23 @@ pub type BrokerResult<T> = Result<T, BrokerError>;
 
 pub struct ProducerEpochJournal {
     path: PathBuf,
-    file: File,
+    file: Box<dyn StorageFile>,
     current: HashMap<Uuid, u64>,
     poisoned: bool,
 }
 
 impl ProducerEpochJournal {
     pub fn open(path: impl AsRef<Path>) -> BrokerResult<Self> {
+        Self::open_in(&Env::real(), path)
+    }
+
+    pub fn open_in(env: &Env, path: impl AsRef<Path>) -> BrokerResult<Self> {
         let path = path.as_ref().to_path_buf();
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&path)
+        let mut file = env
+            .storage
+            .open(&path, OpenMode::CreateAppend)
             .map_err(|source| io_error(&path, source))?;
-        let mut len = file
-            .metadata()
-            .map_err(|source| io_error(&path, source))?
-            .len();
+        let mut len = file.len().map_err(|source| io_error(&path, source))?;
         if len > MAX_EPOCH_JOURNAL_BYTES {
             return Err(BrokerError::EpochJournalCorrupt(format!(
                 "journal is {len} bytes; maximum is {MAX_EPOCH_JOURNAL_BYTES}"
@@ -98,7 +96,7 @@ impl ProducerEpochJournal {
                 .and_then(|()| file.write_all(&EPOCH_VERSION.to_be_bytes()))
                 .and_then(|()| file.sync_data())
                 .map_err(|source| io_error(&path, source))?;
-            sync_parent(&path)?;
+            sync_parent(env.storage.as_ref(), &path)?;
             len = EPOCH_HEADER_BYTES;
         }
         if len < EPOCH_HEADER_BYTES {
@@ -188,9 +186,8 @@ impl ProducerEpochJournal {
         }
         let next_len = self
             .file
-            .metadata()
-            .map_err(|source| io_error(&self.path, source))?
             .len()
+            .map_err(|source| io_error(&self.path, source))?
             .saturating_add(EPOCH_ENTRY_BYTES);
         if next_len > MAX_EPOCH_JOURNAL_BYTES {
             return Err(BrokerError::InvalidConfig(
@@ -1050,15 +1047,15 @@ fn io_error(path: &Path, source: std::io::Error) -> BrokerError {
 }
 
 #[cfg(unix)]
-fn sync_parent(path: &Path) -> BrokerResult<()> {
+fn sync_parent(storage: &dyn Storage, path: &Path) -> BrokerResult<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
+    storage
+        .sync_dir(parent)
         .map_err(|source| io_error(parent, source))
 }
 
 #[cfg(not(unix))]
-fn sync_parent(_path: &Path) -> BrokerResult<()> {
+fn sync_parent(_storage: &dyn Storage, _path: &Path) -> BrokerResult<()> {
     Ok(())
 }
 
@@ -1067,6 +1064,7 @@ mod tests {
     use super::*;
     use rcgen::{generate_simple_self_signed, CertifiedKey};
     use rustls::pki_types::{PrivatePkcs8KeyDer, ServerName};
+    use std::fs::OpenOptions;
     use tempfile::TempDir;
     use tokio_rustls::TlsConnector;
     use vtop_log::{KeyRange, RangeLineage, SegmentConfig, SegmentDescriptor};

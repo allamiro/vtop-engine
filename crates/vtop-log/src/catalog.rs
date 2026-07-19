@@ -1,8 +1,8 @@
+use crate::env::Env;
 use crate::segment::{inspect_active_segment, inspect_sealed_segment, SegmentInspection};
 use crate::{LogError, SegmentDescriptor, SegmentId, VtopLogResult};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
-use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -83,43 +83,37 @@ impl StartupCatalog {
     /// method never moves, deletes, repairs, truncates, or otherwise modifies
     /// them. Files unrelated to the native segment naming contract are ignored.
     pub fn discover(directory: impl AsRef<Path>) -> VtopLogResult<Self> {
+        Self::discover_in(&Env::real(), directory)
+    }
+
+    pub fn discover_in(env: &Env, directory: impl AsRef<Path>) -> VtopLogResult<Self> {
         let directory = directory.as_ref();
-        let mut discovered = Vec::new();
-        for entry in fs::read_dir(directory).map_err(|source| LogError::Io {
-            path: directory.to_path_buf(),
-            source,
-        })? {
-            let entry = entry.map_err(|source| LogError::Io {
+        let mut discovered = env
+            .storage
+            .read_dir(directory)
+            .map_err(|source| LogError::Io {
                 path: directory.to_path_buf(),
                 source,
             })?;
-            discovered.push((
-                entry.path(),
-                entry.file_type().map_err(|source| LogError::Io {
-                    path: entry.path(),
-                    source,
-                })?,
-            ));
-        }
-        discovered.sort_by(|left, right| left.0.cmp(&right.0));
+        discovered.sort_by(|left, right| left.path.cmp(&right.path));
 
         let mut bundles = BTreeMap::<PathBuf, ArtifactBundle>::new();
         let mut quarantined = Vec::new();
-        for (path, file_type) in discovered {
-            let Some(classification) = classify_artifact(&path) else {
+        for entry in discovered {
+            let Some(classification) = classify_artifact(&entry.path) else {
                 continue;
             };
             if classification.kind == ArtifactKind::Temporary {
                 quarantined.push(QuarantinedArtifacts {
-                    paths: vec![path],
+                    paths: vec![entry.path],
                     reasons: vec![QuarantineReason::IncompleteAtomicWrite],
                 });
                 continue;
             }
             bundles.entry(classification.base).or_default().insert(
                 classification.kind,
-                path,
-                file_type.is_file(),
+                entry.path,
+                entry.is_regular_file,
             );
         }
 
@@ -152,8 +146,8 @@ impl StartupCatalog {
                 }
             };
             let inspected = match primary.0 {
-                CatalogSegmentState::Active => inspect_active_segment(primary.1),
-                CatalogSegmentState::Sealed => inspect_sealed_segment(primary.1),
+                CatalogSegmentState::Active => inspect_active_segment(env, primary.1),
+                CatalogSegmentState::Sealed => inspect_sealed_segment(env, primary.1),
             };
             match inspected {
                 Ok(inspection) => candidates.push(Candidate {
@@ -528,7 +522,7 @@ mod tests {
         ActiveSegment, Durability, KeyRange, LogRecord, ParentRange, RangeLineage, SegmentConfig,
         SegmentReader,
     };
-    use std::fs::OpenOptions;
+    use std::fs::{self, OpenOptions};
     use std::io::Write;
     use tempfile::tempdir;
 
