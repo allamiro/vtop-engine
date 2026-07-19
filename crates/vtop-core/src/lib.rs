@@ -27,6 +27,7 @@ pub mod replay;
 pub mod state_machine;
 pub mod telemetry;
 pub mod types;
+pub mod work_dir;
 
 pub use errors::{VtopError, VtopResult};
 pub use state_machine::{can_transition, transition, BatchState};

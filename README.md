@@ -662,7 +662,7 @@ VTOP is currently a prototype. The following limits are known and intentional.
 | Area | Current behavior | Planned direction |
 |---|---|---|
 | Large objects | native S3 backend uses single-part `put_object` | add multipart upload |
-| Large records / whole files | a whole-file record and an over-budget line are read fully into memory (soft `max_bytes`); a warning is logged | add bounded reads + streaming compression/upload |
+| Large records / whole files | `max_bytes` is a hard per-source/per-batch ceiling; an oversized record is rejected without advancing source progress | raise the explicit budget only when the deployment has matching memory headroom |
 | Partial upload recovery | replays from source instead of resuming half-written local objects | add resumable local staging |
 | Command backend verification cost | `aws`, `s3cmd`, and `mc` download each stored object to hash it | prefer native S3 SHA-256 when read-back bandwidth is costly |
 | Syslog timestamps | `received_time_*` is not yet extracted into the spool marker | add timestamp extraction |
@@ -692,10 +692,9 @@ Completed:
 Planned implementation areas:
 
 - [ ] Kafka feature gate for lighter builds
-- [ ] bounded reads + streaming compression/upload for very large records —
-      `max_records` / `max_bytes` bound a *batch*, but a single oversized record
-      (a long line, a large Kafka message, or `whole_file`) is still buffered
-      whole before the budget is checked
+- [x] bounded file/syslog/whole-file reads, pre-clone Kafka record checks, and
+      streaming local compression; `max_bytes` is enforced before source
+      progress advances (native object upload remains single-part)
 - [ ] multipart upload support
 - [x] optional keyed-BLAKE3 manifest authentication via a named secret env var
 - [ ] manifest MAC key rotation / optional public-key signatures

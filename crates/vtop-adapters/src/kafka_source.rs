@@ -156,6 +156,13 @@ impl MultiTopicAcc {
             return false;
         }
         let usage = &mut self.usage[topic_idx];
+        if usage.records >= self.max_records
+            || payload.len() > self.max_bytes.saturating_sub(usage.bytes)
+        {
+            self.full[topic_idx] = true;
+            self.full_topics += 1;
+            return false;
+        }
         usage.records += 1;
         usage.bytes += payload.len();
         if usage.records >= self.max_records || usage.bytes >= self.max_bytes {
@@ -600,18 +607,27 @@ impl SourceAdapter for KafkaSource {
                             msg.topic()
                         )));
                     };
+                    let payload = msg.payload().unwrap_or_default();
+                    if payload.len() > max_bytes {
+                        // librdkafka owns the fetched message buffer, but do
+                        // not clone an oversized record into engine memory or
+                        // advance its cursor. The operator must raise the
+                        // explicit budget or fix the producer.
+                        return Err(VtopError::Source(format!(
+                            "Kafka record {}-{}@{} is {} bytes, exceeding max_bytes={max_bytes}",
+                            msg.topic(),
+                            msg.partition(),
+                            msg.offset(),
+                            payload.len()
+                        )));
+                    }
                     // Track what librdkafka delivered — kept OR rejected — so
                     // the next pass seeks only genuinely diverged partitions.
                     delivered_local.insert((idx, msg.partition()), msg.offset() + 1);
                     // push() rejects messages for topics at budget; rejected
                     // offsets are re-read next pass because cursors advance
                     // only over kept records.
-                    let _ = acc.push(
-                        idx,
-                        msg.partition(),
-                        msg.offset(),
-                        msg.payload().unwrap_or_default().to_vec(),
-                    );
+                    let _ = acc.push(idx, msg.partition(), msg.offset(), payload.to_vec());
                     // A full topic keeps DELIVERING otherwise: rdkafka would
                     // go on fetching its tail, and every discarded message is
                     // bandwidth spent on data the next pass refetches anyway.
@@ -918,7 +934,7 @@ mod tests {
     fn multi_topic_acc_enforces_record_budget_per_topic() {
         // Budget of 2 records PER TOPIC: a busy topic (idx 0) must not eat
         // another topic's allowance (an aggregate budget would let one topic
-        // take topic_count x max_bytes in a single unit — codex P1 on #106).
+        // take topic_count x max_bytes in a single unit — P1 review on #106).
         let (busy, quiet) = (0usize, 1usize);
         let mut acc = MultiTopicAcc::new(2, 2, usize::MAX);
         assert!(acc.push(busy, 0, 0, b"r".to_vec()));
@@ -951,11 +967,11 @@ mod tests {
     fn multi_topic_acc_enforces_byte_budget_per_topic() {
         let (t_a, t_b) = (0usize, 1usize);
         let mut acc = MultiTopicAcc::new(2, usize::MAX, 10);
-        // 6 bytes accepted; the next push crosses the 10-byte budget and is
-        // accepted (budgets are checked before, not truncated mid-record)...
+        // 6 bytes accepted; the next push would cross the 10-byte budget and
+        // is rejected without recording its offset.
         assert!(acc.push(t_a, 0, 0, vec![0u8; 6]));
-        assert!(acc.push(t_a, 0, 1, vec![0u8; 6]));
-        // ...after which the topic is full and rejects.
+        assert!(!acc.push(t_a, 0, 1, vec![0u8; 6]));
+        // The topic is then full and continues to reject.
         assert!(!acc.push(t_a, 0, 2, vec![0u8; 1]));
         // Other topics are unaffected by t_a's bytes.
         assert!(acc.push(t_b, 0, 0, vec![0u8; 6]));

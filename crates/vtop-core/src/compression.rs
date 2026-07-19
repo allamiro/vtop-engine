@@ -13,7 +13,8 @@ use crate::state_machine::BatchState;
 use crate::types::CompressionType;
 use flate2::write::GzEncoder;
 use flate2::Compression as GzLevel;
-use std::io::Write;
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 /// Result of compressing a batch: the local object path and its byte size.
@@ -45,39 +46,87 @@ pub fn compress_batch(
         });
     }
 
-    let payload = batch.to_record_bytes();
-    let uncompressed_bytes = payload.len() as u64;
-
     let format_ext = batch.format.extension();
-    let (compressed, extension) = match compression {
-        CompressionType::Gzip => {
-            let mut enc = GzEncoder::new(Vec::new(), GzLevel::new(clamp_gzip_level(level)));
-            enc.write_all(&payload)
-                .map_err(|e| VtopError::Compression(e.to_string()))?;
-            let out = enc
-                .finish()
-                .map_err(|e| VtopError::Compression(e.to_string()))?;
-            (out, format!("{format_ext}.gz"))
-        }
-        CompressionType::Zstd => {
-            let out = zstd::encode_all(payload.as_slice(), clamp_zstd_level(level))
-                .map_err(|e| VtopError::Compression(e.to_string()))?;
-            (out, format!("{format_ext}.zst"))
-        }
-        CompressionType::None => (payload, format_ext.to_string()),
+    let extension = match compression {
+        CompressionType::Gzip => format!("{format_ext}.gz"),
+        CompressionType::Zstd => format!("{format_ext}.zst"),
+        CompressionType::None => format_ext.to_string(),
     };
 
     std::fs::create_dir_all(work_dir)?;
     let path = work_dir.join(format!("{}.{}", batch.batch_id, extension));
-    std::fs::write(&path, &compressed)?;
+    let result = (|| -> Result<u64, VtopError> {
+        let file = File::create(&path)?;
+        match compression {
+            CompressionType::Gzip => {
+                let mut encoder = GzEncoder::new(file, GzLevel::new(clamp_gzip_level(level)));
+                let written = write_batch_payload(batch, &mut encoder)?;
+                encoder
+                    .finish()
+                    .map_err(|e| VtopError::Compression(e.to_string()))?;
+                Ok(written)
+            }
+            CompressionType::Zstd => {
+                let mut encoder = zstd::Encoder::new(file, clamp_zstd_level(level))
+                    .map_err(|e| VtopError::Compression(e.to_string()))?;
+                let written = write_batch_payload(batch, &mut encoder)?;
+                encoder
+                    .finish()
+                    .map_err(|e| VtopError::Compression(e.to_string()))?;
+                Ok(written)
+            }
+            CompressionType::None => {
+                let mut writer = BufWriter::new(file);
+                let written = write_batch_payload(batch, &mut writer)?;
+                writer.flush()?;
+                Ok(written)
+            }
+        }
+    })();
+    let uncompressed_bytes = match result {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            // A failed encoder must not leave a plausible-looking partial
+            // object for a later operator or recovery scan to mistake as
+            // complete.
+            let _ = std::fs::remove_file(&path);
+            return Err(error);
+        }
+    };
+    let size_bytes = match std::fs::metadata(&path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) => {
+            let _ = std::fs::remove_file(&path);
+            return Err(error.into());
+        }
+    };
 
     Ok(CompressedObject {
         path,
-        size_bytes: compressed.len() as u64,
+        size_bytes,
         uncompressed_bytes,
         compression,
         extension,
     })
+}
+
+/// Stream a batch's exact wire framing into `writer` without first
+/// materializing a second batch-sized payload buffer.
+fn write_batch_payload<W: Write>(batch: &TelemetryBatch, writer: &mut W) -> Result<u64, VtopError> {
+    let mut written = 0_u64;
+    for record in &batch.records {
+        writer
+            .write_all(record)
+            .map_err(|e| VtopError::Compression(e.to_string()))?;
+        written += record.len() as u64;
+        if !batch.verbatim && !record.ends_with(b"\n") {
+            writer
+                .write_all(b"\n")
+                .map_err(|e| VtopError::Compression(e.to_string()))?;
+            written += 1;
+        }
+    }
+    Ok(written)
 }
 
 fn clamp_gzip_level(level: i32) -> u32 {
@@ -138,6 +187,7 @@ mod tests {
         use std::io::Read;
         decoder.read_to_string(&mut out).unwrap();
         assert_eq!(out, "line-1\nline-2\nline-3\n");
+        assert_eq!(obj.uncompressed_bytes, out.len() as u64);
     }
 
     #[test]
@@ -148,6 +198,17 @@ mod tests {
         let bytes = std::fs::read(&obj.path).unwrap();
         let out = zstd::decode_all(bytes.as_slice()).unwrap();
         assert_eq!(out, b"a\nb\n");
+        assert_eq!(obj.uncompressed_bytes, out.len() as u64);
+    }
+
+    #[test]
+    fn uncompressed_output_streams_with_exact_framing() {
+        let dir = tempfile::tempdir().unwrap();
+        let batch = sealed_batch(vec![b"a", b"b\n"]);
+        let obj = compress_batch(&batch, CompressionType::None, 0, dir.path()).unwrap();
+        assert_eq!(std::fs::read(&obj.path).unwrap(), b"a\nb\n");
+        assert_eq!(obj.uncompressed_bytes, 4);
+        assert_eq!(obj.size_bytes, 4);
     }
 
     #[test]
