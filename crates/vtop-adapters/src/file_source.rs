@@ -63,34 +63,48 @@ impl FileSource {
         c.read_byte = committed_byte;
     }
 
+    fn identity_of(md: &std::fs::Metadata) -> FileIdentity {
+        FileIdentity {
+            inode: inode_of(md),
+            file_size: md.len(),
+            mtime: md
+                .modified()
+                .ok()
+                .map(|t| {
+                    let dt: chrono::DateTime<chrono::Utc> = t.into();
+                    dt.to_rfc3339()
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Identity of whatever the PATH names right now. Only for comparing the
+    /// current file against a previously recorded marker (the delete guard in
+    /// `commit_progress`) — never for building a marker, which must describe
+    /// the file actually READ (#65): use the open descriptor's identity.
     fn file_identity(path: &Path) -> (Option<u64>, u64, String) {
         match std::fs::metadata(path) {
             Ok(md) => {
-                let inode = inode_of(&md);
-                let size = md.len();
-                let mtime = md
-                    .modified()
-                    .ok()
-                    .map(|t| {
-                        let dt: chrono::DateTime<chrono::Utc> = t.into();
-                        dt.to_rfc3339()
-                    })
-                    .unwrap_or_default();
-                (inode, size, mtime)
+                let id = Self::identity_of(&md);
+                (id.inode, id.file_size, id.mtime)
             }
             Err(_) => (None, 0, String::new()),
         }
     }
 
-    fn marker(&self, path: &str, start: u64, end: u64) -> ProgressMarker {
-        let (inode, file_size, mtime) = Self::file_identity(Path::new(path));
+    /// Marker from a descriptor-derived identity: the inode/size/mtime are of
+    /// the file whose BYTES were read, so a rotation between read and marker
+    /// construction cannot mix the old file's offsets with the new file's
+    /// identity (#65) — which previously let `delete_after_commit` match and
+    /// delete the replacement.
+    fn marker_from(path: &str, id: &FileIdentity, start: u64, end: u64) -> ProgressMarker {
         ProgressMarker::File {
             path: path.to_string(),
-            inode,
+            inode: id.inode,
             start_byte: start,
             end_byte: end,
-            file_size,
-            mtime,
+            file_size: id.file_size,
+            mtime: id.mtime.clone(),
         }
     }
 
@@ -107,17 +121,20 @@ impl FileSource {
         max_records: usize,
         max_bytes: usize,
         whole_file: bool,
-    ) -> Result<(Vec<Vec<u8>>, u64, bool), VtopError> {
+    ) -> Result<(Vec<Vec<u8>>, u64, bool, FileIdentity), VtopError> {
         // Whole-file mode: read the entire remaining file as one opaque record.
         // Used for binary / already-compressed source files with no line
         // structure. The whole file commits as a single byte range.
         if whole_file {
-            // Whole-file mode loads the entire remaining file into memory. Warn
-            // when it exceeds the batch byte budget so operators know a single
-            // large file can dominate memory (streaming is a documented
-            // follow-up; see README known limitations).
-            let (_, fsize, _) = Self::file_identity(Path::new(&path));
+            // Read AND fingerprint through one open descriptor: a rotation
+            // between "read the bytes" and "stat the path" would otherwise mix
+            // the old file's offsets with the NEW file's identity (#65).
+            let mut file = tokio::fs::File::open(&path).await?;
+            let md = file.metadata().await?; // fstat: the opened file, not the path
+            let fsize = md.len();
             if fsize.saturating_sub(start) as usize > max_bytes {
+                // Whole-file mode loads the entire remaining file into memory;
+                // streaming is a documented follow-up (README known limits).
                 tracing::warn!(
                     path,
                     file_bytes = fsize,
@@ -125,14 +142,16 @@ impl FileSource {
                     "whole-file source exceeds max_bytes; loading entire file into memory"
                 );
             }
-            let data = tokio::fs::read(&path).await?;
+            let mut data = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut file, &mut data).await?;
             let end = data.len() as u64;
             let records = if start >= end || data.is_empty() {
                 Vec::new()
             } else {
                 vec![data[start as usize..].to_vec()]
             };
-            return Ok((records, end, true));
+            let identity = Self::identity_of(&file.metadata().await?);
+            return Ok((records, end, true, identity));
         }
 
         let file = tokio::fs::File::open(&path).await?;
@@ -175,8 +194,20 @@ impl FileSource {
             }
             records.push(line);
         }
-        Ok((records, pos, false))
+        // fstat on the descriptor we READ from — the same file even if the
+        // path was rotated away mid-read (#65).
+        let identity = Self::identity_of(&reader.get_ref().metadata().await?);
+        Ok((records, pos, false, identity))
     }
+}
+
+/// Inode / size / mtime of the file a read actually consumed, taken from the
+/// OPEN descriptor (`fstat`), never from a second path lookup.
+#[derive(Debug, Clone)]
+struct FileIdentity {
+    inode: Option<u64>,
+    file_size: u64,
+    mtime: String,
 }
 
 /// How many files are read concurrently in one pass. Bounded so a glob that
@@ -213,12 +244,12 @@ impl SourceAdapter for FileSource {
     ) -> Result<Vec<ReadResult>, VtopError> {
         let path = source.source_name.clone();
         let start = self.cursors.entry(path.clone()).or_default().read_byte;
-        let (records, end, verbatim) =
+        let (records, end, verbatim, id) =
             Self::read_slice(path.clone(), start, max_records, max_bytes, self.whole_file).await?;
         self.cursors.get_mut(&path).unwrap().read_byte = end;
         Ok(vec![ReadResult {
-            progress_start: self.marker(&path, start, start),
-            progress_end: self.marker(&path, start, end),
+            progress_start: Self::marker_from(&path, &id, start, start),
+            progress_end: Self::marker_from(&path, &id, start, end),
             records,
             first_timestamp: None,
             last_timestamp: None,
@@ -258,7 +289,7 @@ impl SourceAdapter for FileSource {
             usize,
             String,
             u64,
-            Result<(Vec<Vec<u8>>, u64, bool), VtopError>,
+            Result<(Vec<Vec<u8>>, u64, bool, FileIdentity), VtopError>,
         )> = futures::stream::iter(jobs.into_iter().map(|(i, path, start)| async move {
             let res =
                 Self::read_slice(path.clone(), start, max_records, max_bytes, whole_file).await;
@@ -280,12 +311,12 @@ impl SourceAdapter for FileSource {
         let mut any_failed = false;
         for (source_index, path, start, res) in results {
             let result = match res {
-                Ok((records, end, verbatim)) => {
+                Ok((records, end, verbatim, id)) => {
                     self.cursors.get_mut(&path).unwrap().read_byte = end;
                     any_records |= !records.is_empty();
                     Ok(vec![ReadResult {
-                        progress_start: self.marker(&path, start, start),
-                        progress_end: self.marker(&path, start, end),
+                        progress_start: Self::marker_from(&path, &id, start, start),
+                        progress_end: Self::marker_from(&path, &id, start, end),
                         records,
                         first_timestamp: None,
                         last_timestamp: None,
@@ -515,6 +546,52 @@ mod tests {
         // One file == one committable unit; see `reads_lines_and_tracks_offset`.
         assert_eq!(reads.len(), 1);
         assert_eq!(reads[0].records, vec![b"complete".to_vec()]);
+    }
+
+    /// #65: the marker's identity must describe the file whose BYTES were
+    /// read (fstat on the open descriptor), so that after a rotation the
+    /// recorded inode disagrees with the replacement and the delete guard
+    /// protects it. A path-stat at marker-build time could fingerprint the
+    /// replacement instead.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn marker_identity_comes_from_the_file_actually_read() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rotating.log");
+        std::fs::write(&path, "old-1\nold-2\n").unwrap();
+        let read_inode = std::fs::metadata(&path).unwrap().ino();
+        let spath = path.to_string_lossy().into_owned();
+
+        let mut fs = FileSource::new(vec![spath.clone()], TelemetryFormat::Raw, true);
+        let reads = fs
+            .read_batch_candidates(&src(&spath), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        let ProgressMarker::File { inode, .. } = &reads[0].progress_end else {
+            panic!("expected file marker");
+        };
+        assert_eq!(
+            *inode,
+            Some(read_inode),
+            "marker carries the READ file's inode"
+        );
+
+        // Rotate: replace the path with a NEW file (new inode, same size so a
+        // size-only check would be fooled).
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, "new-1\nnew-2\n").unwrap();
+        assert_ne!(std::fs::metadata(&path).unwrap().ino(), read_inode);
+
+        // Committing the OLD read with delete_after_commit=true must not
+        // delete the replacement: the recorded identity disagrees with what
+        // the path now names.
+        fs.commit_progress(&reads[0].progress_end).await.unwrap();
+        assert!(
+            path.exists(),
+            "rotation replacement must survive delete_after_commit"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new-1\nnew-2\n");
     }
 
     #[tokio::test]
