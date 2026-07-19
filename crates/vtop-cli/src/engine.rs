@@ -192,6 +192,7 @@ impl<'a> Pipeline<'a> {
             manifest_uri: None,
             object_sha256: None,
             manifest_sha256: None,
+            object_size_bytes: None,
             record_count: Some(batch.records.len() as i64),
             error_message: None,
             // Ownership (#93): this engine claims the batch at birth, leased so
@@ -398,6 +399,9 @@ impl<'a> Pipeline<'a> {
         let obj_patch = BatchPatch {
             object_uri: Some(object_uri.clone()),
             object_sha256: Some(object_checksum.clone().unwrap_or_default()),
+            // Recorded so recovery's storage re-check can compare size even
+            // when no digest is available (#125).
+            object_size_bytes: Some(compressed.size_bytes as i64),
             record_count: Some(batch.record_count as i64),
             ..Default::default()
         };
@@ -1321,8 +1325,16 @@ impl Engine {
                 return false;
             }
         };
-        if head.size_bytes.is_none() {
+        let Some(stored_size) = head.size_bytes else {
             return false; // gone
+        };
+        // Size must match the recorded upload when we have it (#125): a
+        // same-URI replacement with a different size fails here even when no
+        // digest comparison is possible below.
+        if let Some(want) = rec.object_size_bytes {
+            if want >= 0 && stored_size != want as u64 {
+                return false;
+            }
         }
         // The manifest is half of what VERIFIED means; a batch whose manifest
         // vanished is not verified either (#123 review).

@@ -40,6 +40,7 @@ async fn state_persists_across_reopen() {
         manifest_uri: None,
         object_sha256: None,
         manifest_sha256: None,
+        object_size_bytes: None,
         record_count: Some(10),
         error_message: None,
         owner: None,
@@ -114,6 +115,7 @@ async fn recovery_commits_verified_but_uncommitted_batch() {
         manifest_uri: Some("s3://telemetry-data/x/b-verified.manifest.json".into()),
         object_sha256: Some("deadbeef".into()),
         manifest_sha256: Some("feedface".into()),
+        object_size_bytes: None,
         record_count: Some(4),
         error_message: None,
         owner: None,
@@ -219,6 +221,7 @@ async fn recovery_refuses_to_commit_when_storage_no_longer_verifies() {
         manifest_uri: Some("s3://telemetry-data/x/b-stale.manifest.json".into()),
         object_sha256: Some("deadbeef".into()),
         manifest_sha256: Some("feedface".into()),
+        object_size_bytes: None,
         record_count: Some(2),
         error_message: None,
         owner: None,
@@ -263,4 +266,135 @@ async fn recovery_refuses_to_commit_when_storage_no_longer_verifies() {
         BatchState::ReplayRequired,
         "source progress stays unadvanced; the uncommitted range will be re-read"
     );
+}
+
+/// #125: with no digest to compare (checksums disabled) and
+/// `require_strong_verification: false`, the recovery re-check must still
+/// compare the RECORDED size — a same-URI replacement of a different size
+/// cannot pass on existence alone.
+#[tokio::test]
+async fn recovery_size_check_rejects_replaced_object_without_checksums() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    let input = dir.path().join("in.log");
+    std::fs::write(&input, "line-0\n").unwrap();
+    let db = dir.path().join("state.db");
+    let url = format!("sqlite://{}", db.display());
+
+    let marker = vtop_core::types::ProgressMarker::File {
+        path: input.to_string_lossy().into_owned(),
+        inode: None,
+        start_byte: 0,
+        end_byte: 7,
+        file_size: 7,
+        mtime: String::new(),
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut rec = BatchRecord {
+        batch_id: "b-size".into(),
+        tenant: "default".into(),
+        source_type: SourceType::File,
+        source_name: input.to_string_lossy().into_owned(),
+        format: vtop_core::types::TelemetryFormat::Raw,
+        state: BatchState::Batching,
+        progress_start: marker.clone(),
+        progress_end: marker,
+        object_uri: Some("s3://telemetry-data/x/b-size.raw.gz".into()),
+        manifest_uri: Some("s3://telemetry-data/x/b-size.manifest.json".into()),
+        // Checksums disabled: the ledger recorded an empty digest…
+        object_sha256: Some(String::new()),
+        manifest_sha256: Some(String::new()),
+        // …but it DID record the uploaded size.
+        object_size_bytes: Some(100),
+        record_count: Some(1),
+        error_message: None,
+        owner: None,
+        lease_expires_at: None,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    {
+        let store = SqliteStateStore::connect(&url).await.unwrap();
+        store.save_batch_state(&rec).await.unwrap();
+        for st in [
+            BatchState::Sealed,
+            BatchState::Compressed,
+            BatchState::Checksummed,
+            BatchState::ObjectUploaded,
+            BatchState::ManifestUploaded,
+            BatchState::Verified,
+        ] {
+            store
+                .update_batch_state("b-size", st, &BatchPatch::default())
+                .await
+                .unwrap();
+        }
+    }
+
+    let cfg = file_config(
+        work.to_str().unwrap(),
+        &url,
+        vec![input.to_string_lossy().into_owned()],
+        "mock", // testkit config has require_strong_verification: false
+    );
+    let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+        .await
+        .unwrap();
+    // Stage object + manifest, but the object is 14 bytes, not the recorded 100
+    // — a replaced object that existence-only checking would wave through.
+    let staged = dir.path().join("staged");
+    std::fs::write(&staged, b"replaced-bytes").unwrap();
+    engine
+        .backend
+        .put_object(&staged, "s3://telemetry-data/x/b-size.raw.gz", None)
+        .await
+        .unwrap();
+    engine
+        .backend
+        .put_manifest(&staged, "s3://telemetry-data/x/b-size.manifest.json", None)
+        .await
+        .unwrap();
+
+    let summary = engine.recover().await.unwrap();
+    assert_eq!(summary.committed, 0, "size mismatch must refuse the commit");
+    assert_eq!(summary.replay_required, 1);
+
+    // Drop the size expectation and it becomes the accepted backend-limited
+    // case again (existence-only, require_strong=false), proving the refusal
+    // above was the SIZE gate.
+    rec.batch_id = "b-size-ok".into();
+    rec.object_size_bytes = Some(14);
+    rec.object_uri = Some("s3://telemetry-data/x/b-size-ok.raw.gz".into());
+    rec.manifest_uri = Some("s3://telemetry-data/x/b-size-ok.manifest.json".into());
+    engine.store.save_batch_state(&rec).await.unwrap();
+    for st in [
+        BatchState::Sealed,
+        BatchState::Compressed,
+        BatchState::Checksummed,
+        BatchState::ObjectUploaded,
+        BatchState::ManifestUploaded,
+        BatchState::Verified,
+    ] {
+        engine
+            .store
+            .update_batch_state("b-size-ok", st, &BatchPatch::default())
+            .await
+            .unwrap();
+    }
+    engine
+        .backend
+        .put_object(&staged, "s3://telemetry-data/x/b-size-ok.raw.gz", None)
+        .await
+        .unwrap();
+    engine
+        .backend
+        .put_manifest(
+            &staged,
+            "s3://telemetry-data/x/b-size-ok.manifest.json",
+            None,
+        )
+        .await
+        .unwrap();
+    let summary = engine.recover().await.unwrap();
+    assert_eq!(summary.committed, 1, "matching size commits");
 }

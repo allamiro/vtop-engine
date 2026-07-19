@@ -41,6 +41,7 @@ pub fn sample_record(id: &str) -> BatchRecord {
         manifest_uri: None,
         object_sha256: None,
         manifest_sha256: None,
+        object_size_bytes: None,
         record_count: None,
         error_message: None,
         owner: None,
