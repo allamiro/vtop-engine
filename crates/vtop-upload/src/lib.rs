@@ -8,6 +8,7 @@
 
 pub mod awscli_backend;
 pub mod base;
+mod command;
 pub mod localfs_backend;
 pub mod minio_backend;
 pub mod mock;
@@ -29,14 +30,31 @@ pub async fn build_backend(cfg: &UploadConfig) -> Result<Arc<dyn UploadBackend>,
             let s3cfg = s3_native::config_from_upload(cfg);
             Arc::new(s3_native::S3NativeBackend::new(&s3cfg).await?)
         }
-        "s3cmd" => Arc::new(s3cmd_backend::S3cmdBackend::new(cfg.profile.clone())),
-        "awscli" => Arc::new(awscli_backend::AwsCliBackend::new(
-            cfg.endpoint_url.clone(),
-            cfg.profile.clone(),
-        )),
-        "minio" => Arc::new(minio_backend::MinioBackend::new(
-            cfg.profile.clone().unwrap_or_else(|| "local".to_string()),
-        )),
+        "s3cmd" => {
+            let command = command::CommandPolicy::from_config(cfg, "s3cmd")?;
+            command.verify_version("s3cmd version").await?;
+            Arc::new(s3cmd_backend::S3cmdBackend::new(
+                command,
+                cfg.profile.clone(),
+            ))
+        }
+        "awscli" => {
+            let command = command::CommandPolicy::from_config(cfg, "aws cli")?;
+            command.verify_version("aws-cli/").await?;
+            Arc::new(awscli_backend::AwsCliBackend::new(
+                command,
+                cfg.endpoint_url.clone(),
+                cfg.profile.clone(),
+            ))
+        }
+        "minio" => {
+            let command = command::CommandPolicy::from_config(cfg, "mc")?;
+            command.verify_version("mc version").await?;
+            Arc::new(minio_backend::MinioBackend::new(
+                command,
+                cfg.profile.clone().unwrap_or_else(|| "local".to_string()),
+            ))
+        }
         "localfs" => {
             let root = cfg.local_path.clone().ok_or_else(|| {
                 VtopError::Config("localfs backend requires upload.local_path".into())

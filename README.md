@@ -613,6 +613,14 @@ VTOP supports multiple upload backends.
 > Strong verification is the default. A sidecar, ETag, or uploader-written user
 > metadata is never accepted as proof of stored content.
 
+The `awscli`, `s3cmd`, and `minio` compatibility backends are an explicit
+opt-in. They require `upload.command_binary` to be an absolute path, verify the
+tool's `--version` identity at startup, clear the child environment, and apply
+wall-clock and captured-output limits. Add only the exact runtime variable
+names the selected tool needs to `upload.command_env_allowlist`; values are
+resolved at startup and are never serialized. Native `s3_native` does not
+spawn an external process and does not use these settings.
+
 ---
 
 ## Replay and recovery
