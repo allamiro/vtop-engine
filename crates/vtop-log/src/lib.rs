@@ -7,13 +7,15 @@
 
 mod catalog;
 mod codec;
+pub mod env;
 mod segment;
+pub mod sim;
 mod types;
 
 pub use catalog::{
     CatalogEntry, CatalogSegmentState, QuarantineReason, QuarantinedArtifacts, StartupCatalog,
 };
-pub use segment::{rebuild_index, ActiveSegment, SegmentReader};
+pub use segment::{rebuild_index, rebuild_index_in, ActiveSegment, SegmentReader};
 pub use types::{
     AppendOutcome, Durability, FetchBatch, FetchedRecord, KeyRange, LogError, LogRecord,
     ParentRange, RangeLineage, RecoveryReport, SegmentConfig, SegmentCursor, SegmentDescriptor,

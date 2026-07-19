@@ -2,12 +2,12 @@ use crate::codec::{
     encode_header, encode_record, read_frame, read_header, record_content_hash, FrameRead,
     SegmentHeader, INDEX_MAGIC,
 };
+use crate::env::{Env, OpenMode, Storage, StorageFile};
 use crate::types::{
     AppendOutcome, Durability, FetchBatch, FetchedRecord, LogError, LogRecord, RecoveryReport,
     SegmentConfig, SegmentDescriptor, SegmentManifest, VtopLogResult, FORMAT_NAME, FORMAT_VERSION,
 };
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -79,8 +79,9 @@ struct SealedFileInspection {
 }
 
 pub struct ActiveSegment {
+    env: Env,
     path: PathBuf,
-    file: File,
+    file: Box<dyn StorageFile>,
     header: SegmentHeader,
     header_len: u64,
     next_offset: u64,
@@ -101,17 +102,24 @@ impl ActiveSegment {
         descriptor: SegmentDescriptor,
         config: SegmentConfig,
     ) -> VtopLogResult<Self> {
+        Self::create_in(&Env::real(), path, descriptor, config)
+    }
+
+    pub fn create_in(
+        env: &Env,
+        path: impl AsRef<Path>,
+        descriptor: SegmentDescriptor,
+        config: SegmentConfig,
+    ) -> VtopLogResult<Self> {
         descriptor.validate()?;
         let config = config.validate()?;
         let path = path.as_ref().to_path_buf();
         let paths = SegmentPaths::from_active(&path)?;
         let header = SegmentHeader::new(descriptor, config);
         let encoded_header = encode_header(&header)?;
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)
+        let mut file = env
+            .storage
+            .open(&path, OpenMode::CreateNew)
             .map_err(|source| io_error(&path, source))?;
         if let Err(source) = file
             .write_all(&encoded_header)
@@ -119,10 +127,11 @@ impl ActiveSegment {
         {
             return Err(io_error(&path, source));
         }
-        sync_parent(&path)?;
+        sync_parent(env.storage.as_ref(), &path)?;
         let header_len = encoded_header.len() as u64;
         let base_offset = header.descriptor.base_offset;
         write_commit_boundary_atomic(
+            env,
             &paths.commit,
             CommitBoundary {
                 segment_id: header.descriptor.segment_id,
@@ -131,6 +140,7 @@ impl ActiveSegment {
             },
         )?;
         Ok(Self {
+            env: env.clone(),
             path,
             file,
             header,
@@ -159,13 +169,16 @@ impl ActiveSegment {
     /// Invalid lengths, magic, or checksums are corruption and are never
     /// silently discarded.
     pub fn recover(path: impl AsRef<Path>) -> VtopLogResult<Self> {
+        Self::recover_in(&Env::real(), path)
+    }
+
+    pub fn recover_in(env: &Env, path: impl AsRef<Path>) -> VtopLogResult<Self> {
         let path = path.as_ref().to_path_buf();
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
+        let mut file = env
+            .storage
+            .open(&path, OpenMode::ReadWrite)
             .map_err(|source| io_error(&path, source))?;
-        let inspection = inspect_active_file(&mut file, &path)?;
+        let inspection = inspect_active_file(env.storage.as_ref(), file.as_mut(), &path)?;
         let header = inspection.header;
         let header_len = inspection.header_len;
         let mut scan = inspection.scan;
@@ -184,6 +197,7 @@ impl ActiveSegment {
             next_offset: scan.next_offset,
         };
         Ok(Self {
+            env: env.clone(),
             path,
             file,
             header,
@@ -375,7 +389,7 @@ impl ActiveSegment {
         max_records: usize,
     ) -> VtopLogResult<FetchBatch> {
         let result = fetch_from_file(
-            &mut self.file,
+            self.file.as_mut(),
             &self.path,
             &self.header,
             self.header_len,
@@ -403,9 +417,8 @@ impl ActiveSegment {
         self.commit()?;
         let actual_file_bytes = self
             .file
-            .metadata()
-            .map_err(|source| io_error(&self.path, source))?
-            .len();
+            .len()
+            .map_err(|source| io_error(&self.path, source))?;
         let actual_content_bytes =
             actual_file_bytes
                 .checked_sub(self.header_len)
@@ -431,18 +444,26 @@ impl ActiveSegment {
             index_stride: self.header.config.index_stride,
         };
         let paths = SegmentPaths::from_active(&self.path)?;
-        if paths.segment.exists() {
+        if self
+            .env
+            .storage
+            .exists(&paths.segment)
+            .map_err(|source| io_error(&paths.segment, source))?
+        {
             return Err(LogError::InvalidDescriptor(format!(
                 "refusing to replace existing sealed segment {}",
                 paths.segment.display()
             )));
         }
-        write_index_atomic(&paths.index, &self.index)?;
-        write_manifest_atomic(&paths.manifest, &manifest)?;
-        fs::rename(&self.path, &paths.segment).map_err(|source| io_error(&self.path, source))?;
-        sync_parent(&paths.segment)?;
+        write_index_atomic(&self.env, &paths.index, &self.index)?;
+        write_manifest_atomic(&self.env, &paths.manifest, &manifest)?;
+        self.env
+            .storage
+            .rename(&self.path, &paths.segment)
+            .map_err(|source| io_error(&self.path, source))?;
+        sync_parent(self.env.storage.as_ref(), &paths.segment)?;
         self.sealed = true;
-        SegmentReader::open(paths.segment)
+        SegmentReader::open_in(&self.env, paths.segment)
     }
 
     fn persist_commit_boundary(
@@ -456,6 +477,7 @@ impl ActiveSegment {
         }
         let paths = SegmentPaths::from_active(&self.path)?;
         if let Err(error) = write_commit_boundary_atomic(
+            &self.env,
             &paths.commit,
             CommitBoundary {
                 segment_id: self.header.descriptor.segment_id,
@@ -482,7 +504,7 @@ impl ActiveSegment {
 
 pub struct SegmentReader {
     path: PathBuf,
-    file: File,
+    file: Box<dyn StorageFile>,
     header: SegmentHeader,
     header_len: u64,
     manifest: SegmentManifest,
@@ -491,22 +513,26 @@ pub struct SegmentReader {
 
 impl SegmentReader {
     pub fn open(path: impl AsRef<Path>) -> VtopLogResult<Self> {
+        Self::open_in(&Env::real(), path)
+    }
+
+    pub fn open_in(env: &Env, path: impl AsRef<Path>) -> VtopLogResult<Self> {
         let path = path.as_ref().to_path_buf();
         let paths = SegmentPaths::from_segment(&path)?;
-        let mut file = OpenOptions::new()
-            .read(true)
-            .open(&path)
+        let mut file = env
+            .storage
+            .open(&path, OpenMode::Read)
             .map_err(|source| io_error(&path, source))?;
-        let inspection = inspect_sealed_file(&mut file, &path)?;
+        let inspection = inspect_sealed_file(env.storage.as_ref(), file.as_mut(), &path)?;
         let header = inspection.header;
         let header_len = inspection.header_len;
         let scan = inspection.scan;
         let manifest = inspection.manifest;
 
-        let index = match read_index(&paths.index) {
+        let index = match read_index(env.storage.as_ref(), &paths.index) {
             Ok(index) if index == scan.index => index,
             Ok(_) | Err(_) => {
-                write_index_atomic(&paths.index, &scan.index)?;
+                write_index_atomic(env, &paths.index, &scan.index)?;
                 scan.index
             }
         };
@@ -549,7 +575,7 @@ impl SegmentReader {
         max_records: usize,
     ) -> VtopLogResult<FetchBatch> {
         fetch_from_file(
-            &mut self.file,
+            self.file.as_mut(),
             &self.path,
             &self.header,
             self.header_len,
@@ -563,18 +589,28 @@ impl SegmentReader {
 }
 
 pub fn rebuild_index(path: impl AsRef<Path>) -> VtopLogResult<()> {
-    let path = path.as_ref();
-    let paths = SegmentPaths::from_segment(path)?;
-    let mut file = File::open(path).map_err(|source| io_error(path, source))?;
-    let (header, header_len) = read_header_with_path(&mut file, path)?;
-    let scan = scan_records(&mut file, path, &header, header_len, None, false)?;
-    write_index_atomic(&paths.index, &scan.index)
+    rebuild_index_in(&Env::real(), path)
 }
 
-pub(crate) fn inspect_active_segment(path: &Path) -> VtopLogResult<SegmentInspection> {
+pub fn rebuild_index_in(env: &Env, path: impl AsRef<Path>) -> VtopLogResult<()> {
+    let path = path.as_ref();
+    let paths = SegmentPaths::from_segment(path)?;
+    let mut file = env
+        .storage
+        .open(path, OpenMode::Read)
+        .map_err(|source| io_error(path, source))?;
+    let (header, header_len) = read_header_with_path(file.as_mut(), path)?;
+    let scan = scan_records(file.as_mut(), path, &header, header_len, None, false)?;
+    write_index_atomic(env, &paths.index, &scan.index)
+}
+
+pub(crate) fn inspect_active_segment(env: &Env, path: &Path) -> VtopLogResult<SegmentInspection> {
     SegmentPaths::from_active(path)?;
-    let mut file = File::open(path).map_err(|source| io_error(path, source))?;
-    let inspection = inspect_active_file(&mut file, path)?;
+    let mut file = env
+        .storage
+        .open(path, OpenMode::Read)
+        .map_err(|source| io_error(path, source))?;
+    let inspection = inspect_active_file(env.storage.as_ref(), file.as_mut(), path)?;
     Ok(SegmentInspection {
         descriptor: inspection.header.descriptor,
         record_count: inspection.scan.records,
@@ -584,10 +620,13 @@ pub(crate) fn inspect_active_segment(path: &Path) -> VtopLogResult<SegmentInspec
     })
 }
 
-pub(crate) fn inspect_sealed_segment(path: &Path) -> VtopLogResult<SegmentInspection> {
+pub(crate) fn inspect_sealed_segment(env: &Env, path: &Path) -> VtopLogResult<SegmentInspection> {
     SegmentPaths::from_segment(path)?;
-    let mut file = File::open(path).map_err(|source| io_error(path, source))?;
-    let inspection = inspect_sealed_file(&mut file, path)?;
+    let mut file = env
+        .storage
+        .open(path, OpenMode::Read)
+        .map_err(|source| io_error(path, source))?;
+    let inspection = inspect_sealed_file(env.storage.as_ref(), file.as_mut(), path)?;
     Ok(SegmentInspection {
         descriptor: inspection.header.descriptor,
         record_count: inspection.scan.records,
@@ -597,13 +636,17 @@ pub(crate) fn inspect_sealed_segment(path: &Path) -> VtopLogResult<SegmentInspec
     })
 }
 
-fn inspect_active_file(file: &mut File, path: &Path) -> VtopLogResult<ActiveFileInspection> {
+fn inspect_active_file(
+    storage: &dyn Storage,
+    file: &mut dyn StorageFile,
+    path: &Path,
+) -> VtopLogResult<ActiveFileInspection> {
     let paths = SegmentPaths::from_active(path)?;
     let (header, header_len) = read_header_with_path(file, path)?;
     // A missing marker is ambiguous: the file may contain acknowledged Fsync
     // appends whose boundary sidecar was deleted. Inspection and recovery must
     // never manufacture a boundary or promote the surviving bytes.
-    let boundary = read_commit_boundary(&paths.commit)?;
+    let boundary = read_commit_boundary(storage, &paths.commit)?;
     if boundary.segment_id != header.descriptor.segment_id {
         return Err(LogError::CommitBoundaryMismatch(
             "segment id differs from the active segment header".to_owned(),
@@ -614,10 +657,7 @@ fn inspect_active_file(file: &mut File, path: &Path) -> VtopLogResult<ActiveFile
         .ok_or_else(|| {
             LogError::CommitBoundaryMismatch("committed byte length overflows".to_owned())
         })?;
-    let actual_len = file
-        .metadata()
-        .map_err(|source| io_error(path, source))?
-        .len();
+    let actual_len = file.len().map_err(|source| io_error(path, source))?;
     if committed_end > actual_len {
         return Err(LogError::CommitBoundaryMismatch(format!(
             "committed byte end {committed_end} exceeds file length {actual_len}"
@@ -640,12 +680,17 @@ fn inspect_active_file(file: &mut File, path: &Path) -> VtopLogResult<ActiveFile
     })
 }
 
-fn inspect_sealed_file(file: &mut File, path: &Path) -> VtopLogResult<SealedFileInspection> {
+fn inspect_sealed_file(
+    storage: &dyn Storage,
+    file: &mut dyn StorageFile,
+    path: &Path,
+) -> VtopLogResult<SealedFileInspection> {
     let paths = SegmentPaths::from_segment(path)?;
     let (header, header_len) = read_header_with_path(file, path)?;
     let scan = scan_records(file, path, &header, header_len, None, false)?;
-    let manifest_bytes =
-        fs::read(&paths.manifest).map_err(|source| io_error(&paths.manifest, source))?;
+    let manifest_bytes = storage
+        .read(&paths.manifest)
+        .map_err(|source| io_error(&paths.manifest, source))?;
     let manifest: SegmentManifest = serde_json::from_slice(&manifest_bytes)
         .map_err(|error| LogError::ManifestMismatch(format!("cannot decode manifest: {error}")))?;
     if manifest_bytes != canonical_manifest_bytes(&manifest)? {
@@ -823,7 +868,7 @@ fn merge_producer_deltas(
 }
 
 fn scan_records(
-    file: &mut File,
+    mut file: &mut dyn StorageFile,
     path: &Path,
     header: &SegmentHeader,
     header_len: u64,
@@ -832,10 +877,7 @@ fn scan_records(
 ) -> VtopLogResult<ScanResult> {
     file.seek(SeekFrom::Start(header_len))
         .map_err(|source| io_error(path, source))?;
-    let actual_file_len = file
-        .metadata()
-        .map_err(|source| io_error(path, source))?
-        .len();
+    let actual_file_len = file.len().map_err(|source| io_error(path, source))?;
     let file_len = logical_end.unwrap_or(actual_file_len);
     if file_len < header_len || file_len > actual_file_len {
         return Err(LogError::CommitBoundaryMismatch(format!(
@@ -858,7 +900,7 @@ fn scan_records(
                 "commit boundary splits a record frame".to_owned(),
             ));
         }
-        match read_frame(file, position, header.config.max_record_bytes)
+        match read_frame(&mut file, position, header.config.max_record_bytes)
             .map_err(|error| with_path(error, path))?
         {
             FrameRead::End => break,
@@ -952,7 +994,7 @@ fn scan_records(
 
 #[allow(clippy::too_many_arguments)]
 fn fetch_from_file(
-    file: &mut File,
+    mut file: &mut dyn StorageFile,
     path: &Path,
     header: &SegmentHeader,
     header_len: u64,
@@ -990,7 +1032,7 @@ fn fetch_from_file(
     let mut encoded_bytes = 0_usize;
 
     while offset < high_watermark && records.len() < max_records {
-        let frame = match read_frame(file, position, header.config.max_record_bytes)
+        let frame = match read_frame(&mut file, position, header.config.max_record_bytes)
             .map_err(|error| with_path(error, path))?
         {
             FrameRead::Complete(frame) => frame,
@@ -1092,13 +1134,17 @@ fn validate_manifest(
     Ok(())
 }
 
-fn write_manifest_atomic(path: &Path, manifest: &SegmentManifest) -> VtopLogResult<()> {
+fn write_manifest_atomic(env: &Env, path: &Path, manifest: &SegmentManifest) -> VtopLogResult<()> {
     let bytes = canonical_manifest_bytes(manifest)?;
-    write_atomic(path, &bytes)
+    write_atomic(env, path, &bytes)
 }
 
-fn write_commit_boundary_atomic(path: &Path, boundary: CommitBoundary) -> VtopLogResult<()> {
-    write_atomic(path, &encode_commit_boundary(boundary))
+fn write_commit_boundary_atomic(
+    env: &Env,
+    path: &Path,
+    boundary: CommitBoundary,
+) -> VtopLogResult<()> {
+    write_atomic(env, path, &encode_commit_boundary(boundary))
 }
 
 fn encode_commit_boundary(boundary: CommitBoundary) -> Vec<u8> {
@@ -1114,8 +1160,10 @@ fn encode_commit_boundary(boundary: CommitBoundary) -> Vec<u8> {
     bytes
 }
 
-fn read_commit_boundary(path: &Path) -> VtopLogResult<CommitBoundary> {
-    let bytes = fs::read(path).map_err(|source| io_error(path, source))?;
+fn read_commit_boundary(storage: &dyn Storage, path: &Path) -> VtopLogResult<CommitBoundary> {
+    let bytes = storage
+        .read(path)
+        .map_err(|source| io_error(path, source))?;
     if bytes.len() != COMMIT_BOUNDARY_LEN {
         return Err(LogError::CommitBoundaryMismatch(format!(
             "expected {COMMIT_BOUNDARY_LEN} bytes, found {}",
@@ -1156,7 +1204,7 @@ fn canonical_manifest_bytes(manifest: &SegmentManifest) -> VtopLogResult<Vec<u8>
     Ok(bytes)
 }
 
-fn write_index_atomic(path: &Path, entries: &[IndexEntry]) -> VtopLogResult<()> {
+fn write_index_atomic(env: &Env, path: &Path, entries: &[IndexEntry]) -> VtopLogResult<()> {
     let mut bytes = Vec::with_capacity(16 + entries.len() * 16);
     bytes.extend_from_slice(INDEX_MAGIC);
     bytes.extend_from_slice(&(entries.len() as u64).to_be_bytes());
@@ -1164,11 +1212,13 @@ fn write_index_atomic(path: &Path, entries: &[IndexEntry]) -> VtopLogResult<()> 
         bytes.extend_from_slice(&entry.offset.to_be_bytes());
         bytes.extend_from_slice(&entry.position.to_be_bytes());
     }
-    write_atomic(path, &bytes)
+    write_atomic(env, path, &bytes)
 }
 
-fn read_index(path: &Path) -> VtopLogResult<Vec<IndexEntry>> {
-    let bytes = fs::read(path).map_err(|source| io_error(path, source))?;
+fn read_index(storage: &dyn Storage, path: &Path) -> VtopLogResult<Vec<IndexEntry>> {
+    let bytes = storage
+        .read(path)
+        .map_err(|source| io_error(path, source))?;
     if bytes.len() < 16 || &bytes[..8] != INDEX_MAGIC {
         return Err(LogError::Corrupt {
             position: 0,
@@ -1199,41 +1249,46 @@ fn read_index(path: &Path) -> VtopLogResult<Vec<IndexEntry>> {
         .collect())
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> VtopLogResult<()> {
+fn write_atomic(env: &Env, path: &Path, bytes: &[u8]) -> VtopLogResult<()> {
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| {
             LogError::InvalidDescriptor("sidecar path has no UTF-8 filename".to_owned())
         })?;
-    let temporary = path.with_file_name(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
+    let temporary = path.with_file_name(format!(
+        ".{file_name}.{}.tmp",
+        Uuid::from_u128(env.rng.next_u128())
+    ));
+    let mut file = env
+        .storage
+        .open(&temporary, OpenMode::CreateNew)
         .map_err(|source| io_error(&temporary, source))?;
     let result = file.write_all(bytes).and_then(|()| file.sync_data());
+    drop(file);
     if let Err(source) = result {
-        let _ = fs::remove_file(&temporary);
+        let _ = env.storage.remove_file(&temporary);
         return Err(io_error(&temporary, source));
     }
-    if let Err(source) = fs::rename(&temporary, path) {
-        let _ = fs::remove_file(&temporary);
+    if let Err(source) = env.storage.rename(&temporary, path) {
+        let _ = env.storage.remove_file(&temporary);
         return Err(io_error(path, source));
     }
-    sync_parent(path)
+    sync_parent(env.storage.as_ref(), path)
 }
 
-fn sync_parent(path: &Path) -> VtopLogResult<()> {
+fn sync_parent(storage: &dyn Storage, path: &Path) -> VtopLogResult<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let directory = File::open(parent).map_err(|source| io_error(parent, source))?;
-    directory
-        .sync_all()
+    storage
+        .sync_dir(parent)
         .map_err(|source| io_error(parent, source))
 }
 
-fn read_header_with_path(file: &mut File, path: &Path) -> VtopLogResult<(SegmentHeader, u64)> {
-    read_header(file).map_err(|error| with_path(error, path))
+fn read_header_with_path(
+    mut file: &mut dyn StorageFile,
+    path: &Path,
+) -> VtopLogResult<(SegmentHeader, u64)> {
+    read_header(&mut file).map_err(|error| with_path(error, path))
 }
 
 fn with_path(error: LogError, path: &Path) -> LogError {
@@ -1296,8 +1351,13 @@ impl SegmentPaths {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::{self, OpenOptions};
     use std::io::Seek;
     use tempfile::tempdir;
+
+    fn real_storage() -> std::sync::Arc<dyn Storage> {
+        Env::real().storage
+    }
 
     fn descriptor() -> SegmentDescriptor {
         SegmentDescriptor {
@@ -1506,7 +1566,7 @@ mod tests {
 
         let mut sealed = segment.seal().unwrap();
         let paths = SegmentPaths::from_segment(&sealed.path).unwrap();
-        let boundary = read_commit_boundary(&paths.commit).unwrap();
+        let boundary = read_commit_boundary(real_storage().as_ref(), &paths.commit).unwrap();
         assert_eq!(boundary.committed_offset, 41);
         assert_eq!(sealed.fetch(40, usize::MAX, 10).unwrap().records.len(), 1);
     }
@@ -2054,7 +2114,7 @@ mod tests {
             }
             fs::write(&path, bytes).unwrap();
             assert!(matches!(
-                read_commit_boundary(&path),
+                read_commit_boundary(real_storage().as_ref(), &path),
                 Err(LogError::CommitBoundaryMismatch(_))
             ));
         }
