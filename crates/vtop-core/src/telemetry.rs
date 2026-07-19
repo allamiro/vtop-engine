@@ -29,13 +29,14 @@ use prometheus::{
 use std::sync::OnceLock;
 
 /// Pipeline stages, used as a bounded `stage` label.
-pub const STAGES: [&str; 6] = [
+pub const STAGES: [&str; 7] = [
     "compress",
     "checksum",
     "object_upload",
     "manifest_upload",
     "verify",
     "commit",
+    "state_write",
 ];
 
 /// The engine's metric set. Cheap to clone (all fields are `Arc` internally).
