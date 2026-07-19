@@ -94,6 +94,10 @@ fn main() {
         eprintln!("--dir is required");
         std::process::exit(2);
     }
+    if options.records == 0 || options.batch == 0 || options.value_bytes == 0 {
+        eprintln!("--records, --batch, and --value-bytes must be greater than zero");
+        std::process::exit(2);
+    }
     match mode.as_str() {
         "produce" => run_async(produce(options)),
         "verify" => run_async(verify(options)),
@@ -390,6 +394,9 @@ async fn produce(options: Options) -> Result<(), String> {
             if acked >= abort_after {
                 println!("acked_total={acked}");
                 println!("aborting_now");
+                // The parent parses these markers; make sure they reach the
+                // pipe before the process dies without running destructors.
+                std::io::stdout().flush().expect("flush abort markers");
                 std::process::abort();
             }
         }
@@ -590,6 +597,15 @@ async fn corrupt_test(options: Options) -> Result<(), String> {
         file.write_all(&[0xAB; 4096]).map_err(|e| e.to_string())?;
     }
     println!("corrupt_test appended 4096 garbage bytes to the active tail");
+    {
+        let segment = ActiveSegment::recover(&path).map_err(|e| e.to_string())?;
+        let report = segment.recovery_report();
+        if report.truncated_bytes != 4096 || report.records != records {
+            return Err(format!(
+                "expected recovery to truncate exactly the 4096 garbage bytes and keep {records} records, got {report:?}"
+            ));
+        }
+    }
     verify(Options {
         expect: records,
         abort_after: None,
