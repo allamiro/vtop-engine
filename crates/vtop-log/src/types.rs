@@ -13,6 +13,8 @@ pub const MAX_RECORD_BYTES: u32 = 64 * 1024 * 1024;
 pub const MAX_GROUP_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_SEGMENT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 pub const MAX_SEGMENT_RECORDS: u64 = 10_000_000;
+/// Bytes added around every key/value payload by the v1 record frame.
+pub const RECORD_FRAME_OVERHEAD_BYTES: u64 = 12 + 8 + 16 + 8 + 8 + 4 + 4 + 32;
 
 pub type SegmentId = Uuid;
 
@@ -100,7 +102,8 @@ impl KeyRange {
     }
 
     pub fn contains(self, key_hash: u64) -> bool {
-        self.prefix_bits == 0 || (key_hash & self.mask()) == self.prefix
+        self.validate().is_ok()
+            && (self.prefix_bits == 0 || (key_hash & self.mask()) == self.prefix)
     }
 
     pub fn children(self) -> VtopLogResult<(Self, Self)> {
@@ -135,6 +138,25 @@ impl KeyRange {
         Ok(Self {
             prefix: self.prefix ^ buddy_bit,
             prefix_bits: self.prefix_bits,
+        })
+    }
+
+    pub fn parent(self) -> VtopLogResult<Self> {
+        self.validate()?;
+        if self.prefix_bits == 0 {
+            return Err(LogError::InvalidDescriptor(
+                "the full keyspace has no parent".to_owned(),
+            ));
+        }
+        let prefix_bits = self.prefix_bits - 1;
+        let mask = if prefix_bits == 0 {
+            0
+        } else {
+            u64::MAX << (64 - prefix_bits)
+        };
+        Ok(Self {
+            prefix: self.prefix & mask,
+            prefix_bits,
         })
     }
 
@@ -182,9 +204,17 @@ impl RangeLineage {
 
     pub(crate) fn validate(&self) -> VtopLogResult<()> {
         self.key_range.validate()?;
-        if self.generation > 0 && self.parents.is_empty() {
+        if self.generation == 0 {
+            if !self.parents.is_empty() || self.key_range != KeyRange::full() {
+                return Err(LogError::InvalidDescriptor(
+                    "generation-zero lineage must be the parentless full keyspace".to_owned(),
+                ));
+            }
+            return Ok(());
+        }
+        if self.parents.is_empty() || self.parents.len() > 2 {
             return Err(LogError::InvalidDescriptor(
-                "non-root range lineage must name at least one parent".to_owned(),
+                "non-root range lineage must name one split parent or two merge parents".to_owned(),
             ));
         }
         for parent in &self.parents {
@@ -206,6 +236,38 @@ impl RangeLineage {
             return Err(LogError::InvalidDescriptor(
                 "range lineage contains duplicate parents".to_owned(),
             ));
+        }
+        let expected_parent_generation = self.generation - 1;
+        if self
+            .parents
+            .iter()
+            .any(|parent| parent.generation != expected_parent_generation)
+        {
+            return Err(LogError::InvalidDescriptor(
+                "range lineage must name direct parents from the previous generation".to_owned(),
+            ));
+        }
+        match self.parents.as_slice() {
+            [parent] => {
+                let (left, right) = parent.key_range.children()?;
+                if self.key_range != left && self.key_range != right {
+                    return Err(LogError::InvalidDescriptor(
+                        "single-parent lineage must be an exact buddy split child".to_owned(),
+                    ));
+                }
+            }
+            [left, right] => {
+                if left.key_range.buddy()? != right.key_range
+                    || left.key_range.parent()? != self.key_range
+                    || right.key_range.parent()? != self.key_range
+                {
+                    return Err(LogError::InvalidDescriptor(
+                        "two-parent lineage must merge exact buddy ranges into their parent"
+                            .to_owned(),
+                    ));
+                }
+            }
+            _ => unreachable!("parent count was validated above"),
         }
         Ok(())
     }
@@ -273,9 +335,12 @@ impl SegmentConfig {
                 "max_group_bytes must be in 1..={MAX_GROUP_BYTES}"
             )));
         }
-        if self.max_group_bytes < u64::from(self.max_record_bytes) {
+        let minimum_group_bytes = u64::from(self.max_record_bytes)
+            .checked_add(RECORD_FRAME_OVERHEAD_BYTES)
+            .expect("record limits are bounded constants");
+        if self.max_group_bytes < minimum_group_bytes {
             return Err(LogError::InvalidConfig(
-                "max_group_bytes must be at least max_record_bytes".to_owned(),
+                "max_group_bytes must fit max_record_bytes plus v1 frame overhead".to_owned(),
             ));
         }
         if self.max_segment_bytes < self.max_group_bytes

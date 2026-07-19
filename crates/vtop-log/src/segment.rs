@@ -29,6 +29,11 @@ struct ProducerState {
     seen: HashMap<u64, SeenRecord>,
 }
 
+struct ProducerDelta {
+    latest_sequence: u64,
+    seen: HashMap<u64, SeenRecord>,
+}
+
 #[derive(Clone)]
 struct SeenRecord {
     offset: u64,
@@ -77,6 +82,7 @@ impl ActiveSegment {
         descriptor.validate()?;
         let config = config.validate()?;
         let path = path.as_ref().to_path_buf();
+        let paths = SegmentPaths::from_active(&path)?;
         let header = SegmentHeader::new(descriptor, config);
         let encoded_header = encode_header(&header)?;
         let mut file = OpenOptions::new()
@@ -94,7 +100,6 @@ impl ActiveSegment {
         sync_parent(&path)?;
         let header_len = encoded_header.len() as u64;
         let base_offset = header.descriptor.base_offset;
-        let paths = SegmentPaths::from_active(&path)?;
         write_commit_boundary_atomic(
             &paths.commit,
             CommitBoundary {
@@ -133,13 +138,13 @@ impl ActiveSegment {
     /// silently discarded.
     pub fn recover(path: impl AsRef<Path>) -> VtopLogResult<Self> {
         let path = path.as_ref().to_path_buf();
+        let paths = SegmentPaths::from_active(&path)?;
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(&path)
             .map_err(|source| io_error(&path, source))?;
         let (header, header_len) = read_header_with_path(&mut file, &path)?;
-        let paths = SegmentPaths::from_active(&path)?;
         let boundary = match read_commit_boundary(&paths.commit) {
             Ok(boundary) => boundary,
             Err(LogError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
@@ -261,17 +266,20 @@ impl ActiveSegment {
         Ok(outcomes.remove(0))
     }
 
-    /// Validate and append a producer group with a single durability barrier.
+    /// Validate an entire producer group before writing any bytes.
     ///
-    /// Duplicate retries return their original offsets and are not written a
-    /// second time. The full group is validated before any bytes are emitted.
+    /// `Fsync` commits new and previously buffered bytes with one data barrier
+    /// plus an atomic commit-boundary update. `Buffered` returns after writing
+    /// to the operating system and leaves the group below the visible commit
+    /// point until `commit` or a later `Fsync` append. Duplicate retries return
+    /// their original offsets and are not written a second time.
     pub fn append_group(
         &mut self,
         records: &[LogRecord],
         durability: Durability,
     ) -> VtopLogResult<Vec<AppendOutcome>> {
         self.ensure_writable()?;
-        let mut prospective = self.producer_states.clone();
+        let mut producer_deltas = HashMap::new();
         let mut prospective_next = self.next_offset;
         let mut outcomes = Vec::with_capacity(records.len());
         let mut pending = Vec::new();
@@ -279,7 +287,12 @@ impl ActiveSegment {
 
         for record in records {
             let hash = record_content_hash(record);
-            match validate_sequence(&prospective, record, hash)? {
+            match validate_sequence_with_delta(
+                &self.producer_states,
+                &producer_deltas,
+                record,
+                hash,
+            )? {
                 SequenceDecision::Duplicate(offset) => {
                     outcomes.push(AppendOutcome::Duplicate { offset });
                 }
@@ -306,7 +319,7 @@ impl ActiveSegment {
                             maximum: self.header.config.max_group_bytes,
                         });
                     }
-                    remember_sequence(&mut prospective, record, offset, hash);
+                    remember_pending_sequence(&mut producer_deltas, record, offset, hash);
                     outcomes.push(AppendOutcome::Appended { offset });
                     pending.push((offset, encoded));
                 }
@@ -372,7 +385,7 @@ impl ActiveSegment {
         for (_, encoded) in &pending {
             self.content_hasher.update(encoded);
         }
-        self.producer_states = prospective;
+        merge_producer_deltas(&mut self.producer_states, producer_deltas);
         self.next_offset = prospective_next;
         self.record_count += pending.len() as u64;
         self.content_bytes = attempted_bytes;
@@ -415,12 +428,18 @@ impl ActiveSegment {
         // commit boundary first so sealing can never publish buffered records
         // that were not committed on this node.
         self.commit()?;
-        let actual_content_bytes = self
+        let actual_file_bytes = self
             .file
             .metadata()
             .map_err(|source| io_error(&self.path, source))?
-            .len()
-            - self.header_len;
+            .len();
+        let actual_content_bytes =
+            actual_file_bytes
+                .checked_sub(self.header_len)
+                .ok_or_else(|| LogError::Corrupt {
+                    position: actual_file_bytes,
+                    reason: "active segment is shorter than its validated header".to_owned(),
+                })?;
         if actual_content_bytes != self.content_bytes {
             return Err(LogError::Corrupt {
                 position: self.header_len + self.content_bytes,
@@ -500,13 +519,13 @@ pub struct SegmentReader {
 impl SegmentReader {
     pub fn open(path: impl AsRef<Path>) -> VtopLogResult<Self> {
         let path = path.as_ref().to_path_buf();
+        let paths = SegmentPaths::from_segment(&path)?;
         let mut file = OpenOptions::new()
             .read(true)
             .open(&path)
             .map_err(|source| io_error(&path, source))?;
         let (header, header_len) = read_header_with_path(&mut file, &path)?;
         let scan = scan_records(&mut file, &path, &header, header_len, None, false)?;
-        let paths = SegmentPaths::from_segment(&path)?;
         let manifest_bytes =
             fs::read(&paths.manifest).map_err(|source| io_error(&paths.manifest, source))?;
         let manifest: SegmentManifest =
@@ -581,10 +600,10 @@ impl SegmentReader {
 
 pub fn rebuild_index(path: impl AsRef<Path>) -> VtopLogResult<()> {
     let path = path.as_ref();
+    let paths = SegmentPaths::from_segment(path)?;
     let mut file = File::open(path).map_err(|source| io_error(path, source))?;
     let (header, header_len) = read_header_with_path(&mut file, path)?;
     let scan = scan_records(&mut file, path, &header, header_len, None, false)?;
-    let paths = SegmentPaths::from_segment(path)?;
     write_index_atomic(&paths.index, &scan.index)
 }
 
@@ -634,6 +653,118 @@ fn validate_sequence(
         });
     }
     Ok(SequenceDecision::Append)
+}
+
+fn validate_sequence_with_delta(
+    states: &HashMap<Uuid, ProducerState>,
+    deltas: &HashMap<Uuid, ProducerDelta>,
+    record: &LogRecord,
+    hash: blake3::Hash,
+) -> VtopLogResult<SequenceDecision> {
+    if let Some(seen) = deltas
+        .get(&record.producer_id)
+        .and_then(|delta| delta.seen.get(&record.sequence))
+        .or_else(|| {
+            states
+                .get(&record.producer_id)
+                .and_then(|state| state.seen.get(&record.sequence))
+        })
+    {
+        return if hash == seen.content_hash {
+            Ok(SequenceDecision::Duplicate(seen.offset))
+        } else {
+            Err(LogError::SequenceConflict {
+                producer_id: record.producer_id,
+                sequence: record.sequence,
+            })
+        };
+    }
+
+    let latest = deltas
+        .get(&record.producer_id)
+        .map(|delta| delta.latest_sequence)
+        .or_else(|| {
+            states
+                .get(&record.producer_id)
+                .map(|state| state.latest_sequence)
+        });
+    let Some(latest) = latest else {
+        return if record.sequence == 0 {
+            Ok(SequenceDecision::Append)
+        } else {
+            Err(LogError::FirstSequence {
+                producer_id: record.producer_id,
+                actual: record.sequence,
+            })
+        };
+    };
+    let expected = latest.checked_add(1).ok_or(LogError::SequenceGap {
+        producer_id: record.producer_id,
+        expected: u64::MAX,
+        actual: record.sequence,
+    })?;
+    if record.sequence != expected {
+        return Err(LogError::SequenceGap {
+            producer_id: record.producer_id,
+            expected,
+            actual: record.sequence,
+        });
+    }
+    Ok(SequenceDecision::Append)
+}
+
+fn remember_pending_sequence(
+    deltas: &mut HashMap<Uuid, ProducerDelta>,
+    record: &LogRecord,
+    offset: u64,
+    content_hash: blake3::Hash,
+) {
+    deltas
+        .entry(record.producer_id)
+        .and_modify(|delta| {
+            delta.latest_sequence = record.sequence;
+            delta.seen.insert(
+                record.sequence,
+                SeenRecord {
+                    offset,
+                    content_hash,
+                },
+            );
+        })
+        .or_insert_with(|| ProducerDelta {
+            latest_sequence: record.sequence,
+            seen: HashMap::from([(
+                record.sequence,
+                SeenRecord {
+                    offset,
+                    content_hash,
+                },
+            )]),
+        });
+}
+
+fn merge_producer_deltas(
+    states: &mut HashMap<Uuid, ProducerState>,
+    deltas: HashMap<Uuid, ProducerDelta>,
+) {
+    for (producer_id, delta) in deltas {
+        let ProducerDelta {
+            latest_sequence,
+            seen,
+        } = delta;
+        if let Some(state) = states.get_mut(&producer_id) {
+            state.latest_sequence = latest_sequence;
+            state.seen.extend(seen);
+        } else {
+            states.insert(
+                producer_id,
+                ProducerState {
+                    latest_sequence,
+                    seen,
+                },
+            );
+        }
+    }
 }
 
 fn scan_records(
@@ -1383,6 +1514,35 @@ mod tests {
     }
 
     #[test]
+    fn append_group_handles_existing_and_in_group_duplicates() {
+        let directory = tempdir().unwrap();
+        let producer = Uuid::from_u128(22);
+        let first = record(producer, 0, b"first");
+        let second = record(producer, 1, b"second");
+        let mut segment = ActiveSegment::create(
+            directory.path().join("delta-validation.active"),
+            descriptor(),
+            config(),
+        )
+        .unwrap();
+        segment.append(first.clone(), Durability::Fsync).unwrap();
+
+        let outcomes = segment
+            .append_group(&[first, second.clone(), second], Durability::Fsync)
+            .unwrap();
+        assert_eq!(
+            outcomes,
+            vec![
+                AppendOutcome::Duplicate { offset: 40 },
+                AppendOutcome::Appended { offset: 41 },
+                AppendOutcome::Duplicate { offset: 41 },
+            ]
+        );
+        assert_eq!(segment.next_offset(), 42);
+        assert_eq!(segment.fetch(40, usize::MAX, 10).unwrap().records.len(), 2);
+    }
+
+    #[test]
     fn group_is_fully_validated_before_writing() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("atomic-validation.active");
@@ -1479,6 +1639,57 @@ mod tests {
         };
         assert!(matches!(error, LogError::Corrupt { .. }));
         assert_eq!(fs::metadata(&path).unwrap().len(), length);
+    }
+
+    #[test]
+    fn active_apis_reject_non_active_and_sealed_paths() {
+        let directory = tempdir().unwrap();
+        let invalid_path = directory.path().join("wrong.segment");
+        let create_error = match ActiveSegment::create(&invalid_path, descriptor(), config()) {
+            Ok(_) => panic!("non-active path should be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(create_error, LogError::InvalidDescriptor(_)));
+        assert!(!invalid_path.exists());
+
+        let active_path = directory.path().join("immutable.active");
+        let mut active = ActiveSegment::create(&active_path, descriptor(), config()).unwrap();
+        active
+            .append(
+                record(Uuid::from_u128(23), 0, b"immutable"),
+                Durability::Fsync,
+            )
+            .unwrap();
+        let sealed = active.seal().unwrap();
+        let sealed_path = sealed.path.clone();
+        drop(sealed);
+        let before = fs::metadata(&sealed_path).unwrap().len();
+
+        let recover_error = match ActiveSegment::recover(&sealed_path) {
+            Ok(_) => panic!("sealed path should never become writable"),
+            Err(error) => error,
+        };
+        assert!(matches!(recover_error, LogError::InvalidDescriptor(_)));
+        assert_eq!(fs::metadata(&sealed_path).unwrap().len(), before);
+        SegmentReader::open(&sealed_path).unwrap();
+    }
+
+    #[test]
+    fn sealing_a_file_shorter_than_its_header_returns_corruption() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("short-header.active");
+        let active = ActiveSegment::create(&path, descriptor(), config()).unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        let error = match active.seal() {
+            Ok(_) => panic!("short active file should fail sealing"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, LogError::Corrupt { .. }));
     }
 
     #[test]
@@ -1608,6 +1819,54 @@ mod tests {
     }
 
     #[test]
+    fn lineage_accepts_exact_splits_and_buddy_merges_only() {
+        let parent_id = Uuid::from_u128(24);
+        let left_id = Uuid::from_u128(25);
+        let right_id = Uuid::from_u128(26);
+        let merged_id = Uuid::from_u128(27);
+        let full = crate::KeyRange::full();
+        let (left, right) = full.children().unwrap();
+
+        let left_lineage = crate::RangeLineage {
+            range_id: left_id,
+            generation: 1,
+            key_range: left,
+            parents: vec![crate::ParentRange {
+                range_id: parent_id,
+                generation: 0,
+                key_range: full,
+            }],
+        };
+        left_lineage.validate().unwrap();
+
+        let merged = crate::RangeLineage {
+            range_id: merged_id,
+            generation: 2,
+            key_range: full,
+            parents: vec![
+                crate::ParentRange {
+                    range_id: left_id,
+                    generation: 1,
+                    key_range: left,
+                },
+                crate::ParentRange {
+                    range_id: right_id,
+                    generation: 1,
+                    key_range: right,
+                },
+            ],
+        };
+        merged.validate().unwrap();
+
+        let mut unrelated = left_lineage;
+        unrelated.key_range = right.children().unwrap().0;
+        assert!(matches!(
+            unrelated.validate(),
+            Err(LogError::InvalidDescriptor(_))
+        ));
+    }
+
+    #[test]
     fn buddy_key_ranges_split_cover_and_rejoin_the_parent_space() {
         let full = crate::KeyRange::full();
         let (low, high) = full.children().unwrap();
@@ -1620,5 +1879,25 @@ mod tests {
         assert!(!low.contains(1_u64 << 63));
         assert!(high.contains(u64::MAX));
         assert!(crate::KeyRange::new(1, 1).is_err());
+        assert!(!crate::KeyRange {
+            prefix: 0,
+            prefix_bits: 65,
+        }
+        .contains(0));
+    }
+
+    #[test]
+    fn group_limit_accounts_for_encoded_record_overhead() {
+        let mut too_small = config();
+        too_small.max_record_bytes = 1024;
+        too_small.max_group_bytes = 1024;
+        assert!(matches!(
+            too_small.validate(),
+            Err(LogError::InvalidConfig(_))
+        ));
+
+        too_small.max_group_bytes =
+            u64::from(too_small.max_record_bytes) + crate::types::RECORD_FRAME_OVERHEAD_BYTES;
+        too_small.validate().unwrap();
     }
 }

@@ -1,6 +1,6 @@
 use crate::types::{
     LogError, LogRecord, SegmentConfig, SegmentDescriptor, VtopLogResult, FORMAT_NAME,
-    FORMAT_VERSION,
+    FORMAT_VERSION, RECORD_FRAME_OVERHEAD_BYTES,
 };
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Seek, SeekFrom};
@@ -10,7 +10,8 @@ pub(crate) const RECORD_MAGIC: &[u8; 8] = b"VTOPREC1";
 pub(crate) const INDEX_MAGIC: &[u8; 8] = b"VTOPIDX1";
 pub(crate) const CHECKSUM_LEN: usize = 32;
 pub(crate) const FRAME_PREFIX_LEN: usize = 12;
-pub(crate) const RECORD_FIXED_BODY_LEN: usize = 8 + 16 + 8 + 8 + 4 + 4 + CHECKSUM_LEN;
+pub(crate) const RECORD_FIXED_BODY_LEN: usize =
+    RECORD_FRAME_OVERHEAD_BYTES as usize - FRAME_PREFIX_LEN;
 const MAX_HEADER_BYTES: u32 = 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,10 +75,7 @@ pub(crate) fn read_header<R: Read + Seek>(reader: &mut R) -> VtopLogResult<(Segm
     let mut prefix = [0_u8; 12];
     reader
         .read_exact(&mut prefix)
-        .map_err(|source| LogError::Corrupt {
-            position: 0,
-            reason: format!("incomplete segment header: {source}"),
-        })?;
+        .map_err(|source| header_read_error(source, 0, "segment header"))?;
     if &prefix[..8] != HEADER_MAGIC {
         return Err(LogError::Corrupt {
             position: 0,
@@ -94,17 +92,11 @@ pub(crate) fn read_header<R: Read + Seek>(reader: &mut R) -> VtopLogResult<(Segm
     let mut json = vec![0_u8; json_len as usize];
     reader
         .read_exact(&mut json)
-        .map_err(|source| LogError::Corrupt {
-            position: 12,
-            reason: format!("incomplete segment header: {source}"),
-        })?;
+        .map_err(|source| header_read_error(source, 12, "segment header JSON"))?;
     let mut stored_hash = [0_u8; CHECKSUM_LEN];
-    reader
-        .read_exact(&mut stored_hash)
-        .map_err(|source| LogError::Corrupt {
-            position: 12 + u64::from(json_len),
-            reason: format!("incomplete segment header checksum: {source}"),
-        })?;
+    reader.read_exact(&mut stored_hash).map_err(|source| {
+        header_read_error(source, 12 + u64::from(json_len), "segment header checksum")
+    })?;
     let mut authenticated = prefix.to_vec();
     authenticated.extend_from_slice(&json);
     if blake3::hash(&authenticated).as_bytes() != &stored_hash {
@@ -209,7 +201,16 @@ pub(crate) fn read_frame<R: Read>(
     while prefix_read < prefix.len() {
         match reader.read(&mut prefix[prefix_read..]) {
             Ok(0) if prefix_read == 0 => return Ok(FrameRead::End),
-            Ok(0) => return Ok(FrameRead::Torn),
+            Ok(0) => {
+                let comparable = prefix_read.min(RECORD_MAGIC.len());
+                if prefix[..comparable] != RECORD_MAGIC[..comparable] {
+                    return Err(LogError::Corrupt {
+                        position,
+                        reason: "invalid record magic in incomplete frame".to_owned(),
+                    });
+                }
+                return Ok(FrameRead::Torn);
+            }
             Ok(count) => prefix_read += count,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(source) => {
@@ -288,4 +289,75 @@ pub(crate) fn read_frame<R: Read>(
         encoded_len: encoded.len(),
         encoded,
     }))
+}
+
+fn header_read_error(source: std::io::Error, position: u64, part: &str) -> LogError {
+    if source.kind() == std::io::ErrorKind::UnexpectedEof {
+        LogError::Corrupt {
+            position,
+            reason: format!("incomplete {part}: {source}"),
+        }
+    } else {
+        LogError::Io {
+            path: "<segment>".into(),
+            source,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Cursor, Error, ErrorKind};
+
+    struct FailingReader;
+
+    impl Read for FailingReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "injected read failure",
+            ))
+        }
+    }
+
+    impl Seek for FailingReader {
+        fn seek(&mut self, _position: SeekFrom) -> std::io::Result<u64> {
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn header_preserves_non_eof_io_errors() {
+        assert!(matches!(
+            read_header(&mut FailingReader),
+            Err(LogError::Io { source, .. }) if source.kind() == ErrorKind::PermissionDenied
+        ));
+    }
+
+    #[test]
+    fn incomplete_header_is_corruption() {
+        let mut reader = Cursor::new(HEADER_MAGIC[..4].to_vec());
+        assert!(matches!(
+            read_header(&mut reader),
+            Err(LogError::Corrupt { position: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn incomplete_frame_requires_a_valid_magic_prefix() {
+        for retained in 1..FRAME_PREFIX_LEN {
+            let mut valid = Cursor::new(RECORD_MAGIC[..retained.min(8)].to_vec());
+            assert!(matches!(
+                read_frame(&mut valid, 99, 1024).unwrap(),
+                FrameRead::Torn
+            ));
+        }
+
+        let mut invalid = Cursor::new(b"XTOPREC1bad".to_vec());
+        assert!(matches!(
+            read_frame(&mut invalid, 123, 1024),
+            Err(LogError::Corrupt { position: 123, .. })
+        ));
+    }
 }
