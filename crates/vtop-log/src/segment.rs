@@ -145,22 +145,11 @@ impl ActiveSegment {
             .open(&path)
             .map_err(|source| io_error(&path, source))?;
         let (header, header_len) = read_header_with_path(&mut file, &path)?;
-        let boundary = match read_commit_boundary(&paths.commit) {
-            Ok(boundary) => boundary,
-            Err(LogError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
-                // Pre-boundary active files are recovered conservatively: no
-                // record is promoted merely because its complete bytes happen
-                // to have survived a restart.
-                let boundary = CommitBoundary {
-                    segment_id: header.descriptor.segment_id,
-                    committed_offset: header.descriptor.base_offset,
-                    content_bytes: 0,
-                };
-                write_commit_boundary_atomic(&paths.commit, boundary)?;
-                boundary
-            }
-            Err(error) => return Err(error),
-        };
+        // A missing marker is ambiguous: the file may contain acknowledged
+        // Fsync appends whose boundary sidecar was deleted. Never manufacture
+        // an empty boundary and truncate possibly committed data; leave the
+        // segment untouched for quarantine/operator recovery.
+        let boundary = read_commit_boundary(&paths.commit)?;
         if boundary.segment_id != header.descriptor.segment_id {
             return Err(LogError::CommitBoundaryMismatch(
                 "segment id differs from the active segment header".to_owned(),
@@ -1475,6 +1464,33 @@ mod tests {
             Err(error) => error,
         };
         assert!(matches!(error, LogError::CommitBoundaryMismatch(_)));
+        assert_eq!(fs::metadata(&path).unwrap().len(), data_len);
+    }
+
+    #[test]
+    fn recovery_rejects_a_missing_commit_boundary_without_changing_data() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("missing-commit.active");
+        let mut segment = ActiveSegment::create(&path, descriptor(), config()).unwrap();
+        segment
+            .append(
+                record(Uuid::from_u128(28), 0, b"acknowledged"),
+                Durability::Fsync,
+            )
+            .unwrap();
+        drop(segment);
+        let data_len = fs::metadata(&path).unwrap().len();
+        let paths = SegmentPaths::from_active(&path).unwrap();
+        fs::remove_file(&paths.commit).unwrap();
+
+        let error = match ActiveSegment::recover(&path) {
+            Ok(_) => panic!("missing commit boundary should fail recovery"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            LogError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound
+        ));
         assert_eq!(fs::metadata(&path).unwrap().len(), data_len);
     }
 
