@@ -91,6 +91,13 @@ impl UploadBackend for LocalFsBackend {
             .await
     }
 
+    async fn get_object(&self, object_uri: &str) -> Result<Vec<u8>, VtopError> {
+        let path = self.object_path(object_uri)?;
+        tokio::fs::read(&path)
+            .await
+            .map_err(|_| VtopError::NotFound(object_uri.to_string()))
+    }
+
     async fn head_object(&self, object_uri: &str) -> Result<ObjectHead, VtopError> {
         let path = self.object_path(object_uri)?;
         let meta = tokio::fs::metadata(&path)

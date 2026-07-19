@@ -98,6 +98,14 @@ pub trait UploadBackend: Send + Sync {
     /// HEAD/stat an object.
     async fn head_object(&self, object_uri: &str) -> Result<ObjectHead, VtopError>;
 
+    /// Download an object's full content.
+    ///
+    /// For explicit verification tooling (`vtopctl verify-manifest`), which
+    /// must hash the ACTUAL stored bytes — metadata can lie about a replaced
+    /// object, content cannot (#68). Never called on the archiving hot path,
+    /// so implementations may favour simplicity over streaming.
+    async fn get_object(&self, object_uri: &str) -> Result<Vec<u8>, VtopError>;
+
     /// Verify a stored object against an expected size and (when provided)
     /// checksum. `expected = None` means checksums are disabled, so only
     /// size/existence can be confirmed (a backend-limited result).

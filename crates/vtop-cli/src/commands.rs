@@ -318,34 +318,165 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 cli.json,
             );
             let engine = Engine::new(cfg, streams).await?;
-            let head = engine.backend.head_object(manifest).await?;
-            let exists = head.size_bytes.is_some();
+            let report =
+                verify_manifest_deep(engine.store.as_ref(), engine.backend.as_ref(), manifest)
+                    .await?;
             if cli.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "manifest": manifest,
-                        "exists": exists,
-                        "size_bytes": head.size_bytes,
-                        "stored_sha256": head.checksum_sha256,
-                        "backend": engine.backend.backend_name(),
-                    }))?
-                );
-            } else if exists {
-                println!(
-                    "manifest present: {} ({} bytes){}",
-                    manifest,
-                    head.size_bytes.unwrap_or(0),
-                    head.checksum_sha256
-                        .map(|s| format!(", sha256={s}"))
-                        .unwrap_or_default()
-                );
+                println!("{}", serde_json::to_string_pretty(&report.json)?);
             } else {
-                println!("manifest NOT found: {manifest}");
+                for line in &report.lines {
+                    println!("{line}");
+                }
             }
-            Ok(())
+            if report.passed {
+                Ok(())
+            } else {
+                Err(VtopError::Other(format!(
+                    "verification FAILED for {manifest} (see report above)"
+                )))
+            }
         }
     }
+}
+
+/// Outcome of a deep manifest verification, in both output shapes.
+pub struct VerifyReport {
+    pub passed: bool,
+    pub json: serde_json::Value,
+    pub lines: Vec<String>,
+}
+
+/// Deep verification of a stored manifest (#68). A HEAD proves only that
+/// *something* with that name exists; every check here works on downloaded
+/// CONTENT, because metadata can lie about a replaced object and content
+/// cannot:
+///
+/// 1. the manifest downloads and parses as a VTOP manifest;
+/// 2. its self-hash verifies (the manifest itself is untampered/uncorrupted);
+/// 3. the referenced object's size AND content digest (recomputed from the
+///    downloaded bytes, using the manifest's algorithm) match the manifest;
+/// 4. the ledger row for the batch agrees (state and recorded digest).
+///
+/// A missing ledger row is reported but is not a failure: the manifest may
+/// have been written by a different engine with its own state store.
+pub async fn verify_manifest_deep(
+    store: &dyn vtop_state::StateStore,
+    backend: &dyn vtop_upload::UploadBackend,
+    manifest_uri: &str,
+) -> Result<VerifyReport, VtopError> {
+    use vtop_core::checksum::digest_bytes;
+    use vtop_core::types::ChecksumAlgorithm;
+
+    let mut lines = Vec::new();
+    let mut failed = false;
+
+    // 1. Content, not metadata.
+    let manifest_bytes = backend.get_object(manifest_uri).await?;
+    let parsed: vtop_core::manifest::VtopManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|e| VtopError::Other(format!("manifest {manifest_uri} does not parse: {e}")))?;
+    lines.push(format!(
+        "manifest        : {} ({} bytes, batch {})",
+        manifest_uri,
+        manifest_bytes.len(),
+        parsed.batch_id
+    ));
+
+    // 2. Self-hash: is the manifest itself intact?
+    let self_hash_ok = parsed.verify_self_hash().is_ok();
+    failed |= !self_hash_ok;
+    lines.push(format!(
+        "self-hash       : {}",
+        if self_hash_ok {
+            "OK"
+        } else {
+            "FAILED (manifest content does not match its embedded sha256)"
+        }
+    ));
+
+    // 3. The stored object's actual content.
+    let object_bytes = backend.get_object(&parsed.object.uri).await?;
+    let size_ok = object_bytes.len() as u64 == parsed.object.size_bytes;
+    failed |= !size_ok;
+    lines.push(format!(
+        "object size     : {} ({} bytes stored, {} expected)",
+        if size_ok { "OK" } else { "FAILED" },
+        object_bytes.len(),
+        parsed.object.size_bytes
+    ));
+
+    let algo = parsed
+        .object
+        .checksum_algorithm
+        .parse::<ChecksumAlgorithm>()
+        .ok();
+    let recomputed = algo.and_then(|a| digest_bytes(a, &object_bytes));
+    let checksum_status = match &recomputed {
+        Some(actual) if parsed.object.checksum.is_empty() => {
+            // Manifest says an algorithm but carries no digest: nothing to
+            // compare against; surface it rather than calling it a pass.
+            format!("LIMITED (no digest recorded; computed {actual})")
+        }
+        Some(actual) => {
+            let ok = actual.eq_ignore_ascii_case(&parsed.object.checksum);
+            failed |= !ok;
+            if ok {
+                format!("OK ({} {})", parsed.object.checksum_algorithm, actual)
+            } else {
+                format!(
+                    "FAILED (stored content hashes to {actual}, manifest says {})",
+                    parsed.object.checksum
+                )
+            }
+        }
+        None => "LIMITED (checksums disabled for this batch)".to_string(),
+    };
+    lines.push(format!("object content  : {checksum_status}"));
+
+    // 4. Ledger reconciliation.
+    let row = store.get_batch(&parsed.batch_id).await?;
+    let ledger_status = match &row {
+        None => "ABSENT (not a failure: manifest may belong to another engine's store)".to_string(),
+        Some(r) => {
+            let state_ok = matches!(r.state, BatchState::Verified | BatchState::SourceCommitted);
+            let digest_ok = match (&r.object_sha256, &recomputed, algo) {
+                (Some(ledger), Some(actual), Some(ChecksumAlgorithm::Sha256)) => {
+                    ledger.eq_ignore_ascii_case(actual)
+                }
+                _ => true, // nothing comparable recorded
+            };
+            failed |= !state_ok || !digest_ok;
+            match (state_ok, digest_ok) {
+                (true, true) => format!("OK (state {})", r.state),
+                (false, _) => format!(
+                    "FAILED (state {} — the ledger never saw this batch verified)",
+                    r.state
+                ),
+                (_, false) => "FAILED (ledger digest differs from stored content)".to_string(),
+            }
+        }
+    };
+    lines.push(format!("ledger          : {ledger_status}"));
+
+    let verdict = if failed { "FAILED" } else { "PASSED" };
+    lines.push(format!("verdict         : {verdict}"));
+
+    let json = serde_json::json!({
+        "manifest": manifest_uri,
+        "batch_id": parsed.batch_id,
+        "object_uri": parsed.object.uri,
+        "self_hash_ok": self_hash_ok,
+        "object_size_ok": size_ok,
+        "object_content": checksum_status,
+        "ledger": ledger_status,
+        "backend": backend.backend_name(),
+        "passed": !failed,
+    });
+
+    Ok(VerifyReport {
+        passed: !failed,
+        json,
+        lines,
+    })
 }
 
 fn describe_recovery(state: BatchState) -> &'static str {

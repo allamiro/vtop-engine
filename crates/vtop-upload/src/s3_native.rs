@@ -150,6 +150,29 @@ impl UploadBackend for S3NativeBackend {
             .await
     }
 
+    async fn get_object(&self, object_uri: &str) -> Result<Vec<u8>, VtopError> {
+        let (bucket, key) = parse_s3_uri(object_uri)?;
+        let out = self
+            .client
+            .get_object()
+            .bucket(&bucket)
+            .key(&key)
+            .send()
+            .await
+            .map_err(|e| {
+                VtopError::Upload(format!(
+                    "get_object {object_uri}: {}",
+                    e.into_service_error()
+                ))
+            })?;
+        let bytes = out
+            .body
+            .collect()
+            .await
+            .map_err(|e| VtopError::Upload(format!("get_object body {object_uri}: {e}")))?;
+        Ok(bytes.into_bytes().to_vec())
+    }
+
     async fn head_object(&self, object_uri: &str) -> Result<ObjectHead, VtopError> {
         let (bucket, key) = parse_s3_uri(object_uri)?;
         let out = self
