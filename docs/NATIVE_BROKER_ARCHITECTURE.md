@@ -101,8 +101,10 @@ It is not yet a proof-carrying or cluster-safe segment implementation:
   prefixes and sealed bytes, and quarantines ambiguous local artifacts without
   selecting a winner. Directory ownership/locking, concurrent producers,
   injectable disk/clock/RNG seams, bounded queues, backpressure, crash-point
-  tests, property tests, fuzzing, and native storage benchmarks remain future
-  work.
+  injection, property tests, fuzzing, and native storage benchmarks remain
+  future work. The real-filesystem `startup_crash_matrix` already freezes the
+  safe startup decision for observable create, commit, and seal publication
+  states without pretending to simulate kernel durability.
 
 These are staging gaps, not reasons to discard the slice. The first merge must
 keep the committed-boundary regression tests and accurately label all
