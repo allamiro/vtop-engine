@@ -5,7 +5,8 @@
 //! never printed by this module.
 
 use crate::base::{
-    verify_file_content, ObjectChecksum, ObjectHead, UploadBackend, VerificationResult,
+    read_command_bounded, verify_command_content, ObjectChecksum, ObjectHead, UploadBackend,
+    VerificationResult,
 };
 use async_trait::async_trait;
 use std::path::Path;
@@ -69,6 +70,16 @@ impl UploadBackend for S3cmdBackend {
             .map_err(|e| VtopError::Upload(format!("reading downloaded {object_uri}: {e}")))
     }
 
+    async fn get_object_bounded(
+        &self,
+        object_uri: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, VtopError> {
+        let mut cmd = self.base_cmd();
+        cmd.arg("get").arg(object_uri).arg("-");
+        read_command_bounded(&mut cmd, max_bytes, object_uri, "s3cmd").await
+    }
+
     async fn head_object(&self, object_uri: &str) -> Result<ObjectHead, VtopError> {
         let out = output(self.base_cmd().arg("info").arg(object_uri)).await?;
         let size = parse_size(&out);
@@ -86,16 +97,21 @@ impl UploadBackend for S3cmdBackend {
         expected_size: u64,
         expected_checksum: Option<ObjectChecksum<'_>>,
     ) -> Result<VerificationResult, VtopError> {
-        let tmp = tempfile::NamedTempFile::new()
-            .map_err(|e| VtopError::Upload(format!("temp file for verification: {e}")))?;
-        run(self
-            .base_cmd()
-            .arg("get")
-            .arg("--force")
-            .arg(object_uri)
-            .arg(tmp.path()))
-        .await?;
-        verify_file_content(tmp.path(), expected_size, expected_checksum, "s3cmd").await
+        let Some(expected) = expected_checksum else {
+            let head = self.head_object(object_uri).await?;
+            return match head.size_bytes {
+                Some(size) if size == expected_size => Ok(VerificationResult::limited(
+                    "s3cmd: object present and size matches (checksums disabled)",
+                )),
+                Some(size) => Ok(VerificationResult::failed(format!(
+                    "size mismatch: expected {expected_size}, got {size}"
+                ))),
+                None => Ok(VerificationResult::failed("could not read object size")),
+            };
+        };
+        let mut cmd = self.base_cmd();
+        cmd.arg("get").arg(object_uri).arg("-");
+        verify_command_content(&mut cmd, expected_size, expected, "s3cmd").await
     }
 
     async fn delete_object(&self, object_uri: &str) -> Result<(), VtopError> {

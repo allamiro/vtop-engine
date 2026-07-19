@@ -137,7 +137,7 @@ impl Metrics {
         )?;
         let verification_backend_limited_total = cv(
             "verification_backend_limited_total",
-            "Verifications confirmed by size/existence only, without a checksum",
+            "Size-only verifications committed under an explicit require_strong_verification=false opt-out",
             labels3(),
         )?;
         let replay_required_total = cv(

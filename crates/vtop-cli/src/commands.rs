@@ -376,7 +376,9 @@ pub async fn verify_manifest_deep(
     let mut failed = false;
 
     // 1. Content, not metadata.
-    let manifest_bytes = backend.get_object(manifest_uri).await?;
+    let manifest_bytes = backend
+        .get_object_bounded(manifest_uri, vtop_core::manifest::MAX_MANIFEST_BYTES)
+        .await?;
     let parsed: vtop_core::manifest::VtopManifest = serde_json::from_slice(&manifest_bytes)
         .map_err(|e| VtopError::Other(format!("manifest {manifest_uri} does not parse: {e}")))?;
     lines.push(format!(

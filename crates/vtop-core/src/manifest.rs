@@ -15,6 +15,12 @@ use std::path::{Path, PathBuf};
 pub const VTOP_PROTOCOL: &str = "VTOP";
 /// Manifest schema version.
 pub const VTOP_VERSION: &str = "0.2";
+/// Maximum serialized manifest size accepted from storage.
+///
+/// Manifests contain metadata only and are normally a few KiB. A hard 1 MiB
+/// cap prevents a replaced manifest key from exhausting memory during startup
+/// recovery while leaving ample room for long source markers and extensions.
+pub const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 
 /// Runtime-only key used to authenticate manifests with BLAKE3 keyed hashing.
 ///
@@ -280,7 +286,13 @@ impl VtopManifest {
     pub fn write_to_file(&self, work_dir: &Path) -> Result<PathBuf, VtopError> {
         std::fs::create_dir_all(work_dir)?;
         let path = work_dir.join(format!("{}.manifest.json", self.batch_id));
-        std::fs::write(&path, self.to_json_bytes()?)?;
+        let bytes = self.to_json_bytes()?;
+        if bytes.len() > MAX_MANIFEST_BYTES {
+            return Err(VtopError::Manifest(format!(
+                "manifest exceeds the {MAX_MANIFEST_BYTES}-byte limit"
+            )));
+        }
+        std::fs::write(&path, bytes)?;
         Ok(path)
     }
 
@@ -416,5 +428,15 @@ mod tests {
         assert!(json.contains("source_progress"));
         assert!(json.contains("start_offset"));
         assert!(json.contains("481000"));
+    }
+
+    #[test]
+    fn refuses_to_write_an_oversized_manifest() {
+        let mut manifest = builder().build().unwrap();
+        manifest.source_name = "x".repeat(MAX_MANIFEST_BYTES + 1);
+        let dir = tempfile::tempdir().unwrap();
+        let err = manifest.write_to_file(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("manifest exceeds"));
+        assert!(!dir.path().join("vtop-test.manifest.json").exists());
     }
 }

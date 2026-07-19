@@ -9,7 +9,7 @@
 //! mapped onto the local tree.
 
 use crate::base::{
-    parse_s3_uri, verify_file_content, ObjectChecksum, ObjectHead, UploadBackend,
+    parse_s3_uri, read_bounded, verify_file_content, ObjectChecksum, ObjectHead, UploadBackend,
     VerificationResult,
 };
 use async_trait::async_trait;
@@ -101,6 +101,18 @@ impl UploadBackend for LocalFsBackend {
         tokio::fs::read(&path)
             .await
             .map_err(|_| VtopError::NotFound(object_uri.to_string()))
+    }
+
+    async fn get_object_bounded(
+        &self,
+        object_uri: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, VtopError> {
+        let path = self.object_path(object_uri)?;
+        let file = tokio::fs::File::open(&path)
+            .await
+            .map_err(|_| VtopError::NotFound(object_uri.to_string()))?;
+        read_bounded(file, max_bytes, object_uri).await
     }
 
     async fn head_object(&self, object_uri: &str) -> Result<ObjectHead, VtopError> {

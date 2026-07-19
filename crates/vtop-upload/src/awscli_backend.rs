@@ -4,8 +4,8 @@
 //! Credentials come from the environment / profile and are never printed.
 
 use crate::base::{
-    parse_s3_uri, verify_file_content, ObjectChecksum, ObjectHead, UploadBackend,
-    VerificationResult,
+    parse_s3_uri, read_command_bounded, verify_command_content, ObjectChecksum, ObjectHead,
+    UploadBackend, VerificationResult,
 };
 use async_trait::async_trait;
 use std::path::Path;
@@ -86,6 +86,16 @@ impl UploadBackend for AwsCliBackend {
             .map_err(|e| VtopError::Upload(format!("reading downloaded {object_uri}: {e}")))
     }
 
+    async fn get_object_bounded(
+        &self,
+        object_uri: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, VtopError> {
+        let mut cmd = self.base_cmd();
+        cmd.arg("s3").arg("cp").arg(object_uri).arg("-");
+        read_command_bounded(&mut cmd, max_bytes, object_uri, "aws cli").await
+    }
+
     async fn head_object(&self, object_uri: &str) -> Result<ObjectHead, VtopError> {
         let (bucket, key) = parse_s3_uri(object_uri)?;
         let out = output(
@@ -119,16 +129,21 @@ impl UploadBackend for AwsCliBackend {
         expected_size: u64,
         expected: Option<ObjectChecksum<'_>>,
     ) -> Result<VerificationResult, VtopError> {
-        let tmp = tempfile::NamedTempFile::new()
-            .map_err(|e| VtopError::Upload(format!("temp file for verification: {e}")))?;
-        run(self
-            .base_cmd()
-            .arg("s3")
-            .arg("cp")
-            .arg(object_uri)
-            .arg(tmp.path()))
-        .await?;
-        verify_file_content(tmp.path(), expected_size, expected, "aws cli").await
+        let Some(expected) = expected else {
+            let head = self.head_object(object_uri).await?;
+            return match head.size_bytes {
+                Some(size) if size == expected_size => Ok(VerificationResult::limited(
+                    "aws cli: object present and size matches (checksums disabled)",
+                )),
+                Some(size) => Ok(VerificationResult::failed(format!(
+                    "size mismatch: expected {expected_size}, got {size}"
+                ))),
+                None => Ok(VerificationResult::failed("object size unavailable")),
+            };
+        };
+        let mut cmd = self.base_cmd();
+        cmd.arg("s3").arg("cp").arg(object_uri).arg("-");
+        verify_command_content(&mut cmd, expected_size, expected, "aws cli").await
     }
 
     async fn delete_object(&self, object_uri: &str) -> Result<(), VtopError> {

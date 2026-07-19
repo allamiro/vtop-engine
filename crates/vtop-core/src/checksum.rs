@@ -92,6 +92,9 @@ pub async fn digest_file(
     algo: ChecksumAlgorithm,
     path: &Path,
 ) -> Result<Option<String>, VtopError> {
+    if algo == ChecksumAlgorithm::None {
+        return Ok(None);
+    }
     let file = tokio::fs::File::open(path).await?;
     Ok(digest_reader(algo, file).await?.map(|(hex, _)| hex))
 }
@@ -210,6 +213,13 @@ mod tests {
         assert_eq!(b3, blake3_bytes(data));
         assert_eq!(size, data.len() as u64);
         assert!(digest_reader(None, &data[..]).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn disabled_digest_does_not_touch_the_path() {
+        use crate::types::ChecksumAlgorithm::None;
+        let missing = std::path::Path::new("/definitely/not/a/vtop/file");
+        assert_eq!(digest_file(None, missing).await.unwrap(), Option::None);
     }
 
     #[tokio::test]

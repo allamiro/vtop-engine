@@ -13,7 +13,9 @@
 //! When checksums are disabled, verification falls back to size + existence
 //! (backend-limited).
 
-use crate::base::{parse_s3_uri, ObjectChecksum, ObjectHead, UploadBackend, VerificationResult};
+use crate::base::{
+    parse_s3_uri, read_bounded, ObjectChecksum, ObjectHead, UploadBackend, VerificationResult,
+};
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Region;
@@ -254,6 +256,36 @@ impl UploadBackend for S3NativeBackend {
             .await
             .map_err(|e| VtopError::Upload(format!("get_object body {object_uri}: {e}")))?;
         Ok(bytes.into_bytes().to_vec())
+    }
+
+    async fn get_object_bounded(
+        &self,
+        object_uri: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, VtopError> {
+        let (bucket, key) = parse_s3_uri(object_uri)?;
+        let out = self
+            .client
+            .get_object()
+            .bucket(&bucket)
+            .key(&key)
+            .send()
+            .await
+            .map_err(|e| {
+                VtopError::Upload(format!(
+                    "get_object {object_uri}: {}",
+                    e.into_service_error()
+                ))
+            })?;
+        if out
+            .content_length()
+            .is_some_and(|size| size < 0 || size as u64 > max_bytes as u64)
+        {
+            return Err(VtopError::Upload(format!(
+                "stored object {object_uri} exceeds the {max_bytes}-byte read limit"
+            )));
+        }
+        read_bounded(out.body.into_async_read(), max_bytes, object_uri).await
     }
 
     async fn head_object(&self, object_uri: &str) -> Result<ObjectHead, VtopError> {

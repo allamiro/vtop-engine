@@ -23,7 +23,7 @@ use vtop_core::batch::{AdaptiveBatcher, BatchLimits, SealReason, TelemetryBatch}
 use vtop_core::compression::compress_batch;
 use vtop_core::config::{StreamConfig, StreamsConfig, VtopConfig};
 use vtop_core::errors::VtopError;
-use vtop_core::manifest::{ManifestBuilder, ManifestMacKey, VtopManifest};
+use vtop_core::manifest::{ManifestBuilder, ManifestMacKey, VtopManifest, MAX_MANIFEST_BYTES};
 use vtop_core::metrics::BatchMetrics;
 use vtop_core::partitioning::{self, PartitionContext};
 use vtop_core::replay::{next_recovery_action, RecoveryAction};
@@ -518,7 +518,11 @@ impl<'a> Pipeline<'a> {
         // keyed mode always downloads the small manifest and checks its
         // binding before the batch may reach VERIFIED.
         if let Some(key) = self.manifest_mac_key.as_ref() {
-            let stored_bytes = match self.backend.get_object(&manifest_uri).await {
+            let stored_bytes = match self
+                .backend
+                .get_object_bounded(&manifest_uri, MAX_MANIFEST_BYTES)
+                .await
+            {
                 Ok(bytes) => bytes,
                 Err(e) => fail!(format!("stored manifest download failed: {e}")),
             };
@@ -1359,7 +1363,11 @@ impl Engine {
             // cannot identify the manifest cannot safely advance its source.
             return false;
         };
-        let bytes = match self.backend.get_object(muri).await {
+        let bytes = match self
+            .backend
+            .get_object_bounded(muri, MAX_MANIFEST_BYTES)
+            .await
+        {
             Ok(bytes) => bytes,
             Err(e) => {
                 tracing::warn!(muri, error = %e, "recovery re-check: manifest download failed");
@@ -1374,12 +1382,16 @@ impl Engine {
             }
         };
 
+        let ledger_manifest_hash_matches = rec.manifest_sha256.as_deref().is_some_and(|want| {
+            !want.is_empty() && want.eq_ignore_ascii_case(&manifest.manifest.sha256)
+        });
         if manifest
             .verify_authentication(self.manifest_mac_key.as_ref())
             .is_err()
             || manifest.batch_id != rec.batch_id
             || manifest.manifest.uri != muri
             || manifest.object.uri != uri
+            || !ledger_manifest_hash_matches
         {
             tracing::warn!(
                 muri,

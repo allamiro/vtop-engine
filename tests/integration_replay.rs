@@ -188,6 +188,7 @@ async fn metadata_preserving_content_replacement_never_commits() {
         .read_batch_candidates(&source, 1000, 1 << 20, std::time::Duration::ZERO)
         .await
         .unwrap();
+    assert_eq!(reads.len(), 1);
     let outcome = pipeline(&store, backend, &cfg)
         .process(&mut adapter, &source, reads.remove(0), None)
         .await
@@ -246,6 +247,7 @@ async fn backend_limited_verification_requires_explicit_opt_out() {
             .read_batch_candidates(&source, 1000, 1 << 20, std::time::Duration::ZERO)
             .await
             .unwrap();
+        assert_eq!(reads.len(), 1);
 
         let outcome = pipeline(&store, backend, &cfg)
             .process(&mut adapter, &source, reads.remove(0), None)

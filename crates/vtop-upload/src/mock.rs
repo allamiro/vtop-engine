@@ -18,6 +18,9 @@ struct Stored {
     checksum: Option<String>,
     /// Full content, so `get_object`-based verification is testable.
     data: Vec<u8>,
+    /// Prevent the corrupt-on-verify fault from toggling the same byte back to
+    /// its original value on a retry.
+    corrupted: bool,
 }
 
 /// A test double for [`UploadBackend`].
@@ -86,6 +89,7 @@ impl MockBackend {
         if let Some(s) = self.objects.lock().unwrap().get_mut(uri) {
             if let Some(b) = s.data.first_mut() {
                 *b ^= 0xff;
+                s.corrupted = true;
             }
         }
     }
@@ -101,6 +105,7 @@ impl MockBackend {
             size: data.len() as u64,
             checksum: checksum.map(|s| s.to_string()),
             data,
+            corrupted: false,
         };
         self.objects.lock().unwrap().insert(uri.to_string(), stored);
         Ok(())
@@ -137,6 +142,23 @@ impl UploadBackend for MockBackend {
         Ok(s.data.clone())
     }
 
+    async fn get_object_bounded(
+        &self,
+        object_uri: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, VtopError> {
+        let map = self.objects.lock().unwrap();
+        let stored = map
+            .get(object_uri)
+            .ok_or_else(|| VtopError::NotFound(object_uri.to_string()))?;
+        if stored.data.len() > max_bytes {
+            return Err(VtopError::Upload(format!(
+                "stored object {object_uri} exceeds the {max_bytes}-byte read limit"
+            )));
+        }
+        Ok(stored.data.clone())
+    }
+
     async fn head_object(&self, object_uri: &str) -> Result<ObjectHead, VtopError> {
         let map = self.objects.lock().unwrap();
         let s = map
@@ -167,9 +189,10 @@ impl UploadBackend for MockBackend {
         let stored = map
             .get_mut(object_uri)
             .ok_or_else(|| VtopError::NotFound(object_uri.to_string()))?;
-        if self.corrupt_on_verify {
+        if self.corrupt_on_verify && !stored.corrupted {
             if let Some(first) = stored.data.first_mut() {
                 *first ^= 0xff;
+                stored.corrupted = true;
             }
         }
         if stored.data.len() as u64 != expected_size {
@@ -265,6 +288,32 @@ mod tests {
         let res = b.verify_object(uri, 7, Some(ck(&digest))).await.unwrap();
         assert!(!res.passed);
         assert!(!res.backend_limited);
+    }
+
+    #[tokio::test]
+    async fn corrupting_backend_stays_corrupt_across_retries() {
+        let b = MockBackend::corrupting();
+        let f = tmp(b"payload");
+        let uri = "s3://bucket/retry";
+        let digest = vtop_core::checksum::sha256_bytes(b"payload");
+        b.put_object(f.path(), uri, Some(ck(&digest)))
+            .await
+            .unwrap();
+
+        for _ in 0..2 {
+            let res = b.verify_object(uri, 7, Some(ck(&digest))).await.unwrap();
+            assert!(!res.passed);
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_download_rejects_oversized_content() {
+        let b = MockBackend::new();
+        let f = tmp(b"12345");
+        let uri = "s3://bucket/manifest";
+        b.put_manifest(f.path(), uri, None).await.unwrap();
+        assert!(b.get_object_bounded(uri, 5).await.is_ok());
+        assert!(b.get_object_bounded(uri, 4).await.is_err());
     }
 
     #[tokio::test]

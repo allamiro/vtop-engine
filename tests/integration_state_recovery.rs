@@ -359,6 +359,141 @@ async fn recovery_rejects_same_size_replacement_with_matching_metadata() {
     assert_eq!(got.state, BatchState::ReplayRequired);
 }
 
+/// #64 review regression: an unsigned manifest can be edited and rehashed, so
+/// recovery must also bind its embedded self-hash to the durable ledger value.
+#[tokio::test]
+async fn recovery_rejects_rehashed_manifest_not_bound_to_ledger() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work-manifest-replacement");
+    let input = dir.path().join("manifest-replacement.log");
+    std::fs::write(&input, b"line-0\n").unwrap();
+    let db = dir.path().join("manifest-replacement.db");
+    let url = format!("sqlite://{}", db.display());
+    let batch_id = "b-manifest-replaced";
+    let object_uri = "s3://telemetry-data/x/b-manifest-replaced.raw.gz";
+    let manifest_uri = "s3://telemetry-data/x/b-manifest-replaced.manifest.json";
+    let original_bytes = b"payload-A";
+    let replacement_bytes = b"payload-B";
+    let object_digest = vtop_core::checksum::sha256_bytes(original_bytes);
+    let marker = ProgressMarker::File {
+        path: input.to_string_lossy().into_owned(),
+        inode: None,
+        start_byte: 0,
+        end_byte: 7,
+        file_size: 7,
+        mtime: String::new(),
+    };
+    let (original_manifest, _) = write_recovery_manifest(
+        &work,
+        batch_id,
+        &input.to_string_lossy(),
+        marker.clone(),
+        object_uri,
+        manifest_uri,
+        original_bytes.len() as u64,
+        "sha256",
+        &object_digest,
+    );
+    // Same binding strings and checksum value, but a rehashed replacement
+    // downgrades the algorithm to size-only. Under the explicit weak policy it
+    // would pass unless the ledger's original manifest hash is checked.
+    let (replacement_manifest, replacement_path) = write_recovery_manifest(
+        &work,
+        batch_id,
+        &input.to_string_lossy(),
+        marker.clone(),
+        object_uri,
+        manifest_uri,
+        replacement_bytes.len() as u64,
+        "none",
+        &object_digest,
+    );
+    assert_ne!(
+        original_manifest.manifest.sha256,
+        replacement_manifest.manifest.sha256
+    );
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let rec = BatchRecord {
+        batch_id: batch_id.into(),
+        tenant: "default".into(),
+        source_type: SourceType::File,
+        source_name: input.to_string_lossy().into_owned(),
+        format: TelemetryFormat::Raw,
+        state: BatchState::Batching,
+        progress_start: marker.clone(),
+        progress_end: marker,
+        object_uri: Some(object_uri.into()),
+        manifest_uri: Some(manifest_uri.into()),
+        object_sha256: Some(object_digest.clone()),
+        manifest_sha256: Some(original_manifest.manifest.sha256.clone()),
+        object_size_bytes: Some(original_bytes.len() as i64),
+        record_count: Some(1),
+        error_message: None,
+        owner: None,
+        lease_expires_at: None,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    let store = SqliteStateStore::connect(&url).await.unwrap();
+    store.save_batch_state(&rec).await.unwrap();
+    for state in [
+        BatchState::Sealed,
+        BatchState::Compressed,
+        BatchState::Checksummed,
+        BatchState::ObjectUploaded,
+        BatchState::ManifestUploaded,
+        BatchState::Verified,
+    ] {
+        store
+            .update_batch_state(batch_id, state, &BatchPatch::default())
+            .await
+            .unwrap();
+    }
+    drop(store);
+
+    let cfg = file_config(
+        work.to_str().unwrap(),
+        &url,
+        vec![input.to_string_lossy().into_owned()],
+        "mock",
+    );
+    assert!(!cfg.upload.require_strong_verification);
+    let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+        .await
+        .unwrap();
+    let staged = dir.path().join("same-size-replacement");
+    std::fs::write(&staged, replacement_bytes).unwrap();
+    engine
+        .backend
+        .put_object(
+            &staged,
+            object_uri,
+            Some(vtop_upload::ObjectChecksum::new("sha256", &object_digest)),
+        )
+        .await
+        .unwrap();
+    engine
+        .backend
+        .put_manifest(&replacement_path, manifest_uri, None)
+        .await
+        .unwrap();
+
+    let summary = engine.recover().await.unwrap();
+    assert_eq!(summary.committed, 0);
+    assert_eq!(summary.replay_required, 1);
+    assert_eq!(
+        engine
+            .store
+            .get_batch(batch_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        BatchState::ReplayRequired
+    );
+}
+
 /// #69: a VERIFIED ledger row whose object is GONE (deleted/modified while the
 /// engine was down) must NOT get its source progress committed — recovery must
 /// route it to replay. Committing would advance the source past data that no
