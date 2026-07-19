@@ -96,6 +96,9 @@ Additional guidance:
 - The engine **SHOULD** support loading credentials from external secret managers without persisting them to disk.
 - Inline SQLite paths remain valid. PostgreSQL URLs **MUST** be referenced as `engine.state_store: { env: VTOP_STATE_STORE }` or `engine.state_store: { file: /run/secrets/vtop-state-store }`; inline PostgreSQL URLs are rejected before startup.
 - Secret files may contain one PostgreSQL URL with a trailing newline. The resolved URL is held only in an opaque runtime value and is not retained in serializable configuration.
+- PostgreSQL schema migrations **MUST** run as a separate deployment identity via `vtopctl migrate`; normal engine startup performs no DDL.
+- The PostgreSQL engine identity **SHOULD** have only database `CONNECT`, schema `USAGE`, and `SELECT, INSERT, UPDATE` on the `batches` ledger. It **MUST NOT** own the table or receive `CREATE`, `ALTER`, `DROP`, `DELETE`, or `TRUNCATE` privileges.
+- The privileged migration secret **MUST NOT** be mounted into the engine workload. See [PostgreSQL deployment](POSTGRES_DEPLOYMENT.md) for the rollout and grant sequence.
 
 ## 4. Manifest Confidentiality
 

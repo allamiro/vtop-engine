@@ -395,6 +395,11 @@ cargo run -p vtop-cli -- list-batches \
 cargo run -p vtop-cli -- verify-manifest \
   --manifest s3://telemetry-data/.../batch.manifest.json \
   --config examples/config.yaml
+
+# PostgreSQL only: run once with the privileged migration secret before the
+# engine starts with its DML-only runtime secret.
+cargo run -p vtop-cli --features postgres -- migrate \
+  --config examples/config.yaml
 ```
 
 Common CLI behavior:
@@ -405,6 +410,11 @@ Common CLI behavior:
 | `--log-level` | runtime log level |
 | non-zero exit | command failure |
 | secret-safe output | commands should not print credentials |
+
+PostgreSQL schema changes are never run by normal engine startup. Use a
+separate migration identity for `vtopctl migrate`, then give the runtime role
+only schema `USAGE` and `SELECT, INSERT, UPDATE` on `batches`. See
+[PostgreSQL deployment](docs/POSTGRES_DEPLOYMENT.md).
 
 ---
 

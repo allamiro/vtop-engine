@@ -5,7 +5,7 @@
 //! self-HA store such as YugabyteDB / CockroachDB). It is behaviourally
 //! identical to the SQLite backend — it passes the same [`crate::test_battery`]
 //! — and differs only in the driver (`PgPool`), the `$N` placeholders, the
-//! Postgres DDL, and two production concerns SQLite does not have:
+//! Postgres DDL, and four production concerns SQLite does not have:
 //!
 //! 1. **Defense in depth.** The verify-before-commit invariant is enforced by
 //!    `vtop_core::state_machine` at write time AND by a database trigger, so the
@@ -18,6 +18,10 @@
 //! 3. **Transport and credential boundary.** Parsed connection options keep the
 //!    URL out of errors, and every non-loopback connection requires
 //!    `sslmode=verify-full` using rustls.
+//! 4. **Separate migration identity.** Runtime startup performs only a read-only
+//!    schema readiness check. DDL is applied explicitly through
+//!    [`PgStateStore::migrate`], so the engine role needs table DML, not schema
+//!    ownership or `CREATE`/`ALTER` privileges.
 //!
 //! Compiled only with `--features postgres`.
 
@@ -33,67 +37,10 @@ use vtop_core::errors::VtopError;
 use vtop_core::state_machine::{transition, BatchState};
 use vtop_core::types::{ProgressMarker, SourceType, TelemetryFormat};
 
-/// DDL. The logical schema mirrors the SQLite backend (same columns, same
-/// meaning) so a `BatchRecord` round-trips identically; the differences are
-/// Postgres types plus the invariant guards.
-const SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS batches (
-    batch_id TEXT PRIMARY KEY,
-    tenant TEXT NOT NULL,
-    source_type TEXT NOT NULL,
-    source_name TEXT NOT NULL,
-    format TEXT NOT NULL,
-    state TEXT NOT NULL,
-    progress_start_json TEXT NOT NULL,
-    progress_end_json TEXT NOT NULL,
-    object_uri TEXT,
-    manifest_uri TEXT,
-    object_sha256 TEXT,
-    manifest_sha256 TEXT,
-    object_size_bytes BIGINT,
-    record_count BIGINT,
-    error_message TEXT,
-    owner TEXT,
-    lease_expires_at TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    CONSTRAINT state_enum CHECK (state IN (
-        'discovered','batching','sealed','compressed','checksummed',
-        'object_uploaded','manifest_uploaded','verified','source_committed',
-        'failed','replay_required'))
-);
-CREATE INDEX IF NOT EXISTS idx_batches_state ON batches(state);
-CREATE INDEX IF NOT EXISTS idx_batches_source ON batches(source_type, source_name);
-"#;
-
-/// The database-level backstop for THE invariant: a row may only ARRIVE at
-/// `source_committed` by an UPDATE from `verified`. `vtop_core` already refuses
-/// this before the write runs, so the trigger fires only if that check is ever
-/// bypassed — which is precisely why it exists. It guards BOTH statements:
-///   - UPDATE -> source_committed is legal only from verified;
-///   - INSERT of a source_committed row is never legal (a batch cannot be born
-///     committed; it must walk through verified), which closes the hole where a
-///     direct insert would skip an UPDATE-only trigger entirely.
-const INVARIANT_TRIGGER: &str = r#"
-CREATE OR REPLACE FUNCTION vtop_enforce_commit_after_verify() RETURNS trigger AS $fn$
-BEGIN
-    IF NEW.state = 'source_committed' THEN
-        IF TG_OP = 'INSERT' THEN
-            RAISE EXCEPTION 'commit before verified: batch % inserted directly as source_committed', NEW.batch_id
-                USING ERRCODE = 'check_violation';
-        ELSIF OLD.state <> 'verified' THEN
-            RAISE EXCEPTION 'commit before verified: batch % is %', OLD.batch_id, OLD.state
-                USING ERRCODE = 'check_violation';
-        END IF;
-    END IF;
-    RETURN NEW;
-END;
-$fn$ LANGUAGE plpgsql;
-
-DROP TRIGGER IF EXISTS trg_commit_after_verify ON batches;
-CREATE TRIGGER trg_commit_after_verify BEFORE INSERT OR UPDATE ON batches
-    FOR EACH ROW EXECUTE FUNCTION vtop_enforce_commit_after_verify();
-"#;
+/// Idempotent DDL owned by the deployment/migration identity. Keeping it in a
+/// standalone SQL file makes the exact privileged operation auditable and lets
+/// operators apply the same artifact outside the engine if desired.
+const MIGRATION: &str = include_str!("../migrations/postgres/0001_state_store.sql");
 
 /// Retry budget for transient serialization failures (SQLSTATE 40001). One
 /// retry per attempt with a small backoff; a single-node Postgres essentially
@@ -154,6 +101,42 @@ fn enforce_tls_policy(options: &PgConnectOptions) -> Result<(), VtopError> {
     ))
 }
 
+async fn connect_pool(conn_str: &str, max_connections: u32) -> Result<PgPool, VtopError> {
+    let options = PgConnectOptions::from_str(conn_str).map_err(|_| {
+        VtopError::Config(
+            "invalid PostgreSQL state-store connection (connection details redacted)".into(),
+        )
+    })?;
+    enforce_tls_policy(&options)?;
+    PgPoolOptions::new()
+        .max_connections(max_connections)
+        .connect_with(options)
+        .await
+        .map_err(map_sqlx)
+}
+
+fn schema_migration_required() -> VtopError {
+    VtopError::State(
+        "PostgreSQL state-store schema is missing or outdated; run `vtopctl migrate --config <path>` with the privileged migration identity before starting the engine"
+            .into(),
+    )
+}
+
+fn map_schema_check(error: sqlx::Error) -> VtopError {
+    match error
+        .as_database_error()
+        .and_then(|database_error| database_error.code())
+        .as_deref()
+    {
+        Some("42P01" | "42703" | "42883" | "3F000") => schema_migration_required(),
+        Some("42501") => VtopError::State(
+            "PostgreSQL runtime identity lacks schema/table access; grant USAGE on the state-store schema and SELECT, INSERT, UPDATE on batches"
+                .into(),
+        ),
+        _ => map_sqlx(error),
+    }
+}
+
 /// True if the error is a transient serialization failure worth retrying.
 fn is_serialization_failure(e: &sqlx::Error) -> bool {
     e.as_database_error()
@@ -182,22 +165,27 @@ where
 }
 
 impl PgStateStore {
-    /// Open a connection pool and apply the schema + invariant trigger.
+    /// Open a runtime connection pool without executing any DDL.
+    ///
+    /// The connected identity needs only `USAGE` on the schema and
+    /// `SELECT, INSERT, UPDATE` on `batches`. Deployments must run
+    /// [`Self::migrate`] first with a separate privileged identity.
     pub async fn connect(conn_str: &str) -> Result<Self, VtopError> {
-        let options = PgConnectOptions::from_str(conn_str).map_err(|_| {
-            VtopError::Config(
-                "invalid PostgreSQL state-store connection (connection details redacted)".into(),
-            )
-        })?;
-        enforce_tls_policy(&options)?;
-        let pool = PgPoolOptions::new()
-            .max_connections(10)
-            .connect_with(options)
+        let pool = connect_pool(conn_str, 10).await?;
+        let store = Self { pool };
+        store.check_schema().await?;
+        Ok(store)
+    }
+
+    /// Apply the PostgreSQL schema and invariant trigger with a privileged
+    /// deployment identity. The engine never calls this during startup.
+    pub async fn migrate(conn_str: &str) -> Result<(), VtopError> {
+        let pool = connect_pool(conn_str, 1).await?;
+        sqlx::raw_sql(MIGRATION)
+            .execute(&pool)
             .await
             .map_err(map_sqlx)?;
-        let store = Self { pool };
-        store.migrate().await?;
-        Ok(store)
+        Self { pool }.check_schema().await
     }
 
     /// Execute a raw SQL string against the pool. TEST-ONLY: the battery uses it
@@ -216,28 +204,35 @@ impl PgStateStore {
         Ok(())
     }
 
-    async fn migrate(&self) -> Result<(), VtopError> {
-        // raw_sql uses the simple query protocol, which runs a string containing
-        // MULTIPLE statements. A prepared statement (sqlx::query) cannot, and the
-        // trigger DDL in particular is several commands. Table + indexes first,
-        // then the trigger that references the table.
-        sqlx::raw_sql(SCHEMA)
-            .execute(&self.pool)
-            .await
-            .map_err(map_sqlx)?;
-        // Pre-#93 databases lack the ownership columns.
-        sqlx::raw_sql(
-            "ALTER TABLE batches ADD COLUMN IF NOT EXISTS owner TEXT; \
-             ALTER TABLE batches ADD COLUMN IF NOT EXISTS lease_expires_at TEXT; \
-             ALTER TABLE batches ADD COLUMN IF NOT EXISTS object_size_bytes BIGINT;",
+    async fn check_schema(&self) -> Result<(), VtopError> {
+        // Listing every runtime column makes an old/partial schema fail during
+        // startup instead of halfway through a batch. This is a SELECT only.
+        sqlx::query(
+            "SELECT batch_id, tenant, source_type, source_name, format, state, \
+                    progress_start_json, progress_end_json, object_uri, manifest_uri, \
+                    object_sha256, manifest_sha256, object_size_bytes, record_count, \
+                    error_message, owner, lease_expires_at, created_at, updated_at \
+             FROM batches WHERE FALSE",
         )
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await
-        .map_err(map_sqlx)?;
-        sqlx::raw_sql(INVARIANT_TRIGGER)
-            .execute(&self.pool)
-            .await
-            .map_err(map_sqlx)?;
+        .map_err(map_schema_check)?;
+
+        let trigger_present: bool = sqlx::query_scalar(
+            "SELECT EXISTS ( \
+                SELECT 1 FROM pg_catalog.pg_trigger t \
+                JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid \
+                WHERE c.oid = 'batches'::regclass \
+                  AND t.tgname = 'trg_commit_after_verify' \
+                  AND NOT t.tgisinternal \
+             )",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_schema_check)?;
+        if !trigger_present {
+            return Err(schema_migration_required());
+        }
         Ok(())
     }
 

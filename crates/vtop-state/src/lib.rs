@@ -22,4 +22,4 @@ pub use models::{BatchPatch, BatchRecord};
 #[cfg(feature = "postgres")]
 pub use pg_store::PgStateStore;
 pub use sqlite_store::SqliteStateStore;
-pub use store::{connect_state_store, StateStore};
+pub use store::{connect_state_store, migrate_state_store, StateStore};

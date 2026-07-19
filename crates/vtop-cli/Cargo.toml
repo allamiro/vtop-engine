@@ -14,6 +14,11 @@ path = "src/lib.rs"
 name = "vtopctl"
 path = "src/main.rs"
 
+[features]
+# Keep PostgreSQL optional in the CLI while providing a discoverable feature
+# for production builds and the separate `vtopctl migrate` deployment step.
+postgres = ["vtop-state/postgres"]
+
 [dependencies]
 http-body-util = { workspace = true }
 hyper-util = { workspace = true }

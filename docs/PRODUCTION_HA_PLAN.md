@@ -211,7 +211,7 @@ secret reference so credentials never enter serializable config.
 | Driver | `sqlx` `SqlitePool` | `sqlx` `PgPool` (pure-Rust, no libpq) |
 | Placeholders | `?` | `$1, $2, …` |
 | Insert | plain `INSERT` | plain `INSERT` |
-| Migrations | SQLite DDL | Postgres DDL (separate file) |
+| Migrations | SQLite initializes locally | `vtopctl migrate` with a separate privileged identity; runtime executes no DDL |
 | **Conflict retry** | none | **retry on SQLSTATE `40001`** (distributed serialization) |
 | Build | default | behind Cargo `--features postgres` |
 
@@ -533,6 +533,9 @@ roadmap detail (dependencies, test plans, rollback) is in §12.
 ### Phase 3 — Postgres backend + DB constraints (`--features postgres`)  ✅ DONE
 - `PgStateStore` (PgPool, `$N`, Postgres DDL); **schema constraints from §5.5**;
   **retry-on-`40001`**; run the battery against Postgres.
+- PostgreSQL DDL is an explicit `vtopctl migrate` deployment step. The engine
+  role receives only schema `USAGE` plus `SELECT, INSERT, UPDATE` on `batches`;
+  the live battery proves DDL, `DELETE`, and `TRUNCATE` remain denied.
 - **Exit:** identical behavior SQLite/Postgres; `postgres://` selectable; DB
   enforces the invariant too.
 

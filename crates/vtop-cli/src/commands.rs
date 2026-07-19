@@ -70,6 +70,11 @@ pub enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Apply state-store schema migrations with a deployment identity.
+    Migrate {
+        #[arg(long)]
+        config: PathBuf,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -339,6 +344,30 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                     "verification FAILED for {manifest} (see report above)"
                 )))
             }
+        }
+        Command::Migrate { config } => {
+            let cfg = VtopConfig::from_path(config)?;
+            cfg.validate()?;
+            init_tracing(
+                cli.log_level.as_deref().unwrap_or(&cfg.engine.log_level),
+                cli.json,
+            );
+            let state_store = cfg.engine.state_store.resolve()?;
+            let backend = if state_store.is_postgres() {
+                "postgresql"
+            } else {
+                "sqlite"
+            };
+            vtop_state::migrate_state_store(state_store.expose_secret()).await?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"status": "ok", "backend": backend})
+                );
+            } else {
+                println!("state-store migration complete ({backend})");
+            }
+            Ok(())
         }
     }
 }
