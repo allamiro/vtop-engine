@@ -149,9 +149,108 @@ async fn recovery_commits_verified_but_uncommitted_batch() {
     let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
         .await
         .unwrap();
+
+    // Recovery re-verifies storage before committing (#69), so the object the
+    // ledger points at must actually EXIST in the backend with the recorded
+    // digest — exactly what a real crash-restart would find.
+    let staged = dir.path().join("staged-object");
+    std::fs::write(&staged, b"archived-bytes").unwrap();
+    engine
+        .backend
+        .put_object(
+            &staged,
+            "s3://telemetry-data/x/b-verified.raw.gz",
+            Some(vtop_upload::ObjectChecksum::new("sha256", "deadbeef")),
+        )
+        .await
+        .unwrap();
+
     let summary = engine.recover().await.unwrap();
     assert_eq!(summary.committed, 1, "verified batch committed on recovery");
 
     let got = engine.store.get_batch("b-verified").await.unwrap().unwrap();
     assert_eq!(got.state, BatchState::SourceCommitted);
+}
+
+/// #69: a VERIFIED ledger row whose object is GONE (deleted/modified while the
+/// engine was down) must NOT get its source progress committed — recovery must
+/// route it to replay. Committing would advance the source past data that no
+/// longer exists as verified.
+#[tokio::test]
+async fn recovery_refuses_to_commit_when_storage_no_longer_verifies() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    let input = dir.path().join("in.log");
+    std::fs::write(&input, "line-0\nline-1\n").unwrap();
+    let db = dir.path().join("state.db");
+    let url = format!("sqlite://{}", db.display());
+
+    let marker = vtop_core::types::ProgressMarker::File {
+        path: input.to_string_lossy().into_owned(),
+        inode: None,
+        start_byte: 0,
+        end_byte: 14,
+        file_size: 14,
+        mtime: String::new(),
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let rec = BatchRecord {
+        batch_id: "b-stale".into(),
+        tenant: "default".into(),
+        source_type: SourceType::File,
+        source_name: input.to_string_lossy().into_owned(),
+        format: vtop_core::types::TelemetryFormat::Raw,
+        state: BatchState::Batching,
+        progress_start: marker.clone(),
+        progress_end: marker,
+        // The ledger CLAIMS this object exists — the mock backend is empty, so
+        // the claim is stale, exactly as after an out-of-band deletion.
+        object_uri: Some("s3://telemetry-data/x/b-stale.raw.gz".into()),
+        manifest_uri: Some("s3://telemetry-data/x/b-stale.manifest.json".into()),
+        object_sha256: Some("deadbeef".into()),
+        manifest_sha256: Some("feedface".into()),
+        record_count: Some(2),
+        error_message: None,
+        owner: None,
+        lease_expires_at: None,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    {
+        let store = SqliteStateStore::connect(&url).await.unwrap();
+        store.save_batch_state(&rec).await.unwrap();
+        for st in [
+            BatchState::Sealed,
+            BatchState::Compressed,
+            BatchState::Checksummed,
+            BatchState::ObjectUploaded,
+            BatchState::ManifestUploaded,
+            BatchState::Verified,
+        ] {
+            store
+                .update_batch_state("b-stale", st, &BatchPatch::default())
+                .await
+                .unwrap();
+        }
+    }
+
+    let cfg = file_config(
+        work.to_str().unwrap(),
+        &url,
+        vec![input.to_string_lossy().into_owned()],
+        "mock",
+    );
+    let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+        .await
+        .unwrap();
+    let summary = engine.recover().await.unwrap();
+
+    assert_eq!(summary.committed, 0, "a stale VERIFIED must never commit");
+    assert_eq!(summary.replay_required, 1, "it must be routed to replay");
+    let got = engine.store.get_batch("b-stale").await.unwrap().unwrap();
+    assert_eq!(
+        got.state,
+        BatchState::ReplayRequired,
+        "source progress stays unadvanced; the uncommitted range will be re-read"
+    );
 }
