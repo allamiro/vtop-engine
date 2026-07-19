@@ -5,7 +5,9 @@
 //! own delivery; the VTOP engine owns batching, checksum, manifest, upload,
 //! verification, replay state, and the commit rule.
 
-use crate::base::{DiscoveredSource, ReadResult, SourceAdapter};
+use crate::base::{
+    AdapterReadReport, DiscoveredSource, ReadResult, SourceAdapter, SourceReadOutcome,
+};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::Path;
@@ -56,7 +58,45 @@ impl SyslogSpoolSource {
             received_time_end: None,
         }
     }
+
+    /// Read one spool file from `start`, honouring the budgets. No `&self`, so
+    /// many spool files can be read CONCURRENTLY in one pass (#96 B2). Only
+    /// complete (newline-terminated) lines are accepted — a partial line still
+    /// being written by rsyslog is left for the next pass.
+    async fn read_slice(
+        path: String,
+        start: u64,
+        max_records: usize,
+        max_bytes: usize,
+    ) -> Result<(Vec<Vec<u8>>, u64), VtopError> {
+        let file = tokio::fs::File::open(&path).await?;
+        let mut reader = BufReader::new(file);
+        reader.seek(std::io::SeekFrom::Start(start)).await?;
+
+        let mut records = Vec::new();
+        let mut bytes_read: u64 = 0;
+        let mut pos = start;
+
+        loop {
+            if records.len() >= max_records || bytes_read as usize >= max_bytes {
+                break;
+            }
+            let mut line = Vec::new();
+            let n = reader.read_until(b'\n', &mut line).await?;
+            if n == 0 || !line.ends_with(b"\n") {
+                break;
+            }
+            pos += n as u64;
+            bytes_read += n as u64;
+            line.pop();
+            records.push(line);
+        }
+        Ok((records, pos))
+    }
 }
+
+/// How many spool files are read concurrently in one pass.
+const SPOOL_READ_CONCURRENCY: usize = 8;
 
 #[async_trait]
 impl SourceAdapter for SyslogSpoolSource {
@@ -88,30 +128,7 @@ impl SourceAdapter for SyslogSpoolSource {
     ) -> Result<Vec<ReadResult>, VtopError> {
         let path = source.source_name.clone();
         let start = self.cursors.entry(path.clone()).or_default().read_byte;
-
-        let file = tokio::fs::File::open(&path).await?;
-        let mut reader = BufReader::new(file);
-        reader.seek(std::io::SeekFrom::Start(start)).await?;
-
-        let mut records = Vec::new();
-        let mut bytes_read: u64 = 0;
-        let mut pos = start;
-
-        loop {
-            if records.len() >= max_records || bytes_read as usize >= max_bytes {
-                break;
-            }
-            let mut line = Vec::new();
-            let n = reader.read_until(b'\n', &mut line).await?;
-            if n == 0 || !line.ends_with(b"\n") {
-                break;
-            }
-            pos += n as u64;
-            bytes_read += n as u64;
-            line.pop();
-            records.push(line);
-        }
-
+        let (records, pos) = Self::read_slice(path.clone(), start, max_records, max_bytes).await?;
         self.cursors.get_mut(&path).unwrap().read_byte = pos;
 
         Ok(vec![ReadResult {
@@ -123,6 +140,87 @@ impl SourceAdapter for SyslogSpoolSource {
             // Spool lines are re-framed with newlines on serialization.
             verbatim: false,
         }])
+    }
+
+    /// Read every spool file CONCURRENTLY (#96 B2): independent handles and
+    /// snapshotted cursors per file, cursor updates applied serially after the
+    /// joins.
+    async fn read_all_batch_candidates(
+        &mut self,
+        sources: &[DiscoveredSource],
+        max_records: usize,
+        max_bytes: usize,
+        _max_wait: Duration,
+    ) -> Result<AdapterReadReport, VtopError> {
+        use futures::StreamExt;
+        let started = std::time::Instant::now();
+
+        let jobs: Vec<(usize, String, u64)> = sources
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let start = self
+                    .cursors
+                    .entry(s.source_name.clone())
+                    .or_default()
+                    .read_byte;
+                (i, s.source_name.clone(), start)
+            })
+            .collect();
+
+        let mut results: Vec<(usize, String, u64, Result<(Vec<Vec<u8>>, u64), VtopError>)> =
+            futures::stream::iter(jobs.into_iter().map(|(i, path, start)| async move {
+                let res = Self::read_slice(path.clone(), start, max_records, max_bytes).await;
+                (i, path, start, res)
+            }))
+            .buffer_unordered(SPOOL_READ_CONCURRENCY)
+            .collect()
+            .await;
+        results.sort_by_key(|(i, ..)| *i);
+
+        let mut report = AdapterReadReport {
+            outcomes: Vec::with_capacity(results.len()),
+            productive_ms: 0,
+            empty_ms: 0,
+            failed_ms: 0,
+        };
+        let mut any_records = false;
+        let mut any_failed = false;
+        for (source_index, path, start, res) in results {
+            let result = match res {
+                Ok((records, pos)) => {
+                    self.cursors.get_mut(&path).unwrap().read_byte = pos;
+                    any_records |= !records.is_empty();
+                    Ok(vec![ReadResult {
+                        progress_start: Self::marker(&path, start, start),
+                        progress_end: Self::marker(&path, start, pos),
+                        records,
+                        first_timestamp: None,
+                        last_timestamp: None,
+                        verbatim: false,
+                    }])
+                }
+                Err(e) => {
+                    any_failed = true;
+                    Err(e)
+                }
+            };
+            report.outcomes.push(SourceReadOutcome {
+                source_index,
+                result,
+            });
+        }
+        // Shared attribution, same convention as the other overrides: the
+        // overlapped reads are one wall-clock bucket.
+        let elapsed = started.elapsed().as_millis() as u64;
+        if any_records {
+            report.productive_ms = elapsed;
+        } else if any_failed {
+            report.failed_ms = elapsed;
+        } else {
+            report.empty_ms = elapsed;
+        }
+        Ok(report)
     }
 
     async fn commit_progress(&mut self, marker: &ProgressMarker) -> Result<(), VtopError> {
