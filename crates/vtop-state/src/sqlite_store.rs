@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS batches (
     manifest_uri TEXT,
     object_sha256 TEXT,
     manifest_sha256 TEXT,
+    object_size_bytes INTEGER,
     record_count INTEGER,
     error_message TEXT,
     owner TEXT,
@@ -89,6 +90,7 @@ impl SqliteStateStore {
         for stmt in [
             "ALTER TABLE batches ADD COLUMN owner TEXT",
             "ALTER TABLE batches ADD COLUMN lease_expires_at TEXT",
+            "ALTER TABLE batches ADD COLUMN object_size_bytes INTEGER",
         ] {
             if let Err(e) = sqlx::raw_sql(stmt).execute(&self.pool).await {
                 if !e.to_string().contains("duplicate column name") {
@@ -139,9 +141,9 @@ impl StateStore for SqliteStateStore {
             r#"INSERT INTO batches
                (batch_id, tenant, source_type, source_name, format, state,
                 progress_start_json, progress_end_json, object_uri, manifest_uri,
-                object_sha256, manifest_sha256, record_count, error_message,
-                owner, lease_expires_at, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"#,
+                object_sha256, manifest_sha256, object_size_bytes, record_count,
+                error_message, owner, lease_expires_at, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"#,
         )
         .bind(&rec.batch_id)
         .bind(&rec.tenant)
@@ -155,6 +157,7 @@ impl StateStore for SqliteStateStore {
         .bind(&rec.manifest_uri)
         .bind(&rec.object_sha256)
         .bind(&rec.manifest_sha256)
+        .bind(rec.object_size_bytes)
         .bind(rec.record_count)
         .bind(&rec.error_message)
         .bind(&rec.owner)
@@ -188,6 +191,7 @@ impl StateStore for SqliteStateStore {
                  manifest_uri = COALESCE(?, manifest_uri),
                  object_sha256 = COALESCE(?, object_sha256),
                  manifest_sha256 = COALESCE(?, manifest_sha256),
+                 object_size_bytes = COALESCE(?, object_size_bytes),
                  record_count = COALESCE(?, record_count),
                  error_message = COALESCE(?, error_message),
                  updated_at = ?
@@ -198,6 +202,7 @@ impl StateStore for SqliteStateStore {
         .bind(&patch.manifest_uri)
         .bind(&patch.object_sha256)
         .bind(&patch.manifest_sha256)
+        .bind(patch.object_size_bytes)
         .bind(patch.record_count)
         .bind(&patch.error_message)
         .bind(now)
@@ -386,6 +391,7 @@ fn row_to_record(row: sqlx::sqlite::SqliteRow) -> Result<BatchRecord, VtopError>
         manifest_uri: row.get("manifest_uri"),
         object_sha256: row.get("object_sha256"),
         manifest_sha256: row.get("manifest_sha256"),
+        object_size_bytes: row.get("object_size_bytes"),
         record_count: row.get("record_count"),
         error_message: row.get("error_message"),
         owner: row.get("owner"),

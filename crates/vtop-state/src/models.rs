@@ -21,6 +21,9 @@ pub struct BatchRecord {
     pub manifest_uri: Option<String>,
     pub object_sha256: Option<String>,
     pub manifest_sha256: Option<String>,
+    /// Size in bytes of the uploaded (compressed) object. Lets recovery's
+    /// storage re-check compare size even when no digest is available (#125).
+    pub object_size_bytes: Option<i64>,
     pub record_count: Option<i64>,
     pub error_message: Option<String>,
     /// Engine instance that owns this in-flight batch (#93). `None` on rows
@@ -49,6 +52,7 @@ pub struct BatchPatch {
     pub manifest_uri: Option<String>,
     pub object_sha256: Option<String>,
     pub manifest_sha256: Option<String>,
+    pub object_size_bytes: Option<i64>,
     pub record_count: Option<i64>,
     pub error_message: Option<String>,
 }
@@ -62,6 +66,7 @@ impl BatchPatch {
             manifest_uri: Some(m.manifest.uri.clone()),
             object_sha256: Some(m.object.checksum.clone()),
             manifest_sha256: Some(m.manifest.sha256.clone()),
+            object_size_bytes: Some(m.object.size_bytes as i64),
             record_count: Some(m.record_count as i64),
             error_message: None,
         }
