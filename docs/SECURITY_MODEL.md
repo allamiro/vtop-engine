@@ -55,6 +55,7 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are used as normat
 | Engine ↔ state store | The database is trusted for ledger correctness, progress durability, and availability, but not for telemetry-object integrity. Remote PostgreSQL requires hostname-verified TLS; its URL is resolved from an env/file secret reference and never serialized. |
 | Engine ↔ external CLI backends | Version-pinned tools executing outside the Rust dependency graph; stored objects are downloaded and hashed. |
 | Engine ↔ operator/logs | Secret redaction; manifests carry no secrets. |
+| Native client ↔ broker | TLS 1.3 with mandatory client certificates, explicit certificate/principal/role authorization, bounded frames/sessions/windows, and range/producer fencing checks. |
 | Build ↔ runtime | Supply-chain auditing; container hardening. |
 
 ---
@@ -81,6 +82,26 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are used as normat
 
 - Kafka authentication **SHOULD** support **SASL/SCRAM** and **mTLS**.
 - The selected mechanism and identity **MAY** be logged, but associated secrets **MUST NOT** be logged.
+
+### Native broker transport
+
+- The native broker transport is restricted to TLS 1.3 and requires a client
+  certificate chained to the configured client roots.
+- Certificate validity alone does not grant a role. The embedding deployment
+  **MUST** supply a `SessionAuthorizer` that binds the peer certificate chain,
+  declared principal ID, and requested producer/consumer role. Produce requests
+  additionally require `producer_id == principal_id` before the durable producer
+  epoch journal can be changed.
+- Native clients **MUST** validate the broker certificate against their
+  configured roots and the expected server identity (no insecure or
+  accept-any verifiers). TLS peer authentication is mutual: server-side client
+  verification alone does not protect a client from connecting to an imposter
+  broker.
+- Wire frames are length-bounded and BLAKE3-checksummed independently of TLS.
+  The checksum detects accidental framing corruption; TLS provides peer
+  authentication, confidentiality, and active-tamper protection.
+- Session count, global in-flight work, negotiated record/frame limits, idle
+  timeouts, and fetch-response byte credit are explicit resource boundaries.
 
 ## 3. Credential Handling
 
@@ -237,7 +258,7 @@ the ignore list and the build re-audited.
 | Manifest authentication | Optional | Keyed BLAKE3 MAC; required when configured. |
 | Chain of custody (object ↔ source markers) | Yes | Manifest binds object hash to covered markers. |
 | Replay safety / no premature commit | Yes | Enforced in state machine, state store, and pipeline. |
-| Transport confidentiality | Configurable | Via TLS/SASL/mTLS; not implemented in core. |
+| Transport confidentiality | Yes (native broker) / Configurable (Kafka, S3, PostgreSQL) | The native broker transport in `vtop-broker` is TLS 1.3 mTLS only. Kafka/S3/PostgreSQL confidentiality is configured on those clients, not implemented in core. |
 | PostgreSQL transport authentication | Yes for remote hosts | Non-loopback connections require `sslmode=verify-full`; loopback/socket plaintext is limited to local operation. |
 | Backend-limited verification disclosure | Yes | Size-only mode is labeled and rejected by default. |
 | Data-at-rest encryption | Not by VTOP | Delegated to storage layer (SSE/bucket default). |
@@ -263,3 +284,7 @@ the ignore list and the build re-audited.
 | Configured manifest MAC verifies without downgrade | **MUST** |
 | Object lock / immutability | **SHOULD** (later) |
 | Secret redaction in logs | **MUST** |
+| Native broker transport restricted to TLS 1.3 with client certificates | **MUST** |
+| Native broker sessions authorized by an explicit `SessionAuthorizer` | **MUST** |
+| Native clients validate the broker certificate and expected server identity | **MUST** |
+| Native produce bound to the authenticated principal (`producer_id == principal_id`) | **MUST** |

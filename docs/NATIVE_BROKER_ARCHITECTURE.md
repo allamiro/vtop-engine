@@ -110,6 +110,34 @@ These are staging gaps, not reasons to discard the slice. The first merge must
 keep the committed-boundary regression tests and accurately label all
 unimplemented guarantees.
 
+### 2.4 Native local protocol slice
+
+The next implementation slice adds `vtop-protocol` and `vtop-broker` without
+adding Kafka, a database, object storage, or consensus to either dependency
+graph. The wire codec uses a fixed header plus bounded length-delimited payload,
+negotiated frame/record ceilings, BLAKE3 frame checksums, centralized range
+identity, request/stream IDs, explicit fencing epochs, producer epochs, and
+byte-window updates. It preflights encoded sizes and rejects oversized lengths
+before allocating their declared payload.
+
+The local broker accepts only `LocalFsync` produce requests, persists a newer
+producer epoch before appending, derives a v1 storage namespace from
+`(producer_id, producer_epoch)`, and acknowledges only after the segment commit
+boundary advances. Fetch delegates to the segment's committed high-water mark.
+The TLS server is TLS-1.3-only, requires client certificates, requires an
+explicit VTOP-owned `SessionAuthorizer`, and bounds sessions and global request
+work with semaphores and per-session fetch-response byte credit. A producer
+request's producer ID must equal the authenticated session principal ID, so one
+trusted producer cannot advance another producer's durable fencing epoch.
+
+This remains a single-node library slice. It does not provide an operator
+daemon/config surface, replicated metadata, quorum durability, authoritative
+leader grants, replication, consumer groups, proof-carrying v2 segments, or
+repair/retirement. Its configured range fencing epoch rejects mismatched
+requests but is not yet a Raft-issued lease. Producer epoch identity becomes an
+explicit record-frame field in segment v2; v1 remains byte-compatible and uses
+the deterministic namespace described above.
+
 ## 3. System boundaries
 
 The eventual workspace boundary is:
@@ -254,14 +282,18 @@ SegmentHeaderV1
 
 RecordFrameV1 repeated
   magic, frame_len, relative_offset
-  producer_id, producer_epoch, producer_sequence
-  timestamp, attributes_len, key_len, value_len
-  attributes, key, value, frame_checksum
+  producer_id, producer_sequence
+  timestamp, key_len, value_len
+  key, value, frame_checksum
 ```
 
-The producer epoch fences a restarted or superseded producer identity.
-Sequence state is scoped by `(producer_id, producer_epoch)` and retained long
-enough to make retries unambiguous across segment roll.
+This is the frozen v1 layout (golden vectors in `vtop-log`). The producer
+epoch fences a restarted or superseded producer identity but is not a v1
+record-frame field: v1 derives a deterministic storage namespace from
+`(producer_id, producer_epoch)`, and the epoch (with per-record attributes)
+becomes an explicit field only in segment v2. Sequence state is scoped by
+`(producer_id, producer_epoch)` and retained long enough to make retries
+unambiguous across segment roll.
 
 ### 6.2 Durable commit marker
 

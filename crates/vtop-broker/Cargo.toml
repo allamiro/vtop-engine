@@ -1,0 +1,21 @@
+[package]
+name = "vtop-broker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Kafka-independent local broker and mTLS server for VTOP native segments."
+
+[dependencies]
+blake3 = { workspace = true }
+rustls = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+uuid = { workspace = true }
+vtop-log = { workspace = true }
+vtop-protocol = { workspace = true }
+
+[dev-dependencies]
+rcgen = "0.14"
+tempfile = { workspace = true }
