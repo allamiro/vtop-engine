@@ -224,6 +224,16 @@ pub struct KafkaSource {
     /// Partitions paused mid-pass (topic hit its budget); resumed at the
     /// start of the next pass.
     paused: Vec<(String, i32)>,
+    /// Partitions assigned at `Offset::Stored` that have not delivered yet.
+    ///
+    /// Stored resolution needs the group coordinator, which a FRESH broker
+    /// creates lazily on the first group operation; an assign() that lands
+    /// before then leaves dead fetchers. The pre-sticky code retried
+    /// implicitly by re-assigning every pass — sticky assignment must retry
+    /// EXPLICITLY: while any of these partitions is pending and a pass reads
+    /// nothing at all, the next pass re-assigns (there are no warm fetchers
+    /// worth protecting when zero records are flowing).
+    stored_pending: std::collections::HashSet<(String, i32)>,
     /// Partition ids per topic, cached with a TTL.
     ///
     /// assign() needs the partition list, but fetching metadata on EVERY read
@@ -260,6 +270,7 @@ impl KafkaSource {
             assigned: Vec::new(),
             delivered: HashMap::new(),
             paused: Vec::new(),
+            stored_pending: std::collections::HashSet::new(),
             partitions: HashMap::new(),
         })
     }
@@ -529,6 +540,11 @@ impl SourceAdapter for KafkaSource {
                     self.delivered.insert((topic.clone(), *p), *want);
                 }
             }
+            self.stored_pending = desired
+                .iter()
+                .filter(|(_, _, off)| matches!(off, Offset::Stored))
+                .map(|(t, p, _)| (t.clone(), *p))
+                .collect();
             self.paused.clear();
         } else {
             if !self.paused.is_empty() {
@@ -632,8 +648,18 @@ impl SourceAdapter for KafkaSource {
         // Persist the pass's delivery positions and pause state for the next
         // pass's sticky-assignment decisions.
         for ((idx, p), next) in delivered_local {
-            self.delivered
-                .insert((sources[idx].source_name.clone(), p), next);
+            let key = (sources[idx].source_name.clone(), p);
+            self.stored_pending.remove(&key);
+            self.delivered.insert(key, next);
+        }
+        // Fresh-broker retry (#115 regression caught by e2e): a Stored
+        // assignment that raced the lazily-created group coordinator leaves
+        // dead fetchers, and a sticky assignment would never retry it. If the
+        // pass read NOTHING while Stored partitions are still pending, force a
+        // fresh assign next pass — with zero records flowing there are no warm
+        // fetchers to protect.
+        if total_records == 0 && !self.stored_pending.is_empty() {
+            self.assigned.clear();
         }
         for (idx, was_paused) in paused.iter().enumerate() {
             if *was_paused {
