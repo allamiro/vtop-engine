@@ -61,6 +61,8 @@ pub enum BrokerError {
     Protocol(#[from] vtop_protocol::ProtocolError),
     #[error("server task failed: {0}")]
     Task(#[from] tokio::task::JoinError),
+    #[error("{0} timed out")]
+    Timeout(&'static str),
 }
 
 pub type BrokerResult<T> = Result<T, BrokerError>;
@@ -644,6 +646,18 @@ impl NativeServer {
     }
 }
 
+async fn write_session_frame(
+    stream: &mut tokio_rustls::server::TlsStream<TcpStream>,
+    frame: &WireFrame,
+    limits: ProtocolLimits,
+    write_timeout: Duration,
+) -> BrokerResult<()> {
+    timeout(write_timeout, write_frame(stream, frame, limits))
+        .await
+        .map_err(|_| BrokerError::Timeout("protocol response write"))??;
+    Ok(())
+}
+
 async fn serve_connection(
     socket: TcpStream,
     _peer: SocketAddr,
@@ -655,7 +669,7 @@ async fn serve_connection(
 ) -> BrokerResult<()> {
     let mut stream = timeout(config.handshake_timeout, acceptor.accept(socket))
         .await
-        .map_err(|_| BrokerError::InvalidConfig("TLS handshake timed out".to_owned()))?
+        .map_err(|_| BrokerError::Timeout("TLS handshake"))?
         .map_err(|source| BrokerError::Io {
             path: PathBuf::from("tls-session"),
             source,
@@ -677,7 +691,7 @@ async fn serve_connection(
         read_frame(&mut stream, initial_limits),
     )
     .await
-    .map_err(|_| BrokerError::InvalidConfig("protocol handshake timed out".to_owned()))??;
+    .map_err(|_| BrokerError::Timeout("protocol handshake"))??;
     let Some(WireFrame {
         request_id: 0,
         stream_id: 0,
@@ -687,7 +701,7 @@ async fn serve_connection(
         return Ok(());
     };
     if !authorizer.authorize(&peer_chain_der, hello.principal_id, hello.role) {
-        write_frame(
+        write_session_frame(
             &mut stream,
             &error(
                 0,
@@ -696,6 +710,7 @@ async fn serve_connection(
                 "certificate is not authorized for the requested principal and role",
             ),
             initial_limits,
+            config.idle_timeout,
         )
         .await?;
         return Ok(());
@@ -703,7 +718,13 @@ async fn serve_connection(
     let (role, negotiated_limits, negotiated_window) = match negotiate(&hello, &config) {
         Ok(value) => value,
         Err((code, message)) => {
-            write_frame(&mut stream, &error(0, 0, code, message), initial_limits).await?;
+            write_session_frame(
+                &mut stream,
+                &error(0, 0, code, message),
+                initial_limits,
+                config.idle_timeout,
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -729,7 +750,7 @@ async fn serve_connection(
             session_nonce,
         }),
     };
-    write_frame(&mut stream, &ack, negotiated_limits).await?;
+    write_session_frame(&mut stream, &ack, negotiated_limits, config.idle_timeout).await?;
 
     let mut last_request_id = 0_u64;
     let mut send_credit = negotiated_window;
@@ -754,7 +775,13 @@ async fn serve_connection(
                 ErrorCode::InvalidRequest,
                 "request IDs must be non-zero and strictly increasing per session",
             );
-            write_frame(&mut stream, &response, negotiated_limits).await?;
+            write_session_frame(
+                &mut stream,
+                &response,
+                negotiated_limits,
+                config.idle_timeout,
+            )
+            .await?;
             continue;
         }
         last_request_id = request_id;
@@ -768,7 +795,13 @@ async fn serve_connection(
                 ErrorCode::Unauthorized,
                 "producer ID must equal the authenticated session principal ID",
             );
-            write_frame(&mut stream, &response, negotiated_limits).await?;
+            write_session_frame(
+                &mut stream,
+                &response,
+                negotiated_limits,
+                config.idle_timeout,
+            )
+            .await?;
             continue;
         }
         let frame = match frame {
@@ -783,7 +816,13 @@ async fn serve_connection(
                         ErrorCode::InvalidRequest,
                         "window update must add at least one byte",
                     );
-                    write_frame(&mut stream, &response, negotiated_limits).await?;
+                    write_session_frame(
+                        &mut stream,
+                        &response,
+                        negotiated_limits,
+                        config.idle_timeout,
+                    )
+                    .await?;
                 } else {
                     send_credit = send_credit
                         .saturating_add(update.additional_bytes)
@@ -796,7 +835,7 @@ async fn serve_connection(
                 stream_id,
                 message: Message::Ping,
             } => {
-                write_frame(
+                write_session_frame(
                     &mut stream,
                     &WireFrame {
                         request_id,
@@ -804,6 +843,7 @@ async fn serve_connection(
                         message: Message::Pong,
                     },
                     negotiated_limits,
+                    config.idle_timeout,
                 )
                 .await?;
                 continue;
@@ -820,7 +860,13 @@ async fn serve_connection(
                         ErrorCode::Overloaded,
                         "session byte window is exhausted; send WindowUpdate",
                     );
-                    write_frame(&mut stream, &response, negotiated_limits).await?;
+                    write_session_frame(
+                        &mut stream,
+                        &response,
+                        negotiated_limits,
+                        config.idle_timeout,
+                    )
+                    .await?;
                     continue;
                 }
                 let response_budget = negotiated_limits
@@ -846,7 +892,13 @@ async fn serve_connection(
                 ErrorCode::Overloaded,
                 "broker request capacity is exhausted",
             );
-            write_frame(&mut stream, &response, negotiated_limits).await?;
+            write_session_frame(
+                &mut stream,
+                &response,
+                negotiated_limits,
+                config.idle_timeout,
+            )
+            .await?;
             continue;
         };
         let broker = Arc::clone(&broker);
@@ -864,12 +916,24 @@ async fn serve_connection(
                     ErrorCode::Overloaded,
                     "session byte window is exhausted; send WindowUpdate",
                 );
-                write_frame(&mut stream, &response, negotiated_limits).await?;
+                write_session_frame(
+                    &mut stream,
+                    &response,
+                    negotiated_limits,
+                    config.idle_timeout,
+                )
+                .await?;
                 continue;
             }
             send_credit -= response_bytes;
         }
-        write_frame(&mut stream, &response, negotiated_limits).await?;
+        write_session_frame(
+            &mut stream,
+            &response,
+            negotiated_limits,
+            config.idle_timeout,
+        )
+        .await?;
     }
 }
 
