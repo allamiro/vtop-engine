@@ -31,6 +31,11 @@ It ingests telemetry from:
 - append-only log files
 - syslog spool files
 
+The longer-term cluster direction is a VTOP-owned native Rust broker and
+control plane. Kafka remains supported as an optional edge/source adapter, not
+as VTOP's coordinator or correctness dependency. See
+[the native broker architecture](docs/NATIVE_BROKER_ARCHITECTURE.md).
+
 For every batch, VTOP:
 
 1. reads records from a source
@@ -299,6 +304,10 @@ crates/
                    checksums, compression, partitioning,
                    config, replay
 
+  vtop-log/        Kafka-independent native broker storage:
+                   framed records, active/sealed segments,
+                   crash recovery, sparse indexes, manifests
+
   vtop-adapters/   source adapters:
                    Kafka, file, syslog spool
 
@@ -353,6 +362,14 @@ cargo build --release
 ```
 
 CI runs formatting, linting, tests, and release build on push and pull request.
+
+Kafka is enabled by default for compatibility with existing deployments, but
+it is a feature-gated adapter. A native/file/syslog-only CLI build does not
+compile or link `rdkafka`:
+
+```bash
+cargo build -p vtop-cli --no-default-features
+```
 
 Workflow file:
 
@@ -696,10 +713,12 @@ Completed:
       `/readyz`) behind `VTOP_METRICS_ADDR`; see [observability/](observability/)
       for the optional Grafana LGTM stack and dashboards
 - [x] **end-to-end smoke + live-broker Kafka CI** over the full compose lab
+- [x] Kafka is isolated behind the optional `kafka` Cargo feature
+- [x] first Kafka-independent native segment-log storage kernel
 
 Planned implementation areas:
 
-- [ ] Kafka feature gate for lighter builds
+- [ ] native three-node metadata/control-plane prototype
 - [ ] bounded reads + streaming compression/upload for very large records —
       `max_records` / `max_bytes` bound a *batch*, but a single oversized record
       (a long line, a large Kafka message, or `whole_file`) is still buffered
