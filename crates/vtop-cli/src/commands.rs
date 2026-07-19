@@ -404,19 +404,31 @@ pub async fn verify_manifest_deep(
         parsed.object.size_bytes
     ));
 
+    // LIMITED is reserved for an EXPLICIT `none` algorithm (the operator chose
+    // to run without checksums). Anything else that prevents a content
+    // comparison — an algorithm this build cannot compute, or a declared
+    // algorithm with no recorded digest — is a hard failure: reporting it as
+    // "limited" would hand a PASSED verdict to a same-sized replacement.
     let algo = parsed
         .object
         .checksum_algorithm
-        .parse::<ChecksumAlgorithm>()
-        .ok();
-    let recomputed = algo.and_then(|a| digest_bytes(a, &object_bytes));
-    let checksum_status = match &recomputed {
-        Some(actual) if parsed.object.checksum.is_empty() => {
-            // Manifest says an algorithm but carries no digest: nothing to
-            // compare against; surface it rather than calling it a pass.
-            format!("LIMITED (no digest recorded; computed {actual})")
+        .parse::<ChecksumAlgorithm>();
+    let recomputed = algo
+        .as_ref()
+        .ok()
+        .and_then(|a| digest_bytes(*a, &object_bytes));
+    let checksum_status = match (&algo, &recomputed) {
+        (Err(e), _) => {
+            failed = true;
+            format!("FAILED (cannot verify content: {e})")
         }
-        Some(actual) => {
+        (Ok(_), Some(actual)) if parsed.object.checksum.is_empty() => {
+            failed = true;
+            format!(
+                "FAILED (algorithm declared but no digest recorded; content hashes to {actual})"
+            )
+        }
+        (Ok(_), Some(actual)) => {
             let ok = actual.eq_ignore_ascii_case(&parsed.object.checksum);
             failed |= !ok;
             if ok {
@@ -428,7 +440,7 @@ pub async fn verify_manifest_deep(
                 )
             }
         }
-        None => "LIMITED (checksums disabled for this batch)".to_string(),
+        (Ok(_), None) => "LIMITED (checksums disabled for this batch)".to_string(),
     };
     lines.push(format!("object content  : {checksum_status}"));
 
@@ -438,10 +450,13 @@ pub async fn verify_manifest_deep(
         None => "ABSENT (not a failure: manifest may belong to another engine's store)".to_string(),
         Some(r) => {
             let state_ok = matches!(r.state, BatchState::Verified | BatchState::SourceCommitted);
-            let digest_ok = match (&r.object_sha256, &recomputed, algo) {
-                (Some(ledger), Some(actual), Some(ChecksumAlgorithm::Sha256)) => {
-                    ledger.eq_ignore_ascii_case(actual)
-                }
+            // The ledger column is named object_sha256 but records the digest
+            // of the CONFIGURED algorithm (engine.rs stores blake3 there too),
+            // so compare whenever both digests exist — restricting this to
+            // SHA-256 would let a coherently-replaced blake3 object+manifest
+            // pass with a ledger that disagrees.
+            let digest_ok = match (&r.object_sha256, &recomputed) {
+                (Some(ledger), Some(actual)) => ledger.eq_ignore_ascii_case(actual),
                 _ => true, // nothing comparable recorded
             };
             failed |= !state_ok || !digest_ok;
