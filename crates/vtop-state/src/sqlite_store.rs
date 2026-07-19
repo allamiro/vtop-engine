@@ -328,9 +328,24 @@ fn parse_sqlite_opts(conn_str: &str) -> Result<SqliteConnectOptions, VtopError> 
             .strip_prefix("sqlite://")
             .or_else(|| conn_str.strip_prefix("sqlite:"))
             .unwrap_or(conn_str);
+        // WAL + synchronous=NORMAL. The default (rollback journal, FULL)
+        // fsyncs twice per transaction, and the ledger writes ~8 transactions
+        // per batch — measured at 54% of total batch time under backlog (#87).
+        //
+        // Durability trade, argued not assumed: NORMAL in WAL can lose the
+        // most recent commits on power loss (never corrupt the DB). Losing a
+        // ledger tail only rolls batches back to an EARLIER state, and every
+        // recovery action from an earlier state is idempotent at the archive
+        // layer: pre-verified states replay the still-uncommitted source range
+        // (duplicate object at worst — the documented at-least-once
+        // semantics), and a lost SOURCE_COMMITTED row retries an idempotent
+        // source commit. The invariant is untouched: source progress still
+        // advances only after verification actually verified stored content.
         SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
     };
     Ok(opts.busy_timeout(std::time::Duration::from_secs(10)))
 }
