@@ -90,6 +90,87 @@ async fn file_source_archives_and_commits() {
     assert!(again.is_empty(), "committed data must not be reprocessed");
 }
 
+/// #67: authenticated mode must sign the manifest that reaches storage, keep
+/// the secret out of config/artifacts, and make CLI-style verification reject
+/// a different key without disturbing the unsigned default path above.
+#[tokio::test]
+async fn configured_manifest_key_authenticates_the_stored_manifest() {
+    use vtop_cli::commands::verify_manifest_deep;
+    use vtop_core::manifest::ManifestMacKey;
+
+    let dir = tempfile::tempdir().unwrap();
+    let work_dir = dir.path().join("work");
+    let input = dir.path().join("authenticated.log");
+    std::fs::write(&input, b"record-1\nrecord-2\n").unwrap();
+
+    let key_hex = "5a".repeat(32);
+    let key = ManifestMacKey::from_hex(&key_hex).unwrap();
+    let wrong_key = ManifestMacKey::from_hex(&"a5".repeat(32)).unwrap();
+    let env_name = format!("VTOP_TEST_MANIFEST_MAC_{}", std::process::id());
+    std::env::set_var(&env_name, &key_hex);
+
+    let mut cfg = file_config(
+        work_dir.to_str().unwrap(),
+        "sqlite::memory:",
+        vec![input.to_string_lossy().into_owned()],
+        "mock",
+    );
+    cfg.manifest_mac_key_env = Some(env_name.clone());
+    let serialized_config = serde_yaml::to_string(&cfg).unwrap();
+    assert!(serialized_config.contains(&env_name));
+    assert!(!serialized_config.contains(&key_hex));
+    let mut engine = Engine::new(cfg.clone(), StreamsConfig { streams: vec![] })
+        .await
+        .unwrap();
+    // Resolution is once-at-startup: the live engine owns an opaque key, not
+    // an ongoing dependency on mutable process environment.
+    std::env::remove_var(&env_name);
+
+    let outcome = engine
+        .process_once(SourceType::File)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(outcome.committed);
+    let row = engine
+        .store
+        .get_batch(&outcome.batch_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let manifest_uri = row.manifest_uri.unwrap();
+    let stored = engine.backend.get_object(&manifest_uri).await.unwrap();
+    let manifest: VtopManifest = serde_json::from_slice(&stored).unwrap();
+    assert_eq!(manifest.version, "0.2");
+    assert_eq!(manifest.manifest.mac.as_deref().map(str::len), Some(64));
+    manifest.verify_authentication(Some(&key)).unwrap();
+    assert!(manifest.verify_authentication(Some(&wrong_key)).is_err());
+    assert!(!stored
+        .windows(key_hex.len())
+        .any(|w| w == key_hex.as_bytes()));
+
+    let report = verify_manifest_deep(
+        engine.store.as_ref(),
+        engine.backend.as_ref(),
+        &manifest_uri,
+        Some(&key),
+    )
+    .await
+    .unwrap();
+    assert!(report.passed, "correct key: {:?}", report.lines);
+
+    let report = verify_manifest_deep(
+        engine.store.as_ref(),
+        engine.backend.as_ref(),
+        &manifest_uri,
+        Some(&wrong_key),
+    )
+    .await
+    .unwrap();
+    assert!(!report.passed, "wrong key must fail: {:?}", report.lines);
+}
+
 /// #68: `verify-manifest` must verify CONTENT, not existence. A corrupted
 /// object whose size and metadata still match is exactly what a HEAD-only
 /// check waves through — deep verification must catch it.
@@ -148,7 +229,7 @@ async fn verify_manifest_checks_content_not_just_existence() {
     let object_uri = row.object_uri.clone().expect("object uri recorded");
 
     // Intact store: every check passes.
-    let report = verify_manifest_deep(&store, backend.as_ref(), &manifest_uri)
+    let report = verify_manifest_deep(&store, backend.as_ref(), &manifest_uri, None)
         .await
         .expect("verification runs");
     assert!(
@@ -160,7 +241,7 @@ async fn verify_manifest_checks_content_not_just_existence() {
     // Corrupt ONE byte of the stored object, leaving size and recorded
     // metadata identical. A HEAD-based check still passes; content must fail.
     mock.corrupt(&object_uri);
-    let report = verify_manifest_deep(&store, backend.as_ref(), &manifest_uri)
+    let report = verify_manifest_deep(&store, backend.as_ref(), &manifest_uri, None)
         .await
         .expect("verification still runs");
     assert!(

@@ -30,7 +30,8 @@ expression: json
   },
   "manifest": {
     "uri": "s3://telemetry-cef/tenant=default/source=app_events/format=cef/year=2026/month=01/day=01/hour=00/vtop-20260101T000000Z-app_events-p0-0-99-deadbeef.manifest.json",
-    "sha256": "9cd45db4359fd86c26e274c376f2509fe20991a955a03b8112ccee01cd9a41ec"
+    "sha256": "fd82d824211ab272a441145a51c2af5cc0507b024242de9f78d5604312330d13",
+    "mac": "d3622fcb6781175783979aac84b90f7ed8c00032acd4136f033563be885f1296"
   },
   "partitioning": {
     "path_template": "tenant={tenant}/source={source}/format={format}/year={yyyy}/month={mm}/day={dd}/hour={hh}/",

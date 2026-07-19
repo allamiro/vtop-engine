@@ -13,7 +13,7 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are used as normat
 5. [Object storage permissions and least privilege](#5-object-storage-permissions-and-least-privilege)
 6. [Integrity verification and chain of custody](#6-integrity-verification-and-chain-of-custody)
 7. [Data at rest and object immutability](#7-data-at-rest-and-object-immutability)
-8. [Manifest signing (future)](#8-manifest-signing-future)
+8. [Manifest authentication](#8-manifest-authentication)
 9. [Audit and failure logging](#9-audit-and-failure-logging)
 10. [Secret redaction](#10-secret-redaction)
 11. [Container and runtime hardening](#11-container-and-runtime-hardening)
@@ -33,7 +33,7 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are used as normat
 | Telemetry objects at rest | Long-lived archival; integrity and immutability matter for audit/compliance. |
 | Manifests | Bind object hash to source markers; the chain-of-custody record. |
 | Source progress markers / state store | Authoritative record of what has been safely committed. |
-| Credentials | Kafka SASL/mTLS material, object-storage keys, future signing keys. |
+| Credentials | Kafka SASL/mTLS material, object-storage keys, manifest MAC/signing keys. |
 
 ### 1.2 Adversaries
 
@@ -122,9 +122,10 @@ Per-format buckets (e.g. `telemetry-{format}`) with optional on-demand creation 
 - The engine **MUST** verify the durably stored object against the manifest before transitioning to `VERIFIED`.
 - The engine **MUST** verify the stored manifest before committing source progress.
 - A source progress marker **MUST NOT** be committed unless both object and manifest verification succeed (see the protocol commit rule).
-- The manifest binds the object hash to the covered source progress markers, providing object-level **chain of custody**; the manifest **self-hash** (computed with the self-hash field blanked) makes the manifest tamper-evident and reproducible.
+- The manifest binds the object hash to the covered source progress markers. Its unkeyed **self-hash** is reproducible corruption detection, not authenticity: a writer who can replace the document can recompute it.
+- When `manifest_mac_key_env` is configured, the stored manifest **MUST** carry a valid keyed BLAKE3 `manifest.mac`; missing or invalid MACs fail pipeline, CLI, and recovery verification.
 - Where the backend can only confirm size/existence, verification is **backend-limited** and the engine **MUST** report it as such rather than as cryptographic verification.
-- Optional manifest signing (§8) **MAY** further strengthen chain of custody when introduced.
+- A keyed MAC authenticates data among key holders but does not provide public verification or non-repudiation.
 
 ## 7. Data at rest and object immutability
 
@@ -133,11 +134,13 @@ Per-format buckets (e.g. `telemetry-{format}`) with optional on-demand creation 
 - Immutability complements verification: verification detects tampering, immutability prevents post-write tampering or accidental overwrite.
 - At-rest encryption (server-side or bucket-default) **MAY** be enabled at the storage layer; it is orthogonal to VTOP's integrity guarantees.
 
-## 8. Manifest Signing (Future)
+## 8. Manifest Authentication
 
-- **Manifest signing SHOULD be supported later.**
-- When enabled, manifests **MAY** carry a detached or embedded signature to strengthen chain-of-custody and tamper-evidence guarantees.
-- Signing keys, when introduced, **MUST** be handled under the same credential rules in §3 and **MUST NOT** appear in manifests or logs.
+- VTOP 0.2 supports an optional keyed BLAKE3 authenticator in `manifest.mac`.
+- Config stores only the environment-variable name (`manifest_mac_key_env`); the 32-byte hex key **MUST NOT** appear in config serialization, manifests, or logs.
+- Naming an absent or malformed key **MUST** fail startup rather than silently emit unsigned manifests.
+- Enabling a key deliberately rejects unsigned pre-cutover manifests. Operators **MUST** verify or explicitly migrate their backlog before enabling it.
+- One active key is supported. Rotation and public-key signatures are not implemented; object versioning/lock remains necessary to resist deletion and rollback to an older valid manifest.
 
 ## 9. Audit and Failure Logging
 
@@ -189,14 +192,15 @@ the ignore list and the build re-audited.
 | Property | Provided? | Notes |
 |----------|-----------|-------|
 | Object integrity (cryptographic) | Yes, with SHA-256/BLAKE3 | Stored object hash verified against manifest before commit. |
-| Manifest tamper-evidence | Yes | Reproducible self-hash. |
+| Manifest corruption detection | Yes | Reproducible unkeyed self-hash. |
+| Manifest authentication | Optional | Keyed BLAKE3 MAC; required when configured. |
 | Chain of custody (object ↔ source markers) | Yes | Manifest binds object hash to covered markers. |
 | Replay safety / no premature commit | Yes | Enforced in state machine, state store, and pipeline. |
 | Transport confidentiality | Configurable | Via TLS/SASL/mTLS; not implemented in core. |
 | Backend-limited verification disclosure | Yes | `s3cmd`/`mc` flagged as size/existence-only. |
 | Data-at-rest encryption | Not by VTOP | Delegated to storage layer (SSE/bucket default). |
 | Object immutability (WORM) | Not yet | Designed; relies on backend object lock (future). |
-| Manifest signing | Not yet | Designed (future). |
+| Public-key manifest signing / MAC rotation | Not yet | One shared MAC key is supported. |
 | Multipart upload integrity for very large objects | Not yet | Native backend uses single-part `put_object`. |
 | Authorization / multi-tenant isolation | Not by VTOP | Relies on storage-side IAM and least-privilege credentials. |
 
@@ -212,6 +216,6 @@ the ignore list and the build re-audited.
 | `CreateBucket` scoped/avoided in runtime identity (per-format auto-create) | **SHOULD** |
 | Verify object + manifest before commit | **MUST** |
 | Report backend-limited verification as such (not cryptographic) | **MUST** |
-| Manifest signing | **SHOULD** (later) |
+| Configured manifest MAC verifies without downgrade | **MUST** |
 | Object lock / immutability | **SHOULD** (later) |
 | Secret redaction in logs | **MUST** |

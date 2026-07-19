@@ -23,7 +23,7 @@ use vtop_core::batch::{AdaptiveBatcher, BatchLimits, SealReason, TelemetryBatch}
 use vtop_core::compression::compress_batch;
 use vtop_core::config::{StreamConfig, StreamsConfig, VtopConfig};
 use vtop_core::errors::VtopError;
-use vtop_core::manifest::ManifestBuilder;
+use vtop_core::manifest::{ManifestBuilder, ManifestMacKey, VtopManifest};
 use vtop_core::metrics::BatchMetrics;
 use vtop_core::partitioning::{self, PartitionContext};
 use vtop_core::replay::{next_recovery_action, RecoveryAction};
@@ -81,6 +81,8 @@ pub struct Pipeline<'a> {
     pub store: &'a dyn StateStore,
     pub backend: Arc<dyn UploadBackend>,
     pub config: &'a VtopConfig,
+    /// Runtime-only secret, resolved once at startup and never serialized.
+    pub manifest_mac_key: Option<ManifestMacKey>,
 }
 
 impl<'a> Pipeline<'a> {
@@ -435,12 +437,12 @@ impl<'a> Pipeline<'a> {
             upload_backend: self.backend.backend_name().to_string(),
             created_at: now.clone(),
         }
-        .build()?;
+        .build_with_mac(self.manifest_mac_key.as_ref())?;
 
         let manifest_path = manifest.write_to_file(&work_dir)?;
         // Storage-integrity digest of the manifest file (configured algorithm).
         // The manifest's own self-hash (manifest.manifest.sha256) is the
-        // tamper-evidence record and is always SHA-256.
+        // reproducible corruption-detection record and is always SHA-256.
         let manifest_checksum = vtop_core::checksum::digest_file(algo, &manifest_path).await?;
         let manifest_ck = manifest_checksum
             .as_deref()
@@ -473,8 +475,8 @@ impl<'a> Pipeline<'a> {
         // ---- MANIFEST_UPLOADED -> VERIFIED (or FAILED) ------------------
         let t = Instant::now();
         // 1) the manifest is internally consistent (self-hash),
-        if let Err(e) = manifest.verify_self_hash() {
-            fail!(format!("manifest self-hash verification failed: {e}"));
+        if let Err(e) = manifest.verify_authentication(self.manifest_mac_key.as_ref()) {
+            fail!(format!("manifest authentication verification failed: {e}"));
         }
         // 2) the stored object matches size + checksum,
         let obj_v = self
@@ -509,6 +511,28 @@ impl<'a> Pipeline<'a> {
                     .inc();
             }
             fail!(format!("manifest verification failed: {}", man_v.message));
+        }
+        // A MAC is meaningful only if we authenticate the bytes that actually
+        // reached storage. Backend metadata can describe content supplied by
+        // the engine rather than content read back from the object (#64), so
+        // keyed mode always downloads the small manifest and checks its
+        // binding before the batch may reach VERIFIED.
+        if let Some(key) = self.manifest_mac_key.as_ref() {
+            let stored_bytes = match self.backend.get_object(&manifest_uri).await {
+                Ok(bytes) => bytes,
+                Err(e) => fail!(format!("stored manifest download failed: {e}")),
+            };
+            let stored: VtopManifest = match serde_json::from_slice(&stored_bytes) {
+                Ok(stored) => stored,
+                Err(e) => fail!(format!("stored manifest parse failed: {e}")),
+            };
+            if stored.verify_authentication(Some(key)).is_err()
+                || stored.batch_id != batch_id
+                || stored.manifest.uri != manifest_uri
+                || stored.object.uri != object_uri
+            {
+                fail!("stored manifest authentication or batch binding failed".to_string());
+            }
         }
         metrics.verify_ms = t.elapsed().as_millis() as u64;
         let backend_limited = obj_v.backend_limited || man_v.backend_limited;
@@ -782,6 +806,9 @@ pub struct Engine {
     pub store: Box<dyn StateStore>,
     pub backend: Arc<dyn UploadBackend>,
     pub adapters: HashMap<SourceType, Box<dyn SourceAdapter>>,
+    /// Runtime-only manifest authentication secret, resolved from the named
+    /// environment variable before any backend is initialized.
+    manifest_mac_key: Option<ManifestMacKey>,
     /// Per-source accumulation buffers, keyed by `(source_type, source_name)`.
     pending: HashMap<(SourceType, String), PendingBuffer>,
     /// Set by a read cycle that returned any records; drives the adaptive
@@ -919,6 +946,8 @@ impl Engine {
     /// cannot perform the recovery/commit races the lock exists to prevent.
     /// Anything that mutates goes through [`Engine::new_exclusive`].
     pub async fn new(config: VtopConfig, streams: StreamsConfig) -> Result<Self, VtopError> {
+        config.validate()?;
+        let manifest_mac_key = config.resolve_manifest_mac_key()?;
         let store = connect_state_store(&config.engine.state_store).await?;
         let backend = vtop_upload::build_backend(&config.upload).await?;
 
@@ -961,6 +990,7 @@ impl Engine {
             store,
             backend,
             adapters,
+            manifest_mac_key,
             pending: HashMap::new(),
             cycle_had_data: false,
             _instance_locks: Vec::new(),
@@ -981,7 +1011,14 @@ impl Engine {
             store: self.store.as_ref(),
             backend: self.backend.clone(),
             config: &self.config,
+            manifest_mac_key: self.manifest_mac_key.clone(),
         }
+    }
+
+    /// Key used by read-only manifest verification, if authentication is
+    /// required by this process's configuration.
+    pub(crate) fn manifest_mac_key(&self) -> Option<&ManifestMacKey> {
+        self.manifest_mac_key.as_ref()
     }
 
     /// Enumerate all sources across all enabled adapters.
@@ -1347,6 +1384,42 @@ impl Engine {
                     return false;
                 }
             }
+            // When authentication is enabled, recovery must inspect the
+            // stored manifest bytes — HEAD metadata cannot prove a MAC. This
+            // intentionally rejects unsigned pre-cutover manifests rather
+            // than silently weakening the newly configured policy.
+            if let Some(key) = self.manifest_mac_key.as_ref() {
+                let bytes = match self.backend.get_object(muri).await {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        tracing::warn!(muri, error = %e, "recovery re-check: manifest download failed");
+                        return false;
+                    }
+                };
+                let manifest: VtopManifest = match serde_json::from_slice(&bytes) {
+                    Ok(manifest) => manifest,
+                    Err(e) => {
+                        tracing::warn!(muri, error = %e, "recovery re-check: manifest parse failed");
+                        return false;
+                    }
+                };
+                if manifest.verify_authentication(Some(key)).is_err()
+                    || manifest.batch_id != rec.batch_id
+                    || manifest.manifest.uri != muri
+                    || manifest.object.uri != uri
+                {
+                    tracing::warn!(
+                        muri,
+                        batch_id = %rec.batch_id,
+                        "recovery re-check: manifest authentication or ledger binding failed"
+                    );
+                    return false;
+                }
+            }
+        } else if self.manifest_mac_key.is_some() {
+            // A keyed policy cannot authenticate a manifest the ledger does
+            // not identify.
+            return false;
         }
         match (
             rec.object_sha256.as_deref(),

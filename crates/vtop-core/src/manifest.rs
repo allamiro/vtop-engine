@@ -14,7 +14,43 @@ use std::path::{Path, PathBuf};
 /// Protocol identifier embedded in every manifest.
 pub const VTOP_PROTOCOL: &str = "VTOP";
 /// Manifest schema version.
-pub const VTOP_VERSION: &str = "0.1";
+pub const VTOP_VERSION: &str = "0.2";
+
+/// Runtime-only key used to authenticate manifests with BLAKE3 keyed hashing.
+///
+/// The key is deliberately opaque and has no serialization implementation: it
+/// may be loaded from an environment variable, but it can never accidentally
+/// become part of a config dump or manifest.
+#[derive(Clone)]
+pub struct ManifestMacKey([u8; 32]);
+
+impl std::fmt::Debug for ManifestMacKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ManifestMacKey([REDACTED])")
+    }
+}
+
+impl ManifestMacKey {
+    /// Decode the required 32-byte key from its 64-character hex form.
+    pub fn from_hex(value: &str) -> Result<Self, VtopError> {
+        if value.len() != 64 {
+            return Err(VtopError::Config(
+                "manifest MAC key must be exactly 32 bytes (64 hex characters)".into(),
+            ));
+        }
+        let mut key = [0_u8; 32];
+        hex::decode_to_slice(value, &mut key).map_err(|_| {
+            VtopError::Config(
+                "manifest MAC key must be exactly 32 bytes (64 hex characters)".into(),
+            )
+        })?;
+        Ok(Self(key))
+    }
+
+    fn authenticate(&self, bytes: &[u8]) -> blake3::Hash {
+        blake3::keyed_hash(&self.0, bytes)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -39,6 +75,12 @@ pub struct ObjectMetadata {
 pub struct ManifestMetadata {
     pub uri: String,
     pub sha256: String,
+    /// Optional keyed BLAKE3 authenticator over the canonical manifest.
+    ///
+    /// Missing on version 0.1 and unsigned manifests. When a runtime MAC key
+    /// is configured, verification requires this field to exist and match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +142,14 @@ impl ManifestBuilder {
     /// canonical serialization of the manifest *with that field empty*, so the
     /// hash is reproducible and self-consistent.
     pub fn build(self) -> Result<VtopManifest, VtopError> {
+        self.build_with_mac(None)
+    }
+
+    /// Build a manifest, authenticating it when a runtime key is configured.
+    pub fn build_with_mac(
+        self,
+        mac_key: Option<&ManifestMacKey>,
+    ) -> Result<VtopManifest, VtopError> {
         let mut manifest = VtopManifest {
             protocol: VTOP_PROTOCOL.to_string(),
             version: VTOP_VERSION.to_string(),
@@ -122,6 +172,9 @@ impl ManifestBuilder {
             manifest: ManifestMetadata {
                 uri: self.manifest_uri,
                 sha256: String::new(),
+                // Presence is authenticated too: signed manifests canonicalize
+                // this to an empty string, while unsigned manifests omit it.
+                mac: mac_key.map(|_| String::new()),
             },
             partitioning: PartitionMetadata {
                 path_template: self.path_template,
@@ -134,6 +187,13 @@ impl ManifestBuilder {
         };
 
         manifest.manifest.sha256 = manifest.self_hash()?;
+        if let Some(key) = mac_key {
+            manifest.manifest.mac = Some(
+                key.authenticate(&manifest.auth_bytes()?)
+                    .to_hex()
+                    .to_string(),
+            );
+        }
         Ok(manifest)
     }
 }
@@ -145,13 +205,20 @@ impl VtopManifest {
         Ok(serde_json::to_vec_pretty(self)?)
     }
 
-    /// Compute the manifest's own SHA-256 over its serialization with the
-    /// `manifest.sha256` field blanked out (so the value is reproducible).
-    pub fn self_hash(&self) -> Result<String, VtopError> {
+    /// Canonical bytes shared by the unkeyed self-hash and keyed authenticator.
+    /// Both embedded values are blanked so neither calculation is circular.
+    fn auth_bytes(&self) -> Result<Vec<u8>, VtopError> {
         let mut clone = self.clone();
         clone.manifest.sha256 = String::new();
-        let bytes = serde_json::to_vec(&clone)?;
-        Ok(sha256_bytes(&bytes))
+        if clone.manifest.mac.is_some() {
+            clone.manifest.mac = Some(String::new());
+        }
+        Ok(serde_json::to_vec(&clone)?)
+    }
+
+    /// Compute the manifest's own SHA-256 over its canonical serialization.
+    pub fn self_hash(&self) -> Result<String, VtopError> {
+        Ok(sha256_bytes(&self.auth_bytes()?))
     }
 
     /// Recompute and compare the embedded manifest hash. Used during
@@ -166,6 +233,46 @@ impl VtopManifest {
                 expected,
                 actual: self.manifest.sha256.clone(),
             })
+        }
+    }
+
+    /// Verify the reproducible self-hash and, when configured, require a valid
+    /// keyed BLAKE3 authenticator.
+    ///
+    /// Supplying a key deliberately rejects legacy/unsigned manifests. This is
+    /// the migration boundary: operators must verify their backlog before
+    /// enabling authentication rather than silently grandfathering it forever.
+    pub fn verify_authentication(&self, mac_key: Option<&ManifestMacKey>) -> Result<(), VtopError> {
+        self.verify_self_hash()?;
+        let Some(key) = mac_key else {
+            return Ok(());
+        };
+        let actual_hex = self.manifest.mac.as_deref().ok_or_else(|| {
+            VtopError::Manifest(
+                "manifest MAC is required because manifest_mac_key_env is configured".into(),
+            )
+        })?;
+        let actual = hex::decode(actual_hex)
+            .map_err(|_| VtopError::Manifest("manifest MAC is not valid hex".into()))?;
+        if actual.len() != 32 {
+            return Err(VtopError::Manifest(
+                "manifest MAC must be exactly 32 bytes".into(),
+            ));
+        }
+        let expected = key.authenticate(&self.auth_bytes()?);
+        // Compare without an early exit so a remote verification path does not
+        // leak how many prefix bytes were correct.
+        let mismatch = expected
+            .as_bytes()
+            .iter()
+            .zip(actual.iter())
+            .fold(0_u8, |acc, (left, right)| acc | (left ^ right));
+        if mismatch == 0 {
+            Ok(())
+        } else {
+            Err(VtopError::Manifest(
+                "manifest MAC verification failed".into(),
+            ))
         }
     }
 
@@ -244,6 +351,62 @@ mod tests {
         let mut m = builder().build().unwrap();
         m.record_count = 9999; // tamper
         assert!(m.verify_self_hash().is_err());
+    }
+
+    #[test]
+    fn authenticated_manifest_requires_the_configured_key() {
+        let key = ManifestMacKey::from_hex(&"11".repeat(32)).unwrap();
+        let wrong = ManifestMacKey::from_hex(&"22".repeat(32)).unwrap();
+        let m = builder().build_with_mac(Some(&key)).unwrap();
+
+        assert_eq!(m.version, VTOP_VERSION);
+        assert_eq!(m.manifest.mac.as_deref().map(str::len), Some(64));
+        m.verify_authentication(Some(&key))
+            .expect("the writing key must authenticate the manifest");
+        assert!(m.verify_authentication(Some(&wrong)).is_err());
+    }
+
+    #[test]
+    fn recomputing_the_unkeyed_hash_cannot_hide_tampering() {
+        let key = ManifestMacKey::from_hex(&"33".repeat(32)).unwrap();
+        let mut m = builder().build_with_mac(Some(&key)).unwrap();
+
+        // This is the exact attack the old self-hash could not detect: rewrite
+        // content and then recompute the unkeyed value stored beside it.
+        m.record_count = 9999;
+        m.manifest.sha256 = m.self_hash().unwrap();
+        m.verify_self_hash()
+            .expect("the attacker can recompute an unkeyed self-hash");
+        assert!(m.verify_authentication(Some(&key)).is_err());
+    }
+
+    #[test]
+    fn enabling_a_key_rejects_unsigned_and_legacy_manifests() {
+        let key = ManifestMacKey::from_hex(&"44".repeat(32)).unwrap();
+        let unsigned = builder().build().unwrap();
+        unsigned.verify_self_hash().unwrap();
+        assert!(unsigned.verify_authentication(Some(&key)).is_err());
+
+        // Version 0.1 JSON did not have `manifest.mac`; serde must still read
+        // it so an operator without a key retains today's behavior.
+        let mut json = serde_json::to_value(&unsigned).unwrap();
+        json["version"] = serde_json::json!("0.1");
+        json["manifest"].as_object_mut().unwrap().remove("mac");
+        let mut legacy: VtopManifest = serde_json::from_value(json).unwrap();
+        legacy.manifest.sha256 = legacy.self_hash().unwrap();
+        legacy.verify_authentication(None).unwrap();
+        assert!(legacy.verify_authentication(Some(&key)).is_err());
+    }
+
+    #[test]
+    fn manifest_key_parser_rejects_wrong_length_and_non_hex() {
+        assert!(ManifestMacKey::from_hex("11").is_err());
+        assert!(ManifestMacKey::from_hex(&"zz".repeat(32)).is_err());
+        let key_hex = "ab".repeat(32);
+        let key = ManifestMacKey::from_hex(&key_hex).unwrap();
+        let debug = format!("{key:?}");
+        assert!(debug.contains("REDACTED"));
+        assert!(!debug.contains(&key_hex));
     }
 
     #[test]

@@ -100,10 +100,11 @@ pub trait UploadBackend: Send + Sync {
 
     /// Download an object's full content.
     ///
-    /// For explicit verification tooling (`vtopctl verify-manifest`), which
-    /// must hash the ACTUAL stored bytes — metadata can lie about a replaced
-    /// object, content cannot (#68). Never called on the archiving hot path,
-    /// so implementations may favour simplicity over streaming.
+    /// Used by explicit verification tooling and by the archiving path when
+    /// manifest authentication is enabled. Both must inspect ACTUAL stored
+    /// bytes — metadata can describe a replaced object without detecting it.
+    /// Manifests are small, so implementations may return them as one buffer;
+    /// telemetry-object verification should use a streaming API when added.
     async fn get_object(&self, object_uri: &str) -> Result<Vec<u8>, VtopError>;
 
     /// Verify a stored object against an expected size and (when provided)

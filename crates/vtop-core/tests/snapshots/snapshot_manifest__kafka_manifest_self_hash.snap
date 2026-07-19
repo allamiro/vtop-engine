@@ -2,4 +2,4 @@
 source: crates/vtop-core/tests/snapshot_manifest.rs
 expression: m.manifest.sha256
 ---
-9e2c72ecc55fdb0dc623f93611a6195eaa055f8bab993f8fb4238a6d985e80d4
+9cd45db4359fd86c26e274c376f2509fe20991a955a03b8112ccee01cd9a41ec

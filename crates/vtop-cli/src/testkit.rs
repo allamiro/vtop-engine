@@ -47,6 +47,7 @@ pub fn file_config(
         checksum: ChecksumConfig {
             algorithm: ChecksumAlgorithm::Sha256,
         },
+        manifest_mac_key_env: None,
         sources: SourcesConfig {
             kafka: None,
             file: Some(FileSourceConfig {
@@ -136,5 +137,6 @@ pub fn pipeline<'a>(
         store,
         backend,
         config,
+        manifest_mac_key: config.resolve_manifest_mac_key().unwrap(),
     }
 }

@@ -15,7 +15,7 @@
 //! consumers verify against.
 
 use insta::assert_snapshot;
-use vtop_core::manifest::ManifestBuilder;
+use vtop_core::manifest::{ManifestBuilder, ManifestMacKey};
 use vtop_core::types::{CompressionType, ProgressMarker, SourceType, TelemetryFormat};
 
 /// Every value here is fixed. The manifest must be a pure function of its
@@ -80,6 +80,17 @@ fn kafka_manifest_json_contract() {
     assert_snapshot!("kafka_manifest", json);
 }
 
+/// The authenticated v0.2 shape is a separate contract: the MAC is nested
+/// beside the self-hash, deterministic for a fixed key, and never contains the
+/// key itself.
+#[test]
+fn authenticated_manifest_json_contract() {
+    let key = ManifestMacKey::from_hex(&"42".repeat(32)).unwrap();
+    let m = kafka_builder().build_with_mac(Some(&key)).unwrap();
+    let json = String::from_utf8(m.to_json_bytes().unwrap()).unwrap();
+    assert_snapshot!("authenticated_kafka_manifest", json);
+}
+
 /// The file-sourced variant: proves the source_progress marker is serialized
 /// per-source-type (inode/byte range, not offsets) — the field downstream replay
 /// tooling depends on.
@@ -101,6 +112,20 @@ fn manifest_self_hash_is_pinned() {
     // And it must actually validate, not merely be stable.
     m.verify_self_hash()
         .expect("the pinned hash must verify against the manifest itself");
+}
+
+/// A v0.1 document has no `manifest.mac`. Adding the optional v0.2 field must
+/// not change canonicalization when reading and verifying historical bytes.
+#[test]
+fn legacy_v01_self_hash_still_verifies() {
+    let mut legacy = kafka_builder().build().unwrap();
+    legacy.version = "0.1".into();
+    legacy.manifest.mac = None;
+    legacy.manifest.sha256 =
+        "9e2c72ecc55fdb0dc623f93611a6195eaa055f8bab993f8fb4238a6d985e80d4".into();
+    legacy
+        .verify_self_hash()
+        .expect("the published v0.1 canonical hash must remain readable");
 }
 
 /// A manifest built twice from identical inputs must be byte-identical.

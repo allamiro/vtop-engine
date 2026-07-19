@@ -169,7 +169,7 @@ It links:
 - compression type
 - detected format
 - batch metadata
-- manifest self-hash
+- reproducible manifest self-hash and optional keyed-BLAKE3 authentication
 
 ---
 
@@ -511,7 +511,7 @@ tests/integration_file_to_minio.rs
 ```json
 {
   "protocol": "VTOP",
-  "version": "0.1",
+  "version": "0.2",
   "batch_id": "vtop-20260618T150000Z-app_events-p0-481000-482499-1a2b3c4d",
   "tenant": "default",
   "source_type": "kafka",
@@ -534,7 +534,8 @@ tests/integration_file_to_minio.rs
   },
   "manifest": {
     "uri": "s3://telemetry-data/.../vtop-....manifest.json",
-    "sha256": "def456..."
+    "sha256": "def456...",
+    "mac": "0123abcd..."
   },
   "state": "manifest_uploaded",
   "verification_status": "not_verified"
@@ -546,7 +547,13 @@ tests/integration_file_to_minio.rs
 >
 > The authoritative post-verification state lives in the state store and can be queried with `vtopctl status` or `vtopctl list-batches --json`.
 
-The manifest self-hash is computed with the `manifest.sha256` field blanked, making the manifest reproducible and tamper-evident.
+The manifest self-hash is reproducible and detects accidental changes, but an
+attacker able to rewrite the manifest can recompute it. Set
+`manifest_mac_key_env` to the name of an environment variable containing a
+32-byte hex key to add `manifest.mac`, a keyed BLAKE3 authenticator. Both
+embedded values are blanked for canonicalization. The key itself is never
+serialized. Enabling a key intentionally rejects older unsigned manifests;
+verify the backlog before cutover. Key rotation is not implemented yet.
 
 ---
 
@@ -647,7 +654,7 @@ VTOP is currently a prototype. The following limits are known and intentional.
 | Partial upload recovery | replays from source instead of resuming half-written local objects | add resumable local staging |
 | Command backend verification | `s3cmd` and `mc` verify size and existence only | prefer native checksum verification |
 | Syslog timestamps | `received_time_*` is not yet extracted into the spool marker | add timestamp extraction |
-| Manifest integrity | self-hash exists, signing not implemented | add manifest signing |
+| Manifest integrity | self-hash plus optional keyed-BLAKE3 authentication; key rotation not implemented | add multi-key rotation and public-key signatures if required |
 | Object immutability | S3 Object Lock is designed but not implemented | add Object Lock profile |
 | Metrics export | **Prometheus `/metrics` implemented** (opt-in via `VTOP_METRICS_ADDR`); OpenTelemetry trace export not yet | add OTLP span export |
 | Kafka integration test | requires live broker and is ignored by default | add optional CI service profile |
@@ -678,7 +685,8 @@ Planned implementation areas:
       (a long line, a large Kafka message, or `whole_file`) is still buffered
       whole before the budget is checked
 - [ ] multipart upload support
-- [ ] manifest signing
+- [x] optional keyed-BLAKE3 manifest authentication via a named secret env var
+- [ ] manifest MAC key rotation / optional public-key signatures
 - [ ] S3 Object Lock profile
 - [ ] OpenTelemetry trace export (the metrics endpoint exists; spans do not yet)
 - [ ] million-file benchmark suite
@@ -702,4 +710,3 @@ Planned implementation areas:
 ## License
 
 [MIT](LICENSE) © 2026 Tamir Suliman.
-
