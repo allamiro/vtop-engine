@@ -746,31 +746,80 @@ pub struct Engine {
     /// inter-cycle sleep in [`Engine::run`]. Reset at the top of each cycle.
     cycle_had_data: bool,
     /// Exclusive work-dir lock held for the engine's lifetime (#66).
-    _instance_lock: InstanceLock,
+    /// Held only by [`Engine::new_exclusive`] instances; empty for read-only
+    /// construction (#66).
+    _instance_locks: Vec<InstanceLock>,
 }
 
-/// An OS-level exclusive lock on the work directory, held for the engine's
-/// lifetime and released automatically on drop or process death (#66).
+/// An OS-level exclusive lock held for the engine's lifetime and released
+/// automatically on drop or process death (#66).
 ///
 /// The engine is SINGLE-INSTANCE per state store: without claim/lease/fencing
 /// (#93, HA plan Phase 5), two engines over the same store would both list the
 /// same incomplete batches, both recover them, and both commit source
-/// progress — duplicate ingestion at best, double-commit at worst. This lock
-/// enforces that on one host. It CANNOT see a second engine on another host
-/// pointed at the same Postgres — that configuration is warned about at
-/// startup and remains unsupported until #93.
+/// progress — duplicate ingestion at best, double-commit at worst.
+///
+/// The exclusion is keyed by BOTH shared resources: the state store (the real
+/// hazard — two work dirs pointing at one SQLite file must still exclude each
+/// other) and the work dir (shared temp objects/manifests). It CANNOT see a
+/// second engine on another host pointed at the same Postgres — that
+/// configuration is warned about at startup and remains unsupported until #93.
 struct InstanceLock {
     _file: std::fs::File,
 }
 
-fn acquire_instance_lock(work_dir: &std::path::Path) -> Result<InstanceLock, VtopError> {
-    std::fs::create_dir_all(work_dir)?;
-    let path = work_dir.join(".vtop.instance.lock");
+/// Strip a case-insensitive `sqlite:`/`sqlite://` scheme prefix.
+fn strip_sqlite_scheme(s: &str) -> &str {
+    for p in ["sqlite://", "sqlite:"] {
+        if s.len() >= p.len() && s[..p.len()].eq_ignore_ascii_case(p) {
+            return &s[p.len()..];
+        }
+    }
+    s
+}
+
+/// The lock file representing a state store's identity on THIS host, or `None`
+/// when no cross-process exclusion is needed (`:memory:` is per-process).
+///
+/// SQLite: a sibling lock next to the (parent-canonicalized) database file, so
+/// two spellings of the same path collide. Postgres: a temp-dir lock keyed by
+/// the connection string's digest — same-host protection only; the cross-host
+/// gap is documented and tracked in #93.
+fn state_store_lock_path(state_store: &str) -> Option<std::path::PathBuf> {
+    let s = state_store.trim();
+    let lower = s.to_ascii_lowercase();
+    if lower.starts_with("postgres") {
+        let digest = vtop_core::checksum::sha256_bytes(s.as_bytes());
+        return Some(std::env::temp_dir().join(format!("vtop-pg-{}.lock", &digest[..16])));
+    }
+    let path = strip_sqlite_scheme(s);
+    if path.trim_start_matches('/').starts_with(":memory:") || path == "memory:" {
+        return None;
+    }
+    let pb = std::path::Path::new(path);
+    let canon = pb
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .and_then(|d| d.canonicalize().ok())
+        .map(|d| d.join(pb.file_name().unwrap_or_default()))
+        .unwrap_or_else(|| pb.to_path_buf());
+    Some(std::path::PathBuf::from(format!(
+        "{}.vtop.lock",
+        canon.display()
+    )))
+}
+
+fn acquire_lock_file(path: &std::path::Path) -> Result<InstanceLock, VtopError> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(&path)?;
+        .open(path)?;
     match file.try_lock() {
         Ok(()) => Ok(InstanceLock { _file: file }),
         Err(std::fs::TryLockError::WouldBlock) => Err(VtopError::Config(format!(
@@ -782,21 +831,52 @@ fn acquire_instance_lock(work_dir: &std::path::Path) -> Result<InstanceLock, Vto
     }
 }
 
+/// Acquire every exclusion lock a MUTATING engine must hold (#66).
+fn acquire_instance_locks(config: &VtopConfig) -> Result<Vec<InstanceLock>, VtopError> {
+    let mut locks = Vec::new();
+    // The state store is the resource whose double-use corrupts progress.
+    if let Some(store_lock) = state_store_lock_path(&config.engine.state_store) {
+        locks.push(acquire_lock_file(&store_lock)?);
+    }
+    // The work dir holds in-flight objects/manifests; sharing it is also a
+    // misconfiguration even with distinct stores.
+    let work_dir = std::path::Path::new(&config.engine.work_dir);
+    std::fs::create_dir_all(work_dir)?;
+    locks.push(acquire_lock_file(&work_dir.join(".vtop.instance.lock"))?);
+    Ok(locks)
+}
+
 impl Engine {
-    /// Build the engine from parsed config + streams, initializing the state
-    /// store, the upload backend, and every enabled source adapter.
-    pub async fn new(config: VtopConfig, streams: StreamsConfig) -> Result<Self, VtopError> {
-        // Refuse to start beside another engine on this host (#66). A shared
-        // NETWORK store (Postgres) on other hosts is invisible to a file lock:
-        // say so loudly until #93 adds real claim/lease semantics.
-        let instance_lock = acquire_instance_lock(std::path::Path::new(&config.engine.work_dir))?;
+    /// Build an engine for MUTATING use (`run`, `process-once`, `replay`):
+    /// refuses to start while another engine holds the same state store or
+    /// work dir on this host (#66). A shared NETWORK store (Postgres) on other
+    /// hosts is invisible to a file lock: warned loudly until #93 adds real
+    /// claim/lease semantics.
+    pub async fn new_exclusive(
+        config: VtopConfig,
+        streams: StreamsConfig,
+    ) -> Result<Self, VtopError> {
+        let locks = acquire_instance_locks(&config)?;
         if config.engine.state_store.starts_with("postgres") {
             tracing::warn!(
                 "state store is Postgres: the engine is SINGLE-INSTANCE per state \
-                 store, and the work-dir lock cannot see engines on OTHER hosts. \
+                 store, and host-local locks cannot see engines on OTHER hosts. \
                  Do not run replicas against this database (see #66/#93)"
             );
         }
+        let mut engine = Self::new(config, streams).await?;
+        engine._instance_locks = locks;
+        Ok(engine)
+    }
+
+    /// Build the engine from parsed config + streams, initializing the state
+    /// store, the upload backend, and every enabled source adapter.
+    ///
+    /// Takes NO instance lock: read-only commands (`status`, `list-batches`,
+    /// `discover`, `verify-manifest`) must work while the service runs — they
+    /// cannot perform the recovery/commit races the lock exists to prevent.
+    /// Anything that mutates goes through [`Engine::new_exclusive`].
+    pub async fn new(config: VtopConfig, streams: StreamsConfig) -> Result<Self, VtopError> {
         let store = connect_state_store(&config.engine.state_store).await?;
         let backend = vtop_upload::build_backend(&config.upload).await?;
 
@@ -841,7 +921,7 @@ impl Engine {
             adapters,
             pending: HashMap::new(),
             cycle_had_data: false,
-            _instance_lock: instance_lock,
+            _instance_locks: Vec::new(),
         })
     }
 
@@ -1436,38 +1516,84 @@ mod tests {
     use std::io::Write;
     use vtop_core::config::StreamsConfig;
 
-    /// #66: the engine is single-instance per state store; a second engine on
-    /// the same work dir must be refused at startup, and the lock must free
-    /// when the first engine goes away.
+    /// #66: a mutating engine is single-instance per state store AND work dir;
+    /// a second one must be refused however the collision arises, read-only
+    /// construction must keep working alongside, and the locks must free when
+    /// the holder goes away.
     #[tokio::test]
-    async fn second_engine_on_same_work_dir_is_refused() {
+    async fn second_exclusive_engine_is_refused_but_read_only_is_not() {
         let dir = tempfile::tempdir().unwrap();
-        let work = dir.path().join("work");
         let input = dir.path().join("in.log");
         std::fs::write(&input, "one\n").unwrap();
-        let cfg = || {
+        let db = dir.path().join("state.db");
+        let cfg = |work: &str, store: &str| {
             crate::testkit::file_config(
-                work.to_str().unwrap(),
-                "sqlite::memory:",
+                dir.path().join(work).to_str().unwrap(),
+                store,
                 vec![input.to_string_lossy().into_owned()],
                 "mock",
             )
         };
-        let first = Engine::new(cfg(), StreamsConfig { streams: vec![] })
-            .await
-            .expect("first engine starts");
-        let second = Engine::new(cfg(), StreamsConfig { streams: vec![] }).await;
-        let err = second.err().expect("second engine must be refused");
-        assert!(
-            matches!(err, VtopError::Config(_)),
-            "refusal must be a Config error naming the lock: {err:?}"
-        );
+        let store_uri = format!("sqlite://{}", db.display());
+
+        let first =
+            Engine::new_exclusive(cfg("work-a", &store_uri), StreamsConfig { streams: vec![] })
+                .await
+                .expect("first exclusive engine starts");
+
+        // Same work dir → refused.
+        let err = Engine::new_exclusive(
+            cfg("work-a", "sqlite::memory:"),
+            StreamsConfig { streams: vec![] },
+        )
+        .await
+        .err()
+        .expect("same work dir must be refused");
+        assert!(matches!(err, VtopError::Config(_)), "{err:?}");
         assert!(err.to_string().contains("another VTOP engine"));
-        // Lock releases with the engine: a successor can start.
+
+        // DIFFERENT work dir but the SAME state store → still refused. This is
+        // the dangerous variant (both would recover and commit the same
+        // batches); a work-dir-only lock waves it through.
+        let err =
+            Engine::new_exclusive(cfg("work-b", &store_uri), StreamsConfig { streams: vec![] })
+                .await
+                .err()
+                .expect("same state store must be refused even from another work dir");
+        assert!(err.to_string().contains("another VTOP engine"));
+
+        // Read-only construction takes no lock: operators must be able to run
+        // status/list-batches/verify-manifest beside the running service.
+        let read_only = Engine::new(cfg("work-a", &store_uri), StreamsConfig { streams: vec![] })
+            .await
+            .expect("read-only engine must start alongside the exclusive one");
+        drop(read_only);
+
+        // Locks release with the engine: a successor can start.
         drop(first);
-        Engine::new(cfg(), StreamsConfig { streams: vec![] })
+        Engine::new_exclusive(cfg("work-a", &store_uri), StreamsConfig { streams: vec![] })
             .await
             .expect("engine restarts after the previous one is gone");
+    }
+
+    /// The store lock is keyed by the store's identity, not its spelling:
+    /// `sqlite:` and `sqlite://` forms of one path must collide, and
+    /// `:memory:` stores (per-process by nature) must not lock at all.
+    #[test]
+    fn state_store_lock_path_normalizes_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("s.db");
+        let a = state_store_lock_path(&format!("sqlite://{}", db.display()));
+        let b = state_store_lock_path(&format!("sqlite:{}", db.display()));
+        assert_eq!(a, b, "scheme spelling must not change the lock identity");
+        assert!(a.is_some());
+        assert!(state_store_lock_path("sqlite::memory:").is_none());
+        // Postgres: same conn string → same lock; different → different.
+        let p1 = state_store_lock_path("postgres://u@h/db");
+        let p2 = state_store_lock_path("postgres://u@h/db");
+        let p3 = state_store_lock_path("postgres://u@h/other");
+        assert_eq!(p1, p2);
+        assert_ne!(p1, p3);
     }
 
     #[test]

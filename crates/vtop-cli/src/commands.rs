@@ -157,7 +157,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             // for a few milliseconds and never be scraped. Failure to start is
             // logged, never fatal - telemetry must not block archiving.
             crate::metrics_server::maybe_start().await;
-            let mut engine = Engine::new(cfg, streams).await?;
+            let mut engine = Engine::new_exclusive(cfg, streams).await?;
             engine.run().await
         }
         Command::Discover { config } => {
@@ -194,7 +194,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 cli.log_level.as_deref().unwrap_or(&cfg.engine.log_level),
                 cli.json,
             );
-            let mut engine = Engine::new(cfg, streams).await?;
+            let mut engine = Engine::new_exclusive(cfg, streams).await?;
             engine.recover().await?;
             let outcomes = engine.process_once((*source).into()).await?;
             if cli.json {
@@ -233,7 +233,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 cli.log_level.as_deref().unwrap_or(&cfg.engine.log_level),
                 cli.json,
             );
-            let mut engine = Engine::new(cfg, streams).await?;
+            let mut engine = Engine::new_exclusive(cfg, streams).await?;
             if let Some(id) = batch_id {
                 match engine.store.get_batch(id).await? {
                     Some(rec) => println!(
