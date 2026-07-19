@@ -164,6 +164,16 @@ async fn recovery_commits_verified_but_uncommitted_batch() {
         )
         .await
         .unwrap();
+    // The re-check requires the MANIFEST too — verified means both halves.
+    engine
+        .backend
+        .put_manifest(
+            &staged,
+            "s3://telemetry-data/x/b-verified.manifest.json",
+            Some(vtop_upload::ObjectChecksum::new("sha256", "feedface")),
+        )
+        .await
+        .unwrap();
 
     let summary = engine.recover().await.unwrap();
     assert_eq!(summary.committed, 1, "verified batch committed on recovery");
