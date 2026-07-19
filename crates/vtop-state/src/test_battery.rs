@@ -304,6 +304,13 @@ async fn claims_respect_live_leases_and_take_over_expired_ones(store: &dyn State
             .unwrap();
     }
 
+    // A lease expiring EXACTLY at `now` is expired (inclusive boundary): a
+    // batch must never sit unclaimable at the instant of expiry.
+    let mut edge = sample_record("claim-edge");
+    edge.owner = Some("engine-a".into());
+    edge.lease_expires_at = Some(now.to_string());
+    store.save_batch_state(&edge).await.unwrap();
+
     // engine-b recovers: gets the expired batch and the orphan - NOT the live
     // one, NOT the committed one.
     let claimed = store
@@ -318,6 +325,10 @@ async fn claims_respect_live_leases_and_take_over_expired_ones(store: &dyn State
     assert!(
         ids.contains(&"claim-orphan"),
         "ownerless row must be claimable: {ids:?}"
+    );
+    assert!(
+        ids.contains(&"claim-edge"),
+        "expiry is inclusive - a lease ending AT now transfers: {ids:?}"
     );
     assert!(
         !ids.contains(&"claim-live"),

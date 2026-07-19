@@ -206,10 +206,10 @@ impl<'a> Pipeline<'a> {
         // Ledger-write time is accumulated across the WHOLE pipeline (~8
         // writes per batch): it was the unmeasured gap between staged time and
         // total_ms (#87), and an unmeasured stage is where regressions hide.
-        let mut state_write_ms: u64 = 0;
+        let mut state_write = Duration::ZERO;
         let t_write = Instant::now();
         self.store.save_batch_state(&record).await?;
-        state_write_ms += t_write.elapsed().as_millis() as u64;
+        state_write += t_write.elapsed();
         tracing::info!(batch_id, source = %source.source_name, "batch_started");
 
         // The record count `fail!` reports. Declared here, before the macro,
@@ -276,12 +276,11 @@ impl<'a> Pipeline<'a> {
         self.store
             .update_batch_state(&batch_id, BatchState::Sealed, &BatchPatch::default())
             .await?;
-        state_write_ms += t_write.elapsed().as_millis() as u64;
+        state_write += t_write.elapsed();
         mark_state!(BatchState::Sealed);
         tracing::info!(batch_id, records = batch.record_count, "batch_sealed");
 
         let mut metrics = BatchMetrics::new(&batch_id, batch.record_count, 0);
-        metrics.state_write_ms = state_write_ms;
 
         // ---- SEALED -> COMPRESSED ---------------------------------------
         let work_dir = std::path::PathBuf::from(&self.config.engine.work_dir);
@@ -316,7 +315,7 @@ impl<'a> Pipeline<'a> {
         self.store
             .update_batch_state(&batch_id, BatchState::Compressed, &BatchPatch::default())
             .await?;
-        metrics.state_write_ms += t_write.elapsed().as_millis() as u64;
+        state_write += t_write.elapsed();
         mark_state!(BatchState::Compressed);
         tracing::info!(
             batch_id,
@@ -339,7 +338,7 @@ impl<'a> Pipeline<'a> {
         self.store
             .update_batch_state(&batch_id, BatchState::Checksummed, &BatchPatch::default())
             .await?;
-        metrics.state_write_ms += t_write.elapsed().as_millis() as u64;
+        state_write += t_write.elapsed();
         mark_state!(BatchState::Checksummed);
         tracing::info!(
             batch_id,
@@ -406,7 +405,7 @@ impl<'a> Pipeline<'a> {
         self.store
             .update_batch_state(&batch_id, BatchState::ObjectUploaded, &obj_patch)
             .await?;
-        metrics.state_write_ms += t_write.elapsed().as_millis() as u64;
+        state_write += t_write.elapsed();
         mark_state!(BatchState::ObjectUploaded);
         tracing::info!(batch_id, uri = %object_uri, "object_uploaded");
 
@@ -463,7 +462,7 @@ impl<'a> Pipeline<'a> {
         self.store
             .update_batch_state(&batch_id, BatchState::ManifestUploaded, &man_patch)
             .await?;
-        metrics.state_write_ms += t_write.elapsed().as_millis() as u64;
+        state_write += t_write.elapsed();
         mark_state!(BatchState::ManifestUploaded);
         tracing::info!(batch_id, uri = %manifest_uri, "manifest_uploaded");
 
@@ -529,7 +528,7 @@ impl<'a> Pipeline<'a> {
         }
         let t_write = Instant::now();
         self.store.mark_verified(&batch_id).await?;
-        metrics.state_write_ms += t_write.elapsed().as_millis() as u64;
+        state_write += t_write.elapsed();
         // Counted only AFTER the store has persisted ManifestUploaded ->
         // Verified. Incrementing first would let a failed state write leave
         // verified_total claiming a verification the ledger never recorded -
@@ -553,6 +552,10 @@ impl<'a> Pipeline<'a> {
                     .inc();
             }
         }
+
+        // Converted ONCE: per-write as_millis() truncation made eight sub-ms
+        // WAL writes export as 0.
+        metrics.state_write_ms = state_write.as_millis() as u64;
 
         Ok(VerifyStep::Verified(VerifiedBatch {
             batch_id,
