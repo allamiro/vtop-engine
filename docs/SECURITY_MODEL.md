@@ -51,6 +51,7 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are used as normat
 |----------|---------|
 | Source ↔ engine | Transport security (TLS/SASL/mTLS); engine owns commit, source never self-commits. |
 | Engine ↔ object storage | TLS; integrity verification of stored object + manifest; least-privilege credentials. |
+| Engine ↔ state store | The database is trusted for ledger correctness, progress durability, and availability, but not for telemetry-object integrity. Remote PostgreSQL requires hostname-verified TLS; its URL is resolved from an env/file secret reference and never serialized. |
 | Engine ↔ external CLI backends | Version-pinned tools executing outside the Rust dependency graph; stored objects are downloaded and hashed. |
 | Engine ↔ operator/logs | Secret redaction; manifests carry no secrets. |
 | Build ↔ runtime | Supply-chain auditing; container hardening. |
@@ -68,6 +69,12 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are used as normat
 
 - Connections to S3-compatible object storage endpoints **SHOULD** use TLS (HTTPS).
 - Custom CA bundles **MAY** be supplied for private/self-hosted endpoints.
+
+### TLS for PostgreSQL state stores
+
+- PostgreSQL over a Unix socket or loopback address **MAY** use plaintext for local development and CI.
+- Every non-loopback PostgreSQL connection **MUST** use `sslmode=verify-full`, which verifies both the issuing CA and the database hostname.
+- A private database CA **MUST** be supplied with `sslrootcert` when it is not in the bundled public trust roots. `sslmode=require` and `verify-ca` are rejected for remote databases because they do not provide the required hostname verification.
 
 ### Authentication mechanisms
 
@@ -87,6 +94,8 @@ Additional guidance:
 - Configuration files containing secrets **SHOULD** have restrictive filesystem permissions.
 - Credentials **SHOULD NOT** be passed as plaintext command-line arguments where avoidable, since arguments may be visible to other processes.
 - The engine **SHOULD** support loading credentials from external secret managers without persisting them to disk.
+- Inline SQLite paths remain valid. PostgreSQL URLs **MUST** be referenced as `engine.state_store: { env: VTOP_STATE_STORE }` or `engine.state_store: { file: /run/secrets/vtop-state-store }`; inline PostgreSQL URLs are rejected before startup.
+- Secret files may contain one PostgreSQL URL with a trailing newline. The resolved URL is held only in an opaque runtime value and is not retained in serializable configuration.
 
 ## 4. Manifest Confidentiality
 
@@ -153,6 +162,7 @@ Per-format buckets (e.g. `telemetry-{format}`) with optional on-demand creation 
 
 - Any log path, error type, or diagnostic that could surface credentials **MUST** redact them.
 - Connection strings, headers, and configuration dumps **MUST** have secret fields masked before logging.
+- PostgreSQL parse/connect errors **MUST NOT** echo the supplied URL. VTOP connects from parsed options and applies URL redaction at the state-store error boundary as defense in depth.
 - The redaction layer **SHOULD** default to redacting unknown sensitive-looking fields rather than printing them.
 
 ## 11. Container and Runtime Hardening
@@ -198,6 +208,7 @@ the ignore list and the build re-audited.
 | Chain of custody (object ↔ source markers) | Yes | Manifest binds object hash to covered markers. |
 | Replay safety / no premature commit | Yes | Enforced in state machine, state store, and pipeline. |
 | Transport confidentiality | Configurable | Via TLS/SASL/mTLS; not implemented in core. |
+| PostgreSQL transport authentication | Yes for remote hosts | Non-loopback connections require `sslmode=verify-full`; loopback/socket plaintext is limited to local operation. |
 | Backend-limited verification disclosure | Yes | Size-only mode is labeled and rejected by default. |
 | Data-at-rest encryption | Not by VTOP | Delegated to storage layer (SSE/bucket default). |
 | Object immutability (WORM) | Not yet | Designed; relies on backend object lock (future). |
@@ -213,6 +224,8 @@ the ignore list and the build re-audited.
 | Credentials printed in logs | **MUST NOT** |
 | Credentials via env vars / mounted secrets / external secret managers | **SHOULD** |
 | TLS for Kafka and S3-compatible endpoints | **SHOULD** |
+| Hostname-verified TLS for remote PostgreSQL | **MUST** |
+| PostgreSQL URL supplied through an env/file reference | **MUST** |
 | Least-privilege object storage permissions | **SHOULD** |
 | `CreateBucket` scoped/avoided in runtime identity (per-format auto-create) | **SHOULD** |
 | Verify object + manifest before commit | **MUST** |

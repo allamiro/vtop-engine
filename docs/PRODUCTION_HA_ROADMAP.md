@@ -220,16 +220,17 @@ manifest SHA-256/BLAKE3 remains the source of truth.
 
 ## 7. The `StateStore` abstraction
 
-### 7.1 Backend selection = a config string
-The engine reads `engine.state_store`; a factory dispatches on the URL scheme. Same
-binary; switching backends is a one-line config change.
+### 7.1 Backend selection = a config or secret reference
+The engine reads `engine.state_store`; a factory dispatches on the resolved URL
+scheme. SQLite paths may be inline. PostgreSQL URLs must come from an env/file
+secret reference so credentials never enter serializable config.
 
 | Deployment | `engine.state_store` |
 |---|---|
 | Dev / single appliance | `sqlite:///data/state/vtop-state.db` |
-| Production (Postgres) | `postgres://vtop@pg-host:5432/vtop` |
-| Production (Yugabyte) | `postgres://vtop@yb-host:5433/vtop` |
-| Production (Cockroach) | `postgres://vtop@crdb-host:26257/vtop` |
+| Production (Postgres) | `{ env: VTOP_STATE_STORE }` → `postgres://…?sslmode=verify-full` |
+| Production (Yugabyte) | `{ file: /run/secrets/vtop-state-store }` → `postgres://…?sslmode=verify-full` |
+| Production (Cockroach) | `{ env: VTOP_STATE_STORE }` → `postgres://…?sslmode=verify-full` |
 
 ### 7.2 The trait (single source of truth for the invariant)
 Abstracts: `save_batch_state`, `update_batch_state`, `mark_verified`,
@@ -637,7 +638,7 @@ zero-behavior-change groundwork.
   constraints); connection-pool settings; **retry-on-`40001`**; config/env support;
   run the shared battery against Postgres (testcontainers / CI service).
 - **Dependencies:** Phases 1–2.
-- **Config changes:** `engine.state_store: postgres://…`; new env (§20.3).
+- **Config changes:** `engine.state_store: { env: VTOP_STATE_STORE }` or a mounted-file reference; remote URLs require `sslmode=verify-full`.
 - **Test plan:** shared battery on Postgres; conflict-retry test; constraint-
   violation tests (invariant enforced by DB).
 - **Exit criteria:** SQLite and Postgres behave identically; `postgres://` works by
@@ -785,16 +786,15 @@ create_bucket,local_path,require_strong_verification}`; `partitioning.template`.
 `AWS_REGION`; `VTOP_S3_ENDPOINT_URL`; `VTOP_S3_FORCE_PATH_STYLE`;
 `VTOP_S3_VERIFY_TLS`; Kafka SASL password via the env var **named** in
 `sasl_password_env`; the manifest MAC key via the env var named in
-`manifest_mac_key_env`.
+`manifest_mac_key_env`; PostgreSQL URL via the env var or mounted file named by
+`engine.state_store`.
 
 ### 20.3 Proposed environment variables (HA phases) **[PROPOSED]**
 | Variable | Phase | Purpose |
 |---|---|---|
-| `VTOP_STATE_STORE` | 1 | override `engine.state_store` from a secret/env |
 | `VTOP_PG_MAX_CONNECTIONS` | 3 | Postgres pool size per replica |
 | `VTOP_PG_STATEMENT_TIMEOUT_MS` | 3 | guard stuck statements |
 | `VTOP_STATE_RETRY_MAX` | 3 | max retries on SQLSTATE `40001` |
-| `PGPASSWORD` / conn-string secret | 3 | DB password via secret manager |
 | `VTOP_KAFKA_GROUP_MODE` | 4 | `assign` (single-node) \| `subscribe` (fleet) |
 | `VTOP_METRICS_ADDR` | 5 | Prometheus endpoint (e.g. `0.0.0.0:9090`) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | 5 | OpenTelemetry collector |

@@ -6,6 +6,12 @@
 engine:
   name: vtop-engine
   tenant: default
+  # SQLite paths may be inline. For PostgreSQL, replace this line with one of:
+  #   state_store: { env: VTOP_STATE_STORE }
+  #   state_store: { file: /run/secrets/vtop-state-store }
+  # The resolved remote URL must include sslmode=verify-full (and sslrootcert
+  # for a private CA that is not in the bundled public trust roots). Inline
+  # PostgreSQL URLs are rejected so credentials never enter serializable config.
   state_store: "sqlite:///data/state/vtop-state.db"
   work_dir: /data/work
   log_level: INFO

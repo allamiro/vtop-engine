@@ -21,7 +21,7 @@ use vtop_adapters::base::{DiscoveredSource, ReadResult, SourceAdapter};
 use vtop_adapters::{FileSource, KafkaSource, SyslogSpoolSource};
 use vtop_core::batch::{AdaptiveBatcher, BatchLimits, SealReason, TelemetryBatch};
 use vtop_core::compression::compress_batch;
-use vtop_core::config::{StreamConfig, StreamsConfig, VtopConfig};
+use vtop_core::config::{ResolvedStateStore, StreamConfig, StreamsConfig, VtopConfig};
 use vtop_core::errors::VtopError;
 use vtop_core::manifest::{ManifestBuilder, ManifestMacKey, VtopManifest, MAX_MANIFEST_BYTES};
 use vtop_core::metrics::BatchMetrics;
@@ -904,10 +904,13 @@ fn acquire_lock_file(path: &std::path::Path) -> Result<InstanceLock, VtopError> 
 }
 
 /// Acquire every exclusion lock a MUTATING engine must hold (#66).
-fn acquire_instance_locks(config: &VtopConfig) -> Result<Vec<InstanceLock>, VtopError> {
+fn acquire_instance_locks(
+    config: &VtopConfig,
+    state_store: &ResolvedStateStore,
+) -> Result<Vec<InstanceLock>, VtopError> {
     let mut locks = Vec::new();
     // The state store is the resource whose double-use corrupts progress.
-    if let Some(store_lock) = state_store_lock_path(&config.engine.state_store) {
+    if let Some(store_lock) = state_store_lock_path(state_store.expose_secret()) {
         locks.push(acquire_lock_file(&store_lock)?);
     }
     // The work dir holds in-flight objects/manifests; sharing it is also a
@@ -928,15 +931,17 @@ impl Engine {
         config: VtopConfig,
         streams: StreamsConfig,
     ) -> Result<Self, VtopError> {
-        let locks = acquire_instance_locks(&config)?;
-        if config.engine.state_store.starts_with("postgres") {
+        config.validate()?;
+        let state_store = config.engine.state_store.resolve()?;
+        let locks = acquire_instance_locks(&config, &state_store)?;
+        if state_store.is_postgres() {
             tracing::warn!(
                 "state store is Postgres: the engine is SINGLE-INSTANCE per state \
                  store, and host-local locks cannot see engines on OTHER hosts. \
                  Do not run replicas against this database (see #66/#93)"
             );
         }
-        let mut engine = Self::new(config, streams).await?;
+        let mut engine = Self::new_with_state_store(config, streams, state_store).await?;
         engine._instance_locks = locks;
         Ok(engine)
     }
@@ -950,8 +955,17 @@ impl Engine {
     /// Anything that mutates goes through [`Engine::new_exclusive`].
     pub async fn new(config: VtopConfig, streams: StreamsConfig) -> Result<Self, VtopError> {
         config.validate()?;
+        let state_store = config.engine.state_store.resolve()?;
+        Self::new_with_state_store(config, streams, state_store).await
+    }
+
+    async fn new_with_state_store(
+        config: VtopConfig,
+        streams: StreamsConfig,
+        state_store: ResolvedStateStore,
+    ) -> Result<Self, VtopError> {
         let manifest_mac_key = config.resolve_manifest_mac_key()?;
-        let store = connect_state_store(&config.engine.state_store).await?;
+        let store = connect_state_store(state_store.expose_secret()).await?;
         let backend = vtop_upload::build_backend(&config.upload).await?;
 
         let mut adapters: HashMap<SourceType, Box<dyn SourceAdapter>> = HashMap::new();

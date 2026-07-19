@@ -6,7 +6,9 @@
 use crate::errors::VtopError;
 use crate::manifest::ManifestMacKey;
 use crate::types::{ChecksumAlgorithm, CompressionType, SourceType, TelemetryFormat};
-use serde::{Deserialize, Serialize};
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Serialize, Serializer};
+use std::fmt;
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,10 +52,170 @@ pub struct EngineConfig {
     pub name: String,
     #[serde(default = "default_tenant")]
     pub tenant: String,
-    pub state_store: String,
+    /// SQLite may be configured inline. PostgreSQL connection URLs may contain
+    /// credentials and therefore must be resolved from an environment variable
+    /// or mounted secret file instead of living in serializable config.
+    pub state_store: StateStoreConfig,
     pub work_dir: String,
     #[serde(default = "default_log_level")]
     pub log_level: String,
+}
+
+/// Serializable reference to the engine's state-store connection.
+///
+/// Supported YAML forms:
+///
+/// ```yaml
+/// state_store: "sqlite:///data/state/vtop-state.db"
+/// state_store: { env: VTOP_STATE_STORE }
+/// state_store: { file: /run/secrets/vtop-state-store }
+/// ```
+///
+/// An inline PostgreSQL URL is rejected by [`VtopConfig::validate`]. Custom
+/// `Debug` and `Serialize` implementations additionally redact one if an
+/// unvalidated value is constructed programmatically.
+#[derive(Clone, Deserialize)]
+#[serde(untagged)]
+pub enum StateStoreConfig {
+    Inline(String),
+    Env(StateStoreEnvRef),
+    File(StateStoreFileRef),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateStoreEnvRef {
+    pub env: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateStoreFileRef {
+    pub file: String,
+}
+
+/// A resolved state-store connection string. It is deliberately neither
+/// serializable nor printable: callers must opt in to borrowing the secret for
+/// the narrow connection/lock operations that need it.
+#[derive(Clone)]
+pub struct ResolvedStateStore(String);
+
+impl ResolvedStateStore {
+    pub fn expose_secret(&self) -> &str {
+        &self.0
+    }
+
+    pub fn is_postgres(&self) -> bool {
+        is_postgres_url(&self.0)
+    }
+}
+
+impl fmt::Debug for ResolvedStateStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ResolvedStateStore([REDACTED])")
+    }
+}
+
+impl StateStoreConfig {
+    pub fn resolve(&self) -> Result<ResolvedStateStore, VtopError> {
+        let value = match self {
+            Self::Inline(value) => value.clone(),
+            Self::Env(reference) => std::env::var(reference.env.trim()).map_err(|_| {
+                VtopError::Config(format!(
+                    "state-store environment variable {} is missing or not valid Unicode",
+                    reference.env.trim()
+                ))
+            })?,
+            Self::File(reference) => {
+                std::fs::read_to_string(reference.file.trim()).map_err(|e| {
+                    VtopError::Config(format!(
+                        "reading state-store secret file {}: {e}",
+                        reference.file.trim()
+                    ))
+                })?
+            }
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(VtopError::Config(
+                "resolved state-store connection must not be empty".into(),
+            ));
+        }
+        Ok(ResolvedStateStore(value.to_owned()))
+    }
+
+    fn validate(&self) -> Result<(), VtopError> {
+        match self {
+            Self::Inline(value) if value.trim().is_empty() => Err(VtopError::Config(
+                "engine.state_store must not be empty".into(),
+            )),
+            Self::Inline(value) if is_postgres_url(value) => Err(VtopError::Config(
+                "PostgreSQL engine.state_store URLs must be loaded from a secret reference: use state_store: { env: VTOP_STATE_STORE } or state_store: { file: /run/secrets/vtop-state-store }"
+                    .into(),
+            )),
+            Self::Env(reference) if reference.env.trim().is_empty() => Err(VtopError::Config(
+                "engine.state_store.env must name a non-empty environment variable".into(),
+            )),
+            Self::File(reference) if reference.file.trim().is_empty() => Err(VtopError::Config(
+                "engine.state_store.file must name a non-empty secret file path".into(),
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
+impl From<String> for StateStoreConfig {
+    fn from(value: String) -> Self {
+        Self::Inline(value)
+    }
+}
+
+impl From<&str> for StateStoreConfig {
+    fn from(value: &str) -> Self {
+        Self::Inline(value.to_owned())
+    }
+}
+
+impl fmt::Debug for StateStoreConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Inline(value) if is_postgres_url(value) => {
+                f.write_str("Inline(\"postgres://[REDACTED]\")")
+            }
+            Self::Inline(value) => f.debug_tuple("Inline").field(value).finish(),
+            Self::Env(reference) => f.debug_tuple("Env").field(reference).finish(),
+            Self::File(reference) => f.debug_tuple("File").field(reference).finish(),
+        }
+    }
+}
+
+impl Serialize for StateStoreConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Inline(value) if is_postgres_url(value) => {
+                serializer.serialize_str("postgres://[REDACTED]")
+            }
+            Self::Inline(value) => serializer.serialize_str(value),
+            Self::Env(reference) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("env", &reference.env)?;
+                map.end()
+            }
+            Self::File(reference) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("file", &reference.file)?;
+                map.end()
+            }
+        }
+    }
+}
+
+fn is_postgres_url(value: &str) -> bool {
+    let lower = value.trim().to_ascii_lowercase();
+    lower.starts_with("postgres://") || lower.starts_with("postgresql://")
 }
 
 fn default_tenant() -> String {
@@ -285,6 +447,7 @@ impl VtopConfig {
 
     /// Enforce invariants that cannot be expressed by the type system.
     pub fn validate(&self) -> Result<(), VtopError> {
+        self.engine.state_store.validate()?;
         if self
             .manifest_mac_key_env
             .as_deref()
@@ -487,6 +650,59 @@ upload:
         let err = cfg.resolve_manifest_mac_key().unwrap_err().to_string();
         assert!(err.contains(&name));
         assert!(err.contains("missing"));
+    }
+
+    #[test]
+    fn postgres_state_store_requires_a_secret_reference() {
+        let secret = "database-password-that-must-not-leak";
+        let state_store = StateStoreConfig::Inline(format!(
+            "postgres://vtop:{secret}@db.example/vtop?sslmode=verify-full"
+        ));
+        let err = state_store.validate().unwrap_err().to_string();
+        assert!(err.contains("secret reference"));
+        assert!(!err.contains(secret));
+
+        let serialized = serde_yaml::to_string(&state_store).unwrap();
+        let debug = format!("{state_store:?}");
+        assert!(!serialized.contains(secret));
+        assert!(!debug.contains(secret));
+        assert!(serialized.contains("REDACTED"));
+        assert!(debug.contains("REDACTED"));
+    }
+
+    #[test]
+    fn state_store_secret_references_round_trip_without_secret_material() {
+        let env: StateStoreConfig = serde_yaml::from_str("env: VTOP_STATE_STORE\n").unwrap();
+        let file: StateStoreConfig =
+            serde_yaml::from_str("file: /run/secrets/vtop-state-store\n").unwrap();
+
+        let env_yaml = serde_yaml::to_string(&env).unwrap();
+        let file_yaml = serde_yaml::to_string(&file).unwrap();
+        assert!(env_yaml.contains("VTOP_STATE_STORE"));
+        assert!(file_yaml.contains("/run/secrets/vtop-state-store"));
+        env.validate().unwrap();
+        file.validate().unwrap();
+    }
+
+    #[test]
+    fn state_store_secret_file_is_trimmed_and_resolved_once() {
+        use std::io::Write;
+
+        let mut secret = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            secret,
+            "postgres://vtop:password@localhost/vtop?sslmode=disable"
+        )
+        .unwrap();
+        let reference = StateStoreConfig::File(StateStoreFileRef {
+            file: secret.path().to_string_lossy().into_owned(),
+        });
+        let resolved = reference.resolve().unwrap();
+        assert_eq!(
+            resolved.expose_secret(),
+            "postgres://vtop:password@localhost/vtop?sslmode=disable"
+        );
+        assert!(!format!("{resolved:?}").contains("password"));
     }
 
     #[test]

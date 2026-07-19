@@ -305,7 +305,7 @@ crates/
   vtop-upload/     upload backends:
                    native S3, s3cmd, awscli, MinIO, mock
 
-  vtop-state/      durable SQLite state store
+  vtop-state/      durable SQLite / feature-gated PostgreSQL state store
 
   vtop-cli/        vtopctl CLI and engine runtime
 
