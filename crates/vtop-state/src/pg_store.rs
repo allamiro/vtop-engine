@@ -324,6 +324,33 @@ impl StateStore for PgStateStore {
             .await
     }
 
+    async fn max_committed_end_bytes(
+        &self,
+        source_type: SourceType,
+    ) -> Result<Vec<(String, u64)>, VtopError> {
+        // Aggregated in SQL — see the SQLite impl and #77. The column is TEXT,
+        // so cast to jsonb; markers are internally tagged (fields at top level).
+        let rows = sqlx::query(
+            "SELECT progress_end_json::jsonb ->> 'path' AS path, \
+                    MAX((progress_end_json::jsonb ->> 'end_byte')::bigint) AS end_byte \
+             FROM batches WHERE state = $1 AND source_type = $2 \
+             GROUP BY progress_end_json::jsonb ->> 'path'",
+        )
+        .bind(BatchState::SourceCommitted.as_str())
+        .bind(source_type.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                let path: Option<String> = r.get("path");
+                let end: Option<i64> = r.get("end_byte");
+                Some((path?, end?.max(0) as u64))
+            })
+            .collect())
+    }
+
     async fn list_incomplete_batches(&self) -> Result<Vec<BatchRecord>, VtopError> {
         self.query_records(
             "SELECT * FROM batches WHERE state != $1 ORDER BY created_at ASC",

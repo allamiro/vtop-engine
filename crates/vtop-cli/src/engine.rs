@@ -1259,27 +1259,16 @@ impl Engine {
     }
 
     async fn seed_committed_offsets(&mut self) -> Result<(), VtopError> {
-        let all = self.store.list_batches().await?;
-        // path -> highest committed end_byte
-        let mut file_max: HashMap<String, u64> = HashMap::new();
-        let mut spool_max: HashMap<String, u64> = HashMap::new();
-        for rec in all
-            .into_iter()
-            .filter(|r| r.state == BatchState::SourceCommitted)
-        {
-            match &rec.progress_end {
-                ProgressMarker::File { path, end_byte, .. } => {
-                    let e = file_max.entry(path.clone()).or_default();
-                    *e = (*e).max(*end_byte);
-                }
-                ProgressMarker::SyslogSpool { path, end_byte, .. } => {
-                    let e = spool_max.entry(path.clone()).or_default();
-                    *e = (*e).max(*end_byte);
-                }
-                ProgressMarker::Kafka { .. } => { /* Kafka resumes from broker-side committed offset */
-                }
-            }
-        }
+        // The per-path MAX(end_byte) is computed IN THE STORE. This runs at
+        // every startup and the ledger grows without bound, so materialising
+        // every row here made recovery memory scale with history (#77).
+        // (Kafka needs no seeding: it resumes from the broker-side committed
+        // offset.)
+        let file_max = self.store.max_committed_end_bytes(SourceType::File).await?;
+        let spool_max = self
+            .store
+            .max_committed_end_bytes(SourceType::SyslogSpool)
+            .await?;
         if let Some(a) = self.adapters.get_mut(&SourceType::File) {
             if let Some(fs) = a.as_any_mut().downcast_mut::<FileSource>() {
                 for (p, b) in file_max {
