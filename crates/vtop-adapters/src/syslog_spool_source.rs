@@ -70,9 +70,16 @@ impl SyslogSpoolSource {
         max_records: usize,
         max_bytes: usize,
     ) -> Result<(Vec<Vec<u8>>, u64, Option<u64>), VtopError> {
-        let file = tokio::fs::File::open(&path).await?;
-        let mut reader = BufReader::new(file);
-        reader.seek(std::io::SeekFrom::Start(start)).await?;
+        let mut file = tokio::fs::File::open(&path).await?;
+        file.seek(std::io::SeekFrom::Start(start)).await?;
+        // Put the whole-call byte limiter BELOW BufReader. If Take wrapped the
+        // BufReader instead, its default 8 KiB fill could read far beyond a
+        // small max_bytes before the outer limit observed the line.
+        let read_limit = u64::try_from(max_bytes)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let buffer_capacity = max_bytes.saturating_add(1).clamp(1, 8 * 1024);
+        let mut reader = BufReader::with_capacity(buffer_capacity, file.take(read_limit));
 
         let mut records = Vec::new();
         let mut bytes_read: u64 = 0;
@@ -110,7 +117,7 @@ impl SyslogSpoolSource {
         // Fingerprint the descriptor whose bytes were actually consumed. A
         // path lookup here could instead describe a replacement installed by
         // a concurrent spool rotation (#127).
-        let inode = inode_of(&reader.get_ref().metadata().await?);
+        let inode = inode_of(&reader.get_ref().get_ref().metadata().await?);
         Ok((records, pos, inode))
     }
 }

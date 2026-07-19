@@ -161,9 +161,16 @@ impl FileSource {
             return Ok((records, end, true, identity));
         }
 
-        let file = tokio::fs::File::open(&path).await?;
-        let mut reader = BufReader::new(file);
-        reader.seek(std::io::SeekFrom::Start(start)).await?;
+        let mut file = tokio::fs::File::open(&path).await?;
+        file.seek(std::io::SeekFrom::Start(start)).await?;
+        // Bound the descriptor itself for the whole call. An outer Take over
+        // BufReader would still allow its default 8 KiB fill to read beyond a
+        // small max_bytes budget.
+        let read_limit = u64::try_from(max_bytes)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let buffer_capacity = max_bytes.saturating_add(1).clamp(1, 8 * 1024);
+        let mut reader = BufReader::with_capacity(buffer_capacity, file.take(read_limit));
 
         let mut records = Vec::new();
         let mut bytes_read: u64 = 0;
@@ -212,7 +219,7 @@ impl FileSource {
         }
         // fstat on the descriptor we READ from — the same file even if the
         // path was rotated away mid-read (#65).
-        let identity = Self::identity_of(&reader.get_ref().metadata().await?);
+        let identity = Self::identity_of(&reader.get_ref().get_ref().metadata().await?);
         Ok((records, pos, false, identity))
     }
 }

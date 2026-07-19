@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "crates/vtop-core",
+  "crates/vtop-log",
   "crates/vtop-adapters",
   "crates/vtop-upload",
   "crates/vtop-state",
@@ -58,6 +59,7 @@ insta = { version = "1", features = ["json"] }
 bytes = "1"
 futures = "0.3"
 regex = "1"
+rustix = { version = "1", features = ["fs"] }
 
 # Internal crates
 # Internal crates carry an explicit `version` alongside `path`: cargo uses the
@@ -65,7 +67,8 @@ regex = "1"
 # it these are wildcard dependencies, which crates.io rejects outright - so the
 # workspace could not actually be published as declared.
 vtop-core = { path = "crates/vtop-core", version = "0.1.0" }
-vtop-adapters = { path = "crates/vtop-adapters", version = "0.1.0" }
+vtop-log = { path = "crates/vtop-log", version = "0.1.0" }
+vtop-adapters = { path = "crates/vtop-adapters", version = "0.1.0", default-features = false }
 vtop-upload = { path = "crates/vtop-upload", version = "0.1.0" }
 vtop-state = { path = "crates/vtop-state", version = "0.1.0" }
 

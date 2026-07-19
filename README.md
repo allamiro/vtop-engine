@@ -31,6 +31,11 @@ It ingests telemetry from:
 - append-only log files
 - syslog spool files
 
+The longer-term cluster direction is a VTOP-owned native Rust broker and
+control plane. Kafka remains supported as an optional edge/source adapter, not
+as VTOP's coordinator or correctness dependency. See
+[the native broker architecture](docs/NATIVE_BROKER_ARCHITECTURE.md).
+
 For every batch, VTOP:
 
 1. reads records from a source
@@ -299,6 +304,10 @@ crates/
                    checksums, compression, partitioning,
                    config, replay
 
+  vtop-log/        Kafka-independent native broker storage:
+                   framed records, active/sealed segments,
+                   crash recovery, sparse indexes, manifests
+
   vtop-adapters/   source adapters:
                    Kafka, file, syslog spool
 
@@ -353,6 +362,14 @@ cargo build --release
 ```
 
 CI runs formatting, linting, tests, and release build on push and pull request.
+
+Kafka is enabled by default for compatibility with existing deployments, but
+it is a feature-gated adapter. A native/file/syslog-only CLI build does not
+compile or link `rdkafka`:
+
+```bash
+cargo build -p vtop-cli --no-default-features
+```
 
 Workflow file:
 
@@ -613,6 +630,14 @@ VTOP supports multiple upload backends.
 > Strong verification is the default. A sidecar, ETag, or uploader-written user
 > metadata is never accepted as proof of stored content.
 
+The `awscli`, `s3cmd`, and `minio` compatibility backends are an explicit
+opt-in. They require `upload.command_binary` to be an absolute path, verify the
+tool's `--version` identity at startup, clear the child environment, and apply
+wall-clock and captured-output limits. Add only the exact runtime variable
+names the selected tool needs to `upload.command_env_allowlist`; values are
+resolved at startup and are never serialized. Native `s3_native` does not
+spawn an external process and does not use these settings.
+
 ---
 
 ## Replay and recovery
@@ -688,13 +713,15 @@ Completed:
       `/readyz`) behind `VTOP_METRICS_ADDR`; see [observability/](observability/)
       for the optional Grafana LGTM stack and dashboards
 - [x] **end-to-end smoke + live-broker Kafka CI** over the full compose lab
+- [x] Kafka is isolated behind the optional `kafka` Cargo feature
+- [x] first Kafka-independent native segment-log storage kernel
 
 Planned implementation areas:
 
-- [ ] Kafka feature gate for lighter builds
 - [x] bounded file/syslog/whole-file reads, pre-clone Kafka record checks, and
       streaming local compression; `max_bytes` is enforced before source
       progress advances (native object upload remains single-part)
+- [ ] native three-node metadata/control-plane prototype
 - [ ] multipart upload support
 - [x] optional keyed-BLAKE3 manifest authentication via a named secret env var
 - [ ] manifest MAC key rotation / optional public-key signatures

@@ -6,9 +6,13 @@ rust-version.workspace = true
 license.workspace = true
 description = "Source adapters (Kafka, file, syslog spool) for the VTOP Engine."
 
+[features]
+default = []
+kafka = ["dep:rdkafka"]
+
 [dependencies]
 vtop-core = { workspace = true }
-rdkafka = { workspace = true }
+rdkafka = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }

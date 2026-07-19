@@ -7,6 +7,7 @@ use crate::base::{
     parse_s3_uri, read_command_bounded, verify_command_content, ObjectChecksum, ObjectHead,
     UploadBackend, VerificationResult,
 };
+use crate::command::CommandPolicy;
 use async_trait::async_trait;
 use std::path::Path;
 use tokio::process::Command;
@@ -15,20 +16,26 @@ use vtop_core::errors::VtopError;
 const SHA256_META_KEY: &str = "vtop-sha256";
 
 pub struct AwsCliBackend {
+    command: CommandPolicy,
     pub endpoint_url: Option<String>,
     pub profile: Option<String>,
 }
 
 impl AwsCliBackend {
-    pub fn new(endpoint_url: Option<String>, profile: Option<String>) -> Self {
+    pub(crate) fn new(
+        command: CommandPolicy,
+        endpoint_url: Option<String>,
+        profile: Option<String>,
+    ) -> Self {
         Self {
+            command,
             endpoint_url,
-            profile: profile.or_else(|| std::env::var("AWS_PROFILE").ok()),
+            profile,
         }
     }
 
     fn base_cmd(&self) -> Command {
-        let mut c = Command::new("aws");
+        let mut c = self.command.command();
         if let Some(ep) = &self.endpoint_url {
             c.arg("--endpoint-url").arg(ep);
         }
@@ -53,7 +60,7 @@ impl UploadBackend for AwsCliBackend {
             cmd.arg("--metadata")
                 .arg(format!("{SHA256_META_KEY}={}", c.hex));
         }
-        run(&mut cmd).await
+        self.command.run(&mut cmd, "object upload").await
     }
 
     async fn put_manifest(
@@ -68,19 +75,15 @@ impl UploadBackend for AwsCliBackend {
             cmd.arg("--metadata")
                 .arg(format!("{SHA256_META_KEY}={}", c.hex));
         }
-        run(&mut cmd).await
+        self.command.run(&mut cmd, "manifest upload").await
     }
 
     async fn get_object(&self, object_uri: &str) -> Result<Vec<u8>, VtopError> {
         let tmp = tempfile::NamedTempFile::new()
             .map_err(|e| VtopError::Upload(format!("temp file for download: {e}")))?;
-        run(self
-            .base_cmd()
-            .arg("s3")
-            .arg("cp")
-            .arg(object_uri)
-            .arg(tmp.path()))
-        .await?;
+        let mut command = self.base_cmd();
+        command.arg("s3").arg("cp").arg(object_uri).arg(tmp.path());
+        self.command.run(&mut command, "object download").await?;
         tokio::fs::read(tmp.path())
             .await
             .map_err(|e| VtopError::Upload(format!("reading downloaded {object_uri}: {e}")))
@@ -93,21 +96,27 @@ impl UploadBackend for AwsCliBackend {
     ) -> Result<Vec<u8>, VtopError> {
         let mut cmd = self.base_cmd();
         cmd.arg("s3").arg("cp").arg(object_uri).arg("-");
-        read_command_bounded(&mut cmd, max_bytes, object_uri, "aws cli").await
+        read_command_bounded(
+            &mut cmd,
+            max_bytes,
+            object_uri,
+            "aws cli",
+            self.command.timeout(),
+        )
+        .await
     }
 
     async fn head_object(&self, object_uri: &str) -> Result<ObjectHead, VtopError> {
         let (bucket, key) = parse_s3_uri(object_uri)?;
-        let out = output(
-            self.base_cmd()
-                .arg("s3api")
-                .arg("head-object")
-                .arg("--bucket")
-                .arg(&bucket)
-                .arg("--key")
-                .arg(&key),
-        )
-        .await?;
+        let mut command = self.base_cmd();
+        command
+            .arg("s3api")
+            .arg("head-object")
+            .arg("--bucket")
+            .arg(&bucket)
+            .arg("--key")
+            .arg(&key);
+        let out = self.command.output(&mut command, "object metadata").await?;
         let json: serde_json::Value = serde_json::from_str(&out).unwrap_or(serde_json::Value::Null);
         let size = json.get("ContentLength").and_then(|v| v.as_u64());
         Ok(ObjectHead {
@@ -143,11 +152,20 @@ impl UploadBackend for AwsCliBackend {
         };
         let mut cmd = self.base_cmd();
         cmd.arg("s3").arg("cp").arg(object_uri).arg("-");
-        verify_command_content(&mut cmd, expected_size, expected, "aws cli").await
+        verify_command_content(
+            &mut cmd,
+            expected_size,
+            expected,
+            "aws cli",
+            self.command.timeout(),
+        )
+        .await
     }
 
     async fn delete_object(&self, object_uri: &str) -> Result<(), VtopError> {
-        run(self.base_cmd().arg("s3").arg("rm").arg(object_uri)).await
+        let mut command = self.base_cmd();
+        command.arg("s3").arg("rm").arg(object_uri);
+        self.command.run(&mut command, "object delete").await
     }
 
     fn backend_name(&self) -> &'static str {
@@ -159,30 +177,4 @@ impl UploadBackend for AwsCliBackend {
     fn supports_multipart(&self) -> bool {
         true
     }
-}
-
-async fn run(cmd: &mut Command) -> Result<(), VtopError> {
-    let status = cmd
-        .status()
-        .await
-        .map_err(|e| VtopError::Upload(format!("spawning command failed: {e}")))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(VtopError::Upload(format!("command exited with {status}")))
-    }
-}
-
-async fn output(cmd: &mut Command) -> Result<String, VtopError> {
-    let out = cmd
-        .output()
-        .await
-        .map_err(|e| VtopError::Upload(format!("spawning command failed: {e}")))?;
-    if !out.status.success() {
-        return Err(VtopError::Upload(format!(
-            "command exited with {}",
-            out.status
-        )));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }

@@ -403,6 +403,20 @@ pub struct UploadConfig {
     /// Optional named profile / alias for command-based backends.
     #[serde(default)]
     pub profile: Option<String>,
+    /// Absolute executable path for compatibility backends (`awscli`,
+    /// `s3cmd`, `minio`). PATH lookup is deliberately forbidden.
+    #[serde(default)]
+    pub command_binary: Option<String>,
+    /// Wall-clock limit for each external command invocation.
+    #[serde(default = "default_command_timeout_seconds")]
+    pub command_timeout_seconds: u64,
+    /// Maximum captured stdout or stderr for command metadata/version calls.
+    #[serde(default = "default_command_max_output_bytes")]
+    pub command_max_output_bytes: usize,
+    /// Exact environment-variable names copied into an otherwise empty child
+    /// environment. Values remain runtime-only and are never serialized.
+    #[serde(default)]
+    pub command_env_allowlist: Vec<String>,
     /// Create the target bucket if it does not exist (native S3 backend only).
     /// Useful with a templated `bucket` like `telemetry-{format}` so per-format
     /// buckets are provisioned automatically. Defaults to false (least
@@ -426,6 +440,12 @@ fn default_backend() -> String {
 }
 fn default_region() -> String {
     "us-east-1".to_string()
+}
+fn default_command_timeout_seconds() -> u64 {
+    300
+}
+fn default_command_max_output_bytes() -> usize {
+    1024 * 1024
 }
 fn default_true() -> bool {
     true
@@ -485,6 +505,43 @@ impl VtopConfig {
         }
         if self.upload.bucket.trim().is_empty() {
             return Err(VtopError::Config("upload.bucket must not be empty".into()));
+        }
+        if matches!(self.upload.backend.as_str(), "awscli" | "s3cmd" | "minio") {
+            let binary = self
+                .upload
+                .command_binary
+                .as_deref()
+                .filter(|path| !path.trim().is_empty())
+                .ok_or_else(|| {
+                    VtopError::Config(format!(
+                        "upload.command_binary must be an explicit absolute path for the {} backend",
+                        self.upload.backend
+                    ))
+                })?;
+            if !Path::new(binary).is_absolute() {
+                return Err(VtopError::Config(
+                    "upload.command_binary must be an absolute path; PATH lookup is forbidden"
+                        .into(),
+                ));
+            }
+            if self.upload.command_timeout_seconds == 0 {
+                return Err(VtopError::Config(
+                    "upload.command_timeout_seconds must be > 0".into(),
+                ));
+            }
+            if self.upload.command_max_output_bytes == 0 {
+                return Err(VtopError::Config(
+                    "upload.command_max_output_bytes must be > 0".into(),
+                ));
+            }
+            for name in &self.upload.command_env_allowlist {
+                if name.trim().is_empty() || name.contains('=') {
+                    return Err(VtopError::Config(
+                        "upload.command_env_allowlist entries must be non-empty environment-variable names"
+                            .into(),
+                    ));
+                }
+            }
         }
 
         // Batching limits must be positive, or the engine would seal degenerate
@@ -663,6 +720,55 @@ upload:
             .unwrap_err()
             .to_string()
             .contains("work_max_bytes"));
+    }
+
+    #[test]
+    fn command_backends_require_an_absolute_binary_and_bounded_policy() {
+        let yaml = r#"
+engine:
+  name: vtop-engine
+  state_store: "sqlite::memory:"
+  work_dir: /tmp/work
+batching: {}
+compression: {}
+sources: {}
+upload:
+  bucket: telemetry-data
+  backend: awscli
+"#;
+        let missing: VtopConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(missing
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("command_binary"));
+
+        let relative = yaml.replace(
+            "  backend: awscli",
+            "  backend: awscli\n  command_binary: aws",
+        );
+        let relative: VtopConfig = serde_yaml::from_str(&relative).unwrap();
+        assert!(relative
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("absolute path"));
+
+        let absolute = yaml.replace(
+            "  backend: awscli",
+            "  backend: awscli\n  command_binary: /usr/bin/aws",
+        );
+        let mut absolute: VtopConfig = serde_yaml::from_str(&absolute).unwrap();
+        absolute.validate().unwrap();
+        assert_eq!(absolute.upload.command_timeout_seconds, 300);
+        assert_eq!(absolute.upload.command_max_output_bytes, 1024 * 1024);
+
+        absolute.upload.command_timeout_seconds = 0;
+        assert!(absolute
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("command_timeout_seconds"));
     }
 
     #[test]
