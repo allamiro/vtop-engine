@@ -74,6 +74,7 @@ fn verify_reopened(journal: &ProducerEpochJournal, acked: &[(Uuid, u64)], contex
 #[test]
 fn epoch_journal_crash_before_every_operation_preserves_exactly_the_acked_epochs() {
     let clean = SimStorage::new();
+    clean.create_dir_all(Path::new("/log"));
     let clean_acked = run_workload(&clean.env(SEED));
     assert_eq!(clean_acked.len(), accepts().len());
     let total = clean.op_count();
@@ -81,6 +82,7 @@ fn epoch_journal_crash_before_every_operation_preserves_exactly_the_acked_epochs
     for op in 0..total {
         let context = format!("crash-before op={op} seed={SEED:#x}");
         let sim = SimStorage::new();
+        sim.create_dir_all(Path::new("/log"));
         let env = sim.env(SEED);
         sim.set_fault(FaultPlan::CrashBefore(op));
         let acked = run_workload(&env);
@@ -111,6 +113,7 @@ fn epoch_journal_crash_before_every_operation_preserves_exactly_the_acked_epochs
 #[test]
 fn epoch_journal_torn_writes_yield_old_value_new_value_or_detected_corruption() {
     let clean = SimStorage::new();
+    clean.create_dir_all(Path::new("/log"));
     run_workload(&clean.env(SEED));
     let trace = clean.trace();
 
@@ -124,6 +127,7 @@ fn epoch_journal_torn_writes_yield_old_value_new_value_or_detected_corruption() 
                 entry.index, entry.len
             );
             let sim = SimStorage::new();
+            sim.create_dir_all(Path::new("/log"));
             let env = sim.env(SEED);
             sim.set_fault(FaultPlan::CrashDuringWrite {
                 op: entry.index,

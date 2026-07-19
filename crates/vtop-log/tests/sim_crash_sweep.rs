@@ -97,6 +97,7 @@ fn run_workload(env: &Env, steps: &[(LogRecord, Durability)], seal: bool) -> Run
 
 fn clean_run(steps: &[(LogRecord, Durability)], seal: bool) -> Vec<TraceEntry> {
     let sim = SimStorage::new();
+    sim.create_dir_all(Path::new("/log"));
     let run = run_workload(&sim.env(SEED), steps, seal);
     assert!(run.completed, "clean run must finish without faults");
     sim.trace()
@@ -152,6 +153,7 @@ fn sim_startup_catalog_classifies_every_crash_boundary_durable_state() {
     for op in 0..total as u64 {
         let context = format!("op={op} seed={SEED:#x}");
         let sim = SimStorage::new();
+        sim.create_dir_all(Path::new("/log"));
         let env = sim.env(SEED);
         sim.set_fault(FaultPlan::CrashBefore(op));
         let run = run_workload(&env, &steps, true);
@@ -304,6 +306,7 @@ fn sim_acknowledgment_oracle_holds_across_every_crash_point_and_byte_cut() {
     for op in 0..trace.len() as u64 {
         let context = format!("crash-before op={op} seed={SEED:#x}");
         let sim = SimStorage::new();
+        sim.create_dir_all(Path::new("/log"));
         let env = sim.env(SEED);
         sim.set_fault(FaultPlan::CrashBefore(op));
         let run = run_workload(&env, &steps, true);
@@ -323,6 +326,7 @@ fn sim_acknowledgment_oracle_holds_across_every_crash_point_and_byte_cut() {
                 entry.path.display()
             );
             let sim = SimStorage::new();
+            sim.create_dir_all(Path::new("/log"));
             let env = sim.env(SEED);
             sim.set_fault(FaultPlan::CrashDuringWrite {
                 op: entry.index,
@@ -348,6 +352,7 @@ fn sim_recovery_truncates_every_torn_record_write_and_preserves_idempotency() {
     ];
     let create_ops = {
         let sim = SimStorage::new();
+        sim.create_dir_all(Path::new("/log"));
         let env = sim.env(SEED);
         drop(ActiveSegment::create_in(&env, active_path(), descriptor(), config()).unwrap());
         sim.op_count()
@@ -367,6 +372,7 @@ fn sim_recovery_truncates_every_torn_record_write_and_preserves_idempotency() {
         for cut in 0..=entry.len as usize {
             let context = format!("op={} cut={cut} seed={SEED:#x}", entry.index);
             let sim = SimStorage::new();
+            sim.create_dir_all(Path::new("/log"));
             let env = sim.env(SEED);
             sim.set_fault(FaultPlan::CrashDuringWrite {
                 op: entry.index,
@@ -410,6 +416,7 @@ fn sim_single_byte_corruption_of_active_artifacts_is_always_detected() {
         (record(1, b"protected"), Durability::Fsync),
     ];
     let sim = SimStorage::new();
+    sim.create_dir_all(Path::new("/log"));
     let env = sim.env(SEED);
     let run = run_workload(&env, &steps, false);
     assert!(run.completed);
@@ -462,6 +469,7 @@ fn sim_single_byte_corruption_of_sealed_artifacts_is_never_silently_accepted() {
         (record(1, b"sealed-b"), Durability::Fsync),
     ];
     let sim = SimStorage::new();
+    sim.create_dir_all(Path::new("/log"));
     let env = sim.env(SEED);
     let run = run_workload(&env, &steps, true);
     assert!(run.completed);
@@ -536,6 +544,7 @@ fn sim_injected_storage_errors_surface_poison_and_stay_recoverable() {
         for op in 0..total as u64 {
             let context = format!("op={op} kind={kind:?} seed={SEED:#x}");
             let sim = SimStorage::new();
+            sim.create_dir_all(Path::new("/log"));
             let env = sim.env(SEED);
             sim.set_fault(FaultPlan::FailOp { op, kind });
 

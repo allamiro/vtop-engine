@@ -9,7 +9,7 @@
 //! log must recover from.
 
 use crate::env::{Clock, DirEntryInfo, Env, OpenMode, Rng, Storage, StorageFile};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -65,6 +65,7 @@ pub struct TraceEntry {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SimDiskState {
     pub files: BTreeMap<PathBuf, Vec<u8>>,
+    pub dirs: BTreeSet<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -96,6 +97,9 @@ struct SimState {
     inodes: Vec<Inode>,
     ns_visible: BTreeMap<PathBuf, usize>,
     ns_durable: BTreeMap<PathBuf, usize>,
+    /// Directories that exist. Modeled as pre-existing filesystem state (like
+    /// a test's tempdir), durable immediately and outside the crash model.
+    dirs: BTreeSet<PathBuf>,
     pending: Vec<PendingOp>,
     plan: FaultPlan,
     trace: Vec<TraceEntry>,
@@ -110,12 +114,24 @@ impl SimState {
             inodes: Vec::new(),
             ns_visible: BTreeMap::new(),
             ns_durable: BTreeMap::new(),
+            dirs: BTreeSet::new(),
             pending: Vec::new(),
             plan: FaultPlan::None,
             trace: Vec::new(),
             next_op: 0,
             epoch: 0,
             crashed: false,
+        }
+    }
+
+    fn require_dir(&self, path: &Path) -> io::Result<()> {
+        if self.dirs.contains(path) {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no such simulated directory",
+            ))
         }
     }
 
@@ -281,6 +297,17 @@ impl SimStorage {
         }
     }
 
+    /// Declare a directory (and its ancestors) as existing, mirroring a
+    /// tempdir created before the workload starts. Not a traced storage op.
+    pub fn create_dir_all(&self, path: &Path) {
+        let mut state = self.lock();
+        let mut current = Some(path);
+        while let Some(dir) = current {
+            state.dirs.insert(dir.to_path_buf());
+            current = dir.parent();
+        }
+    }
+
     pub fn set_fault(&self, plan: FaultPlan) {
         self.lock().plan = plan;
     }
@@ -314,6 +341,7 @@ impl SimStorage {
                 .iter()
                 .map(|(path, inode)| (path.clone(), state.inodes[*inode].durable.clone()))
                 .collect(),
+            dirs: state.dirs.clone(),
         }
     }
 
@@ -324,6 +352,7 @@ impl SimStorage {
         let epoch = state.epoch + 1;
         *state = SimState::new();
         state.epoch = epoch;
+        state.dirs = disk.dirs.clone();
         for (path, bytes) in &disk.files {
             let inode = state.inodes.len();
             state.inodes.push(Inode {
@@ -373,6 +402,7 @@ impl Storage for SimStorage {
             }
             (OpenMode::CreateAppend, Some(inode)) => inode,
             (OpenMode::CreateNew | OpenMode::CreateAppend, None) => {
+                state.require_dir(path.parent().unwrap_or_else(|| Path::new("/")))?;
                 let inode = state.inodes.len();
                 state.inodes.push(Inode::default());
                 state.ns_visible.insert(path.to_path_buf(), inode);
@@ -389,6 +419,7 @@ impl Storage for SimStorage {
             inode,
             position: 0,
             epoch: state.epoch,
+            writable: mode != OpenMode::Read,
         }))
     }
 
@@ -403,6 +434,7 @@ impl Storage for SimStorage {
         let mut state = self.lock();
         state.begin_op(TraceKind::Rename, from, 0)?;
         let inode = state.visible_inode(from)?;
+        state.require_dir(to.parent().unwrap_or_else(|| Path::new("/")))?;
         state.ns_visible.remove(from);
         state.ns_visible.insert(to.to_path_buf(), inode);
         state.pending.push(PendingOp::Namespace(NsOp::Rename {
@@ -426,12 +458,13 @@ impl Storage for SimStorage {
     fn exists(&self, path: &Path) -> io::Result<bool> {
         let mut state = self.lock();
         state.begin_op(TraceKind::Exists, path, 0)?;
-        Ok(state.ns_visible.contains_key(path))
+        Ok(state.ns_visible.contains_key(path) || state.dirs.contains(path))
     }
 
     fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntryInfo>> {
         let mut state = self.lock();
         state.begin_op(TraceKind::ReadDir, path, 0)?;
+        state.require_dir(path)?;
         Ok(state
             .ns_visible
             .keys()
@@ -446,6 +479,7 @@ impl Storage for SimStorage {
     fn sync_dir(&self, path: &Path) -> io::Result<()> {
         let mut state = self.lock();
         state.begin_op(TraceKind::SyncDir, path, 0)?;
+        state.require_dir(path)?;
         state.promote_dir(path);
         Ok(())
     }
@@ -457,6 +491,7 @@ struct SimFile {
     inode: usize,
     position: u64,
     epoch: u64,
+    writable: bool,
 }
 
 fn lock_handle(
@@ -488,6 +523,12 @@ impl Read for SimFile {
 
 impl Write for SimFile {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if !self.writable {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "simulated file handle is read-only",
+            ));
+        }
         let mut state = lock_handle(&self.state, self.epoch)?;
         if state.crashed {
             return Err(io::Error::other("simulated storage is down until reboot"));
@@ -561,6 +602,12 @@ impl StorageFile for SimFile {
     }
 
     fn set_len(&mut self, len: u64) -> io::Result<()> {
+        if !self.writable {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "simulated file handle is read-only",
+            ));
+        }
         let mut state = lock_handle(&self.state, self.epoch)?;
         state.begin_op(TraceKind::HandleSetLen, &self.path, 0)?;
         let op = DataOp::SetLen { len };
@@ -697,6 +744,47 @@ mod tests {
     }
 
     #[test]
+    fn read_only_handles_and_missing_directories_are_rejected_like_the_real_fs() {
+        let sim = SimStorage::new();
+        sim.create_dir_all(Path::new("/log"));
+        let storage = sim.env(1).storage;
+
+        // Creating a file under a directory that does not exist must fail.
+        let missing_parent = storage
+            .open(Path::new("/absent/file"), OpenMode::CreateAppend)
+            .err()
+            .expect("open under a missing directory must fail");
+        assert_eq!(missing_parent.kind(), io::ErrorKind::NotFound);
+        // Listing or syncing a missing directory must fail, not report empty.
+        assert_eq!(
+            storage.read_dir(Path::new("/absent")).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            storage.sync_dir(Path::new("/absent")).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+
+        // A read-only handle must reject mutation.
+        let mut writer = storage
+            .open(Path::new("/log/file"), OpenMode::CreateNew)
+            .unwrap();
+        writer.write_all(b"bytes").unwrap();
+        writer.sync_data().unwrap();
+        let mut reader = storage
+            .open(Path::new("/log/file"), OpenMode::Read)
+            .unwrap();
+        assert_eq!(
+            reader.write(b"x").unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            reader.set_len(0).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
     fn identical_workload_produces_byte_identical_durable_files_on_real_and_sim_storage() {
         let real_dir = tempfile::tempdir().unwrap();
         run_workload(&Env::real(), real_dir.path());
@@ -709,6 +797,7 @@ mod tests {
             .collect();
 
         let sim = SimStorage::new();
+        sim.create_dir_all(Path::new("/log"));
         run_workload(&sim.env(0x5eed), Path::new("/log"));
         let sim_files = by_file_name(sim.snapshot().files);
 
@@ -718,6 +807,7 @@ mod tests {
     #[test]
     fn unsynced_writes_and_renames_do_not_survive_a_plain_crash() {
         let sim = SimStorage::new();
+        sim.create_dir_all(Path::new("/log"));
         let env = sim.env(1);
         let root = Path::new("/log");
         let mut segment =
@@ -741,6 +831,7 @@ mod tests {
     #[test]
     fn snapshot_and_restore_round_trip_resets_ops_and_faults() {
         let sim = SimStorage::new();
+        sim.create_dir_all(Path::new("/log"));
         let env = sim.env(2);
         drop(ActiveSegment::create_in(&env, "/log/reset.active", descriptor(), config()).unwrap());
         let disk = sim.snapshot();
