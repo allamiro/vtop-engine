@@ -418,6 +418,12 @@ pub struct RecoveryReport {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Canonical metadata for the v1 sealed local segment.
+///
+/// `blake3_root` is the linear BLAKE3 digest of all encoded record frames in
+/// order. It detects whole-segment mutation but is not a chunk tree and does
+/// not support independent chunk proofs. A future proof-carrying format must
+/// use a new version rather than silently changing this v1 contract.
 pub struct SegmentManifest {
     pub format: String,
     pub version: u16,
