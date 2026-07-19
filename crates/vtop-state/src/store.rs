@@ -16,6 +16,7 @@ use crate::sqlite_store::SqliteStateStore;
 use async_trait::async_trait;
 use vtop_core::errors::VtopError;
 use vtop_core::state_machine::BatchState;
+use vtop_core::types::SourceType;
 
 /// Construct a state store from a connection string, dispatching on the URI
 /// scheme. The engine calls this instead of naming a concrete backend, so the
@@ -67,6 +68,17 @@ pub trait StateStore: Send + Sync {
 
     /// Fetch a single batch, or `None` if it does not exist.
     async fn get_batch(&self, batch_id: &str) -> Result<Option<BatchRecord>, VtopError>;
+
+    /// Highest committed `end_byte` per source path for a byte-offset source
+    /// type (file / syslog spool), computed IN THE STORE.
+    ///
+    /// Recovery seeds adapter cursors from this. It must be an aggregate
+    /// query: materialising the whole ledger to compute a per-path MAX makes
+    /// startup memory grow without bound as history accumulates (#77).
+    async fn max_committed_end_bytes(
+        &self,
+        source_type: SourceType,
+    ) -> Result<Vec<(String, u64)>, VtopError>;
 
     /// All batches, newest first.
     async fn list_batches(&self) -> Result<Vec<BatchRecord>, VtopError>;

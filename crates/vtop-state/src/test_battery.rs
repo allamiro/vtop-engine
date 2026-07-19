@@ -70,6 +70,7 @@ pub async fn run_all(store: &dyn StateStore) {
     full_legal_walk_commits(store).await;
     mark_failed_from_any_state(store).await;
     lists_incomplete_and_failed(store).await;
+    max_committed_end_bytes_aggregates_in_store(store).await;
 }
 
 async fn empty_store_is_empty(store: &dyn StateStore) {
@@ -201,4 +202,65 @@ async fn lists_incomplete_and_failed(store: &dyn StateStore) {
     let fail_ids: Vec<_> = failed.iter().map(|b| b.batch_id.as_str()).collect();
     assert!(fail_ids.contains(&"list-fail"));
     assert!(fail_ids.contains(&"fail-1"));
+}
+
+/// #77: recovery seeds byte-offset cursors from a store-side aggregate, so
+/// the aggregate must return the per-path MAX over COMMITTED rows only —
+/// uncommitted progress must never advance a cursor.
+async fn max_committed_end_bytes_aggregates_in_store(store: &dyn StateStore) {
+    let file_marker = |path: &str, end: u64| ProgressMarker::File {
+        path: path.into(),
+        inode: None,
+        start_byte: 0,
+        end_byte: end,
+        file_size: end,
+        mtime: String::new(),
+    };
+    let mk = |id: &str, path: &str, end: u64| {
+        let mut r = sample_record(id);
+        r.source_type = SourceType::File;
+        r.source_name = path.to_string();
+        r.progress_start = file_marker(path, 0);
+        r.progress_end = file_marker(path, end);
+        r
+    };
+    // Two committed generations for /a.log (100 then 250), one for /b.log,
+    // and an UNCOMMITTED 999 for /a.log that must not win.
+    for (id, path, end, commit) in [
+        ("agg-1", "/a.log", 100, true),
+        ("agg-2", "/a.log", 250, true),
+        ("agg-3", "/b.log", 40, true),
+        ("agg-4", "/a.log", 999, false),
+    ] {
+        store.save_batch_state(&mk(id, path, end)).await.unwrap();
+        if commit {
+            let p = BatchPatch::default();
+            for st in LEGAL_WALK {
+                store.update_batch_state(id, st, &p).await.unwrap();
+            }
+        }
+    }
+
+    let mut got = store
+        .max_committed_end_bytes(SourceType::File)
+        .await
+        .unwrap();
+    got.sort();
+    got.retain(|(p, _)| p == "/a.log" || p == "/b.log");
+    assert_eq!(
+        got,
+        vec![("/a.log".to_string(), 250), ("/b.log".to_string(), 40)],
+        "per-path MAX over committed rows only (uncommitted 999 must not win)"
+    );
+    // Kafka rows exist in the store (from earlier checks) but are a different
+    // source_type: they must not appear in a File aggregate.
+    assert!(
+        store
+            .max_committed_end_bytes(SourceType::Kafka)
+            .await
+            .unwrap()
+            .iter()
+            .all(|(p, _)| !p.is_empty()),
+        "kafka markers have no path field; the aggregate must not fabricate one"
+    );
 }

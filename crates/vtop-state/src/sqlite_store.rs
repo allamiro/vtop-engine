@@ -204,6 +204,35 @@ impl StateStore for SqliteStateStore {
             .await
     }
 
+    async fn max_committed_end_bytes(
+        &self,
+        source_type: SourceType,
+    ) -> Result<Vec<(String, u64)>, VtopError> {
+        // Aggregated in SQL: the ledger grows without bound and this runs at
+        // every startup, so the per-path MAX must not materialise the rows
+        // (#77). ProgressMarker serializes internally tagged, so the payload
+        // fields sit at the JSON top level.
+        let rows = sqlx::query(
+            "SELECT json_extract(progress_end_json, '$.path') AS path, \
+                    MAX(json_extract(progress_end_json, '$.end_byte')) AS end_byte \
+             FROM batches WHERE state = ? AND source_type = ? \
+             GROUP BY json_extract(progress_end_json, '$.path')",
+        )
+        .bind(BatchState::SourceCommitted.as_str())
+        .bind(source_type.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                let path: Option<String> = r.get("path");
+                let end: Option<i64> = r.get("end_byte");
+                Some((path?, end?.max(0) as u64))
+            })
+            .collect())
+    }
+
     async fn list_incomplete_batches(&self) -> Result<Vec<BatchRecord>, VtopError> {
         self.query_records(
             "SELECT * FROM batches WHERE state != ? ORDER BY created_at ASC",
