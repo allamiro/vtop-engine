@@ -43,6 +43,8 @@ pub fn sample_record(id: &str) -> BatchRecord {
         manifest_sha256: None,
         record_count: None,
         error_message: None,
+        owner: None,
+        lease_expires_at: None,
         created_at: now.clone(),
         updated_at: now,
     }
@@ -71,6 +73,7 @@ pub async fn run_all(store: &dyn StateStore) {
     mark_failed_from_any_state(store).await;
     lists_incomplete_and_failed(store).await;
     max_committed_end_bytes_aggregates_in_store(store).await;
+    claims_respect_live_leases_and_take_over_expired_ones(store).await;
 }
 
 async fn empty_store_is_empty(store: &dyn StateStore) {
@@ -262,5 +265,87 @@ async fn max_committed_end_bytes_aggregates_in_store(store: &dyn StateStore) {
             .iter()
             .all(|(p, _)| !p.is_empty()),
         "kafka markers have no path field; the aggregate must not fabricate one"
+    );
+}
+
+/// #93: the claim primitive is what makes N engines safe over one store. A
+/// live engine's in-flight batches must NEVER transfer; a dead engine's must
+/// transfer wholesale once its lease expires; committed rows are never
+/// claimable.
+async fn claims_respect_live_leases_and_take_over_expired_ones(store: &dyn StateStore) {
+    let past = "2000-01-01T00:00:00+00:00".to_string();
+    let future = "2100-01-01T00:00:00+00:00".to_string();
+    let now = "2050-01-01T00:00:00+00:00";
+
+    // engine-a owns one live-leased batch and one expired-leased batch.
+    let mut live = sample_record("claim-live");
+    live.owner = Some("engine-a".into());
+    live.lease_expires_at = Some(future.clone());
+    store.save_batch_state(&live).await.unwrap();
+    let mut dead = sample_record("claim-dead");
+    dead.owner = Some("engine-a".into());
+    dead.lease_expires_at = Some(past.clone());
+    store.save_batch_state(&dead).await.unwrap();
+    // An ownerless pre-#93 row is claimable by anyone.
+    store
+        .save_batch_state(&sample_record("claim-orphan"))
+        .await
+        .unwrap();
+    // A committed row must never be claimed, whatever its lease says.
+    let mut done = sample_record("claim-done");
+    done.owner = Some("engine-a".into());
+    done.lease_expires_at = Some(past.clone());
+    store.save_batch_state(&done).await.unwrap();
+    let p = BatchPatch::default();
+    for st in LEGAL_WALK {
+        store
+            .update_batch_state("claim-done", st, &p)
+            .await
+            .unwrap();
+    }
+
+    // engine-b recovers: gets the expired batch and the orphan - NOT the live
+    // one, NOT the committed one.
+    let claimed = store
+        .claim_incomplete_batches("engine-b", now, &future)
+        .await
+        .unwrap();
+    let ids: Vec<_> = claimed.iter().map(|b| b.batch_id.as_str()).collect();
+    assert!(
+        ids.contains(&"claim-dead"),
+        "expired lease must transfer: {ids:?}"
+    );
+    assert!(
+        ids.contains(&"claim-orphan"),
+        "ownerless row must be claimable: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"claim-live"),
+        "a LIVE engine's batch must never transfer: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"claim-done"),
+        "committed rows are never claimable: {ids:?}"
+    );
+    for b in claimed.iter().filter(|b| b.batch_id.starts_with("claim-")) {
+        assert_eq!(b.owner.as_deref(), Some("engine-b"));
+        assert_eq!(b.lease_expires_at.as_deref(), Some(future.as_str()));
+    }
+
+    // engine-a recovers afterwards: its live batch is still its own; the
+    // transferred one now belongs to engine-b under a live lease and must not
+    // come back.
+    let reclaimed = store
+        .claim_incomplete_batches("engine-a", now, &future)
+        .await
+        .unwrap();
+    let ids: Vec<_> = reclaimed.iter().map(|b| b.batch_id.as_str()).collect();
+    assert!(
+        ids.contains(&"claim-live"),
+        "own live batch stays claimable by its owner: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"claim-dead"),
+        "a batch transferred under a live lease must not bounce back: {ids:?}"
     );
 }

@@ -69,6 +69,26 @@ pub trait StateStore: Send + Sync {
     /// Fetch a single batch, or `None` if it does not exist.
     async fn get_batch(&self, batch_id: &str) -> Result<Option<BatchRecord>, VtopError>;
 
+    /// Atomically claim every incomplete batch this `owner` may work on, and
+    /// return the claimed rows (#93).
+    ///
+    /// Claimable = not SOURCE_COMMITTED, and (already owned by `owner`, OR
+    /// never owned, OR the previous owner's lease has expired as of `now`).
+    /// The claim is ONE update — set owner and a fresh lease on exactly the
+    /// claimable rows — so two engines recovering concurrently cannot both
+    /// claim the same batch: a live engine's in-flight work is never touched,
+    /// and a dead engine's work transfers wholesale after lease expiry.
+    ///
+    /// `now` and `lease_until` are passed in (RFC3339) rather than read from
+    /// the DB clock so the semantics are identical across backends and
+    /// testable without waiting out a real lease.
+    async fn claim_incomplete_batches(
+        &self,
+        owner: &str,
+        now: &str,
+        lease_until: &str,
+    ) -> Result<Vec<BatchRecord>, VtopError>;
+
     /// Highest committed `end_byte` per source path for a byte-offset source
     /// type (file / syslog spool), computed IN THE STORE.
     ///
