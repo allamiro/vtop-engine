@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncSeekExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader};
 use vtop_core::errors::VtopError;
 use vtop_core::types::{ProgressMarker, SourceType, TelemetryFormat};
 
@@ -70,9 +70,16 @@ impl SyslogSpoolSource {
         max_records: usize,
         max_bytes: usize,
     ) -> Result<(Vec<Vec<u8>>, u64, Option<u64>), VtopError> {
-        let file = tokio::fs::File::open(&path).await?;
-        let mut reader = BufReader::new(file);
-        reader.seek(std::io::SeekFrom::Start(start)).await?;
+        let mut file = tokio::fs::File::open(&path).await?;
+        file.seek(std::io::SeekFrom::Start(start)).await?;
+        // Put the whole-call byte limiter BELOW BufReader. If Take wrapped the
+        // BufReader instead, its default 8 KiB fill could read far beyond a
+        // small max_bytes before the outer limit observed the line.
+        let read_limit = u64::try_from(max_bytes)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let buffer_capacity = max_bytes.saturating_add(1).clamp(1, 8 * 1024);
+        let mut reader = BufReader::with_capacity(buffer_capacity, file.take(read_limit));
 
         let mut records = Vec::new();
         let mut bytes_read: u64 = 0;
@@ -82,8 +89,23 @@ impl SyslogSpoolSource {
             if records.len() >= max_records || bytes_read as usize >= max_bytes {
                 break;
             }
+            let remaining = max_bytes.saturating_sub(bytes_read as usize);
+            let limit = u64::try_from(remaining)
+                .unwrap_or(u64::MAX)
+                .saturating_add(1);
             let mut line = Vec::new();
-            let n = reader.read_until(b'\n', &mut line).await?;
+            let n = (&mut reader)
+                .take(limit)
+                .read_until(b'\n', &mut line)
+                .await?;
+            if n > remaining {
+                if records.is_empty() {
+                    return Err(VtopError::Source(format!(
+                        "record in {path} exceeds max_bytes={max_bytes}"
+                    )));
+                }
+                break;
+            }
             if n == 0 || !line.ends_with(b"\n") {
                 break;
             }
@@ -95,7 +117,7 @@ impl SyslogSpoolSource {
         // Fingerprint the descriptor whose bytes were actually consumed. A
         // path lookup here could instead describe a replacement installed by
         // a concurrent spool rotation (#127).
-        let inode = inode_of(&reader.get_ref().metadata().await?);
+        let inode = inode_of(&reader.get_ref().get_ref().metadata().await?);
         Ok((records, pos, inode))
     }
 }
@@ -346,6 +368,30 @@ mod tests {
         assert_eq!(reads2.len(), 1);
         assert_eq!(reads2[0].records.len(), 1);
         assert_eq!(reads2[0].records[0], b"<13>msg two");
+    }
+
+    #[tokio::test]
+    async fn rejects_an_oversized_spool_record_without_advancing() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "12345678").unwrap(); // nine bytes including newline
+        f.flush().unwrap();
+        let path = f.path().to_string_lossy().into_owned();
+        let source = DiscoveredSource {
+            source_type: SourceType::SyslogSpool,
+            source_name: path.clone(),
+            format: TelemetryFormat::Syslog,
+        };
+        let mut spool = SyslogSpoolSource::new(vec![path.clone()]);
+
+        let error = spool
+            .read_batch_candidates(&source, 10, 8, Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeds max_bytes=8"));
+        assert_eq!(
+            spool.cursors[&path].read_byte, 0,
+            "oversized data is not skipped"
+        );
     }
 
     #[cfg(unix)]

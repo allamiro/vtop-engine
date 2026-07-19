@@ -156,6 +156,13 @@ impl MultiTopicAcc {
             return false;
         }
         let usage = &mut self.usage[topic_idx];
+        if usage.records >= self.max_records
+            || payload.len() > self.max_bytes.saturating_sub(usage.bytes)
+        {
+            self.full[topic_idx] = true;
+            self.full_topics += 1;
+            return false;
+        }
         usage.records += 1;
         usage.bytes += payload.len();
         if usage.records >= self.max_records || usage.bytes >= self.max_bytes {
@@ -179,6 +186,28 @@ impl MultiTopicAcc {
     /// Whether this topic has reached its budget for the pass.
     fn is_full(&self, topic_idx: usize) -> bool {
         self.full[topic_idx]
+    }
+
+    /// Discard a topic's accumulated prefix after a source-local failure.
+    /// Other topics in the multiplexed pass remain independently returnable.
+    fn fail_topic(&mut self, topic_idx: usize) {
+        let keys = self
+            .parts
+            .keys()
+            .filter(|(idx, _)| *idx == topic_idx)
+            .copied()
+            .collect::<Vec<_>>();
+        for key in keys {
+            self.parts.remove(&key);
+        }
+        self.total_records = self
+            .total_records
+            .saturating_sub(self.usage[topic_idx].records);
+        self.usage[topic_idx] = TopicUsage::default();
+        if !self.full[topic_idx] {
+            self.full[topic_idx] = true;
+            self.full_topics += 1;
+        }
     }
 
     /// True once every one of the `assigned_topics` topics that can receive
@@ -582,6 +611,12 @@ impl SourceAdapter for KafkaSource {
         // Delivery positions touched THIS pass, keyed by index (no per-message
         // allocation); merged into self.delivered after the loop.
         let mut delivered_local: HashMap<(usize, i32), i64> = HashMap::new();
+        // Any record rejected after librdkafka delivered it requires a fresh
+        // assignment next pass. A concrete cursor can be seek()ed, but a
+        // previously unread partition still uses Offset::Stored; keeping the
+        // sticky assignment there would continue after the rejected record.
+        let mut must_reassign = false;
+        let mut poll_source_failed = false;
         let deadline = std::time::Instant::now() + max_wait;
         loop {
             if acc.all_full(assigned_topics) {
@@ -595,23 +630,41 @@ impl SourceAdapter for KafkaSource {
                     // fail loudly (cursors have not advanced — nothing is
                     // abandoned).
                     let Some(&idx) = topic_index.get(msg.topic()) else {
+                        // librdkafka did advance its internal delivery head.
+                        // Since this pass returns no results, rebuild the next
+                        // assignment from VTOP's unchanged cursors.
+                        self.assigned.clear();
                         return Err(VtopError::Source(format!(
                             "kafka poll returned unassigned topic {}",
                             msg.topic()
                         )));
                     };
-                    // Track what librdkafka delivered — kept OR rejected — so
-                    // the next pass seeks only genuinely diverged partitions.
-                    delivered_local.insert((idx, msg.partition()), msg.offset() + 1);
-                    // push() rejects messages for topics at budget; rejected
-                    // offsets are re-read next pass because cursors advance
-                    // only over kept records.
-                    let _ = acc.push(
-                        idx,
-                        msg.partition(),
-                        msg.offset(),
-                        msg.payload().unwrap_or_default().to_vec(),
-                    );
+                    let payload = msg.payload().unwrap_or_default();
+                    if payload.len() > max_bytes {
+                        // librdkafka owns the fetched message buffer, but do
+                        // not clone an oversized record into engine memory or
+                        // advance its cursor. Fail only this topic: valid
+                        // results already accumulated for other topics remain
+                        // returnable from the shared pass.
+                        source_errors[idx] = Some(VtopError::Source(format!(
+                            "Kafka record {}-{}@{} is {} bytes, exceeding max_bytes={max_bytes}",
+                            msg.topic(),
+                            msg.partition(),
+                            msg.offset(),
+                            payload.len()
+                        )));
+                        acc.fail_topic(idx);
+                        must_reassign = true;
+                        poll_source_failed = true;
+                    } else {
+                        // Track what librdkafka delivered — kept OR rejected —
+                        // so a concrete cursor can detect divergence. A
+                        // rejected record also invalidates sticky assignment
+                        // for Offset::Stored partitions below.
+                        delivered_local.insert((idx, msg.partition()), msg.offset() + 1);
+                        let kept = acc.push(idx, msg.partition(), msg.offset(), payload.to_vec());
+                        must_reassign |= !kept;
+                    }
                     // A full topic keeps DELIVERING otherwise: rdkafka would
                     // go on fetching its tail, and every discarded message is
                     // bandwidth spent on data the next pass refetches anyway.
@@ -635,6 +688,11 @@ impl SourceAdapter for KafkaSource {
                 // whole pass here abandons nothing: every accumulated offset is
                 // re-read on the next cycle.
                 Some(Err(e)) => {
+                    // A prior message in this pass may already have advanced
+                    // librdkafka beyond VTOP's unchanged cursor. Force the
+                    // next pass to assign from the cursor instead of retaining
+                    // that delivery position.
+                    self.assigned.clear();
                     return Err(VtopError::Source(format!("kafka poll error: {e}")));
                 }
                 None => break, // no more messages within the wait window
@@ -644,6 +702,10 @@ impl SourceAdapter for KafkaSource {
             }
         }
         let total_records = acc.total_records;
+
+        if must_reassign {
+            self.assigned.clear();
+        }
 
         // Persist the pass's delivery positions and pause state for the next
         // pass's sticky-assignment decisions.
@@ -707,10 +769,12 @@ impl SourceAdapter for KafkaSource {
         // of buckets against the phase total.
         let elapsed = started.elapsed().as_millis() as u64;
         let shared = elapsed.saturating_sub(meta_failed_ms);
-        let (productive_ms, empty_ms) = if total_records > 0 {
-            (shared, 0)
+        let (productive_ms, empty_ms, poll_failed_ms) = if total_records > 0 {
+            (shared, 0, 0)
+        } else if poll_source_failed {
+            (0, 0, shared)
         } else {
-            (0, shared)
+            (0, shared, 0)
         };
         Ok(AdapterReadReport {
             outcomes: per_source
@@ -727,7 +791,7 @@ impl SourceAdapter for KafkaSource {
                 .collect(),
             productive_ms,
             empty_ms,
-            failed_ms: meta_failed_ms,
+            failed_ms: meta_failed_ms.saturating_add(poll_failed_ms),
         })
     }
 
@@ -918,7 +982,7 @@ mod tests {
     fn multi_topic_acc_enforces_record_budget_per_topic() {
         // Budget of 2 records PER TOPIC: a busy topic (idx 0) must not eat
         // another topic's allowance (an aggregate budget would let one topic
-        // take topic_count x max_bytes in a single unit — codex P1 on #106).
+        // take topic_count x max_bytes in a single unit — P1 review on #106).
         let (busy, quiet) = (0usize, 1usize);
         let mut acc = MultiTopicAcc::new(2, 2, usize::MAX);
         assert!(acc.push(busy, 0, 0, b"r".to_vec()));
@@ -951,15 +1015,31 @@ mod tests {
     fn multi_topic_acc_enforces_byte_budget_per_topic() {
         let (t_a, t_b) = (0usize, 1usize);
         let mut acc = MultiTopicAcc::new(2, usize::MAX, 10);
-        // 6 bytes accepted; the next push crosses the 10-byte budget and is
-        // accepted (budgets are checked before, not truncated mid-record)...
+        // 6 bytes accepted; the next push would cross the 10-byte budget and
+        // is rejected without recording its offset.
         assert!(acc.push(t_a, 0, 0, vec![0u8; 6]));
-        assert!(acc.push(t_a, 0, 1, vec![0u8; 6]));
-        // ...after which the topic is full and rejects.
+        assert!(!acc.push(t_a, 0, 1, vec![0u8; 6]));
+        // The topic is then full and continues to reject.
         assert!(!acc.push(t_a, 0, 2, vec![0u8; 1]));
         // Other topics are unaffected by t_a's bytes.
         assert!(acc.push(t_b, 0, 0, vec![0u8; 6]));
         assert_eq!(acc.full_topics, 1, "only t_a is at its byte budget");
         assert!(!acc.all_full(2), "t_b still has allowance");
+    }
+
+    #[test]
+    fn multi_topic_acc_failure_discards_only_the_failed_topic() {
+        let mut acc = MultiTopicAcc::new(2, usize::MAX, usize::MAX);
+        assert!(acc.push(0, 0, 10, b"discard".to_vec()));
+        assert!(acc.push(1, 0, 20, b"preserve".to_vec()));
+
+        acc.fail_topic(0);
+
+        assert!(acc.is_full(0));
+        assert_eq!(acc.total_records, 1);
+        let sorted = acc.into_sorted();
+        assert_eq!(sorted.len(), 1);
+        assert_eq!((sorted[0].0, sorted[0].1), (1, 0));
+        assert_eq!(sorted[0].2.records, vec![b"preserve".to_vec()]);
     }
 }

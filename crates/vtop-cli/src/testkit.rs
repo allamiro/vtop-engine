@@ -30,6 +30,8 @@ pub fn file_config(
             tenant: "default".into(),
             state_store: state_store.into(),
             work_dir: work_dir.into(),
+            work_retention_seconds: 86_400,
+            work_max_bytes: 10 * 1024 * 1024 * 1024,
             log_level: "warn".into(),
         },
         batching: BatchingConfig {

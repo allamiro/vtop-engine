@@ -22,6 +22,9 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 prometheus = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 # async KAT tests hash from files (the path uploads actually use)

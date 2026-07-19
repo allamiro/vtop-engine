@@ -14,6 +14,10 @@ engine:
   # PostgreSQL URLs are rejected so credentials never enter serializable config.
   state_store: "sqlite:///data/state/vtop-state.db"
   work_dir: /data/work
+  # Successful batches remove staging files immediately. These limits clean up
+  # artifacts left by a crash and cap their aggregate disk use on restart.
+  work_retention_seconds: 86400
+  work_max_bytes: 10737418240
   log_level: INFO
 
 batching:

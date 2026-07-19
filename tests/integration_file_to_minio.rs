@@ -56,27 +56,15 @@ async fn file_source_archives_and_commits() {
     let object_uri = o.object_uri.clone().expect("object uri set");
     assert!(object_uri.ends_with(".cef.gz") || object_uri.ends_with(".raw.gz"));
 
-    // A manifest must exist on disk and bind the source progress marker.
+    // Work objects and manifests are scratch files: after their uploaded bytes
+    // are verified and source progress commits, neither may accumulate locally.
     let manifest_path = work_dir.join(format!("{}.manifest.json", o.batch_id));
-    let bytes = std::fs::read(&manifest_path).expect("manifest written");
-    let manifest: VtopManifest = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(manifest.protocol, "VTOP");
-    assert_eq!(manifest.record_count, 3);
-    assert!(
-        !manifest.object.checksum.is_empty(),
-        "object checksum present"
+    assert!(!manifest_path.exists(), "manifest staging file cleaned");
+    assert_eq!(
+        std::fs::read_dir(&work_dir).unwrap().count(),
+        0,
+        "work directory must not grow after a completed batch"
     );
-    assert_eq!(manifest.object.checksum_algorithm, "sha256");
-    manifest
-        .verify_self_hash()
-        .expect("manifest self-hash verifies");
-    // The manifest binds source progress (file byte range) to the object.
-    match manifest.source_progress {
-        vtop_core::types::ProgressMarker::File { end_byte, .. } => {
-            assert!(end_byte > 0, "file end byte recorded in manifest");
-        }
-        _ => panic!("expected a file progress marker"),
-    }
 
     // State store reflects exactly one committed batch.
     let batches = engine.store.list_batches().await.unwrap();
@@ -84,6 +72,16 @@ async fn file_source_archives_and_commits() {
     assert_eq!(batches[0].state, BatchState::SourceCommitted);
     assert!(batches[0].object_uri.is_some());
     assert!(batches[0].manifest_uri.is_some());
+    assert!(batches[0]
+        .manifest_sha256
+        .as_deref()
+        .is_some_and(|h| !h.is_empty()));
+    match &batches[0].progress_end {
+        vtop_core::types::ProgressMarker::File { end_byte, .. } => {
+            assert!(*end_byte > 0, "file end byte recorded in ledger");
+        }
+        _ => panic!("expected a file progress marker"),
+    }
 
     // Re-running finds nothing new (offset was committed).
     let again = engine.process_once(SourceType::File).await.unwrap();

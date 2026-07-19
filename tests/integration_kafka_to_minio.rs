@@ -309,6 +309,121 @@ async fn one_pass_reads_many_topics_and_demuxes_by_marker_topic() {
         .await;
 }
 
+/// Review regression for #140: an oversized record is a failure of its own
+/// topic, not of the shared Kafka pass, and it must be delivered again after
+/// the operator raises the budget. This exercises both per-source isolation
+/// and invalidation of a sticky Offset::Stored assignment.
+#[tokio::test]
+#[ignore = "requires a running Kafka broker"]
+async fn oversized_topic_is_isolated_and_retried_after_budget_change() {
+    use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
+    use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
+
+    let bootstrap = bootstrap();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let oversized_topic = format!("it_oversized_{nanos}");
+    let healthy_topic = format!("it_healthy_{nanos}");
+    let admin: AdminClient<_> = build_client_config(&kafka_cfg(&bootstrap, "vtop-it-admin"))
+        .unwrap()
+        .create()
+        .expect("admin client");
+    admin
+        .create_topics(
+            &[
+                NewTopic::new(&oversized_topic, 1, TopicReplication::Fixed(1)),
+                NewTopic::new(&healthy_topic, 1, TopicReplication::Fixed(1)),
+            ],
+            &AdminOptions::new(),
+        )
+        .await
+        .expect("create_topics call failed")
+        .into_iter()
+        .for_each(|result| {
+            result.expect("topic creation failed");
+        });
+
+    let producer: BaseProducer = build_client_config(&kafka_cfg(&bootstrap, "vtop-it-producer"))
+        .unwrap()
+        .create()
+        .expect("producer");
+    producer
+        .send(BaseRecord::<(), [u8]>::to(&oversized_topic).payload(&[b'x'; 32]))
+        .expect("enqueue oversized record");
+    producer
+        .send(BaseRecord::<(), [u8]>::to(&healthy_topic).payload(b"ok"))
+        .expect("enqueue healthy record");
+    producer
+        .flush(std::time::Duration::from_secs(10))
+        .expect("flush produce");
+
+    let sources = vec![
+        DiscoveredSource {
+            source_type: vtop_core::types::SourceType::Kafka,
+            source_name: oversized_topic.clone(),
+            format: TelemetryFormat::Cef,
+        },
+        DiscoveredSource {
+            source_type: vtop_core::types::SourceType::Kafka,
+            source_name: healthy_topic.clone(),
+            format: TelemetryFormat::Cef,
+        },
+    ];
+    let mut adapter = KafkaSource::new(
+        kafka_cfg(&bootstrap, &unique_group("oversized-isolation")),
+        TelemetryFormat::Cef,
+    )
+    .unwrap();
+
+    let first = adapter
+        .read_all_batch_candidates(&sources, 100, 16, std::time::Duration::from_secs(10))
+        .await
+        .expect("one bad topic must not fail the shared pass");
+    let oversized_error = first.outcomes[0]
+        .result
+        .as_ref()
+        .expect_err("oversized topic must report a source-local failure");
+    assert!(oversized_error
+        .to_string()
+        .contains("exceeding max_bytes=16"));
+    let healthy_records: usize = first.outcomes[1]
+        .result
+        .as_ref()
+        .expect("healthy topic remains returnable")
+        .iter()
+        .map(|read| read.records.len())
+        .sum();
+    assert!(
+        healthy_records > 0,
+        "healthy topic was discarded with its peer"
+    );
+
+    let retry = adapter
+        .read_all_batch_candidates(&sources, 100, 64, std::time::Duration::from_secs(10))
+        .await
+        .expect("retry pass");
+    let retried_records: usize = retry.outcomes[0]
+        .result
+        .as_ref()
+        .expect("raised budget accepts the previously rejected topic")
+        .iter()
+        .map(|read| read.records.len())
+        .sum();
+    assert_eq!(
+        retried_records, 1,
+        "oversized record was skipped instead of reassigned from its unadvanced cursor"
+    );
+
+    let _ = admin
+        .delete_topics(
+            &[oversized_topic.as_str(), healthy_topic.as_str()],
+            &AdminOptions::new(),
+        )
+        .await;
+}
+
 /// After an explicit commit (what the engine does only once VERIFIED), a new
 /// consumer in the same group must resume past the committed offsets rather than
 /// re-reading them, or verified batches would be archived twice.

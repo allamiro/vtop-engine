@@ -71,6 +71,11 @@ async fn crash_before_commit_is_replayable_then_recovers() {
 
     let rec = store.get_batch(&outcome.batch_id).await.unwrap().unwrap();
     assert_eq!(rec.state, BatchState::Verified);
+    assert_eq!(
+        std::fs::read_dir(&work).unwrap().count(),
+        0,
+        "a failed source commit must not retain uploaded staging files"
+    );
 
     // ---- Recovery: a fresh read still sees the uncommitted data ----------
     // (source progress was never advanced).
@@ -144,6 +149,11 @@ async fn verification_failure_never_commits() {
 
     assert_eq!(outcome.final_state, BatchState::Failed);
     assert!(!outcome.committed, "failed verification must never commit");
+    assert_eq!(
+        std::fs::read_dir(&work).unwrap().count(),
+        0,
+        "a verification failure must clean its staging files"
+    );
 
     // The source offset was never committed: the data is fully replayable.
     adapter

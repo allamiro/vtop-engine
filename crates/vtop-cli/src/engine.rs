@@ -32,6 +32,7 @@ use vtop_core::replay::{next_recovery_action, RecoveryAction};
 use vtop_core::state_machine::BatchState;
 use vtop_core::telemetry;
 use vtop_core::types::{ChecksumAlgorithm, ProgressMarker, SourceType};
+use vtop_core::work_dir::cleanup_work_dir;
 use vtop_state::{connect_state_store, BatchPatch, BatchRecord, StateStore};
 use vtop_upload::{ObjectChecksum, UploadBackend};
 
@@ -68,6 +69,35 @@ pub struct VerifiedBatch {
     format: vtop_core::types::TelemetryFormat,
     metrics: BatchMetrics,
     started: Instant,
+}
+
+/// Deletes batch-local scratch files on every normal return path, including
+/// failures after compression. A process crash cannot run `Drop`; startup's
+/// bounded work-dir sweep handles those leftovers.
+struct StagedFiles {
+    paths: Vec<std::path::PathBuf>,
+}
+
+impl StagedFiles {
+    fn new(path: std::path::PathBuf) -> Self {
+        Self { paths: vec![path] }
+    }
+
+    fn track(&mut self, path: std::path::PathBuf) {
+        self.paths.push(path);
+    }
+}
+
+impl Drop for StagedFiles {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            if let Err(error) = std::fs::remove_file(path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(path = %path.display(), %error, "failed to remove staging artifact");
+                }
+            }
+        }
+    }
 }
 
 /// Result of the verify phase: either the batch is ready to commit, or it
@@ -313,6 +343,7 @@ impl<'a> Pipeline<'a> {
             Ok(c) => c,
             Err(e) => fail!(format!("compression failed: {e}")),
         };
+        let mut staged_files = StagedFiles::new(compressed.path.clone());
         metrics.compress_ms = t.elapsed().as_millis() as u64;
         metrics.uncompressed_bytes = compressed.uncompressed_bytes;
         metrics.set_compression(compressed.size_bytes);
@@ -441,6 +472,10 @@ impl<'a> Pipeline<'a> {
         }
         .build_with_mac(self.manifest_mac_key.as_ref())?;
 
+        // Track the expected path before writing so even a short/failed write
+        // is removed on unwind through this function.
+        let expected_manifest_path = work_dir.join(format!("{batch_id}.manifest.json"));
+        staged_files.track(expected_manifest_path);
         let manifest_path = manifest.write_to_file(&work_dir)?;
         // Storage-integrity digest of the manifest file (configured algorithm).
         // The manifest's own self-hash (manifest.manifest.sha256) is the
@@ -936,6 +971,19 @@ impl Engine {
         config.validate()?;
         let state_store = config.engine.state_store.resolve()?;
         let locks = acquire_instance_locks(&config, &state_store)?;
+        let cleanup = cleanup_work_dir(
+            std::path::Path::new(&config.engine.work_dir),
+            Duration::from_secs(config.engine.work_retention_seconds),
+            config.engine.work_max_bytes,
+        )?;
+        if cleanup.removed_files > 0 {
+            tracing::info!(
+                removed_files = cleanup.removed_files,
+                removed_bytes = cleanup.removed_bytes,
+                retained_bytes = cleanup.retained_bytes,
+                "cleaned stale work-directory artifacts"
+            );
+        }
         if state_store.is_postgres() {
             tracing::warn!(
                 "state store is Postgres: the engine is SINGLE-INSTANCE per state \

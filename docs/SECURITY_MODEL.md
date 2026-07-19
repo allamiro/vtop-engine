@@ -14,12 +14,13 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are used as normat
 6. [Integrity verification and chain of custody](#6-integrity-verification-and-chain-of-custody)
 7. [Data at rest and object immutability](#7-data-at-rest-and-object-immutability)
 8. [Manifest authentication](#8-manifest-authentication)
-9. [Audit and failure logging](#9-audit-and-failure-logging)
-10. [Secret redaction](#10-secret-redaction)
-11. [Container and runtime hardening](#11-container-and-runtime-hardening)
-12. [Supply-chain security](#12-supply-chain-security)
-13. [Security properties provided vs. not provided](#13-security-properties-provided-vs-not-provided)
-14. [Summary of normative rules](#14-summary-of-normative-rules)
+9. [Resource exhaustion controls](#9-resource-exhaustion-controls)
+10. [Audit and failure logging](#10-audit-and-failure-logging)
+11. [Secret redaction](#11-secret-redaction)
+12. [Container and runtime hardening](#12-container-and-runtime-hardening)
+13. [Supply-chain security](#13-supply-chain-security)
+14. [Security properties provided vs. not provided](#14-security-properties-provided-vs-not-provided)
+15. [Summary of normative rules](#15-summary-of-normative-rules)
 
 ---
 
@@ -163,20 +164,38 @@ Per-format buckets (e.g. `telemetry-{format}`) with optional on-demand creation 
 - Enabling a key deliberately rejects unsigned pre-cutover manifests. Operators **MUST** verify or explicitly migrate their backlog before enabling it.
 - One active key is supported. Rotation and public-key signatures are not implemented; object versioning/lock remains necessary to resist deletion and rollback to an older valid manifest.
 
-## 9. Audit and Failure Logging
+## 9. Resource Exhaustion Controls
+
+Resource exhaustion controls are part of the security boundary:
+
+- `batching.max_bytes` is a hard ceiling for a source read. File and syslog
+  readers stop before allocating beyond it; whole-file and Kafka records that
+  exceed it fail without advancing source progress.
+- Compression streams directly to the staging file instead of holding both an
+  uncompressed aggregate and compressed aggregate in memory.
+- Successfully processed staging objects/manifests are removed immediately.
+  Crash-left VTOP artifacts are removed after `engine.work_retention_seconds`,
+  with `engine.work_max_bytes` enforcing an oldest-first aggregate ceiling on
+  mutating-engine startup. Locks, directories, and unrelated files are excluded
+  from cleanup. Symlinks are never followed; on Unix, deletion is anchored to
+  an open directory and the regular file's device, inode, size, and no-follow
+  entry type are revalidated immediately before unlinking. Changed entries are
+  retained for the next cleanup pass.
+
+## 10. Audit and Failure Logging
 
 - The engine **SHOULD** emit structured audit logs for batch lifecycle events (seal, upload, verify, commit) including `batch_id`, object key, and outcome.
 - Failures **SHOULD** be logged with enough context to support replay and forensic review, **without** including secrets or raw sensitive payloads.
 - Audit logs **SHOULD** be append-oriented and suitable for retention alongside the archived objects.
 
-## 10. Secret Redaction
+## 11. Secret Redaction
 
 - Any log path, error type, or diagnostic that could surface credentials **MUST** redact them.
 - Connection strings, headers, and configuration dumps **MUST** have secret fields masked before logging.
 - PostgreSQL parse/connect errors **MUST NOT** echo the supplied URL. VTOP connects from parsed options and applies URL redaction at the state-store error boundary as defense in depth.
 - The redaction layer **SHOULD** default to redacting unknown sensitive-looking fields rather than printing them.
 
-## 11. Container and Runtime Hardening
+## 12. Container and Runtime Hardening
 
 - Container images **SHOULD** run as a non-root user.
 - Images **SHOULD** use minimal/distroless-style bases to reduce attack surface.
@@ -184,7 +203,7 @@ Per-format buckets (e.g. `telemetry-{format}`) with optional on-demand creation 
 - Linux capabilities **SHOULD** be dropped to the minimum required.
 - Secrets **SHOULD** be provided via mounted secrets or the orchestrator's secret store, never baked into images.
 
-## 12. Supply-Chain Security
+## 13. Supply-Chain Security
 
 - Dependencies **SHOULD** be pinned and audited (e.g., dependency vulnerability scanning).
 - Builds **SHOULD** be reproducible where practical, and release artifacts **SHOULD** be checksummed and **MAY** be signed.
@@ -209,7 +228,7 @@ When the AWS SDK ships an `aws-smithy-http-client` release that drops
 `hyper-rustls 0.24`, the three `rustls-webpki` entries **MUST** be removed from
 the ignore list and the build re-audited.
 
-## 13. Security properties provided vs. not provided
+## 14. Security properties provided vs. not provided
 
 | Property | Provided? | Notes |
 |----------|-----------|-------|
@@ -227,7 +246,7 @@ the ignore list and the build re-audited.
 | Multipart upload integrity for very large objects | Not yet | Native backend uses single-part `put_object`. |
 | Authorization / multi-tenant isolation | Not by VTOP | Relies on storage-side IAM and least-privilege credentials. |
 
-## 14. Summary of Normative Rules
+## 15. Summary of Normative Rules
 
 | Rule | Level |
 |------|-------|

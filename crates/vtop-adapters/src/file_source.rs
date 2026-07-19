@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncSeekExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader};
 use vtop_core::errors::VtopError;
 use vtop_core::types::{ProgressMarker, SourceType, TelemetryFormat};
 
@@ -132,31 +132,45 @@ impl FileSource {
             let mut file = tokio::fs::File::open(&path).await?;
             let md = file.metadata().await?; // fstat: the opened file, not the path
             let fsize = md.len();
-            if fsize.saturating_sub(start) as usize > max_bytes {
-                // Whole-file mode loads the entire remaining file into memory;
-                // streaming is a documented follow-up (README known limits).
-                tracing::warn!(
-                    path,
-                    file_bytes = fsize,
-                    max_bytes,
-                    "whole-file source exceeds max_bytes; loading entire file into memory"
-                );
+            let remaining = fsize.saturating_sub(start);
+            let max_bytes_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+            if remaining > max_bytes_u64 {
+                return Err(VtopError::Source(format!(
+                    "whole-file record in {path} is {remaining} bytes, exceeding max_bytes={max_bytes}"
+                )));
             }
-            let mut data = Vec::new();
-            tokio::io::AsyncReadExt::read_to_end(&mut file, &mut data).await?;
-            let end = data.len() as u64;
-            let records = if start >= end || data.is_empty() {
+            file.seek(std::io::SeekFrom::Start(start)).await?;
+            // fstat happened before the read. Limit to one byte beyond the
+            // budget as well, so a concurrently-growing file cannot turn that
+            // size check into an unbounded allocation.
+            let mut data = Vec::with_capacity(usize::try_from(remaining).unwrap_or(max_bytes));
+            let mut limited = (&mut file).take(max_bytes_u64.saturating_add(1));
+            limited.read_to_end(&mut data).await?;
+            if data.len() > max_bytes {
+                return Err(VtopError::Source(format!(
+                    "whole-file record in {path} grew beyond max_bytes={max_bytes} while being read"
+                )));
+            }
+            let end = start.saturating_add(data.len() as u64);
+            let records = if data.is_empty() {
                 Vec::new()
             } else {
-                vec![data[start as usize..].to_vec()]
+                vec![data]
             };
             let identity = Self::identity_of(&file.metadata().await?);
             return Ok((records, end, true, identity));
         }
 
-        let file = tokio::fs::File::open(&path).await?;
-        let mut reader = BufReader::new(file);
-        reader.seek(std::io::SeekFrom::Start(start)).await?;
+        let mut file = tokio::fs::File::open(&path).await?;
+        file.seek(std::io::SeekFrom::Start(start)).await?;
+        // Bound the descriptor itself for the whole call. An outer Take over
+        // BufReader would still allow its default 8 KiB fill to read beyond a
+        // small max_bytes budget.
+        let read_limit = u64::try_from(max_bytes)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let buffer_capacity = max_bytes.saturating_add(1).clamp(1, 8 * 1024);
+        let mut reader = BufReader::with_capacity(buffer_capacity, file.take(read_limit));
 
         let mut records = Vec::new();
         let mut bytes_read: u64 = 0;
@@ -166,25 +180,34 @@ impl FileSource {
             if records.len() >= max_records || bytes_read as usize >= max_bytes {
                 break;
             }
+            let remaining = max_bytes.saturating_sub(bytes_read as usize);
+            let limit = u64::try_from(remaining)
+                .unwrap_or(u64::MAX)
+                .saturating_add(1);
             let mut line = Vec::new();
-            let n = reader.read_until(b'\n', &mut line).await?;
+            let n = (&mut reader)
+                .take(limit)
+                .read_until(b'\n', &mut line)
+                .await?;
             if n == 0 {
                 break; // EOF
+            }
+            if n > remaining {
+                if records.is_empty() {
+                    return Err(VtopError::Source(format!(
+                        "record in {path} exceeds max_bytes={max_bytes}"
+                    )));
+                }
+                // Return the already-complete prefix. The over-budget bytes
+                // were consumed only from this temporary descriptor; `pos`
+                // remains at the prior newline, so the next call re-reads the
+                // record with a fresh budget.
+                break;
             }
             // Only accept complete (newline-terminated) lines so a partially
             // written tail is not committed.
             if !line.ends_with(b"\n") {
                 break;
-            }
-            if n > max_bytes {
-                // A single line larger than the whole batch budget is a soft-
-                // limit overrun (read_until already buffered it); surface it.
-                tracing::warn!(
-                    path,
-                    line_bytes = n,
-                    max_bytes,
-                    "single record exceeds max_bytes"
-                );
             }
             pos += n as u64;
             bytes_read += n as u64;
@@ -196,7 +219,7 @@ impl FileSource {
         }
         // fstat on the descriptor we READ from — the same file even if the
         // path was rotated away mid-read (#65).
-        let identity = Self::identity_of(&reader.get_ref().metadata().await?);
+        let identity = Self::identity_of(&reader.get_ref().get_ref().metadata().await?);
         Ok((records, pos, false, identity))
     }
 }
@@ -546,6 +569,43 @@ mod tests {
         // One file == one committable unit; see `reads_lines_and_tracks_offset`.
         assert_eq!(reads.len(), 1);
         assert_eq!(reads[0].records, vec![b"complete".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn rejects_a_line_before_it_can_exceed_the_memory_budget() {
+        let f = write_log(&["12345678"]); // nine bytes including newline
+        let path = f.path().to_string_lossy().into_owned();
+        let mut source = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+
+        let error = source
+            .read_batch_candidates(&src(&path), 10, 8, Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeds max_bytes=8"));
+        assert_eq!(
+            source.cursors[&path].read_byte, 0,
+            "oversized data is not skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn whole_file_mode_refuses_an_over_budget_record() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"0123456789").unwrap();
+        f.flush().unwrap();
+        let path = f.path().to_string_lossy().into_owned();
+        let mut source =
+            FileSource::with_mode(vec![path.clone()], TelemetryFormat::Raw, false, true);
+
+        let error = source
+            .read_batch_candidates(&src(&path), 10, 8, Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("whole-file record"));
+        assert_eq!(
+            source.cursors[&path].read_byte, 0,
+            "oversized data is not skipped"
+        );
     }
 
     /// #65: the marker's identity must describe the file whose BYTES were

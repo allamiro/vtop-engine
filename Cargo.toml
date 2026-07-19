@@ -59,6 +59,7 @@ insta = { version = "1", features = ["json"] }
 bytes = "1"
 futures = "0.3"
 regex = "1"
+rustix = { version = "1", features = ["fs"] }
 
 # Internal crates
 # Internal crates carry an explicit `version` alongside `path`: cargo uses the

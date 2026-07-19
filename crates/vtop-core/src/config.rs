@@ -57,6 +57,14 @@ pub struct EngineConfig {
     /// or mounted secret file instead of living in serializable config.
     pub state_store: StateStoreConfig,
     pub work_dir: String,
+    /// Remove crash-left staging objects older than this many seconds.
+    /// Successfully processed batches remove their staging files immediately.
+    #[serde(default = "default_work_retention_seconds")]
+    pub work_retention_seconds: u64,
+    /// Hard ceiling for recognized VTOP staging artifacts left in `work_dir`.
+    /// Startup removes the oldest artifacts until the directory is below it.
+    #[serde(default = "default_work_max_bytes")]
+    pub work_max_bytes: u64,
     #[serde(default = "default_log_level")]
     pub log_level: String,
 }
@@ -223,6 +231,12 @@ fn default_tenant() -> String {
 }
 fn default_log_level() -> String {
     "INFO".to_string()
+}
+fn default_work_retention_seconds() -> u64 {
+    86_400
+}
+fn default_work_max_bytes() -> u64 {
+    10 * 1024 * 1024 * 1024
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -556,6 +570,16 @@ impl VtopConfig {
         if self.batching.max_bytes == 0 {
             return Err(VtopError::Config("batching.max_bytes must be > 0".into()));
         }
+        if self.engine.work_retention_seconds == 0 {
+            return Err(VtopError::Config(
+                "engine.work_retention_seconds must be > 0".into(),
+            ));
+        }
+        if self.engine.work_max_bytes == 0 {
+            return Err(VtopError::Config(
+                "engine.work_max_bytes must be > 0".into(),
+            ));
+        }
 
         // An enabled file/syslog source with no paths silently does nothing.
         if let Some(f) = &self.sources.file {
@@ -677,8 +701,25 @@ upload:
         cfg.validate().unwrap();
         assert_eq!(cfg.batching.max_records, 10_000);
         assert_eq!(cfg.compression.kind, CompressionType::Gzip);
+        assert_eq!(cfg.engine.work_retention_seconds, 86_400);
+        assert_eq!(cfg.engine.work_max_bytes, 10 * 1024 * 1024 * 1024);
         assert!(cfg.upload.require_strong_verification);
         assert!(cfg.resolve_manifest_mac_key().unwrap().is_none());
+
+        let mut bad_retention = cfg.clone();
+        bad_retention.engine.work_retention_seconds = 0;
+        assert!(bad_retention
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("work_retention_seconds"));
+        let mut bad_ceiling = cfg;
+        bad_ceiling.engine.work_max_bytes = 0;
+        assert!(bad_ceiling
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("work_max_bytes"));
     }
 
     #[test]
