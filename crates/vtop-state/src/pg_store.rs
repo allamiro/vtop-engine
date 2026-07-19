@@ -343,19 +343,26 @@ impl StateStore for PgStateStore {
         lease_until: &str,
     ) -> Result<Vec<BatchRecord>, VtopError> {
         // ONE atomic statement claims (see the SQLite impl for the invariant
-        // argument); RFC3339 TEXT comparison is lexicographic and sound.
-        sqlx::query(
-            "UPDATE batches SET owner = $1, lease_expires_at = $2, updated_at = $3 \
-             WHERE state != $4 \
-               AND (owner IS NULL OR owner = $1 OR lease_expires_at IS NULL OR lease_expires_at < $3)",
-        )
-        .bind(owner)
-        .bind(lease_until)
-        .bind(now)
-        .bind(BatchState::SourceCommitted.as_str())
-        .execute(&self.pool)
-        .await
-        .map_err(map_sqlx)?;
+        // argument); instants are normalized to canonical UTC because the
+        // comparison is textual. Routed through with_retry like every other
+        // write: concurrent fleet recoveries must not fail startup on a
+        // transient serialization error (SQLSTATE 40001).
+        let now = crate::store::normalize_rfc3339_utc("now", now)?;
+        let lease_until = crate::store::normalize_rfc3339_utc("lease_until", lease_until)?;
+        let (now, lease_until) = (now.as_str(), lease_until.as_str());
+        with_retry(|| {
+            sqlx::query(
+                "UPDATE batches SET owner = $1, lease_expires_at = $2, updated_at = $3 \
+                 WHERE state != $4 \
+                   AND (owner IS NULL OR owner = $1 OR lease_expires_at IS NULL OR lease_expires_at <= $3)",
+            )
+            .bind(owner)
+            .bind(lease_until)
+            .bind(now)
+            .bind(BatchState::SourceCommitted.as_str())
+            .execute(&self.pool)
+        })
+        .await?;
         let rows = sqlx::query(
             "SELECT * FROM batches WHERE state != $1 AND owner = $2 ORDER BY created_at ASC",
         )

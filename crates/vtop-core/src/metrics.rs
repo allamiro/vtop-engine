@@ -34,6 +34,9 @@ pub struct BatchMetrics {
     /// Cumulative time in ledger writes across the whole pipeline (~8 writes
     /// per batch: initial save + 6 transitions + commit). Previously the
     /// unmeasured gap between staged time and `total_ms` (#87).
+    /// `serde(default)`: batch_metrics emitted before this field existed must
+    /// stay deserializable.
+    #[serde(default)]
     pub state_write_ms: u64,
     /// Total time from batch start to source-committed.
     pub total_ms: u64,
@@ -88,7 +91,7 @@ impl BatchMetrics {
     pub fn summary(&self) -> String {
         format!(
             "{} records, {}->{} ({:.2}x, {:.1}% saved) in {} ms | {:.0} rec/s, {:.2} MiB/s up | \
-             stages: compress={}ms checksum={}ms put_obj={}ms put_manifest={}ms verify={}ms commit={}ms",
+             stages: compress={}ms checksum={}ms put_obj={}ms put_manifest={}ms verify={}ms commit={}ms state_write={}ms",
             self.records,
             human_bytes(self.uncompressed_bytes),
             human_bytes(self.compressed_bytes),
@@ -103,6 +106,7 @@ impl BatchMetrics {
             self.manifest_upload_ms,
             self.verify_ms,
             self.commit_ms,
+            self.state_write_ms,
         )
     }
 }

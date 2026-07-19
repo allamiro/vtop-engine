@@ -45,6 +45,17 @@ pub async fn connect_state_store(conn_str: &str) -> Result<Box<dyn StateStore>, 
     Ok(Box::new(store))
 }
 
+/// Normalize a caller-supplied RFC3339 instant to canonical UTC text, so the
+/// stores' lexicographic lease comparisons are sound regardless of the offset
+/// spelling the caller used (`Z`, `+00:00`, `+02:00`, ...). Rejecting invalid
+/// input here beats silently mis-ordering a lease at the SQL layer (#118
+/// review).
+pub(crate) fn normalize_rfc3339_utc(label: &str, s: &str) -> Result<String, VtopError> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|d| d.with_timezone(&chrono::Utc).to_rfc3339())
+        .map_err(|e| VtopError::State(format!("{label} is not RFC3339 ({s}): {e}")))
+}
+
 /// A durable, replay-safe ledger of batch state transitions.
 ///
 /// The method set is deliberately small and matches exactly what the engine

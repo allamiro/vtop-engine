@@ -82,15 +82,20 @@ impl SqliteStateStore {
                 .await
                 .map_err(map_sqlx)?;
         }
-        // Pre-#93 databases lack the ownership columns; ALTER is idempotent-by
-        // -failure here (SQLite has no IF NOT EXISTS for columns, and the only
-        // failure mode for a duplicate add is the error we ignore).
-        let _ = sqlx::query("ALTER TABLE batches ADD COLUMN owner TEXT")
-            .execute(&self.pool)
-            .await;
-        let _ = sqlx::query("ALTER TABLE batches ADD COLUMN lease_expires_at TEXT")
-            .execute(&self.pool)
-            .await;
+        // Pre-#93 databases lack the ownership columns; SQLite has no IF NOT
+        // EXISTS for columns, so ONLY the duplicate-column error is ignored -
+        // any other failure (locked file, corruption) must surface now, not as
+        // a missing-column error on the first batch write.
+        for stmt in [
+            "ALTER TABLE batches ADD COLUMN owner TEXT",
+            "ALTER TABLE batches ADD COLUMN lease_expires_at TEXT",
+        ] {
+            if let Err(e) = sqlx::raw_sql(stmt).execute(&self.pool).await {
+                if !e.to_string().contains("duplicate column name") {
+                    return Err(map_sqlx(e));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -224,13 +229,15 @@ impl StateStore for SqliteStateStore {
         lease_until: &str,
     ) -> Result<Vec<BatchRecord>, VtopError> {
         // ONE statement claims; the statement is atomic, so concurrent
-        // recoveries cannot both take a batch. RFC3339 strings compare
-        // lexicographically, which is what makes the TEXT lease comparison
-        // sound (both writers use Utc::to_rfc3339).
+        // recoveries cannot both take a batch. Lease comparison is textual, so
+        // both instants are normalized to canonical UTC first.
+        let now = crate::store::normalize_rfc3339_utc("now", now)?;
+        let lease_until = crate::store::normalize_rfc3339_utc("lease_until", lease_until)?;
+        let (now, lease_until) = (now.as_str(), lease_until.as_str());
         sqlx::query(
             "UPDATE batches SET owner = ?1, lease_expires_at = ?2, updated_at = ?3 \
              WHERE state != ?4 \
-               AND (owner IS NULL OR owner = ?1 OR lease_expires_at IS NULL OR lease_expires_at < ?3)",
+               AND (owner IS NULL OR owner = ?1 OR lease_expires_at IS NULL OR lease_expires_at <= ?3)",
         )
         .bind(owner)
         .bind(lease_until)
@@ -341,6 +348,15 @@ fn parse_sqlite_opts(conn_str: &str) -> Result<SqliteConnectOptions, VtopError> 
         // semantics), and a lost SOURCE_COMMITTED row retries an idempotent
         // source commit. The invariant is untouched: source progress still
         // advances only after verification actually verified stored content.
+        //
+        // The one asymmetric case (#120 review): source progress commits
+        // EXTERNALLY (Kafka broker) after the verified write; if a batch's
+        // entire ledger tail is lost, the offset stays advanced with no row to
+        // reconcile. That still loses no telemetry — verification durably put
+        // the object AND manifest in the store before the commit could run —
+        // it leaves an ORPHANED (archived, verified, unledgered) object,
+        // discoverable by manifest listing. Accepted for the same reason
+        // duplicates are.
         SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
