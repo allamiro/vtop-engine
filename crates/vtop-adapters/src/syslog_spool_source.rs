@@ -393,8 +393,11 @@ mod tests {
             .await
             .unwrap();
 
-        std::fs::remove_file(&path).unwrap();
-        std::fs::write(&path, "new message\n").unwrap();
+        // Keep both files allocated until the atomic replacement. Removing
+        // first lets Linux reuse the freed inode and makes this test flaky.
+        let replacement = dir.path().join("replacement.log");
+        std::fs::write(&replacement, "new message\n").unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
         let error = spool
             .replay_from_marker(&reads[0].progress_start)
             .await

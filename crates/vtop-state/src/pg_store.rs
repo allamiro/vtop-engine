@@ -267,7 +267,7 @@ impl StateStore for PgStateStore {
         // Read -> validate -> conditional write, retried on a lost update.
         //
         // The UPDATE only applies if the row is STILL in the state we validated
-        // against (`AND state = $10`). In an HA fleet two instances could both
+        // against (`AND state = $11`). In an HA fleet two instances could both
         // read the same state, both validate, and both write; the guard makes
         // the loser's UPDATE affect zero rows. Rather than surface that as a hard
         // error to the orchestrator (which does not retry), re-read and
@@ -295,7 +295,7 @@ impl StateStore for PgStateStore {
                          record_count = COALESCE($7, record_count),
                          error_message = COALESCE($8, error_message),
                          updated_at = $9
-                       WHERE batch_id = $10 AND state = $10"#,
+                       WHERE batch_id = $10 AND state = $11"#,
                 )
                 .bind(validated.as_str())
                 .bind(&patch.object_uri)
