@@ -770,7 +770,8 @@ zero-behavior-change groundwork.
 ### 20.1 Current config (`config.yaml`) — implemented
 `engine.{name,tenant,state_store,work_dir,log_level}`;
 `batching.{max_records,max_bytes,max_batch_age_seconds}`;
-`compression.{type,level}`; `checksum.algorithm`;
+`compression.{type,level}`; `checksum.algorithm`; `manifest_mac_key_env`
+(optional env-var name; the key itself is not serialized);
 `sources.kafka.*` (incl. `enable_auto_commit:false`), `sources.file.*`
 (`paths,delete_after_commit,whole_file`), `sources.syslog_spool.paths`;
 `upload.{backend,bucket,prefix,endpoint_url,region,force_path_style,verify_tls,
@@ -782,7 +783,8 @@ create_bucket,local_path,require_strong_verification}`; `partitioning.template`.
 `VTOP_CONFIG`; `RUST_LOG`; `AWS_ACCESS_KEY_ID`; `AWS_SECRET_ACCESS_KEY`;
 `AWS_REGION`; `VTOP_S3_ENDPOINT_URL`; `VTOP_S3_FORCE_PATH_STYLE`;
 `VTOP_S3_VERIFY_TLS`; Kafka SASL password via the env var **named** in
-`sasl_password_env`.
+`sasl_password_env`; the manifest MAC key via the env var named in
+`manifest_mac_key_env`.
 
 ### 20.3 Proposed environment variables (HA phases) **[PROPOSED]**
 | Variable | Phase | Purpose |

@@ -318,9 +318,13 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 cli.json,
             );
             let engine = Engine::new(cfg, streams).await?;
-            let report =
-                verify_manifest_deep(engine.store.as_ref(), engine.backend.as_ref(), manifest)
-                    .await?;
+            let report = verify_manifest_deep(
+                engine.store.as_ref(),
+                engine.backend.as_ref(),
+                manifest,
+                engine.manifest_mac_key(),
+            )
+            .await?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&report.json)?);
             } else {
@@ -352,7 +356,7 @@ pub struct VerifyReport {
 /// cannot:
 ///
 /// 1. the manifest downloads and parses as a VTOP manifest;
-/// 2. its self-hash verifies (the manifest itself is untampered/uncorrupted);
+/// 2. its self-hash verifies and, when configured, its keyed MAC authenticates;
 /// 3. the referenced object's size AND content digest (recomputed from the
 ///    downloaded bytes, using the manifest's algorithm) match the manifest;
 /// 4. the ledger row for the batch agrees (state and recorded digest).
@@ -363,6 +367,7 @@ pub async fn verify_manifest_deep(
     store: &dyn vtop_state::StateStore,
     backend: &dyn vtop_upload::UploadBackend,
     manifest_uri: &str,
+    manifest_mac_key: Option<&vtop_core::manifest::ManifestMacKey>,
 ) -> Result<VerifyReport, VtopError> {
     use vtop_core::checksum::digest_bytes;
     use vtop_core::types::ChecksumAlgorithm;
@@ -392,6 +397,19 @@ pub async fn verify_manifest_deep(
             "FAILED (manifest content does not match its embedded sha256)"
         }
     ));
+
+    // A configured key upgrades the verdict from corruption detection to
+    // authentication and deliberately rejects pre-key manifests. Without a
+    // key, retain legacy behavior but do not claim an unverified MAC is valid.
+    let authentication_ok = parsed.verify_authentication(manifest_mac_key).is_ok();
+    failed |= !authentication_ok;
+    let authentication_status = match (manifest_mac_key, parsed.manifest.mac.as_deref()) {
+        (Some(_), _) if authentication_ok => "OK (keyed BLAKE3)".to_string(),
+        (Some(_), _) => "FAILED (MAC missing or invalid)".to_string(),
+        (None, Some(_)) => "PRESENT (not checked: no key configured)".to_string(),
+        (None, None) => "NOT CONFIGURED (self-hash only)".to_string(),
+    };
+    lines.push(format!("authentication  : {authentication_status}"));
 
     // 3. The stored object's actual content.
     let object_bytes = backend.get_object(&parsed.object.uri).await?;
@@ -480,6 +498,8 @@ pub async fn verify_manifest_deep(
         "batch_id": parsed.batch_id,
         "object_uri": parsed.object.uri,
         "self_hash_ok": self_hash_ok,
+        "manifest_authentication": authentication_status,
+        "manifest_authentication_required": manifest_mac_key.is_some(),
         "object_size_ok": size_ok,
         "object_content": checksum_status,
         "ledger": ledger_status,

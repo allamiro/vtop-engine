@@ -4,6 +4,7 @@
 //! environment variables or mounted secrets and are never serialized.
 
 use crate::errors::VtopError;
+use crate::manifest::ManifestMacKey;
 use crate::types::{ChecksumAlgorithm, CompressionType, SourceType, TelemetryFormat};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -15,6 +16,10 @@ pub struct VtopConfig {
     pub compression: CompressionConfig,
     #[serde(default)]
     pub checksum: ChecksumConfig,
+    /// Name of the environment variable holding a 32-byte hex manifest MAC
+    /// key. The secret itself is never part of this serializable config.
+    #[serde(default)]
+    pub manifest_mac_key_env: Option<String>,
     pub sources: SourcesConfig,
     pub upload: UploadConfig,
     #[serde(default)]
@@ -280,6 +285,15 @@ impl VtopConfig {
 
     /// Enforce invariants that cannot be expressed by the type system.
     pub fn validate(&self) -> Result<(), VtopError> {
+        if self
+            .manifest_mac_key_env
+            .as_deref()
+            .is_some_and(|name| name.trim().is_empty())
+        {
+            return Err(VtopError::Config(
+                "manifest_mac_key_env must name a non-empty environment variable".into(),
+            ));
+        }
         if let Some(k) = &self.sources.kafka {
             if k.enabled && k.enable_auto_commit {
                 return Err(VtopError::Config(
@@ -339,6 +353,27 @@ impl VtopConfig {
             }
         }
         Ok(())
+    }
+
+    /// Resolve the optional manifest authentication key from its named
+    /// environment variable. A configured-but-missing key is a hard startup
+    /// error, never a silent downgrade to unsigned manifests.
+    pub fn resolve_manifest_mac_key(&self) -> Result<Option<ManifestMacKey>, VtopError> {
+        let Some(name) = self.manifest_mac_key_env.as_deref() else {
+            return Ok(None);
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(VtopError::Config(
+                "manifest_mac_key_env must name a non-empty environment variable".into(),
+            ));
+        }
+        let value = std::env::var(name).map_err(|_| {
+            VtopError::Config(format!(
+                "manifest MAC key environment variable {name} is missing or not valid Unicode"
+            ))
+        })?;
+        ManifestMacKey::from_hex(value.trim()).map(Some)
     }
 }
 
@@ -422,6 +457,35 @@ upload:
         cfg.validate().unwrap();
         assert_eq!(cfg.batching.max_records, 10_000);
         assert_eq!(cfg.compression.kind, CompressionType::Gzip);
+        assert!(cfg.resolve_manifest_mac_key().unwrap().is_none());
+    }
+
+    #[test]
+    fn configured_manifest_key_must_exist_without_silent_downgrade() {
+        let name = format!("VTOP_TEST_MISSING_MAC_{}", uuid::Uuid::new_v4());
+        let yaml = format!(
+            r#"
+engine:
+  name: vtop-engine
+  state_store: "sqlite::memory:"
+  work_dir: /tmp/work
+batching: {{}}
+compression: {{}}
+manifest_mac_key_env: {name}
+sources:
+  file:
+    enabled: true
+    paths: ["/data/*.log"]
+upload:
+  bucket: telemetry-data
+  backend: s3_native
+"#
+        );
+        let cfg: VtopConfig = serde_yaml::from_str(&yaml).unwrap();
+        cfg.validate().unwrap();
+        let err = cfg.resolve_manifest_mac_key().unwrap_err().to_string();
+        assert!(err.contains(&name));
+        assert!(err.contains("missing"));
     }
 
     #[test]

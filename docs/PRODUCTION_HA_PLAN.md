@@ -617,6 +617,7 @@ once, and **requires validation** under your write rate.
 | `batching.max_records` / `max_bytes` / `max_batch_age_seconds` | seal thresholds |
 | `compression.type` / `level` | `gzip` \| `zstd` \| `none` |
 | `checksum.algorithm` | `sha256` \| `blake3` \| disabled |
+| `manifest_mac_key_env` | optional env-var name for the 32-byte hex manifest MAC key; the secret is not serialized |
 | `sources.kafka.*` | brokers, group, include/exclude, `enable_auto_commit:false` |
 | `sources.file.*` | paths, `delete_after_commit`, `whole_file` |
 | `sources.syslog_spool.*` | spool paths |

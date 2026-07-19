@@ -4,7 +4,7 @@ expression: json
 ---
 {
   "protocol": "VTOP",
-  "version": "0.1",
+  "version": "0.2",
   "batch_id": "vtop-20260101T000000Z-_data_input_app_log-b0-2048-cafebabe",
   "tenant": "default",
   "source_type": "file",
@@ -31,7 +31,7 @@ expression: json
   },
   "manifest": {
     "uri": "s3://telemetry-jsonl/tenant=default/source=_data_input_app.log/format=jsonl/year=2026/month=01/day=01/hour=00/obj.manifest.json",
-    "sha256": "ca5167abe321fcf3e6743e80c8f645f07616a4eb3d9c336a6eb4cf2bd30441b4"
+    "sha256": "4a496a4ac8c1cd9150821988223dfd4931fb1f5389c28de604f68d5c45b40192"
   },
   "partitioning": {
     "path_template": "tenant={tenant}/source={source}/format={format}/year={yyyy}/month={mm}/day={dd}/hour={hh}/",

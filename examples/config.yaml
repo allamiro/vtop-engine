@@ -47,6 +47,14 @@ compression:
   type: zstd          # gzip | zstd | none
   level: 3
 
+# Optional manifest authentication. The config stores only this environment
+# variable NAME; its value must be a 32-byte key encoded as 64 hex characters.
+# A configured-but-missing/malformed key is a startup error. Enabling it
+# deliberately rejects unsigned pre-cutover manifests during verification and
+# recovery, so verify any backlog before the cutover. Single-key rotation is
+# not implemented yet.
+# manifest_mac_key_env: VTOP_MANIFEST_MAC_KEY
+
 sources:
   kafka:
     enabled: true

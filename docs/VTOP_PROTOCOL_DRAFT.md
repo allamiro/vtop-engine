@@ -235,7 +235,8 @@ The batch **format** **MAY** be declared explicitly per stream or **MAY** be aut
 | `BLAKE3` | Cryptographic | Stored object hash vs. manifest hash. |
 | disabled | Size-only | Stored object size vs. declared size (weaker; see §17). |
 
-The manifest itself additionally carries a **self-hash** for tamper-evidence (§11.2).
+The manifest additionally carries a reproducible **self-hash** for corruption
+detection and MAY carry a keyed authenticator for tamper detection (§11.2).
 
 ---
 
@@ -256,14 +257,15 @@ A conformant manifest:
 - **MUST** include a creation timestamp.
 - **MUST NOT** include credentials, secrets, or authentication material (§18).
 - **SHOULD** include retention/partitioning metadata to support archival policies.
-- **MAY** include a manifest signature when manifest signing is enabled.
+- **MAY** include `manifest.mac`, a keyed BLAKE3 authenticator.
+- **MAY** include a future public-key signature when signing is enabled.
 
 ### 11.2 Field reference
 
 | Field | Type | Requirement | Description |
 |-------|------|-------------|-------------|
 | `protocol` | string | MUST | Constant `"VTOP"`. |
-| `version` | string | MUST | Protocol version (e.g. `"0.1"`). |
+| `version` | string | MUST | Protocol version (e.g. `"0.2"`). |
 | `batch_id` | string | MUST | Unique batch identifier. |
 | `tenant` | string | MUST | Tenant/source-owner identity. |
 | `source_type` | enum | MUST | `kafka` \| `file` \| `syslog`. |
@@ -278,13 +280,19 @@ A conformant manifest:
 | `object.checksum_algorithm` | enum | MUST | `sha256` \| `blake3` \| `disabled`. |
 | `object.sha256` / checksum value | string | MUST* | Hash value; required unless checksum disabled. |
 | `manifest.uri` | string | MUST | Manifest storage URI/key. |
-| `manifest.sha256` (self-hash) | string | MUST | Self-hash computed with this field blanked. |
+| `manifest.sha256` (self-hash) | string | MUST | Reproducible SHA-256 computed with both embedded hash/MAC values blanked. |
+| `manifest.mac` | string | MAY | 32-byte keyed BLAKE3 authenticator (lowercase hex), computed over the same canonical bytes. |
 | `state` | enum | SHOULD | Lifecycle state at manifest-write time. |
 | `verification_status` | enum | SHOULD | Status at manifest-write time. |
 | `partition` / retention metadata | object | SHOULD | Time/retention partitioning context. |
 | `signature` | string | MAY | Manifest signature when signing enabled. |
 
-The manifest binds the object's hash to the source progress markers, establishing an object-level **chain of custody**. The **self-hash** is computed over the manifest with the self-hash field blanked, so it is reproducible and tamper-evident.
+The manifest binds the object's hash to the source progress markers. The
+unkeyed **self-hash** is reproducible and detects corruption, but it does not
+prove authenticity because anyone who can rewrite the document can recompute
+it. When `manifest.mac` is required by local policy, changing any bound field
+without the secret key fails authentication. A shared-key MAC does not provide
+public verifiability or non-repudiation.
 
 > The manifest is written at the `MANIFEST_UPLOADED` step, before storage-side verification, so its embedded `state`/`verification_status` reflect that point in time and its hash stays stable. The authoritative post-verification state (`VERIFIED` → `SOURCE_COMMITTED`) lives in the state store.
 
@@ -436,7 +444,10 @@ Some backends can confirm only object **existence and size**, not a content hash
 
 ### 17.3 Manifest verification
 
-The stored **manifest** **MUST** also be verified (including its self-hash) before commit. The self-hash **MUST** be reproducible: computed over the manifest with the self-hash field blanked.
+The stored **manifest** **MUST** also be verified before commit. The self-hash
+**MUST** be reproducible. When manifest authentication is configured, the
+stored bytes **MUST** contain a valid keyed MAC; a missing MAC **MUST NOT**
+silently downgrade verification.
 
 ---
 
@@ -447,7 +458,8 @@ The stored **manifest** **MUST** also be verified (including its self-hash) befo
 - Transport to Kafka and to S3-compatible endpoints **SHOULD** be protected with TLS; Kafka authentication **SHOULD** support SASL/SCRAM and mTLS.
 - Object storage permissions **SHOULD** follow least privilege; on-demand bucket creation (§15.2) has `CreateBucket` implications addressed in the security model.
 - Implementations **SHOULD** support object immutability (e.g., object lock / WORM) where the backend allows it.
-- Implementations **SHOULD** support optional manifest signing to strengthen chain-of-custody guarantees.
+- Implementations **SHOULD** support manifest authentication. VTOP 0.2 supports
+  a shared-key BLAKE3 MAC; public-key signatures remain a possible extension.
 - Verification (§10, §17) protects against silent corruption but is not a substitute for transport security.
 
 See the accompanying [SECURITY_MODEL.md](SECURITY_MODEL.md) for the full security model.

@@ -268,6 +268,142 @@ async fn recovery_refuses_to_commit_when_storage_no_longer_verifies() {
     );
 }
 
+/// #67: once a manifest MAC key is enabled, recovery must download and
+/// authenticate the stored manifest. A legacy/unsigned manifest with a valid
+/// self-hash is not grandfathered into a keyed deployment.
+#[tokio::test]
+async fn recovery_rejects_unsigned_manifest_after_mac_cutover() {
+    use vtop_core::manifest::ManifestBuilder;
+    use vtop_core::types::{CompressionType, ProgressMarker, TelemetryFormat};
+
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work-mac-cutover");
+    let input = dir.path().join("mac-cutover.log");
+    std::fs::write(&input, b"line-0\n").unwrap();
+    let db = dir.path().join("mac-cutover.db");
+    let url = format!("sqlite://{}", db.display());
+    let object_uri = "s3://telemetry-data/x/b-unsigned.raw.gz";
+    let manifest_uri = "s3://telemetry-data/x/b-unsigned.manifest.json";
+    let marker = ProgressMarker::File {
+        path: input.to_string_lossy().into_owned(),
+        inode: None,
+        start_byte: 0,
+        end_byte: 7,
+        file_size: 7,
+        mtime: String::new(),
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let unsigned = ManifestBuilder {
+        batch_id: "b-unsigned".into(),
+        tenant: "default".into(),
+        source_type: SourceType::File,
+        source_name: input.to_string_lossy().into_owned(),
+        format: TelemetryFormat::Raw,
+        compression: CompressionType::None,
+        record_count: 1,
+        first_timestamp: None,
+        last_timestamp: None,
+        source_progress: marker.clone(),
+        object_uri: object_uri.into(),
+        object_size: 14,
+        object_checksum_algorithm: "sha256".into(),
+        object_checksum: "deadbeef".into(),
+        manifest_uri: manifest_uri.into(),
+        path_template: "test".into(),
+        resolved_prefix: "x".into(),
+        upload_backend: "mock".into(),
+        created_at: now.clone(),
+    }
+    .build()
+    .unwrap();
+    unsigned.verify_self_hash().unwrap();
+    assert!(unsigned.manifest.mac.is_none());
+    let manifest_path = unsigned.write_to_file(&work).unwrap();
+
+    let rec = BatchRecord {
+        batch_id: "b-unsigned".into(),
+        tenant: "default".into(),
+        source_type: SourceType::File,
+        source_name: input.to_string_lossy().into_owned(),
+        format: TelemetryFormat::Raw,
+        state: BatchState::Batching,
+        progress_start: marker.clone(),
+        progress_end: marker,
+        object_uri: Some(object_uri.into()),
+        manifest_uri: Some(manifest_uri.into()),
+        object_sha256: Some("deadbeef".into()),
+        manifest_sha256: Some(unsigned.manifest.sha256.clone()),
+        object_size_bytes: Some(14),
+        record_count: Some(1),
+        error_message: None,
+        owner: None,
+        lease_expires_at: None,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    {
+        let store = SqliteStateStore::connect(&url).await.unwrap();
+        store.save_batch_state(&rec).await.unwrap();
+        for state in [
+            BatchState::Sealed,
+            BatchState::Compressed,
+            BatchState::Checksummed,
+            BatchState::ObjectUploaded,
+            BatchState::ManifestUploaded,
+            BatchState::Verified,
+        ] {
+            store
+                .update_batch_state("b-unsigned", state, &BatchPatch::default())
+                .await
+                .unwrap();
+        }
+    }
+
+    let env_name = format!("VTOP_TEST_RECOVERY_MAC_{}", std::process::id());
+    std::env::set_var(&env_name, "6b".repeat(32));
+    let mut cfg = file_config(
+        work.to_str().unwrap(),
+        &url,
+        vec![input.to_string_lossy().into_owned()],
+        "mock",
+    );
+    cfg.manifest_mac_key_env = Some(env_name.clone());
+    let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+        .await
+        .unwrap();
+    std::env::remove_var(&env_name);
+
+    let staged = dir.path().join("staged-object-mac-cutover");
+    std::fs::write(&staged, b"archived-bytes").unwrap();
+    engine
+        .backend
+        .put_object(
+            &staged,
+            object_uri,
+            Some(vtop_upload::ObjectChecksum::new("sha256", "deadbeef")),
+        )
+        .await
+        .unwrap();
+    engine
+        .backend
+        .put_manifest(
+            &manifest_path,
+            manifest_uri,
+            Some(vtop_upload::ObjectChecksum::new(
+                "sha256",
+                &unsigned.manifest.sha256,
+            )),
+        )
+        .await
+        .unwrap();
+
+    let summary = engine.recover().await.unwrap();
+    assert_eq!(summary.committed, 0);
+    assert_eq!(summary.replay_required, 1);
+    let got = engine.store.get_batch("b-unsigned").await.unwrap().unwrap();
+    assert_eq!(got.state, BatchState::ReplayRequired);
+}
+
 /// #125: with no digest to compare (checksums disabled) and
 /// `require_strong_verification: false`, the recovery re-check must still
 /// compare the RECORDED size — a same-URI replacement of a different size
