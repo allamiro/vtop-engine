@@ -68,6 +68,21 @@ impl UploadBackend for AwsCliBackend {
         run(&mut cmd).await
     }
 
+    async fn get_object(&self, object_uri: &str) -> Result<Vec<u8>, VtopError> {
+        let tmp = tempfile::NamedTempFile::new()
+            .map_err(|e| VtopError::Upload(format!("temp file for download: {e}")))?;
+        run(self
+            .base_cmd()
+            .arg("s3")
+            .arg("cp")
+            .arg(object_uri)
+            .arg(tmp.path()))
+        .await?;
+        tokio::fs::read(tmp.path())
+            .await
+            .map_err(|e| VtopError::Upload(format!("reading downloaded {object_uri}: {e}")))
+    }
+
     async fn head_object(&self, object_uri: &str) -> Result<ObjectHead, VtopError> {
         let (bucket, key) = parse_s3_uri(object_uri)?;
         let out = output(

@@ -51,6 +51,22 @@ impl UploadBackend for S3cmdBackend {
         run(self.base_cmd().arg("put").arg(local_path).arg(manifest_uri)).await
     }
 
+    async fn get_object(&self, object_uri: &str) -> Result<Vec<u8>, VtopError> {
+        let tmp = tempfile::NamedTempFile::new()
+            .map_err(|e| VtopError::Upload(format!("temp file for download: {e}")))?;
+        // --force: the temp file already exists (NamedTempFile creates it).
+        run(self
+            .base_cmd()
+            .arg("get")
+            .arg("--force")
+            .arg(object_uri)
+            .arg(tmp.path()))
+        .await?;
+        tokio::fs::read(tmp.path())
+            .await
+            .map_err(|e| VtopError::Upload(format!("reading downloaded {object_uri}: {e}")))
+    }
+
     async fn head_object(&self, object_uri: &str) -> Result<ObjectHead, VtopError> {
         let out = output(self.base_cmd().arg("info").arg(object_uri)).await?;
         let size = parse_size(&out);

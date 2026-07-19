@@ -51,6 +51,16 @@ impl UploadBackend for MinioBackend {
         run(Command::new("mc").arg("cp").arg(local_path).arg(target)).await
     }
 
+    async fn get_object(&self, object_uri: &str) -> Result<Vec<u8>, VtopError> {
+        let target = self.mc_target(object_uri)?;
+        let tmp = tempfile::NamedTempFile::new()
+            .map_err(|e| VtopError::Upload(format!("temp file for download: {e}")))?;
+        run(Command::new("mc").arg("cp").arg(target).arg(tmp.path())).await?;
+        tokio::fs::read(tmp.path())
+            .await
+            .map_err(|e| VtopError::Upload(format!("reading downloaded {object_uri}: {e}")))
+    }
+
     async fn head_object(&self, object_uri: &str) -> Result<ObjectHead, VtopError> {
         let target = self.mc_target(object_uri)?;
         let out = output(Command::new("mc").arg("stat").arg("--json").arg(target)).await?;

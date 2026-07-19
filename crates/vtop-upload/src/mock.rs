@@ -16,6 +16,8 @@ struct Stored {
     size: u64,
     /// Engine-provided object checksum (None when checksums are disabled).
     checksum: Option<String>,
+    /// Full content, so `get_object`-based verification is testable.
+    data: Vec<u8>,
 }
 
 /// A test double for [`UploadBackend`].
@@ -63,6 +65,18 @@ impl MockBackend {
         self.objects.lock().unwrap().contains_key(uri)
     }
 
+    /// Test hook: flip one byte of the stored content while leaving the
+    /// recorded size and checksum untouched — the shape of silent corruption
+    /// or replacement that a HEAD/metadata check cannot see and content
+    /// verification must (#68).
+    pub fn corrupt(&self, uri: &str) {
+        if let Some(s) = self.objects.lock().unwrap().get_mut(uri) {
+            if let Some(b) = s.data.first_mut() {
+                *b ^= 0xff;
+            }
+        }
+    }
+
     async fn store(
         &self,
         local_path: &Path,
@@ -73,6 +87,7 @@ impl MockBackend {
         let stored = Stored {
             size: data.len() as u64,
             checksum: checksum.map(|s| s.to_string()),
+            data,
         };
         self.objects.lock().unwrap().insert(uri.to_string(), stored);
         Ok(())
@@ -99,6 +114,14 @@ impl UploadBackend for MockBackend {
     ) -> Result<(), VtopError> {
         self.store(local_path, manifest_uri, checksum.map(|c| c.hex))
             .await
+    }
+
+    async fn get_object(&self, object_uri: &str) -> Result<Vec<u8>, VtopError> {
+        let map = self.objects.lock().unwrap();
+        let s = map
+            .get(object_uri)
+            .ok_or_else(|| VtopError::NotFound(object_uri.to_string()))?;
+        Ok(s.data.clone())
     }
 
     async fn head_object(&self, object_uri: &str) -> Result<ObjectHead, VtopError> {
