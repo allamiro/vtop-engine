@@ -281,8 +281,10 @@ pub(crate) fn read_frame<R: Read>(
         relative_offset,
         record: LogRecord {
             producer_id,
+            producer_epoch: 0,
             sequence,
             timestamp_millis,
+            attributes: 0,
             key: body[48..key_end].to_vec(),
             value: body[key_end..payload_end].to_vec(),
         },
@@ -417,8 +419,10 @@ mod tests {
     fn v1_record_frame_matches_golden_vector() {
         let record = LogRecord {
             producer_id: uuid::Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap(),
+            producer_epoch: 0,
             sequence: 0x0102_0304_0506_0708,
             timestamp_millis: -2,
+            attributes: 0,
             key: b"k".to_vec(),
             value: b"value".to_vec(),
         };
@@ -470,8 +474,10 @@ mod tests {
     fn v1_record_rejects_magic_checksum_length_trailing_and_over_limit_mutations() {
         let record = LogRecord {
             producer_id: uuid::Uuid::from_u128(9),
+            producer_epoch: 0,
             sequence: 0,
             timestamp_millis: 1,
+            attributes: 0,
             key: b"key".to_vec(),
             value: b"value".to_vec(),
         };

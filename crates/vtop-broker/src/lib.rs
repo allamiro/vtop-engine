@@ -336,8 +336,12 @@ impl LocalBroker {
                         let sequence = request.first_sequence.checked_add(index as u64).ok_or(());
                         sequence.map(|sequence| LogRecord {
                             producer_id: stored_id,
+                            // The v1 storage schema cannot carry the epoch;
+                            // it is folded into `stored_id` above instead.
+                            producer_epoch: 0,
                             sequence,
                             timestamp_millis: record.timestamp_millis,
+                            attributes: 0,
                             key: record.key,
                             value: record.value,
                         })

@@ -570,8 +570,10 @@ mod tests {
     fn record(producer: u128, sequence: u64, value: &[u8]) -> LogRecord {
         LogRecord {
             producer_id: Uuid::from_u128(producer),
+            producer_epoch: 0,
             sequence,
             timestamp_millis: 1_700_000_000_000 + sequence as i64,
+            attributes: 0,
             key: b"key".to_vec(),
             value: value.to_vec(),
         }

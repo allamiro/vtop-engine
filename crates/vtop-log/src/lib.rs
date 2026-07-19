@@ -7,7 +7,9 @@
 
 mod catalog;
 mod codec;
+mod codec_v2;
 pub mod env;
+pub mod proof;
 mod segment;
 pub mod sim;
 mod types;
@@ -15,9 +17,13 @@ mod types;
 pub use catalog::{
     CatalogEntry, CatalogSegmentState, QuarantineReason, QuarantinedArtifacts, StartupCatalog,
 };
+pub use codec_v2::RECORD_FRAME_OVERHEAD_BYTES_V2;
 pub use segment::{rebuild_index, rebuild_index_in, ActiveSegment, SegmentReader};
 pub use types::{
-    AppendOutcome, Durability, FetchBatch, FetchedRecord, KeyRange, LogError, LogRecord,
-    ParentRange, RangeLineage, RecoveryReport, SegmentConfig, SegmentCursor, SegmentDescriptor,
-    SegmentId, SegmentManifest, VtopLogResult,
+    AppendOutcome, CommitStatementV1, Durability, FetchBatch, FetchedRecord, KeyRange, LogError,
+    LogRecord, ParentRange, ProducerSummaryEntry, RangeLineage, RecoveryReport, SegmentCommitKey,
+    SegmentConfig, SegmentConfigV2, SegmentCursor, SegmentDescriptor, SegmentDescriptorV2,
+    SegmentEvidence, SegmentId, SegmentManifest, SegmentManifestV2, VtopLogResult,
+    CHUNK_SIDECAR_MAGIC, CHUNK_TREE_SCHEME_V1, COMMIT_SCHEME_KEYED, COMMIT_SCHEME_UNKEYED,
+    FORMAT_VERSION_V2, RECORD_SCHEMA_VERSION_V2,
 };
