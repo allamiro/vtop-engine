@@ -42,6 +42,8 @@ async fn state_persists_across_reopen() {
         manifest_sha256: None,
         record_count: Some(10),
         error_message: None,
+        owner: None,
+        lease_expires_at: None,
         created_at: now.clone(),
         updated_at: now,
     };
@@ -114,6 +116,8 @@ async fn recovery_commits_verified_but_uncommitted_batch() {
         manifest_sha256: Some("feedface".into()),
         record_count: Some(4),
         error_message: None,
+        owner: None,
+        lease_expires_at: None,
         created_at: now.clone(),
         updated_at: now,
     };

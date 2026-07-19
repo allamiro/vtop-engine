@@ -36,6 +36,8 @@ CREATE TABLE IF NOT EXISTS batches (
     manifest_sha256 TEXT,
     record_count INTEGER,
     error_message TEXT,
+    owner TEXT,
+    lease_expires_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -80,6 +82,15 @@ impl SqliteStateStore {
                 .await
                 .map_err(map_sqlx)?;
         }
+        // Pre-#93 databases lack the ownership columns; ALTER is idempotent-by
+        // -failure here (SQLite has no IF NOT EXISTS for columns, and the only
+        // failure mode for a duplicate add is the error we ignore).
+        let _ = sqlx::query("ALTER TABLE batches ADD COLUMN owner TEXT")
+            .execute(&self.pool)
+            .await;
+        let _ = sqlx::query("ALTER TABLE batches ADD COLUMN lease_expires_at TEXT")
+            .execute(&self.pool)
+            .await;
         Ok(())
     }
 
@@ -124,8 +135,8 @@ impl StateStore for SqliteStateStore {
                (batch_id, tenant, source_type, source_name, format, state,
                 progress_start_json, progress_end_json, object_uri, manifest_uri,
                 object_sha256, manifest_sha256, record_count, error_message,
-                created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"#,
+                owner, lease_expires_at, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"#,
         )
         .bind(&rec.batch_id)
         .bind(&rec.tenant)
@@ -141,6 +152,8 @@ impl StateStore for SqliteStateStore {
         .bind(&rec.manifest_sha256)
         .bind(rec.record_count)
         .bind(&rec.error_message)
+        .bind(&rec.owner)
+        .bind(&rec.lease_expires_at)
         .bind(&rec.created_at)
         .bind(&rec.updated_at)
         .execute(&self.pool)
@@ -202,6 +215,39 @@ impl StateStore for SqliteStateStore {
     async fn list_batches(&self) -> Result<Vec<BatchRecord>, VtopError> {
         self.query_records("SELECT * FROM batches ORDER BY created_at DESC", None)
             .await
+    }
+
+    async fn claim_incomplete_batches(
+        &self,
+        owner: &str,
+        now: &str,
+        lease_until: &str,
+    ) -> Result<Vec<BatchRecord>, VtopError> {
+        // ONE statement claims; the statement is atomic, so concurrent
+        // recoveries cannot both take a batch. RFC3339 strings compare
+        // lexicographically, which is what makes the TEXT lease comparison
+        // sound (both writers use Utc::to_rfc3339).
+        sqlx::query(
+            "UPDATE batches SET owner = ?1, lease_expires_at = ?2, updated_at = ?3 \
+             WHERE state != ?4 \
+               AND (owner IS NULL OR owner = ?1 OR lease_expires_at IS NULL OR lease_expires_at < ?3)",
+        )
+        .bind(owner)
+        .bind(lease_until)
+        .bind(now)
+        .bind(BatchState::SourceCommitted.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        let rows = sqlx::query(
+            "SELECT * FROM batches WHERE state != ? AND owner = ? ORDER BY created_at ASC",
+        )
+        .bind(BatchState::SourceCommitted.as_str())
+        .bind(owner)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.into_iter().map(row_to_record).collect()
     }
 
     async fn max_committed_end_bytes(
@@ -311,6 +357,8 @@ fn row_to_record(row: sqlx::sqlite::SqliteRow) -> Result<BatchRecord, VtopError>
         manifest_sha256: row.get("manifest_sha256"),
         record_count: row.get("record_count"),
         error_message: row.get("error_message"),
+        owner: row.get("owner"),
+        lease_expires_at: row.get("lease_expires_at"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     })

@@ -23,6 +23,13 @@ pub struct BatchRecord {
     pub manifest_sha256: Option<String>,
     pub record_count: Option<i64>,
     pub error_message: Option<String>,
+    /// Engine instance that owns this in-flight batch (#93). `None` on rows
+    /// written before ownership existed.
+    pub owner: Option<String>,
+    /// RFC3339 instant after which the owner's claim may be taken over by
+    /// another engine. A live engine's batches are NEVER touched; a dead
+    /// engine's are reclaimable once this passes.
+    pub lease_expires_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }

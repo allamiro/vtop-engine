@@ -48,6 +48,8 @@ CREATE TABLE IF NOT EXISTS batches (
     manifest_sha256 TEXT,
     record_count BIGINT,
     error_message TEXT,
+    owner TEXT,
+    lease_expires_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     CONSTRAINT state_enum CHECK (state IN (
@@ -173,6 +175,14 @@ impl PgStateStore {
             .execute(&self.pool)
             .await
             .map_err(map_sqlx)?;
+        // Pre-#93 databases lack the ownership columns.
+        sqlx::raw_sql(
+            "ALTER TABLE batches ADD COLUMN IF NOT EXISTS owner TEXT; \
+             ALTER TABLE batches ADD COLUMN IF NOT EXISTS lease_expires_at TEXT;",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
         sqlx::raw_sql(INVARIANT_TRIGGER)
             .execute(&self.pool)
             .await
@@ -218,8 +228,8 @@ impl StateStore for PgStateStore {
                    (batch_id, tenant, source_type, source_name, format, state,
                     progress_start_json, progress_end_json, object_uri, manifest_uri,
                     object_sha256, manifest_sha256, record_count, error_message,
-                    created_at, updated_at)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)"#,
+                    owner, lease_expires_at, created_at, updated_at)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)"#,
             )
             .bind(&rec.batch_id)
             .bind(&rec.tenant)
@@ -235,6 +245,8 @@ impl StateStore for PgStateStore {
             .bind(&rec.manifest_sha256)
             .bind(rec.record_count)
             .bind(&rec.error_message)
+            .bind(&rec.owner)
+            .bind(&rec.lease_expires_at)
             .bind(&rec.created_at)
             .bind(&rec.updated_at)
             .execute(&self.pool)
@@ -322,6 +334,37 @@ impl StateStore for PgStateStore {
     async fn list_batches(&self) -> Result<Vec<BatchRecord>, VtopError> {
         self.query_records("SELECT * FROM batches ORDER BY created_at DESC", None)
             .await
+    }
+
+    async fn claim_incomplete_batches(
+        &self,
+        owner: &str,
+        now: &str,
+        lease_until: &str,
+    ) -> Result<Vec<BatchRecord>, VtopError> {
+        // ONE atomic statement claims (see the SQLite impl for the invariant
+        // argument); RFC3339 TEXT comparison is lexicographic and sound.
+        sqlx::query(
+            "UPDATE batches SET owner = $1, lease_expires_at = $2, updated_at = $3 \
+             WHERE state != $4 \
+               AND (owner IS NULL OR owner = $1 OR lease_expires_at IS NULL OR lease_expires_at < $3)",
+        )
+        .bind(owner)
+        .bind(lease_until)
+        .bind(now)
+        .bind(BatchState::SourceCommitted.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        let rows = sqlx::query(
+            "SELECT * FROM batches WHERE state != $1 AND owner = $2 ORDER BY created_at ASC",
+        )
+        .bind(BatchState::SourceCommitted.as_str())
+        .bind(owner)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.into_iter().map(row_to_record).collect()
     }
 
     async fn max_committed_end_bytes(
@@ -413,6 +456,8 @@ fn row_to_record(row: sqlx::postgres::PgRow) -> Result<BatchRecord, VtopError> {
         manifest_sha256: row.get("manifest_sha256"),
         record_count: row.get("record_count"),
         error_message: row.get("error_message"),
+        owner: row.get("owner"),
+        lease_expires_at: row.get("lease_expires_at"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     })

@@ -33,6 +33,12 @@ use vtop_core::types::{ProgressMarker, SourceType};
 use vtop_state::{connect_state_store, BatchPatch, BatchRecord, StateStore};
 use vtop_upload::{ObjectChecksum, UploadBackend};
 
+/// How long a batch claim stays exclusive without renewal (#93). Batches
+/// complete in seconds; the lease only has to outlive the slowest healthy
+/// batch by a wide margin so a crashed engine's work transfers reasonably
+/// fast. Renewal-per-transition can shorten this later if needed.
+const LEASE_TTL_SECS: i64 = 600;
+
 /// Outcome of processing a single batch.
 #[derive(Debug, Clone)]
 pub struct BatchOutcome {
@@ -188,6 +194,12 @@ impl<'a> Pipeline<'a> {
             manifest_sha256: None,
             record_count: Some(batch.records.len() as i64),
             error_message: None,
+            // Ownership (#93): this engine claims the batch at birth, leased so
+            // a crashed engine's work is reclaimable and a live one's is not.
+            owner: Some(self.config.engine.name.clone()),
+            lease_expires_at: Some(
+                (Utc::now() + chrono::Duration::seconds(LEASE_TTL_SECS)).to_rfc3339(),
+            ),
             created_at: now.clone(),
             updated_at: now.clone(),
         };
@@ -1295,7 +1307,18 @@ impl Engine {
         // Seed file/syslog committed offsets from previously committed batches.
         self.seed_committed_offsets().await?;
 
-        let incomplete = self.store.list_incomplete_batches().await?;
+        // CLAIM, not list (#93): only batches this engine owns, never owned, or
+        // whose previous owner's lease has expired. Recovery on a shared store
+        // must not touch another live engine's in-flight work.
+        let now = Utc::now();
+        let incomplete = self
+            .store
+            .claim_incomplete_batches(
+                &self.config.engine.name,
+                &now.to_rfc3339(),
+                &(now + chrono::Duration::seconds(LEASE_TTL_SECS)).to_rfc3339(),
+            )
+            .await?;
         let mut summary = RecoverySummary::default();
         for rec in incomplete {
             let action = next_recovery_action(rec.state);
