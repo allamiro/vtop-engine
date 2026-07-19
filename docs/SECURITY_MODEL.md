@@ -55,6 +55,7 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are used as normat
 | Engine ↔ state store | The database is trusted for ledger correctness, progress durability, and availability, but not for telemetry-object integrity. Remote PostgreSQL requires hostname-verified TLS; its URL is resolved from an env/file secret reference and never serialized. |
 | Engine ↔ external CLI backends | Version-pinned tools executing outside the Rust dependency graph; stored objects are downloaded and hashed. |
 | Engine ↔ operator/logs | Secret redaction; manifests carry no secrets. |
+| Native client ↔ broker | TLS 1.3 with mandatory client certificates, explicit certificate/principal/role authorization, bounded frames/sessions/windows, and range/producer fencing checks. |
 | Build ↔ runtime | Supply-chain auditing; container hardening. |
 
 ---
@@ -81,6 +82,21 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are used as normat
 
 - Kafka authentication **SHOULD** support **SASL/SCRAM** and **mTLS**.
 - The selected mechanism and identity **MAY** be logged, but associated secrets **MUST NOT** be logged.
+
+### Native broker transport
+
+- The native broker transport is restricted to TLS 1.3 and requires a client
+  certificate chained to the configured client roots.
+- Certificate validity alone does not grant a role. The embedding deployment
+  **MUST** supply a `SessionAuthorizer` that binds the peer certificate chain,
+  declared principal ID, and requested producer/consumer role. Produce requests
+  additionally require `producer_id == principal_id` before the durable producer
+  epoch journal can be changed.
+- Wire frames are length-bounded and BLAKE3-checksummed independently of TLS.
+  The checksum detects accidental framing corruption; TLS provides peer
+  authentication, confidentiality, and active-tamper protection.
+- Session count, global in-flight work, negotiated record/frame limits, idle
+  timeouts, and fetch-response byte credit are explicit resource boundaries.
 
 ## 3. Credential Handling
 

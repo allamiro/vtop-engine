@@ -715,6 +715,8 @@ Completed:
 - [x] **end-to-end smoke + live-broker Kafka CI** over the full compose lab
 - [x] Kafka is isolated behind the optional `kafka` Cargo feature
 - [x] first Kafka-independent native segment-log storage kernel
+- [x] bounded native produce/fetch wire codec and TLS-1.3 mTLS local-broker
+      library with durable producer-epoch fencing and committed-only fetch
 
 Planned implementation areas:
 

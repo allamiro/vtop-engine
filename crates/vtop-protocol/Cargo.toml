@@ -1,0 +1,13 @@
+[package]
+name = "vtop-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Bounded, versioned wire protocol for the native VTOP broker."
+
+[dependencies]
+blake3 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }

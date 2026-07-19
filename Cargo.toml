@@ -3,6 +3,8 @@ resolver = "2"
 members = [
   "crates/vtop-core",
   "crates/vtop-log",
+  "crates/vtop-protocol",
+  "crates/vtop-broker",
   "crates/vtop-adapters",
   "crates/vtop-upload",
   "crates/vtop-state",
@@ -60,6 +62,8 @@ bytes = "1"
 futures = "0.3"
 regex = "1"
 rustix = { version = "1", features = ["fs"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 
 # Internal crates
 # Internal crates carry an explicit `version` alongside `path`: cargo uses the
@@ -68,6 +72,8 @@ rustix = { version = "1", features = ["fs"] }
 # workspace could not actually be published as declared.
 vtop-core = { path = "crates/vtop-core", version = "0.1.0" }
 vtop-log = { path = "crates/vtop-log", version = "0.1.0" }
+vtop-protocol = { path = "crates/vtop-protocol", version = "0.1.0" }
+vtop-broker = { path = "crates/vtop-broker", version = "0.1.0" }
 vtop-adapters = { path = "crates/vtop-adapters", version = "0.1.0", default-features = false }
 vtop-upload = { path = "crates/vtop-upload", version = "0.1.0" }
 vtop-state = { path = "crates/vtop-state", version = "0.1.0" }
