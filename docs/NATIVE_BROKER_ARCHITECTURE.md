@@ -97,9 +97,12 @@ It is not yet a proof-carrying or cluster-safe segment implementation:
   recovers only through that boundary, and truncates any surviving tail.
 - Sealing now durably advances that local boundary before publishing the
   immutable segment. This is local durability only, not a quorum commit proof.
-- Startup discovery, quarantine, concurrent producers, bounded queues,
-  backpressure, crash-point tests, property tests, fuzzing, and native storage
-  benchmarks remain future work.
+- `StartupCatalog` now performs read-only discovery, validates committed active
+  prefixes and sealed bytes, and quarantines ambiguous local artifacts without
+  selecting a winner. Directory ownership/locking, concurrent producers,
+  injectable disk/clock/RNG seams, bounded queues, backpressure, crash-point
+  tests, property tests, fuzzing, and native storage benchmarks remain future
+  work.
 
 These are staging gaps, not reasons to discard the slice. The first merge must
 keep the committed-boundary regression tests and accurately label all

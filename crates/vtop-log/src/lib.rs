@@ -5,10 +5,14 @@
 //! Replication and the control plane can therefore build on a small, stable
 //! segment contract without leaking an external platform into that contract.
 
+mod catalog;
 mod codec;
 mod segment;
 mod types;
 
+pub use catalog::{
+    CatalogEntry, CatalogSegmentState, QuarantineReason, QuarantinedArtifacts, StartupCatalog,
+};
 pub use segment::{rebuild_index, ActiveSegment, SegmentReader};
 pub use types::{
     AppendOutcome, Durability, FetchBatch, FetchedRecord, KeyRange, LogError, LogRecord,
