@@ -1324,6 +1324,18 @@ impl Engine {
         if head.size_bytes.is_none() {
             return false; // gone
         }
+        // The manifest is half of what VERIFIED means; a batch whose manifest
+        // vanished is not verified either (#123 review).
+        if let Some(muri) = rec.manifest_uri.as_deref() {
+            match self.backend.head_object(muri).await {
+                Ok(mh) if mh.size_bytes.is_some() => {}
+                Ok(_) => return false,
+                Err(e) => {
+                    tracing::warn!(muri, error = %e, "recovery re-check: manifest head failed");
+                    return false;
+                }
+            }
+        }
         match (
             rec.object_sha256.as_deref(),
             head.checksum_sha256.as_deref(),
@@ -1374,23 +1386,56 @@ impl Engine {
                             object_uri = rec.object_uri.as_deref().unwrap_or(""),
                             "recovery: VERIFIED batch failed storage re-check; replaying instead of committing"
                         );
-                        let _ = self
+                        // The replay decision must be DURABLE before the
+                        // adapter rewinds: if these transitions fail, the row
+                        // stays VERIFIED and the next recovery re-checks it
+                        // again — never rewind on a decision the ledger did
+                        // not record (#123 review).
+                        if let Err(e) = self
                             .store
                             .mark_failed(
                                 &rec.batch_id,
                                 "recovery: stale VERIFIED (storage re-check failed)",
                             )
-                            .await;
-                        self.store
+                            .await
+                        {
+                            tracing::error!(batch_id = %rec.batch_id, error = %e, "recovery: could not persist re-check failure");
+                            summary.still_pending += 1;
+                            continue;
+                        }
+                        if let Err(e) = self
+                            .store
                             .update_batch_state(
                                 &rec.batch_id,
                                 BatchState::ReplayRequired,
                                 &BatchPatch::default(),
                             )
                             .await
-                            .ok();
+                        {
+                            tracing::error!(batch_id = %rec.batch_id, error = %e, "recovery: could not persist REPLAY_REQUIRED");
+                            summary.still_pending += 1;
+                            continue;
+                        }
                         if let Some(adapter) = self.adapters.get_mut(&rec.source_type) {
                             let _ = adapter.replay_from_marker(&rec.progress_start).await;
+                        }
+                        // Dashboards must see this refusal path like any other
+                        // replay (#123 review).
+                        if let Some(mx) = telemetry::metrics() {
+                            let l = [
+                                rec.tenant.as_str(),
+                                rec.source_type.as_str(),
+                                rec.format.extension(),
+                            ];
+                            mx.replay_required_total.with_label_values(&l).inc();
+                            mx.batches_total
+                                .with_label_values(&[
+                                    l[0],
+                                    l[1],
+                                    l[2],
+                                    BatchState::ReplayRequired.as_str(),
+                                ])
+                                .inc();
                         }
                         summary.replay_required += 1;
                         continue;
