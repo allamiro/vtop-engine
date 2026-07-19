@@ -58,14 +58,64 @@ pub struct S3NativeBackend {
     client: Client,
 }
 
+/// Enforce the transport policy BEFORE any client is built (#75).
+///
+/// `verify_tls: true` (the default) means "telemetry must travel encrypted":
+/// a plaintext `http://` endpoint under it is a configuration error, not a
+/// warning — silently accepting one is exactly the downgrade the flag claims
+/// to prevent. `verify_tls: false` is the explicit lab opt-out that permits
+/// plaintext endpoints (e.g. the compose lab's `http://minio:9000`).
+///
+/// Honest scope: this flag does NOT disable certificate verification for
+/// `https://` endpoints — the AWS SDK always verifies against the system
+/// trust store. A self-signed or private-CA endpoint needs its CA in the
+/// system trust store; skipping verification is deliberately unsupported.
+fn validate_endpoint_scheme(endpoint_url: Option<&str>, verify_tls: bool) -> Result<(), VtopError> {
+    let Some(ep) = endpoint_url else {
+        return Ok(()); // default AWS endpoints are always https
+    };
+    let plaintext = ep.trim().to_ascii_lowercase().starts_with("http://");
+    if plaintext && verify_tls {
+        return Err(VtopError::Config(format!(
+            "endpoint_url {ep} is plaintext http:// while verify_tls is true; refusing to send \
+             telemetry unencrypted. Use an https:// endpoint, or set verify_tls: false \
+             (VTOP_S3_VERIFY_TLS=false) to explicitly opt into a plaintext LAB endpoint"
+        )));
+    }
+    if plaintext {
+        tracing::warn!(
+            endpoint = %ep,
+            "plaintext S3 endpoint permitted because verify_tls=false (lab use only)"
+        );
+    }
+    Ok(())
+}
+
 impl S3NativeBackend {
     /// Build the backend from config, resolving credentials via the standard
     /// AWS credential chain (env vars, profile, instance metadata).
     pub async fn new(cfg: &S3NativeConfig) -> Result<Self, VtopError> {
+        validate_endpoint_scheme(cfg.endpoint_url.as_deref(), cfg.verify_tls)?;
         if !cfg.verify_tls {
             tracing::warn!(
-                "VTOP_S3_VERIFY_TLS is disabled; TLS verification is OFF (lab use only)"
+                "verify_tls is false: plaintext endpoints are permitted (lab use only). \
+                 Certificate verification for https:// endpoints is NOT disabled - \
+                 private CAs must be in the system trust store"
             );
+        }
+
+        // The SDK resolves endpoints from its OWN configuration too —
+        // AWS_ENDPOINT_URL / AWS_ENDPOINT_URL_S3 and the shared config file —
+        // and those must not bypass the policy the explicit config obeys.
+        // The service-specific variable is checked here because it is applied
+        // at service-config construction, where no resolved value is
+        // observable; the globally-resolved endpoint is checked on the loaded
+        // SdkConfig below.
+        for var in ["AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL"] {
+            if let Ok(ep) = std::env::var(var) {
+                validate_endpoint_scheme(Some(&ep), cfg.verify_tls)
+                    .map_err(|e| VtopError::Config(format!("{var}: {e}")))?;
+            }
         }
 
         let mut loader =
@@ -74,6 +124,10 @@ impl S3NativeBackend {
             loader = loader.endpoint_url(ep.clone());
         }
         let shared = loader.load().await;
+        // Whatever endpoint actually resolved (explicit config, env, or the
+        // shared config file) is what the client will talk to — validate THAT,
+        // not only the value we passed in.
+        validate_endpoint_scheme(shared.endpoint_url(), cfg.verify_tls)?;
 
         let s3_conf = aws_sdk_s3::config::Builder::from(&shared)
             .force_path_style(cfg.force_path_style)
@@ -333,5 +387,32 @@ mod tests {
         assert!(hex_to_b64_sha256("zz").is_none()); // not valid hex
         assert!(b64_to_hex_sha256("not-base64!!").is_none());
         assert!(b64_to_hex_sha256(&B64.encode([0u8; 16])).is_none()); // 16 bytes
+    }
+
+    /// #75: verify_tls=true must REJECT plaintext endpoints, not warn past
+    /// them; verify_tls=false is the explicit lab opt-out.
+    #[test]
+    fn plaintext_endpoint_policy() {
+        // The hole this closes: verify_tls promised encryption but plaintext
+        // was accepted anyway.
+        let err = validate_endpoint_scheme(Some("http://minio:9000"), true)
+            .expect_err("plaintext + verify_tls=true must fail");
+        assert!(matches!(err, VtopError::Config(_)));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("http://minio:9000"),
+            "names the endpoint: {msg}"
+        );
+        assert!(msg.contains("verify_tls"), "names the fix: {msg}");
+
+        // Explicit lab opt-out still works (the compose lab is plaintext).
+        assert!(validate_endpoint_scheme(Some("http://minio:9000"), false).is_ok());
+        // Scheme check is case-insensitive and trims whitespace.
+        assert!(validate_endpoint_scheme(Some("  HTTP://minio:9000"), true).is_err());
+        // https endpoints pass under either setting.
+        assert!(validate_endpoint_scheme(Some("https://s3.example.com"), true).is_ok());
+        assert!(validate_endpoint_scheme(Some("https://s3.example.com"), false).is_ok());
+        // No custom endpoint = default AWS https endpoints.
+        assert!(validate_endpoint_scheme(None, true).is_ok());
     }
 }
