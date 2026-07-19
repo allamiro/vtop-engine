@@ -92,6 +92,10 @@ upload:
   # verification on https endpoints; private CAs go in the system trust store.
   verify_tls: false
   create_bucket: true           # auto-create per-format buckets on first use
+  # Default true: VERIFIED requires a digest derived from stored content (or a
+  # storage-service-computed digest). Set false only for explicit size-only
+  # compatibility/lab operation.
+  require_strong_verification: true
 
 partitioning:
   template: "tenant={tenant}/source={source}/format={format}/year={yyyy}/month={mm}/day={dd}/hour={hh}/"

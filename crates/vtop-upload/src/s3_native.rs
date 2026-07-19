@@ -7,12 +7,15 @@
 //! Integrity: for **SHA-256** the precomputed digest is sent on `PUT`
 //! (`x-amz-checksum-sha256`), so the store recomputes the body hash and rejects
 //! a corrupted upload (server-validated), and verification reads that
-//! store-computed checksum back via `head_object`. For any algorithm (including
-//! **BLAKE3**) the hex digest is also kept as user metadata
-//! (`x-amz-meta-vtop-checksum`) for tooling and verification. When checksums are
-//! disabled, verification falls back to size + existence (backend-limited).
+//! store-computed checksum back via `head_object`. For **BLAKE3**, verification
+//! streams the stored body through BLAKE3. The uploader-provided digest remains
+//! user metadata for inventory tooling only and is never strong evidence.
+//! When checksums are disabled, verification falls back to size + existence
+//! (backend-limited).
 
-use crate::base::{parse_s3_uri, ObjectChecksum, ObjectHead, UploadBackend, VerificationResult};
+use crate::base::{
+    parse_s3_uri, read_bounded, ObjectChecksum, ObjectHead, UploadBackend, VerificationResult,
+};
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Region;
@@ -21,7 +24,9 @@ use aws_sdk_s3::types::ChecksumMode;
 use aws_sdk_s3::Client;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use std::path::Path;
+use vtop_core::checksum::digest_reader;
 use vtop_core::errors::VtopError;
+use vtop_core::types::ChecksumAlgorithm;
 
 const CHECKSUM_META_KEY: &str = "vtop-checksum";
 
@@ -180,6 +185,32 @@ impl S3NativeBackend {
         tracing::info!(uri, "object uploaded via s3_native");
         Ok(())
     }
+
+    /// Recompute a digest from the bytes returned by S3 without buffering the
+    /// full object. Used for algorithms S3 does not compute natively.
+    async fn digest_stored_body(
+        &self,
+        object_uri: &str,
+        algo: ChecksumAlgorithm,
+    ) -> Result<(String, u64), VtopError> {
+        let (bucket, key) = parse_s3_uri(object_uri)?;
+        let out = self
+            .client
+            .get_object()
+            .bucket(&bucket)
+            .key(&key)
+            .send()
+            .await
+            .map_err(|e| {
+                VtopError::Upload(format!(
+                    "get_object {object_uri}: {}",
+                    e.into_service_error()
+                ))
+            })?;
+        digest_reader(algo, out.body.into_async_read())
+            .await?
+            .ok_or_else(|| VtopError::Upload("cannot hash with disabled checksum mode".into()))
+    }
 }
 
 #[async_trait]
@@ -227,6 +258,36 @@ impl UploadBackend for S3NativeBackend {
         Ok(bytes.into_bytes().to_vec())
     }
 
+    async fn get_object_bounded(
+        &self,
+        object_uri: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, VtopError> {
+        let (bucket, key) = parse_s3_uri(object_uri)?;
+        let out = self
+            .client
+            .get_object()
+            .bucket(&bucket)
+            .key(&key)
+            .send()
+            .await
+            .map_err(|e| {
+                VtopError::Upload(format!(
+                    "get_object {object_uri}: {}",
+                    e.into_service_error()
+                ))
+            })?;
+        if out
+            .content_length()
+            .is_some_and(|size| size < 0 || size as u64 > max_bytes as u64)
+        {
+            return Err(VtopError::Upload(format!(
+                "stored object {object_uri} exceeds the {max_bytes}-byte read limit"
+            )));
+        }
+        read_bounded(out.body.into_async_read(), max_bytes, object_uri).await
+    }
+
     async fn head_object(&self, object_uri: &str) -> Result<ObjectHead, VtopError> {
         let (bucket, key) = parse_s3_uri(object_uri)?;
         let out = self
@@ -244,17 +305,10 @@ impl UploadBackend for S3NativeBackend {
                 ))
             })?;
 
-        // Prefer the checksum S3 itself computed over the object body (SHA-256,
-        // base64 -> hex) — that is server-validated. Fall back to the
-        // engine-asserted metadata digest (covers BLAKE3 and older objects).
-        let checksum_sha256 = out
-            .checksum_sha256()
-            .and_then(b64_to_hex_sha256)
-            .or_else(|| {
-                out.metadata()
-                    .and_then(|m| m.get(CHECKSUM_META_KEY))
-                    .cloned()
-            });
+        // Only expose the checksum S3 itself computed over the stored body.
+        // x-amz-meta-vtop-checksum is written by the uploader and therefore
+        // cannot establish content integrity (#64).
+        let checksum_sha256 = out.checksum_sha256().and_then(b64_to_hex_sha256);
 
         Ok(ObjectHead {
             uri: object_uri.to_string(),
@@ -289,17 +343,42 @@ impl UploadBackend for S3NativeBackend {
             ));
         };
 
-        match head.checksum_sha256 {
-            Some(stored) if stored.eq_ignore_ascii_case(expected.hex) => {
-                Ok(VerificationResult::passed("size + checksum verified"))
+        let algo = match expected.algorithm.parse::<ChecksumAlgorithm>() {
+            Ok(ChecksumAlgorithm::None) => {
+                return Ok(VerificationResult::failed(
+                    "checksum value supplied with disabled algorithm",
+                ))
             }
-            Some(stored) => Ok(VerificationResult::failed(format!(
-                "checksum mismatch: expected {}, stored {stored}",
-                expected.hex
-            ))),
-            None => Ok(VerificationResult::limited(
-                "object present and size matches; backend did not return checksum metadata",
-            )),
+            Ok(algo) => algo,
+            Err(e) => return Ok(VerificationResult::failed(e)),
+        };
+
+        match algo {
+            ChecksumAlgorithm::Sha256 => match head.checksum_sha256 {
+                Some(stored) if stored.eq_ignore_ascii_case(expected.hex) => Ok(
+                    VerificationResult::passed("S3 service-computed SHA-256 verified"),
+                ),
+                Some(_) => Ok(VerificationResult::failed(
+                    "S3 service-computed SHA-256 mismatch",
+                )),
+                None => Ok(VerificationResult::limited(
+                    "object size matches; S3 returned no service-computed SHA-256",
+                )),
+            },
+            ChecksumAlgorithm::Blake3 => {
+                let (actual, bytes_read) = self.digest_stored_body(object_uri, algo).await?;
+                if bytes_read != expected_size {
+                    return Ok(VerificationResult::failed(format!(
+                        "size mismatch: expected {expected_size}, read {bytes_read} stored bytes"
+                    )));
+                }
+                if actual.eq_ignore_ascii_case(expected.hex) {
+                    Ok(VerificationResult::passed("stored content BLAKE3 verified"))
+                } else {
+                    Ok(VerificationResult::failed("stored content BLAKE3 mismatch"))
+                }
+            }
+            ChecksumAlgorithm::None => unreachable!("handled above"),
         }
     }
 

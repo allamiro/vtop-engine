@@ -2,11 +2,16 @@
 //!
 //! Writes telemetry objects under a local directory tree
 //! (`<root>/<bucket>/<key>`), with the engine-provided checksum stored in a
-//! sidecar file (`<key>.vtopck`). Useful for air-gapped / offline archival and
-//! for benchmarking the pipeline with real disk I/O but no object-storage
-//! service. `s3://bucket/key` URIs are mapped onto the local tree.
+//! sidecar file (`<key>.vtopck`) as an inventory hint. Verification ignores the
+//! sidecar and streams the stored body through the configured digest. Useful
+//! for air-gapped / offline archival and for benchmarking the pipeline with
+//! real disk I/O but no object-storage service. `s3://bucket/key` URIs are
+//! mapped onto the local tree.
 
-use crate::base::{parse_s3_uri, ObjectChecksum, ObjectHead, UploadBackend, VerificationResult};
+use crate::base::{
+    parse_s3_uri, read_bounded, verify_file_content, ObjectChecksum, ObjectHead, UploadBackend,
+    VerificationResult,
+};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use vtop_core::errors::VtopError;
@@ -98,20 +103,30 @@ impl UploadBackend for LocalFsBackend {
             .map_err(|_| VtopError::NotFound(object_uri.to_string()))
     }
 
+    async fn get_object_bounded(
+        &self,
+        object_uri: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, VtopError> {
+        let path = self.object_path(object_uri)?;
+        let file = tokio::fs::File::open(&path)
+            .await
+            .map_err(|_| VtopError::NotFound(object_uri.to_string()))?;
+        read_bounded(file, max_bytes, object_uri).await
+    }
+
     async fn head_object(&self, object_uri: &str) -> Result<ObjectHead, VtopError> {
         let path = self.object_path(object_uri)?;
         let meta = tokio::fs::metadata(&path)
             .await
             .map_err(|_| VtopError::NotFound(object_uri.to_string()))?;
-        let checksum = tokio::fs::read_to_string(Self::checksum_sidecar(&path))
-            .await
-            .ok()
-            .map(|s| s.trim().to_string());
         Ok(ObjectHead {
             uri: object_uri.to_string(),
             size_bytes: Some(meta.len()),
             etag: None,
-            checksum_sha256: checksum,
+            // The .vtopck file is written by this engine. It is useful as an
+            // inventory hint, but cannot prove what bytes are in `path`.
+            checksum_sha256: None,
         })
     }
 
@@ -121,30 +136,8 @@ impl UploadBackend for LocalFsBackend {
         expected_size: u64,
         expected: Option<ObjectChecksum<'_>>,
     ) -> Result<VerificationResult, VtopError> {
-        let head = self.head_object(object_uri).await?;
-        if head.size_bytes != Some(expected_size) {
-            return Ok(VerificationResult::failed(format!(
-                "size mismatch: expected {expected_size}, got {:?}",
-                head.size_bytes
-            )));
-        }
-        let Some(expected) = expected else {
-            return Ok(VerificationResult::limited(
-                "localfs: size matches (checksums disabled)",
-            ));
-        };
-        match head.checksum_sha256 {
-            Some(stored) if stored.eq_ignore_ascii_case(expected.hex) => Ok(
-                VerificationResult::passed("localfs: size + checksum verified"),
-            ),
-            Some(stored) => Ok(VerificationResult::failed(format!(
-                "checksum mismatch: expected {}, stored {stored}",
-                expected.hex
-            ))),
-            None => Ok(VerificationResult::limited(
-                "localfs: size matches; no checksum sidecar",
-            )),
-        }
+        let path = self.object_path(object_uri)?;
+        verify_file_content(&path, expected_size, expected, "localfs").await
     }
 
     async fn delete_object(&self, object_uri: &str) -> Result<(), VtopError> {
@@ -188,7 +181,8 @@ mod tests {
         let b = LocalFsBackend::new(root.path());
         let f = tmp(b"payload");
         let uri = "s3://telemetry-cef/a/b/obj.cef.gz";
-        let ck = ObjectChecksum::new("sha256", "deadbeef");
+        let digest = vtop_core::checksum::sha256_bytes(b"payload");
+        let ck = ObjectChecksum::new("sha256", &digest);
         b.put_object(f.path(), uri, Some(ck)).await.unwrap();
         let res = b.verify_object(uri, 7, Some(ck)).await.unwrap();
         assert!(res.passed && !res.backend_limited);
@@ -198,6 +192,26 @@ mod tests {
             .await
             .unwrap();
         assert!(!bad.passed);
+    }
+
+    #[tokio::test]
+    async fn same_size_replacement_fails_even_when_sidecar_is_unchanged() {
+        let root = tempfile::tempdir().unwrap();
+        let b = LocalFsBackend::new(root.path());
+        let f = tmp(b"payload-A");
+        let uri = "s3://telemetry-cef/a/obj.cef.gz";
+        let digest = vtop_core::checksum::sha256_bytes(b"payload-A");
+        let ck = ObjectChecksum::new("sha256", &digest);
+        b.put_object(f.path(), uri, Some(ck)).await.unwrap();
+
+        // Replace only the stored body. The engine-written .vtopck sidecar
+        // still asserts the original digest and must not make this pass.
+        tokio::fs::write(b.object_path(uri).unwrap(), b"payload-B")
+            .await
+            .unwrap();
+        let res = b.verify_object(uri, 9, Some(ck)).await.unwrap();
+        assert!(!res.passed);
+        assert!(!res.backend_limited);
     }
 
     #[tokio::test]

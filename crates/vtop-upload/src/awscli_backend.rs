@@ -3,7 +3,10 @@
 //! Compatibility mode only. Supports `--endpoint-url` and `AWS_PROFILE`.
 //! Credentials come from the environment / profile and are never printed.
 
-use crate::base::{parse_s3_uri, ObjectChecksum, ObjectHead, UploadBackend, VerificationResult};
+use crate::base::{
+    parse_s3_uri, read_command_bounded, verify_command_content, ObjectChecksum, ObjectHead,
+    UploadBackend, VerificationResult,
+};
 use async_trait::async_trait;
 use std::path::Path;
 use tokio::process::Command;
@@ -83,6 +86,16 @@ impl UploadBackend for AwsCliBackend {
             .map_err(|e| VtopError::Upload(format!("reading downloaded {object_uri}: {e}")))
     }
 
+    async fn get_object_bounded(
+        &self,
+        object_uri: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, VtopError> {
+        let mut cmd = self.base_cmd();
+        cmd.arg("s3").arg("cp").arg(object_uri).arg("-");
+        read_command_bounded(&mut cmd, max_bytes, object_uri, "aws cli").await
+    }
+
     async fn head_object(&self, object_uri: &str) -> Result<ObjectHead, VtopError> {
         let (bucket, key) = parse_s3_uri(object_uri)?;
         let out = output(
@@ -97,11 +110,6 @@ impl UploadBackend for AwsCliBackend {
         .await?;
         let json: serde_json::Value = serde_json::from_str(&out).unwrap_or(serde_json::Value::Null);
         let size = json.get("ContentLength").and_then(|v| v.as_u64());
-        let checksum_sha256 = json
-            .get("Metadata")
-            .and_then(|m| m.get(SHA256_META_KEY))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
         Ok(ObjectHead {
             uri: object_uri.to_string(),
             size_bytes: size,
@@ -109,7 +117,9 @@ impl UploadBackend for AwsCliBackend {
                 .get("ETag")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            checksum_sha256,
+            // vtop-sha256 is uploader-controlled user metadata, not a digest
+            // computed by S3 over the stored body.
+            checksum_sha256: None,
         })
     }
 
@@ -119,33 +129,21 @@ impl UploadBackend for AwsCliBackend {
         expected_size: u64,
         expected: Option<ObjectChecksum<'_>>,
     ) -> Result<VerificationResult, VtopError> {
-        let head = self.head_object(object_uri).await?;
-        match head.size_bytes {
-            Some(sz) if sz != expected_size => {
-                return Ok(VerificationResult::failed(format!(
-                    "size mismatch: expected {expected_size}, got {sz}"
-                )))
-            }
-            None => return Ok(VerificationResult::failed("object size unavailable")),
-            _ => {}
-        }
         let Some(expected) = expected else {
-            return Ok(VerificationResult::limited(
-                "aws cli: size matches (checksums disabled)",
-            ));
+            let head = self.head_object(object_uri).await?;
+            return match head.size_bytes {
+                Some(size) if size == expected_size => Ok(VerificationResult::limited(
+                    "aws cli: object present and size matches (checksums disabled)",
+                )),
+                Some(size) => Ok(VerificationResult::failed(format!(
+                    "size mismatch: expected {expected_size}, got {size}"
+                ))),
+                None => Ok(VerificationResult::failed("object size unavailable")),
+            };
         };
-        match head.checksum_sha256 {
-            Some(stored) if stored.eq_ignore_ascii_case(expected.hex) => Ok(
-                VerificationResult::passed("aws cli: size + checksum verified"),
-            ),
-            Some(stored) => Ok(VerificationResult::failed(format!(
-                "checksum mismatch: expected {}, stored {stored}",
-                expected.hex
-            ))),
-            None => Ok(VerificationResult::limited(
-                "aws cli: size matches; no checksum metadata returned",
-            )),
-        }
+        let mut cmd = self.base_cmd();
+        cmd.arg("s3").arg("cp").arg(object_uri).arg("-");
+        verify_command_content(&mut cmd, expected_size, expected, "aws cli").await
     }
 
     async fn delete_object(&self, object_uri: &str) -> Result<(), VtopError> {

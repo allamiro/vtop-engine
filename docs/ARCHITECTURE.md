@@ -220,15 +220,18 @@ All backends implement `UploadBackend` (`upload`, `verify_object`, `ensure_bucke
 
 | Backend | Target | Checksum verification | Multipart | Bucket create | Use |
 |---------|--------|-----------------------|-----------|---------------|-----|
-| `s3_native` | AWS S3 / MinIO / Ceph RGW (endpoint + path-style) via `aws-sdk-s3` | Strong (stored SHA-256/BLAKE3) | No (`put_object`; `supports_multipart()` = false) | Yes (on-demand) | Primary production backend. |
-| LocalFS | Local directory tree | Strong (re-reads object) | N/A | Yes (mkdir tree) | Testing / air-gapped. |
-| `awscli` | S3 via AWS CLI | Strong (verifies stored hash) | Tool-dependent | Yes | Command-compatible. |
-| `s3cmd` | S3 via s3cmd | Backend-limited (size + existence) | Tool-dependent | Yes | Command-compatible. |
-| `minio mc` | S3-compatible via `mc` | Backend-limited (size + existence) | Tool-dependent | Yes | Command-compatible. |
+| `s3_native` | AWS S3 / MinIO / Ceph RGW (endpoint + path-style) via `aws-sdk-s3` | Strong (service-computed SHA-256; streamed stored-content BLAKE3) | No (`put_object`; `supports_multipart()` = false) | Yes (on-demand) | Primary production backend. |
+| LocalFS | Local directory tree | Strong (streams the stored file; sidecar is not trusted) | N/A | Yes (mkdir tree) | Testing / air-gapped. |
+| `awscli` | S3 via AWS CLI | Strong (downloads and hashes stored content) | Tool-dependent | Yes | Command-compatible. |
+| `s3cmd` | S3 via s3cmd | Strong (downloads and hashes stored content) | Tool-dependent | Yes | Command-compatible. |
+| `minio mc` | S3-compatible via `mc` | Strong (downloads and hashes stored content) | Tool-dependent | Yes | Command-compatible. |
 | `mock` | In-memory | Configurable | N/A | Yes | Tests/benchmarks. |
 | `mock_fail` / `mock_limited` | In-memory fault injection | Forced failure / size-only | N/A | Yes | Fault-injection tests. |
 
-Backends that can only confirm size + existence report **backend-limited** verification; they still gate the commit rule but do not provide cryptographic assurance (see protocol §17).
+Checksums disabled by configuration (or a service unable to return a required
+service checksum) produce **backend-limited** verification. Strong verification
+is the default; accepting a limited result requires an explicit opt-out (see
+protocol §17).
 
 ---
 
@@ -238,7 +241,7 @@ Backends that can only confirm size + existence report **backend-limited** verif
 - Supported modes: **SHA-256**, **BLAKE3**, or **disabled** (size-only verification). The mode is configurable per run.
 - The chosen algorithm and value (or the disabled indicator) are recorded in the manifest.
 - The manifest additionally carries a reproducible **self-hash** (computed with the self-hash field blanked) for tamper-evidence (`verify_self_hash`).
-- Verification compares the stored object's hash (or size, in disabled mode) against the manifest before `VERIFIED` is reached.
+- Verification compares a digest derived from the stored body (or S3's service-computed SHA-256) against the manifest before `VERIFIED` is reached. Uploader metadata and LocalFS sidecars are never strong evidence.
 
 ---
 

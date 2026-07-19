@@ -162,3 +162,98 @@ async fn verification_failure_never_commits() {
     assert_eq!(replay.len(), 1);
     assert_eq!(replay[0].records.len(), 5, "data replayable after failure");
 }
+
+/// #64: a same-size replacement must fail in the normal pipeline even when
+/// uploader-controlled checksum metadata still advertises the expected hash.
+#[tokio::test]
+async fn metadata_preserving_content_replacement_never_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work-content-attack");
+    let path = sample(dir.path());
+    let cfg = file_config(
+        work.to_str().unwrap(),
+        "sqlite::memory:",
+        vec![path.clone()],
+        "mock",
+    );
+    let store = SqliteStateStore::connect(&cfg.engine.state_store)
+        .await
+        .unwrap();
+    let concrete = Arc::new(MockBackend::corrupting());
+    let backend: Arc<dyn vtop_upload::UploadBackend> = concrete.clone();
+
+    let mut adapter = FileSource::new(vec![path], TelemetryFormat::Raw, false);
+    let source = adapter.discover_sources().await.unwrap().pop().unwrap();
+    let mut reads = adapter
+        .read_batch_candidates(&source, 1000, 1 << 20, std::time::Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(reads.len(), 1);
+    let outcome = pipeline(&store, backend, &cfg)
+        .process(&mut adapter, &source, reads.remove(0), None)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.final_state, BatchState::Failed);
+    assert!(!outcome.committed);
+    let row = store
+        .get_batch(&outcome.batch_id)
+        .await
+        .unwrap()
+        .expect("failed batch remains in ledger");
+    let object_uri = row.object_uri.expect("object was uploaded before attack");
+    let head = vtop_upload::UploadBackend::head_object(concrete.as_ref(), &object_uri)
+        .await
+        .unwrap();
+    let stored = vtop_upload::UploadBackend::get_object(concrete.as_ref(), &object_uri)
+        .await
+        .unwrap();
+    assert_eq!(head.size_bytes, Some(stored.len() as u64));
+    assert!(
+        head.etag.is_some(),
+        "uploader checksum metadata remains present"
+    );
+    assert!(
+        head.checksum_sha256.is_none(),
+        "uploader metadata must not be exposed as a service-computed checksum"
+    );
+}
+
+/// #64 migration contract: strong verification is the default behavior, while
+/// an explicit false value preserves a compatibility path for size-only stores.
+#[tokio::test]
+async fn backend_limited_verification_requires_explicit_opt_out() {
+    for (require_strong, expected_state) in [
+        (true, BatchState::Failed),
+        (false, BatchState::SourceCommitted),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work-limited");
+        let path = sample(dir.path());
+        let mut cfg = file_config(
+            work.to_str().unwrap(),
+            "sqlite::memory:",
+            vec![path.clone()],
+            "mock",
+        );
+        cfg.upload.require_strong_verification = require_strong;
+        let store = SqliteStateStore::connect(&cfg.engine.state_store)
+            .await
+            .unwrap();
+        let backend: Arc<dyn vtop_upload::UploadBackend> = Arc::new(MockBackend::limited());
+        let mut adapter = FileSource::new(vec![path], TelemetryFormat::Raw, false);
+        let source = adapter.discover_sources().await.unwrap().pop().unwrap();
+        let mut reads = adapter
+            .read_batch_candidates(&source, 1000, 1 << 20, std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(reads.len(), 1);
+
+        let outcome = pipeline(&store, backend, &cfg)
+            .process(&mut adapter, &source, reads.remove(0), None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_state, expected_state);
+        assert_eq!(outcome.committed, !require_strong);
+    }
+}

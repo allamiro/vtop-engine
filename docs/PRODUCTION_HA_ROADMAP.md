@@ -97,8 +97,8 @@ A batch is **VERIFIED** only when **all** of the following hold:
 1. the **object exists** in object storage;
 2. the **manifest exists** in object storage;
 3. the **object size matches** the size recorded in the manifest;
-4. the **checksum recorded in the manifest matches** the generated/served object
-   checksum (SHA-256 or BLAKE3);
+4. the **checksum recorded in the manifest matches** a digest derived from the
+   stored object or computed over it by the storage service (SHA-256/BLAKE3);
 5. **compression type, checksum algorithm, source range, `batch_id`, object key,
    and manifest key are recorded** in the state store before the VERIFIED
    transition;
@@ -107,10 +107,11 @@ A batch is **VERIFIED** only when **all** of the following hold:
 7. **verification failure prevents source commit** (the batch never advances to
    SOURCE_COMMITTED).
 
-**Verification strength (current code):** the engine supports **strong** (checksum)
-and **backend-limited** (size / existence only) verification. The
-`upload.require_strong_verification: true` setting rejects a backend-limited result
-instead of committing. **Production should set this to `true`.**
+**Verification strength (current code):** the engine supports **strong**
+(stored-content/service-computed checksum) and **backend-limited** (size /
+existence only) verification. Strong verification defaults on;
+`upload.require_strong_verification: false` explicitly opts into weak
+compatibility/lab behavior.
 
 **ETag caveat:** S3 **multipart ETags are not reliable MD5 checksums** and must not
 be treated as the authoritative integrity value. The manifest SHA-256/BLAKE3 is the
@@ -777,7 +778,7 @@ zero-behavior-change groundwork.
 `upload.{backend,bucket,prefix,endpoint_url,region,force_path_style,verify_tls,
 create_bucket,local_path,require_strong_verification}`; `partitioning.template`.
 
-> Production: set `upload.require_strong_verification: true` (§3.2).
+> Production: retain the default `upload.require_strong_verification: true` (§3.2).
 
 ### 20.2 Current environment variables — implemented
 `VTOP_CONFIG`; `RUST_LOG`; `AWS_ACCESS_KEY_ID`; `AWS_SECRET_ACCESS_KEY`;
@@ -861,7 +862,7 @@ Correctness & invariant
   [ ] verify-before-commit enforced in core AND database (CHECK constraint)
   [ ] crash before VERIFY → replay; crash after VERIFY/before COMMIT → safe
   [ ] deterministic/content-addressed object keys (idempotent replay)
-  [ ] require_strong_verification = true in production
+  [ ] require_strong_verification remains true in production
 
 State store
   [ ] StateStore trait + Postgres backend; shared test battery green on both

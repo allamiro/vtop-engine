@@ -179,10 +179,10 @@ safety = dashboard(
         stat("Backend-limited verifications (1h)", {"h": 5, "w": 8, "x": 8, "y": 1},
              promql('sum(increase(vtop_verification_backend_limited_total[1h])) or vector(0)', "size-only"),
              MIMIR, thresholds=[{"color": "green", "value": None}, {"color": "orange", "value": 1}],
-             desc="Verified by SIZE ONLY, not checksum — the backend could not "
-                  "do better. Committing on this is weaker than the protocol "
-                  "intends. Set upload.require_strong_verification: true in "
-                  "production to refuse it."),
+             desc="Verified by SIZE ONLY, not checksum. The default policy "
+                  "refuses this result; any non-zero value means an explicit "
+                  "require_strong_verification: false compatibility/lab "
+                  "opt-out is active."),
         stat("Replay required (1h)", {"h": 5, "w": 8, "x": 16, "y": 1},
              promql('sum(increase(vtop_replay_required_total[1h])) or vector(0)', "replays"),
              MIMIR, thresholds=BAD,

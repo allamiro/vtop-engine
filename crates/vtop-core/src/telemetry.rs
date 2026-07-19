@@ -60,9 +60,8 @@ pub struct Metrics {
     /// stuck.
     pub verification_failures_total: IntCounterVec,
 
-    /// Verified by size/existence only because the backend could not do better.
-    /// Committing on this is weaker than the protocol intends; production sets
-    /// `upload.require_strong_verification` to refuse it.
+    /// Verified by size/existence only. The default policy refuses to commit;
+    /// this counter records explicit compatibility/lab opt-outs.
     pub verification_backend_limited_total: IntCounterVec,
 
     /// Batches sent back to be re-read from source. Safe by design, but a
@@ -138,7 +137,7 @@ impl Metrics {
         )?;
         let verification_backend_limited_total = cv(
             "verification_backend_limited_total",
-            "Verifications confirmed by size/existence only, without a checksum",
+            "Size-only verifications committed under an explicit require_strong_verification=false opt-out",
             labels3(),
         )?;
         let replay_required_total = cv(

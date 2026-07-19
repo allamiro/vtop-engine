@@ -430,11 +430,14 @@ A conformant implementation **MAY** extend the partition path with additional de
 
 ### 17.1 Strong verification
 
-When the configured checksum mode is cryptographic (`SHA-256` or `BLAKE3`) and the backend can read back the stored object's hash, verification is **strong**: the stored object's hash **MUST** equal the manifest hash before `VERIFIED`.
+When the configured checksum mode is cryptographic (`SHA-256` or `BLAKE3`), verification is **strong** only when the digest is computed from the stored body or by the storage service over that body. It **MUST** equal the manifest digest before `VERIFIED`. An uploader-written sidecar, ETag, or user-metadata digest **MUST NOT** be classified as strong.
 
 ### 17.2 Backend-limited verification
 
 Some backends can confirm only object **existence and size**, not a content hash. Such verification is **backend-limited**: a conformant implementation **MUST** report it as backend-limited and **MUST NOT** represent it as cryptographic verification. Backend-limited verification still gates the commit rule, but provides only size/existence assurance.
+
+VTOP Engine defaults to refusing backend-limited verification. Accepting it
+requires an explicit compatibility/lab opt-out.
 
 | Verification class | Basis | Strength |
 |--------------------|-------|----------|
