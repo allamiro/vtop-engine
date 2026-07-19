@@ -14,13 +14,14 @@
 //! (backend-limited).
 
 use crate::base::{
-    parse_s3_uri, read_bounded, ObjectChecksum, ObjectHead, UploadBackend, VerificationResult,
+    parse_s3_uri, read_bounded, ObjectChecksum, ObjectHead, StoredManifest, UploadBackend,
+    VerificationResult,
 };
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Region;
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::ChecksumMode;
+use aws_sdk_s3::types::{BucketVersioningStatus, ChecksumMode};
 use aws_sdk_s3::Client;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use std::path::Path;
@@ -149,7 +150,7 @@ impl S3NativeBackend {
         uri: &str,
         content_type: &str,
         checksum: Option<ObjectChecksum<'_>>,
-    ) -> Result<(), VtopError> {
+    ) -> Result<Option<String>, VtopError> {
         let (bucket, key) = parse_s3_uri(uri)?;
         let body = ByteStream::from_path(local_path)
             .await
@@ -179,11 +180,11 @@ impl S3NativeBackend {
             }
         }
 
-        req.send().await.map_err(|e| {
+        let out = req.send().await.map_err(|e| {
             VtopError::Upload(format!("put_object {uri}: {}", e.into_service_error()))
         })?;
         tracing::info!(uri, "object uploaded via s3_native");
-        Ok(())
+        Ok(out.version_id().map(str::to_owned))
     }
 
     /// Recompute a digest from the bytes returned by S3 without buffering the
@@ -223,6 +224,7 @@ impl UploadBackend for S3NativeBackend {
     ) -> Result<(), VtopError> {
         self.put(local_path, object_uri, "application/octet-stream", checksum)
             .await
+            .map(|_| ())
     }
 
     async fn put_manifest(
@@ -230,9 +232,69 @@ impl UploadBackend for S3NativeBackend {
         local_path: &Path,
         manifest_uri: &str,
         checksum: Option<ObjectChecksum<'_>>,
-    ) -> Result<(), VtopError> {
-        self.put(local_path, manifest_uri, "application/json", checksum)
+    ) -> Result<StoredManifest, VtopError> {
+        let version_id = self
+            .put(local_path, manifest_uri, "application/json", checksum)
+            .await?;
+        Ok(StoredManifest { version_id })
+    }
+
+    async fn get_manifest_pinned(
+        &self,
+        manifest_uri: &str,
+        version_id: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, VtopError> {
+        let (bucket, key) = parse_s3_uri(manifest_uri)?;
+        let out = self
+            .client
+            .get_object()
+            .bucket(&bucket)
+            .key(&key)
+            .version_id(version_id)
+            .send()
             .await
+            .map_err(|e| {
+                VtopError::Upload(format!(
+                    "get_object {manifest_uri} (version {version_id}): {}",
+                    e.into_service_error()
+                ))
+            })?;
+        if out
+            .content_length()
+            .is_some_and(|size| size < 0 || size as u64 > max_bytes as u64)
+        {
+            return Err(VtopError::Upload(format!(
+                "stored object {manifest_uri} exceeds the {max_bytes}-byte read limit"
+            )));
+        }
+        read_bounded(out.body.into_async_read(), max_bytes, manifest_uri).await
+    }
+
+    fn supports_object_versions(&self) -> bool {
+        true
+    }
+
+    async fn verify_bucket_versioning(&self, bucket: &str) -> Result<(), VtopError> {
+        let out = self
+            .client
+            .get_bucket_versioning()
+            .bucket(bucket)
+            .send()
+            .await
+            .map_err(|e| {
+                VtopError::Upload(format!(
+                    "get_bucket_versioning {bucket}: {}",
+                    e.into_service_error()
+                ))
+            })?;
+        match out.status() {
+            Some(BucketVersioningStatus::Enabled) => Ok(()),
+            other => Err(VtopError::Upload(format!(
+                "bucket {bucket} does not have versioning enabled (status: {other:?}); \
+                 the hardened manifest profile requires it"
+            ))),
+        }
     }
 
     async fn get_object(&self, object_uri: &str) -> Result<Vec<u8>, VtopError> {

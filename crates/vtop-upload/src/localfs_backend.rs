@@ -9,8 +9,8 @@
 //! mapped onto the local tree.
 
 use crate::base::{
-    parse_s3_uri, read_bounded, verify_file_content, ObjectChecksum, ObjectHead, UploadBackend,
-    VerificationResult,
+    parse_s3_uri, read_bounded, verify_file_content, ObjectChecksum, ObjectHead, StoredManifest,
+    UploadBackend, VerificationResult,
 };
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
@@ -91,9 +91,11 @@ impl UploadBackend for LocalFsBackend {
         local_path: &Path,
         manifest_uri: &str,
         checksum: Option<ObjectChecksum<'_>>,
-    ) -> Result<(), VtopError> {
+    ) -> Result<StoredManifest, VtopError> {
         self.store(local_path, manifest_uri, checksum.map(|c| c.hex))
-            .await
+            .await?;
+        // A plain filesystem tree has no object versions to pin.
+        Ok(StoredManifest::default())
     }
 
     async fn get_object(&self, object_uri: &str) -> Result<Vec<u8>, VtopError> {

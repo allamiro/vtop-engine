@@ -115,6 +115,9 @@ pub struct Pipeline<'a> {
     pub config: &'a VtopConfig,
     /// Runtime-only secret, resolved once at startup and never serialized.
     pub manifest_mac_key: Option<ManifestMacKey>,
+    /// Buckets whose versioning status passed the hardened-profile preflight
+    /// (#135); checked once per bucket per process.
+    pub versioned_buckets: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl<'a> Pipeline<'a> {
@@ -226,6 +229,7 @@ impl<'a> Pipeline<'a> {
             manifest_uri: None,
             object_sha256: None,
             manifest_sha256: None,
+            manifest_version_id: None,
             object_size_bytes: None,
             record_count: Some(batch.records.len() as i64),
             error_message: None,
@@ -416,6 +420,29 @@ impl<'a> Pipeline<'a> {
             }
         }
 
+        // Hardened manifest profile (#135): refuse to upload into a bucket
+        // that discards overwritten versions — version pinning below is only
+        // meaningful if the store keeps what we pin.
+        if self.config.upload.require_object_versioning {
+            if !self.backend.supports_object_versions() {
+                fail!(format!(
+                    "require_object_versioning is set but backend {} does not expose \
+                     immutable object versions",
+                    self.backend.backend_name()
+                ));
+            }
+            let checked = self.versioned_buckets.lock().unwrap().contains(&bucket);
+            if !checked {
+                if let Err(e) = self.backend.verify_bucket_versioning(&bucket).await {
+                    fail!(format!("bucket versioning preflight failed: {e}"));
+                }
+                self.versioned_buckets
+                    .lock()
+                    .unwrap()
+                    .insert(bucket.clone());
+            }
+        }
+
         // ---- CHECKSUMMED -> OBJECT_UPLOADED -----------------------------
         // Engine-computed object checksum (algorithm + hex), if enabled.
         let object_ck = object_checksum
@@ -488,17 +515,27 @@ impl<'a> Pipeline<'a> {
 
         // ---- OBJECT_UPLOADED -> MANIFEST_UPLOADED -----------------------
         let t = Instant::now();
-        if let Err(e) = self
+        let stored_manifest = match self
             .backend
             .put_manifest(&manifest_path, &manifest_uri, manifest_ck)
             .await
         {
-            fail!(format!("manifest upload failed: {e}"));
+            Ok(stored) => stored,
+            Err(e) => fail!(format!("manifest upload failed: {e}")),
+        };
+        // The hardened profile pins recovery to this exact stored version;
+        // an upload the store did not version cannot be pinned, so it cannot
+        // advance (#135).
+        if self.config.upload.require_object_versioning && stored_manifest.version_id.is_none() {
+            fail!("manifest upload returned no object version to pin \
+                   (require_object_versioning is set)"
+                .to_string());
         }
         metrics.manifest_upload_ms = t.elapsed().as_millis() as u64;
         let man_patch = BatchPatch {
             manifest_uri: Some(manifest_uri.clone()),
             manifest_sha256: Some(manifest.manifest.sha256.clone()),
+            manifest_version_id: stored_manifest.version_id.clone(),
             ..Default::default()
         };
         let t_write = Instant::now();
@@ -555,11 +592,22 @@ impl<'a> Pipeline<'a> {
         // keyed mode always downloads the small manifest and checks its
         // binding before the batch may reach VERIFIED.
         if let Some(key) = self.manifest_mac_key.as_ref() {
-            let stored_bytes = match self
-                .backend
-                .get_object_bounded(&manifest_uri, MAX_MANIFEST_BYTES)
-                .await
-            {
+            // When storage assigned a version, authenticate the bytes of that
+            // exact immutable version — the same bytes recovery will pin to —
+            // instead of whatever currently sits at the key.
+            let stored_read = match stored_manifest.version_id.as_deref() {
+                Some(version) => {
+                    self.backend
+                        .get_manifest_pinned(&manifest_uri, version, MAX_MANIFEST_BYTES)
+                        .await
+                }
+                None => {
+                    self.backend
+                        .get_object_bounded(&manifest_uri, MAX_MANIFEST_BYTES)
+                        .await
+                }
+            };
+            let stored_bytes = match stored_read {
                 Ok(bytes) => bytes,
                 Err(e) => fail!(format!("stored manifest download failed: {e}")),
             };
@@ -1086,6 +1134,7 @@ impl Engine {
             backend: self.backend.clone(),
             config: &self.config,
             manifest_mac_key: self.manifest_mac_key.clone(),
+            versioned_buckets: Default::default(),
         }
     }
 
@@ -1435,14 +1484,32 @@ impl Engine {
             // cannot identify the manifest cannot safely advance its source.
             return false;
         };
-        let bytes = match self
-            .backend
-            .get_object_bounded(muri, MAX_MANIFEST_BYTES)
-            .await
-        {
+        // A recorded version pins recovery to the immutable manifest this
+        // batch actually verified (#135). Overwriting the current key cannot
+        // roll the batch back to an older validly-authenticated manifest, and
+        // deleting the pinned version fails closed here rather than falling
+        // back to whatever replaced it.
+        let read = match rec.manifest_version_id.as_deref() {
+            Some(version) => {
+                self.backend
+                    .get_manifest_pinned(muri, version, MAX_MANIFEST_BYTES)
+                    .await
+            }
+            None => {
+                self.backend
+                    .get_object_bounded(muri, MAX_MANIFEST_BYTES)
+                    .await
+            }
+        };
+        let bytes = match read {
             Ok(bytes) => bytes,
             Err(e) => {
-                tracing::warn!(muri, error = %e, "recovery re-check: manifest download failed");
+                tracing::warn!(
+                    muri,
+                    version_id = rec.manifest_version_id.as_deref().unwrap_or("<current>"),
+                    error = %e,
+                    "recovery re-check: manifest download failed"
+                );
                 return false;
             }
         };

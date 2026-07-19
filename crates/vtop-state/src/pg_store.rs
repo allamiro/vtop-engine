@@ -210,7 +210,7 @@ impl PgStateStore {
         sqlx::query(
             "SELECT batch_id, tenant, source_type, source_name, format, state, \
                     progress_start_json, progress_end_json, object_uri, manifest_uri, \
-                    object_sha256, manifest_sha256, object_size_bytes, record_count, \
+                    object_sha256, manifest_sha256, manifest_version_id, object_size_bytes, record_count, \
                     error_message, owner, lease_expires_at, created_at, updated_at \
              FROM batches WHERE FALSE",
         )
@@ -273,9 +273,9 @@ impl StateStore for PgStateStore {
                 r#"INSERT INTO batches
                    (batch_id, tenant, source_type, source_name, format, state,
                     progress_start_json, progress_end_json, object_uri, manifest_uri,
-                    object_sha256, manifest_sha256, object_size_bytes, record_count,
-                    error_message, owner, lease_expires_at, created_at, updated_at)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)"#,
+                    object_sha256, manifest_sha256, manifest_version_id, object_size_bytes,
+                    record_count, error_message, owner, lease_expires_at, created_at, updated_at)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)"#,
             )
             .bind(&rec.batch_id)
             .bind(&rec.tenant)
@@ -289,6 +289,7 @@ impl StateStore for PgStateStore {
             .bind(&rec.manifest_uri)
             .bind(&rec.object_sha256)
             .bind(&rec.manifest_sha256)
+            .bind(&rec.manifest_version_id)
             .bind(rec.object_size_bytes)
             .bind(rec.record_count)
             .bind(&rec.error_message)
@@ -335,17 +336,19 @@ impl StateStore for PgStateStore {
                          manifest_uri = COALESCE($3, manifest_uri),
                          object_sha256 = COALESCE($4, object_sha256),
                          manifest_sha256 = COALESCE($5, manifest_sha256),
-                         object_size_bytes = COALESCE($6, object_size_bytes),
-                         record_count = COALESCE($7, record_count),
-                         error_message = COALESCE($8, error_message),
-                         updated_at = $9
-                       WHERE batch_id = $10 AND state = $11"#,
+                         manifest_version_id = COALESCE($6, manifest_version_id),
+                         object_size_bytes = COALESCE($7, object_size_bytes),
+                         record_count = COALESCE($8, record_count),
+                         error_message = COALESCE($9, error_message),
+                         updated_at = $10
+                       WHERE batch_id = $11 AND state = $12"#,
                 )
                 .bind(validated.as_str())
                 .bind(&patch.object_uri)
                 .bind(&patch.manifest_uri)
                 .bind(&patch.object_sha256)
                 .bind(&patch.manifest_sha256)
+                .bind(&patch.manifest_version_id)
                 .bind(patch.object_size_bytes)
                 .bind(patch.record_count)
                 .bind(&patch.error_message)
@@ -510,6 +513,7 @@ fn row_to_record(row: sqlx::postgres::PgRow) -> Result<BatchRecord, VtopError> {
         manifest_uri: row.get("manifest_uri"),
         object_sha256: row.get("object_sha256"),
         manifest_sha256: row.get("manifest_sha256"),
+        manifest_version_id: row.get("manifest_version_id"),
         object_size_bytes: row.get("object_size_bytes"),
         record_count: row.get("record_count"),
         error_message: row.get("error_message"),

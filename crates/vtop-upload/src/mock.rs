@@ -4,7 +4,7 @@
 //! fail verification — exercising the "verification fails -> source not
 //! committed" path without any external service.
 
-use crate::base::{ObjectChecksum, ObjectHead, UploadBackend, VerificationResult};
+use crate::base::{ObjectChecksum, ObjectHead, StoredManifest, UploadBackend, VerificationResult};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::Path;
@@ -23,9 +23,17 @@ struct Stored {
     corrupted: bool,
 }
 
+/// `(version_id, stored bytes)` pairs, oldest first.
+type VersionHistory = Vec<(String, Vec<u8>)>;
+
 /// A test double for [`UploadBackend`].
 pub struct MockBackend {
     objects: Mutex<HashMap<String, Stored>>,
+    /// Immutable version history per key, mirroring a versioned bucket: every
+    /// store appends `(version_id, bytes)` and nothing mutates old entries.
+    /// `corrupt()`/`corrupt_on_verify` intentionally touch only the current
+    /// key, so pinned reads stay stable the way S3 versions do.
+    versions: Mutex<HashMap<String, VersionHistory>>,
     /// When true, `verify_object` always reports failure.
     fail_verification: bool,
     /// When true, `verify_object` reports backend-limited (size-only) success.
@@ -45,6 +53,7 @@ impl MockBackend {
     pub fn new() -> Self {
         Self {
             objects: Mutex::new(HashMap::new()),
+            versions: Mutex::new(HashMap::new()),
             fail_verification: false,
             backend_limited: false,
             corrupt_on_verify: false,
@@ -99,16 +108,28 @@ impl MockBackend {
         local_path: &Path,
         uri: &str,
         checksum: Option<&str>,
-    ) -> Result<(), VtopError> {
+    ) -> Result<String, VtopError> {
         let data = tokio::fs::read(local_path).await?;
         let stored = Stored {
             size: data.len() as u64,
             checksum: checksum.map(|s| s.to_string()),
-            data,
+            data: data.clone(),
             corrupted: false,
         };
         self.objects.lock().unwrap().insert(uri.to_string(), stored);
-        Ok(())
+        let mut versions = self.versions.lock().unwrap();
+        let history = versions.entry(uri.to_string()).or_default();
+        let version_id = format!("v{}", history.len() + 1);
+        history.push((version_id.clone(), data));
+        Ok(version_id)
+    }
+
+    /// Test hook: remove one stored version, simulating retention expiry or a
+    /// privileged versioned delete.
+    pub fn delete_version(&self, uri: &str, version_id: &str) {
+        if let Some(history) = self.versions.lock().unwrap().get_mut(uri) {
+            history.retain(|(id, _)| id != version_id);
+        }
     }
 }
 
@@ -122,6 +143,7 @@ impl UploadBackend for MockBackend {
     ) -> Result<(), VtopError> {
         self.store(local_path, object_uri, checksum.map(|c| c.hex))
             .await
+            .map(|_| ())
     }
 
     async fn put_manifest(
@@ -129,9 +151,37 @@ impl UploadBackend for MockBackend {
         local_path: &Path,
         manifest_uri: &str,
         checksum: Option<ObjectChecksum<'_>>,
-    ) -> Result<(), VtopError> {
-        self.store(local_path, manifest_uri, checksum.map(|c| c.hex))
-            .await
+    ) -> Result<StoredManifest, VtopError> {
+        let version_id = self
+            .store(local_path, manifest_uri, checksum.map(|c| c.hex))
+            .await?;
+        Ok(StoredManifest {
+            version_id: Some(version_id),
+        })
+    }
+
+    async fn get_manifest_pinned(
+        &self,
+        manifest_uri: &str,
+        version_id: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, VtopError> {
+        let versions = self.versions.lock().unwrap();
+        let data = versions
+            .get(manifest_uri)
+            .and_then(|history| {
+                history
+                    .iter()
+                    .find(|(id, _)| id == version_id)
+                    .map(|(_, data)| data.clone())
+            })
+            .ok_or_else(|| VtopError::NotFound(format!("{manifest_uri} (version {version_id})")))?;
+        if data.len() > max_bytes {
+            return Err(VtopError::Upload(format!(
+                "stored object {manifest_uri} exceeds the {max_bytes}-byte read limit"
+            )));
+        }
+        Ok(data)
     }
 
     async fn get_object(&self, object_uri: &str) -> Result<Vec<u8>, VtopError> {
@@ -231,11 +281,20 @@ impl UploadBackend for MockBackend {
 
     async fn delete_object(&self, object_uri: &str) -> Result<(), VtopError> {
         self.objects.lock().unwrap().remove(object_uri);
+        self.versions.lock().unwrap().remove(object_uri);
         Ok(())
     }
 
     fn backend_name(&self) -> &'static str {
         "mock"
+    }
+
+    fn supports_object_versions(&self) -> bool {
+        true
+    }
+
+    async fn verify_bucket_versioning(&self, _bucket: &str) -> Result<(), VtopError> {
+        Ok(())
     }
     fn supports_checksum_verification(&self) -> bool {
         !self.backend_limited
@@ -334,5 +393,48 @@ mod tests {
             .unwrap();
         let res = b.verify_object("s3://b/o", 1, Some(ck("x"))).await.unwrap();
         assert!(!res.passed);
+    }
+
+    #[tokio::test]
+    async fn pinned_version_is_immutable_across_overwrites() {
+        let b = MockBackend::new();
+        let uri = "s3://b/m.json";
+        let v1 = tmp(b"manifest-v1");
+        let first = b.put_manifest(v1.path(), uri, None).await.unwrap();
+        let first_version = first.version_id.unwrap();
+        let v2 = tmp(b"manifest-v2-rollback");
+        let second = b.put_manifest(v2.path(), uri, None).await.unwrap();
+        assert_ne!(Some(&first_version), second.version_id.as_ref());
+
+        // The current key serves the overwrite; the pin still serves v1.
+        assert_eq!(b.get_object(uri).await.unwrap(), b"manifest-v2-rollback");
+        assert_eq!(
+            b.get_manifest_pinned(uri, &first_version, 1024)
+                .await
+                .unwrap(),
+            b"manifest-v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleted_version_fails_pinned_read() {
+        let b = MockBackend::new();
+        let uri = "s3://b/m.json";
+        let f = tmp(b"manifest-v1");
+        let stored = b.put_manifest(f.path(), uri, None).await.unwrap();
+        let version = stored.version_id.unwrap();
+        b.delete_version(uri, &version);
+        assert!(b.get_manifest_pinned(uri, &version, 1024).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn pinned_read_enforces_byte_bound() {
+        let b = MockBackend::new();
+        let uri = "s3://b/m.json";
+        let f = tmp(b"12345");
+        let stored = b.put_manifest(f.path(), uri, None).await.unwrap();
+        let version = stored.version_id.unwrap();
+        assert!(b.get_manifest_pinned(uri, &version, 5).await.is_ok());
+        assert!(b.get_manifest_pinned(uri, &version, 4).await.is_err());
     }
 }

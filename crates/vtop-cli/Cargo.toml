@@ -61,6 +61,10 @@ name = "integration_state_recovery"
 path = "../../tests/integration_state_recovery.rs"
 
 [[test]]
+name = "integration_manifest_rollback"
+path = "../../tests/integration_manifest_rollback.rs"
+
+[[test]]
 name = "integration_kafka_to_minio"
 path = "../../tests/integration_kafka_to_minio.rs"
 required-features = ["kafka"]
