@@ -671,6 +671,11 @@ fn decode_message(
             let first_sequence = decoder.u64()?;
             let durability = Durability::decode(decoder.u8()?)?;
             let count = decoder.count(limits.max_records)?;
+            if count == 0 {
+                return Err(ProtocolError::InvalidFrame(
+                    "produce request has no records".to_owned(),
+                ));
+            }
             let mut records = Vec::with_capacity(count);
             for _ in 0..count {
                 records.push(ProduceRecord {

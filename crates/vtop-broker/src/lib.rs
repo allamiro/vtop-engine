@@ -413,11 +413,24 @@ impl LocalBroker {
                     .state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                match state.segment.fetch(
+                let mut fetched = state.segment.fetch(
                     request.start_offset,
                     request.max_bytes as usize,
                     request.max_records as usize,
-                ) {
+                );
+                if let Ok(batch) = &fetched {
+                    // The byte budget excluded even the first committed
+                    // record. Refetch exactly that record so the consumer
+                    // always makes progress; the session layer enforces the
+                    // negotiated wire-frame cap on the actual response.
+                    if batch.records.is_empty()
+                        && batch.next_offset == request.start_offset
+                        && batch.next_offset < batch.high_watermark
+                    {
+                        fetched = state.segment.fetch(request.start_offset, usize::MAX, 1);
+                    }
+                }
+                match fetched {
                     Ok(batch) => WireFrame {
                         request_id,
                         stream_id,
@@ -876,6 +889,12 @@ async fn serve_connection(
                     .await?;
                     continue;
                 }
+                // Budget the log fetch in log-encoded bytes, which bound the
+                // wire bytes from above (the storage frame carries more fixed
+                // overhead per record than the wire frame); 128 covers the
+                // response's fixed fields. A first record excluded by this
+                // budget is still served alone by the progress refetch in
+                // `LocalBroker::handle`.
                 let response_budget = negotiated_limits
                     .max_frame_bytes
                     .saturating_sub(vtop_protocol::HEADER_LEN as u32 + 128)
@@ -914,8 +933,32 @@ async fn serve_connection(
             broker.handle(role, frame)
         })
         .await?;
-        if matches!(response.message, Message::FetchResponse(_)) {
-            let response_bytes = encode_frame(&response, negotiated_limits)?.len() as u64;
+        let is_fetch_response = matches!(response.message, Message::FetchResponse(_));
+        let encoded = match encode_frame(&response, negotiated_limits) {
+            Ok(encoded) => encoded,
+            // Only a single-record progress fetch can exceed the negotiated
+            // frame: the client must reconnect with a larger frame limit, so
+            // answer with a terminal error instead of dropping the session.
+            Err(vtop_protocol::ProtocolError::Limit(_)) if is_fetch_response => {
+                let response = error(
+                    request_id,
+                    response.stream_id,
+                    ErrorCode::InvalidRequest,
+                    "the next record exceeds the negotiated frame limit; reconnect with a larger max_frame_bytes",
+                );
+                write_session_frame(
+                    &mut stream,
+                    &response,
+                    negotiated_limits,
+                    config.idle_timeout,
+                )
+                .await?;
+                continue;
+            }
+            Err(problem) => return Err(problem.into()),
+        };
+        if is_fetch_response {
+            let response_bytes = encoded.len() as u64;
             if response_bytes > send_credit {
                 let response = error(
                     request_id,
@@ -934,14 +977,27 @@ async fn serve_connection(
             }
             send_credit -= response_bytes;
         }
-        write_session_frame(
-            &mut stream,
-            &response,
-            negotiated_limits,
-            config.idle_timeout,
-        )
-        .await?;
+        write_session_bytes(&mut stream, &encoded, config.idle_timeout).await?;
     }
+}
+
+async fn write_session_bytes(
+    stream: &mut tokio_rustls::server::TlsStream<TcpStream>,
+    encoded: &[u8],
+    write_timeout: Duration,
+) -> BrokerResult<()> {
+    use tokio::io::AsyncWriteExt;
+    timeout(write_timeout, async {
+        stream.write_all(encoded).await?;
+        stream.flush().await
+    })
+    .await
+    .map_err(|_| BrokerError::Timeout("protocol response write"))?
+    .map_err(|source| BrokerError::Io {
+        path: PathBuf::from("tls-session"),
+        source,
+    })?;
+    Ok(())
 }
 
 fn negotiate(
@@ -1140,6 +1196,34 @@ mod tests {
         };
         assert_eq!(fetched.records.len(), 2);
         assert_eq!(fetched.committed_high_watermark, 2);
+    }
+
+    #[test]
+    fn fetch_returns_the_first_record_even_when_the_byte_budget_excludes_it() {
+        let (_dir, broker, range) = fixture();
+        let producer = Uuid::from_u128(40);
+        let ack = broker.handle(Role::Producer, produce(range.clone(), producer, 1, 0, 1));
+        assert!(matches!(ack.message, Message::ProduceResponse(_)));
+        let fetched = broker.handle(
+            Role::Consumer,
+            WireFrame {
+                request_id: 2,
+                stream_id: 1,
+                message: Message::FetchRequest(FetchRequest {
+                    range,
+                    fencing_epoch: 7,
+                    start_offset: 0,
+                    max_bytes: 1,
+                    max_records: 10,
+                }),
+            },
+        );
+        let Message::FetchResponse(fetched) = fetched.message else {
+            panic!("expected fetch response")
+        };
+        assert_eq!(fetched.records.len(), 1);
+        assert_eq!(fetched.next_offset, 1);
+        assert_eq!(fetched.committed_high_watermark, 1);
     }
 
     #[test]

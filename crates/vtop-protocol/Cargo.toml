@@ -9,5 +9,12 @@ description = "Bounded, versioned wire protocol for the native VTOP broker."
 [dependencies]
 blake3 = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
+tokio = { version = "1", default-features = false, features = ["io-util"] }
 uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = [
+    "io-util",
+    "macros",
+    "rt",
+] }

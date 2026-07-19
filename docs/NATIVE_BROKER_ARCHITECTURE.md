@@ -282,14 +282,18 @@ SegmentHeaderV1
 
 RecordFrameV1 repeated
   magic, frame_len, relative_offset
-  producer_id, producer_epoch, producer_sequence
-  timestamp, attributes_len, key_len, value_len
-  attributes, key, value, frame_checksum
+  producer_id, producer_sequence
+  timestamp, key_len, value_len
+  key, value, frame_checksum
 ```
 
-The producer epoch fences a restarted or superseded producer identity.
-Sequence state is scoped by `(producer_id, producer_epoch)` and retained long
-enough to make retries unambiguous across segment roll.
+This is the frozen v1 layout (golden vectors in `vtop-log`). The producer
+epoch fences a restarted or superseded producer identity but is not a v1
+record-frame field: v1 derives a deterministic storage namespace from
+`(producer_id, producer_epoch)`, and the epoch (with per-record attributes)
+becomes an explicit field only in segment v2. Sequence state is scoped by
+`(producer_id, producer_epoch)` and retained long enough to make retries
+unambiguous across segment roll.
 
 ### 6.2 Durable commit marker
 
