@@ -195,16 +195,17 @@ complementary.
 
 - When the backend assigns an immutable object version on manifest upload
   (S3 `x-amz-version-id`), the engine records it in the durable ledger
-  (`manifest_version_id`) and every later read — the pre-commit stored-bytes
-  authentication and the recovery re-check — addresses that exact version,
-  never the mutable current key.
+  (`manifest_version_id`), and every later read — the pre-commit stored-bytes
+  authentication and the recovery re-check — **MUST** address that exact
+  version, never the mutable current key.
 - A recorded version that can no longer be read **MUST** fail closed: the
   batch is flagged `replay_required`, and source progress is not committed.
   Recovery **MUST NOT** fall back from a pinned version to the current key.
 - With `upload.require_object_versioning = true` (the hardened profile), the
-  backend **MUST** expose immutable object versions, bucket versioning is
-  preflighted before the first upload to each bucket, and a manifest upload
-  that returns no version fails the batch.
+  backend **MUST** expose immutable object versions, bucket versioning
+  **MUST** be preflighted before the first upload to each bucket, and a
+  manifest upload that returns no immutable version (including S3's literal
+  `null` version from a suspended bucket) **MUST** fail the batch.
 - Retention is the storage layer's half of the guarantee: bucket versioning
   keeps overwritten versions, and S3 **Object Lock** (compliance or
   governance retention covering the archive's audit window) **SHOULD** be

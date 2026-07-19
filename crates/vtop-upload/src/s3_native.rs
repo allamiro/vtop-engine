@@ -184,7 +184,13 @@ impl S3NativeBackend {
             VtopError::Upload(format!("put_object {uri}: {}", e.into_service_error()))
         })?;
         tracing::info!(uri, "object uploaded via s3_native");
-        Ok(out.version_id().map(str::to_owned))
+        // A suspended-versioning bucket reports the literal version "null",
+        // which later writes overwrite — it is not an immutable pin. Surface
+        // it as unversioned so it is never persisted as one (#135).
+        Ok(out
+            .version_id()
+            .filter(|id| *id != "null")
+            .map(str::to_owned))
     }
 
     /// Recompute a digest from the bytes returned by S3 without buffering the

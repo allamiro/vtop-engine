@@ -23,8 +23,13 @@ struct Stored {
     corrupted: bool,
 }
 
-/// `(version_id, stored bytes)` pairs, oldest first.
-type VersionHistory = Vec<(String, Vec<u8>)>;
+/// Version history for one key. IDs come from a monotonic counter so a
+/// deleted version's ID is never reused by a later upload.
+#[derive(Default)]
+struct VersionHistory {
+    next: u64,
+    entries: Vec<(String, Vec<u8>)>,
+}
 
 /// A test double for [`UploadBackend`].
 pub struct MockBackend {
@@ -119,8 +124,9 @@ impl MockBackend {
         self.objects.lock().unwrap().insert(uri.to_string(), stored);
         let mut versions = self.versions.lock().unwrap();
         let history = versions.entry(uri.to_string()).or_default();
-        let version_id = format!("v{}", history.len() + 1);
-        history.push((version_id.clone(), data));
+        history.next += 1;
+        let version_id = format!("v{}", history.next);
+        history.entries.push((version_id.clone(), data));
         Ok(version_id)
     }
 
@@ -128,7 +134,7 @@ impl MockBackend {
     /// privileged versioned delete.
     pub fn delete_version(&self, uri: &str, version_id: &str) {
         if let Some(history) = self.versions.lock().unwrap().get_mut(uri) {
-            history.retain(|(id, _)| id != version_id);
+            history.entries.retain(|(id, _)| id != version_id);
         }
     }
 }
@@ -171,6 +177,7 @@ impl UploadBackend for MockBackend {
             .get(manifest_uri)
             .and_then(|history| {
                 history
+                    .entries
                     .iter()
                     .find(|(id, _)| id == version_id)
                     .map(|(_, data)| data.clone())
@@ -417,13 +424,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deleted_version_fails_pinned_read() {
+    async fn deleted_version_fails_pinned_read_and_is_never_reused() {
         let b = MockBackend::new();
         let uri = "s3://b/m.json";
         let f = tmp(b"manifest-v1");
         let stored = b.put_manifest(f.path(), uri, None).await.unwrap();
         let version = stored.version_id.unwrap();
         b.delete_version(uri, &version);
+        assert!(b.get_manifest_pinned(uri, &version, 1024).await.is_err());
+
+        // A later upload must not resurrect the deleted ID: the old pin keeps
+        // failing instead of silently serving the new bytes.
+        let g = tmp(b"manifest-after-delete");
+        let second = b.put_manifest(g.path(), uri, None).await.unwrap();
+        assert_ne!(second.version_id.as_deref(), Some(version.as_str()));
         assert!(b.get_manifest_pinned(uri, &version, 1024).await.is_err());
     }
 

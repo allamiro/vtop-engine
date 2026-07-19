@@ -145,6 +145,6 @@ pub fn pipeline<'a>(
         backend,
         config,
         manifest_mac_key: config.resolve_manifest_mac_key().unwrap(),
-        versioned_buckets: Default::default(),
+        versioned_buckets: std::sync::Arc::default(),
     }
 }

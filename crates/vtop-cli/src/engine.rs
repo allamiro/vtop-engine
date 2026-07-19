@@ -116,8 +116,9 @@ pub struct Pipeline<'a> {
     /// Runtime-only secret, resolved once at startup and never serialized.
     pub manifest_mac_key: Option<ManifestMacKey>,
     /// Buckets whose versioning status passed the hardened-profile preflight
-    /// (#135); checked once per bucket per process.
-    pub versioned_buckets: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// (#135). Owned by [`Engine`] and shared into every pipeline so the
+    /// check runs once per bucket per process, not per batch.
+    pub versioned_buckets: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl<'a> Pipeline<'a> {
@@ -897,6 +898,9 @@ pub struct Engine {
     /// Runtime-only manifest authentication secret, resolved from the named
     /// environment variable before any backend is initialized.
     manifest_mac_key: Option<ManifestMacKey>,
+    /// Process-wide hardened-profile preflight cache (#135); see
+    /// [`Pipeline::versioned_buckets`].
+    versioned_buckets: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Per-source accumulation buffers, keyed by `(source_type, source_name)`.
     pending: HashMap<(SourceType, String), PendingBuffer>,
     /// Set by a read cycle that returned any records; drives the adaptive
@@ -1113,6 +1117,7 @@ impl Engine {
             backend,
             adapters,
             manifest_mac_key,
+            versioned_buckets: Arc::default(),
             pending: HashMap::new(),
             cycle_had_data: false,
             _instance_locks: Vec::new(),
@@ -1134,7 +1139,7 @@ impl Engine {
             backend: self.backend.clone(),
             config: &self.config,
             manifest_mac_key: self.manifest_mac_key.clone(),
-            versioned_buckets: Default::default(),
+            versioned_buckets: Arc::clone(&self.versioned_buckets),
         }
     }
 
