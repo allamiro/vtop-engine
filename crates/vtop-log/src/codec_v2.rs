@@ -3,9 +3,6 @@
 //! The envelope and frame shapes deliberately mirror `codec.rs`; v2 adds the
 //! producer epoch and reserved attribute bits to every record frame so sealed
 //! segments can carry per-epoch producer summaries and future record flags.
-// The v2 writer ships in the follow-up change; until then only the frame
-// overhead constant and the in-module tests reference these items.
-#![allow(dead_code)]
 
 use crate::codec::{DecodedFrame, FrameRead};
 use crate::types::{

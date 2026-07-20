@@ -342,6 +342,230 @@ fn sim_acknowledgment_oracle_holds_across_every_crash_point_and_byte_cut() {
     }
 }
 
+fn descriptor_v2() -> vtop_log::SegmentDescriptorV2 {
+    vtop_log::SegmentDescriptorV2 {
+        segment_id: Uuid::from_u128(1),
+        topic: "events.v1".to_owned(),
+        topic_epoch: 7,
+        lineage: RangeLineage::root(Uuid::from_u128(100)),
+        base_offset: BASE_OFFSET,
+        segment_generation: 3,
+        creation_node_id: Uuid::from_u128(500),
+        creation_fencing_epoch: 1,
+    }
+}
+
+fn config_v2() -> vtop_log::SegmentConfigV2 {
+    vtop_log::SegmentConfigV2 {
+        max_record_bytes: 1024,
+        max_group_bytes: 4096,
+        max_segment_bytes: 16 * 1024,
+        max_segment_records: 100,
+        index_stride: 2,
+        chunk_size: 64 * 1024,
+    }
+}
+
+fn record_v2(producer: u128, epoch: u64, sequence: u64, value: &[u8]) -> LogRecord {
+    LogRecord {
+        producer_id: Uuid::from_u128(producer),
+        producer_epoch: epoch,
+        sequence,
+        timestamp_millis: 1_700_000_000_000 + sequence as i64,
+        attributes: 0,
+        key: b"key".to_vec(),
+        value: value.to_vec(),
+    }
+}
+
+/// Two producers with mixed durability; the second bumps its epoch mid-way.
+fn mixed_steps_v2() -> Vec<(LogRecord, Durability)> {
+    vec![
+        (record_v2(210, 0, 0, b"a"), Durability::Fsync),
+        (record_v2(211, 1, 0, b"bb"), Durability::Buffered),
+        (record_v2(210, 0, 1, b"ccc"), Durability::Fsync),
+        (record_v2(211, 1, 1, b"dddd"), Durability::Buffered),
+        (record_v2(211, 2, 0, b"eeeee"), Durability::Buffered),
+        (record_v2(211, 2, 1, b"ffffff"), Durability::Fsync),
+    ]
+}
+
+/// Twin of `run_workload` for the v2 format, sealing via `seal_v2`.
+fn run_workload_v2(env: &Env, steps: &[(LogRecord, Durability)], seal: bool) -> RunResult {
+    let mut result = RunResult {
+        appended: Vec::new(),
+        acked_committed: BASE_OFFSET,
+        completed: false,
+    };
+    let mut segment =
+        match ActiveSegment::create_v2_in(env, active_path(), descriptor_v2(), config_v2()) {
+            Ok(segment) => segment,
+            Err(_) => return result,
+        };
+    for (record, durability) in steps {
+        match segment.append(record.clone(), *durability) {
+            Ok(AppendOutcome::Appended { .. }) => {
+                result.appended.push(record.clone());
+                if matches!(durability, Durability::Fsync) {
+                    result.acked_committed = segment.committed_offset();
+                }
+            }
+            Ok(AppendOutcome::Duplicate { .. }) => {
+                panic!("workload never retries, so appends cannot be duplicates")
+            }
+            Err(_) => return result,
+        }
+    }
+    if seal {
+        if segment.seal_v2(None).is_err() {
+            return result;
+        }
+        result.acked_committed = BASE_OFFSET + steps.len() as u64;
+    }
+    result.completed = true;
+    result
+}
+
+fn clean_run_v2(steps: &[(LogRecord, Durability)], seal: bool) -> Vec<TraceEntry> {
+    let sim = SimStorage::new();
+    sim.create_dir_all(Path::new("/log"));
+    let run = run_workload_v2(&sim.env(SEED), steps, seal);
+    assert!(run.completed, "clean run must finish without faults");
+    sim.trace()
+}
+
+/// The v1 acknowledgment oracle restated for v2 durable states: sealed via
+/// the v2 manifest, active via recovery plus an idempotent full-history
+/// retry whose per-(producer, epoch) decisions must survive the crash.
+fn verify_v2_acknowledgment_oracle(
+    sim: &SimStorage,
+    env: &Env,
+    run: &RunResult,
+    steps: &[(LogRecord, Durability)],
+    context: &str,
+) {
+    let catalog = discover_read_only(sim, env, context);
+    let acked_any = run.acked_committed > BASE_OFFSET;
+    for quarantined in &catalog.quarantined {
+        for reason in &quarantined.reasons {
+            match reason {
+                QuarantineReason::IncompleteAtomicWrite => {}
+                QuarantineReason::InvalidArtifact(_) if !acked_any => {}
+                other => panic!("unexpected quarantine reason {other:?} ({context})"),
+            }
+        }
+    }
+    if catalog.entries.is_empty() {
+        assert!(!acked_any, "acknowledged records disappeared ({context})");
+        return;
+    }
+    assert_eq!(catalog.entries.len(), 1, "{context}");
+    let entry = &catalog.entries[0];
+    assert_eq!(entry.format_version, 2, "{context}");
+    match entry.state {
+        CatalogSegmentState::Sealed => {
+            let mut reader = SegmentReader::open_in(env, &entry.path)
+                .unwrap_or_else(|error| panic!("sealed reader failed ({context}): {error}"));
+            let manifest = reader.manifest_v2().expect("sealed v2 manifest").clone();
+            assert_eq!(manifest.record_count, steps.len() as u64, "{context}");
+            assert_eq!(
+                manifest.committed_high_watermark,
+                BASE_OFFSET + steps.len() as u64,
+                "{context}"
+            );
+            let batch = reader.fetch(BASE_OFFSET, usize::MAX, usize::MAX).unwrap();
+            assert_eq!(batch.records.len(), steps.len(), "{context}");
+            for (index, fetched) in batch.records.iter().enumerate() {
+                assert_eq!(fetched.offset, BASE_OFFSET + index as u64, "{context}");
+                assert_eq!(fetched.record, steps[index].0, "{context}");
+            }
+        }
+        CatalogSegmentState::Active => {
+            let mut segment = ActiveSegment::recover_in(env, &entry.path)
+                .unwrap_or_else(|error| panic!("recovery failed ({context}): {error}"));
+            let committed = segment.committed_offset();
+            assert!(
+                committed >= run.acked_committed,
+                "commit boundary regressed below acknowledgments ({context})"
+            );
+            assert!(
+                committed <= BASE_OFFSET + steps.len() as u64,
+                "boundary covers records that were never appended ({context})"
+            );
+            let batch = segment.fetch(BASE_OFFSET, usize::MAX, usize::MAX).unwrap();
+            assert_eq!(
+                batch.records.len(),
+                (committed - BASE_OFFSET) as usize,
+                "{context}"
+            );
+            for (index, fetched) in batch.records.iter().enumerate() {
+                assert_eq!(fetched.offset, BASE_OFFSET + index as u64, "{context}");
+                assert_eq!(
+                    fetched.record, steps[index].0,
+                    "visible record differs from what was produced ({context})"
+                );
+            }
+            for (index, (record, _)) in steps.iter().enumerate() {
+                let offset = BASE_OFFSET + index as u64;
+                let outcome = segment
+                    .append(record.clone(), Durability::Fsync)
+                    .unwrap_or_else(|error| panic!("history retry failed ({context}): {error}"));
+                if offset < committed {
+                    assert_eq!(outcome, AppendOutcome::Duplicate { offset }, "{context}");
+                } else {
+                    assert_eq!(outcome, AppendOutcome::Appended { offset }, "{context}");
+                }
+            }
+            let replayed = segment.fetch(BASE_OFFSET, usize::MAX, usize::MAX).unwrap();
+            assert_eq!(replayed.records.len(), steps.len(), "{context}");
+        }
+    }
+}
+
+/// Twin of the v1 sweep for the v2 format: crash before every operation and
+/// during every write at every byte cut of an epoch-bearing workload.
+#[test]
+fn sim_v2_acknowledgment_oracle_holds_across_every_crash_point_and_byte_cut() {
+    let steps = mixed_steps_v2();
+    let trace = clean_run_v2(&steps, true);
+
+    for op in 0..trace.len() as u64 {
+        let context = format!("v2 crash-before op={op} seed={SEED:#x}");
+        let sim = SimStorage::new();
+        sim.create_dir_all(Path::new("/log"));
+        let env = sim.env(SEED);
+        sim.set_fault(FaultPlan::CrashBefore(op));
+        let run = run_workload_v2(&env, &steps, true);
+        assert!(sim.has_crashed(), "{context}");
+        sim.reboot();
+        verify_v2_acknowledgment_oracle(&sim, &env, &run, &steps, &context);
+    }
+
+    for entry in trace
+        .iter()
+        .filter(|entry| entry.kind == TraceKind::HandleWrite)
+    {
+        for cut in 0..=entry.len as usize {
+            let context = format!(
+                "v2 torn-write op={} cut={cut} path={} seed={SEED:#x}",
+                entry.index,
+                entry.path.display()
+            );
+            let sim = SimStorage::new();
+            sim.create_dir_all(Path::new("/log"));
+            let env = sim.env(SEED);
+            sim.set_fault(FaultPlan::CrashDuringWrite {
+                op: entry.index,
+                byte_cut: cut,
+            });
+            let run = run_workload_v2(&env, &steps, true);
+            assert!(sim.has_crashed(), "{context}");
+            sim.reboot();
+            verify_v2_acknowledgment_oracle(&sim, &env, &run, &steps, &context);
+        }
+    }
+}
+
 /// Twin of the real-FS torn-tail test: tear every record write at every byte,
 /// recover, and confirm truncation to the commit boundary plus idempotent
 /// re-append of the torn suffix.
