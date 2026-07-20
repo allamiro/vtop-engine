@@ -266,6 +266,16 @@ impl ActiveSegment {
         durability: Durability,
     ) -> VtopLogResult<Vec<AppendOutcome>> {
         self.ensure_writable()?;
+        // The v1 frame cannot represent the schema-v2 record fields; refusing
+        // nonzero values keeps the v1 on-disk contract byte-for-byte frozen.
+        for record in records {
+            if record.producer_epoch != 0 {
+                return Err(LogError::UnsupportedRecordField("producer_epoch"));
+            }
+            if record.attributes != 0 {
+                return Err(LogError::UnsupportedRecordField("attributes"));
+            }
+        }
         let mut producer_deltas = HashMap::new();
         let mut prospective_next = self.next_offset;
         let mut outcomes = Vec::with_capacity(records.len());
@@ -1382,11 +1392,41 @@ mod tests {
     fn record(producer: Uuid, sequence: u64, value: &[u8]) -> LogRecord {
         LogRecord {
             producer_id: producer,
+            producer_epoch: 0,
             sequence,
             timestamp_millis: 1_700_000_000_000 + sequence as i64,
+            attributes: 0,
             key: b"key".to_vec(),
             value: value.to_vec(),
         }
+    }
+
+    #[test]
+    fn v1_append_rejects_nonzero_schema_v2_record_fields() {
+        let directory = tempdir().unwrap();
+        let active_path = directory.path().join("v2-fields.active");
+        let mut segment = ActiveSegment::create(&active_path, descriptor(), config()).unwrap();
+
+        let mut epoch = record(Uuid::from_u128(3), 0, b"a");
+        epoch.producer_epoch = 1;
+        assert!(matches!(
+            segment.append(epoch, Durability::Buffered),
+            Err(LogError::UnsupportedRecordField("producer_epoch"))
+        ));
+
+        let mut attributes = record(Uuid::from_u128(3), 0, b"a");
+        attributes.attributes = 1;
+        assert!(matches!(
+            segment.append(attributes, Durability::Buffered),
+            Err(LogError::UnsupportedRecordField("attributes"))
+        ));
+
+        // The rejection happens before any state change; a clean record with
+        // the same sequence still lands at the first offset.
+        let outcome = segment
+            .append(record(Uuid::from_u128(3), 0, b"a"), Durability::Fsync)
+            .unwrap();
+        assert!(matches!(outcome, AppendOutcome::Appended { offset: 40 }));
     }
 
     #[test]
