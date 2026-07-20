@@ -65,6 +65,14 @@ pub enum LogError {
     },
     #[error("producer {producer_id} reused sequence {sequence} with different record content")]
     SequenceConflict { producer_id: Uuid, sequence: u64 },
+    #[error(
+        "producer {producer_id} epoch {actual_epoch} is fenced by newer epoch {latest_epoch} in this segment"
+    )]
+    ProducerFenced {
+        producer_id: Uuid,
+        latest_epoch: u64,
+        actual_epoch: u64,
+    },
     #[error("record is {actual} bytes; configured maximum is {maximum} bytes")]
     RecordTooLarge { actual: usize, maximum: u32 },
     #[error("append group is {actual} bytes; configured maximum is {maximum} bytes")]

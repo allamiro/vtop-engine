@@ -13,13 +13,17 @@ use uuid::Uuid;
 pub struct CatalogEntry {
     pub state: CatalogSegmentState,
     pub path: PathBuf,
+    /// The v1-shaped identity of the segment; a v2 descriptor projects onto
+    /// its common prefix.
     pub descriptor: SegmentDescriptor,
+    /// On-disk envelope version of the primary file: 1 or 2.
+    pub format_version: u16,
     pub record_count: u64,
     pub next_offset: u64,
     pub content_bytes: u64,
     /// Present only for a sealed segment whose stored bytes matched its
-    /// canonical v1 manifest. V1 roots are linear integrity digests, not
-    /// authenticated proof roots.
+    /// canonical manifest. A v1 root is a linear integrity digest, not an
+    /// authenticated proof root; a v2 root is the BLAKE3 chunk-tree root.
     pub sealed_content_root: Option<String>,
 }
 
@@ -120,6 +124,7 @@ impl StartupCatalog {
         let mut candidates = Vec::new();
         for bundle in bundles.into_values() {
             let paths = bundle.paths();
+            let bundle_has_chunks = bundle.chunks.is_some();
             if bundle.has_non_regular {
                 quarantined.push(QuarantinedArtifacts {
                     paths,
@@ -150,6 +155,19 @@ impl StartupCatalog {
                 CatalogSegmentState::Sealed => inspect_sealed_segment(env, primary.1),
             };
             match inspected {
+                // A v1 segment never publishes a `.chunks` sidecar, so one
+                // sitting beside a valid v1 bundle is an orphan of some other
+                // history and quarantines the whole bundle. A v2 segment
+                // without its rebuildable sidecar stays catalogable.
+                Ok(inspection)
+                    if inspection.format_version == crate::types::FORMAT_VERSION
+                        && bundle_has_chunks =>
+                {
+                    quarantined.push(QuarantinedArtifacts {
+                        paths,
+                        reasons: vec![QuarantineReason::OrphanSidecars],
+                    });
+                }
                 Ok(inspection) => candidates.push(Candidate {
                     entry: catalog_entry(primary.0, primary.1.clone(), inspection),
                     paths,
@@ -201,6 +219,7 @@ fn catalog_entry(
         state,
         path,
         descriptor: inspection.descriptor,
+        format_version: inspection.format_version,
         record_count: inspection.record_count,
         next_offset: inspection.next_offset,
         content_bytes: inspection.content_bytes,
@@ -215,6 +234,7 @@ struct ArtifactBundle {
     commit: Option<PathBuf>,
     index: Option<PathBuf>,
     manifest: Option<PathBuf>,
+    chunks: Option<PathBuf>,
     has_non_regular: bool,
 }
 
@@ -226,6 +246,7 @@ impl ArtifactBundle {
             ArtifactKind::Commit => &mut self.commit,
             ArtifactKind::Index => &mut self.index,
             ArtifactKind::Manifest => &mut self.manifest,
+            ArtifactKind::Chunks => &mut self.chunks,
             ArtifactKind::Temporary => unreachable!("temporary files are not bundled"),
         };
         *destination = Some(path);
@@ -239,6 +260,7 @@ impl ArtifactBundle {
             self.commit.as_ref(),
             self.index.as_ref(),
             self.manifest.as_ref(),
+            self.chunks.as_ref(),
         ]
         .into_iter()
         .flatten()
@@ -256,6 +278,7 @@ enum ArtifactKind {
     Commit,
     Index,
     Manifest,
+    Chunks,
     Temporary,
 }
 
@@ -268,7 +291,7 @@ fn classify_artifact(path: &Path) -> Option<ArtifactClassification> {
     let name = path.file_name()?.to_str()?;
     if name.starts_with('.')
         && name.ends_with(".tmp")
-        && [".commit.", ".index.", ".manifest.json."]
+        && [".commit.", ".index.", ".manifest.json.", ".chunks."]
             .iter()
             .any(|marker| name.contains(marker))
     {
@@ -291,6 +314,7 @@ fn classify_artifact(path: &Path) -> Option<ArtifactClassification> {
         Some(extension) if extension == OsStr::new("segment") => ArtifactKind::Sealed,
         Some(extension) if extension == OsStr::new("commit") => ArtifactKind::Commit,
         Some(extension) if extension == OsStr::new("index") => ArtifactKind::Index,
+        Some(extension) if extension == OsStr::new("chunks") => ArtifactKind::Chunks,
         _ => return None,
     };
     Some(ArtifactClassification {
@@ -887,6 +911,155 @@ mod tests {
             .any(|item| has_reason(item, |reason| {
                 matches!(reason, QuarantineReason::IncompleteAtomicWrite)
             })));
+    }
+
+    fn descriptor_v2(segment_id: u128, base_offset: u64) -> crate::SegmentDescriptorV2 {
+        crate::SegmentDescriptorV2 {
+            segment_id: Uuid::from_u128(segment_id),
+            topic: "events.v1".to_owned(),
+            topic_epoch: 7,
+            lineage: RangeLineage::root(Uuid::from_u128(100)),
+            base_offset,
+            segment_generation: 3,
+            creation_node_id: Uuid::from_u128(500),
+            creation_fencing_epoch: 1,
+        }
+    }
+
+    fn config_v2() -> crate::SegmentConfigV2 {
+        crate::SegmentConfigV2 {
+            max_record_bytes: 1024,
+            max_group_bytes: 4096,
+            max_segment_bytes: 16 * 1024,
+            max_segment_records: 100,
+            index_stride: 2,
+            chunk_size: 64 * 1024,
+        }
+    }
+
+    fn record_v2(producer: u128, epoch: u64, sequence: u64, value: &[u8]) -> LogRecord {
+        LogRecord {
+            producer_epoch: epoch,
+            ..record(producer, sequence, value)
+        }
+    }
+
+    #[test]
+    fn mixed_directory_catalogs_v1_and_v2_bundles_with_their_format_versions() {
+        let directory = tempdir().unwrap();
+        let mut v1 = ActiveSegment::create(
+            directory.path().join("v1.active"),
+            descriptor(30, 0),
+            config(),
+        )
+        .unwrap();
+        v1.append(record(300, 0, b"v1-sealed"), Durability::Fsync)
+            .unwrap();
+        drop(v1.seal().unwrap());
+        let mut v2 = ActiveSegment::create_v2(
+            directory.path().join("v2.active"),
+            descriptor_v2(31, 100),
+            config_v2(),
+        )
+        .unwrap();
+        v2.append(record_v2(301, 2, 0, b"v2-sealed"), Durability::Fsync)
+            .unwrap();
+        let v2_root = v2
+            .seal_v2(None)
+            .unwrap()
+            .manifest_v2()
+            .unwrap()
+            .chunk_tree_root
+            .clone();
+        let mut v2_active = ActiveSegment::create_v2(
+            directory.path().join("v2-active.active"),
+            descriptor_v2(32, 200),
+            config_v2(),
+        )
+        .unwrap();
+        v2_active
+            .append(record_v2(302, 1, 0, b"v2-active"), Durability::Fsync)
+            .unwrap();
+        drop(v2_active);
+
+        let catalog = StartupCatalog::discover(directory.path()).unwrap();
+
+        assert!(catalog.quarantined.is_empty(), "{:?}", catalog.quarantined);
+        assert_eq!(catalog.entries.len(), 3);
+        assert_eq!(
+            catalog
+                .entries
+                .iter()
+                .map(|entry| (
+                    entry.descriptor.base_offset,
+                    entry.format_version,
+                    entry.state
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, 1, CatalogSegmentState::Sealed),
+                (100, 2, CatalogSegmentState::Sealed),
+                (200, 2, CatalogSegmentState::Active),
+            ]
+        );
+        assert_eq!(
+            catalog.entries[1].sealed_content_root.as_deref(),
+            Some(v2_root.as_str())
+        );
+        assert!(catalog.entries[2].sealed_content_root.is_none());
+    }
+
+    #[test]
+    fn v1_bundle_with_stray_chunk_sidecar_is_quarantined_as_orphan() {
+        let directory = tempdir().unwrap();
+        let sealed = ActiveSegment::create(
+            directory.path().join("stray.active"),
+            descriptor(33, 0),
+            config(),
+        )
+        .unwrap();
+        drop(sealed.seal().unwrap());
+        fs::write(directory.path().join("stray.chunks"), b"not a v1 artifact").unwrap();
+
+        let catalog = StartupCatalog::discover(directory.path()).unwrap();
+
+        assert!(catalog.entries.is_empty());
+        assert_eq!(catalog.quarantined.len(), 1);
+        assert_eq!(
+            catalog.quarantined[0].reasons,
+            vec![QuarantineReason::OrphanSidecars]
+        );
+        assert!(catalog.quarantined[0]
+            .paths
+            .contains(&directory.path().join("stray.chunks")));
+    }
+
+    #[test]
+    fn v2_segment_without_chunk_sidecar_is_catalogable_and_rebuilt_on_open() {
+        let directory = tempdir().unwrap();
+        let mut segment = ActiveSegment::create_v2(
+            directory.path().join("rebuildable.active"),
+            descriptor_v2(34, 0),
+            config_v2(),
+        )
+        .unwrap();
+        segment
+            .append(record_v2(340, 1, 0, b"stored"), Durability::Fsync)
+            .unwrap();
+        drop(segment.seal_v2(None).unwrap());
+        let chunks = directory.path().join("rebuildable.chunks");
+        let pristine = fs::read(&chunks).unwrap();
+        fs::remove_file(&chunks).unwrap();
+
+        let catalog = StartupCatalog::discover(directory.path()).unwrap();
+
+        assert!(catalog.quarantined.is_empty(), "{:?}", catalog.quarantined);
+        assert_eq!(catalog.entries.len(), 1);
+        assert_eq!(catalog.entries[0].format_version, 2);
+        assert!(!chunks.exists());
+
+        drop(SegmentReader::open(directory.path().join("rebuildable.segment")).unwrap());
+        assert_eq!(fs::read(&chunks).unwrap(), pristine);
     }
 
     #[test]

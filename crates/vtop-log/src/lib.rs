@@ -18,7 +18,10 @@ pub use catalog::{
     CatalogEntry, CatalogSegmentState, QuarantineReason, QuarantinedArtifacts, StartupCatalog,
 };
 pub use codec_v2::RECORD_FRAME_OVERHEAD_BYTES_V2;
-pub use segment::{rebuild_index, rebuild_index_in, ActiveSegment, SegmentReader};
+pub use segment::{
+    rebuild_chunk_index, rebuild_chunk_index_in, rebuild_index, rebuild_index_in, ActiveSegment,
+    SegmentReader,
+};
 pub use types::{
     AppendOutcome, CommitStatementV1, Durability, FetchBatch, FetchedRecord, KeyRange, LogError,
     LogRecord, ParentRange, ProducerSummaryEntry, RangeLineage, RecoveryReport, SegmentCommitKey,

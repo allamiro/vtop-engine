@@ -223,6 +223,161 @@ fn startup_matrix_covers_create_commit_and_seal_publication_states() {
     }
 }
 
+fn descriptor_v2(segment_id: u128) -> vtop_log::SegmentDescriptorV2 {
+    vtop_log::SegmentDescriptorV2 {
+        segment_id: Uuid::from_u128(segment_id),
+        topic: "events.v1".to_owned(),
+        topic_epoch: 7,
+        lineage: RangeLineage::root(Uuid::from_u128(100)),
+        base_offset: 0,
+        segment_generation: 3,
+        creation_node_id: Uuid::from_u128(500),
+        creation_fencing_epoch: 1,
+    }
+}
+
+fn config_v2() -> vtop_log::SegmentConfigV2 {
+    vtop_log::SegmentConfigV2 {
+        max_record_bytes: 1024,
+        max_group_bytes: 4096,
+        max_segment_bytes: 16 * 1024,
+        max_segment_records: 100,
+        index_stride: 2,
+        chunk_size: 64 * 1024,
+    }
+}
+
+fn create_active_v2(name: &str, segment_id: u128) -> (TempDir, PathBuf) {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join(format!("{name}.active"));
+    let mut segment =
+        ActiveSegment::create_v2(&path, descriptor_v2(segment_id), config_v2()).unwrap();
+    let mut record = record(0);
+    record.producer_epoch = 2;
+    segment.append(record, Durability::Fsync).unwrap();
+    drop(segment);
+    (directory, path)
+}
+
+fn create_sealed_v2(name: &str, segment_id: u128) -> (TempDir, PathBuf) {
+    let (directory, active) = create_active_v2(name, segment_id);
+    let sealed = active.with_extension("segment");
+    let segment = ActiveSegment::recover(&active).unwrap();
+    drop(segment.seal_v2(None).unwrap());
+    (directory, sealed)
+}
+
+/// The v2 seal publishes `.chunks`, then `.index`, then `.manifest.json`,
+/// then renames the primary. A crash before or after each step must leave a
+/// state that classifies without repair: the manifest is the only sidecar
+/// that is required rather than rebuildable.
+#[test]
+fn startup_matrix_covers_v2_chunk_sidecar_publication_states() {
+    // Crash after the initial commit publication, before any seal sidecar.
+    let (created, _) = create_active_v2("v2-created", 40);
+
+    // Crash after `.chunks` publication, before `.index`.
+    let (chunks_published, chunks_segment) = create_sealed_v2("v2-chunks", 41);
+    fs::rename(&chunks_segment, chunks_segment.with_extension("active")).unwrap();
+    fs::remove_file(chunks_segment.with_extension("index")).unwrap();
+    fs::remove_file(chunks_segment.with_extension("manifest.json")).unwrap();
+
+    // Crash after `.index` publication, before `.manifest.json`.
+    let (index_published, index_segment) = create_sealed_v2("v2-index", 42);
+    fs::rename(&index_segment, index_segment.with_extension("active")).unwrap();
+    fs::remove_file(index_segment.with_extension("manifest.json")).unwrap();
+
+    // Crash after `.manifest.json` publication, before the rename.
+    let (manifest_published, manifest_segment) = create_sealed_v2("v2-manifest", 43);
+    fs::rename(&manifest_segment, manifest_segment.with_extension("active")).unwrap();
+
+    // Crash after the rename: the sealed bundle is complete.
+    let (sealed_complete, _) = create_sealed_v2("v2-sealed", 44);
+
+    // A sealed v2 segment with its rebuildable `.chunks` sidecar lost.
+    let (sealed_without_chunks, sealed_without_chunks_path) = create_sealed_v2("v2-no-chunks", 45);
+    fs::remove_file(sealed_without_chunks_path.with_extension("chunks")).unwrap();
+
+    // A sealed v2 segment with its rebuildable `.index` lost.
+    let (sealed_without_index, sealed_without_index_path) = create_sealed_v2("v2-no-index", 46);
+    fs::remove_file(sealed_without_index_path.with_extension("index")).unwrap();
+
+    // A sealed v2 segment without its required manifest.
+    let (sealed_without_manifest, sealed_without_manifest_path) =
+        create_sealed_v2("v2-no-manifest", 47);
+    fs::remove_file(sealed_without_manifest_path.with_extension("manifest.json")).unwrap();
+
+    let expectations = [
+        (
+            "v2 active after initial commit publication",
+            &created,
+            Some(CatalogSegmentState::Active),
+        ),
+        (
+            "v2 active after chunks publication",
+            &chunks_published,
+            Some(CatalogSegmentState::Active),
+        ),
+        (
+            "v2 active after index publication",
+            &index_published,
+            Some(CatalogSegmentState::Active),
+        ),
+        (
+            "v2 active after manifest publication before rename",
+            &manifest_published,
+            Some(CatalogSegmentState::Active),
+        ),
+        (
+            "v2 sealed after primary rename",
+            &sealed_complete,
+            Some(CatalogSegmentState::Sealed),
+        ),
+        (
+            "v2 sealed with rebuildable chunks absent",
+            &sealed_without_chunks,
+            Some(CatalogSegmentState::Sealed),
+        ),
+        (
+            "v2 sealed with rebuildable index absent",
+            &sealed_without_index,
+            Some(CatalogSegmentState::Sealed),
+        ),
+        (
+            "v2 sealed before required manifest publication",
+            &sealed_without_manifest,
+            None,
+        ),
+    ];
+    for (name, directory, expected_state) in expectations {
+        let catalog = discover_read_only(directory.path());
+        match expected_state {
+            Some(state) => {
+                assert!(
+                    catalog.quarantined.is_empty(),
+                    "{name} unexpectedly quarantined: {:?}",
+                    catalog.quarantined
+                );
+                assert_eq!(catalog.entries.len(), 1, "{name}");
+                assert_eq!(catalog.entries[0].state, state, "{name}");
+                assert_eq!(catalog.entries[0].format_version, 2, "{name}");
+            }
+            None => {
+                assert!(catalog.entries.is_empty(), "{name}");
+                assert_eq!(catalog.quarantined.len(), 1, "{name}");
+                assert!(
+                    catalog.quarantined[0]
+                        .reasons
+                        .iter()
+                        .any(|reason| matches!(reason, QuarantineReason::InvalidArtifact(_))),
+                    "{name}: {:?}",
+                    catalog.quarantined[0].reasons
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn prior_commit_marker_exposes_only_the_prior_prefix_and_keeps_newer_bytes() {
     let directory = tempdir().unwrap();

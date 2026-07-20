@@ -65,7 +65,42 @@ pub(crate) fn encode_header(header: &SegmentHeader) -> VtopLogResult<Vec<u8>> {
     Ok(encoded)
 }
 
-pub(crate) fn read_header<R: Read + Seek>(reader: &mut R) -> VtopLogResult<(SegmentHeader, u64)> {
+/// A decoded segment envelope of any supported on-disk format version.
+pub(crate) enum AnyHeader {
+    V1(SegmentHeader),
+    V2(crate::codec_v2::SegmentHeaderV2),
+}
+
+/// Decode a segment header, dispatching on the 8-byte envelope magic.
+///
+/// `VTOPSEG1` decodes as v1 and `VTOPSEG2` delegates to the v2 codec; any
+/// other magic is corruption. An unknown version number inside a known magic
+/// stays `UnsupportedVersion` so future formats fail open-loud, not as rot.
+pub(crate) fn read_header<R: Read + Seek>(reader: &mut R) -> VtopLogResult<(AnyHeader, u64)> {
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|source| LogError::Io {
+            path: "<segment>".into(),
+            source,
+        })?;
+    let mut magic = [0_u8; 8];
+    reader
+        .read_exact(&mut magic)
+        .map_err(|source| header_read_error(source, 0, "segment header"))?;
+    if &magic == HEADER_MAGIC {
+        read_header_v1(reader).map(|(header, content_start)| (AnyHeader::V1(header), content_start))
+    } else if &magic == crate::codec_v2::HEADER_MAGIC_V2 {
+        crate::codec_v2::read_header_v2(reader)
+            .map(|(header, content_start)| (AnyHeader::V2(header), content_start))
+    } else {
+        Err(LogError::Corrupt {
+            position: 0,
+            reason: "invalid segment header magic".to_owned(),
+        })
+    }
+}
+
+fn read_header_v1<R: Read + Seek>(reader: &mut R) -> VtopLogResult<(SegmentHeader, u64)> {
     reader
         .seek(SeekFrom::Start(0))
         .map_err(|source| LogError::Io {
