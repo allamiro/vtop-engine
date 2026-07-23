@@ -6,13 +6,14 @@
 
 use uuid::Uuid;
 use vtop_meta::{
-    CommandEnvelope, MetaKey, MetaStateMachine, MetaValue, MetadataCommand, MetadataError,
-    MetadataResponse, NodeState, RangeAssignment, SegmentState, DEDUP_CAPACITY,
-    MAX_NODE_ADDR_BYTES, MAX_TOPIC_NAME_BYTES,
+    select_replicas, CommandEnvelope, MetaKey, MetaStateMachine, MetaValue, MetadataCommand,
+    MetadataError, MetadataResponse, NodeState, PlacementCandidate, RangeAssignment, SegmentState,
+    DEDUP_CAPACITY, MAX_NODE_ADDR_BYTES, MAX_TOPIC_NAME_BYTES,
 };
 
 const NODE: Uuid = Uuid::from_u128(0x10);
 const NODE_B: Uuid = Uuid::from_u128(0x11);
+const NODE_C: Uuid = Uuid::from_u128(0x12);
 const TOPIC: Uuid = Uuid::from_u128(0x20);
 const RANGE: Uuid = Uuid::from_u128(0x21);
 const SEGMENT: Uuid = Uuid::from_u128(0x30);
@@ -1572,5 +1573,327 @@ fn sealed_segment_lineage_is_checked_on_cursor_commit() {
         MetadataResponse::CursorCommitted {
             checkpoint_generation: 0,
         }
+    );
+}
+
+fn set_placement_attrs(
+    requests: &mut Requests,
+    node: Uuid,
+    domain: &str,
+    weight: u32,
+    expected_generation: u64,
+) -> MetadataCommand {
+    MetadataCommand::SetNodePlacementAttrs {
+        env: requests.next(),
+        node_uuid: node,
+        failure_domain: domain.to_owned(),
+        placement_weight: weight,
+        expected_generation,
+    }
+}
+
+fn verified_segment_machine(requests: &mut Requests) -> (MetaStateMachine, [u8; 32], u64) {
+    let mut machine = machine_with_topic_and_node(requests);
+    assert_eq!(
+        machine.apply(3, &grant(requests, NODE, 0)),
+        MetadataResponse::LeaseGranted { fencing_epoch: 1 }
+    );
+    let root = [0xab; 32];
+    assert_eq!(
+        machine.apply(
+            4,
+            &MetadataCommand::RegisterSealedSegment {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: SEGMENT,
+                segment_generation: 0,
+                base_offset: 0,
+                next_offset: 64,
+                content_root: root,
+                sealed_by_epoch: 1,
+                expected_range_generation: 1,
+            }
+        ),
+        MetadataResponse::Ack { generation: 2 }
+    );
+    assert_eq!(
+        machine.apply(
+            5,
+            &MetadataCommand::MarkSegmentVerified {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: SEGMENT,
+                content_root: root,
+                expected_generation: 0,
+            }
+        ),
+        MetadataResponse::Ack { generation: 1 }
+    );
+    (machine, root, 1)
+}
+
+#[test]
+fn node_placement_attrs_cas_and_bounds() {
+    let mut requests = Requests(0);
+    let mut machine = MetaStateMachine::new();
+    assert_eq!(
+        machine.apply(1, &register_node(&mut requests, NODE)),
+        MetadataResponse::Ack { generation: 0 }
+    );
+    assert_eq!(
+        machine.apply(
+            2,
+            &set_placement_attrs(&mut requests, NODE, "rack-a", 100, 0)
+        ),
+        MetadataResponse::Ack { generation: 1 }
+    );
+    let Some(MetaValue::Node(node)) = machine.record(&MetaKey::Node { node_uuid: NODE }) else {
+        panic!("node must exist");
+    };
+    assert_eq!(node.failure_domain, "rack-a");
+    assert_eq!(node.placement_weight, 100);
+    assert_eq!(node.generation, 1);
+
+    assert_eq!(
+        machine.apply(
+            3,
+            &set_placement_attrs(&mut requests, NODE, "rack-b", 50, 0)
+        ),
+        rejected(MetadataError::GenerationMismatch {
+            expected: 0,
+            actual: 1,
+        })
+    );
+    assert_eq!(
+        machine.apply(
+            4,
+            &MetadataCommand::SetNodePlacementAttrs {
+                env: requests.next(),
+                node_uuid: NODE,
+                failure_domain: "x".repeat(65),
+                placement_weight: 100,
+                expected_generation: 1,
+            }
+        ),
+        rejected(MetadataError::limit(
+            "failure domain must be 0..=64 bytes, got 65"
+        ))
+    );
+    assert_eq!(
+        machine.apply(
+            5,
+            &set_placement_attrs(&mut requests, NODE_B, "rack-a", 100, 0)
+        ),
+        rejected(MetadataError::NotFound)
+    );
+}
+
+#[test]
+fn segment_placement_commits_only_deterministic_verified_sets() {
+    let mut requests = Requests(0);
+    let (mut machine, _root, segment_generation) = verified_segment_machine(&mut requests);
+
+    // Register two more Active nodes in distinct domains.
+    for (node, domain, gen_idx) in [(NODE_B, "rack-b", 6_u64), (NODE_C, "rack-c", 8)] {
+        assert_eq!(
+            machine.apply(gen_idx, &register_node(&mut requests, node)),
+            MetadataResponse::Ack { generation: 0 }
+        );
+        assert_eq!(
+            machine.apply(
+                gen_idx + 1,
+                &set_placement_attrs(&mut requests, node, domain, 100, 0)
+            ),
+            MetadataResponse::Ack { generation: 1 }
+        );
+    }
+    assert_eq!(
+        machine.apply(
+            10,
+            &set_placement_attrs(&mut requests, NODE, "rack-a", 100, 0)
+        ),
+        MetadataResponse::Ack { generation: 1 }
+    );
+
+    let expected = select_replicas(
+        SEGMENT,
+        &[
+            PlacementCandidate {
+                node_uuid: NODE,
+                failure_domain: "rack-a".to_owned(),
+                weight: 100,
+            },
+            PlacementCandidate {
+                node_uuid: NODE_B,
+                failure_domain: "rack-b".to_owned(),
+                weight: 100,
+            },
+            PlacementCandidate {
+                node_uuid: NODE_C,
+                failure_domain: "rack-c".to_owned(),
+                weight: 100,
+            },
+        ],
+        3,
+        true,
+    )
+    .unwrap();
+
+    // Wrong ordering / set is rejected.
+    let mut wrong = expected.clone();
+    wrong.reverse();
+    if wrong == expected {
+        wrong.swap(0, 1);
+    }
+    assert_eq!(
+        machine.apply(
+            11,
+            &MetadataCommand::CommitSegmentPlacement {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: SEGMENT,
+                replication_factor: 3,
+                replica_nodes: wrong,
+                expected_segment_generation: segment_generation,
+                expected_placement_generation: None,
+            }
+        ),
+        rejected(MetadataError::invalid_transition(
+            "proposed replica set does not match deterministic placement"
+        ))
+    );
+
+    // Independent RF must match the proposed list length.
+    assert_eq!(
+        machine.apply(
+            12,
+            &MetadataCommand::CommitSegmentPlacement {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: SEGMENT,
+                replication_factor: 3,
+                replica_nodes: expected[..1].to_vec(),
+                expected_segment_generation: segment_generation,
+                expected_placement_generation: None,
+            }
+        ),
+        rejected(MetadataError::invalid_transition(
+            "replica set length 1 does not match replication_factor 3"
+        ))
+    );
+
+    assert_eq!(
+        machine.apply(
+            13,
+            &MetadataCommand::CommitSegmentPlacement {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: SEGMENT,
+                replication_factor: 3,
+                replica_nodes: expected.clone(),
+                expected_segment_generation: segment_generation,
+                expected_placement_generation: None,
+            }
+        ),
+        MetadataResponse::Ack { generation: 0 }
+    );
+
+    let Some(MetaValue::SegmentPlacement(placement)) = machine.record(&MetaKey::SegmentPlacement {
+        topic_uuid: TOPIC,
+        range_uuid: RANGE,
+        segment_uuid: SEGMENT,
+    }) else {
+        panic!("placement record must exist");
+    };
+    assert_eq!(placement.replica_nodes, expected);
+    assert_eq!(placement.replication_factor, 3);
+    assert_eq!(placement.generation, 0);
+    assert_eq!(placement.committed_apply_index, 13);
+
+    // Unverified segment cannot be placed: seal a second segment and try.
+    let unverified = Uuid::from_u128(0x31);
+    assert_eq!(
+        machine.apply(
+            14,
+            &MetadataCommand::RegisterSealedSegment {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: unverified,
+                segment_generation: 0,
+                base_offset: 64,
+                next_offset: 128,
+                content_root: [0xcd; 32],
+                sealed_by_epoch: 1,
+                expected_range_generation: 2,
+            }
+        ),
+        MetadataResponse::Ack { generation: 3 }
+    );
+    assert_eq!(
+        machine.apply(
+            15,
+            &MetadataCommand::CommitSegmentPlacement {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: unverified,
+                replication_factor: 3,
+                replica_nodes: expected,
+                expected_segment_generation: 0,
+                expected_placement_generation: None,
+            }
+        ),
+        rejected(MetadataError::invalid_transition(
+            "placement requires a verified segment"
+        ))
+    );
+}
+
+#[test]
+fn segment_placement_rejects_same_domain_when_replicas_require_distinctness() {
+    let mut requests = Requests(0);
+    let (mut machine, _root, segment_generation) = verified_segment_machine(&mut requests);
+    assert_eq!(
+        machine.apply(6, &register_node(&mut requests, NODE_B)),
+        MetadataResponse::Ack { generation: 0 }
+    );
+    assert_eq!(
+        machine.apply(
+            7,
+            &set_placement_attrs(&mut requests, NODE, "rack-a", 100, 0)
+        ),
+        MetadataResponse::Ack { generation: 1 }
+    );
+    assert_eq!(
+        machine.apply(
+            8,
+            &set_placement_attrs(&mut requests, NODE_B, "rack-a", 100, 0)
+        ),
+        MetadataResponse::Ack { generation: 1 }
+    );
+
+    assert_eq!(
+        machine.apply(
+            9,
+            &MetadataCommand::CommitSegmentPlacement {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: SEGMENT,
+                replication_factor: 2,
+                replica_nodes: vec![NODE, NODE_B],
+                expected_segment_generation: segment_generation,
+                expected_placement_generation: None,
+            }
+        ),
+        rejected(MetadataError::invalid_transition(
+            "need 2 eligible replica(s), only 1 available"
+        ))
     );
 }

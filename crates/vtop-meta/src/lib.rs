@@ -1,5 +1,5 @@
 //! Deterministic metadata state machine, durable store, Raft adapter, and
-//! mTLS peer/admin transport — stage-5 PR 1 + PR 2 + PR 3.
+//! mTLS peer/admin transport — stage-5 through stage-8 placement foundation.
 //!
 //! This crate provides the storage half of the replicated metadata control
 //! plane, the contained consensus adapter, and the VTPM mTLS transport:
@@ -10,6 +10,8 @@
 //! - a pure, deterministic state machine with CAS generations, strictly
 //!   monotonic fencing epochs, and an exactly-once request dedup table that
 //!   travels inside snapshots ([`state`]);
+//! - deterministic weighted-rendezvous placement over failure-domain
+//!   constraints ([`placement`]), committed as durable segment replica sets;
 //! - durable hard state, a chunked checksummed raft log, atomic snapshots,
 //!   and a deterministic recovery orchestrator ([`storage`]), all running
 //!   through the [`vtop_log::env::Env`] seam so crash sweeps drive the exact
@@ -29,6 +31,7 @@
 
 pub mod command;
 pub mod keys;
+pub mod placement;
 pub mod raft;
 pub mod state;
 pub mod storage;
@@ -43,6 +46,10 @@ pub use keys::{
     validate_group_name, validate_topic_name, MetaKey, MetaNodeId, MAX_GROUP_NAME_BYTES,
     MAX_TOPIC_NAME_BYTES, META_SHARD_ID,
 };
+pub use placement::{
+    rendezvous_score, select_replicas, PlacementCandidate, PlacementError,
+    DEFAULT_PLACEMENT_WEIGHT, MAX_FAILURE_DOMAIN_BYTES, MAX_REPLICAS, MIN_PLACEMENT_WEIGHT,
+};
 pub use raft::{
     CommitReceipt, Consensus, ConsensusError, ConsensusResult, MetaRaftLogStore,
     MetaRaftStateMachine, MetaRaftStore, MetaRaftTypeConfig, OpenraftConsensus, PeerDirectory,
@@ -50,8 +57,9 @@ pub use raft::{
 };
 pub use state::{
     ConsumerGroupRecord, CursorCheckpointRecord, GroupMemberRecord, GroupNameRecord, KeyRecord,
-    KeyState, LeaseRecord, MetaStateMachine, MetaValue, NodeRecord, RangeRecord, SegmentRecord,
-    SegmentState, TopicNameRecord, TopicRecord, DEDUP_CAPACITY,
+    KeyState, LeaseRecord, MetaStateMachine, MetaValue, NodeRecord, RangeRecord,
+    SegmentPlacementRecord, SegmentRecord, SegmentState, TopicNameRecord, TopicRecord,
+    DEDUP_CAPACITY,
 };
 pub use storage::hardstate::{HardState, HardStateFile};
 pub use storage::log::{

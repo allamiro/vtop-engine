@@ -35,6 +35,7 @@ const CATEGORY_GROUP: u8 = 9;
 const CATEGORY_GROUP_BY_NAME: u8 = 10;
 const CATEGORY_GROUP_MEMBER: u8 = 11;
 const CATEGORY_GROUP_CURSOR: u8 = 12;
+const CATEGORY_SEGMENT_PLACEMENT: u8 = 13;
 
 /// Consumer-group names reuse the topic-name bound so group identity stays
 /// allocation-bounded on the wire and in snapshots.
@@ -98,6 +99,13 @@ pub enum MetaKey {
         topic_uuid: Uuid,
         range_uuid: Uuid,
     },
+    /// Ordered replica-node set for a verified segment, committed after
+    /// deterministic placement validation.
+    SegmentPlacement {
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        segment_uuid: Uuid,
+    },
 }
 
 /// Validate a topic name against the shared 249-byte semantics.
@@ -139,6 +147,7 @@ impl MetaKey {
             MetaKey::GroupByName { .. } => CATEGORY_GROUP_BY_NAME,
             MetaKey::GroupMember { .. } => CATEGORY_GROUP_MEMBER,
             MetaKey::GroupCursor { .. } => CATEGORY_GROUP_CURSOR,
+            MetaKey::SegmentPlacement { .. } => CATEGORY_SEGMENT_PLACEMENT,
         }
     }
 
@@ -189,6 +198,15 @@ impl MetaKey {
                 put_uuid(&mut out, *group_uuid);
                 put_uuid(&mut out, *topic_uuid);
                 put_uuid(&mut out, *range_uuid);
+            }
+            MetaKey::SegmentPlacement {
+                topic_uuid,
+                range_uuid,
+                segment_uuid,
+            } => {
+                put_uuid(&mut out, *topic_uuid);
+                put_uuid(&mut out, *range_uuid);
+                put_uuid(&mut out, *segment_uuid);
             }
         }
         out
@@ -267,6 +285,11 @@ impl MetaKey {
                 topic_uuid: reader.uuid("topic uuid")?,
                 range_uuid: reader.uuid("range uuid")?,
             },
+            CATEGORY_SEGMENT_PLACEMENT => MetaKey::SegmentPlacement {
+                topic_uuid: reader.uuid("topic uuid")?,
+                range_uuid: reader.uuid("range uuid")?,
+                segment_uuid: reader.uuid("segment uuid")?,
+            },
             other => {
                 return Err(CodecError::UnknownTag {
                     what: "meta key category",
@@ -328,6 +351,14 @@ impl fmt::Display for MetaKey {
                 formatter,
                 "/meta/0/group/{group_uuid}/cursor/{topic_uuid}/{range_uuid}"
             ),
+            MetaKey::SegmentPlacement {
+                topic_uuid,
+                range_uuid,
+                segment_uuid,
+            } => write!(
+                formatter,
+                "/meta/0/segment-placement/{topic_uuid}/{range_uuid}/{segment_uuid}"
+            ),
         }
     }
 }
@@ -377,6 +408,11 @@ mod tests {
                 group_uuid: Uuid::from_u128(7),
                 topic_uuid: Uuid::from_u128(2),
                 range_uuid: Uuid::from_u128(3),
+            },
+            MetaKey::SegmentPlacement {
+                topic_uuid: Uuid::from_u128(2),
+                range_uuid: Uuid::from_u128(3),
+                segment_uuid: Uuid::from_u128(4),
             },
         ]
     }
