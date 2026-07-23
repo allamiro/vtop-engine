@@ -202,6 +202,22 @@ impl RaftLogStorage<MetaRaftTypeConfig> for MetaRaftLogStore {
     async fn purge(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
         let mut guard = self.store.lock();
         let meta_index = to_meta_index(log_id.index);
+        // Persist the logical frontier BEFORE deleting chunks. A crash between
+        // chunk deletion and a later save would leave a stale lower
+        // `meta.purged` while the corresponding entries are already gone;
+        // recovery prefers that file and would treat the missing interval as
+        // readable. Saving first is safe: readers already hide through the
+        // frontier even if physical deletion is interrupted.
+        match guard.last_purged {
+            Some(prev) if prev.index > log_id.index => {}
+            _ => {
+                guard.last_purged = Some(log_id);
+                guard
+                    .storage
+                    .save_purged(log_id.leader_id.term, meta_index)
+                    .map_err(map_store_err)?;
+            }
+        }
         let covered = guard
             .storage
             .snapshots()
@@ -224,17 +240,7 @@ impl RaftLogStorage<MetaRaftTypeConfig> for MetaRaftLogStore {
         // InstallFullSnapshot without waiting for the SM command to finish
         // (`Command::PurgeLog` has no Condition). On a blank follower the log
         // is empty so skipping the physical purge is safe; `last_purged`
-        // still advances so readers honor the logical frontier after install.
-        match guard.last_purged {
-            Some(prev) if prev.index > log_id.index => {}
-            _ => {
-                guard.last_purged = Some(log_id);
-                guard
-                    .storage
-                    .save_purged(log_id.leader_id.term, meta_index)
-                    .map_err(map_store_err)?;
-            }
-        }
+        // still advanced above so readers honor the logical frontier.
         Ok(())
     }
 }

@@ -50,7 +50,11 @@ impl MetaRaftStore {
         config: MetaStorageConfig,
     ) -> MetaStoreResult<Self> {
         let data_dir = data_dir.as_ref().to_path_buf();
-        let storage = MetaStorage::open_with(env, &data_dir, cluster_id, config)?;
+        let mut storage = MetaStorage::open_with(env, &data_dir, cluster_id, config)?;
+        // Crash window after snapshot install: applied/snapshot may be durable
+        // while discard_stale_log_tail never ran. Heal on every reopen so the
+        // recovered log is appendable from last_applied + 1.
+        storage.discard_stale_log_tail()?;
         let last_membership = recover_membership(&storage)?;
         let last_purged = recover_last_purged(&storage);
         Ok(Self {
