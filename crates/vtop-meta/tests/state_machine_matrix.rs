@@ -669,6 +669,110 @@ fn sealed_segment_registration_and_verification_cover_every_rejection() {
 }
 
 #[test]
+fn sealing_requires_a_live_lease_before_any_grant_and_after_release() {
+    let mut requests = Requests(0);
+    let mut machine = machine_with_topic_and_node(&mut requests);
+
+    let seal =
+        |requests: &mut Requests, segment: u128, sealed_by_epoch, expected_range_generation| {
+            MetadataCommand::RegisterSealedSegment {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: Uuid::from_u128(segment),
+                segment_generation: 0,
+                base_offset: 0,
+                next_offset: 128,
+                content_root: [7; 32],
+                sealed_by_epoch,
+                expected_range_generation,
+            }
+        };
+
+    // A fresh range sits at epoch 0 with generation 0, so a forged
+    // registration carrying exactly those default values must still be
+    // rejected: no lease was ever granted, so nobody holds the authority.
+    assert!(matches!(
+        machine.apply(3, &seal(&mut requests, 0x31, 0, 0)),
+        MetadataResponse::Rejected(MetadataError::InvalidTransition(_))
+    ));
+
+    // Grant (epoch 1, generation 1), then release (generation 2): the
+    // epoch still "matches" after release, but the lease is gone and the
+    // authority with it.
+    machine.apply(4, &grant(&mut requests, NODE, 0));
+    assert_eq!(
+        machine.apply(5, &release(&mut requests, 1)),
+        MetadataResponse::Ack { generation: 2 }
+    );
+    assert!(matches!(
+        machine.apply(6, &seal(&mut requests, 0x32, 1, 2)),
+        MetadataResponse::Rejected(MetadataError::InvalidTransition(_))
+    ));
+
+    // A re-grant restores authority under the freshly minted epoch.
+    machine.apply(7, &grant(&mut requests, NODE, 2));
+    assert_eq!(
+        machine.apply(8, &seal(&mut requests, 0x33, 2, 3)),
+        MetadataResponse::Ack { generation: 4 }
+    );
+}
+
+#[test]
+fn verifying_a_segment_at_the_generation_ceiling_is_rejected_not_wrapped() {
+    let mut requests = Requests(0);
+    let mut machine = machine_with_topic_and_node(&mut requests);
+    machine.apply(3, &grant(&mut requests, NODE, 0));
+
+    // Registration accepts any proposer-supplied generation, including the
+    // ceiling; the increment on verification must reject deterministically
+    // rather than wrap (or panic every replica in checked builds).
+    assert_eq!(
+        machine.apply(
+            4,
+            &MetadataCommand::RegisterSealedSegment {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: SEGMENT,
+                segment_generation: u64::MAX,
+                base_offset: 0,
+                next_offset: 128,
+                content_root: [7; 32],
+                sealed_by_epoch: 1,
+                expected_range_generation: 1,
+            }
+        ),
+        MetadataResponse::Ack { generation: 2 }
+    );
+    assert!(matches!(
+        machine.apply(
+            5,
+            &MetadataCommand::MarkSegmentVerified {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: SEGMENT,
+                content_root: [7; 32],
+                expected_generation: u64::MAX,
+            }
+        ),
+        MetadataResponse::Rejected(MetadataError::Limit(_))
+    ));
+    // The rejection left the segment untouched: still unverified, still at
+    // the ceiling generation.
+    let Some(MetaValue::Segment(segment)) = machine.record(&MetaKey::Segment {
+        topic_uuid: TOPIC,
+        range_uuid: RANGE,
+        segment_uuid: SEGMENT,
+    }) else {
+        panic!("segment must exist");
+    };
+    assert_eq!(segment.state, SegmentState::SealedUnverified);
+    assert_eq!(segment.segment_generation, u64::MAX);
+}
+
+#[test]
 fn put_key_record_creates_immutable_records_and_rejects_collisions() {
     let mut requests = Requests(0);
     let mut machine = MetaStateMachine::new();

@@ -696,12 +696,21 @@ impl MetaStateMachine {
         let Some(MetaValue::Range(range)) = self.records.get(&range_key) else {
             return reject(MetadataError::NotFound);
         };
+        // Sealing is an act of the current leaseholder. Without a live
+        // lease there is no authority to publish at all: a fresh range and
+        // a just-released range both sit at a "matching" epoch with no
+        // holder, and neither may accept a segment.
+        let Some(lease) = range.lease.as_ref() else {
+            return reject(MetadataError::invalid_transition(
+                "range holds no active lease to seal under",
+            ));
+        };
         // The epoch gate: a sealer fenced by a newer grant must not be able
         // to publish, however stale or fresh its CAS token is.
-        if sealed_by_epoch != range.fencing_epoch {
+        if sealed_by_epoch != lease.fencing_epoch {
             return reject(MetadataError::EpochMismatch {
                 expected: sealed_by_epoch,
-                actual: range.fencing_epoch,
+                actual: lease.fencing_epoch,
             });
         }
         if range.generation != expected_range_generation {
@@ -771,10 +780,18 @@ impl MetaStateMachine {
                 "segment is already verified",
             ));
         }
+        // The registration accepts any proposer-supplied generation, so the
+        // ceiling must be rejected deterministically here rather than
+        // wrapping (or panicking every replica in checked builds).
+        let Some(next_generation) = segment.segment_generation.checked_add(1) else {
+            return reject(MetadataError::limit(
+                "segment generation space is exhausted",
+            ));
+        };
         segment.state = SegmentState::Verified;
-        segment.segment_generation += 1;
+        segment.segment_generation = next_generation;
         MetadataResponse::Ack {
-            generation: segment.segment_generation,
+            generation: next_generation,
         }
     }
 

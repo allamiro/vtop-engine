@@ -43,6 +43,7 @@ pub struct HardStateFile {
     path: PathBuf,
     state: HardState,
     generation: u64,
+    poisoned: bool,
 }
 
 impl HardStateFile {
@@ -60,6 +61,7 @@ impl HardStateFile {
                 path,
                 state: HardState::default(),
                 generation: 0,
+                poisoned: false,
             });
         }
         let bytes = env
@@ -72,6 +74,7 @@ impl HardStateFile {
             path,
             state,
             generation,
+            poisoned: false,
         })
     }
 
@@ -88,6 +91,9 @@ impl HardStateFile {
     /// here, next to the bytes: the term can never regress, and within a
     /// term a cast vote can never change or be forgotten.
     pub fn save(&mut self, next: HardState) -> MetaStoreResult<()> {
+        if self.poisoned {
+            return Err(MetaStoreError::Poisoned("hard state"));
+        }
         if next.term < self.state.term {
             return Err(MetaStoreError::InvalidConfig(format!(
                 "hard state term regressed from {} to {}",
@@ -103,10 +109,26 @@ impl HardStateFile {
                     )));
                 }
             }
+            // Within a term the committed flag is monotonic too: forgetting
+            // that a vote was committed would let recovery treat it as
+            // retractable, which is the same double-vote hazard.
+            if self.state.vote_committed && !next.vote_committed {
+                return Err(MetaStoreError::InvalidConfig(format!(
+                    "committed vote in term {} cannot be uncommitted",
+                    next.term
+                )));
+            }
         }
         let generation = self.generation + 1;
         let bytes = encode(&next, generation);
-        write_atomic(&self.env, &self.path, &bytes)?;
+        if let Err(error) = write_atomic(&self.env, &self.path, &bytes) {
+            // The failure may have struck after the rename published the
+            // new bytes, so the cached copy can no longer be trusted to
+            // enforce the vote guards. Fail closed until a reopen re-reads
+            // whatever was durably published.
+            self.poisoned = true;
+            return Err(error);
+        }
         self.state = next;
         self.generation = generation;
         Ok(())
@@ -188,8 +210,9 @@ fn decode(path: &Path, bytes: &[u8]) -> MetaStoreResult<(HardState, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
     use std::path::Path;
-    use vtop_log::sim::SimStorage;
+    use vtop_log::sim::{FaultPlan, SimStorage};
 
     fn sim_env() -> (SimStorage, Env) {
         let sim = SimStorage::new();
@@ -261,5 +284,103 @@ mod tests {
             vote_committed: false,
         })
         .unwrap();
+    }
+
+    #[test]
+    fn a_committed_vote_cannot_be_uncommitted_within_the_same_term() {
+        let (_sim, env) = sim_env();
+        let mut file = HardStateFile::open_in(&env, "/meta/meta.hardstate").unwrap();
+        file.save(HardState {
+            term: 5,
+            voted_for: Some(MetaNodeId(1)),
+            vote_committed: true,
+        })
+        .unwrap();
+
+        // Same term, same candidate, but the committed flag regresses:
+        // recovery would forget the commitment, which is the double-vote
+        // hazard the flag exists to prevent.
+        assert!(matches!(
+            file.save(HardState {
+                term: 5,
+                voted_for: Some(MetaNodeId(1)),
+                vote_committed: false,
+            }),
+            Err(MetaStoreError::InvalidConfig(_))
+        ));
+        // Re-saving the identical committed state stays legal.
+        file.save(HardState {
+            term: 5,
+            voted_for: Some(MetaNodeId(1)),
+            vote_committed: true,
+        })
+        .unwrap();
+        // A new term starts uncommitted again.
+        file.save(HardState {
+            term: 6,
+            voted_for: Some(MetaNodeId(2)),
+            vote_committed: false,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_failed_save_poisons_the_file_until_reopened() {
+        // Sweep an injected failure across every storage operation of one
+        // save. Wherever the save errors — before or after the rename that
+        // publishes the new bytes — the cached copy is untrustworthy, so
+        // the file must refuse further saves until a reopen re-reads the
+        // durable truth.
+        let first = HardState {
+            term: 1,
+            voted_for: Some(MetaNodeId(1)),
+            vote_committed: false,
+        };
+        let second = HardState {
+            term: 2,
+            voted_for: Some(MetaNodeId(2)),
+            vote_committed: false,
+        };
+        let mut failing_positions = 0;
+        for offset in 1..32 {
+            let (sim, env) = sim_env();
+            let path = Path::new("/meta/meta.hardstate");
+            let mut file = HardStateFile::open_in(&env, path).unwrap();
+            file.save(first).unwrap();
+
+            sim.set_fault(FaultPlan::FailOp {
+                op: sim.op_count() + offset,
+                kind: io::ErrorKind::Other,
+            });
+            match file.save(second) {
+                // The fault landed beyond this save's operation sequence;
+                // the whole sequence has been swept.
+                Ok(()) => break,
+                Err(_) => {
+                    failing_positions += 1;
+                    // Even a perfectly valid follow-up must be refused.
+                    assert!(matches!(
+                        file.save(HardState {
+                            term: 3,
+                            voted_for: Some(MetaNodeId(3)),
+                            vote_committed: false,
+                        }),
+                        Err(MetaStoreError::Poisoned(_))
+                    ));
+                    // Reopening re-reads the published truth: exactly the
+                    // old or the new value, never a blend or a default.
+                    let reopened = HardStateFile::open_in(&env, path).unwrap();
+                    assert!(
+                        reopened.state() == &first || reopened.state() == &second,
+                        "reopened state {:?} matches neither save (offset {offset})",
+                        reopened.state()
+                    );
+                }
+            }
+        }
+        assert!(
+            failing_positions >= 4,
+            "the sweep must cover open/write/sync/rename/dir-sync, hit {failing_positions}"
+        );
     }
 }
