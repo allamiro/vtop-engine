@@ -283,7 +283,26 @@ fn lease_publications_are_monotonic() {
     view.clear_lease(2);
     assert!(!view.lease_active());
     assert_eq!(view.get(), 2);
-    // Equal-epoch re-grant reactivates.
+    // Re-publishing the same released epoch stays inactive.
     view.set(2);
+    assert!(!view.lease_active());
+    // A newer grant after that release activates.
+    view.set(3);
     assert!(view.lease_active());
+    assert_eq!(view.get(), 3);
+}
+
+#[test]
+fn release_before_grant_still_deactivates() {
+    // View still at epoch 1; release(2) arrives before set(2).
+    let view = MetaFencingEpoch::new(1);
+    view.clear_lease(2);
+    assert!(view.lease_active()); // epoch-1 holder unaffected
+    assert_eq!(view.get(), 1);
+    view.set(2);
+    assert_eq!(view.get(), 2);
+    assert!(
+        !view.lease_active(),
+        "grant for an already-released epoch must not reactivate"
+    );
 }

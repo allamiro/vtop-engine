@@ -276,6 +276,10 @@ struct MetaLeaseState {
     /// Whether a live lease currently exists. Release clears this without
     /// changing `fencing_epoch`.
     lease_active: bool,
+    /// Highest epoch for which a release has been observed. Lets a release
+    /// that arrives before its matching grant still win when the grant is
+    /// applied later.
+    released_through: u64,
 }
 
 impl MetaFencingEpoch {
@@ -285,6 +289,7 @@ impl MetaFencingEpoch {
             state: Arc::new(Mutex::new(MetaLeaseState {
                 fencing_epoch: epoch,
                 lease_active: true,
+                released_through: 0,
             })),
         }
     }
@@ -308,7 +313,8 @@ impl MetaFencingEpoch {
     /// Publish a metadata grant (including a steal that mints a newer epoch).
     ///
     /// Stale grants with a lower epoch than the view already knows are ignored
-    /// so concurrent/retried observer callbacks cannot rewind fencing.
+    /// so concurrent/retried observer callbacks cannot rewind fencing. A grant
+    /// whose epoch was already released (possibly out of order) stays inactive.
     pub fn set(&self, epoch: u64) {
         let mut state = self
             .state
@@ -318,23 +324,27 @@ impl MetaFencingEpoch {
             return;
         }
         state.fencing_epoch = epoch;
-        state.lease_active = true;
+        state.lease_active = epoch > state.released_through;
     }
 
     /// Publish a metadata release for `expected_epoch`.
     ///
     /// The fencing epoch is retained, but no leaseholder remains authorized.
-    /// A release whose epoch does not match the current view is ignored so a
-    /// delayed release for an older grant cannot deactivate a newer lease.
+    /// Releases always advance `released_through`, so a release that arrives
+    /// before its grant still deactivates that epoch when the grant shows up.
+    /// A release for an older epoch than the current view does not deactivate
+    /// a newer live lease.
     pub fn clear_lease(&self, expected_epoch: u64) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.fencing_epoch != expected_epoch {
-            return;
+        if expected_epoch > state.released_through {
+            state.released_through = expected_epoch;
         }
-        state.lease_active = false;
+        if state.fencing_epoch == expected_epoch {
+            state.lease_active = false;
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, MetaLeaseState> {
