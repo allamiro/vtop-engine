@@ -42,6 +42,8 @@ const VALUE_TAG_KEY: u8 = 6;
 const VALUE_TAG_GROUP: u8 = 7;
 const VALUE_TAG_GROUP_NAME: u8 = 8;
 const VALUE_TAG_GROUP_MEMBER: u8 = 9;
+/// Member records that include `last_heartbeat_apply_index`.
+const VALUE_TAG_GROUP_MEMBER_V2: u8 = 11;
 const VALUE_TAG_GROUP_CURSOR: u8 = 10;
 
 /// A registered broker/controller node.
@@ -259,7 +261,7 @@ impl MetaValue {
                 put_uuid(&mut out, name.group_uuid);
             }
             MetaValue::GroupMember(member) => {
-                put_u8(&mut out, VALUE_TAG_GROUP_MEMBER);
+                put_u8(&mut out, VALUE_TAG_GROUP_MEMBER_V2);
                 put_u64(&mut out, member.generation);
                 put_u64(&mut out, member.last_heartbeat_apply_index);
                 encode_assigned_ranges(&mut out, &member.assigned)?;
@@ -365,6 +367,13 @@ impl MetaValue {
                 group_uuid: reader.uuid("group uuid")?,
             }),
             VALUE_TAG_GROUP_MEMBER => MetaValue::GroupMember(GroupMemberRecord {
+                generation: reader.u64("member generation")?,
+                // Pre-heartbeat member records omit liveness; treat as never
+                // heartbeated so ExpireStaleMember can reclaim them.
+                last_heartbeat_apply_index: 0,
+                assigned: decode_assigned_ranges(&mut reader)?,
+            }),
+            VALUE_TAG_GROUP_MEMBER_V2 => MetaValue::GroupMember(GroupMemberRecord {
                 generation: reader.u64("member generation")?,
                 last_heartbeat_apply_index: reader.u64("member last heartbeat apply index")?,
                 assigned: decode_assigned_ranges(&mut reader)?,
@@ -1804,5 +1813,22 @@ mod tests {
             .encode()
             .unwrap()
             .len()
+    }
+
+    #[test]
+    fn legacy_group_member_value_tag_decodes_with_zero_heartbeat() {
+        let mut bytes = Vec::new();
+        put_u8(&mut bytes, VALUE_TAG_GROUP_MEMBER);
+        put_u64(&mut bytes, 3);
+        put_u16(&mut bytes, 0); // no assigned ranges
+        let value = MetaValue::decode(&bytes).unwrap();
+        assert_eq!(
+            value,
+            MetaValue::GroupMember(GroupMemberRecord {
+                generation: 3,
+                last_heartbeat_apply_index: 0,
+                assigned: Vec::new(),
+            })
+        );
     }
 }
