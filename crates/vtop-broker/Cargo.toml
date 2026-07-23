@@ -19,3 +19,4 @@ vtop-protocol = { workspace = true }
 [dev-dependencies]
 rcgen = "0.14"
 tempfile = { workspace = true }
+vtop-meta = { workspace = true }
