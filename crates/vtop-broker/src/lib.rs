@@ -259,6 +259,11 @@ struct BrokerState {
 /// ([`MetaFencingEpoch::clear_lease`]). Brokers lock this view for the
 /// entire produce/fetch critical section so a concurrent revocation cannot
 /// race past the fencing check into a durable append.
+///
+/// This handle is process-local: a Raft applied-state watcher (follow-up)
+/// must drive [`MetaFencingEpoch::set`] / [`MetaFencingEpoch::clear_lease`]
+/// from committed metadata on every node. Publication itself is monotonic so
+/// out-of-order observer callbacks cannot rewind a fenced view.
 #[derive(Clone, Debug)]
 pub struct MetaFencingEpoch {
     state: Arc<Mutex<MetaLeaseState>>,
@@ -301,22 +306,34 @@ impl MetaFencingEpoch {
     }
 
     /// Publish a metadata grant (including a steal that mints a newer epoch).
+    ///
+    /// Stale grants with a lower epoch than the view already knows are ignored
+    /// so concurrent/retried observer callbacks cannot rewind fencing.
     pub fn set(&self, epoch: u64) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if epoch < state.fencing_epoch {
+            return;
+        }
         state.fencing_epoch = epoch;
         state.lease_active = true;
     }
 
-    /// Publish a metadata release: the fencing epoch is retained, but no
-    /// leaseholder remains authorized.
-    pub fn clear_lease(&self) {
+    /// Publish a metadata release for `expected_epoch`.
+    ///
+    /// The fencing epoch is retained, but no leaseholder remains authorized.
+    /// A release whose epoch does not match the current view is ignored so a
+    /// delayed release for an older grant cannot deactivate a newer lease.
+    pub fn clear_lease(&self, expected_epoch: u64) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.fencing_epoch != expected_epoch {
+            return;
+        }
         state.lease_active = false;
     }
 
@@ -1487,7 +1504,7 @@ mod tests {
         assert!(matches!(ok.message, Message::ProduceResponse(_)));
 
         // Release keeps the epoch number but clears lease liveness.
-        meta_epoch.clear_lease();
+        meta_epoch.clear_lease(1);
         let released = broker.handle(
             Role::Producer,
             produce_at(range.clone(), 1, producer, 1, 1, 2),

@@ -251,7 +251,7 @@ fn release_clears_lease_and_fences_holder_without_epoch_bump() {
     ));
     assert_eq!(range_fencing_epoch(&machine), 1);
     assert!(!range_lease_active(&machine));
-    meta_epoch.clear_lease();
+    meta_epoch.clear_lease(1);
     assert!(!meta_epoch.lease_active());
     assert_eq!(meta_epoch.get(), 1);
 
@@ -266,4 +266,24 @@ fn release_clears_lease_and_fences_holder_without_epoch_bump() {
         ),
         "release must fence the prior holder even when the epoch number is unchanged"
     );
+}
+
+#[test]
+fn lease_publications_are_monotonic() {
+    let view = MetaFencingEpoch::new(2);
+    // Stale grant cannot rewind.
+    view.set(1);
+    assert_eq!(view.get(), 2);
+    assert!(view.lease_active());
+    // Stale release for epoch 1 cannot clear epoch 2.
+    view.clear_lease(1);
+    assert!(view.lease_active());
+    assert_eq!(view.get(), 2);
+    // Matching release clears liveness without rewinding the epoch.
+    view.clear_lease(2);
+    assert!(!view.lease_active());
+    assert_eq!(view.get(), 2);
+    // Equal-epoch re-grant reactivates.
+    view.set(2);
+    assert!(view.lease_active());
 }
