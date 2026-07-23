@@ -75,6 +75,13 @@ pub enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Offline verification tools for sealed native segments. Unlike every
+    /// other subcommand these take no --config: an independent verifier must
+    /// run from the sealed artifacts and explicit pins alone.
+    Segment {
+        #[command(subcommand)]
+        command: crate::segment_tools::SegmentCommand,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -138,6 +145,11 @@ fn load(config: &Path) -> Result<(VtopConfig, StreamsConfig), VtopError> {
 
 /// Dispatch a parsed CLI invocation. Returns a process exit code.
 pub async fn dispatch(cli: Cli) -> i32 {
+    // Segment tools are synchronous, config-free, and use their own exit-code
+    // contract (see segment_tools), so they bypass the engine dispatch path.
+    if let Command::Segment { command } = &cli.command {
+        return crate::segment_tools::run(command, cli.json);
+    }
     match run_command(&cli).await {
         Ok(()) => 0,
         Err(e) => {
@@ -369,6 +381,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             }
             Ok(())
         }
+        Command::Segment { .. } => unreachable!("dispatched before run_command"),
     }
 }
 
