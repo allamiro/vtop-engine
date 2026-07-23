@@ -105,8 +105,8 @@ impl RaftStateMachine<MetaRaftTypeConfig> for MetaRaftStateMachine {
                     out.push(bytes);
                 }
                 EntryPayload::Membership(membership) => {
-                    // apply_through already updated MetaStorage membership;
-                    // record the openraft view with this entry's log id.
+                    // apply_through already updated MetaStorage membership and
+                    // flushed meta.membership_log_id; keep the openraft view.
                     membership_to_meta(membership)?;
                     guard.last_membership =
                         StoredMembership::new(Some(entry.log_id), membership.clone());
@@ -161,9 +161,17 @@ impl RaftStateMachine<MetaRaftTypeConfig> for MetaRaftStateMachine {
             }
         }
         // Re-sync membership from the recovered store; openraft meta wins for
-        // the StoredMembership log_id.
+        // the StoredMembership log_id and must be durable across reopen when the
+        // membership entry is absent from the physical log.
         let recovered = meta_to_membership(guard.storage.membership())?;
-        guard.last_membership = StoredMembership::new(*meta.last_membership.log_id(), recovered);
+        let membership_log_id = *meta.last_membership.log_id();
+        guard.last_membership = StoredMembership::new(membership_log_id, recovered);
+        if let Some(log_id) = membership_log_id {
+            guard
+                .storage
+                .save_membership_log_id(log_id.leader_id.term, to_meta_index(log_id.index))
+                .map_err(sto_err_snapshot)?;
+        }
         Ok(())
     }
 

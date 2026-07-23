@@ -11,6 +11,7 @@
 pub mod applied;
 pub mod hardstate;
 pub mod log;
+pub mod membership_log_id;
 pub mod purged;
 pub mod snapshot;
 
@@ -20,6 +21,7 @@ use crate::wire::CodecError;
 use applied::{AppliedFrontier, AppliedFrontierFile, APPLIED_FILE_NAME};
 use hardstate::{HardState, HardStateFile};
 use log::{MetaLog, MetaLogConfig, MetaLogEntry, MetaLogPayload, MetaMembership};
+use membership_log_id::{MembershipLogId, MembershipLogIdFile, MEMBERSHIP_LOG_ID_FILE_NAME};
 use purged::{PurgedFrontierFile, PurgedLogId, PURGED_FILE_NAME};
 use snapshot::{MetaSnapshots, SnapshotMeta};
 use std::io;
@@ -126,6 +128,7 @@ pub struct MetaStorage {
     hardstate: HardStateFile,
     applied: AppliedFrontierFile,
     purged: PurgedFrontierFile,
+    membership_log_id: MembershipLogIdFile,
     log: MetaLog,
     snapshots: MetaSnapshots,
     state: MetaStateMachine,
@@ -164,6 +167,8 @@ impl MetaStorage {
             HardStateFile::open_in(env, data_dir.join(hardstate::HARD_STATE_FILE_NAME))?;
         let applied = AppliedFrontierFile::open_in(env, data_dir.join(APPLIED_FILE_NAME))?;
         let purged = PurgedFrontierFile::open_in(env, data_dir.join(PURGED_FILE_NAME))?;
+        let membership_log_id =
+            MembershipLogIdFile::open_in(env, data_dir.join(MEMBERSHIP_LOG_ID_FILE_NAME))?;
         let log = MetaLog::open_in(env, data_dir, cluster_id, config.log)?;
 
         let (mut state, mut membership, mut last_applied_index, mut last_applied_term) =
@@ -223,6 +228,7 @@ impl MetaStorage {
             hardstate,
             applied,
             purged,
+            membership_log_id,
             log,
             snapshots,
             state,
@@ -255,6 +261,11 @@ impl MetaStorage {
     /// Exact last-purged meta log id, when the adapter has persisted one.
     pub fn last_purged(&self) -> Option<PurgedLogId> {
         self.purged.get()
+    }
+
+    /// Exact log id of the applied membership, when the adapter has persisted one.
+    pub fn last_membership_log_id(&self) -> Option<MembershipLogId> {
+        self.membership_log_id.get()
     }
 
     pub fn log(&self) -> &MetaLog {
@@ -299,6 +310,7 @@ impl MetaStorage {
             )));
         }
         let mut responses = Vec::new();
+        let mut membership_log_id = None;
         for entry in self
             .log
             .read_range(self.last_applied_index + 1, index + 1)?
@@ -309,6 +321,10 @@ impl MetaStorage {
                 }
                 MetaLogPayload::Membership(membership) => {
                     self.membership = membership.clone();
+                    membership_log_id = Some(MembershipLogId {
+                        term: entry.term,
+                        index: entry.index,
+                    });
                 }
                 MetaLogPayload::Blank => {}
             }
@@ -319,6 +335,11 @@ impl MetaStorage {
             index: self.last_applied_index,
             term: self.last_applied_term,
         })?;
+        // After the applied frontier is durable, persist the membership LogId so
+        // reopen does not invent one from a later normal entry at the frontier.
+        if let Some(log_id) = membership_log_id {
+            self.membership_log_id.save(log_id)?;
+        }
         Ok(responses)
     }
 
@@ -369,6 +390,11 @@ impl MetaStorage {
     /// Persist the exact acknowledged purged log id (meta coordinates).
     pub fn save_purged(&mut self, term: u64, index: u64) -> MetaStoreResult<()> {
         self.purged.save(PurgedLogId { term, index })
+    }
+
+    /// Persist the exact log id of the applied membership (meta coordinates).
+    pub fn save_membership_log_id(&mut self, term: u64, index: u64) -> MetaStoreResult<()> {
+        self.membership_log_id.save(MembershipLogId { term, index })
     }
 
     /// Align the durable applied frontier with the in-memory cursor (e.g.

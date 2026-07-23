@@ -21,7 +21,9 @@
 //! PR 3 adds the mTLS peer/admin transport. [`storage::MetaStorage`] flushes a
 //! durable `meta.applied` frontier on apply; reopen replays only through that
 //! cursor so uncommitted log tails stay out of the state machine. Disks without
-//! the file keep the legacy single-node full-log replay behaviour.
+//! the file keep the legacy single-node full-log replay behaviour. The adapter
+//! also persists `meta.purged` and `meta.membership_log_id` so reopen does not
+//! invent LogIds after purge or blank-follower snapshot install.
 
 pub mod command;
 pub mod keys;

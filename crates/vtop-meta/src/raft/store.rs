@@ -119,8 +119,15 @@ fn recover_membership(
     let membership = meta_to_membership(storage.membership()).map_err(|error| {
         crate::MetaStoreError::InvalidConfig(format!("cannot map recovered membership: {error}"))
     })?;
-    // Prefer the log id of the last membership entry at or below applied,
-    // scanning the durable log; fall back to the applied frontier.
+    // Prefer the exact LogId the adapter persisted on apply / snapshot install.
+    // Falling back to the applied frontier invents a membership version when the
+    // membership entry was purged or never present on a blank follower.
+    if let Some(id) = storage.last_membership_log_id() {
+        let membership_log_id = to_raft_index(id.index).map(|index| raft_log_id(id.term, index));
+        return Ok(StoredMembership::new(membership_log_id, membership));
+    }
+    // Legacy disks: scan the durable log for the last membership entry at or
+    // below applied; only then fall back to the applied frontier.
     let mut membership_log_id = applied_raft_log_id(storage);
     let applied = storage.last_applied();
     if applied > 0 {

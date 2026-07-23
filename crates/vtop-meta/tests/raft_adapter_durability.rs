@@ -5,6 +5,7 @@
 //! 3. Snapshot install discards a stale physical log ending below the snapshot.
 //! 4. Reopen heals a stale tail left by an interrupted snapshot install.
 //! 5. Purge persists the logical frontier before physical chunk deletion.
+//! 6. Membership LogId persists across purge / blank-follower snapshot install.
 
 use openraft::storage::{RaftLogStorage, RaftStateMachine};
 use openraft::{CommittedLeaderId, LogId, Membership, SnapshotMeta, StoredMembership};
@@ -148,9 +149,10 @@ async fn snapshot_install_discards_stale_tail_and_allows_append_at_frontier() {
         None::<std::collections::BTreeSet<u64>>,
     );
     let last_log_id = LogId::new(CommittedLeaderId::new(3, 0), 9); // meta 10 → raft 9
+    let membership_log_id = LogId::new(CommittedLeaderId::new(3, 0), 0); // meta 1
     let meta = SnapshotMeta {
         last_log_id: Some(last_log_id),
-        last_membership: StoredMembership::new(Some(last_log_id), membership),
+        last_membership: StoredMembership::new(Some(membership_log_id), membership),
         snapshot_id: snap_meta.snapshot_id.clone(),
     };
     sm.install_snapshot(&meta, Box::new(Cursor::new(snap_bytes)))
@@ -297,5 +299,123 @@ async fn purge_persists_frontier_before_chunk_deletion_survives_interrupt() {
         recovered.with_storage(|s| s.last_purged().map(|p| (p.term, p.index))),
         Some((4, 8)),
         "advanced purged frontier must survive even if chunk deletion was interrupted"
+    );
+}
+
+#[tokio::test]
+async fn membership_log_id_survives_purge_without_using_applied_frontier() {
+    let sim = SimStorage::new();
+    sim.create_dir_all(Path::new("/n1"));
+    let env = sim.env(0x57);
+
+    // Tiny chunks so purge can drop the early chunk that held membership@1.
+    let mut storage = MetaStorage::open_with(
+        &env,
+        "/n1",
+        cluster(),
+        vtop_meta::MetaStorageConfig {
+            log: vtop_meta::MetaLogConfig {
+                max_chunk_bytes: 256,
+            },
+        },
+    )
+    .unwrap();
+    let mut entries = Vec::new();
+    for i in 1..=10u64 {
+        entries.push(put_entry(5, i, u128::from(i)));
+    }
+    entries[0] = MetaLogEntry {
+        term: 5,
+        index: 1,
+        payload: MetaLogPayload::Membership(MetaMembership {
+            voters: vec![MetaNodeId(1)],
+            learners: vec![],
+        }),
+    };
+    storage.append(&entries).unwrap();
+    storage.apply_through(10).unwrap();
+    assert_eq!(
+        storage
+            .last_membership_log_id()
+            .map(|id| (id.term, id.index)),
+        Some((5, 1))
+    );
+    storage.write_snapshot().unwrap();
+    // Drop early chunks so reopen cannot recover membership by log scan.
+    storage.purge_upto(8).unwrap();
+    assert!(
+        storage.log().first_index().unwrap_or(0) > 1,
+        "membership entry must be gone from the physical log"
+    );
+    drop(storage);
+
+    sim.reboot();
+    let store = MetaRaftStore::open_tiny(&env, "/n1", cluster()).unwrap();
+    let mut sm = MetaRaftStateMachine::new(store);
+    let (last_applied, last_membership) = sm.applied_state().await.unwrap();
+    assert_eq!(
+        last_applied,
+        Some(LogId::new(CommittedLeaderId::new(5, 0), 9))
+    );
+    assert_eq!(
+        *last_membership.log_id(),
+        Some(LogId::new(CommittedLeaderId::new(5, 0), 0)),
+        "membership LogId must stay at the membership entry, not the applied frontier"
+    );
+}
+
+#[tokio::test]
+async fn blank_follower_snapshot_install_persists_membership_log_id() {
+    let sim = SimStorage::new();
+    sim.create_dir_all(Path::new("/leader"));
+    sim.create_dir_all(Path::new("/blank"));
+    let env = sim.env(0x58);
+
+    let mut leader = MetaStorage::open_in(&env, "/leader", cluster()).unwrap();
+    let mut entries = Vec::new();
+    for i in 1..=10u64 {
+        entries.push(put_entry(6, i, u128::from(i)));
+    }
+    entries[0] = MetaLogEntry {
+        term: 6,
+        index: 1,
+        payload: MetaLogPayload::Membership(MetaMembership {
+            voters: vec![MetaNodeId(1), MetaNodeId(2)],
+            learners: vec![],
+        }),
+    };
+    leader.append(&entries).unwrap();
+    leader.apply_through(10).unwrap();
+    let snap_meta = leader.write_snapshot().unwrap();
+    let snap_bytes = env.storage.read(&snap_meta.path).unwrap();
+    drop(leader);
+
+    let store = MetaRaftStore::open_in(&env, "/blank", cluster()).unwrap();
+    let mut sm = MetaRaftStateMachine::new(store.clone());
+    let membership = Membership::new(
+        vec![BTreeSet::from([1u64, 2u64])],
+        None::<std::collections::BTreeSet<u64>>,
+    );
+    let last_log_id = LogId::new(CommittedLeaderId::new(6, 0), 9);
+    let membership_log_id = LogId::new(CommittedLeaderId::new(6, 0), 0);
+    let meta = SnapshotMeta {
+        last_log_id: Some(last_log_id),
+        last_membership: StoredMembership::new(Some(membership_log_id), membership),
+        snapshot_id: snap_meta.snapshot_id.clone(),
+    };
+    sm.install_snapshot(&meta, Box::new(Cursor::new(snap_bytes)))
+        .await
+        .unwrap();
+    drop(sm);
+    drop(store);
+
+    sim.reboot();
+    let recovered = MetaRaftStore::open_in(&env, "/blank", cluster()).unwrap();
+    let mut sm = MetaRaftStateMachine::new(recovered);
+    let (_applied, last_membership) = sm.applied_state().await.unwrap();
+    assert_eq!(
+        *last_membership.log_id(),
+        Some(membership_log_id),
+        "blank-follower install must durable-store the snapshot membership LogId"
     );
 }
