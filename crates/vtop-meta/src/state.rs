@@ -42,6 +42,8 @@ const VALUE_TAG_KEY: u8 = 6;
 const VALUE_TAG_GROUP: u8 = 7;
 const VALUE_TAG_GROUP_NAME: u8 = 8;
 const VALUE_TAG_GROUP_MEMBER: u8 = 9;
+/// Member records that include `last_heartbeat_apply_index`.
+const VALUE_TAG_GROUP_MEMBER_V2: u8 = 11;
 const VALUE_TAG_GROUP_CURSOR: u8 = 10;
 
 /// A registered broker/controller node.
@@ -140,6 +142,9 @@ pub struct GroupNameRecord {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GroupMemberRecord {
     pub generation: u64,
+    /// Apply-index of the most recent join or heartbeat. Ephemeral liveness
+    /// only — durable cursors outlive member expiry.
+    pub last_heartbeat_apply_index: u64,
     pub assigned: Vec<RangeAssignment>,
 }
 
@@ -256,8 +261,9 @@ impl MetaValue {
                 put_uuid(&mut out, name.group_uuid);
             }
             MetaValue::GroupMember(member) => {
-                put_u8(&mut out, VALUE_TAG_GROUP_MEMBER);
+                put_u8(&mut out, VALUE_TAG_GROUP_MEMBER_V2);
                 put_u64(&mut out, member.generation);
+                put_u64(&mut out, member.last_heartbeat_apply_index);
                 encode_assigned_ranges(&mut out, &member.assigned)?;
             }
             MetaValue::GroupCursor(cursor) => {
@@ -362,6 +368,14 @@ impl MetaValue {
             }),
             VALUE_TAG_GROUP_MEMBER => MetaValue::GroupMember(GroupMemberRecord {
                 generation: reader.u64("member generation")?,
+                // Pre-heartbeat member records omit liveness; treat as never
+                // heartbeated so ExpireStaleMember can reclaim them.
+                last_heartbeat_apply_index: 0,
+                assigned: decode_assigned_ranges(&mut reader)?,
+            }),
+            VALUE_TAG_GROUP_MEMBER_V2 => MetaValue::GroupMember(GroupMemberRecord {
+                generation: reader.u64("member generation")?,
+                last_heartbeat_apply_index: reader.u64("member last heartbeat apply index")?,
                 assigned: decode_assigned_ranges(&mut reader)?,
             }),
             VALUE_TAG_GROUP_CURSOR => {
@@ -550,7 +564,12 @@ impl MetaStateMachine {
                 member_uuid,
                 expected_group_generation,
                 ..
-            } => self.join_consumer_group(*group_uuid, *member_uuid, *expected_group_generation),
+            } => self.join_consumer_group(
+                apply_index,
+                *group_uuid,
+                *member_uuid,
+                *expected_group_generation,
+            ),
             MetadataCommand::LeaveConsumerGroup {
                 group_uuid,
                 member_uuid,
@@ -599,6 +618,17 @@ impl MetaStateMachine {
                 lineage_transition_id: *lineage_transition_id,
                 expected_checkpoint_generation: *expected_checkpoint_generation,
             }),
+            MetadataCommand::HeartbeatMember {
+                group_uuid,
+                member_uuid,
+                ..
+            } => self.heartbeat_member(apply_index, *group_uuid, *member_uuid),
+            MetadataCommand::ExpireStaleMember {
+                group_uuid,
+                member_uuid,
+                stale_before_apply_index,
+                ..
+            } => self.expire_stale_member(*group_uuid, *member_uuid, *stale_before_apply_index),
         }
     }
 
@@ -1030,6 +1060,7 @@ impl MetaStateMachine {
 
     fn join_consumer_group(
         &mut self,
+        apply_index: u64,
         group_uuid: Uuid,
         member_uuid: Uuid,
         expected_group_generation: u64,
@@ -1059,6 +1090,7 @@ impl MetaStateMachine {
             member_key,
             MetaValue::GroupMember(GroupMemberRecord {
                 generation: 0,
+                last_heartbeat_apply_index: apply_index,
                 assigned: Vec::new(),
             }),
         );
@@ -1358,6 +1390,76 @@ impl MetaStateMachine {
                 }
             }
             (Some(_), Some(_)) => unreachable!("cursor keys only hold cursor records"),
+        }
+    }
+
+    fn heartbeat_member(
+        &mut self,
+        apply_index: u64,
+        group_uuid: Uuid,
+        member_uuid: Uuid,
+    ) -> MetadataResponse {
+        let group_key = MetaKey::Group { group_uuid }.encode();
+        if !matches!(self.records.get(&group_key), Some(MetaValue::Group(_))) {
+            return reject(MetadataError::NotFound);
+        }
+        let member_key = MetaKey::GroupMember {
+            group_uuid,
+            member_uuid,
+        }
+        .encode();
+        let Some(MetaValue::GroupMember(member)) = self.records.get_mut(&member_key) else {
+            return reject(MetadataError::NotFound);
+        };
+        // Heartbeats are monotonic in apply order and never rewind. A replayed
+        // lower index cannot appear because apply indices advance, but guard
+        // anyway so identical state machines stay locked.
+        if apply_index < member.last_heartbeat_apply_index {
+            return reject(MetadataError::invalid_transition(
+                "heartbeat apply index would rewind member liveness",
+            ));
+        }
+        member.last_heartbeat_apply_index = apply_index;
+        MetadataResponse::Ack {
+            generation: member.generation,
+        }
+    }
+
+    fn expire_stale_member(
+        &mut self,
+        group_uuid: Uuid,
+        member_uuid: Uuid,
+        stale_before_apply_index: u64,
+    ) -> MetadataResponse {
+        let group_key = MetaKey::Group { group_uuid }.encode();
+        let Some(MetaValue::Group(group)) = self.records.get(&group_key) else {
+            return reject(MetadataError::NotFound);
+        };
+        let Some(next_group_generation) = group.generation.checked_add(1) else {
+            return reject(MetadataError::limit("group generation space is exhausted"));
+        };
+        let member_key = MetaKey::GroupMember {
+            group_uuid,
+            member_uuid,
+        }
+        .encode();
+        let Some(MetaValue::GroupMember(member)) = self.records.get(&member_key) else {
+            return reject(MetadataError::NotFound);
+        };
+        if member.last_heartbeat_apply_index >= stale_before_apply_index {
+            return reject(MetadataError::invalid_transition(
+                "member heartbeat is still within the live window",
+            ));
+        }
+        // Drop membership and assignment only. Durable cursors remain so a
+        // replacement member can resume lineage-aware progress.
+        self.records.remove(&member_key);
+        let Some(MetaValue::Group(group)) = self.records.get_mut(&group_key) else {
+            unreachable!("group record was present above");
+        };
+        group.generation = next_group_generation;
+        MetadataResponse::Ack {
+            generation: next_group_generation,
         }
     }
 
@@ -1711,5 +1813,22 @@ mod tests {
             .encode()
             .unwrap()
             .len()
+    }
+
+    #[test]
+    fn legacy_group_member_value_tag_decodes_with_zero_heartbeat() {
+        let mut bytes = Vec::new();
+        put_u8(&mut bytes, VALUE_TAG_GROUP_MEMBER);
+        put_u64(&mut bytes, 3);
+        put_u16(&mut bytes, 0); // no assigned ranges
+        let value = MetaValue::decode(&bytes).unwrap();
+        assert_eq!(
+            value,
+            MetaValue::GroupMember(GroupMemberRecord {
+                generation: 3,
+                last_heartbeat_apply_index: 0,
+                assigned: Vec::new(),
+            })
+        );
     }
 }

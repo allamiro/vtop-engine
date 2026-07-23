@@ -43,6 +43,8 @@ const COMMAND_KIND_JOIN_CONSUMER_GROUP: u16 = 10;
 const COMMAND_KIND_LEAVE_CONSUMER_GROUP: u16 = 11;
 const COMMAND_KIND_ASSIGN_MEMBER_RANGES: u16 = 12;
 const COMMAND_KIND_COMMIT_GROUP_CURSOR: u16 = 13;
+const COMMAND_KIND_HEARTBEAT_MEMBER: u16 = 14;
+const COMMAND_KIND_EXPIRE_STALE_MEMBER: u16 = 15;
 
 const RESPONSE_KIND_ACK: u16 = 1;
 const RESPONSE_KIND_TOPIC_CREATED: u16 = 2;
@@ -225,6 +227,21 @@ pub enum MetadataCommand {
         lineage_transition_id: Option<Uuid>,
         expected_checkpoint_generation: Option<u64>,
     },
+    /// Refresh ephemeral member liveness. Does not bump member generation and
+    /// never mutates durable cursors.
+    HeartbeatMember {
+        env: CommandEnvelope,
+        group_uuid: Uuid,
+        member_uuid: Uuid,
+    },
+    /// Remove a member whose last heartbeat apply-index is strictly older than
+    /// `stale_before_apply_index`. Durable cursors are retained.
+    ExpireStaleMember {
+        env: CommandEnvelope,
+        group_uuid: Uuid,
+        member_uuid: Uuid,
+        stale_before_apply_index: u64,
+    },
 }
 
 impl MetadataCommand {
@@ -242,7 +259,9 @@ impl MetadataCommand {
             | MetadataCommand::JoinConsumerGroup { env, .. }
             | MetadataCommand::LeaveConsumerGroup { env, .. }
             | MetadataCommand::AssignMemberRanges { env, .. }
-            | MetadataCommand::CommitGroupCursor { env, .. } => env,
+            | MetadataCommand::CommitGroupCursor { env, .. }
+            | MetadataCommand::HeartbeatMember { env, .. }
+            | MetadataCommand::ExpireStaleMember { env, .. } => env,
         }
     }
 
@@ -443,6 +462,28 @@ impl MetadataCommand {
                 encode_optional_uuid(&mut out, *lineage_transition_id);
                 encode_optional_u64(&mut out, *expected_checkpoint_generation);
             }
+            MetadataCommand::HeartbeatMember {
+                env,
+                group_uuid,
+                member_uuid,
+            } => {
+                put_u16(&mut out, COMMAND_KIND_HEARTBEAT_MEMBER);
+                encode_envelope(&mut out, env);
+                put_uuid(&mut out, *group_uuid);
+                put_uuid(&mut out, *member_uuid);
+            }
+            MetadataCommand::ExpireStaleMember {
+                env,
+                group_uuid,
+                member_uuid,
+                stale_before_apply_index,
+            } => {
+                put_u16(&mut out, COMMAND_KIND_EXPIRE_STALE_MEMBER);
+                encode_envelope(&mut out, env);
+                put_uuid(&mut out, *group_uuid);
+                put_uuid(&mut out, *member_uuid);
+                put_u64(&mut out, *stale_before_apply_index);
+            }
         }
         Ok(out)
     }
@@ -588,6 +629,17 @@ impl MetadataCommand {
                     reader,
                     "expected checkpoint generation",
                 )?,
+            }),
+            COMMAND_KIND_HEARTBEAT_MEMBER => Ok(MetadataCommand::HeartbeatMember {
+                env: decode_envelope(reader)?,
+                group_uuid: reader.uuid("group uuid")?,
+                member_uuid: reader.uuid("member uuid")?,
+            }),
+            COMMAND_KIND_EXPIRE_STALE_MEMBER => Ok(MetadataCommand::ExpireStaleMember {
+                env: decode_envelope(reader)?,
+                group_uuid: reader.uuid("group uuid")?,
+                member_uuid: reader.uuid("member uuid")?,
+                stale_before_apply_index: reader.u64("stale-before apply index")?,
             }),
             other => Err(CodecError::UnknownTag {
                 what: "command kind",
@@ -1032,6 +1084,17 @@ mod tests {
                 record_index: 7,
                 lineage_transition_id: Some(Uuid::from_u128(60)),
                 expected_checkpoint_generation: None,
+            },
+            MetadataCommand::HeartbeatMember {
+                env: envelope(15),
+                group_uuid: Uuid::from_u128(50),
+                member_uuid: Uuid::from_u128(51),
+            },
+            MetadataCommand::ExpireStaleMember {
+                env: envelope(16),
+                group_uuid: Uuid::from_u128(50),
+                member_uuid: Uuid::from_u128(51),
+                stale_before_apply_index: 42,
             },
         ]
     }
