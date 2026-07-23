@@ -1,9 +1,10 @@
-//! Single-node native VTOP broker with a bounded TLS transport.
+//! Native VTOP broker with a bounded TLS transport.
 //!
-//! This slice deliberately has no Kafka, database, object-store, or consensus
-//! dependency. Produce acknowledgements use the local `Fsync` durability
-//! boundary, fetches stop at the committed high-water mark, and producer epochs
-//! are fenced by a separate durable append-only journal.
+//! Single-node produce acknowledgements use the local `Fsync` durability
+//! boundary. When configured with a [`replication::ReplicaSet`], `Quorum`
+//! produce waits for a majority of locally durable replica acks, advances the
+//! [`replication::ClusterCommittedOffset`], and propagates that high-water mark
+//! so fetch never exposes records above the quorum-committed point.
 //!
 //! Range leadership is gated by a metadata-issued lease view
 //! ([`MetaFencingEpoch`]): the broker holds the epoch it was granted and, on
@@ -12,6 +13,9 @@
 //! newer grant or a release fences the prior leaseholder before the next
 //! durable append can complete.
 
+pub mod replication;
+
+use crate::replication::{ClusterCommittedOffset, ReplicaSet};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -29,11 +33,11 @@ use uuid::Uuid;
 use vtop_log::env::{Env, OpenMode, Storage, StorageFile};
 use vtop_log::{ActiveSegment, AppendOutcome, Durability, LogRecord};
 use vtop_protocol::{
-    encode_frame, read_frame, write_frame, ClientHello, Durability as WireDurability, ErrorCode,
-    ErrorResponse, FetchResponse, FetchedRecord, Message, ProduceOutcome, ProduceResponse,
-    ProtocolLimits, RangeIdentity, Role, ServerHello, WireFrame, ABSOLUTE_MAX_FRAME_BYTES,
-    ABSOLUTE_MAX_RECORDS, DEFAULT_MAX_FRAME_BYTES, DEFAULT_MAX_RECORDS, PROTOCOL_MAJOR,
-    PROTOCOL_MINOR,
+    encode_frame, read_frame, write_frame, ClientHello, CommittedHwmUpdate,
+    Durability as WireDurability, ErrorCode, ErrorResponse, FetchResponse, FetchedRecord, Message,
+    ProduceOutcome, ProduceResponse, ProtocolLimits, RangeIdentity, ReplicaAppendRequest, Role,
+    ServerHello, WireFrame, ABSOLUTE_MAX_FRAME_BYTES, ABSOLUTE_MAX_RECORDS,
+    DEFAULT_MAX_FRAME_BYTES, DEFAULT_MAX_RECORDS, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 
 const EPOCH_MAGIC: &[u8; 8] = b"VTOPEPC1";
@@ -226,7 +230,7 @@ fn epoch_checksum(producer_id: Uuid, epoch: u64) -> blake3::Hash {
     hasher.finalize()
 }
 
-fn storage_producer_id(producer_id: Uuid, epoch: u64) -> Uuid {
+pub(crate) fn storage_producer_id(producer_id: Uuid, epoch: u64) -> Uuid {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"vtop-segment-v1-producer-epoch-namespace\0");
     hasher.update(producer_id.as_bytes());
@@ -270,12 +274,12 @@ pub struct MetaFencingEpoch {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct MetaLeaseState {
+pub(crate) struct MetaLeaseState {
     /// Latest metadata fencing epoch for the range (never rewound on release).
-    fencing_epoch: u64,
+    pub(crate) fencing_epoch: u64,
     /// Whether a live lease currently exists. Release clears this without
     /// changing `fencing_epoch`.
-    lease_active: bool,
+    pub(crate) lease_active: bool,
     /// Highest epoch for which a release has been observed. Lets a release
     /// that arrives before its matching grant still win when the grant is
     /// applied later.
@@ -353,7 +357,7 @@ impl MetaFencingEpoch {
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, MetaLeaseState> {
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, MetaLeaseState> {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -373,6 +377,13 @@ pub struct LocalBroker {
     /// Latest metadata-committed fencing epoch for the range.
     meta_fencing_epoch: MetaFencingEpoch,
     segment_format: SegmentFormat,
+    /// Quorum-committed high-water mark. When set, fetch never exposes above it
+    /// and `Durability::Quorum` produce waits for it to cover the append.
+    cluster_committed: Option<ClusterCommittedOffset>,
+    /// Optional follower fan-out for quorum produce.
+    replicas: Option<Arc<dyn ReplicaSet>>,
+    /// Leader identity embedded in replica append requests.
+    node_id: Uuid,
     state: Mutex<BrokerState>,
 }
 
@@ -408,6 +419,34 @@ impl LocalBroker {
         held_fencing_epoch: u64,
         meta_fencing_epoch: MetaFencingEpoch,
     ) -> BrokerResult<Self> {
+        Self::with_replication(
+            segment,
+            producer_epochs,
+            range,
+            held_fencing_epoch,
+            meta_fencing_epoch,
+            Uuid::nil(),
+            None,
+            None,
+        )
+    }
+
+    /// Construct a leaseholder that can acknowledge `Durability::Quorum`.
+    ///
+    /// `cluster_committed` is the shared quorum high-water mark observed by
+    /// fetch. `replicas` fans appends out to followers after the leader's local
+    /// `Fsync`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_replication(
+        segment: ActiveSegment,
+        producer_epochs: ProducerEpochJournal,
+        range: RangeIdentity,
+        held_fencing_epoch: u64,
+        meta_fencing_epoch: MetaFencingEpoch,
+        node_id: Uuid,
+        cluster_committed: Option<ClusterCommittedOffset>,
+        replicas: Option<Arc<dyn ReplicaSet>>,
+    ) -> BrokerResult<Self> {
         // The format is derived from the segment itself so the broker's
         // produce-time behavior can never disagree with the on-disk frames.
         let segment_format = if segment.format_version() == vtop_log::FORMAT_VERSION_V2 {
@@ -438,11 +477,19 @@ impl LocalBroker {
                 "broker range identity does not match active segment".to_owned(),
             ));
         }
+        if replicas.is_some() && cluster_committed.is_none() {
+            return Err(BrokerError::InvalidConfig(
+                "replica set requires a cluster committed high-water mark".to_owned(),
+            ));
+        }
         Ok(Self {
             range,
             held_fencing_epoch,
             meta_fencing_epoch,
             segment_format,
+            cluster_committed,
+            replicas,
+            node_id,
             state: Mutex::new(BrokerState {
                 segment,
                 producer_epochs,
@@ -463,6 +510,12 @@ impl LocalBroker {
     /// Shared metadata fencing-epoch handle observed by this broker.
     pub fn meta_fencing_epoch(&self) -> &MetaFencingEpoch {
         &self.meta_fencing_epoch
+    }
+
+    /// Quorum-committed high-water mark when this broker is configured for
+    /// cluster durability; `None` for single-node LocalFsync-only brokers.
+    pub fn cluster_committed(&self) -> Option<&ClusterCommittedOffset> {
+        self.cluster_committed.as_ref()
     }
 
     pub fn handle(&self, role: Role, frame: WireFrame) -> WireFrame {
@@ -489,100 +542,183 @@ impl LocalBroker {
                         "produce request has no records",
                     );
                 }
-                if request.durability != WireDurability::LocalFsync {
+                if request.durability != WireDurability::LocalFsync
+                    && request.durability != WireDurability::Quorum
+                {
                     return error(
                         request_id,
                         stream_id,
                         ErrorCode::InvalidRequest,
-                        "the local broker acknowledges only LocalFsync produce requests",
+                        "broker acknowledges only LocalFsync or Quorum produce requests",
                     );
                 }
-                // Lock order: metadata lease view, then broker state. Holding
-                // the lease lock across the durable append ensures a concurrent
-                // grant/release cannot revoke after the fencing check but
-                // before fsync.
-                let meta = self.meta_fencing_epoch.lock();
-                if let Err((code, message)) =
-                    self.check_range(&meta, &request.range, request.fencing_epoch)
+                if request.durability == WireDurability::Quorum
+                    && (self.replicas.is_none() || self.cluster_committed.is_none())
                 {
-                    return error(request_id, stream_id, code, message);
-                }
-                let mut state = self
-                    .state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if let Err(problem) = state
-                    .producer_epochs
-                    .accept(request.producer_id, request.producer_epoch)
-                {
-                    return match problem {
-                        BrokerError::ProducerFenced { .. } => error(
-                            request_id,
-                            stream_id,
-                            ErrorCode::Fenced,
-                            &problem.to_string(),
-                        ),
-                        _ => error(
-                            request_id,
-                            stream_id,
-                            ErrorCode::Storage,
-                            &problem.to_string(),
-                        ),
-                    };
-                }
-                // The v1 storage schema cannot carry the epoch, so it is
-                // folded into a derived producer id; schema v2 persists the
-                // epoch in every frame (attributes stay reserved as zero).
-                let (stored_id, stored_epoch) = match self.segment_format {
-                    SegmentFormat::V1 => (
-                        storage_producer_id(request.producer_id, request.producer_epoch),
-                        0,
-                    ),
-                    SegmentFormat::V2 => (request.producer_id, request.producer_epoch),
-                };
-                let records = match request
-                    .records
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, record)| {
-                        let sequence = request.first_sequence.checked_add(index as u64).ok_or(());
-                        sequence.map(|sequence| LogRecord {
-                            producer_id: stored_id,
-                            producer_epoch: stored_epoch,
-                            sequence,
-                            timestamp_millis: record.timestamp_millis,
-                            attributes: 0,
-                            key: record.key,
-                            value: record.value,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-                {
-                    Ok(records) => records,
-                    Err(()) => {
-                        return error(
-                            request_id,
-                            stream_id,
-                            ErrorCode::InvalidRequest,
-                            "producer sequence range overflows u64",
-                        )
-                    }
-                };
-                match state.segment.append_group(&records, Durability::Fsync) {
-                    Ok(outcomes) => WireFrame {
+                    return error(
                         request_id,
                         stream_id,
-                        message: Message::ProduceResponse(ProduceResponse {
-                            outcomes: outcomes
+                        ErrorCode::InvalidRequest,
+                        "Quorum durability requires a configured replica set",
+                    );
+                }
+                // Lock order: metadata lease view, then broker state. Hold both
+                // only through the local durable append so a concurrent
+                // grant/release cannot revoke between the fencing check and
+                // fsync. Quorum fan-out runs after these locks are released:
+                // followers take the same shared meta lock, and the replica
+                // request carries the fencing epoch for independent rejection.
+                let append = {
+                    let meta = self.meta_fencing_epoch.lock();
+                    if let Err((code, message)) =
+                        self.check_range(&meta, &request.range, request.fencing_epoch)
+                    {
+                        return error(request_id, stream_id, code, message);
+                    }
+                    let mut state = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if let Err(problem) = state
+                        .producer_epochs
+                        .accept(request.producer_id, request.producer_epoch)
+                    {
+                        return match problem {
+                            BrokerError::ProducerFenced { .. } => error(
+                                request_id,
+                                stream_id,
+                                ErrorCode::Fenced,
+                                &problem.to_string(),
+                            ),
+                            _ => error(
+                                request_id,
+                                stream_id,
+                                ErrorCode::Storage,
+                                &problem.to_string(),
+                            ),
+                        };
+                    }
+                    // The v1 storage schema cannot carry the epoch, so it is
+                    // folded into a derived producer id; schema v2 persists the
+                    // epoch in every frame (attributes stay reserved as zero).
+                    let (stored_id, stored_epoch) = match self.segment_format {
+                        SegmentFormat::V1 => (
+                            storage_producer_id(request.producer_id, request.producer_epoch),
+                            0,
+                        ),
+                        SegmentFormat::V2 => (request.producer_id, request.producer_epoch),
+                    };
+                    let records = match request
+                        .records
+                        .iter()
+                        .enumerate()
+                        .map(|(index, record)| {
+                            let sequence =
+                                request.first_sequence.checked_add(index as u64).ok_or(());
+                            sequence.map(|sequence| LogRecord {
+                                producer_id: stored_id,
+                                producer_epoch: stored_epoch,
+                                sequence,
+                                timestamp_millis: record.timestamp_millis,
+                                attributes: 0,
+                                key: record.key.clone(),
+                                value: record.value.clone(),
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                    {
+                        Ok(records) => records,
+                        Err(()) => {
+                            return error(
+                                request_id,
+                                stream_id,
+                                ErrorCode::InvalidRequest,
+                                "producer sequence range overflows u64",
+                            )
+                        }
+                    };
+                    let tip_before = state.segment.next_offset();
+                    match state.segment.append_group(&records, Durability::Fsync) {
+                        Ok(outcomes) => {
+                            let leader_committed = state.segment.committed_offset();
+                            let wire_outcomes: Vec<ProduceOutcome> = outcomes
                                 .into_iter()
                                 .map(|outcome| ProduceOutcome {
                                     offset: outcome.offset(),
                                     duplicate: matches!(outcome, AppendOutcome::Duplicate { .. }),
                                 })
-                                .collect(),
-                            committed_next_offset: state.segment.committed_offset(),
-                        }),
-                    },
+                                .collect();
+                            Ok((tip_before, leader_committed, wire_outcomes))
+                        }
+                        Err(problem) => Err(problem),
+                    }
+                };
+                match append {
+                    Ok((tip_before, leader_committed, wire_outcomes)) => {
+                        if request.durability == WireDurability::LocalFsync {
+                            return WireFrame {
+                                request_id,
+                                stream_id,
+                                message: Message::ProduceResponse(ProduceResponse {
+                                    outcomes: wire_outcomes,
+                                    committed_next_offset: leader_committed,
+                                }),
+                            };
+                        }
+                        // Quorum path: ack only after majority local durability
+                        // and HWM propagation. Duplicate retries that are already
+                        // covered by the cluster HWM short-circuit.
+                        let cluster = self
+                            .cluster_committed
+                            .as_ref()
+                            .expect("Quorum path checked cluster_committed");
+                        if cluster.get() >= leader_committed {
+                            return WireFrame {
+                                request_id,
+                                stream_id,
+                                message: Message::ProduceResponse(ProduceResponse {
+                                    outcomes: wire_outcomes,
+                                    committed_next_offset: cluster.get(),
+                                }),
+                            };
+                        }
+                        let replicas = self
+                            .replicas
+                            .as_ref()
+                            .expect("Quorum path checked replicas");
+                        let replicate = ReplicaAppendRequest {
+                            range: request.range.clone(),
+                            fencing_epoch: request.fencing_epoch,
+                            leader_node_id: self.node_id,
+                            expected_base_offset: tip_before,
+                            producer_id: request.producer_id,
+                            producer_epoch: request.producer_epoch,
+                            first_sequence: request.first_sequence,
+                            records: request.records,
+                        };
+                        let quorum = replicas.replicate_append(&replicate, leader_committed);
+                        if !quorum.has_quorum() {
+                            let message = format!(
+                                "quorum not reached: {} follower ack(s), need majority of {}",
+                                quorum.follower_acks, quorum.replication_factor
+                            );
+                            return error(request_id, stream_id, ErrorCode::Overloaded, &message);
+                        }
+                        let committed = cluster.advance_to(leader_committed);
+                        replicas.propagate_committed_hwm(&CommittedHwmUpdate {
+                            range: request.range,
+                            fencing_epoch: request.fencing_epoch,
+                            committed_high_watermark: committed,
+                        });
+                        WireFrame {
+                            request_id,
+                            stream_id,
+                            message: Message::ProduceResponse(ProduceResponse {
+                                outcomes: wire_outcomes,
+                                committed_next_offset: committed,
+                            }),
+                        }
+                    }
                     Err(problem) => error(
                         request_id,
                         stream_id,
@@ -629,10 +765,16 @@ impl LocalBroker {
                     .state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let mut fetched = state.segment.fetch(
+                let fetch_hwm = self
+                    .cluster_committed
+                    .as_ref()
+                    .map(|hwm| hwm.get().min(state.segment.committed_offset()))
+                    .unwrap_or_else(|| state.segment.committed_offset());
+                let mut fetched = state.segment.fetch_through(
                     request.start_offset,
                     request.max_bytes as usize,
                     request.max_records as usize,
+                    fetch_hwm,
                 );
                 if let Ok(batch) = &fetched {
                     // The byte budget excluded even the first committed
@@ -643,7 +785,12 @@ impl LocalBroker {
                         && batch.next_offset == request.start_offset
                         && batch.next_offset < batch.high_watermark
                     {
-                        fetched = state.segment.fetch(request.start_offset, usize::MAX, 1);
+                        fetched = state.segment.fetch_through(
+                            request.start_offset,
+                            usize::MAX,
+                            1,
+                            fetch_hwm,
+                        );
                     }
                 }
                 match fetched {

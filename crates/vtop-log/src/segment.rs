@@ -670,13 +670,30 @@ impl ActiveSegment {
         max_bytes: usize,
         max_records: usize,
     ) -> VtopLogResult<FetchBatch> {
+        self.fetch_through(start_offset, max_bytes, max_records, self.committed_offset)
+    }
+
+    /// Fetch records visible at or below `high_watermark`.
+    ///
+    /// The effective watermark is clamped to the local durable
+    /// [`Self::committed_offset`] so callers cannot expose buffered tails or
+    /// unrecovered bytes. Clustered brokers pass the quorum-committed point
+    /// here so followers never serve above the cluster high-water mark.
+    pub fn fetch_through(
+        &mut self,
+        start_offset: u64,
+        max_bytes: usize,
+        max_records: usize,
+        high_watermark: u64,
+    ) -> VtopLogResult<FetchBatch> {
+        let high_watermark = high_watermark.min(self.committed_offset);
         let result = fetch_from_file(
             self.file.as_mut(),
             &self.path,
             &self.header,
             self.header_len,
             &self.index,
-            self.committed_offset,
+            high_watermark,
             start_offset,
             max_bytes,
             max_records,

@@ -9,7 +9,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 0;
+/// Minor 1 adds `Durability::Quorum` and peer replication message kinds 60–62.
+pub const PROTOCOL_MINOR: u16 = 1;
 pub const HEADER_LEN: usize = 64;
 pub const MIN_FRAME_BYTES: u32 = HEADER_LEN as u32;
 pub const DEFAULT_MAX_FRAME_BYTES: u32 = 8 * 1024 * 1024;
@@ -102,6 +103,9 @@ impl Role {
 pub enum Durability {
     Buffered = 1,
     LocalFsync = 2,
+    /// Acknowledge only after a quorum of replicas has made the append locally
+    /// durable and the leader has advanced the cluster committed high-water mark.
+    Quorum = 3,
 }
 
 impl Durability {
@@ -109,6 +113,7 @@ impl Durability {
         match value {
             1 => Ok(Self::Buffered),
             2 => Ok(Self::LocalFsync),
+            3 => Ok(Self::Quorum),
             _ => Err(ProtocolError::InvalidFrame(format!(
                 "unknown durability {value}"
             ))),
@@ -254,6 +259,35 @@ pub struct ErrorResponse {
     pub message: String,
 }
 
+/// Leader → follower append of records that are already locally durable on the leader.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplicaAppendRequest {
+    pub range: RangeIdentity,
+    /// Range-leader fencing epoch. Followers reject any other value.
+    pub fencing_epoch: u64,
+    pub leader_node_id: Uuid,
+    /// Follower `next_offset` required before applying this batch.
+    pub expected_base_offset: u64,
+    pub producer_id: Uuid,
+    pub producer_epoch: u64,
+    pub first_sequence: u64,
+    pub records: Vec<ProduceRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplicaAppendResponse {
+    /// Follower local durable frontier after applying the append.
+    pub local_committed_offset: u64,
+}
+
+/// Leader → follower publication of the quorum-committed high-water mark.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommittedHwmUpdate {
+    pub range: RangeIdentity,
+    pub fencing_epoch: u64,
+    pub committed_high_watermark: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Message {
     ClientHello(ClientHello),
@@ -266,6 +300,9 @@ pub enum Message {
     Error(ErrorResponse),
     Ping,
     Pong,
+    ReplicaAppendRequest(ReplicaAppendRequest),
+    ReplicaAppendResponse(ReplicaAppendResponse),
+    CommittedHwmUpdate(CommittedHwmUpdate),
 }
 
 impl Message {
@@ -281,6 +318,9 @@ impl Message {
             Self::Error(_) => 40,
             Self::Ping => 50,
             Self::Pong => 51,
+            Self::ReplicaAppendRequest(_) => 60,
+            Self::ReplicaAppendResponse(_) => 61,
+            Self::CommittedHwmUpdate(_) => 62,
         }
     }
 }
@@ -419,6 +459,23 @@ fn encoded_payload_size(message: &Message, limits: ProtocolLimits) -> Result<usi
                 }
                 size
             }
+            Message::ReplicaAppendRequest(value) => {
+                if value.records.is_empty() {
+                    return Err(ProtocolError::InvalidFrame(
+                        "replica append request has no records".to_owned(),
+                    ));
+                }
+                record_count(value.records.len(), limits)?;
+                let mut size = range_size(&value.range)? + 8 + 16 + 8 + 16 + 8 + 8 + 4;
+                for record in &value.records {
+                    add(&mut size, 8)?;
+                    add(&mut size, bytes_size(&record.key)?)?;
+                    add(&mut size, bytes_size(&record.value)?)?;
+                }
+                size
+            }
+            Message::ReplicaAppendResponse(_) => 8,
+            Message::CommittedHwmUpdate(value) => range_size(&value.range)? + 8 + 8,
         };
     if total > limits.max_payload_bytes() {
         return Err(ProtocolError::Limit(format!(
@@ -519,7 +576,10 @@ fn decode_header(header: &[u8], limits: ProtocolLimits) -> Result<Header, Protoc
         return Err(ProtocolError::UnsupportedVersion { major, minor });
     }
     let kind = u16::from_be_bytes(header[8..10].try_into().expect("fixed slice"));
-    if !matches!(kind, 1 | 2 | 10 | 11 | 20 | 21 | 30 | 40 | 50 | 51) {
+    if !matches!(
+        kind,
+        1 | 2 | 10 | 11 | 20 | 21 | 30 | 40 | 50 | 51 | 60 | 61 | 62
+    ) {
         return Err(ProtocolError::UnknownKind(kind));
     }
     let flags = u16::from_be_bytes(header[10..12].try_into().expect("fixed slice"));
@@ -630,6 +690,29 @@ fn encode_message(message: &Message, out: &mut Vec<u8>) -> Result<(), ProtocolEr
             put_string(out, &value.message)?;
         }
         Message::Ping | Message::Pong => {}
+        Message::ReplicaAppendRequest(value) => {
+            put_range(out, &value.range)?;
+            put_u64(out, value.fencing_epoch);
+            put_uuid(out, value.leader_node_id);
+            put_u64(out, value.expected_base_offset);
+            put_uuid(out, value.producer_id);
+            put_u64(out, value.producer_epoch);
+            put_u64(out, value.first_sequence);
+            put_u32(out, checked_count(value.records.len())?);
+            for record in &value.records {
+                put_i64(out, record.timestamp_millis);
+                put_bytes(out, &record.key)?;
+                put_bytes(out, &record.value)?;
+            }
+        }
+        Message::ReplicaAppendResponse(value) => {
+            put_u64(out, value.local_committed_offset);
+        }
+        Message::CommittedHwmUpdate(value) => {
+            put_range(out, &value.range)?;
+            put_u64(out, value.fencing_epoch);
+            put_u64(out, value.committed_high_watermark);
+        }
     }
     Ok(())
 }
@@ -760,6 +843,47 @@ fn decode_message(
         }
         50 => Message::Ping,
         51 => Message::Pong,
+        60 => {
+            let range = decoder.range()?;
+            let fencing_epoch = decoder.u64()?;
+            let leader_node_id = decoder.uuid()?;
+            let expected_base_offset = decoder.u64()?;
+            let producer_id = decoder.uuid()?;
+            let producer_epoch = decoder.u64()?;
+            let first_sequence = decoder.u64()?;
+            let count = decoder.count(limits.max_records)?;
+            if count == 0 {
+                return Err(ProtocolError::InvalidFrame(
+                    "replica append request has no records".to_owned(),
+                ));
+            }
+            let mut records = Vec::with_capacity(count);
+            for _ in 0..count {
+                records.push(ProduceRecord {
+                    timestamp_millis: decoder.i64()?,
+                    key: decoder.bytes()?,
+                    value: decoder.bytes()?,
+                });
+            }
+            Message::ReplicaAppendRequest(ReplicaAppendRequest {
+                range,
+                fencing_epoch,
+                leader_node_id,
+                expected_base_offset,
+                producer_id,
+                producer_epoch,
+                first_sequence,
+                records,
+            })
+        }
+        61 => Message::ReplicaAppendResponse(ReplicaAppendResponse {
+            local_committed_offset: decoder.u64()?,
+        }),
+        62 => Message::CommittedHwmUpdate(CommittedHwmUpdate {
+            range: decoder.range()?,
+            fencing_epoch: decoder.u64()?,
+            committed_high_watermark: decoder.u64()?,
+        }),
         other => return Err(ProtocolError::UnknownKind(other)),
     })
 }
@@ -1011,7 +1135,7 @@ mod tests {
                 cluster_id: Uuid::from_u128(1),
                 node_id: Uuid::from_u128(2),
                 selected_major: 1,
-                selected_minor: 0,
+                selected_minor: PROTOCOL_MINOR,
                 max_frame_bytes: 4096,
                 max_records: 8,
                 max_inflight_requests: 4,
@@ -1053,6 +1177,28 @@ mod tests {
             }),
             Message::Ping,
             Message::Pong,
+            Message::ReplicaAppendRequest(ReplicaAppendRequest {
+                range: range(),
+                fencing_epoch: 11,
+                leader_node_id: Uuid::from_u128(3),
+                expected_base_offset: 10,
+                producer_id: Uuid::from_u128(6),
+                producer_epoch: 7,
+                first_sequence: 8,
+                records: vec![ProduceRecord {
+                    timestamp_millis: -9,
+                    key: b"key".to_vec(),
+                    value: b"value".to_vec(),
+                }],
+            }),
+            Message::ReplicaAppendResponse(ReplicaAppendResponse {
+                local_committed_offset: 11,
+            }),
+            Message::CommittedHwmUpdate(CommittedHwmUpdate {
+                range: range(),
+                fencing_epoch: 11,
+                committed_high_watermark: 11,
+            }),
         ];
         for (request_id, message) in messages.into_iter().enumerate() {
             let frame = WireFrame {
