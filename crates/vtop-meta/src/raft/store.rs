@@ -55,6 +55,20 @@ impl MetaRaftStore {
         // while discard_stale_log_tail never ran. Heal on every reopen so the
         // recovered log is appendable from last_applied + 1.
         storage.discard_stale_log_tail()?;
+        // New Raft directories get a durable zero applied frontier before any
+        // append; legacy disks without the file keep full-replay semantics.
+        storage.ensure_raft_applied_frontier()?;
+        // If snapshot publish outran the membership sidecar, heal from the
+        // embedded v2 LogId so reopen does not invent a membership version.
+        if storage.last_membership_log_id().is_none() {
+            if let Some(id) = storage
+                .snapshots()
+                .newest()
+                .and_then(|meta| meta.membership_log_id)
+            {
+                storage.save_membership_log_id(id.term, id.index)?;
+            }
+        }
         let last_membership = recover_membership(&storage)?;
         let last_purged = recover_last_purged(&storage);
         Ok(Self {
@@ -123,6 +137,16 @@ fn recover_membership(
     // Falling back to the applied frontier invents a membership version when the
     // membership entry was purged or never present on a blank follower.
     if let Some(id) = storage.last_membership_log_id() {
+        let membership_log_id = to_raft_index(id.index).map(|index| raft_log_id(id.term, index));
+        return Ok(StoredMembership::new(membership_log_id, membership));
+    }
+    // Crash window after snapshot publish: membership LogId may only exist
+    // embedded in the published snapshot until the sidecar is written.
+    if let Some(id) = storage
+        .snapshots()
+        .newest()
+        .and_then(|meta| meta.membership_log_id)
+    {
         let membership_log_id = to_raft_index(id.index).map(|index| raft_log_id(id.term, index));
         return Ok(StoredMembership::new(membership_log_id, membership));
     }

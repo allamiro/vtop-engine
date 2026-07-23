@@ -6,6 +6,8 @@
 //! 4. Reopen heals a stale tail left by an interrupted snapshot install.
 //! 5. Purge persists the logical frontier before physical chunk deletion.
 //! 6. Membership LogId persists across purge / blank-follower snapshot install.
+//! 7. New Raft stores initialize a zero `meta.applied` before the first append.
+//! 8. Membership LogId embedded in v2 snapshots survives a missing sidecar.
 
 use openraft::storage::{RaftLogStorage, RaftStateMachine};
 use openraft::{CommittedLeaderId, LogId, Membership, SnapshotMeta, StoredMembership};
@@ -417,5 +419,120 @@ async fn blank_follower_snapshot_install_persists_membership_log_id() {
         *last_membership.log_id(),
         Some(membership_log_id),
         "blank-follower install must durable-store the snapshot membership LogId"
+    );
+}
+
+#[test]
+fn new_raft_store_initializes_zero_applied_so_uncommitted_tail_is_not_replayed() {
+    let sim = SimStorage::new();
+    sim.create_dir_all(Path::new("/n1"));
+    let env = sim.env(0x59);
+
+    // Opening via the Raft adapter must durably seed meta.applied = (0, 0)
+    // before any append on an empty directory.
+    let store = MetaRaftStore::open_in(&env, "/n1", cluster()).unwrap();
+    drop(store);
+
+    let mut storage = MetaStorage::open_in(&env, "/n1", cluster()).unwrap();
+    storage
+        .append(&[put_entry(1, 1, 1), put_entry(1, 2, 2)])
+        .unwrap();
+    assert_eq!(storage.last_applied(), 0);
+    drop(storage);
+
+    sim.reboot();
+    let mut recovered = MetaStorage::open_in(&env, "/n1", cluster()).unwrap();
+    assert_eq!(
+        recovered.last_applied(),
+        0,
+        "zero applied frontier must prevent full-replay of the uncommitted tail"
+    );
+    assert_eq!(recovered.log().last_index(), Some(2));
+    recovered.truncate_since(1).unwrap();
+    assert_eq!(recovered.log().last_index(), None);
+}
+
+#[test]
+fn legacy_disk_without_applied_file_keeps_full_replay_semantics() {
+    let sim = SimStorage::new();
+    sim.create_dir_all(Path::new("/legacy"));
+    let env = sim.env(0x5a);
+
+    // Single-node / pre-Raft disk: append without ever creating meta.applied.
+    let mut storage = MetaStorage::open_in(&env, "/legacy", cluster()).unwrap();
+    storage
+        .append(&[put_entry(1, 1, 1), put_entry(1, 2, 2)])
+        .unwrap();
+    drop(storage);
+
+    sim.reboot();
+    // Raft open must not invent a zero frontier over an existing log.
+    let store = MetaRaftStore::open_in(&env, "/legacy", cluster()).unwrap();
+    assert_eq!(
+        store.with_storage(|s| s.last_applied()),
+        2,
+        "legacy disks without meta.applied must keep full-log replay"
+    );
+}
+
+#[tokio::test]
+async fn membership_log_id_survives_crash_after_snapshot_publish_before_sidecar() {
+    let sim = SimStorage::new();
+    sim.create_dir_all(Path::new("/leader"));
+    sim.create_dir_all(Path::new("/blank"));
+    let env = sim.env(0x5b);
+
+    let mut leader = MetaStorage::open_in(&env, "/leader", cluster()).unwrap();
+    let mut entries = Vec::new();
+    for i in 1..=10u64 {
+        entries.push(put_entry(7, i, u128::from(i)));
+    }
+    entries[0] = MetaLogEntry {
+        term: 7,
+        index: 1,
+        payload: MetaLogPayload::Membership(MetaMembership {
+            voters: vec![MetaNodeId(1), MetaNodeId(2)],
+            learners: vec![],
+        }),
+    };
+    leader.append(&entries).unwrap();
+    leader.apply_through(10).unwrap();
+    let snap_meta = leader.write_snapshot().unwrap();
+    let expected = snap_meta
+        .membership_log_id
+        .expect("write_snapshot must embed membership LogId when known");
+    assert_eq!((expected.term, expected.index), (7, 1));
+    let snap_bytes = env.storage.read(&snap_meta.path).unwrap();
+    drop(leader);
+
+    // Crash window: snapshot is published, membership sidecar is not.
+    let mut snapshots = MetaSnapshots::open_in(&env, "/blank", cluster()).unwrap();
+    let installed = snapshots.install(&snap_bytes).unwrap();
+    assert_eq!(installed.membership_log_id, Some(expected));
+    drop(snapshots);
+    let mut storage = MetaStorage::open_in(&env, "/blank", cluster()).unwrap();
+    storage.sync_applied_frontier().unwrap();
+    assert!(
+        storage.last_membership_log_id().is_none(),
+        "sidecar must be absent to model the interrupted install window"
+    );
+    drop(storage);
+
+    sim.reboot();
+    let recovered = MetaRaftStore::open_in(&env, "/blank", cluster()).unwrap();
+    assert_eq!(
+        recovered.with_storage(|s| s.last_membership_log_id().map(|id| (id.term, id.index))),
+        Some((expected.term, expected.index)),
+        "reopen must recover membership LogId from the published snapshot"
+    );
+    let mut sm = MetaRaftStateMachine::new(recovered);
+    let (_applied, last_membership) = sm.applied_state().await.unwrap();
+    assert_eq!(
+        *last_membership.log_id(),
+        Some(LogId::new(
+            CommittedLeaderId::new(expected.term, 0),
+            expected.index - 1
+        )),
+        "applied membership version must match the embedded snapshot LogId"
     );
 }

@@ -174,7 +174,12 @@ impl RaftLogStorage<MetaRaftTypeConfig> for MetaRaftLogStore {
         }
         let result = {
             let mut guard = self.store.lock();
-            guard.storage.append(&meta_entries)
+            // Belt-and-suspenders: empty Raft disks must have a zero applied
+            // frontier before the first durable append.
+            guard
+                .storage
+                .ensure_raft_applied_frontier()
+                .and_then(|()| guard.storage.append(&meta_entries))
         };
         match result {
             Ok(()) => {

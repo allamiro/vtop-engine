@@ -13,13 +13,17 @@ use super::{
     MetaStoreResult,
 };
 use crate::storage::log::MetaMembership;
-use crate::wire::{put_u16, put_u32, put_u64, Reader};
+use crate::storage::membership_log_id::MembershipLogId;
+use crate::wire::{put_u16, put_u32, put_u64, put_u8, Reader};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 use vtop_log::env::Env;
 
 pub(crate) const SNAPSHOT_MAGIC: &[u8; 8] = b"VTOPMSN1";
-const SNAPSHOT_VERSION: u16 = 1;
+const SNAPSHOT_VERSION_V1: u16 = 1;
+/// v2 adds the applied membership LogId so publish is self-describing: a crash
+/// after the snapshot rename but before `meta.membership_log_id` cannot lose it.
+const SNAPSHOT_VERSION_V2: u16 = 2;
 const CHECKSUM_LEN: usize = 32;
 const MAX_SNAPSHOT_ID_BYTES: usize = 64;
 const MAX_MEMBERSHIP_BLOCK_BYTES: usize = 64 * 1024;
@@ -34,6 +38,8 @@ pub struct SnapshotMeta {
     pub last_index: u64,
     pub last_term: u64,
     pub membership: MetaMembership,
+    /// Exact LogId of `membership` when known (v2 snapshots). Absent on v1.
+    pub membership_log_id: Option<MembershipLogId>,
     pub snapshot_id: String,
     pub path: PathBuf,
 }
@@ -58,6 +64,7 @@ pub(crate) fn encode_snapshot_file(
     last_index: u64,
     last_term: u64,
     membership: &MetaMembership,
+    membership_log_id: Option<MembershipLogId>,
     snapshot_id: &str,
     payload: &[u8],
 ) -> MetaStoreResult<Vec<u8>> {
@@ -68,6 +75,13 @@ pub(crate) fn encode_snapshot_file(
             snapshot_id.len()
         )));
     }
+    if let Some(id) = membership_log_id {
+        if id.index == 0 {
+            return Err(invalid(
+                "snapshot membership log index must be non-zero".to_owned(),
+            ));
+        }
+    }
     let membership_bytes = membership
         .encode()
         .map_err(|error| invalid(format!("cannot encode membership: {error}")))?;
@@ -77,13 +91,27 @@ pub(crate) fn encode_snapshot_file(
     if payload.len() as u64 > MAX_SNAPSHOT_PAYLOAD_BYTES {
         return Err(invalid("snapshot payload exceeds its bound".to_owned()));
     }
+    // Keep v1 on disk when no membership LogId is known so golden vectors and
+    // legacy readers stay valid; v2 is used whenever the LogId must travel with
+    // the published file (Raft snapshot install crash safety).
+    let version = if membership_log_id.is_some() {
+        SNAPSHOT_VERSION_V2
+    } else {
+        SNAPSHOT_VERSION_V1
+    };
     let mut out = Vec::with_capacity(128 + membership_bytes.len() + payload.len());
     out.extend_from_slice(SNAPSHOT_MAGIC);
-    put_u16(&mut out, SNAPSHOT_VERSION);
+    put_u16(&mut out, version);
     out.extend_from_slice(cluster_id.as_bytes());
     put_u16(&mut out, crate::keys::META_SHARD_ID);
     put_u64(&mut out, last_index);
     put_u64(&mut out, last_term);
+    if version == SNAPSHOT_VERSION_V2 {
+        let id = membership_log_id.expect("v2 requires membership log id");
+        put_u8(&mut out, 1);
+        put_u64(&mut out, id.term);
+        put_u64(&mut out, id.index);
+    }
     put_u32(&mut out, membership_bytes.len() as u32);
     out.extend_from_slice(&membership_bytes);
     put_u16(&mut out, snapshot_id.len() as u16);
@@ -119,7 +147,7 @@ pub(crate) fn decode_snapshot_file(
     let version = reader
         .u16("snapshot version")
         .map_err(|error| codec_corrupt(path, &error))?;
-    if version != SNAPSHOT_VERSION {
+    if version != SNAPSHOT_VERSION_V1 && version != SNAPSHOT_VERSION_V2 {
         return Err(MetaStoreError::UnsupportedVersion {
             path: path.to_path_buf(),
             version,
@@ -149,6 +177,37 @@ pub(crate) fn decode_snapshot_file(
     let last_term = reader
         .u64("snapshot last term")
         .map_err(|error| codec_corrupt(path, &error))?;
+    let membership_log_id = if version == SNAPSHOT_VERSION_V2 {
+        let present = reader
+            .u8("snapshot membership log id present")
+            .map_err(|error| codec_corrupt(path, &error))?;
+        let term = reader
+            .u64("snapshot membership log id term")
+            .map_err(|error| codec_corrupt(path, &error))?;
+        let index = reader
+            .u64("snapshot membership log id index")
+            .map_err(|error| codec_corrupt(path, &error))?;
+        match present {
+            0 => None,
+            1 => {
+                if index == 0 {
+                    return Err(corrupt(
+                        path,
+                        "snapshot membership log id present with zero index",
+                    ));
+                }
+                Some(MembershipLogId { term, index })
+            }
+            _ => {
+                return Err(corrupt(
+                    path,
+                    format!("snapshot membership log id present must be 0 or 1, got {present}"),
+                ));
+            }
+        }
+    } else {
+        None
+    };
     let membership_len = reader
         .u32("membership block length")
         .map_err(|error| codec_corrupt(path, &error))? as usize;
@@ -184,6 +243,7 @@ pub(crate) fn decode_snapshot_file(
             last_index,
             last_term,
             membership,
+            membership_log_id,
             snapshot_id,
             path: path.to_path_buf(),
         },
@@ -266,6 +326,7 @@ impl MetaSnapshots {
         last_index: u64,
         last_term: u64,
         membership: MetaMembership,
+        membership_log_id: Option<MembershipLogId>,
         snapshot_id: &str,
         payload: &[u8],
     ) -> MetaStoreResult<SnapshotMeta> {
@@ -274,10 +335,18 @@ impl MetaSnapshots {
             last_index,
             last_term,
             &membership,
+            membership_log_id,
             snapshot_id,
             payload,
         )?;
-        self.publish(last_index, last_term, membership, snapshot_id, &bytes)
+        self.publish(
+            last_index,
+            last_term,
+            membership,
+            membership_log_id,
+            snapshot_id,
+            &bytes,
+        )
     }
 
     /// Install snapshot bytes received from elsewhere (a leader, in PR 3).
@@ -290,6 +359,7 @@ impl MetaSnapshots {
             meta.last_index,
             meta.last_term,
             meta.membership,
+            meta.membership_log_id,
             &meta.snapshot_id,
             bytes,
         )
@@ -300,6 +370,7 @@ impl MetaSnapshots {
         last_index: u64,
         last_term: u64,
         membership: MetaMembership,
+        membership_log_id: Option<MembershipLogId>,
         snapshot_id: &str,
         bytes: &[u8],
     ) -> MetaStoreResult<SnapshotMeta> {
@@ -309,6 +380,7 @@ impl MetaSnapshots {
             last_index,
             last_term,
             membership,
+            membership_log_id,
             snapshot_id: snapshot_id.to_owned(),
             path: path.clone(),
         };

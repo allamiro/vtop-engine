@@ -357,6 +357,9 @@ impl MetaStorage {
 
     /// Write a snapshot of the current applied state and retire all but the
     /// newest two snapshot files.
+    ///
+    /// When a durable membership LogId is known it is embedded in the snapshot
+    /// (v2) so install/publish cannot lose it if the sidecar write is interrupted.
     pub fn write_snapshot(&mut self) -> MetaStoreResult<SnapshotMeta> {
         let payload = self.state.encode_snapshot().map_err(|error| {
             MetaStoreError::InvalidConfig(format!("cannot encode state snapshot: {error}"))
@@ -366,6 +369,7 @@ impl MetaStorage {
             self.last_applied_index,
             self.last_applied_term,
             self.membership.clone(),
+            self.membership_log_id.get(),
             &snapshot_id,
             &payload,
         )
@@ -408,6 +412,24 @@ impl MetaStorage {
             index: self.last_applied_index,
             term: self.last_applied_term,
         })
+    }
+
+    /// For Raft-managed directories: if `meta.applied` is absent and the disk is
+    /// otherwise empty, persist a zero frontier so a crash after the first
+    /// append does not full-replay uncommitted entries. Legacy disks that
+    /// already have a log or snapshot without `meta.applied` keep the
+    /// absent-file full-replay semantics.
+    pub fn ensure_raft_applied_frontier(&mut self) -> MetaStoreResult<()> {
+        if self.applied.get().is_some() {
+            return Ok(());
+        }
+        if self.log.last_index().is_some()
+            || self.last_applied_index > 0
+            || self.snapshots.newest().is_some()
+        {
+            return Ok(());
+        }
+        self.applied.save(AppliedFrontier { index: 0, term: 0 })
     }
 
     /// Discard the physical log when it ends strictly below the applied
