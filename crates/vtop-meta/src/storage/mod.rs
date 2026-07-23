@@ -368,6 +368,7 @@ impl MetaStorage {
             self.membership.clone(),
             &snapshot_id,
             &payload,
+            self.membership_log_id.get(),
         )
     }
 
@@ -402,6 +403,28 @@ impl MetaStorage {
     /// through [`Self::apply_through`]).
     pub fn sync_applied_frontier(&mut self) -> MetaStoreResult<()> {
         if self.last_applied_index == 0 {
+            return Ok(());
+        }
+        self.applied.save(AppliedFrontier {
+            index: self.last_applied_index,
+            term: self.last_applied_term,
+        })
+    }
+
+    /// Whether a durable `meta.applied` file is present.
+    pub fn has_applied_frontier(&self) -> bool {
+        self.applied.get().is_some()
+    }
+
+    /// Pin a Raft applied frontier when the durable file is still absent.
+    ///
+    /// New blank stores get a zero frontier so a crash after the first
+    /// uncommitted appends does not fall into legacy full-log replay.
+    /// Legacy disks without the file keep full-log replay on
+    /// [`Self::open_with`]; once the Raft adapter opens them it pins the
+    /// recovered cursor here so later uncommitted tails stay truncatable.
+    pub fn ensure_raft_applied_frontier(&mut self) -> MetaStoreResult<()> {
+        if self.applied.get().is_some() {
             return Ok(());
         }
         self.applied.save(AppliedFrontier {

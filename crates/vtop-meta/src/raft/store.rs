@@ -51,6 +51,11 @@ impl MetaRaftStore {
     ) -> MetaStoreResult<Self> {
         let data_dir = data_dir.as_ref().to_path_buf();
         let mut storage = MetaStorage::open_with(env, &data_dir, cluster_id, config)?;
+        // Raft append ≠ commit: pin meta.applied before the first append so a
+        // crash with a durable uncommitted tail cannot fall into legacy
+        // full-log replay (absent file). Legacy disks still full-replay once
+        // in open_with above; this then migrates them to an explicit frontier.
+        storage.ensure_raft_applied_frontier()?;
         // Crash window after snapshot install: applied/snapshot may be durable
         // while discard_stale_log_tail never ran. Heal on every reopen so the
         // recovered log is appendable from last_applied + 1.
@@ -123,6 +128,16 @@ fn recover_membership(
     // Falling back to the applied frontier invents a membership version when the
     // membership entry was purged or never present on a blank follower.
     if let Some(id) = storage.last_membership_log_id() {
+        let membership_log_id = to_raft_index(id.index).map(|index| raft_log_id(id.term, index));
+        return Ok(StoredMembership::new(membership_log_id, membership));
+    }
+    // Snapshot header (v2+) carries the LogId when install published it
+    // atomically with the snapshot; covers the crash window before sidecar.
+    if let Some(id) = storage
+        .snapshots()
+        .newest()
+        .and_then(|meta| meta.membership_log_id)
+    {
         let membership_log_id = to_raft_index(id.index).map(|index| raft_log_id(id.term, index));
         return Ok(StoredMembership::new(membership_log_id, membership));
     }
@@ -228,10 +243,39 @@ pub(crate) fn read_snapshot_file_bytes(
 pub(crate) fn install_snapshot_bytes(
     inner: &mut MetaRaftInner,
     bytes: &[u8],
+    membership_log_id: Option<(u64, u64)>,
 ) -> Result<(), openraft::StorageError<NodeId>> {
+    use crate::storage::membership_log_id::MembershipLogId;
+    use crate::storage::snapshot::{decode_snapshot_file, encode_snapshot_file};
+
+    // Embed the openraft membership LogId in the published snapshot bytes so
+    // a crash after publish (before the sidecar write) still recovers the
+    // exact LogId from the snapshot header on reopen.
+    let publish_bytes = match membership_log_id {
+        Some((term, meta_index)) => {
+            let probe = std::path::Path::new("install-snapshot");
+            let (meta, payload) =
+                decode_snapshot_file(probe, inner.cluster_id, bytes).map_err(sto_err_logs)?;
+            encode_snapshot_file(
+                inner.cluster_id,
+                meta.last_index,
+                meta.last_term,
+                &meta.membership,
+                &meta.snapshot_id,
+                &payload,
+                Some(MembershipLogId {
+                    term,
+                    index: meta_index,
+                }),
+            )
+            .map_err(sto_err_logs)?
+        }
+        None => bytes.to_vec(),
+    };
+
     let mut snapshots = MetaSnapshots::open_in(&inner.env, &inner.data_dir, inner.cluster_id)
         .map_err(sto_err_logs)?;
-    snapshots.install(bytes).map_err(sto_err_logs)?;
+    snapshots.install(&publish_bytes).map_err(sto_err_logs)?;
     // Full recovery path: newest snapshot + replay limited by durable applied.
     inner.storage =
         MetaStorage::open_with(&inner.env, &inner.data_dir, inner.cluster_id, inner.config)
@@ -243,6 +287,15 @@ pub(crate) fn install_snapshot_bytes(
         .storage
         .sync_applied_frontier()
         .map_err(sto_err_logs)?;
+    // Sidecar is redundant when the snapshot header carries the LogId, but
+    // keeps apply_through / recover paths uniform. Safe after publish because
+    // reopen can rebuild from the snapshot if this write never happens.
+    if let Some((term, meta_index)) = membership_log_id {
+        inner
+            .storage
+            .save_membership_log_id(term, meta_index)
+            .map_err(sto_err_logs)?;
+    }
     // A non-blank follower may still hold a physical log ending below the
     // snapshot frontier. purge_upto cannot drop the newest chunk, so discard
     // that stale tail before the next append must extend from last_applied+1.

@@ -46,6 +46,7 @@ pub use storage::log::{
     MetaLog, MetaLogConfig, MetaLogEntry, MetaLogPayload, MetaMembership, DEFAULT_MAX_CHUNK_BYTES,
     MIN_MAX_CHUNK_BYTES,
 };
+pub use storage::membership_log_id::MembershipLogId;
 pub use storage::snapshot::{MetaSnapshots, SnapshotMeta};
 pub use storage::{MetaStorage, MetaStorageConfig, MetaStoreError, MetaStoreResult};
 pub use wire::CodecError;

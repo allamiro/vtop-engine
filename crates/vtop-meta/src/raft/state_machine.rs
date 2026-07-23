@@ -140,12 +140,17 @@ impl RaftStateMachine<MetaRaftTypeConfig> for MetaRaftStateMachine {
         mut snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<NodeId>> {
         let bytes = std::mem::take(snapshot.get_mut());
+        let membership_log_id = *meta.last_membership.log_id();
+        let membership_meta =
+            membership_log_id.map(|log_id| (log_id.leader_id.term, to_meta_index(log_id.index)));
         let mut guard = self.store.lock();
-        install_snapshot_bytes(&mut guard, &bytes)?;
+        // Membership LogId is embedded in the published snapshot (and mirrored
+        // to the sidecar) inside install_snapshot_bytes — no post-publish
+        // sidecar-only window.
+        install_snapshot_bytes(&mut guard, &bytes, membership_meta)?;
         // Align adapter bookkeeping with the installed snapshot. The VTOP
         // file carries its own last_index/term/membership; openraft's meta is
         // the authority for the StoredMembership log_id.
-        guard.last_membership = meta.last_membership.clone();
         if let Some(last_log_id) = meta.last_log_id {
             match guard.last_purged {
                 Some(prev) if prev.index >= last_log_id.index => {}
@@ -160,18 +165,8 @@ impl RaftStateMachine<MetaRaftTypeConfig> for MetaRaftStateMachine {
                 }
             }
         }
-        // Re-sync membership from the recovered store; openraft meta wins for
-        // the StoredMembership log_id and must be durable across reopen when the
-        // membership entry is absent from the physical log.
         let recovered = meta_to_membership(guard.storage.membership())?;
-        let membership_log_id = *meta.last_membership.log_id();
         guard.last_membership = StoredMembership::new(membership_log_id, recovered);
-        if let Some(log_id) = membership_log_id {
-            guard
-                .storage
-                .save_membership_log_id(log_id.leader_id.term, to_meta_index(log_id.index))
-                .map_err(sto_err_snapshot)?;
-        }
         Ok(())
     }
 

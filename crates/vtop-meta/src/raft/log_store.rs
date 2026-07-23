@@ -174,6 +174,12 @@ impl RaftLogStorage<MetaRaftTypeConfig> for MetaRaftLogStore {
         }
         let result = {
             let mut guard = self.store.lock();
+            // Belt-and-suspenders with MetaRaftStore::open: pin zero/migrated
+            // applied frontier before the first durable append.
+            guard
+                .storage
+                .ensure_raft_applied_frontier()
+                .map_err(map_store_err)?;
             guard.storage.append(&meta_entries)
         };
         match result {
