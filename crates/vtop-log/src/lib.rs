@@ -28,5 +28,5 @@ pub use types::{
     SegmentConfig, SegmentConfigV2, SegmentCursor, SegmentDescriptor, SegmentDescriptorV2,
     SegmentEvidence, SegmentId, SegmentManifest, SegmentManifestV2, VtopLogResult,
     CHUNK_SIDECAR_MAGIC, CHUNK_TREE_SCHEME_V1, COMMIT_SCHEME_KEYED, COMMIT_SCHEME_UNKEYED,
-    FORMAT_VERSION_V2, RECORD_SCHEMA_VERSION_V2,
+    FORMAT_VERSION_V2, PRODUCER_SEQUENCE_WINDOW, RECORD_SCHEMA_VERSION_V2,
 };

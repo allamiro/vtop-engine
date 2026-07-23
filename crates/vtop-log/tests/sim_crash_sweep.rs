@@ -3,16 +3,18 @@
 //! an acknowledgment oracle: every crash-consistent durable state must
 //! classify per the frozen startup decision table, keep every Fsync-acked
 //! record readable byte-identically below the commit boundary, expose nothing
-//! above the boundary, and accept a full-history retry idempotently.
+//! above the boundary, and accept a window-covered history retry
+//! idempotently.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 use vtop_log::env::Env;
 use vtop_log::sim::{FaultPlan, SimStorage, TraceEntry, TraceKind};
 use vtop_log::{
-    ActiveSegment, AppendOutcome, CatalogSegmentState, Durability, LogError, LogRecord,
-    QuarantineReason, RangeLineage, SegmentConfig, SegmentDescriptor, SegmentReader,
-    StartupCatalog,
+    ActiveSegment, AppendOutcome, CatalogSegmentState, Durability, FetchedRecord, LogError,
+    LogRecord, QuarantineReason, RangeLineage, SegmentConfig, SegmentDescriptor, SegmentReader,
+    StartupCatalog, PRODUCER_SEQUENCE_WINDOW,
 };
 
 const SEED: u64 = 0x5eed_0093;
@@ -214,6 +216,27 @@ fn sim_startup_catalog_classifies_every_crash_boundary_durable_state() {
     }
 }
 
+/// Retries are unambiguous only within the bounded per-(producer, epoch)
+/// sequence window: a retry below the recovered window floor is rejected
+/// fail-closed instead of answering `Duplicate`, so the oracle clamps its
+/// full-history retry range to the window. The sweep workloads are far
+/// smaller than the window, so every floor here is zero; the clamp keeps the
+/// oracle's invariant honest at scale.
+fn retry_window_floors(records: &[FetchedRecord]) -> HashMap<(Uuid, u64), u64> {
+    let mut floors = HashMap::new();
+    for fetched in records {
+        let floor = fetched
+            .record
+            .sequence
+            .saturating_sub(PRODUCER_SEQUENCE_WINDOW - 1);
+        let entry = floors
+            .entry((fetched.record.producer_id, fetched.record.producer_epoch))
+            .or_insert(floor);
+        *entry = (*entry).max(floor);
+    }
+    floors
+}
+
 fn verify_acknowledgment_oracle(
     sim: &SimStorage,
     env: &Env,
@@ -281,8 +304,17 @@ fn verify_acknowledgment_oracle(
                     "visible record differs from what was produced ({context})"
                 );
             }
+            let floors = retry_window_floors(&batch.records);
             for (index, (record, _)) in steps.iter().enumerate() {
                 let offset = BASE_OFFSET + index as u64;
+                let floor = floors
+                    .get(&(record.producer_id, record.producer_epoch))
+                    .copied()
+                    .unwrap_or(0);
+                if record.sequence < floor {
+                    // Evicted from the retry window; only reachable at scale.
+                    continue;
+                }
                 let outcome = segment
                     .append(record.clone(), Durability::Fsync)
                     .unwrap_or_else(|error| panic!("history retry failed ({context}): {error}"));
@@ -505,8 +537,17 @@ fn verify_v2_acknowledgment_oracle(
                     "visible record differs from what was produced ({context})"
                 );
             }
+            let floors = retry_window_floors(&batch.records);
             for (index, (record, _)) in steps.iter().enumerate() {
                 let offset = BASE_OFFSET + index as u64;
+                let floor = floors
+                    .get(&(record.producer_id, record.producer_epoch))
+                    .copied()
+                    .unwrap_or(0);
+                if record.sequence < floor {
+                    // Evicted from the retry window; only reachable at scale.
+                    continue;
+                }
                 let outcome = segment
                     .append(record.clone(), Durability::Fsync)
                     .unwrap_or_else(|error| panic!("history retry failed ({context}): {error}"));

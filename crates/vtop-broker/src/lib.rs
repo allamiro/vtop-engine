@@ -379,7 +379,8 @@ impl LocalBroker {
                         match problem {
                             vtop_log::LogError::FirstSequence { .. }
                             | vtop_log::LogError::SequenceGap { .. }
-                            | vtop_log::LogError::SequenceConflict { .. } => {
+                            | vtop_log::LogError::SequenceConflict { .. }
+                            | vtop_log::LogError::SequenceBelowWindow { .. } => {
                                 ErrorCode::SequenceConflict
                             }
                             _ => ErrorCode::Storage,

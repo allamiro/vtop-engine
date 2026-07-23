@@ -10,9 +10,9 @@ use crate::types::{
     ProducerSummaryEntry, RecoveryReport, SegmentCommitKey, SegmentConfig, SegmentConfigV2,
     SegmentDescriptor, SegmentDescriptorV2, SegmentEvidence, SegmentManifest, SegmentManifestV2,
     VtopLogResult, CHUNK_SIDECAR_MAGIC, CHUNK_TREE_SCHEME_V1, FORMAT_NAME, FORMAT_VERSION,
-    FORMAT_VERSION_V2, RECORD_SCHEMA_VERSION_V2,
+    FORMAT_VERSION_V2, PRODUCER_SEQUENCE_WINDOW, RECORD_SCHEMA_VERSION_V2,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -36,15 +36,19 @@ struct CommitBoundary {
 /// v1 decision.
 type ProducerKey = (Uuid, u64);
 
+/// `seen` is bounded: it holds only the most recent
+/// `PRODUCER_SEQUENCE_WINDOW` accepted sequences, keyed sequences are dense
+/// (in-order accepts, no gaps), and a `BTreeMap` lets eviction split off
+/// everything below the window floor in one operation.
 #[derive(Clone)]
 struct ProducerState {
     latest_sequence: u64,
-    seen: HashMap<u64, SeenRecord>,
+    seen: BTreeMap<u64, SeenRecord>,
 }
 
 struct ProducerDelta {
     latest_sequence: u64,
-    seen: HashMap<u64, SeenRecord>,
+    seen: BTreeMap<u64, SeenRecord>,
 }
 
 #[derive(Clone)]
@@ -1207,6 +1211,30 @@ fn validate_epoch_not_fenced(latest_epoch: Option<u64>, record: &LogRecord) -> V
     Ok(())
 }
 
+/// Lowest sequence whose idempotency is still verifiable for a producer
+/// state whose newest accepted sequence is `latest_sequence`.
+fn sequence_window_floor(latest_sequence: u64) -> u64 {
+    latest_sequence.saturating_sub(PRODUCER_SEQUENCE_WINDOW - 1)
+}
+
+/// Evict every remembered sequence below the retry window floor; O(evicted).
+fn evict_below_window(seen: &mut BTreeMap<u64, SeenRecord>, latest_sequence: u64) {
+    let floor = sequence_window_floor(latest_sequence);
+    if floor > 0 {
+        *seen = seen.split_off(&floor);
+    }
+}
+
+fn sequence_below_window(record: &LogRecord, latest_sequence: u64) -> Option<LogError> {
+    let window_floor = sequence_window_floor(latest_sequence);
+    (record.sequence < window_floor).then_some(LogError::SequenceBelowWindow {
+        producer_id: record.producer_id,
+        producer_epoch: record.producer_epoch,
+        sequence: record.sequence,
+        window_floor,
+    })
+}
+
 fn validate_sequence(
     states: &HashMap<ProducerKey, ProducerState>,
     epochs: &HashMap<Uuid, u64>,
@@ -1238,6 +1266,11 @@ fn validate_sequence(
             })
         };
     };
+    // The `seen` lookup above missed, so a sequence this old fell out of the
+    // retry window; reject fail-closed rather than guess its idempotency.
+    if let Some(error) = sequence_below_window(record, state.latest_sequence) {
+        return Err(error);
+    }
     let expected = state
         .latest_sequence
         .checked_add(1)
@@ -1305,6 +1338,11 @@ fn validate_sequence_with_delta(
             })
         };
     };
+    // Same fail-closed rule as `validate_sequence`, against the group's
+    // prospective frontier so a large group cannot widen the window.
+    if let Some(error) = sequence_below_window(record, latest) {
+        return Err(error);
+    }
     let expected = latest.checked_add(1).ok_or(LogError::SequenceGap {
         producer_id: record.producer_id,
         expected: u64::MAX,
@@ -1342,10 +1380,11 @@ fn remember_pending_sequence(
                     content_hash,
                 },
             );
+            evict_below_window(&mut delta.seen, record.sequence);
         })
         .or_insert_with(|| ProducerDelta {
             latest_sequence: record.sequence,
-            seen: HashMap::from([(
+            seen: BTreeMap::from([(
                 record.sequence,
                 SeenRecord {
                     offset,
@@ -1373,6 +1412,7 @@ fn merge_producer_deltas(
         if let Some(state) = states.get_mut(&key) {
             state.latest_sequence = latest_sequence;
             state.seen.extend(seen);
+            evict_below_window(&mut state.seen, latest_sequence);
         } else {
             states.insert(
                 key,
@@ -1633,10 +1673,11 @@ fn remember_sequence(
                     content_hash,
                 },
             );
+            evict_below_window(&mut state.seen, record.sequence);
         })
         .or_insert_with(|| ProducerState {
             latest_sequence: record.sequence,
-            seen: HashMap::from([(
+            seen: BTreeMap::from([(
                 record.sequence,
                 SeenRecord {
                     offset,
@@ -2237,6 +2278,172 @@ mod tests {
             .append(record(producer, 0, b"different"), Durability::Buffered)
             .unwrap_err();
         assert!(matches!(error, LogError::SequenceConflict { .. }));
+    }
+
+    /// Limits wide enough to push a producer past `PRODUCER_SEQUENCE_WINDOW`
+    /// accepted sequences within one segment.
+    fn window_config() -> SegmentConfig {
+        SegmentConfig {
+            max_record_bytes: 1024,
+            max_group_bytes: 16 * 1024 * 1024,
+            max_segment_bytes: 64 * 1024 * 1024,
+            max_segment_records: 2 * PRODUCER_SEQUENCE_WINDOW,
+            index_stride: 4096,
+        }
+    }
+
+    /// Append sequences `0..count` for `producer` in groups of `group_len`.
+    fn fill_past_window(segment: &mut ActiveSegment, producer: Uuid, count: u64, group_len: u64) {
+        let mut sequence = 0;
+        while sequence < count {
+            let batch: Vec<LogRecord> = (sequence..(sequence + group_len).min(count))
+                .map(|sequence| record(producer, sequence, b"w"))
+                .collect();
+            sequence += batch.len() as u64;
+            for outcome in segment.append_group(&batch, Durability::Fsync).unwrap() {
+                assert!(matches!(outcome, AppendOutcome::Appended { .. }));
+            }
+        }
+    }
+
+    #[test]
+    fn sequence_window_bounds_seen_state_and_rejects_evicted_retries() {
+        let directory = tempdir().unwrap();
+        let producer = Uuid::from_u128(90);
+        let mut segment = ActiveSegment::create(
+            directory.path().join("window.active"),
+            descriptor(),
+            window_config(),
+        )
+        .unwrap();
+        let total = PRODUCER_SEQUENCE_WINDOW + 10;
+        // One giant group: the delta apply path must evict just like the
+        // per-append path, so a single group cannot bypass the bound.
+        fill_past_window(&mut segment, producer, total, total);
+        let latest = total - 1;
+        let floor = latest - (PRODUCER_SEQUENCE_WINDOW - 1);
+
+        let state = segment.producer_states.get(&(producer, 0)).unwrap();
+        assert_eq!(state.seen.len() as u64, PRODUCER_SEQUENCE_WINDOW);
+        assert_eq!(state.seen.keys().next().copied(), Some(floor));
+
+        // Retries inside the window keep their exact answers.
+        assert_eq!(
+            segment
+                .append(record(producer, latest, b"w"), Durability::Buffered)
+                .unwrap(),
+            AppendOutcome::Duplicate {
+                offset: 40 + latest
+            }
+        );
+        assert_eq!(
+            segment
+                .append(record(producer, floor, b"w"), Durability::Buffered)
+                .unwrap(),
+            AppendOutcome::Duplicate { offset: 40 + floor }
+        );
+        assert!(matches!(
+            segment.append(record(producer, floor, b"different"), Durability::Buffered),
+            Err(LogError::SequenceConflict { .. })
+        ));
+
+        // The evicted sequence right below the floor is rejected fail-closed.
+        match segment
+            .append(record(producer, floor - 1, b"w"), Durability::Buffered)
+            .unwrap_err()
+        {
+            LogError::SequenceBelowWindow {
+                producer_id,
+                producer_epoch,
+                sequence,
+                window_floor,
+            } => {
+                assert_eq!(producer_id, producer);
+                assert_eq!(producer_epoch, 0);
+                assert_eq!(sequence, floor - 1);
+                assert_eq!(window_floor, floor);
+            }
+            other => panic!("expected SequenceBelowWindow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recovery_rebuilds_the_same_bounded_window_as_the_live_path() {
+        let directory = tempdir().unwrap();
+        let active_path = directory.path().join("window-recovery.active");
+        let producer = Uuid::from_u128(91);
+        let mut live = ActiveSegment::create(&active_path, descriptor(), window_config()).unwrap();
+        let total = PRODUCER_SEQUENCE_WINDOW + 3;
+        // Multiple groups: crossing the boundary exercises merge eviction.
+        fill_past_window(&mut live, producer, total, 4096);
+        let latest = total - 1;
+        let floor = latest - (PRODUCER_SEQUENCE_WINDOW - 1);
+
+        let mut recovered = ActiveSegment::recover(&active_path).unwrap();
+        let live_state = live.producer_states.get(&(producer, 0)).unwrap();
+        let recovered_state = recovered.producer_states.get(&(producer, 0)).unwrap();
+        assert_eq!(recovered_state.latest_sequence, live_state.latest_sequence);
+        assert_eq!(recovered_state.seen.len(), live_state.seen.len());
+        assert_eq!(recovered_state.seen.len() as u64, PRODUCER_SEQUENCE_WINDOW);
+
+        // Probes around the window boundary must decide identically on the
+        // live instance and after recovery: rejected below the floor,
+        // duplicate at the floor and at the latest sequence.
+        for probe in [floor - 1, floor, latest] {
+            let live_decision = live.append(record(producer, probe, b"w"), Durability::Buffered);
+            let recovered_decision =
+                recovered.append(record(producer, probe, b"w"), Durability::Buffered);
+            assert_eq!(
+                format!("{live_decision:?}"),
+                format!("{recovered_decision:?}"),
+                "live and recovered decisions diverged at sequence {probe}"
+            );
+            if probe < floor {
+                assert!(matches!(
+                    live_decision,
+                    Err(LogError::SequenceBelowWindow { window_floor, .. }) if window_floor == floor
+                ));
+            } else {
+                assert_eq!(
+                    live_decision.unwrap(),
+                    AppendOutcome::Duplicate { offset: 40 + probe }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn epoch_bump_starts_a_fresh_sequence_window() {
+        let directory = tempdir().unwrap();
+        let producer = Uuid::from_u128(92);
+        let mut segment = ActiveSegment::create_v2(
+            directory.path().join("window-epoch.active"),
+            descriptor_v2(),
+            config_v2(),
+        )
+        .unwrap();
+        for sequence in 0..3 {
+            segment
+                .append(
+                    record_v2(producer, 0, sequence, b"old"),
+                    Durability::Buffered,
+                )
+                .unwrap();
+        }
+        // The bumped epoch keys a fresh window that starts at sequence 0.
+        assert!(matches!(
+            segment.append(record_v2(producer, 1, 3, b"new"), Durability::Buffered),
+            Err(LogError::FirstSequence { .. })
+        ));
+        assert_eq!(
+            segment
+                .append(record_v2(producer, 1, 0, b"new"), Durability::Buffered)
+                .unwrap(),
+            AppendOutcome::Appended { offset: 45 }
+        );
+        let fresh = segment.producer_states.get(&(producer, 1)).unwrap();
+        assert_eq!(fresh.seen.len(), 1);
+        assert_eq!(fresh.latest_sequence, 0);
     }
 
     #[test]
