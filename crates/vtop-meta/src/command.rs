@@ -12,8 +12,10 @@
 //! `apply`.
 
 use crate::keys::{MAX_GROUP_NAME_BYTES, MAX_TOPIC_NAME_BYTES};
+use crate::placement::{MAX_FAILURE_DOMAIN_BYTES, MAX_REPLICAS, MIN_PLACEMENT_WEIGHT};
 use crate::wire::{
-    put_bounded_str, put_bytes32, put_i64, put_u16, put_u64, put_u8, put_uuid, CodecError, Reader,
+    put_bounded_str, put_bytes32, put_i64, put_u16, put_u32, put_u64, put_u8, put_uuid, CodecError,
+    Reader,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -45,6 +47,8 @@ const COMMAND_KIND_ASSIGN_MEMBER_RANGES: u16 = 12;
 const COMMAND_KIND_COMMIT_GROUP_CURSOR: u16 = 13;
 const COMMAND_KIND_HEARTBEAT_MEMBER: u16 = 14;
 const COMMAND_KIND_EXPIRE_STALE_MEMBER: u16 = 15;
+const COMMAND_KIND_SET_NODE_PLACEMENT_ATTRS: u16 = 16;
+const COMMAND_KIND_COMMIT_SEGMENT_PLACEMENT: u16 = 17;
 
 const RESPONSE_KIND_ACK: u16 = 1;
 const RESPONSE_KIND_TOPIC_CREATED: u16 = 2;
@@ -242,6 +246,27 @@ pub enum MetadataCommand {
         member_uuid: Uuid,
         stale_before_apply_index: u64,
     },
+    /// Set failure-domain and capacity weight used by deterministic placement.
+    SetNodePlacementAttrs {
+        env: CommandEnvelope,
+        node_uuid: Uuid,
+        failure_domain: String,
+        placement_weight: u32,
+        expected_generation: u64,
+    },
+    /// Commit an ordered replica set for a verified segment. The proposer
+    /// supplies the candidate list; `apply` rejects any set that differs from
+    /// the deterministic rendezvous selection over currently Active nodes.
+    CommitSegmentPlacement {
+        env: CommandEnvelope,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        segment_uuid: Uuid,
+        replica_nodes: Vec<Uuid>,
+        expected_segment_generation: u64,
+        /// `None` for the first placement; `Some(g)` CAS-updates an existing one.
+        expected_placement_generation: Option<u64>,
+    },
 }
 
 impl MetadataCommand {
@@ -261,7 +286,9 @@ impl MetadataCommand {
             | MetadataCommand::AssignMemberRanges { env, .. }
             | MetadataCommand::CommitGroupCursor { env, .. }
             | MetadataCommand::HeartbeatMember { env, .. }
-            | MetadataCommand::ExpireStaleMember { env, .. } => env,
+            | MetadataCommand::ExpireStaleMember { env, .. }
+            | MetadataCommand::SetNodePlacementAttrs { env, .. }
+            | MetadataCommand::CommitSegmentPlacement { env, .. } => env,
         }
     }
 
@@ -484,6 +511,43 @@ impl MetadataCommand {
                 put_uuid(&mut out, *member_uuid);
                 put_u64(&mut out, *stale_before_apply_index);
             }
+            MetadataCommand::SetNodePlacementAttrs {
+                env,
+                node_uuid,
+                failure_domain,
+                placement_weight,
+                expected_generation,
+            } => {
+                put_u16(&mut out, COMMAND_KIND_SET_NODE_PLACEMENT_ATTRS);
+                encode_envelope(&mut out, env);
+                put_uuid(&mut out, *node_uuid);
+                put_bounded_str(
+                    &mut out,
+                    failure_domain,
+                    MAX_FAILURE_DOMAIN_BYTES,
+                    "failure domain",
+                )?;
+                put_u32(&mut out, *placement_weight);
+                put_u64(&mut out, *expected_generation);
+            }
+            MetadataCommand::CommitSegmentPlacement {
+                env,
+                topic_uuid,
+                range_uuid,
+                segment_uuid,
+                replica_nodes,
+                expected_segment_generation,
+                expected_placement_generation,
+            } => {
+                put_u16(&mut out, COMMAND_KIND_COMMIT_SEGMENT_PLACEMENT);
+                encode_envelope(&mut out, env);
+                put_uuid(&mut out, *topic_uuid);
+                put_uuid(&mut out, *range_uuid);
+                put_uuid(&mut out, *segment_uuid);
+                encode_uuid_list(&mut out, replica_nodes, MAX_REPLICAS, "replica nodes")?;
+                put_u64(&mut out, *expected_segment_generation);
+                encode_optional_u64(&mut out, *expected_placement_generation);
+            }
         }
         Ok(out)
     }
@@ -640,6 +704,38 @@ impl MetadataCommand {
                 group_uuid: reader.uuid("group uuid")?,
                 member_uuid: reader.uuid("member uuid")?,
                 stale_before_apply_index: reader.u64("stale-before apply index")?,
+            }),
+            COMMAND_KIND_SET_NODE_PLACEMENT_ATTRS => {
+                let env = decode_envelope(reader)?;
+                let node_uuid = reader.uuid("node uuid")?;
+                let failure_domain =
+                    reader.bounded_str(MAX_FAILURE_DOMAIN_BYTES, "failure domain")?;
+                let placement_weight = reader.u32("placement weight")?;
+                if placement_weight < MIN_PLACEMENT_WEIGHT {
+                    return Err(CodecError::InvalidValue {
+                        what: "placement weight",
+                        reason: "must be >= 1",
+                    });
+                }
+                Ok(MetadataCommand::SetNodePlacementAttrs {
+                    env,
+                    node_uuid,
+                    failure_domain,
+                    placement_weight,
+                    expected_generation: reader.u64("expected generation")?,
+                })
+            }
+            COMMAND_KIND_COMMIT_SEGMENT_PLACEMENT => Ok(MetadataCommand::CommitSegmentPlacement {
+                env: decode_envelope(reader)?,
+                topic_uuid: reader.uuid("topic uuid")?,
+                range_uuid: reader.uuid("range uuid")?,
+                segment_uuid: reader.uuid("segment uuid")?,
+                replica_nodes: decode_uuid_list(reader, MAX_REPLICAS, "replica nodes")?,
+                expected_segment_generation: reader.u64("expected segment generation")?,
+                expected_placement_generation: decode_optional_u64(
+                    reader,
+                    "expected placement generation",
+                )?,
             }),
             other => Err(CodecError::UnknownTag {
                 what: "command kind",
@@ -966,6 +1062,46 @@ fn decode_range_assignments(reader: &mut Reader<'_>) -> Result<Vec<RangeAssignme
     Ok(ranges)
 }
 
+fn encode_uuid_list(
+    out: &mut Vec<u8>,
+    values: &[Uuid],
+    maximum: usize,
+    what: &'static str,
+) -> Result<(), CodecError> {
+    if values.len() > maximum {
+        return Err(CodecError::BoundExceeded {
+            what,
+            actual: values.len(),
+            maximum,
+        });
+    }
+    put_u16(out, values.len() as u16);
+    for value in values {
+        put_uuid(out, *value);
+    }
+    Ok(())
+}
+
+fn decode_uuid_list(
+    reader: &mut Reader<'_>,
+    maximum: usize,
+    what: &'static str,
+) -> Result<Vec<Uuid>, CodecError> {
+    let count = reader.u16(what)? as usize;
+    if count > maximum {
+        return Err(CodecError::BoundExceeded {
+            what,
+            actual: count,
+            maximum,
+        });
+    }
+    let mut values = Vec::with_capacity(count);
+    for _ in 0..count {
+        values.push(reader.uuid(what)?);
+    }
+    Ok(values)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1095,6 +1231,22 @@ mod tests {
                 group_uuid: Uuid::from_u128(50),
                 member_uuid: Uuid::from_u128(51),
                 stale_before_apply_index: 42,
+            },
+            MetadataCommand::SetNodePlacementAttrs {
+                env: envelope(17),
+                node_uuid: Uuid::from_u128(10),
+                failure_domain: "rack-a".to_owned(),
+                placement_weight: 100,
+                expected_generation: 5,
+            },
+            MetadataCommand::CommitSegmentPlacement {
+                env: envelope(18),
+                topic_uuid: Uuid::from_u128(20),
+                range_uuid: Uuid::from_u128(21),
+                segment_uuid: Uuid::from_u128(30),
+                replica_nodes: vec![Uuid::from_u128(10), Uuid::from_u128(11)],
+                expected_segment_generation: 1,
+                expected_placement_generation: None,
             },
         ]
     }

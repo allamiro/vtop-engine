@@ -16,6 +16,10 @@ use crate::command::{
     MAX_ASSIGNED_RANGES, MAX_NODE_ADDR_BYTES,
 };
 use crate::keys::{validate_group_name, validate_topic_name, MetaKey};
+use crate::placement::{
+    select_replicas, PlacementCandidate, DEFAULT_PLACEMENT_WEIGHT, MAX_FAILURE_DOMAIN_BYTES,
+    MAX_REPLICAS, MIN_PLACEMENT_WEIGHT,
+};
 use crate::wire::{
     put_bounded_str, put_bytes32, put_u16, put_u32, put_u64, put_u8, put_uuid, CodecError, Reader,
 };
@@ -34,6 +38,8 @@ const MAX_SNAPSHOT_RESPONSE_BYTES: usize = 1024;
 const MAX_SNAPSHOT_RECORDS: u32 = 1 << 24;
 
 const VALUE_TAG_NODE: u8 = 1;
+/// Node records that include failure-domain and placement weight.
+const VALUE_TAG_NODE_V2: u8 = 12;
 const VALUE_TAG_TOPIC: u8 = 2;
 const VALUE_TAG_TOPIC_NAME: u8 = 3;
 const VALUE_TAG_RANGE: u8 = 4;
@@ -45,6 +51,7 @@ const VALUE_TAG_GROUP_MEMBER: u8 = 9;
 /// Member records that include `last_heartbeat_apply_index`.
 const VALUE_TAG_GROUP_MEMBER_V2: u8 = 11;
 const VALUE_TAG_GROUP_CURSOR: u8 = 10;
+const VALUE_TAG_SEGMENT_PLACEMENT: u8 = 13;
 
 /// A registered broker/controller node.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,6 +59,11 @@ pub struct NodeRecord {
     pub addr: String,
     pub state: NodeState,
     pub generation: u64,
+    /// Failure-domain attribute used by distinct-domain placement filters.
+    /// Empty until [`MetadataCommand::SetNodePlacementAttrs`] sets it.
+    pub failure_domain: String,
+    /// Relative capacity weight for weighted rendezvous scoring.
+    pub placement_weight: u32,
 }
 
 /// A topic incarnation. `topic_epoch` is allocated by the state machine as
@@ -163,6 +175,14 @@ pub struct CursorCheckpointRecord {
     pub committed_by_member: Uuid,
 }
 
+/// Durable ordered replica set for a verified segment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SegmentPlacementRecord {
+    pub generation: u64,
+    pub replica_nodes: Vec<Uuid>,
+    pub committed_apply_index: u64,
+}
+
 /// A typed record value stored under an encoded [`MetaKey`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MetaValue {
@@ -176,6 +196,7 @@ pub enum MetaValue {
     GroupName(GroupNameRecord),
     GroupMember(GroupMemberRecord),
     GroupCursor(CursorCheckpointRecord),
+    SegmentPlacement(SegmentPlacementRecord),
 }
 
 impl MetaValue {
@@ -183,10 +204,17 @@ impl MetaValue {
         let mut out = Vec::with_capacity(64);
         match self {
             MetaValue::Node(node) => {
-                put_u8(&mut out, VALUE_TAG_NODE);
+                put_u8(&mut out, VALUE_TAG_NODE_V2);
                 put_bounded_str(&mut out, &node.addr, MAX_NODE_ADDR_BYTES, "node address")?;
                 put_u8(&mut out, node_state_tag(node.state));
                 put_u64(&mut out, node.generation);
+                put_bounded_str(
+                    &mut out,
+                    &node.failure_domain,
+                    MAX_FAILURE_DOMAIN_BYTES,
+                    "failure domain",
+                )?;
+                put_u32(&mut out, node.placement_weight);
             }
             MetaValue::Topic(topic) => {
                 put_u8(&mut out, VALUE_TAG_TOPIC);
@@ -285,6 +313,12 @@ impl MetaValue {
                 put_u64(&mut out, cursor.checkpoint_generation);
                 put_uuid(&mut out, cursor.committed_by_member);
             }
+            MetaValue::SegmentPlacement(placement) => {
+                put_u8(&mut out, VALUE_TAG_SEGMENT_PLACEMENT);
+                put_u64(&mut out, placement.generation);
+                put_u64(&mut out, placement.committed_apply_index);
+                encode_replica_nodes(&mut out, &placement.replica_nodes)?;
+            }
         }
         Ok(out)
     }
@@ -297,6 +331,18 @@ impl MetaValue {
                 addr: reader.bounded_str(MAX_NODE_ADDR_BYTES, "node address")?,
                 state: NodeState::from_wire(reader.u8("node state")?)?,
                 generation: reader.u64("node generation")?,
+                // Pre-placement node records omit attrs; defaults keep them
+                // registerable while requiring SetNodePlacementAttrs before
+                // multi-replica distinct-domain placement can succeed.
+                failure_domain: String::new(),
+                placement_weight: DEFAULT_PLACEMENT_WEIGHT,
+            }),
+            VALUE_TAG_NODE_V2 => MetaValue::Node(NodeRecord {
+                addr: reader.bounded_str(MAX_NODE_ADDR_BYTES, "node address")?,
+                state: NodeState::from_wire(reader.u8("node state")?)?,
+                generation: reader.u64("node generation")?,
+                failure_domain: reader.bounded_str(MAX_FAILURE_DOMAIN_BYTES, "failure domain")?,
+                placement_weight: reader.u32("placement weight")?,
             }),
             VALUE_TAG_TOPIC => MetaValue::Topic(TopicRecord {
                 name: reader.bounded_str(crate::keys::MAX_TOPIC_NAME_BYTES, "topic name")?,
@@ -404,6 +450,11 @@ impl MetaValue {
                     committed_by_member: reader.uuid("committed-by member")?,
                 })
             }
+            VALUE_TAG_SEGMENT_PLACEMENT => MetaValue::SegmentPlacement(SegmentPlacementRecord {
+                generation: reader.u64("placement generation")?,
+                committed_apply_index: reader.u64("placement apply index")?,
+                replica_nodes: decode_replica_nodes(&mut reader)?,
+            }),
             other => {
                 return Err(CodecError::UnknownTag {
                     what: "record value tag",
@@ -629,6 +680,35 @@ impl MetaStateMachine {
                 stale_before_apply_index,
                 ..
             } => self.expire_stale_member(*group_uuid, *member_uuid, *stale_before_apply_index),
+            MetadataCommand::SetNodePlacementAttrs {
+                node_uuid,
+                failure_domain,
+                placement_weight,
+                expected_generation,
+                ..
+            } => self.set_node_placement_attrs(
+                *node_uuid,
+                failure_domain,
+                *placement_weight,
+                *expected_generation,
+            ),
+            MetadataCommand::CommitSegmentPlacement {
+                topic_uuid,
+                range_uuid,
+                segment_uuid,
+                replica_nodes,
+                expected_segment_generation,
+                expected_placement_generation,
+                ..
+            } => self.commit_segment_placement(
+                apply_index,
+                *topic_uuid,
+                *range_uuid,
+                *segment_uuid,
+                replica_nodes,
+                *expected_segment_generation,
+                *expected_placement_generation,
+            ),
         }
     }
 
@@ -653,6 +733,8 @@ impl MetaStateMachine {
                         addr: addr.to_owned(),
                         state: NodeState::Active,
                         generation: 0,
+                        failure_domain: String::new(),
+                        placement_weight: DEFAULT_PLACEMENT_WEIGHT,
                     }),
                 );
                 MetadataResponse::Ack { generation: 0 }
@@ -1463,6 +1545,185 @@ impl MetaStateMachine {
         }
     }
 
+    fn set_node_placement_attrs(
+        &mut self,
+        node_uuid: Uuid,
+        failure_domain: &str,
+        placement_weight: u32,
+        expected_generation: u64,
+    ) -> MetadataResponse {
+        if failure_domain.len() > MAX_FAILURE_DOMAIN_BYTES {
+            return reject(MetadataError::limit(format!(
+                "failure domain must be 0..={MAX_FAILURE_DOMAIN_BYTES} bytes, got {}",
+                failure_domain.len()
+            )));
+        }
+        if placement_weight < MIN_PLACEMENT_WEIGHT {
+            return reject(MetadataError::limit(format!(
+                "placement weight must be >= {MIN_PLACEMENT_WEIGHT}"
+            )));
+        }
+        let key = MetaKey::Node { node_uuid }.encode();
+        let Some(MetaValue::Node(node)) = self.records.get_mut(&key) else {
+            return reject(MetadataError::NotFound);
+        };
+        if node.generation != expected_generation {
+            return reject(MetadataError::GenerationMismatch {
+                expected: expected_generation,
+                actual: node.generation,
+            });
+        }
+        node.failure_domain = failure_domain.to_owned();
+        node.placement_weight = placement_weight;
+        node.generation += 1;
+        MetadataResponse::Ack {
+            generation: node.generation,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn commit_segment_placement(
+        &mut self,
+        apply_index: u64,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        segment_uuid: Uuid,
+        replica_nodes: &[Uuid],
+        expected_segment_generation: u64,
+        expected_placement_generation: Option<u64>,
+    ) -> MetadataResponse {
+        if replica_nodes.is_empty() || replica_nodes.len() > MAX_REPLICAS {
+            return reject(MetadataError::limit(format!(
+                "replica set must contain 1..={MAX_REPLICAS} nodes, got {}",
+                replica_nodes.len()
+            )));
+        }
+        let mut seen = replica_nodes.to_vec();
+        seen.sort_unstable();
+        seen.dedup();
+        if seen.len() != replica_nodes.len() {
+            return reject(MetadataError::invalid_transition(
+                "replica set contains duplicate node ids",
+            ));
+        }
+
+        let segment_key = MetaKey::Segment {
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+        }
+        .encode();
+        let Some(MetaValue::Segment(segment)) = self.records.get(&segment_key) else {
+            return reject(MetadataError::NotFound);
+        };
+        if segment.segment_generation != expected_segment_generation {
+            return reject(MetadataError::GenerationMismatch {
+                expected: expected_segment_generation,
+                actual: segment.segment_generation,
+            });
+        }
+        if segment.state != SegmentState::Verified {
+            return reject(MetadataError::invalid_transition(
+                "placement requires a verified segment",
+            ));
+        }
+
+        let candidates = self.active_placement_candidates();
+        let require_distinct = replica_nodes.len() > 1;
+        let expected = match select_replicas(
+            segment_uuid,
+            &candidates,
+            replica_nodes.len(),
+            require_distinct,
+        ) {
+            Ok(nodes) => nodes,
+            Err(error) => {
+                return reject(MetadataError::invalid_transition(error.to_string()));
+            }
+        };
+        if replica_nodes != expected.as_slice() {
+            return reject(MetadataError::invalid_transition(
+                "proposed replica set does not match deterministic placement",
+            ));
+        }
+
+        let placement_key = MetaKey::SegmentPlacement {
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+        }
+        .encode();
+        match (
+            self.records.get(&placement_key),
+            expected_placement_generation,
+        ) {
+            (None, None) => {
+                self.records.insert(
+                    placement_key,
+                    MetaValue::SegmentPlacement(SegmentPlacementRecord {
+                        generation: 0,
+                        replica_nodes: replica_nodes.to_vec(),
+                        committed_apply_index: apply_index,
+                    }),
+                );
+                MetadataResponse::Ack { generation: 0 }
+            }
+            (None, Some(_)) => reject(MetadataError::NotFound),
+            (Some(_), None) => reject(MetadataError::AlreadyExists),
+            (Some(MetaValue::SegmentPlacement(existing)), Some(expected_generation)) => {
+                if existing.generation != expected_generation {
+                    return reject(MetadataError::GenerationMismatch {
+                        expected: expected_generation,
+                        actual: existing.generation,
+                    });
+                }
+                let Some(next_generation) = existing.generation.checked_add(1) else {
+                    return reject(MetadataError::limit(
+                        "placement generation space is exhausted",
+                    ));
+                };
+                self.records.insert(
+                    placement_key,
+                    MetaValue::SegmentPlacement(SegmentPlacementRecord {
+                        generation: next_generation,
+                        replica_nodes: replica_nodes.to_vec(),
+                        committed_apply_index: apply_index,
+                    }),
+                );
+                MetadataResponse::Ack {
+                    generation: next_generation,
+                }
+            }
+            (Some(_), Some(_)) => {
+                unreachable!("placement keys only ever hold placement records")
+            }
+        }
+    }
+
+    fn active_placement_candidates(&self) -> Vec<PlacementCandidate> {
+        let mut candidates = Vec::new();
+        for (key_bytes, value) in &self.records {
+            let Ok(MetaKey::Node { node_uuid }) = MetaKey::decode(key_bytes) else {
+                continue;
+            };
+            let MetaValue::Node(node) = value else {
+                continue;
+            };
+            if node.state != NodeState::Active {
+                continue;
+            }
+            if node.placement_weight < MIN_PLACEMENT_WEIGHT {
+                continue;
+            }
+            candidates.push(PlacementCandidate {
+                node_uuid,
+                failure_domain: node.failure_domain.clone(),
+                weight: node.placement_weight,
+            });
+        }
+        candidates
+    }
+
     /// Encode the full state — sorted records plus the dedup FIFO — as one
     /// canonical byte string. Identical states always produce identical
     /// bytes, which the snapshot determinism tests pin.
@@ -1614,6 +1875,10 @@ fn key_matches_value(key: &MetaKey, value: &MetaValue) -> bool {
             | (MetaKey::GroupByName { .. }, MetaValue::GroupName(_))
             | (MetaKey::GroupMember { .. }, MetaValue::GroupMember(_))
             | (MetaKey::GroupCursor { .. }, MetaValue::GroupCursor(_))
+            | (
+                MetaKey::SegmentPlacement { .. },
+                MetaValue::SegmentPlacement(_)
+            )
     )
 }
 
@@ -1699,6 +1964,37 @@ fn decode_assigned_ranges(reader: &mut Reader<'_>) -> Result<Vec<RangeAssignment
         });
     }
     Ok(ranges)
+}
+
+fn encode_replica_nodes(out: &mut Vec<u8>, nodes: &[Uuid]) -> Result<(), CodecError> {
+    if nodes.len() > MAX_REPLICAS {
+        return Err(CodecError::BoundExceeded {
+            what: "replica nodes",
+            actual: nodes.len(),
+            maximum: MAX_REPLICAS,
+        });
+    }
+    put_u16(out, nodes.len() as u16);
+    for node in nodes {
+        put_uuid(out, *node);
+    }
+    Ok(())
+}
+
+fn decode_replica_nodes(reader: &mut Reader<'_>) -> Result<Vec<Uuid>, CodecError> {
+    let count = reader.u16("replica node count")? as usize;
+    if count > MAX_REPLICAS {
+        return Err(CodecError::BoundExceeded {
+            what: "replica nodes",
+            actual: count,
+            maximum: MAX_REPLICAS,
+        });
+    }
+    let mut nodes = Vec::with_capacity(count);
+    for _ in 0..count {
+        nodes.push(reader.uuid("replica node uuid")?);
+    }
+    Ok(nodes)
 }
 
 fn reject(error: MetadataError) -> MetadataResponse {
@@ -1828,6 +2124,26 @@ mod tests {
                 generation: 3,
                 last_heartbeat_apply_index: 0,
                 assigned: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn legacy_node_value_tag_decodes_with_default_placement_attrs() {
+        let mut bytes = Vec::new();
+        put_u8(&mut bytes, VALUE_TAG_NODE);
+        put_bounded_str(&mut bytes, "10.0.0.1:9200", MAX_NODE_ADDR_BYTES, "addr").unwrap();
+        put_u8(&mut bytes, 1); // Active
+        put_u64(&mut bytes, 2);
+        let value = MetaValue::decode(&bytes).unwrap();
+        assert_eq!(
+            value,
+            MetaValue::Node(NodeRecord {
+                addr: "10.0.0.1:9200".to_owned(),
+                state: NodeState::Active,
+                generation: 2,
+                failure_domain: String::new(),
+                placement_weight: DEFAULT_PLACEMENT_WEIGHT,
             })
         );
     }
