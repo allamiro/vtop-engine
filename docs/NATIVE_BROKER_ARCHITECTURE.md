@@ -572,7 +572,9 @@ identify different records after topic recreation or range evolution.
 
 Consumer membership initially uses the metadata group for durable assignments
 and checkpoints. A bounded session layer handles heartbeats and incremental
-rebalance. Ephemeral liveness does not replace committed cursor ownership.
+rebalance: `HeartbeatMember` refreshes apply-index liveness and
+`ExpireStaleMember` drops membership without deleting durable cursors.
+Ephemeral liveness does not replace committed cursor ownership.
 
 ## 11. Placement and membership
 

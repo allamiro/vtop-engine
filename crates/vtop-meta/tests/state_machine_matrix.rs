@@ -1348,6 +1348,127 @@ fn lineage_aware_cursor_commit_cas_monotonicity_and_lineage_guards() {
 }
 
 #[test]
+fn member_heartbeat_and_stale_expiry_keep_cursors() {
+    let mut requests = Requests(0);
+    let mut machine = machine_with_group(&mut requests);
+    let root = [2u8; 32];
+
+    assert_eq!(
+        machine.apply(6, &grant(&mut requests, NODE, 0)),
+        MetadataResponse::LeaseGranted { fencing_epoch: 1 }
+    );
+    assert_eq!(
+        machine.apply(
+            7,
+            &MetadataCommand::RegisterSealedSegment {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: SEGMENT,
+                segment_generation: 0,
+                base_offset: 0,
+                next_offset: 50,
+                content_root: root,
+                sealed_by_epoch: 1,
+                expected_range_generation: 1,
+            }
+        ),
+        MetadataResponse::Ack { generation: 2 }
+    );
+    assert_eq!(
+        machine.apply(
+            8,
+            &MetadataCommand::CommitGroupCursor {
+                env: requests.next(),
+                group_uuid: GROUP,
+                member_uuid: MEMBER,
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                topic_epoch: 1,
+                range_generation: 2,
+                segment_uuid: SEGMENT,
+                segment_generation: 0,
+                segment_root: root,
+                record_offset: 10,
+                record_index: 0,
+                lineage_transition_id: None,
+                expected_checkpoint_generation: None,
+            }
+        ),
+        MetadataResponse::CursorCommitted {
+            checkpoint_generation: 0,
+        }
+    );
+
+    assert_eq!(
+        machine.apply(
+            9,
+            &MetadataCommand::HeartbeatMember {
+                env: requests.next(),
+                group_uuid: GROUP,
+                member_uuid: MEMBER,
+            }
+        ),
+        MetadataResponse::Ack { generation: 1 }
+    );
+    let MetaValue::GroupMember(member) = machine
+        .record(&MetaKey::GroupMember {
+            group_uuid: GROUP,
+            member_uuid: MEMBER,
+        })
+        .cloned()
+        .unwrap()
+    else {
+        panic!("expected member");
+    };
+    assert_eq!(member.last_heartbeat_apply_index, 9);
+
+    // Still live relative to heartbeat 9.
+    assert_eq!(
+        machine.apply(
+            10,
+            &MetadataCommand::ExpireStaleMember {
+                env: requests.next(),
+                group_uuid: GROUP,
+                member_uuid: MEMBER,
+                stale_before_apply_index: 9,
+            }
+        ),
+        rejected(MetadataError::invalid_transition(
+            "member heartbeat is still within the live window"
+        ))
+    );
+
+    assert_eq!(
+        machine.apply(
+            11,
+            &MetadataCommand::ExpireStaleMember {
+                env: requests.next(),
+                group_uuid: GROUP,
+                member_uuid: MEMBER,
+                stale_before_apply_index: 10,
+            }
+        ),
+        MetadataResponse::Ack { generation: 3 }
+    );
+    assert!(machine
+        .record(&MetaKey::GroupMember {
+            group_uuid: GROUP,
+            member_uuid: MEMBER,
+        })
+        .is_none());
+    // Durable cursor survives member expiry.
+    assert!(matches!(
+        machine.record(&MetaKey::GroupCursor {
+            group_uuid: GROUP,
+            topic_uuid: TOPIC,
+            range_uuid: RANGE,
+        }),
+        Some(MetaValue::GroupCursor(_))
+    ));
+}
+
+#[test]
 fn sealed_segment_lineage_is_checked_on_cursor_commit() {
     let mut requests = Requests(0);
     let mut machine = machine_with_group(&mut requests);
