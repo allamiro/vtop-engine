@@ -82,6 +82,12 @@ pub enum Command {
         #[command(subcommand)]
         command: crate::segment_tools::SegmentCommand,
     },
+    /// Metadata Raft admin client (status, membership, propose). Uses a
+    /// dedicated meta admin YAML via --config (endpoint + PEM paths).
+    Meta {
+        #[command(subcommand)]
+        command: crate::meta_tools::MetaCommand,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -149,6 +155,12 @@ pub async fn dispatch(cli: Cli) -> i32 {
     // contract (see segment_tools), so they bypass the engine dispatch path.
     if let Command::Segment { command } = &cli.command {
         return crate::segment_tools::run(command, cli.json);
+    }
+    // Meta admin tools talk to the VTPM admin endpoint; they bypass the
+    // archive engine entirely.
+    if let Command::Meta { command } = cli.command {
+        // Re-bind so we can move `command` into the async helper.
+        return crate::meta_tools::run(command, cli.json).await;
     }
     match run_command(&cli).await {
         Ok(()) => 0,
@@ -382,6 +394,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             Ok(())
         }
         Command::Segment { .. } => unreachable!("dispatched before run_command"),
+        Command::Meta { .. } => unreachable!("dispatched before run_command"),
     }
 }
 
