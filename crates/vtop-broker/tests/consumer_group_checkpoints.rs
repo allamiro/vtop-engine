@@ -17,8 +17,10 @@ const TOPIC_UUID: Uuid = Uuid::from_u128(0x20);
 const RANGE_UUID: Uuid = Uuid::from_u128(0x21);
 const GROUP_UUID: Uuid = Uuid::from_u128(0x50);
 const MEMBER_UUID: Uuid = Uuid::from_u128(0x51);
+const NODE_UUID: Uuid = Uuid::from_u128(0x10);
 const SEGMENT_UUID: Uuid = Uuid::from_u128(0x30);
 const FENCING_EPOCH: u64 = 1;
+const SEGMENT_ROOT: [u8; 32] = [7; 32];
 
 fn range() -> RangeIdentity {
     RangeIdentity {
@@ -39,8 +41,17 @@ fn envelope(n: u128) -> CommandEnvelope {
 fn seeded_group_store() -> GroupCheckpointStore {
     let store = GroupCheckpointStore::new();
     assert_eq!(
-        store.apply(MetadataCommand::CreateTopic {
+        store.apply(MetadataCommand::RegisterNode {
             env: envelope(1),
+            node_uuid: NODE_UUID,
+            addr: "10.0.0.1:9200".to_owned(),
+            expected_generation: None,
+        }),
+        MetadataResponse::Ack { generation: 0 }
+    );
+    assert_eq!(
+        store.apply(MetadataCommand::CreateTopic {
+            env: envelope(2),
             name: TOPIC.to_owned(),
             topic_uuid: TOPIC_UUID,
             root_range_uuid: RANGE_UUID,
@@ -52,8 +63,33 @@ fn seeded_group_store() -> GroupCheckpointStore {
         }
     );
     assert_eq!(
+        store.apply(MetadataCommand::GrantRangeLease {
+            env: envelope(3),
+            topic_uuid: TOPIC_UUID,
+            range_uuid: RANGE_UUID,
+            holder_node_uuid: NODE_UUID,
+            expected_range_generation: 0,
+        }),
+        MetadataResponse::LeaseGranted { fencing_epoch: 1 }
+    );
+    assert_eq!(
+        store.apply(MetadataCommand::RegisterSealedSegment {
+            env: envelope(4),
+            topic_uuid: TOPIC_UUID,
+            range_uuid: RANGE_UUID,
+            segment_uuid: SEGMENT_UUID,
+            segment_generation: 0,
+            base_offset: 0,
+            next_offset: 100,
+            content_root: SEGMENT_ROOT,
+            sealed_by_epoch: 1,
+            expected_range_generation: 1,
+        }),
+        MetadataResponse::Ack { generation: 2 }
+    );
+    assert_eq!(
         store.apply(MetadataCommand::CreateConsumerGroup {
-            env: envelope(2),
+            env: envelope(5),
             name: "audit.consumers".to_owned(),
             group_uuid: GROUP_UUID,
         }),
@@ -64,7 +100,7 @@ fn seeded_group_store() -> GroupCheckpointStore {
     );
     assert_eq!(
         store.apply(MetadataCommand::JoinConsumerGroup {
-            env: envelope(3),
+            env: envelope(6),
             group_uuid: GROUP_UUID,
             member_uuid: MEMBER_UUID,
             expected_group_generation: 0,
@@ -76,7 +112,7 @@ fn seeded_group_store() -> GroupCheckpointStore {
     );
     assert_eq!(
         store.apply(MetadataCommand::AssignMemberRanges {
-            env: envelope(4),
+            env: envelope(7),
             group_uuid: GROUP_UUID,
             member_uuid: MEMBER_UUID,
             ranges: vec![RangeAssignment {
@@ -125,10 +161,10 @@ fn cursor_at(offset: u64, checkpoint_generation: u64) -> LineageCursor {
         topic_id: TOPIC_UUID,
         topic_epoch: 1,
         range_id: RANGE_UUID,
-        range_generation: 0,
+        range_generation: 2,
         segment_id: SEGMENT_UUID,
         segment_generation: 0,
-        segment_root: [7; 32],
+        segment_root: SEGMENT_ROOT,
         record_offset: offset,
         record_index: 0,
         lineage_transition_id: None,
@@ -180,7 +216,7 @@ fn commit_and_fetch_lineage_cursor_through_broker() {
     let cursor = response.cursor.expect("checkpoint should exist");
     assert_eq!(cursor.record_offset, 10);
     assert_eq!(cursor.checkpoint_generation, 0);
-    assert_eq!(cursor.segment_root, [7; 32]);
+    assert_eq!(cursor.segment_root, SEGMENT_ROOT);
 
     let advance = broker.handle(
         Role::Consumer,

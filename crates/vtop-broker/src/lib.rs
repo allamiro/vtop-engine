@@ -42,12 +42,12 @@ use vtop_meta::{
     MetadataResponse,
 };
 use vtop_protocol::{
-    encode_frame, read_frame, write_frame, ClientHello, CommitCursorResponse, CommittedHwmUpdate,
-    Durability as WireDurability, ErrorCode, ErrorResponse, FetchCursorResponse, FetchResponse,
-    FetchedRecord, LineageCursor, Message, ProduceOutcome, ProduceResponse, ProtocolLimits,
-    RangeIdentity, ReplicaAppendRequest, Role, ServerHello, WireFrame, ABSOLUTE_MAX_FRAME_BYTES,
-    ABSOLUTE_MAX_RECORDS, DEFAULT_MAX_FRAME_BYTES, DEFAULT_MAX_RECORDS, PROTOCOL_MAJOR,
-    PROTOCOL_MINOR,
+    encode_frame, read_frame, write_frame, ClientHello, CommitCursorRequest, CommitCursorResponse,
+    CommittedHwmUpdate, Durability as WireDurability, ErrorCode, ErrorResponse,
+    FetchCursorResponse, FetchResponse, FetchedRecord, LineageCursor, Message, ProduceOutcome,
+    ProduceResponse, ProtocolLimits, RangeIdentity, ReplicaAppendRequest, Role, ServerHello,
+    WireFrame, ABSOLUTE_MAX_FRAME_BYTES, ABSOLUTE_MAX_RECORDS, DEFAULT_MAX_FRAME_BYTES,
+    DEFAULT_MAX_RECORDS, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 
 const EPOCH_MAGIC: &[u8; 8] = b"VTOPEPC1";
@@ -934,9 +934,7 @@ impl LocalBroker {
                 };
                 let command = MetadataCommand::CommitGroupCursor {
                     env: CommandEnvelope {
-                        request_id: Uuid::from_u128(
-                            (u128::from(request_id) << 64) | u128::from(stream_id),
-                        ),
+                        request_id: cursor_commit_request_id(request_id, stream_id, &request),
                         issued_at_ms: 0,
                     },
                     group_uuid: request.cursor.group_id,
@@ -1073,6 +1071,53 @@ fn map_metadata_error(error: &MetadataError) -> (ErrorCode, String) {
         MetadataError::InvalidTransition(detail) => (ErrorCode::WrongLineage, detail.clone()),
         MetadataError::Limit(detail) => (ErrorCode::InvalidRequest, detail.clone()),
     }
+}
+
+/// Domain-separated request id for metadata dedup. Includes member/group/cursor
+/// identity so distinct sessions that reuse low wire `(request_id, stream_id)`
+/// counters cannot collide, while identical retries still hit the dedup table.
+fn cursor_commit_request_id(
+    request_id: u64,
+    stream_id: u64,
+    request: &CommitCursorRequest,
+) -> Uuid {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"vtop-broker-cursor-commit-v1\0");
+    hasher.update(&request_id.to_be_bytes());
+    hasher.update(&stream_id.to_be_bytes());
+    hasher.update(request.member_id.as_bytes());
+    hasher.update(request.cursor.group_id.as_bytes());
+    hasher.update(request.cursor.topic_id.as_bytes());
+    hasher.update(request.cursor.range_id.as_bytes());
+    hasher.update(&request.cursor.topic_epoch.to_be_bytes());
+    hasher.update(&request.cursor.range_generation.to_be_bytes());
+    hasher.update(request.cursor.segment_id.as_bytes());
+    hasher.update(&request.cursor.segment_generation.to_be_bytes());
+    hasher.update(&request.cursor.segment_root);
+    hasher.update(&request.cursor.record_offset.to_be_bytes());
+    hasher.update(&request.cursor.record_index.to_be_bytes());
+    match request.cursor.lineage_transition_id {
+        None => {
+            hasher.update(&[0]);
+        }
+        Some(id) => {
+            hasher.update(&[1]);
+            hasher.update(id.as_bytes());
+        }
+    }
+    match request.expected_checkpoint_generation {
+        None => {
+            hasher.update(&[0]);
+        }
+        Some(generation) => {
+            hasher.update(&[1]);
+            hasher.update(&generation.to_be_bytes());
+        }
+    }
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    Uuid::from_bytes(bytes)
 }
 
 fn error(request_id: u64, stream_id: u64, code: ErrorCode, message: &str) -> WireFrame {

@@ -1083,10 +1083,57 @@ fn lineage_aware_cursor_commit_cas_monotonicity_and_lineage_guards() {
     let mut machine = machine_with_group(&mut requests);
     let root = [9u8; 32];
 
+    assert_eq!(
+        machine.apply(6, &grant(&mut requests, NODE, 0)),
+        MetadataResponse::LeaseGranted { fencing_epoch: 1 }
+    );
+    assert_eq!(
+        machine.apply(
+            7,
+            &MetadataCommand::RegisterSealedSegment {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: SEGMENT,
+                segment_generation: 0,
+                base_offset: 0,
+                next_offset: 100,
+                content_root: root,
+                sealed_by_epoch: 1,
+                expected_range_generation: 1,
+            }
+        ),
+        MetadataResponse::Ack { generation: 2 }
+    );
+
+    // Unregistered segment identity is rejected fail-closed.
+    assert_eq!(
+        machine.apply(
+            8,
+            &MetadataCommand::CommitGroupCursor {
+                env: requests.next(),
+                group_uuid: GROUP,
+                member_uuid: MEMBER,
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                topic_epoch: 1,
+                range_generation: 2,
+                segment_uuid: Uuid::from_u128(0x999),
+                segment_generation: 0,
+                segment_root: root,
+                record_offset: 10,
+                record_index: 0,
+                lineage_transition_id: None,
+                expected_checkpoint_generation: None,
+            }
+        ),
+        rejected(MetadataError::NotFound)
+    );
+
     // Wrong topic epoch is rejected before any durable write.
     assert_eq!(
         machine.apply(
-            6,
+            9,
             &MetadataCommand::CommitGroupCursor {
                 env: requests.next(),
                 group_uuid: GROUP,
@@ -1094,7 +1141,7 @@ fn lineage_aware_cursor_commit_cas_monotonicity_and_lineage_guards() {
                 topic_uuid: TOPIC,
                 range_uuid: RANGE,
                 topic_epoch: 99,
-                range_generation: 0,
+                range_generation: 2,
                 segment_uuid: SEGMENT,
                 segment_generation: 0,
                 segment_root: root,
@@ -1113,7 +1160,7 @@ fn lineage_aware_cursor_commit_cas_monotonicity_and_lineage_guards() {
     // First commit creates checkpoint generation 0.
     assert_eq!(
         machine.apply(
-            7,
+            10,
             &MetadataCommand::CommitGroupCursor {
                 env: requests.next(),
                 group_uuid: GROUP,
@@ -1121,7 +1168,7 @@ fn lineage_aware_cursor_commit_cas_monotonicity_and_lineage_guards() {
                 topic_uuid: TOPIC,
                 range_uuid: RANGE,
                 topic_epoch: 1,
-                range_generation: 0,
+                range_generation: 2,
                 segment_uuid: SEGMENT,
                 segment_generation: 0,
                 segment_root: root,
@@ -1137,7 +1184,7 @@ fn lineage_aware_cursor_commit_cas_monotonicity_and_lineage_guards() {
     );
     assert_eq!(
         machine.apply(
-            8,
+            11,
             &MetadataCommand::CommitGroupCursor {
                 env: requests.next(),
                 group_uuid: GROUP,
@@ -1145,7 +1192,7 @@ fn lineage_aware_cursor_commit_cas_monotonicity_and_lineage_guards() {
                 topic_uuid: TOPIC,
                 range_uuid: RANGE,
                 topic_epoch: 1,
-                range_generation: 0,
+                range_generation: 2,
                 segment_uuid: SEGMENT,
                 segment_generation: 0,
                 segment_root: root,
@@ -1161,7 +1208,7 @@ fn lineage_aware_cursor_commit_cas_monotonicity_and_lineage_guards() {
     // Stale CAS generation is rejected.
     assert_eq!(
         machine.apply(
-            9,
+            12,
             &MetadataCommand::CommitGroupCursor {
                 env: requests.next(),
                 group_uuid: GROUP,
@@ -1169,7 +1216,7 @@ fn lineage_aware_cursor_commit_cas_monotonicity_and_lineage_guards() {
                 topic_uuid: TOPIC,
                 range_uuid: RANGE,
                 topic_epoch: 1,
-                range_generation: 0,
+                range_generation: 2,
                 segment_uuid: SEGMENT,
                 segment_generation: 0,
                 segment_root: root,
@@ -1188,7 +1235,7 @@ fn lineage_aware_cursor_commit_cas_monotonicity_and_lineage_guards() {
     // Backward move within the same segment is rejected.
     assert_eq!(
         machine.apply(
-            10,
+            13,
             &MetadataCommand::CommitGroupCursor {
                 env: requests.next(),
                 group_uuid: GROUP,
@@ -1196,7 +1243,7 @@ fn lineage_aware_cursor_commit_cas_monotonicity_and_lineage_guards() {
                 topic_uuid: TOPIC,
                 range_uuid: RANGE,
                 topic_epoch: 1,
-                range_generation: 0,
+                range_generation: 2,
                 segment_uuid: SEGMENT,
                 segment_generation: 0,
                 segment_root: root,
@@ -1214,7 +1261,7 @@ fn lineage_aware_cursor_commit_cas_monotonicity_and_lineage_guards() {
     // Forward CAS succeeds and bumps checkpoint generation.
     assert_eq!(
         machine.apply(
-            11,
+            14,
             &MetadataCommand::CommitGroupCursor {
                 env: requests.next(),
                 group_uuid: GROUP,
@@ -1222,7 +1269,7 @@ fn lineage_aware_cursor_commit_cas_monotonicity_and_lineage_guards() {
                 topic_uuid: TOPIC,
                 range_uuid: RANGE,
                 topic_epoch: 1,
-                range_generation: 0,
+                range_generation: 2,
                 segment_uuid: SEGMENT,
                 segment_generation: 0,
                 segment_root: root,
@@ -1253,9 +1300,9 @@ fn lineage_aware_cursor_commit_cas_monotonicity_and_lineage_guards() {
     assert_eq!(cursor.committed_by_member, MEMBER);
     assert_eq!(cursor.lineage_transition_id, Some(Uuid::from_u128(0x60)));
 
-    // Unassigned member cannot commit.
+    // Unassigned member cannot commit. Group generation is 2 after join+assign.
     assert_eq!(
-        machine.apply(12, &join_member(&mut requests, MEMBER_B, 2)),
+        machine.apply(15, &join_member(&mut requests, MEMBER_B, 2)),
         MetadataResponse::MemberJoined {
             member_generation: 0,
             group_generation: 3,
@@ -1263,7 +1310,7 @@ fn lineage_aware_cursor_commit_cas_monotonicity_and_lineage_guards() {
     );
     assert_eq!(
         machine.apply(
-            13,
+            16,
             &MetadataCommand::CommitGroupCursor {
                 env: requests.next(),
                 group_uuid: GROUP,
@@ -1271,7 +1318,7 @@ fn lineage_aware_cursor_commit_cas_monotonicity_and_lineage_guards() {
                 topic_uuid: TOPIC,
                 range_uuid: RANGE,
                 topic_epoch: 1,
-                range_generation: 0,
+                range_generation: 2,
                 segment_uuid: SEGMENT,
                 segment_generation: 0,
                 segment_root: root,
@@ -1283,6 +1330,14 @@ fn lineage_aware_cursor_commit_cas_monotonicity_and_lineage_guards() {
         ),
         rejected(MetadataError::invalid_transition(
             "member is not assigned the cursor topic/range"
+        ))
+    );
+
+    // Exclusive assignment: MEMBER still holds RANGE, so MEMBER_B cannot steal it.
+    assert_eq!(
+        machine.apply(17, &assign_member(&mut requests, MEMBER_B, 0)),
+        rejected(MetadataError::invalid_transition(
+            "range is already assigned to another group member"
         ))
     );
 

@@ -1141,6 +1141,34 @@ impl MetaStateMachine {
                 ));
             }
         }
+        // Exclusive ownership: a range may be assigned to at most one live
+        // member of the group. Overlapping assignment during rebalance is
+        // rejected rather than allowing concurrent cursor commits.
+        for (key_bytes, value) in &self.records {
+            let Ok(MetaKey::GroupMember {
+                group_uuid: other_group,
+                member_uuid: other_member,
+            }) = MetaKey::decode(key_bytes)
+            else {
+                continue;
+            };
+            if other_group != group_uuid || other_member == member_uuid {
+                continue;
+            }
+            let MetaValue::GroupMember(other) = value else {
+                continue;
+            };
+            for assignment in ranges {
+                if other.assigned.iter().any(|held| {
+                    held.topic_uuid == assignment.topic_uuid
+                        && held.range_uuid == assignment.range_uuid
+                }) {
+                    return reject(MetadataError::invalid_transition(
+                        "range is already assigned to another group member",
+                    ));
+                }
+            }
+        }
         let group_key = MetaKey::Group { group_uuid }.encode();
         if !matches!(self.records.get(&group_key), Some(MetaValue::Group(_))) {
             return reject(MetadataError::NotFound);
@@ -1236,25 +1264,25 @@ impl MetaStateMachine {
             segment_uuid: args.segment_uuid,
         }
         .encode();
-        if let Some(MetaValue::Segment(segment)) = self.records.get(&segment_key) {
-            if segment.segment_generation != args.segment_generation {
-                return reject(MetadataError::GenerationMismatch {
-                    expected: args.segment_generation,
-                    actual: segment.segment_generation,
-                });
-            }
-            if segment.content_root != args.segment_root {
-                return reject(MetadataError::invalid_transition(
-                    "segment root does not match the registered segment",
-                ));
-            }
-            if args.record_offset < segment.base_offset || args.record_offset > segment.next_offset
-            {
-                return reject(MetadataError::invalid_transition(format!(
-                    "record offset {} is outside sealed segment [{}, {}]",
-                    args.record_offset, segment.base_offset, segment.next_offset
-                )));
-            }
+        let Some(MetaValue::Segment(segment)) = self.records.get(&segment_key) else {
+            return reject(MetadataError::NotFound);
+        };
+        if segment.segment_generation != args.segment_generation {
+            return reject(MetadataError::GenerationMismatch {
+                expected: args.segment_generation,
+                actual: segment.segment_generation,
+            });
+        }
+        if segment.content_root != args.segment_root {
+            return reject(MetadataError::invalid_transition(
+                "segment root does not match the registered segment",
+            ));
+        }
+        if args.record_offset < segment.base_offset || args.record_offset > segment.next_offset {
+            return reject(MetadataError::invalid_transition(format!(
+                "record offset {} is outside sealed segment [{}, {}]",
+                args.record_offset, segment.base_offset, segment.next_offset
+            )));
         }
 
         let cursor_key = MetaKey::GroupCursor {
