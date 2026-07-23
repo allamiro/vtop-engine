@@ -3993,6 +3993,7 @@ dependencies = [
  "tokio-rustls",
  "uuid",
  "vtop-log",
+ "vtop-meta",
  "vtop-protocol",
 ]
 

@@ -4,12 +4,19 @@
 //! dependency. Produce acknowledgements use the local `Fsync` durability
 //! boundary, fetches stop at the committed high-water mark, and producer epochs
 //! are fenced by a separate durable append-only journal.
+//!
+//! Range leadership is gated by a metadata-issued fencing epoch
+//! ([`MetaFencingEpoch`]): the broker holds the epoch it was granted and
+//! compares it on every produce/fetch against the latest committed metadata
+//! epoch for the range. When metadata grants a newer epoch, observers update
+//! the shared handle and the prior leaseholder is fenced.
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
@@ -246,19 +253,73 @@ struct BrokerState {
     producer_epochs: ProducerEpochJournal,
 }
 
+/// Shared view of the metadata-committed fencing epoch for a range.
+///
+/// Lease observers (tests today; a Raft applied-state watcher later) publish
+/// the latest grant into this handle. Brokers compare their held lease epoch
+/// against [`MetaFencingEpoch::get`] on every produce/fetch.
+#[derive(Clone, Debug, Default)]
+pub struct MetaFencingEpoch {
+    epoch: Arc<AtomicU64>,
+}
+
+impl MetaFencingEpoch {
+    pub fn new(epoch: u64) -> Self {
+        Self {
+            epoch: Arc::new(AtomicU64::new(epoch)),
+        }
+    }
+
+    pub fn get(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    pub fn set(&self, epoch: u64) {
+        self.epoch.store(epoch, Ordering::Release);
+    }
+}
+
 pub struct LocalBroker {
     range: RangeIdentity,
-    fencing_epoch: u64,
+    /// Epoch this broker was granted as range leaseholder.
+    held_fencing_epoch: u64,
+    /// Latest metadata-committed fencing epoch for the range.
+    meta_fencing_epoch: MetaFencingEpoch,
     segment_format: SegmentFormat,
     state: Mutex<BrokerState>,
 }
 
 impl LocalBroker {
+    /// Construct a broker whose held lease epoch and metadata view start equal.
+    ///
+    /// Prefer [`Self::with_meta_fencing_epoch`] when the broker should observe
+    /// live metadata grants (so a newer grant fences this instance).
     pub fn new(
         segment: ActiveSegment,
         producer_epochs: ProducerEpochJournal,
         range: RangeIdentity,
         fencing_epoch: u64,
+    ) -> BrokerResult<Self> {
+        Self::with_meta_fencing_epoch(
+            segment,
+            producer_epochs,
+            range,
+            fencing_epoch,
+            MetaFencingEpoch::new(fencing_epoch),
+        )
+    }
+
+    /// Construct a broker bound to a live metadata fencing-epoch handle.
+    ///
+    /// `held_fencing_epoch` is the grant this process accepted. Produce and
+    /// fetch succeed only while that value still equals
+    /// [`MetaFencingEpoch::get`] and the request carries the same epoch.
+    pub fn with_meta_fencing_epoch(
+        segment: ActiveSegment,
+        producer_epochs: ProducerEpochJournal,
+        range: RangeIdentity,
+        held_fencing_epoch: u64,
+        meta_fencing_epoch: MetaFencingEpoch,
     ) -> BrokerResult<Self> {
         // The format is derived from the segment itself so the broker's
         // produce-time behavior can never disagree with the on-disk frames.
@@ -292,7 +353,8 @@ impl LocalBroker {
         }
         Ok(Self {
             range,
-            fencing_epoch,
+            held_fencing_epoch,
+            meta_fencing_epoch,
             segment_format,
             state: Mutex::new(BrokerState {
                 segment,
@@ -304,6 +366,16 @@ impl LocalBroker {
     /// The segment format this broker writes, derived from its segment.
     pub fn segment_format(&self) -> SegmentFormat {
         self.segment_format
+    }
+
+    /// Fencing epoch this broker was granted as range leaseholder.
+    pub fn held_fencing_epoch(&self) -> u64 {
+        self.held_fencing_epoch
+    }
+
+    /// Shared metadata fencing-epoch handle observed by this broker.
+    pub fn meta_fencing_epoch(&self) -> &MetaFencingEpoch {
+        &self.meta_fencing_epoch
     }
 
     pub fn handle(&self, role: Role, frame: WireFrame) -> WireFrame {
@@ -528,10 +600,19 @@ impl LocalBroker {
                 "request range identity does not match this broker",
             ));
         }
-        if fencing_epoch != self.fencing_epoch {
+        if fencing_epoch != self.held_fencing_epoch {
             return Err((
                 ErrorCode::Fenced,
-                "request fencing epoch is stale or unknown",
+                "request fencing epoch does not match this broker's lease",
+            ));
+        }
+        // Metadata is the authority: a newer grant fences this leaseholder
+        // even when the producer still presents the previously granted epoch.
+        let meta_epoch = self.meta_fencing_epoch.get();
+        if self.held_fencing_epoch != meta_epoch {
+            return Err((
+                ErrorCode::Fenced,
+                "broker lease epoch is fenced by a newer metadata grant",
             ));
         }
         Ok(())
@@ -1297,6 +1378,91 @@ mod tests {
         };
         assert_eq!(fetched.records.len(), 2);
         assert_eq!(fetched.committed_high_watermark, 2);
+    }
+
+    #[test]
+    fn metadata_epoch_bump_fences_prior_leaseholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let range_id = Uuid::from_u128(42);
+        let range = RangeIdentity {
+            topic: "native".to_owned(),
+            topic_epoch: 1,
+            range_id,
+            range_generation: 0,
+        };
+        let descriptor = SegmentDescriptor {
+            segment_id: Uuid::from_u128(7),
+            topic: range.topic.clone(),
+            topic_epoch: range.topic_epoch,
+            lineage: RangeLineage {
+                range_id,
+                generation: 0,
+                key_range: KeyRange::full(),
+                parents: Vec::new(),
+            },
+            base_offset: 0,
+        };
+        let segment = ActiveSegment::create(
+            dir.path().join("native.active"),
+            descriptor,
+            SegmentConfig::default(),
+        )
+        .unwrap();
+        let epochs = ProducerEpochJournal::open(dir.path().join("native.epochs")).unwrap();
+        let meta_epoch = MetaFencingEpoch::new(1);
+        let broker = LocalBroker::with_meta_fencing_epoch(
+            segment,
+            epochs,
+            range.clone(),
+            1,
+            meta_epoch.clone(),
+        )
+        .unwrap();
+
+        let producer = Uuid::from_u128(12);
+        let ok = broker.handle(
+            Role::Producer,
+            produce_at(range.clone(), 1, producer, 1, 0, 1),
+        );
+        assert!(matches!(ok.message, Message::ProduceResponse(_)));
+
+        // Metadata grants a newer epoch to another holder.
+        meta_epoch.set(2);
+        let fenced = broker.handle(Role::Producer, produce_at(range, 1, producer, 1, 1, 2));
+        assert!(matches!(
+            fenced.message,
+            Message::Error(ErrorResponse {
+                code: ErrorCode::Fenced,
+                ..
+            })
+        ));
+    }
+
+    fn produce_at(
+        range: RangeIdentity,
+        fencing_epoch: u64,
+        producer_id: Uuid,
+        epoch: u64,
+        sequence: u64,
+        request_id: u64,
+    ) -> WireFrame {
+        WireFrame {
+            request_id,
+            stream_id: 1,
+            message: Message::ProduceRequest(ProduceRequest {
+                range,
+                fencing_epoch,
+                producer_id,
+                producer_epoch: epoch,
+                first_sequence: sequence,
+                durability: WireDurability::LocalFsync,
+                records: vec![ProduceRecord {
+                    timestamp_millis: 42,
+                    key: b"key".to_vec(),
+                    value: b"value".to_vec(),
+                }],
+            }),
+        }
     }
 
     #[test]
