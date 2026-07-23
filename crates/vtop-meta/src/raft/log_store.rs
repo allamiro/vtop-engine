@@ -141,7 +141,9 @@ impl RaftLogStorage<MetaRaftTypeConfig> for MetaRaftLogStore {
         &mut self,
         _committed: Option<LogId<NodeId>>,
     ) -> Result<(), StorageError<NodeId>> {
-        // Applied state is durable via MetaLog frames + snapshots.
+        // Applied frontier is flushed from RaftStateMachine::apply via
+        // MetaStorage::apply_through → meta.applied; committed==applied for
+        // this store because apply is synchronous with commit handling.
         Ok(())
     }
 
@@ -211,6 +213,12 @@ impl RaftLogStorage<MetaRaftTypeConfig> for MetaRaftLogStore {
                 .storage
                 .purge_upto(meta_index)
                 .map_err(map_store_err)?;
+            // After snapshot install, the physical tail may still end below
+            // the purge/snapshot frontier; drop it so appends can continue.
+            guard
+                .storage
+                .discard_stale_log_tail()
+                .map_err(map_store_err)?;
         }
         // else: openraft emits PurgeLog in the same command batch as
         // InstallFullSnapshot without waiting for the SM command to finish
@@ -219,7 +227,13 @@ impl RaftLogStorage<MetaRaftTypeConfig> for MetaRaftLogStore {
         // still advances so readers honor the logical frontier after install.
         match guard.last_purged {
             Some(prev) if prev.index > log_id.index => {}
-            _ => guard.last_purged = Some(log_id),
+            _ => {
+                guard.last_purged = Some(log_id);
+                guard
+                    .storage
+                    .save_purged(log_id.leader_id.term, meta_index)
+                    .map_err(map_store_err)?;
+            }
         }
         Ok(())
     }

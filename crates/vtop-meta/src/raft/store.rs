@@ -134,26 +134,28 @@ fn recover_membership(
 }
 
 fn recover_last_purged(storage: &MetaStorage) -> Option<LogId<NodeId>> {
+    // Prefer the exact LogId the adapter persisted on purge(). Inferring from
+    // chunk layout is lossy when only whole chunks were removed.
+    if let Some(purged) = storage.last_purged() {
+        return to_raft_index(purged.index).map(|index| raft_log_id(purged.term, index));
+    }
     match storage.log().first_index() {
         Some(first) if first > 1 => {
             let purged_meta = first - 1;
+            // Without a durable purged file, fall back to the term of the
+            // first live entry (never invent a snapshot-final term for an
+            // index the snapshot may not have covered at that term).
             let term = storage
-                .snapshots()
-                .newest()
-                .map(|meta| {
-                    if meta.last_index >= purged_meta {
-                        meta.last_term
-                    } else {
-                        // Should not happen under MetaStorage guards; use a
-                        // conservative term from the first live entry.
-                        storage
-                            .log()
-                            .read_range(first, first + 1)
-                            .ok()
-                            .and_then(|entries| entries.into_iter().next())
-                            .map(|entry| entry.term)
-                            .unwrap_or(0)
-                    }
+                .log()
+                .read_range(first, first + 1)
+                .ok()
+                .and_then(|entries| entries.into_iter().next())
+                .map(|entry| entry.term)
+                .or_else(|| {
+                    storage
+                        .snapshots()
+                        .newest()
+                        .and_then(|meta| (meta.last_index == purged_meta).then_some(meta.last_term))
                 })
                 .unwrap_or(0);
             to_raft_index(purged_meta).map(|index| raft_log_id(term, index))
@@ -219,9 +221,23 @@ pub(crate) fn install_snapshot_bytes(
     let mut snapshots = MetaSnapshots::open_in(&inner.env, &inner.data_dir, inner.cluster_id)
         .map_err(sto_err_logs)?;
     snapshots.install(bytes).map_err(sto_err_logs)?;
-    // Full recovery path: newest snapshot + replay of any log above it.
+    // Full recovery path: newest snapshot + replay limited by durable applied.
     inner.storage =
         MetaStorage::open_with(&inner.env, &inner.data_dir, inner.cluster_id, inner.config)
             .map_err(sto_err_logs)?;
+    // Snapshot install advances the applied cursor without apply_through; keep
+    // the durable frontier aligned so a later reopen does not replay a stale
+    // pre-snapshot applied file past the new baseline incorrectly.
+    inner
+        .storage
+        .sync_applied_frontier()
+        .map_err(sto_err_logs)?;
+    // A non-blank follower may still hold a physical log ending below the
+    // snapshot frontier. purge_upto cannot drop the newest chunk, so discard
+    // that stale tail before the next append must extend from last_applied+1.
+    inner
+        .storage
+        .discard_stale_log_tail()
+        .map_err(sto_err_logs)?;
     Ok(())
 }

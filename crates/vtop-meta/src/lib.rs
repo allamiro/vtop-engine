@@ -18,9 +18,10 @@
 //!   field-by-field into the durable codecs above — every consensus-crate
 //!   import is confined to that module tree.
 //!
-//! PR 3 adds the mTLS peer/admin transport. [`storage::MetaStorage`] still
-//! treats every durable log entry as committed during single-node recovery;
-//! under the adapter, the consensus engine decides the commit frontier.
+//! PR 3 adds the mTLS peer/admin transport. [`storage::MetaStorage`] flushes a
+//! durable `meta.applied` frontier on apply; reopen replays only through that
+//! cursor so uncommitted log tails stay out of the state machine. Disks without
+//! the file keep the legacy single-node full-log replay behaviour.
 
 pub mod command;
 pub mod keys;
