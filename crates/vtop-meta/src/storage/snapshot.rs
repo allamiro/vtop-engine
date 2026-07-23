@@ -13,13 +13,16 @@ use super::{
     MetaStoreResult,
 };
 use crate::storage::log::MetaMembership;
-use crate::wire::{put_u16, put_u32, put_u64, Reader};
+use crate::storage::membership_log_id::MembershipLogId;
+use crate::wire::{put_u16, put_u32, put_u64, put_u8, Reader};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 use vtop_log::env::Env;
 
 pub(crate) const SNAPSHOT_MAGIC: &[u8; 8] = b"VTOPMSN1";
-const SNAPSHOT_VERSION: u16 = 1;
+const SNAPSHOT_VERSION_V1: u16 = 1;
+/// Adds an optional membership LogId published atomically with the snapshot.
+const SNAPSHOT_VERSION_V2: u16 = 2;
 const CHECKSUM_LEN: usize = 32;
 const MAX_SNAPSHOT_ID_BYTES: usize = 64;
 const MAX_MEMBERSHIP_BLOCK_BYTES: usize = 64 * 1024;
@@ -34,6 +37,9 @@ pub struct SnapshotMeta {
     pub last_index: u64,
     pub last_term: u64,
     pub membership: MetaMembership,
+    /// Exact applied membership LogId (meta coordinates), when known.
+    /// Present on v2 snapshots so reopen does not need the sidecar.
+    pub membership_log_id: Option<MembershipLogId>,
     pub snapshot_id: String,
     pub path: PathBuf,
 }
@@ -60,6 +66,7 @@ pub(crate) fn encode_snapshot_file(
     membership: &MetaMembership,
     snapshot_id: &str,
     payload: &[u8],
+    membership_log_id: Option<MembershipLogId>,
 ) -> MetaStoreResult<Vec<u8>> {
     let invalid = |reason: String| MetaStoreError::InvalidConfig(reason);
     if snapshot_id.is_empty() || snapshot_id.len() > MAX_SNAPSHOT_ID_BYTES {
@@ -67,6 +74,11 @@ pub(crate) fn encode_snapshot_file(
             "snapshot id must be 1..={MAX_SNAPSHOT_ID_BYTES} bytes, got {}",
             snapshot_id.len()
         )));
+    }
+    if let Some(id) = membership_log_id {
+        if id.index == 0 {
+            return Err(invalid("membership log index must be non-zero".to_owned()));
+        }
     }
     let membership_bytes = membership
         .encode()
@@ -77,13 +89,25 @@ pub(crate) fn encode_snapshot_file(
     if payload.len() as u64 > MAX_SNAPSHOT_PAYLOAD_BYTES {
         return Err(invalid("snapshot payload exceeds its bound".to_owned()));
     }
+    // v1 when no membership LogId (legacy golden + callers); v2 embeds it so
+    // snapshot publish and membership version are one atomic artifact.
+    let version = if membership_log_id.is_some() {
+        SNAPSHOT_VERSION_V2
+    } else {
+        SNAPSHOT_VERSION_V1
+    };
     let mut out = Vec::with_capacity(128 + membership_bytes.len() + payload.len());
     out.extend_from_slice(SNAPSHOT_MAGIC);
-    put_u16(&mut out, SNAPSHOT_VERSION);
+    put_u16(&mut out, version);
     out.extend_from_slice(cluster_id.as_bytes());
     put_u16(&mut out, crate::keys::META_SHARD_ID);
     put_u64(&mut out, last_index);
     put_u64(&mut out, last_term);
+    if let Some(id) = membership_log_id {
+        put_u8(&mut out, 1);
+        put_u64(&mut out, id.term);
+        put_u64(&mut out, id.index);
+    }
     put_u32(&mut out, membership_bytes.len() as u32);
     out.extend_from_slice(&membership_bytes);
     put_u16(&mut out, snapshot_id.len() as u16);
@@ -119,7 +143,7 @@ pub(crate) fn decode_snapshot_file(
     let version = reader
         .u16("snapshot version")
         .map_err(|error| codec_corrupt(path, &error))?;
-    if version != SNAPSHOT_VERSION {
+    if version != SNAPSHOT_VERSION_V1 && version != SNAPSHOT_VERSION_V2 {
         return Err(MetaStoreError::UnsupportedVersion {
             path: path.to_path_buf(),
             version,
@@ -149,6 +173,42 @@ pub(crate) fn decode_snapshot_file(
     let last_term = reader
         .u64("snapshot last term")
         .map_err(|error| codec_corrupt(path, &error))?;
+    let membership_log_id = if version == SNAPSHOT_VERSION_V2 {
+        let present = reader
+            .u8("membership log id presence")
+            .map_err(|error| codec_corrupt(path, &error))?;
+        let term = reader
+            .u64("membership log id term")
+            .map_err(|error| codec_corrupt(path, &error))?;
+        let index = reader
+            .u64("membership log id index")
+            .map_err(|error| codec_corrupt(path, &error))?;
+        match present {
+            0 => {
+                if term != 0 || index != 0 {
+                    return Err(corrupt(path, "absent membership log id must encode zeros"));
+                }
+                None
+            }
+            1 => {
+                if index == 0 {
+                    return Err(corrupt(
+                        path,
+                        "present membership log id must have non-zero index",
+                    ));
+                }
+                Some(MembershipLogId { term, index })
+            }
+            _ => {
+                return Err(corrupt(
+                    path,
+                    format!("membership log id presence flag must be 0 or 1, got {present}"),
+                ));
+            }
+        }
+    } else {
+        None
+    };
     let membership_len = reader
         .u32("membership block length")
         .map_err(|error| codec_corrupt(path, &error))? as usize;
@@ -184,6 +244,7 @@ pub(crate) fn decode_snapshot_file(
             last_index,
             last_term,
             membership,
+            membership_log_id,
             snapshot_id,
             path: path.to_path_buf(),
         },
@@ -268,6 +329,7 @@ impl MetaSnapshots {
         membership: MetaMembership,
         snapshot_id: &str,
         payload: &[u8],
+        membership_log_id: Option<MembershipLogId>,
     ) -> MetaStoreResult<SnapshotMeta> {
         let bytes = encode_snapshot_file(
             self.cluster_id,
@@ -276,6 +338,7 @@ impl MetaSnapshots {
             &membership,
             snapshot_id,
             payload,
+            membership_log_id,
         )?;
         self.publish(last_index, last_term, membership, snapshot_id, &bytes)
     }
@@ -305,10 +368,12 @@ impl MetaSnapshots {
     ) -> MetaStoreResult<SnapshotMeta> {
         let path = self.dir.join(snapshot_file_name(last_index, last_term));
         write_atomic(&self.env, &path, bytes)?;
+        let (decoded, _) = decode_snapshot_file(&path, self.cluster_id, bytes)?;
         let meta = SnapshotMeta {
             last_index,
             last_term,
             membership,
+            membership_log_id: decoded.membership_log_id,
             snapshot_id: snapshot_id.to_owned(),
             path: path.clone(),
         };

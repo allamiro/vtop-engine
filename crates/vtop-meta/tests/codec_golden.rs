@@ -319,7 +319,7 @@ fn v1_snapshot_file_matches_golden_vector() {
         learners: vec![(MetaNodeId(4), "n4:9200".to_owned())],
     };
     let meta = snapshots
-        .write(1, 2, membership, "golden-snap", &payload)
+        .write(1, 2, membership, "golden-snap", &payload, None)
         .unwrap();
     assert_eq!(
         meta.path,
@@ -354,16 +354,17 @@ fn v1_snapshot_rejects_corruption_trailing_oversize_unknown_version_and_mismatch
     assert!(MetaSnapshots::open_in(&env, ROOT, cluster_id()).is_err());
 
     // Unknown version with a recomputed trailer is refused by version.
+    // v2 is supported (membership LogId); probe with v3.
     let (_sim, env) = sim_env();
     let mut future = golden.clone();
-    future[8..10].copy_from_slice(&2_u16.to_be_bytes());
+    future[8..10].copy_from_slice(&3_u16.to_be_bytes());
     let body_len = future.len() - 32;
     let checksum = *blake3::hash(&future[..body_len]).as_bytes();
     future[body_len..].copy_from_slice(&checksum);
     write_sim_file(&env, snapshot_name, &future);
     assert!(matches!(
         MetaSnapshots::open_in(&env, ROOT, cluster_id()),
-        Err(MetaStoreError::UnsupportedVersion { version: 2, .. })
+        Err(MetaStoreError::UnsupportedVersion { version: 3, .. })
     ));
 
     // A membership block length over its bound is rejected even with a
