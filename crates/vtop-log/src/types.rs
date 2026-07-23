@@ -33,6 +33,12 @@ pub const CHUNK_SIDECAR_MAGIC: &[u8; 8] = b"VTOPCHK1";
 pub const COMMIT_SCHEME_KEYED: &str = "blake3-keyed";
 /// Commit-statement scheme when no commit key is configured.
 pub const COMMIT_SCHEME_UNKEYED: &str = "unkeyed-digest";
+/// Per `(producer_id, producer_epoch)`, only the most recent
+/// `PRODUCER_SEQUENCE_WINDOW` accepted sequences are retriable: a retry at or
+/// above the window floor keeps its exact duplicate/conflict answer, while
+/// anything older can no longer have its idempotency verified and is rejected
+/// fail-closed with [`LogError::SequenceBelowWindow`].
+pub const PRODUCER_SEQUENCE_WINDOW: u64 = 65_536;
 /// Domain separator prefixed to canonical commit-statement bytes before
 /// hashing, so the MAC can never collide with any other keyed use of BLAKE3.
 const COMMIT_STATEMENT_DOMAIN: &[u8] = b"vtop-segment-v2 commit-statement v1\0";
@@ -65,6 +71,15 @@ pub enum LogError {
     },
     #[error("producer {producer_id} reused sequence {sequence} with different record content")]
     SequenceConflict { producer_id: Uuid, sequence: u64 },
+    #[error(
+        "producer {producer_id} epoch {producer_epoch} sequence {sequence} is below the retry window floor {window_floor}; its idempotency can no longer be verified"
+    )]
+    SequenceBelowWindow {
+        producer_id: Uuid,
+        producer_epoch: u64,
+        sequence: u64,
+        window_floor: u64,
+    },
     #[error(
         "producer {producer_id} epoch {actual_epoch} is fenced by newer epoch {latest_epoch} in this segment"
     )]

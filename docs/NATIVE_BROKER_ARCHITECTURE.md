@@ -292,8 +292,11 @@ epoch fences a restarted or superseded producer identity but is not a v1
 record-frame field: v1 derives a deterministic storage namespace from
 `(producer_id, producer_epoch)`, and the epoch (with per-record attributes)
 becomes an explicit field only in segment v2. Sequence state is scoped by
-`(producer_id, producer_epoch)` and retained long enough to make retries
-unambiguous across segment roll.
+`(producer_id, producer_epoch)` and retained within a bounded window (the
+`PRODUCER_SEQUENCE_WINDOW` most recently accepted sequences per scope), which
+keeps retries unambiguous across segment roll while bounding per-producer
+memory. A retry older than the window cannot have its idempotency verified
+and is rejected fail-closed.
 
 ### 6.2 Durable commit marker
 
