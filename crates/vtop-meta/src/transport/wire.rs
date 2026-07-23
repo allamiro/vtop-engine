@@ -490,6 +490,9 @@ impl PeerAppendResponse {
 pub struct PeerInstallRequest {
     pub vote: HardState,
     pub last_log_id: Option<WireLogId>,
+    /// Log id of the membership config itself — may differ from `last_log_id`
+    /// when normal entries follow the membership entry in the snapshot.
+    pub membership_log_id: Option<WireLogId>,
     pub last_membership: MetaMembership,
     pub snapshot_id: String,
     pub offset: u64,
@@ -509,6 +512,7 @@ impl PeerInstallRequest {
         let mut out = Vec::new();
         put_hard_state(&mut out, &self.vote);
         put_optional_log_id(&mut out, self.last_log_id);
+        put_optional_log_id(&mut out, self.membership_log_id);
         let membership = self.last_membership.encode()?;
         put_u32(&mut out, membership.len() as u32);
         out.extend_from_slice(&membership);
@@ -529,6 +533,7 @@ impl PeerInstallRequest {
         let mut reader = Reader::new(bytes);
         let vote = take_hard_state(&mut reader)?;
         let last_log_id = take_optional_log_id(&mut reader)?;
+        let membership_log_id = take_optional_log_id(&mut reader)?;
         let membership_len = reader.u32("membership len")? as usize;
         let membership_bytes = reader.take(membership_len, "membership")?;
         let last_membership = MetaMembership::decode(membership_bytes)?;
@@ -548,6 +553,7 @@ impl PeerInstallRequest {
         Ok(Self {
             vote,
             last_log_id,
+            membership_log_id,
             last_membership,
             snapshot_id,
             offset,
@@ -848,6 +854,7 @@ mod tests {
         let install = PeerInstallRequest {
             vote: sample_vote(),
             last_log_id: Some(WireLogId { term: 7, index: 9 }),
+            membership_log_id: Some(WireLogId { term: 7, index: 4 }),
             last_membership: MetaMembership {
                 voters: vec![MetaNodeId(1), MetaNodeId(2)],
                 learners: vec![],

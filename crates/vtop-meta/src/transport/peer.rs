@@ -12,6 +12,7 @@ use super::wire::{
     KIND_VOTE_REQ, KIND_VOTE_RESP,
 };
 use crate::keys::MetaNodeId;
+use crate::storage::hardstate::HardState;
 use async_trait::async_trait;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -86,17 +87,16 @@ async fn serve_connection(
         .accept(tcp)
         .await
         .map_err(|error| TransportError::Tls(format!("peer accept handshake: {error}")))?;
-    // Authenticated client cert is required by the verifier; extract id for
-    // logging / future ACL. Peer RPCs are authorized by membership, not CN
-    // alone — the raft core rejects unknown voters.
-    let _peer_id = peer_id_from_server_stream(&stream)?;
+    // Mutual TLS authenticates the chain; the CN→MetaNodeId binding must also
+    // match the Raft sender claimed in each request's HardState.voted_for.
+    let peer_id = peer_id_from_server_stream(&stream)?;
     loop {
         let frame = match read_frame(&mut stream).await {
             Ok(frame) => frame,
             Err(TransportError::Closed) => return Ok(()),
             Err(error) => return Err(error),
         };
-        let response = dispatch_peer_rpc(handler.as_ref(), frame).await?;
+        let response = dispatch_peer_rpc(handler.as_ref(), peer_id, frame).await?;
         write_frame(&mut stream, &response).await?;
     }
 }
@@ -110,13 +110,27 @@ fn peer_id_from_server_stream(stream: &ServerTlsStream<TcpStream>) -> TransportR
     super::tls::meta_node_id_from_cert(leaf)
 }
 
+fn assert_sender_identity(peer_id: MetaNodeId, vote: &HardState) -> TransportResult<()> {
+    match vote.voted_for {
+        Some(claimed) if claimed == peer_id => Ok(()),
+        Some(claimed) => Err(TransportError::Identity(format!(
+            "certificate CN maps to node {peer_id}, but request claims sender {claimed}"
+        ))),
+        None => Err(TransportError::Identity(
+            "peer request HardState is missing voted_for (sender id)".to_owned(),
+        )),
+    }
+}
+
 async fn dispatch_peer_rpc(
     handler: &dyn PeerRpcHandler,
+    peer_id: MetaNodeId,
     frame: VtpmFrame,
 ) -> TransportResult<VtpmFrame> {
     match frame.kind {
         KIND_VOTE_REQ => {
             let request = PeerVoteRequest::decode(&frame.payload)?;
+            assert_sender_identity(peer_id, &request.vote)?;
             let response = handler.handle_vote(request).await?;
             Ok(VtpmFrame {
                 kind: KIND_VOTE_RESP,
@@ -125,6 +139,7 @@ async fn dispatch_peer_rpc(
         }
         KIND_APPEND_REQ => {
             let request = PeerAppendRequest::decode(&frame.payload)?;
+            assert_sender_identity(peer_id, &request.vote)?;
             let response = handler.handle_append(request).await?;
             Ok(VtpmFrame {
                 kind: KIND_APPEND_RESP,
@@ -133,6 +148,7 @@ async fn dispatch_peer_rpc(
         }
         KIND_INSTALL_REQ => {
             let request = PeerInstallRequest::decode(&frame.payload)?;
+            assert_sender_identity(peer_id, &request.vote)?;
             let response = handler.handle_install(request).await?;
             Ok(VtpmFrame {
                 kind: KIND_INSTALL_RESP,
@@ -391,6 +407,60 @@ mod tests {
         let (_, conn) = stream.get_ref();
         let err = assert_peer_identity(conn.peer_certificates(), MetaNodeId(9)).unwrap_err();
         assert!(matches!(err, TransportError::Identity(_)));
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn mtls_rejects_vote_sender_spoof() {
+        // Client cert CN=2, but the Vote claims sender 99.
+        let (server_leaf, server_key) = mint_leaf("1");
+        let (client_leaf, client_key) = mint_leaf("2");
+
+        let mut server_roots = RootCertStore::empty();
+        server_roots.add(client_leaf.clone()).unwrap();
+        let server_material = TlsMaterial {
+            certificate_chain: vec![server_leaf.clone()],
+            private_key: server_key.into(),
+            trust_roots: server_roots,
+        };
+
+        let mut client_roots = RootCertStore::empty();
+        client_roots.add(server_leaf).unwrap();
+        let client_material = TlsMaterial {
+            certificate_chain: vec![client_leaf],
+            private_key: client_key.into(),
+            trust_roots: client_roots,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server =
+            PeerServer::new(server_material, MetaNodeId(1), Arc::new(EchoHandler)).unwrap();
+        let server_task = tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let client = PeerClient::new(client_material, "localhost", MetaNodeId(1)).unwrap();
+        let err = client
+            .vote(
+                addr,
+                &PeerVoteRequest {
+                    vote: HardState {
+                        term: 3,
+                        voted_for: Some(MetaNodeId(99)),
+                        vote_committed: false,
+                    },
+                    last_log_id: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        // Server closes after identity reject; client sees closed/io/protocol.
+        assert!(matches!(
+            err,
+            TransportError::Closed | TransportError::Io(_) | TransportError::Protocol(_)
+        ));
         server_task.abort();
     }
 }

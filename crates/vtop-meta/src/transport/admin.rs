@@ -14,7 +14,7 @@ use super::wire::{
 use crate::command::MetadataCommand;
 use crate::keys::MetaNodeId;
 use async_trait::async_trait;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -84,10 +84,20 @@ async fn serve_admin_connection(
 fn truncate_error(message: &str) -> String {
     let max = crate::command::MAX_ERROR_DETAIL_BYTES;
     if message.len() <= max {
-        message.to_owned()
-    } else {
-        message.chars().take(max).collect()
+        return message.to_owned();
     }
+    let mut end = max;
+    while end > 0 && !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    message[..end].to_owned()
+}
+
+/// Resolve `host:port` (DNS name or literal) to a socket address.
+pub fn resolve_endpoint(endpoint: &str) -> TransportResult<SocketAddr> {
+    endpoint.to_socket_addrs()?.next().ok_or_else(|| {
+        TransportError::Protocol(format!("endpoint {endpoint:?} resolved to no addresses"))
+    })
 }
 
 async fn dispatch_admin(
@@ -194,5 +204,26 @@ pub fn stub_status(node_id: MetaNodeId) -> AdminStatusResponse {
         server_state: "Learner".to_owned(),
         last_applied: None,
         membership: MetaMembership::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_endpoint, truncate_error};
+    use crate::command::MAX_ERROR_DETAIL_BYTES;
+
+    #[test]
+    fn truncate_error_respects_utf8_byte_bound() {
+        // 'é' is two UTF-8 bytes; taking `max` chars would exceed the byte bound.
+        let message = "é".repeat(MAX_ERROR_DETAIL_BYTES);
+        let truncated = truncate_error(&message);
+        assert!(truncated.len() <= MAX_ERROR_DETAIL_BYTES);
+        assert!(truncated.is_char_boundary(truncated.len()));
+    }
+
+    #[test]
+    fn resolve_endpoint_accepts_localhost_name() {
+        let addr = resolve_endpoint("localhost:0").expect("localhost resolves");
+        assert_eq!(addr.port(), 0);
     }
 }

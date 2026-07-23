@@ -7,13 +7,12 @@
 use clap::{Args, Subcommand};
 use serde::Deserialize;
 use std::fs;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 use vtop_meta::command::{CommandEnvelope, NodeState, MAX_NODE_ADDR_BYTES};
 use vtop_meta::{
-    AdminClient, AdminStatusResponse, MetaNodeId, MetadataCommand, MetadataResponse, TlsMaterial,
-    WireLogId,
+    resolve_endpoint, AdminClient, AdminStatusResponse, MetaNodeId, MetadataCommand,
+    MetadataResponse, TlsMaterial, WireLogId,
 };
 
 #[derive(Subcommand, Debug)]
@@ -101,10 +100,7 @@ fn load_admin_config(path: &Path) -> Result<MetaAdminConfig, String> {
 }
 
 fn connect(config: &MetaAdminConfig) -> Result<AdminClient, String> {
-    let endpoint: SocketAddr = config
-        .endpoint
-        .parse()
-        .map_err(|error| format!("endpoint {}: {error}", config.endpoint))?;
+    let endpoint = resolve_endpoint(&config.endpoint).map_err(|error| error.to_string())?;
     let material =
         TlsMaterial::from_pem_files(&config.client_cert, &config.client_key, &config.ca_cert)
             .map_err(|error| error.to_string())?;
@@ -246,6 +242,9 @@ async fn propose_and_print(
             response.log_id.term, response.log_id.index
         );
         print_response(&response.response);
+    }
+    if matches!(response.response, MetadataResponse::Rejected(_)) {
+        return Err("metadata command was rejected".to_owned());
     }
     Ok(())
 }

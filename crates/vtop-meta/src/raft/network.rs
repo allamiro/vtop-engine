@@ -159,12 +159,11 @@ impl RaftNetwork<MetaRaftTypeConfig> for TlsRaftNetwork {
     async fn append_entries(
         &mut self,
         rpc: AppendEntriesRequest<MetaRaftTypeConfig>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, EmptyNode, RaftError<NodeId>>> {
         let (client, addr) = self.client()?;
         let request = append_to_wire(&rpc).map_err(|e| self.unreachable(e))?;
-        let response = client
-            .append(addr, &request)
+        let response = with_rpc_deadline(option.hard_ttl(), client.append(addr, &request))
             .await
             .map_err(|e| self.unreachable(e))?;
         append_from_wire(response).map_err(|e| self.unreachable(e))
@@ -173,12 +172,11 @@ impl RaftNetwork<MetaRaftTypeConfig> for TlsRaftNetwork {
     async fn vote(
         &mut self,
         rpc: VoteRequest<NodeId>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, EmptyNode, RaftError<NodeId>>> {
         let (client, addr) = self.client()?;
         let request = vote_req_to_wire(&rpc).map_err(|e| self.unreachable(e))?;
-        let response = client
-            .vote(addr, &request)
+        let response = with_rpc_deadline(option.hard_ttl(), client.vote(addr, &request))
             .await
             .map_err(|e| self.unreachable(e))?;
         vote_resp_from_wire(response).map_err(|e| self.unreachable(e))
@@ -187,23 +185,43 @@ impl RaftNetwork<MetaRaftTypeConfig> for TlsRaftNetwork {
     async fn install_snapshot(
         &mut self,
         rpc: InstallSnapshotRequest<MetaRaftTypeConfig>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<
         InstallSnapshotResponse<NodeId>,
         RPCError<NodeId, EmptyNode, RaftError<NodeId, openraft::error::InstallSnapshotError>>,
     > {
         let (client, addr) = self.client().map_err(|e| match e {
             RPCError::Unreachable(u) => RPCError::Unreachable(u),
-            other => RPCError::Unreachable(Unreachable::new(&io::Error::other(format!("{other}")))),
+            other => install_unreachable(other),
         })?;
-        let request = install_to_wire(&rpc).map_err(|e| {
-            RPCError::Unreachable(Unreachable::new(&io::Error::other(e.to_string())))
-        })?;
-        let response = client.install(addr, &request).await.map_err(|e| {
-            RPCError::Unreachable(Unreachable::new(&io::Error::other(e.to_string())))
-        })?;
-        install_from_wire(response)
-            .map_err(|e| RPCError::Unreachable(Unreachable::new(&io::Error::other(e.to_string()))))
+        let request = install_to_wire(&rpc).map_err(install_unreachable)?;
+        let response = with_rpc_deadline(option.hard_ttl(), client.install(addr, &request))
+            .await
+            .map_err(install_unreachable)?;
+        install_from_wire(response).map_err(install_unreachable)
+    }
+}
+
+fn install_unreachable(
+    error: impl std::fmt::Display,
+) -> RPCError<NodeId, EmptyNode, RaftError<NodeId, openraft::error::InstallSnapshotError>> {
+    RPCError::Unreachable(Unreachable::new(&io::Error::other(error.to_string())))
+}
+
+async fn with_rpc_deadline<T, E, F>(
+    deadline: std::time::Duration,
+    fut: F,
+) -> Result<T, TransportError>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+    E: Into<TransportError>,
+{
+    match tokio::time::timeout(deadline, fut).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(error.into()),
+        Err(_) => Err(TransportError::Protocol(format!(
+            "peer RPC exceeded hard deadline ({deadline:?})"
+        ))),
     }
 }
 
@@ -386,6 +404,7 @@ fn install_to_wire(
     Ok(PeerInstallRequest {
         vote: vote_to_wire(&rpc.vote),
         last_log_id: wire_log_id(rpc.meta.last_log_id),
+        membership_log_id: wire_log_id(*rpc.meta.last_membership.log_id()),
         last_membership,
         snapshot_id: rpc.meta.snapshot_id.clone(),
         offset: rpc.offset,
@@ -400,12 +419,12 @@ fn install_from_peer(
     let membership = meta_to_membership(&request.last_membership)
         .map_err(|e| TransportError::Protocol(e.to_string()))?;
     let last_log_id = raft_log_id(request.last_log_id)?;
-    let log_id_for_membership = last_log_id;
+    let membership_log_id = raft_log_id(request.membership_log_id)?;
     Ok(InstallSnapshotRequest {
         vote: vote_from_wire(request.vote)?,
         meta: SnapshotMeta {
             last_log_id,
-            last_membership: StoredMembership::new(log_id_for_membership, membership),
+            last_membership: StoredMembership::new(membership_log_id, membership),
             snapshot_id: request.snapshot_id,
         },
         offset: request.offset,
