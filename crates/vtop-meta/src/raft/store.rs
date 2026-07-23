@@ -177,26 +177,26 @@ pub(crate) fn applied_raft_log_id(storage: &MetaStorage) -> Option<LogId<NodeId>
         return None;
     }
     let raft_index = to_raft_index(meta_index)?;
-    let term = if let Ok(entries) = storage.log().read_range(meta_index, meta_index + 1) {
-        if let Some(entry) = entries.into_iter().next() {
-            entry.term
-        } else if let Some(snap) = storage.snapshots().newest() {
+    let term = match storage.log().read_range(meta_index, meta_index + 1) {
+        Ok(entries) => match entries.into_iter().next() {
+            Some(entry) => entry.term,
+            None => {
+                let snap = storage.snapshots().newest()?;
+                if snap.last_index == meta_index {
+                    snap.last_term
+                } else {
+                    return None;
+                }
+            }
+        },
+        Err(_) => {
+            let snap = storage.snapshots().newest()?;
             if snap.last_index == meta_index {
                 snap.last_term
             } else {
                 return None;
             }
-        } else {
-            return None;
         }
-    } else if let Some(snap) = storage.snapshots().newest() {
-        if snap.last_index == meta_index {
-            snap.last_term
-        } else {
-            return None;
-        }
-    } else {
-        return None;
     };
     Some(raft_log_id(term, raft_index))
 }
