@@ -3655,6 +3655,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "vtop-meta"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
+ "vtop-log",
+]
+
+[[package]]
 name = "vtop-protocol"
 version = "0.1.0"
 dependencies = [

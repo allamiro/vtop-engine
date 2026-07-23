@@ -1,0 +1,22 @@
+[package]
+name = "vtop-meta"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Deterministic metadata state machine and durable raft-shaped store for the native VTOP control plane."
+
+[dependencies]
+# tokio and async-trait are part of this crate's declared contract for the
+# stage-5 slice: PR 2 wires openraft's async storage traits over exactly the
+# types defined here, so the dependency floor is fixed now to keep that PR a
+# pure addition.
+tokio = { workspace = true }
+async-trait = { workspace = true }
+blake3 = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+vtop-log = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

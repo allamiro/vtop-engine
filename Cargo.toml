@@ -5,6 +5,7 @@ members = [
   "crates/vtop-log",
   "crates/vtop-protocol",
   "crates/vtop-broker",
+  "crates/vtop-meta",
   "crates/vtop-adapters",
   "crates/vtop-upload",
   "crates/vtop-state",
@@ -82,6 +83,7 @@ vtop-core = { path = "crates/vtop-core", version = "0.1.0" }
 vtop-log = { path = "crates/vtop-log", version = "0.1.0" }
 vtop-protocol = { path = "crates/vtop-protocol", version = "0.1.0" }
 vtop-broker = { path = "crates/vtop-broker", version = "0.1.0" }
+vtop-meta = { path = "crates/vtop-meta", version = "0.1.0" }
 vtop-adapters = { path = "crates/vtop-adapters", version = "0.1.0", default-features = false }
 vtop-upload = { path = "crates/vtop-upload", version = "0.1.0" }
 vtop-state = { path = "crates/vtop-state", version = "0.1.0" }
