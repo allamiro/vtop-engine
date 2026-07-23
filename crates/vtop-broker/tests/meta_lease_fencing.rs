@@ -297,8 +297,9 @@ fn release_before_grant_still_deactivates() {
     // View still at epoch 1; release(2) arrives before set(2).
     let view = MetaFencingEpoch::new(1);
     view.clear_lease(2);
-    assert!(view.lease_active()); // epoch-1 holder unaffected
-    assert_eq!(view.get(), 1);
+    // Observing release(2) proves grant 2 committed, so epoch 1 is fenced now.
+    assert!(!view.lease_active());
+    assert_eq!(view.get(), 2);
     view.set(2);
     assert_eq!(view.get(), 2);
     assert!(

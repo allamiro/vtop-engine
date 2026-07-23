@@ -329,11 +329,14 @@ impl MetaFencingEpoch {
 
     /// Publish a metadata release for `expected_epoch`.
     ///
-    /// The fencing epoch is retained, but no leaseholder remains authorized.
-    /// Releases always advance `released_through`, so a release that arrives
-    /// before its grant still deactivates that epoch when the grant shows up.
-    /// A release for an older epoch than the current view does not deactivate
-    /// a newer live lease.
+    /// The fencing epoch is retained when releasing the current epoch, but no
+    /// leaseholder remains authorized. Releases always advance
+    /// `released_through`, so a release that arrives before its grant still
+    /// deactivates that epoch when the grant shows up. A release newer than
+    /// the current view also advances/deactivates immediately: observing
+    /// `clear_lease(n)` proves grant `n` already committed and fenced every
+    /// older holder. A release for an older epoch than the current view does
+    /// not deactivate a newer live lease.
     pub fn clear_lease(&self, expected_epoch: u64) {
         let mut state = self
             .state
@@ -343,6 +346,9 @@ impl MetaFencingEpoch {
             state.released_through = expected_epoch;
         }
         if state.fencing_epoch == expected_epoch {
+            state.lease_active = false;
+        } else if expected_epoch > state.fencing_epoch {
+            state.fencing_epoch = expected_epoch;
             state.lease_active = false;
         }
     }
