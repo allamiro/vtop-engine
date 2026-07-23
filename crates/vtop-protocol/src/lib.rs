@@ -9,7 +9,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-/// Quorum durability and peer replication kinds (60–62) are additive under 1.0.
+/// Quorum durability and peer replication kinds (60–62) plus consumer cursor
+/// kinds (70–73) are additive under 1.0.
 /// Keeping the minor at 0 preserves decode compatibility for existing 1.0
 /// clients: replies continue to advertise the same minor they already accept.
 pub const PROTOCOL_MINOR: u16 = 0;
@@ -136,6 +137,10 @@ pub enum ErrorCode {
     Overloaded = 8,
     Storage = 9,
     ProtocolViolation = 10,
+    /// Cursor/checkpoint CAS lost to a newer durable generation.
+    CheckpointConflict = 11,
+    /// Topic epoch, range generation, or segment lineage did not match.
+    WrongLineage = 12,
 }
 
 impl ErrorCode {
@@ -151,6 +156,8 @@ impl ErrorCode {
             8 => Ok(Self::Overloaded),
             9 => Ok(Self::Storage),
             10 => Ok(Self::ProtocolViolation),
+            11 => Ok(Self::CheckpointConflict),
+            12 => Ok(Self::WrongLineage),
             _ => Err(ProtocolError::InvalidFrame(format!(
                 "unknown error code {value}"
             ))),
@@ -290,6 +297,52 @@ pub struct CommittedHwmUpdate {
     pub committed_high_watermark: u64,
 }
 
+/// Lineage-aware durable consumer progress. Bound to topic epoch, range
+/// generation, segment identity/root, and record position — never a bare
+/// integer offset.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LineageCursor {
+    pub group_id: Uuid,
+    pub topic_id: Uuid,
+    pub topic_epoch: u64,
+    pub range_id: Uuid,
+    pub range_generation: u64,
+    pub segment_id: Uuid,
+    pub segment_generation: u64,
+    pub segment_root: [u8; 32],
+    pub record_offset: u64,
+    pub record_index: u64,
+    pub lineage_transition_id: Option<Uuid>,
+    pub checkpoint_generation: u64,
+}
+
+/// Consumer → broker request to durably CAS-commit a lineage-aware cursor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitCursorRequest {
+    pub member_id: Uuid,
+    pub cursor: LineageCursor,
+    /// `None` creates the first checkpoint; `Some(g)` is a CAS against `g`.
+    pub expected_checkpoint_generation: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitCursorResponse {
+    pub checkpoint_generation: u64,
+}
+
+/// Consumer → broker request to read the durable checkpoint for a group range.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FetchCursorRequest {
+    pub group_id: Uuid,
+    pub topic_id: Uuid,
+    pub range_id: Uuid,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FetchCursorResponse {
+    pub cursor: Option<LineageCursor>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Message {
     ClientHello(ClientHello),
@@ -305,6 +358,10 @@ pub enum Message {
     ReplicaAppendRequest(ReplicaAppendRequest),
     ReplicaAppendResponse(ReplicaAppendResponse),
     CommittedHwmUpdate(CommittedHwmUpdate),
+    CommitCursorRequest(CommitCursorRequest),
+    CommitCursorResponse(CommitCursorResponse),
+    FetchCursorRequest(FetchCursorRequest),
+    FetchCursorResponse(FetchCursorResponse),
 }
 
 impl Message {
@@ -323,6 +380,10 @@ impl Message {
             Self::ReplicaAppendRequest(_) => 60,
             Self::ReplicaAppendResponse(_) => 61,
             Self::CommittedHwmUpdate(_) => 62,
+            Self::CommitCursorRequest(_) => 70,
+            Self::CommitCursorResponse(_) => 71,
+            Self::FetchCursorRequest(_) => 72,
+            Self::FetchCursorResponse(_) => 73,
         }
     }
 }
@@ -478,6 +539,17 @@ fn encoded_payload_size(message: &Message, limits: ProtocolLimits) -> Result<usi
             }
             Message::ReplicaAppendResponse(_) => 8,
             Message::CommittedHwmUpdate(value) => range_size(&value.range)? + 8 + 8,
+            Message::CommitCursorRequest(value) => {
+                lineage_cursor_size(&value.cursor)?
+                    + 16
+                    + optional_u64_size(value.expected_checkpoint_generation)
+            }
+            Message::CommitCursorResponse(_) => 8,
+            Message::FetchCursorRequest(_) => 16 + 16 + 16,
+            Message::FetchCursorResponse(value) => match &value.cursor {
+                None => 1,
+                Some(cursor) => 1 + lineage_cursor_size(cursor)?,
+            },
         };
     if total > limits.max_payload_bytes() {
         return Err(ProtocolError::Limit(format!(
@@ -580,7 +652,7 @@ fn decode_header(header: &[u8], limits: ProtocolLimits) -> Result<Header, Protoc
     let kind = u16::from_be_bytes(header[8..10].try_into().expect("fixed slice"));
     if !matches!(
         kind,
-        1 | 2 | 10 | 11 | 20 | 21 | 30 | 40 | 50 | 51 | 60 | 61 | 62
+        1 | 2 | 10 | 11 | 20 | 21 | 30 | 40 | 50 | 51 | 60 | 61 | 62 | 70 | 71 | 72 | 73
     ) {
         return Err(ProtocolError::UnknownKind(kind));
     }
@@ -715,6 +787,26 @@ fn encode_message(message: &Message, out: &mut Vec<u8>) -> Result<(), ProtocolEr
             put_u64(out, value.fencing_epoch);
             put_u64(out, value.committed_high_watermark);
         }
+        Message::CommitCursorRequest(value) => {
+            put_uuid(out, value.member_id);
+            put_lineage_cursor(out, &value.cursor);
+            put_optional_u64(out, value.expected_checkpoint_generation);
+        }
+        Message::CommitCursorResponse(value) => {
+            put_u64(out, value.checkpoint_generation);
+        }
+        Message::FetchCursorRequest(value) => {
+            put_uuid(out, value.group_id);
+            put_uuid(out, value.topic_id);
+            put_uuid(out, value.range_id);
+        }
+        Message::FetchCursorResponse(value) => match &value.cursor {
+            None => put_u8(out, 0),
+            Some(cursor) => {
+                put_u8(out, 1);
+                put_lineage_cursor(out, cursor);
+            }
+        },
     }
     Ok(())
 }
@@ -886,12 +978,114 @@ fn decode_message(
             fencing_epoch: decoder.u64()?,
             committed_high_watermark: decoder.u64()?,
         }),
+        70 => Message::CommitCursorRequest(CommitCursorRequest {
+            member_id: decoder.uuid()?,
+            cursor: decode_lineage_cursor(decoder)?,
+            expected_checkpoint_generation: decode_optional_u64(decoder)?,
+        }),
+        71 => Message::CommitCursorResponse(CommitCursorResponse {
+            checkpoint_generation: decoder.u64()?,
+        }),
+        72 => Message::FetchCursorRequest(FetchCursorRequest {
+            group_id: decoder.uuid()?,
+            topic_id: decoder.uuid()?,
+            range_id: decoder.uuid()?,
+        }),
+        73 => {
+            let cursor = if decoder.boolean()? {
+                Some(decode_lineage_cursor(decoder)?)
+            } else {
+                None
+            };
+            Message::FetchCursorResponse(FetchCursorResponse { cursor })
+        }
         other => return Err(ProtocolError::UnknownKind(other)),
     })
 }
 
 fn checked_count(count: usize) -> Result<u32, ProtocolError> {
     u32::try_from(count).map_err(|_| ProtocolError::Limit("record count exceeds u32".to_owned()))
+}
+
+fn optional_u64_size(value: Option<u64>) -> usize {
+    match value {
+        None => 1,
+        Some(_) => 1 + 8,
+    }
+}
+
+fn lineage_cursor_size(cursor: &LineageCursor) -> Result<usize, ProtocolError> {
+    let mut size: usize = 16 + 16 + 8 + 16 + 8 + 16 + 8 + 32 + 8 + 8;
+    size = size
+        .checked_add(match cursor.lineage_transition_id {
+            None => 1,
+            Some(_) => 1 + 16,
+        })
+        .ok_or_else(|| ProtocolError::Limit("lineage cursor overflow".to_owned()))?;
+    size = size
+        .checked_add(8)
+        .ok_or_else(|| ProtocolError::Limit("lineage cursor overflow".to_owned()))?;
+    Ok(size)
+}
+
+fn put_lineage_cursor(out: &mut Vec<u8>, cursor: &LineageCursor) {
+    put_uuid(out, cursor.group_id);
+    put_uuid(out, cursor.topic_id);
+    put_u64(out, cursor.topic_epoch);
+    put_uuid(out, cursor.range_id);
+    put_u64(out, cursor.range_generation);
+    put_uuid(out, cursor.segment_id);
+    put_u64(out, cursor.segment_generation);
+    out.extend_from_slice(&cursor.segment_root);
+    put_u64(out, cursor.record_offset);
+    put_u64(out, cursor.record_index);
+    match cursor.lineage_transition_id {
+        None => put_u8(out, 0),
+        Some(id) => {
+            put_u8(out, 1);
+            put_uuid(out, id);
+        }
+    }
+    put_u64(out, cursor.checkpoint_generation);
+}
+
+fn decode_lineage_cursor(decoder: &mut Decoder<'_>) -> Result<LineageCursor, ProtocolError> {
+    Ok(LineageCursor {
+        group_id: decoder.uuid()?,
+        topic_id: decoder.uuid()?,
+        topic_epoch: decoder.u64()?,
+        range_id: decoder.uuid()?,
+        range_generation: decoder.u64()?,
+        segment_id: decoder.uuid()?,
+        segment_generation: decoder.u64()?,
+        segment_root: decoder.array()?,
+        record_offset: decoder.u64()?,
+        record_index: decoder.u64()?,
+        lineage_transition_id: if decoder.boolean()? {
+            Some(decoder.uuid()?)
+        } else {
+            None
+        },
+        checkpoint_generation: decoder.u64()?,
+    })
+}
+
+fn put_optional_u64(out: &mut Vec<u8>, value: Option<u64>) {
+    match value {
+        None => put_u8(out, 0),
+        Some(value) => {
+            put_u8(out, 1);
+            put_u64(out, value);
+        }
+    }
+}
+
+fn decode_optional_u64(decoder: &mut Decoder<'_>) -> Result<Option<u64>, ProtocolError> {
+    if decoder.boolean()? {
+        Ok(Some(decoder.u64()?))
+    } else {
+        Ok(None)
+    }
 }
 
 fn put_range(out: &mut Vec<u8>, range: &RangeIdentity) -> Result<(), ProtocolError> {
@@ -1201,6 +1395,49 @@ mod tests {
                 fencing_epoch: 11,
                 committed_high_watermark: 11,
             }),
+            Message::CommitCursorRequest(CommitCursorRequest {
+                member_id: Uuid::from_u128(51),
+                cursor: LineageCursor {
+                    group_id: Uuid::from_u128(50),
+                    topic_id: Uuid::from_u128(20),
+                    topic_epoch: 1,
+                    range_id: Uuid::from_u128(21),
+                    range_generation: 0,
+                    segment_id: Uuid::from_u128(30),
+                    segment_generation: 0,
+                    segment_root: [3; 32],
+                    record_offset: 42,
+                    record_index: 7,
+                    lineage_transition_id: Some(Uuid::from_u128(60)),
+                    checkpoint_generation: 0,
+                },
+                expected_checkpoint_generation: None,
+            }),
+            Message::CommitCursorResponse(CommitCursorResponse {
+                checkpoint_generation: 0,
+            }),
+            Message::FetchCursorRequest(FetchCursorRequest {
+                group_id: Uuid::from_u128(50),
+                topic_id: Uuid::from_u128(20),
+                range_id: Uuid::from_u128(21),
+            }),
+            Message::FetchCursorResponse(FetchCursorResponse {
+                cursor: Some(LineageCursor {
+                    group_id: Uuid::from_u128(50),
+                    topic_id: Uuid::from_u128(20),
+                    topic_epoch: 1,
+                    range_id: Uuid::from_u128(21),
+                    range_generation: 0,
+                    segment_id: Uuid::from_u128(30),
+                    segment_generation: 0,
+                    segment_root: [3; 32],
+                    record_offset: 42,
+                    record_index: 7,
+                    lineage_transition_id: None,
+                    checkpoint_generation: 1,
+                }),
+            }),
+            Message::FetchCursorResponse(FetchCursorResponse { cursor: None }),
         ];
         for (request_id, message) in messages.into_iter().enumerate() {
             let frame = WireFrame {

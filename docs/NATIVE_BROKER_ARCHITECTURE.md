@@ -132,7 +132,8 @@ trusted producer cannot advance another producer's durable fencing epoch.
 
 This remains a single-node library slice by default. It does not provide an
 operator daemon/config surface, replicated metadata ownership of replica sets,
-peer TCP replication transport, consumer groups, or repair/retirement. Its
+peer TCP replication transport, consumer groups beyond the stage-7 checkpoint
+slice, or repair/retirement. Its
 configured range fencing epoch rejects mismatched requests; when wired to a
 metadata lease view (`MetaFencingEpoch`), grants and releases fence stale
 leaseholders. An optional in-process `ReplicaSet` enables `Durability::Quorum`:

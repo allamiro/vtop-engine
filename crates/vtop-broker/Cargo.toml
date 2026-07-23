@@ -14,9 +14,9 @@ tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 uuid = { workspace = true }
 vtop-log = { workspace = true }
+vtop-meta = { workspace = true }
 vtop-protocol = { workspace = true }
 
 [dev-dependencies]
 rcgen = "0.14"
 tempfile = { workspace = true }
-vtop-meta = { workspace = true }

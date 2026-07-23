@@ -36,18 +36,22 @@ pub mod transport;
 mod wire;
 
 pub use command::{
-    CommandEnvelope, MetadataCommand, MetadataError, MetadataResponse, NodeState,
-    MAX_ERROR_DETAIL_BYTES, MAX_NODE_ADDR_BYTES,
+    CommandEnvelope, MetadataCommand, MetadataError, MetadataResponse, NodeState, RangeAssignment,
+    MAX_ASSIGNED_RANGES, MAX_ERROR_DETAIL_BYTES, MAX_NODE_ADDR_BYTES,
 };
-pub use keys::{validate_topic_name, MetaKey, MetaNodeId, MAX_TOPIC_NAME_BYTES, META_SHARD_ID};
+pub use keys::{
+    validate_group_name, validate_topic_name, MetaKey, MetaNodeId, MAX_GROUP_NAME_BYTES,
+    MAX_TOPIC_NAME_BYTES, META_SHARD_ID,
+};
 pub use raft::{
     CommitReceipt, Consensus, ConsensusError, ConsensusResult, MetaRaftLogStore,
     MetaRaftStateMachine, MetaRaftStore, MetaRaftTypeConfig, OpenraftConsensus, PeerDirectory,
     PeerEndpoint, RaftPeerHandler, ReadFence, TlsRaftNetworkFactory,
 };
 pub use state::{
-    KeyRecord, KeyState, LeaseRecord, MetaStateMachine, MetaValue, NodeRecord, RangeRecord,
-    SegmentRecord, SegmentState, TopicNameRecord, TopicRecord, DEDUP_CAPACITY,
+    ConsumerGroupRecord, CursorCheckpointRecord, GroupMemberRecord, GroupNameRecord, KeyRecord,
+    KeyState, LeaseRecord, MetaStateMachine, MetaValue, NodeRecord, RangeRecord, SegmentRecord,
+    SegmentState, TopicNameRecord, TopicRecord, DEDUP_CAPACITY,
 };
 pub use storage::hardstate::{HardState, HardStateFile};
 pub use storage::log::{

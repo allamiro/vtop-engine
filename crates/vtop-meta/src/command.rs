@@ -11,7 +11,7 @@
 //! `issued_at_ms` is advisory — recorded for operators, never read by
 //! `apply`.
 
-use crate::keys::MAX_TOPIC_NAME_BYTES;
+use crate::keys::{MAX_GROUP_NAME_BYTES, MAX_TOPIC_NAME_BYTES};
 use crate::wire::{
     put_bounded_str, put_bytes32, put_i64, put_u16, put_u64, put_u8, put_uuid, CodecError, Reader,
 };
@@ -25,6 +25,11 @@ pub const MAX_NODE_ADDR_BYTES: usize = 256;
 /// Bound for the human-readable detail carried by deterministic rejections.
 pub const MAX_ERROR_DETAIL_BYTES: usize = 256;
 
+/// Upper bound on ranges assigned to one consumer-group member in a single
+/// durable assignment command. Keeps member records inside the snapshot value
+/// bound without inviting rebalance storms in this slice.
+pub const MAX_ASSIGNED_RANGES: usize = 16;
+
 const COMMAND_KIND_REGISTER_NODE: u16 = 1;
 const COMMAND_KIND_SET_NODE_STATE: u16 = 2;
 const COMMAND_KIND_CREATE_TOPIC: u16 = 3;
@@ -33,11 +38,19 @@ const COMMAND_KIND_RELEASE_RANGE_LEASE: u16 = 5;
 const COMMAND_KIND_REGISTER_SEALED_SEGMENT: u16 = 6;
 const COMMAND_KIND_MARK_SEGMENT_VERIFIED: u16 = 7;
 const COMMAND_KIND_PUT_KEY_RECORD: u16 = 8;
+const COMMAND_KIND_CREATE_CONSUMER_GROUP: u16 = 9;
+const COMMAND_KIND_JOIN_CONSUMER_GROUP: u16 = 10;
+const COMMAND_KIND_LEAVE_CONSUMER_GROUP: u16 = 11;
+const COMMAND_KIND_ASSIGN_MEMBER_RANGES: u16 = 12;
+const COMMAND_KIND_COMMIT_GROUP_CURSOR: u16 = 13;
 
 const RESPONSE_KIND_ACK: u16 = 1;
 const RESPONSE_KIND_TOPIC_CREATED: u16 = 2;
 const RESPONSE_KIND_LEASE_GRANTED: u16 = 3;
 const RESPONSE_KIND_REJECTED: u16 = 4;
+const RESPONSE_KIND_GROUP_CREATED: u16 = 5;
+const RESPONSE_KIND_MEMBER_JOINED: u16 = 6;
+const RESPONSE_KIND_CURSOR_COMMITTED: u16 = 7;
 
 const ERROR_KIND_GENERATION_MISMATCH: u16 = 1;
 const ERROR_KIND_EPOCH_MISMATCH: u16 = 2;
@@ -99,7 +112,15 @@ impl std::fmt::Display for NodeState {
     }
 }
 
-/// The full deterministic command set of stage-5 PR 1.
+/// A topic/range pair assigned to a consumer-group member.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RangeAssignment {
+    pub topic_uuid: Uuid,
+    pub range_uuid: Uuid,
+}
+
+/// The full deterministic command set of stage-5 PR 1 plus stage-7 group and
+/// lineage-aware cursor commands.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MetadataCommand {
     RegisterNode {
@@ -161,6 +182,49 @@ pub enum MetadataCommand {
         scheme: u16,
         public_material_digest: [u8; 32],
     },
+    CreateConsumerGroup {
+        env: CommandEnvelope,
+        name: String,
+        group_uuid: Uuid,
+    },
+    JoinConsumerGroup {
+        env: CommandEnvelope,
+        group_uuid: Uuid,
+        member_uuid: Uuid,
+        expected_group_generation: u64,
+    },
+    LeaveConsumerGroup {
+        env: CommandEnvelope,
+        group_uuid: Uuid,
+        member_uuid: Uuid,
+        expected_member_generation: u64,
+    },
+    AssignMemberRanges {
+        env: CommandEnvelope,
+        group_uuid: Uuid,
+        member_uuid: Uuid,
+        ranges: Vec<RangeAssignment>,
+        expected_member_generation: u64,
+    },
+    /// Durably commit a lineage-aware cursor. `expected_checkpoint_generation`
+    /// is `None` for the first commit (cursor must be absent) and `Some(g)` for
+    /// a CAS advance against an existing checkpoint.
+    CommitGroupCursor {
+        env: CommandEnvelope,
+        group_uuid: Uuid,
+        member_uuid: Uuid,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        topic_epoch: u64,
+        range_generation: u64,
+        segment_uuid: Uuid,
+        segment_generation: u64,
+        segment_root: [u8; 32],
+        record_offset: u64,
+        record_index: u64,
+        lineage_transition_id: Option<Uuid>,
+        expected_checkpoint_generation: Option<u64>,
+    },
 }
 
 impl MetadataCommand {
@@ -173,7 +237,12 @@ impl MetadataCommand {
             | MetadataCommand::ReleaseRangeLease { env, .. }
             | MetadataCommand::RegisterSealedSegment { env, .. }
             | MetadataCommand::MarkSegmentVerified { env, .. }
-            | MetadataCommand::PutKeyRecord { env, .. } => env,
+            | MetadataCommand::PutKeyRecord { env, .. }
+            | MetadataCommand::CreateConsumerGroup { env, .. }
+            | MetadataCommand::JoinConsumerGroup { env, .. }
+            | MetadataCommand::LeaveConsumerGroup { env, .. }
+            | MetadataCommand::AssignMemberRanges { env, .. }
+            | MetadataCommand::CommitGroupCursor { env, .. } => env,
         }
     }
 
@@ -294,6 +363,86 @@ impl MetadataCommand {
                 put_u16(&mut out, *scheme);
                 put_bytes32(&mut out, public_material_digest);
             }
+            MetadataCommand::CreateConsumerGroup {
+                env,
+                name,
+                group_uuid,
+            } => {
+                put_u16(&mut out, COMMAND_KIND_CREATE_CONSUMER_GROUP);
+                encode_envelope(&mut out, env);
+                put_bounded_str(&mut out, name, MAX_GROUP_NAME_BYTES, "group name")?;
+                put_uuid(&mut out, *group_uuid);
+            }
+            MetadataCommand::JoinConsumerGroup {
+                env,
+                group_uuid,
+                member_uuid,
+                expected_group_generation,
+            } => {
+                put_u16(&mut out, COMMAND_KIND_JOIN_CONSUMER_GROUP);
+                encode_envelope(&mut out, env);
+                put_uuid(&mut out, *group_uuid);
+                put_uuid(&mut out, *member_uuid);
+                put_u64(&mut out, *expected_group_generation);
+            }
+            MetadataCommand::LeaveConsumerGroup {
+                env,
+                group_uuid,
+                member_uuid,
+                expected_member_generation,
+            } => {
+                put_u16(&mut out, COMMAND_KIND_LEAVE_CONSUMER_GROUP);
+                encode_envelope(&mut out, env);
+                put_uuid(&mut out, *group_uuid);
+                put_uuid(&mut out, *member_uuid);
+                put_u64(&mut out, *expected_member_generation);
+            }
+            MetadataCommand::AssignMemberRanges {
+                env,
+                group_uuid,
+                member_uuid,
+                ranges,
+                expected_member_generation,
+            } => {
+                put_u16(&mut out, COMMAND_KIND_ASSIGN_MEMBER_RANGES);
+                encode_envelope(&mut out, env);
+                put_uuid(&mut out, *group_uuid);
+                put_uuid(&mut out, *member_uuid);
+                encode_range_assignments(&mut out, ranges)?;
+                put_u64(&mut out, *expected_member_generation);
+            }
+            MetadataCommand::CommitGroupCursor {
+                env,
+                group_uuid,
+                member_uuid,
+                topic_uuid,
+                range_uuid,
+                topic_epoch,
+                range_generation,
+                segment_uuid,
+                segment_generation,
+                segment_root,
+                record_offset,
+                record_index,
+                lineage_transition_id,
+                expected_checkpoint_generation,
+            } => {
+                put_u16(&mut out, COMMAND_KIND_COMMIT_GROUP_CURSOR);
+                encode_envelope(&mut out, env);
+                put_uuid(&mut out, *group_uuid);
+                put_uuid(&mut out, *member_uuid);
+                put_uuid(&mut out, *topic_uuid);
+                put_uuid(&mut out, *range_uuid);
+                put_u64(&mut out, *topic_epoch);
+                put_u64(&mut out, *range_generation);
+                put_uuid(&mut out, *segment_uuid);
+                put_u64(&mut out, *segment_generation);
+                put_bytes32(&mut out, segment_root);
+                put_u64(&mut out, *record_offset);
+                put_u64(&mut out, *record_index);
+                encode_optional_uuid(&mut out, *lineage_transition_id);
+                encode_optional_u64(&mut out, *expected_checkpoint_generation);
+            }
         }
         Ok(out)
     }
@@ -386,6 +535,59 @@ impl MetadataCommand {
                 key_uuid: reader.uuid("key uuid")?,
                 scheme: reader.u16("key scheme")?,
                 public_material_digest: reader.bytes32("public material digest")?,
+            }),
+            COMMAND_KIND_CREATE_CONSUMER_GROUP => {
+                let env = decode_envelope(reader)?;
+                let name = reader.bounded_str(MAX_GROUP_NAME_BYTES, "group name")?;
+                if name.is_empty() {
+                    return Err(CodecError::InvalidValue {
+                        what: "group name",
+                        reason: "must not be empty",
+                    });
+                }
+                Ok(MetadataCommand::CreateConsumerGroup {
+                    env,
+                    name,
+                    group_uuid: reader.uuid("group uuid")?,
+                })
+            }
+            COMMAND_KIND_JOIN_CONSUMER_GROUP => Ok(MetadataCommand::JoinConsumerGroup {
+                env: decode_envelope(reader)?,
+                group_uuid: reader.uuid("group uuid")?,
+                member_uuid: reader.uuid("member uuid")?,
+                expected_group_generation: reader.u64("expected group generation")?,
+            }),
+            COMMAND_KIND_LEAVE_CONSUMER_GROUP => Ok(MetadataCommand::LeaveConsumerGroup {
+                env: decode_envelope(reader)?,
+                group_uuid: reader.uuid("group uuid")?,
+                member_uuid: reader.uuid("member uuid")?,
+                expected_member_generation: reader.u64("expected member generation")?,
+            }),
+            COMMAND_KIND_ASSIGN_MEMBER_RANGES => Ok(MetadataCommand::AssignMemberRanges {
+                env: decode_envelope(reader)?,
+                group_uuid: reader.uuid("group uuid")?,
+                member_uuid: reader.uuid("member uuid")?,
+                ranges: decode_range_assignments(reader)?,
+                expected_member_generation: reader.u64("expected member generation")?,
+            }),
+            COMMAND_KIND_COMMIT_GROUP_CURSOR => Ok(MetadataCommand::CommitGroupCursor {
+                env: decode_envelope(reader)?,
+                group_uuid: reader.uuid("group uuid")?,
+                member_uuid: reader.uuid("member uuid")?,
+                topic_uuid: reader.uuid("topic uuid")?,
+                range_uuid: reader.uuid("range uuid")?,
+                topic_epoch: reader.u64("topic epoch")?,
+                range_generation: reader.u64("range generation")?,
+                segment_uuid: reader.uuid("segment uuid")?,
+                segment_generation: reader.u64("segment generation")?,
+                segment_root: reader.bytes32("segment root")?,
+                record_offset: reader.u64("record offset")?,
+                record_index: reader.u64("record index")?,
+                lineage_transition_id: decode_optional_uuid(reader, "lineage transition id")?,
+                expected_checkpoint_generation: decode_optional_u64(
+                    reader,
+                    "expected checkpoint generation",
+                )?,
             }),
             other => Err(CodecError::UnknownTag {
                 what: "command kind",
@@ -505,6 +707,17 @@ pub enum MetadataResponse {
     LeaseGranted {
         fencing_epoch: u64,
     },
+    GroupCreated {
+        group_uuid: Uuid,
+        generation: u64,
+    },
+    MemberJoined {
+        member_generation: u64,
+        group_generation: u64,
+    },
+    CursorCommitted {
+        checkpoint_generation: u64,
+    },
     Rejected(MetadataError),
 }
 
@@ -535,6 +748,28 @@ impl MetadataResponse {
                 put_u16(out, RESPONSE_KIND_LEASE_GRANTED);
                 put_u64(out, *fencing_epoch);
             }
+            MetadataResponse::GroupCreated {
+                group_uuid,
+                generation,
+            } => {
+                put_u16(out, RESPONSE_KIND_GROUP_CREATED);
+                put_uuid(out, *group_uuid);
+                put_u64(out, *generation);
+            }
+            MetadataResponse::MemberJoined {
+                member_generation,
+                group_generation,
+            } => {
+                put_u16(out, RESPONSE_KIND_MEMBER_JOINED);
+                put_u64(out, *member_generation);
+                put_u64(out, *group_generation);
+            }
+            MetadataResponse::CursorCommitted {
+                checkpoint_generation,
+            } => {
+                put_u16(out, RESPONSE_KIND_CURSOR_COMMITTED);
+                put_u64(out, *checkpoint_generation);
+            }
             MetadataResponse::Rejected(error) => {
                 put_u16(out, RESPONSE_KIND_REJECTED);
                 error.encode_into(out)?;
@@ -563,6 +798,17 @@ impl MetadataResponse {
             }),
             RESPONSE_KIND_LEASE_GRANTED => Ok(MetadataResponse::LeaseGranted {
                 fencing_epoch: reader.u64("fencing epoch")?,
+            }),
+            RESPONSE_KIND_GROUP_CREATED => Ok(MetadataResponse::GroupCreated {
+                group_uuid: reader.uuid("group uuid")?,
+                generation: reader.u64("group generation")?,
+            }),
+            RESPONSE_KIND_MEMBER_JOINED => Ok(MetadataResponse::MemberJoined {
+                member_generation: reader.u64("member generation")?,
+                group_generation: reader.u64("group generation")?,
+            }),
+            RESPONSE_KIND_CURSOR_COMMITTED => Ok(MetadataResponse::CursorCommitted {
+                checkpoint_generation: reader.u64("checkpoint generation")?,
             }),
             RESPONSE_KIND_REJECTED => Ok(MetadataResponse::Rejected(MetadataError::decode_from(
                 reader,
@@ -607,6 +853,65 @@ fn decode_optional_u64(
     } else {
         Ok(None)
     }
+}
+
+fn encode_optional_uuid(out: &mut Vec<u8>, value: Option<Uuid>) {
+    match value {
+        None => put_u8(out, 0),
+        Some(value) => {
+            put_u8(out, 1);
+            put_uuid(out, value);
+        }
+    }
+}
+
+fn decode_optional_uuid(
+    reader: &mut Reader<'_>,
+    what: &'static str,
+) -> Result<Option<Uuid>, CodecError> {
+    if reader.flag(what)? {
+        Ok(Some(reader.uuid(what)?))
+    } else {
+        Ok(None)
+    }
+}
+
+fn encode_range_assignments(
+    out: &mut Vec<u8>,
+    ranges: &[RangeAssignment],
+) -> Result<(), CodecError> {
+    if ranges.len() > MAX_ASSIGNED_RANGES {
+        return Err(CodecError::BoundExceeded {
+            what: "assigned ranges",
+            actual: ranges.len(),
+            maximum: MAX_ASSIGNED_RANGES,
+        });
+    }
+    put_u16(out, ranges.len() as u16);
+    for range in ranges {
+        put_uuid(out, range.topic_uuid);
+        put_uuid(out, range.range_uuid);
+    }
+    Ok(())
+}
+
+fn decode_range_assignments(reader: &mut Reader<'_>) -> Result<Vec<RangeAssignment>, CodecError> {
+    let count = reader.u16("assigned range count")? as usize;
+    if count > MAX_ASSIGNED_RANGES {
+        return Err(CodecError::BoundExceeded {
+            what: "assigned ranges",
+            actual: count,
+            maximum: MAX_ASSIGNED_RANGES,
+        });
+    }
+    let mut ranges = Vec::with_capacity(count);
+    for _ in 0..count {
+        ranges.push(RangeAssignment {
+            topic_uuid: reader.uuid("assigned topic uuid")?,
+            range_uuid: reader.uuid("assigned range uuid")?,
+        });
+    }
+    Ok(ranges)
 }
 
 #[cfg(test)]
@@ -685,6 +990,49 @@ mod tests {
                 scheme: 1,
                 public_material_digest: [9; 32],
             },
+            MetadataCommand::CreateConsumerGroup {
+                env: envelope(10),
+                name: "audit.consumers".to_owned(),
+                group_uuid: Uuid::from_u128(50),
+            },
+            MetadataCommand::JoinConsumerGroup {
+                env: envelope(11),
+                group_uuid: Uuid::from_u128(50),
+                member_uuid: Uuid::from_u128(51),
+                expected_group_generation: 0,
+            },
+            MetadataCommand::LeaveConsumerGroup {
+                env: envelope(12),
+                group_uuid: Uuid::from_u128(50),
+                member_uuid: Uuid::from_u128(51),
+                expected_member_generation: 0,
+            },
+            MetadataCommand::AssignMemberRanges {
+                env: envelope(13),
+                group_uuid: Uuid::from_u128(50),
+                member_uuid: Uuid::from_u128(51),
+                ranges: vec![RangeAssignment {
+                    topic_uuid: Uuid::from_u128(20),
+                    range_uuid: Uuid::from_u128(21),
+                }],
+                expected_member_generation: 0,
+            },
+            MetadataCommand::CommitGroupCursor {
+                env: envelope(14),
+                group_uuid: Uuid::from_u128(50),
+                member_uuid: Uuid::from_u128(51),
+                topic_uuid: Uuid::from_u128(20),
+                range_uuid: Uuid::from_u128(21),
+                topic_epoch: 1,
+                range_generation: 0,
+                segment_uuid: Uuid::from_u128(30),
+                segment_generation: 0,
+                segment_root: [3; 32],
+                record_offset: 42,
+                record_index: 7,
+                lineage_transition_id: Some(Uuid::from_u128(60)),
+                expected_checkpoint_generation: None,
+            },
         ]
     }
 
@@ -697,6 +1045,17 @@ mod tests {
                 root_range_uuid: Uuid::from_u128(21),
             },
             MetadataResponse::LeaseGranted { fencing_epoch: 9 },
+            MetadataResponse::GroupCreated {
+                group_uuid: Uuid::from_u128(50),
+                generation: 0,
+            },
+            MetadataResponse::MemberJoined {
+                member_generation: 0,
+                group_generation: 1,
+            },
+            MetadataResponse::CursorCommitted {
+                checkpoint_generation: 0,
+            },
             MetadataResponse::Rejected(MetadataError::GenerationMismatch {
                 expected: 1,
                 actual: 2,

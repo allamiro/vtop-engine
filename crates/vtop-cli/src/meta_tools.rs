@@ -322,6 +322,19 @@ fn print_response(response: &MetadataResponse) {
         MetadataResponse::LeaseGranted { fencing_epoch } => {
             println!("lease_granted fencing_epoch={fencing_epoch}")
         }
+        MetadataResponse::GroupCreated {
+            group_uuid,
+            generation,
+        } => println!("group_created uuid={group_uuid} generation={generation}"),
+        MetadataResponse::MemberJoined {
+            member_generation,
+            group_generation,
+        } => println!(
+            "member_joined member_generation={member_generation} group_generation={group_generation}"
+        ),
+        MetadataResponse::CursorCommitted {
+            checkpoint_generation,
+        } => println!("cursor_committed checkpoint_generation={checkpoint_generation}"),
         MetadataResponse::Rejected(error) => println!("rejected: {error}"),
     }
 }
