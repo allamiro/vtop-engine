@@ -255,13 +255,16 @@ pub enum MetadataCommand {
         expected_generation: u64,
     },
     /// Commit an ordered replica set for a verified segment. The proposer
-    /// supplies the candidate list; `apply` rejects any set that differs from
-    /// the deterministic rendezvous selection over currently Active nodes.
+    /// supplies an explicit `replication_factor` and candidate list; `apply`
+    /// rejects any set whose length differs from that factor or that differs
+    /// from the deterministic rendezvous selection over currently Active nodes.
     CommitSegmentPlacement {
         env: CommandEnvelope,
         topic_uuid: Uuid,
         range_uuid: Uuid,
         segment_uuid: Uuid,
+        /// Independent durability target; must equal `replica_nodes.len()`.
+        replication_factor: u8,
         replica_nodes: Vec<Uuid>,
         expected_segment_generation: u64,
         /// `None` for the first placement; `Some(g)` CAS-updates an existing one.
@@ -535,6 +538,7 @@ impl MetadataCommand {
                 topic_uuid,
                 range_uuid,
                 segment_uuid,
+                replication_factor,
                 replica_nodes,
                 expected_segment_generation,
                 expected_placement_generation,
@@ -544,6 +548,7 @@ impl MetadataCommand {
                 put_uuid(&mut out, *topic_uuid);
                 put_uuid(&mut out, *range_uuid);
                 put_uuid(&mut out, *segment_uuid);
+                put_u8(&mut out, *replication_factor);
                 encode_uuid_list(&mut out, replica_nodes, MAX_REPLICAS, "replica nodes")?;
                 put_u64(&mut out, *expected_segment_generation);
                 encode_optional_u64(&mut out, *expected_placement_generation);
@@ -725,18 +730,39 @@ impl MetadataCommand {
                     expected_generation: reader.u64("expected generation")?,
                 })
             }
-            COMMAND_KIND_COMMIT_SEGMENT_PLACEMENT => Ok(MetadataCommand::CommitSegmentPlacement {
-                env: decode_envelope(reader)?,
-                topic_uuid: reader.uuid("topic uuid")?,
-                range_uuid: reader.uuid("range uuid")?,
-                segment_uuid: reader.uuid("segment uuid")?,
-                replica_nodes: decode_uuid_list(reader, MAX_REPLICAS, "replica nodes")?,
-                expected_segment_generation: reader.u64("expected segment generation")?,
-                expected_placement_generation: decode_optional_u64(
-                    reader,
-                    "expected placement generation",
-                )?,
-            }),
+            COMMAND_KIND_COMMIT_SEGMENT_PLACEMENT => {
+                let env = decode_envelope(reader)?;
+                let topic_uuid = reader.uuid("topic uuid")?;
+                let range_uuid = reader.uuid("range uuid")?;
+                let segment_uuid = reader.uuid("segment uuid")?;
+                let replication_factor = reader.u8("replication factor")?;
+                if replication_factor == 0 || usize::from(replication_factor) > MAX_REPLICAS {
+                    return Err(CodecError::InvalidValue {
+                        what: "replication factor",
+                        reason: "must be 1..=MAX_REPLICAS",
+                    });
+                }
+                let replica_nodes = decode_uuid_list(reader, MAX_REPLICAS, "replica nodes")?;
+                if replica_nodes.len() != usize::from(replication_factor) {
+                    return Err(CodecError::InvalidValue {
+                        what: "replica nodes",
+                        reason: "length must equal replication_factor",
+                    });
+                }
+                Ok(MetadataCommand::CommitSegmentPlacement {
+                    env,
+                    topic_uuid,
+                    range_uuid,
+                    segment_uuid,
+                    replication_factor,
+                    replica_nodes,
+                    expected_segment_generation: reader.u64("expected segment generation")?,
+                    expected_placement_generation: decode_optional_u64(
+                        reader,
+                        "expected placement generation",
+                    )?,
+                })
+            }
             other => Err(CodecError::UnknownTag {
                 what: "command kind",
                 tag: u32::from(other),
@@ -1244,6 +1270,7 @@ mod tests {
                 topic_uuid: Uuid::from_u128(20),
                 range_uuid: Uuid::from_u128(21),
                 segment_uuid: Uuid::from_u128(30),
+                replication_factor: 2,
                 replica_nodes: vec![Uuid::from_u128(10), Uuid::from_u128(11)],
                 expected_segment_generation: 1,
                 expected_placement_generation: None,

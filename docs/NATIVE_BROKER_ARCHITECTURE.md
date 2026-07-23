@@ -595,10 +595,11 @@ Stage-8 metadata foundation (`vtop-meta`):
 - Weighted rendezvous scoring is domain-separated BLAKE3 over
   `(segment_uuid, node_uuid)`, scaled by weight.
 - `CommitSegmentPlacement` accepts an ordered replica set only when the
-  segment is `Verified` and the set exactly matches the deterministic
-  selection over currently `Active` nodes (distinct failure domains when
-  RF > 1). The committed `SegmentPlacement` record is the durable audit
-  trail for later repair/rebalance slices.
+  segment is `Verified`, the proposer's explicit `replication_factor` equals
+  the list length, and the set exactly matches the deterministic selection
+  over currently `Active` nodes (distinct failure domains when RF > 1). The
+  committed `SegmentPlacement` record stores that factor and node list as the
+  durable audit trail for later repair/rebalance slices.
 
 New sealed segments are striped across eligible nodes so new capacity receives
 new work naturally. Existing data is moved only for policy, health, or measured

@@ -179,6 +179,8 @@ pub struct CursorCheckpointRecord {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SegmentPlacementRecord {
     pub generation: u64,
+    /// Declared replication factor; must equal `replica_nodes.len()`.
+    pub replication_factor: u8,
     pub replica_nodes: Vec<Uuid>,
     pub committed_apply_index: u64,
 }
@@ -316,6 +318,7 @@ impl MetaValue {
             MetaValue::SegmentPlacement(placement) => {
                 put_u8(&mut out, VALUE_TAG_SEGMENT_PLACEMENT);
                 put_u64(&mut out, placement.generation);
+                put_u8(&mut out, placement.replication_factor);
                 put_u64(&mut out, placement.committed_apply_index);
                 encode_replica_nodes(&mut out, &placement.replica_nodes)?;
             }
@@ -452,6 +455,7 @@ impl MetaValue {
             }
             VALUE_TAG_SEGMENT_PLACEMENT => MetaValue::SegmentPlacement(SegmentPlacementRecord {
                 generation: reader.u64("placement generation")?,
+                replication_factor: reader.u8("replication factor")?,
                 committed_apply_index: reader.u64("placement apply index")?,
                 replica_nodes: decode_replica_nodes(&mut reader)?,
             }),
@@ -696,6 +700,7 @@ impl MetaStateMachine {
                 topic_uuid,
                 range_uuid,
                 segment_uuid,
+                replication_factor,
                 replica_nodes,
                 expected_segment_generation,
                 expected_placement_generation,
@@ -705,6 +710,7 @@ impl MetaStateMachine {
                 *topic_uuid,
                 *range_uuid,
                 *segment_uuid,
+                *replication_factor,
                 replica_nodes,
                 *expected_segment_generation,
                 *expected_placement_generation,
@@ -1588,13 +1594,23 @@ impl MetaStateMachine {
         topic_uuid: Uuid,
         range_uuid: Uuid,
         segment_uuid: Uuid,
+        replication_factor: u8,
         replica_nodes: &[Uuid],
         expected_segment_generation: u64,
         expected_placement_generation: Option<u64>,
     ) -> MetadataResponse {
-        if replica_nodes.is_empty() || replica_nodes.len() > MAX_REPLICAS {
+        let rf = usize::from(replication_factor);
+        if !(1..=MAX_REPLICAS).contains(&rf) {
             return reject(MetadataError::limit(format!(
-                "replica set must contain 1..={MAX_REPLICAS} nodes, got {}",
+                "replication factor must be 1..={MAX_REPLICAS}, got {replication_factor}"
+            )));
+        }
+        // RF is an independent durability claim: never infer it from the list
+        // length alone, so an undersized proposal cannot silently drop
+        // intended redundancy.
+        if replica_nodes.len() != rf {
+            return reject(MetadataError::invalid_transition(format!(
+                "replica set length {} does not match replication_factor {replication_factor}",
                 replica_nodes.len()
             )));
         }
@@ -1629,13 +1645,8 @@ impl MetaStateMachine {
         }
 
         let candidates = self.active_placement_candidates();
-        let require_distinct = replica_nodes.len() > 1;
-        let expected = match select_replicas(
-            segment_uuid,
-            &candidates,
-            replica_nodes.len(),
-            require_distinct,
-        ) {
+        let require_distinct = rf > 1;
+        let expected = match select_replicas(segment_uuid, &candidates, rf, require_distinct) {
             Ok(nodes) => nodes,
             Err(error) => {
                 return reject(MetadataError::invalid_transition(error.to_string()));
@@ -1662,6 +1673,7 @@ impl MetaStateMachine {
                     placement_key,
                     MetaValue::SegmentPlacement(SegmentPlacementRecord {
                         generation: 0,
+                        replication_factor,
                         replica_nodes: replica_nodes.to_vec(),
                         committed_apply_index: apply_index,
                     }),
@@ -1686,6 +1698,7 @@ impl MetaStateMachine {
                     placement_key,
                     MetaValue::SegmentPlacement(SegmentPlacementRecord {
                         generation: next_generation,
+                        replication_factor,
                         replica_nodes: replica_nodes.to_vec(),
                         committed_apply_index: apply_index,
                     }),

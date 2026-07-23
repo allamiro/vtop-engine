@@ -1755,6 +1755,7 @@ fn segment_placement_commits_only_deterministic_verified_sets() {
                 topic_uuid: TOPIC,
                 range_uuid: RANGE,
                 segment_uuid: SEGMENT,
+                replication_factor: 3,
                 replica_nodes: wrong,
                 expected_segment_generation: segment_generation,
                 expected_placement_generation: None,
@@ -1765,6 +1766,7 @@ fn segment_placement_commits_only_deterministic_verified_sets() {
         ))
     );
 
+    // Independent RF must match the proposed list length.
     assert_eq!(
         machine.apply(
             12,
@@ -1773,6 +1775,26 @@ fn segment_placement_commits_only_deterministic_verified_sets() {
                 topic_uuid: TOPIC,
                 range_uuid: RANGE,
                 segment_uuid: SEGMENT,
+                replication_factor: 3,
+                replica_nodes: expected[..1].to_vec(),
+                expected_segment_generation: segment_generation,
+                expected_placement_generation: None,
+            }
+        ),
+        rejected(MetadataError::invalid_transition(
+            "replica set length 1 does not match replication_factor 3"
+        ))
+    );
+
+    assert_eq!(
+        machine.apply(
+            13,
+            &MetadataCommand::CommitSegmentPlacement {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: SEGMENT,
+                replication_factor: 3,
                 replica_nodes: expected.clone(),
                 expected_segment_generation: segment_generation,
                 expected_placement_generation: None,
@@ -1789,14 +1811,15 @@ fn segment_placement_commits_only_deterministic_verified_sets() {
         panic!("placement record must exist");
     };
     assert_eq!(placement.replica_nodes, expected);
+    assert_eq!(placement.replication_factor, 3);
     assert_eq!(placement.generation, 0);
-    assert_eq!(placement.committed_apply_index, 12);
+    assert_eq!(placement.committed_apply_index, 13);
 
     // Unverified segment cannot be placed: seal a second segment and try.
     let unverified = Uuid::from_u128(0x31);
     assert_eq!(
         machine.apply(
-            13,
+            14,
             &MetadataCommand::RegisterSealedSegment {
                 env: requests.next(),
                 topic_uuid: TOPIC,
@@ -1814,12 +1837,13 @@ fn segment_placement_commits_only_deterministic_verified_sets() {
     );
     assert_eq!(
         machine.apply(
-            14,
+            15,
             &MetadataCommand::CommitSegmentPlacement {
                 env: requests.next(),
                 topic_uuid: TOPIC,
                 range_uuid: RANGE,
                 segment_uuid: unverified,
+                replication_factor: 3,
                 replica_nodes: expected,
                 expected_segment_generation: 0,
                 expected_placement_generation: None,
@@ -1862,6 +1886,7 @@ fn segment_placement_rejects_same_domain_when_replicas_require_distinctness() {
                 topic_uuid: TOPIC,
                 range_uuid: RANGE,
                 segment_uuid: SEGMENT,
+                replication_factor: 2,
                 replica_nodes: vec![NODE, NODE_B],
                 expected_segment_generation: segment_generation,
                 expected_placement_generation: None,
