@@ -130,13 +130,17 @@ work with semaphores and per-session fetch-response byte credit. A producer
 request's producer ID must equal the authenticated session principal ID, so one
 trusted producer cannot advance another producer's durable fencing epoch.
 
-This remains a single-node library slice. It does not provide an operator
-daemon/config surface, replicated metadata, quorum durability, authoritative
-leader grants, replication, consumer groups, proof-carrying v2 segments, or
-repair/retirement. Its configured range fencing epoch rejects mismatched
-requests but is not yet a Raft-issued lease. Producer epoch identity becomes an
-explicit record-frame field in segment v2; v1 remains byte-compatible and uses
-the deterministic namespace described above.
+This remains a single-node library slice by default. It does not provide an
+operator daemon/config surface, replicated metadata ownership of replica sets,
+peer TCP replication transport, consumer groups, or repair/retirement. Its
+configured range fencing epoch rejects mismatched requests; when wired to a
+metadata lease view (`MetaFencingEpoch`), grants and releases fence stale
+leaseholders. An optional in-process `ReplicaSet` enables `Durability::Quorum`:
+the leader fans appends to followers, advances a cluster committed high-water
+mark only after majority local durability, propagates that mark, and caps fetch
+visibility at the quorum point. Producer epoch identity becomes an explicit
+record-frame field in segment v2; v1 remains byte-compatible and uses the
+deterministic namespace described above.
 
 ## 3. System boundaries
 
