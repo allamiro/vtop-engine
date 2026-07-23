@@ -1,7 +1,8 @@
-//! Deterministic metadata state machine and durable store — stage-5 PR 1.
+//! Deterministic metadata state machine, durable store, and Raft adapter
+//! — stage-5 PR 1 + PR 2.
 //!
 //! This crate provides the storage half of the replicated metadata control
-//! plane:
+//! plane, plus the contained consensus adapter:
 //!
 //! - typed, canonically encoded metadata keys ([`keys`]);
 //! - hand-coded, bounded, checksummed codecs for commands and responses
@@ -12,15 +13,18 @@
 //! - durable hard state, a chunked checksummed raft log, atomic snapshots,
 //!   and a deterministic recovery orchestrator ([`storage`]), all running
 //!   through the [`vtop_log::env::Env`] seam so crash sweeps drive the exact
-//!   production byte paths.
+//!   production byte paths;
+//! - a Raft storage adapter ([`raft`]) that translates consensus engine types
+//!   field-by-field into the durable codecs above — every consensus-crate
+//!   import is confined to that module tree.
 //!
-//! Consensus and networking deliberately do *not* live here: PR 2 wires
-//! openraft over these primitives and PR 3 adds the transport. Until then
-//! [`storage::MetaStorage`] treats every durable log entry as committed
-//! during recovery, which is the correct degenerate single-node reading.
+//! PR 3 adds the mTLS peer/admin transport. [`storage::MetaStorage`] still
+//! treats every durable log entry as committed during single-node recovery;
+//! under the adapter, the consensus engine decides the commit frontier.
 
 pub mod command;
 pub mod keys;
+pub mod raft;
 pub mod state;
 pub mod storage;
 mod wire;

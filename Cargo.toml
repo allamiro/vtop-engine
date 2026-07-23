@@ -55,6 +55,18 @@ anyhow = "1"
 async-trait = "0.1"
 sha2 = "0.11"
 blake3 = "1"
+# Consensus for the metadata control plane. Pinned exactly: openraft 0.9 is
+# pre-1.0 and its storage/network traits shift between minors, while the
+# vtop-meta adapter translates its types field-by-field into frozen on-disk
+# codecs — an silent upgrade could change semantics under those bytes.
+# `single-term-leader` selects standard Raft (at most one leader per term), so
+# a Vote is exactly {term, voted_for, committed} and a log id is exactly
+# (term, index) — the only shapes the vtop-meta durable formats can carry.
+# `storage-v2` unseals RaftLogStorage/RaftStateMachine for third-party impls.
+# `loosen-follower-log-revert` is required by the blank-follower snapshot
+# harness (openraft panics if a wiped follower reports a lower matching
+# index); see openraft FAQ "Can I wipe out the data of ONE node".
+openraft = { version = "=0.9.24", features = ["single-term-leader", "storage-v2", "loosen-follower-log-revert"] }
 hex = "0.4"
 base64 = "0.22"
 uuid = { version = "1", features = ["v4", "serde"] }

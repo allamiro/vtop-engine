@@ -3,9 +3,10 @@
 //!
 //! Every byte flows through the [`vtop_log::env::Env`] seam, so the whole
 //! store runs unchanged against the real filesystem or the deterministic
-//! crash simulator. Consensus does not live here: PR 2 wires openraft over
-//! these primitives, and until then `MetaStorage` treats every durable log
-//! entry as committed during recovery.
+//! crash simulator. Consensus does not live here: PR 2 wires a Raft engine over
+//! these primitives; `MetaStorage` treats every durable log
+//! entry as committed during single-node recovery, while the adapter decides
+//! the commit frontier under consensus.
 
 pub mod hardstate;
 pub mod log;
