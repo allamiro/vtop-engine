@@ -7,8 +7,8 @@
 use uuid::Uuid;
 use vtop_meta::{
     CommandEnvelope, MetaKey, MetaStateMachine, MetaValue, MetadataCommand, MetadataError,
-    MetadataResponse, NodeState, SegmentState, DEDUP_CAPACITY, MAX_NODE_ADDR_BYTES,
-    MAX_TOPIC_NAME_BYTES,
+    MetadataResponse, NodeState, RangeAssignment, SegmentState, DEDUP_CAPACITY,
+    MAX_NODE_ADDR_BYTES, MAX_TOPIC_NAME_BYTES,
 };
 
 const NODE: Uuid = Uuid::from_u128(0x10);
@@ -17,6 +17,9 @@ const TOPIC: Uuid = Uuid::from_u128(0x20);
 const RANGE: Uuid = Uuid::from_u128(0x21);
 const SEGMENT: Uuid = Uuid::from_u128(0x30);
 const KEY: Uuid = Uuid::from_u128(0x40);
+const GROUP: Uuid = Uuid::from_u128(0x50);
+const MEMBER: Uuid = Uuid::from_u128(0x51);
+const MEMBER_B: Uuid = Uuid::from_u128(0x52);
 
 /// Deterministic unique request ids for commands whose dedup identity is
 /// irrelevant to the test at hand.
@@ -919,5 +922,534 @@ fn two_instances_applying_the_same_sequence_produce_byte_identical_snapshots() {
             .unwrap(),
         first,
         "decode/encode must be a fixed point"
+    );
+}
+
+fn create_group(requests: &mut Requests) -> MetadataCommand {
+    MetadataCommand::CreateConsumerGroup {
+        env: requests.next(),
+        name: "audit.consumers".to_owned(),
+        group_uuid: GROUP,
+    }
+}
+
+fn join_member(
+    requests: &mut Requests,
+    member: Uuid,
+    expected_group_generation: u64,
+) -> MetadataCommand {
+    MetadataCommand::JoinConsumerGroup {
+        env: requests.next(),
+        group_uuid: GROUP,
+        member_uuid: member,
+        expected_group_generation,
+    }
+}
+
+fn assign_member(
+    requests: &mut Requests,
+    member: Uuid,
+    expected_member_generation: u64,
+) -> MetadataCommand {
+    MetadataCommand::AssignMemberRanges {
+        env: requests.next(),
+        group_uuid: GROUP,
+        member_uuid: member,
+        ranges: vec![RangeAssignment {
+            topic_uuid: TOPIC,
+            range_uuid: RANGE,
+        }],
+        expected_member_generation,
+    }
+}
+
+fn machine_with_group(requests: &mut Requests) -> MetaStateMachine {
+    let mut machine = machine_with_topic_and_node(requests);
+    assert_eq!(
+        machine.apply(3, &create_group(requests)),
+        MetadataResponse::GroupCreated {
+            group_uuid: GROUP,
+            generation: 0,
+        }
+    );
+    assert_eq!(
+        machine.apply(4, &join_member(requests, MEMBER, 0)),
+        MetadataResponse::MemberJoined {
+            member_generation: 0,
+            group_generation: 1,
+        }
+    );
+    assert_eq!(
+        machine.apply(5, &assign_member(requests, MEMBER, 0)),
+        MetadataResponse::Ack { generation: 1 }
+    );
+    machine
+}
+
+#[test]
+fn consumer_group_join_leave_assign_and_rejections() {
+    let mut requests = Requests(0);
+    let mut machine = machine_with_topic_and_node(&mut requests);
+
+    assert_eq!(
+        machine.apply(3, &create_group(&mut requests)),
+        MetadataResponse::GroupCreated {
+            group_uuid: GROUP,
+            generation: 0,
+        }
+    );
+    assert_eq!(
+        machine.apply(4, &create_group(&mut requests)),
+        rejected(MetadataError::AlreadyExists)
+    );
+    assert_eq!(
+        machine.apply(
+            5,
+            &MetadataCommand::CreateConsumerGroup {
+                env: requests.next(),
+                name: "audit.consumers".to_owned(),
+                group_uuid: Uuid::from_u128(0x99),
+            }
+        ),
+        rejected(MetadataError::AlreadyExists)
+    );
+    assert_eq!(
+        machine.apply(6, &join_member(&mut requests, MEMBER, 7)),
+        rejected(MetadataError::GenerationMismatch {
+            expected: 7,
+            actual: 0,
+        })
+    );
+    assert_eq!(
+        machine.apply(7, &join_member(&mut requests, MEMBER, 0)),
+        MetadataResponse::MemberJoined {
+            member_generation: 0,
+            group_generation: 1,
+        }
+    );
+    assert_eq!(
+        machine.apply(8, &join_member(&mut requests, MEMBER, 1)),
+        rejected(MetadataError::AlreadyExists)
+    );
+    assert_eq!(
+        machine.apply(9, &assign_member(&mut requests, MEMBER, 0)),
+        MetadataResponse::Ack { generation: 1 }
+    );
+    assert_eq!(
+        machine.apply(
+            10,
+            &MetadataCommand::LeaveConsumerGroup {
+                env: requests.next(),
+                group_uuid: GROUP,
+                member_uuid: MEMBER,
+                expected_member_generation: 0,
+            }
+        ),
+        rejected(MetadataError::GenerationMismatch {
+            expected: 0,
+            actual: 1,
+        })
+    );
+    assert_eq!(
+        machine.apply(
+            11,
+            &MetadataCommand::LeaveConsumerGroup {
+                env: requests.next(),
+                group_uuid: GROUP,
+                member_uuid: MEMBER,
+                expected_member_generation: 1,
+            }
+        ),
+        MetadataResponse::Ack { generation: 3 }
+    );
+    assert!(machine
+        .record(&MetaKey::GroupMember {
+            group_uuid: GROUP,
+            member_uuid: MEMBER,
+        })
+        .is_none());
+    assert_eq!(
+        machine.apply(12, &join_member(&mut requests, MEMBER_B, 3)),
+        MetadataResponse::MemberJoined {
+            member_generation: 0,
+            group_generation: 4,
+        }
+    );
+}
+
+#[test]
+fn lineage_aware_cursor_commit_cas_monotonicity_and_lineage_guards() {
+    let mut requests = Requests(0);
+    let mut machine = machine_with_group(&mut requests);
+    let root = [9u8; 32];
+
+    assert_eq!(
+        machine.apply(6, &grant(&mut requests, NODE, 0)),
+        MetadataResponse::LeaseGranted { fencing_epoch: 1 }
+    );
+    assert_eq!(
+        machine.apply(
+            7,
+            &MetadataCommand::RegisterSealedSegment {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: SEGMENT,
+                segment_generation: 0,
+                base_offset: 0,
+                next_offset: 100,
+                content_root: root,
+                sealed_by_epoch: 1,
+                expected_range_generation: 1,
+            }
+        ),
+        MetadataResponse::Ack { generation: 2 }
+    );
+
+    // Unregistered segment identity is rejected fail-closed.
+    assert_eq!(
+        machine.apply(
+            8,
+            &MetadataCommand::CommitGroupCursor {
+                env: requests.next(),
+                group_uuid: GROUP,
+                member_uuid: MEMBER,
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                topic_epoch: 1,
+                range_generation: 2,
+                segment_uuid: Uuid::from_u128(0x999),
+                segment_generation: 0,
+                segment_root: root,
+                record_offset: 10,
+                record_index: 0,
+                lineage_transition_id: None,
+                expected_checkpoint_generation: None,
+            }
+        ),
+        rejected(MetadataError::NotFound)
+    );
+
+    // Wrong topic epoch is rejected before any durable write.
+    assert_eq!(
+        machine.apply(
+            9,
+            &MetadataCommand::CommitGroupCursor {
+                env: requests.next(),
+                group_uuid: GROUP,
+                member_uuid: MEMBER,
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                topic_epoch: 99,
+                range_generation: 2,
+                segment_uuid: SEGMENT,
+                segment_generation: 0,
+                segment_root: root,
+                record_offset: 10,
+                record_index: 0,
+                lineage_transition_id: None,
+                expected_checkpoint_generation: None,
+            }
+        ),
+        rejected(MetadataError::EpochMismatch {
+            expected: 99,
+            actual: 1,
+        })
+    );
+
+    // First commit creates checkpoint generation 0.
+    assert_eq!(
+        machine.apply(
+            10,
+            &MetadataCommand::CommitGroupCursor {
+                env: requests.next(),
+                group_uuid: GROUP,
+                member_uuid: MEMBER,
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                topic_epoch: 1,
+                range_generation: 2,
+                segment_uuid: SEGMENT,
+                segment_generation: 0,
+                segment_root: root,
+                record_offset: 10,
+                record_index: 0,
+                lineage_transition_id: None,
+                expected_checkpoint_generation: None,
+            }
+        ),
+        MetadataResponse::CursorCommitted {
+            checkpoint_generation: 0,
+        }
+    );
+    assert_eq!(
+        machine.apply(
+            11,
+            &MetadataCommand::CommitGroupCursor {
+                env: requests.next(),
+                group_uuid: GROUP,
+                member_uuid: MEMBER,
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                topic_epoch: 1,
+                range_generation: 2,
+                segment_uuid: SEGMENT,
+                segment_generation: 0,
+                segment_root: root,
+                record_offset: 10,
+                record_index: 0,
+                lineage_transition_id: None,
+                expected_checkpoint_generation: None,
+            }
+        ),
+        rejected(MetadataError::AlreadyExists)
+    );
+
+    // Stale CAS generation is rejected.
+    assert_eq!(
+        machine.apply(
+            12,
+            &MetadataCommand::CommitGroupCursor {
+                env: requests.next(),
+                group_uuid: GROUP,
+                member_uuid: MEMBER,
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                topic_epoch: 1,
+                range_generation: 2,
+                segment_uuid: SEGMENT,
+                segment_generation: 0,
+                segment_root: root,
+                record_offset: 20,
+                record_index: 0,
+                lineage_transition_id: None,
+                expected_checkpoint_generation: Some(7),
+            }
+        ),
+        rejected(MetadataError::GenerationMismatch {
+            expected: 7,
+            actual: 0,
+        })
+    );
+
+    // Backward move within the same segment is rejected.
+    assert_eq!(
+        machine.apply(
+            13,
+            &MetadataCommand::CommitGroupCursor {
+                env: requests.next(),
+                group_uuid: GROUP,
+                member_uuid: MEMBER,
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                topic_epoch: 1,
+                range_generation: 2,
+                segment_uuid: SEGMENT,
+                segment_generation: 0,
+                segment_root: root,
+                record_offset: 5,
+                record_index: 0,
+                lineage_transition_id: None,
+                expected_checkpoint_generation: Some(0),
+            }
+        ),
+        rejected(MetadataError::invalid_transition(
+            "cursor moved backward within the same segment"
+        ))
+    );
+
+    // Forward CAS succeeds and bumps checkpoint generation.
+    assert_eq!(
+        machine.apply(
+            14,
+            &MetadataCommand::CommitGroupCursor {
+                env: requests.next(),
+                group_uuid: GROUP,
+                member_uuid: MEMBER,
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                topic_epoch: 1,
+                range_generation: 2,
+                segment_uuid: SEGMENT,
+                segment_generation: 0,
+                segment_root: root,
+                record_offset: 20,
+                record_index: 1,
+                lineage_transition_id: Some(Uuid::from_u128(0x60)),
+                expected_checkpoint_generation: Some(0),
+            }
+        ),
+        MetadataResponse::CursorCommitted {
+            checkpoint_generation: 1,
+        }
+    );
+
+    let MetaValue::GroupCursor(cursor) = machine
+        .record(&MetaKey::GroupCursor {
+            group_uuid: GROUP,
+            topic_uuid: TOPIC,
+            range_uuid: RANGE,
+        })
+        .cloned()
+        .unwrap()
+    else {
+        panic!("expected cursor record");
+    };
+    assert_eq!(cursor.record_offset, 20);
+    assert_eq!(cursor.checkpoint_generation, 1);
+    assert_eq!(cursor.committed_by_member, MEMBER);
+    assert_eq!(cursor.lineage_transition_id, Some(Uuid::from_u128(0x60)));
+
+    // Unassigned member cannot commit. Group generation is 2 after join+assign.
+    assert_eq!(
+        machine.apply(15, &join_member(&mut requests, MEMBER_B, 2)),
+        MetadataResponse::MemberJoined {
+            member_generation: 0,
+            group_generation: 3,
+        }
+    );
+    assert_eq!(
+        machine.apply(
+            16,
+            &MetadataCommand::CommitGroupCursor {
+                env: requests.next(),
+                group_uuid: GROUP,
+                member_uuid: MEMBER_B,
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                topic_epoch: 1,
+                range_generation: 2,
+                segment_uuid: SEGMENT,
+                segment_generation: 0,
+                segment_root: root,
+                record_offset: 30,
+                record_index: 0,
+                lineage_transition_id: None,
+                expected_checkpoint_generation: Some(1),
+            }
+        ),
+        rejected(MetadataError::invalid_transition(
+            "member is not assigned the cursor topic/range"
+        ))
+    );
+
+    // Exclusive assignment: MEMBER still holds RANGE, so MEMBER_B cannot steal it.
+    assert_eq!(
+        machine.apply(17, &assign_member(&mut requests, MEMBER_B, 0)),
+        rejected(MetadataError::invalid_transition(
+            "range is already assigned to another group member"
+        ))
+    );
+
+    // Snapshot round-trip preserves group/cursor records.
+    let encoded = machine.encode_snapshot().unwrap();
+    let restored = MetaStateMachine::decode_snapshot(&encoded).unwrap();
+    assert_eq!(restored.encode_snapshot().unwrap(), encoded);
+}
+
+#[test]
+fn sealed_segment_lineage_is_checked_on_cursor_commit() {
+    let mut requests = Requests(0);
+    let mut machine = machine_with_group(&mut requests);
+    let root = [4u8; 32];
+
+    assert_eq!(
+        machine.apply(6, &grant(&mut requests, NODE, 0)),
+        MetadataResponse::LeaseGranted { fencing_epoch: 1 }
+    );
+    assert_eq!(
+        machine.apply(
+            7,
+            &MetadataCommand::RegisterSealedSegment {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: SEGMENT,
+                segment_generation: 0,
+                base_offset: 0,
+                next_offset: 100,
+                content_root: root,
+                sealed_by_epoch: 1,
+                expected_range_generation: 1,
+            }
+        ),
+        MetadataResponse::Ack { generation: 2 }
+    );
+
+    // Outside sealed bounds.
+    assert_eq!(
+        machine.apply(
+            8,
+            &MetadataCommand::CommitGroupCursor {
+                env: requests.next(),
+                group_uuid: GROUP,
+                member_uuid: MEMBER,
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                topic_epoch: 1,
+                range_generation: 2,
+                segment_uuid: SEGMENT,
+                segment_generation: 0,
+                segment_root: root,
+                record_offset: 101,
+                record_index: 0,
+                lineage_transition_id: None,
+                expected_checkpoint_generation: None,
+            }
+        ),
+        rejected(MetadataError::invalid_transition(
+            "record offset 101 is outside sealed segment [0, 100]"
+        ))
+    );
+
+    // Root mismatch.
+    assert_eq!(
+        machine.apply(
+            9,
+            &MetadataCommand::CommitGroupCursor {
+                env: requests.next(),
+                group_uuid: GROUP,
+                member_uuid: MEMBER,
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                topic_epoch: 1,
+                range_generation: 2,
+                segment_uuid: SEGMENT,
+                segment_generation: 0,
+                segment_root: [1; 32],
+                record_offset: 10,
+                record_index: 0,
+                lineage_transition_id: None,
+                expected_checkpoint_generation: None,
+            }
+        ),
+        rejected(MetadataError::invalid_transition(
+            "segment root does not match the registered segment"
+        ))
+    );
+
+    assert_eq!(
+        machine.apply(
+            10,
+            &MetadataCommand::CommitGroupCursor {
+                env: requests.next(),
+                group_uuid: GROUP,
+                member_uuid: MEMBER,
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                topic_epoch: 1,
+                range_generation: 2,
+                segment_uuid: SEGMENT,
+                segment_generation: 0,
+                segment_root: root,
+                record_offset: 10,
+                record_index: 0,
+                lineage_transition_id: None,
+                expected_checkpoint_generation: None,
+            }
+        ),
+        MetadataResponse::CursorCommitted {
+            checkpoint_generation: 0,
+        }
     );
 }

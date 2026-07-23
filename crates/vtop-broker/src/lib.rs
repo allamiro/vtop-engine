@@ -12,6 +12,11 @@
 //! storage. Observers publish grants and releases into the same handle; a
 //! newer grant or a release fences the prior leaseholder before the next
 //! durable append can complete.
+//!
+//! Stage-7 consumer checkpoints use an optional shared [`GroupCheckpointStore`]
+//! backed by the deterministic metadata state machine. Commit/fetch cursor
+//! requests validate lineage against that store; membership join/leave/assign
+//! remain metadata commands (Raft-proposed in later wiring).
 
 pub mod replication;
 
@@ -32,12 +37,17 @@ use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
 use vtop_log::env::{Env, OpenMode, Storage, StorageFile};
 use vtop_log::{ActiveSegment, AppendOutcome, Durability, LogRecord};
+use vtop_meta::{
+    CommandEnvelope, MetaKey, MetaStateMachine, MetaValue, MetadataCommand, MetadataError,
+    MetadataResponse,
+};
 use vtop_protocol::{
-    encode_frame, read_frame, write_frame, ClientHello, CommittedHwmUpdate,
-    Durability as WireDurability, ErrorCode, ErrorResponse, FetchResponse, FetchedRecord, Message,
-    ProduceOutcome, ProduceResponse, ProtocolLimits, RangeIdentity, ReplicaAppendRequest, Role,
-    ServerHello, WireFrame, ABSOLUTE_MAX_FRAME_BYTES, ABSOLUTE_MAX_RECORDS,
-    DEFAULT_MAX_FRAME_BYTES, DEFAULT_MAX_RECORDS, PROTOCOL_MAJOR, PROTOCOL_MINOR,
+    encode_frame, read_frame, write_frame, ClientHello, CommitCursorRequest, CommitCursorResponse,
+    CommittedHwmUpdate, Durability as WireDurability, ErrorCode, ErrorResponse,
+    FetchCursorResponse, FetchResponse, FetchedRecord, LineageCursor, Message, ProduceOutcome,
+    ProduceResponse, ProtocolLimits, RangeIdentity, ReplicaAppendRequest, Role, ServerHello,
+    WireFrame, ABSOLUTE_MAX_FRAME_BYTES, ABSOLUTE_MAX_RECORDS, DEFAULT_MAX_FRAME_BYTES,
+    DEFAULT_MAX_RECORDS, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 
 const EPOCH_MAGIC: &[u8; 8] = b"VTOPEPC1";
@@ -370,6 +380,52 @@ impl Default for MetaFencingEpoch {
     }
 }
 
+/// Shared metadata state machine used for durable consumer-group checkpoints.
+///
+/// In this slice the broker applies group/cursor commands in-process. A later
+/// stage wires the same command types through Raft propose on the metadata
+/// group; the broker surface stays the lineage-aware commit/fetch path.
+#[derive(Clone, Default)]
+pub struct GroupCheckpointStore {
+    state: Arc<Mutex<MetaStateMachine>>,
+    /// Monotonic apply index for in-process command application.
+    apply_index: Arc<Mutex<u64>>,
+}
+
+impl GroupCheckpointStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn from_state(state: MetaStateMachine) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(state)),
+            apply_index: Arc::new(Mutex::new(0)),
+        }
+    }
+
+    pub fn apply(&self, command: MetadataCommand) -> MetadataResponse {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut apply_index = self
+            .apply_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *apply_index = apply_index.saturating_add(1);
+        state.apply(*apply_index, &command)
+    }
+
+    pub fn with_state<R>(&self, f: impl FnOnce(&MetaStateMachine) -> R) -> R {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        f(&state)
+    }
+}
+
 pub struct LocalBroker {
     range: RangeIdentity,
     /// Epoch this broker was granted as range leaseholder.
@@ -384,6 +440,8 @@ pub struct LocalBroker {
     replicas: Option<Arc<dyn ReplicaSet>>,
     /// Leader identity embedded in replica append requests.
     node_id: Uuid,
+    /// Optional durable consumer-group checkpoint store.
+    group_checkpoints: Option<GroupCheckpointStore>,
     state: Mutex<BrokerState>,
 }
 
@@ -490,11 +548,24 @@ impl LocalBroker {
             cluster_committed,
             replicas,
             node_id,
+            group_checkpoints: None,
             state: Mutex::new(BrokerState {
                 segment,
                 producer_epochs,
             }),
         })
+    }
+
+    /// Attach a durable consumer-group checkpoint store for CommitCursor /
+    /// FetchCursor handling.
+    pub fn with_group_checkpoints(mut self, store: GroupCheckpointStore) -> Self {
+        self.group_checkpoints = Some(store);
+        self
+    }
+
+    /// Shared group checkpoint store, when configured.
+    pub fn group_checkpoints(&self) -> Option<&GroupCheckpointStore> {
+        self.group_checkpoints.as_ref()
     }
 
     /// The segment format this broker writes, derived from its segment.
@@ -844,11 +915,116 @@ impl LocalBroker {
                     ),
                 }
             }
+            Message::CommitCursorRequest(request) => {
+                if role != Role::Consumer {
+                    return error(
+                        request_id,
+                        stream_id,
+                        ErrorCode::Unauthorized,
+                        "session role cannot commit cursors",
+                    );
+                }
+                let Some(store) = self.group_checkpoints.as_ref() else {
+                    return error(
+                        request_id,
+                        stream_id,
+                        ErrorCode::InvalidRequest,
+                        "broker has no group checkpoint store configured",
+                    );
+                };
+                let command = MetadataCommand::CommitGroupCursor {
+                    env: CommandEnvelope {
+                        request_id: cursor_commit_request_id(request_id, stream_id, &request),
+                        issued_at_ms: 0,
+                    },
+                    group_uuid: request.cursor.group_id,
+                    member_uuid: request.member_id,
+                    topic_uuid: request.cursor.topic_id,
+                    range_uuid: request.cursor.range_id,
+                    topic_epoch: request.cursor.topic_epoch,
+                    range_generation: request.cursor.range_generation,
+                    segment_uuid: request.cursor.segment_id,
+                    segment_generation: request.cursor.segment_generation,
+                    segment_root: request.cursor.segment_root,
+                    record_offset: request.cursor.record_offset,
+                    record_index: request.cursor.record_index,
+                    lineage_transition_id: request.cursor.lineage_transition_id,
+                    expected_checkpoint_generation: request.expected_checkpoint_generation,
+                };
+                match store.apply(command) {
+                    MetadataResponse::CursorCommitted {
+                        checkpoint_generation,
+                    } => WireFrame {
+                        request_id,
+                        stream_id,
+                        message: Message::CommitCursorResponse(CommitCursorResponse {
+                            checkpoint_generation,
+                        }),
+                    },
+                    MetadataResponse::Rejected(error_kind) => {
+                        let (code, message) = map_metadata_error(&error_kind);
+                        error(request_id, stream_id, code, &message)
+                    }
+                    other => error(
+                        request_id,
+                        stream_id,
+                        ErrorCode::Storage,
+                        &format!("unexpected metadata response for cursor commit: {other:?}"),
+                    ),
+                }
+            }
+            Message::FetchCursorRequest(request) => {
+                if role != Role::Consumer {
+                    return error(
+                        request_id,
+                        stream_id,
+                        ErrorCode::Unauthorized,
+                        "session role cannot fetch cursors",
+                    );
+                }
+                let Some(store) = self.group_checkpoints.as_ref() else {
+                    return error(
+                        request_id,
+                        stream_id,
+                        ErrorCode::InvalidRequest,
+                        "broker has no group checkpoint store configured",
+                    );
+                };
+                let cursor = store.with_state(|state| {
+                    let key = MetaKey::GroupCursor {
+                        group_uuid: request.group_id,
+                        topic_uuid: request.topic_id,
+                        range_uuid: request.range_id,
+                    };
+                    match state.record(&key) {
+                        Some(MetaValue::GroupCursor(record)) => Some(LineageCursor {
+                            group_id: request.group_id,
+                            topic_id: request.topic_id,
+                            topic_epoch: record.topic_epoch,
+                            range_id: request.range_id,
+                            range_generation: record.range_generation,
+                            segment_id: record.segment_uuid,
+                            segment_generation: record.segment_generation,
+                            segment_root: record.segment_root,
+                            record_offset: record.record_offset,
+                            record_index: record.record_index,
+                            lineage_transition_id: record.lineage_transition_id,
+                            checkpoint_generation: record.checkpoint_generation,
+                        }),
+                        _ => None,
+                    }
+                });
+                WireFrame {
+                    request_id,
+                    stream_id,
+                    message: Message::FetchCursorResponse(FetchCursorResponse { cursor }),
+                }
+            }
             _ => error(
                 request_id,
                 stream_id,
                 ErrorCode::InvalidRequest,
-                "expected produce or fetch request",
+                "expected produce, fetch, or cursor request",
             ),
         }
     }
@@ -881,6 +1057,67 @@ impl LocalBroker {
         }
         Ok(())
     }
+}
+
+fn map_metadata_error(error: &MetadataError) -> (ErrorCode, String) {
+    match error {
+        MetadataError::GenerationMismatch { .. } => {
+            (ErrorCode::CheckpointConflict, error.to_string())
+        }
+        MetadataError::EpochMismatch { .. } => (ErrorCode::WrongLineage, error.to_string()),
+        MetadataError::AlreadyExists | MetadataError::NotFound => {
+            (ErrorCode::InvalidRequest, error.to_string())
+        }
+        MetadataError::InvalidTransition(detail) => (ErrorCode::WrongLineage, detail.clone()),
+        MetadataError::Limit(detail) => (ErrorCode::InvalidRequest, detail.clone()),
+    }
+}
+
+/// Domain-separated request id for metadata dedup. Includes member/group/cursor
+/// identity so distinct sessions that reuse low wire `(request_id, stream_id)`
+/// counters cannot collide, while identical retries still hit the dedup table.
+fn cursor_commit_request_id(
+    request_id: u64,
+    stream_id: u64,
+    request: &CommitCursorRequest,
+) -> Uuid {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"vtop-broker-cursor-commit-v1\0");
+    hasher.update(&request_id.to_be_bytes());
+    hasher.update(&stream_id.to_be_bytes());
+    hasher.update(request.member_id.as_bytes());
+    hasher.update(request.cursor.group_id.as_bytes());
+    hasher.update(request.cursor.topic_id.as_bytes());
+    hasher.update(request.cursor.range_id.as_bytes());
+    hasher.update(&request.cursor.topic_epoch.to_be_bytes());
+    hasher.update(&request.cursor.range_generation.to_be_bytes());
+    hasher.update(request.cursor.segment_id.as_bytes());
+    hasher.update(&request.cursor.segment_generation.to_be_bytes());
+    hasher.update(&request.cursor.segment_root);
+    hasher.update(&request.cursor.record_offset.to_be_bytes());
+    hasher.update(&request.cursor.record_index.to_be_bytes());
+    match request.cursor.lineage_transition_id {
+        None => {
+            hasher.update(&[0]);
+        }
+        Some(id) => {
+            hasher.update(&[1]);
+            hasher.update(id.as_bytes());
+        }
+    }
+    match request.expected_checkpoint_generation {
+        None => {
+            hasher.update(&[0]);
+        }
+        Some(generation) => {
+            hasher.update(&[1]);
+            hasher.update(&generation.to_be_bytes());
+        }
+    }
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    Uuid::from_bytes(bytes)
 }
 
 fn error(request_id: u64, stream_id: u64, code: ErrorCode, message: &str) -> WireFrame {

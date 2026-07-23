@@ -194,6 +194,7 @@ impl MetaLogEntry {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum FrameParse {
     Complete {
         term: u64,

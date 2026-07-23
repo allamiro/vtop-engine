@@ -31,6 +31,14 @@ const CATEGORY_RANGE: u8 = 5;
 const CATEGORY_SEGMENT: u8 = 6;
 const CATEGORY_KEY: u8 = 7;
 const CATEGORY_REQUEST: u8 = 8;
+const CATEGORY_GROUP: u8 = 9;
+const CATEGORY_GROUP_BY_NAME: u8 = 10;
+const CATEGORY_GROUP_MEMBER: u8 = 11;
+const CATEGORY_GROUP_CURSOR: u8 = 12;
+
+/// Consumer-group names reuse the topic-name bound so group identity stays
+/// allocation-bounded on the wire and in snapshots.
+pub const MAX_GROUP_NAME_BYTES: usize = MAX_TOPIC_NAME_BYTES;
 
 /// Raft-level node identifier, distinct from the storage-level node UUID so
 /// consensus membership (small dense ids) and node records (stable UUIDs)
@@ -75,6 +83,21 @@ pub enum MetaKey {
     Request {
         request_id: Uuid,
     },
+    Group {
+        group_uuid: Uuid,
+    },
+    GroupByName {
+        name: String,
+    },
+    GroupMember {
+        group_uuid: Uuid,
+        member_uuid: Uuid,
+    },
+    GroupCursor {
+        group_uuid: Uuid,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+    },
 }
 
 /// Validate a topic name against the shared 249-byte semantics.
@@ -84,6 +107,18 @@ pub fn validate_topic_name(name: &str) -> Result<(), CodecError> {
             what: "topic name",
             actual: name.len(),
             maximum: MAX_TOPIC_NAME_BYTES,
+        });
+    }
+    Ok(())
+}
+
+/// Validate a consumer-group name against the shared 249-byte semantics.
+pub fn validate_group_name(name: &str) -> Result<(), CodecError> {
+    if name.is_empty() || name.len() > MAX_GROUP_NAME_BYTES {
+        return Err(CodecError::BoundExceeded {
+            what: "group name",
+            actual: name.len(),
+            maximum: MAX_GROUP_NAME_BYTES,
         });
     }
     Ok(())
@@ -100,6 +135,10 @@ impl MetaKey {
             MetaKey::Segment { .. } => CATEGORY_SEGMENT,
             MetaKey::Key { .. } => CATEGORY_KEY,
             MetaKey::Request { .. } => CATEGORY_REQUEST,
+            MetaKey::Group { .. } => CATEGORY_GROUP,
+            MetaKey::GroupByName { .. } => CATEGORY_GROUP_BY_NAME,
+            MetaKey::GroupMember { .. } => CATEGORY_GROUP_MEMBER,
+            MetaKey::GroupCursor { .. } => CATEGORY_GROUP_CURSOR,
         }
     }
 
@@ -133,6 +172,24 @@ impl MetaKey {
             }
             MetaKey::Key { key_uuid } => put_uuid(&mut out, *key_uuid),
             MetaKey::Request { request_id } => put_uuid(&mut out, *request_id),
+            MetaKey::Group { group_uuid } => put_uuid(&mut out, *group_uuid),
+            MetaKey::GroupByName { name } => out.extend_from_slice(name.as_bytes()),
+            MetaKey::GroupMember {
+                group_uuid,
+                member_uuid,
+            } => {
+                put_uuid(&mut out, *group_uuid);
+                put_uuid(&mut out, *member_uuid);
+            }
+            MetaKey::GroupCursor {
+                group_uuid,
+                topic_uuid,
+                range_uuid,
+            } => {
+                put_uuid(&mut out, *group_uuid);
+                put_uuid(&mut out, *topic_uuid);
+                put_uuid(&mut out, *range_uuid);
+            }
         }
         out
     }
@@ -185,6 +242,31 @@ impl MetaKey {
             CATEGORY_REQUEST => MetaKey::Request {
                 request_id: reader.uuid("request id")?,
             },
+            CATEGORY_GROUP => MetaKey::Group {
+                group_uuid: reader.uuid("group uuid")?,
+            },
+            CATEGORY_GROUP_BY_NAME => {
+                let raw = reader.remaining();
+                if raw == 0 || raw > MAX_GROUP_NAME_BYTES {
+                    return Err(CodecError::BoundExceeded {
+                        what: "group name",
+                        actual: raw,
+                        maximum: MAX_GROUP_NAME_BYTES,
+                    });
+                }
+                let name = String::from_utf8(reader.take(raw, "group name")?.to_vec())
+                    .map_err(|_| CodecError::InvalidUtf8("group name"))?;
+                MetaKey::GroupByName { name }
+            }
+            CATEGORY_GROUP_MEMBER => MetaKey::GroupMember {
+                group_uuid: reader.uuid("group uuid")?,
+                member_uuid: reader.uuid("member uuid")?,
+            },
+            CATEGORY_GROUP_CURSOR => MetaKey::GroupCursor {
+                group_uuid: reader.uuid("group uuid")?,
+                topic_uuid: reader.uuid("topic uuid")?,
+                range_uuid: reader.uuid("range uuid")?,
+            },
             other => {
                 return Err(CodecError::UnknownTag {
                     what: "meta key category",
@@ -232,6 +314,20 @@ impl fmt::Display for MetaKey {
             ),
             MetaKey::Key { key_uuid } => write!(formatter, "/meta/0/key/{key_uuid}"),
             MetaKey::Request { request_id } => write!(formatter, "/meta/0/request/{request_id}"),
+            MetaKey::Group { group_uuid } => write!(formatter, "/meta/0/group/{group_uuid}"),
+            MetaKey::GroupByName { name } => write!(formatter, "/meta/0/group-by-name/{name}"),
+            MetaKey::GroupMember {
+                group_uuid,
+                member_uuid,
+            } => write!(formatter, "/meta/0/group/{group_uuid}/member/{member_uuid}"),
+            MetaKey::GroupCursor {
+                group_uuid,
+                topic_uuid,
+                range_uuid,
+            } => write!(
+                formatter,
+                "/meta/0/group/{group_uuid}/cursor/{topic_uuid}/{range_uuid}"
+            ),
         }
     }
 }
@@ -266,6 +362,21 @@ mod tests {
             },
             MetaKey::Request {
                 request_id: Uuid::from_u128(6),
+            },
+            MetaKey::Group {
+                group_uuid: Uuid::from_u128(7),
+            },
+            MetaKey::GroupByName {
+                name: "audit.consumers".to_owned(),
+            },
+            MetaKey::GroupMember {
+                group_uuid: Uuid::from_u128(7),
+                member_uuid: Uuid::from_u128(8),
+            },
+            MetaKey::GroupCursor {
+                group_uuid: Uuid::from_u128(7),
+                topic_uuid: Uuid::from_u128(2),
+                range_uuid: Uuid::from_u128(3),
             },
         ]
     }

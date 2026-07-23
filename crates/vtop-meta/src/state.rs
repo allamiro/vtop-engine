@@ -12,9 +12,10 @@
 //! dedup survives snapshot/restore identically on every replica.
 
 use crate::command::{
-    MetadataCommand, MetadataError, MetadataResponse, NodeState, MAX_NODE_ADDR_BYTES,
+    MetadataCommand, MetadataError, MetadataResponse, NodeState, RangeAssignment,
+    MAX_ASSIGNED_RANGES, MAX_NODE_ADDR_BYTES,
 };
-use crate::keys::{validate_topic_name, MetaKey};
+use crate::keys::{validate_group_name, validate_topic_name, MetaKey};
 use crate::wire::{
     put_bounded_str, put_bytes32, put_u16, put_u32, put_u64, put_u8, put_uuid, CodecError, Reader,
 };
@@ -38,6 +39,10 @@ const VALUE_TAG_TOPIC_NAME: u8 = 3;
 const VALUE_TAG_RANGE: u8 = 4;
 const VALUE_TAG_SEGMENT: u8 = 5;
 const VALUE_TAG_KEY: u8 = 6;
+const VALUE_TAG_GROUP: u8 = 7;
+const VALUE_TAG_GROUP_NAME: u8 = 8;
+const VALUE_TAG_GROUP_MEMBER: u8 = 9;
+const VALUE_TAG_GROUP_CURSOR: u8 = 10;
 
 /// A registered broker/controller node.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -118,6 +123,41 @@ pub struct KeyRecord {
     pub state: KeyState,
 }
 
+/// A consumer group incarnation. `generation` bumps on join/leave/assign.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConsumerGroupRecord {
+    pub name: String,
+    pub generation: u64,
+}
+
+/// Name index entry for consumer groups.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupNameRecord {
+    pub group_uuid: Uuid,
+}
+
+/// A joined consumer-group member and its durable range assignment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupMemberRecord {
+    pub generation: u64,
+    pub assigned: Vec<RangeAssignment>,
+}
+
+/// Lineage-aware durable cursor checkpoint for one group/topic/range.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CursorCheckpointRecord {
+    pub topic_epoch: u64,
+    pub range_generation: u64,
+    pub segment_uuid: Uuid,
+    pub segment_generation: u64,
+    pub segment_root: [u8; 32],
+    pub record_offset: u64,
+    pub record_index: u64,
+    pub lineage_transition_id: Option<Uuid>,
+    pub checkpoint_generation: u64,
+    pub committed_by_member: Uuid,
+}
+
 /// A typed record value stored under an encoded [`MetaKey`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MetaValue {
@@ -127,6 +167,10 @@ pub enum MetaValue {
     Range(RangeRecord),
     Segment(SegmentRecord),
     Key(KeyRecord),
+    Group(ConsumerGroupRecord),
+    GroupName(GroupNameRecord),
+    GroupMember(GroupMemberRecord),
+    GroupCursor(CursorCheckpointRecord),
 }
 
 impl MetaValue {
@@ -196,6 +240,44 @@ impl MetaValue {
                         KeyState::Active => 1,
                     },
                 );
+            }
+            MetaValue::Group(group) => {
+                put_u8(&mut out, VALUE_TAG_GROUP);
+                put_bounded_str(
+                    &mut out,
+                    &group.name,
+                    crate::keys::MAX_GROUP_NAME_BYTES,
+                    "group name",
+                )?;
+                put_u64(&mut out, group.generation);
+            }
+            MetaValue::GroupName(name) => {
+                put_u8(&mut out, VALUE_TAG_GROUP_NAME);
+                put_uuid(&mut out, name.group_uuid);
+            }
+            MetaValue::GroupMember(member) => {
+                put_u8(&mut out, VALUE_TAG_GROUP_MEMBER);
+                put_u64(&mut out, member.generation);
+                encode_assigned_ranges(&mut out, &member.assigned)?;
+            }
+            MetaValue::GroupCursor(cursor) => {
+                put_u8(&mut out, VALUE_TAG_GROUP_CURSOR);
+                put_u64(&mut out, cursor.topic_epoch);
+                put_u64(&mut out, cursor.range_generation);
+                put_uuid(&mut out, cursor.segment_uuid);
+                put_u64(&mut out, cursor.segment_generation);
+                put_bytes32(&mut out, &cursor.segment_root);
+                put_u64(&mut out, cursor.record_offset);
+                put_u64(&mut out, cursor.record_index);
+                match cursor.lineage_transition_id {
+                    None => put_u8(&mut out, 0),
+                    Some(id) => {
+                        put_u8(&mut out, 1);
+                        put_uuid(&mut out, id);
+                    }
+                }
+                put_u64(&mut out, cursor.checkpoint_generation);
+                put_uuid(&mut out, cursor.committed_by_member);
             }
         }
         Ok(out)
@@ -271,6 +353,43 @@ impl MetaValue {
                     }
                 },
             }),
+            VALUE_TAG_GROUP => MetaValue::Group(ConsumerGroupRecord {
+                name: reader.bounded_str(crate::keys::MAX_GROUP_NAME_BYTES, "group name")?,
+                generation: reader.u64("group generation")?,
+            }),
+            VALUE_TAG_GROUP_NAME => MetaValue::GroupName(GroupNameRecord {
+                group_uuid: reader.uuid("group uuid")?,
+            }),
+            VALUE_TAG_GROUP_MEMBER => MetaValue::GroupMember(GroupMemberRecord {
+                generation: reader.u64("member generation")?,
+                assigned: decode_assigned_ranges(&mut reader)?,
+            }),
+            VALUE_TAG_GROUP_CURSOR => {
+                let topic_epoch = reader.u64("topic epoch")?;
+                let range_generation = reader.u64("range generation")?;
+                let segment_uuid = reader.uuid("segment uuid")?;
+                let segment_generation = reader.u64("segment generation")?;
+                let segment_root = reader.bytes32("segment root")?;
+                let record_offset = reader.u64("record offset")?;
+                let record_index = reader.u64("record index")?;
+                let lineage_transition_id = if reader.flag("lineage transition presence")? {
+                    Some(reader.uuid("lineage transition id")?)
+                } else {
+                    None
+                };
+                MetaValue::GroupCursor(CursorCheckpointRecord {
+                    topic_epoch,
+                    range_generation,
+                    segment_uuid,
+                    segment_generation,
+                    segment_root,
+                    record_offset,
+                    record_index,
+                    lineage_transition_id,
+                    checkpoint_generation: reader.u64("checkpoint generation")?,
+                    committed_by_member: reader.uuid("committed-by member")?,
+                })
+            }
             other => {
                 return Err(CodecError::UnknownTag {
                     what: "record value tag",
@@ -423,6 +542,63 @@ impl MetaStateMachine {
                 public_material_digest,
                 ..
             } => self.put_key_record(*key_uuid, *scheme, *public_material_digest),
+            MetadataCommand::CreateConsumerGroup {
+                name, group_uuid, ..
+            } => self.create_consumer_group(name, *group_uuid),
+            MetadataCommand::JoinConsumerGroup {
+                group_uuid,
+                member_uuid,
+                expected_group_generation,
+                ..
+            } => self.join_consumer_group(*group_uuid, *member_uuid, *expected_group_generation),
+            MetadataCommand::LeaveConsumerGroup {
+                group_uuid,
+                member_uuid,
+                expected_member_generation,
+                ..
+            } => self.leave_consumer_group(*group_uuid, *member_uuid, *expected_member_generation),
+            MetadataCommand::AssignMemberRanges {
+                group_uuid,
+                member_uuid,
+                ranges,
+                expected_member_generation,
+                ..
+            } => self.assign_member_ranges(
+                *group_uuid,
+                *member_uuid,
+                ranges,
+                *expected_member_generation,
+            ),
+            MetadataCommand::CommitGroupCursor {
+                group_uuid,
+                member_uuid,
+                topic_uuid,
+                range_uuid,
+                topic_epoch,
+                range_generation,
+                segment_uuid,
+                segment_generation,
+                segment_root,
+                record_offset,
+                record_index,
+                lineage_transition_id,
+                expected_checkpoint_generation,
+                ..
+            } => self.commit_group_cursor(CommitCursorArgs {
+                group_uuid: *group_uuid,
+                member_uuid: *member_uuid,
+                topic_uuid: *topic_uuid,
+                range_uuid: *range_uuid,
+                topic_epoch: *topic_epoch,
+                range_generation: *range_generation,
+                segment_uuid: *segment_uuid,
+                segment_generation: *segment_generation,
+                segment_root: *segment_root,
+                record_offset: *record_offset,
+                record_index: *record_index,
+                lineage_transition_id: *lineage_transition_id,
+                expected_checkpoint_generation: *expected_checkpoint_generation,
+            }),
         }
     }
 
@@ -816,6 +992,375 @@ impl MetaStateMachine {
         MetadataResponse::Ack { generation: 0 }
     }
 
+    fn create_consumer_group(&mut self, name: &str, group_uuid: Uuid) -> MetadataResponse {
+        if validate_group_name(name).is_err() {
+            return reject(MetadataError::limit(format!(
+                "group name must be 1..={} bytes, got {}",
+                crate::keys::MAX_GROUP_NAME_BYTES,
+                name.len()
+            )));
+        }
+        let group_key = MetaKey::Group { group_uuid }.encode();
+        if self.records.contains_key(&group_key) {
+            return reject(MetadataError::AlreadyExists);
+        }
+        let name_key = MetaKey::GroupByName {
+            name: name.to_owned(),
+        }
+        .encode();
+        if self.records.contains_key(&name_key) {
+            return reject(MetadataError::AlreadyExists);
+        }
+        self.records.insert(
+            name_key,
+            MetaValue::GroupName(GroupNameRecord { group_uuid }),
+        );
+        self.records.insert(
+            group_key,
+            MetaValue::Group(ConsumerGroupRecord {
+                name: name.to_owned(),
+                generation: 0,
+            }),
+        );
+        MetadataResponse::GroupCreated {
+            group_uuid,
+            generation: 0,
+        }
+    }
+
+    fn join_consumer_group(
+        &mut self,
+        group_uuid: Uuid,
+        member_uuid: Uuid,
+        expected_group_generation: u64,
+    ) -> MetadataResponse {
+        let group_key = MetaKey::Group { group_uuid }.encode();
+        let Some(MetaValue::Group(group)) = self.records.get(&group_key) else {
+            return reject(MetadataError::NotFound);
+        };
+        if group.generation != expected_group_generation {
+            return reject(MetadataError::GenerationMismatch {
+                expected: expected_group_generation,
+                actual: group.generation,
+            });
+        }
+        let member_key = MetaKey::GroupMember {
+            group_uuid,
+            member_uuid,
+        }
+        .encode();
+        if self.records.contains_key(&member_key) {
+            return reject(MetadataError::AlreadyExists);
+        }
+        let Some(next_group_generation) = group.generation.checked_add(1) else {
+            return reject(MetadataError::limit("group generation space is exhausted"));
+        };
+        self.records.insert(
+            member_key,
+            MetaValue::GroupMember(GroupMemberRecord {
+                generation: 0,
+                assigned: Vec::new(),
+            }),
+        );
+        let Some(MetaValue::Group(group)) = self.records.get_mut(&group_key) else {
+            unreachable!("group record was present above");
+        };
+        group.generation = next_group_generation;
+        MetadataResponse::MemberJoined {
+            member_generation: 0,
+            group_generation: next_group_generation,
+        }
+    }
+
+    fn leave_consumer_group(
+        &mut self,
+        group_uuid: Uuid,
+        member_uuid: Uuid,
+        expected_member_generation: u64,
+    ) -> MetadataResponse {
+        let group_key = MetaKey::Group { group_uuid }.encode();
+        let Some(MetaValue::Group(group)) = self.records.get(&group_key) else {
+            return reject(MetadataError::NotFound);
+        };
+        let Some(next_group_generation) = group.generation.checked_add(1) else {
+            return reject(MetadataError::limit("group generation space is exhausted"));
+        };
+        let member_key = MetaKey::GroupMember {
+            group_uuid,
+            member_uuid,
+        }
+        .encode();
+        let Some(MetaValue::GroupMember(member)) = self.records.get(&member_key) else {
+            return reject(MetadataError::NotFound);
+        };
+        if member.generation != expected_member_generation {
+            return reject(MetadataError::GenerationMismatch {
+                expected: expected_member_generation,
+                actual: member.generation,
+            });
+        }
+        self.records.remove(&member_key);
+        let Some(MetaValue::Group(group)) = self.records.get_mut(&group_key) else {
+            unreachable!("group record was present above");
+        };
+        group.generation = next_group_generation;
+        MetadataResponse::Ack {
+            generation: next_group_generation,
+        }
+    }
+
+    fn assign_member_ranges(
+        &mut self,
+        group_uuid: Uuid,
+        member_uuid: Uuid,
+        ranges: &[RangeAssignment],
+        expected_member_generation: u64,
+    ) -> MetadataResponse {
+        if ranges.len() > MAX_ASSIGNED_RANGES {
+            return reject(MetadataError::limit(format!(
+                "assigned ranges must be <= {MAX_ASSIGNED_RANGES}, got {}",
+                ranges.len()
+            )));
+        }
+        let mut seen = BTreeMap::new();
+        for assignment in ranges {
+            let range_key = MetaKey::Range {
+                topic_uuid: assignment.topic_uuid,
+                range_uuid: assignment.range_uuid,
+            }
+            .encode();
+            if !matches!(self.records.get(&range_key), Some(MetaValue::Range(_))) {
+                return reject(MetadataError::NotFound);
+            }
+            if seen
+                .insert((assignment.topic_uuid, assignment.range_uuid), ())
+                .is_some()
+            {
+                return reject(MetadataError::invalid_transition(
+                    "assigned ranges contain a duplicate topic/range pair",
+                ));
+            }
+        }
+        // Exclusive ownership: a range may be assigned to at most one live
+        // member of the group. Overlapping assignment during rebalance is
+        // rejected rather than allowing concurrent cursor commits.
+        for (key_bytes, value) in &self.records {
+            let Ok(MetaKey::GroupMember {
+                group_uuid: other_group,
+                member_uuid: other_member,
+            }) = MetaKey::decode(key_bytes)
+            else {
+                continue;
+            };
+            if other_group != group_uuid || other_member == member_uuid {
+                continue;
+            }
+            let MetaValue::GroupMember(other) = value else {
+                continue;
+            };
+            for assignment in ranges {
+                if other.assigned.iter().any(|held| {
+                    held.topic_uuid == assignment.topic_uuid
+                        && held.range_uuid == assignment.range_uuid
+                }) {
+                    return reject(MetadataError::invalid_transition(
+                        "range is already assigned to another group member",
+                    ));
+                }
+            }
+        }
+        let group_key = MetaKey::Group { group_uuid }.encode();
+        if !matches!(self.records.get(&group_key), Some(MetaValue::Group(_))) {
+            return reject(MetadataError::NotFound);
+        }
+        let member_key = MetaKey::GroupMember {
+            group_uuid,
+            member_uuid,
+        }
+        .encode();
+        let Some(MetaValue::GroupMember(member)) = self.records.get_mut(&member_key) else {
+            return reject(MetadataError::NotFound);
+        };
+        if member.generation != expected_member_generation {
+            return reject(MetadataError::GenerationMismatch {
+                expected: expected_member_generation,
+                actual: member.generation,
+            });
+        }
+        let Some(next_member_generation) = member.generation.checked_add(1) else {
+            return reject(MetadataError::limit("member generation space is exhausted"));
+        };
+        member.assigned = ranges.to_vec();
+        member.generation = next_member_generation;
+        let Some(MetaValue::Group(group)) = self.records.get_mut(&group_key) else {
+            unreachable!("group record was present above");
+        };
+        let Some(next_group_generation) = group.generation.checked_add(1) else {
+            return reject(MetadataError::limit("group generation space is exhausted"));
+        };
+        group.generation = next_group_generation;
+        MetadataResponse::Ack {
+            generation: next_member_generation,
+        }
+    }
+
+    fn commit_group_cursor(&mut self, args: CommitCursorArgs) -> MetadataResponse {
+        let group_key = MetaKey::Group {
+            group_uuid: args.group_uuid,
+        }
+        .encode();
+        if !matches!(self.records.get(&group_key), Some(MetaValue::Group(_))) {
+            return reject(MetadataError::NotFound);
+        }
+        let member_key = MetaKey::GroupMember {
+            group_uuid: args.group_uuid,
+            member_uuid: args.member_uuid,
+        }
+        .encode();
+        let Some(MetaValue::GroupMember(member)) = self.records.get(&member_key) else {
+            return reject(MetadataError::NotFound);
+        };
+        let owns_range = member.assigned.iter().any(|assignment| {
+            assignment.topic_uuid == args.topic_uuid && assignment.range_uuid == args.range_uuid
+        });
+        if !owns_range {
+            return reject(MetadataError::invalid_transition(
+                "member is not assigned the cursor topic/range",
+            ));
+        }
+
+        let topic_key = MetaKey::Topic {
+            topic_uuid: args.topic_uuid,
+        }
+        .encode();
+        let Some(MetaValue::Topic(topic)) = self.records.get(&topic_key) else {
+            return reject(MetadataError::NotFound);
+        };
+        if topic.topic_epoch != args.topic_epoch {
+            return reject(MetadataError::EpochMismatch {
+                expected: args.topic_epoch,
+                actual: topic.topic_epoch,
+            });
+        }
+
+        let range_key = MetaKey::Range {
+            topic_uuid: args.topic_uuid,
+            range_uuid: args.range_uuid,
+        }
+        .encode();
+        let Some(MetaValue::Range(range)) = self.records.get(&range_key) else {
+            return reject(MetadataError::NotFound);
+        };
+        if range.generation != args.range_generation {
+            return reject(MetadataError::GenerationMismatch {
+                expected: args.range_generation,
+                actual: range.generation,
+            });
+        }
+
+        let segment_key = MetaKey::Segment {
+            topic_uuid: args.topic_uuid,
+            range_uuid: args.range_uuid,
+            segment_uuid: args.segment_uuid,
+        }
+        .encode();
+        let Some(MetaValue::Segment(segment)) = self.records.get(&segment_key) else {
+            return reject(MetadataError::NotFound);
+        };
+        if segment.segment_generation != args.segment_generation {
+            return reject(MetadataError::GenerationMismatch {
+                expected: args.segment_generation,
+                actual: segment.segment_generation,
+            });
+        }
+        if segment.content_root != args.segment_root {
+            return reject(MetadataError::invalid_transition(
+                "segment root does not match the registered segment",
+            ));
+        }
+        if args.record_offset < segment.base_offset || args.record_offset > segment.next_offset {
+            return reject(MetadataError::invalid_transition(format!(
+                "record offset {} is outside sealed segment [{}, {}]",
+                args.record_offset, segment.base_offset, segment.next_offset
+            )));
+        }
+
+        let cursor_key = MetaKey::GroupCursor {
+            group_uuid: args.group_uuid,
+            topic_uuid: args.topic_uuid,
+            range_uuid: args.range_uuid,
+        }
+        .encode();
+        match (
+            self.records.get(&cursor_key).cloned(),
+            args.expected_checkpoint_generation,
+        ) {
+            (None, None) => {
+                self.records.insert(
+                    cursor_key,
+                    MetaValue::GroupCursor(CursorCheckpointRecord {
+                        topic_epoch: args.topic_epoch,
+                        range_generation: args.range_generation,
+                        segment_uuid: args.segment_uuid,
+                        segment_generation: args.segment_generation,
+                        segment_root: args.segment_root,
+                        record_offset: args.record_offset,
+                        record_index: args.record_index,
+                        lineage_transition_id: args.lineage_transition_id,
+                        checkpoint_generation: 0,
+                        committed_by_member: args.member_uuid,
+                    }),
+                );
+                MetadataResponse::CursorCommitted {
+                    checkpoint_generation: 0,
+                }
+            }
+            (None, Some(_)) => reject(MetadataError::NotFound),
+            (Some(_), None) => reject(MetadataError::AlreadyExists),
+            (Some(MetaValue::GroupCursor(existing)), Some(expected)) => {
+                if existing.checkpoint_generation != expected {
+                    return reject(MetadataError::GenerationMismatch {
+                        expected,
+                        actual: existing.checkpoint_generation,
+                    });
+                }
+                if existing.topic_epoch != args.topic_epoch {
+                    return reject(MetadataError::EpochMismatch {
+                        expected: args.topic_epoch,
+                        actual: existing.topic_epoch,
+                    });
+                }
+                if let Err(error) = cursor_is_forward_or_equal(&existing, &args) {
+                    return reject(error);
+                }
+                let Some(next_generation) = existing.checkpoint_generation.checked_add(1) else {
+                    return reject(MetadataError::limit(
+                        "checkpoint generation space is exhausted",
+                    ));
+                };
+                self.records.insert(
+                    cursor_key,
+                    MetaValue::GroupCursor(CursorCheckpointRecord {
+                        topic_epoch: args.topic_epoch,
+                        range_generation: args.range_generation,
+                        segment_uuid: args.segment_uuid,
+                        segment_generation: args.segment_generation,
+                        segment_root: args.segment_root,
+                        record_offset: args.record_offset,
+                        record_index: args.record_index,
+                        lineage_transition_id: args.lineage_transition_id,
+                        checkpoint_generation: next_generation,
+                        committed_by_member: args.member_uuid,
+                    }),
+                );
+                MetadataResponse::CursorCommitted {
+                    checkpoint_generation: next_generation,
+                }
+            }
+            (Some(_), Some(_)) => unreachable!("cursor keys only hold cursor records"),
+        }
+    }
+
     /// Encode the full state — sorted records plus the dedup FIFO — as one
     /// canonical byte string. Identical states always produce identical
     /// bytes, which the snapshot determinism tests pin.
@@ -963,7 +1508,95 @@ fn key_matches_value(key: &MetaKey, value: &MetaValue) -> bool {
             | (MetaKey::Range { .. }, MetaValue::Range(_))
             | (MetaKey::Segment { .. }, MetaValue::Segment(_))
             | (MetaKey::Key { .. }, MetaValue::Key(_))
+            | (MetaKey::Group { .. }, MetaValue::Group(_))
+            | (MetaKey::GroupByName { .. }, MetaValue::GroupName(_))
+            | (MetaKey::GroupMember { .. }, MetaValue::GroupMember(_))
+            | (MetaKey::GroupCursor { .. }, MetaValue::GroupCursor(_))
     )
+}
+
+struct CommitCursorArgs {
+    group_uuid: Uuid,
+    member_uuid: Uuid,
+    topic_uuid: Uuid,
+    range_uuid: Uuid,
+    topic_epoch: u64,
+    range_generation: u64,
+    segment_uuid: Uuid,
+    segment_generation: u64,
+    segment_root: [u8; 32],
+    record_offset: u64,
+    record_index: u64,
+    lineage_transition_id: Option<Uuid>,
+    expected_checkpoint_generation: Option<u64>,
+}
+
+fn cursor_is_forward_or_equal(
+    existing: &CursorCheckpointRecord,
+    args: &CommitCursorArgs,
+) -> Result<(), MetadataError> {
+    if args.segment_uuid == existing.segment_uuid {
+        if args.segment_generation != existing.segment_generation
+            || args.segment_root != existing.segment_root
+        {
+            return Err(MetadataError::invalid_transition(
+                "same segment identity changed generation or root",
+            ));
+        }
+        if args.record_offset < existing.record_offset
+            || (args.record_offset == existing.record_offset
+                && args.record_index < existing.record_index)
+        {
+            return Err(MetadataError::invalid_transition(
+                "cursor moved backward within the same segment",
+            ));
+        }
+        return Ok(());
+    }
+    // Different segment: require a non-decreasing record offset as a coarse
+    // forward signal until split/merge transition evidence lands in a later
+    // slice. Equal offsets across segment identity changes are rejected.
+    if args.record_offset < existing.record_offset {
+        return Err(MetadataError::invalid_transition(
+            "cursor moved backward across segment identity",
+        ));
+    }
+    Ok(())
+}
+
+fn encode_assigned_ranges(out: &mut Vec<u8>, ranges: &[RangeAssignment]) -> Result<(), CodecError> {
+    if ranges.len() > MAX_ASSIGNED_RANGES {
+        return Err(CodecError::BoundExceeded {
+            what: "assigned ranges",
+            actual: ranges.len(),
+            maximum: MAX_ASSIGNED_RANGES,
+        });
+    }
+    put_u16(out, ranges.len() as u16);
+    for range in ranges {
+        put_uuid(out, range.topic_uuid);
+        put_uuid(out, range.range_uuid);
+    }
+    Ok(())
+}
+
+fn decode_assigned_ranges(reader: &mut Reader<'_>) -> Result<Vec<RangeAssignment>, CodecError> {
+    let count = reader.u16("assigned range count")? as usize;
+    if count > MAX_ASSIGNED_RANGES {
+        return Err(CodecError::BoundExceeded {
+            what: "assigned ranges",
+            actual: count,
+            maximum: MAX_ASSIGNED_RANGES,
+        });
+    }
+    let mut ranges = Vec::with_capacity(count);
+    for _ in 0..count {
+        ranges.push(RangeAssignment {
+            topic_uuid: reader.uuid("assigned topic uuid")?,
+            range_uuid: reader.uuid("assigned range uuid")?,
+        });
+    }
+    Ok(ranges)
 }
 
 fn reject(error: MetadataError) -> MetadataResponse {
