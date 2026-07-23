@@ -62,6 +62,25 @@ fn grant(requests: &mut Requests, holder: Uuid, expected_range_generation: u64) 
     }
 }
 
+fn release(requests: &mut Requests, expected_fencing_epoch: u64) -> MetadataCommand {
+    MetadataCommand::ReleaseRangeLease {
+        env: requests.next(),
+        topic_uuid: TOPIC,
+        range_uuid: RANGE,
+        expected_fencing_epoch,
+    }
+}
+
+fn range_lease_active(machine: &MetaStateMachine) -> bool {
+    let Some(MetaValue::Range(range)) = machine.record(&MetaKey::Range {
+        topic_uuid: TOPIC,
+        range_uuid: RANGE,
+    }) else {
+        panic!("range record missing");
+    };
+    range.lease.is_some()
+}
+
 fn range_fencing_epoch(machine: &MetaStateMachine) -> u64 {
     let Some(MetaValue::Range(range)) = machine.record(&MetaKey::Range {
         topic_uuid: TOPIC,
@@ -196,4 +215,55 @@ fn grant_produce_steal_fences_prior_broker() {
     let (broker_b, _) = open_broker(&dir, 2, meta_epoch);
     let ok_b = broker_b.handle(Role::Producer, produce(range, 2, 1));
     assert!(matches!(ok_b.message, Message::ProduceResponse(_)));
+}
+
+#[test]
+fn release_clears_lease_and_fences_holder_without_epoch_bump() {
+    let mut requests = Requests(0);
+    let mut machine = MetaStateMachine::new();
+    assert_eq!(
+        machine.apply(1, &register(&mut requests, NODE_A, "10.0.0.1:9200")),
+        MetadataResponse::Ack { generation: 0 }
+    );
+    assert!(matches!(
+        machine.apply(2, &create_topic(&mut requests)),
+        MetadataResponse::TopicCreated { .. }
+    ));
+    assert_eq!(
+        machine.apply(3, &grant(&mut requests, NODE_A, 0)),
+        MetadataResponse::LeaseGranted { fencing_epoch: 1 }
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let meta_epoch = MetaFencingEpoch::new(1);
+    let (broker, range) = open_broker(&dir, 1, meta_epoch.clone());
+    assert!(matches!(
+        broker
+            .handle(Role::Producer, produce(range.clone(), 1, 1))
+            .message,
+        Message::ProduceResponse(_)
+    ));
+
+    // Release keeps fencing_epoch=1 but clears the live lease.
+    assert!(matches!(
+        machine.apply(4, &release(&mut requests, 1)),
+        MetadataResponse::Ack { .. }
+    ));
+    assert_eq!(range_fencing_epoch(&machine), 1);
+    assert!(!range_lease_active(&machine));
+    meta_epoch.clear_lease();
+    assert!(!meta_epoch.lease_active());
+    assert_eq!(meta_epoch.get(), 1);
+
+    let fenced = broker.handle(Role::Producer, produce(range, 1, 2));
+    assert!(
+        matches!(
+            fenced.message,
+            Message::Error(ErrorResponse {
+                code: ErrorCode::Fenced,
+                ..
+            })
+        ),
+        "release must fence the prior holder even when the epoch number is unchanged"
+    );
 }

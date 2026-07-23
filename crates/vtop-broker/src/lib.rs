@@ -5,18 +5,18 @@
 //! boundary, fetches stop at the committed high-water mark, and producer epochs
 //! are fenced by a separate durable append-only journal.
 //!
-//! Range leadership is gated by a metadata-issued fencing epoch
-//! ([`MetaFencingEpoch`]): the broker holds the epoch it was granted and
-//! compares it on every produce/fetch against the latest committed metadata
-//! epoch for the range. When metadata grants a newer epoch, observers update
-//! the shared handle and the prior leaseholder is fenced.
+//! Range leadership is gated by a metadata-issued lease view
+//! ([`MetaFencingEpoch`]): the broker holds the epoch it was granted and, on
+//! every produce/fetch, locks that shared view while validating and mutating
+//! storage. Observers publish grants and releases into the same handle; a
+//! newer grant or a release fences the prior leaseholder before the next
+//! durable append can complete.
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
@@ -253,29 +253,83 @@ struct BrokerState {
     producer_epochs: ProducerEpochJournal,
 }
 
-/// Shared view of the metadata-committed fencing epoch for a range.
+/// Shared metadata lease view for a range.
 ///
-/// Lease observers (tests today; a Raft applied-state watcher later) publish
-/// the latest grant into this handle. Brokers compare their held lease epoch
-/// against [`MetaFencingEpoch::get`] on every produce/fetch.
-#[derive(Clone, Debug, Default)]
+/// Observers publish grants ([`MetaFencingEpoch::set`]) and releases
+/// ([`MetaFencingEpoch::clear_lease`]). Brokers lock this view for the
+/// entire produce/fetch critical section so a concurrent revocation cannot
+/// race past the fencing check into a durable append.
+#[derive(Clone, Debug)]
 pub struct MetaFencingEpoch {
-    epoch: Arc<AtomicU64>,
+    state: Arc<Mutex<MetaLeaseState>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MetaLeaseState {
+    /// Latest metadata fencing epoch for the range (never rewound on release).
+    fencing_epoch: u64,
+    /// Whether a live lease currently exists. Release clears this without
+    /// changing `fencing_epoch`.
+    lease_active: bool,
 }
 
 impl MetaFencingEpoch {
+    /// Start with an active lease at `epoch` (fixed single-node / test default).
     pub fn new(epoch: u64) -> Self {
         Self {
-            epoch: Arc::new(AtomicU64::new(epoch)),
+            state: Arc::new(Mutex::new(MetaLeaseState {
+                fencing_epoch: epoch,
+                lease_active: true,
+            })),
         }
     }
 
+    /// Latest metadata fencing epoch (whether or not a lease is live).
     pub fn get(&self) -> u64 {
-        self.epoch.load(Ordering::Acquire)
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .fencing_epoch
     }
 
+    /// Whether metadata currently records an active lease for the range.
+    pub fn lease_active(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .lease_active
+    }
+
+    /// Publish a metadata grant (including a steal that mints a newer epoch).
     pub fn set(&self, epoch: u64) {
-        self.epoch.store(epoch, Ordering::Release);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.fencing_epoch = epoch;
+        state.lease_active = true;
+    }
+
+    /// Publish a metadata release: the fencing epoch is retained, but no
+    /// leaseholder remains authorized.
+    pub fn clear_lease(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.lease_active = false;
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, MetaLeaseState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl Default for MetaFencingEpoch {
+    fn default() -> Self {
+        Self::new(0)
     }
 }
 
@@ -410,8 +464,13 @@ impl LocalBroker {
                         "the local broker acknowledges only LocalFsync produce requests",
                     );
                 }
+                // Lock order: metadata lease view, then broker state. Holding
+                // the lease lock across the durable append ensures a concurrent
+                // grant/release cannot revoke after the fencing check but
+                // before fsync.
+                let meta = self.meta_fencing_epoch.lock();
                 if let Err((code, message)) =
-                    self.check_range(&request.range, request.fencing_epoch)
+                    self.check_range(&meta, &request.range, request.fencing_epoch)
                 {
                     return error(request_id, stream_id, code, message);
                 }
@@ -527,8 +586,9 @@ impl LocalBroker {
                         "fetch limits must be non-zero",
                     );
                 }
+                let meta = self.meta_fencing_epoch.lock();
                 if let Err((code, message)) =
-                    self.check_range(&request.range, request.fencing_epoch)
+                    self.check_range(&meta, &request.range, request.fencing_epoch)
                 {
                     return error(request_id, stream_id, code, message);
                 }
@@ -591,6 +651,7 @@ impl LocalBroker {
 
     fn check_range(
         &self,
+        meta: &MetaLeaseState,
         range: &RangeIdentity,
         fencing_epoch: u64,
     ) -> Result<(), (ErrorCode, &'static str)> {
@@ -606,13 +667,12 @@ impl LocalBroker {
                 "request fencing epoch does not match this broker's lease",
             ));
         }
-        // Metadata is the authority: a newer grant fences this leaseholder
-        // even when the producer still presents the previously granted epoch.
-        let meta_epoch = self.meta_fencing_epoch.get();
-        if self.held_fencing_epoch != meta_epoch {
+        // Release clears lease_active without bumping the epoch; a steal
+        // advances fencing_epoch. Either case fences this leaseholder.
+        if !meta.lease_active || meta.fencing_epoch != self.held_fencing_epoch {
             return Err((
                 ErrorCode::Fenced,
-                "broker lease epoch is fenced by a newer metadata grant",
+                "broker lease is inactive or fenced by a newer metadata grant",
             ));
         }
         Ok(())
@@ -1426,11 +1486,25 @@ mod tests {
         );
         assert!(matches!(ok.message, Message::ProduceResponse(_)));
 
-        // Metadata grants a newer epoch to another holder.
-        meta_epoch.set(2);
-        let fenced = broker.handle(Role::Producer, produce_at(range, 1, producer, 1, 1, 2));
+        // Release keeps the epoch number but clears lease liveness.
+        meta_epoch.clear_lease();
+        let released = broker.handle(
+            Role::Producer,
+            produce_at(range.clone(), 1, producer, 1, 1, 2),
+        );
         assert!(matches!(
-            fenced.message,
+            released.message,
+            Message::Error(ErrorResponse {
+                code: ErrorCode::Fenced,
+                ..
+            })
+        ));
+
+        // Re-grant at a newer epoch, then steal again via set(3).
+        meta_epoch.set(2);
+        let still_old = broker.handle(Role::Producer, produce_at(range, 1, producer, 1, 2, 3));
+        assert!(matches!(
+            still_old.message,
             Message::Error(ErrorResponse {
                 code: ErrorCode::Fenced,
                 ..
