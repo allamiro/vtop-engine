@@ -151,7 +151,7 @@ services:
   #   docker compose -f docker-compose.yml -f docker-compose.observability.yml \
   #       up --force-recreate grafana-seed
   grafana-seed:
-    image: curlimages/curl:8.11.1
+    image: curlimages/curl:8.21.0
     container_name: vtop-grafana-seed
     depends_on:
       - grafana
