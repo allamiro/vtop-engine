@@ -1814,7 +1814,9 @@ fn producer_summary_from_states(
 
 /// The commit statement implied by a sealed manifest whose statement slot is
 /// still empty; `scheme` and `mac` are filled by authentication.
-fn commit_statement_core(manifest: &SegmentManifestV2) -> VtopLogResult<CommitStatementV1> {
+pub(crate) fn commit_statement_core(
+    manifest: &SegmentManifestV2,
+) -> VtopLogResult<CommitStatementV1> {
     let core_bytes = canonical_manifest_v2_bytes(manifest)?;
     Ok(CommitStatementV1 {
         statement_version: 1,
@@ -1907,14 +1909,14 @@ fn read_commit_boundary(storage: &dyn Storage, path: &Path) -> VtopLogResult<Com
     })
 }
 
-fn canonical_manifest_bytes(manifest: &SegmentManifest) -> VtopLogResult<Vec<u8>> {
+pub(crate) fn canonical_manifest_bytes(manifest: &SegmentManifest) -> VtopLogResult<Vec<u8>> {
     let mut bytes = serde_json::to_vec(manifest)
         .map_err(|error| LogError::ManifestMismatch(format!("cannot encode manifest: {error}")))?;
     bytes.push(b'\n');
     Ok(bytes)
 }
 
-fn canonical_manifest_v2_bytes(manifest: &SegmentManifestV2) -> VtopLogResult<Vec<u8>> {
+pub(crate) fn canonical_manifest_v2_bytes(manifest: &SegmentManifestV2) -> VtopLogResult<Vec<u8>> {
     let mut bytes = serde_json::to_vec(manifest)
         .map_err(|error| LogError::ManifestMismatch(format!("cannot encode manifest: {error}")))?;
     bytes.push(b'\n');
@@ -1944,7 +1946,7 @@ fn write_chunk_sidecar_atomic(
     write_atomic(env, path, &encode_chunk_sidecar(chunk_size, leaves))
 }
 
-fn read_chunk_sidecar(
+pub(crate) fn read_chunk_sidecar(
     storage: &dyn Storage,
     path: &Path,
 ) -> VtopLogResult<(u32, Vec<blake3::Hash>)> {
@@ -2092,12 +2094,12 @@ fn io_error(path: &Path, source: std::io::Error) -> LogError {
     }
 }
 
-struct SegmentPaths {
-    segment: PathBuf,
-    index: PathBuf,
-    manifest: PathBuf,
-    commit: PathBuf,
-    chunks: PathBuf,
+pub(crate) struct SegmentPaths {
+    pub(crate) segment: PathBuf,
+    pub(crate) index: PathBuf,
+    pub(crate) manifest: PathBuf,
+    pub(crate) commit: PathBuf,
+    pub(crate) chunks: PathBuf,
 }
 
 impl SegmentPaths {
@@ -2110,7 +2112,7 @@ impl SegmentPaths {
         Self::from_stem(path)
     }
 
-    fn from_segment(path: &Path) -> VtopLogResult<Self> {
+    pub(crate) fn from_segment(path: &Path) -> VtopLogResult<Self> {
         if path.extension().and_then(|value| value.to_str()) != Some("segment") {
             return Err(LogError::InvalidDescriptor(
                 "sealed segment path must end in .segment".to_owned(),

@@ -3589,6 +3589,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "blake3",
  "chrono",
  "clap",
  "futures",
@@ -3603,8 +3604,10 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "vtop-adapters",
  "vtop-core",
+ "vtop-log",
  "vtop-state",
  "vtop-upload",
 ]

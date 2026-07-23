@@ -225,6 +225,7 @@ async fn start(broker: Arc<LocalBroker>) -> Result<Harness, String> {
         ServerConfig {
             cluster_id: CLUSTER_ID,
             node_id: NODE_ID,
+            segment_format: vtop_broker::SegmentFormat::V1,
             max_frame_bytes: LIMITS.max_frame_bytes,
             max_records_per_frame: LIMITS.max_records,
             window_bytes: WINDOW_BYTES,

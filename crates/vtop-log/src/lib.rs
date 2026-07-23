@@ -13,6 +13,7 @@ pub mod proof;
 mod segment;
 pub mod sim;
 mod types;
+pub mod verify;
 
 pub use catalog::{
     CatalogEntry, CatalogSegmentState, QuarantineReason, QuarantinedArtifacts, StartupCatalog,

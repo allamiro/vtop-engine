@@ -229,6 +229,18 @@ fn storage_producer_id(producer_id: Uuid, epoch: u64) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
+/// On-disk segment format the broker writes to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SegmentFormat {
+    /// v1 frames cannot carry producer epochs, so each epoch is folded into
+    /// a derived storage producer id.
+    #[default]
+    V1,
+    /// v2 frames persist the producer epoch, so records land with their real
+    /// producer identity and the log itself enforces epoch fencing.
+    V2,
+}
+
 struct BrokerState {
     segment: ActiveSegment,
     producer_epochs: ProducerEpochJournal,
@@ -237,6 +249,7 @@ struct BrokerState {
 pub struct LocalBroker {
     range: RangeIdentity,
     fencing_epoch: u64,
+    segment_format: SegmentFormat,
     state: Mutex<BrokerState>,
 }
 
@@ -247,12 +260,32 @@ impl LocalBroker {
         range: RangeIdentity,
         fencing_epoch: u64,
     ) -> BrokerResult<Self> {
-        let descriptor = segment.descriptor();
-        if descriptor.topic != range.topic
-            || descriptor.topic_epoch != range.topic_epoch
-            || descriptor.lineage.range_id != range.range_id
-            || descriptor.lineage.generation != range.range_generation
-        {
+        // The format is derived from the segment itself so the broker's
+        // produce-time behavior can never disagree with the on-disk frames.
+        let segment_format = if segment.format_version() == vtop_log::FORMAT_VERSION_V2 {
+            SegmentFormat::V2
+        } else {
+            SegmentFormat::V1
+        };
+        let identity_matches = match segment_format {
+            SegmentFormat::V1 => {
+                let descriptor = segment.descriptor();
+                descriptor.topic == range.topic
+                    && descriptor.topic_epoch == range.topic_epoch
+                    && descriptor.lineage.range_id == range.range_id
+                    && descriptor.lineage.generation == range.range_generation
+            }
+            SegmentFormat::V2 => {
+                let descriptor = segment
+                    .descriptor_v2()
+                    .expect("v2 format was detected from this segment");
+                descriptor.topic == range.topic
+                    && descriptor.topic_epoch == range.topic_epoch
+                    && descriptor.lineage.range_id == range.range_id
+                    && descriptor.lineage.generation == range.range_generation
+            }
+        };
+        if !identity_matches {
             return Err(BrokerError::InvalidConfig(
                 "broker range identity does not match active segment".to_owned(),
             ));
@@ -260,11 +293,17 @@ impl LocalBroker {
         Ok(Self {
             range,
             fencing_epoch,
+            segment_format,
             state: Mutex::new(BrokerState {
                 segment,
                 producer_epochs,
             }),
         })
+    }
+
+    /// The segment format this broker writes, derived from its segment.
+    pub fn segment_format(&self) -> SegmentFormat {
+        self.segment_format
     }
 
     pub fn handle(&self, role: Role, frame: WireFrame) -> WireFrame {
@@ -327,7 +366,16 @@ impl LocalBroker {
                         ),
                     };
                 }
-                let stored_id = storage_producer_id(request.producer_id, request.producer_epoch);
+                // The v1 storage schema cannot carry the epoch, so it is
+                // folded into a derived producer id; schema v2 persists the
+                // epoch in every frame (attributes stay reserved as zero).
+                let (stored_id, stored_epoch) = match self.segment_format {
+                    SegmentFormat::V1 => (
+                        storage_producer_id(request.producer_id, request.producer_epoch),
+                        0,
+                    ),
+                    SegmentFormat::V2 => (request.producer_id, request.producer_epoch),
+                };
                 let records = match request
                     .records
                     .into_iter()
@@ -336,9 +384,7 @@ impl LocalBroker {
                         let sequence = request.first_sequence.checked_add(index as u64).ok_or(());
                         sequence.map(|sequence| LogRecord {
                             producer_id: stored_id,
-                            // The v1 storage schema cannot carry the epoch;
-                            // it is folded into `stored_id` above instead.
-                            producer_epoch: 0,
+                            producer_epoch: stored_epoch,
                             sequence,
                             timestamp_millis: record.timestamp_millis,
                             attributes: 0,
@@ -383,6 +429,9 @@ impl LocalBroker {
                             | vtop_log::LogError::SequenceBelowWindow { .. } => {
                                 ErrorCode::SequenceConflict
                             }
+                            // In v2 mode the segment sees real epochs and can
+                            // fence a session the journal has not heard from.
+                            vtop_log::LogError::ProducerFenced { .. } => ErrorCode::Fenced,
                             _ => ErrorCode::Storage,
                         },
                         &problem.to_string(),
@@ -510,6 +559,9 @@ fn error(request_id: u64, stream_id: u64, code: ErrorCode, message: &str) -> Wir
 pub struct ServerConfig {
     pub cluster_id: Uuid,
     pub node_id: Uuid,
+    /// Segment format the server expects its broker to write. V2 is an
+    /// explicit opt-in; the default keeps every existing deployment on v1.
+    pub segment_format: SegmentFormat,
     pub max_frame_bytes: u32,
     pub max_records_per_frame: u32,
     pub window_bytes: u64,
@@ -555,6 +607,7 @@ impl Default for ServerConfig {
         Self {
             cluster_id: Uuid::nil(),
             node_id: Uuid::nil(),
+            segment_format: SegmentFormat::V1,
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
             max_records_per_frame: DEFAULT_MAX_RECORDS,
             window_bytes: u64::from(DEFAULT_MAX_FRAME_BYTES),
@@ -597,6 +650,16 @@ impl NativeServer {
         config: ServerConfig,
     ) -> BrokerResult<Self> {
         config.validate()?;
+        // The configured format is a declaration of intent; refusing a
+        // mismatch here keeps a v1 deployment from silently serving a v2
+        // segment (or the reverse) after a bad rollout.
+        if config.segment_format != broker.segment_format() {
+            return Err(BrokerError::InvalidConfig(format!(
+                "configured segment format {:?} does not match the broker's active segment ({:?})",
+                config.segment_format,
+                broker.segment_format()
+            )));
+        }
         // Pin the provider: workspace feature unification can enable more
         // than one rustls backend, and process-level auto-detection then
         // aborts instead of choosing.
@@ -1072,7 +1135,10 @@ mod tests {
     use std::fs::OpenOptions;
     use tempfile::TempDir;
     use tokio_rustls::TlsConnector;
-    use vtop_log::{KeyRange, RangeLineage, SegmentConfig, SegmentDescriptor};
+    use vtop_log::{
+        KeyRange, RangeLineage, SegmentConfig, SegmentConfigV2, SegmentDescriptor,
+        SegmentDescriptorV2,
+    };
     use vtop_protocol::{ClientHello, FetchRequest, ProduceRecord, ProduceRequest};
 
     struct TestAuthorizer {
@@ -1118,6 +1184,38 @@ mod tests {
         let epochs = ProducerEpochJournal::open(dir.path().join("native.epochs")).unwrap();
         let broker = Arc::new(LocalBroker::new(segment, epochs, range.clone(), 7).unwrap());
         (dir, broker, range)
+    }
+
+    /// A v2-mode broker over a fresh proof-carrying segment. Sealing is not
+    /// broker API, so broker tests never seal this segment.
+    fn fixture_v2(dir: &TempDir, journal_name: &str) -> (Arc<LocalBroker>, RangeIdentity) {
+        let range_id = Uuid::from_u128(50);
+        let range = RangeIdentity {
+            topic: "native-v2".to_owned(),
+            topic_epoch: 1,
+            range_id,
+            range_generation: 0,
+        };
+        let descriptor = SegmentDescriptorV2 {
+            segment_id: Uuid::from_u128(51),
+            topic: range.topic.clone(),
+            topic_epoch: range.topic_epoch,
+            lineage: RangeLineage::root(range_id),
+            base_offset: 0,
+            segment_generation: 0,
+            creation_node_id: Uuid::from_u128(52),
+            creation_fencing_epoch: 7,
+        };
+        let path = dir.path().join("native-v2.active");
+        let segment = if path.exists() {
+            ActiveSegment::recover(&path).unwrap()
+        } else {
+            ActiveSegment::create_v2(&path, descriptor, SegmentConfigV2::default()).unwrap()
+        };
+        let epochs = ProducerEpochJournal::open(dir.path().join(journal_name)).unwrap();
+        let broker = Arc::new(LocalBroker::new(segment, epochs, range.clone(), 7).unwrap());
+        assert_eq!(broker.segment_format(), SegmentFormat::V2);
+        (broker, range)
     }
 
     fn produce(
@@ -1230,6 +1328,125 @@ mod tests {
     }
 
     #[test]
+    fn v2_mode_broker_persists_real_producer_epochs_and_fences_stale_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let producer = Uuid::from_u128(53);
+        {
+            let (broker, range) = fixture_v2(&dir, "native-v2.epochs");
+            let first = broker.handle(Role::Producer, produce(range.clone(), producer, 1, 0, 1));
+            let Message::ProduceResponse(first) = first.message else {
+                panic!("expected ack for the epoch-1 produce")
+            };
+            assert_eq!(first.committed_next_offset, 1);
+
+            // An epoch bump restarts the per-(producer, epoch) sequence at 0.
+            let bumped = broker.handle(Role::Producer, produce(range.clone(), producer, 2, 0, 2));
+            let Message::ProduceResponse(bumped) = bumped.message else {
+                panic!("expected ack for the epoch-2 produce")
+            };
+            assert_eq!(bumped.committed_next_offset, 2);
+
+            let fetched = broker.handle(
+                Role::Consumer,
+                WireFrame {
+                    request_id: 3,
+                    stream_id: 1,
+                    message: Message::FetchRequest(FetchRequest {
+                        range: range.clone(),
+                        fencing_epoch: 7,
+                        start_offset: 0,
+                        max_bytes: 4096,
+                        max_records: 10,
+                    }),
+                },
+            );
+            let Message::FetchResponse(fetched) = fetched.message else {
+                panic!("expected fetch response")
+            };
+            assert_eq!(fetched.records.len(), 2);
+
+            // The durable journal has seen epoch 2, so the older session is
+            // fenced before its records ever reach the segment.
+            let stale = broker.handle(Role::Producer, produce(range.clone(), producer, 1, 1, 4));
+            assert!(matches!(
+                stale.message,
+                Message::Error(ErrorResponse {
+                    code: ErrorCode::Fenced,
+                    ..
+                })
+            ));
+        }
+
+        // Reopen the segment directly: v2 frames must carry the producer's
+        // real id and epoch instead of a derived storage id with epoch 0.
+        let mut recovered = ActiveSegment::recover(dir.path().join("native-v2.active")).unwrap();
+        let batch = recovered.fetch(0, usize::MAX, 16).unwrap();
+        let stored: Vec<(Uuid, u64, u64)> = batch
+            .records
+            .iter()
+            .map(|entry| {
+                (
+                    entry.record.producer_id,
+                    entry.record.producer_epoch,
+                    entry.record.sequence,
+                )
+            })
+            .collect();
+        assert_eq!(stored, vec![(producer, 1, 0), (producer, 2, 0)]);
+    }
+
+    #[test]
+    fn v2_mode_segment_fences_stale_epochs_the_journal_never_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let producer = Uuid::from_u128(54);
+        {
+            let (broker, range) = fixture_v2(&dir, "first.epochs");
+            let newest = broker.handle(Role::Producer, produce(range, producer, 3, 0, 1));
+            assert!(matches!(newest.message, Message::ProduceResponse(_)));
+        }
+
+        // A fresh journal has no memory of epoch 3, so only the recovered
+        // segment's own fencing (LogError::ProducerFenced) can reject the
+        // stale session; the broker must surface it as Fenced.
+        let (broker, range) = fixture_v2(&dir, "second.epochs");
+        let stale = broker.handle(Role::Producer, produce(range, producer, 2, 0, 1));
+        assert!(matches!(
+            stale.message,
+            Message::Error(ErrorResponse {
+                code: ErrorCode::Fenced,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn native_server_rejects_a_config_whose_format_disagrees_with_the_broker() {
+        let dir = tempfile::tempdir().unwrap();
+        let (broker, _range) = fixture_v2(&dir, "native-v2.epochs");
+        let identity = generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let mut client_roots = rustls::RootCertStore::empty();
+        client_roots.add(identity.cert.der().clone()).unwrap();
+        let result = NativeServer::new(
+            broker,
+            ServerTlsMaterial {
+                certificate_chain: vec![identity.cert.der().clone()],
+                private_key: private_key(&identity),
+                client_roots,
+            },
+            Arc::new(TestAuthorizer {
+                leaf_der: identity.cert.der().as_ref().to_vec(),
+                principal_id: Uuid::from_u128(55),
+            }),
+            // Default config declares V1, but the broker writes V2 frames.
+            ServerConfig::default(),
+        );
+        let Err(BrokerError::InvalidConfig(message)) = result else {
+            panic!("expected the format mismatch to be rejected")
+        };
+        assert!(message.contains("segment format"));
+    }
+
+    #[test]
     fn producer_epoch_survives_clean_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("epochs");
@@ -1293,6 +1510,7 @@ mod tests {
             ServerConfig {
                 cluster_id,
                 node_id: Uuid::from_u128(31),
+                segment_format: SegmentFormat::V1,
                 max_frame_bytes: 16 * 1024,
                 max_records_per_frame: 32,
                 window_bytes: 16 * 1024,
