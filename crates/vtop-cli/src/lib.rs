@@ -6,6 +6,7 @@
 
 pub mod commands;
 pub mod engine;
+pub mod meta_tools;
 pub mod metrics_server;
 pub mod segment_tools;
 pub mod testkit;

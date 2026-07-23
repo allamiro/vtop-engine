@@ -29,6 +29,7 @@ hyper-util = { workspace = true }
 hyper = { workspace = true }
 vtop-core = { workspace = true }
 vtop-log = { workspace = true }
+vtop-meta = { workspace = true }
 vtop-adapters = { workspace = true, default-features = false }
 vtop-upload = { workspace = true }
 vtop-state = { workspace = true }
@@ -43,11 +44,11 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 async-trait = { workspace = true }
+uuid = { workspace = true }
 rdkafka = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-uuid = { workspace = true }
 
 # Integration tests live in the repo-root tests/ directory and are compiled as
 # integration tests of this package.

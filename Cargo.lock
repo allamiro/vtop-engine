@@ -4021,6 +4021,7 @@ dependencies = [
  "vtop-adapters",
  "vtop-core",
  "vtop-log",
+ "vtop-meta",
  "vtop-state",
  "vtop-upload",
 ]
@@ -4068,11 +4069,15 @@ dependencies = [
  "async-trait",
  "blake3",
  "openraft",
+ "rcgen",
+ "rustls",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
+ "tokio-rustls",
  "uuid",
  "vtop-log",
+ "x509-parser",
 ]
 
 [[package]]

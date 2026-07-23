@@ -9,8 +9,8 @@ description = "Deterministic metadata state machine and durable raft-shaped stor
 [dependencies]
 # tokio and async-trait are part of this crate's declared contract for the
 # stage-5 slice: PR 2 wires openraft's async storage traits over exactly the
-# types defined here, so the dependency floor is fixed now to keep that PR a
-# pure addition.
+# types defined here; PR 3 adds the mTLS peer/admin transport on the same
+# floor so the Consensus façade stays a pure addition.
 tokio = { workspace = true }
 async-trait = { workspace = true }
 blake3 = { workspace = true }
@@ -18,9 +18,13 @@ openraft = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 vtop-log = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+x509-parser = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+rcgen = { workspace = true }
 # `test-util` enables tokio::time::pause(): the three-node raft harness runs
 # on a paused-clock current-thread runtime so timer-driven behavior is
 # reproducible instead of wall-clock-dependent.
