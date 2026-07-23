@@ -3,19 +3,26 @@
 //!
 //! Every byte flows through the [`vtop_log::env::Env`] seam, so the whole
 //! store runs unchanged against the real filesystem or the deterministic
-//! crash simulator. Consensus does not live here: PR 2 wires openraft over
-//! these primitives, and until then `MetaStorage` treats every durable log
-//! entry as committed during recovery.
+//! crash simulator. Consensus does not live here: PR 2 wires a Raft engine over
+//! these primitives; `MetaStorage` treats every durable log
+//! entry as committed during single-node recovery, while the adapter decides
+//! the commit frontier under consensus.
 
+pub mod applied;
 pub mod hardstate;
 pub mod log;
+pub mod membership_log_id;
+pub mod purged;
 pub mod snapshot;
 
 use crate::command::MetadataResponse;
 use crate::state::MetaStateMachine;
 use crate::wire::CodecError;
+use applied::{AppliedFrontier, AppliedFrontierFile, APPLIED_FILE_NAME};
 use hardstate::{HardState, HardStateFile};
 use log::{MetaLog, MetaLogConfig, MetaLogEntry, MetaLogPayload, MetaMembership};
+use membership_log_id::{MembershipLogId, MembershipLogIdFile, MEMBERSHIP_LOG_ID_FILE_NAME};
+use purged::{PurgedFrontierFile, PurgedLogId, PURGED_FILE_NAME};
 use snapshot::{MetaSnapshots, SnapshotMeta};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -119,6 +126,9 @@ pub struct MetaStorageConfig {
 pub struct MetaStorage {
     env: Env,
     hardstate: HardStateFile,
+    applied: AppliedFrontierFile,
+    purged: PurgedFrontierFile,
+    membership_log_id: MembershipLogIdFile,
     log: MetaLog,
     snapshots: MetaSnapshots,
     state: MetaStateMachine,
@@ -137,10 +147,14 @@ impl MetaStorage {
         Self::open_with(env, data_dir, cluster_id, MetaStorageConfig::default())
     }
 
-    /// Deterministic recovery: newest valid snapshot, then replay of every
-    /// durable log entry above it through a fresh state machine. Apply
-    /// idempotence across snapshot/log overlap comes from the dedup table,
-    /// which travels inside the snapshot payload.
+    /// Deterministic recovery: newest valid snapshot, then replay of durable
+    /// log entries above it through a fresh state machine.
+    ///
+    /// When a durable `meta.applied` frontier is present, replay
+    /// stops there so uncommitted tail entries stay durable but invisible to
+    /// the state machine (Raft append ≠ commit). When the file is absent,
+    /// recovery keeps the historical single-node behaviour of replaying every
+    /// durable log entry through the log tail.
     pub fn open_with(
         env: &Env,
         data_dir: impl AsRef<Path>,
@@ -151,6 +165,10 @@ impl MetaStorage {
         let snapshots = MetaSnapshots::open_in(env, data_dir, cluster_id)?;
         let hardstate =
             HardStateFile::open_in(env, data_dir.join(hardstate::HARD_STATE_FILE_NAME))?;
+        let applied = AppliedFrontierFile::open_in(env, data_dir.join(APPLIED_FILE_NAME))?;
+        let purged = PurgedFrontierFile::open_in(env, data_dir.join(PURGED_FILE_NAME))?;
+        let membership_log_id =
+            MembershipLogIdFile::open_in(env, data_dir.join(MEMBERSHIP_LOG_ID_FILE_NAME))?;
         let log = MetaLog::open_in(env, data_dir, cluster_id, config.log)?;
 
         let (mut state, mut membership, mut last_applied_index, mut last_applied_term) =
@@ -164,20 +182,32 @@ impl MetaStorage {
                 None => (MetaStateMachine::new(), MetaMembership::default(), 0, 0),
             };
 
+        // Durable applied frontier wins over the snapshot baseline when it is
+        // ahead; a stale file behind the snapshot is ignored (snapshot install
+        // is the newer authority).
+        let replay_through = match applied.get() {
+            Some(frontier) if frontier.index > last_applied_index => frontier.index,
+            Some(_) => last_applied_index,
+            // Legacy single-node disks: no applied file means "everything
+            // durable was committed".
+            None => log.last_index().unwrap_or(last_applied_index),
+        };
+
         if let Some(first_index) = log.first_index() {
             if first_index > last_applied_index + 1 {
                 return Err(corrupt(
                     data_dir,
                     format!(
-                        "log begins at {first_index} but the newest snapshot covers only \
-                         up to {last_applied_index}: entries are missing"
+                        "log begins at {first_index} but the newest snapshot covers only                          up to {last_applied_index}: entries are missing"
                     ),
                 ));
             }
         }
-        if let Some(last_index) = log.last_index() {
-            if last_index > last_applied_index {
-                for entry in log.read_range(last_applied_index + 1, last_index + 1)? {
+        if replay_through > last_applied_index {
+            let last = log.last_index().unwrap_or(last_applied_index);
+            let through = replay_through.min(last);
+            if through > last_applied_index {
+                for entry in log.read_range(last_applied_index + 1, through + 1)? {
                     match &entry.payload {
                         MetaLogPayload::Normal(command) => {
                             state.apply(entry.index, command);
@@ -196,6 +226,9 @@ impl MetaStorage {
         Ok(Self {
             env: env.clone(),
             hardstate,
+            applied,
+            purged,
+            membership_log_id,
             log,
             snapshots,
             state,
@@ -219,6 +252,20 @@ impl MetaStorage {
 
     pub fn last_applied(&self) -> u64 {
         self.last_applied_index
+    }
+
+    pub fn last_applied_term(&self) -> u64 {
+        self.last_applied_term
+    }
+
+    /// Exact last-purged meta log id, when the adapter has persisted one.
+    pub fn last_purged(&self) -> Option<PurgedLogId> {
+        self.purged.get()
+    }
+
+    /// Exact log id of the applied membership, when the adapter has persisted one.
+    pub fn last_membership_log_id(&self) -> Option<MembershipLogId> {
+        self.membership_log_id.get()
     }
 
     pub fn log(&self) -> &MetaLog {
@@ -263,6 +310,7 @@ impl MetaStorage {
             )));
         }
         let mut responses = Vec::new();
+        let mut membership_log_id = None;
         for entry in self
             .log
             .read_range(self.last_applied_index + 1, index + 1)?
@@ -273,11 +321,24 @@ impl MetaStorage {
                 }
                 MetaLogPayload::Membership(membership) => {
                     self.membership = membership.clone();
+                    membership_log_id = Some(MembershipLogId {
+                        term: entry.term,
+                        index: entry.index,
+                    });
                 }
                 MetaLogPayload::Blank => {}
             }
             self.last_applied_index = entry.index;
             self.last_applied_term = entry.term;
+        }
+        self.applied.save(AppliedFrontier {
+            index: self.last_applied_index,
+            term: self.last_applied_term,
+        })?;
+        // After the applied frontier is durable, persist the membership LogId so
+        // reopen does not invent one from a later normal entry at the frontier.
+        if let Some(log_id) = membership_log_id {
+            self.membership_log_id.save(log_id)?;
         }
         Ok(responses)
     }
@@ -324,5 +385,42 @@ impl MetaStorage {
             )));
         }
         self.log.purge_upto(index)
+    }
+
+    /// Persist the exact acknowledged purged log id (meta coordinates).
+    pub fn save_purged(&mut self, term: u64, index: u64) -> MetaStoreResult<()> {
+        self.purged.save(PurgedLogId { term, index })
+    }
+
+    /// Persist the exact log id of the applied membership (meta coordinates).
+    pub fn save_membership_log_id(&mut self, term: u64, index: u64) -> MetaStoreResult<()> {
+        self.membership_log_id.save(MembershipLogId { term, index })
+    }
+
+    /// Align the durable applied frontier with the in-memory cursor (e.g.
+    /// after installing a snapshot that advanced `last_applied` without going
+    /// through [`Self::apply_through`]).
+    pub fn sync_applied_frontier(&mut self) -> MetaStoreResult<()> {
+        if self.last_applied_index == 0 {
+            return Ok(());
+        }
+        self.applied.save(AppliedFrontier {
+            index: self.last_applied_index,
+            term: self.last_applied_term,
+        })
+    }
+
+    /// Discard the physical log when it ends strictly below the applied
+    /// frontier. Needed after snapshot install onto a non-blank disk: the
+    /// chunked log always retains its newest chunk, which would otherwise
+    /// reject appends that must continue from `last_applied + 1`.
+    pub fn discard_stale_log_tail(&mut self) -> MetaStoreResult<()> {
+        let Some(last) = self.log.last_index() else {
+            return Ok(());
+        };
+        if last < self.last_applied_index {
+            self.log.discard_all()?;
+        }
+        Ok(())
     }
 }

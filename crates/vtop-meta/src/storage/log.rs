@@ -822,6 +822,27 @@ impl MetaLog {
     /// whole chunks are ever purged, and the newest chunk is always kept so
     /// the log retains its position. Deletion runs lowest-first, so a crash
     /// leaves a contiguous suffix.
+    /// Drop every log chunk and in-memory entry. Used after installing a
+    /// snapshot whose frontier is ahead of the physical log tail: `purge_upto`
+    /// always retains the newest chunk, which would otherwise block appends
+    /// that must extend from the snapshot index.
+    pub fn discard_all(&mut self) -> MetaStoreResult<()> {
+        self.guard_poisoned()?;
+        for chunk in &self.chunks {
+            if let Err(source) = self.env.storage.remove_file(&chunk.path) {
+                self.poisoned = true;
+                return Err(io_error(&chunk.path, source));
+            }
+        }
+        if let Err(error) = self.sync_dir() {
+            self.poisoned = true;
+            return Err(error);
+        }
+        self.chunks.clear();
+        self.entries.clear();
+        Ok(())
+    }
+
     pub fn purge_upto(&mut self, index: u64) -> MetaStoreResult<()> {
         self.guard_poisoned()?;
         if self.chunks.len() < 2 {
