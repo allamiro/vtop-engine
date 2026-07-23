@@ -79,7 +79,7 @@ services:
   # read-only; still a privileged handle, which is another reason this stack is
   # lab-only.
   alloy:
-    image: grafana/alloy:v1.17.1
+    image: grafana/alloy:v1.18.0
     container_name: vtop-alloy
     command:
       - run
