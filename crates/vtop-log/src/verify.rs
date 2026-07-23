@@ -21,10 +21,10 @@ use crate::segment::{
 use crate::types::{
     LogError, ProducerSummaryEntry, SegmentCommitKey, SegmentManifest, SegmentManifestV2,
     VtopLogResult, CHUNK_TREE_SCHEME_V1, COMMIT_SCHEME_KEYED, COMMIT_SCHEME_UNKEYED, FORMAT_NAME,
-    FORMAT_VERSION, FORMAT_VERSION_V2, RECORD_SCHEMA_VERSION_V2,
+    FORMAT_VERSION, FORMAT_VERSION_V2, PRODUCER_SEQUENCE_WINDOW, RECORD_SCHEMA_VERSION_V2,
 };
 use std::collections::{BTreeMap, HashMap};
-use std::io::SeekFrom;
+use std::io::{Read, SeekFrom};
 use std::path::Path;
 use uuid::Uuid;
 
@@ -279,24 +279,47 @@ pub fn chunk_proof_in(
             manifest.chunk_count
         )));
     }
-    let bytes = env.storage.read(path).map_err(|source| LogError::Io {
+    // Segments run to gigabytes, so the proof must not materialize the file:
+    // the tree comes from the sidecar leaves (validated against the sealed
+    // root below and freshly repaired by the reader open above), and only
+    // the requested chunk's byte range is read from the segment.
+    let paths = SegmentPaths::from_segment(path)?;
+    let (sidecar_chunk_size, leaves) = read_chunk_sidecar(env.storage.as_ref(), &paths.chunks)?;
+    if sidecar_chunk_size != manifest.chunk_size
+        || leaves.len() as u64 != manifest.chunk_count
+        || proof::tree_root(&leaves).to_hex().as_str() != manifest.chunk_tree_root
+    {
+        return Err(LogError::ManifestMismatch(
+            "chunk sidecar does not fold to the sealed chunk-tree root".to_owned(),
+        ));
+    }
+    let io_error = |source: std::io::Error| LogError::Io {
         path: path.to_path_buf(),
         source,
-    })?;
-    let (_, header_len) = read_header(&mut std::io::Cursor::new(&bytes))?;
-    let content = &bytes[header_len as usize..];
-    let mut builder = ChunkTreeBuilder::new(manifest.chunk_size);
-    builder.update(content);
-    let (leaves, root) = builder.finalize();
-    debug_assert_eq!(root.to_hex().as_str(), manifest.chunk_tree_root);
+    };
+    let mut file = env.storage.open(path, OpenMode::Read).map_err(io_error)?;
+    let (_, header_len) = read_header(&mut file)?;
+    let start = index * u64::from(manifest.chunk_size);
+    let length = manifest
+        .content_bytes
+        .saturating_sub(start)
+        .min(u64::from(manifest.chunk_size));
+    file.seek(SeekFrom::Start(header_len + start))
+        .map_err(io_error)?;
+    let mut chunk = vec![0_u8; length as usize];
+    file.read_exact(&mut chunk).map_err(io_error)?;
+    // One cheap hash guards the freshly read bytes against racing mutation
+    // between the validating open and this read.
+    if proof::leaf_hash(&chunk) != leaves[index as usize] {
+        return Err(LogError::ManifestMismatch(format!(
+            "chunk {index} bytes do not match the validated sidecar leaf"
+        )));
+    }
     let params = ChunkParams {
         chunk_size: manifest.chunk_size,
-        chunk_count: leaves.len() as u64,
+        chunk_count: manifest.chunk_count,
     };
-    let chunk_proof = proof::prove_chunk(&leaves, index);
-    let start = (index * u64::from(manifest.chunk_size)) as usize;
-    let end = content.len().min(start + manifest.chunk_size as usize);
-    Ok((params, chunk_proof, content[start..end].to_vec()))
+    Ok((params, proof::prove_chunk(&leaves, index), chunk))
 }
 
 /// The frame scan re-derives everything a sealed manifest claims about the
@@ -429,17 +452,22 @@ fn scan_frames(
 
     let mut producer_summary: Vec<ProducerSummaryEntry> = sequences
         .iter()
-        .map(
-            |((producer_id, producer_epoch), latest)| ProducerSummaryEntry {
+        .map(|((producer_id, producer_epoch), latest)| {
+            // Every (producer, epoch) run starts at sequence zero and
+            // advances by one, as enforced above — but the seal path
+            // derives the summary from the RETAINED duplicate-detection
+            // window (at most PRODUCER_SEQUENCE_WINDOW most recent
+            // sequences), so a run longer than the window reports the
+            // window floor, not zero. Reproduce that arithmetic exactly.
+            let first_sequence = latest.saturating_sub(PRODUCER_SEQUENCE_WINDOW - 1);
+            ProducerSummaryEntry {
                 producer_id: *producer_id,
                 producer_epoch: *producer_epoch,
-                // Every (producer, epoch) run starts at sequence zero and
-                // advances by one, as enforced above.
-                first_sequence: 0,
+                first_sequence,
                 last_sequence: *latest,
-                record_count: latest + 1,
-            },
-        )
+                record_count: latest - first_sequence + 1,
+            }
+        })
         .collect();
     producer_summary.sort_by_key(|entry| (entry.producer_id, entry.producer_epoch));
     let (leaves, root) = digest.finalize();
@@ -955,7 +983,7 @@ mod tests {
         Durability, LogRecord, SegmentConfig, SegmentConfigV2, SegmentDescriptor,
         SegmentDescriptorV2,
     };
-    use crate::{ActiveSegment, RangeLineage};
+    use crate::{ActiveSegment, AppendOutcome, RangeLineage};
     use std::fs;
     use std::path::PathBuf;
     use tempfile::tempdir;
@@ -1372,6 +1400,51 @@ mod tests {
             ),
             Err(LogError::InvalidDescriptor(_))
         ));
+    }
+
+    #[test]
+    fn sealed_segment_past_the_producer_retry_window_still_verifies_self_consistent() {
+        // The seal path derives producer summaries from the retained
+        // PRODUCER_SEQUENCE_WINDOW; reconstructing 0..latest would disagree
+        // with the sealed manifest and falsely report corruption.
+        let directory = tempdir().unwrap();
+        let active = directory.path().join("window.active");
+        let config = SegmentConfigV2 {
+            max_record_bytes: 256,
+            max_group_bytes: 16 * 1024 * 1024,
+            max_segment_bytes: 64 * 1024 * 1024,
+            max_segment_records: 2 * PRODUCER_SEQUENCE_WINDOW,
+            index_stride: 4096,
+            chunk_size: 64 * 1024,
+        };
+        let mut segment = ActiveSegment::create_v2(&active, descriptor_v2(), config).unwrap();
+        let producer = Uuid::from_u128(0x54);
+        let total = PRODUCER_SEQUENCE_WINDOW + 10;
+        let mut sequence = 0_u64;
+        while sequence < total {
+            let batch: Vec<LogRecord> = (sequence..(sequence + 4096).min(total))
+                .map(|sequence| LogRecord {
+                    producer_id: producer,
+                    producer_epoch: 1,
+                    sequence,
+                    timestamp_millis: 1_700_000_000_000 + sequence as i64,
+                    attributes: 0,
+                    key: Vec::new(),
+                    value: b"w".to_vec(),
+                })
+                .collect();
+            sequence += batch.len() as u64;
+            for outcome in segment.append_group(&batch, Durability::Fsync).unwrap() {
+                assert!(matches!(outcome, AppendOutcome::Appended { .. }));
+            }
+        }
+        drop(segment.seal_v2(None).unwrap());
+        let sealed = directory.path().join("window.segment");
+        let report = verify_sealed_segment(&sealed, &VerifyExpectations::default()).unwrap();
+        assert!(report.passed(), "{:?}", report.checks);
+        assert_eq!(report.achieved, VerifyLevel::SelfConsistent);
+        assert!(check(&report, CHECK_MANIFEST_CONSISTENCY).passed);
+        assert_eq!(report.record_count, total);
     }
 
     #[test]

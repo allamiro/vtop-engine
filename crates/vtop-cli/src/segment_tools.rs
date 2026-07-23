@@ -302,6 +302,30 @@ fn run_verify(args: &VerifyArgs, json: bool) -> i32 {
     let mut exit_code = EXIT_OK;
     let mut json_reports = Vec::new();
     for path in &args.paths {
+        // Path-shape mistakes are usage; anything the verifier surfaces after
+        // that — including InvalidDescriptor/InvalidConfig from a decoded
+        // but invalid header — is an artifact we could not trust.
+        if path.extension().and_then(|value| value.to_str()) != Some("segment") {
+            let message = format!(
+                "{}: sealed segment path must end in .segment",
+                path.display()
+            );
+            let code = EXIT_USAGE;
+            if json {
+                json_reports.push(serde_json::json!({
+                    "path": path.display().to_string(),
+                    "error": message,
+                    "passed": false,
+                    "exit_code": code,
+                }));
+            } else {
+                eprintln!("error: {message}");
+            }
+            if exit_code == EXIT_OK {
+                exit_code = code;
+            }
+            continue;
+        }
         let code = match verify_sealed_segment(path, &expectations) {
             Ok(report) => {
                 let code = exit_code_for(&report);
@@ -313,7 +337,7 @@ fn run_verify(args: &VerifyArgs, json: bool) -> i32 {
                 code
             }
             Err(error) => {
-                let code = error_exit_code(&error);
+                let code = EXIT_CORRUPT;
                 if json {
                     json_reports.push(serde_json::json!({
                         "path": path.display().to_string(),
@@ -371,10 +395,11 @@ fn print_human_report(
     );
 }
 
+/// Exit codes for prove-chunk / verify-chunk argument and open failures.
+/// Unlike [`run_verify`], these subcommands treat a malformed path or an
+/// out-of-range chunk index as a caller mistake (usage), not corruption.
 fn error_exit_code(error: &LogError) -> i32 {
     match error {
-        // A path that is not even shaped like a sealed segment is a usage
-        // error; anything else is an artifact we could not establish trust in.
         LogError::InvalidDescriptor(_) | LogError::InvalidConfig(_) => EXIT_USAGE,
         _ => EXIT_CORRUPT,
     }
@@ -636,6 +661,36 @@ mod tests {
             require: RequireLevel::SelfConsistent,
         };
         assert!(build_expectations(&unpaired).is_err());
+    }
+
+    #[test]
+    fn verify_maps_decoded_artifact_errors_to_corruption_and_path_shape_to_usage() {
+        // Wrong extension is a caller mistake, caught before the verifier runs.
+        let wrong_shape = VerifyArgs {
+            paths: vec![PathBuf::from("bundle.active")],
+            expect_root: None,
+            expect_manifest_digest: None,
+            key_ids: Vec::new(),
+            key_envs: Vec::new(),
+            key_files: Vec::new(),
+            require: RequireLevel::SelfConsistent,
+        };
+        assert_eq!(run_verify(&wrong_shape, false), EXIT_USAGE);
+
+        // A .segment path whose contents are garbage is an artifact problem.
+        let directory = tempfile::tempdir().unwrap();
+        let garbage = directory.path().join("garbage.segment");
+        std::fs::write(&garbage, b"not a segment").unwrap();
+        let corrupt = VerifyArgs {
+            paths: vec![garbage],
+            expect_root: None,
+            expect_manifest_digest: None,
+            key_ids: Vec::new(),
+            key_envs: Vec::new(),
+            key_files: Vec::new(),
+            require: RequireLevel::SelfConsistent,
+        };
+        assert_eq!(run_verify(&corrupt, false), EXIT_CORRUPT);
     }
 
     #[test]
