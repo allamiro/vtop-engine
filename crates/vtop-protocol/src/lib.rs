@@ -9,8 +9,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-/// Minor 1 adds `Durability::Quorum` and peer replication message kinds 60–62.
-pub const PROTOCOL_MINOR: u16 = 1;
+/// Quorum durability and peer replication kinds (60–62) are additive under 1.0.
+/// Keeping the minor at 0 preserves decode compatibility for existing 1.0
+/// clients: replies continue to advertise the same minor they already accept.
+pub const PROTOCOL_MINOR: u16 = 0;
 pub const HEADER_LEN: usize = 64;
 pub const MIN_FRAME_BYTES: u32 = HEADER_LEN as u32;
 pub const DEFAULT_MAX_FRAME_BYTES: u32 = 8 * 1024 * 1024;
@@ -1135,7 +1137,7 @@ mod tests {
                 cluster_id: Uuid::from_u128(1),
                 node_id: Uuid::from_u128(2),
                 selected_major: 1,
-                selected_minor: PROTOCOL_MINOR,
+                selected_minor: 0,
                 max_frame_bytes: 4096,
                 max_records: 8,
                 max_inflight_requests: 4,

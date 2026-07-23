@@ -368,6 +368,72 @@ fn idempotent_retry_after_quorum_commit_returns_same_offsets() {
 }
 
 #[test]
+fn quorum_retry_after_failure_catches_up_lagging_followers() {
+    let h = harness();
+    h.followers[0].set_online(false);
+    h.followers[1].set_online(false);
+
+    let failed = h.leader.handle(
+        Role::Producer,
+        produce_frame(h.range.clone(), 0, 1, WireDurability::Quorum),
+    );
+    match failed.message {
+        Message::Error(ErrorResponse {
+            code: ErrorCode::Overloaded,
+            ..
+        }) => {}
+        other => panic!("expected Overloaded, got {other:?}"),
+    }
+    assert_eq!(h.cluster_committed.get(), 0);
+
+    // Recover a majority and retry the same producer sequence. The leader tip
+    // is already past the record; replication must still catch followers up
+    // from the original base offset.
+    h.followers[0].set_online(true);
+    let recovered = produce_ok(&h.leader, h.range.clone(), 0);
+    assert!(recovered.outcomes[0].duplicate);
+    assert_eq!(recovered.outcomes[0].offset, 0);
+    assert_eq!(recovered.committed_next_offset, 1);
+    assert_eq!(h.cluster_committed.get(), 1);
+    assert_eq!(h.followers[0].local_committed_offset(), 1);
+    assert_eq!(h.followers[0].cluster_committed().get(), 1);
+}
+
+#[test]
+fn steal_before_hwm_publish_fences_quorum_commit() {
+    let h = harness();
+    // First establish a healthy quorum commit.
+    produce_ok(&h.leader, h.range.clone(), 0);
+
+    // Take followers offline so the next produce reaches local durability but
+    // cannot form quorum yet.
+    h.followers[0].set_online(false);
+    h.followers[1].set_online(false);
+    let _ = h.leader.handle(
+        Role::Producer,
+        produce_frame(h.range.clone(), 1, 2, WireDurability::Quorum),
+    );
+    assert_eq!(h.cluster_committed.get(), 1);
+
+    // Steal the lease, then bring a follower online. A retry must not advance
+    // the cluster HWM under the fenced epoch.
+    h.meta.set(FENCING_EPOCH + 1);
+    h.followers[0].set_online(true);
+    let fenced = h.leader.handle(
+        Role::Producer,
+        produce_frame(h.range.clone(), 1, 3, WireDurability::Quorum),
+    );
+    match fenced.message {
+        Message::Error(ErrorResponse {
+            code: ErrorCode::Fenced,
+            ..
+        }) => {}
+        other => panic!("expected Fenced after steal, got {other:?}"),
+    }
+    assert_eq!(h.cluster_committed.get(), 1);
+}
+
+#[test]
 fn replica_set_majority_math_matches_rf3() {
     let h = harness();
     assert_eq!(h.replica_set.replication_factor(), 3);

@@ -686,11 +686,24 @@ impl LocalBroker {
                             .replicas
                             .as_ref()
                             .expect("Quorum path checked replicas");
+                        // New appends replicate from the pre-append tip. An
+                        // all-duplicate retry after a prior quorum failure uses
+                        // the lowest assigned offset so lagging followers can
+                        // catch up from the original base.
+                        let expected_base_offset = if tip_before < leader_committed {
+                            tip_before
+                        } else {
+                            wire_outcomes
+                                .iter()
+                                .map(|outcome| outcome.offset)
+                                .min()
+                                .unwrap_or(tip_before)
+                        };
                         let replicate = ReplicaAppendRequest {
                             range: request.range.clone(),
                             fencing_epoch: request.fencing_epoch,
                             leader_node_id: self.node_id,
-                            expected_base_offset: tip_before,
+                            expected_base_offset,
                             producer_id: request.producer_id,
                             producer_epoch: request.producer_epoch,
                             first_sequence: request.first_sequence,
@@ -703,6 +716,17 @@ impl LocalBroker {
                                 quorum.follower_acks, quorum.replication_factor
                             );
                             return error(request_id, stream_id, ErrorCode::Overloaded, &message);
+                        }
+                        // Re-validate the lease before publishing cluster commit.
+                        // Fan-out released the meta lock; a steal observed here
+                        // must not advance the HWM under a fenced epoch.
+                        {
+                            let meta = self.meta_fencing_epoch.lock();
+                            if let Err((code, message)) =
+                                self.check_range(&meta, &request.range, request.fencing_epoch)
+                            {
+                                return error(request_id, stream_id, code, message);
+                            }
                         }
                         let committed = cluster.advance_to(leader_committed);
                         replicas.propagate_committed_hwm(&CommittedHwmUpdate {

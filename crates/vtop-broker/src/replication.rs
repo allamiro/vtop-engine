@@ -211,12 +211,35 @@ impl InProcessFollower {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.segment.next_offset() != request.expected_base_offset {
+        let tip = state.segment.next_offset();
+        if tip > request.expected_base_offset {
+            // Idempotent retry / catch-up: this follower already applied through
+            // the batch. Ack when local durability covers the batch end.
+            let batch_end = request
+                .expected_base_offset
+                .checked_add(request.records.len() as u64)
+                .ok_or((
+                    ErrorCode::InvalidRequest,
+                    "replica append batch end overflows u64".to_owned(),
+                ))?;
+            if state.segment.committed_offset() >= batch_end {
+                return Ok(ReplicaAppendResponse {
+                    local_committed_offset: state.segment.committed_offset(),
+                });
+            }
             return Err((
                 ErrorCode::InvalidRequest,
                 format!(
-                    "follower next_offset {} does not match expected_base_offset {}",
-                    state.segment.next_offset(),
+                    "follower next_offset {tip} is ahead of expected_base_offset {} but not durable through {batch_end}",
+                    request.expected_base_offset
+                ),
+            ));
+        }
+        if tip != request.expected_base_offset {
+            return Err((
+                ErrorCode::InvalidRequest,
+                format!(
+                    "follower next_offset {tip} does not match expected_base_offset {}",
                     request.expected_base_offset
                 ),
             ));
