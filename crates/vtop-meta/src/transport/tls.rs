@@ -14,10 +14,9 @@
 
 use super::wire::{TransportError, TransportResult};
 use crate::keys::MetaNodeId;
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
-use std::fs::File;
-use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -54,9 +53,9 @@ impl TlsMaterial {
 }
 
 fn load_certs(path: &Path) -> TransportResult<Vec<CertificateDer<'static>>> {
-    let file = File::open(path).map_err(|error| TransportError::Io(io_path(path, error)))?;
-    let mut reader = BufReader::new(file);
-    let certs: Result<Vec<_>, _> = rustls_pemfile::certs(&mut reader).collect();
+    let certs: Result<Vec<_>, _> = CertificateDer::pem_file_iter(path)
+        .map_err(|error| TransportError::Tls(format!("open certs {}: {error}", path.display())))?
+        .collect();
     let certs = certs
         .map_err(|error| TransportError::Tls(format!("parse certs {}: {error}", path.display())))?;
     if certs.is_empty() {
@@ -69,16 +68,8 @@ fn load_certs(path: &Path) -> TransportResult<Vec<CertificateDer<'static>>> {
 }
 
 fn load_private_key(path: &Path) -> TransportResult<PrivateKeyDer<'static>> {
-    let file = File::open(path).map_err(|error| TransportError::Io(io_path(path, error)))?;
-    let mut reader = BufReader::new(file);
-    let key = rustls_pemfile::private_key(&mut reader)
-        .map_err(|error| TransportError::Tls(format!("parse key {}: {error}", path.display())))?
-        .ok_or_else(|| TransportError::Tls(format!("no private key in {}", path.display())))?;
-    Ok(key)
-}
-
-fn io_path(path: &Path, source: std::io::Error) -> std::io::Error {
-    std::io::Error::new(source.kind(), format!("{}: {source}", path.display()))
+    PrivateKeyDer::from_pem_file(path)
+        .map_err(|error| TransportError::Tls(format!("parse key {}: {error}", path.display())))
 }
 
 /// Build a TLS 1.3 mTLS server acceptor.

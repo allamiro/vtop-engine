@@ -20,7 +20,6 @@ uuid = { workspace = true }
 vtop-log = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 x509-parser = { workspace = true }
 
 [dev-dependencies]
