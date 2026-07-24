@@ -142,6 +142,11 @@ impl MetaMembership {
 }
 
 /// The payload of one log entry.
+// `Normal` carries the full command by value (CommitTierEvidence's inline
+// digests and bounded strings put it past the lint's threshold); log entries
+// are built once and immediately encoded, so indirection would only add an
+// allocation to the hot append path.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MetaLogPayload {
     Normal(MetadataCommand),

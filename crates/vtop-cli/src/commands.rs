@@ -88,6 +88,13 @@ pub enum Command {
         #[command(subcommand)]
         command: crate::meta_tools::MetaCommand,
     },
+    /// Cold-tier copy tools for sealed native segments: upload, read-back
+    /// verification against a pinned root, and tier-evidence commit through
+    /// the meta admin endpoint.
+    Tier {
+        #[command(subcommand)]
+        command: crate::tier_tools::TierCommand,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -161,6 +168,11 @@ pub async fn dispatch(cli: Cli) -> i32 {
     if let Command::Meta { command } = cli.command {
         // Re-bind so we can move `command` into the async helper.
         return crate::meta_tools::run(command, cli.json).await;
+    }
+    // Tier tools drive an upload backend plus the meta admin endpoint; they
+    // also bypass the archive engine.
+    if let Command::Tier { command } = cli.command {
+        return crate::tier_tools::run(command, cli.json).await;
     }
     match run_command(&cli).await {
         Ok(()) => 0,
@@ -395,6 +407,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
         }
         Command::Segment { .. } => unreachable!("dispatched before run_command"),
         Command::Meta { .. } => unreachable!("dispatched before run_command"),
+        Command::Tier { .. } => unreachable!("dispatched before run_command"),
     }
 }
 

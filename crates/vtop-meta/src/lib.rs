@@ -41,6 +41,7 @@ mod wire;
 pub use command::{
     CommandEnvelope, MetadataCommand, MetadataError, MetadataResponse, NodeState, RangeAssignment,
     VerificationMethod, MAX_ASSIGNED_RANGES, MAX_ERROR_DETAIL_BYTES, MAX_NODE_ADDR_BYTES,
+    MAX_TIER_BACKEND_ID_BYTES, MAX_TIER_OBJECT_URI_BYTES, MAX_TIER_VERSION_ID_BYTES,
 };
 pub use keys::{
     validate_group_name, validate_topic_name, MetaKey, MetaNodeId, MAX_GROUP_NAME_BYTES,
@@ -59,7 +60,8 @@ pub use state::{
     ConsumerGroupRecord, CursorCheckpointRecord, GroupMemberRecord, GroupNameRecord, KeyRecord,
     KeyState, LeaseRecord, MetaStateMachine, MetaValue, NodeRecord, RangeRecord,
     RebalanceIntentRecord, ReplacementProofRecord, SegmentPlacementRecord, SegmentRecord,
-    SegmentState, TopicNameRecord, TopicRecord, DEDUP_CAPACITY,
+    SegmentState, TierCopyRecord, TopicNameRecord, TopicRecord, TopicRetentionPolicyRecord,
+    DEDUP_CAPACITY,
 };
 pub use storage::hardstate::{HardState, HardStateFile};
 pub use storage::log::{

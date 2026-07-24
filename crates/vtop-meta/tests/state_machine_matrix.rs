@@ -8,7 +8,7 @@ use uuid::Uuid;
 use vtop_meta::{
     select_replicas, CommandEnvelope, MetaKey, MetaStateMachine, MetaValue, MetadataCommand,
     MetadataError, MetadataResponse, NodeState, PlacementCandidate, RangeAssignment, SegmentState,
-    DEDUP_CAPACITY, MAX_NODE_ADDR_BYTES, MAX_TOPIC_NAME_BYTES,
+    DEDUP_CAPACITY, MAX_NODE_ADDR_BYTES, MAX_TIER_OBJECT_URI_BYTES, MAX_TOPIC_NAME_BYTES,
 };
 
 const NODE: Uuid = Uuid::from_u128(0x10);
@@ -2101,6 +2101,13 @@ fn replacement_proof_gates_replica_retirement() {
         panic!("segment must exist");
     };
     assert_eq!(segment.state, SegmentState::Retired);
+    assert!(machine
+        .record(&MetaKey::SegmentReplacementProof {
+            topic_uuid: TOPIC,
+            range_uuid: RANGE,
+            segment_uuid: SEGMENT,
+        })
+        .is_none());
 }
 
 /// A verified segment with a committed RF-2 placement over three Active
@@ -2270,9 +2277,19 @@ fn rebalance_lifecycle_completes_via_verified_retirement() {
     let other = replicas[1];
     assert_at_or_above_declared_rf(&machine, 2);
 
+    // Tier evidence committed before the move must remain usable afterward:
+    // replica lifecycle CAS churn does not change sealed identity.
+    assert_eq!(
+        machine.apply(
+            12,
+            &commit_tier_evidence(&mut requests, SEGMENT, root, segment_generation, 1, NODE)
+        ),
+        MetadataResponse::Ack { generation: 0 }
+    );
+
     // Propose: intent recorded, destination added, declared RF untouched.
     assert_eq!(
-        machine.apply(12, &propose_rebalance(&mut requests, from, spare, 0)),
+        machine.apply(13, &propose_rebalance(&mut requests, from, spare, 0)),
         MetadataResponse::Ack { generation: 1 }
     );
     let placement = placement_record(&machine);
@@ -2283,19 +2300,19 @@ fn rebalance_lifecycle_completes_via_verified_retirement() {
     let intent = intent_record(&machine).expect("intent must exist after propose");
     assert_eq!(intent.from_node_uuid, from);
     assert_eq!(intent.to_node_uuid, spare);
-    assert_eq!(intent.proposed_at_apply_index, 12);
+    assert_eq!(intent.proposed_at_apply_index, 13);
     assert_eq!(intent.placement_generation_at_proposal, 0);
 
     // A second in-flight rebalance is blocked outright.
     assert_eq!(
-        machine.apply(13, &propose_rebalance(&mut requests, other, spare, 1)),
+        machine.apply(14, &propose_rebalance(&mut requests, other, spare, 1)),
         rejected(MetadataError::AlreadyExists)
     );
 
     // During the intent, retirement may only ever target the intent source.
     assert_eq!(
         machine.apply(
-            14,
+            15,
             &MetadataCommand::PlanReplicaRetirement {
                 env: requests.next(),
                 topic_uuid: TOPIC,
@@ -2314,7 +2331,7 @@ fn rebalance_lifecycle_completes_via_verified_retirement() {
     // A proof that is not the intended (from -> to) move is rejected.
     assert_eq!(
         machine.apply(
-            15,
+            16,
             &commit_proof(&mut requests, root, other, spare, segment_generation)
         ),
         rejected(MetadataError::invalid_transition(
@@ -2325,7 +2342,7 @@ fn rebalance_lifecycle_completes_via_verified_retirement() {
     // The matching proof, plan, and confirmation complete the move.
     assert_eq!(
         machine.apply(
-            16,
+            17,
             &commit_proof(&mut requests, root, from, spare, segment_generation)
         ),
         MetadataResponse::Ack { generation: 0 }
@@ -2333,7 +2350,7 @@ fn rebalance_lifecycle_completes_via_verified_retirement() {
     assert_at_or_above_declared_rf(&machine, 2);
     assert_eq!(
         machine.apply(
-            17,
+            18,
             &MetadataCommand::PlanReplicaRetirement {
                 env: requests.next(),
                 topic_uuid: TOPIC,
@@ -2350,7 +2367,7 @@ fn rebalance_lifecycle_completes_via_verified_retirement() {
     assert_eq!(placement_record(&machine).replica_nodes.len(), 3);
     assert_eq!(
         machine.apply(
-            18,
+            19,
             &MetadataCommand::ConfirmReplicaRetired {
                 env: requests.next(),
                 topic_uuid: TOPIC,
@@ -2364,13 +2381,20 @@ fn rebalance_lifecycle_completes_via_verified_retirement() {
     );
 
     // Completed: destination replaced the source at exactly declared RF, and
-    // the intent record went with the confirmation, atomically.
+    // the intent + consumed proof went with the confirmation atomically.
     let placement = placement_record(&machine);
     assert_eq!(placement.replica_nodes, vec![other, spare]);
     assert_eq!(placement.declared_replication_factor, 2);
     assert_eq!(placement.generation, 2);
     assert_at_or_above_declared_rf(&machine, 2);
     assert_eq!(intent_record(&machine), None);
+    assert!(machine
+        .record(&MetaKey::SegmentReplacementProof {
+            topic_uuid: TOPIC,
+            range_uuid: RANGE,
+            segment_uuid: SEGMENT,
+        })
+        .is_none());
     let Some(MetaValue::Segment(segment)) = machine.record(&MetaKey::Segment {
         topic_uuid: TOPIC,
         range_uuid: RANGE,
@@ -2378,7 +2402,18 @@ fn rebalance_lifecycle_completes_via_verified_retirement() {
     }) else {
         panic!("segment must exist");
     };
-    assert_eq!(segment.state, SegmentState::Retired);
+    assert_eq!(segment.state, SegmentState::Verified);
+
+    // The consumed proof no longer blocks retention, and the pre-move tier
+    // evidence still matches the immutable root despite generation 1 -> 3.
+    assert_eq!(
+        machine.apply(20, &plan_retention(&mut requests, SEGMENT, 3, 1)),
+        MetadataResponse::Ack { generation: 4 }
+    );
+    assert_eq!(
+        segment_record(&machine, SEGMENT).state,
+        SegmentState::RetentionPlanned
+    );
 }
 
 #[test]
@@ -2725,4 +2760,1483 @@ fn snapshots_round_trip_active_rebalance_intents_byte_exactly() {
     let placement = placement_record(&decoded);
     assert_eq!(placement.replica_nodes.len(), 3);
     assert_eq!(placement.declared_replication_factor, 2);
+}
+
+// ---------------------------------------------------------------------------
+// Stage-8b: retention and object-store tiering metadata.
+// ---------------------------------------------------------------------------
+
+const SEGMENT_B: Uuid = Uuid::from_u128(0x31);
+
+fn commit_tier_evidence(
+    requests: &mut Requests,
+    segment: Uuid,
+    root: [u8; 32],
+    expected_segment_generation: u64,
+    fencing_epoch: u64,
+    verifier: Uuid,
+) -> MetadataCommand {
+    MetadataCommand::CommitTierEvidence {
+        env: requests.next(),
+        topic_uuid: TOPIC,
+        range_uuid: RANGE,
+        segment_uuid: segment,
+        expected_segment_generation,
+        content_root: root,
+        byte_length: 4096,
+        backend_id: "s3-native".to_owned(),
+        object_uri: "s3://tier/native/events.v1/segment-30.segment".to_owned(),
+        manifest_version_id: Some("3sL4kqCJo05qOWBhBqpfOFAdT4dRJVvV".to_owned()),
+        manifest_core_digest: [0x5d; 32],
+        verification_method: vtop_meta::VerificationMethod::AuthenticatedContentRoot,
+        verifier_node_uuid: verifier,
+        fencing_epoch,
+        verified_term: 5,
+    }
+}
+
+fn set_retention_policy(
+    requests: &mut Requests,
+    allowed: bool,
+    expected_generation: Option<u64>,
+) -> MetadataCommand {
+    MetadataCommand::SetTopicRetentionPolicy {
+        env: requests.next(),
+        topic_uuid: TOPIC,
+        unarchived_deletion_allowed: allowed,
+        expected_generation,
+    }
+}
+
+fn plan_retention(
+    requests: &mut Requests,
+    segment: Uuid,
+    expected_segment_generation: u64,
+    fencing_epoch: u64,
+) -> MetadataCommand {
+    MetadataCommand::PlanRetention {
+        env: requests.next(),
+        topic_uuid: TOPIC,
+        range_uuid: RANGE,
+        segment_uuid: segment,
+        expected_segment_generation,
+        fencing_epoch,
+    }
+}
+
+fn confirm_retention_expired(
+    requests: &mut Requests,
+    segment: Uuid,
+    expected_segment_generation: u64,
+) -> MetadataCommand {
+    MetadataCommand::ConfirmRetentionExpired {
+        env: requests.next(),
+        topic_uuid: TOPIC,
+        range_uuid: RANGE,
+        segment_uuid: segment,
+        expected_segment_generation,
+    }
+}
+
+fn cancel_retention(
+    requests: &mut Requests,
+    segment: Uuid,
+    expected_segment_generation: u64,
+) -> MetadataCommand {
+    MetadataCommand::CancelRetention {
+        env: requests.next(),
+        topic_uuid: TOPIC,
+        range_uuid: RANGE,
+        segment_uuid: segment,
+        expected_segment_generation,
+    }
+}
+
+fn segment_record(machine: &MetaStateMachine, segment: Uuid) -> vtop_meta::SegmentRecord {
+    let Some(MetaValue::Segment(record)) = machine.record(&MetaKey::Segment {
+        topic_uuid: TOPIC,
+        range_uuid: RANGE,
+        segment_uuid: segment,
+    }) else {
+        panic!("segment record must exist");
+    };
+    record.clone()
+}
+
+fn tier_record(machine: &MetaStateMachine, segment: Uuid) -> Option<vtop_meta::TierCopyRecord> {
+    match machine.record(&MetaKey::SegmentTierCopy {
+        topic_uuid: TOPIC,
+        range_uuid: RANGE,
+        segment_uuid: segment,
+    }) {
+        Some(MetaValue::TierCopy(tier)) => Some(tier.clone()),
+        None => None,
+        Some(_) => panic!("tier-copy keys only hold tier-copy records"),
+    }
+}
+
+/// Rewrite one record's value bytes inside an encoded snapshot, fixing up the
+/// value length. Lets tests reach defensive rejection branches (a mismatched
+/// evidence root, a placement generation at the ceiling) that no command
+/// sequence can produce, without exposing state internals.
+fn rewrite_snapshot_value(
+    snapshot: &[u8],
+    target: &MetaKey,
+    mut mutate: impl FnMut(&mut Vec<u8>),
+) -> Vec<u8> {
+    let record_count = u32::from_be_bytes(snapshot[2..6].try_into().unwrap());
+    let target_key = target.encode();
+    let mut out = snapshot[..6].to_vec();
+    let mut at = 6_usize;
+    let mut found = false;
+    for _ in 0..record_count {
+        let key_len = u16::from_be_bytes(snapshot[at..at + 2].try_into().unwrap()) as usize;
+        let key = &snapshot[at + 2..at + 2 + key_len];
+        let value_len_at = at + 2 + key_len;
+        let value_len =
+            u32::from_be_bytes(snapshot[value_len_at..value_len_at + 4].try_into().unwrap())
+                as usize;
+        let mut value = snapshot[value_len_at + 4..value_len_at + 4 + value_len].to_vec();
+        if key == target_key.as_slice() {
+            mutate(&mut value);
+            found = true;
+        }
+        out.extend_from_slice(&snapshot[at..at + 2 + key_len]);
+        out.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        out.extend_from_slice(&value);
+        at = value_len_at + 4 + value_len;
+    }
+    assert!(found, "target key not present in snapshot");
+    out.extend_from_slice(&snapshot[at..]);
+    out
+}
+
+#[test]
+fn commit_tier_evidence_records_verified_facts_and_rejects_every_bad_shape() {
+    let mut requests = Requests(0);
+    let (mut machine, root, segment_generation) = verified_segment_machine(&mut requests);
+
+    // Bounds are re-checked in apply, not just the codec, so a
+    // hand-constructed command cannot bypass them.
+    let bounded =
+        |byte_length: u64, backend_id: &str, object_uri: &str, version: Option<String>| {
+            MetadataCommand::CommitTierEvidence {
+                env: CommandEnvelope {
+                    request_id: Uuid::new_v4(),
+                    issued_at_ms: 0,
+                },
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: SEGMENT,
+                expected_segment_generation: segment_generation,
+                content_root: root,
+                byte_length,
+                backend_id: backend_id.to_owned(),
+                object_uri: object_uri.to_owned(),
+                manifest_version_id: version,
+                manifest_core_digest: [0x5d; 32],
+                verification_method: vtop_meta::VerificationMethod::AuthenticatedContentRoot,
+                verifier_node_uuid: NODE,
+                fencing_epoch: 1,
+                verified_term: 5,
+            }
+        };
+    for (at, command) in [
+        bounded(0, "s3-native", "s3://tier/object", None),
+        bounded(4096, "", "s3://tier/object", None),
+        bounded(4096, &"b".repeat(65), "s3://tier/object", None),
+        bounded(4096, "s3-native", "", None),
+        bounded(
+            4096,
+            "s3-native",
+            &"u".repeat(MAX_TIER_OBJECT_URI_BYTES + 1),
+            None,
+        ),
+        bounded(4096, "s3-native", "s3://tier/object", Some("v".repeat(129))),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(
+            matches!(
+                machine.apply(6 + at as u64, &command),
+                MetadataResponse::Rejected(MetadataError::Limit(_))
+            ),
+            "bound violation {at} must reject with Limit"
+        );
+    }
+
+    // Unknown range.
+    assert_eq!(
+        machine.apply(
+            12,
+            &MetadataCommand::CommitTierEvidence {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: Uuid::from_u128(0xff),
+                segment_uuid: SEGMENT,
+                expected_segment_generation: segment_generation,
+                content_root: root,
+                byte_length: 4096,
+                backend_id: "s3-native".to_owned(),
+                object_uri: "s3://tier/object".to_owned(),
+                manifest_version_id: None,
+                manifest_core_digest: [0x5d; 32],
+                verification_method: vtop_meta::VerificationMethod::AuthenticatedContentRoot,
+                verifier_node_uuid: NODE,
+                fencing_epoch: 1,
+                verified_term: 5,
+            }
+        ),
+        rejected(MetadataError::NotFound)
+    );
+    // A stale actor cannot commit evidence: epoch fencing.
+    assert_eq!(
+        machine.apply(
+            13,
+            &commit_tier_evidence(&mut requests, SEGMENT, root, segment_generation, 99, NODE)
+        ),
+        rejected(MetadataError::EpochMismatch {
+            expected: 99,
+            actual: 1,
+        })
+    );
+    // Unknown segment, then a stale CAS token.
+    assert_eq!(
+        machine.apply(
+            14,
+            &commit_tier_evidence(&mut requests, Uuid::from_u128(0xfe), root, 0, 1, NODE)
+        ),
+        rejected(MetadataError::NotFound)
+    );
+    assert_eq!(
+        machine.apply(
+            15,
+            &commit_tier_evidence(&mut requests, SEGMENT, root, 9, 1, NODE)
+        ),
+        rejected(MetadataError::GenerationMismatch {
+            expected: 9,
+            actual: 1,
+        })
+    );
+    // A sealed-but-unverified segment can never carry tier evidence.
+    assert_eq!(
+        machine.apply(
+            16,
+            &MetadataCommand::RegisterSealedSegment {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: SEGMENT_B,
+                segment_generation: 0,
+                base_offset: 64,
+                next_offset: 128,
+                content_root: [0xcd; 32],
+                sealed_by_epoch: 1,
+                expected_range_generation: 2,
+            }
+        ),
+        MetadataResponse::Ack { generation: 3 }
+    );
+    assert_eq!(
+        machine.apply(
+            17,
+            &commit_tier_evidence(&mut requests, SEGMENT_B, [0xcd; 32], 0, 1, NODE)
+        ),
+        rejected(MetadataError::invalid_transition(
+            "tier evidence requires a verified segment"
+        ))
+    );
+    // Wrong content root.
+    assert_eq!(
+        machine.apply(
+            18,
+            &commit_tier_evidence(&mut requests, SEGMENT, [8; 32], segment_generation, 1, NODE)
+        ),
+        rejected(MetadataError::invalid_transition(
+            "tier evidence content root does not match the sealed segment"
+        ))
+    );
+    // Verifier must be a registered, non-dead node.
+    assert_eq!(
+        machine.apply(
+            19,
+            &commit_tier_evidence(&mut requests, SEGMENT, root, segment_generation, 1, NODE_C)
+        ),
+        rejected(MetadataError::NotFound)
+    );
+    machine.apply(20, &register_node(&mut requests, NODE_B));
+    assert_eq!(
+        machine.apply(
+            21,
+            &MetadataCommand::SetNodeState {
+                env: requests.next(),
+                node_uuid: NODE_B,
+                state: NodeState::Dead,
+                expected_generation: 0,
+            }
+        ),
+        MetadataResponse::Ack { generation: 1 }
+    );
+    assert_eq!(
+        machine.apply(
+            22,
+            &commit_tier_evidence(&mut requests, SEGMENT, root, segment_generation, 1, NODE_B)
+        ),
+        rejected(MetadataError::invalid_transition(
+            "tier evidence verifier node is dead"
+        ))
+    );
+
+    // Nothing above created a record.
+    assert_eq!(tier_record(&machine, SEGMENT), None);
+
+    // Success records verified facts only and does NOT mutate the segment.
+    assert_eq!(
+        machine.apply(
+            23,
+            &commit_tier_evidence(&mut requests, SEGMENT, root, segment_generation, 1, NODE)
+        ),
+        MetadataResponse::Ack { generation: 0 }
+    );
+    let tier = tier_record(&machine, SEGMENT).expect("tier record must exist");
+    assert_eq!(tier.generation, 0);
+    assert_eq!(tier.segment_generation, segment_generation);
+    assert_eq!(tier.content_root, root);
+    assert_eq!(tier.byte_length, 4096);
+    assert_eq!(tier.backend_id, "s3-native");
+    assert_eq!(
+        tier.object_uri,
+        "s3://tier/native/events.v1/segment-30.segment"
+    );
+    assert_eq!(
+        tier.manifest_version_id.as_deref(),
+        Some("3sL4kqCJo05qOWBhBqpfOFAdT4dRJVvV")
+    );
+    assert_eq!(tier.manifest_core_digest, [0x5d; 32]);
+    assert_eq!(
+        tier.verification_method,
+        vtop_meta::VerificationMethod::AuthenticatedContentRoot
+    );
+    assert_eq!(tier.verifier_node_uuid, NODE);
+    assert_eq!(tier.verified_at_apply_index, 23);
+    assert_eq!(tier.verified_term, 5);
+    assert_eq!(tier.fencing_epoch, 1);
+    let segment = segment_record(&machine, SEGMENT);
+    assert_eq!(segment.state, SegmentState::Verified);
+    assert_eq!(segment.segment_generation, segment_generation);
+
+    // One tier copy per segment in this slice.
+    assert_eq!(
+        machine.apply(
+            24,
+            &commit_tier_evidence(&mut requests, SEGMENT, root, segment_generation, 1, NODE)
+        ),
+        rejected(MetadataError::AlreadyExists)
+    );
+
+    // Without a live lease there is no authority to commit evidence at all.
+    assert_eq!(
+        machine.apply(25, &release(&mut requests, 1)),
+        MetadataResponse::Ack { generation: 4 }
+    );
+    assert_eq!(
+        machine.apply(
+            26,
+            &commit_tier_evidence(&mut requests, SEGMENT_B, [0xcd; 32], 0, 1, NODE)
+        ),
+        rejected(MetadataError::invalid_transition(
+            "range holds no active lease for tier evidence"
+        ))
+    );
+}
+
+#[test]
+fn set_topic_retention_policy_follows_the_register_node_cas_pattern() {
+    let mut requests = Requests(0);
+    let mut machine = machine_with_topic_and_node(&mut requests);
+
+    // The topic must exist.
+    assert_eq!(
+        machine.apply(
+            3,
+            &MetadataCommand::SetTopicRetentionPolicy {
+                env: requests.next(),
+                topic_uuid: Uuid::from_u128(0xff),
+                unarchived_deletion_allowed: true,
+                expected_generation: None,
+            }
+        ),
+        rejected(MetadataError::NotFound)
+    );
+    // Absent + CAS expectation: nothing to CAS against.
+    assert_eq!(
+        machine.apply(4, &set_retention_policy(&mut requests, true, Some(0))),
+        rejected(MetadataError::NotFound)
+    );
+    // Creation at generation 0.
+    assert_eq!(
+        machine.apply(5, &set_retention_policy(&mut requests, true, None)),
+        MetadataResponse::Ack { generation: 0 }
+    );
+    // Present + no expectation: collision.
+    assert_eq!(
+        machine.apply(6, &set_retention_policy(&mut requests, true, None)),
+        rejected(MetadataError::AlreadyExists)
+    );
+    // CAS with the wrong generation.
+    assert_eq!(
+        machine.apply(7, &set_retention_policy(&mut requests, false, Some(5))),
+        rejected(MetadataError::GenerationMismatch {
+            expected: 5,
+            actual: 0,
+        })
+    );
+    // CAS update flips the flag and bumps the generation.
+    assert_eq!(
+        machine.apply(8, &set_retention_policy(&mut requests, false, Some(0))),
+        MetadataResponse::Ack { generation: 1 }
+    );
+    let Some(MetaValue::TopicRetentionPolicy(policy)) =
+        machine.record(&MetaKey::TopicRetentionPolicy { topic_uuid: TOPIC })
+    else {
+        panic!("policy record must exist");
+    };
+    assert_eq!(policy.generation, 1);
+    assert!(!policy.unarchived_deletion_allowed);
+}
+
+#[test]
+fn plan_retention_requires_tier_evidence_or_an_explicit_policy() {
+    // No evidence and no policy: fail-closed.
+    let mut requests = Requests(0);
+    let (mut machine, _root, segment_generation) = verified_segment_machine(&mut requests);
+    assert_eq!(
+        machine.apply(
+            6,
+            &plan_retention(&mut requests, SEGMENT, segment_generation, 1)
+        ),
+        rejected(MetadataError::invalid_transition(
+            "retention requires verified tier evidence or an explicit unarchived-deletion policy"
+        ))
+    );
+    // An explicit policy that does NOT allow unarchived deletion still fails.
+    assert_eq!(
+        machine.apply(7, &set_retention_policy(&mut requests, false, None)),
+        MetadataResponse::Ack { generation: 0 }
+    );
+    assert_eq!(
+        machine.apply(
+            8,
+            &plan_retention(&mut requests, SEGMENT, segment_generation, 1)
+        ),
+        rejected(MetadataError::invalid_transition(
+            "retention requires verified tier evidence or an explicit unarchived-deletion policy"
+        ))
+    );
+    assert_eq!(
+        segment_record(&machine, SEGMENT).state,
+        SegmentState::Verified
+    );
+    // The committed opt-out unlocks the plan.
+    assert_eq!(
+        machine.apply(9, &set_retention_policy(&mut requests, true, Some(0))),
+        MetadataResponse::Ack { generation: 1 }
+    );
+    assert_eq!(
+        machine.apply(
+            10,
+            &plan_retention(&mut requests, SEGMENT, segment_generation, 1)
+        ),
+        MetadataResponse::Ack { generation: 2 }
+    );
+    let segment = segment_record(&machine, SEGMENT);
+    assert_eq!(segment.state, SegmentState::RetentionPlanned);
+    assert_eq!(segment.segment_generation, 2);
+}
+
+#[test]
+fn plan_retention_reuses_evidence_across_lifecycle_cas_churn() {
+    let mut requests = Requests(0);
+    let (mut machine, root, segment_generation) = verified_segment_machine(&mut requests);
+    assert_eq!(
+        machine.apply(
+            6,
+            &commit_tier_evidence(&mut requests, SEGMENT, root, segment_generation, 1, NODE)
+        ),
+        MetadataResponse::Ack { generation: 0 }
+    );
+    // The evidence path authorizes the plan...
+    assert_eq!(
+        machine.apply(
+            7,
+            &plan_retention(&mut requests, SEGMENT, segment_generation, 1)
+        ),
+        MetadataResponse::Ack { generation: 2 }
+    );
+    // ...and cancelling moves the lifecycle CAS generation past the value
+    // recorded for audit when the tier copy was committed.
+    assert_eq!(
+        machine.apply(8, &cancel_retention(&mut requests, SEGMENT, 2)),
+        MetadataResponse::Ack { generation: 3 }
+    );
+    // The immutable identity did not change, so the same evidence remains
+    // valid without re-uploading bytes or weakening the policy gate.
+    assert_eq!(
+        machine.apply(9, &plan_retention(&mut requests, SEGMENT, 3, 1)),
+        MetadataResponse::Ack { generation: 4 }
+    );
+    assert_eq!(
+        tier_record(&machine, SEGMENT).unwrap().segment_generation,
+        1
+    );
+    assert_eq!(
+        segment_record(&machine, SEGMENT).state,
+        SegmentState::RetentionPlanned
+    );
+}
+
+#[test]
+fn plan_retention_rejects_a_mismatched_evidence_root_fail_closed() {
+    // No command sequence can produce evidence whose root disagrees with the
+    // segment (CommitTierEvidence validates the match and nothing rewrites a
+    // sealed root), so reach the defensive branch through snapshot surgery:
+    // flip the pinned root inside the tier record, then inside the segment
+    // record, and require the fail-closed rejection both ways even though a
+    // maximally permissive policy is committed.
+    let build = || {
+        let mut requests = Requests(0);
+        let (mut machine, root, segment_generation) = verified_segment_machine(&mut requests);
+        assert_eq!(
+            machine.apply(
+                6,
+                &commit_tier_evidence(&mut requests, SEGMENT, root, segment_generation, 1, NODE)
+            ),
+            MetadataResponse::Ack { generation: 0 }
+        );
+        assert_eq!(
+            machine.apply(7, &set_retention_policy(&mut requests, true, None)),
+            MetadataResponse::Ack { generation: 0 }
+        );
+        (machine, requests)
+    };
+
+    // Tier record layout: tag 1 + generation 8 + segment generation 8, then
+    // the 32-byte content root.
+    let (machine, mut requests) = build();
+    let snapshot = machine.encode_snapshot().unwrap();
+    let evidence_flipped = rewrite_snapshot_value(
+        &snapshot,
+        &MetaKey::SegmentTierCopy {
+            topic_uuid: TOPIC,
+            range_uuid: RANGE,
+            segment_uuid: SEGMENT,
+        },
+        |value| value[17] ^= 0xff,
+    );
+    let mut mutated = MetaStateMachine::decode_snapshot(&evidence_flipped).unwrap();
+    assert_eq!(
+        mutated.apply(8, &plan_retention(&mut requests, SEGMENT, 1, 1)),
+        rejected(MetadataError::invalid_transition(
+            "tier evidence content root does not match the sealed segment"
+        ))
+    );
+
+    // Segment record layout: tag 1 + generation 8 + base 8 + next 8, then
+    // the 32-byte content root.
+    let (machine, mut requests) = build();
+    let snapshot = machine.encode_snapshot().unwrap();
+    let segment_flipped = rewrite_snapshot_value(
+        &snapshot,
+        &MetaKey::Segment {
+            topic_uuid: TOPIC,
+            range_uuid: RANGE,
+            segment_uuid: SEGMENT,
+        },
+        |value| value[25] ^= 0xff,
+    );
+    let mut mutated = MetaStateMachine::decode_snapshot(&segment_flipped).unwrap();
+    assert_eq!(
+        mutated.apply(8, &plan_retention(&mut requests, SEGMENT, 1, 1)),
+        rejected(MetadataError::invalid_transition(
+            "tier evidence content root does not match the sealed segment"
+        ))
+    );
+}
+
+#[test]
+fn plan_retention_is_blocked_by_durable_group_cursors_below_the_segment_end() {
+    let mut requests = Requests(0);
+    let mut machine = machine_with_group(&mut requests);
+    let root = [9u8; 32];
+
+    assert_eq!(
+        machine.apply(6, &grant(&mut requests, NODE, 0)),
+        MetadataResponse::LeaseGranted { fencing_epoch: 1 }
+    );
+    assert_eq!(
+        machine.apply(
+            7,
+            &MetadataCommand::RegisterSealedSegment {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: SEGMENT,
+                segment_generation: 0,
+                base_offset: 0,
+                next_offset: 100,
+                content_root: root,
+                sealed_by_epoch: 1,
+                expected_range_generation: 1,
+            }
+        ),
+        MetadataResponse::Ack { generation: 2 }
+    );
+    assert_eq!(
+        machine.apply(
+            8,
+            &MetadataCommand::MarkSegmentVerified {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: SEGMENT,
+                content_root: root,
+                expected_generation: 0,
+            }
+        ),
+        MetadataResponse::Ack { generation: 1 }
+    );
+    assert_eq!(
+        machine.apply(
+            9,
+            &commit_tier_evidence(&mut requests, SEGMENT, root, 1, 1, NODE)
+        ),
+        MetadataResponse::Ack { generation: 0 }
+    );
+
+    // A durable committed cursor below the segment end blocks the plan.
+    let cursor = |requests: &mut Requests,
+                  segment: Uuid,
+                  segment_generation: u64,
+                  segment_root: [u8; 32],
+                  record_offset: u64,
+                  expected: Option<u64>| {
+        MetadataCommand::CommitGroupCursor {
+            env: requests.next(),
+            group_uuid: GROUP,
+            member_uuid: MEMBER,
+            topic_uuid: TOPIC,
+            range_uuid: RANGE,
+            topic_epoch: 1,
+            range_generation: 0,
+            segment_uuid: segment,
+            segment_generation,
+            segment_root,
+            record_offset,
+            record_index: 0,
+            lineage_transition_id: None,
+            expected_checkpoint_generation: expected,
+        }
+    };
+    assert_eq!(
+        machine.apply(10, &cursor(&mut requests, SEGMENT, 1, root, 10, None)),
+        MetadataResponse::CursorCommitted {
+            checkpoint_generation: 0,
+        }
+    );
+    assert_eq!(
+        machine.apply(11, &plan_retention(&mut requests, SEGMENT, 1, 1)),
+        rejected(MetadataError::invalid_transition(format!(
+            "group cursor {GROUP} at offset 10 is below segment end 100"
+        )))
+    );
+    assert_eq!(
+        segment_record(&machine, SEGMENT).state,
+        SegmentState::Verified
+    );
+
+    // A cursor at exactly next_offset has fully consumed the segment and
+    // does not block: advancing unblocks the same plan.
+    assert_eq!(
+        machine.apply(12, &cursor(&mut requests, SEGMENT, 1, root, 100, Some(0))),
+        MetadataResponse::CursorCommitted {
+            checkpoint_generation: 1,
+        }
+    );
+    assert_eq!(
+        machine.apply(13, &plan_retention(&mut requests, SEGMENT, 1, 1)),
+        MetadataResponse::Ack { generation: 2 }
+    );
+
+    // A cursor sitting in an EARLIER segment of the range still protects a
+    // later one: offsets are monotonic within the range's lineage stream.
+    let root_b = [0xcd; 32];
+    assert_eq!(
+        machine.apply(
+            14,
+            &MetadataCommand::RegisterSealedSegment {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: SEGMENT_B,
+                segment_generation: 0,
+                base_offset: 100,
+                next_offset: 200,
+                content_root: root_b,
+                sealed_by_epoch: 1,
+                expected_range_generation: 2,
+            }
+        ),
+        MetadataResponse::Ack { generation: 3 }
+    );
+    assert_eq!(
+        machine.apply(
+            15,
+            &MetadataCommand::MarkSegmentVerified {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: SEGMENT_B,
+                content_root: root_b,
+                expected_generation: 0,
+            }
+        ),
+        MetadataResponse::Ack { generation: 1 }
+    );
+    assert_eq!(
+        machine.apply(
+            16,
+            &commit_tier_evidence(&mut requests, SEGMENT_B, root_b, 1, 1, NODE)
+        ),
+        MetadataResponse::Ack { generation: 0 }
+    );
+    assert_eq!(
+        machine.apply(17, &plan_retention(&mut requests, SEGMENT_B, 1, 1)),
+        rejected(MetadataError::invalid_transition(format!(
+            "group cursor {GROUP} at offset 100 is below segment end 200"
+        )))
+    );
+
+    // A cursor on a different topic/range holds no claim over this one, and
+    // once the range's own cursor advances past the segment end the plan
+    // succeeds.
+    let other_topic = Uuid::from_u128(0x60);
+    let other_range = Uuid::from_u128(0x61);
+    assert_eq!(
+        machine.apply(
+            18,
+            &MetadataCommand::CreateTopic {
+                env: requests.next(),
+                name: "other.v1".to_owned(),
+                topic_uuid: other_topic,
+                root_range_uuid: other_range,
+            }
+        ),
+        MetadataResponse::TopicCreated {
+            topic_uuid: other_topic,
+            topic_epoch: 1,
+            root_range_uuid: other_range,
+        }
+    );
+    assert_eq!(
+        machine.apply(
+            19,
+            &MetadataCommand::GrantRangeLease {
+                env: requests.next(),
+                topic_uuid: other_topic,
+                range_uuid: other_range,
+                holder_node_uuid: NODE,
+                expected_range_generation: 0,
+            }
+        ),
+        MetadataResponse::LeaseGranted { fencing_epoch: 1 }
+    );
+    let other_root = [0x11; 32];
+    assert_eq!(
+        machine.apply(
+            20,
+            &MetadataCommand::RegisterSealedSegment {
+                env: requests.next(),
+                topic_uuid: other_topic,
+                range_uuid: other_range,
+                segment_uuid: Uuid::from_u128(0x32),
+                segment_generation: 0,
+                base_offset: 0,
+                next_offset: 50,
+                content_root: other_root,
+                sealed_by_epoch: 1,
+                expected_range_generation: 1,
+            }
+        ),
+        MetadataResponse::Ack { generation: 2 }
+    );
+    assert_eq!(
+        machine.apply(
+            21,
+            &MetadataCommand::AssignMemberRanges {
+                env: requests.next(),
+                group_uuid: GROUP,
+                member_uuid: MEMBER,
+                ranges: vec![
+                    RangeAssignment {
+                        topic_uuid: TOPIC,
+                        range_uuid: RANGE,
+                    },
+                    RangeAssignment {
+                        topic_uuid: other_topic,
+                        range_uuid: other_range,
+                    },
+                ],
+                expected_member_generation: 1,
+            }
+        ),
+        MetadataResponse::Ack { generation: 2 }
+    );
+    assert_eq!(
+        machine.apply(
+            22,
+            &MetadataCommand::CommitGroupCursor {
+                env: requests.next(),
+                group_uuid: GROUP,
+                member_uuid: MEMBER,
+                topic_uuid: other_topic,
+                range_uuid: other_range,
+                topic_epoch: 1,
+                range_generation: 0,
+                segment_uuid: Uuid::from_u128(0x32),
+                segment_generation: 0,
+                segment_root: other_root,
+                record_offset: 10,
+                record_index: 0,
+                lineage_transition_id: None,
+                expected_checkpoint_generation: None,
+            }
+        ),
+        MetadataResponse::CursorCommitted {
+            checkpoint_generation: 0,
+        }
+    );
+    assert_eq!(
+        machine.apply(
+            23,
+            &cursor(&mut requests, SEGMENT_B, 1, root_b, 200, Some(1))
+        ),
+        MetadataResponse::CursorCommitted {
+            checkpoint_generation: 2,
+        }
+    );
+    assert_eq!(
+        machine.apply(24, &plan_retention(&mut requests, SEGMENT_B, 1, 1)),
+        MetadataResponse::Ack { generation: 2 }
+    );
+}
+
+#[test]
+fn plan_retention_is_mutually_exclusive_with_rebalance_and_repair() {
+    let mut requests = Requests(0);
+    let (mut machine, root, segment_generation, replicas, spare) =
+        placed_segment_machine(&mut requests);
+    let from = replicas[0];
+
+    assert_eq!(
+        machine.apply(
+            12,
+            &commit_tier_evidence(&mut requests, SEGMENT, root, segment_generation, 1, NODE)
+        ),
+        MetadataResponse::Ack { generation: 0 }
+    );
+
+    // A live rebalance intent blocks retention planning outright.
+    assert_eq!(
+        machine.apply(13, &propose_rebalance(&mut requests, from, spare, 0)),
+        MetadataResponse::Ack { generation: 1 }
+    );
+    assert_eq!(
+        machine.apply(
+            14,
+            &plan_retention(&mut requests, SEGMENT, segment_generation, 1)
+        ),
+        rejected(MetadataError::invalid_transition(
+            "segment has an active rebalance intent"
+        ))
+    );
+    assert_eq!(
+        machine.apply(15, &cancel_rebalance(&mut requests, 1)),
+        MetadataResponse::Ack { generation: 2 }
+    );
+
+    // A committed replacement proof (an in-flight verified move) also blocks.
+    assert_eq!(
+        machine.apply(
+            16,
+            &commit_proof(&mut requests, root, from, spare, segment_generation)
+        ),
+        MetadataResponse::Ack { generation: 0 }
+    );
+    assert_eq!(
+        machine.apply(
+            17,
+            &plan_retention(&mut requests, SEGMENT, segment_generation, 1)
+        ),
+        rejected(MetadataError::invalid_transition(
+            "segment has a committed replacement proof; complete or resolve the replica retirement first"
+        ))
+    );
+    assert_eq!(
+        segment_record(&machine, SEGMENT).state,
+        SegmentState::Verified
+    );
+}
+
+#[test]
+fn retention_states_block_placement_rebalance_and_repair_conversely() {
+    let mut requests = Requests(0);
+    let (mut machine, root, segment_generation, replicas, spare) =
+        placed_segment_machine(&mut requests);
+    let from = replicas[0];
+
+    assert_eq!(
+        machine.apply(
+            12,
+            &commit_tier_evidence(&mut requests, SEGMENT, root, segment_generation, 1, NODE)
+        ),
+        MetadataResponse::Ack { generation: 0 }
+    );
+    assert_eq!(
+        machine.apply(
+            13,
+            &plan_retention(&mut requests, SEGMENT, segment_generation, 1)
+        ),
+        MetadataResponse::Ack { generation: 2 }
+    );
+
+    // The existing Verified guards pin the reverse direction for
+    // RetentionPlanned...
+    let assert_blocked = |machine: &mut MetaStateMachine,
+                          requests: &mut Requests,
+                          at: u64,
+                          expected_segment_generation: u64,
+                          expected_placement_generation: u64| {
+        assert_eq!(
+            machine.apply(
+                at,
+                &propose_rebalance(requests, from, spare, expected_placement_generation)
+            ),
+            rejected(MetadataError::invalid_transition(
+                "rebalance requires a verified segment"
+            ))
+        );
+        assert_eq!(
+            machine.apply(
+                at + 1,
+                &MetadataCommand::CommitSegmentPlacement {
+                    env: requests.next(),
+                    topic_uuid: TOPIC,
+                    range_uuid: RANGE,
+                    segment_uuid: SEGMENT,
+                    replication_factor: 2,
+                    replica_nodes: replicas.clone(),
+                    expected_segment_generation,
+                    expected_placement_generation: Some(0),
+                }
+            ),
+            rejected(MetadataError::invalid_transition(
+                "placement requires a verified segment"
+            ))
+        );
+        assert_eq!(
+            machine.apply(
+                at + 2,
+                &commit_proof(requests, root, from, spare, expected_segment_generation)
+            ),
+            rejected(MetadataError::invalid_transition(
+                "replacement proof requires a verified or repairing segment"
+            ))
+        );
+    };
+    assert_blocked(&mut machine, &mut requests, 14, 2, 0);
+
+    // ...and for RetentionExpired (whose confirmation bumped the placement
+    // generation while emptying the replica set).
+    assert_eq!(
+        machine.apply(17, &confirm_retention_expired(&mut requests, SEGMENT, 2)),
+        MetadataResponse::Ack { generation: 3 }
+    );
+    assert_blocked(&mut machine, &mut requests, 18, 3, 1);
+}
+
+#[test]
+fn confirm_retention_expired_empties_placement_and_preserves_declared_rf() {
+    let mut requests = Requests(0);
+    let (mut machine, root, segment_generation, replicas, _spare) =
+        placed_segment_machine(&mut requests);
+
+    assert_eq!(
+        machine.apply(
+            12,
+            &commit_tier_evidence(&mut requests, SEGMENT, root, segment_generation, 1, NODE)
+        ),
+        MetadataResponse::Ack { generation: 0 }
+    );
+    // Confirmation without a plan is rejected.
+    assert_eq!(
+        machine.apply(
+            13,
+            &confirm_retention_expired(&mut requests, SEGMENT, segment_generation)
+        ),
+        rejected(MetadataError::invalid_transition(
+            "retention confirmation requires RETENTION_PLANNED"
+        ))
+    );
+    assert_eq!(
+        machine.apply(
+            14,
+            &plan_retention(&mut requests, SEGMENT, segment_generation, 1)
+        ),
+        MetadataResponse::Ack { generation: 2 }
+    );
+    // A rejected confirmation mutates nothing (apply is all-or-nothing).
+    assert_eq!(
+        machine.apply(15, &confirm_retention_expired(&mut requests, SEGMENT, 999)),
+        rejected(MetadataError::GenerationMismatch {
+            expected: 999,
+            actual: 2,
+        })
+    );
+    let segment = segment_record(&machine, SEGMENT);
+    assert_eq!(segment.state, SegmentState::RetentionPlanned);
+    assert_eq!(segment.segment_generation, 2);
+    assert_eq!(placement_record(&machine).replica_nodes, replicas);
+
+    // The single-apply effect: segment state + generation, and the placement
+    // empties while its declared factor survives verbatim — the durable
+    // audit reads "target RF 2, zero local replicas, tier evidence present".
+    assert_eq!(
+        machine.apply(16, &confirm_retention_expired(&mut requests, SEGMENT, 2)),
+        MetadataResponse::Ack { generation: 3 }
+    );
+    let segment = segment_record(&machine, SEGMENT);
+    assert_eq!(segment.state, SegmentState::RetentionExpired);
+    assert_eq!(segment.segment_generation, 3);
+    assert_eq!(segment.content_root, root);
+    let placement = placement_record(&machine);
+    assert!(placement.replica_nodes.is_empty());
+    assert_eq!(placement.declared_replication_factor, 2);
+    assert_eq!(placement.generation, 1);
+    assert_eq!(placement.committed_apply_index, 11);
+    // The segment and tier-copy records are retained forever.
+    assert!(tier_record(&machine, SEGMENT).is_some());
+
+    // Terminal: neither confirmation nor cancellation applies again.
+    assert_eq!(
+        machine.apply(17, &confirm_retention_expired(&mut requests, SEGMENT, 3)),
+        rejected(MetadataError::invalid_transition(
+            "retention confirmation requires RETENTION_PLANNED"
+        ))
+    );
+    assert_eq!(
+        machine.apply(18, &cancel_retention(&mut requests, SEGMENT, 3)),
+        rejected(MetadataError::invalid_transition(
+            "retention cancellation requires RETENTION_PLANNED"
+        ))
+    );
+}
+
+#[test]
+fn cancel_retention_restores_the_verified_segment_byte_exactly() {
+    let mut requests = Requests(0);
+    let (mut machine, root, segment_generation) = verified_segment_machine(&mut requests);
+    assert_eq!(
+        machine.apply(
+            6,
+            &commit_tier_evidence(&mut requests, SEGMENT, root, segment_generation, 1, NODE)
+        ),
+        MetadataResponse::Ack { generation: 0 }
+    );
+    let before = segment_record(&machine, SEGMENT);
+    assert_eq!(
+        machine.apply(
+            7,
+            &plan_retention(&mut requests, SEGMENT, segment_generation, 1)
+        ),
+        MetadataResponse::Ack { generation: 2 }
+    );
+    // A cancel with a stale CAS token changes nothing.
+    assert_eq!(
+        machine.apply(8, &cancel_retention(&mut requests, SEGMENT, 7)),
+        rejected(MetadataError::GenerationMismatch {
+            expected: 7,
+            actual: 2,
+        })
+    );
+    assert_eq!(
+        machine.apply(9, &cancel_retention(&mut requests, SEGMENT, 2)),
+        MetadataResponse::Ack { generation: 3 }
+    );
+    // Everything except the CAS generation is restored byte-exactly.
+    let after = segment_record(&machine, SEGMENT);
+    assert_eq!(after.state, SegmentState::Verified);
+    assert_eq!(after.segment_generation, 3);
+    assert_eq!(after.base_offset, before.base_offset);
+    assert_eq!(after.next_offset, before.next_offset);
+    assert_eq!(after.content_root, before.content_root);
+    assert_eq!(after.sealed_by_epoch, before.sealed_by_epoch);
+    // Cancelling on a Verified segment (nothing planned) is rejected.
+    assert_eq!(
+        machine.apply(10, &cancel_retention(&mut requests, SEGMENT, 3)),
+        rejected(MetadataError::invalid_transition(
+            "retention cancellation requires RETENTION_PLANNED"
+        ))
+    );
+    // Unknown segment.
+    assert_eq!(
+        machine.apply(
+            11,
+            &cancel_retention(&mut requests, Uuid::from_u128(0xfe), 0)
+        ),
+        rejected(MetadataError::NotFound)
+    );
+}
+
+#[test]
+fn retention_planning_rejects_without_lease_and_with_stale_epoch() {
+    let mut requests = Requests(0);
+    let (mut machine, root, segment_generation) = verified_segment_machine(&mut requests);
+    assert_eq!(
+        machine.apply(
+            6,
+            &commit_tier_evidence(&mut requests, SEGMENT, root, segment_generation, 1, NODE)
+        ),
+        MetadataResponse::Ack { generation: 0 }
+    );
+    // Unknown range, stale epoch, unknown segment, stale CAS.
+    assert_eq!(
+        machine.apply(
+            7,
+            &MetadataCommand::PlanRetention {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: Uuid::from_u128(0xff),
+                segment_uuid: SEGMENT,
+                expected_segment_generation: segment_generation,
+                fencing_epoch: 1,
+            }
+        ),
+        rejected(MetadataError::NotFound)
+    );
+    assert_eq!(
+        machine.apply(
+            8,
+            &plan_retention(&mut requests, SEGMENT, segment_generation, 99)
+        ),
+        rejected(MetadataError::EpochMismatch {
+            expected: 99,
+            actual: 1,
+        })
+    );
+    assert_eq!(
+        machine.apply(
+            9,
+            &plan_retention(&mut requests, Uuid::from_u128(0xfe), 0, 1)
+        ),
+        rejected(MetadataError::NotFound)
+    );
+    assert_eq!(
+        machine.apply(10, &plan_retention(&mut requests, SEGMENT, 9, 1)),
+        rejected(MetadataError::GenerationMismatch {
+            expected: 9,
+            actual: 1,
+        })
+    );
+    // Releasing the lease removes retention authority entirely: deletion is
+    // an act of current leaseholder authority.
+    assert_eq!(
+        machine.apply(11, &release(&mut requests, 1)),
+        MetadataResponse::Ack { generation: 3 }
+    );
+    assert_eq!(
+        machine.apply(
+            12,
+            &plan_retention(&mut requests, SEGMENT, segment_generation, 1)
+        ),
+        rejected(MetadataError::invalid_transition(
+            "range holds no active lease for retention planning"
+        ))
+    );
+    assert_eq!(
+        segment_record(&machine, SEGMENT).state,
+        SegmentState::Verified
+    );
+}
+
+#[test]
+fn retention_generation_ceilings_reject_deterministically_without_mutation() {
+    let mut requests = Requests(0);
+    let mut machine = machine_with_topic_and_node(&mut requests);
+    machine.apply(3, &grant(&mut requests, NODE, 0));
+    assert_eq!(
+        machine.apply(4, &set_retention_policy(&mut requests, true, None)),
+        MetadataResponse::Ack { generation: 0 }
+    );
+
+    // PlanRetention at the segment-generation ceiling.
+    assert_eq!(
+        machine.apply(
+            5,
+            &MetadataCommand::RegisterSealedSegment {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: SEGMENT,
+                segment_generation: u64::MAX - 1,
+                base_offset: 0,
+                next_offset: 64,
+                content_root: [7; 32],
+                sealed_by_epoch: 1,
+                expected_range_generation: 1,
+            }
+        ),
+        MetadataResponse::Ack { generation: 2 }
+    );
+    assert_eq!(
+        machine.apply(
+            6,
+            &MetadataCommand::MarkSegmentVerified {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: SEGMENT,
+                content_root: [7; 32],
+                expected_generation: u64::MAX - 1,
+            }
+        ),
+        MetadataResponse::Ack {
+            generation: u64::MAX
+        }
+    );
+    assert!(matches!(
+        machine.apply(7, &plan_retention(&mut requests, SEGMENT, u64::MAX, 1)),
+        MetadataResponse::Rejected(MetadataError::Limit(_))
+    ));
+    let segment = segment_record(&machine, SEGMENT);
+    assert_eq!(segment.state, SegmentState::Verified);
+    assert_eq!(segment.segment_generation, u64::MAX);
+
+    // Confirm and cancel at the ceiling: plan a second segment into
+    // RetentionPlanned at u64::MAX, then both follow-ups must reject with
+    // Limit and leave it untouched.
+    assert_eq!(
+        machine.apply(
+            8,
+            &MetadataCommand::RegisterSealedSegment {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: SEGMENT_B,
+                segment_generation: u64::MAX - 2,
+                base_offset: 64,
+                next_offset: 128,
+                content_root: [8; 32],
+                sealed_by_epoch: 1,
+                expected_range_generation: 2,
+            }
+        ),
+        MetadataResponse::Ack { generation: 3 }
+    );
+    assert_eq!(
+        machine.apply(
+            9,
+            &MetadataCommand::MarkSegmentVerified {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: SEGMENT_B,
+                content_root: [8; 32],
+                expected_generation: u64::MAX - 2,
+            }
+        ),
+        MetadataResponse::Ack {
+            generation: u64::MAX - 1
+        }
+    );
+    assert_eq!(
+        machine.apply(
+            10,
+            &plan_retention(&mut requests, SEGMENT_B, u64::MAX - 1, 1)
+        ),
+        MetadataResponse::Ack {
+            generation: u64::MAX
+        }
+    );
+    for (at, command) in [
+        confirm_retention_expired(&mut requests, SEGMENT_B, u64::MAX),
+        cancel_retention(&mut requests, SEGMENT_B, u64::MAX),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(matches!(
+            machine.apply(11 + at as u64, &command),
+            MetadataResponse::Rejected(MetadataError::Limit(_))
+        ));
+        let segment = segment_record(&machine, SEGMENT_B);
+        assert_eq!(segment.state, SegmentState::RetentionPlanned);
+        assert_eq!(segment.segment_generation, u64::MAX);
+    }
+}
+
+#[test]
+fn confirm_retention_expired_validates_the_placement_ceiling_before_mutating() {
+    // A placement generation at the ceiling is unreachable through commands
+    // (it starts at 0 and only ever increments), so reach the defensive
+    // branch through snapshot surgery and require all-or-nothing behaviour:
+    // the segment must NOT flip to RetentionExpired when the placement bump
+    // would overflow.
+    let mut requests = Requests(0);
+    let (mut machine, root, segment_generation, _replicas, _spare) =
+        placed_segment_machine(&mut requests);
+    assert_eq!(
+        machine.apply(
+            12,
+            &commit_tier_evidence(&mut requests, SEGMENT, root, segment_generation, 1, NODE)
+        ),
+        MetadataResponse::Ack { generation: 0 }
+    );
+    assert_eq!(
+        machine.apply(
+            13,
+            &plan_retention(&mut requests, SEGMENT, segment_generation, 1)
+        ),
+        MetadataResponse::Ack { generation: 2 }
+    );
+    let snapshot = machine.encode_snapshot().unwrap();
+    // Placement record layout: tag 1, then the 8-byte generation.
+    let mutated_snapshot = rewrite_snapshot_value(
+        &snapshot,
+        &MetaKey::SegmentPlacement {
+            topic_uuid: TOPIC,
+            range_uuid: RANGE,
+            segment_uuid: SEGMENT,
+        },
+        |value| value[1..9].copy_from_slice(&u64::MAX.to_be_bytes()),
+    );
+    let mut mutated = MetaStateMachine::decode_snapshot(&mutated_snapshot).unwrap();
+    assert!(matches!(
+        mutated.apply(14, &confirm_retention_expired(&mut requests, SEGMENT, 2)),
+        MetadataResponse::Rejected(MetadataError::Limit(_))
+    ));
+    let segment = segment_record(&mutated, SEGMENT);
+    assert_eq!(segment.state, SegmentState::RetentionPlanned);
+    assert_eq!(segment.segment_generation, 2);
+    assert!(!placement_record(&mutated).replica_nodes.is_empty());
+}
+
+#[test]
+fn retention_full_circle_produces_byte_identical_snapshots() {
+    let build = || {
+        let mut requests = Requests(0);
+        let (mut machine, root, segment_generation, _replicas, _spare) =
+            placed_segment_machine(&mut requests);
+        assert_eq!(
+            machine.apply(
+                12,
+                &commit_tier_evidence(&mut requests, SEGMENT, root, segment_generation, 1, NODE)
+            ),
+            MetadataResponse::Ack { generation: 0 }
+        );
+        assert_eq!(
+            machine.apply(13, &set_retention_policy(&mut requests, false, None)),
+            MetadataResponse::Ack { generation: 0 }
+        );
+        assert_eq!(
+            machine.apply(
+                14,
+                &plan_retention(&mut requests, SEGMENT, segment_generation, 1)
+            ),
+            MetadataResponse::Ack { generation: 2 }
+        );
+        assert_eq!(
+            machine.apply(15, &confirm_retention_expired(&mut requests, SEGMENT, 2)),
+            MetadataResponse::Ack { generation: 3 }
+        );
+        machine
+    };
+    let first = build().encode_snapshot().unwrap();
+    let second = build().encode_snapshot().unwrap();
+    assert_eq!(first, second);
+    let decoded = MetaStateMachine::decode_snapshot(&first).unwrap();
+    assert_eq!(
+        decoded.encode_snapshot().unwrap(),
+        first,
+        "decode/encode must be a fixed point"
+    );
+    // The full-circle audit trail survives the round trip.
+    assert_eq!(
+        segment_record(&decoded, SEGMENT).state,
+        SegmentState::RetentionExpired
+    );
+    assert!(tier_record(&decoded, SEGMENT).is_some());
+    let placement = placement_record(&decoded);
+    assert!(placement.replica_nodes.is_empty());
+    assert_eq!(placement.declared_replication_factor, 2);
+}
+
+#[test]
+fn retention_commands_deduplicate_including_across_snapshot_restore() {
+    let mut requests = Requests(0);
+    let (mut machine, root, segment_generation, _replicas, _spare) =
+        placed_segment_machine(&mut requests);
+
+    let evidence = commit_tier_evidence(&mut requests, SEGMENT, root, segment_generation, 1, NODE);
+    let policy = set_retention_policy(&mut requests, true, None);
+    let plan = plan_retention(&mut requests, SEGMENT, segment_generation, 1);
+    let cancel = cancel_retention(&mut requests, SEGMENT, 2);
+    let replan = plan_retention(&mut requests, SEGMENT, 3, 1);
+    let confirm = confirm_retention_expired(&mut requests, SEGMENT, 4);
+
+    // Drive the policy path (no evidence yet, so the re-plan after cancel is
+    // not blocked by a stale pinned generation) and commit the evidence LAST
+    // so its dedup entry — a rejection — is exercised too.
+    let mut originals = Vec::new();
+    for (at, command) in [&policy, &plan, &cancel, &replan, &confirm, &evidence]
+        .into_iter()
+        .enumerate()
+    {
+        originals.push(machine.apply(12 + at as u64, command));
+    }
+    assert_eq!(
+        originals[..5],
+        [
+            MetadataResponse::Ack { generation: 0 },
+            MetadataResponse::Ack { generation: 2 },
+            MetadataResponse::Ack { generation: 3 },
+            MetadataResponse::Ack { generation: 4 },
+            MetadataResponse::Ack { generation: 5 },
+        ]
+    );
+    // Evidence proposed against the now-RetentionExpired segment is a
+    // rejection — dedup must preserve rejections identically too.
+    assert!(matches!(
+        originals[5],
+        MetadataResponse::Rejected(MetadataError::GenerationMismatch { .. })
+    ));
+
+    // Replays return the stored originals even though the state has moved on.
+    for (at, (command, original)) in [&policy, &plan, &cancel, &replan, &confirm, &evidence]
+        .into_iter()
+        .zip(&originals)
+        .enumerate()
+    {
+        assert_eq!(machine.apply(30 + at as u64, command), *original);
+    }
+    // And across a snapshot round trip.
+    let mut restored =
+        MetaStateMachine::decode_snapshot(&machine.encode_snapshot().unwrap()).unwrap();
+    for (at, (command, original)) in [&policy, &plan, &cancel, &replan, &confirm, &evidence]
+        .into_iter()
+        .zip(&originals)
+        .enumerate()
+    {
+        assert_eq!(restored.apply(40 + at as u64, command), *original);
+    }
 }

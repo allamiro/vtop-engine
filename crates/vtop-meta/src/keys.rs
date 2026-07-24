@@ -38,6 +38,8 @@ const CATEGORY_GROUP_CURSOR: u8 = 12;
 const CATEGORY_SEGMENT_PLACEMENT: u8 = 13;
 const CATEGORY_SEGMENT_REPLACEMENT_PROOF: u8 = 14;
 const CATEGORY_SEGMENT_REBALANCE_INTENT: u8 = 15;
+const CATEGORY_SEGMENT_TIER_COPY: u8 = 16;
+const CATEGORY_TOPIC_RETENTION_POLICY: u8 = 17;
 
 /// Consumer-group names reuse the topic-name bound so group identity stays
 /// allocation-bounded on the wire and in snapshots.
@@ -121,6 +123,19 @@ pub enum MetaKey {
         range_uuid: Uuid,
         segment_uuid: Uuid,
     },
+    /// Verified cold-tier copy evidence for a sealed segment (one per segment
+    /// in this slice); its presence plus a `Verified` segment is the derived
+    /// TIER_VERIFIED condition that authorizes retention planning.
+    SegmentTierCopy {
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        segment_uuid: Uuid,
+    },
+    /// Per-topic retention policy record. An absent record is the fail-closed
+    /// default: no unarchived deletion.
+    TopicRetentionPolicy {
+        topic_uuid: Uuid,
+    },
 }
 
 /// Validate a topic name against the shared 249-byte semantics.
@@ -165,6 +180,8 @@ impl MetaKey {
             MetaKey::SegmentPlacement { .. } => CATEGORY_SEGMENT_PLACEMENT,
             MetaKey::SegmentReplacementProof { .. } => CATEGORY_SEGMENT_REPLACEMENT_PROOF,
             MetaKey::SegmentRebalanceIntent { .. } => CATEGORY_SEGMENT_REBALANCE_INTENT,
+            MetaKey::SegmentTierCopy { .. } => CATEGORY_SEGMENT_TIER_COPY,
+            MetaKey::TopicRetentionPolicy { .. } => CATEGORY_TOPIC_RETENTION_POLICY,
         }
     }
 
@@ -243,6 +260,16 @@ impl MetaKey {
                 put_uuid(&mut out, *range_uuid);
                 put_uuid(&mut out, *segment_uuid);
             }
+            MetaKey::SegmentTierCopy {
+                topic_uuid,
+                range_uuid,
+                segment_uuid,
+            } => {
+                put_uuid(&mut out, *topic_uuid);
+                put_uuid(&mut out, *range_uuid);
+                put_uuid(&mut out, *segment_uuid);
+            }
+            MetaKey::TopicRetentionPolicy { topic_uuid } => put_uuid(&mut out, *topic_uuid),
         }
         out
     }
@@ -335,6 +362,14 @@ impl MetaKey {
                 range_uuid: reader.uuid("range uuid")?,
                 segment_uuid: reader.uuid("segment uuid")?,
             },
+            CATEGORY_SEGMENT_TIER_COPY => MetaKey::SegmentTierCopy {
+                topic_uuid: reader.uuid("topic uuid")?,
+                range_uuid: reader.uuid("range uuid")?,
+                segment_uuid: reader.uuid("segment uuid")?,
+            },
+            CATEGORY_TOPIC_RETENTION_POLICY => MetaKey::TopicRetentionPolicy {
+                topic_uuid: reader.uuid("topic uuid")?,
+            },
             other => {
                 return Err(CodecError::UnknownTag {
                     what: "meta key category",
@@ -420,6 +455,17 @@ impl fmt::Display for MetaKey {
                 formatter,
                 "/meta/0/segment-rebalance-intent/{topic_uuid}/{range_uuid}/{segment_uuid}"
             ),
+            MetaKey::SegmentTierCopy {
+                topic_uuid,
+                range_uuid,
+                segment_uuid,
+            } => write!(
+                formatter,
+                "/meta/0/segment-tier-copy/{topic_uuid}/{range_uuid}/{segment_uuid}"
+            ),
+            MetaKey::TopicRetentionPolicy { topic_uuid } => {
+                write!(formatter, "/meta/0/topic-retention-policy/{topic_uuid}")
+            }
         }
     }
 }
@@ -484,6 +530,14 @@ mod tests {
                 topic_uuid: Uuid::from_u128(2),
                 range_uuid: Uuid::from_u128(3),
                 segment_uuid: Uuid::from_u128(4),
+            },
+            MetaKey::SegmentTierCopy {
+                topic_uuid: Uuid::from_u128(2),
+                range_uuid: Uuid::from_u128(3),
+                segment_uuid: Uuid::from_u128(4),
+            },
+            MetaKey::TopicRetentionPolicy {
+                topic_uuid: Uuid::from_u128(2),
             },
         ]
     }
@@ -590,6 +644,26 @@ mod tests {
             }
             .to_string(),
             "/meta/0/node/00000000-0000-0000-0000-000000000001"
+        );
+        assert_eq!(
+            MetaKey::SegmentTierCopy {
+                topic_uuid: Uuid::from_u128(2),
+                range_uuid: Uuid::from_u128(3),
+                segment_uuid: Uuid::from_u128(4),
+            }
+            .to_string(),
+            concat!(
+                "/meta/0/segment-tier-copy/00000000-0000-0000-0000-000000000002",
+                "/00000000-0000-0000-0000-000000000003",
+                "/00000000-0000-0000-0000-000000000004"
+            )
+        );
+        assert_eq!(
+            MetaKey::TopicRetentionPolicy {
+                topic_uuid: Uuid::from_u128(2)
+            }
+            .to_string(),
+            "/meta/0/topic-retention-policy/00000000-0000-0000-0000-000000000002"
         );
     }
 }

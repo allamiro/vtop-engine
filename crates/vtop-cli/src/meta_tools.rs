@@ -57,6 +57,116 @@ pub enum MetaCommand {
         #[arg(long)]
         request_id: Option<Uuid>,
     },
+    /// Propose raw `CommitTierEvidence` (escape hatch for evidence produced
+    /// by tooling other than `vtopctl tier copy`).
+    CommitTierEvidence {
+        #[command(flatten)]
+        common: MetaCommonArgs,
+        #[arg(long)]
+        topic_uuid: Uuid,
+        #[arg(long)]
+        range_uuid: Uuid,
+        #[arg(long)]
+        segment_uuid: Uuid,
+        #[arg(long)]
+        expected_generation: u64,
+        /// Sealed content root as 64 hex characters.
+        #[arg(long, value_parser = parse_hash32)]
+        content_root: [u8; 32],
+        #[arg(long)]
+        byte_length: u64,
+        #[arg(long)]
+        backend_id: String,
+        #[arg(long)]
+        object_uri: String,
+        /// Immutable manifest version id (omit only for unversioned backends).
+        #[arg(long)]
+        manifest_version_id: Option<String>,
+        /// BLAKE3 digest (64 hex characters) of the canonical manifest core.
+        #[arg(long, value_parser = parse_hash32)]
+        manifest_core_digest: [u8; 32],
+        #[arg(long)]
+        verifier_node_uuid: Uuid,
+        #[arg(long)]
+        fencing_epoch: u64,
+        #[arg(long)]
+        verified_term: u64,
+        #[arg(long, default_value_t = 0)]
+        issued_at_ms: i64,
+        #[arg(long)]
+        request_id: Option<Uuid>,
+    },
+    /// Propose `SetTopicRetentionPolicy` (create with no
+    /// --expected-generation; CAS-update with one).
+    SetRetentionPolicy {
+        #[command(flatten)]
+        common: MetaCommonArgs,
+        #[arg(long)]
+        topic_uuid: Uuid,
+        /// Allow retention planning WITHOUT tier evidence for this topic.
+        #[arg(long)]
+        allow_unarchived_deletion: bool,
+        #[arg(long)]
+        expected_generation: Option<u64>,
+        #[arg(long, default_value_t = 0)]
+        issued_at_ms: i64,
+        #[arg(long)]
+        request_id: Option<Uuid>,
+    },
+    /// Propose `PlanRetention` (Verified -> RetentionPlanned).
+    PlanRetention {
+        #[command(flatten)]
+        common: MetaCommonArgs,
+        #[arg(long)]
+        topic_uuid: Uuid,
+        #[arg(long)]
+        range_uuid: Uuid,
+        #[arg(long)]
+        segment_uuid: Uuid,
+        #[arg(long)]
+        expected_generation: u64,
+        #[arg(long)]
+        fencing_epoch: u64,
+        #[arg(long, default_value_t = 0)]
+        issued_at_ms: i64,
+        #[arg(long)]
+        request_id: Option<Uuid>,
+    },
+    /// Propose `ConfirmRetentionExpired` after every local replica has been
+    /// physically deleted (RetentionPlanned -> RetentionExpired).
+    ConfirmRetentionExpired {
+        #[command(flatten)]
+        common: MetaCommonArgs,
+        #[arg(long)]
+        topic_uuid: Uuid,
+        #[arg(long)]
+        range_uuid: Uuid,
+        #[arg(long)]
+        segment_uuid: Uuid,
+        #[arg(long)]
+        expected_generation: u64,
+        #[arg(long, default_value_t = 0)]
+        issued_at_ms: i64,
+        #[arg(long)]
+        request_id: Option<Uuid>,
+    },
+    /// Propose `CancelRetention` (RetentionPlanned -> Verified).
+    CancelRetention {
+        #[command(flatten)]
+        common: MetaCommonArgs,
+        #[arg(long)]
+        topic_uuid: Uuid,
+        #[arg(long)]
+        range_uuid: Uuid,
+        #[arg(long)]
+        segment_uuid: Uuid,
+        #[arg(long)]
+        expected_generation: u64,
+        #[arg(long, default_value_t = 0)]
+        issued_at_ms: i64,
+        #[arg(long)]
+        request_id: Option<Uuid>,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -80,6 +190,13 @@ struct MetaAdminConfig {
 
 fn default_server_name() -> String {
     "localhost".to_owned()
+}
+
+/// Parse a 64-hex-character BLAKE3 digest / content root into raw bytes.
+pub(crate) fn parse_hash32(value: &str) -> Result<[u8; 32], String> {
+    blake3::Hash::from_hex(value)
+        .map(|hash| *hash.as_bytes())
+        .map_err(|_| format!("{value:?} is not a 64-hex-character digest"))
 }
 
 fn parse_node_state(value: &str) -> Result<NodeState, String> {
@@ -216,10 +333,134 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
             };
             propose_and_print(&common.config, command, json).await
         }
+        MetaCommand::CommitTierEvidence {
+            common,
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+            expected_generation,
+            content_root,
+            byte_length,
+            backend_id,
+            object_uri,
+            manifest_version_id,
+            manifest_core_digest,
+            verifier_node_uuid,
+            fencing_epoch,
+            verified_term,
+            issued_at_ms,
+            request_id,
+        } => {
+            let command = MetadataCommand::CommitTierEvidence {
+                env: CommandEnvelope {
+                    request_id: request_id.unwrap_or_else(Uuid::new_v4),
+                    issued_at_ms,
+                },
+                topic_uuid,
+                range_uuid,
+                segment_uuid,
+                expected_segment_generation: expected_generation,
+                content_root,
+                byte_length,
+                backend_id,
+                object_uri,
+                manifest_version_id,
+                manifest_core_digest,
+                verification_method: vtop_meta::VerificationMethod::AuthenticatedContentRoot,
+                verifier_node_uuid,
+                fencing_epoch,
+                verified_term,
+            };
+            propose_and_print(&common.config, command, json).await
+        }
+        MetaCommand::SetRetentionPolicy {
+            common,
+            topic_uuid,
+            allow_unarchived_deletion,
+            expected_generation,
+            issued_at_ms,
+            request_id,
+        } => {
+            let command = MetadataCommand::SetTopicRetentionPolicy {
+                env: CommandEnvelope {
+                    request_id: request_id.unwrap_or_else(Uuid::new_v4),
+                    issued_at_ms,
+                },
+                topic_uuid,
+                unarchived_deletion_allowed: allow_unarchived_deletion,
+                expected_generation,
+            };
+            propose_and_print(&common.config, command, json).await
+        }
+        MetaCommand::PlanRetention {
+            common,
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+            expected_generation,
+            fencing_epoch,
+            issued_at_ms,
+            request_id,
+        } => {
+            let command = MetadataCommand::PlanRetention {
+                env: CommandEnvelope {
+                    request_id: request_id.unwrap_or_else(Uuid::new_v4),
+                    issued_at_ms,
+                },
+                topic_uuid,
+                range_uuid,
+                segment_uuid,
+                expected_segment_generation: expected_generation,
+                fencing_epoch,
+            };
+            propose_and_print(&common.config, command, json).await
+        }
+        MetaCommand::ConfirmRetentionExpired {
+            common,
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+            expected_generation,
+            issued_at_ms,
+            request_id,
+        } => {
+            let command = MetadataCommand::ConfirmRetentionExpired {
+                env: CommandEnvelope {
+                    request_id: request_id.unwrap_or_else(Uuid::new_v4),
+                    issued_at_ms,
+                },
+                topic_uuid,
+                range_uuid,
+                segment_uuid,
+                expected_segment_generation: expected_generation,
+            };
+            propose_and_print(&common.config, command, json).await
+        }
+        MetaCommand::CancelRetention {
+            common,
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+            expected_generation,
+            issued_at_ms,
+            request_id,
+        } => {
+            let command = MetadataCommand::CancelRetention {
+                env: CommandEnvelope {
+                    request_id: request_id.unwrap_or_else(Uuid::new_v4),
+                    issued_at_ms,
+                },
+                topic_uuid,
+                range_uuid,
+                segment_uuid,
+                expected_segment_generation: expected_generation,
+            };
+            propose_and_print(&common.config, command, json).await
+        }
     }
 }
 
-async fn propose_and_print(
+pub(crate) async fn propose_and_print(
     config_path: &Path,
     command: MetadataCommand,
     json: bool,
