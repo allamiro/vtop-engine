@@ -64,8 +64,11 @@ pub fn detect_record(record: &[u8]) -> TelemetryFormat {
     // framing whitespace. Trim only for the JSON check so CEF/LEEF/syslog
     // detection retains its existing byte-level behavior (#105).
     let json = trim_ascii_end(s);
-    let json_shaped = (json.first() == Some(&b'{') && json.last() == Some(&b'}'))
-        || (json.first() == Some(&b'[') && json.last() == Some(&b']'));
+    // The first byte alone decides the candidate kind: a valid JSON value can
+    // only be an object or array if it starts with '{' or '[', and the parse
+    // is the authority on everything else — a closing-delimiter pre-check is
+    // redundant with the parse and only hides equivalent mutants.
+    let json_shaped = matches!(json.first(), Some(&b'{') | Some(&b'['));
     if json_shaped && serde_json::from_slice::<serde_json::Value>(json).is_ok() {
         return TelemetryFormat::Jsonl;
     }
@@ -271,14 +274,19 @@ mod tests {
 
     #[test]
     fn json_shape_needs_both_delimiters() {
-        // json_shaped requires the FIRST byte to open and the LAST to close.
-        // A record with only one side is not JSON-shaped → Raw (kills the
-        // `&&`→`||` and `==`→`!=` mutants on the shape check).
+        // A record that opens like JSON but does not parse, or parses but
+        // does not open like an object/array, is Raw. The parse is the
+        // authority; the first byte only selects the candidate kind.
         assert_eq!(detect_record(b"{\"a\":1"), TelemetryFormat::Raw); // no closing }
         assert_eq!(detect_record(b"\"a\":1}"), TelemetryFormat::Raw); // no opening {
         assert_eq!(detect_record(b"[1,2"), TelemetryFormat::Raw); // no closing ]
         assert_eq!(detect_record(b"1,2]"), TelemetryFormat::Raw); // no opening [
         assert_eq!(detect_record(b"{\"a\":1}"), TelemetryFormat::Jsonl); // both → JSONL
+
+        // Leading whitespace is start-trimmed at entry, so a whitespace-
+        // prefixed JSON record is still JSONL.
+        assert_eq!(detect_record(b" {\"a\":1}"), TelemetryFormat::Jsonl);
+        assert_eq!(detect_record(b" [1,2]"), TelemetryFormat::Jsonl);
     }
 
     #[test]
