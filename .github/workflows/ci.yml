@@ -461,7 +461,10 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
-          toolchain: nightly
+          # Pinned: the floating "nightly" channel broke on 2026-07-24 with an
+          # ICE compiling tokio under ASAN (rustc 89c61a754). Pin the last
+          # known-good nightly; bump deliberately when a newer one is verified.
+          toolchain: nightly-2026-07-22
           # ASAN (which libFuzzer builds with) is incompatible with a statically
           # linked libc, so the fuzz build must target the GNU (dynamic-libc)
           # triple explicitly - otherwise a musl default fails with
@@ -481,7 +484,7 @@ jobs:
         run: |
           for t in detect_record detect_batch manifest_parse; do
             echo "::group::fuzz $t"
-            cargo +nightly fuzz run "$t" --target x86_64-unknown-linux-gnu -- \
+            cargo +nightly-2026-07-22 fuzz run "$t" --target x86_64-unknown-linux-gnu -- \
               -max_total_time=60 -print_final_stats=1
             echo "::endgroup::"
           done
