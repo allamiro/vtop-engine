@@ -2084,13 +2084,16 @@ impl MetaStateMachine {
         }
         let destination = proof.destination_node_uuid;
 
+        // Apply is all-or-nothing: validate every rejection path — segment
+        // AND placement — before mutating either record, so a rejected
+        // command never leaves the segment half-retired and unretryable.
         let segment_key = MetaKey::Segment {
             topic_uuid,
             range_uuid,
             segment_uuid,
         }
         .encode();
-        let Some(MetaValue::Segment(segment)) = self.records.get_mut(&segment_key) else {
+        let Some(MetaValue::Segment(segment)) = self.records.get(&segment_key) else {
             return reject(MetadataError::NotFound);
         };
         if segment.segment_generation != expected_segment_generation {
@@ -2109,33 +2112,46 @@ impl MetaStateMachine {
                 "segment generation space is exhausted",
             ));
         };
-        segment.state = SegmentState::Retired;
-        segment.segment_generation = next_generation;
 
-        // Drop the retiring replica from durable placement when present; the
-        // verified destination must remain.
         let placement_key = MetaKey::SegmentPlacement {
             topic_uuid,
             range_uuid,
             segment_uuid,
         }
         .encode();
-        if let Some(MetaValue::SegmentPlacement(placement)) = self.records.get_mut(&placement_key) {
-            if !placement.replica_nodes.contains(&destination) {
-                return reject(MetadataError::invalid_transition(
-                    "placement no longer contains the verified replacement destination",
-                ));
+        let next_placement_generation = match self.records.get(&placement_key) {
+            Some(MetaValue::SegmentPlacement(placement)) => {
+                if !placement.replica_nodes.contains(&destination) {
+                    return reject(MetadataError::invalid_transition(
+                        "placement no longer contains the verified replacement destination",
+                    ));
+                }
+                let Some(next) = placement.generation.checked_add(1) else {
+                    return reject(MetadataError::limit(
+                        "placement generation space is exhausted",
+                    ));
+                };
+                Some(next)
             }
-            placement
-                .replica_nodes
-                .retain(|node| *node != retiring_node_uuid);
-            placement.replication_factor = placement.replica_nodes.len() as u8;
-            let Some(next_placement_generation) = placement.generation.checked_add(1) else {
-                return reject(MetadataError::limit(
-                    "placement generation space is exhausted",
-                ));
-            };
-            placement.generation = next_placement_generation;
+            _ => None,
+        };
+
+        // Every rejection has been ruled out; mutate both records.
+        if let Some(MetaValue::Segment(segment)) = self.records.get_mut(&segment_key) {
+            segment.state = SegmentState::Retired;
+            segment.segment_generation = next_generation;
+        }
+        if let Some(next_placement_generation) = next_placement_generation {
+            if let Some(MetaValue::SegmentPlacement(placement)) =
+                self.records.get_mut(&placement_key)
+            {
+                // Drop the retiring replica; the verified destination remains.
+                placement
+                    .replica_nodes
+                    .retain(|node| *node != retiring_node_uuid);
+                placement.replication_factor = placement.replica_nodes.len() as u8;
+                placement.generation = next_placement_generation;
+            }
         }
 
         MetadataResponse::Ack {

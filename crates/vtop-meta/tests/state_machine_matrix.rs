@@ -2019,9 +2019,39 @@ fn replacement_proof_gates_replica_retirement() {
     assert_eq!(segment.state, SegmentState::RetirePlanned);
     assert_eq!(segment.segment_generation, 2);
 
+    // A rejected confirmation must mutate nothing (apply is all-or-nothing):
+    // after this rejection the segment must still be RETIRE_PLANNED at
+    // generation 2, or the successful confirmation below could not succeed.
     assert_eq!(
         machine.apply(
             12,
+            &MetadataCommand::ConfirmReplicaRetired {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: SEGMENT,
+                retiring_node_uuid: NODE,
+                expected_segment_generation: 999,
+            }
+        ),
+        rejected(MetadataError::GenerationMismatch {
+            expected: 999,
+            actual: 2,
+        })
+    );
+    let Some(MetaValue::Segment(segment)) = machine.record(&MetaKey::Segment {
+        topic_uuid: TOPIC,
+        range_uuid: RANGE,
+        segment_uuid: SEGMENT,
+    }) else {
+        panic!("segment must exist");
+    };
+    assert_eq!(segment.state, SegmentState::RetirePlanned);
+    assert_eq!(segment.segment_generation, 2);
+
+    assert_eq!(
+        machine.apply(
+            13,
             &MetadataCommand::ConfirmReplicaRetired {
                 env: requests.next(),
                 topic_uuid: TOPIC,

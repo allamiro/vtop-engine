@@ -790,10 +790,8 @@ impl LocalBroker {
                         }
                         // Re-validate the lease before publishing cluster commit.
                         // Fan-out released the meta lock; a steal observed here
-                        // must not advance the HWM under a fenced epoch. Hold
-                        // the lock through advance_to and HWM propagation so a
-                        // concurrent steal cannot slip between the check and the
-                        // publication.
+                        // must not advance the HWM under a fenced epoch, so the
+                        // leader's own advance happens while the guard is held.
                         let committed = {
                             let meta = self.meta_fencing_epoch.lock();
                             if let Err((code, message)) =
@@ -801,14 +799,17 @@ impl LocalBroker {
                             {
                                 return error(request_id, stream_id, code, message);
                             }
-                            let committed = cluster.advance_to(leader_committed);
-                            replicas.propagate_committed_hwm(&CommittedHwmUpdate {
-                                range: request.range.clone(),
-                                fencing_epoch: request.fencing_epoch,
-                                committed_high_watermark: committed,
-                            });
-                            committed
+                            cluster.advance_to(leader_committed)
                         };
+                        // Followers re-validate the epoch under their own view
+                        // of the (possibly shared) guard, so propagation must
+                        // happen after release — calling them while holding it
+                        // deadlocks when leader and followers share the handle.
+                        replicas.propagate_committed_hwm(&CommittedHwmUpdate {
+                            range: request.range.clone(),
+                            fencing_epoch: request.fencing_epoch,
+                            committed_high_watermark: committed,
+                        });
                         WireFrame {
                             request_id,
                             stream_id,
