@@ -177,6 +177,38 @@ fn quorum_acks_with_majority_and_survives_one_follower_loss() {
 }
 
 #[test]
+fn local_fsync_produce_is_rejected_on_a_replicated_broker() {
+    let h = harness();
+
+    // A LocalFsync append would land on the leader only and open follower
+    // gaps; silently replicating instead would change the acknowledged
+    // durability contract. The broker must fail closed.
+    let response = h.leader.handle(
+        Role::Producer,
+        produce_frame(h.range.clone(), 0, 1, WireDurability::LocalFsync),
+    );
+    match response.message {
+        Message::Error(ErrorResponse {
+            code: ErrorCode::InvalidRequest,
+            message,
+            ..
+        }) => assert!(message.contains("Quorum durability"), "{message}"),
+        other => panic!("expected InvalidRequest, got {other:?}"),
+    }
+
+    // Nothing was appended or committed anywhere.
+    assert_eq!(h.cluster_committed.get(), 0);
+    for follower in &h.followers {
+        assert_eq!(follower.local_committed_offset(), 0);
+    }
+
+    // The same batch still succeeds under Quorum durability.
+    let produced = produce_ok(&h.leader, h.range.clone(), 0);
+    assert_eq!(produced.outcomes[0].offset, 0);
+    assert_eq!(produced.committed_next_offset, 1);
+}
+
+#[test]
 fn quorum_produce_fails_when_majority_is_unavailable() {
     let h = harness();
     h.followers[0].set_online(false);

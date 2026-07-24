@@ -1118,7 +1118,7 @@ fn lineage_aware_cursor_commit_cas_monotonicity_and_lineage_guards() {
                 topic_uuid: TOPIC,
                 range_uuid: RANGE,
                 topic_epoch: 1,
-                range_generation: 2,
+                range_generation: 0,
                 segment_uuid: Uuid::from_u128(0x999),
                 segment_generation: 0,
                 segment_root: root,
@@ -1142,7 +1142,7 @@ fn lineage_aware_cursor_commit_cas_monotonicity_and_lineage_guards() {
                 topic_uuid: TOPIC,
                 range_uuid: RANGE,
                 topic_epoch: 99,
-                range_generation: 2,
+                range_generation: 0,
                 segment_uuid: SEGMENT,
                 segment_generation: 0,
                 segment_root: root,
@@ -1169,7 +1169,7 @@ fn lineage_aware_cursor_commit_cas_monotonicity_and_lineage_guards() {
                 topic_uuid: TOPIC,
                 range_uuid: RANGE,
                 topic_epoch: 1,
-                range_generation: 2,
+                range_generation: 0,
                 segment_uuid: SEGMENT,
                 segment_generation: 0,
                 segment_root: root,
@@ -1193,7 +1193,7 @@ fn lineage_aware_cursor_commit_cas_monotonicity_and_lineage_guards() {
                 topic_uuid: TOPIC,
                 range_uuid: RANGE,
                 topic_epoch: 1,
-                range_generation: 2,
+                range_generation: 0,
                 segment_uuid: SEGMENT,
                 segment_generation: 0,
                 segment_root: root,
@@ -1217,7 +1217,7 @@ fn lineage_aware_cursor_commit_cas_monotonicity_and_lineage_guards() {
                 topic_uuid: TOPIC,
                 range_uuid: RANGE,
                 topic_epoch: 1,
-                range_generation: 2,
+                range_generation: 0,
                 segment_uuid: SEGMENT,
                 segment_generation: 0,
                 segment_root: root,
@@ -1244,7 +1244,7 @@ fn lineage_aware_cursor_commit_cas_monotonicity_and_lineage_guards() {
                 topic_uuid: TOPIC,
                 range_uuid: RANGE,
                 topic_epoch: 1,
-                range_generation: 2,
+                range_generation: 0,
                 segment_uuid: SEGMENT,
                 segment_generation: 0,
                 segment_root: root,
@@ -1270,7 +1270,7 @@ fn lineage_aware_cursor_commit_cas_monotonicity_and_lineage_guards() {
                 topic_uuid: TOPIC,
                 range_uuid: RANGE,
                 topic_epoch: 1,
-                range_generation: 2,
+                range_generation: 0,
                 segment_uuid: SEGMENT,
                 segment_generation: 0,
                 segment_root: root,
@@ -1319,7 +1319,7 @@ fn lineage_aware_cursor_commit_cas_monotonicity_and_lineage_guards() {
                 topic_uuid: TOPIC,
                 range_uuid: RANGE,
                 topic_epoch: 1,
-                range_generation: 2,
+                range_generation: 0,
                 segment_uuid: SEGMENT,
                 segment_generation: 0,
                 segment_root: root,
@@ -1340,6 +1340,36 @@ fn lineage_aware_cursor_commit_cas_monotonicity_and_lineage_guards() {
         rejected(MetadataError::invalid_transition(
             "range is already assigned to another group member"
         ))
+    );
+
+    // Lineage is decoupled from the CAS token: the range's metadata
+    // generation is 2 after grant + segment registration, but no lineage
+    // transition ever happened, so a cursor pinning that CAS value fails
+    // the lineage check — not a checkpoint-generation conflict.
+    assert_eq!(
+        machine.apply(
+            18,
+            &MetadataCommand::CommitGroupCursor {
+                env: requests.next(),
+                group_uuid: GROUP,
+                member_uuid: MEMBER,
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                topic_epoch: 1,
+                range_generation: 2,
+                segment_uuid: SEGMENT,
+                segment_generation: 0,
+                segment_root: root,
+                record_offset: 30,
+                record_index: 0,
+                lineage_transition_id: None,
+                expected_checkpoint_generation: Some(1),
+            }
+        ),
+        rejected(MetadataError::LineageMismatch {
+            expected: 2,
+            actual: 0,
+        })
     );
 
     // Snapshot round-trip preserves group/cursor records.
@@ -1386,7 +1416,7 @@ fn member_heartbeat_and_stale_expiry_keep_cursors() {
                 topic_uuid: TOPIC,
                 range_uuid: RANGE,
                 topic_epoch: 1,
-                range_generation: 2,
+                range_generation: 0,
                 segment_uuid: SEGMENT,
                 segment_generation: 0,
                 segment_root: root,
@@ -1509,7 +1539,7 @@ fn sealed_segment_lineage_is_checked_on_cursor_commit() {
                 topic_uuid: TOPIC,
                 range_uuid: RANGE,
                 topic_epoch: 1,
-                range_generation: 2,
+                range_generation: 0,
                 segment_uuid: SEGMENT,
                 segment_generation: 0,
                 segment_root: root,
@@ -1535,7 +1565,7 @@ fn sealed_segment_lineage_is_checked_on_cursor_commit() {
                 topic_uuid: TOPIC,
                 range_uuid: RANGE,
                 topic_epoch: 1,
-                range_generation: 2,
+                range_generation: 0,
                 segment_uuid: SEGMENT,
                 segment_generation: 0,
                 segment_root: [1; 32],
@@ -1560,7 +1590,7 @@ fn sealed_segment_lineage_is_checked_on_cursor_commit() {
                 topic_uuid: TOPIC,
                 range_uuid: RANGE,
                 topic_epoch: 1,
-                range_generation: 2,
+                range_generation: 0,
                 segment_uuid: SEGMENT,
                 segment_generation: 0,
                 segment_root: root,

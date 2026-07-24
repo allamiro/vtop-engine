@@ -42,12 +42,12 @@ use vtop_meta::{
     MetadataResponse,
 };
 use vtop_protocol::{
-    encode_frame, read_frame, write_frame, ClientHello, CommitCursorRequest, CommitCursorResponse,
-    CommittedHwmUpdate, Durability as WireDurability, ErrorCode, ErrorResponse,
-    FetchCursorResponse, FetchResponse, FetchedRecord, LineageCursor, Message, ProduceOutcome,
-    ProduceResponse, ProtocolLimits, RangeIdentity, ReplicaAppendRequest, Role, ServerHello,
-    WireFrame, ABSOLUTE_MAX_FRAME_BYTES, ABSOLUTE_MAX_RECORDS, DEFAULT_MAX_FRAME_BYTES,
-    DEFAULT_MAX_RECORDS, PROTOCOL_MAJOR, PROTOCOL_MINOR,
+    encode_frame, read_frame, write_frame, ClientHello, CommitCursorResponse, CommittedHwmUpdate,
+    Durability as WireDurability, ErrorCode, ErrorResponse, FetchCursorResponse, FetchResponse,
+    FetchedRecord, LineageCursor, Message, ProduceOutcome, ProduceResponse, ProtocolLimits,
+    RangeIdentity, ReplicaAppendRequest, Role, ServerHello, WireFrame, ABSOLUTE_MAX_FRAME_BYTES,
+    ABSOLUTE_MAX_RECORDS, DEFAULT_MAX_FRAME_BYTES, DEFAULT_MAX_RECORDS, PROTOCOL_MAJOR,
+    PROTOCOL_MINOR,
 };
 
 const EPOCH_MAGIC: &[u8; 8] = b"VTOPEPC1";
@@ -633,6 +633,19 @@ impl LocalBroker {
                         "Quorum durability requires a configured replica set",
                     );
                 }
+                // Fail closed rather than silently upgrade: a LocalFsync
+                // append on a replicated range would land on the leader only,
+                // opening a follower gap the client believes is durable, and
+                // replicating it anyway would change the acknowledged
+                // durability contract under the client.
+                if request.durability == WireDurability::LocalFsync && self.replicas.is_some() {
+                    return error(
+                        request_id,
+                        stream_id,
+                        ErrorCode::InvalidRequest,
+                        "brokers with a configured replica set accept only Quorum durability produce requests",
+                    );
+                }
                 // Lock order: metadata lease view, then broker state. Hold both
                 // only through the local durable append so a concurrent
                 // grant/release cannot revoke between the fencing check and
@@ -939,7 +952,15 @@ impl LocalBroker {
                 };
                 let command = MetadataCommand::CommitGroupCursor {
                     env: CommandEnvelope {
-                        request_id: cursor_commit_request_id(request_id, stream_id, &request),
+                        // The metadata dedup table requires globally unique
+                        // request ids. Wire (request_id, stream_id) counters
+                        // are connection-scoped and collide across sessions,
+                        // so mint a fresh id per application. The broker is
+                        // not the deterministic state machine — randomness is
+                        // fine here — and it applies each wire request exactly
+                        // once, so no internal retry needs a stable id; client
+                        // retries are protected by the checkpoint CAS instead.
+                        request_id: Uuid::new_v4(),
                         issued_at_ms: 0,
                     },
                     group_uuid: request.cursor.group_id,
@@ -1069,60 +1090,15 @@ fn map_metadata_error(error: &MetadataError) -> (ErrorCode, String) {
         MetadataError::GenerationMismatch { .. } => {
             (ErrorCode::CheckpointConflict, error.to_string())
         }
-        MetadataError::EpochMismatch { .. } => (ErrorCode::WrongLineage, error.to_string()),
+        MetadataError::EpochMismatch { .. } | MetadataError::LineageMismatch { .. } => {
+            (ErrorCode::WrongLineage, error.to_string())
+        }
         MetadataError::AlreadyExists | MetadataError::NotFound => {
             (ErrorCode::InvalidRequest, error.to_string())
         }
         MetadataError::InvalidTransition(detail) => (ErrorCode::WrongLineage, detail.clone()),
         MetadataError::Limit(detail) => (ErrorCode::InvalidRequest, detail.clone()),
     }
-}
-
-/// Domain-separated request id for metadata dedup. Includes member/group/cursor
-/// identity so distinct sessions that reuse low wire `(request_id, stream_id)`
-/// counters cannot collide, while identical retries still hit the dedup table.
-fn cursor_commit_request_id(
-    request_id: u64,
-    stream_id: u64,
-    request: &CommitCursorRequest,
-) -> Uuid {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"vtop-broker-cursor-commit-v1\0");
-    hasher.update(&request_id.to_be_bytes());
-    hasher.update(&stream_id.to_be_bytes());
-    hasher.update(request.member_id.as_bytes());
-    hasher.update(request.cursor.group_id.as_bytes());
-    hasher.update(request.cursor.topic_id.as_bytes());
-    hasher.update(request.cursor.range_id.as_bytes());
-    hasher.update(&request.cursor.topic_epoch.to_be_bytes());
-    hasher.update(&request.cursor.range_generation.to_be_bytes());
-    hasher.update(request.cursor.segment_id.as_bytes());
-    hasher.update(&request.cursor.segment_generation.to_be_bytes());
-    hasher.update(&request.cursor.segment_root);
-    hasher.update(&request.cursor.record_offset.to_be_bytes());
-    hasher.update(&request.cursor.record_index.to_be_bytes());
-    match request.cursor.lineage_transition_id {
-        None => {
-            hasher.update(&[0]);
-        }
-        Some(id) => {
-            hasher.update(&[1]);
-            hasher.update(id.as_bytes());
-        }
-    }
-    match request.expected_checkpoint_generation {
-        None => {
-            hasher.update(&[0]);
-        }
-        Some(generation) => {
-            hasher.update(&[1]);
-            hasher.update(&generation.to_be_bytes());
-        }
-    }
-    let digest = hasher.finalize();
-    let mut bytes = [0_u8; 16];
-    bytes.copy_from_slice(&digest.as_bytes()[..16]);
-    Uuid::from_bytes(bytes)
 }
 
 fn error(request_id: u64, stream_id: u64, code: ErrorCode, message: &str) -> WireFrame {
@@ -1476,6 +1452,28 @@ async fn serve_connection(
             .await?;
             continue;
         }
+        // Mirror of the producer rule above: a consumer-group member identity
+        // is only trusted when it is the TLS-authenticated principal, so one
+        // authenticated consumer cannot move another member's cursor.
+        if matches!(
+            &frame.message,
+            Message::CommitCursorRequest(request) if request.member_id != principal_id
+        ) {
+            let response = error(
+                request_id,
+                frame.stream_id,
+                ErrorCode::Unauthorized,
+                "member ID must equal the authenticated session principal ID",
+            );
+            write_session_frame(
+                &mut stream,
+                &response,
+                negotiated_limits,
+                config.idle_timeout,
+            )
+            .await?;
+            continue;
+        }
         let frame = match frame {
             WireFrame {
                 message: Message::WindowUpdate(update),
@@ -1726,7 +1724,9 @@ mod tests {
         KeyRange, RangeLineage, SegmentConfig, SegmentConfigV2, SegmentDescriptor,
         SegmentDescriptorV2,
     };
-    use vtop_protocol::{ClientHello, FetchRequest, ProduceRecord, ProduceRequest};
+    use vtop_protocol::{
+        ClientHello, CommitCursorRequest, FetchRequest, ProduceRecord, ProduceRequest,
+    };
 
     struct TestAuthorizer {
         leaf_der: Vec<u8>,
@@ -2321,6 +2321,143 @@ mod tests {
         };
         assert_eq!(fetched.records.len(), 1);
         assert_eq!(fetched.committed_high_watermark, 1);
+        drop(consumer);
+
+        shutdown_tx.send(()).unwrap();
+        server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn mtls_session_binds_cursor_member_id_to_the_authenticated_principal() {
+        let (_dir, broker, _range) = fixture();
+        let cluster_id = Uuid::from_u128(60);
+        let principal_id = Uuid::from_u128(61);
+        let server_identity = generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let client_identity = generate_simple_self_signed(vec!["vtop-client".to_owned()]).unwrap();
+
+        let mut client_roots = rustls::RootCertStore::empty();
+        client_roots
+            .add(client_identity.cert.der().clone())
+            .unwrap();
+        let server = NativeServer::new(
+            broker,
+            ServerTlsMaterial {
+                certificate_chain: vec![server_identity.cert.der().clone()],
+                private_key: private_key(&server_identity),
+                client_roots,
+            },
+            Arc::new(TestAuthorizer {
+                leaf_der: client_identity.cert.der().as_ref().to_vec(),
+                principal_id,
+            }),
+            ServerConfig {
+                cluster_id,
+                node_id: Uuid::from_u128(62),
+                segment_format: SegmentFormat::V1,
+                max_frame_bytes: 16 * 1024,
+                max_records_per_frame: 32,
+                window_bytes: 16 * 1024,
+                max_sessions: 4,
+                max_inflight_requests: 2,
+                handshake_timeout: Duration::from_secs(2),
+                idle_timeout: Duration::from_secs(2),
+            },
+        )
+        .unwrap();
+        let mut server_roots = rustls::RootCertStore::empty();
+        server_roots
+            .add(server_identity.cert.der().clone())
+            .unwrap();
+        let client_tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_root_certificates(server_roots)
+        .with_client_auth_cert(
+            vec![client_identity.cert.der().clone()],
+            private_key(&client_identity),
+        )
+        .unwrap();
+        let connector = TlsConnector::from(Arc::new(client_tls));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server_task = tokio::spawn(server.serve(listener, shutdown_rx));
+
+        let limits = ProtocolLimits {
+            max_frame_bytes: 16 * 1024,
+            max_records: 32,
+        };
+        let mut consumer = connect(
+            &connector,
+            address,
+            cluster_id,
+            principal_id,
+            Role::Consumer,
+            limits,
+        )
+        .await;
+        let commit_as = |member_id: Uuid, request_id: u64| WireFrame {
+            request_id,
+            stream_id: 1,
+            message: Message::CommitCursorRequest(CommitCursorRequest {
+                member_id,
+                cursor: LineageCursor {
+                    group_id: Uuid::from_u128(70),
+                    topic_id: Uuid::from_u128(71),
+                    topic_epoch: 1,
+                    range_id: Uuid::from_u128(72),
+                    range_generation: 0,
+                    segment_id: Uuid::from_u128(73),
+                    segment_generation: 0,
+                    segment_root: [3; 32],
+                    record_offset: 1,
+                    record_index: 0,
+                    lineage_transition_id: None,
+                    checkpoint_generation: 0,
+                },
+                expected_checkpoint_generation: None,
+            }),
+        };
+
+        // A member id that is not the authenticated principal is refused at
+        // the session boundary, before the broker touches metadata.
+        write_frame(&mut consumer, &commit_as(Uuid::from_u128(999), 1), limits)
+            .await
+            .unwrap();
+        let rejected = read_frame(&mut consumer, limits).await.unwrap().unwrap();
+        assert!(
+            matches!(
+                rejected.message,
+                Message::Error(ErrorResponse {
+                    code: ErrorCode::Unauthorized,
+                    ..
+                })
+            ),
+            "{:?}",
+            rejected.message
+        );
+
+        // The principal's own member id passes the identity gate; this broker
+        // has no checkpoint store, so the request reaches the handler and is
+        // answered with InvalidRequest rather than Unauthorized.
+        write_frame(&mut consumer, &commit_as(principal_id, 2), limits)
+            .await
+            .unwrap();
+        let handled = read_frame(&mut consumer, limits).await.unwrap().unwrap();
+        assert!(
+            matches!(
+                handled.message,
+                Message::Error(ErrorResponse {
+                    code: ErrorCode::InvalidRequest,
+                    ..
+                })
+            ),
+            "{:?}",
+            handled.message
+        );
         drop(consumer);
 
         shutdown_tx.send(()).unwrap();
