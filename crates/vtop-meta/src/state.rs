@@ -18,7 +18,7 @@ use crate::command::{
 use crate::keys::{validate_group_name, validate_topic_name, MetaKey};
 use crate::placement::{
     select_replicas, PlacementCandidate, DEFAULT_PLACEMENT_WEIGHT, MAX_FAILURE_DOMAIN_BYTES,
-    MAX_REPLICAS, MIN_PLACEMENT_WEIGHT,
+    MAX_REPLICAS, MAX_TRANSIENT_REPLICAS, MIN_PLACEMENT_WEIGHT,
 };
 use crate::wire::{
     put_bounded_str, put_bytes32, put_u16, put_u32, put_u64, put_u8, put_uuid, CodecError, Reader,
@@ -53,6 +53,7 @@ const VALUE_TAG_GROUP_MEMBER_V2: u8 = 11;
 const VALUE_TAG_GROUP_CURSOR: u8 = 10;
 const VALUE_TAG_SEGMENT_PLACEMENT: u8 = 13;
 const VALUE_TAG_REPLACEMENT_PROOF: u8 = 14;
+const VALUE_TAG_REBALANCE_INTENT: u8 = 15;
 
 /// A registered broker/controller node.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -188,10 +189,25 @@ pub struct CursorCheckpointRecord {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SegmentPlacementRecord {
     pub generation: u64,
-    /// Declared replication factor; must equal `replica_nodes.len()`.
-    pub replication_factor: u8,
+    /// Declared replication factor — the durability target. Preserved across
+    /// every placement mutation: `replica_nodes.len()` may temporarily exceed
+    /// it while a rebalance intent is in flight (RF + 1) and drops below it
+    /// only after a plain retirement, pending repair. It is never inferred
+    /// from the list length.
+    pub declared_replication_factor: u8,
     pub replica_nodes: Vec<Uuid>,
     pub committed_apply_index: u64,
+}
+
+/// The single in-flight rebalance move for a segment. Present from
+/// `ProposeRebalance` until `ConfirmReplicaRetired` completes the move (or
+/// `CancelRebalance` abandons it); its presence blocks a second proposal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RebalanceIntentRecord {
+    pub from_node_uuid: Uuid,
+    pub to_node_uuid: Uuid,
+    pub proposed_at_apply_index: u64,
+    pub placement_generation_at_proposal: u64,
 }
 
 /// Authenticated evidence that a replacement replica matches sealed identity.
@@ -225,6 +241,7 @@ pub enum MetaValue {
     GroupCursor(CursorCheckpointRecord),
     SegmentPlacement(SegmentPlacementRecord),
     ReplacementProof(ReplacementProofRecord),
+    RebalanceIntent(RebalanceIntentRecord),
 }
 
 impl MetaValue {
@@ -348,7 +365,7 @@ impl MetaValue {
             MetaValue::SegmentPlacement(placement) => {
                 put_u8(&mut out, VALUE_TAG_SEGMENT_PLACEMENT);
                 put_u64(&mut out, placement.generation);
-                put_u8(&mut out, placement.replication_factor);
+                put_u8(&mut out, placement.declared_replication_factor);
                 put_u64(&mut out, placement.committed_apply_index);
                 encode_replica_nodes(&mut out, &placement.replica_nodes)?;
             }
@@ -370,6 +387,13 @@ impl MetaValue {
                 put_uuid(&mut out, proof.verifier_node_uuid);
                 put_u64(&mut out, proof.verified_at_apply_index);
                 put_u64(&mut out, proof.verified_term);
+            }
+            MetaValue::RebalanceIntent(intent) => {
+                put_u8(&mut out, VALUE_TAG_REBALANCE_INTENT);
+                put_uuid(&mut out, intent.from_node_uuid);
+                put_uuid(&mut out, intent.to_node_uuid);
+                put_u64(&mut out, intent.proposed_at_apply_index);
+                put_u64(&mut out, intent.placement_generation_at_proposal);
             }
         }
         Ok(out)
@@ -508,7 +532,7 @@ impl MetaValue {
             }
             VALUE_TAG_SEGMENT_PLACEMENT => MetaValue::SegmentPlacement(SegmentPlacementRecord {
                 generation: reader.u64("placement generation")?,
-                replication_factor: reader.u8("replication factor")?,
+                declared_replication_factor: reader.u8("replication factor")?,
                 committed_apply_index: reader.u64("placement apply index")?,
                 replica_nodes: decode_replica_nodes(&mut reader)?,
             }),
@@ -526,6 +550,13 @@ impl MetaValue {
                 verifier_node_uuid: reader.uuid("proof verifier node")?,
                 verified_at_apply_index: reader.u64("proof verified apply index")?,
                 verified_term: reader.u64("proof verified term")?,
+            }),
+            VALUE_TAG_REBALANCE_INTENT => MetaValue::RebalanceIntent(RebalanceIntentRecord {
+                from_node_uuid: reader.uuid("rebalance source node")?,
+                to_node_uuid: reader.uuid("rebalance destination node")?,
+                proposed_at_apply_index: reader.u64("rebalance proposed apply index")?,
+                placement_generation_at_proposal: reader
+                    .u64("rebalance placement generation at proposal")?,
             }),
             other => {
                 return Err(CodecError::UnknownTag {
@@ -843,6 +874,35 @@ impl MetaStateMachine {
                 *segment_uuid,
                 *retiring_node_uuid,
                 *expected_segment_generation,
+            ),
+            MetadataCommand::ProposeRebalance {
+                topic_uuid,
+                range_uuid,
+                segment_uuid,
+                from_node_uuid,
+                to_node_uuid,
+                expected_placement_generation,
+                ..
+            } => self.propose_rebalance(
+                apply_index,
+                *topic_uuid,
+                *range_uuid,
+                *segment_uuid,
+                *from_node_uuid,
+                *to_node_uuid,
+                *expected_placement_generation,
+            ),
+            MetadataCommand::CancelRebalance {
+                topic_uuid,
+                range_uuid,
+                segment_uuid,
+                expected_placement_generation,
+                ..
+            } => self.cancel_rebalance(
+                *topic_uuid,
+                *range_uuid,
+                *segment_uuid,
+                *expected_placement_generation,
             ),
         }
     }
@@ -1773,6 +1833,21 @@ impl MetaStateMachine {
             ));
         }
 
+        // A placement under an active rebalance intent is locked: re-running
+        // the deterministic assignment would clobber the temporary RF + 1 set
+        // and orphan the intent. Cancel or complete the move first.
+        let intent_key = MetaKey::SegmentRebalanceIntent {
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+        }
+        .encode();
+        if self.records.contains_key(&intent_key) {
+            return reject(MetadataError::invalid_transition(
+                "placement is locked by an active rebalance intent",
+            ));
+        }
+
         let candidates = self.active_placement_candidates();
         let require_distinct = rf > 1;
         let expected = match select_replicas(segment_uuid, &candidates, rf, require_distinct) {
@@ -1802,7 +1877,7 @@ impl MetaStateMachine {
                     placement_key,
                     MetaValue::SegmentPlacement(SegmentPlacementRecord {
                         generation: 0,
-                        replication_factor,
+                        declared_replication_factor: replication_factor,
                         replica_nodes: replica_nodes.to_vec(),
                         committed_apply_index: apply_index,
                     }),
@@ -1827,7 +1902,7 @@ impl MetaStateMachine {
                     placement_key,
                     MetaValue::SegmentPlacement(SegmentPlacementRecord {
                         generation: next_generation,
-                        replication_factor,
+                        declared_replication_factor: replication_factor,
                         replica_nodes: replica_nodes.to_vec(),
                         committed_apply_index: apply_index,
                     }),
@@ -1929,6 +2004,25 @@ impl MetaStateMachine {
             }
         }
 
+        // During an active rebalance intent only the intended move may be
+        // proven; an unrelated proof would let retirement race the rebalance
+        // and strand the intent.
+        let intent_key = MetaKey::SegmentRebalanceIntent {
+            topic_uuid: args.topic_uuid,
+            range_uuid: args.range_uuid,
+            segment_uuid: args.segment_uuid,
+        }
+        .encode();
+        if let Some(MetaValue::RebalanceIntent(intent)) = self.records.get(&intent_key) {
+            if intent.from_node_uuid != args.source_node_uuid
+                || intent.to_node_uuid != args.destination_node_uuid
+            {
+                return reject(MetadataError::invalid_transition(
+                    "replacement proof does not match the active rebalance intent",
+                ));
+            }
+        }
+
         let proof_key = MetaKey::SegmentReplacementProof {
             topic_uuid: args.topic_uuid,
             range_uuid: args.range_uuid,
@@ -1984,6 +2078,23 @@ impl MetaStateMachine {
                 expected: fencing_epoch,
                 actual: lease.fencing_epoch,
             });
+        }
+
+        // While a rebalance intent is in flight, the only replica that may be
+        // retired is the intent's source: retiring any other node would drop
+        // the segment below its declared replication factor mid-move.
+        let intent_key = MetaKey::SegmentRebalanceIntent {
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+        }
+        .encode();
+        if let Some(MetaValue::RebalanceIntent(intent)) = self.records.get(&intent_key) {
+            if intent.from_node_uuid != retiring_node_uuid {
+                return reject(MetadataError::invalid_transition(
+                    "segment has an active rebalance intent for a different node",
+                ));
+            }
         }
 
         let proof_key = MetaKey::SegmentReplacementProof {
@@ -2084,6 +2195,22 @@ impl MetaStateMachine {
         }
         let destination = proof.destination_node_uuid;
 
+        // A rebalance intent matching the proof completes with this
+        // confirmation: the intent record is removed in the same apply so the
+        // whole move commits or rejects as one unit.
+        let intent_key = MetaKey::SegmentRebalanceIntent {
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+        }
+        .encode();
+        let completes_rebalance = matches!(
+            self.records.get(&intent_key),
+            Some(MetaValue::RebalanceIntent(intent))
+                if intent.from_node_uuid == retiring_node_uuid
+                    && intent.to_node_uuid == destination
+        );
+
         // Apply is all-or-nothing: validate every rejection path — segment
         // AND placement — before mutating either record, so a rejected
         // command never leaves the segment half-retired and unretryable.
@@ -2146,16 +2273,257 @@ impl MetaStateMachine {
                 self.records.get_mut(&placement_key)
             {
                 // Drop the retiring replica; the verified destination remains.
+                // The declared replication factor is a durability target and
+                // is deliberately preserved — never rewritten from the list
+                // length — so a shrunken set stays visibly below target.
                 placement
                     .replica_nodes
                     .retain(|node| *node != retiring_node_uuid);
-                placement.replication_factor = placement.replica_nodes.len() as u8;
                 placement.generation = next_placement_generation;
             }
+        }
+        if completes_rebalance {
+            self.records.remove(&intent_key);
         }
 
         MetadataResponse::Ack {
             generation: next_generation,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn propose_rebalance(
+        &mut self,
+        apply_index: u64,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        segment_uuid: Uuid,
+        from_node_uuid: Uuid,
+        to_node_uuid: Uuid,
+        expected_placement_generation: u64,
+    ) -> MetadataResponse {
+        // Existence first: segment, placement, then the destination node.
+        let segment_key = MetaKey::Segment {
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+        }
+        .encode();
+        let Some(MetaValue::Segment(segment)) = self.records.get(&segment_key) else {
+            return reject(MetadataError::NotFound);
+        };
+        let placement_key = MetaKey::SegmentPlacement {
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+        }
+        .encode();
+        let Some(MetaValue::SegmentPlacement(placement)) = self.records.get(&placement_key) else {
+            return reject(MetadataError::NotFound);
+        };
+        let Some(MetaValue::Node(to_node)) = self.records.get(
+            &MetaKey::Node {
+                node_uuid: to_node_uuid,
+            }
+            .encode(),
+        ) else {
+            return reject(MetadataError::NotFound);
+        };
+        // Generation CAS on the placement record being mutated.
+        if placement.generation != expected_placement_generation {
+            return reject(MetadataError::GenerationMismatch {
+                expected: expected_placement_generation,
+                actual: placement.generation,
+            });
+        }
+        // One in-flight rebalance per segment: a live intent blocks a second
+        // proposal outright.
+        let intent_key = MetaKey::SegmentRebalanceIntent {
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+        }
+        .encode();
+        if self.records.contains_key(&intent_key) {
+            return reject(MetadataError::AlreadyExists);
+        }
+        // Semantic guards, all validated before any mutation.
+        if segment.state != SegmentState::Verified {
+            return reject(MetadataError::invalid_transition(
+                "rebalance requires a verified segment",
+            ));
+        }
+        // A pre-existing proof belongs to a repair/retirement already under
+        // way; the rebalance lifecycle must start before its proof.
+        let proof_key = MetaKey::SegmentReplacementProof {
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+        }
+        .encode();
+        if self.records.contains_key(&proof_key) {
+            return reject(MetadataError::invalid_transition(
+                "segment already has a committed replacement proof",
+            ));
+        }
+        if from_node_uuid == to_node_uuid {
+            return reject(MetadataError::invalid_transition(
+                "rebalance source and destination must differ",
+            ));
+        }
+        if !placement.replica_nodes.contains(&from_node_uuid) {
+            return reject(MetadataError::invalid_transition(
+                "rebalance source is not in the current placement",
+            ));
+        }
+        if placement.replica_nodes.contains(&to_node_uuid) {
+            return reject(MetadataError::invalid_transition(
+                "rebalance destination is already in the placement",
+            ));
+        }
+        if to_node.state != NodeState::Active {
+            return reject(MetadataError::invalid_transition(format!(
+                "rebalance destination {to_node_uuid} is {}, not active",
+                to_node.state
+            )));
+        }
+        if to_node.placement_weight < MIN_PLACEMENT_WEIGHT {
+            return reject(MetadataError::invalid_transition(
+                "rebalance destination has no placement weight",
+            ));
+        }
+        // The temporary set may hold exactly one replica above the declared
+        // bound (add-before-retire); a second concurrent expansion is
+        // impossible because the intent record is exclusive.
+        if placement.replica_nodes.len() >= MAX_TRANSIENT_REPLICAS {
+            return reject(MetadataError::limit(format!(
+                "placement already holds {MAX_TRANSIENT_REPLICAS} replicas"
+            )));
+        }
+        // Preserve the distinct-failure-domain durability constraint that
+        // deterministic placement enforced: when RF > 1, the destination
+        // must not share a domain with any replica that SURVIVES the move
+        // (the source is leaving, so its domain is free to reuse).
+        if usize::from(placement.declared_replication_factor) > 1 {
+            for survivor in placement
+                .replica_nodes
+                .iter()
+                .filter(|node| **node != from_node_uuid)
+            {
+                let survivor_key = MetaKey::Node {
+                    node_uuid: *survivor,
+                }
+                .encode();
+                let Some(MetaValue::Node(survivor_node)) = self.records.get(&survivor_key) else {
+                    return reject(MetadataError::invalid_transition(format!(
+                        "surviving replica {survivor} has no node record"
+                    )));
+                };
+                if survivor_node.failure_domain == to_node.failure_domain {
+                    return reject(MetadataError::invalid_transition(format!(
+                        "rebalance destination shares failure domain {:?} with surviving replica {survivor}",
+                        to_node.failure_domain
+                    )));
+                }
+            }
+        }
+        let Some(next_placement_generation) = placement.generation.checked_add(1) else {
+            return reject(MetadataError::limit(
+                "placement generation space is exhausted",
+            ));
+        };
+
+        // Every rejection has been ruled out; record the intent and add the
+        // destination so the segment never runs below its declared RF.
+        self.records.insert(
+            intent_key,
+            MetaValue::RebalanceIntent(RebalanceIntentRecord {
+                from_node_uuid,
+                to_node_uuid,
+                proposed_at_apply_index: apply_index,
+                placement_generation_at_proposal: expected_placement_generation,
+            }),
+        );
+        let Some(MetaValue::SegmentPlacement(placement)) = self.records.get_mut(&placement_key)
+        else {
+            unreachable!("placement record was present above and apply is single-threaded");
+        };
+        placement.replica_nodes.push(to_node_uuid);
+        placement.generation = next_placement_generation;
+        MetadataResponse::Ack {
+            generation: next_placement_generation,
+        }
+    }
+
+    fn cancel_rebalance(
+        &mut self,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        segment_uuid: Uuid,
+        expected_placement_generation: u64,
+    ) -> MetadataResponse {
+        let intent_key = MetaKey::SegmentRebalanceIntent {
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+        }
+        .encode();
+        let Some(MetaValue::RebalanceIntent(intent)) = self.records.get(&intent_key) else {
+            return reject(MetadataError::NotFound);
+        };
+        let intent = intent.clone();
+        let placement_key = MetaKey::SegmentPlacement {
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+        }
+        .encode();
+        let Some(MetaValue::SegmentPlacement(placement)) = self.records.get(&placement_key) else {
+            return reject(MetadataError::NotFound);
+        };
+        if placement.generation != expected_placement_generation {
+            return reject(MetadataError::GenerationMismatch {
+                expected: expected_placement_generation,
+                actual: placement.generation,
+            });
+        }
+        // Once the move's replacement proof is committed the copy is verified
+        // evidence; the move must complete via retirement, not be cancelled.
+        let proof_key = MetaKey::SegmentReplacementProof {
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+        }
+        .encode();
+        if let Some(MetaValue::ReplacementProof(proof)) = self.records.get(&proof_key) {
+            if proof.source_node_uuid == intent.from_node_uuid
+                && proof.destination_node_uuid == intent.to_node_uuid
+            {
+                return reject(MetadataError::invalid_transition(
+                    "cannot cancel a rebalance whose replacement proof is committed",
+                ));
+            }
+        }
+        let Some(next_placement_generation) = placement.generation.checked_add(1) else {
+            return reject(MetadataError::limit(
+                "placement generation space is exhausted",
+            ));
+        };
+
+        // Every rejection has been ruled out; drop the intent and the
+        // destination replica it added (a no-op retain if an unrelated
+        // retirement already removed it).
+        self.records.remove(&intent_key);
+        let Some(MetaValue::SegmentPlacement(placement)) = self.records.get_mut(&placement_key)
+        else {
+            unreachable!("placement record was present above and apply is single-threaded");
+        };
+        placement
+            .replica_nodes
+            .retain(|node| *node != intent.to_node_uuid);
+        placement.generation = next_placement_generation;
+        MetadataResponse::Ack {
+            generation: next_placement_generation,
         }
     }
 
@@ -2342,6 +2710,10 @@ fn key_matches_value(key: &MetaKey, value: &MetaValue) -> bool {
                 MetaKey::SegmentReplacementProof { .. },
                 MetaValue::ReplacementProof(_)
             )
+            | (
+                MetaKey::SegmentRebalanceIntent { .. },
+                MetaValue::RebalanceIntent(_)
+            )
     )
 }
 
@@ -2447,11 +2819,14 @@ fn decode_assigned_ranges(reader: &mut Reader<'_>) -> Result<Vec<RangeAssignment
 }
 
 fn encode_replica_nodes(out: &mut Vec<u8>, nodes: &[Uuid]) -> Result<(), CodecError> {
-    if nodes.len() > MAX_REPLICAS {
+    // Must match decode_replica_nodes: a snapshot taken while a rebalance
+    // intent holds the transient RF + 1 set has to encode, or Raft snapshot
+    // creation and follower recovery stall for the whole move.
+    if nodes.len() > MAX_TRANSIENT_REPLICAS {
         return Err(CodecError::BoundExceeded {
             what: "replica nodes",
             actual: nodes.len(),
-            maximum: MAX_REPLICAS,
+            maximum: MAX_TRANSIENT_REPLICAS,
         });
     }
     put_u16(out, nodes.len() as u16);
@@ -2463,11 +2838,13 @@ fn encode_replica_nodes(out: &mut Vec<u8>, nodes: &[Uuid]) -> Result<(), CodecEr
 
 fn decode_replica_nodes(reader: &mut Reader<'_>) -> Result<Vec<Uuid>, CodecError> {
     let count = reader.u16("replica node count")? as usize;
-    if count > MAX_REPLICAS {
+    // The stored set may transiently exceed MAX_REPLICAS by one while a
+    // rebalance intent is in flight; snapshots taken then must round-trip.
+    if count > MAX_TRANSIENT_REPLICAS {
         return Err(CodecError::BoundExceeded {
             what: "replica nodes",
             actual: count,
-            maximum: MAX_REPLICAS,
+            maximum: MAX_TRANSIENT_REPLICAS,
         });
     }
     let mut nodes = Vec::with_capacity(count);
@@ -2491,6 +2868,28 @@ mod tests {
             request_id: Uuid::from_u128(request),
             issued_at_ms: 0,
         }
+    }
+
+    #[test]
+    fn replica_node_codec_round_trips_the_transient_nine_node_set() {
+        // A snapshot taken mid-rebalance carries declared RF + 1 replicas;
+        // encoder and decoder must agree on the transient bound or Raft
+        // snapshot creation stalls for the duration of the move.
+        let nine: Vec<Uuid> = (0..MAX_TRANSIENT_REPLICAS as u128)
+            .map(Uuid::from_u128)
+            .collect();
+        let mut out = Vec::new();
+        encode_replica_nodes(&mut out, &nine).expect("transient set must encode");
+        let mut reader = Reader::new(&out);
+        assert_eq!(
+            decode_replica_nodes(&mut reader).expect("transient set must decode"),
+            nine
+        );
+
+        let ten: Vec<Uuid> = (0..(MAX_TRANSIENT_REPLICAS + 1) as u128)
+            .map(Uuid::from_u128)
+            .collect();
+        assert!(encode_replica_nodes(&mut Vec::new(), &ten).is_err());
     }
 
     #[test]

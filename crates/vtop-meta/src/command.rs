@@ -52,6 +52,8 @@ const COMMAND_KIND_COMMIT_SEGMENT_PLACEMENT: u16 = 17;
 const COMMAND_KIND_COMMIT_REPLACEMENT_PROOF: u16 = 18;
 const COMMAND_KIND_PLAN_REPLICA_RETIREMENT: u16 = 19;
 const COMMAND_KIND_CONFIRM_REPLICA_RETIRED: u16 = 20;
+const COMMAND_KIND_PROPOSE_REBALANCE: u16 = 21;
+const COMMAND_KIND_CANCEL_REBALANCE: u16 = 22;
 
 const RESPONSE_KIND_ACK: u16 = 1;
 const RESPONSE_KIND_TOPIC_CREATED: u16 = 2;
@@ -335,6 +337,29 @@ pub enum MetadataCommand {
         retiring_node_uuid: Uuid,
         expected_segment_generation: u64,
     },
+    /// Open the single in-flight rebalance move for a verified segment:
+    /// records a `RebalanceIntent` and adds `to_node_uuid` to the placement so
+    /// the segment temporarily runs at declared RF + 1 replicas, never fewer.
+    /// The move completes through the existing replacement-proof/retirement
+    /// flow ([`MetadataCommand::CommitReplacementProof`] onward).
+    ProposeRebalance {
+        env: CommandEnvelope,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        segment_uuid: Uuid,
+        from_node_uuid: Uuid,
+        to_node_uuid: Uuid,
+        expected_placement_generation: u64,
+    },
+    /// Abandon an in-flight rebalance before its replacement proof commits:
+    /// removes the intent and drops the destination replica it added.
+    CancelRebalance {
+        env: CommandEnvelope,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        segment_uuid: Uuid,
+        expected_placement_generation: u64,
+    },
 }
 
 impl MetadataCommand {
@@ -359,7 +384,9 @@ impl MetadataCommand {
             | MetadataCommand::CommitSegmentPlacement { env, .. }
             | MetadataCommand::CommitReplacementProof { env, .. }
             | MetadataCommand::PlanReplicaRetirement { env, .. }
-            | MetadataCommand::ConfirmReplicaRetired { env, .. } => env,
+            | MetadataCommand::ConfirmReplicaRetired { env, .. }
+            | MetadataCommand::ProposeRebalance { env, .. }
+            | MetadataCommand::CancelRebalance { env, .. } => env,
         }
     }
 
@@ -685,6 +712,38 @@ impl MetadataCommand {
                 put_uuid(&mut out, *retiring_node_uuid);
                 put_u64(&mut out, *expected_segment_generation);
             }
+            MetadataCommand::ProposeRebalance {
+                env,
+                topic_uuid,
+                range_uuid,
+                segment_uuid,
+                from_node_uuid,
+                to_node_uuid,
+                expected_placement_generation,
+            } => {
+                put_u16(&mut out, COMMAND_KIND_PROPOSE_REBALANCE);
+                encode_envelope(&mut out, env);
+                put_uuid(&mut out, *topic_uuid);
+                put_uuid(&mut out, *range_uuid);
+                put_uuid(&mut out, *segment_uuid);
+                put_uuid(&mut out, *from_node_uuid);
+                put_uuid(&mut out, *to_node_uuid);
+                put_u64(&mut out, *expected_placement_generation);
+            }
+            MetadataCommand::CancelRebalance {
+                env,
+                topic_uuid,
+                range_uuid,
+                segment_uuid,
+                expected_placement_generation,
+            } => {
+                put_u16(&mut out, COMMAND_KIND_CANCEL_REBALANCE);
+                encode_envelope(&mut out, env);
+                put_uuid(&mut out, *topic_uuid);
+                put_uuid(&mut out, *range_uuid);
+                put_uuid(&mut out, *segment_uuid);
+                put_u64(&mut out, *expected_placement_generation);
+            }
         }
         Ok(out)
     }
@@ -942,6 +1001,22 @@ impl MetadataCommand {
                 segment_uuid: reader.uuid("segment uuid")?,
                 retiring_node_uuid: reader.uuid("retiring node uuid")?,
                 expected_segment_generation: reader.u64("expected segment generation")?,
+            }),
+            COMMAND_KIND_PROPOSE_REBALANCE => Ok(MetadataCommand::ProposeRebalance {
+                env: decode_envelope(reader)?,
+                topic_uuid: reader.uuid("topic uuid")?,
+                range_uuid: reader.uuid("range uuid")?,
+                segment_uuid: reader.uuid("segment uuid")?,
+                from_node_uuid: reader.uuid("rebalance source node uuid")?,
+                to_node_uuid: reader.uuid("rebalance destination node uuid")?,
+                expected_placement_generation: reader.u64("expected placement generation")?,
+            }),
+            COMMAND_KIND_CANCEL_REBALANCE => Ok(MetadataCommand::CancelRebalance {
+                env: decode_envelope(reader)?,
+                topic_uuid: reader.uuid("topic uuid")?,
+                range_uuid: reader.uuid("range uuid")?,
+                segment_uuid: reader.uuid("segment uuid")?,
+                expected_placement_generation: reader.u64("expected placement generation")?,
             }),
             other => Err(CodecError::UnknownTag {
                 what: "command kind",
@@ -1486,6 +1561,22 @@ mod tests {
                 segment_uuid: Uuid::from_u128(30),
                 retiring_node_uuid: Uuid::from_u128(10),
                 expected_segment_generation: 2,
+            },
+            MetadataCommand::ProposeRebalance {
+                env: envelope(22),
+                topic_uuid: Uuid::from_u128(20),
+                range_uuid: Uuid::from_u128(21),
+                segment_uuid: Uuid::from_u128(30),
+                from_node_uuid: Uuid::from_u128(10),
+                to_node_uuid: Uuid::from_u128(12),
+                expected_placement_generation: 0,
+            },
+            MetadataCommand::CancelRebalance {
+                env: envelope(23),
+                topic_uuid: Uuid::from_u128(20),
+                range_uuid: Uuid::from_u128(21),
+                segment_uuid: Uuid::from_u128(30),
+                expected_placement_generation: 1,
             },
         ]
     }

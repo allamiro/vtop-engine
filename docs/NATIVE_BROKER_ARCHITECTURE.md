@@ -614,6 +614,13 @@ Stage-8 metadata foundation (`vtop-meta`):
   over currently `Active` nodes (distinct failure domains when RF > 1). The
   committed `SegmentPlacement` record stores that factor and node list as the
   durable audit trail for later repair/rebalance slices.
+- `ProposeRebalance`/`CancelRebalance` move one replica of a verified segment
+  at a time: a durable `RebalanceIntent` adds the destination first (the
+  segment temporarily runs at declared RF + 1, never fewer), the move
+  completes only through the existing replacement-proof/retirement flow —
+  `ConfirmReplicaRetired` removes the matching intent atomically — and the
+  declared replication factor is preserved verbatim across every placement
+  mutation rather than inferred from the replica-list length.
 
 New sealed segments are striped across eligible nodes so new capacity receives
 new work naturally. Existing data is moved only for policy, health, or measured

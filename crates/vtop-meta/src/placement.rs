@@ -10,6 +10,11 @@ use uuid::Uuid;
 /// Upper bound on replicas recorded for one segment placement.
 pub const MAX_REPLICAS: usize = 8;
 
+/// A placement may briefly hold one replica above [`MAX_REPLICAS`] while a
+/// rebalance intent is in flight (add-before-retire): the stored-placement
+/// codec accepts this transient size; declared replication factors never do.
+pub const MAX_TRANSIENT_REPLICAS: usize = MAX_REPLICAS + 1;
+
 /// Bound for failure-domain attribute strings on node records.
 pub const MAX_FAILURE_DOMAIN_BYTES: usize = 64;
 
@@ -74,7 +79,12 @@ pub fn rendezvous_score(segment_uuid: Uuid, node_uuid: Uuid, weight: u32) -> u12
     let mut high = [0u8; 8];
     high.copy_from_slice(&digest.as_bytes()[..8]);
     let hash = u64::from_be_bytes(high);
-    u128::from(hash).saturating_mul(u128::from(weight))
+    // A u64 hash times a u32 weight is at most 2^96, so the product can never
+    // reach u128::MAX. `wrapping_mul` documents that no clamping is possible:
+    // a saturating product would tie every maximum-weight candidate at
+    // u128::MAX and bias selection, so any future widening of these operands
+    // must revisit the score space rather than silently saturate.
+    u128::from(hash).wrapping_mul(u128::from(weight))
 }
 
 /// Select an ordered replica set for `segment_uuid`.
