@@ -21,7 +21,7 @@ use crate::segment::{
 use crate::types::{
     LogError, ProducerSummaryEntry, SegmentCommitKey, SegmentManifest, SegmentManifestV2,
     VtopLogResult, CHUNK_TREE_SCHEME_V1, COMMIT_SCHEME_KEYED, COMMIT_SCHEME_UNKEYED, FORMAT_NAME,
-    FORMAT_VERSION, FORMAT_VERSION_V2, PRODUCER_SEQUENCE_WINDOW, RECORD_SCHEMA_VERSION_V2,
+    FORMAT_VERSION, FORMAT_VERSION_V2, RECORD_SCHEMA_VERSION_V2,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, SeekFrom};
@@ -454,18 +454,15 @@ fn scan_frames(
         .iter()
         .map(|((producer_id, producer_epoch), latest)| {
             // Every (producer, epoch) run starts at sequence zero and
-            // advances by one, as enforced above — but the seal path
-            // derives the summary from the RETAINED duplicate-detection
-            // window (at most PRODUCER_SEQUENCE_WINDOW most recent
-            // sequences), so a run longer than the window reports the
-            // window floor, not zero. Reproduce that arithmetic exactly.
-            let first_sequence = latest.saturating_sub(PRODUCER_SEQUENCE_WINDOW - 1);
+            // advances by one, as enforced above, and the seal path
+            // summarizes the full run (not just the bounded retry window),
+            // so coverage is exactly 0..=latest.
             ProducerSummaryEntry {
                 producer_id: *producer_id,
                 producer_epoch: *producer_epoch,
-                first_sequence,
+                first_sequence: 0,
                 last_sequence: *latest,
-                record_count: latest - first_sequence + 1,
+                record_count: latest + 1,
             }
         })
         .collect();
@@ -983,7 +980,7 @@ mod tests {
         Durability, LogRecord, SegmentConfig, SegmentConfigV2, SegmentDescriptor,
         SegmentDescriptorV2,
     };
-    use crate::{ActiveSegment, AppendOutcome, RangeLineage};
+    use crate::{ActiveSegment, AppendOutcome, RangeLineage, PRODUCER_SEQUENCE_WINDOW};
     use std::fs;
     use std::path::PathBuf;
     use tempfile::tempdir;
@@ -1404,9 +1401,9 @@ mod tests {
 
     #[test]
     fn sealed_segment_past_the_producer_retry_window_still_verifies_self_consistent() {
-        // The seal path derives producer summaries from the retained
-        // PRODUCER_SEQUENCE_WINDOW; reconstructing 0..latest would disagree
-        // with the sealed manifest and falsely report corruption.
+        // The seal path summarizes the producer's full run even when it
+        // outgrows the bounded PRODUCER_SEQUENCE_WINDOW retry state; the
+        // verifier must reconstruct the same 0..=latest coverage.
         let directory = tempdir().unwrap();
         let active = directory.path().join("window.active");
         let config = SegmentConfigV2 {

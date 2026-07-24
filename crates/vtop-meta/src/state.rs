@@ -54,6 +54,7 @@ const VALUE_TAG_GROUP_CURSOR: u8 = 10;
 const VALUE_TAG_SEGMENT_PLACEMENT: u8 = 13;
 const VALUE_TAG_REPLACEMENT_PROOF: u8 = 14;
 const VALUE_TAG_REBALANCE_INTENT: u8 = 15;
+const VALUE_TAG_RANGE_V2: u8 = 16;
 
 /// A registered broker/controller node.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -99,10 +100,17 @@ pub struct LeaseRecord {
 /// grant increments it, and a release never rewinds it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RangeRecord {
+    /// Metadata CAS token: bumps on every mutation of this record (grants,
+    /// segment registrations, ...). Never a lineage signal.
     pub generation: u64,
     pub key_prefix: u64,
     pub key_prefix_bits: u8,
     pub fencing_epoch: u64,
+    /// Lineage version of the key interval itself. Bumps only on an actual
+    /// lineage transition (split/merge); unrelated metadata updates that
+    /// advance `generation` leave it untouched, so cursor lineage checks
+    /// survive CAS churn. No transition exists yet, so it stays 0 today.
+    pub lineage_generation: u64,
     pub lease: Option<LeaseRecord>,
 }
 
@@ -174,6 +182,8 @@ pub struct GroupMemberRecord {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CursorCheckpointRecord {
     pub topic_epoch: u64,
+    /// The range's [`RangeRecord::lineage_generation`] the cursor was
+    /// committed under — not the record's CAS `generation`.
     pub range_generation: u64,
     pub segment_uuid: Uuid,
     pub segment_generation: u64,
@@ -278,11 +288,22 @@ impl MetaValue {
                 put_u64(&mut out, name.latest_epoch);
             }
             MetaValue::Range(range) => {
-                put_u8(&mut out, VALUE_TAG_RANGE);
+                // A range that has never seen a lineage transition encodes as
+                // the legacy tag byte-for-byte, so pinned snapshot vectors and
+                // mixed-version replicas stay stable; the v2 tag appears only
+                // once a transition actually bumps `lineage_generation`.
+                if range.lineage_generation == 0 {
+                    put_u8(&mut out, VALUE_TAG_RANGE);
+                } else {
+                    put_u8(&mut out, VALUE_TAG_RANGE_V2);
+                }
                 put_u64(&mut out, range.generation);
                 put_u64(&mut out, range.key_prefix);
                 put_u8(&mut out, range.key_prefix_bits);
                 put_u64(&mut out, range.fencing_epoch);
+                if range.lineage_generation != 0 {
+                    put_u64(&mut out, range.lineage_generation);
+                }
                 match &range.lease {
                     None => put_u8(&mut out, 0),
                     Some(lease) => {
@@ -429,11 +450,27 @@ impl MetaValue {
                 topic_uuid: reader.uuid("topic uuid")?,
                 latest_epoch: reader.u64("latest topic epoch")?,
             }),
-            VALUE_TAG_RANGE => {
+            VALUE_TAG_RANGE | VALUE_TAG_RANGE_V2 => {
                 let generation = reader.u64("range generation")?;
                 let key_prefix = reader.u64("key prefix")?;
                 let key_prefix_bits = reader.u8("key prefix bits")?;
                 let fencing_epoch = reader.u64("fencing epoch")?;
+                // Legacy range records predate lineage transitions, so their
+                // lineage version is the initial one. The v2 tag exists only
+                // for transitioned ranges; a zero there is non-canonical (it
+                // would re-encode as the legacy tag) and must be rejected.
+                let lineage_generation = if tag == VALUE_TAG_RANGE_V2 {
+                    let lineage_generation = reader.u64("lineage generation")?;
+                    if lineage_generation == 0 {
+                        return Err(CodecError::InvalidValue {
+                            what: "range lineage generation",
+                            reason: "v2 range records must carry a nonzero lineage generation",
+                        });
+                    }
+                    lineage_generation
+                } else {
+                    0
+                };
                 let lease = if reader.flag("lease presence")? {
                     Some(LeaseRecord {
                         holder_node_uuid: reader.uuid("lease holder uuid")?,
@@ -448,6 +485,7 @@ impl MetaValue {
                     key_prefix,
                     key_prefix_bits,
                     fencing_epoch,
+                    lineage_generation,
                     lease,
                 })
             }
@@ -1049,7 +1087,7 @@ impl MetaStateMachine {
             }),
         );
         // The root range covers the full key interval: prefix 0 with 0
-        // prefix bits, generation 0, no fencing history yet.
+        // prefix bits, generation 0, no fencing or lineage history yet.
         self.records.insert(
             range_key,
             MetaValue::Range(RangeRecord {
@@ -1057,6 +1095,7 @@ impl MetaStateMachine {
                 key_prefix: 0,
                 key_prefix_bits: 0,
                 fencing_epoch: 0,
+                lineage_generation: 0,
                 lease: None,
             }),
         );
@@ -1560,10 +1599,14 @@ impl MetaStateMachine {
         let Some(MetaValue::Range(range)) = self.records.get(&range_key) else {
             return reject(MetadataError::NotFound);
         };
-        if range.generation != args.range_generation {
-            return reject(MetadataError::GenerationMismatch {
+        // The cursor pins the range's lineage version, not its CAS token:
+        // unrelated metadata updates (grants, segment registrations) bump
+        // `generation` without moving the key interval, and must not strand
+        // an otherwise valid checkpoint.
+        if range.lineage_generation != args.range_generation {
+            return reject(MetadataError::LineageMismatch {
                 expected: args.range_generation,
-                actual: range.generation,
+                actual: range.lineage_generation,
             });
         }
 
@@ -3005,6 +3048,48 @@ mod tests {
                 assigned: Vec::new(),
             })
         );
+    }
+
+    #[test]
+    fn range_value_codec_keeps_legacy_bytes_until_a_lineage_transition() {
+        // Untransitioned ranges encode as the legacy tag byte-for-byte, so
+        // pinned snapshot vectors stay stable; decode defaults lineage to 0.
+        let untransitioned = MetaValue::Range(RangeRecord {
+            generation: 5,
+            key_prefix: 0,
+            key_prefix_bits: 0,
+            fencing_epoch: 3,
+            lineage_generation: 0,
+            lease: None,
+        });
+        let encoded = untransitioned.encode().unwrap();
+        assert_eq!(encoded[0], VALUE_TAG_RANGE);
+        assert_eq!(MetaValue::decode(&encoded).unwrap(), untransitioned);
+
+        // A transitioned range round-trips through the v2 tag.
+        let transitioned = MetaValue::Range(RangeRecord {
+            generation: 5,
+            key_prefix: 0,
+            key_prefix_bits: 0,
+            fencing_epoch: 3,
+            lineage_generation: 4,
+            lease: None,
+        });
+        let encoded = transitioned.encode().unwrap();
+        assert_eq!(encoded[0], VALUE_TAG_RANGE_V2);
+        assert_eq!(MetaValue::decode(&encoded).unwrap(), transitioned);
+
+        // A v2 tag carrying lineage 0 would re-encode as the legacy tag, so
+        // it is rejected as non-canonical instead of silently accepted.
+        let mut noncanonical = encoded.clone();
+        noncanonical[26..34].fill(0);
+        assert!(matches!(
+            MetaValue::decode(&noncanonical),
+            Err(CodecError::InvalidValue {
+                what: "range lineage generation",
+                ..
+            })
+        ));
     }
 
     #[test]

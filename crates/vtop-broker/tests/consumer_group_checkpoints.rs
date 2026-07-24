@@ -161,7 +161,9 @@ fn cursor_at(offset: u64, checkpoint_generation: u64) -> LineageCursor {
         topic_id: TOPIC_UUID,
         topic_epoch: 1,
         range_id: RANGE_UUID,
-        range_generation: 2,
+        // The range's lineage generation: still 0 after grant and segment
+        // registration, which only bump the metadata CAS generation.
+        range_generation: 0,
         segment_id: SEGMENT_UUID,
         segment_generation: 0,
         segment_root: SEGMENT_ROOT,
@@ -275,6 +277,32 @@ fn commit_and_fetch_lineage_cursor_through_broker() {
         ),
         "{:?}",
         backward.message
+    );
+
+    // A cursor carrying the range's CAS generation (2 after grant + segment
+    // registration) instead of its lineage generation is a lineage failure,
+    // not a checkpoint conflict.
+    let mut cas_cursor = cursor_at(40, 0);
+    cas_cursor.range_generation = 2;
+    let wrong_lineage = broker.handle(
+        Role::Consumer,
+        WireFrame {
+            request_id: 6,
+            stream_id: 1,
+            message: Message::CommitCursorRequest(CommitCursorRequest {
+                member_id: MEMBER_UUID,
+                cursor: cas_cursor,
+                expected_checkpoint_generation: Some(1),
+            }),
+        },
+    );
+    assert!(
+        matches!(
+            wrong_lineage.message,
+            Message::Error(ref err) if err.code == ErrorCode::WrongLineage
+        ),
+        "{:?}",
+        wrong_lineage.message
     );
 }
 

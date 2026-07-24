@@ -43,11 +43,20 @@ type ProducerKey = (Uuid, u64);
 #[derive(Clone)]
 struct ProducerState {
     latest_sequence: u64,
+    /// First accepted sequence for this (producer, epoch). Summary aggregate
+    /// only — retry decisions always consult the bounded `seen` window.
+    first_sequence: u64,
+    /// Total accepted appends for this (producer, epoch). Unlike `seen`,
+    /// never truncated to the retry window, so the sealed manifest summary
+    /// covers the full run.
+    record_count: u64,
     seen: BTreeMap<u64, SeenRecord>,
 }
 
 struct ProducerDelta {
     latest_sequence: u64,
+    first_sequence: u64,
+    record_count: u64,
     seen: BTreeMap<u64, SeenRecord>,
 }
 
@@ -1318,11 +1327,29 @@ fn validate_sequence_with_delta(
     if let Some(seen) = deltas
         .get(&key)
         .and_then(|delta| delta.seen.get(&record.sequence))
-        .or_else(|| {
-            states
-                .get(&key)
-                .and_then(|state| state.seen.get(&record.sequence))
-        })
+    {
+        return if hash == seen.content_hash {
+            Ok(SequenceDecision::Duplicate(seen.offset))
+        } else {
+            Err(LogError::SequenceConflict {
+                producer_id: record.producer_id,
+                sequence: record.sequence,
+            })
+        };
+    }
+    // Honor the group's prospective window floor before consulting the base
+    // map: earlier records in this group may have advanced the frontier past
+    // sequences the base map still remembers, and those entries are evicted
+    // when the group merges. Answering "duplicate" from doomed memory would
+    // make the decision depend on where the group boundary fell.
+    if let Some(delta) = deltas.get(&key) {
+        if let Some(error) = sequence_below_window(record, delta.latest_sequence) {
+            return Err(error);
+        }
+    }
+    if let Some(seen) = states
+        .get(&key)
+        .and_then(|state| state.seen.get(&record.sequence))
     {
         return if hash == seen.content_hash {
             Ok(SequenceDecision::Duplicate(seen.offset))
@@ -1390,6 +1417,7 @@ fn remember_pending_sequence(
         .entry((record.producer_id, record.producer_epoch))
         .and_modify(|delta| {
             delta.latest_sequence = record.sequence;
+            delta.record_count += 1;
             delta.seen.insert(
                 record.sequence,
                 SeenRecord {
@@ -1401,6 +1429,8 @@ fn remember_pending_sequence(
         })
         .or_insert_with(|| ProducerDelta {
             latest_sequence: record.sequence,
+            first_sequence: record.sequence,
+            record_count: 1,
             seen: BTreeMap::from([(
                 record.sequence,
                 SeenRecord {
@@ -1424,10 +1454,14 @@ fn merge_producer_deltas(
     for (key, delta) in deltas {
         let ProducerDelta {
             latest_sequence,
+            first_sequence,
+            record_count,
             seen,
         } = delta;
         if let Some(state) = states.get_mut(&key) {
             state.latest_sequence = latest_sequence;
+            state.first_sequence = state.first_sequence.min(first_sequence);
+            state.record_count += record_count;
             state.seen.extend(seen);
             evict_below_window(&mut state.seen, latest_sequence);
         } else {
@@ -1435,6 +1469,8 @@ fn merge_producer_deltas(
                 key,
                 ProducerState {
                     latest_sequence,
+                    first_sequence,
+                    record_count,
                     seen,
                 },
             );
@@ -1683,6 +1719,7 @@ fn remember_sequence(
         .entry((record.producer_id, record.producer_epoch))
         .and_modify(|state| {
             state.latest_sequence = record.sequence;
+            state.record_count += 1;
             state.seen.insert(
                 record.sequence,
                 SeenRecord {
@@ -1694,6 +1731,8 @@ fn remember_sequence(
         })
         .or_insert_with(|| ProducerState {
             latest_sequence: record.sequence,
+            first_sequence: record.sequence,
+            record_count: 1,
             seen: BTreeMap::from([(
                 record.sequence,
                 SeenRecord {
@@ -1805,6 +1844,10 @@ fn validate_manifest_v2(
 }
 
 /// Per-(producer, epoch) coverage, sorted by `(producer_id, producer_epoch)`.
+///
+/// Built from the full-run aggregates, never the bounded retry window: a run
+/// longer than `PRODUCER_SEQUENCE_WINDOW` must still summarize every accepted
+/// sequence, or reopening a valid segment would reject its own manifest.
 fn producer_summary_from_states(
     states: &HashMap<ProducerKey, ProducerState>,
 ) -> Vec<ProducerSummaryEntry> {
@@ -1814,14 +1857,9 @@ fn producer_summary_from_states(
             |((producer_id, producer_epoch), state)| ProducerSummaryEntry {
                 producer_id: *producer_id,
                 producer_epoch: *producer_epoch,
-                first_sequence: state
-                    .seen
-                    .keys()
-                    .copied()
-                    .min()
-                    .unwrap_or(state.latest_sequence),
+                first_sequence: state.first_sequence,
                 last_sequence: state.latest_sequence,
-                record_count: state.seen.len() as u64,
+                record_count: state.record_count,
             },
         )
         .collect();
@@ -2429,6 +2467,54 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn v2_segment_past_the_dedup_window_seals_a_full_summary_and_reopens() {
+        let directory = tempdir().unwrap();
+        let active = directory.path().join("window-full.active");
+        let producer = Uuid::from_u128(93);
+        let config = SegmentConfigV2 {
+            max_record_bytes: 1024,
+            max_group_bytes: 16 * 1024 * 1024,
+            max_segment_bytes: 64 * 1024 * 1024,
+            max_segment_records: 2 * PRODUCER_SEQUENCE_WINDOW,
+            index_stride: 4096,
+            chunk_size: 64 * 1024,
+        };
+        let mut segment = ActiveSegment::create_v2(&active, descriptor_v2(), config).unwrap();
+        let total = PRODUCER_SEQUENCE_WINDOW + 2;
+        let mut sequence = 0_u64;
+        while sequence < total {
+            let batch: Vec<LogRecord> = (sequence..(sequence + 4096).min(total))
+                .map(|sequence| record_v2(producer, 2, sequence, b"w"))
+                .collect();
+            sequence += batch.len() as u64;
+            for outcome in segment.append_group(&batch, Durability::Buffered).unwrap() {
+                assert!(matches!(outcome, AppendOutcome::Appended { .. }));
+            }
+        }
+
+        // The manifest must summarize the producer's full run, not just the
+        // bounded PRODUCER_SEQUENCE_WINDOW retry state it retains in memory.
+        let sealed = segment.seal_v2(None).unwrap();
+        assert_eq!(
+            sealed.manifest_v2().unwrap().producer_summary,
+            vec![ProducerSummaryEntry {
+                producer_id: producer,
+                producer_epoch: 2,
+                first_sequence: 0,
+                last_sequence: total - 1,
+                record_count: total,
+            }]
+        );
+        drop(sealed);
+
+        // Reopening revalidates the manifest against a fresh full scan; a
+        // window-truncated reconstruction would reject this valid segment.
+        let sealed_path = directory.path().join("window-full.segment");
+        let reopened = SegmentReader::open(&sealed_path).unwrap();
+        assert_eq!(reopened.manifest_v2().unwrap().record_count, total);
     }
 
     #[test]

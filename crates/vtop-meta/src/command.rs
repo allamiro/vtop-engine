@@ -69,6 +69,7 @@ const ERROR_KIND_ALREADY_EXISTS: u16 = 3;
 const ERROR_KIND_NOT_FOUND: u16 = 4;
 const ERROR_KIND_INVALID_TRANSITION: u16 = 5;
 const ERROR_KIND_LIMIT: u16 = 6;
+const ERROR_KIND_LINEAGE_MISMATCH: u16 = 7;
 
 /// Common prefix of every command. `request_id` keys the exactly-once dedup
 /// table; `issued_at_ms` comes from the proposer's advisory clock and is
@@ -1036,6 +1037,8 @@ pub enum MetadataError {
     GenerationMismatch { expected: u64, actual: u64 },
     #[error("epoch mismatch: proposer expected {expected}, state holds {actual}")]
     EpochMismatch { expected: u64, actual: u64 },
+    #[error("lineage generation mismatch: proposer expected {expected}, state holds {actual}")]
+    LineageMismatch { expected: u64, actual: u64 },
     #[error("record already exists")]
     AlreadyExists,
     #[error("record not found")]
@@ -1070,6 +1073,11 @@ impl MetadataError {
                 put_u64(out, *expected);
                 put_u64(out, *actual);
             }
+            MetadataError::LineageMismatch { expected, actual } => {
+                put_u16(out, ERROR_KIND_LINEAGE_MISMATCH);
+                put_u64(out, *expected);
+                put_u64(out, *actual);
+            }
             MetadataError::AlreadyExists => put_u16(out, ERROR_KIND_ALREADY_EXISTS),
             MetadataError::NotFound => put_u16(out, ERROR_KIND_NOT_FOUND),
             MetadataError::InvalidTransition(detail) => {
@@ -1094,6 +1102,10 @@ impl MetadataError {
             ERROR_KIND_EPOCH_MISMATCH => Ok(MetadataError::EpochMismatch {
                 expected: reader.u64("expected epoch")?,
                 actual: reader.u64("actual epoch")?,
+            }),
+            ERROR_KIND_LINEAGE_MISMATCH => Ok(MetadataError::LineageMismatch {
+                expected: reader.u64("expected lineage generation")?,
+                actual: reader.u64("actual lineage generation")?,
             }),
             ERROR_KIND_ALREADY_EXISTS => Ok(MetadataError::AlreadyExists),
             ERROR_KIND_NOT_FOUND => Ok(MetadataError::NotFound),
@@ -1608,6 +1620,10 @@ mod tests {
             MetadataResponse::Rejected(MetadataError::EpochMismatch {
                 expected: 3,
                 actual: 4,
+            }),
+            MetadataResponse::Rejected(MetadataError::LineageMismatch {
+                expected: 0,
+                actual: 1,
             }),
             MetadataResponse::Rejected(MetadataError::AlreadyExists),
             MetadataResponse::Rejected(MetadataError::NotFound),
