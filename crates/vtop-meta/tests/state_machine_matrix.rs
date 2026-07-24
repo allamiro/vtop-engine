@@ -1811,7 +1811,7 @@ fn segment_placement_commits_only_deterministic_verified_sets() {
         panic!("placement record must exist");
     };
     assert_eq!(placement.replica_nodes, expected);
-    assert_eq!(placement.replication_factor, 3);
+    assert_eq!(placement.declared_replication_factor, 3);
     assert_eq!(placement.generation, 0);
     assert_eq!(placement.committed_apply_index, 13);
 
@@ -2071,4 +2071,572 @@ fn replacement_proof_gates_replica_retirement() {
         panic!("segment must exist");
     };
     assert_eq!(segment.state, SegmentState::Retired);
+}
+
+/// A verified segment with a committed RF-2 placement over three Active
+/// nodes in distinct racks. Returns the machine, the sealed content root,
+/// the segment generation, the committed replica list, and the one Active
+/// node the deterministic selection left out (the natural rebalance target).
+fn placed_segment_machine(
+    requests: &mut Requests,
+) -> (MetaStateMachine, [u8; 32], u64, Vec<Uuid>, Uuid) {
+    let (mut machine, root, segment_generation) = verified_segment_machine(requests);
+    for (node, domain, at) in [(NODE_B, "rack-b", 6_u64), (NODE_C, "rack-c", 8)] {
+        assert_eq!(
+            machine.apply(at, &register_node(requests, node)),
+            MetadataResponse::Ack { generation: 0 }
+        );
+        assert_eq!(
+            machine.apply(at + 1, &set_placement_attrs(requests, node, domain, 100, 0)),
+            MetadataResponse::Ack { generation: 1 }
+        );
+    }
+    assert_eq!(
+        machine.apply(10, &set_placement_attrs(requests, NODE, "rack-a", 100, 0)),
+        MetadataResponse::Ack { generation: 1 }
+    );
+    let replicas = select_replicas(
+        SEGMENT,
+        &[
+            PlacementCandidate {
+                node_uuid: NODE,
+                failure_domain: "rack-a".to_owned(),
+                weight: 100,
+            },
+            PlacementCandidate {
+                node_uuid: NODE_B,
+                failure_domain: "rack-b".to_owned(),
+                weight: 100,
+            },
+            PlacementCandidate {
+                node_uuid: NODE_C,
+                failure_domain: "rack-c".to_owned(),
+                weight: 100,
+            },
+        ],
+        2,
+        true,
+    )
+    .unwrap();
+    assert_eq!(
+        machine.apply(
+            11,
+            &MetadataCommand::CommitSegmentPlacement {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: SEGMENT,
+                replication_factor: 2,
+                replica_nodes: replicas.clone(),
+                expected_segment_generation: segment_generation,
+                expected_placement_generation: None,
+            }
+        ),
+        MetadataResponse::Ack { generation: 0 }
+    );
+    let spare = [NODE, NODE_B, NODE_C]
+        .into_iter()
+        .find(|node| !replicas.contains(node))
+        .expect("RF 2 over three nodes always leaves one out");
+    (machine, root, segment_generation, replicas, spare)
+}
+
+fn propose_rebalance(
+    requests: &mut Requests,
+    from: Uuid,
+    to: Uuid,
+    expected_placement_generation: u64,
+) -> MetadataCommand {
+    MetadataCommand::ProposeRebalance {
+        env: requests.next(),
+        topic_uuid: TOPIC,
+        range_uuid: RANGE,
+        segment_uuid: SEGMENT,
+        from_node_uuid: from,
+        to_node_uuid: to,
+        expected_placement_generation,
+    }
+}
+
+fn cancel_rebalance(
+    requests: &mut Requests,
+    expected_placement_generation: u64,
+) -> MetadataCommand {
+    MetadataCommand::CancelRebalance {
+        env: requests.next(),
+        topic_uuid: TOPIC,
+        range_uuid: RANGE,
+        segment_uuid: SEGMENT,
+        expected_placement_generation,
+    }
+}
+
+fn commit_proof(
+    requests: &mut Requests,
+    root: [u8; 32],
+    source: Uuid,
+    destination: Uuid,
+    expected_segment_generation: u64,
+) -> MetadataCommand {
+    MetadataCommand::CommitReplacementProof {
+        env: requests.next(),
+        topic_uuid: TOPIC,
+        range_uuid: RANGE,
+        segment_uuid: SEGMENT,
+        expected_segment_generation,
+        content_root: root,
+        expected_length_bytes: 4096,
+        source_node_uuid: source,
+        destination_node_uuid: destination,
+        fencing_epoch: 1,
+        verification_method: vtop_meta::VerificationMethod::AuthenticatedContentRoot,
+        verifier_node_uuid: destination,
+        verified_term: 1,
+    }
+}
+
+fn placement_record(machine: &MetaStateMachine) -> vtop_meta::SegmentPlacementRecord {
+    let Some(MetaValue::SegmentPlacement(placement)) = machine.record(&MetaKey::SegmentPlacement {
+        topic_uuid: TOPIC,
+        range_uuid: RANGE,
+        segment_uuid: SEGMENT,
+    }) else {
+        panic!("placement record must exist");
+    };
+    placement.clone()
+}
+
+fn intent_record(machine: &MetaStateMachine) -> Option<vtop_meta::RebalanceIntentRecord> {
+    match machine.record(&MetaKey::SegmentRebalanceIntent {
+        topic_uuid: TOPIC,
+        range_uuid: RANGE,
+        segment_uuid: SEGMENT,
+    }) {
+        Some(MetaValue::RebalanceIntent(intent)) => Some(intent.clone()),
+        None => None,
+        Some(_) => panic!("intent keys only hold intent records"),
+    }
+}
+
+/// Asserts the core rebalance invariant at every step: the replica set never
+/// holds fewer nodes than the declared replication factor, and the declared
+/// factor itself is never rewritten.
+fn assert_at_or_above_declared_rf(machine: &MetaStateMachine, declared: u8) {
+    let placement = placement_record(machine);
+    assert_eq!(placement.declared_replication_factor, declared);
+    assert!(
+        placement.replica_nodes.len() >= usize::from(declared),
+        "replica set {} dropped below declared RF {declared}",
+        placement.replica_nodes.len()
+    );
+}
+
+#[test]
+fn rebalance_lifecycle_completes_via_verified_retirement() {
+    let mut requests = Requests(0);
+    let (mut machine, root, segment_generation, replicas, spare) =
+        placed_segment_machine(&mut requests);
+    let from = replicas[0];
+    let other = replicas[1];
+    assert_at_or_above_declared_rf(&machine, 2);
+
+    // Propose: intent recorded, destination added, declared RF untouched.
+    assert_eq!(
+        machine.apply(12, &propose_rebalance(&mut requests, from, spare, 0)),
+        MetadataResponse::Ack { generation: 1 }
+    );
+    let placement = placement_record(&machine);
+    assert_eq!(placement.replica_nodes, vec![from, other, spare]);
+    assert_eq!(placement.declared_replication_factor, 2);
+    assert_eq!(placement.generation, 1);
+    assert_at_or_above_declared_rf(&machine, 2);
+    let intent = intent_record(&machine).expect("intent must exist after propose");
+    assert_eq!(intent.from_node_uuid, from);
+    assert_eq!(intent.to_node_uuid, spare);
+    assert_eq!(intent.proposed_at_apply_index, 12);
+    assert_eq!(intent.placement_generation_at_proposal, 0);
+
+    // A second in-flight rebalance is blocked outright.
+    assert_eq!(
+        machine.apply(13, &propose_rebalance(&mut requests, other, spare, 1)),
+        rejected(MetadataError::AlreadyExists)
+    );
+
+    // During the intent, retirement may only ever target the intent source.
+    assert_eq!(
+        machine.apply(
+            14,
+            &MetadataCommand::PlanReplicaRetirement {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: SEGMENT,
+                retiring_node_uuid: other,
+                expected_segment_generation: segment_generation,
+                fencing_epoch: 1,
+            }
+        ),
+        rejected(MetadataError::invalid_transition(
+            "segment has an active rebalance intent for a different node"
+        ))
+    );
+
+    // A proof that is not the intended (from -> to) move is rejected.
+    assert_eq!(
+        machine.apply(
+            15,
+            &commit_proof(&mut requests, root, other, spare, segment_generation)
+        ),
+        rejected(MetadataError::invalid_transition(
+            "replacement proof does not match the active rebalance intent"
+        ))
+    );
+
+    // The matching proof, plan, and confirmation complete the move.
+    assert_eq!(
+        machine.apply(
+            16,
+            &commit_proof(&mut requests, root, from, spare, segment_generation)
+        ),
+        MetadataResponse::Ack { generation: 0 }
+    );
+    assert_at_or_above_declared_rf(&machine, 2);
+    assert_eq!(
+        machine.apply(
+            17,
+            &MetadataCommand::PlanReplicaRetirement {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: SEGMENT,
+                retiring_node_uuid: from,
+                expected_segment_generation: segment_generation,
+                fencing_epoch: 1,
+            }
+        ),
+        MetadataResponse::Ack { generation: 2 }
+    );
+    assert_at_or_above_declared_rf(&machine, 2);
+    assert_eq!(placement_record(&machine).replica_nodes.len(), 3);
+    assert_eq!(
+        machine.apply(
+            18,
+            &MetadataCommand::ConfirmReplicaRetired {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: SEGMENT,
+                retiring_node_uuid: from,
+                expected_segment_generation: 2,
+            }
+        ),
+        MetadataResponse::Ack { generation: 3 }
+    );
+
+    // Completed: destination replaced the source at exactly declared RF, and
+    // the intent record went with the confirmation, atomically.
+    let placement = placement_record(&machine);
+    assert_eq!(placement.replica_nodes, vec![other, spare]);
+    assert_eq!(placement.declared_replication_factor, 2);
+    assert_eq!(placement.generation, 2);
+    assert_at_or_above_declared_rf(&machine, 2);
+    assert_eq!(intent_record(&machine), None);
+    let Some(MetaValue::Segment(segment)) = machine.record(&MetaKey::Segment {
+        topic_uuid: TOPIC,
+        range_uuid: RANGE,
+        segment_uuid: SEGMENT,
+    }) else {
+        panic!("segment must exist");
+    };
+    assert_eq!(segment.state, SegmentState::Retired);
+}
+
+#[test]
+fn cancel_rebalance_before_proof_restores_placement() {
+    let mut requests = Requests(0);
+    let (mut machine, _root, segment_generation, replicas, spare) =
+        placed_segment_machine(&mut requests);
+    let from = replicas[0];
+
+    assert_eq!(
+        machine.apply(12, &propose_rebalance(&mut requests, from, spare, 0)),
+        MetadataResponse::Ack { generation: 1 }
+    );
+
+    // Stale CAS token is rejected without touching state.
+    assert_eq!(
+        machine.apply(13, &cancel_rebalance(&mut requests, 0)),
+        rejected(MetadataError::GenerationMismatch {
+            expected: 0,
+            actual: 1,
+        })
+    );
+    assert!(intent_record(&machine).is_some());
+
+    // The placement itself is locked while the intent is in flight.
+    assert_eq!(
+        machine.apply(
+            14,
+            &MetadataCommand::CommitSegmentPlacement {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: SEGMENT,
+                replication_factor: 2,
+                replica_nodes: replicas.clone(),
+                expected_segment_generation: segment_generation,
+                expected_placement_generation: Some(1),
+            }
+        ),
+        rejected(MetadataError::invalid_transition(
+            "placement is locked by an active rebalance intent"
+        ))
+    );
+
+    // Cancel restores the original replica set and drops the intent.
+    assert_eq!(
+        machine.apply(15, &cancel_rebalance(&mut requests, 1)),
+        MetadataResponse::Ack { generation: 2 }
+    );
+    let placement = placement_record(&machine);
+    assert_eq!(placement.replica_nodes, replicas);
+    assert_eq!(placement.declared_replication_factor, 2);
+    assert_eq!(placement.generation, 2);
+    assert_eq!(intent_record(&machine), None);
+
+    // Nothing left to cancel.
+    assert_eq!(
+        machine.apply(16, &cancel_rebalance(&mut requests, 2)),
+        rejected(MetadataError::NotFound)
+    );
+
+    // A fresh proposal is allowed again after the cancel.
+    assert_eq!(
+        machine.apply(17, &propose_rebalance(&mut requests, from, spare, 2)),
+        MetadataResponse::Ack { generation: 3 }
+    );
+}
+
+#[test]
+fn cancel_rebalance_after_matching_proof_is_rejected() {
+    let mut requests = Requests(0);
+    let (mut machine, root, segment_generation, replicas, spare) =
+        placed_segment_machine(&mut requests);
+    let from = replicas[0];
+
+    assert_eq!(
+        machine.apply(12, &propose_rebalance(&mut requests, from, spare, 0)),
+        MetadataResponse::Ack { generation: 1 }
+    );
+    assert_eq!(
+        machine.apply(
+            13,
+            &commit_proof(&mut requests, root, from, spare, segment_generation)
+        ),
+        MetadataResponse::Ack { generation: 0 }
+    );
+
+    // The verified copy is committed evidence; the move can only complete.
+    assert_eq!(
+        machine.apply(14, &cancel_rebalance(&mut requests, 1)),
+        rejected(MetadataError::invalid_transition(
+            "cannot cancel a rebalance whose replacement proof is committed"
+        ))
+    );
+    assert!(intent_record(&machine).is_some());
+    assert_eq!(placement_record(&machine).replica_nodes.len(), 3);
+}
+
+#[test]
+fn confirm_replica_retired_without_intent_preserves_declared_rf() {
+    let mut requests = Requests(0);
+    let (mut machine, root, segment_generation, replicas, spare) =
+        placed_segment_machine(&mut requests);
+    let (retiring, surviving) = (replicas[0], replicas[1]);
+
+    // Plain repair-style retirement: proof between two placed replicas.
+    assert_eq!(
+        machine.apply(
+            12,
+            &commit_proof(&mut requests, root, retiring, surviving, segment_generation)
+        ),
+        MetadataResponse::Ack { generation: 0 }
+    );
+
+    // A rebalance cannot start once a replacement proof already exists.
+    assert_eq!(
+        machine.apply(13, &propose_rebalance(&mut requests, retiring, spare, 0)),
+        rejected(MetadataError::invalid_transition(
+            "segment already has a committed replacement proof"
+        ))
+    );
+
+    assert_eq!(
+        machine.apply(
+            14,
+            &MetadataCommand::PlanReplicaRetirement {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: SEGMENT,
+                retiring_node_uuid: retiring,
+                expected_segment_generation: segment_generation,
+                fencing_epoch: 1,
+            }
+        ),
+        MetadataResponse::Ack { generation: 2 }
+    );
+
+    // A rebalance also cannot start on a segment that is no longer Verified.
+    assert_eq!(
+        machine.apply(15, &propose_rebalance(&mut requests, surviving, spare, 0)),
+        rejected(MetadataError::invalid_transition(
+            "rebalance requires a verified segment"
+        ))
+    );
+
+    assert_eq!(
+        machine.apply(
+            16,
+            &MetadataCommand::ConfirmReplicaRetired {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: SEGMENT,
+                retiring_node_uuid: retiring,
+                expected_segment_generation: 2,
+            }
+        ),
+        MetadataResponse::Ack { generation: 3 }
+    );
+
+    // Regression: the declared factor survives the shrink instead of being
+    // rewritten to the post-retirement list length.
+    let placement = placement_record(&machine);
+    assert_eq!(placement.replica_nodes, vec![surviving]);
+    assert_eq!(placement.declared_replication_factor, 2);
+    assert_eq!(placement.generation, 1);
+}
+
+#[test]
+fn propose_rebalance_rejects_every_bad_shape_deterministically() {
+    let mut requests = Requests(0);
+    let (mut machine, _root, _segment_generation, replicas, spare) =
+        placed_segment_machine(&mut requests);
+    let from = replicas[0];
+    const NODE_D: Uuid = Uuid::from_u128(0x13);
+
+    // Unknown segment, then unknown destination node.
+    assert_eq!(
+        machine.apply(
+            12,
+            &MetadataCommand::ProposeRebalance {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: Uuid::from_u128(0x99),
+                from_node_uuid: from,
+                to_node_uuid: spare,
+                expected_placement_generation: 0,
+            }
+        ),
+        rejected(MetadataError::NotFound)
+    );
+    assert_eq!(
+        machine.apply(13, &propose_rebalance(&mut requests, from, NODE_D, 0)),
+        rejected(MetadataError::NotFound)
+    );
+
+    // Stale placement CAS.
+    assert_eq!(
+        machine.apply(14, &propose_rebalance(&mut requests, from, spare, 5)),
+        rejected(MetadataError::GenerationMismatch {
+            expected: 5,
+            actual: 0,
+        })
+    );
+
+    // Source and destination must differ; source must be placed; the
+    // destination must not already be placed.
+    assert_eq!(
+        machine.apply(15, &propose_rebalance(&mut requests, from, from, 0)),
+        rejected(MetadataError::invalid_transition(
+            "rebalance source and destination must differ"
+        ))
+    );
+    assert_eq!(
+        machine.apply(16, &register_node(&mut requests, NODE_D)),
+        MetadataResponse::Ack { generation: 0 }
+    );
+    assert_eq!(
+        machine.apply(17, &propose_rebalance(&mut requests, spare, NODE_D, 0)),
+        rejected(MetadataError::invalid_transition(
+            "rebalance source is not in the current placement"
+        ))
+    );
+    assert_eq!(
+        machine.apply(18, &propose_rebalance(&mut requests, from, replicas[1], 0)),
+        rejected(MetadataError::invalid_transition(
+            "rebalance destination is already in the placement"
+        ))
+    );
+
+    // A draining destination cannot receive a rebalance.
+    assert_eq!(
+        machine.apply(
+            19,
+            &MetadataCommand::SetNodeState {
+                env: requests.next(),
+                node_uuid: spare,
+                state: NodeState::Draining,
+                expected_generation: 1,
+            }
+        ),
+        MetadataResponse::Ack { generation: 2 }
+    );
+    assert_eq!(
+        machine.apply(20, &propose_rebalance(&mut requests, from, spare, 0)),
+        rejected(MetadataError::invalid_transition(format!(
+            "rebalance destination {spare} is draining, not active"
+        )))
+    );
+
+    // Nothing above mutated the placement or created an intent.
+    let placement = placement_record(&machine);
+    assert_eq!(placement.replica_nodes, replicas);
+    assert_eq!(placement.generation, 0);
+    assert_eq!(intent_record(&machine), None);
+}
+
+#[test]
+fn snapshots_round_trip_active_rebalance_intents_byte_exactly() {
+    fn drive(requests: &mut Requests) -> MetaStateMachine {
+        let (mut machine, _root, _segment_generation, replicas, spare) =
+            placed_segment_machine(requests);
+        assert_eq!(
+            machine.apply(12, &propose_rebalance(requests, replicas[0], spare, 0)),
+            MetadataResponse::Ack { generation: 1 }
+        );
+        machine
+    }
+
+    let machine_a = drive(&mut Requests(0));
+    let machine_b = drive(&mut Requests(0));
+
+    // Independently driven instances agree byte-for-byte with an intent live.
+    let encoded_a = machine_a.encode_snapshot().unwrap();
+    let encoded_b = machine_b.encode_snapshot().unwrap();
+    assert_eq!(encoded_a, encoded_b);
+
+    // Restore preserves the intent, the RF + 1 placement, and the dedup FIFO,
+    // and re-encodes to the identical byte string.
+    let decoded = MetaStateMachine::decode_snapshot(&encoded_a).unwrap();
+    assert_eq!(decoded.encode_snapshot().unwrap(), encoded_a);
+    assert_eq!(decoded, machine_a);
+    let intent = intent_record(&decoded).expect("intent must survive restore");
+    assert_eq!(intent.proposed_at_apply_index, 12);
+    assert_eq!(intent.placement_generation_at_proposal, 0);
+    let placement = placement_record(&decoded);
+    assert_eq!(placement.replica_nodes.len(), 3);
+    assert_eq!(placement.declared_replication_factor, 2);
 }

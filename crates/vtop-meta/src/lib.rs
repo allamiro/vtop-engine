@@ -58,8 +58,8 @@ pub use raft::{
 pub use state::{
     ConsumerGroupRecord, CursorCheckpointRecord, GroupMemberRecord, GroupNameRecord, KeyRecord,
     KeyState, LeaseRecord, MetaStateMachine, MetaValue, NodeRecord, RangeRecord,
-    ReplacementProofRecord, SegmentPlacementRecord, SegmentRecord, SegmentState, TopicNameRecord,
-    TopicRecord, DEDUP_CAPACITY,
+    RebalanceIntentRecord, ReplacementProofRecord, SegmentPlacementRecord, SegmentRecord,
+    SegmentState, TopicNameRecord, TopicRecord, DEDUP_CAPACITY,
 };
 pub use storage::hardstate::{HardState, HardStateFile};
 pub use storage::log::{

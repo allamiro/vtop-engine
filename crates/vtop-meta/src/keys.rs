@@ -37,6 +37,7 @@ const CATEGORY_GROUP_MEMBER: u8 = 11;
 const CATEGORY_GROUP_CURSOR: u8 = 12;
 const CATEGORY_SEGMENT_PLACEMENT: u8 = 13;
 const CATEGORY_SEGMENT_REPLACEMENT_PROOF: u8 = 14;
+const CATEGORY_SEGMENT_REBALANCE_INTENT: u8 = 15;
 
 /// Consumer-group names reuse the topic-name bound so group identity stays
 /// allocation-bounded on the wire and in snapshots.
@@ -113,6 +114,13 @@ pub enum MetaKey {
         range_uuid: Uuid,
         segment_uuid: Uuid,
     },
+    /// The single in-flight rebalance move for a segment; its presence blocks
+    /// a second proposal until the move completes or is cancelled.
+    SegmentRebalanceIntent {
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        segment_uuid: Uuid,
+    },
 }
 
 /// Validate a topic name against the shared 249-byte semantics.
@@ -156,6 +164,7 @@ impl MetaKey {
             MetaKey::GroupCursor { .. } => CATEGORY_GROUP_CURSOR,
             MetaKey::SegmentPlacement { .. } => CATEGORY_SEGMENT_PLACEMENT,
             MetaKey::SegmentReplacementProof { .. } => CATEGORY_SEGMENT_REPLACEMENT_PROOF,
+            MetaKey::SegmentRebalanceIntent { .. } => CATEGORY_SEGMENT_REBALANCE_INTENT,
         }
     }
 
@@ -217,6 +226,15 @@ impl MetaKey {
                 put_uuid(&mut out, *segment_uuid);
             }
             MetaKey::SegmentReplacementProof {
+                topic_uuid,
+                range_uuid,
+                segment_uuid,
+            } => {
+                put_uuid(&mut out, *topic_uuid);
+                put_uuid(&mut out, *range_uuid);
+                put_uuid(&mut out, *segment_uuid);
+            }
+            MetaKey::SegmentRebalanceIntent {
                 topic_uuid,
                 range_uuid,
                 segment_uuid,
@@ -312,6 +330,11 @@ impl MetaKey {
                 range_uuid: reader.uuid("range uuid")?,
                 segment_uuid: reader.uuid("segment uuid")?,
             },
+            CATEGORY_SEGMENT_REBALANCE_INTENT => MetaKey::SegmentRebalanceIntent {
+                topic_uuid: reader.uuid("topic uuid")?,
+                range_uuid: reader.uuid("range uuid")?,
+                segment_uuid: reader.uuid("segment uuid")?,
+            },
             other => {
                 return Err(CodecError::UnknownTag {
                     what: "meta key category",
@@ -389,6 +412,14 @@ impl fmt::Display for MetaKey {
                 formatter,
                 "/meta/0/segment-replacement-proof/{topic_uuid}/{range_uuid}/{segment_uuid}"
             ),
+            MetaKey::SegmentRebalanceIntent {
+                topic_uuid,
+                range_uuid,
+                segment_uuid,
+            } => write!(
+                formatter,
+                "/meta/0/segment-rebalance-intent/{topic_uuid}/{range_uuid}/{segment_uuid}"
+            ),
         }
     }
 }
@@ -445,6 +476,11 @@ mod tests {
                 segment_uuid: Uuid::from_u128(4),
             },
             MetaKey::SegmentReplacementProof {
+                topic_uuid: Uuid::from_u128(2),
+                range_uuid: Uuid::from_u128(3),
+                segment_uuid: Uuid::from_u128(4),
+            },
+            MetaKey::SegmentRebalanceIntent {
                 topic_uuid: Uuid::from_u128(2),
                 range_uuid: Uuid::from_u128(3),
                 segment_uuid: Uuid::from_u128(4),
