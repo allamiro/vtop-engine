@@ -790,21 +790,25 @@ impl LocalBroker {
                         }
                         // Re-validate the lease before publishing cluster commit.
                         // Fan-out released the meta lock; a steal observed here
-                        // must not advance the HWM under a fenced epoch.
-                        {
+                        // must not advance the HWM under a fenced epoch. Hold
+                        // the lock through advance_to and HWM propagation so a
+                        // concurrent steal cannot slip between the check and the
+                        // publication.
+                        let committed = {
                             let meta = self.meta_fencing_epoch.lock();
                             if let Err((code, message)) =
                                 self.check_range(&meta, &request.range, request.fencing_epoch)
                             {
                                 return error(request_id, stream_id, code, message);
                             }
-                        }
-                        let committed = cluster.advance_to(leader_committed);
-                        replicas.propagate_committed_hwm(&CommittedHwmUpdate {
-                            range: request.range,
-                            fencing_epoch: request.fencing_epoch,
-                            committed_high_watermark: committed,
-                        });
+                            let committed = cluster.advance_to(leader_committed);
+                            replicas.propagate_committed_hwm(&CommittedHwmUpdate {
+                                range: request.range.clone(),
+                                fencing_epoch: request.fencing_epoch,
+                                committed_high_watermark: committed,
+                            });
+                            committed
+                        };
                         WireFrame {
                             request_id,
                             stream_id,

@@ -240,11 +240,13 @@ fn parse_frame(bytes: &[u8], position: usize) -> FrameParse {
     let frame = &remaining[..total_bytes];
     let (authenticated, stored_checksum) = frame.split_at(total_bytes - CHECKSUM_LEN);
     if blake3::hash(authenticated).as_bytes() != stored_checksum {
-        // The final bytes of the file may be one torn write whose cut
-        // happened to land inside the checksum; anywhere else this is rot.
-        if remaining.len() == total_bytes {
-            return FrameParse::Torn;
-        }
+        // A torn write produces a *shorter* file, not a full-length frame
+        // with a valid frame_len but an invalid checksum. Classify a
+        // complete tail frame with bad checksum as corruption so recovery
+        // does not silently discard an applied entry.
+        //
+        // Only remaining trailing bytes *after* this frame indicate a mid-
+        // checksum tear on a non-final frame; that case is also corruption.
         return FrameParse::Corrupt("entry checksum mismatch".to_owned());
     }
     let term = u64::from_be_bytes(frame[12..20].try_into().expect("fixed slice"));

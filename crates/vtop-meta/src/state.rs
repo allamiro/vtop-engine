@@ -13,7 +13,7 @@
 
 use crate::command::{
     MetadataCommand, MetadataError, MetadataResponse, NodeState, RangeAssignment,
-    MAX_ASSIGNED_RANGES, MAX_NODE_ADDR_BYTES,
+    VerificationMethod, MAX_ASSIGNED_RANGES, MAX_NODE_ADDR_BYTES,
 };
 use crate::keys::{validate_group_name, validate_topic_name, MetaKey};
 use crate::placement::{
@@ -52,6 +52,7 @@ const VALUE_TAG_GROUP_MEMBER: u8 = 9;
 const VALUE_TAG_GROUP_MEMBER_V2: u8 = 11;
 const VALUE_TAG_GROUP_CURSOR: u8 = 10;
 const VALUE_TAG_SEGMENT_PLACEMENT: u8 = 13;
+const VALUE_TAG_REPLACEMENT_PROOF: u8 = 14;
 
 /// A registered broker/controller node.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,6 +110,14 @@ pub struct RangeRecord {
 pub enum SegmentState {
     SealedUnverified,
     Verified,
+    /// Replacement verification in progress; still not retireable.
+    Repairing,
+    /// Retirement authorized by a committed ReplacementProof.
+    RetirePlanned,
+    /// Physical retirement effect confirmed.
+    Retired,
+    /// Bytes failed verification; must not be served.
+    Quarantined,
 }
 
 /// A sealed segment registered against a range under a fencing epoch.
@@ -185,6 +194,22 @@ pub struct SegmentPlacementRecord {
     pub committed_apply_index: u64,
 }
 
+/// Authenticated evidence that a replacement replica matches sealed identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplacementProofRecord {
+    pub generation: u64,
+    pub segment_generation: u64,
+    pub content_root: [u8; 32],
+    pub expected_length_bytes: u64,
+    pub source_node_uuid: Uuid,
+    pub destination_node_uuid: Uuid,
+    pub fencing_epoch: u64,
+    pub verification_method: VerificationMethod,
+    pub verifier_node_uuid: Uuid,
+    pub verified_at_apply_index: u64,
+    pub verified_term: u64,
+}
+
 /// A typed record value stored under an encoded [`MetaKey`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MetaValue {
@@ -199,6 +224,7 @@ pub enum MetaValue {
     GroupMember(GroupMemberRecord),
     GroupCursor(CursorCheckpointRecord),
     SegmentPlacement(SegmentPlacementRecord),
+    ReplacementProof(ReplacementProofRecord),
 }
 
 impl MetaValue {
@@ -261,6 +287,10 @@ impl MetaValue {
                     match segment.state {
                         SegmentState::SealedUnverified => 1,
                         SegmentState::Verified => 2,
+                        SegmentState::Repairing => 3,
+                        SegmentState::RetirePlanned => 4,
+                        SegmentState::Retired => 5,
+                        SegmentState::Quarantined => 6,
                     },
                 );
                 put_u64(&mut out, segment.sealed_by_epoch);
@@ -321,6 +351,25 @@ impl MetaValue {
                 put_u8(&mut out, placement.replication_factor);
                 put_u64(&mut out, placement.committed_apply_index);
                 encode_replica_nodes(&mut out, &placement.replica_nodes)?;
+            }
+            MetaValue::ReplacementProof(proof) => {
+                put_u8(&mut out, VALUE_TAG_REPLACEMENT_PROOF);
+                put_u64(&mut out, proof.generation);
+                put_u64(&mut out, proof.segment_generation);
+                put_bytes32(&mut out, &proof.content_root);
+                put_u64(&mut out, proof.expected_length_bytes);
+                put_uuid(&mut out, proof.source_node_uuid);
+                put_uuid(&mut out, proof.destination_node_uuid);
+                put_u64(&mut out, proof.fencing_epoch);
+                put_u8(
+                    &mut out,
+                    match proof.verification_method {
+                        VerificationMethod::AuthenticatedContentRoot => 1,
+                    },
+                );
+                put_uuid(&mut out, proof.verifier_node_uuid);
+                put_u64(&mut out, proof.verified_at_apply_index);
+                put_u64(&mut out, proof.verified_term);
             }
         }
         Ok(out)
@@ -386,6 +435,10 @@ impl MetaValue {
                 state: match reader.u8("segment state")? {
                     1 => SegmentState::SealedUnverified,
                     2 => SegmentState::Verified,
+                    3 => SegmentState::Repairing,
+                    4 => SegmentState::RetirePlanned,
+                    5 => SegmentState::Retired,
+                    6 => SegmentState::Quarantined,
                     other => {
                         return Err(CodecError::UnknownTag {
                             what: "segment state",
@@ -458,6 +511,21 @@ impl MetaValue {
                 replication_factor: reader.u8("replication factor")?,
                 committed_apply_index: reader.u64("placement apply index")?,
                 replica_nodes: decode_replica_nodes(&mut reader)?,
+            }),
+            VALUE_TAG_REPLACEMENT_PROOF => MetaValue::ReplacementProof(ReplacementProofRecord {
+                generation: reader.u64("proof generation")?,
+                segment_generation: reader.u64("proof segment generation")?,
+                content_root: reader.bytes32("proof content root")?,
+                expected_length_bytes: reader.u64("proof expected length")?,
+                source_node_uuid: reader.uuid("proof source node")?,
+                destination_node_uuid: reader.uuid("proof destination node")?,
+                fencing_epoch: reader.u64("proof fencing epoch")?,
+                verification_method: VerificationMethod::from_wire(
+                    reader.u8("proof verification method")?,
+                )?,
+                verifier_node_uuid: reader.uuid("proof verifier node")?,
+                verified_at_apply_index: reader.u64("proof verified apply index")?,
+                verified_term: reader.u64("proof verified term")?,
             }),
             other => {
                 return Err(CodecError::UnknownTag {
@@ -714,6 +782,67 @@ impl MetaStateMachine {
                 replica_nodes,
                 *expected_segment_generation,
                 *expected_placement_generation,
+            ),
+            MetadataCommand::CommitReplacementProof {
+                topic_uuid,
+                range_uuid,
+                segment_uuid,
+                expected_segment_generation,
+                content_root,
+                expected_length_bytes,
+                source_node_uuid,
+                destination_node_uuid,
+                fencing_epoch,
+                verification_method,
+                verifier_node_uuid,
+                verified_term,
+                ..
+            } => self.commit_replacement_proof(
+                apply_index,
+                CommitReplacementProofArgs {
+                    topic_uuid: *topic_uuid,
+                    range_uuid: *range_uuid,
+                    segment_uuid: *segment_uuid,
+                    expected_segment_generation: *expected_segment_generation,
+                    content_root: *content_root,
+                    expected_length_bytes: *expected_length_bytes,
+                    source_node_uuid: *source_node_uuid,
+                    destination_node_uuid: *destination_node_uuid,
+                    fencing_epoch: *fencing_epoch,
+                    verification_method: *verification_method,
+                    verifier_node_uuid: *verifier_node_uuid,
+                    verified_term: *verified_term,
+                },
+            ),
+            MetadataCommand::PlanReplicaRetirement {
+                topic_uuid,
+                range_uuid,
+                segment_uuid,
+                retiring_node_uuid,
+                expected_segment_generation,
+                fencing_epoch,
+                ..
+            } => self.plan_replica_retirement(
+                *topic_uuid,
+                *range_uuid,
+                *segment_uuid,
+                *retiring_node_uuid,
+                *expected_segment_generation,
+                *fencing_epoch,
+            ),
+            MetadataCommand::ConfirmReplicaRetired {
+                topic_uuid,
+                range_uuid,
+                segment_uuid,
+                retiring_node_uuid,
+                expected_segment_generation,
+                ..
+            } => self.confirm_replica_retired(
+                *topic_uuid,
+                *range_uuid,
+                *segment_uuid,
+                *retiring_node_uuid,
+                *expected_segment_generation,
             ),
         }
     }
@@ -1713,6 +1842,307 @@ impl MetaStateMachine {
         }
     }
 
+    fn commit_replacement_proof(
+        &mut self,
+        apply_index: u64,
+        args: CommitReplacementProofArgs,
+    ) -> MetadataResponse {
+        if args.source_node_uuid == args.destination_node_uuid {
+            return reject(MetadataError::invalid_transition(
+                "replacement source and destination must differ",
+            ));
+        }
+        if args.expected_length_bytes == 0 {
+            return reject(MetadataError::limit(
+                "replacement expected length must be > 0",
+            ));
+        }
+        // Only authenticated content-root verification may authorize retirement.
+        if args.verification_method != VerificationMethod::AuthenticatedContentRoot {
+            return reject(MetadataError::invalid_transition(
+                "unsupported verification method for replacement proof",
+            ));
+        }
+
+        let range_key = MetaKey::Range {
+            topic_uuid: args.topic_uuid,
+            range_uuid: args.range_uuid,
+        }
+        .encode();
+        let Some(MetaValue::Range(range)) = self.records.get(&range_key) else {
+            return reject(MetadataError::NotFound);
+        };
+        let Some(lease) = range.lease.as_ref() else {
+            return reject(MetadataError::invalid_transition(
+                "range holds no active lease for replacement proof",
+            ));
+        };
+        if args.fencing_epoch != lease.fencing_epoch {
+            return reject(MetadataError::EpochMismatch {
+                expected: args.fencing_epoch,
+                actual: lease.fencing_epoch,
+            });
+        }
+
+        let segment_key = MetaKey::Segment {
+            topic_uuid: args.topic_uuid,
+            range_uuid: args.range_uuid,
+            segment_uuid: args.segment_uuid,
+        }
+        .encode();
+        let Some(MetaValue::Segment(segment)) = self.records.get(&segment_key) else {
+            return reject(MetadataError::NotFound);
+        };
+        if segment.segment_generation != args.expected_segment_generation {
+            return reject(MetadataError::GenerationMismatch {
+                expected: args.expected_segment_generation,
+                actual: segment.segment_generation,
+            });
+        }
+        if !matches!(
+            segment.state,
+            SegmentState::Verified | SegmentState::Repairing
+        ) {
+            return reject(MetadataError::invalid_transition(
+                "replacement proof requires a verified or repairing segment",
+            ));
+        }
+        if segment.content_root != args.content_root {
+            return reject(MetadataError::invalid_transition(
+                "replacement proof content root does not match sealed segment",
+            ));
+        }
+
+        for node_uuid in [
+            args.source_node_uuid,
+            args.destination_node_uuid,
+            args.verifier_node_uuid,
+        ] {
+            let node_key = MetaKey::Node { node_uuid }.encode();
+            let Some(MetaValue::Node(node)) = self.records.get(&node_key) else {
+                return reject(MetadataError::NotFound);
+            };
+            if node.state == NodeState::Dead {
+                return reject(MetadataError::invalid_transition(
+                    "replacement proof references a dead node",
+                ));
+            }
+        }
+
+        let proof_key = MetaKey::SegmentReplacementProof {
+            topic_uuid: args.topic_uuid,
+            range_uuid: args.range_uuid,
+            segment_uuid: args.segment_uuid,
+        }
+        .encode();
+        if self.records.contains_key(&proof_key) {
+            return reject(MetadataError::AlreadyExists);
+        }
+        self.records.insert(
+            proof_key,
+            MetaValue::ReplacementProof(ReplacementProofRecord {
+                generation: 0,
+                segment_generation: args.expected_segment_generation,
+                content_root: args.content_root,
+                expected_length_bytes: args.expected_length_bytes,
+                source_node_uuid: args.source_node_uuid,
+                destination_node_uuid: args.destination_node_uuid,
+                fencing_epoch: args.fencing_epoch,
+                verification_method: args.verification_method,
+                verifier_node_uuid: args.verifier_node_uuid,
+                verified_at_apply_index: apply_index,
+                verified_term: args.verified_term,
+            }),
+        );
+        MetadataResponse::Ack { generation: 0 }
+    }
+
+    fn plan_replica_retirement(
+        &mut self,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        segment_uuid: Uuid,
+        retiring_node_uuid: Uuid,
+        expected_segment_generation: u64,
+        fencing_epoch: u64,
+    ) -> MetadataResponse {
+        let range_key = MetaKey::Range {
+            topic_uuid,
+            range_uuid,
+        }
+        .encode();
+        let Some(MetaValue::Range(range)) = self.records.get(&range_key) else {
+            return reject(MetadataError::NotFound);
+        };
+        let Some(lease) = range.lease.as_ref() else {
+            return reject(MetadataError::invalid_transition(
+                "range holds no active lease for retirement planning",
+            ));
+        };
+        if fencing_epoch != lease.fencing_epoch {
+            return reject(MetadataError::EpochMismatch {
+                expected: fencing_epoch,
+                actual: lease.fencing_epoch,
+            });
+        }
+
+        let proof_key = MetaKey::SegmentReplacementProof {
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+        }
+        .encode();
+        let Some(MetaValue::ReplacementProof(proof)) = self.records.get(&proof_key) else {
+            return reject(MetadataError::invalid_transition(
+                "replica retirement requires a committed replacement proof",
+            ));
+        };
+        if proof.segment_generation != expected_segment_generation {
+            return reject(MetadataError::GenerationMismatch {
+                expected: expected_segment_generation,
+                actual: proof.segment_generation,
+            });
+        }
+        if proof.fencing_epoch != fencing_epoch {
+            return reject(MetadataError::EpochMismatch {
+                expected: fencing_epoch,
+                actual: proof.fencing_epoch,
+            });
+        }
+        if proof.destination_node_uuid == retiring_node_uuid {
+            return reject(MetadataError::invalid_transition(
+                "cannot retire the verified replacement destination",
+            ));
+        }
+        if proof.source_node_uuid != retiring_node_uuid {
+            return reject(MetadataError::invalid_transition(
+                "retiring node is not the replacement proof source",
+            ));
+        }
+        let proof_content_root = proof.content_root;
+
+        let segment_key = MetaKey::Segment {
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+        }
+        .encode();
+        let Some(MetaValue::Segment(segment)) = self.records.get_mut(&segment_key) else {
+            return reject(MetadataError::NotFound);
+        };
+        if segment.segment_generation != expected_segment_generation {
+            return reject(MetadataError::GenerationMismatch {
+                expected: expected_segment_generation,
+                actual: segment.segment_generation,
+            });
+        }
+        if segment.content_root != proof_content_root {
+            return reject(MetadataError::invalid_transition(
+                "segment content root no longer matches replacement proof",
+            ));
+        }
+        if segment.state != SegmentState::Verified {
+            return reject(MetadataError::invalid_transition(
+                "retirement planning requires a verified segment",
+            ));
+        }
+        let Some(next_generation) = segment.segment_generation.checked_add(1) else {
+            return reject(MetadataError::limit(
+                "segment generation space is exhausted",
+            ));
+        };
+        segment.state = SegmentState::RetirePlanned;
+        segment.segment_generation = next_generation;
+        MetadataResponse::Ack {
+            generation: next_generation,
+        }
+    }
+
+    fn confirm_replica_retired(
+        &mut self,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        segment_uuid: Uuid,
+        retiring_node_uuid: Uuid,
+        expected_segment_generation: u64,
+    ) -> MetadataResponse {
+        let proof_key = MetaKey::SegmentReplacementProof {
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+        }
+        .encode();
+        let Some(MetaValue::ReplacementProof(proof)) = self.records.get(&proof_key) else {
+            return reject(MetadataError::invalid_transition(
+                "replica retirement confirmation requires a committed replacement proof",
+            ));
+        };
+        if proof.source_node_uuid != retiring_node_uuid {
+            return reject(MetadataError::invalid_transition(
+                "retiring node is not the replacement proof source",
+            ));
+        }
+        let destination = proof.destination_node_uuid;
+
+        let segment_key = MetaKey::Segment {
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+        }
+        .encode();
+        let Some(MetaValue::Segment(segment)) = self.records.get_mut(&segment_key) else {
+            return reject(MetadataError::NotFound);
+        };
+        if segment.segment_generation != expected_segment_generation {
+            return reject(MetadataError::GenerationMismatch {
+                expected: expected_segment_generation,
+                actual: segment.segment_generation,
+            });
+        }
+        if segment.state != SegmentState::RetirePlanned {
+            return reject(MetadataError::invalid_transition(
+                "retirement confirmation requires RETIRE_PLANNED",
+            ));
+        }
+        let Some(next_generation) = segment.segment_generation.checked_add(1) else {
+            return reject(MetadataError::limit(
+                "segment generation space is exhausted",
+            ));
+        };
+        segment.state = SegmentState::Retired;
+        segment.segment_generation = next_generation;
+
+        // Drop the retiring replica from durable placement when present; the
+        // verified destination must remain.
+        let placement_key = MetaKey::SegmentPlacement {
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+        }
+        .encode();
+        if let Some(MetaValue::SegmentPlacement(placement)) = self.records.get_mut(&placement_key) {
+            if !placement.replica_nodes.contains(&destination) {
+                return reject(MetadataError::invalid_transition(
+                    "placement no longer contains the verified replacement destination",
+                ));
+            }
+            placement
+                .replica_nodes
+                .retain(|node| *node != retiring_node_uuid);
+            placement.replication_factor = placement.replica_nodes.len() as u8;
+            let Some(next_placement_generation) = placement.generation.checked_add(1) else {
+                return reject(MetadataError::limit(
+                    "placement generation space is exhausted",
+                ));
+            };
+            placement.generation = next_placement_generation;
+        }
+
+        MetadataResponse::Ack {
+            generation: next_generation,
+        }
+    }
+
     fn active_placement_candidates(&self) -> Vec<PlacementCandidate> {
         let mut candidates = Vec::new();
         for (key_bytes, value) in &self.records {
@@ -1892,6 +2322,10 @@ fn key_matches_value(key: &MetaKey, value: &MetaValue) -> bool {
                 MetaKey::SegmentPlacement { .. },
                 MetaValue::SegmentPlacement(_)
             )
+            | (
+                MetaKey::SegmentReplacementProof { .. },
+                MetaValue::ReplacementProof(_)
+            )
     )
 }
 
@@ -1909,6 +2343,21 @@ struct CommitCursorArgs {
     record_index: u64,
     lineage_transition_id: Option<Uuid>,
     expected_checkpoint_generation: Option<u64>,
+}
+
+struct CommitReplacementProofArgs {
+    topic_uuid: Uuid,
+    range_uuid: Uuid,
+    segment_uuid: Uuid,
+    expected_segment_generation: u64,
+    content_root: [u8; 32],
+    expected_length_bytes: u64,
+    source_node_uuid: Uuid,
+    destination_node_uuid: Uuid,
+    fencing_epoch: u64,
+    verification_method: VerificationMethod,
+    verifier_node_uuid: Uuid,
+    verified_term: u64,
 }
 
 fn cursor_is_forward_or_equal(
@@ -1933,12 +2382,14 @@ fn cursor_is_forward_or_equal(
         }
         return Ok(());
     }
-    // Different segment: require a non-decreasing record offset as a coarse
-    // forward signal until split/merge transition evidence lands in a later
-    // slice. Equal offsets across segment identity changes are rejected.
-    if args.record_offset < existing.record_offset {
+    // Different segment: require a strictly increasing record offset as a
+    // coarse forward signal until split/merge transition evidence lands in
+    // a later slice. Equal offsets across segment identity changes are
+    // rejected — the same numeric offset in a different segment is not
+    // proven to represent forward progress.
+    if args.record_offset <= existing.record_offset {
         return Err(MetadataError::invalid_transition(
-            "cursor moved backward across segment identity",
+            "cursor did not advance across segment identity change",
         ));
     }
     Ok(())

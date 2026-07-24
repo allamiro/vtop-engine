@@ -1897,3 +1897,148 @@ fn segment_placement_rejects_same_domain_when_replicas_require_distinctness() {
         ))
     );
 }
+
+#[test]
+fn replacement_proof_gates_replica_retirement() {
+    let mut requests = Requests(0);
+    let (mut machine, root, segment_generation) = verified_segment_machine(&mut requests);
+    assert_eq!(
+        machine.apply(6, &register_node(&mut requests, NODE_B)),
+        MetadataResponse::Ack { generation: 0 }
+    );
+
+    // Retirement without a proof is rejected.
+    assert_eq!(
+        machine.apply(
+            7,
+            &MetadataCommand::PlanReplicaRetirement {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: SEGMENT,
+                retiring_node_uuid: NODE,
+                expected_segment_generation: segment_generation,
+                fencing_epoch: 1,
+            }
+        ),
+        rejected(MetadataError::invalid_transition(
+            "replica retirement requires a committed replacement proof"
+        ))
+    );
+
+    // Stale fencing epoch is rejected on proof commit.
+    assert_eq!(
+        machine.apply(
+            8,
+            &MetadataCommand::CommitReplacementProof {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: SEGMENT,
+                expected_segment_generation: segment_generation,
+                content_root: root,
+                expected_length_bytes: 4096,
+                source_node_uuid: NODE,
+                destination_node_uuid: NODE_B,
+                fencing_epoch: 99,
+                verification_method: vtop_meta::VerificationMethod::AuthenticatedContentRoot,
+                verifier_node_uuid: NODE_B,
+                verified_term: 1,
+            }
+        ),
+        rejected(MetadataError::EpochMismatch {
+            expected: 99,
+            actual: 1,
+        })
+    );
+
+    assert_eq!(
+        machine.apply(
+            9,
+            &MetadataCommand::CommitReplacementProof {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: SEGMENT,
+                expected_segment_generation: segment_generation,
+                content_root: root,
+                expected_length_bytes: 4096,
+                source_node_uuid: NODE,
+                destination_node_uuid: NODE_B,
+                fencing_epoch: 1,
+                verification_method: vtop_meta::VerificationMethod::AuthenticatedContentRoot,
+                verifier_node_uuid: NODE_B,
+                verified_term: 1,
+            }
+        ),
+        MetadataResponse::Ack { generation: 0 }
+    );
+
+    // Wrong content root rejected before planning.
+    assert_eq!(
+        machine.apply(
+            10,
+            &MetadataCommand::PlanReplicaRetirement {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: SEGMENT,
+                retiring_node_uuid: NODE_B,
+                expected_segment_generation: segment_generation,
+                fencing_epoch: 1,
+            }
+        ),
+        rejected(MetadataError::invalid_transition(
+            "cannot retire the verified replacement destination"
+        ))
+    );
+
+    assert_eq!(
+        machine.apply(
+            11,
+            &MetadataCommand::PlanReplicaRetirement {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: SEGMENT,
+                retiring_node_uuid: NODE,
+                expected_segment_generation: segment_generation,
+                fencing_epoch: 1,
+            }
+        ),
+        MetadataResponse::Ack { generation: 2 }
+    );
+
+    let Some(MetaValue::Segment(segment)) = machine.record(&MetaKey::Segment {
+        topic_uuid: TOPIC,
+        range_uuid: RANGE,
+        segment_uuid: SEGMENT,
+    }) else {
+        panic!("segment must exist");
+    };
+    assert_eq!(segment.state, SegmentState::RetirePlanned);
+    assert_eq!(segment.segment_generation, 2);
+
+    assert_eq!(
+        machine.apply(
+            12,
+            &MetadataCommand::ConfirmReplicaRetired {
+                env: requests.next(),
+                topic_uuid: TOPIC,
+                range_uuid: RANGE,
+                segment_uuid: SEGMENT,
+                retiring_node_uuid: NODE,
+                expected_segment_generation: 2,
+            }
+        ),
+        MetadataResponse::Ack { generation: 3 }
+    );
+    let Some(MetaValue::Segment(segment)) = machine.record(&MetaKey::Segment {
+        topic_uuid: TOPIC,
+        range_uuid: RANGE,
+        segment_uuid: SEGMENT,
+    }) else {
+        panic!("segment must exist");
+    };
+    assert_eq!(segment.state, SegmentState::Retired);
+}

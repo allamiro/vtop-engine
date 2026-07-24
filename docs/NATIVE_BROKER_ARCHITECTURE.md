@@ -508,6 +508,20 @@ sequenceDiagram
 Repair is pull-based and idempotent. The destination verifies identity, epoch,
 length, and root; it does not trust a source-side “copy succeeded” response.
 
+Stage-8 metadata foundation (`vtop-meta`):
+
+- `CommitReplacementProof` records authenticated evidence (source,
+  destination, expected length, content root, segment generation, fencing
+  epoch, verification method, verifier, apply-index, consensus term) only
+  when the segment is `Verified`/`Repairing` and the fencing epoch matches
+  the live range lease.
+- `PlanReplicaRetirement` transitions `Verified -> RetirePlanned` only when
+  a matching proof is committed and the retiring node is the proof source
+  (never the verified destination).
+- `ConfirmReplicaRetired` transitions `RetirePlanned -> Retired` and drops
+  the retiring node from any durable `SegmentPlacement` while requiring the
+  verified destination to remain.
+
 ### 9.3 Verified tier retirement
 
 ```mermaid

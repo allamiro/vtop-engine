@@ -49,6 +49,9 @@ const COMMAND_KIND_HEARTBEAT_MEMBER: u16 = 14;
 const COMMAND_KIND_EXPIRE_STALE_MEMBER: u16 = 15;
 const COMMAND_KIND_SET_NODE_PLACEMENT_ATTRS: u16 = 16;
 const COMMAND_KIND_COMMIT_SEGMENT_PLACEMENT: u16 = 17;
+const COMMAND_KIND_COMMIT_REPLACEMENT_PROOF: u16 = 18;
+const COMMAND_KIND_PLAN_REPLICA_RETIREMENT: u16 = 19;
+const COMMAND_KIND_CONFIRM_REPLICA_RETIRED: u16 = 20;
 
 const RESPONSE_KIND_ACK: u16 = 1;
 const RESPONSE_KIND_TOPIC_CREATED: u16 = 2;
@@ -115,6 +118,31 @@ impl NodeState {
 impl std::fmt::Display for NodeState {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.as_str())
+    }
+}
+
+/// How replacement bytes were verified before retirement may be planned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerificationMethod {
+    /// Destination bytes match the authenticated segment content root.
+    AuthenticatedContentRoot,
+}
+
+impl VerificationMethod {
+    fn wire_tag(self) -> u8 {
+        match self {
+            VerificationMethod::AuthenticatedContentRoot => 1,
+        }
+    }
+
+    pub(crate) fn from_wire(tag: u8) -> Result<Self, CodecError> {
+        match tag {
+            1 => Ok(VerificationMethod::AuthenticatedContentRoot),
+            other => Err(CodecError::UnknownTag {
+                what: "verification method",
+                tag: u32::from(other),
+            }),
+        }
     }
 }
 
@@ -270,6 +298,43 @@ pub enum MetadataCommand {
         /// `None` for the first placement; `Some(g)` CAS-updates an existing one.
         expected_placement_generation: Option<u64>,
     },
+    /// Commit authenticated evidence that a replacement replica matches the
+    /// sealed segment identity, length, epoch, and content root.
+    CommitReplacementProof {
+        env: CommandEnvelope,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        segment_uuid: Uuid,
+        expected_segment_generation: u64,
+        content_root: [u8; 32],
+        expected_length_bytes: u64,
+        source_node_uuid: Uuid,
+        destination_node_uuid: Uuid,
+        fencing_epoch: u64,
+        verification_method: VerificationMethod,
+        verifier_node_uuid: Uuid,
+        /// Proposer-supplied consensus term recorded for audit; not a clock.
+        verified_term: u64,
+    },
+    /// Gate replica retirement on a committed matching ReplacementProof.
+    PlanReplicaRetirement {
+        env: CommandEnvelope,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        segment_uuid: Uuid,
+        retiring_node_uuid: Uuid,
+        expected_segment_generation: u64,
+        fencing_epoch: u64,
+    },
+    /// Confirm physical retirement effect after RETIRE_PLANNED.
+    ConfirmReplicaRetired {
+        env: CommandEnvelope,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        segment_uuid: Uuid,
+        retiring_node_uuid: Uuid,
+        expected_segment_generation: u64,
+    },
 }
 
 impl MetadataCommand {
@@ -291,7 +356,10 @@ impl MetadataCommand {
             | MetadataCommand::HeartbeatMember { env, .. }
             | MetadataCommand::ExpireStaleMember { env, .. }
             | MetadataCommand::SetNodePlacementAttrs { env, .. }
-            | MetadataCommand::CommitSegmentPlacement { env, .. } => env,
+            | MetadataCommand::CommitSegmentPlacement { env, .. }
+            | MetadataCommand::CommitReplacementProof { env, .. }
+            | MetadataCommand::PlanReplicaRetirement { env, .. }
+            | MetadataCommand::ConfirmReplicaRetired { env, .. } => env,
         }
     }
 
@@ -553,6 +621,70 @@ impl MetadataCommand {
                 put_u64(&mut out, *expected_segment_generation);
                 encode_optional_u64(&mut out, *expected_placement_generation);
             }
+            MetadataCommand::CommitReplacementProof {
+                env,
+                topic_uuid,
+                range_uuid,
+                segment_uuid,
+                expected_segment_generation,
+                content_root,
+                expected_length_bytes,
+                source_node_uuid,
+                destination_node_uuid,
+                fencing_epoch,
+                verification_method,
+                verifier_node_uuid,
+                verified_term,
+            } => {
+                put_u16(&mut out, COMMAND_KIND_COMMIT_REPLACEMENT_PROOF);
+                encode_envelope(&mut out, env);
+                put_uuid(&mut out, *topic_uuid);
+                put_uuid(&mut out, *range_uuid);
+                put_uuid(&mut out, *segment_uuid);
+                put_u64(&mut out, *expected_segment_generation);
+                put_bytes32(&mut out, content_root);
+                put_u64(&mut out, *expected_length_bytes);
+                put_uuid(&mut out, *source_node_uuid);
+                put_uuid(&mut out, *destination_node_uuid);
+                put_u64(&mut out, *fencing_epoch);
+                put_u8(&mut out, verification_method.wire_tag());
+                put_uuid(&mut out, *verifier_node_uuid);
+                put_u64(&mut out, *verified_term);
+            }
+            MetadataCommand::PlanReplicaRetirement {
+                env,
+                topic_uuid,
+                range_uuid,
+                segment_uuid,
+                retiring_node_uuid,
+                expected_segment_generation,
+                fencing_epoch,
+            } => {
+                put_u16(&mut out, COMMAND_KIND_PLAN_REPLICA_RETIREMENT);
+                encode_envelope(&mut out, env);
+                put_uuid(&mut out, *topic_uuid);
+                put_uuid(&mut out, *range_uuid);
+                put_uuid(&mut out, *segment_uuid);
+                put_uuid(&mut out, *retiring_node_uuid);
+                put_u64(&mut out, *expected_segment_generation);
+                put_u64(&mut out, *fencing_epoch);
+            }
+            MetadataCommand::ConfirmReplicaRetired {
+                env,
+                topic_uuid,
+                range_uuid,
+                segment_uuid,
+                retiring_node_uuid,
+                expected_segment_generation,
+            } => {
+                put_u16(&mut out, COMMAND_KIND_CONFIRM_REPLICA_RETIRED);
+                encode_envelope(&mut out, env);
+                put_uuid(&mut out, *topic_uuid);
+                put_uuid(&mut out, *range_uuid);
+                put_uuid(&mut out, *segment_uuid);
+                put_uuid(&mut out, *retiring_node_uuid);
+                put_u64(&mut out, *expected_segment_generation);
+            }
         }
         Ok(out)
     }
@@ -763,6 +895,54 @@ impl MetadataCommand {
                     )?,
                 })
             }
+            COMMAND_KIND_COMMIT_REPLACEMENT_PROOF => {
+                let env = decode_envelope(reader)?;
+                let topic_uuid = reader.uuid("topic uuid")?;
+                let range_uuid = reader.uuid("range uuid")?;
+                let segment_uuid = reader.uuid("segment uuid")?;
+                let expected_segment_generation = reader.u64("expected segment generation")?;
+                let content_root = reader.bytes32("content root")?;
+                let expected_length_bytes = reader.u64("expected length bytes")?;
+                let source_node_uuid = reader.uuid("source node uuid")?;
+                let destination_node_uuid = reader.uuid("destination node uuid")?;
+                let fencing_epoch = reader.u64("fencing epoch")?;
+                let verification_method =
+                    VerificationMethod::from_wire(reader.u8("verification method")?)?;
+                let verifier_node_uuid = reader.uuid("verifier node uuid")?;
+                let verified_term = reader.u64("verified term")?;
+                Ok(MetadataCommand::CommitReplacementProof {
+                    env,
+                    topic_uuid,
+                    range_uuid,
+                    segment_uuid,
+                    expected_segment_generation,
+                    content_root,
+                    expected_length_bytes,
+                    source_node_uuid,
+                    destination_node_uuid,
+                    fencing_epoch,
+                    verification_method,
+                    verifier_node_uuid,
+                    verified_term,
+                })
+            }
+            COMMAND_KIND_PLAN_REPLICA_RETIREMENT => Ok(MetadataCommand::PlanReplicaRetirement {
+                env: decode_envelope(reader)?,
+                topic_uuid: reader.uuid("topic uuid")?,
+                range_uuid: reader.uuid("range uuid")?,
+                segment_uuid: reader.uuid("segment uuid")?,
+                retiring_node_uuid: reader.uuid("retiring node uuid")?,
+                expected_segment_generation: reader.u64("expected segment generation")?,
+                fencing_epoch: reader.u64("fencing epoch")?,
+            }),
+            COMMAND_KIND_CONFIRM_REPLICA_RETIRED => Ok(MetadataCommand::ConfirmReplicaRetired {
+                env: decode_envelope(reader)?,
+                topic_uuid: reader.uuid("topic uuid")?,
+                range_uuid: reader.uuid("range uuid")?,
+                segment_uuid: reader.uuid("segment uuid")?,
+                retiring_node_uuid: reader.uuid("retiring node uuid")?,
+                expected_segment_generation: reader.u64("expected segment generation")?,
+            }),
             other => Err(CodecError::UnknownTag {
                 what: "command kind",
                 tag: u32::from(other),
@@ -1274,6 +1454,38 @@ mod tests {
                 replica_nodes: vec![Uuid::from_u128(10), Uuid::from_u128(11)],
                 expected_segment_generation: 1,
                 expected_placement_generation: None,
+            },
+            MetadataCommand::CommitReplacementProof {
+                env: envelope(19),
+                topic_uuid: Uuid::from_u128(20),
+                range_uuid: Uuid::from_u128(21),
+                segment_uuid: Uuid::from_u128(30),
+                expected_segment_generation: 1,
+                content_root: [7; 32],
+                expected_length_bytes: 4096,
+                source_node_uuid: Uuid::from_u128(10),
+                destination_node_uuid: Uuid::from_u128(11),
+                fencing_epoch: 3,
+                verification_method: VerificationMethod::AuthenticatedContentRoot,
+                verifier_node_uuid: Uuid::from_u128(11),
+                verified_term: 5,
+            },
+            MetadataCommand::PlanReplicaRetirement {
+                env: envelope(20),
+                topic_uuid: Uuid::from_u128(20),
+                range_uuid: Uuid::from_u128(21),
+                segment_uuid: Uuid::from_u128(30),
+                retiring_node_uuid: Uuid::from_u128(10),
+                expected_segment_generation: 1,
+                fencing_epoch: 3,
+            },
+            MetadataCommand::ConfirmReplicaRetired {
+                env: envelope(21),
+                topic_uuid: Uuid::from_u128(20),
+                range_uuid: Uuid::from_u128(21),
+                segment_uuid: Uuid::from_u128(30),
+                retiring_node_uuid: Uuid::from_u128(10),
+                expected_segment_generation: 2,
             },
         ]
     }

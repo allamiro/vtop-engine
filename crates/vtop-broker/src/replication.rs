@@ -117,6 +117,40 @@ impl InProcessFollower {
         meta_fencing_epoch: MetaFencingEpoch,
         cluster_committed: ClusterCommittedOffset,
     ) -> BrokerResult<Self> {
+        // Validate that the segment's embedded identity matches the range
+        // this follower is being constructed for. A mismatch means the
+        // caller supplied a segment for a different range, which would
+        // silently accept appends under the wrong identity.
+        let (seg_topic, seg_topic_epoch, seg_range_id, seg_generation) =
+            if let Some(desc) = segment.descriptor_v2() {
+                (
+                    desc.topic.as_str(),
+                    desc.topic_epoch,
+                    desc.lineage.range_id,
+                    desc.lineage.generation,
+                )
+            } else {
+                let desc = segment.descriptor();
+                (
+                    desc.topic.as_str(),
+                    desc.topic_epoch,
+                    desc.lineage.range_id,
+                    desc.lineage.generation,
+                )
+            };
+        if seg_topic != range.topic
+            || seg_topic_epoch != range.topic_epoch
+            || seg_range_id != range.range_id
+            || seg_generation != range.range_generation
+        {
+            return Err(BrokerError::InvalidConfig(format!(
+                "follower segment identity ({seg_topic}, epoch {seg_topic_epoch}, \
+                 {seg_range_id}, generation {seg_generation}) does not match range \
+                 ({}, epoch {}, {}, generation {})",
+                range.topic, range.topic_epoch, range.range_id, range.range_generation,
+            )));
+        }
+
         let segment_format = if segment.format_version() == vtop_log::FORMAT_VERSION_V2 {
             SegmentFormat::V2
         } else {
