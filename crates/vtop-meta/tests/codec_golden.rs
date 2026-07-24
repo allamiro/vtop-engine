@@ -68,6 +68,39 @@ const GOLDEN_SNAPSHOT_FILE_HEX: &str = concat!(
     "b39964e2e2f1464a7da8fc9791a37d0e4375834e"
 );
 
+/// v1 state-machine snapshot payload containing the stage-8b retention
+/// records: a tier-copy evidence record and a topic retention policy, plus
+/// the node/topic/range/segment records and dedup FIFO that produced them.
+/// Pins the new value tags (17, 18) byte-exactly.
+const GOLDEN_RETENTION_PAYLOAD_HEX: &str = concat!(
+    "000100000007001300000211111111222243338444555555555555000000190c00076e31",
+    "3a39323030010000000000000000000000000064000b00000361756469742e7631000000",
+    "1903ffeeddccbbaa9988776655443322110000000000000000010013000004ffeeddccbb",
+    "aa998877665544332211000000001b02000861756469742e763100000000000000010000",
+    "0000000000000023000005ffeeddccbbaa998877665544332211000f1e2d3c4b5a697887",
+    "96a5b4c3d2e1f00000003b04000000000000000200000000000000000000000000000000",
+    "010111111111222243338444555555555555000000000000000100000000000000030033",
+    "000006ffeeddccbbaa998877665544332211000f1e2d3c4b5a69788796a5b4c3d2e1f0aa",
+    "aaaaaabbbb4ccc8dddeeeeeeeeeeee000000420500000000000000010000000000000000",
+    "0000000000000080abababababababababababababababababababababababababababab",
+    "abababab0200000000000000010033000010ffeeddccbbaa998877665544332211000f1e",
+    "2d3c4b5a69788796a5b4c3d2e1f0aaaaaaaabbbb4ccc8dddeeeeeeeeeeee000000db1100",
+    "000000000000000000000000000001ababababababababababababababababababababab",
+    "ababababababababababab0000000000001000000973332d6e6174697665002973333a2f",
+    "2f746965722f6e61746976652f61756469742e76312f7365676d656e742e7365676d656e",
+    "7401002033734c346b71434a6f3035714f574268427170664f464164543464524a567656",
+    "5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d01111111",
+    "112222433384445555555555550000000000000006000000000000000200000000000000",
+    "010013000011ffeeddccbbaa998877665544332211000000000a12000000000000000000",
+    "00000007000000000000000000009300000000010000000a000100000000000000000000",
+    "00000000000000009300000000020000002a0002ffeeddccbbaa99887766554433221100",
+    "00000000000000010f1e2d3c4b5a69788796a5b4c3d2e1f0000000000000000000009300",
+    "000000030000000a00030000000000000001000000000000000000009300000000040000",
+    "000a00010000000000000002000000000000000000009300000000050000000a00010000",
+    "000000000001000000000000000000009300000000060000000a00010000000000000000",
+    "000000000000000000009300000000070000000a00010000000000000000",
+);
+
 fn cluster_id() -> Uuid {
     Uuid::parse_str("c1c1c1c1-0000-4000-8000-000000000001").unwrap()
 }
@@ -303,6 +336,136 @@ fn v1_log_rejects_corruption_trailing_oversize_unknown_version_and_foreign_clust
         MetaLog::open_in(&env, ROOT, cluster_id(), MetaLogConfig::default()),
         Err(MetaStoreError::Corrupt { .. })
     ));
+}
+
+/// Drive the deterministic command sequence that produces the stage-8b
+/// retention records: register node, create topic, grant, seal, verify,
+/// commit tier evidence, set the retention policy.
+fn retention_machine() -> MetaStateMachine {
+    let env = |request: u128| CommandEnvelope {
+        request_id: Uuid::from_u128(0x9300_0000_0000 + request),
+        issued_at_ms: 0x0102_0304_0506_0708,
+    };
+    let node = Uuid::parse_str("11111111-2222-4333-8444-555555555555").unwrap();
+    let topic = Uuid::parse_str("ffeeddcc-bbaa-9988-7766-554433221100").unwrap();
+    let range = Uuid::parse_str("0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0").unwrap();
+    let segment = Uuid::parse_str("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee").unwrap();
+    let mut machine = MetaStateMachine::new();
+    machine.apply(
+        1,
+        &MetadataCommand::RegisterNode {
+            env: env(1),
+            node_uuid: node,
+            addr: "n1:9200".to_owned(),
+            expected_generation: None,
+        },
+    );
+    machine.apply(
+        2,
+        &MetadataCommand::CreateTopic {
+            env: env(2),
+            name: "audit.v1".to_owned(),
+            topic_uuid: topic,
+            root_range_uuid: range,
+        },
+    );
+    machine.apply(
+        3,
+        &MetadataCommand::GrantRangeLease {
+            env: env(3),
+            topic_uuid: topic,
+            range_uuid: range,
+            holder_node_uuid: node,
+            expected_range_generation: 0,
+        },
+    );
+    machine.apply(
+        4,
+        &MetadataCommand::RegisterSealedSegment {
+            env: env(4),
+            topic_uuid: topic,
+            range_uuid: range,
+            segment_uuid: segment,
+            segment_generation: 0,
+            base_offset: 0,
+            next_offset: 128,
+            content_root: [0xab; 32],
+            sealed_by_epoch: 1,
+            expected_range_generation: 1,
+        },
+    );
+    machine.apply(
+        5,
+        &MetadataCommand::MarkSegmentVerified {
+            env: env(5),
+            topic_uuid: topic,
+            range_uuid: range,
+            segment_uuid: segment,
+            content_root: [0xab; 32],
+            expected_generation: 0,
+        },
+    );
+    machine.apply(
+        6,
+        &MetadataCommand::CommitTierEvidence {
+            env: env(6),
+            topic_uuid: topic,
+            range_uuid: range,
+            segment_uuid: segment,
+            expected_segment_generation: 1,
+            content_root: [0xab; 32],
+            byte_length: 4096,
+            backend_id: "s3-native".to_owned(),
+            object_uri: "s3://tier/native/audit.v1/segment.segment".to_owned(),
+            manifest_version_id: Some("3sL4kqCJo05qOWBhBqpfOFAdT4dRJVvV".to_owned()),
+            manifest_core_digest: [0x5d; 32],
+            verification_method: vtop_meta::VerificationMethod::AuthenticatedContentRoot,
+            verifier_node_uuid: node,
+            fencing_epoch: 1,
+            verified_term: 2,
+        },
+    );
+    machine.apply(
+        7,
+        &MetadataCommand::SetTopicRetentionPolicy {
+            env: env(7),
+            topic_uuid: topic,
+            unarchived_deletion_allowed: false,
+            expected_generation: None,
+        },
+    );
+    machine
+}
+
+#[test]
+fn v1_snapshot_payload_with_retention_records_matches_golden_vector() {
+    let payload = retention_machine().encode_snapshot().unwrap();
+    assert_eq!(to_hex(&payload), GOLDEN_RETENTION_PAYLOAD_HEX);
+
+    // The pinned bytes decode back to the identical machine (fixed point),
+    // and the two new value tags are actually present in the vector.
+    let decoded = MetaStateMachine::decode_snapshot(&payload).unwrap();
+    assert_eq!(decoded.encode_snapshot().unwrap(), payload);
+    assert_eq!(decoded, retention_machine());
+
+    // An unknown verification-method tag inside the tier record must refuse
+    // to decode, never default. The method byte immediately follows the
+    // 32-byte manifest core digest (0x5d repeated), which appears exactly
+    // once in the payload.
+    let digest_start = payload
+        .windows(32)
+        .position(|window| window == [0x5d_u8; 32])
+        .expect("manifest core digest present exactly once");
+    let method_at = digest_start + 32;
+    assert_eq!(payload[method_at], 1);
+    let mut mutated = payload.clone();
+    mutated[method_at] = 9;
+    assert!(MetaStateMachine::decode_snapshot(&mutated).is_err());
+
+    // Trailing bytes are rejected as everywhere else.
+    let mut trailing = payload.clone();
+    trailing.push(0);
+    assert!(MetaStateMachine::decode_snapshot(&trailing).is_err());
 }
 
 #[test]

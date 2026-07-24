@@ -32,6 +32,17 @@ pub const MAX_ERROR_DETAIL_BYTES: usize = 256;
 /// bound without inviting rebalance storms in this slice.
 pub const MAX_ASSIGNED_RANGES: usize = 16;
 
+/// Bound for a tier backend identifier (`"s3-native"`, `"localfs"`, ...).
+pub const MAX_TIER_BACKEND_ID_BYTES: usize = 64;
+
+/// Bound for a tier object URI. Deliberately below S3's 1024-byte key limit
+/// so a max-size [`crate::state::TierCopyRecord`] stays inside the snapshot
+/// value bound with margin (the arithmetic is pinned in a state test).
+pub const MAX_TIER_OBJECT_URI_BYTES: usize = 512;
+
+/// Bound for an immutable object version id (S3 `x-amz-version-id`).
+pub const MAX_TIER_VERSION_ID_BYTES: usize = 128;
+
 const COMMAND_KIND_REGISTER_NODE: u16 = 1;
 const COMMAND_KIND_SET_NODE_STATE: u16 = 2;
 const COMMAND_KIND_CREATE_TOPIC: u16 = 3;
@@ -54,6 +65,11 @@ const COMMAND_KIND_PLAN_REPLICA_RETIREMENT: u16 = 19;
 const COMMAND_KIND_CONFIRM_REPLICA_RETIRED: u16 = 20;
 const COMMAND_KIND_PROPOSE_REBALANCE: u16 = 21;
 const COMMAND_KIND_CANCEL_REBALANCE: u16 = 22;
+const COMMAND_KIND_COMMIT_TIER_EVIDENCE: u16 = 23;
+const COMMAND_KIND_SET_TOPIC_RETENTION_POLICY: u16 = 24;
+const COMMAND_KIND_PLAN_RETENTION: u16 = 25;
+const COMMAND_KIND_CONFIRM_RETENTION_EXPIRED: u16 = 26;
+const COMMAND_KIND_CANCEL_RETENTION: u16 = 27;
 
 const RESPONSE_KIND_ACK: u16 = 1;
 const RESPONSE_KIND_TOPIC_CREATED: u16 = 2;
@@ -329,7 +345,9 @@ pub enum MetadataCommand {
         expected_segment_generation: u64,
         fencing_epoch: u64,
     },
-    /// Confirm physical retirement effect after RETIRE_PLANNED.
+    /// Confirm physical retirement effect after RETIRE_PLANNED. Consumes the
+    /// replacement proof; a segment with surviving placed replicas returns to
+    /// `Verified`, while an unplaced segment becomes `Retired`.
     ConfirmReplicaRetired {
         env: CommandEnvelope,
         topic_uuid: Uuid,
@@ -361,6 +379,78 @@ pub enum MetadataCommand {
         segment_uuid: Uuid,
         expected_placement_generation: u64,
     },
+    /// Commit verified cold-tier copy evidence for a sealed segment. The
+    /// upload and read-back verification happen out-of-band (vtopctl); only
+    /// *verified* facts enter the state machine — there is no unverified
+    /// tier-copy record, and the segment record itself is not mutated.
+    CommitTierEvidence {
+        env: CommandEnvelope,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        segment_uuid: Uuid,
+        expected_segment_generation: u64,
+        content_root: [u8; 32],
+        byte_length: u64,
+        backend_id: String,
+        /// Object URI of the tiered segment bytes; the manifest object is
+        /// `object_uri + ".manifest.json"` by convention (no separate field,
+        /// keeping the record inside the snapshot value bound).
+        object_uri: String,
+        /// Immutable manifest version pin (#135); `None` only when the
+        /// backend exposes no versions and the operator opted out.
+        manifest_version_id: Option<String>,
+        manifest_core_digest: [u8; 32],
+        verification_method: VerificationMethod,
+        verifier_node_uuid: Uuid,
+        fencing_epoch: u64,
+        /// Proposer-supplied consensus term recorded for audit; not a clock.
+        verified_term: u64,
+    },
+    /// Create or CAS-update a topic's retention policy. The absent record is
+    /// the fail-closed default: retention planning without tier evidence is
+    /// rejected unless an explicit committed policy allows it.
+    SetTopicRetentionPolicy {
+        env: CommandEnvelope,
+        topic_uuid: Uuid,
+        unarchived_deletion_allowed: bool,
+        /// `None` expects the policy to be absent (creation); `Some(g)` is a
+        /// CAS update of an existing record — the `RegisterNode` pattern.
+        expected_generation: Option<u64>,
+    },
+    /// Authorize whole-segment deletion: `Verified -> RetentionPlanned`,
+    /// gated on matching tier evidence (or an explicit policy override),
+    /// mutual exclusion with rebalance/repair, and durable group cursors.
+    PlanRetention {
+        env: CommandEnvelope,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        segment_uuid: Uuid,
+        expected_segment_generation: u64,
+        fencing_epoch: u64,
+    },
+    /// Confirm the physical deletion of every local replica after
+    /// `RetentionPlanned`: `RetentionPlanned -> RetentionExpired`, emptying
+    /// the placement replica set while preserving its declared factor. The
+    /// segment and tier-copy records are retained forever as the rehydration
+    /// pointer and corruption-audit anchor.
+    ConfirmRetentionExpired {
+        env: CommandEnvelope,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        segment_uuid: Uuid,
+        expected_segment_generation: u64,
+    },
+    /// Revert a mistaken plan before deletion is confirmed:
+    /// `RetentionPlanned -> Verified`. Local bytes were never deleted
+    /// (deletion is only authorized between plan and confirm), so the
+    /// reversal is safe.
+    CancelRetention {
+        env: CommandEnvelope,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        segment_uuid: Uuid,
+        expected_segment_generation: u64,
+    },
 }
 
 impl MetadataCommand {
@@ -387,7 +477,12 @@ impl MetadataCommand {
             | MetadataCommand::PlanReplicaRetirement { env, .. }
             | MetadataCommand::ConfirmReplicaRetired { env, .. }
             | MetadataCommand::ProposeRebalance { env, .. }
-            | MetadataCommand::CancelRebalance { env, .. } => env,
+            | MetadataCommand::CancelRebalance { env, .. }
+            | MetadataCommand::CommitTierEvidence { env, .. }
+            | MetadataCommand::SetTopicRetentionPolicy { env, .. }
+            | MetadataCommand::PlanRetention { env, .. }
+            | MetadataCommand::ConfirmRetentionExpired { env, .. }
+            | MetadataCommand::CancelRetention { env, .. } => env,
         }
     }
 
@@ -745,6 +840,117 @@ impl MetadataCommand {
                 put_uuid(&mut out, *segment_uuid);
                 put_u64(&mut out, *expected_placement_generation);
             }
+            MetadataCommand::CommitTierEvidence {
+                env,
+                topic_uuid,
+                range_uuid,
+                segment_uuid,
+                expected_segment_generation,
+                content_root,
+                byte_length,
+                backend_id,
+                object_uri,
+                manifest_version_id,
+                manifest_core_digest,
+                verification_method,
+                verifier_node_uuid,
+                fencing_epoch,
+                verified_term,
+            } => {
+                put_u16(&mut out, COMMAND_KIND_COMMIT_TIER_EVIDENCE);
+                encode_envelope(&mut out, env);
+                put_uuid(&mut out, *topic_uuid);
+                put_uuid(&mut out, *range_uuid);
+                put_uuid(&mut out, *segment_uuid);
+                put_u64(&mut out, *expected_segment_generation);
+                put_bytes32(&mut out, content_root);
+                put_u64(&mut out, *byte_length);
+                put_bounded_str(
+                    &mut out,
+                    backend_id,
+                    MAX_TIER_BACKEND_ID_BYTES,
+                    "backend id",
+                )?;
+                put_bounded_str(
+                    &mut out,
+                    object_uri,
+                    MAX_TIER_OBJECT_URI_BYTES,
+                    "object uri",
+                )?;
+                match manifest_version_id {
+                    None => put_u8(&mut out, 0),
+                    Some(version_id) => {
+                        put_u8(&mut out, 1);
+                        put_bounded_str(
+                            &mut out,
+                            version_id,
+                            MAX_TIER_VERSION_ID_BYTES,
+                            "manifest version id",
+                        )?;
+                    }
+                }
+                put_bytes32(&mut out, manifest_core_digest);
+                put_u8(&mut out, verification_method.wire_tag());
+                put_uuid(&mut out, *verifier_node_uuid);
+                put_u64(&mut out, *fencing_epoch);
+                put_u64(&mut out, *verified_term);
+            }
+            MetadataCommand::SetTopicRetentionPolicy {
+                env,
+                topic_uuid,
+                unarchived_deletion_allowed,
+                expected_generation,
+            } => {
+                put_u16(&mut out, COMMAND_KIND_SET_TOPIC_RETENTION_POLICY);
+                encode_envelope(&mut out, env);
+                put_uuid(&mut out, *topic_uuid);
+                put_u8(&mut out, u8::from(*unarchived_deletion_allowed));
+                encode_optional_u64(&mut out, *expected_generation);
+            }
+            MetadataCommand::PlanRetention {
+                env,
+                topic_uuid,
+                range_uuid,
+                segment_uuid,
+                expected_segment_generation,
+                fencing_epoch,
+            } => {
+                put_u16(&mut out, COMMAND_KIND_PLAN_RETENTION);
+                encode_envelope(&mut out, env);
+                put_uuid(&mut out, *topic_uuid);
+                put_uuid(&mut out, *range_uuid);
+                put_uuid(&mut out, *segment_uuid);
+                put_u64(&mut out, *expected_segment_generation);
+                put_u64(&mut out, *fencing_epoch);
+            }
+            MetadataCommand::ConfirmRetentionExpired {
+                env,
+                topic_uuid,
+                range_uuid,
+                segment_uuid,
+                expected_segment_generation,
+            } => {
+                put_u16(&mut out, COMMAND_KIND_CONFIRM_RETENTION_EXPIRED);
+                encode_envelope(&mut out, env);
+                put_uuid(&mut out, *topic_uuid);
+                put_uuid(&mut out, *range_uuid);
+                put_uuid(&mut out, *segment_uuid);
+                put_u64(&mut out, *expected_segment_generation);
+            }
+            MetadataCommand::CancelRetention {
+                env,
+                topic_uuid,
+                range_uuid,
+                segment_uuid,
+                expected_segment_generation,
+            } => {
+                put_u16(&mut out, COMMAND_KIND_CANCEL_RETENTION);
+                encode_envelope(&mut out, env);
+                put_uuid(&mut out, *topic_uuid);
+                put_uuid(&mut out, *range_uuid);
+                put_uuid(&mut out, *segment_uuid);
+                put_u64(&mut out, *expected_segment_generation);
+            }
         }
         Ok(out)
     }
@@ -1018,6 +1224,91 @@ impl MetadataCommand {
                 range_uuid: reader.uuid("range uuid")?,
                 segment_uuid: reader.uuid("segment uuid")?,
                 expected_placement_generation: reader.u64("expected placement generation")?,
+            }),
+            COMMAND_KIND_COMMIT_TIER_EVIDENCE => {
+                let env = decode_envelope(reader)?;
+                let topic_uuid = reader.uuid("topic uuid")?;
+                let range_uuid = reader.uuid("range uuid")?;
+                let segment_uuid = reader.uuid("segment uuid")?;
+                let expected_segment_generation = reader.u64("expected segment generation")?;
+                let content_root = reader.bytes32("content root")?;
+                let byte_length = reader.u64("byte length")?;
+                if byte_length == 0 {
+                    return Err(CodecError::InvalidValue {
+                        what: "byte length",
+                        reason: "must be > 0",
+                    });
+                }
+                let backend_id = reader.bounded_str(MAX_TIER_BACKEND_ID_BYTES, "backend id")?;
+                if backend_id.is_empty() {
+                    return Err(CodecError::InvalidValue {
+                        what: "backend id",
+                        reason: "must not be empty",
+                    });
+                }
+                let object_uri = reader.bounded_str(MAX_TIER_OBJECT_URI_BYTES, "object uri")?;
+                if object_uri.is_empty() {
+                    return Err(CodecError::InvalidValue {
+                        what: "object uri",
+                        reason: "must not be empty",
+                    });
+                }
+                let manifest_version_id = if reader.flag("manifest version presence")? {
+                    Some(reader.bounded_str(MAX_TIER_VERSION_ID_BYTES, "manifest version id")?)
+                } else {
+                    None
+                };
+                Ok(MetadataCommand::CommitTierEvidence {
+                    env,
+                    topic_uuid,
+                    range_uuid,
+                    segment_uuid,
+                    expected_segment_generation,
+                    content_root,
+                    byte_length,
+                    backend_id,
+                    object_uri,
+                    manifest_version_id,
+                    manifest_core_digest: reader.bytes32("manifest core digest")?,
+                    verification_method: VerificationMethod::from_wire(
+                        reader.u8("verification method")?,
+                    )?,
+                    verifier_node_uuid: reader.uuid("verifier node uuid")?,
+                    fencing_epoch: reader.u64("fencing epoch")?,
+                    verified_term: reader.u64("verified term")?,
+                })
+            }
+            COMMAND_KIND_SET_TOPIC_RETENTION_POLICY => {
+                Ok(MetadataCommand::SetTopicRetentionPolicy {
+                    env: decode_envelope(reader)?,
+                    topic_uuid: reader.uuid("topic uuid")?,
+                    unarchived_deletion_allowed: reader.flag("unarchived deletion allowed")?,
+                    expected_generation: decode_optional_u64(reader, "expected generation")?,
+                })
+            }
+            COMMAND_KIND_PLAN_RETENTION => Ok(MetadataCommand::PlanRetention {
+                env: decode_envelope(reader)?,
+                topic_uuid: reader.uuid("topic uuid")?,
+                range_uuid: reader.uuid("range uuid")?,
+                segment_uuid: reader.uuid("segment uuid")?,
+                expected_segment_generation: reader.u64("expected segment generation")?,
+                fencing_epoch: reader.u64("fencing epoch")?,
+            }),
+            COMMAND_KIND_CONFIRM_RETENTION_EXPIRED => {
+                Ok(MetadataCommand::ConfirmRetentionExpired {
+                    env: decode_envelope(reader)?,
+                    topic_uuid: reader.uuid("topic uuid")?,
+                    range_uuid: reader.uuid("range uuid")?,
+                    segment_uuid: reader.uuid("segment uuid")?,
+                    expected_segment_generation: reader.u64("expected segment generation")?,
+                })
+            }
+            COMMAND_KIND_CANCEL_RETENTION => Ok(MetadataCommand::CancelRetention {
+                env: decode_envelope(reader)?,
+                topic_uuid: reader.uuid("topic uuid")?,
+                range_uuid: reader.uuid("range uuid")?,
+                segment_uuid: reader.uuid("segment uuid")?,
+                expected_segment_generation: reader.u64("expected segment generation")?,
             }),
             other => Err(CodecError::UnknownTag {
                 what: "command kind",
@@ -1590,6 +1881,74 @@ mod tests {
                 segment_uuid: Uuid::from_u128(30),
                 expected_placement_generation: 1,
             },
+            MetadataCommand::CommitTierEvidence {
+                env: envelope(24),
+                topic_uuid: Uuid::from_u128(20),
+                range_uuid: Uuid::from_u128(21),
+                segment_uuid: Uuid::from_u128(30),
+                expected_segment_generation: 1,
+                content_root: [7; 32],
+                byte_length: 4096,
+                backend_id: "s3-native".to_owned(),
+                object_uri: "s3://tier/native/audit.v1/segment-30.segment".to_owned(),
+                manifest_version_id: Some("3sL4kqCJo05qOWBhBqpfOFAdT4dRJVvV".to_owned()),
+                manifest_core_digest: [11; 32],
+                verification_method: VerificationMethod::AuthenticatedContentRoot,
+                verifier_node_uuid: Uuid::from_u128(10),
+                fencing_epoch: 3,
+                verified_term: 5,
+            },
+            MetadataCommand::CommitTierEvidence {
+                env: envelope(25),
+                topic_uuid: Uuid::from_u128(20),
+                range_uuid: Uuid::from_u128(21),
+                segment_uuid: Uuid::from_u128(30),
+                expected_segment_generation: 1,
+                content_root: [7; 32],
+                byte_length: 4096,
+                backend_id: "localfs".to_owned(),
+                object_uri: "s3://tier/native/audit.v1/segment-30.segment".to_owned(),
+                manifest_version_id: None,
+                manifest_core_digest: [11; 32],
+                verification_method: VerificationMethod::AuthenticatedContentRoot,
+                verifier_node_uuid: Uuid::from_u128(10),
+                fencing_epoch: 3,
+                verified_term: 5,
+            },
+            MetadataCommand::SetTopicRetentionPolicy {
+                env: envelope(26),
+                topic_uuid: Uuid::from_u128(20),
+                unarchived_deletion_allowed: true,
+                expected_generation: None,
+            },
+            MetadataCommand::SetTopicRetentionPolicy {
+                env: envelope(27),
+                topic_uuid: Uuid::from_u128(20),
+                unarchived_deletion_allowed: false,
+                expected_generation: Some(2),
+            },
+            MetadataCommand::PlanRetention {
+                env: envelope(28),
+                topic_uuid: Uuid::from_u128(20),
+                range_uuid: Uuid::from_u128(21),
+                segment_uuid: Uuid::from_u128(30),
+                expected_segment_generation: 1,
+                fencing_epoch: 3,
+            },
+            MetadataCommand::ConfirmRetentionExpired {
+                env: envelope(29),
+                topic_uuid: Uuid::from_u128(20),
+                range_uuid: Uuid::from_u128(21),
+                segment_uuid: Uuid::from_u128(30),
+                expected_segment_generation: 2,
+            },
+            MetadataCommand::CancelRetention {
+                env: envelope(30),
+                topic_uuid: Uuid::from_u128(20),
+                range_uuid: Uuid::from_u128(21),
+                segment_uuid: Uuid::from_u128(30),
+                expected_segment_generation: 2,
+            },
         ]
     }
 
@@ -1725,6 +2084,130 @@ mod tests {
         assert!(matches!(
             long_topic.encode(),
             Err(CodecError::BoundExceeded { .. })
+        ));
+    }
+
+    /// A CommitTierEvidence with the variable-length fields parameterized so
+    /// bound tests can probe each one without functional-update syntax
+    /// (unavailable on enum variants).
+    fn tier_evidence(
+        request: u128,
+        byte_length: u64,
+        backend_id: &str,
+        object_uri: &str,
+        manifest_version_id: Option<String>,
+    ) -> MetadataCommand {
+        MetadataCommand::CommitTierEvidence {
+            env: envelope(request),
+            topic_uuid: Uuid::from_u128(20),
+            range_uuid: Uuid::from_u128(21),
+            segment_uuid: Uuid::from_u128(30),
+            expected_segment_generation: 1,
+            content_root: [7; 32],
+            byte_length,
+            backend_id: backend_id.to_owned(),
+            object_uri: object_uri.to_owned(),
+            manifest_version_id,
+            manifest_core_digest: [11; 32],
+            verification_method: VerificationMethod::AuthenticatedContentRoot,
+            verifier_node_uuid: Uuid::from_u128(10),
+            fencing_epoch: 3,
+            verified_term: 5,
+        }
+    }
+
+    #[test]
+    fn tier_evidence_codec_enforces_every_bound_and_validity_rule() {
+        // Exactly at the URI bound round-trips; one byte over rejects at
+        // encode time.
+        let at_bound = tier_evidence(
+            1,
+            4096,
+            "s3-native",
+            &"u".repeat(MAX_TIER_OBJECT_URI_BYTES),
+            None,
+        );
+        let encoded = at_bound.encode().unwrap();
+        assert_eq!(MetadataCommand::decode(&encoded).unwrap(), at_bound);
+        assert!(matches!(
+            tier_evidence(
+                2,
+                4096,
+                "s3-native",
+                &"u".repeat(MAX_TIER_OBJECT_URI_BYTES + 1),
+                None,
+            )
+            .encode(),
+            Err(CodecError::BoundExceeded { .. })
+        ));
+
+        // Backend id and version id bounds reject at encode time.
+        assert!(matches!(
+            tier_evidence(
+                3,
+                4096,
+                &"b".repeat(MAX_TIER_BACKEND_ID_BYTES + 1),
+                "s3://tier/object",
+                None,
+            )
+            .encode(),
+            Err(CodecError::BoundExceeded { .. })
+        ));
+        assert!(matches!(
+            tier_evidence(
+                4,
+                4096,
+                "s3-native",
+                "s3://tier/object",
+                Some("v".repeat(MAX_TIER_VERSION_ID_BYTES + 1)),
+            )
+            .encode(),
+            Err(CodecError::BoundExceeded { .. })
+        ));
+
+        // Zero byte length and empty strings survive encode but the decoder
+        // rejects them, so they can never round-trip into apply.
+        for invalid in [
+            tier_evidence(5, 0, "s3-native", "s3://tier/object", None),
+            tier_evidence(6, 4096, "", "s3://tier/object", None),
+            tier_evidence(7, 4096, "s3-native", "", None),
+        ] {
+            assert!(matches!(
+                MetadataCommand::decode(&invalid.encode().unwrap()),
+                Err(CodecError::InvalidValue { .. })
+            ));
+        }
+
+        // An unknown verification-method tag is rejected, never defaulted.
+        let mut unknown_method = tier_evidence(8, 4096, "s3-native", "s3://tier/object", None)
+            .encode()
+            .unwrap();
+        // The method byte sits immediately before verifier uuid + two u64s.
+        let method_at = unknown_method.len() - 8 - 8 - 16 - 1;
+        assert_eq!(unknown_method[method_at], 1);
+        unknown_method[method_at] = 9;
+        assert_eq!(
+            MetadataCommand::decode(&unknown_method),
+            Err(CodecError::UnknownTag {
+                what: "verification method",
+                tag: 9,
+            })
+        );
+
+        // The retention-policy flag byte is canonical (0 or 1 only).
+        let policy = MetadataCommand::SetTopicRetentionPolicy {
+            env: envelope(9),
+            topic_uuid: Uuid::from_u128(20),
+            unarchived_deletion_allowed: false,
+            expected_generation: None,
+        };
+        let mut bytes = policy.encode().unwrap();
+        let flag_at = bytes.len() - 2;
+        assert_eq!(bytes[flag_at], 0);
+        bytes[flag_at] = 2;
+        assert!(matches!(
+            MetadataCommand::decode(&bytes),
+            Err(CodecError::InvalidValue { .. })
         ));
     }
 

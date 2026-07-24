@@ -518,9 +518,11 @@ Stage-8 metadata foundation (`vtop-meta`):
 - `PlanReplicaRetirement` transitions `Verified -> RetirePlanned` only when
   a matching proof is committed and the retiring node is the proof source
   (never the verified destination).
-- `ConfirmReplicaRetired` transitions `RetirePlanned -> Retired` and drops
-  the retiring node from any durable `SegmentPlacement` while requiring the
-  verified destination to remain.
+- `ConfirmReplicaRetired` drops the retiring node from any durable
+  `SegmentPlacement` while requiring the verified destination to remain,
+  consumes the one-shot replacement proof, and returns the segment to
+  `Verified` when replicas survive (`Retired` is reserved for an unplaced
+  segment with no durable local placement).
 
 ### 9.3 Verified tier retirement
 
@@ -543,6 +545,38 @@ Rejected: direct access to `UploadBackend::delete_object` from placement,
 repair, or retention code. Capability separation prevents an unchecked copy
 result from becoming deletion authority.
 
+Stage-8 metadata foundation (`vtop-meta`):
+
+- `CommitTierEvidence` records a verified cold-tier copy (backend id, object
+  URI, immutable manifest version pin, byte length, content root, manifest
+  core digest, verifier, apply-index, consensus term) only when the segment
+  is `Verified`, the content root matches, the fencing epoch matches the
+  live range lease, and the verification method is
+  `AuthenticatedContentRoot`. TIER_VERIFIED is the derived condition
+  `Verified` + committed `SegmentTierCopy` record, not a new segment state,
+  so tiered segments remain eligible for placement and repair. Upload and
+  read-back verification happen out-of-band (`vtopctl tier copy`); the state
+  machine records only verified facts.
+- `SetTopicRetentionPolicy` commits an explicit per-topic opt-out
+  (`unarchived_deletion_allowed`); the absent record is the fail-closed
+  default.
+- `PlanRetention` transitions `Verified -> RetentionPlanned` under the
+  current lease epoch only when matching tier evidence is committed (a
+  present-but-mismatched record rejects and never falls through to policy)
+  or the explicit policy allows unarchived deletion; a live rebalance
+  intent or committed replacement proof blocks it, and any durable group
+  cursor below the segment's end offset in the same range rejects the plan
+  (only committed cursors protect data — membership is ephemeral). Evidence
+  is matched by immutable segment UUID + content root, not the mutable
+  lifecycle CAS generation, so a cancelled plan or completed replica move
+  never forces a byte-identical re-upload.
+- `ConfirmRetentionExpired` transitions `RetentionPlanned ->
+  RetentionExpired` after the external actor deletes every local replica,
+  emptying the `SegmentPlacement` replica set in the same apply while
+  preserving its declared replication factor; the segment and tier-copy
+  records are retained forever as the rehydration pointer and
+  corruption-audit anchor. `CancelRetention` reverts a mistaken plan to
+  `Verified` (local bytes are only deleted between plan and confirm).
 ## 10. Lineage-aware cursors and consumer groups
 
 A durable cursor contains:

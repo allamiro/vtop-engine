@@ -10,5 +10,6 @@ pub mod meta_tools;
 pub mod metrics_server;
 pub mod segment_tools;
 pub mod testkit;
+pub mod tier_tools;
 
 pub use engine::{BatchOutcome, Engine, Pipeline, RecoverySummary};

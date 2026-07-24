@@ -13,7 +13,8 @@
 
 use crate::command::{
     MetadataCommand, MetadataError, MetadataResponse, NodeState, RangeAssignment,
-    VerificationMethod, MAX_ASSIGNED_RANGES, MAX_NODE_ADDR_BYTES,
+    VerificationMethod, MAX_ASSIGNED_RANGES, MAX_NODE_ADDR_BYTES, MAX_TIER_BACKEND_ID_BYTES,
+    MAX_TIER_OBJECT_URI_BYTES, MAX_TIER_VERSION_ID_BYTES,
 };
 use crate::keys::{validate_group_name, validate_topic_name, MetaKey};
 use crate::placement::{
@@ -55,6 +56,8 @@ const VALUE_TAG_SEGMENT_PLACEMENT: u8 = 13;
 const VALUE_TAG_REPLACEMENT_PROOF: u8 = 14;
 const VALUE_TAG_REBALANCE_INTENT: u8 = 15;
 const VALUE_TAG_RANGE_V2: u8 = 16;
+const VALUE_TAG_SEGMENT_TIER_COPY: u8 = 17;
+const VALUE_TAG_TOPIC_RETENTION_POLICY: u8 = 18;
 
 /// A registered broker/controller node.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -123,10 +126,23 @@ pub enum SegmentState {
     Repairing,
     /// Retirement authorized by a committed ReplacementProof.
     RetirePlanned,
-    /// Physical retirement effect confirmed.
+    /// Physical retirement effect confirmed and no durable local placement
+    /// remains. A per-replica retirement with surviving replicas returns the
+    /// segment to `Verified`.
     Retired,
     /// Bytes failed verification; must not be served.
     Quarantined,
+    /// Whole-segment deletion authorized; local bytes still present. Distinct
+    /// from `RetirePlanned`, which is the *per-replica* move/repair state — a
+    /// single-replica replacement proof must never authorize whole-segment
+    /// deletion. TIER_VERIFIED is deliberately not a state: it is the derived
+    /// condition `Verified` + committed `SegmentTierCopy` record, so tiered
+    /// segments stay eligible for placement and repair.
+    RetentionPlanned,
+    /// Physical deletion of all local replicas confirmed. The segment and
+    /// tier-copy records are retained forever as the rehydration pointer and
+    /// corruption-audit anchor.
+    RetentionExpired,
 }
 
 /// A sealed segment registered against a range under a fencing epoch.
@@ -236,6 +252,49 @@ pub struct ReplacementProofRecord {
     pub verified_term: u64,
 }
 
+/// Verified cold-tier copy of a sealed segment. One per segment in this
+/// slice; committed only after out-of-band upload plus read-back verification
+/// of the authenticated content root. There is no `verified` flag: the state
+/// machine records only verified facts (an unverified upload is external,
+/// idempotent, and re-runnable).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TierCopyRecord {
+    /// CAS token, starts at 0.
+    pub generation: u64,
+    /// Segment generation pinned at commit time, like `ReplacementProof`.
+    pub segment_generation: u64,
+    /// Must equal `SegmentRecord.content_root` at commit and at plan time.
+    pub content_root: [u8; 32],
+    pub byte_length: u64,
+    /// 1..=[`MAX_TIER_BACKEND_ID_BYTES`] bytes ("s3-native", "localfs", ...).
+    pub backend_id: String,
+    /// 1..=[`MAX_TIER_OBJECT_URI_BYTES`] bytes; the manifest object is
+    /// `object_uri + ".manifest.json"` by convention.
+    pub object_uri: String,
+    /// 0..=[`MAX_TIER_VERSION_ID_BYTES`] bytes; the #135 immutable-version pin.
+    pub manifest_version_id: Option<String>,
+    /// Pins the canonical v2 manifest bytes with the commit statement
+    /// stripped (the verifier's manifest-digest pin).
+    pub manifest_core_digest: [u8; 32],
+    /// Only `AuthenticatedContentRoot` may authorize retention.
+    pub verification_method: VerificationMethod,
+    pub verifier_node_uuid: Uuid,
+    pub verified_at_apply_index: u64,
+    pub verified_term: u64,
+    pub fencing_epoch: u64,
+}
+
+/// Per-topic retention policy. Minimal and clock-free: the deterministic
+/// state machine cannot judge age or size, so retention is proposed
+/// externally and this record only widens (never replaces) the evidence gate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TopicRetentionPolicyRecord {
+    pub generation: u64,
+    /// Explicit operator opt-out: sealed segments of this topic may be
+    /// retention-planned WITHOUT tier evidence. An absent record means false.
+    pub unarchived_deletion_allowed: bool,
+}
+
 /// A typed record value stored under an encoded [`MetaKey`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MetaValue {
@@ -252,6 +311,8 @@ pub enum MetaValue {
     SegmentPlacement(SegmentPlacementRecord),
     ReplacementProof(ReplacementProofRecord),
     RebalanceIntent(RebalanceIntentRecord),
+    TierCopy(TierCopyRecord),
+    TopicRetentionPolicy(TopicRetentionPolicyRecord),
 }
 
 impl MetaValue {
@@ -329,6 +390,8 @@ impl MetaValue {
                         SegmentState::RetirePlanned => 4,
                         SegmentState::Retired => 5,
                         SegmentState::Quarantined => 6,
+                        SegmentState::RetentionPlanned => 7,
+                        SegmentState::RetentionExpired => 8,
                     },
                 );
                 put_u64(&mut out, segment.sealed_by_epoch);
@@ -416,6 +479,53 @@ impl MetaValue {
                 put_u64(&mut out, intent.proposed_at_apply_index);
                 put_u64(&mut out, intent.placement_generation_at_proposal);
             }
+            MetaValue::TierCopy(tier) => {
+                put_u8(&mut out, VALUE_TAG_SEGMENT_TIER_COPY);
+                put_u64(&mut out, tier.generation);
+                put_u64(&mut out, tier.segment_generation);
+                put_bytes32(&mut out, &tier.content_root);
+                put_u64(&mut out, tier.byte_length);
+                put_bounded_str(
+                    &mut out,
+                    &tier.backend_id,
+                    MAX_TIER_BACKEND_ID_BYTES,
+                    "tier backend id",
+                )?;
+                put_bounded_str(
+                    &mut out,
+                    &tier.object_uri,
+                    MAX_TIER_OBJECT_URI_BYTES,
+                    "tier object uri",
+                )?;
+                match &tier.manifest_version_id {
+                    None => put_u8(&mut out, 0),
+                    Some(version_id) => {
+                        put_u8(&mut out, 1);
+                        put_bounded_str(
+                            &mut out,
+                            version_id,
+                            MAX_TIER_VERSION_ID_BYTES,
+                            "tier manifest version id",
+                        )?;
+                    }
+                }
+                put_bytes32(&mut out, &tier.manifest_core_digest);
+                put_u8(
+                    &mut out,
+                    match tier.verification_method {
+                        VerificationMethod::AuthenticatedContentRoot => 1,
+                    },
+                );
+                put_uuid(&mut out, tier.verifier_node_uuid);
+                put_u64(&mut out, tier.verified_at_apply_index);
+                put_u64(&mut out, tier.verified_term);
+                put_u64(&mut out, tier.fencing_epoch);
+            }
+            MetaValue::TopicRetentionPolicy(policy) => {
+                put_u8(&mut out, VALUE_TAG_TOPIC_RETENTION_POLICY);
+                put_u64(&mut out, policy.generation);
+                put_u8(&mut out, u8::from(policy.unarchived_deletion_allowed));
+            }
         }
         Ok(out)
     }
@@ -501,6 +611,8 @@ impl MetaValue {
                     4 => SegmentState::RetirePlanned,
                     5 => SegmentState::Retired,
                     6 => SegmentState::Quarantined,
+                    7 => SegmentState::RetentionPlanned,
+                    8 => SegmentState::RetentionExpired,
                     other => {
                         return Err(CodecError::UnknownTag {
                             what: "segment state",
@@ -596,6 +708,65 @@ impl MetaValue {
                 placement_generation_at_proposal: reader
                     .u64("rebalance placement generation at proposal")?,
             }),
+            VALUE_TAG_SEGMENT_TIER_COPY => {
+                let generation = reader.u64("tier generation")?;
+                let segment_generation = reader.u64("tier segment generation")?;
+                let content_root = reader.bytes32("tier content root")?;
+                let byte_length = reader.u64("tier byte length")?;
+                if byte_length == 0 {
+                    return Err(CodecError::InvalidValue {
+                        what: "tier byte length",
+                        reason: "must be > 0",
+                    });
+                }
+                let backend_id =
+                    reader.bounded_str(MAX_TIER_BACKEND_ID_BYTES, "tier backend id")?;
+                if backend_id.is_empty() {
+                    return Err(CodecError::InvalidValue {
+                        what: "tier backend id",
+                        reason: "must not be empty",
+                    });
+                }
+                let object_uri =
+                    reader.bounded_str(MAX_TIER_OBJECT_URI_BYTES, "tier object uri")?;
+                if object_uri.is_empty() {
+                    return Err(CodecError::InvalidValue {
+                        what: "tier object uri",
+                        reason: "must not be empty",
+                    });
+                }
+                let manifest_version_id = if reader.flag("tier manifest version presence")? {
+                    Some(
+                        reader
+                            .bounded_str(MAX_TIER_VERSION_ID_BYTES, "tier manifest version id")?,
+                    )
+                } else {
+                    None
+                };
+                MetaValue::TierCopy(TierCopyRecord {
+                    generation,
+                    segment_generation,
+                    content_root,
+                    byte_length,
+                    backend_id,
+                    object_uri,
+                    manifest_version_id,
+                    manifest_core_digest: reader.bytes32("tier manifest core digest")?,
+                    verification_method: VerificationMethod::from_wire(
+                        reader.u8("tier verification method")?,
+                    )?,
+                    verifier_node_uuid: reader.uuid("tier verifier node")?,
+                    verified_at_apply_index: reader.u64("tier verified apply index")?,
+                    verified_term: reader.u64("tier verified term")?,
+                    fencing_epoch: reader.u64("tier fencing epoch")?,
+                })
+            }
+            VALUE_TAG_TOPIC_RETENTION_POLICY => {
+                MetaValue::TopicRetentionPolicy(TopicRetentionPolicyRecord {
+                    generation: reader.u64("retention policy generation")?,
+                    unarchived_deletion_allowed: reader.flag("unarchived deletion allowed")?,
+                })
+            }
             other => {
                 return Err(CodecError::UnknownTag {
                     what: "record value tag",
@@ -941,6 +1112,89 @@ impl MetaStateMachine {
                 *range_uuid,
                 *segment_uuid,
                 *expected_placement_generation,
+            ),
+            MetadataCommand::CommitTierEvidence {
+                topic_uuid,
+                range_uuid,
+                segment_uuid,
+                expected_segment_generation,
+                content_root,
+                byte_length,
+                backend_id,
+                object_uri,
+                manifest_version_id,
+                manifest_core_digest,
+                verification_method,
+                verifier_node_uuid,
+                fencing_epoch,
+                verified_term,
+                ..
+            } => self.commit_tier_evidence(
+                apply_index,
+                CommitTierEvidenceArgs {
+                    topic_uuid: *topic_uuid,
+                    range_uuid: *range_uuid,
+                    segment_uuid: *segment_uuid,
+                    expected_segment_generation: *expected_segment_generation,
+                    content_root: *content_root,
+                    byte_length: *byte_length,
+                    backend_id: backend_id.clone(),
+                    object_uri: object_uri.clone(),
+                    manifest_version_id: manifest_version_id.clone(),
+                    manifest_core_digest: *manifest_core_digest,
+                    verification_method: *verification_method,
+                    verifier_node_uuid: *verifier_node_uuid,
+                    fencing_epoch: *fencing_epoch,
+                    verified_term: *verified_term,
+                },
+            ),
+            MetadataCommand::SetTopicRetentionPolicy {
+                topic_uuid,
+                unarchived_deletion_allowed,
+                expected_generation,
+                ..
+            } => self.set_topic_retention_policy(
+                *topic_uuid,
+                *unarchived_deletion_allowed,
+                *expected_generation,
+            ),
+            MetadataCommand::PlanRetention {
+                topic_uuid,
+                range_uuid,
+                segment_uuid,
+                expected_segment_generation,
+                fencing_epoch,
+                ..
+            } => self.plan_retention(
+                *topic_uuid,
+                *range_uuid,
+                *segment_uuid,
+                *expected_segment_generation,
+                *fencing_epoch,
+            ),
+            MetadataCommand::ConfirmRetentionExpired {
+                topic_uuid,
+                range_uuid,
+                segment_uuid,
+                expected_segment_generation,
+                ..
+            } => self.confirm_retention_expired(
+                *topic_uuid,
+                *range_uuid,
+                *segment_uuid,
+                *expected_segment_generation,
+            ),
+            MetadataCommand::CancelRetention {
+                topic_uuid,
+                range_uuid,
+                segment_uuid,
+                expected_segment_generation,
+                ..
+            } => self.cancel_retention(
+                *topic_uuid,
+                *range_uuid,
+                *segment_uuid,
+                *expected_segment_generation,
             ),
         }
     }
@@ -2289,26 +2543,38 @@ impl MetaStateMachine {
             segment_uuid,
         }
         .encode();
-        let next_placement_generation = match self.records.get(&placement_key) {
-            Some(MetaValue::SegmentPlacement(placement)) => {
-                if !placement.replica_nodes.contains(&destination) {
-                    return reject(MetadataError::invalid_transition(
-                        "placement no longer contains the verified replacement destination",
-                    ));
+        let (next_placement_generation, has_surviving_placement) =
+            match self.records.get(&placement_key) {
+                Some(MetaValue::SegmentPlacement(placement)) => {
+                    if !placement.replica_nodes.contains(&destination) {
+                        return reject(MetadataError::invalid_transition(
+                            "placement no longer contains the verified replacement destination",
+                        ));
+                    }
+                    if !placement.replica_nodes.contains(&retiring_node_uuid) {
+                        return reject(MetadataError::invalid_transition(
+                            "placement no longer contains the retiring source replica",
+                        ));
+                    }
+                    let Some(next) = placement.generation.checked_add(1) else {
+                        return reject(MetadataError::limit(
+                            "placement generation space is exhausted",
+                        ));
+                    };
+                    (Some(next), true)
                 }
-                let Some(next) = placement.generation.checked_add(1) else {
-                    return reject(MetadataError::limit(
-                        "placement generation space is exhausted",
-                    ));
-                };
-                Some(next)
-            }
-            _ => None,
-        };
+                _ => (None, false),
+            };
 
-        // Every rejection has been ruled out; mutate both records.
+        // Every rejection has been ruled out; mutate both records. Replica
+        // retirement consumes its proof so a later repair/rebalance can
+        // commit fresh evidence under the segment's new CAS generation.
         if let Some(MetaValue::Segment(segment)) = self.records.get_mut(&segment_key) {
-            segment.state = SegmentState::Retired;
+            segment.state = if has_surviving_placement {
+                SegmentState::Verified
+            } else {
+                SegmentState::Retired
+            };
             segment.segment_generation = next_generation;
         }
         if let Some(next_placement_generation) = next_placement_generation {
@@ -2328,6 +2594,7 @@ impl MetaStateMachine {
         if completes_rebalance {
             self.records.remove(&intent_key);
         }
+        self.records.remove(&proof_key);
 
         MetadataResponse::Ack {
             generation: next_generation,
@@ -2570,6 +2837,471 @@ impl MetaStateMachine {
         }
     }
 
+    fn commit_tier_evidence(
+        &mut self,
+        apply_index: u64,
+        args: CommitTierEvidenceArgs,
+    ) -> MetadataResponse {
+        // Bounds first: the codec already rejects these, but apply re-checks
+        // them so a hand-constructed command cannot bypass the invariants.
+        if args.byte_length == 0 {
+            return reject(MetadataError::limit("tier byte length must be > 0"));
+        }
+        if args.backend_id.is_empty() || args.backend_id.len() > MAX_TIER_BACKEND_ID_BYTES {
+            return reject(MetadataError::limit(format!(
+                "tier backend id must be 1..={MAX_TIER_BACKEND_ID_BYTES} bytes, got {}",
+                args.backend_id.len()
+            )));
+        }
+        if args.object_uri.is_empty() || args.object_uri.len() > MAX_TIER_OBJECT_URI_BYTES {
+            return reject(MetadataError::limit(format!(
+                "tier object uri must be 1..={MAX_TIER_OBJECT_URI_BYTES} bytes, got {}",
+                args.object_uri.len()
+            )));
+        }
+        if let Some(version_id) = &args.manifest_version_id {
+            if version_id.len() > MAX_TIER_VERSION_ID_BYTES {
+                return reject(MetadataError::limit(format!(
+                    "tier manifest version id must be <= {MAX_TIER_VERSION_ID_BYTES} bytes, got {}",
+                    version_id.len()
+                )));
+            }
+        }
+        // Only authenticated content-root verification may become deletion
+        // authority (the ADR rule: object-store replication by itself is not
+        // VTOP verification).
+        if args.verification_method != VerificationMethod::AuthenticatedContentRoot {
+            return reject(MetadataError::invalid_transition(
+                "unsupported verification method for tier evidence",
+            ));
+        }
+
+        let range_key = MetaKey::Range {
+            topic_uuid: args.topic_uuid,
+            range_uuid: args.range_uuid,
+        }
+        .encode();
+        let Some(MetaValue::Range(range)) = self.records.get(&range_key) else {
+            return reject(MetadataError::NotFound);
+        };
+        let Some(lease) = range.lease.as_ref() else {
+            return reject(MetadataError::invalid_transition(
+                "range holds no active lease for tier evidence",
+            ));
+        };
+        if args.fencing_epoch != lease.fencing_epoch {
+            return reject(MetadataError::EpochMismatch {
+                expected: args.fencing_epoch,
+                actual: lease.fencing_epoch,
+            });
+        }
+
+        let segment_key = MetaKey::Segment {
+            topic_uuid: args.topic_uuid,
+            range_uuid: args.range_uuid,
+            segment_uuid: args.segment_uuid,
+        }
+        .encode();
+        let Some(MetaValue::Segment(segment)) = self.records.get(&segment_key) else {
+            return reject(MetadataError::NotFound);
+        };
+        if segment.segment_generation != args.expected_segment_generation {
+            return reject(MetadataError::GenerationMismatch {
+                expected: args.expected_segment_generation,
+                actual: segment.segment_generation,
+            });
+        }
+        if segment.state != SegmentState::Verified {
+            return reject(MetadataError::invalid_transition(
+                "tier evidence requires a verified segment",
+            ));
+        }
+        if segment.content_root != args.content_root {
+            return reject(MetadataError::invalid_transition(
+                "tier evidence content root does not match the sealed segment",
+            ));
+        }
+
+        let verifier_key = MetaKey::Node {
+            node_uuid: args.verifier_node_uuid,
+        }
+        .encode();
+        let Some(MetaValue::Node(verifier)) = self.records.get(&verifier_key) else {
+            return reject(MetadataError::NotFound);
+        };
+        if verifier.state == NodeState::Dead {
+            return reject(MetadataError::invalid_transition(
+                "tier evidence verifier node is dead",
+            ));
+        }
+
+        let tier_key = MetaKey::SegmentTierCopy {
+            topic_uuid: args.topic_uuid,
+            range_uuid: args.range_uuid,
+            segment_uuid: args.segment_uuid,
+        }
+        .encode();
+        if self.records.contains_key(&tier_key) {
+            return reject(MetadataError::AlreadyExists);
+        }
+        // The segment record itself is NOT mutated (same as
+        // CommitReplacementProof), so the pinned generation still matches at
+        // PlanRetention time unless something else moved the segment.
+        self.records.insert(
+            tier_key,
+            MetaValue::TierCopy(TierCopyRecord {
+                generation: 0,
+                segment_generation: args.expected_segment_generation,
+                content_root: args.content_root,
+                byte_length: args.byte_length,
+                backend_id: args.backend_id,
+                object_uri: args.object_uri,
+                manifest_version_id: args.manifest_version_id,
+                manifest_core_digest: args.manifest_core_digest,
+                verification_method: args.verification_method,
+                verifier_node_uuid: args.verifier_node_uuid,
+                verified_at_apply_index: apply_index,
+                verified_term: args.verified_term,
+                fencing_epoch: args.fencing_epoch,
+            }),
+        );
+        MetadataResponse::Ack { generation: 0 }
+    }
+
+    fn set_topic_retention_policy(
+        &mut self,
+        topic_uuid: Uuid,
+        unarchived_deletion_allowed: bool,
+        expected_generation: Option<u64>,
+    ) -> MetadataResponse {
+        let topic_key = MetaKey::Topic { topic_uuid }.encode();
+        if !matches!(self.records.get(&topic_key), Some(MetaValue::Topic(_))) {
+            return reject(MetadataError::NotFound);
+        }
+        let policy_key = MetaKey::TopicRetentionPolicy { topic_uuid }.encode();
+        match (self.records.get_mut(&policy_key), expected_generation) {
+            (None, None) => {
+                self.records.insert(
+                    policy_key,
+                    MetaValue::TopicRetentionPolicy(TopicRetentionPolicyRecord {
+                        generation: 0,
+                        unarchived_deletion_allowed,
+                    }),
+                );
+                MetadataResponse::Ack { generation: 0 }
+            }
+            (None, Some(_)) => reject(MetadataError::NotFound),
+            (Some(_), None) => reject(MetadataError::AlreadyExists),
+            (Some(MetaValue::TopicRetentionPolicy(policy)), Some(expected)) => {
+                if policy.generation != expected {
+                    return reject(MetadataError::GenerationMismatch {
+                        expected,
+                        actual: policy.generation,
+                    });
+                }
+                let Some(next_generation) = policy.generation.checked_add(1) else {
+                    return reject(MetadataError::limit(
+                        "retention policy generation space is exhausted",
+                    ));
+                };
+                policy.unarchived_deletion_allowed = unarchived_deletion_allowed;
+                policy.generation = next_generation;
+                MetadataResponse::Ack {
+                    generation: next_generation,
+                }
+            }
+            (Some(_), Some(_)) => {
+                unreachable!("retention policy keys only ever hold policy records")
+            }
+        }
+    }
+
+    fn plan_retention(
+        &mut self,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        segment_uuid: Uuid,
+        expected_segment_generation: u64,
+        fencing_epoch: u64,
+    ) -> MetadataResponse {
+        // Retention is an act of current leaseholder authority, mirroring
+        // plan_replica_retirement: no lease, no deletion authorization.
+        let range_key = MetaKey::Range {
+            topic_uuid,
+            range_uuid,
+        }
+        .encode();
+        let Some(MetaValue::Range(range)) = self.records.get(&range_key) else {
+            return reject(MetadataError::NotFound);
+        };
+        let Some(lease) = range.lease.as_ref() else {
+            return reject(MetadataError::invalid_transition(
+                "range holds no active lease for retention planning",
+            ));
+        };
+        if fencing_epoch != lease.fencing_epoch {
+            return reject(MetadataError::EpochMismatch {
+                expected: fencing_epoch,
+                actual: lease.fencing_epoch,
+            });
+        }
+
+        let segment_key = MetaKey::Segment {
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+        }
+        .encode();
+        let Some(MetaValue::Segment(segment)) = self.records.get(&segment_key) else {
+            return reject(MetadataError::NotFound);
+        };
+        if segment.segment_generation != expected_segment_generation {
+            return reject(MetadataError::GenerationMismatch {
+                expected: expected_segment_generation,
+                actual: segment.segment_generation,
+            });
+        }
+        // This alone excludes retention during repair, after quarantine, and
+        // during a replica retirement.
+        if segment.state != SegmentState::Verified {
+            return reject(MetadataError::invalid_transition(
+                "retention planning requires a verified segment",
+            ));
+        }
+        let segment_content_root = segment.content_root;
+        let segment_next_offset = segment.next_offset;
+
+        // Planning retention mid-move would strand the intent, violating the
+        // add-before-retire discipline.
+        let intent_key = MetaKey::SegmentRebalanceIntent {
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+        }
+        .encode();
+        if self.records.contains_key(&intent_key) {
+            return reject(MetadataError::invalid_transition(
+                "segment has an active rebalance intent",
+            ));
+        }
+        // Mirrors propose_rebalance's guard: retention must not race an
+        // in-flight verified move.
+        let proof_key = MetaKey::SegmentReplacementProof {
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+        }
+        .encode();
+        if self.records.contains_key(&proof_key) {
+            return reject(MetadataError::invalid_transition(
+                "segment has a committed replacement proof; complete or resolve the replica retirement first",
+            ));
+        }
+
+        // The evidence gate — the point of this slice. A present-but-
+        // mismatched tier copy REJECTS; it never falls through to the policy
+        // branch (fail-closed).
+        let tier_key = MetaKey::SegmentTierCopy {
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+        }
+        .encode();
+        match self.records.get(&tier_key) {
+            Some(MetaValue::TierCopy(evidence)) => {
+                // Tier evidence is bound to immutable segment identity (the
+                // key's segment UUID plus the sealed content root), not the
+                // lifecycle CAS token. Planning/cancelling retention or a
+                // replica move may bump `segment_generation` without changing
+                // a byte, and must not strand a still-valid cold copy.
+                if evidence.content_root != segment_content_root {
+                    return reject(MetadataError::invalid_transition(
+                        "tier evidence content root does not match the sealed segment",
+                    ));
+                }
+            }
+            Some(_) => unreachable!("tier-copy keys only ever hold tier-copy records"),
+            None => {
+                let policy_key = MetaKey::TopicRetentionPolicy { topic_uuid }.encode();
+                let allowed = matches!(
+                    self.records.get(&policy_key),
+                    Some(MetaValue::TopicRetentionPolicy(policy))
+                        if policy.unarchived_deletion_allowed
+                );
+                // An absent policy record is the fail-closed default.
+                if !allowed {
+                    return reject(MetadataError::invalid_transition(
+                        "retention requires verified tier evidence or an explicit unarchived-deletion policy",
+                    ));
+                }
+            }
+        }
+
+        // Cursor protection over stage-7 state: only *durable committed
+        // cursors* protect data. A member assigned the range that has never
+        // committed holds no durable claim (stage 7: durable cursors are the
+        // ownership; membership is ephemeral). Offsets are logical and
+        // monotonic within a range's lineage stream, so one comparison covers
+        // both a cursor inside this segment and a cursor in an older segment
+        // that will still need this one; a cursor at exactly `next_offset`
+        // has fully consumed the segment and does not block.
+        for (key_bytes, value) in &self.records {
+            let Ok(MetaKey::GroupCursor {
+                group_uuid,
+                topic_uuid: cursor_topic,
+                range_uuid: cursor_range,
+            }) = MetaKey::decode(key_bytes)
+            else {
+                continue;
+            };
+            if cursor_topic != topic_uuid || cursor_range != range_uuid {
+                continue;
+            }
+            let MetaValue::GroupCursor(cursor) = value else {
+                continue;
+            };
+            if cursor.record_offset < segment_next_offset {
+                return reject(MetadataError::invalid_transition(format!(
+                    "group cursor {group_uuid} at offset {} is below segment end {}",
+                    cursor.record_offset, segment_next_offset
+                )));
+            }
+        }
+
+        let Some(MetaValue::Segment(segment)) = self.records.get_mut(&segment_key) else {
+            unreachable!("segment record was present above and apply is single-threaded");
+        };
+        let Some(next_generation) = segment.segment_generation.checked_add(1) else {
+            return reject(MetadataError::limit(
+                "segment generation space is exhausted",
+            ));
+        };
+        segment.state = SegmentState::RetentionPlanned;
+        segment.segment_generation = next_generation;
+        MetadataResponse::Ack {
+            generation: next_generation,
+        }
+    }
+
+    fn confirm_retention_expired(
+        &mut self,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        segment_uuid: Uuid,
+        expected_segment_generation: u64,
+    ) -> MetadataResponse {
+        // Apply is all-or-nothing: validate every rejection path — segment
+        // AND placement — before mutating either record.
+        let segment_key = MetaKey::Segment {
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+        }
+        .encode();
+        let Some(MetaValue::Segment(segment)) = self.records.get(&segment_key) else {
+            return reject(MetadataError::NotFound);
+        };
+        if segment.segment_generation != expected_segment_generation {
+            return reject(MetadataError::GenerationMismatch {
+                expected: expected_segment_generation,
+                actual: segment.segment_generation,
+            });
+        }
+        if segment.state != SegmentState::RetentionPlanned {
+            return reject(MetadataError::invalid_transition(
+                "retention confirmation requires RETENTION_PLANNED",
+            ));
+        }
+        let Some(next_generation) = segment.segment_generation.checked_add(1) else {
+            return reject(MetadataError::limit(
+                "segment generation space is exhausted",
+            ));
+        };
+
+        let placement_key = MetaKey::SegmentPlacement {
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+        }
+        .encode();
+        let next_placement_generation = match self.records.get(&placement_key) {
+            Some(MetaValue::SegmentPlacement(placement)) => {
+                let Some(next) = placement.generation.checked_add(1) else {
+                    return reject(MetadataError::limit(
+                        "placement generation space is exhausted",
+                    ));
+                };
+                Some(next)
+            }
+            _ => None,
+        };
+
+        // Every rejection has been ruled out; mutate both records in one
+        // apply. The segment and tier-copy records are retained forever: the
+        // durable audit reads "target RF n, zero local replicas, tier
+        // evidence at key X" — the full-circle record.
+        if let Some(MetaValue::Segment(segment)) = self.records.get_mut(&segment_key) {
+            segment.state = SegmentState::RetentionExpired;
+            segment.segment_generation = next_generation;
+        }
+        if let Some(next_placement_generation) = next_placement_generation {
+            if let Some(MetaValue::SegmentPlacement(placement)) =
+                self.records.get_mut(&placement_key)
+            {
+                // Empty the replica set but preserve the declared replication
+                // factor verbatim: the durability target is never rewritten
+                // from the list length.
+                placement.replica_nodes.clear();
+                placement.generation = next_placement_generation;
+            }
+        }
+        MetadataResponse::Ack {
+            generation: next_generation,
+        }
+    }
+
+    fn cancel_retention(
+        &mut self,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        segment_uuid: Uuid,
+        expected_segment_generation: u64,
+    ) -> MetadataResponse {
+        let segment_key = MetaKey::Segment {
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+        }
+        .encode();
+        let Some(MetaValue::Segment(segment)) = self.records.get_mut(&segment_key) else {
+            return reject(MetadataError::NotFound);
+        };
+        if segment.segment_generation != expected_segment_generation {
+            return reject(MetadataError::GenerationMismatch {
+                expected: expected_segment_generation,
+                actual: segment.segment_generation,
+            });
+        }
+        if segment.state != SegmentState::RetentionPlanned {
+            return reject(MetadataError::invalid_transition(
+                "retention cancellation requires RETENTION_PLANNED",
+            ));
+        }
+        let Some(next_generation) = segment.segment_generation.checked_add(1) else {
+            return reject(MetadataError::limit(
+                "segment generation space is exhausted",
+            ));
+        };
+        // Local bytes were never deleted (deletion is authorized only between
+        // plan and confirm), so restoring Verified is safe; without this a
+        // mistaken plan would wedge the segment.
+        segment.state = SegmentState::Verified;
+        segment.segment_generation = next_generation;
+        MetadataResponse::Ack {
+            generation: next_generation,
+        }
+    }
+
     fn active_placement_candidates(&self) -> Vec<PlacementCandidate> {
         let mut candidates = Vec::new();
         for (key_bytes, value) in &self.records {
@@ -2757,6 +3489,11 @@ fn key_matches_value(key: &MetaKey, value: &MetaValue) -> bool {
                 MetaKey::SegmentRebalanceIntent { .. },
                 MetaValue::RebalanceIntent(_)
             )
+            | (MetaKey::SegmentTierCopy { .. }, MetaValue::TierCopy(_))
+            | (
+                MetaKey::TopicRetentionPolicy { .. },
+                MetaValue::TopicRetentionPolicy(_)
+            )
     )
 }
 
@@ -2788,6 +3525,23 @@ struct CommitReplacementProofArgs {
     fencing_epoch: u64,
     verification_method: VerificationMethod,
     verifier_node_uuid: Uuid,
+    verified_term: u64,
+}
+
+struct CommitTierEvidenceArgs {
+    topic_uuid: Uuid,
+    range_uuid: Uuid,
+    segment_uuid: Uuid,
+    expected_segment_generation: u64,
+    content_root: [u8; 32],
+    byte_length: u64,
+    backend_id: String,
+    object_uri: String,
+    manifest_version_id: Option<String>,
+    manifest_core_digest: [u8; 32],
+    verification_method: VerificationMethod,
+    verifier_node_uuid: Uuid,
+    fencing_epoch: u64,
     verified_term: u64,
 }
 
@@ -3090,6 +3844,153 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    fn max_tier_copy_record() -> TierCopyRecord {
+        TierCopyRecord {
+            generation: u64::MAX,
+            segment_generation: u64::MAX,
+            content_root: [0xff; 32],
+            byte_length: u64::MAX,
+            backend_id: "b".repeat(MAX_TIER_BACKEND_ID_BYTES),
+            object_uri: "u".repeat(MAX_TIER_OBJECT_URI_BYTES),
+            manifest_version_id: Some("v".repeat(MAX_TIER_VERSION_ID_BYTES)),
+            manifest_core_digest: [0xff; 32],
+            verification_method: VerificationMethod::AuthenticatedContentRoot,
+            verifier_node_uuid: Uuid::from_u128(u128::MAX),
+            verified_at_apply_index: u64::MAX,
+            verified_term: u64::MAX,
+            fencing_epoch: u64::MAX,
+        }
+    }
+
+    #[test]
+    fn max_size_tier_copy_record_stays_inside_the_snapshot_value_bound() {
+        // Pin the arithmetic: tag 1 + generation 8 + segment generation 8 +
+        // root 32 + length 8 + backend (2 + 64) + uri (2 + 512) + version
+        // (1 + 2 + 128) + digest 32 + method 1 + verifier 16 + apply index 8
+        // + term 8 + epoch 8 = 841 bytes. This is why the URI bound is 512
+        // (not S3's 1024) and the manifest has no separate URI field.
+        let encoded = MetaValue::TierCopy(max_tier_copy_record())
+            .encode()
+            .unwrap();
+        assert_eq!(encoded.len(), 841);
+        assert!(encoded.len() < MAX_SNAPSHOT_VALUE_BYTES);
+        assert_eq!(
+            MetaValue::decode(&encoded).unwrap(),
+            MetaValue::TierCopy(max_tier_copy_record())
+        );
+    }
+
+    #[test]
+    fn tier_copy_value_codec_rejects_bounds_and_non_verified_facts() {
+        // One byte over the URI bound rejects at encode time...
+        let mut over = max_tier_copy_record();
+        over.object_uri = "u".repeat(MAX_TIER_OBJECT_URI_BYTES + 1);
+        assert!(matches!(
+            MetaValue::TierCopy(over).encode(),
+            Err(CodecError::BoundExceeded { .. })
+        ));
+        // ...and a crafted byte string carrying 513 URI bytes rejects at
+        // decode time, so an over-bound record can never enter the map.
+        let encoded = MetaValue::TierCopy(max_tier_copy_record())
+            .encode()
+            .unwrap();
+        let uri_len_at = 1 + 8 + 8 + 32 + 8 + 2 + MAX_TIER_BACKEND_ID_BYTES;
+        let mut crafted = encoded[..uri_len_at].to_vec();
+        crafted.extend_from_slice(&((MAX_TIER_OBJECT_URI_BYTES + 1) as u16).to_be_bytes());
+        crafted.extend_from_slice("u".repeat(MAX_TIER_OBJECT_URI_BYTES + 1).as_bytes());
+        crafted.extend_from_slice(&encoded[uri_len_at + 2 + MAX_TIER_OBJECT_URI_BYTES..]);
+        assert!(matches!(
+            MetaValue::decode(&crafted),
+            Err(CodecError::BoundExceeded { .. })
+        ));
+
+        // Zero byte length is rejected: the record only ever stores verified
+        // facts, and nothing verifiable has zero length.
+        let mut zero_length = encoded.clone();
+        zero_length[1 + 8 + 8 + 32..1 + 8 + 8 + 32 + 8].fill(0);
+        assert!(matches!(
+            MetaValue::decode(&zero_length),
+            Err(CodecError::InvalidValue { .. })
+        ));
+
+        // An unknown verification-method tag is rejected, never defaulted.
+        let method_at = encoded.len() - 8 - 8 - 8 - 16 - 1;
+        assert_eq!(encoded[method_at], 1);
+        let mut unknown_method = encoded.clone();
+        unknown_method[method_at] = 9;
+        assert!(matches!(
+            MetaValue::decode(&unknown_method),
+            Err(CodecError::UnknownTag {
+                what: "verification method",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn retention_policy_value_codec_round_trips_and_rejects_noncanonical_flags() {
+        for allowed in [false, true] {
+            let value = MetaValue::TopicRetentionPolicy(TopicRetentionPolicyRecord {
+                generation: 3,
+                unarchived_deletion_allowed: allowed,
+            });
+            let encoded = value.encode().unwrap();
+            assert_eq!(encoded[0], VALUE_TAG_TOPIC_RETENTION_POLICY);
+            assert_eq!(MetaValue::decode(&encoded).unwrap(), value);
+        }
+        let mut noncanonical = MetaValue::TopicRetentionPolicy(TopicRetentionPolicyRecord {
+            generation: 3,
+            unarchived_deletion_allowed: false,
+        })
+        .encode()
+        .unwrap();
+        *noncanonical.last_mut().unwrap() = 2;
+        assert!(matches!(
+            MetaValue::decode(&noncanonical),
+            Err(CodecError::InvalidValue { .. })
+        ));
+    }
+
+    #[test]
+    fn retention_segment_states_round_trip_and_unknown_tag_nine_rejects() {
+        for (state, tag) in [
+            (SegmentState::RetentionPlanned, 7_u8),
+            (SegmentState::RetentionExpired, 8),
+        ] {
+            let value = MetaValue::Segment(SegmentRecord {
+                segment_generation: 4,
+                base_offset: 0,
+                next_offset: 64,
+                content_root: [7; 32],
+                state,
+                sealed_by_epoch: 1,
+            });
+            let encoded = value.encode().unwrap();
+            assert_eq!(encoded[1 + 8 + 8 + 8 + 32], tag);
+            assert_eq!(MetaValue::decode(&encoded).unwrap(), value);
+        }
+        // The next unassigned state tag is rejected, never defaulted: a
+        // snapshot from a future version must refuse to decode here.
+        let mut future = MetaValue::Segment(SegmentRecord {
+            segment_generation: 4,
+            base_offset: 0,
+            next_offset: 64,
+            content_root: [7; 32],
+            state: SegmentState::Verified,
+            sealed_by_epoch: 1,
+        })
+        .encode()
+        .unwrap();
+        future[1 + 8 + 8 + 8 + 32] = 9;
+        assert_eq!(
+            MetaValue::decode(&future),
+            Err(CodecError::UnknownTag {
+                what: "segment state",
+                tag: 9,
+            })
+        );
     }
 
     #[test]
