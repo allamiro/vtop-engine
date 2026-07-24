@@ -18,7 +18,7 @@ use crate::command::{
 use crate::keys::{validate_group_name, validate_topic_name, MetaKey};
 use crate::placement::{
     select_replicas, PlacementCandidate, DEFAULT_PLACEMENT_WEIGHT, MAX_FAILURE_DOMAIN_BYTES,
-    MAX_REPLICAS, MIN_PLACEMENT_WEIGHT,
+    MAX_REPLICAS, MAX_TRANSIENT_REPLICAS, MIN_PLACEMENT_WEIGHT,
 };
 use crate::wire::{
     put_bounded_str, put_bytes32, put_u16, put_u32, put_u64, put_u8, put_uuid, CodecError, Reader,
@@ -2392,11 +2392,40 @@ impl MetaStateMachine {
                 "rebalance destination has no placement weight",
             ));
         }
-        // The temporary RF + 1 set must stay inside the replica bound.
-        if placement.replica_nodes.len() >= MAX_REPLICAS {
+        // The temporary set may hold exactly one replica above the declared
+        // bound (add-before-retire); a second concurrent expansion is
+        // impossible because the intent record is exclusive.
+        if placement.replica_nodes.len() >= MAX_TRANSIENT_REPLICAS {
             return reject(MetadataError::limit(format!(
-                "placement already holds {MAX_REPLICAS} replicas"
+                "placement already holds {MAX_TRANSIENT_REPLICAS} replicas"
             )));
+        }
+        // Preserve the distinct-failure-domain durability constraint that
+        // deterministic placement enforced: when RF > 1, the destination
+        // must not share a domain with any replica that SURVIVES the move
+        // (the source is leaving, so its domain is free to reuse).
+        if usize::from(placement.declared_replication_factor) > 1 {
+            for survivor in placement
+                .replica_nodes
+                .iter()
+                .filter(|node| **node != from_node_uuid)
+            {
+                let survivor_key = MetaKey::Node {
+                    node_uuid: *survivor,
+                }
+                .encode();
+                let Some(MetaValue::Node(survivor_node)) = self.records.get(&survivor_key) else {
+                    return reject(MetadataError::invalid_transition(format!(
+                        "surviving replica {survivor} has no node record"
+                    )));
+                };
+                if survivor_node.failure_domain == to_node.failure_domain {
+                    return reject(MetadataError::invalid_transition(format!(
+                        "rebalance destination shares failure domain {:?} with surviving replica {survivor}",
+                        to_node.failure_domain
+                    )));
+                }
+            }
         }
         let Some(next_placement_generation) = placement.generation.checked_add(1) else {
             return reject(MetadataError::limit(
@@ -2806,11 +2835,13 @@ fn encode_replica_nodes(out: &mut Vec<u8>, nodes: &[Uuid]) -> Result<(), CodecEr
 
 fn decode_replica_nodes(reader: &mut Reader<'_>) -> Result<Vec<Uuid>, CodecError> {
     let count = reader.u16("replica node count")? as usize;
-    if count > MAX_REPLICAS {
+    // The stored set may transiently exceed MAX_REPLICAS by one while a
+    // rebalance intent is in flight; snapshots taken then must round-trip.
+    if count > MAX_TRANSIENT_REPLICAS {
         return Err(CodecError::BoundExceeded {
             what: "replica nodes",
             actual: count,
-            maximum: MAX_REPLICAS,
+            maximum: MAX_TRANSIENT_REPLICAS,
         });
     }
     let mut nodes = Vec::with_capacity(count);

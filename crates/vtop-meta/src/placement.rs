@@ -10,6 +10,11 @@ use uuid::Uuid;
 /// Upper bound on replicas recorded for one segment placement.
 pub const MAX_REPLICAS: usize = 8;
 
+/// A placement may briefly hold one replica above [`MAX_REPLICAS`] while a
+/// rebalance intent is in flight (add-before-retire): the stored-placement
+/// codec accepts this transient size; declared replication factors never do.
+pub const MAX_TRANSIENT_REPLICAS: usize = MAX_REPLICAS + 1;
+
 /// Bound for failure-domain attribute strings on node records.
 pub const MAX_FAILURE_DOMAIN_BYTES: usize = 64;
 

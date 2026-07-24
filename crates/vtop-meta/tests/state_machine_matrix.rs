@@ -2609,6 +2609,62 @@ fn propose_rebalance_rejects_every_bad_shape_deterministically() {
 }
 
 #[test]
+fn propose_rebalance_preserves_distinct_failure_domains() {
+    let mut requests = Requests(0);
+    let (mut machine, _root, _segment_generation, replicas, _spare) =
+        placed_segment_machine(&mut requests);
+    let from = replicas[0];
+    let survivor = replicas[1];
+    let domain_of = |node: Uuid| -> &'static str {
+        if node == NODE {
+            "rack-a"
+        } else if node == NODE_B {
+            "rack-b"
+        } else {
+            "rack-c"
+        }
+    };
+    const NODE_D: Uuid = Uuid::from_u128(0x14);
+    assert_eq!(
+        machine.apply(12, &register_node(&mut requests, NODE_D)),
+        MetadataResponse::Ack { generation: 0 }
+    );
+
+    // Destination sharing the SURVIVOR's failure domain is rejected: the
+    // completed move would put two replicas in one domain, silently
+    // bypassing the distinct-domain durability constraint the deterministic
+    // placement enforced.
+    assert_eq!(
+        machine.apply(
+            13,
+            &set_placement_attrs(&mut requests, NODE_D, domain_of(survivor), 100, 0)
+        ),
+        MetadataResponse::Ack { generation: 1 }
+    );
+    assert_eq!(
+        machine.apply(14, &propose_rebalance(&mut requests, from, NODE_D, 0)),
+        rejected(MetadataError::invalid_transition(format!(
+            "rebalance destination shares failure domain {:?} with surviving replica {survivor}",
+            domain_of(survivor)
+        )))
+    );
+
+    // Reusing the SOURCE's domain is allowed: the source is leaving, so its
+    // domain frees up and the completed move stays domain-distinct.
+    assert_eq!(
+        machine.apply(
+            15,
+            &set_placement_attrs(&mut requests, NODE_D, domain_of(from), 100, 1)
+        ),
+        MetadataResponse::Ack { generation: 2 }
+    );
+    assert_eq!(
+        machine.apply(16, &propose_rebalance(&mut requests, from, NODE_D, 0)),
+        MetadataResponse::Ack { generation: 1 }
+    );
+}
+
+#[test]
 fn snapshots_round_trip_active_rebalance_intents_byte_exactly() {
     fn drive(requests: &mut Requests) -> MetaStateMachine {
         let (mut machine, _root, _segment_generation, replicas, spare) =
