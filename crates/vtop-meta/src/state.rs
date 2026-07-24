@@ -2819,11 +2819,14 @@ fn decode_assigned_ranges(reader: &mut Reader<'_>) -> Result<Vec<RangeAssignment
 }
 
 fn encode_replica_nodes(out: &mut Vec<u8>, nodes: &[Uuid]) -> Result<(), CodecError> {
-    if nodes.len() > MAX_REPLICAS {
+    // Must match decode_replica_nodes: a snapshot taken while a rebalance
+    // intent holds the transient RF + 1 set has to encode, or Raft snapshot
+    // creation and follower recovery stall for the whole move.
+    if nodes.len() > MAX_TRANSIENT_REPLICAS {
         return Err(CodecError::BoundExceeded {
             what: "replica nodes",
             actual: nodes.len(),
-            maximum: MAX_REPLICAS,
+            maximum: MAX_TRANSIENT_REPLICAS,
         });
     }
     put_u16(out, nodes.len() as u16);
@@ -2865,6 +2868,28 @@ mod tests {
             request_id: Uuid::from_u128(request),
             issued_at_ms: 0,
         }
+    }
+
+    #[test]
+    fn replica_node_codec_round_trips_the_transient_nine_node_set() {
+        // A snapshot taken mid-rebalance carries declared RF + 1 replicas;
+        // encoder and decoder must agree on the transient bound or Raft
+        // snapshot creation stalls for the duration of the move.
+        let nine: Vec<Uuid> = (0..MAX_TRANSIENT_REPLICAS as u128)
+            .map(Uuid::from_u128)
+            .collect();
+        let mut out = Vec::new();
+        encode_replica_nodes(&mut out, &nine).expect("transient set must encode");
+        let mut reader = Reader::new(&out);
+        assert_eq!(
+            decode_replica_nodes(&mut reader).expect("transient set must decode"),
+            nine
+        );
+
+        let ten: Vec<Uuid> = (0..(MAX_TRANSIENT_REPLICAS + 1) as u128)
+            .map(Uuid::from_u128)
+            .collect();
+        assert!(encode_replica_nodes(&mut Vec::new(), &ten).is_err());
     }
 
     #[test]
