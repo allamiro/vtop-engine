@@ -10,7 +10,13 @@
 //! pipelined batches, per-follower flow-control windows, reconnect, and a
 //! bounded retransmission buffer for basic catch-up. Full sealed-segment
 //! transfer / repair remains a follow-up.
+//!
+//! [`fault::FaultInjectingReplicaSet`] layers controllable network delivery
+//! faults (loss / duplicate / reorder / delay) over the in-process set for
+//! the distributed data-plane fault harness (#188). Disk faults stay on
+//! [`vtop_log::sim`] and are injected independently.
 
+pub mod fault;
 pub mod network;
 
 use crate::{
@@ -26,6 +32,9 @@ use vtop_protocol::{
     ReplicaAppendResponse,
 };
 
+pub use fault::{
+    FaultInjectingReplicaSet, FollowerNetworkFault, NetworkFaultPlan, PendingDeliveryStats,
+};
 pub use network::{
     FlowControlConfig, NetworkFollowerConfig, NetworkedReplicaSet, ReplicaPeerHandler,
     ReplicaPeerServer, ReplicaTlsMaterial,
@@ -127,6 +136,11 @@ pub struct InProcessFollower {
     cluster_committed: ClusterCommittedOffset,
     state: Mutex<FollowerState>,
     online: AtomicBool,
+    /// When set, appends land with [`Durability::Buffered`] and are not
+    /// committed until [`Self::flush_held_fsync`]. Used by the data-plane
+    /// fault harness to delay follower durability independently of network
+    /// delivery faults.
+    hold_fsync: AtomicBool,
 }
 
 impl InProcessFollower {
@@ -190,6 +204,7 @@ impl InProcessFollower {
                 producer_epochs,
             }),
             online: AtomicBool::new(true),
+            hold_fsync: AtomicBool::new(false),
         })
     }
 
@@ -211,6 +226,76 @@ impl InProcessFollower {
 
     pub fn is_online(&self) -> bool {
         self.online.load(Ordering::SeqCst)
+    }
+
+    /// Delay promoting appended bytes to local durability until
+    /// [`Self::flush_held_fsync`]. Orthogonal to [`Self::set_online`] and to
+    /// network delivery faults on [`FaultInjectingReplicaSet`].
+    pub fn set_hold_fsync(&self, hold: bool) {
+        self.hold_fsync.store(hold, Ordering::SeqCst);
+    }
+
+    pub fn hold_fsync(&self) -> bool {
+        self.hold_fsync.load(Ordering::SeqCst)
+    }
+
+    /// Commit any bytes held by [`Self::set_hold_fsync`].
+    pub fn flush_held_fsync(&self) -> Result<u64, (ErrorCode, String)> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.segment.commit().map_err(|problem| {
+            (
+                ErrorCode::Storage,
+                format!("follower {} flush_held_fsync: {problem}", self.node_id),
+            )
+        })
+    }
+
+    /// Replace on-disk state after a simulated crash/reboot recovery.
+    ///
+    /// Returns the previous handles so the caller can drop them before
+    /// recovering the same paths. The follower Arc stays in the replica set.
+    pub fn swap_storage(
+        &self,
+        segment: ActiveSegment,
+        producer_epochs: ProducerEpochJournal,
+    ) -> BrokerResult<(ActiveSegment, ProducerEpochJournal)> {
+        let (seg_topic, seg_topic_epoch, seg_range_id, seg_generation) =
+            if let Some(desc) = segment.descriptor_v2() {
+                (
+                    desc.topic.as_str(),
+                    desc.topic_epoch,
+                    desc.lineage.range_id,
+                    desc.lineage.generation,
+                )
+            } else {
+                let desc = segment.descriptor();
+                (
+                    desc.topic.as_str(),
+                    desc.topic_epoch,
+                    desc.lineage.range_id,
+                    desc.lineage.generation,
+                )
+            };
+        if seg_topic != self.range.topic
+            || seg_topic_epoch != self.range.topic_epoch
+            || seg_range_id != self.range.range_id
+            || seg_generation != self.range.range_generation
+        {
+            return Err(BrokerError::InvalidConfig(format!(
+                "recovered follower segment identity does not match range {}",
+                self.range.topic
+            )));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let old_segment = std::mem::replace(&mut state.segment, segment);
+        let old_epochs = std::mem::replace(&mut state.producer_epochs, producer_epochs);
+        Ok((old_segment, old_epochs))
     }
 
     pub fn local_committed_offset(&self) -> u64 {
@@ -337,7 +422,12 @@ impl InProcessFollower {
             Ok(records) => records,
             Err(message) => return Err((ErrorCode::InvalidRequest, message.to_owned())),
         };
-        match state.segment.append_group(&records, Durability::Fsync) {
+        let durability = if self.hold_fsync.load(Ordering::SeqCst) {
+            Durability::Buffered
+        } else {
+            Durability::Fsync
+        };
+        match state.segment.append_group(&records, durability) {
             Ok(_) => Ok(ReplicaAppendResponse {
                 local_committed_offset: state.segment.committed_offset(),
             }),
@@ -463,6 +553,11 @@ impl InProcessFollower {
                     problem.to_string(),
                 ));
             }
+        }
+        if self.hold_fsync.load(Ordering::SeqCst) {
+            return Ok(ReplicaAppendResponse {
+                local_committed_offset: state.segment.committed_offset(),
+            });
         }
         match state.segment.commit() {
             Ok(local_committed_offset) => Ok(ReplicaAppendResponse {

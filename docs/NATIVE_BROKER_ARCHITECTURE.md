@@ -781,6 +781,32 @@ benefits have been measured for VTOP traffic.
   regresses; sealed identity never changes.
 - Legacy regression suites remain green with Kafka both enabled and disabled.
 
+### 15.1.1 Distributed data-plane fault harness (#188)
+
+Local disk and metadata fault injection remain in their existing suites
+(`vtop_log::sim` / `sim_crash_sweep`, meta storage crash sweeps, Raft
+three-node partition router). The broker data-plane harness builds on those
+seams rather than reimplementing them:
+
+| Layer | Mechanism |
+|---|---|
+| Disk | Per-node `SimStorage` + `FaultPlan` (same as #155/#167) |
+| Network | `FaultInjectingReplicaSet` over `InProcessReplicaSet` (loss / dup / reorder / delay) |
+| Follower fsync delay | `InProcessFollower::set_hold_fsync` (independent of network) |
+| Quorum / fencing | Real produce/fetch paths + `MetaFencingEpoch` |
+
+```text
+# CI (small suite; also in workspace test)
+cargo test -p vtop-broker --test data_plane_fault_harness --locked
+
+# Extended nightly-style matrix
+cargo test -p vtop-broker --test data_plane_fault_harness --locked -- --ignored
+```
+
+Failed runs print `seed=…` and are replayable with the same seed. A full
+10k-scenario combinatorial matrix and sealed-segment transfer faults remain
+follow-ups.
+
 ### 15.2 Benchmarks
 
 Measure before optimization:
