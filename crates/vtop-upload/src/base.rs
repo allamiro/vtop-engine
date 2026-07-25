@@ -43,6 +43,14 @@ pub struct StoredManifest {
     pub version_id: Option<String>,
 }
 
+/// Result of a telemetry/segment object upload.
+#[derive(Debug, Clone, Default)]
+pub struct StoredObject {
+    /// Immutable object version assigned by the store (S3 `x-amz-version-id`).
+    /// `None` when the backend or bucket does not expose versions.
+    pub version_id: Option<String>,
+}
+
 /// Result of a HEAD/stat on a stored object.
 #[derive(Debug, Clone)]
 pub struct ObjectHead {
@@ -313,7 +321,7 @@ pub trait UploadBackend: Send + Sync {
         local_path: &Path,
         object_uri: &str,
         checksum: Option<ObjectChecksum<'_>>,
-    ) -> Result<(), VtopError>;
+    ) -> Result<StoredObject, VtopError>;
 
     /// Upload the manifest JSON (with its digest as the checksum).
     ///

@@ -271,6 +271,10 @@ pub struct TierCopyRecord {
     /// 1..=[`MAX_TIER_OBJECT_URI_BYTES`] bytes; the manifest object is
     /// `object_uri + ".manifest.json"` by convention.
     pub object_uri: String,
+    /// Immutable version of the segment object itself. Without this pin a
+    /// later overwrite of `object_uri` could redirect rehydration after local
+    /// replicas have been retired.
+    pub object_version_id: Option<String>,
     /// 0..=[`MAX_TIER_VERSION_ID_BYTES`] bytes; the #135 immutable-version pin.
     pub manifest_version_id: Option<String>,
     /// Pins the canonical v2 manifest bytes with the commit statement
@@ -520,6 +524,15 @@ impl MetaValue {
                 put_u64(&mut out, tier.verified_at_apply_index);
                 put_u64(&mut out, tier.verified_term);
                 put_u64(&mut out, tier.fencing_epoch);
+                if let Some(version_id) = &tier.object_version_id {
+                    put_u8(&mut out, 1);
+                    put_bounded_str(
+                        &mut out,
+                        version_id,
+                        MAX_TIER_VERSION_ID_BYTES,
+                        "tier object version id",
+                    )?;
+                }
             }
             MetaValue::TopicRetentionPolicy(policy) => {
                 put_u8(&mut out, VALUE_TAG_TOPIC_RETENTION_POLICY);
@@ -743,6 +756,23 @@ impl MetaValue {
                 } else {
                     None
                 };
+                let manifest_core_digest = reader.bytes32("tier manifest core digest")?;
+                let verification_method =
+                    VerificationMethod::from_wire(reader.u8("tier verification method")?)?;
+                let verifier_node_uuid = reader.uuid("tier verifier node")?;
+                let verified_at_apply_index = reader.u64("tier verified apply index")?;
+                let verified_term = reader.u64("tier verified term")?;
+                let fencing_epoch = reader.u64("tier fencing epoch")?;
+                let object_version_id = if reader.remaining() == 0 {
+                    None
+                } else if reader.flag("tier object version presence")? {
+                    Some(reader.bounded_str(MAX_TIER_VERSION_ID_BYTES, "tier object version id")?)
+                } else {
+                    return Err(CodecError::InvalidValue {
+                        what: "tier object version presence",
+                        reason: "legacy None must omit the extension",
+                    });
+                };
                 MetaValue::TierCopy(TierCopyRecord {
                     generation,
                     segment_generation,
@@ -750,15 +780,14 @@ impl MetaValue {
                     byte_length,
                     backend_id,
                     object_uri,
+                    object_version_id,
                     manifest_version_id,
-                    manifest_core_digest: reader.bytes32("tier manifest core digest")?,
-                    verification_method: VerificationMethod::from_wire(
-                        reader.u8("tier verification method")?,
-                    )?,
-                    verifier_node_uuid: reader.uuid("tier verifier node")?,
-                    verified_at_apply_index: reader.u64("tier verified apply index")?,
-                    verified_term: reader.u64("tier verified term")?,
-                    fencing_epoch: reader.u64("tier fencing epoch")?,
+                    manifest_core_digest,
+                    verification_method,
+                    verifier_node_uuid,
+                    verified_at_apply_index,
+                    verified_term,
+                    fencing_epoch,
                 })
             }
             VALUE_TAG_TOPIC_RETENTION_POLICY => {
@@ -1078,6 +1107,7 @@ impl MetaStateMachine {
                 expected_segment_generation,
                 ..
             } => self.confirm_replica_retired(
+                apply_index,
                 *topic_uuid,
                 *range_uuid,
                 *segment_uuid,
@@ -1108,6 +1138,7 @@ impl MetaStateMachine {
                 expected_placement_generation,
                 ..
             } => self.cancel_rebalance(
+                apply_index,
                 *topic_uuid,
                 *range_uuid,
                 *segment_uuid,
@@ -1122,6 +1153,7 @@ impl MetaStateMachine {
                 byte_length,
                 backend_id,
                 object_uri,
+                object_version_id,
                 manifest_version_id,
                 manifest_core_digest,
                 verification_method,
@@ -1140,6 +1172,7 @@ impl MetaStateMachine {
                     byte_length: *byte_length,
                     backend_id: backend_id.clone(),
                     object_uri: object_uri.clone(),
+                    object_version_id: object_version_id.clone(),
                     manifest_version_id: manifest_version_id.clone(),
                     manifest_core_digest: *manifest_core_digest,
                     verification_method: *verification_method,
@@ -1179,6 +1212,7 @@ impl MetaStateMachine {
                 expected_segment_generation,
                 ..
             } => self.confirm_retention_expired(
+                apply_index,
                 *topic_uuid,
                 *range_uuid,
                 *segment_uuid,
@@ -1551,9 +1585,9 @@ impl MetaStateMachine {
                 "content root does not match the sealed segment",
             ));
         }
-        if segment.state == SegmentState::Verified {
+        if segment.state != SegmentState::SealedUnverified {
             return reject(MetadataError::invalid_transition(
-                "segment is already verified",
+                "verification requires SEALED_UNVERIFIED",
             ));
         }
         // The registration accepts any proposer-supplied generation, so the
@@ -1853,16 +1887,34 @@ impl MetaStateMachine {
         let Some(MetaValue::Range(range)) = self.records.get(&range_key) else {
             return reject(MetadataError::NotFound);
         };
+        let cursor_key = MetaKey::GroupCursor {
+            group_uuid: args.group_uuid,
+            topic_uuid: args.topic_uuid,
+            range_uuid: args.range_uuid,
+        }
+        .encode();
+        let existing_cursor = self.records.get(&cursor_key).cloned();
+        let legacy_cursor_generation = matches!(
+            &existing_cursor,
+            Some(MetaValue::GroupCursor(existing))
+                if range.lineage_generation == 0
+                    && args.range_generation != 0
+                    && existing.range_generation == args.range_generation
+        );
         // The cursor pins the range's lineage version, not its CAS token:
         // unrelated metadata updates (grants, segment registrations) bump
         // `generation` without moving the key interval, and must not strand
-        // an otherwise valid checkpoint.
-        if range.lineage_generation != args.range_generation {
+        // an otherwise valid checkpoint. Snapshots from the pre-lineage
+        // release stored that CAS token in existing cursor records; accept
+        // exactly that previously committed value once, then normalize the
+        // rewritten checkpoint to lineage generation zero.
+        if range.lineage_generation != args.range_generation && !legacy_cursor_generation {
             return reject(MetadataError::LineageMismatch {
                 expected: args.range_generation,
                 actual: range.lineage_generation,
             });
         }
+        let committed_range_generation = range.lineage_generation;
 
         let segment_key = MetaKey::Segment {
             topic_uuid: args.topic_uuid,
@@ -1891,22 +1943,13 @@ impl MetaStateMachine {
             )));
         }
 
-        let cursor_key = MetaKey::GroupCursor {
-            group_uuid: args.group_uuid,
-            topic_uuid: args.topic_uuid,
-            range_uuid: args.range_uuid,
-        }
-        .encode();
-        match (
-            self.records.get(&cursor_key).cloned(),
-            args.expected_checkpoint_generation,
-        ) {
+        match (existing_cursor, args.expected_checkpoint_generation) {
             (None, None) => {
                 self.records.insert(
                     cursor_key,
                     MetaValue::GroupCursor(CursorCheckpointRecord {
                         topic_epoch: args.topic_epoch,
-                        range_generation: args.range_generation,
+                        range_generation: committed_range_generation,
                         segment_uuid: args.segment_uuid,
                         segment_generation: args.segment_generation,
                         segment_root: args.segment_root,
@@ -1948,7 +1991,7 @@ impl MetaStateMachine {
                     cursor_key,
                     MetaValue::GroupCursor(CursorCheckpointRecord {
                         topic_epoch: args.topic_epoch,
-                        range_generation: args.range_generation,
+                        range_generation: committed_range_generation,
                         segment_uuid: args.segment_uuid,
                         segment_generation: args.segment_generation,
                         segment_root: args.segment_root,
@@ -2326,13 +2369,36 @@ impl MetaStateMachine {
             segment_uuid: args.segment_uuid,
         }
         .encode();
-        if self.records.contains_key(&proof_key) {
-            return reject(MetadataError::AlreadyExists);
-        }
+        let proof_generation = match self.records.get(&proof_key) {
+            None => 0,
+            Some(MetaValue::ReplacementProof(existing)) => {
+                if existing.fencing_epoch == args.fencing_epoch {
+                    return reject(MetadataError::AlreadyExists);
+                }
+                if existing.segment_generation != args.expected_segment_generation
+                    || existing.content_root != args.content_root
+                    || existing.expected_length_bytes != args.expected_length_bytes
+                    || existing.source_node_uuid != args.source_node_uuid
+                    || existing.destination_node_uuid != args.destination_node_uuid
+                    || existing.verification_method != args.verification_method
+                {
+                    return reject(MetadataError::invalid_transition(
+                        "stale replacement proof identity does not match the new proof",
+                    ));
+                }
+                let Some(next_generation) = existing.generation.checked_add(1) else {
+                    return reject(MetadataError::limit(
+                        "replacement proof generation space is exhausted",
+                    ));
+                };
+                next_generation
+            }
+            Some(_) => unreachable!("replacement-proof keys only hold proof records"),
+        };
         self.records.insert(
             proof_key,
             MetaValue::ReplacementProof(ReplacementProofRecord {
-                generation: 0,
+                generation: proof_generation,
                 segment_generation: args.expected_segment_generation,
                 content_root: args.content_root,
                 expected_length_bytes: args.expected_length_bytes,
@@ -2345,7 +2411,9 @@ impl MetaStateMachine {
                 verified_term: args.verified_term,
             }),
         );
-        MetadataResponse::Ack { generation: 0 }
+        MetadataResponse::Ack {
+            generation: proof_generation,
+        }
     }
 
     fn plan_replica_retirement(
@@ -2428,6 +2496,30 @@ impl MetaStateMachine {
             ));
         }
         let proof_content_root = proof.content_root;
+        let placement_key = MetaKey::SegmentPlacement {
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+        }
+        .encode();
+        let Some(MetaValue::SegmentPlacement(placement)) = self.records.get(&placement_key) else {
+            return reject(MetadataError::invalid_transition(
+                "replica retirement requires a committed segment placement",
+            ));
+        };
+        if !placement
+            .replica_nodes
+            .contains(&proof.destination_node_uuid)
+        {
+            return reject(MetadataError::invalid_transition(
+                "placement does not contain the verified replacement destination",
+            ));
+        }
+        if !placement.replica_nodes.contains(&retiring_node_uuid) {
+            return reject(MetadataError::invalid_transition(
+                "placement does not contain the retiring source replica",
+            ));
+        }
 
         let segment_key = MetaKey::Segment {
             topic_uuid,
@@ -2468,6 +2560,7 @@ impl MetaStateMachine {
 
     fn confirm_replica_retired(
         &mut self,
+        apply_index: u64,
         topic_uuid: Uuid,
         range_uuid: Uuid,
         segment_uuid: Uuid,
@@ -2589,6 +2682,7 @@ impl MetaStateMachine {
                     .replica_nodes
                     .retain(|node| *node != retiring_node_uuid);
                 placement.generation = next_placement_generation;
+                placement.committed_apply_index = apply_index;
             }
         }
         if completes_rebalance {
@@ -2760,6 +2854,7 @@ impl MetaStateMachine {
         };
         placement.replica_nodes.push(to_node_uuid);
         placement.generation = next_placement_generation;
+        placement.committed_apply_index = apply_index;
         MetadataResponse::Ack {
             generation: next_placement_generation,
         }
@@ -2767,6 +2862,7 @@ impl MetaStateMachine {
 
     fn cancel_rebalance(
         &mut self,
+        apply_index: u64,
         topic_uuid: Uuid,
         range_uuid: Uuid,
         segment_uuid: Uuid,
@@ -2832,6 +2928,7 @@ impl MetaStateMachine {
             .replica_nodes
             .retain(|node| *node != intent.to_node_uuid);
         placement.generation = next_placement_generation;
+        placement.committed_apply_index = apply_index;
         MetadataResponse::Ack {
             generation: next_placement_generation,
         }
@@ -2863,6 +2960,14 @@ impl MetaStateMachine {
             if version_id.len() > MAX_TIER_VERSION_ID_BYTES {
                 return reject(MetadataError::limit(format!(
                     "tier manifest version id must be <= {MAX_TIER_VERSION_ID_BYTES} bytes, got {}",
+                    version_id.len()
+                )));
+            }
+        }
+        if let Some(version_id) = &args.object_version_id {
+            if version_id.is_empty() || version_id.len() > MAX_TIER_VERSION_ID_BYTES {
+                return reject(MetadataError::limit(format!(
+                    "tier object version id must be 1..={MAX_TIER_VERSION_ID_BYTES} bytes, got {}",
                     version_id.len()
                 )));
             }
@@ -2956,6 +3061,7 @@ impl MetaStateMachine {
                 byte_length: args.byte_length,
                 backend_id: args.backend_id,
                 object_uri: args.object_uri,
+                object_version_id: args.object_version_id,
                 manifest_version_id: args.manifest_version_id,
                 manifest_core_digest: args.manifest_core_digest,
                 verification_method: args.verification_method,
@@ -3185,6 +3291,7 @@ impl MetaStateMachine {
 
     fn confirm_retention_expired(
         &mut self,
+        apply_index: u64,
         topic_uuid: Uuid,
         range_uuid: Uuid,
         segment_uuid: Uuid,
@@ -3253,6 +3360,7 @@ impl MetaStateMachine {
                 // from the list length.
                 placement.replica_nodes.clear();
                 placement.generation = next_placement_generation;
+                placement.committed_apply_index = apply_index;
             }
         }
         MetadataResponse::Ack {
@@ -3273,7 +3381,7 @@ impl MetaStateMachine {
             segment_uuid,
         }
         .encode();
-        let Some(MetaValue::Segment(segment)) = self.records.get_mut(&segment_key) else {
+        let Some(MetaValue::Segment(segment)) = self.records.get(&segment_key) else {
             return reject(MetadataError::NotFound);
         };
         if segment.segment_generation != expected_segment_generation {
@@ -3287,19 +3395,14 @@ impl MetaStateMachine {
                 "retention cancellation requires RETENTION_PLANNED",
             ));
         }
-        let Some(next_generation) = segment.segment_generation.checked_add(1) else {
-            return reject(MetadataError::limit(
-                "segment generation space is exhausted",
-            ));
-        };
-        // Local bytes were never deleted (deletion is authorized only between
-        // plan and confirm), so restoring Verified is safe; without this a
-        // mistaken plan would wedge the segment.
-        segment.state = SegmentState::Verified;
-        segment.segment_generation = next_generation;
-        MetadataResponse::Ack {
-            generation: next_generation,
-        }
+        // PlanRetention is the durable deletion authorization. The state
+        // machine has no proof that workers have not already removed one or
+        // more replicas, so restoring Verified here would make possibly
+        // deleted replicas readable again. Recovery must complete retention
+        // or establish fresh verified placement evidence through repair.
+        reject(MetadataError::invalid_transition(
+            "retention cannot be cancelled after deletion is authorized",
+        ))
     }
 
     fn active_placement_candidates(&self) -> Vec<PlacementCandidate> {
@@ -3537,6 +3640,7 @@ struct CommitTierEvidenceArgs {
     byte_length: u64,
     backend_id: String,
     object_uri: String,
+    object_version_id: Option<String>,
     manifest_version_id: Option<String>,
     manifest_core_digest: [u8; 32],
     verification_method: VerificationMethod,
@@ -3854,6 +3958,7 @@ mod tests {
             byte_length: u64::MAX,
             backend_id: "b".repeat(MAX_TIER_BACKEND_ID_BYTES),
             object_uri: "u".repeat(MAX_TIER_OBJECT_URI_BYTES),
+            object_version_id: Some("o".repeat(MAX_TIER_VERSION_ID_BYTES)),
             manifest_version_id: Some("v".repeat(MAX_TIER_VERSION_ID_BYTES)),
             manifest_core_digest: [0xff; 32],
             verification_method: VerificationMethod::AuthenticatedContentRoot,
@@ -3869,12 +3974,13 @@ mod tests {
         // Pin the arithmetic: tag 1 + generation 8 + segment generation 8 +
         // root 32 + length 8 + backend (2 + 64) + uri (2 + 512) + version
         // (1 + 2 + 128) + digest 32 + method 1 + verifier 16 + apply index 8
-        // + term 8 + epoch 8 = 841 bytes. This is why the URI bound is 512
-        // (not S3's 1024) and the manifest has no separate URI field.
+        // + term 8 + epoch 8 + object version extension (1 + 2 + 128) =
+        // 972 bytes. This is why the URI bound is 512 (not S3's 1024) and the
+        // manifest has no separate URI field.
         let encoded = MetaValue::TierCopy(max_tier_copy_record())
             .encode()
             .unwrap();
-        assert_eq!(encoded.len(), 841);
+        assert_eq!(encoded.len(), 972);
         assert!(encoded.len() < MAX_SNAPSHOT_VALUE_BYTES);
         assert_eq!(
             MetaValue::decode(&encoded).unwrap(),
@@ -3916,7 +4022,19 @@ mod tests {
         ));
 
         // An unknown verification-method tag is rejected, never defaulted.
-        let method_at = encoded.len() - 8 - 8 - 8 - 16 - 1;
+        let method_at = 1
+            + 8
+            + 8
+            + 32
+            + 8
+            + 2
+            + MAX_TIER_BACKEND_ID_BYTES
+            + 2
+            + MAX_TIER_OBJECT_URI_BYTES
+            + 1
+            + 2
+            + MAX_TIER_VERSION_ID_BYTES
+            + 32;
         assert_eq!(encoded[method_at], 1);
         let mut unknown_method = encoded.clone();
         unknown_method[method_at] = 9;

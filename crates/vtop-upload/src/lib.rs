@@ -15,7 +15,9 @@ pub mod mock;
 pub mod s3_native;
 pub mod s3cmd_backend;
 
-pub use base::{ObjectChecksum, ObjectHead, UploadBackend, VerificationResult};
+pub use base::{
+    ObjectChecksum, ObjectHead, StoredManifest, StoredObject, UploadBackend, VerificationResult,
+};
 pub use mock::MockBackend;
 
 use std::sync::Arc;

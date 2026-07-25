@@ -9,10 +9,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-/// Quorum durability and peer replication kinds (60–62) plus consumer cursor
-/// kinds (70–73) are additive under 1.0.
-/// Keeping the minor at 0 preserves decode compatibility for existing 1.0
-/// clients: replies continue to advertise the same minor they already accept.
+/// New request families remain additive under 1.0. In particular, kind 74
+/// carries the explicit cursor-commit operation ID while legacy kind 70
+/// decodes without authority to commit.
 pub const PROTOCOL_MINOR: u16 = 0;
 pub const HEADER_LEN: usize = 64;
 pub const MIN_FRAME_BYTES: u32 = HEADER_LEN as u32;
@@ -319,6 +318,10 @@ pub struct LineageCursor {
 /// Consumer → broker request to durably CAS-commit a lineage-aware cursor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommitCursorRequest {
+    /// Stable idempotency identity chosen by the consumer. Retry an ambiguous
+    /// operation with the same value; choose a new value after a definitive
+    /// rejection once its prerequisite has changed.
+    pub operation_id: Uuid,
     pub member_id: Uuid,
     pub cursor: LineageCursor,
     /// `None` creates the first checkpoint; `Some(g)` is a CAS against `g`.
@@ -380,7 +383,7 @@ impl Message {
             Self::ReplicaAppendRequest(_) => 60,
             Self::ReplicaAppendResponse(_) => 61,
             Self::CommittedHwmUpdate(_) => 62,
-            Self::CommitCursorRequest(_) => 70,
+            Self::CommitCursorRequest(_) => 74,
             Self::CommitCursorResponse(_) => 71,
             Self::FetchCursorRequest(_) => 72,
             Self::FetchCursorResponse(_) => 73,
@@ -542,6 +545,7 @@ fn encoded_payload_size(message: &Message, limits: ProtocolLimits) -> Result<usi
             Message::CommitCursorRequest(value) => {
                 lineage_cursor_size(&value.cursor)?
                     + 16
+                    + 16
                     + optional_u64_size(value.expected_checkpoint_generation)
             }
             Message::CommitCursorResponse(_) => 8,
@@ -652,7 +656,7 @@ fn decode_header(header: &[u8], limits: ProtocolLimits) -> Result<Header, Protoc
     let kind = u16::from_be_bytes(header[8..10].try_into().expect("fixed slice"));
     if !matches!(
         kind,
-        1 | 2 | 10 | 11 | 20 | 21 | 30 | 40 | 50 | 51 | 60 | 61 | 62 | 70 | 71 | 72 | 73
+        1 | 2 | 10 | 11 | 20 | 21 | 30 | 40 | 50 | 51 | 60 | 61 | 62 | 70 | 71 | 72 | 73 | 74
     ) {
         return Err(ProtocolError::UnknownKind(kind));
     }
@@ -788,6 +792,7 @@ fn encode_message(message: &Message, out: &mut Vec<u8>) -> Result<(), ProtocolEr
             put_u64(out, value.committed_high_watermark);
         }
         Message::CommitCursorRequest(value) => {
+            put_uuid(out, value.operation_id);
             put_uuid(out, value.member_id);
             put_lineage_cursor(out, &value.cursor);
             put_optional_u64(out, value.expected_checkpoint_generation);
@@ -979,6 +984,16 @@ fn decode_message(
             committed_high_watermark: decoder.u64()?,
         }),
         70 => Message::CommitCursorRequest(CommitCursorRequest {
+            // Legacy kind 70 did not carry an operation identity. Decode it
+            // as nil so the broker rejects it explicitly instead of caching
+            // content-derived failures. Kind 74 is the retry-safe form.
+            operation_id: Uuid::nil(),
+            member_id: decoder.uuid()?,
+            cursor: decode_lineage_cursor(decoder)?,
+            expected_checkpoint_generation: decode_optional_u64(decoder)?,
+        }),
+        74 => Message::CommitCursorRequest(CommitCursorRequest {
+            operation_id: decoder.uuid()?,
             member_id: decoder.uuid()?,
             cursor: decode_lineage_cursor(decoder)?,
             expected_checkpoint_generation: decode_optional_u64(decoder)?,
@@ -1396,6 +1411,7 @@ mod tests {
                 committed_high_watermark: 11,
             }),
             Message::CommitCursorRequest(CommitCursorRequest {
+                operation_id: Uuid::from_u128(52),
                 member_id: Uuid::from_u128(51),
                 cursor: LineageCursor {
                     group_id: Uuid::from_u128(50),
@@ -1446,8 +1462,51 @@ mod tests {
                 message,
             };
             let encoded = encode_frame(&frame, limits()).unwrap();
+            if matches!(&frame.message, Message::CommitCursorRequest(_)) {
+                assert_eq!(u16::from_be_bytes(encoded[8..10].try_into().unwrap()), 74);
+                assert_eq!(
+                    u16::from_be_bytes(encoded[6..8].try_into().unwrap()),
+                    PROTOCOL_MINOR
+                );
+            }
             assert_eq!(decode_frame(&encoded, limits()).unwrap(), frame);
         }
+    }
+
+    #[test]
+    fn legacy_kind_70_cursor_commit_decodes_with_no_operation_authority() {
+        let member_id = Uuid::from_u128(51);
+        let cursor = LineageCursor {
+            group_id: Uuid::from_u128(50),
+            topic_id: Uuid::from_u128(20),
+            topic_epoch: 1,
+            range_id: Uuid::from_u128(21),
+            range_generation: 0,
+            segment_id: Uuid::from_u128(30),
+            segment_generation: 0,
+            segment_root: [3; 32],
+            record_offset: 42,
+            record_index: 7,
+            lineage_transition_id: None,
+            checkpoint_generation: 0,
+        };
+        let mut payload = Vec::new();
+        put_uuid(&mut payload, member_id);
+        put_lineage_cursor(&mut payload, &cursor);
+        put_optional_u64(&mut payload, Some(0));
+
+        let mut decoder = Decoder::new(&payload);
+        let decoded = decode_message(70, &mut decoder, limits()).unwrap();
+        decoder.finish().unwrap();
+        assert_eq!(
+            decoded,
+            Message::CommitCursorRequest(CommitCursorRequest {
+                operation_id: Uuid::nil(),
+                member_id,
+                cursor,
+                expected_checkpoint_generation: Some(0),
+            })
+        );
     }
 
     #[test]

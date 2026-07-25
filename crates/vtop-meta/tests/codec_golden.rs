@@ -417,6 +417,7 @@ fn retention_machine() -> MetaStateMachine {
             byte_length: 4096,
             backend_id: "s3-native".to_owned(),
             object_uri: "s3://tier/native/audit.v1/segment.segment".to_owned(),
+            object_version_id: None,
             manifest_version_id: Some("3sL4kqCJo05qOWBhBqpfOFAdT4dRJVvV".to_owned()),
             manifest_core_digest: [0x5d; 32],
             verification_method: vtop_meta::VerificationMethod::AuthenticatedContentRoot,

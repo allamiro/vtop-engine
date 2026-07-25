@@ -259,12 +259,22 @@ mod tests {
     }
 
     fn executable_script(body: &str) -> (tempfile::TempDir, PathBuf) {
+        // Write to a temp name, sync, chmod, then rename into place. On some CI
+        // filesystems, exec'ing a script that was just written in-place races
+        // with the writer close and fails with ETXTBSY (os error 26).
+        use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tool");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        let tmp = dir.path().join("tool.tmp");
+        {
+            let mut file = std::fs::File::create(&tmp).unwrap();
+            write!(file, "#!/bin/sh\n{body}\n").unwrap();
+            file.sync_all().unwrap();
+        }
+        let mut permissions = std::fs::metadata(&tmp).unwrap().permissions();
         permissions.set_mode(0o700);
-        std::fs::set_permissions(&path, permissions).unwrap();
+        std::fs::set_permissions(&tmp, permissions).unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
         (dir, path)
     }
 

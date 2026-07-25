@@ -4,7 +4,9 @@
 //! fail verification — exercising the "verification fails -> source not
 //! committed" path without any external service.
 
-use crate::base::{ObjectChecksum, ObjectHead, StoredManifest, UploadBackend, VerificationResult};
+use crate::base::{
+    ObjectChecksum, ObjectHead, StoredManifest, StoredObject, UploadBackend, VerificationResult,
+};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::Path;
@@ -146,10 +148,13 @@ impl UploadBackend for MockBackend {
         local_path: &Path,
         object_uri: &str,
         checksum: Option<ObjectChecksum<'_>>,
-    ) -> Result<(), VtopError> {
-        self.store(local_path, object_uri, checksum.map(|c| c.hex))
-            .await
-            .map(|_| ())
+    ) -> Result<StoredObject, VtopError> {
+        let version_id = self
+            .store(local_path, object_uri, checksum.map(|c| c.hex))
+            .await?;
+        Ok(StoredObject {
+            version_id: Some(version_id),
+        })
     }
 
     async fn put_manifest(

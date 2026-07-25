@@ -950,20 +950,20 @@ impl LocalBroker {
                         "broker has no group checkpoint store configured",
                     );
                 };
+                if request.operation_id.is_nil() {
+                    return error(
+                        request_id,
+                        stream_id,
+                        ErrorCode::InvalidRequest,
+                        "cursor commit requires a non-nil operation ID",
+                    );
+                }
                 let command = MetadataCommand::CommitGroupCursor {
                     env: CommandEnvelope {
-                        // The metadata dedup table requires ids that are
-                        // unique across sessions yet STABLE across retries of
-                        // the same logical operation: a client whose commit
-                        // applied but whose response was lost must get the
-                        // original receipt back, not a spurious CAS conflict.
-                        // Content-address the operation — principal plus every
-                        // request field — so identical retries dedup to the
-                        // stored response while any differing operation
-                        // (different principal, cursor, or expectation) gets
-                        // a distinct id. Connection-scoped wire counters are
-                        // deliberately excluded.
-                        request_id: cursor_commit_request_id(&request),
+                        // Retry an ambiguous commit with this same ID. After
+                        // a definitive rejection, the client may rotate it
+                        // once prerequisites have changed.
+                        request_id: request.operation_id,
                         issued_at_ms: 0,
                     },
                     group_uuid: request.cursor.group_id,
@@ -1086,53 +1086,6 @@ impl LocalBroker {
         }
         Ok(())
     }
-}
-
-/// Content-addressed request id for cursor commits. Identical retries of the
-/// same logical operation (every field equal) must map to the same id so the
-/// metadata dedup table returns the stored receipt after a lost response;
-/// any differing operation hashes to a distinct id. `member_id` is bound to
-/// the authenticated principal at the session boundary, scoping the id to
-/// the caller. Fixed-width fields plus tagged options keep the encoding
-/// prefix-free and canonical.
-fn cursor_commit_request_id(request: &vtop_protocol::CommitCursorRequest) -> Uuid {
-    let mut hasher = blake3::Hasher::new_derive_key("vtop-broker 2026 cursor-commit request-id v1");
-    hasher.update(request.member_id.as_bytes());
-    let cursor = &request.cursor;
-    hasher.update(cursor.group_id.as_bytes());
-    hasher.update(cursor.topic_id.as_bytes());
-    hasher.update(&cursor.topic_epoch.to_be_bytes());
-    hasher.update(cursor.range_id.as_bytes());
-    hasher.update(&cursor.range_generation.to_be_bytes());
-    hasher.update(cursor.segment_id.as_bytes());
-    hasher.update(&cursor.segment_generation.to_be_bytes());
-    hasher.update(&cursor.segment_root);
-    hasher.update(&cursor.record_offset.to_be_bytes());
-    hasher.update(&cursor.record_index.to_be_bytes());
-    match cursor.lineage_transition_id {
-        Some(id) => {
-            hasher.update(&[1]);
-            hasher.update(id.as_bytes());
-        }
-        None => {
-            hasher.update(&[0]);
-        }
-    }
-    hasher.update(&cursor.checkpoint_generation.to_be_bytes());
-    match request.expected_checkpoint_generation {
-        Some(generation) => {
-            hasher.update(&[1]);
-            hasher.update(&generation.to_be_bytes());
-        }
-        None => {
-            hasher.update(&[0]);
-        }
-    }
-    let hash = hasher.finalize();
-    let bytes: [u8; 16] = hash.as_bytes()[..16]
-        .try_into()
-        .expect("BLAKE3 output is 32 bytes");
-    Uuid::from_u128(u128::from_be_bytes(bytes))
 }
 
 fn map_metadata_error(error: &MetadataError) -> (ErrorCode, String) {
@@ -2377,52 +2330,6 @@ mod tests {
         server_task.await.unwrap().unwrap();
     }
 
-    #[test]
-    fn cursor_commit_request_ids_are_stable_for_retries_and_distinct_per_operation() {
-        let base = vtop_protocol::CommitCursorRequest {
-            member_id: Uuid::from_u128(1),
-            cursor: vtop_protocol::LineageCursor {
-                group_id: Uuid::from_u128(2),
-                topic_id: Uuid::from_u128(3),
-                topic_epoch: 4,
-                range_id: Uuid::from_u128(5),
-                range_generation: 6,
-                segment_id: Uuid::from_u128(7),
-                segment_generation: 8,
-                segment_root: [9; 32],
-                record_offset: 10,
-                record_index: 11,
-                lineage_transition_id: None,
-                checkpoint_generation: 12,
-            },
-            expected_checkpoint_generation: Some(12),
-        };
-        // A retry of the identical logical operation maps to the same id, so
-        // the metadata dedup table returns the original receipt after a lost
-        // response.
-        assert_eq!(
-            cursor_commit_request_id(&base),
-            cursor_commit_request_id(&base)
-        );
-        // Any differing field is a different operation with a distinct id.
-        let mut ids = vec![cursor_commit_request_id(&base)];
-        let mut other = base.clone();
-        other.member_id = Uuid::from_u128(99);
-        ids.push(cursor_commit_request_id(&other));
-        let mut other = base.clone();
-        other.cursor.record_offset = 99;
-        ids.push(cursor_commit_request_id(&other));
-        let mut other = base.clone();
-        other.expected_checkpoint_generation = None;
-        ids.push(cursor_commit_request_id(&other));
-        let mut other = base.clone();
-        other.cursor.lineage_transition_id = Some(Uuid::from_u128(13));
-        ids.push(cursor_commit_request_id(&other));
-        ids.sort_unstable();
-        ids.dedup();
-        assert_eq!(ids.len(), 5, "every operation variant must hash distinctly");
-    }
-
     #[tokio::test]
     async fn mtls_session_binds_cursor_member_id_to_the_authenticated_principal() {
         let (_dir, broker, _range) = fixture();
@@ -2499,6 +2406,7 @@ mod tests {
             request_id,
             stream_id: 1,
             message: Message::CommitCursorRequest(CommitCursorRequest {
+                operation_id: Uuid::from_u128(79),
                 member_id,
                 cursor: LineageCursor {
                     group_id: Uuid::from_u128(70),
