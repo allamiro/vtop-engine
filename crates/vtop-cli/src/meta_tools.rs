@@ -79,6 +79,9 @@ pub enum MetaCommand {
         backend_id: String,
         #[arg(long)]
         object_uri: String,
+        /// Immutable segment-object version id (omit only for unversioned backends).
+        #[arg(long)]
+        object_version_id: Option<String>,
         /// Immutable manifest version id (omit only for unversioned backends).
         #[arg(long)]
         manifest_version_id: Option<String>,
@@ -343,6 +346,7 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
             byte_length,
             backend_id,
             object_uri,
+            object_version_id,
             manifest_version_id,
             manifest_core_digest,
             verifier_node_uuid,
@@ -364,6 +368,7 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
                 byte_length,
                 backend_id,
                 object_uri,
+                object_version_id,
                 manifest_version_id,
                 manifest_core_digest,
                 verification_method: vtop_meta::VerificationMethod::AuthenticatedContentRoot,

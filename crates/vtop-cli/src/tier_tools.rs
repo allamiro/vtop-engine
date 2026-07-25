@@ -91,6 +91,10 @@ pub struct TierCopyArgs {
 
     #[arg(long, default_value_t = 0)]
     pub issued_at_ms: i64,
+    /// Stable metadata idempotency identity. When omitted, VTOP derives it
+    /// from the logical tier-copy inputs so a retry after an ambiguous
+    /// response replays the original receipt. Supply a new value only after a
+    /// definitive rejection whose prerequisite has been corrected.
     #[arg(long)]
     pub request_id: Option<Uuid>,
 }
@@ -221,10 +225,10 @@ pub async fn run_tier_copy(
             .map_err(|error| refuse("versioning preflight", error))?;
     }
 
-    // 3. Upload segment and manifest, capturing the immutable manifest
-    //    version. A missing version id under the hardened profile is exactly
+    // 3. Upload segment and manifest, capturing both immutable object
+    //    versions. A missing version id under the hardened profile is exactly
     //    the rollback surface #135 removed: abort.
-    backend
+    let stored_segment = backend
         .put_object(
             &request.segment,
             &request.object_uri,
@@ -232,6 +236,12 @@ pub async fn run_tier_copy(
         )
         .await
         .map_err(|error| refuse("segment upload", error))?;
+    if request.require_versioning && stored_segment.version_id.is_none() {
+        return Err(refuse(
+            "segment upload",
+            "backend returned no immutable segment version id under --require-versioning",
+        ));
+    }
     let manifest_uri = format!("{}.manifest.json", request.object_uri);
     let stored = backend
         .put_manifest(
@@ -313,6 +323,7 @@ pub async fn run_tier_copy(
         byte_length,
         backend_id: backend.backend_name().to_owned(),
         object_uri: request.object_uri.clone(),
+        object_version_id: stored_segment.version_id,
         manifest_version_id: stored.version_id,
         manifest_core_digest,
         verification_method: vtop_meta::VerificationMethod::AuthenticatedContentRoot,
@@ -335,6 +346,9 @@ pub fn build_request(args: &TierCopyArgs) -> Result<TierCopyRequest, String> {
             .map_err(|_| format!("--commit-key-env {variable}: not 64 hex characters"))?;
         keyring.insert(args.commit_key_id.clone(), key);
     }
+    let request_id = args
+        .request_id
+        .unwrap_or_else(|| derived_tier_copy_request_id(args, expected_root.as_bytes()));
     Ok(TierCopyRequest {
         segment: args.segment.clone(),
         topic_uuid: args.topic_uuid,
@@ -348,9 +362,27 @@ pub fn build_request(args: &TierCopyArgs) -> Result<TierCopyRequest, String> {
         keyring,
         verifier_node_uuid: args.verifier_node_uuid,
         verified_term: args.verified_term,
-        request_id: args.request_id.unwrap_or_else(Uuid::new_v4),
+        request_id,
         issued_at_ms: args.issued_at_ms,
     })
+}
+
+fn derived_tier_copy_request_id(args: &TierCopyArgs, expected_root: &[u8; 32]) -> Uuid {
+    let mut hasher = blake3::Hasher::new_derive_key("vtop tier-copy operation id v1");
+    hasher.update(args.topic_uuid.as_bytes());
+    hasher.update(args.range_uuid.as_bytes());
+    hasher.update(args.segment_uuid.as_bytes());
+    hasher.update(&args.expected_generation.to_be_bytes());
+    hasher.update(&args.fencing_epoch.to_be_bytes());
+    hasher.update(expected_root);
+    hasher.update(&(args.object_uri.len() as u64).to_be_bytes());
+    hasher.update(args.object_uri.as_bytes());
+    hasher.update(&[u8::from(args.require_versioning)]);
+    hasher.update(args.verifier_node_uuid.as_bytes());
+    hasher.update(&args.verified_term.to_be_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    Uuid::from_bytes(bytes)
 }
 
 /// Dispatch `vtopctl tier` and return a process exit code.
@@ -480,8 +512,9 @@ mod tests {
             local_path: &Path,
             object_uri: &str,
             checksum: Option<ObjectChecksum<'_>>,
-        ) -> Result<(), VtopError> {
-            self.0.put_object(local_path, object_uri, checksum).await
+        ) -> Result<vtop_upload::StoredObject, VtopError> {
+            self.0.put_object(local_path, object_uri, checksum).await?;
+            Ok(vtop_upload::StoredObject { version_id: None })
         }
         async fn put_manifest(
             &self,
@@ -553,6 +586,7 @@ mod tests {
             byte_length,
             backend_id,
             object_uri,
+            object_version_id,
             manifest_version_id,
             manifest_core_digest,
             verification_method,
@@ -576,6 +610,10 @@ mod tests {
         );
         assert_eq!(backend_id, "mock");
         assert_eq!(object_uri, "s3://tier/native/events.v1/bundle.segment");
+        assert!(
+            object_version_id.is_some(),
+            "versioned backend must pin the segment object"
+        );
         assert!(manifest_version_id.is_some(), "versioned backend must pin");
         assert_eq!(
             *verification_method,
@@ -690,7 +728,7 @@ mod tests {
         let error = run_tier_copy(&backend, &request(&sealed, root))
             .await
             .expect_err("missing version id must refuse under the hardened profile");
-        assert!(error.contains("no immutable version id"), "{error}");
+        assert!(error.contains("no immutable segment version id"), "{error}");
     }
 
     #[tokio::test]
@@ -723,7 +761,7 @@ mod tests {
 
     #[test]
     fn build_request_maps_arguments_and_rejects_bad_hex() {
-        let args = TierCopyArgs {
+        let mut args = TierCopyArgs {
             upload_config: PathBuf::from("upload.yaml"),
             meta_config: PathBuf::from("meta.yaml"),
             segment: PathBuf::from("bundle.segment"),
@@ -747,10 +785,15 @@ mod tests {
         assert!(request.keyring.is_empty());
         assert_eq!(request.request_id, Uuid::from_u128(1));
 
-        let bad = TierCopyArgs {
-            expected_root: "zz".repeat(32),
-            ..args
-        };
-        assert!(build_request(&bad).is_err());
+        // The default operation ID is retry-stable for identical logical
+        // inputs and changes when the destination operation changes.
+        args.request_id = None;
+        let derived = build_request(&args).unwrap().request_id;
+        assert_eq!(build_request(&args).unwrap().request_id, derived);
+        args.object_uri = "s3://tier/other.segment".to_owned();
+        assert_ne!(build_request(&args).unwrap().request_id, derived);
+
+        args.expected_root = "zz".repeat(32);
+        assert!(build_request(&args).is_err());
     }
 }

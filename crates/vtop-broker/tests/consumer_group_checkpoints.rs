@@ -185,6 +185,7 @@ fn commit_and_fetch_lineage_cursor_through_broker() {
             request_id: 1,
             stream_id: 1,
             message: Message::CommitCursorRequest(CommitCursorRequest {
+                operation_id: Uuid::from_u128(100),
                 member_id: MEMBER_UUID,
                 cursor: cursor_at(10, 0),
                 expected_checkpoint_generation: None,
@@ -199,6 +200,26 @@ fn commit_and_fetch_lineage_cursor_through_broker() {
         "{:?}",
         commit.message
     );
+
+    // A response-loss retry uses a new wire request counter but the same
+    // logical operation ID and receives the original durable receipt.
+    let retry = broker.handle(
+        Role::Consumer,
+        WireFrame {
+            request_id: 7,
+            stream_id: 1,
+            message: Message::CommitCursorRequest(CommitCursorRequest {
+                operation_id: Uuid::from_u128(100),
+                member_id: MEMBER_UUID,
+                cursor: cursor_at(10, 0),
+                expected_checkpoint_generation: None,
+            }),
+        },
+    );
+    assert!(matches!(
+        retry.message,
+        Message::CommitCursorResponse(ref response) if response.checkpoint_generation == 0
+    ));
 
     let fetched = broker.handle(
         Role::Consumer,
@@ -226,6 +247,7 @@ fn commit_and_fetch_lineage_cursor_through_broker() {
             request_id: 3,
             stream_id: 1,
             message: Message::CommitCursorRequest(CommitCursorRequest {
+                operation_id: Uuid::from_u128(101),
                 member_id: MEMBER_UUID,
                 cursor: cursor_at(20, 0),
                 expected_checkpoint_generation: Some(0),
@@ -243,6 +265,7 @@ fn commit_and_fetch_lineage_cursor_through_broker() {
             request_id: 4,
             stream_id: 1,
             message: Message::CommitCursorRequest(CommitCursorRequest {
+                operation_id: Uuid::from_u128(102),
                 member_id: MEMBER_UUID,
                 cursor: cursor_at(30, 0),
                 expected_checkpoint_generation: Some(0),
@@ -264,6 +287,7 @@ fn commit_and_fetch_lineage_cursor_through_broker() {
             request_id: 5,
             stream_id: 1,
             message: Message::CommitCursorRequest(CommitCursorRequest {
+                operation_id: Uuid::from_u128(103),
                 member_id: MEMBER_UUID,
                 cursor: cursor_at(5, 0),
                 expected_checkpoint_generation: Some(1),
@@ -290,6 +314,7 @@ fn commit_and_fetch_lineage_cursor_through_broker() {
             request_id: 6,
             stream_id: 1,
             message: Message::CommitCursorRequest(CommitCursorRequest {
+                operation_id: Uuid::from_u128(104),
                 member_id: MEMBER_UUID,
                 cursor: cas_cursor,
                 expected_checkpoint_generation: Some(1),
@@ -304,6 +329,73 @@ fn commit_and_fetch_lineage_cursor_through_broker() {
         "{:?}",
         wrong_lineage.message
     );
+}
+
+#[test]
+fn cursor_operation_id_rotates_only_after_a_definitive_rejection() {
+    let store = seeded_group_store();
+    // Temporarily remove the member's assignment so the first operation is
+    // definitively rejected and that rejection enters metadata dedup.
+    assert_eq!(
+        store.apply(MetadataCommand::AssignMemberRanges {
+            env: envelope(8),
+            group_uuid: GROUP_UUID,
+            member_uuid: MEMBER_UUID,
+            ranges: Vec::new(),
+            expected_member_generation: 1,
+        }),
+        MetadataResponse::Ack { generation: 2 }
+    );
+    let shared_store = store.clone();
+    let (_dir, broker) = open_broker(store);
+    let commit = |request_id, operation_id| {
+        broker.handle(
+            Role::Consumer,
+            WireFrame {
+                request_id,
+                stream_id: 1,
+                message: Message::CommitCursorRequest(CommitCursorRequest {
+                    operation_id,
+                    member_id: MEMBER_UUID,
+                    cursor: cursor_at(10, 0),
+                    expected_checkpoint_generation: None,
+                }),
+            },
+        )
+    };
+
+    let rejected_once = commit(1, Uuid::from_u128(200));
+    assert!(matches!(
+        rejected_once.message,
+        Message::Error(ref error) if error.code == ErrorCode::WrongLineage
+    ));
+    assert_eq!(
+        shared_store.apply(MetadataCommand::AssignMemberRanges {
+            env: envelope(9),
+            group_uuid: GROUP_UUID,
+            member_uuid: MEMBER_UUID,
+            ranges: vec![RangeAssignment {
+                topic_uuid: TOPIC_UUID,
+                range_uuid: RANGE_UUID,
+            }],
+            expected_member_generation: 2,
+        }),
+        MetadataResponse::Ack { generation: 3 }
+    );
+
+    // The old ID still means the old rejected operation, even after its
+    // prerequisite changes.
+    let rejected_retry = commit(2, Uuid::from_u128(200));
+    assert!(matches!(
+        rejected_retry.message,
+        Message::Error(ref error) if error.code == ErrorCode::WrongLineage
+    ));
+    // A fresh ID starts a new logical operation and can now commit.
+    let corrected = commit(3, Uuid::from_u128(201));
+    assert!(matches!(
+        corrected.message,
+        Message::CommitCursorResponse(ref response) if response.checkpoint_generation == 0
+    ));
 }
 
 #[test]
@@ -336,6 +428,7 @@ fn producer_cannot_commit_cursors_and_missing_store_rejects() {
             request_id: 1,
             stream_id: 1,
             message: Message::CommitCursorRequest(CommitCursorRequest {
+                operation_id: Uuid::from_u128(105),
                 member_id: MEMBER_UUID,
                 cursor: cursor_at(1, 0),
                 expected_checkpoint_generation: None,
@@ -353,6 +446,7 @@ fn producer_cannot_commit_cursors_and_missing_store_rejects() {
             request_id: 2,
             stream_id: 1,
             message: Message::CommitCursorRequest(CommitCursorRequest {
+                operation_id: Uuid::from_u128(106),
                 member_id: MEMBER_UUID,
                 cursor: cursor_at(1, 0),
                 expected_checkpoint_generation: None,

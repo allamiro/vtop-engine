@@ -396,6 +396,8 @@ pub enum MetadataCommand {
         /// `object_uri + ".manifest.json"` by convention (no separate field,
         /// keeping the record inside the snapshot value bound).
         object_uri: String,
+        /// Immutable version of the segment object itself.
+        object_version_id: Option<String>,
         /// Immutable manifest version pin (#135); `None` only when the
         /// backend exposes no versions and the operator opted out.
         manifest_version_id: Option<String>,
@@ -850,6 +852,7 @@ impl MetadataCommand {
                 byte_length,
                 backend_id,
                 object_uri,
+                object_version_id,
                 manifest_version_id,
                 manifest_core_digest,
                 verification_method,
@@ -894,6 +897,15 @@ impl MetadataCommand {
                 put_uuid(&mut out, *verifier_node_uuid);
                 put_u64(&mut out, *fencing_epoch);
                 put_u64(&mut out, *verified_term);
+                if let Some(version_id) = object_version_id {
+                    put_u8(&mut out, 1);
+                    put_bounded_str(
+                        &mut out,
+                        version_id,
+                        MAX_TIER_VERSION_ID_BYTES,
+                        "object version id",
+                    )?;
+                }
             }
             MetadataCommand::SetTopicRetentionPolicy {
                 env,
@@ -1258,6 +1270,22 @@ impl MetadataCommand {
                 } else {
                     None
                 };
+                let manifest_core_digest = reader.bytes32("manifest core digest")?;
+                let verification_method =
+                    VerificationMethod::from_wire(reader.u8("verification method")?)?;
+                let verifier_node_uuid = reader.uuid("verifier node uuid")?;
+                let fencing_epoch = reader.u64("fencing epoch")?;
+                let verified_term = reader.u64("verified term")?;
+                let object_version_id = if reader.remaining() == 0 {
+                    None
+                } else if reader.flag("object version presence")? {
+                    Some(reader.bounded_str(MAX_TIER_VERSION_ID_BYTES, "object version id")?)
+                } else {
+                    return Err(CodecError::InvalidValue {
+                        what: "object version presence",
+                        reason: "legacy None must omit the extension",
+                    });
+                };
                 Ok(MetadataCommand::CommitTierEvidence {
                     env,
                     topic_uuid,
@@ -1268,14 +1296,13 @@ impl MetadataCommand {
                     byte_length,
                     backend_id,
                     object_uri,
+                    object_version_id,
                     manifest_version_id,
-                    manifest_core_digest: reader.bytes32("manifest core digest")?,
-                    verification_method: VerificationMethod::from_wire(
-                        reader.u8("verification method")?,
-                    )?,
-                    verifier_node_uuid: reader.uuid("verifier node uuid")?,
-                    fencing_epoch: reader.u64("fencing epoch")?,
-                    verified_term: reader.u64("verified term")?,
+                    manifest_core_digest,
+                    verification_method,
+                    verifier_node_uuid,
+                    fencing_epoch,
+                    verified_term,
                 })
             }
             COMMAND_KIND_SET_TOPIC_RETENTION_POLICY => {
@@ -1891,6 +1918,7 @@ mod tests {
                 byte_length: 4096,
                 backend_id: "s3-native".to_owned(),
                 object_uri: "s3://tier/native/audit.v1/segment-30.segment".to_owned(),
+                object_version_id: Some("4sL4kqCJo05qOWBhBqpfOFAdT4dRJVvW".to_owned()),
                 manifest_version_id: Some("3sL4kqCJo05qOWBhBqpfOFAdT4dRJVvV".to_owned()),
                 manifest_core_digest: [11; 32],
                 verification_method: VerificationMethod::AuthenticatedContentRoot,
@@ -1908,6 +1936,7 @@ mod tests {
                 byte_length: 4096,
                 backend_id: "localfs".to_owned(),
                 object_uri: "s3://tier/native/audit.v1/segment-30.segment".to_owned(),
+                object_version_id: None,
                 manifest_version_id: None,
                 manifest_core_digest: [11; 32],
                 verification_method: VerificationMethod::AuthenticatedContentRoot,
@@ -2008,10 +2037,24 @@ mod tests {
         for command in every_command() {
             let mut trailing = command.encode().unwrap();
             trailing.push(0);
-            assert_eq!(
-                MetadataCommand::decode(&trailing),
-                Err(CodecError::Trailing(1))
-            );
+            let decoded = MetadataCommand::decode(&trailing);
+            if matches!(
+                command,
+                MetadataCommand::CommitTierEvidence {
+                    object_version_id: None,
+                    ..
+                }
+            ) {
+                assert!(matches!(
+                    decoded,
+                    Err(CodecError::InvalidValue {
+                        what: "object version presence",
+                        ..
+                    })
+                ));
+            } else {
+                assert_eq!(decoded, Err(CodecError::Trailing(1)));
+            }
 
             let encoded = command.encode().unwrap();
             let mut truncated = encoded.clone();
@@ -2095,6 +2138,7 @@ mod tests {
         byte_length: u64,
         backend_id: &str,
         object_uri: &str,
+        object_version_id: Option<String>,
         manifest_version_id: Option<String>,
     ) -> MetadataCommand {
         MetadataCommand::CommitTierEvidence {
@@ -2107,6 +2151,7 @@ mod tests {
             byte_length,
             backend_id: backend_id.to_owned(),
             object_uri: object_uri.to_owned(),
+            object_version_id,
             manifest_version_id,
             manifest_core_digest: [11; 32],
             verification_method: VerificationMethod::AuthenticatedContentRoot,
@@ -2126,6 +2171,7 @@ mod tests {
             "s3-native",
             &"u".repeat(MAX_TIER_OBJECT_URI_BYTES),
             None,
+            None,
         );
         let encoded = at_bound.encode().unwrap();
         assert_eq!(MetadataCommand::decode(&encoded).unwrap(), at_bound);
@@ -2135,6 +2181,7 @@ mod tests {
                 4096,
                 "s3-native",
                 &"u".repeat(MAX_TIER_OBJECT_URI_BYTES + 1),
+                None,
                 None,
             )
             .encode(),
@@ -2149,6 +2196,7 @@ mod tests {
                 &"b".repeat(MAX_TIER_BACKEND_ID_BYTES + 1),
                 "s3://tier/object",
                 None,
+                None,
             )
             .encode(),
             Err(CodecError::BoundExceeded { .. })
@@ -2159,7 +2207,20 @@ mod tests {
                 4096,
                 "s3-native",
                 "s3://tier/object",
+                None,
                 Some("v".repeat(MAX_TIER_VERSION_ID_BYTES + 1)),
+            )
+            .encode(),
+            Err(CodecError::BoundExceeded { .. })
+        ));
+        assert!(matches!(
+            tier_evidence(
+                5,
+                4096,
+                "s3-native",
+                "s3://tier/object",
+                Some("v".repeat(MAX_TIER_VERSION_ID_BYTES + 1)),
+                None,
             )
             .encode(),
             Err(CodecError::BoundExceeded { .. })
@@ -2168,9 +2229,9 @@ mod tests {
         // Zero byte length and empty strings survive encode but the decoder
         // rejects them, so they can never round-trip into apply.
         for invalid in [
-            tier_evidence(5, 0, "s3-native", "s3://tier/object", None),
-            tier_evidence(6, 4096, "", "s3://tier/object", None),
-            tier_evidence(7, 4096, "s3-native", "", None),
+            tier_evidence(6, 0, "s3-native", "s3://tier/object", None, None),
+            tier_evidence(7, 4096, "", "s3://tier/object", None, None),
+            tier_evidence(8, 4096, "s3-native", "", None, None),
         ] {
             assert!(matches!(
                 MetadataCommand::decode(&invalid.encode().unwrap()),
@@ -2179,9 +2240,10 @@ mod tests {
         }
 
         // An unknown verification-method tag is rejected, never defaulted.
-        let mut unknown_method = tier_evidence(8, 4096, "s3-native", "s3://tier/object", None)
-            .encode()
-            .unwrap();
+        let mut unknown_method =
+            tier_evidence(9, 4096, "s3-native", "s3://tier/object", None, None)
+                .encode()
+                .unwrap();
         // The method byte sits immediately before verifier uuid + two u64s.
         let method_at = unknown_method.len() - 8 - 8 - 16 - 1;
         assert_eq!(unknown_method[method_at], 1);

@@ -14,8 +14,8 @@
 //! (backend-limited).
 
 use crate::base::{
-    parse_s3_uri, read_bounded, ObjectChecksum, ObjectHead, StoredManifest, UploadBackend,
-    VerificationResult,
+    parse_s3_uri, read_bounded, ObjectChecksum, ObjectHead, StoredManifest, StoredObject,
+    UploadBackend, VerificationResult,
 };
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
@@ -227,10 +227,11 @@ impl UploadBackend for S3NativeBackend {
         local_path: &Path,
         object_uri: &str,
         checksum: Option<ObjectChecksum<'_>>,
-    ) -> Result<(), VtopError> {
-        self.put(local_path, object_uri, "application/octet-stream", checksum)
-            .await
-            .map(|_| ())
+    ) -> Result<StoredObject, VtopError> {
+        let version_id = self
+            .put(local_path, object_uri, "application/octet-stream", checksum)
+            .await?;
+        Ok(StoredObject { version_id })
     }
 
     async fn put_manifest(

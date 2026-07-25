@@ -6,7 +6,7 @@
 
 use crate::base::{
     parse_s3_uri, read_command_bounded, verify_command_content, ObjectChecksum, ObjectHead,
-    StoredManifest, UploadBackend, VerificationResult,
+    StoredManifest, StoredObject, UploadBackend, VerificationResult,
 };
 use crate::command::CommandPolicy;
 use async_trait::async_trait;
@@ -46,11 +46,14 @@ impl UploadBackend for MinioBackend {
         local_path: &Path,
         object_uri: &str,
         _checksum: Option<ObjectChecksum<'_>>,
-    ) -> Result<(), VtopError> {
+    ) -> Result<StoredObject, VtopError> {
         let target = self.mc_target(object_uri)?;
         let mut command = self.base_cmd();
         command.arg("cp").arg(local_path).arg(target);
-        self.command.run(&mut command, "object upload").await
+        self.command
+            .run(&mut command, "object upload")
+            .await
+            .map(|()| StoredObject::default())
     }
 
     async fn put_manifest(

@@ -10,7 +10,7 @@
 
 use crate::base::{
     parse_s3_uri, read_bounded, verify_file_content, ObjectChecksum, ObjectHead, StoredManifest,
-    UploadBackend, VerificationResult,
+    StoredObject, UploadBackend, VerificationResult,
 };
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
@@ -81,9 +81,10 @@ impl UploadBackend for LocalFsBackend {
         local_path: &Path,
         object_uri: &str,
         checksum: Option<ObjectChecksum<'_>>,
-    ) -> Result<(), VtopError> {
+    ) -> Result<StoredObject, VtopError> {
         self.store(local_path, object_uri, checksum.map(|c| c.hex))
             .await
+            .map(|()| StoredObject::default())
     }
 
     async fn put_manifest(

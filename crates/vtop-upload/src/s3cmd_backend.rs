@@ -6,7 +6,7 @@
 
 use crate::base::{
     read_command_bounded, verify_command_content, ObjectChecksum, ObjectHead, StoredManifest,
-    UploadBackend, VerificationResult,
+    StoredObject, UploadBackend, VerificationResult,
 };
 use crate::command::CommandPolicy;
 use async_trait::async_trait;
@@ -44,10 +44,13 @@ impl UploadBackend for S3cmdBackend {
         local_path: &Path,
         object_uri: &str,
         _checksum: Option<ObjectChecksum<'_>>,
-    ) -> Result<(), VtopError> {
+    ) -> Result<StoredObject, VtopError> {
         let mut command = self.base_cmd();
         command.arg("put").arg(local_path).arg(object_uri);
-        self.command.run(&mut command, "object upload").await
+        self.command
+            .run(&mut command, "object upload")
+            .await
+            .map(|()| StoredObject::default())
     }
 
     async fn put_manifest(
