@@ -246,9 +246,11 @@ fn classify_temp_target(path: &Path) -> Option<WriteBucket> {
     }
     // Temps are `.{final_name}.{uuid}.tmp`.
     let trimmed = name.trim_start_matches('.').trim_end_matches(".tmp");
-    let final_name = trimmed.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(trimmed);
-    if final_name.ends_with(".commit") || final_name == "commit" || final_name.contains(".commit")
-    {
+    let final_name = trimmed
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(trimmed);
+    if final_name.ends_with(".commit") || final_name == "commit" || final_name.contains(".commit") {
         Some(WriteBucket::CommitBoundary)
     } else if final_name.ends_with(".index") || final_name.contains(".index") {
         Some(WriteBucket::Index)
@@ -383,10 +385,8 @@ fn check_single_copy(
 }
 
 fn commit_key() -> SegmentCommitKey {
-    SegmentCommitKey::from_hex(
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-    )
-    .expect("valid test commit key")
+    SegmentCommitKey::from_hex("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        .expect("valid test commit key")
 }
 
 fn run_v1(name: &str) -> ScenarioReport {
@@ -551,9 +551,8 @@ fn run_v2_rollover() -> ScenarioReport {
         total_framed += manifest.content_bytes;
         let sealed = Path::new(ROOT).join(format!("{stem}.segment"));
         total_durable += durable_len(&sim, &sealed);
-        estimated_proof_state = estimated_proof_state.max(
-            u64::from(manifest.chunk_size) + manifest.chunk_count.saturating_mul(32),
-        );
+        estimated_proof_state = estimated_proof_state
+            .max(u64::from(manifest.chunk_size) + manifest.chunk_count.saturating_mul(32));
         if idx == 0 {
             let (_, p, chunk) = chunk_proof_in(&env, &sealed, 0).expect("proof");
             let sample_proof_bytes = proof_encoded_bytes(&p);
@@ -855,7 +854,10 @@ fn prove_chunk_size_matches_encoded_estimate() {
     // sibling path length from the public prove_chunk API.
     let leaves: Vec<_> = (0..8_u8).map(|i| leaf_hash(&[i])).collect();
     let proof = prove_chunk(&leaves, 3);
-    assert_eq!(proof_encoded_bytes(&proof), 8 + proof.path.len() as u64 * 33);
+    assert_eq!(
+        proof_encoded_bytes(&proof),
+        8 + proof.path.len() as u64 * 33
+    );
 }
 
 /// Optional longer local run (not in default CI). Same assertions, larger N.
