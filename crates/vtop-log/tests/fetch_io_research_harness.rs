@@ -1225,11 +1225,11 @@ fn sendfile_to_null(
     let input = File::open(path)?;
     let null = OpenOptions::new().write(true).open("/dev/null")?;
     let len = input.metadata()?.len();
-    let mut offset: off64_t = 0;
+    let mut offset: libc::off_t = 0;
     while (offset as u64) < len {
         let t0 = Instant::now();
         let chunk = (len - offset as u64).min(1024 * 1024) as usize;
-        // SAFETY: both fds are open; offset points to a valid off64_t.
+        // SAFETY: both fds are open; offset points to a valid off_t.
         let n = unsafe { libc::sendfile(null.as_raw_fd(), input.as_raw_fd(), &mut offset, chunk) };
         if n < 0 {
             return Err(io::Error::last_os_error());
@@ -1243,9 +1243,6 @@ fn sendfile_to_null(
     }
     Ok(())
 }
-
-#[cfg(target_os = "linux")]
-type off64_t = i64;
 
 #[cfg(target_os = "linux")]
 fn splice_to_null(
@@ -1276,7 +1273,7 @@ fn splice_to_null(
         }
     }
     let _guard = PipeGuard(r_fd, w_fd);
-    let mut offset: off64_t = 0;
+    let mut offset: libc::off_t = 0;
     while (offset as u64) < len {
         let t0 = Instant::now();
         let want = (len - offset as u64).min(64 * 1024) as usize;
@@ -1340,9 +1337,9 @@ fn odirect_read_all(
         .custom_flags(libc::O_DIRECT)
         .open(path)?;
     let len = file.metadata()?.len();
-    let buf_len = ((len as usize + ALIGN - 1) / ALIGN) * ALIGN;
-    let layout = std::alloc::Layout::from_size_align(buf_len.max(ALIGN), ALIGN)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let buf_len = (len as usize).div_ceil(ALIGN) * ALIGN;
+    let layout =
+        std::alloc::Layout::from_size_align(buf_len.max(ALIGN), ALIGN).map_err(io::Error::other)?;
     // SAFETY: aligned allocation for O_DIRECT.
     let ptr = unsafe { std::alloc::alloc(layout) };
     if ptr.is_null() {
@@ -1363,7 +1360,7 @@ fn odirect_read_all(
     let mut done = 0_u64;
     while done < len {
         let want = ((len - done) as usize).min(buf_len);
-        let want_aligned = ((want + ALIGN - 1) / ALIGN) * ALIGN;
+        let want_aligned = want.div_ceil(ALIGN) * ALIGN;
         // SAFETY: ptr is allocated for at least want_aligned bytes.
         let buf = unsafe { std::slice::from_raw_parts_mut(aligned.ptr, want_aligned) };
         let t0 = Instant::now();
