@@ -180,6 +180,8 @@ impl UploadBackend for AwsCliBackend {
         true
     }
     fn supports_multipart(&self) -> bool {
-        true
+        // The AWS CLI may multipart internally inside `put_object`, but it does
+        // not expose a resumable upload-id API to the engine (#191).
+        false
     }
 }

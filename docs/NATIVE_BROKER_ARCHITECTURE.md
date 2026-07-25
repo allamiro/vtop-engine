@@ -611,6 +611,37 @@ Stage-8 metadata foundation (`vtop-meta`):
   records are retained forever as the rehydration pointer and
   corruption-audit anchor. `CancelRetention` reverts a mistaken plan to
   `Verified` (local bytes are only deleted between plan and confirm).
+
+### 9.4 Quorum ack vs archive-verified
+
+These are different durability stages and must not be conflated in APIs or
+operator runbooks:
+
+| Stage | Meaning | Who decides | What it authorizes |
+|-------|---------|-------------|--------------------|
+| Locally durable | Leader fsynced the native segment | Broker produce path | Local crash recovery only |
+| Quorum ack | Replica set has durable copies per RF | Broker produce + replication | Producer success under `WireDurability::Quorum` |
+| Archive upload in flight | Multipart/object put started; session may be resumable | `vtopctl tier` / upload backend | Nothing — not metadata evidence |
+| Archive-verified | Strong read-back verify + version pins committed as `CommitTierEvidence` (`AuthenticatedContentRoot`) | Metadata state machine after out-of-band verify | Retention planning / local retirement gates (#183) |
+
+A quorum produce ack never implies the segment is cold-tier durable. Local
+retirement still requires verified archival evidence (or an explicit
+`unarchived_deletion_allowed` policy). Multipart resume (#191) improves upload
+operability only; it does not weaken the verify-before-evidence rule.
+
+### 9.5 Rehydration and physical deletion effects (#191)
+
+- **Rehydration:** `vtopctl tier rehydrate` downloads a version-pinned tier
+  object (`object_uri` + `object_version_id` from `SegmentTierCopy`), checks
+  the expected content digest, and writes a local file. It does not mutate
+  metadata. Streaming/serve-path integration and automatic repair wiring remain
+  follow-ups.
+- **Physical deletion:** still gated by `PlanRetention` → external local delete
+  → `ConfirmRetentionExpired`. Upload backends' `delete_object` is not called
+  from retention/placement code. Tier object GC and disk-pressure schedulers
+  that prioritize the tiering backlog are follow-ups; backlog age is observable
+  via multipart session mtimes and meta retention state.
+
 ## 10. Lineage-aware cursors and consumer groups
 
 A durable cursor contains:

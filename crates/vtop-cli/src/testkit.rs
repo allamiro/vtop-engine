@@ -77,6 +77,10 @@ pub fn file_config(
             local_path: None,
             require_strong_verification: false,
             require_object_versioning: false,
+            multipart_part_size_bytes: 8 * 1024 * 1024,
+            multipart_threshold_bytes: 8 * 1024 * 1024,
+            multipart_max_parallelism: 4,
+            multipart_abandon_after_secs: 24 * 60 * 60,
         },
         partitioning: PartitioningConfig {
             template: DEFAULT_TEMPLATE.into(),

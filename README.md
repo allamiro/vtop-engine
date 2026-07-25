@@ -686,7 +686,7 @@ VTOP is currently a prototype. The following limits are known and intentional.
 
 | Area | Current behavior | Planned direction |
 |---|---|---|
-| Large objects | native S3 backend uses single-part `put_object` | add multipart upload |
+| Large objects | native S3 + mock support resumable multipart with persisted sessions (`vtopctl tier copy --multipart-state-dir`); compatibility backends still single-shot `put_object` | wire remaining backends / streaming rehydrate |
 | Large records / whole files | `max_bytes` is a hard per-source/per-batch ceiling; an oversized record is rejected without advancing source progress | raise the explicit budget only when the deployment has matching memory headroom |
 | Partial upload recovery | replays from source instead of resuming half-written local objects | add resumable local staging |
 | Command backend verification cost | `aws`, `s3cmd`, and `mc` download each stored object to hash it | prefer native S3 SHA-256 when read-back bandwidth is costly |
@@ -722,9 +722,9 @@ Planned implementation areas:
 
 - [x] bounded file/syslog/whole-file reads, pre-clone Kafka record checks, and
       streaming local compression; `max_bytes` is enforced before source
-      progress advances (native object upload remains single-part)
+      progress advances
 - [ ] native three-node metadata/control-plane prototype
-- [ ] multipart upload support
+- [x] multipart resumable upload (native S3 + mock; persisted sessions, fencing, abandoned cleanup)
 - [x] optional keyed-BLAKE3 manifest authentication via a named secret env var
 - [ ] manifest MAC key rotation / optional public-key signatures
 - [ ] S3 Object Lock profile

@@ -15,15 +15,18 @@
 
 use crate::base::{
     parse_s3_uri, read_bounded, ObjectChecksum, ObjectHead, StoredManifest, StoredObject,
-    UploadBackend, VerificationResult,
+    UploadBackend, UploadedPart, VerificationResult,
 };
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Region;
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{BucketVersioningStatus, ChecksumMode};
+use aws_sdk_s3::types::{
+    BucketVersioningStatus, ChecksumMode, CompletedMultipartUpload, CompletedPart,
+};
 use aws_sdk_s3::Client;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use bytes::Bytes;
 use std::path::Path;
 use vtop_core::checksum::digest_reader;
 use vtop_core::errors::VtopError;
@@ -252,7 +255,17 @@ impl UploadBackend for S3NativeBackend {
         version_id: &str,
         max_bytes: usize,
     ) -> Result<Vec<u8>, VtopError> {
-        let (bucket, key) = parse_s3_uri(manifest_uri)?;
+        self.get_object_pinned(manifest_uri, version_id, max_bytes)
+            .await
+    }
+
+    async fn get_object_pinned(
+        &self,
+        object_uri: &str,
+        version_id: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, VtopError> {
+        let (bucket, key) = parse_s3_uri(object_uri)?;
         let out = self
             .client
             .get_object()
@@ -263,7 +276,7 @@ impl UploadBackend for S3NativeBackend {
             .await
             .map_err(|e| {
                 VtopError::Upload(format!(
-                    "get_object {manifest_uri} (version {version_id}): {}",
+                    "get_object {object_uri} (version {version_id}): {}",
                     e.into_service_error()
                 ))
             })?;
@@ -272,10 +285,10 @@ impl UploadBackend for S3NativeBackend {
             .is_some_and(|size| size < 0 || size as u64 > max_bytes as u64)
         {
             return Err(VtopError::Upload(format!(
-                "stored object {manifest_uri} exceeds the {max_bytes}-byte read limit"
+                "stored object {object_uri} exceeds the {max_bytes}-byte read limit"
             )));
         }
-        read_bounded(out.body.into_async_read(), max_bytes, manifest_uri).await
+        read_bounded(out.body.into_async_read(), max_bytes, object_uri).await
     }
 
     fn supports_object_versions(&self) -> bool {
@@ -499,8 +512,136 @@ impl UploadBackend for S3NativeBackend {
         true
     }
     fn supports_multipart(&self) -> bool {
-        // Single-part put for the prototype; multipart is a documented follow-up.
-        false
+        true
+    }
+
+    async fn create_multipart_upload(
+        &self,
+        object_uri: &str,
+        content_type: &str,
+        checksum: Option<ObjectChecksum<'_>>,
+    ) -> Result<String, VtopError> {
+        let (bucket, key) = parse_s3_uri(object_uri)?;
+        let mut req = self
+            .client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(&key)
+            .content_type(content_type);
+        if let Some(c) = checksum {
+            // Inventory metadata only — never strong evidence. BLAKE3 must not
+            // be sent as x-amz-checksum-sha256.
+            req = req.metadata(CHECKSUM_META_KEY, c.hex);
+        }
+        let out = req.send().await.map_err(|e| {
+            VtopError::Upload(format!(
+                "create_multipart_upload {object_uri}: {}",
+                e.into_service_error()
+            ))
+        })?;
+        out.upload_id().map(str::to_owned).ok_or_else(|| {
+            VtopError::Upload(format!(
+                "create_multipart_upload {object_uri}: service returned no upload id"
+            ))
+        })
+    }
+
+    async fn upload_part(
+        &self,
+        object_uri: &str,
+        upload_id: &str,
+        part_number: u32,
+        data: Bytes,
+    ) -> Result<UploadedPart, VtopError> {
+        let (bucket, key) = parse_s3_uri(object_uri)?;
+        let out = self
+            .client
+            .upload_part()
+            .bucket(&bucket)
+            .key(&key)
+            .upload_id(upload_id)
+            .part_number(part_number as i32)
+            .body(ByteStream::from(data))
+            .send()
+            .await
+            .map_err(|e| {
+                VtopError::Upload(format!(
+                    "upload_part {object_uri}#{part_number}: {}",
+                    e.into_service_error()
+                ))
+            })?;
+        let etag = out.e_tag().map(str::to_owned).ok_or_else(|| {
+            VtopError::Upload(format!(
+                "upload_part {object_uri}#{part_number}: service returned no etag"
+            ))
+        })?;
+        Ok(UploadedPart { part_number, etag })
+    }
+
+    async fn complete_multipart_upload(
+        &self,
+        object_uri: &str,
+        upload_id: &str,
+        parts: &[UploadedPart],
+    ) -> Result<StoredObject, VtopError> {
+        let (bucket, key) = parse_s3_uri(object_uri)?;
+        let mut ordered = parts.to_vec();
+        ordered.sort_by_key(|p| p.part_number);
+        let completed_parts: Vec<CompletedPart> = ordered
+            .iter()
+            .map(|p| {
+                CompletedPart::builder()
+                    .part_number(p.part_number as i32)
+                    .e_tag(&p.etag)
+                    .build()
+            })
+            .collect();
+        let multipart = CompletedMultipartUpload::builder()
+            .set_parts(Some(completed_parts))
+            .build();
+        let out = self
+            .client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(&key)
+            .upload_id(upload_id)
+            .multipart_upload(multipart)
+            .send()
+            .await
+            .map_err(|e| {
+                VtopError::Upload(format!(
+                    "complete_multipart_upload {object_uri}: {}",
+                    e.into_service_error()
+                ))
+            })?;
+        let version_id = out
+            .version_id()
+            .filter(|id| *id != "null")
+            .map(str::to_owned);
+        tracing::info!(uri = object_uri, "object uploaded via s3_native multipart");
+        Ok(StoredObject { version_id })
+    }
+
+    async fn abort_multipart_upload(
+        &self,
+        object_uri: &str,
+        upload_id: &str,
+    ) -> Result<(), VtopError> {
+        let (bucket, key) = parse_s3_uri(object_uri)?;
+        self.client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(&key)
+            .upload_id(upload_id)
+            .send()
+            .await
+            .map_err(|e| {
+                VtopError::Upload(format!(
+                    "abort_multipart_upload {object_uri}: {}",
+                    e.into_service_error()
+                ))
+            })?;
+        Ok(())
     }
 }
 

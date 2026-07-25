@@ -154,7 +154,8 @@ impl UploadBackend for S3cmdBackend {
         true
     }
     fn supports_multipart(&self) -> bool {
-        true
+        // s3cmd may multipart internally; it does not expose resume (#191).
+        false
     }
 }
 
