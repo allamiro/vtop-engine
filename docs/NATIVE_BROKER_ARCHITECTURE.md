@@ -837,6 +837,21 @@ ratios. Emit JSON with `VTOP_WRITE_AMP_JSON=…`. This complements archive
 matrix work (#92 / #98 / #130) and does not claim Kafka superiority.
 Multi-hour soak and same-hardware Kafka comparison remain deferred.
 
+#### 15.2.2 Native fetch I/O research (#190)
+
+Fetch-path research lives in
+`crates/vtop-log/tests/fetch_io_research_harness.rs` with methodology in
+[`FETCH_IO_RESEARCH.md`](FETCH_IO_RESEARCH.md). It measures the buffered
+page-cache baseline (`SegmentReader::fetch`) under hot/cold/catch-up/
+concurrent and plain-vs-TLS-proxy workloads, plus Linux-only
+`sendfile` / `splice` / experimental `O_DIRECT` probes. `io_uring` is a
+deferred probe slot (no production engine). The JSON recommendation gate
+keeps buffered I/O as the default and opens `O_DIRECT`/`io_uring` follow-up
+work only when buffered cold is disk-bound and Direct I/O clearly wins.
+Emit JSON with `VTOP_FETCH_IO_JSON=…`. Complements #92 / #98 / #130; does
+not claim Kafka superiority. Production sendfile/io_uring engines and
+multi-hour soaks remain deferred.
+
 ## 16. Implementation roadmap as small PRs
 
 1. **Local committed-boundary correctness.** Finish the current `vtop-log`
