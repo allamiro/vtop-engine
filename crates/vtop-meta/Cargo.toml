@@ -25,6 +25,10 @@ x509-parser = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 rcgen = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# `getrusage` CPU samples for the metadata saturation research harness (#192).
+libc = "0.2.189"
 # `test-util` enables tokio::time::pause(): the three-node raft harness runs
 # on a paused-clock current-thread runtime so timer-driven behavior is
 # reproducible instead of wall-clock-dependent.

@@ -159,6 +159,21 @@ This is a research harness — it does not ship three production fetch engines.
 It complements matrix issues #92 / #98 / #130 and does not claim Kafka
 superiority.
 
+## Native metadata saturation research (#192)
+
+Single three-node metadata Raft saturation and sharding-trigger criteria are
+measured in-process by the Rust harness (see
+[`docs/METADATA_SATURATION_RESEARCH.md`](../docs/METADATA_SATURATION_RESEARCH.md)):
+
+```bash
+mkdir -p benchmarks/results/native-meta-saturation
+VTOP_META_SATURATION_JSON=benchmarks/results/native-meta-saturation/summary.json \
+  cargo test -p vtop-meta --test metadata_saturation_harness --locked -- --nocapture
+```
+
+This is a research harness — it does **not** implement multi-group metadata
+sharding (epic #93). Multi-hour dedicated soaks remain deferred.
+
 ## Design principles
 
 - Benchmark logic is **separate** from engine logic (drives the binary only).
