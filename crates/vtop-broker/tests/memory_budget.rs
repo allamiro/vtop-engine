@@ -169,7 +169,9 @@ fn oversized_record_rejected_before_admission() {
         other => panic!("expected InvalidRequest, got {other:?}"),
     }
     assert_eq!(
-        budget.metrics().rejections(BudgetRejectReason::OversizedRecord),
+        budget
+            .metrics()
+            .rejections(BudgetRejectReason::OversizedRecord),
         1
     );
     assert_eq!(budget.metrics().shard_used_bytes(), 0);
@@ -254,15 +256,15 @@ fn follower_budget_bounds_slow_replica_inflight() {
     let a = follower.try_reserve_inflight(1_500).unwrap();
     assert!(follower.try_reserve_inflight(1_000).is_err());
     assert_eq!(
-        budget.metrics().rejections(BudgetRejectReason::ReplicaFollower),
+        budget
+            .metrics()
+            .rejections(BudgetRejectReason::ReplicaFollower),
         1
     );
     drop(a);
     let catch = follower.try_reserve_catch_up(1_000).unwrap();
     assert_eq!(
-        follower
-            .try_reserve_catch_up(100)
-            .unwrap_err(),
+        follower.try_reserve_catch_up(100).unwrap_err(),
         BudgetRejectReason::ReplicaCatchUp
     );
     drop(catch);

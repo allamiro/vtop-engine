@@ -135,7 +135,10 @@ impl MemoryBudgetConfig {
             ("process_ceiling_bytes", self.process_ceiling_bytes),
             ("per_follower_bytes", self.per_follower_bytes),
             ("catch_up_bytes", self.catch_up_bytes),
-            ("fetch_response_queue_bytes", self.fetch_response_queue_bytes),
+            (
+                "fetch_response_queue_bytes",
+                self.fetch_response_queue_bytes,
+            ),
             ("max_record_bytes", self.max_record_bytes),
         ] {
             if value == 0 {
@@ -148,7 +151,9 @@ impl MemoryBudgetConfig {
             );
         }
         if self.catch_up_bytes > self.per_follower_bytes {
-            return Err("catch_up_bytes must be less than or equal to per_follower_bytes".to_owned());
+            return Err(
+                "catch_up_bytes must be less than or equal to per_follower_bytes".to_owned(),
+            );
         }
         Ok(())
     }
@@ -284,7 +289,11 @@ impl MemoryBudgetPool {
     }
 
     /// Reject a single record that exceeds `max_record_bytes` before allocation.
-    pub fn check_record_size(&self, key_len: usize, value_len: usize) -> Result<(), BudgetRejectReason> {
+    pub fn check_record_size(
+        &self,
+        key_len: usize,
+        value_len: usize,
+    ) -> Result<(), BudgetRejectReason> {
         let bytes = (key_len as u64).saturating_add(value_len as u64);
         if bytes > self.config.max_record_bytes {
             self.metrics
@@ -414,9 +423,7 @@ impl MemoryBudgetPool {
             return;
         }
         let _ = self.process_used.fetch_sub(bytes, Ordering::Relaxed);
-        let _ = self
-            .fetch_queue_used
-            .fetch_sub(bytes, Ordering::Relaxed);
+        let _ = self.fetch_queue_used.fetch_sub(bytes, Ordering::Relaxed);
         conn.release(bytes);
     }
 
@@ -753,7 +760,9 @@ pub fn reject_message(reason: BudgetRejectReason) -> &'static str {
         BudgetRejectReason::ReplicaCatchUp => {
             "replication catch-up buffer budget exhausted; retry later"
         }
-        BudgetRejectReason::FetchQueue => "fetch response queue memory budget exhausted; retry later",
+        BudgetRejectReason::FetchQueue => {
+            "fetch response queue memory budget exhausted; retry later"
+        }
         BudgetRejectReason::OversizedRecord => {
             "record exceeds configured max_record_bytes memory budget"
         }
@@ -829,7 +838,11 @@ mod tests {
         let _fetch = pool.try_reserve_fetch(2_500, &consumer).unwrap();
         let err = pool.try_reserve_produce(1_800, None).unwrap_err();
         assert_eq!(err, BudgetRejectReason::ProcessCeiling);
-        assert_eq!(pool.metrics().rejections(BudgetRejectReason::ProcessCeiling), 1);
+        assert_eq!(
+            pool.metrics()
+                .rejections(BudgetRejectReason::ProcessCeiling),
+            1
+        );
         assert_eq!(pool.metrics().shard_used_bytes(), 0);
     }
 
@@ -839,7 +852,8 @@ mod tests {
         let err = pool.check_record_size(300, 300).unwrap_err();
         assert_eq!(err, BudgetRejectReason::OversizedRecord);
         assert_eq!(
-            pool.metrics().rejections(BudgetRejectReason::OversizedRecord),
+            pool.metrics()
+                .rejections(BudgetRejectReason::OversizedRecord),
             1
         );
     }

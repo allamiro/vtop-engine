@@ -32,10 +32,7 @@ pub mod memory_budget;
 pub mod replication;
 
 use crate::group_commit::{GroupCommitConfig, GroupCommitCoordinator, QueuedProduce};
-use crate::memory_budget::{
-    reject_message, BudgetRejectReason, BudgetReservation, ConnectionBudget, MemoryBudgetConfig,
-    MemoryBudgetPool, OverloadAction,
-};
+use crate::memory_budget::{reject_message, BudgetReservation, ConnectionBudget};
 use crate::replication::{ClusterCommittedOffset, ReplicaSet};
 
 pub use crate::group_commit::{FlushReason, GroupCommitMetrics, GroupCommitSample};
@@ -895,7 +892,8 @@ impl LocalBroker {
             }
         };
         if let Some(coordinator) = &self.group_commit {
-            let frame = coordinator.enqueue_and_wait(queued, |batch| self.flush_produce_group(batch));
+            let frame =
+                coordinator.enqueue_and_wait(queued, |batch| self.flush_produce_group(batch));
             drop(reservation);
             return frame;
         }
@@ -1874,10 +1872,10 @@ async fn serve_connection(
                     .max_bytes
                     .min(u32::try_from(send_credit).unwrap_or(u32::MAX))
                     .min(response_budget);
-                match broker.memory_budget().try_reserve_fetch(
-                    u64::from(request.max_bytes),
-                    &conn_budget,
-                ) {
+                match broker
+                    .memory_budget()
+                    .try_reserve_fetch(u64::from(request.max_bytes), &conn_budget)
+                {
                     Ok(reservation) => fetch_reservation = Some(reservation),
                     Err(reason) => {
                         let response = overloaded_budget(request_id, stream_id, reason);
