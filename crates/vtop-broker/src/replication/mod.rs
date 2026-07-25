@@ -1,10 +1,17 @@
-//! In-process leader→follower replication for quorum durability.
+//! Leader→follower replication for quorum durability.
 //!
 //! This slice implements the Stage-6 produce path from the architecture:
 //! leader local append → replica append with fencing epoch → quorum durable
 //! acknowledgements → advance and propagate the cluster committed high-water
-//! mark. Peer TCP transport and catch-up repair remain follow-ups; the wire
-//! message types live in `vtop-protocol` so a later transport can reuse them.
+//! mark.
+//!
+//! [`InProcessReplicaSet`] is the deterministic harness backend. Production
+//! wiring uses [`network::NetworkedReplicaSet`]: persistent mTLS streams,
+//! pipelined batches, per-follower flow-control windows, reconnect, and a
+//! bounded retransmission buffer for basic catch-up. Full sealed-segment
+//! transfer / repair remains a follow-up.
+
+pub mod network;
 
 use crate::{
     storage_producer_id, BrokerError, BrokerResult, MetaFencingEpoch, MetaLeaseState,
@@ -17,6 +24,11 @@ use vtop_log::{ActiveSegment, Durability, FetchBatch, LogRecord};
 use vtop_protocol::{
     CommittedHwmUpdate, ErrorCode, ProduceRecord, RangeIdentity, ReplicaAppendRequest,
     ReplicaAppendResponse,
+};
+
+pub use network::{
+    FlowControlConfig, NetworkFollowerConfig, NetworkedReplicaSet, ReplicaPeerHandler,
+    ReplicaPeerServer, ReplicaTlsMaterial,
 };
 
 /// Shared quorum-committed high-water mark for a range.
@@ -207,6 +219,18 @@ impl InProcessFollower {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .segment
             .committed_offset()
+    }
+
+    pub fn next_offset(&self) -> u64 {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .segment
+            .next_offset()
+    }
+
+    pub fn range(&self) -> &RangeIdentity {
+        &self.range
     }
 
     /// Fetch capped at `min(local_committed, cluster_committed)`.

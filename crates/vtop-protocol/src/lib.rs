@@ -296,6 +296,27 @@ pub struct CommittedHwmUpdate {
     pub committed_high_watermark: u64,
 }
 
+/// Ordered multi-append group sharing one follower durability barrier.
+///
+/// Used by pipelined networked replication so a sealed leader commit group
+/// is applied with a single follower fsync (see broker group commit).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplicaAppendBatchRequest {
+    pub requests: Vec<ReplicaAppendRequest>,
+}
+
+/// Leader → follower probe of local durability / tip after reconnect.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplicaStatusRequest {
+    pub range: RangeIdentity,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplicaStatusResponse {
+    pub local_committed_offset: u64,
+    pub next_offset: u64,
+}
+
 /// Lineage-aware durable consumer progress. Bound to topic epoch, range
 /// generation, segment identity/root, and record position — never a bare
 /// integer offset.
@@ -361,6 +382,9 @@ pub enum Message {
     ReplicaAppendRequest(ReplicaAppendRequest),
     ReplicaAppendResponse(ReplicaAppendResponse),
     CommittedHwmUpdate(CommittedHwmUpdate),
+    ReplicaAppendBatchRequest(ReplicaAppendBatchRequest),
+    ReplicaStatusRequest(ReplicaStatusRequest),
+    ReplicaStatusResponse(ReplicaStatusResponse),
     CommitCursorRequest(CommitCursorRequest),
     CommitCursorResponse(CommitCursorResponse),
     FetchCursorRequest(FetchCursorRequest),
@@ -383,6 +407,9 @@ impl Message {
             Self::ReplicaAppendRequest(_) => 60,
             Self::ReplicaAppendResponse(_) => 61,
             Self::CommittedHwmUpdate(_) => 62,
+            Self::ReplicaAppendBatchRequest(_) => 63,
+            Self::ReplicaStatusRequest(_) => 65,
+            Self::ReplicaStatusResponse(_) => 66,
             Self::CommitCursorRequest(_) => 74,
             Self::CommitCursorResponse(_) => 71,
             Self::FetchCursorRequest(_) => 72,
@@ -542,6 +569,29 @@ fn encoded_payload_size(message: &Message, limits: ProtocolLimits) -> Result<usi
             }
             Message::ReplicaAppendResponse(_) => 8,
             Message::CommittedHwmUpdate(value) => range_size(&value.range)? + 8 + 8,
+            Message::ReplicaAppendBatchRequest(value) => {
+                let mut size = 4usize;
+                for request in &value.requests {
+                    if request.records.is_empty() {
+                        return Err(ProtocolError::InvalidFrame(
+                            "replica append batch member has no records".to_owned(),
+                        ));
+                    }
+                    record_count(request.records.len(), limits)?;
+                    add(
+                        &mut size,
+                        range_size(&request.range)? + 8 + 16 + 8 + 16 + 8 + 8 + 4,
+                    )?;
+                    for record in &request.records {
+                        add(&mut size, 8)?;
+                        add(&mut size, bytes_size(&record.key)?)?;
+                        add(&mut size, bytes_size(&record.value)?)?;
+                    }
+                }
+                size
+            }
+            Message::ReplicaStatusRequest(value) => range_size(&value.range)?,
+            Message::ReplicaStatusResponse(_) => 8 + 8,
             Message::CommitCursorRequest(value) => {
                 lineage_cursor_size(&value.cursor)?
                     + 16
@@ -656,7 +706,26 @@ fn decode_header(header: &[u8], limits: ProtocolLimits) -> Result<Header, Protoc
     let kind = u16::from_be_bytes(header[8..10].try_into().expect("fixed slice"));
     if !matches!(
         kind,
-        1 | 2 | 10 | 11 | 20 | 21 | 30 | 40 | 50 | 51 | 60 | 61 | 62 | 70 | 71 | 72 | 73 | 74
+        1 | 2
+            | 10
+            | 11
+            | 20
+            | 21
+            | 30
+            | 40
+            | 50
+            | 51
+            | 60
+            | 61
+            | 62
+            | 63
+            | 65
+            | 66
+            | 70
+            | 71
+            | 72
+            | 73
+            | 74
     ) {
         return Err(ProtocolError::UnknownKind(kind));
     }
@@ -790,6 +859,34 @@ fn encode_message(message: &Message, out: &mut Vec<u8>) -> Result<(), ProtocolEr
             put_range(out, &value.range)?;
             put_u64(out, value.fencing_epoch);
             put_u64(out, value.committed_high_watermark);
+        }
+        Message::ReplicaAppendBatchRequest(value) => {
+            put_u32(out, checked_count(value.requests.len())?);
+            for request in &value.requests {
+                if request.records.is_empty() {
+                    return Err(ProtocolError::InvalidFrame(
+                        "replica append batch member has no records".to_owned(),
+                    ));
+                }
+                put_range(out, &request.range)?;
+                put_u64(out, request.fencing_epoch);
+                put_uuid(out, request.leader_node_id);
+                put_u64(out, request.expected_base_offset);
+                put_uuid(out, request.producer_id);
+                put_u64(out, request.producer_epoch);
+                put_u64(out, request.first_sequence);
+                put_u32(out, checked_count(request.records.len())?);
+                for record in &request.records {
+                    put_i64(out, record.timestamp_millis);
+                    put_bytes(out, &record.key)?;
+                    put_bytes(out, &record.value)?;
+                }
+            }
+        }
+        Message::ReplicaStatusRequest(value) => put_range(out, &value.range)?,
+        Message::ReplicaStatusResponse(value) => {
+            put_u64(out, value.local_committed_offset);
+            put_u64(out, value.next_offset);
         }
         Message::CommitCursorRequest(value) => {
             put_uuid(out, value.operation_id);
@@ -982,6 +1079,51 @@ fn decode_message(
             range: decoder.range()?,
             fencing_epoch: decoder.u64()?,
             committed_high_watermark: decoder.u64()?,
+        }),
+        63 => {
+            let count = decoder.count(limits.max_records)?;
+            let mut requests = Vec::with_capacity(count);
+            for _ in 0..count {
+                let range = decoder.range()?;
+                let fencing_epoch = decoder.u64()?;
+                let leader_node_id = decoder.uuid()?;
+                let expected_base_offset = decoder.u64()?;
+                let producer_id = decoder.uuid()?;
+                let producer_epoch = decoder.u64()?;
+                let first_sequence = decoder.u64()?;
+                let record_count = decoder.count(limits.max_records)?;
+                if record_count == 0 {
+                    return Err(ProtocolError::InvalidFrame(
+                        "replica append batch member has no records".to_owned(),
+                    ));
+                }
+                let mut records = Vec::with_capacity(record_count);
+                for _ in 0..record_count {
+                    records.push(ProduceRecord {
+                        timestamp_millis: decoder.i64()?,
+                        key: decoder.bytes()?,
+                        value: decoder.bytes()?,
+                    });
+                }
+                requests.push(ReplicaAppendRequest {
+                    range,
+                    fencing_epoch,
+                    leader_node_id,
+                    expected_base_offset,
+                    producer_id,
+                    producer_epoch,
+                    first_sequence,
+                    records,
+                });
+            }
+            Message::ReplicaAppendBatchRequest(ReplicaAppendBatchRequest { requests })
+        }
+        65 => Message::ReplicaStatusRequest(ReplicaStatusRequest {
+            range: decoder.range()?,
+        }),
+        66 => Message::ReplicaStatusResponse(ReplicaStatusResponse {
+            local_committed_offset: decoder.u64()?,
+            next_offset: decoder.u64()?,
         }),
         70 => Message::CommitCursorRequest(CommitCursorRequest {
             // Legacy kind 70 did not carry an operation identity. Decode it
@@ -1409,6 +1551,27 @@ mod tests {
                 range: range(),
                 fencing_epoch: 11,
                 committed_high_watermark: 11,
+            }),
+            Message::ReplicaAppendBatchRequest(ReplicaAppendBatchRequest {
+                requests: vec![ReplicaAppendRequest {
+                    range: range(),
+                    fencing_epoch: 11,
+                    leader_node_id: Uuid::from_u128(3),
+                    expected_base_offset: 10,
+                    producer_id: Uuid::from_u128(6),
+                    producer_epoch: 7,
+                    first_sequence: 8,
+                    records: vec![ProduceRecord {
+                        timestamp_millis: -9,
+                        key: b"key".to_vec(),
+                        value: b"value".to_vec(),
+                    }],
+                }],
+            }),
+            Message::ReplicaStatusRequest(ReplicaStatusRequest { range: range() }),
+            Message::ReplicaStatusResponse(ReplicaStatusResponse {
+                local_committed_offset: 11,
+                next_offset: 12,
             }),
             Message::CommitCursorRequest(CommitCursorRequest {
                 operation_id: Uuid::from_u128(52),

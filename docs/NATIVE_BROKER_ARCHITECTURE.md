@@ -141,18 +141,22 @@ request is acknowledged only after its records are included in a successful
 group barrier. Weighted fair scheduling and soak deltas remain follow-ups
 (see issues #185, #92, #98).
 
-This remains a single-node library slice by default. It does not provide an
-operator daemon/config surface, replicated metadata ownership of replica sets,
-peer TCP replication transport, consumer groups beyond the stage-7 checkpoint
-slice, or repair/retirement. Its
-configured range fencing epoch rejects mismatched requests; when wired to a
+This remains a library slice by default. It does not provide an operator
+daemon/config surface, replicated metadata ownership of replica sets, consumer
+groups beyond the stage-7 checkpoint slice, or sealed-segment repair/retirement.
+Its configured range fencing epoch rejects mismatched requests; when wired to a
 metadata lease view (`MetaFencingEpoch`), grants and releases fence stale
-leaseholders. An optional in-process `ReplicaSet` enables `Durability::Quorum`:
-the leader fans appends to followers, advances a cluster committed high-water
-mark only after majority local durability, propagates that mark, and caps fetch
-visibility at the quorum point. Producer epoch identity becomes an explicit
-record-frame field in segment v2; v1 remains byte-compatible and uses the
-deterministic namespace described above.
+leaseholders. `Durability::Quorum` is backed by a `ReplicaSet`: the leader fans
+appends to followers, advances a cluster committed high-water mark only after
+majority local durability, propagates that mark, and caps fetch visibility at
+the quorum point. The deterministic in-process `ReplicaSet` remains the test
+harness backend; production wiring uses persistent mTLS leader→follower streams
+(`NetworkedReplicaSet`) with pipelined batches, per-follower outstanding-batch
+and byte windows, durable-offset acks, reconnect, and a bounded retransmission
+buffer for basic catch-up. Full sealed-segment transfer and soak numbers remain
+follow-ups. Producer epoch identity becomes an explicit record-frame field in
+segment v2; v1 remains byte-compatible and uses the deterministic namespace
+described above.
 
 ## 3. System boundaries
 
@@ -456,8 +460,12 @@ sequenceDiagram
 ```
 
 An ack policy is explicit (`local_durable`, `quorum`, and later
-`all_in_sync`). The default clustered policy is quorum. Backpressure is based
-on bounded bytes and sessions, not unbounded request counts.
+`all_in_sync`). The default clustered policy is quorum. Networked replication
+keeps persistent TLS-1.3 mTLS streams (peer leaf CN = replica node UUID),
+pipelines multiple in-flight batches per follower, and applies per-follower
+outstanding-batch / byte windows so a slow non-quorum replica cannot stall
+producer acknowledgements indefinitely. Quorum loss still fails closed with
+`Overloaded`. Client session backpressure remains bounded bytes and sessions.
 
 ### 8.2 Consumer committed visibility
 

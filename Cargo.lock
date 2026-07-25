@@ -3995,6 +3995,7 @@ dependencies = [
  "vtop-log",
  "vtop-meta",
  "vtop-protocol",
+ "x509-parser",
 ]
 
 [[package]]

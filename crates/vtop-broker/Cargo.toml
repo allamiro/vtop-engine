@@ -16,7 +16,8 @@ uuid = { workspace = true }
 vtop-log = { workspace = true }
 vtop-meta = { workspace = true }
 vtop-protocol = { workspace = true }
+x509-parser = { workspace = true }
 
 [dev-dependencies]
-rcgen = "0.14"
+rcgen = { workspace = true }
 tempfile = { workspace = true }
