@@ -146,7 +146,10 @@ impl ReplicaPeerHandler for SlowFollower {
 impl SlowFollower {
     fn block(&self) {
         if self.hold.load(Ordering::SeqCst) {
-            std::thread::sleep(self.delay);
+            // Apply runs on the replica peer server's Tokio worker. A plain
+            // thread::sleep would pin that worker and can starve the fast
+            // follower on small test runtimes (CI).
+            tokio::task::block_in_place(|| std::thread::sleep(self.delay));
         }
     }
 }
@@ -187,7 +190,7 @@ fn harness_with(
     slow_follower2: Option<(Duration, Arc<AtomicBool>)>,
 ) -> NetworkHarness {
     let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+        .worker_threads(4)
         .enable_all()
         .build()
         .unwrap();
@@ -264,8 +267,17 @@ fn harness_with(
         .unwrap(),
     );
 
-    // Allow initial connections to establish.
-    std::thread::sleep(Duration::from_millis(100));
+    // Wait until both follower streams are live before producing.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let ready = [FOLLOWER_1, FOLLOWER_2]
+            .iter()
+            .all(|node| replica_set.follower_connected(*node) == Some(true));
+        if ready {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 
     let mut leader = LocalBroker::with_replication(
         leader_segment,
@@ -358,7 +370,9 @@ fn networked_quorum_acks_and_propagates_hwm() {
 fn slow_non_quorum_follower_does_not_block_producer() {
     let hold = Arc::new(AtomicBool::new(true));
     let flow = FlowControlConfig {
-        ack_timeout: Duration::from_millis(200),
+        // Generous enough for CI TLS/setup jitter on the fast follower, but
+        // far below the slow follower's artificial delay.
+        ack_timeout: Duration::from_millis(750),
         ..FlowControlConfig::default()
     };
     let h = harness_with(
@@ -372,9 +386,9 @@ fn slow_non_quorum_follower_does_not_block_producer() {
     let elapsed = started.elapsed();
     assert_eq!(first.committed_next_offset, 1);
     // Quorum is leader + follower1; follower2 is held. Must not wait for the
-    // full 30s delay — only the per-follower ack timeout bound.
+    // full artificial delay.
     assert!(
-        elapsed < Duration::from_secs(2),
+        elapsed < Duration::from_secs(3),
         "slow follower blocked produce for {elapsed:?}"
     );
     hold.store(false, Ordering::SeqCst);
