@@ -12,13 +12,18 @@ mod command;
 pub mod localfs_backend;
 pub mod minio_backend;
 pub mod mock;
+pub mod multipart;
 pub mod s3_native;
 pub mod s3cmd_backend;
 
 pub use base::{
-    ObjectChecksum, ObjectHead, StoredManifest, StoredObject, UploadBackend, VerificationResult,
+    ObjectChecksum, ObjectHead, StoredManifest, StoredObject, UploadBackend, UploadedPart,
+    VerificationResult,
 };
 pub use mock::MockBackend;
+pub use multipart::{
+    abort_session, cleanup_abandoned, upload_resumable, MultipartFence, MultipartUploadConfig,
+};
 
 use std::sync::Arc;
 use vtop_core::config::UploadConfig;

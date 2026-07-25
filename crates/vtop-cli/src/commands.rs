@@ -88,9 +88,9 @@ pub enum Command {
         #[command(subcommand)]
         command: crate::meta_tools::MetaCommand,
     },
-    /// Cold-tier copy tools for sealed native segments: upload, read-back
-    /// verification against a pinned root, and tier-evidence commit through
-    /// the meta admin endpoint.
+    /// Cold-tier tools for sealed native segments: resumable upload + verify,
+    /// rehydrate from a version pin, and abandoned multipart cleanup. Evidence
+    /// commit still goes through the meta admin endpoint.
     Tier {
         #[command(subcommand)]
         command: crate::tier_tools::TierCommand,

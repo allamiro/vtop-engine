@@ -51,6 +51,18 @@ pub struct StoredObject {
     pub version_id: Option<String>,
 }
 
+/// One completed multipart part returned by the storage service.
+///
+/// The `etag` is the store's part receipt (required to complete the upload).
+/// It is **not** an integrity checksum — multipart ETags are not MD5 and must
+/// never authorize evidence commit. Per-part digests live in the persisted
+/// session state; whole-object `verify_object` remains the strong gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadedPart {
+    pub part_number: u32,
+    pub etag: String,
+}
+
 /// Result of a HEAD/stat on a stored object.
 #[derive(Debug, Clone)]
 pub struct ObjectHead {
@@ -404,6 +416,22 @@ pub trait UploadBackend: Send + Sync {
     /// Delete an object (used only for cleanup / explicit operations).
     async fn delete_object(&self, object_uri: &str) -> Result<(), VtopError>;
 
+    /// Download a specific immutable version of an object, bounded like
+    /// `get_object_bounded`. Default fails closed: backends that cannot
+    /// address versions must not silently substitute the current key
+    /// (rehydration must pin the tier-evidence version).
+    async fn get_object_pinned(
+        &self,
+        object_uri: &str,
+        _version_id: &str,
+        _max_bytes: usize,
+    ) -> Result<Vec<u8>, VtopError> {
+        Err(VtopError::Upload(format!(
+            "backend {} cannot read a pinned object version of {object_uri}",
+            self.backend_name()
+        )))
+    }
+
     /// Ensure a bucket exists (idempotent). Default is a no-op; backends that
     /// support it (native S3) override this. Only invoked when the engine is
     /// configured with `upload.create_bucket = true` — used to provision
@@ -416,7 +444,65 @@ pub trait UploadBackend: Send + Sync {
 
     fn supports_checksum_verification(&self) -> bool;
 
+    /// Whether this backend implements the resumable multipart API below
+    /// (`create_multipart_upload` / `upload_part` / `complete_multipart_upload`
+    /// / `abort_multipart_upload`). Compatibility backends that may multipart
+    /// internally inside a single `put_object` still return `false` here —
+    /// resume across process restart requires an explicit upload id.
     fn supports_multipart(&self) -> bool;
+
+    /// Start a resumable multipart upload. Returns the backend upload id.
+    async fn create_multipart_upload(
+        &self,
+        object_uri: &str,
+        _content_type: &str,
+        _checksum: Option<ObjectChecksum<'_>>,
+    ) -> Result<String, VtopError> {
+        Err(VtopError::Upload(format!(
+            "backend {} does not support resumable multipart upload for {object_uri}",
+            self.backend_name()
+        )))
+    }
+
+    /// Upload one part. `part_number` is 1-based. `data` is the exact part body.
+    async fn upload_part(
+        &self,
+        object_uri: &str,
+        _upload_id: &str,
+        _part_number: u32,
+        _data: bytes::Bytes,
+    ) -> Result<UploadedPart, VtopError> {
+        Err(VtopError::Upload(format!(
+            "backend {} does not support resumable multipart upload for {object_uri}",
+            self.backend_name()
+        )))
+    }
+
+    /// Assemble uploaded parts into the final object. Must be idempotent when
+    /// the same parts/upload id are completed again after a crash mid-ack.
+    async fn complete_multipart_upload(
+        &self,
+        object_uri: &str,
+        _upload_id: &str,
+        _parts: &[UploadedPart],
+    ) -> Result<StoredObject, VtopError> {
+        Err(VtopError::Upload(format!(
+            "backend {} does not support resumable multipart upload for {object_uri}",
+            self.backend_name()
+        )))
+    }
+
+    /// Abort an in-progress multipart upload and release remote part storage.
+    async fn abort_multipart_upload(
+        &self,
+        object_uri: &str,
+        _upload_id: &str,
+    ) -> Result<(), VtopError> {
+        Err(VtopError::Upload(format!(
+            "backend {} does not support resumable multipart upload for {object_uri}",
+            self.backend_name()
+        )))
+    }
 }
 
 /// Parse an `s3://bucket/key` URI into `(bucket, key)`.

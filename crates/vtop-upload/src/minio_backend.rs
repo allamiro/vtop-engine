@@ -162,6 +162,7 @@ impl UploadBackend for MinioBackend {
         true
     }
     fn supports_multipart(&self) -> bool {
-        true
+        // `mc` may multipart internally; it does not expose resume (#191).
+        false
     }
 }

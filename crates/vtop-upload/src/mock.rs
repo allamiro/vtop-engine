@@ -5,12 +5,15 @@
 //! committed" path without any external service.
 
 use crate::base::{
-    ObjectChecksum, ObjectHead, StoredManifest, StoredObject, UploadBackend, VerificationResult,
+    ObjectChecksum, ObjectHead, StoredManifest, StoredObject, UploadBackend, UploadedPart,
+    VerificationResult,
 };
 use async_trait::async_trait;
+use bytes::Bytes;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use vtop_core::errors::VtopError;
 
 #[derive(Default)]
@@ -33,6 +36,11 @@ struct VersionHistory {
     entries: Vec<(String, Vec<u8>)>,
 }
 
+#[derive(Default)]
+struct PendingMultipart {
+    parts: HashMap<u32, Vec<u8>>,
+}
+
 /// A test double for [`UploadBackend`].
 pub struct MockBackend {
     objects: Mutex<HashMap<String, Stored>>,
@@ -41,6 +49,9 @@ pub struct MockBackend {
     /// `corrupt()`/`corrupt_on_verify` intentionally touch only the current
     /// key, so pinned reads stay stable the way S3 versions do.
     versions: Mutex<HashMap<String, VersionHistory>>,
+    /// In-progress multipart uploads keyed by `(object_uri, upload_id)`.
+    multiparts: Mutex<HashMap<(String, String), PendingMultipart>>,
+    next_upload_id: Mutex<u64>,
     /// When true, `verify_object` always reports failure.
     fail_verification: bool,
     /// When true, `verify_object` reports backend-limited (size-only) success.
@@ -48,6 +59,10 @@ pub struct MockBackend {
     /// Test-only attack model: alter the stored body immediately before
     /// verification while leaving uploader-provided checksum metadata intact.
     corrupt_on_verify: bool,
+    /// Fail `upload_part` once the number of successful part uploads reaches
+    /// this counter's value (test interrupt/resume). `usize::MAX` disables.
+    multipart_fail_after_parts: Arc<AtomicUsize>,
+    multipart_parts_uploaded: Arc<AtomicUsize>,
 }
 
 impl Default for MockBackend {
@@ -61,9 +76,13 @@ impl MockBackend {
         Self {
             objects: Mutex::new(HashMap::new()),
             versions: Mutex::new(HashMap::new()),
+            multiparts: Mutex::new(HashMap::new()),
+            next_upload_id: Mutex::new(0),
             fail_verification: false,
             backend_limited: false,
             corrupt_on_verify: false,
+            multipart_fail_after_parts: Arc::new(AtomicUsize::new(usize::MAX)),
+            multipart_parts_uploaded: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -92,6 +111,20 @@ impl MockBackend {
         }
     }
 
+    /// Fail part uploads after `n` successful parts (shared counter for resume tests).
+    pub fn with_multipart_fail_after_parts(mut self, counter: Arc<AtomicUsize>) -> Self {
+        self.multipart_fail_after_parts = counter;
+        self
+    }
+
+    pub fn multipart_parts_uploaded(&self) -> usize {
+        self.multipart_parts_uploaded.load(Ordering::SeqCst)
+    }
+
+    pub fn pending_multipart_count(&self) -> usize {
+        self.multiparts.lock().unwrap().len()
+    }
+
     /// True if the object exists in the mock store.
     pub fn contains(&self, uri: &str) -> bool {
         self.objects.lock().unwrap().contains_key(uri)
@@ -117,6 +150,15 @@ impl MockBackend {
         checksum: Option<&str>,
     ) -> Result<String, VtopError> {
         let data = tokio::fs::read(local_path).await?;
+        self.store_bytes(uri, data, checksum)
+    }
+
+    fn store_bytes(
+        &self,
+        uri: &str,
+        data: Vec<u8>,
+        checksum: Option<&str>,
+    ) -> Result<String, VtopError> {
         let stored = Stored {
             size: data.len() as u64,
             checksum: checksum.map(|s| s.to_string()),
@@ -177,9 +219,19 @@ impl UploadBackend for MockBackend {
         version_id: &str,
         max_bytes: usize,
     ) -> Result<Vec<u8>, VtopError> {
+        self.get_object_pinned(manifest_uri, version_id, max_bytes)
+            .await
+    }
+
+    async fn get_object_pinned(
+        &self,
+        object_uri: &str,
+        version_id: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, VtopError> {
         let versions = self.versions.lock().unwrap();
         let data = versions
-            .get(manifest_uri)
+            .get(object_uri)
             .and_then(|history| {
                 history
                     .entries
@@ -187,10 +239,10 @@ impl UploadBackend for MockBackend {
                     .find(|(id, _)| id == version_id)
                     .map(|(_, data)| data.clone())
             })
-            .ok_or_else(|| VtopError::NotFound(format!("{manifest_uri} (version {version_id})")))?;
+            .ok_or_else(|| VtopError::NotFound(format!("{object_uri} (version {version_id})")))?;
         if data.len() > max_bytes {
             return Err(VtopError::Upload(format!(
-                "stored object {manifest_uri} exceeds the {max_bytes}-byte read limit"
+                "stored object {object_uri} exceeds the {max_bytes}-byte read limit"
             )));
         }
         Ok(data)
@@ -312,7 +364,96 @@ impl UploadBackend for MockBackend {
         !self.backend_limited
     }
     fn supports_multipart(&self) -> bool {
-        false
+        true
+    }
+
+    async fn create_multipart_upload(
+        &self,
+        object_uri: &str,
+        _content_type: &str,
+        _checksum: Option<ObjectChecksum<'_>>,
+    ) -> Result<String, VtopError> {
+        let mut next = self.next_upload_id.lock().unwrap();
+        *next += 1;
+        let upload_id = format!("mpu-{next}");
+        self.multiparts.lock().unwrap().insert(
+            (object_uri.to_owned(), upload_id.clone()),
+            PendingMultipart::default(),
+        );
+        Ok(upload_id)
+    }
+
+    async fn upload_part(
+        &self,
+        object_uri: &str,
+        upload_id: &str,
+        part_number: u32,
+        data: Bytes,
+    ) -> Result<UploadedPart, VtopError> {
+        let uploaded = self.multipart_parts_uploaded.fetch_add(1, Ordering::SeqCst);
+        let limit = self.multipart_fail_after_parts.load(Ordering::SeqCst);
+        if uploaded >= limit {
+            return Err(VtopError::Upload(format!(
+                "mock: injected multipart failure after {limit} parts"
+            )));
+        }
+        let mut map = self.multiparts.lock().unwrap();
+        let pending = map
+            .get_mut(&(object_uri.to_owned(), upload_id.to_owned()))
+            .ok_or_else(|| {
+                VtopError::Upload(format!(
+                    "mock: unknown multipart upload {upload_id} for {object_uri}"
+                ))
+            })?;
+        pending.parts.insert(part_number, data.to_vec());
+        Ok(UploadedPart {
+            part_number,
+            etag: format!("etag-{part_number}-{}", data.len()),
+        })
+    }
+
+    async fn complete_multipart_upload(
+        &self,
+        object_uri: &str,
+        upload_id: &str,
+        parts: &[UploadedPart],
+    ) -> Result<StoredObject, VtopError> {
+        let mut map = self.multiparts.lock().unwrap();
+        let pending = map
+            .remove(&(object_uri.to_owned(), upload_id.to_owned()))
+            .ok_or_else(|| {
+                VtopError::Upload(format!(
+                    "mock: unknown multipart upload {upload_id} for {object_uri}"
+                ))
+            })?;
+        let mut body = Vec::new();
+        let mut ordered = parts.to_vec();
+        ordered.sort_by_key(|p| p.part_number);
+        for part in &ordered {
+            let bytes = pending.parts.get(&part.part_number).ok_or_else(|| {
+                VtopError::Upload(format!(
+                    "mock: missing part {} for multipart {upload_id}",
+                    part.part_number
+                ))
+            })?;
+            body.extend_from_slice(bytes);
+        }
+        let version_id = self.store_bytes(object_uri, body, None)?;
+        Ok(StoredObject {
+            version_id: Some(version_id),
+        })
+    }
+
+    async fn abort_multipart_upload(
+        &self,
+        object_uri: &str,
+        upload_id: &str,
+    ) -> Result<(), VtopError> {
+        self.multiparts
+            .lock()
+            .unwrap()
+            .remove(&(object_uri.to_owned(), upload_id.to_owned()));
+        Ok(())
     }
 }
 

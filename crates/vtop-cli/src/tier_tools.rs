@@ -9,6 +9,13 @@
 //!
 //! The whole command is idempotent: re-running re-uploads the same immutable
 //! bytes and the propose replays through dedup or rejects `AlreadyExists`.
+//!
+//! Large segments use resumable multipart upload (#191) when the backend
+//! supports it and the object meets the configured threshold. Physical local
+//! deletion is still authorized only by the metadata plan→confirm path
+//! (`vtopctl meta confirm-retention-expired`); this module never deletes
+//! tier objects. Rehydration downloads a version-pinned tier copy back to a
+//! local path for repair/serve.
 
 use clap::{ArgAction, Args, Subcommand};
 use std::collections::BTreeMap;
@@ -19,7 +26,10 @@ use vtop_log::{SegmentCommitKey, SegmentManifestV2};
 use vtop_meta::command::CommandEnvelope;
 use vtop_meta::MetadataCommand;
 use vtop_upload::base::parse_s3_uri;
-use vtop_upload::{ObjectChecksum, UploadBackend};
+use vtop_upload::{
+    cleanup_abandoned, upload_resumable, MultipartFence, MultipartUploadConfig, ObjectChecksum,
+    UploadBackend,
+};
 
 #[derive(Subcommand, Debug)]
 pub enum TierCommand {
@@ -27,6 +37,12 @@ pub enum TierCommand {
     /// stored bytes by reading them back against the pinned root, and commit
     /// `CommitTierEvidence` through the meta admin endpoint.
     Copy(TierCopyArgs),
+    /// Download a version-pinned tier object to a local path and verify its
+    /// content digest (first-slice rehydration; does not mutate metadata).
+    Rehydrate(TierRehydrateArgs),
+    /// Abort abandoned in-progress multipart uploads whose session files are
+    /// older than `upload.multipart_abandon_after_secs`.
+    CleanupAbandoned(TierCleanupArgs),
 }
 
 #[derive(Args, Debug)]
@@ -97,6 +113,55 @@ pub struct TierCopyArgs {
     /// definitive rejection whose prerequisite has been corrected.
     #[arg(long)]
     pub request_id: Option<Uuid>,
+
+    /// Directory for persisted multipart session files (upload id, parts,
+    /// per-part digests). Required when the segment is large enough to use
+    /// resumable multipart; ignored for single-part puts.
+    #[arg(long)]
+    pub multipart_state_dir: Option<PathBuf>,
+
+    /// Override `upload.multipart_part_size_bytes` for this invocation.
+    #[arg(long)]
+    pub multipart_part_size_bytes: Option<u64>,
+
+    /// Override `upload.multipart_threshold_bytes` for this invocation.
+    #[arg(long)]
+    pub multipart_threshold_bytes: Option<u64>,
+
+    /// Override `upload.multipart_max_parallelism` for this invocation.
+    #[arg(long)]
+    pub multipart_max_parallelism: Option<usize>,
+}
+
+#[derive(Args, Debug)]
+pub struct TierRehydrateArgs {
+    #[arg(long)]
+    pub upload_config: PathBuf,
+    /// Tier object URI recorded in `SegmentTierCopy.object_uri`.
+    #[arg(long)]
+    pub object_uri: String,
+    /// Immutable object version pin from tier evidence (`object_version_id`).
+    #[arg(long)]
+    pub object_version_id: String,
+    /// Expected whole-object digest (hex).
+    #[arg(long)]
+    pub expected_digest: String,
+    #[arg(long, default_value = "blake3")]
+    pub digest_algorithm: String,
+    /// Expected byte length.
+    #[arg(long)]
+    pub expected_size: u64,
+    /// Destination path for the rehydrated bytes.
+    #[arg(long)]
+    pub output: PathBuf,
+}
+
+#[derive(Args, Debug)]
+pub struct TierCleanupArgs {
+    #[arg(long)]
+    pub upload_config: PathBuf,
+    #[arg(long)]
+    pub multipart_state_dir: PathBuf,
 }
 
 /// Resolved, backend-independent inputs of one tier copy. Split from the CLI
@@ -119,6 +184,8 @@ pub struct TierCopyRequest {
     pub verified_term: u64,
     pub request_id: Uuid,
     pub issued_at_ms: i64,
+    /// When set, large segments upload via resumable multipart.
+    pub multipart: Option<MultipartUploadConfig>,
 }
 
 impl TierCopyRequest {
@@ -228,14 +295,38 @@ pub async fn run_tier_copy(
     // 3. Upload segment and manifest, capturing both immutable object
     //    versions. A missing version id under the hardened profile is exactly
     //    the rollback surface #135 removed: abort.
-    let stored_segment = backend
-        .put_object(
-            &request.segment,
-            &request.object_uri,
-            Some(ObjectChecksum::new("blake3", &segment_digest)),
-        )
-        .await
-        .map_err(|error| refuse("segment upload", error))?;
+    //
+    // Large segments use resumable multipart when configured and supported.
+    // Evidence commit still requires the strong read-back verify below —
+    // multipart ETags never authorize CommitTierEvidence.
+    let checksum = ObjectChecksum::new("blake3", &segment_digest);
+    let stored_segment = match &request.multipart {
+        Some(multipart)
+            if multipart.should_multipart(backend, byte_length) =>
+        {
+            let fence = MultipartFence {
+                expected_segment_generation: request.expected_generation,
+                fencing_epoch: request.fencing_epoch,
+                content_digest_hex: segment_digest.clone(),
+                content_digest_algorithm: "blake3".to_owned(),
+                byte_length,
+            };
+            upload_resumable(
+                backend,
+                multipart,
+                &request.segment,
+                &request.object_uri,
+                Some(checksum),
+                fence,
+            )
+            .await
+            .map_err(|error| refuse("segment multipart upload", error))?
+        }
+        _ => backend
+            .put_object(&request.segment, &request.object_uri, Some(checksum))
+            .await
+            .map_err(|error| refuse("segment upload", error))?,
+    };
     if request.require_versioning && stored_segment.version_id.is_none() {
         return Err(refuse(
             "segment upload",
@@ -364,7 +455,83 @@ pub fn build_request(args: &TierCopyArgs) -> Result<TierCopyRequest, String> {
         verified_term: args.verified_term,
         request_id,
         issued_at_ms: args.issued_at_ms,
+        multipart: None,
     })
+}
+
+fn multipart_config_from_args(
+    args: &TierCopyArgs,
+    upload: &vtop_core::config::UploadConfig,
+) -> Result<Option<MultipartUploadConfig>, String> {
+    let Some(state_dir) = &args.multipart_state_dir else {
+        return Ok(None);
+    };
+    let mut cfg = MultipartUploadConfig::from_upload(upload, state_dir.clone());
+    if let Some(v) = args.multipart_part_size_bytes {
+        cfg.part_size_bytes = v;
+    }
+    if let Some(v) = args.multipart_threshold_bytes {
+        cfg.threshold_bytes = v;
+    }
+    if let Some(v) = args.multipart_max_parallelism {
+        cfg.max_parallelism = v;
+    }
+    if cfg.part_size_bytes == 0 || cfg.max_parallelism == 0 || cfg.threshold_bytes == 0 {
+        return Err("multipart part size, threshold, and parallelism must be > 0".to_owned());
+    }
+    Ok(Some(cfg))
+}
+
+/// Rehydrate a version-pinned tier object to a local path after strong verify.
+pub async fn run_tier_rehydrate(
+    backend: &dyn UploadBackend,
+    object_uri: &str,
+    object_version_id: &str,
+    expected_size: u64,
+    expected: ObjectChecksum<'_>,
+    output: &Path,
+) -> Result<(), String> {
+    if expected_size == 0 {
+        return Err(refuse("rehydrate", "expected size must be > 0"));
+    }
+    // Cap the download to the expected size (+0) by using get_object_pinned
+    // with expected_size as the bound — an oversized replacement fails closed.
+    let max_bytes = usize::try_from(expected_size).map_err(|_| {
+        refuse(
+            "rehydrate",
+            "expected size exceeds addressable memory on this host",
+        )
+    })?;
+    let bytes = backend
+        .get_object_pinned(object_uri, object_version_id, max_bytes)
+        .await
+        .map_err(|error| refuse("rehydrate download", error))?;
+    if bytes.len() as u64 != expected_size {
+        return Err(refuse(
+            "rehydrate",
+            format!(
+                "size mismatch: expected {expected_size}, got {}",
+                bytes.len()
+            ),
+        ));
+    }
+    let algo = expected
+        .algorithm
+        .parse::<vtop_core::types::ChecksumAlgorithm>()
+        .map_err(|error| refuse("rehydrate", error))?;
+    let actual = vtop_core::checksum::digest_bytes(algo, &bytes)
+        .ok_or_else(|| refuse("rehydrate", "checksum algorithm disabled"))?;
+    if !actual.eq_ignore_ascii_case(expected.hex) {
+        return Err(refuse(
+            "rehydrate",
+            "pinned object digest does not match expected",
+        ));
+    }
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| refuse("rehydrate write", error))?;
+    }
+    std::fs::write(output, &bytes).map_err(|error| refuse("rehydrate write", error))?;
+    Ok(())
 }
 
 fn derived_tier_copy_request_id(args: &TierCopyArgs, expected_root: &[u8; 32]) -> Uuid {
@@ -399,7 +566,19 @@ pub async fn run(command: TierCommand, json: bool) -> i32 {
 async fn run_inner(command: TierCommand, json: bool) -> Result<(), String> {
     match command {
         TierCommand::Copy(args) => {
-            let request = build_request(&args)?;
+            let mut request = build_request(&args)?;
+            let upload_text = std::fs::read_to_string(&args.upload_config)
+                .map_err(|error| format!("read {}: {error}", args.upload_config.display()))?;
+            let upload_config: vtop_core::config::UploadConfig = serde_yaml::from_str(&upload_text)
+                .map_err(|error| format!("parse {}: {error}", args.upload_config.display()))?;
+            request.multipart = multipart_config_from_args(&args, &upload_config)?;
+            let backend = vtop_upload::build_backend(&upload_config)
+                .await
+                .map_err(|error| error.to_string())?;
+            let command = run_tier_copy(backend.as_ref(), &request).await?;
+            crate::meta_tools::propose_and_print(&args.meta_config, command, json).await
+        }
+        TierCommand::Rehydrate(args) => {
             let upload_text = std::fs::read_to_string(&args.upload_config)
                 .map_err(|error| format!("read {}: {error}", args.upload_config.display()))?;
             let upload_config: vtop_core::config::UploadConfig = serde_yaml::from_str(&upload_text)
@@ -407,8 +586,56 @@ async fn run_inner(command: TierCommand, json: bool) -> Result<(), String> {
             let backend = vtop_upload::build_backend(&upload_config)
                 .await
                 .map_err(|error| error.to_string())?;
-            let command = run_tier_copy(backend.as_ref(), &request).await?;
-            crate::meta_tools::propose_and_print(&args.meta_config, command, json).await
+            run_tier_rehydrate(
+                backend.as_ref(),
+                &args.object_uri,
+                &args.object_version_id,
+                args.expected_size,
+                ObjectChecksum::new(&args.digest_algorithm, &args.expected_digest),
+                &args.output,
+            )
+            .await?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "rehydrated": true,
+                        "object_uri": args.object_uri,
+                        "object_version_id": args.object_version_id,
+                        "output": args.output,
+                        "bytes": args.expected_size,
+                    })
+                );
+            } else {
+                println!(
+                    "rehydrated {}@{} -> {} ({} bytes)",
+                    args.object_uri,
+                    args.object_version_id,
+                    args.output.display(),
+                    args.expected_size
+                );
+            }
+            Ok(())
+        }
+        TierCommand::CleanupAbandoned(args) => {
+            let upload_text = std::fs::read_to_string(&args.upload_config)
+                .map_err(|error| format!("read {}: {error}", args.upload_config.display()))?;
+            let upload_config: vtop_core::config::UploadConfig = serde_yaml::from_str(&upload_text)
+                .map_err(|error| format!("parse {}: {error}", args.upload_config.display()))?;
+            let backend = vtop_upload::build_backend(&upload_config)
+                .await
+                .map_err(|error| error.to_string())?;
+            let cfg =
+                MultipartUploadConfig::from_upload(&upload_config, args.multipart_state_dir.clone());
+            let cleaned = cleanup_abandoned(backend.as_ref(), &cfg)
+                .await
+                .map_err(|error| error.to_string())?;
+            if json {
+                println!("{}", serde_json::json!({ "cleaned": cleaned }));
+            } else {
+                println!("cleaned {cleaned} abandoned multipart session(s)");
+            }
+            Ok(())
         }
     }
 }
@@ -498,6 +725,7 @@ mod tests {
             verified_term: 2,
             request_id: Uuid::from_u128(0xfeed),
             issued_at_ms: 0,
+            multipart: None,
         }
     }
 
@@ -564,6 +792,16 @@ mod tests {
         }
         fn supports_multipart(&self) -> bool {
             false
+        }
+        async fn get_object_pinned(
+            &self,
+            object_uri: &str,
+            version_id: &str,
+            max_bytes: usize,
+        ) -> Result<Vec<u8>, VtopError> {
+            self.0
+                .get_object_pinned(object_uri, version_id, max_bytes)
+                .await
         }
     }
 
@@ -759,6 +997,73 @@ mod tests {
         assert!(error.contains("versioning preflight"), "{error}");
     }
 
+    #[tokio::test]
+    async fn tier_copy_multipart_path_still_pins_versions_and_commits_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let sealed = seal_bundle(directory.path());
+        let root = sealed_root(&sealed);
+        let state = tempfile::tempdir().unwrap();
+        let backend = MockBackend::new();
+        let mut req = request(&sealed, root);
+        let size = std::fs::metadata(&sealed).unwrap().len();
+        req.multipart = Some(MultipartUploadConfig {
+            part_size_bytes: (size / 2).max(1),
+            threshold_bytes: 1,
+            max_parallelism: 2,
+            abandon_after_secs: 60,
+            state_dir: state.path().to_path_buf(),
+        });
+        let command = run_tier_copy(&backend, &req)
+            .await
+            .expect("multipart tier copy must succeed");
+        let MetadataCommand::CommitTierEvidence {
+            object_version_id,
+            manifest_version_id,
+            verification_method,
+            ..
+        } = &command
+        else {
+            panic!("expected CommitTierEvidence");
+        };
+        assert!(object_version_id.is_some());
+        assert!(manifest_version_id.is_some());
+        assert_eq!(
+            *verification_method,
+            vtop_meta::VerificationMethod::AuthenticatedContentRoot
+        );
+        assert!(backend.contains(&req.object_uri));
+    }
+
+    #[tokio::test]
+    async fn tier_rehydrate_writes_pinned_bytes_after_digest_check() {
+        let backend = MockBackend::new();
+        let directory = tempfile::tempdir().unwrap();
+        let sealed = seal_bundle(directory.path());
+        let data = std::fs::read(&sealed).unwrap();
+        let digest = vtop_core::checksum::blake3_bytes(&data);
+        let stored = backend
+            .put_object(
+                &sealed,
+                "s3://tier/rehydrate.segment",
+                Some(ObjectChecksum::new("blake3", &digest)),
+            )
+            .await
+            .unwrap();
+        let version = stored.version_id.unwrap();
+        let out = directory.path().join("restored.segment");
+        run_tier_rehydrate(
+            &backend,
+            "s3://tier/rehydrate.segment",
+            &version,
+            data.len() as u64,
+            ObjectChecksum::new("blake3", &digest),
+            &out,
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), data);
+    }
+
     #[test]
     fn build_request_maps_arguments_and_rejects_bad_hex() {
         let mut args = TierCopyArgs {
@@ -779,6 +1084,10 @@ mod tests {
             verified_term: 7,
             issued_at_ms: 0,
             request_id: Some(Uuid::from_u128(1)),
+            multipart_state_dir: None,
+            multipart_part_size_bytes: None,
+            multipart_threshold_bytes: None,
+            multipart_max_parallelism: None,
         };
         let request = build_request(&args).unwrap();
         assert_eq!(request.expected_root.to_hex().to_string(), "ab".repeat(32));

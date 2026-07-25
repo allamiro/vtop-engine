@@ -443,6 +443,24 @@ pub struct UploadConfig {
     /// (`mc version enable` / S3 bucket versioning, ideally with Object Lock).
     #[serde(default)]
     pub require_object_versioning: bool,
+    /// Byte size of each multipart part (except possibly the last). Used by
+    /// resumable uploads for large sealed segments (#191). Default 8 MiB.
+    /// Real S3 requires at least 5 MiB for non-final parts; mock/local tests
+    /// may use smaller values.
+    #[serde(default = "default_multipart_part_size_bytes")]
+    pub multipart_part_size_bytes: u64,
+    /// Use resumable multipart when the local object is at least this large
+    /// and the backend advertises `supports_multipart()`. Default equals the
+    /// part size (two or more parts).
+    #[serde(default = "default_multipart_threshold_bytes")]
+    pub multipart_threshold_bytes: u64,
+    /// Max concurrent part uploads for one resumable object. Default 4.
+    #[serde(default = "default_multipart_max_parallelism")]
+    pub multipart_max_parallelism: usize,
+    /// Age after which an incomplete multipart session is treated as
+    /// abandoned and safe to abort + delete from the state directory.
+    #[serde(default = "default_multipart_abandon_after_secs")]
+    pub multipart_abandon_after_secs: u64,
 }
 
 fn default_backend() -> String {
@@ -459,6 +477,18 @@ fn default_command_max_output_bytes() -> usize {
 }
 fn default_true() -> bool {
     true
+}
+fn default_multipart_part_size_bytes() -> u64 {
+    8 * 1024 * 1024
+}
+fn default_multipart_threshold_bytes() -> u64 {
+    8 * 1024 * 1024
+}
+fn default_multipart_max_parallelism() -> usize {
+    4
+}
+fn default_multipart_abandon_after_secs() -> u64 {
+    24 * 60 * 60
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -515,6 +545,26 @@ impl VtopConfig {
         }
         if self.upload.bucket.trim().is_empty() {
             return Err(VtopError::Config("upload.bucket must not be empty".into()));
+        }
+        if self.upload.multipart_part_size_bytes == 0 {
+            return Err(VtopError::Config(
+                "upload.multipart_part_size_bytes must be > 0".into(),
+            ));
+        }
+        if self.upload.multipart_threshold_bytes == 0 {
+            return Err(VtopError::Config(
+                "upload.multipart_threshold_bytes must be > 0".into(),
+            ));
+        }
+        if self.upload.multipart_max_parallelism == 0 {
+            return Err(VtopError::Config(
+                "upload.multipart_max_parallelism must be > 0".into(),
+            ));
+        }
+        if self.upload.multipart_abandon_after_secs == 0 {
+            return Err(VtopError::Config(
+                "upload.multipart_abandon_after_secs must be > 0".into(),
+            ));
         }
         if matches!(self.upload.backend.as_str(), "awscli" | "s3cmd" | "minio") {
             let binary = self

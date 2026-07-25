@@ -218,15 +218,32 @@ The marker carried by each adapter is a `SourceProgressMarker` — the unit boun
 
 All backends implement `UploadBackend` (`upload`, `verify_object`, `ensure_bucket`). The engine depends only on the trait, so it is backend-independent, and every backend is held to the same verification-before-commit contract.
 
-| Backend | Target | Checksum verification | Multipart | Bucket create | Use |
-|---------|--------|-----------------------|-----------|---------------|-----|
-| `s3_native` | AWS S3 / MinIO / Ceph RGW (endpoint + path-style) via `aws-sdk-s3` | Strong (service-computed SHA-256; streamed stored-content BLAKE3) | No (`put_object`; `supports_multipart()` = false) | Yes (on-demand) | Primary production backend. |
-| LocalFS | Local directory tree | Strong (streams the stored file; sidecar is not trusted) | N/A | Yes (mkdir tree) | Testing / air-gapped. |
-| `awscli` | S3 via AWS CLI | Strong (downloads and hashes stored content) | Tool-dependent | Yes | Compatibility mode; explicit absolute binary, minimal environment, startup version check, timeout/output caps. |
-| `s3cmd` | S3 via s3cmd | Strong (downloads and hashes stored content) | Tool-dependent | Yes | Compatibility mode; same hardened command policy. |
-| `minio mc` | S3-compatible via `mc` | Strong (downloads and hashes stored content) | Tool-dependent | Yes | Compatibility mode; same hardened command policy. |
-| `mock` | In-memory | Configurable | N/A | Yes | Tests/benchmarks. |
-| `mock_fail` / `mock_limited` | In-memory fault injection | Forced failure / size-only | N/A | Yes | Fault-injection tests. |
+| Backend | Target | Checksum verification | Resumable multipart (`supports_multipart`) | Bucket create | Use |
+|---------|--------|-----------------------|---------------------------------------------|---------------|-----|
+| `s3_native` | AWS S3 / MinIO / Ceph RGW (endpoint + path-style) via `aws-sdk-s3` | Strong (service-computed SHA-256; streamed stored-content BLAKE3) | Yes (create/upload_part/complete/abort + persisted session) | Yes (on-demand) | Primary production backend. |
+| LocalFS | Local directory tree | Strong (streams the stored file; sidecar is not trusted) | No | Yes (mkdir tree) | Testing / air-gapped. |
+| `awscli` | S3 via AWS CLI | Strong (downloads and hashes stored content) | No (CLI may multipart internally; no resume API) | Yes | Compatibility mode; explicit absolute binary, minimal environment, startup version check, timeout/output caps. |
+| `s3cmd` | S3 via s3cmd | Strong (downloads and hashes stored content) | No | Yes | Compatibility mode; same hardened command policy. |
+| `minio mc` | S3-compatible via `mc` | Strong (downloads and hashes stored content) | No | Yes | Compatibility mode; same hardened command policy. |
+| `mock` | In-memory | Configurable | Yes (test double for resume/fencing) | Yes | Tests/benchmarks. |
+| `mock_fail` / `mock_limited` | In-memory fault injection | Forced failure / size-only | Yes | Yes | Fault-injection tests. |
+
+### Resumable multipart (#191)
+
+Large sealed segments (and other objects above `upload.multipart_threshold_bytes`)
+upload through a persisted multipart session when the backend advertises
+`supports_multipart()`:
+
+- Configurable `multipart_part_size_bytes`, `multipart_max_parallelism`, and
+  `multipart_abandon_after_secs`.
+- Session files under an operator-supplied state directory record upload id,
+  completed parts, and per-part BLAKE3 digests so a process restart resumes
+  without retransmitting finished parts.
+- Sessions are fenced by destination URI + segment generation + fencing epoch
+  + content digest; a mismatched fence refuses resume (stale generation).
+- Multipart ETags are **not** integrity evidence. Evidence commit still requires
+  strong whole-object `verify_object` and immutable version pins (#183/#184).
+- `vtopctl tier cleanup-abandoned` aborts aged in-progress uploads.
 
 Checksums disabled by configuration (or a service unable to return a required
 service checksum) produce **backend-limited** verification. Strong verification
