@@ -825,6 +825,18 @@ Measure before optimization:
 No 1M-record/s or fleet-size claim is made without a reproducible end-to-end
 configuration and sustained backpressure/soak results.
 
+#### 15.2.1 Native write amplification and proof overhead (#189)
+
+The first in-process measurement slice for native segments lives in
+`crates/vtop-log/tests/write_amp_proof_harness.rs` with methodology in
+[`WRITE_AMP_PROOF_OVERHEAD.md`](WRITE_AMP_PROOF_OVERHEAD.md). It uses
+`SimStorage` write traces to separate body / commit / index / manifest /
+chunks amplification, asserts the single-copy body path (no second local
+data WAL), and reports v1 vs v2 proof overhead plus repair localization
+ratios. Emit JSON with `VTOP_WRITE_AMP_JSON=…`. This complements archive
+matrix work (#92 / #98 / #130) and does not claim Kafka superiority.
+Multi-hour soak and same-hardware Kafka comparison remain deferred.
+
 ## 16. Implementation roadmap as small PRs
 
 1. **Local committed-boundary correctness.** Finish the current `vtop-log`

@@ -126,6 +126,22 @@ endpoint_url. `run_matrix.py --all` automatically picks it up.
 | Failure conditions | ✅ verification failure, replay/recovery | `backend: mock_fail`, `fault: replay` |
 | Runtime duration | ✅ any (`duration_seconds`) | 5 min / 30 min / 1 h presets easy to add |
 
+## Native segment write amp / proof overhead (#189)
+
+The Python scenarios above drive the **archive** `vtopctl` path. Native
+segment write amplification and proof-carrying overhead are measured in-process
+by the Rust harness (see
+[`docs/WRITE_AMP_PROOF_OVERHEAD.md`](../docs/WRITE_AMP_PROOF_OVERHEAD.md)):
+
+```bash
+mkdir -p benchmarks/results/native-write-amp
+VTOP_WRITE_AMP_JSON=benchmarks/results/native-write-amp/summary.json \
+  cargo test -p vtop-log --test write_amp_proof_harness --locked -- --nocapture
+```
+
+That report complements matrix issues #92 / #98 / #130; it does not claim
+Kafka superiority.
+
 ## Design principles
 
 - Benchmark logic is **separate** from engine logic (drives the binary only).
