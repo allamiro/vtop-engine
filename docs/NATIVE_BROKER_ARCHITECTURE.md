@@ -120,15 +120,26 @@ identity, request/stream IDs, explicit fencing epochs, producer epochs, and
 byte-window updates. It preflights encoded sizes and rejects oversized lengths
 before allocating their declared payload.
 
-The local broker accepts only `LocalFsync` produce requests, persists a newer
-producer epoch before appending, derives a v1 storage namespace from
-`(producer_id, producer_epoch)`, and acknowledges only after the segment commit
-boundary advances. Fetch delegates to the segment's committed high-water mark.
+The local broker accepts `LocalFsync` or `Quorum` produce requests, persists a
+newer producer epoch before appending, derives a v1 storage namespace from
+`(producer_id, producer_epoch)`, and acknowledges only after the requested
+durability barrier completes. Fetch delegates to the segment's committed
+high-water mark (or the quorum high-water mark when replication is configured).
 The TLS server is TLS-1.3-only, requires client certificates, requires an
 explicit VTOP-owned `SessionAuthorizer`, and bounds sessions and global request
 work with semaphores and per-session fetch-response byte credit. A producer
 request's producer ID must equal the authenticated session principal ID, so one
 trusted producer cannot advance another producer's durable fencing epoch.
+
+When `GroupCommitConfig` is attached to `LocalBroker`, concurrent producer
+sessions share one append + local durability / quorum cycle per sealed commit
+group. The coordinator seals on the first of `max_delay`, `max_records`,
+`max_bytes`, or `max_pending_requests`; admits requests FIFO with remainder
+deferred to the next group (no silent drops); and exposes per-commit metrics
+for records/bytes/requests, sync duration, queue wait, and flush reason. Each
+request is acknowledged only after its records are included in a successful
+group barrier. Weighted fair scheduling and soak deltas remain follow-ups
+(see issues #185, #92, #98).
 
 This remains a single-node library slice by default. It does not provide an
 operator daemon/config surface, replicated metadata ownership of replica sets,
