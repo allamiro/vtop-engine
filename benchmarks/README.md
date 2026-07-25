@@ -142,6 +142,23 @@ VTOP_WRITE_AMP_JSON=benchmarks/results/native-write-amp/summary.json \
 That report complements matrix issues #92 / #98 / #130; it does not claim
 Kafka superiority.
 
+## Native fetch I/O research (#190)
+
+Native fetch I/O strategy research (buffered page cache vs Linux
+`sendfile`/`splice` vs experimental `O_DIRECT`, with an explicit gate before
+`io_uring`) is measured in-process by the Rust harness (see
+[`docs/FETCH_IO_RESEARCH.md`](../docs/FETCH_IO_RESEARCH.md)):
+
+```bash
+mkdir -p benchmarks/results/native-fetch-io
+VTOP_FETCH_IO_JSON=benchmarks/results/native-fetch-io/summary.json \
+  cargo test -p vtop-log --test fetch_io_research_harness --locked -- --nocapture
+```
+
+This is a research harness — it does not ship three production fetch engines.
+It complements matrix issues #92 / #98 / #130 and does not claim Kafka
+superiority.
+
 ## Design principles
 
 - Benchmark logic is **separate** from engine logic (drives the binary only).
