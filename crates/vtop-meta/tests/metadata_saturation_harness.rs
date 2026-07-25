@@ -270,7 +270,9 @@ impl NetworkClient {
         if self.router.is_blocked(self.source, self.target) {
             return Err(self.unreachable());
         }
-        self.router.raft(self.target).ok_or_else(|| self.unreachable())
+        self.router
+            .raft(self.target)
+            .ok_or_else(|| self.unreachable())
     }
 }
 
@@ -1115,8 +1117,7 @@ async fn scenario_topic_growth(scale: &WorkloadScale) -> ScenarioReport {
         placements: 0,
     });
     report.notes.push(
-        "Each CreateTopic also inserts one root range (topics == ranges in this scenario)."
-            .into(),
+        "Each CreateTopic also inserts one root range (topics == ranges in this scenario).".into(),
     );
     report
 }
@@ -1202,8 +1203,8 @@ async fn scenario_placement(scale: &WorkloadScale) -> ScenarioReport {
         commands += 2;
 
         let segment_uuid = Uuid::from_u128(fx.next_segment - 1);
-        let replicas = select_replicas(segment_uuid, &candidates, 3, true)
-            .expect("deterministic placement");
+        let replicas =
+            select_replicas(segment_uuid, &candidates, 3, true).expect("deterministic placement");
         let env = cluster.envelope();
         let (resp, p, c) = cluster
             .write_timed(MetadataCommand::CommitSegmentPlacement {
@@ -1379,15 +1380,12 @@ fn build_storage_growth(scale: &WorkloadScale) -> (SimStorage, String, u64) {
 fn scenario_snapshot(scale: &WorkloadScale) -> ScenarioReport {
     let (sim, root, last) = build_storage_growth(scale);
     let env = sim.env(SEED ^ 0x66);
-    let mut storage =
-        MetaStorage::open_with(&env, &root, CLUSTER, storage_config()).expect("reopen for snapshot");
+    let mut storage = MetaStorage::open_with(&env, &root, CLUSTER, storage_config())
+        .expect("reopen for snapshot");
     assert_eq!(storage.last_applied(), last);
 
     let encode_start = Instant::now();
-    let encoded = storage
-        .state()
-        .encode_snapshot()
-        .expect("encode snapshot");
+    let encoded = storage.state().encode_snapshot().expect("encode snapshot");
     let encode_ms = encode_start.elapsed().as_secs_f64() * 1000.0;
 
     let write_start = Instant::now();
@@ -1405,9 +1403,9 @@ fn scenario_snapshot(scale: &WorkloadScale) -> ScenarioReport {
         meta.snapshot_id,
         storage.state().record_count()
     ));
-    report.notes.push(
-        "SimStorage path — durable byte layout without real disk syscall cost.".into(),
-    );
+    report
+        .notes
+        .push("SimStorage path — durable byte layout without real disk syscall cost.".into());
     let _ = sim;
     report
 }
@@ -1457,9 +1455,9 @@ fn scenario_recovery(scale: &WorkloadScale) -> ScenarioReport {
         "Recovery = MetaStorage::open_with after reboot (snapshot + log replay); record_count={}",
         storage.state().record_count()
     ));
-    report.notes.push(
-        "SimStorage path — not a multi-process three-node crash recovery soak.".into(),
-    );
+    report
+        .notes
+        .push("SimStorage path — not a multi-process three-node crash recovery soak.".into());
     report
 }
 
@@ -1544,9 +1542,7 @@ fn evaluate_triggers(scenarios: &[ScenarioReport], scale_name: &str) -> Recommen
             tripped: recovery_ms > TRIGGER_RECOVERY_MS,
             observed: recovery_ms,
             threshold: TRIGGER_RECOVERY_MS,
-            detail: format!(
-                "recovery_ms={recovery_ms:.3} (threshold {TRIGGER_RECOVERY_MS} ms)"
-            ),
+            detail: format!("recovery_ms={recovery_ms:.3} (threshold {TRIGGER_RECOVERY_MS} ms)"),
         },
     ];
 
@@ -1609,15 +1605,15 @@ async fn build_report(scale: WorkloadScale, scale_name: &str) -> HarnessReport {
         scale: scale_name.into(),
         caveats: vec![
             "Research harness only — does not implement multi-group metadata sharding.".into(),
-            "Epic #93: one correct three-node metadata group; shard only after measured need.".into(),
+            "Epic #93: one correct three-node metadata group; shard only after measured need."
+                .into(),
             "Wall-clock / CPU numbers are lab-limited and noisy under CI.".into(),
             "Foundation context: meta issues #167 / #171 / #174.".into(),
         ],
         non_goals: vec![
             "No multi-group / sharded metadata Raft implementation in issue #192.".into(),
             "No production capacity claims from CI timings.".into(),
-            "No multi-hour dedicated-hardware soak in this PR (harness is the entry point)."
-                .into(),
+            "No multi-hour dedicated-hardware soak in this PR (harness is the entry point).".into(),
         ],
         related: vec![
             "https://github.com/allamiro/vtop-engine/issues/192".into(),
