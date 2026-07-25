@@ -10,6 +10,11 @@
 //! sessions share one append + local durability / quorum barrier per sealed
 //! commit group instead of fsyncing and replicating per request.
 //!
+//! [`memory_budget::MemoryBudgetPool`] enforces explicit byte ceilings for
+//! produce, fetch-response queues, and (with networked replicas) follower
+//! inflight / catch-up buffers. Overload fails closed with retryable
+//! `Overloaded` — never by silently dropping accepted records.
+//!
 //! Range leadership is gated by a metadata-issued lease view
 //! ([`MetaFencingEpoch`]): the broker holds the epoch it was granted and, on
 //! every produce/fetch, locks that shared view while validating and mutating
@@ -23,12 +28,20 @@
 //! remain metadata commands (Raft-proposed in later wiring).
 
 pub mod group_commit;
+pub mod memory_budget;
 pub mod replication;
 
 use crate::group_commit::{GroupCommitConfig, GroupCommitCoordinator, QueuedProduce};
+use crate::memory_budget::{
+    reject_message, BudgetRejectReason, BudgetReservation, ConnectionBudget, MemoryBudgetConfig,
+    MemoryBudgetPool, OverloadAction,
+};
 use crate::replication::{ClusterCommittedOffset, ReplicaSet};
 
 pub use crate::group_commit::{FlushReason, GroupCommitMetrics, GroupCommitSample};
+pub use crate::memory_budget::{
+    BudgetRejectReason, MemoryBudgetConfig, MemoryBudgetMetrics, MemoryBudgetPool, OverloadAction,
+};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -452,6 +465,8 @@ pub struct LocalBroker {
     group_checkpoints: Option<GroupCheckpointStore>,
     /// Optional adaptive cross-session group-commit coordinator.
     group_commit: Option<Arc<GroupCommitCoordinator>>,
+    /// Shared memory budgets for produce / fetch / replication admission.
+    memory: Arc<MemoryBudgetPool>,
     state: Mutex<BrokerState>,
 }
 
@@ -560,6 +575,8 @@ impl LocalBroker {
             node_id,
             group_checkpoints: None,
             group_commit: None,
+            memory: MemoryBudgetPool::new(MemoryBudgetConfig::default())
+                .expect("default memory budget config is valid"),
             state: Mutex::new(BrokerState {
                 segment,
                 producer_epochs,
@@ -582,6 +599,12 @@ impl LocalBroker {
         Ok(self)
     }
 
+    /// Replace the broker memory-budget pool (produce / fetch / replica ceilings).
+    pub fn with_memory_budget(mut self, pool: Arc<MemoryBudgetPool>) -> Self {
+        self.memory = pool;
+        self
+    }
+
     /// Shared group checkpoint store, when configured.
     pub fn group_checkpoints(&self) -> Option<&GroupCheckpointStore> {
         self.group_checkpoints.as_ref()
@@ -590,6 +613,11 @@ impl LocalBroker {
     /// Group-commit coordinator, when configured.
     pub fn group_commit(&self) -> Option<&Arc<GroupCommitCoordinator>> {
         self.group_commit.as_ref()
+    }
+
+    /// Shared memory-budget pool.
+    pub fn memory_budget(&self) -> &Arc<MemoryBudgetPool> {
+        &self.memory
     }
 
     /// The segment format this broker writes, derived from its segment.
@@ -614,6 +642,16 @@ impl LocalBroker {
     }
 
     pub fn handle(&self, role: Role, frame: WireFrame) -> WireFrame {
+        self.handle_with_connection(role, frame, None)
+    }
+
+    /// Handle a frame while charging an optional per-session connection budget.
+    pub fn handle_with_connection(
+        &self,
+        role: Role,
+        frame: WireFrame,
+        conn: Option<&ConnectionBudget>,
+    ) -> WireFrame {
         let WireFrame {
             request_id,
             stream_id,
@@ -621,7 +659,7 @@ impl LocalBroker {
         } = frame;
         match message {
             Message::ProduceRequest(request) => {
-                self.handle_produce(role, request_id, stream_id, request)
+                self.handle_produce(role, request_id, stream_id, request, conn)
             }
             Message::FetchRequest(request) => {
                 if role != Role::Consumer {
@@ -836,6 +874,7 @@ impl LocalBroker {
         request_id: u64,
         stream_id: u64,
         request: vtop_protocol::ProduceRequest,
+        conn: Option<&ConnectionBudget>,
     ) -> WireFrame {
         if role != Role::Producer {
             return error(
@@ -849,13 +888,24 @@ impl LocalBroker {
             return frame;
         }
         let queued = QueuedProduce::new(request_id, stream_id, request);
+        let reservation = match self.memory.try_reserve_produce(queued.payload_bytes, conn) {
+            Ok(reservation) => reservation,
+            Err(reason) => {
+                return overloaded_budget(request_id, stream_id, reason);
+            }
+        };
         if let Some(coordinator) = &self.group_commit {
-            return coordinator.enqueue_and_wait(queued, |batch| self.flush_produce_group(batch));
+            let frame = coordinator.enqueue_and_wait(queued, |batch| self.flush_produce_group(batch));
+            drop(reservation);
+            return frame;
         }
-        self.flush_produce_group(std::slice::from_ref(&queued))
+        let frame = self
+            .flush_produce_group(std::slice::from_ref(&queued))
             .into_iter()
             .next()
-            .expect("single produce flush returns one frame")
+            .expect("single produce flush returns one frame");
+        drop(reservation);
+        frame
     }
 
     /// Returns `Some(error_frame)` when the request must be rejected before
@@ -873,6 +923,21 @@ impl LocalBroker {
                 ErrorCode::InvalidRequest,
                 "produce request has no records",
             ));
+        }
+        for record in &request.records {
+            if let Err(reason) = self
+                .memory
+                .check_record_size(record.key.len(), record.value.len())
+            {
+                // Oversized records are rejected before expensive allocation;
+                // not retryable — the client must shrink the record.
+                return Some(error(
+                    request_id,
+                    stream_id,
+                    ErrorCode::InvalidRequest,
+                    reject_message(reason),
+                ));
+            }
         }
         if request.durability != WireDurability::LocalFsync
             && request.durability != WireDurability::Quorum
@@ -1273,6 +1338,17 @@ fn error(request_id: u64, stream_id: u64, code: ErrorCode, message: &str) -> Wir
     }
 }
 
+fn overloaded_budget(request_id: u64, stream_id: u64, reason: BudgetRejectReason) -> WireFrame {
+    let _ = reason.default_action(); // document action catalog; PR1 uses RejectRetryable
+    debug_assert_eq!(reason.default_action(), OverloadAction::RejectRetryable);
+    error(
+        request_id,
+        stream_id,
+        ErrorCode::Overloaded,
+        reject_message(reason),
+    )
+}
+
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub cluster_id: Uuid,
@@ -1422,6 +1498,8 @@ impl NativeServer {
                         Err(source) => return Err(BrokerError::Io { path: PathBuf::from("tcp-listener"), source }),
                     };
                     let Ok(permit) = Arc::clone(&self.sessions).try_acquire_owned() else {
+                        // Explicit overload: refuse the socket rather than queue
+                        // unbounded accept work. No request was accepted.
                         drop(socket);
                         continue;
                     };
@@ -1558,7 +1636,86 @@ async fn serve_connection(
     let mut last_request_id = 0_u64;
     let mut send_credit = negotiated_window;
     let principal_id = hello.principal_id;
+    let conn_budget = match role {
+        Role::Consumer => broker.memory_budget().open_consumer_connection(),
+        Role::Producer | Role::Peer | Role::Administrator => {
+            broker.memory_budget().open_producer_connection()
+        }
+    };
+    // When true, stop admitting new work frames until WindowUpdate restores
+    // send credit (OverloadAction::PauseReads for slow consumers).
+    let mut pause_reads = false;
     loop {
+        if pause_reads {
+            // Only accept WindowUpdate / Ping while paused; other frames are
+            // rejected retryably so accepted produce/fetch work is never dropped.
+            let frame = match timeout(
+                config.idle_timeout,
+                read_frame(&mut stream, negotiated_limits),
+            )
+            .await
+            {
+                Err(_) => return Ok(()),
+                Ok(Err(problem)) => return Err(problem.into()),
+                Ok(Ok(None)) => return Ok(()),
+                Ok(Ok(Some(frame))) => frame,
+            };
+            let request_id = frame.request_id;
+            let stream_id = frame.stream_id;
+            match frame.message {
+                Message::WindowUpdate(update) => {
+                    if update.additional_bytes == 0 {
+                        let response = error(
+                            request_id,
+                            0,
+                            ErrorCode::InvalidRequest,
+                            "window update must add at least one byte",
+                        );
+                        write_session_frame(
+                            &mut stream,
+                            &response,
+                            negotiated_limits,
+                            config.idle_timeout,
+                        )
+                        .await?;
+                    } else {
+                        send_credit = send_credit
+                            .saturating_add(update.additional_bytes)
+                            .min(config.window_bytes);
+                        if send_credit > 0 {
+                            pause_reads = false;
+                        }
+                    }
+                    continue;
+                }
+                Message::Ping => {
+                    write_session_frame(
+                        &mut stream,
+                        &WireFrame {
+                            request_id,
+                            stream_id,
+                            message: Message::Pong,
+                        },
+                        negotiated_limits,
+                        config.idle_timeout,
+                    )
+                    .await?;
+                    continue;
+                }
+                _ => {
+                    let response =
+                        overloaded_budget(request_id, stream_id, BudgetRejectReason::ConsumerConn);
+                    write_session_frame(
+                        &mut stream,
+                        &response,
+                        negotiated_limits,
+                        config.idle_timeout,
+                    )
+                    .await?;
+                    continue;
+                }
+            }
+        }
         let frame = match timeout(
             config.idle_timeout,
             read_frame(&mut stream, negotiated_limits),
@@ -1629,6 +1786,7 @@ async fn serve_connection(
             .await?;
             continue;
         }
+        let mut fetch_reservation: Option<BudgetReservation> = None;
         let frame = match frame {
             WireFrame {
                 message: Message::WindowUpdate(update),
@@ -1652,6 +1810,9 @@ async fn serve_connection(
                     send_credit = send_credit
                         .saturating_add(update.additional_bytes)
                         .min(config.window_bytes);
+                    if send_credit > 0 {
+                        pause_reads = false;
+                    }
                 }
                 continue;
             }
@@ -1692,6 +1853,11 @@ async fn serve_connection(
                         config.idle_timeout,
                     )
                     .await?;
+                    // PauseReads: stop admitting fetch work until credit returns.
+                    pause_reads = true;
+                    broker
+                        .memory_budget()
+                        .record_rejection(BudgetRejectReason::ConsumerConn);
                     continue;
                 }
                 // Budget the log fetch in log-encoded bytes, which bound the
@@ -1708,6 +1874,29 @@ async fn serve_connection(
                     .max_bytes
                     .min(u32::try_from(send_credit).unwrap_or(u32::MAX))
                     .min(response_budget);
+                match broker.memory_budget().try_reserve_fetch(
+                    u64::from(request.max_bytes),
+                    &conn_budget,
+                ) {
+                    Ok(reservation) => fetch_reservation = Some(reservation),
+                    Err(reason) => {
+                        let response = overloaded_budget(request_id, stream_id, reason);
+                        write_session_frame(
+                            &mut stream,
+                            &response,
+                            negotiated_limits,
+                            config.idle_timeout,
+                        )
+                        .await?;
+                        if matches!(
+                            reason,
+                            BudgetRejectReason::ConsumerConn | BudgetRejectReason::FetchQueue
+                        ) {
+                            pause_reads = true;
+                        }
+                        continue;
+                    }
+                }
                 WireFrame {
                     request_id,
                     stream_id,
@@ -1733,11 +1922,13 @@ async fn serve_connection(
             continue;
         };
         let broker = Arc::clone(&broker);
+        let session_budget = conn_budget.clone();
         let response = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            broker.handle(role, frame)
+            broker.handle_with_connection(role, frame, Some(&session_budget))
         })
         .await?;
+        drop(fetch_reservation);
         let is_fetch_response = matches!(response.message, Message::FetchResponse(_));
         let encoded = match encode_frame(&response, negotiated_limits) {
             Ok(encoded) => encoded,
@@ -1778,6 +1969,7 @@ async fn serve_connection(
                     config.idle_timeout,
                 )
                 .await?;
+                pause_reads = true;
                 continue;
             }
             send_credit -= response_bytes;

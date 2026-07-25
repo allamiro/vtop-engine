@@ -131,6 +131,18 @@ work with semaphores and per-session fetch-response byte credit. A producer
 request's producer ID must equal the authenticated session principal ID, so one
 trusted producer cannot advance another producer's durable fencing epoch.
 
+`MemoryBudgetConfig` / `MemoryBudgetPool` add explicit byte ceilings for
+per-producer connections, per-consumer connections, per-append-shard occupancy,
+the broker process, per-replication-follower inflight bytes, catch-up /
+retransmission buffers, and fetch-response queues. Oversized records are
+rejected against `max_record_bytes` before expensive allocation. When a ceiling
+is hit the broker takes exactly one documented overload action — primarily
+retryable `Overloaded` (never a silent drop of accepted work); slow consumers
+may also enter a read-pause until `WindowUpdate` restores send credit.
+Process-local metrics expose reserved/used bytes, queue depth, rejections by
+reason, and backpressure time. Weighted fairness across subsystems and soak
+numbers remain follow-ups (see issues #187, #98).
+
 When `GroupCommitConfig` is attached to `LocalBroker`, concurrent producer
 sessions share one append + local durability / quorum cycle per sealed commit
 group. The coordinator seals on the first of `max_delay`, `max_records`,
@@ -464,8 +476,11 @@ An ack policy is explicit (`local_durable`, `quorum`, and later
 keeps persistent TLS-1.3 mTLS streams (peer leaf CN = replica node UUID),
 pipelines multiple in-flight batches per follower, and applies per-follower
 outstanding-batch / byte windows so a slow non-quorum replica cannot stall
-producer acknowledgements indefinitely. Quorum loss still fails closed with
-`Overloaded`. Client session backpressure remains bounded bytes and sessions.
+producer acknowledgements indefinitely. Those windows are charged against the
+shared `MemoryBudgetPool` follower / catch-up ledgers so replication memory
+stays bounded under overload. Quorum loss still fails closed with
+`Overloaded`. Client session backpressure remains bounded bytes and sessions,
+with fetch-response queue budgets layered on top of per-session send credit.
 
 ### 8.2 Consumer committed visibility
 
@@ -739,7 +754,7 @@ benefits have been measured for VTOP traffic.
 | Ack lost after quorum commit | Producer retry receives the original offsets from idempotency state. |
 | Replica copy reports success but bytes differ | Verification fails; source replica remains; repair is retried/quarantined. |
 | Metadata unavailable | Existing committed reads may continue under explicit lease/read-fence policy; no leadership, retirement, reassignment, or new proof authorization. |
-| Tier unavailable | Local retention pauses; producer admission/backpressure follows configured reserve policy. |
+| Tier unavailable | Local retention pauses; producer admission/backpressure follows configured reserve policy (`MemoryBudgetPool` process/shard ceilings reject retryably rather than dropping accepted records). |
 | Topic recreated with same name | New topic epoch rejects old producer sessions and consumer cursors. |
 | Split/merge interrupted | Metadata exposes either pre-cutover or committed post-cutover topology, never an inferred hybrid. |
 
@@ -755,7 +770,9 @@ benefits have been measured for VTOP traffic.
 - Corruption tests for headers, frames, chunks, tree paths, manifests, commit
   markers, indexes, snapshots, and tier copies.
 - Concurrency tests for multiple producers, duplicate requests, backpressure,
-  slow consumers, seal races, repair races, and leadership loss.
+  memory-budget admission (producer flood, fetch-queue / follower ceilings,
+  oversized-record rejection), slow consumers, seal races, repair races, and
+  leadership loss.
 - Three-node deterministic simulations covering partition, delay, drop,
   reorder, duplicate, clock change, disk full, short write, torn write,
   restart, snapshot install, membership change, and corruption.
