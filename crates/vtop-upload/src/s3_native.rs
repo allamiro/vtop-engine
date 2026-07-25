@@ -539,13 +539,11 @@ impl UploadBackend for S3NativeBackend {
                 e.into_service_error()
             ))
         })?;
-        out.upload_id()
-            .map(str::to_owned)
-            .ok_or_else(|| {
-                VtopError::Upload(format!(
-                    "create_multipart_upload {object_uri}: service returned no upload id"
-                ))
-            })
+        out.upload_id().map(str::to_owned).ok_or_else(|| {
+            VtopError::Upload(format!(
+                "create_multipart_upload {object_uri}: service returned no upload id"
+            ))
+        })
     }
 
     async fn upload_part(

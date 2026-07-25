@@ -32,10 +32,7 @@ pub struct MultipartUploadConfig {
 }
 
 impl MultipartUploadConfig {
-    pub fn from_upload(
-        upload: &vtop_core::config::UploadConfig,
-        state_dir: PathBuf,
-    ) -> Self {
+    pub fn from_upload(upload: &vtop_core::config::UploadConfig, state_dir: PathBuf) -> Self {
         Self {
             part_size_bytes: upload.multipart_part_size_bytes,
             threshold_bytes: upload.multipart_threshold_bytes,
@@ -142,9 +139,8 @@ pub fn save_session(path: &Path, session: &MultipartSession) -> Result<(), VtopE
             ))
         })?;
     }
-    let bytes = serde_json::to_vec_pretty(session).map_err(|e| {
-        VtopError::Upload(format!("encoding multipart session: {e}"))
-    })?;
+    let bytes = serde_json::to_vec_pretty(session)
+        .map_err(|e| VtopError::Upload(format!("encoding multipart session: {e}")))?;
     let tmp = path.with_extension("multipart.json.tmp");
     std::fs::write(&tmp, &bytes).map_err(|e| {
         VtopError::Upload(format!("writing multipart session {}: {e}", tmp.display()))
@@ -177,17 +173,13 @@ fn part_count(byte_length: u64, part_size: u64) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
 
-async fn read_part_bytes(
-    path: &Path,
-    offset: u64,
-    len: u64,
-) -> Result<(Bytes, String), VtopError> {
-    let mut file = tokio::fs::File::open(path).await.map_err(|e| {
-        VtopError::Upload(format!("opening {} for multipart: {e}", path.display()))
-    })?;
-    file.seek(SeekFrom::Start(offset)).await.map_err(|e| {
-        VtopError::Upload(format!("seeking {} for multipart: {e}", path.display()))
-    })?;
+async fn read_part_bytes(path: &Path, offset: u64, len: u64) -> Result<(Bytes, String), VtopError> {
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| VtopError::Upload(format!("opening {} for multipart: {e}", path.display())))?;
+    file.seek(SeekFrom::Start(offset))
+        .await
+        .map_err(|e| VtopError::Upload(format!("seeking {} for multipart: {e}", path.display())))?;
     let mut buf = vec![0_u8; len as usize];
     file.read_exact(&mut buf).await.map_err(|e| {
         VtopError::Upload(format!(
@@ -238,7 +230,9 @@ pub async fn upload_resumable(
     }
     if let Some(c) = checksum {
         if c.hex != fence.content_digest_hex
-            || !c.algorithm.eq_ignore_ascii_case(&fence.content_digest_algorithm)
+            || !c
+                .algorithm
+                .eq_ignore_ascii_case(&fence.content_digest_algorithm)
         {
             return Err(VtopError::Upload(
                 "multipart fence content digest disagrees with upload checksum".into(),
@@ -251,8 +245,7 @@ pub async fn upload_resumable(
         Ok(existing) => {
             validate_resume(&existing, backend, object_uri, local_path, &fence)?;
             if existing.phase == MultipartSessionPhase::Completed {
-                let stored =
-                    finish_idempotent(backend, object_uri, &existing, checksum).await?;
+                let stored = finish_idempotent(backend, object_uri, &existing, checksum).await?;
                 delete_session(&path)?;
                 return Ok(stored);
             }
@@ -306,8 +299,8 @@ pub async fn upload_resumable(
             // Crash between complete and session update: object may already
             // exist. Strong verify + optional version recovery makes complete
             // idempotent.
-            if let Ok(stored) = recover_completed(backend, object_uri, checksum, fence.byte_length)
-                .await
+            if let Ok(stored) =
+                recover_completed(backend, object_uri, checksum, fence.byte_length).await
             {
                 stored
             } else {
@@ -374,10 +367,14 @@ async fn finish_idempotent(
     session: &MultipartSession,
     checksum: Option<ObjectChecksum<'_>>,
 ) -> Result<StoredObject, VtopError> {
-    let stored = recover_completed(backend, object_uri, checksum, session.fence.byte_length).await?;
+    let stored =
+        recover_completed(backend, object_uri, checksum, session.fence.byte_length).await?;
     if session.completed_version_id.is_some()
         && stored.version_id != session.completed_version_id
-        && session.completed_version_id.as_ref().is_some_and(|id| !id.is_empty())
+        && session
+            .completed_version_id
+            .as_ref()
+            .is_some_and(|id| !id.is_empty())
     {
         // Prefer the pinned version from the completed session when the
         // current key has moved — evidence must cite the verified generation.
@@ -452,9 +449,11 @@ async fn upload_missing_parts(
     for chunk in pending.chunks(cfg.max_parallelism.max(1)) {
         let mut joins = Vec::with_capacity(chunk.len());
         for &part_number in chunk {
-            let permit = semaphore.clone().acquire_owned().await.map_err(|e| {
-                VtopError::Upload(format!("multipart semaphore closed: {e}"))
-            })?;
+            let permit = semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|e| VtopError::Upload(format!("multipart semaphore closed: {e}")))?;
             let offset = u64::from(part_number.saturating_sub(1)) * session.part_size_bytes;
             let remaining = session.fence.byte_length.saturating_sub(offset);
             let len = remaining.min(session.part_size_bytes);
@@ -511,12 +510,14 @@ pub async fn cleanup_abandoned(
     let now = now_unix_secs();
     let mut cleaned = 0_usize;
     let entries = std::fs::read_dir(dir).map_err(|e| {
-        VtopError::Upload(format!("listing multipart state dir {}: {e}", dir.display()))
+        VtopError::Upload(format!(
+            "listing multipart state dir {}: {e}",
+            dir.display()
+        ))
     })?;
     for entry in entries {
-        let entry = entry.map_err(|e| {
-            VtopError::Upload(format!("reading multipart state dir entry: {e}"))
-        })?;
+        let entry = entry
+            .map_err(|e| VtopError::Upload(format!("reading multipart state dir entry: {e}")))?;
         let path = entry.path();
         let name = path
             .file_name()
@@ -618,7 +619,11 @@ mod tests {
         .unwrap();
         assert!(stored.version_id.is_some());
         let res = backend
-            .verify_object(uri, data.len() as u64, Some(ObjectChecksum::new("blake3", &digest)))
+            .verify_object(
+                uri,
+                data.len() as u64,
+                Some(ObjectChecksum::new("blake3", &digest)),
+            )
             .await
             .unwrap();
         assert!(res.passed && !res.backend_limited);
@@ -761,11 +766,7 @@ mod tests {
         .expect_err("generation 99 must not resume generation 1 session");
         // Different fence ⇒ different session file ⇒ starts new upload; that
         // is fine. Explicit same-file fence mismatch is tested via load+validate.
-        let path = session_path(
-            state.path(),
-            uri,
-            &fence(&digest, data.len() as u64, 1),
-        );
+        let path = session_path(state.path(), uri, &fence(&digest, data.len() as u64, 1));
         let session = load_session(&path).unwrap();
         let mismatch = validate_resume(
             &session,
@@ -775,7 +776,10 @@ mod tests {
             &fence(&digest, data.len() as u64, 99),
         )
         .expect_err("fence mismatch");
-        assert!(mismatch.to_string().contains("fence mismatch"), "{mismatch}");
+        assert!(
+            mismatch.to_string().contains("fence mismatch"),
+            "{mismatch}"
+        );
         let _ = err;
     }
 
@@ -784,7 +788,8 @@ mod tests {
         let data = vec![3_u8; 3_000];
         let (file, digest) = tmp_file(&data);
         let state = tempfile::tempdir().unwrap();
-        let backend = MockBackend::new().with_multipart_fail_after_parts(Arc::new(AtomicUsize::new(1)));
+        let backend =
+            MockBackend::new().with_multipart_fail_after_parts(Arc::new(AtomicUsize::new(1)));
         let uri = "s3://bucket/abandon.segment";
         let f = fence(&digest, data.len() as u64, 1);
         let mut cfg = cfg(state.path(), 1_000);

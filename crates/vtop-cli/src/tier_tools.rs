@@ -36,7 +36,7 @@ pub enum TierCommand {
     /// Upload a sealed segment + manifest to the object tier, verify the
     /// stored bytes by reading them back against the pinned root, and commit
     /// `CommitTierEvidence` through the meta admin endpoint.
-    Copy(TierCopyArgs),
+    Copy(Box<TierCopyArgs>),
     /// Download a version-pinned tier object to a local path and verify its
     /// content digest (first-slice rehydration; does not mutate metadata).
     Rehydrate(TierRehydrateArgs),
@@ -301,9 +301,7 @@ pub async fn run_tier_copy(
     // multipart ETags never authorize CommitTierEvidence.
     let checksum = ObjectChecksum::new("blake3", &segment_digest);
     let stored_segment = match &request.multipart {
-        Some(multipart)
-            if multipart.should_multipart(backend, byte_length) =>
-        {
+        Some(multipart) if multipart.should_multipart(backend, byte_length) => {
             let fence = MultipartFence {
                 expected_segment_generation: request.expected_generation,
                 fencing_epoch: request.fencing_epoch,
@@ -566,12 +564,12 @@ pub async fn run(command: TierCommand, json: bool) -> i32 {
 async fn run_inner(command: TierCommand, json: bool) -> Result<(), String> {
     match command {
         TierCommand::Copy(args) => {
-            let mut request = build_request(&args)?;
+            let mut request = build_request(args.as_ref())?;
             let upload_text = std::fs::read_to_string(&args.upload_config)
                 .map_err(|error| format!("read {}: {error}", args.upload_config.display()))?;
             let upload_config: vtop_core::config::UploadConfig = serde_yaml::from_str(&upload_text)
                 .map_err(|error| format!("parse {}: {error}", args.upload_config.display()))?;
-            request.multipart = multipart_config_from_args(&args, &upload_config)?;
+            request.multipart = multipart_config_from_args(args.as_ref(), &upload_config)?;
             let backend = vtop_upload::build_backend(&upload_config)
                 .await
                 .map_err(|error| error.to_string())?;
@@ -625,8 +623,10 @@ async fn run_inner(command: TierCommand, json: bool) -> Result<(), String> {
             let backend = vtop_upload::build_backend(&upload_config)
                 .await
                 .map_err(|error| error.to_string())?;
-            let cfg =
-                MultipartUploadConfig::from_upload(&upload_config, args.multipart_state_dir.clone());
+            let cfg = MultipartUploadConfig::from_upload(
+                &upload_config,
+                args.multipart_state_dir.clone(),
+            );
             let cleaned = cleanup_abandoned(backend.as_ref(), &cfg)
                 .await
                 .map_err(|error| error.to_string())?;
