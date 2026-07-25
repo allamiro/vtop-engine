@@ -3516,7 +3516,7 @@ fn plan_retention_requires_tier_evidence_or_an_explicit_policy() {
             &plan_retention(&mut requests, SEGMENT, segment_generation, 1)
         ),
         rejected(MetadataError::invalid_transition(
-            "retention requires verified tier evidence or an explicit unarchived-deletion policy"
+            "retention requires pinned tier evidence or an explicit unarchived-deletion policy"
         ))
     );
     // An explicit policy that does NOT allow unarchived deletion still fails.
@@ -3530,7 +3530,7 @@ fn plan_retention_requires_tier_evidence_or_an_explicit_policy() {
             &plan_retention(&mut requests, SEGMENT, segment_generation, 1)
         ),
         rejected(MetadataError::invalid_transition(
-            "retention requires verified tier evidence or an explicit unarchived-deletion policy"
+            "retention requires pinned tier evidence or an explicit unarchived-deletion policy"
         ))
     );
     assert_eq!(
@@ -3674,6 +3674,92 @@ fn plan_retention_rejects_a_mismatched_evidence_root_fail_closed() {
             "tier evidence content root does not match the sealed segment"
         ))
     );
+}
+
+#[test]
+fn plan_retention_rejects_unpinned_tier_evidence_fail_closed() {
+    // The CLI refuses to commit unpinned evidence under --require-versioning,
+    // but the state machine is the trust boundary: a hand-constructed admin
+    // proposal (or a legacy snapshot record) can carry
+    // `object_version_id: None`. The commit is accepted — the record stays
+    // as the audit anchor — and the retention gate must refuse deletion
+    // authority on it.
+    let mut requests = Requests(0);
+    let (mut machine, root, segment_generation) = verified_segment_machine(&mut requests);
+    let unpinned = |requests: &mut Requests| {
+        let mut command =
+            commit_tier_evidence(requests, SEGMENT, root, segment_generation, 1, NODE);
+        let MetadataCommand::CommitTierEvidence {
+            object_version_id, ..
+        } = &mut command
+        else {
+            unreachable!("helper builds CommitTierEvidence");
+        };
+        *object_version_id = None;
+        command
+    };
+    assert_eq!(
+        machine.apply(6, &unpinned(&mut requests)),
+        MetadataResponse::Ack { generation: 0 }
+    );
+    assert_eq!(
+        tier_record(&machine, SEGMENT).unwrap().object_version_id,
+        None
+    );
+
+    // Archival-required plan: rejected, and the segment is untouched.
+    assert_eq!(
+        machine.apply(
+            7,
+            &plan_retention(&mut requests, SEGMENT, segment_generation, 1)
+        ),
+        rejected(MetadataError::invalid_transition(
+            "retention requires pinned tier evidence or an explicit unarchived-deletion policy"
+        ))
+    );
+    let segment = segment_record(&machine, SEGMENT);
+    assert_eq!(segment.state, SegmentState::Verified);
+    assert_eq!(segment.segment_generation, segment_generation);
+
+    // An explicit policy that does NOT allow unarchived deletion still fails:
+    // unpinned evidence counts as no archive at all.
+    assert_eq!(
+        machine.apply(8, &set_retention_policy(&mut requests, false, None)),
+        MetadataResponse::Ack { generation: 0 }
+    );
+    assert_eq!(
+        machine.apply(
+            9,
+            &plan_retention(&mut requests, SEGMENT, segment_generation, 1)
+        ),
+        rejected(MetadataError::invalid_transition(
+            "retention requires pinned tier evidence or an explicit unarchived-deletion policy"
+        ))
+    );
+
+    // The explicit unarchived-deletion policy is the operator escape hatch:
+    // deletion without archive is already expressible, so the plan succeeds.
+    assert_eq!(
+        machine.apply(10, &set_retention_policy(&mut requests, true, Some(0))),
+        MetadataResponse::Ack { generation: 1 }
+    );
+    assert_eq!(
+        machine.apply(
+            11,
+            &plan_retention(&mut requests, SEGMENT, segment_generation, 1)
+        ),
+        MetadataResponse::Ack { generation: 2 }
+    );
+    assert_eq!(
+        segment_record(&machine, SEGMENT).state,
+        SegmentState::RetentionPlanned
+    );
+
+    // Pinned evidence authorizes the plan with no policy at all; covered by
+    // retention_plan_cannot_be_cancelled_after_deletion_is_authorized and
+    // plan_retention_is_blocked_by_durable_group_cursors_below_the_segment_end,
+    // which both commit evidence through the pinned helper and plan
+    // successfully.
 }
 
 #[test]

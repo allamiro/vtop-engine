@@ -603,14 +603,20 @@ Stage-8 metadata foundation (`vtop-meta`):
   (only committed cursors protect data — membership is ephemeral). Evidence
   is matched by immutable segment UUID + content root, not the mutable
   lifecycle CAS generation, so a cancelled plan or completed replica move
-  never forces a byte-identical re-upload.
+  never forces a byte-identical re-upload. Evidence must also carry the
+  immutable object version pin (`object_version_id`); unpinned evidence
+  counts as no archive at all, so only the explicit unarchived-deletion
+  policy can authorize the plan.
 - `ConfirmRetentionExpired` transitions `RetentionPlanned ->
   RetentionExpired` after the external actor deletes every local replica,
   emptying the `SegmentPlacement` replica set in the same apply while
   preserving its declared replication factor; the segment and tier-copy
   records are retained forever as the rehydration pointer and
-  corruption-audit anchor. `CancelRetention` reverts a mistaken plan to
-  `Verified` (local bytes are only deleted between plan and confirm).
+  corruption-audit anchor. `CancelRetention` is deprecated and always
+  rejected (fails closed) since #184: `PlanRetention` is durable deletion
+  authority, so `RetentionPlanned` is terminal — recovery completes
+  retention or repairs the segment. The command remains on the wire for
+  compatibility only.
 
 ### 9.4 Quorum ack vs archive-verified
 

@@ -153,7 +153,9 @@ pub enum MetaCommand {
         #[arg(long)]
         request_id: Option<Uuid>,
     },
-    /// Propose `CancelRetention` (RetentionPlanned -> Verified).
+    /// Deprecated: propose `CancelRetention`. The state machine always
+    /// rejects it (fails closed) since #184; retained only for wire
+    /// compatibility.
     CancelRetention {
         #[command(flatten)]
         common: MetaCommonArgs,
