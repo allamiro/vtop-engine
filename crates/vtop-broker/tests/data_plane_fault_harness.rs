@@ -274,7 +274,7 @@ impl Cluster {
         }
     }
 
-    fn fetch_leader(&self, start_offset: u64) -> FetchResponse {
+    fn fetch_leader(&self, start_offset: u64, max_records: u32) -> FetchResponse {
         let frame = WireFrame {
             request_id: 0,
             stream_id: 1,
@@ -283,7 +283,7 @@ impl Cluster {
                 fencing_epoch: FENCING_EPOCH,
                 start_offset,
                 max_bytes: 64 * 1024,
-                max_records: 64,
+                max_records,
             }),
         };
         match self.leader().handle(Role::Consumer, frame).message {
@@ -293,9 +293,9 @@ impl Cluster {
         }
     }
 
-    fn fetch_follower(&self, index: usize, start_offset: u64) -> FetchBatch {
+    fn fetch_follower(&self, index: usize, start_offset: u64, max_records: usize) -> FetchBatch {
         self.followers[index]
-            .fetch(start_offset, 64 * 1024, 64)
+            .fetch(start_offset, 64 * 1024, max_records)
             .unwrap_or_else(|e| panic!("{}: follower {index} fetch: {e}", self.ctx()))
     }
 
@@ -305,13 +305,14 @@ impl Cluster {
         let ctx = self.ctx();
 
         // 1. No acknowledged record is lost: HWM covers every ack, and each
-        //    acked offset is visible via leader fetch.
+        //    acked offset is visible via leader fetch. The fetch is sized to
+        //    the acked offset range rather than a fixed record cap.
         if let Some(max_acked) = self.acked.last().copied() {
             assert!(
                 hwm > max_acked,
                 "{ctx}: HWM {hwm} must cover acked offset {max_acked}"
             );
-            let batch = self.fetch_leader(0);
+            let batch = self.fetch_leader(0, u32::try_from(max_acked + 1).unwrap_or(u32::MAX));
             for offset in &self.acked {
                 assert!(
                     batch.records.iter().any(|r| r.offset == *offset),
@@ -320,8 +321,8 @@ impl Cluster {
             }
         }
 
-        // 3. Fetch never crosses committed HWM.
-        let leader_fetch = self.fetch_leader(0);
+        // 2. Fetch never crosses committed HWM.
+        let leader_fetch = self.fetch_leader(0, u32::try_from(hwm).unwrap_or(u32::MAX));
         assert!(
             leader_fetch
                 .records
@@ -354,6 +355,8 @@ impl Cluster {
             }
         }
 
+        // 3. A follower's observed HWM never exceeds its own local
+        //    durability or the cluster HWM.
         for (index, follower) in self.followers.iter().enumerate() {
             let local = follower.local_committed_offset();
             let observed = follower.cluster_committed().get();
@@ -365,6 +368,56 @@ impl Cluster {
                 observed <= hwm,
                 "{ctx}: follower {index} observed HWM {observed} > cluster {hwm}"
             );
+        }
+
+        // 4. Follower log completeness: up to its observed HWM, each online
+        //    follower's log must contain exactly the leader's records
+        //    (offset, key, value, timestamp) — a silently diverged follower
+        //    must not pass on a bounded HWM alone. Fetches are sized to the
+        //    HWM range, so this stays offset-bounded and cheap.
+        for (index, follower) in self.followers.iter().enumerate() {
+            if !follower.is_online() {
+                continue;
+            }
+            let observed = follower.cluster_committed().get();
+            if observed == 0 {
+                continue;
+            }
+            let leader_batch = self.fetch_leader(0, u32::try_from(observed).unwrap_or(u32::MAX));
+            let follower_batch =
+                self.fetch_follower(index, 0, usize::try_from(observed).unwrap_or(usize::MAX));
+            assert_eq!(
+                follower_batch.records.len(),
+                leader_batch.records.len(),
+                "{ctx}: follower {index} holds {} records below its observed HWM {observed}, leader holds {}",
+                follower_batch.records.len(),
+                leader_batch.records.len()
+            );
+            for (leader_record, follower_record) in leader_batch
+                .records
+                .iter()
+                .zip(follower_batch.records.iter())
+            {
+                assert_eq!(
+                    follower_record.offset, leader_record.offset,
+                    "{ctx}: follower {index} offset mismatch below HWM {observed}"
+                );
+                assert_eq!(
+                    follower_record.record.key, leader_record.key,
+                    "{ctx}: follower {index} key diverged at offset {}",
+                    leader_record.offset
+                );
+                assert_eq!(
+                    follower_record.record.value, leader_record.value,
+                    "{ctx}: follower {index} value diverged at offset {}",
+                    leader_record.offset
+                );
+                assert_eq!(
+                    follower_record.record.timestamp_millis, leader_record.timestamp_millis,
+                    "{ctx}: follower {index} timestamp diverged at offset {}",
+                    leader_record.offset
+                );
+            }
         }
     }
 
@@ -529,6 +582,12 @@ fn network_loss_dup_reorder_delay_and_catch_up() {
     c.replica_set.advance_tick(3);
     assert_eq!(c.followers[0].local_committed_offset(), 2, "{}", c.ctx());
 
+    // Activate a reorder window on follower 0 and drop follower 1's next two
+    // appends, then produce through the window: produce 2 stays buffered,
+    // produce 3 fills the window and flushes it LIFO. Follower 0 rejects the
+    // offset-3 append (base mismatch against its tip) and then applies offset
+    // 2 — a real reorder-induced gap at offset 3. Both produces miss quorum
+    // (follower 0 lags, follower 1 drops), so the sequences stay unacked.
     c.replica_set.set_follower_fault(
         0,
         FollowerNetworkFault {
@@ -536,11 +595,57 @@ fn network_loss_dup_reorder_delay_and_catch_up() {
             ..FollowerNetworkFault::default()
         },
     );
-    // With reorder, a two-produce burst may leave a gap on that follower;
-    // quorum still forms via follower 1. Then drain/catch-up.
+    c.replica_set.set_follower_fault(
+        1,
+        FollowerNetworkFault {
+            drop_next: 2,
+            ..FollowerNetworkFault::default()
+        },
+    );
+    let err = c.produce(2).expect_err("no quorum while reorder buffers");
+    assert_eq!(err.code, ErrorCode::Overloaded, "{}", c.ctx());
+    assert_eq!(
+        c.replica_set.pending_stats().reorder_buffered,
+        1,
+        "{}: reorder window must hold the first append",
+        c.ctx()
+    );
+    let err = c.produce(3).expect_err("no quorum while reorder flushes");
+    assert_eq!(err.code, ErrorCode::Overloaded, "{}", c.ctx());
+    // LIFO proof: FIFO delivery would have applied offsets 2 then 3 (local
+    // offset 4); LIFO rejects offset 3 first, so follower 0 stops at 3 with
+    // offset 3 missing while the leader is durable through 4.
+    assert_eq!(c.followers[0].local_committed_offset(), 3, "{}", c.ctx());
+    assert_eq!(c.followers[1].local_committed_offset(), 2, "{}", c.ctx());
+    assert_eq!(c.cluster_committed.get(), 2, "{}", c.ctx());
+
+    // Heal and catch up via the harness's normal path: idempotent producer
+    // retries of the unacked sequences. The seq-2 retry alone cannot form a
+    // quorum (leader committed is 4; replaying one record only covers offset
+    // 2) but backfills follower 1. The seq-3 retry then repairs follower 0's
+    // reorder gap (its tip equals the replayed base offset) and commits.
     c.replica_set.clear_follower_fault(0);
+    c.replica_set.clear_follower_fault(1);
     c.replica_set.drain_all();
-    c.produce(2)
+    let _ = c.produce(2);
+    let caught = c
+        .produce(3)
+        .unwrap_or_else(|e| panic!("{}: {e:?}", c.ctx()));
+    assert!(caught.outcomes[0].duplicate, "{}", c.ctx());
+    assert_eq!(
+        c.followers[0].local_committed_offset(),
+        4,
+        "{}: retry must repair the reorder gap",
+        c.ctx()
+    );
+    assert_eq!(c.followers[1].local_committed_offset(), 4, "{}", c.ctx());
+    assert_eq!(c.cluster_committed.get(), 4, "{}", c.ctx());
+    let retry = c
+        .produce(2)
+        .unwrap_or_else(|e| panic!("{}: {e:?}", c.ctx()));
+    assert!(retry.outcomes[0].duplicate, "{}", c.ctx());
+
+    c.produce(4)
         .unwrap_or_else(|e| panic!("{}: {e:?}", c.ctx()));
     c.assert_invariants();
 }
@@ -701,7 +806,7 @@ fn consumer_fetch_during_leadership_change() {
     c.produce(1)
         .unwrap_or_else(|e| panic!("{}: {e:?}", c.ctx()));
 
-    let before = c.fetch_follower(0, 0);
+    let before = c.fetch_follower(0, 0, 64);
     assert_eq!(before.records.len(), 2, "{}", c.ctx());
     assert_eq!(before.high_watermark, 2, "{}", c.ctx());
 
