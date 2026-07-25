@@ -4,7 +4,7 @@
 //! frames. Per-follower outstanding-batch / byte windows bound memory and keep
 //! a slow non-quorum replica from stalling producer acks indefinitely.
 //! Reconnect probes follower status and retransmits from a bounded buffer when
-//! the gap is still covered; sealed-segment transfer remains a follow-up.
+//! the gap is still covered; sealed-segment transfer remains deferred.
 
 use super::{InProcessFollower, ReplicaQuorumResult, ReplicaSet};
 use crate::BrokerResult;
