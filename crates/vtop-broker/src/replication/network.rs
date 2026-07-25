@@ -7,6 +7,7 @@
 //! the gap is still covered; sealed-segment transfer remains deferred.
 
 use super::{InProcessFollower, ReplicaQuorumResult, ReplicaSet};
+use crate::memory_budget::{BudgetRejectReason, FollowerBudget, MemoryBudgetPool};
 use crate::BrokerResult;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
@@ -286,6 +287,16 @@ impl NetworkedReplicaSet {
         leader_tls: ReplicaTlsMaterial,
         flow: FlowControlConfig,
     ) -> BrokerResult<Self> {
+        Self::start_with_memory(followers, leader_tls, flow, None)
+    }
+
+    /// Like [`Self::start`], sharing a broker-wide [`MemoryBudgetPool`].
+    pub fn start_with_memory(
+        followers: Vec<NetworkFollowerConfig>,
+        leader_tls: ReplicaTlsMaterial,
+        flow: FlowControlConfig,
+        memory: Option<Arc<MemoryBudgetPool>>,
+    ) -> BrokerResult<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -295,7 +306,13 @@ impl NetworkedReplicaSet {
                 path: std::path::PathBuf::from("replica-runtime"),
                 source,
             })?;
-        Self::start_on(RuntimeBinding::Owned(runtime), followers, leader_tls, flow)
+        Self::start_on(
+            RuntimeBinding::Owned(runtime),
+            followers,
+            leader_tls,
+            flow,
+            memory,
+        )
     }
 
     /// Build channels on an existing Tokio handle (tests / embedded runtimes).
@@ -305,11 +322,23 @@ impl NetworkedReplicaSet {
         leader_tls: ReplicaTlsMaterial,
         flow: FlowControlConfig,
     ) -> BrokerResult<Self> {
+        Self::start_on_handle_with_memory(handle, followers, leader_tls, flow, None)
+    }
+
+    /// Like [`Self::start_on_handle`], sharing a broker-wide [`MemoryBudgetPool`].
+    pub fn start_on_handle_with_memory(
+        handle: Handle,
+        followers: Vec<NetworkFollowerConfig>,
+        leader_tls: ReplicaTlsMaterial,
+        flow: FlowControlConfig,
+        memory: Option<Arc<MemoryBudgetPool>>,
+    ) -> BrokerResult<Self> {
         Self::start_on(
             RuntimeBinding::External(handle),
             followers,
             leader_tls,
             flow,
+            memory,
         )
     }
 
@@ -318,12 +347,25 @@ impl NetworkedReplicaSet {
         followers: Vec<NetworkFollowerConfig>,
         leader_tls: ReplicaTlsMaterial,
         flow: FlowControlConfig,
+        memory: Option<Arc<MemoryBudgetPool>>,
     ) -> BrokerResult<Self> {
         if flow.max_inflight_batches == 0 || flow.max_inflight_bytes == 0 {
             return Err(crate::BrokerError::InvalidConfig(
                 "replica flow control windows must be non-zero".to_owned(),
             ));
         }
+        let memory = match memory {
+            Some(pool) => pool,
+            None => MemoryBudgetPool::new(crate::memory_budget::MemoryBudgetConfig {
+                per_follower_bytes: flow.max_inflight_bytes.max(1) as u64,
+                catch_up_bytes: flow
+                    .max_retransmission_bytes
+                    .min(flow.max_inflight_bytes.max(1))
+                    .max(1) as u64,
+                ..crate::memory_budget::MemoryBudgetConfig::default()
+            })
+            .map_err(crate::BrokerError::InvalidConfig)?,
+        };
         let connector = build_client_connector(leader_tls)?;
         let handle = runtime.handle();
         let mut channels = Vec::with_capacity(followers.len());
@@ -331,17 +373,20 @@ impl NetworkedReplicaSet {
         for config in followers {
             let (cmd_tx, cmd_rx) = mpsc::channel(flow.max_inflight_batches.max(1) * 2);
             let (stop_tx, stop_rx) = mpsc::channel(1);
+            let budget = Arc::new(memory.open_follower());
             let channel = Arc::new(FollowerChannel {
                 node_id: config.node_id,
                 durable_offset: AtomicU64::new(0),
                 connected: AtomicBool::new(false),
                 cmd_tx,
+                budget: Arc::clone(&budget),
             });
             let driver = FollowerDriver {
                 config,
                 connector: connector.clone(),
                 flow: flow.clone(),
                 channel: Arc::clone(&channel),
+                budget,
                 cmd_rx,
                 stop_rx,
             };
@@ -464,6 +509,7 @@ struct FollowerChannel {
     durable_offset: AtomicU64,
     connected: AtomicBool,
     cmd_tx: mpsc::Sender<FollowerCmd>,
+    budget: Arc<FollowerBudget>,
 }
 
 impl FollowerChannel {
@@ -474,6 +520,15 @@ impl FollowerChannel {
         bytes: usize,
         ack_timeout: Duration,
     ) -> bool {
+        // Charge follower inflight budget before queueing. On reject, treat as
+        // a missed ack (explicit overload) so a slow follower cannot grow memory.
+        let reservation = match self.budget.try_reserve_inflight(bytes as u64) {
+            Ok(reservation) => reservation,
+            Err(BudgetRejectReason::ReplicaFollower | BudgetRejectReason::ProcessCeiling) => {
+                return false;
+            }
+            Err(_) => return false,
+        };
         let (response_tx, response_rx) = oneshot::channel();
         let cmd = FollowerCmd::Replicate {
             requests,
@@ -483,10 +538,13 @@ impl FollowerChannel {
         };
         if self.cmd_tx.try_send(cmd).is_err() {
             // Channel / window pressure: treat as a missed ack so a slow
-            // follower cannot stall the quorum wait.
+            // follower cannot stall the quorum wait. Reservation drops here.
+            drop(reservation);
             return false;
         }
-        match timeout(ack_timeout, response_rx).await {
+        // Driver owns the byte accounting via flow windows for the on-wire
+        // path; release the ledger reservation when the waiter completes.
+        let acked = match timeout(ack_timeout, response_rx).await {
             Ok(Ok(FollowerReplicateResult::Acked {
                 local_committed_offset,
             })) => {
@@ -495,7 +553,9 @@ impl FollowerChannel {
                 local_committed_offset >= leader_committed_offset
             }
             _ => false,
-        }
+        };
+        drop(reservation);
+        acked
     }
 }
 
@@ -534,6 +594,7 @@ struct FollowerDriver {
     connector: TlsConnector,
     flow: FlowControlConfig,
     channel: Arc<FollowerChannel>,
+    budget: Arc<FollowerBudget>,
     cmd_rx: mpsc::Receiver<FollowerCmd>,
     stop_rx: mpsc::Receiver<()>,
 }
@@ -641,6 +702,7 @@ impl FollowerDriver {
                             if let Some(done) = retransmission.pop_front() {
                                 *retransmission_bytes =
                                     retransmission_bytes.saturating_sub(done.bytes);
+                                self.budget.release_catch_up(done.bytes as u64);
                             }
                         } else {
                             break;
@@ -827,6 +889,7 @@ impl FollowerDriver {
                 leader_committed_offset,
                 bytes,
             },
+            &self.budget,
         );
         *state.inflight_bytes = state.inflight_bytes.saturating_add(bytes);
         state.inflight.insert(
@@ -940,12 +1003,18 @@ fn push_retransmission(
     buffer_bytes: &mut usize,
     max_bytes: usize,
     batch: BufferedBatch,
+    budget: &FollowerBudget,
 ) {
+    // Prefer failing closed on catch-up budget before growing the buffer.
+    if budget.try_charge_catch_up(batch.bytes as u64).is_err() {
+        return;
+    }
     buffer.push_back(batch);
     *buffer_bytes = buffer_bytes.saturating_add(buffer.back().map(|b| b.bytes).unwrap_or(0));
     while *buffer_bytes > max_bytes {
         if let Some(evicted) = buffer.pop_front() {
             *buffer_bytes = buffer_bytes.saturating_sub(evicted.bytes);
+            budget.release_catch_up(evicted.bytes as u64);
         } else {
             break;
         }
