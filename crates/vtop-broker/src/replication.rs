@@ -85,6 +85,16 @@ pub trait ReplicaSet: Send + Sync {
         &self,
         request: &ReplicaAppendRequest,
         leader_committed_offset: u64,
+    ) -> ReplicaQuorumResult {
+        self.replicate_append_batch(std::slice::from_ref(request), leader_committed_offset)
+    }
+
+    /// Replicate an ordered multi-producer commit group with one durability
+    /// barrier per follower when the implementation can do so.
+    fn replicate_append_batch(
+        &self,
+        requests: &[ReplicaAppendRequest],
+        leader_committed_offset: u64,
     ) -> ReplicaQuorumResult;
 
     fn propagate_committed_hwm(&self, update: &CommittedHwmUpdate);
@@ -321,6 +331,123 @@ impl InProcessFollower {
         }
     }
 
+    /// Apply an ordered commit group with one local durability barrier.
+    ///
+    /// Members are appended with [`Durability::Buffered`] and then committed
+    /// once so concurrent producer sessions share the follower fsync.
+    pub fn apply_append_batch(
+        &self,
+        requests: &[ReplicaAppendRequest],
+    ) -> Result<ReplicaAppendResponse, (ErrorCode, String)> {
+        if requests.is_empty() {
+            return Ok(ReplicaAppendResponse {
+                local_committed_offset: self.local_committed_offset(),
+            });
+        }
+        if requests.len() == 1 {
+            return self.apply_append(&requests[0]);
+        }
+        if !self.is_online() {
+            return Err((
+                ErrorCode::Overloaded,
+                format!("follower {} is offline", self.node_id),
+            ));
+        }
+        let meta = self.meta_fencing_epoch.lock();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for request in requests {
+            if request.range != self.range {
+                return Err((
+                    ErrorCode::WrongRange,
+                    "replica append range identity does not match this follower".to_owned(),
+                ));
+            }
+            if let Err((code, message)) =
+                check_follower_fencing(&meta, self.held_fencing_epoch, request.fencing_epoch)
+            {
+                return Err((code, message.to_owned()));
+            }
+            let tip = state.segment.next_offset();
+            if tip > request.expected_base_offset {
+                let batch_end = request
+                    .expected_base_offset
+                    .checked_add(request.records.len() as u64)
+                    .ok_or((
+                        ErrorCode::InvalidRequest,
+                        "replica append batch end overflows u64".to_owned(),
+                    ))?;
+                if state.segment.committed_offset() >= batch_end {
+                    continue;
+                }
+                return Err((
+                    ErrorCode::InvalidRequest,
+                    format!(
+                        "follower next_offset {tip} is ahead of expected_base_offset {} but not durable through {batch_end}",
+                        request.expected_base_offset
+                    ),
+                ));
+            }
+            if tip != request.expected_base_offset {
+                return Err((
+                    ErrorCode::InvalidRequest,
+                    format!(
+                        "follower next_offset {tip} does not match expected_base_offset {}",
+                        request.expected_base_offset
+                    ),
+                ));
+            }
+            if let Err(problem) = state
+                .producer_epochs
+                .accept(request.producer_id, request.producer_epoch)
+            {
+                return Err(match problem {
+                    BrokerError::ProducerFenced { .. } => (ErrorCode::Fenced, problem.to_string()),
+                    other => (ErrorCode::Storage, other.to_string()),
+                });
+            }
+            let (stored_id, stored_epoch) = match self.segment_format {
+                SegmentFormat::V1 => (
+                    storage_producer_id(request.producer_id, request.producer_epoch),
+                    0,
+                ),
+                SegmentFormat::V2 => (request.producer_id, request.producer_epoch),
+            };
+            let records = match records_from_wire(
+                &request.records,
+                stored_id,
+                stored_epoch,
+                request.first_sequence,
+            ) {
+                Ok(records) => records,
+                Err(message) => return Err((ErrorCode::InvalidRequest, message.to_owned())),
+            };
+            if let Err(problem) = state.segment.append_group(&records, Durability::Buffered) {
+                return Err((
+                    match problem {
+                        vtop_log::LogError::FirstSequence { .. }
+                        | vtop_log::LogError::SequenceGap { .. }
+                        | vtop_log::LogError::SequenceConflict { .. }
+                        | vtop_log::LogError::SequenceBelowWindow { .. } => {
+                            ErrorCode::SequenceConflict
+                        }
+                        vtop_log::LogError::ProducerFenced { .. } => ErrorCode::Fenced,
+                        _ => ErrorCode::Storage,
+                    },
+                    problem.to_string(),
+                ));
+            }
+        }
+        match state.segment.commit() {
+            Ok(local_committed_offset) => Ok(ReplicaAppendResponse {
+                local_committed_offset,
+            }),
+            Err(problem) => Err((ErrorCode::Storage, problem.to_string())),
+        }
+    }
+
     pub fn observe_hwm(&self, update: &CommittedHwmUpdate) -> Result<(), (ErrorCode, String)> {
         if update.range != self.range {
             return Err((
@@ -362,14 +489,26 @@ impl ReplicaSet for InProcessReplicaSet {
         1 + self.followers.len()
     }
 
-    fn replicate_append(
+    fn replicate_append_batch(
         &self,
-        request: &ReplicaAppendRequest,
+        requests: &[ReplicaAppendRequest],
         leader_committed_offset: u64,
     ) -> ReplicaQuorumResult {
         let mut follower_acks = 0;
         for follower in &self.followers {
-            if let Ok(response) = follower.apply_append(request) {
+            let applied = if requests.len() <= 1 {
+                requests
+                    .first()
+                    .map(|request| follower.apply_append(request))
+                    .unwrap_or_else(|| {
+                        Ok(ReplicaAppendResponse {
+                            local_committed_offset: follower.local_committed_offset(),
+                        })
+                    })
+            } else {
+                follower.apply_append_batch(requests)
+            };
+            if let Ok(response) = applied {
                 if response.local_committed_offset >= leader_committed_offset {
                     follower_acks += 1;
                 }

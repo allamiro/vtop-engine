@@ -351,16 +351,22 @@ mod tests {
 
     #[tokio::test]
     async fn captured_output_is_bounded() {
-        let (_dir, path) = executable_script("printf '123456789'");
+        // Drive /bin/sh -c rather than a freshly written script so this check
+        // is not coupled to ETXTBSY races on some CI filesystems.
+        let path = PathBuf::from("/bin/sh");
         let mut cfg = config(&path);
         cfg.command_max_output_bytes = 8;
         let policy = CommandPolicy::from_config(&cfg, "test").unwrap();
         let mut command = policy.command();
+        command.args(["-c", "printf '123456789'"]);
         let error = policy
             .output(&mut command, "output test")
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("8-byte output limit"));
+        assert!(
+            error.to_string().contains("8-byte output limit"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
