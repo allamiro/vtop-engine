@@ -883,6 +883,21 @@ Emit JSON with `VTOP_FETCH_IO_JSON=…`. Complements #92 / #98 / #130; does
 not claim Kafka superiority. Production sendfile/io_uring engines and
 multi-hour soaks remain deferred.
 
+#### 15.2.3 Metadata group saturation and sharding triggers (#192)
+
+Single three-node metadata Raft saturation research lives in
+`crates/vtop-meta/tests/metadata_saturation_harness.rs` with methodology in
+[`METADATA_SATURATION_RESEARCH.md`](METADATA_SATURATION_RESEARCH.md). It
+measures commands/s, topic/range/segment growth, placement updates,
+consumer heartbeats, cursor commits, snapshot size/duration, recovery
+duration, and process-CPU / in-process p99 latency proxies. The JSON
+recommendation gate keeps `single_three_node_metadata_group` as the
+default and opens a multi-group design spike only when ≥2 quantitative
+criteria trip on a dedicated lab soak. Emit JSON with
+`VTOP_META_SATURATION_JSON=…`. Explicit non-goal: no multi-group
+implementation in #192 (epic #93; foundation #167 / #171 / #174).
+Multi-hour soaks and sharding code remain deferred.
+
 ## 16. Implementation roadmap as small PRs
 
 1. **Local committed-boundary correctness.** Finish the current `vtop-log`
