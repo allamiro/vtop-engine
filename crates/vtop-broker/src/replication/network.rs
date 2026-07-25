@@ -708,15 +708,17 @@ impl FollowerDriver {
                             break;
                         }
                     }
-                    for batch in retransmission.iter().rev() {
-                        pending.push_front(FollowerCmd::Replicate {
-                            requests: Arc::clone(&batch.requests),
-                            leader_committed_offset: batch.leader_committed_offset,
-                            bytes: batch.bytes,
-                            // Catch-up has no producer waiter; durable_offset still advances.
-                            response_tx: oneshot::channel().0,
-                        });
-                    }
+                    // Move the remaining buffer back into pending for
+                    // retransmission. The catch-up charge is released here
+                    // and re-taken by `push_retransmission` when a batch is
+                    // actually re-sent, so every byte is charged exactly once
+                    // while it occupies the retransmission buffer.
+                    drain_retransmission_to_pending(
+                        pending,
+                        retransmission,
+                        retransmission_bytes,
+                        &self.budget,
+                    );
                 }
                 _ => return SessionOutcome::Disconnected,
             }
@@ -764,7 +766,7 @@ impl FollowerDriver {
                     )
                     .await
                 {
-                    requeue_inflight(pending, &mut inflight);
+                    requeue_inflight(pending, &mut inflight, retransmission);
                     return outcome;
                 }
             }
@@ -780,7 +782,7 @@ impl FollowerDriver {
                             handle_response(frame, &mut inflight, &mut inflight_bytes, &self.channel);
                         }
                         _ => {
-                            requeue_inflight(pending, &mut inflight);
+                            requeue_inflight(pending, &mut inflight, retransmission);
                             return SessionOutcome::Disconnected;
                         }
                     }
@@ -792,7 +794,7 @@ impl FollowerDriver {
                             return SessionOutcome::Shutdown;
                         }
                         Some(FollowerCmd::DropConnection) => {
-                            requeue_inflight(pending, &mut inflight);
+                            requeue_inflight(pending, &mut inflight, retransmission);
                             return SessionOutcome::Disconnected;
                         }
                         Some(FollowerCmd::PropagateHwm { update }) => {
@@ -802,7 +804,7 @@ impl FollowerDriver {
                                 message: Message::CommittedHwmUpdate(update),
                             };
                             if write_frame(&mut stream, &frame, REPLICA_LIMITS).await.is_err() {
-                                requeue_inflight(pending, &mut inflight);
+                                requeue_inflight(pending, &mut inflight, retransmission);
                                 return SessionOutcome::Disconnected;
                             }
                         }
@@ -834,7 +836,7 @@ impl FollowerDriver {
                                 )
                                 .await
                             {
-                                requeue_inflight(pending, &mut inflight);
+                                requeue_inflight(pending, &mut inflight, retransmission);
                                 return outcome;
                             }
                         }
@@ -976,8 +978,16 @@ fn fail_inflight(inflight: &mut HashMap<u64, Inflight>) {
 }
 
 /// Preserve in-flight batches across reconnect so a dropped socket does not
-/// permanently skip a follower that is still within the retransmission window.
-fn requeue_inflight(pending: &mut VecDeque<FollowerCmd>, inflight: &mut HashMap<u64, Inflight>) {
+/// permanently skip a follower. Batches still held by the retransmission
+/// buffer stay there (charged exactly once) and are re-queued by the
+/// reconnect catch-up drain; only batches the buffer no longer holds —
+/// charge-failed or evicted — are re-queued here, so a re-send cannot
+/// duplicate a buffer entry or charge the same bytes twice.
+fn requeue_inflight(
+    pending: &mut VecDeque<FollowerCmd>,
+    inflight: &mut HashMap<u64, Inflight>,
+    retransmission: &VecDeque<BufferedBatch>,
+) {
     let mut batches: Vec<Inflight> = inflight.drain().map(|(_, entry)| entry).collect();
     // Preserve original send order by request_id.
     batches.sort_by_key(|entry| {
@@ -989,6 +999,12 @@ fn requeue_inflight(pending: &mut VecDeque<FollowerCmd>, inflight: &mut HashMap<
     });
     for entry in batches.into_iter().rev() {
         drop(entry.response_tx);
+        if retransmission
+            .iter()
+            .any(|batch| Arc::ptr_eq(&batch.requests, &entry.requests))
+        {
+            continue;
+        }
         pending.push_front(FollowerCmd::Replicate {
             requests: entry.requests,
             leader_committed_offset: entry.leader_committed_offset,
@@ -1018,6 +1034,29 @@ fn push_retransmission(
         } else {
             break;
         }
+    }
+}
+
+/// Move buffered batches back into `pending` for retransmission after a
+/// reconnect, releasing their catch-up charges. `push_retransmission`
+/// re-charges when a batch is actually re-sent, so every byte is charged
+/// exactly once while it occupies the buffer and released exactly once.
+fn drain_retransmission_to_pending(
+    pending: &mut VecDeque<FollowerCmd>,
+    buffer: &mut VecDeque<BufferedBatch>,
+    buffer_bytes: &mut usize,
+    budget: &FollowerBudget,
+) {
+    while let Some(batch) = buffer.pop_back() {
+        *buffer_bytes = buffer_bytes.saturating_sub(batch.bytes);
+        budget.release_catch_up(batch.bytes as u64);
+        pending.push_front(FollowerCmd::Replicate {
+            requests: batch.requests,
+            leader_committed_offset: batch.leader_committed_offset,
+            bytes: batch.bytes,
+            // Catch-up has no producer waiter; durable_offset still advances.
+            response_tx: oneshot::channel().0,
+        });
     }
 }
 
@@ -1108,4 +1147,147 @@ fn uuid_from_cert(der: &CertificateDer<'_>) -> BrokerResult<Uuid> {
     Uuid::parse_str(cn).map_err(|_| {
         crate::BrokerError::InvalidConfig(format!("replica leaf cert CN {cn:?} is not a UUID"))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory_budget::MemoryBudgetConfig;
+    use vtop_protocol::{ProduceRecord, RangeIdentity};
+
+    fn test_budget() -> (Arc<MemoryBudgetPool>, Arc<FollowerBudget>) {
+        let pool = MemoryBudgetPool::new(MemoryBudgetConfig::default()).unwrap();
+        let budget = Arc::new(pool.open_follower());
+        (pool, budget)
+    }
+
+    fn test_batch(base_offset: u64, bytes: usize) -> BufferedBatch {
+        BufferedBatch {
+            requests: Arc::new(vec![ReplicaAppendRequest {
+                range: RangeIdentity {
+                    topic: "events.v1".to_owned(),
+                    topic_epoch: 1,
+                    range_id: Uuid::from_u128(0xC1),
+                    range_generation: 0,
+                },
+                fencing_epoch: 1,
+                leader_node_id: Uuid::from_u128(0xA1),
+                expected_base_offset: base_offset,
+                producer_id: Uuid::from_u128(0xB1),
+                producer_epoch: 1,
+                first_sequence: 0,
+                records: vec![ProduceRecord {
+                    timestamp_millis: 1,
+                    key: b"k".to_vec(),
+                    value: b"v".to_vec(),
+                }],
+            }]),
+            leader_committed_offset: base_offset + 1,
+            bytes,
+        }
+    }
+
+    #[test]
+    fn reconnect_drain_releases_charge_until_resend() {
+        let (_pool, budget) = test_budget();
+        let mut buffer = VecDeque::new();
+        let mut buffer_bytes = 0usize;
+        let mut pending = VecDeque::new();
+        push_retransmission(
+            &mut buffer,
+            &mut buffer_bytes,
+            1_024,
+            test_batch(0, 100),
+            &budget,
+        );
+        assert_eq!(budget.catch_up_used_bytes(), 100);
+        assert_eq!(buffer_bytes, 100);
+
+        // Reconnect: buffered entries move to pending and their catch-up
+        // charge is released; the buffer no longer holds them.
+        drain_retransmission_to_pending(&mut pending, &mut buffer, &mut buffer_bytes, &budget);
+        assert!(buffer.is_empty());
+        assert_eq!(buffer_bytes, 0);
+        assert_eq!(budget.catch_up_used_bytes(), 0);
+        assert_eq!(pending.len(), 1);
+
+        // The re-send re-buffers and re-charges exactly once (no double
+        // charge, no duplicated buffer entry).
+        let Some(FollowerCmd::Replicate {
+            requests,
+            leader_committed_offset,
+            bytes,
+            ..
+        }) = pending.pop_front()
+        else {
+            panic!("expected replicate command");
+        };
+        push_retransmission(
+            &mut buffer,
+            &mut buffer_bytes,
+            1_024,
+            BufferedBatch {
+                requests,
+                leader_committed_offset,
+                bytes,
+            },
+            &budget,
+        );
+        assert_eq!(budget.catch_up_used_bytes(), 100);
+        assert_eq!(buffer.len(), 1);
+        assert_eq!(buffer_bytes, 100);
+    }
+
+    #[test]
+    fn requeue_inflight_skips_batches_still_charged_in_buffer() {
+        let (_pool, budget) = test_budget();
+        let mut buffer = VecDeque::new();
+        let mut buffer_bytes = 0usize;
+        push_retransmission(
+            &mut buffer,
+            &mut buffer_bytes,
+            1_024,
+            test_batch(0, 100),
+            &budget,
+        );
+        let buffered_requests = Arc::clone(&buffer.front().unwrap().requests);
+        // An inflight entry the buffer does not hold (charge-failed / evicted).
+        let unbuffered = test_batch(1, 100);
+
+        let mut inflight = HashMap::new();
+        let (tx_buffered, _rx) = oneshot::channel();
+        inflight.insert(
+            1,
+            Inflight {
+                requests: buffered_requests,
+                leader_committed_offset: 1,
+                bytes: 100,
+                response_tx: tx_buffered,
+            },
+        );
+        let (tx_unbuffered, _rx2) = oneshot::channel();
+        inflight.insert(
+            2,
+            Inflight {
+                requests: Arc::clone(&unbuffered.requests),
+                leader_committed_offset: unbuffered.leader_committed_offset,
+                bytes: unbuffered.bytes,
+                response_tx: tx_unbuffered,
+            },
+        );
+
+        let mut pending = VecDeque::new();
+        requeue_inflight(&mut pending, &mut inflight, &buffer);
+
+        // Only the batch missing from the buffer is re-queued; the buffered
+        // one stays charged exactly once and is left to the reconnect drain.
+        assert_eq!(pending.len(), 1);
+        assert_eq!(budget.catch_up_used_bytes(), 100);
+        match pending.pop_front() {
+            Some(FollowerCmd::Replicate { requests, .. }) => {
+                assert!(Arc::ptr_eq(&requests, &unbuffered.requests));
+            }
+            _ => panic!("expected replicate command"),
+        }
+    }
 }

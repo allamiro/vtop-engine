@@ -638,6 +638,23 @@ impl FollowerBudget {
     }
 }
 
+impl Drop for FollowerBudget {
+    /// Return any outstanding charges to the shared pool. Catch-up bytes are
+    /// charged without an RAII guard (`try_charge_catch_up`), so a follower
+    /// driver that shuts down with an undrained retransmission buffer would
+    /// otherwise leak `catch_up_used`/`process_used` permanently. Inflight
+    /// charges are RAII-guarded by [`FollowerReservation`], which holds its
+    /// own `Arc<FollowerBudget>`, so they are always released before this
+    /// runs; releasing the (normally zero) inflight counter here is purely
+    /// defensive.
+    fn drop(&mut self) {
+        let inflight = self.inflight_used.swap(0, Ordering::Relaxed);
+        let catch_up = self.catch_up_used.swap(0, Ordering::Relaxed);
+        self.pool
+            .release_replica_aggregate(inflight.saturating_add(catch_up));
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum FollowerReserveKind {
     Inflight,
@@ -882,5 +899,20 @@ mod tests {
         assert_eq!(pool.metrics().fetch_queue_used_bytes(), 1_000);
         drop(reservation);
         assert_eq!(pool.metrics().fetch_queue_used_bytes(), 0);
+    }
+
+    #[test]
+    fn follower_budget_drop_returns_outstanding_charges_to_pool() {
+        let pool = MemoryBudgetPool::new(tiny_config()).unwrap();
+        let follower = pool.open_follower();
+        // Non-RAII catch-up charge, mirroring the retransmission buffer: a
+        // follower that shuts down with an undrained buffer must not leak the
+        // shared pool aggregates.
+        follower.try_charge_catch_up(1_000).unwrap();
+        assert_eq!(pool.metrics().replica_used_bytes(), 1_000);
+        assert_eq!(pool.metrics().process_used_bytes(), 1_000);
+        drop(follower);
+        assert_eq!(pool.metrics().replica_used_bytes(), 0);
+        assert_eq!(pool.metrics().process_used_bytes(), 0);
     }
 }
