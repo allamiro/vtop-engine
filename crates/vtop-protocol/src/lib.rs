@@ -578,7 +578,10 @@ fn encoded_payload_size(message: &Message, limits: ProtocolLimits) -> Result<usi
                         ));
                     }
                     record_count(request.records.len(), limits)?;
-                    add(&mut size, range_size(&request.range)? + 8 + 16 + 8 + 16 + 8 + 8 + 4)?;
+                    add(
+                        &mut size,
+                        range_size(&request.range)? + 8 + 16 + 8 + 16 + 8 + 8 + 4,
+                    )?;
                     for record in &request.records {
                         add(&mut size, 8)?;
                         add(&mut size, bytes_size(&record.key)?)?;

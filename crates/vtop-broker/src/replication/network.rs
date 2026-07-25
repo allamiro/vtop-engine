@@ -88,7 +88,10 @@ pub trait ReplicaPeerHandler: Send + Sync {
         requests: &[ReplicaAppendRequest],
     ) -> Result<ReplicaAppendResponse, (ErrorCode, String)>;
     fn observe_hwm(&self, update: &CommittedHwmUpdate) -> Result<(), (ErrorCode, String)>;
-    fn status(&self, range: &vtop_protocol::RangeIdentity) -> Result<ReplicaStatusResponse, (ErrorCode, String)>;
+    fn status(
+        &self,
+        range: &vtop_protocol::RangeIdentity,
+    ) -> Result<ReplicaStatusResponse, (ErrorCode, String)>;
 }
 
 impl ReplicaPeerHandler for InProcessFollower {
@@ -153,12 +156,14 @@ impl ReplicaPeerServer {
 
     pub async fn serve(self, listener: TcpListener) -> BrokerResult<()> {
         loop {
-            let (tcp, _peer) = listener.accept().await.map_err(|source| {
-                crate::BrokerError::Io {
-                    path: std::path::PathBuf::from("replica-peer-listener"),
-                    source,
-                }
-            })?;
+            let (tcp, _peer) =
+                listener
+                    .accept()
+                    .await
+                    .map_err(|source| crate::BrokerError::Io {
+                        path: std::path::PathBuf::from("replica-peer-listener"),
+                        source,
+                    })?;
             let acceptor = self.acceptor.clone();
             let handler = Arc::clone(&self.handler);
             let local_id = self.local_id;
@@ -175,12 +180,13 @@ async fn serve_follower_connection(
     handler: Arc<dyn ReplicaPeerHandler>,
     local_id: Uuid,
 ) -> BrokerResult<()> {
-    let mut stream = acceptor.accept(tcp).await.map_err(|source| {
-        crate::BrokerError::Io {
+    let mut stream = acceptor
+        .accept(tcp)
+        .await
+        .map_err(|source| crate::BrokerError::Io {
             path: std::path::PathBuf::from("replica-peer-accept"),
             source,
-        }
-    })?;
+        })?;
     let peer_id = peer_uuid_from_server_stream(&stream)?;
     // Authenticate the leader cert; local_id is the follower's own identity.
     let _ = (peer_id, local_id);
@@ -289,12 +295,7 @@ impl NetworkedReplicaSet {
                 path: std::path::PathBuf::from("replica-runtime"),
                 source,
             })?;
-        Self::start_on(
-            RuntimeBinding::Owned(runtime),
-            followers,
-            leader_tls,
-            flow,
-        )
+        Self::start_on(RuntimeBinding::Owned(runtime), followers, leader_tls, flow)
     }
 
     /// Build channels on an existing Tokio handle (tests / embedded runtimes).
@@ -486,7 +487,9 @@ impl FollowerChannel {
             return false;
         }
         match timeout(ack_timeout, response_rx).await {
-            Ok(Ok(FollowerReplicateResult::Acked { local_committed_offset })) => {
+            Ok(Ok(FollowerReplicateResult::Acked {
+                local_committed_offset,
+            })) => {
                 self.durable_offset
                     .fetch_max(local_committed_offset, Ordering::SeqCst);
                 local_committed_offset >= leader_committed_offset
@@ -543,13 +546,14 @@ impl FollowerDriver {
         let mut pending: VecDeque<FollowerCmd> = VecDeque::new();
 
         loop {
-            match self.connect_and_session(
-                &mut next_request_id,
-                &mut retransmission,
-                &mut retransmission_bytes,
-                &mut pending,
-            )
-            .await
+            match self
+                .connect_and_session(
+                    &mut next_request_id,
+                    &mut retransmission,
+                    &mut retransmission_bytes,
+                    &mut pending,
+                )
+                .await
             {
                 SessionOutcome::Shutdown => return,
                 SessionOutcome::Disconnected => {
@@ -567,8 +571,11 @@ impl FollowerDriver {
         retransmission_bytes: &mut usize,
         pending: &mut VecDeque<FollowerCmd>,
     ) -> SessionOutcome {
-        let tcp = match timeout(self.flow.connect_timeout, TcpStream::connect(self.config.addr))
-            .await
+        let tcp = match timeout(
+            self.flow.connect_timeout,
+            TcpStream::connect(self.config.addr),
+        )
+        .await
         {
             Ok(Ok(tcp)) => tcp,
             _ => return SessionOutcome::Disconnected,
@@ -586,7 +593,7 @@ impl FollowerDriver {
             Ok(Ok(stream)) => stream,
             _ => return SessionOutcome::Disconnected,
         };
-        if let Err(_) = assert_peer_uuid(peer_certs_client(&stream), self.config.node_id) {
+        if assert_peer_uuid(peer_certs_client(&stream), self.config.node_id).is_err() {
             return SessionOutcome::Disconnected;
         }
         // Catch-up probe + bounded retransmission. Mark connected only after the
@@ -681,15 +688,17 @@ impl FollowerDriver {
                 if let Err(outcome) = self
                     .send_replicate(
                         &mut stream,
-                        next_request_id,
+                        &mut SessionSendState {
+                            next_request_id,
+                            inflight: &mut inflight,
+                            inflight_bytes: &mut inflight_bytes,
+                            retransmission,
+                            retransmission_bytes,
+                        },
                         requests,
                         leader_committed_offset,
                         bytes,
                         response_tx,
-                        &mut inflight,
-                        &mut inflight_bytes,
-                        retransmission,
-                        retransmission_bytes,
                     )
                     .await
                 {
@@ -749,15 +758,17 @@ impl FollowerDriver {
                             if let Err(outcome) = self
                                 .send_replicate(
                                     &mut stream,
-                                    next_request_id,
+                                    &mut SessionSendState {
+                                        next_request_id,
+                                        inflight: &mut inflight,
+                                        inflight_bytes: &mut inflight_bytes,
+                                        retransmission,
+                                        retransmission_bytes,
+                                    },
                                     requests,
                                     leader_committed_offset,
                                     bytes,
                                     response_tx,
-                                    &mut inflight,
-                                    &mut inflight_bytes,
-                                    retransmission,
-                                    retransmission_bytes,
                                 )
                                 .await
                             {
@@ -774,18 +785,14 @@ impl FollowerDriver {
     async fn send_replicate(
         &self,
         stream: &mut ClientTlsStream<TcpStream>,
-        next_request_id: &mut u64,
+        state: &mut SessionSendState<'_>,
         requests: Arc<Vec<ReplicaAppendRequest>>,
         leader_committed_offset: u64,
         bytes: usize,
         response_tx: oneshot::Sender<FollowerReplicateResult>,
-        inflight: &mut HashMap<u64, Inflight>,
-        inflight_bytes: &mut usize,
-        retransmission: &mut VecDeque<BufferedBatch>,
-        retransmission_bytes: &mut usize,
     ) -> Result<(), SessionOutcome> {
-        let request_id = *next_request_id;
-        *next_request_id = next_request_id.wrapping_add(1);
+        let request_id = *state.next_request_id;
+        *state.next_request_id = state.next_request_id.wrapping_add(1);
         let message = if requests.len() <= 1 {
             match requests.first() {
                 Some(request) => Message::ReplicaAppendRequest(request.clone()),
@@ -812,8 +819,8 @@ impl FollowerDriver {
             return Err(SessionOutcome::Disconnected);
         }
         push_retransmission(
-            retransmission,
-            retransmission_bytes,
+            state.retransmission,
+            state.retransmission_bytes,
             self.flow.max_retransmission_bytes,
             BufferedBatch {
                 requests: Arc::clone(&requests),
@@ -821,8 +828,8 @@ impl FollowerDriver {
                 bytes,
             },
         );
-        *inflight_bytes = inflight_bytes.saturating_add(bytes);
-        inflight.insert(
+        *state.inflight_bytes = state.inflight_bytes.saturating_add(bytes);
+        state.inflight.insert(
             request_id,
             Inflight {
                 requests,
@@ -835,12 +842,24 @@ impl FollowerDriver {
     }
 }
 
+struct SessionSendState<'a> {
+    next_request_id: &'a mut u64,
+    inflight: &'a mut HashMap<u64, Inflight>,
+    inflight_bytes: &'a mut usize,
+    retransmission: &'a mut VecDeque<BufferedBatch>,
+    retransmission_bytes: &'a mut usize,
+}
+
 enum SessionOutcome {
     Shutdown,
     Disconnected,
 }
 
-fn can_send(inflight: &HashMap<u64, Inflight>, inflight_bytes: usize, flow: &FlowControlConfig) -> bool {
+fn can_send(
+    inflight: &HashMap<u64, Inflight>,
+    inflight_bytes: usize,
+    flow: &FlowControlConfig,
+) -> bool {
     inflight.len() < flow.max_inflight_batches && inflight_bytes < flow.max_inflight_bytes
 }
 
@@ -876,11 +895,9 @@ fn handle_response(
             channel
                 .durable_offset
                 .fetch_max(local_committed_offset, Ordering::SeqCst);
-            let _ = entry
-                .response_tx
-                .send(FollowerReplicateResult::Acked {
-                    local_committed_offset,
-                });
+            let _ = entry.response_tx.send(FollowerReplicateResult::Acked {
+                local_committed_offset,
+            });
         }
         _ => {
             // Error / unexpected: waiter observes closed/timeout as miss.
@@ -994,12 +1011,9 @@ fn assert_peer_uuid(
     certs: Option<Vec<CertificateDer<'static>>>,
     expected: Uuid,
 ) -> BrokerResult<()> {
-    let leaf = certs
-        .as_ref()
-        .and_then(|c| c.first())
-        .ok_or_else(|| {
-            crate::BrokerError::InvalidConfig("replica peer presented no certificate".to_owned())
-        })?;
+    let leaf = certs.as_ref().and_then(|c| c.first()).ok_or_else(|| {
+        crate::BrokerError::InvalidConfig("replica peer presented no certificate".to_owned())
+    })?;
     let actual = uuid_from_cert(leaf)?;
     if actual != expected {
         return Err(crate::BrokerError::InvalidConfig(format!(
@@ -1023,8 +1037,6 @@ fn uuid_from_cert(der: &CertificateDer<'_>) -> BrokerResult<Uuid> {
             crate::BrokerError::InvalidConfig("replica leaf cert missing CN".to_owned())
         })?;
     Uuid::parse_str(cn).map_err(|_| {
-        crate::BrokerError::InvalidConfig(format!(
-            "replica leaf cert CN {cn:?} is not a UUID"
-        ))
+        crate::BrokerError::InvalidConfig(format!("replica leaf cert CN {cn:?} is not a UUID"))
     })
 }

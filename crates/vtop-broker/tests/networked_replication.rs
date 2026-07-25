@@ -52,7 +52,9 @@ fn cert_for_cn(cn: &str) -> CertBundle {
 
 fn clone_private_key(key: &PrivateKeyDer<'static>) -> PrivateKeyDer<'static> {
     match key {
-        PrivateKeyDer::Pkcs8(key) => PrivatePkcs8KeyDer::from(key.secret_pkcs8_der().to_vec()).into(),
+        PrivateKeyDer::Pkcs8(key) => {
+            PrivatePkcs8KeyDer::from(key.secret_pkcs8_der().to_vec()).into()
+        }
         PrivateKeyDer::Pkcs1(key) => {
             rustls::pki_types::PrivatePkcs1KeyDer::from(key.secret_pkcs1_der().to_vec()).into()
         }
@@ -136,10 +138,7 @@ impl ReplicaPeerHandler for SlowFollower {
         self.inner.observe_hwm(update)
     }
 
-    fn status(
-        &self,
-        range: &RangeIdentity,
-    ) -> Result<ReplicaStatusResponse, (ErrorCode, String)> {
+    fn status(&self, range: &RangeIdentity) -> Result<ReplicaStatusResponse, (ErrorCode, String)> {
         self.inner.status(range)
     }
 }
