@@ -68,7 +68,7 @@ blake3 = "1"
 # index); see openraft FAQ "Can I wipe out the data of ONE node".
 openraft = { version = "=0.9.24", features = ["single-term-leader", "storage-v2", "loosen-follower-log-revert"] }
 hex = "0.4"
-base64 = "0.22"
+base64 = "0.23"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 flate2 = "1"
