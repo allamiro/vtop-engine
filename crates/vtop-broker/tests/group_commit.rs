@@ -236,7 +236,16 @@ fn concurrent_sessions_share_one_quorum_barrier() {
             Some(counting.clone() as Arc<dyn ReplicaSet>),
         )
         .unwrap()
-        .with_group_commit(group_config())
+        // Test-local override: the eight records produced below hit the count
+        // threshold exactly, so the batch seals deterministically instead of
+        // depending on all eight threads enqueueing inside a wall-clock delay
+        // window (flaky on loaded CI runners). The 10s delay is a backstop.
+        .with_group_commit(GroupCommitConfig {
+            max_delay: Duration::from_secs(10),
+            max_records: 8,
+            max_bytes: 1024 * 1024,
+            max_pending_requests: 32,
+        })
         .unwrap(),
     );
     let _dirs = (leader_dir, follower_dirs);

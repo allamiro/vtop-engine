@@ -343,14 +343,22 @@ mod tests {
 
     #[tokio::test]
     async fn timeout_kills_a_hung_child() {
-        let (_dir, path) = executable_script("exec /bin/sleep 5");
+        // The child sleeps 30s against a 50ms timeout: the wall-clock bound
+        // only has to prove the timeout fired instead of waiting the child
+        // out. Keep the margin wide — a tight bound measures CI scheduling
+        // (process spawn + kill under load), not the policy under test.
+        let (_dir, path) = executable_script("exec /bin/sleep 30");
         let mut policy = CommandPolicy::from_config(&config(&path), "test").unwrap();
         policy.timeout = Duration::from_millis(50);
         let mut command = policy.command();
         let started = std::time::Instant::now();
         let error = policy.run(&mut command, "hang test").await.unwrap_err();
         assert!(error.to_string().contains("timeout"));
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "timeout did not fire: elapsed {:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]

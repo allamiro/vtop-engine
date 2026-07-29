@@ -1784,8 +1784,14 @@ async fn serve_connection(
             .await?;
             continue;
         }
-        let mut fetch_reservation: Option<BudgetReservation> = None;
-        let frame = match frame {
+        // The fetch budget reservation is an RAII guard scoped to the rest of
+        // this loop iteration: it must stay alive until this request's
+        // response bytes have been written to the session (every exit path
+        // included). Dropping it earlier releases the fetch-response-queue
+        // budget while the bytes still sit in the write path, so
+        // slow-consumer pileups would go unaccounted exactly when they
+        // matter.
+        let (frame, _fetch_reservation): (WireFrame, Option<BudgetReservation>) = match frame {
             WireFrame {
                 message: Message::WindowUpdate(update),
                 ..
@@ -1872,11 +1878,11 @@ async fn serve_connection(
                     .max_bytes
                     .min(u32::try_from(send_credit).unwrap_or(u32::MAX))
                     .min(response_budget);
-                match broker
+                let reservation = match broker
                     .memory_budget()
                     .try_reserve_fetch(u64::from(request.max_bytes), &conn_budget)
                 {
-                    Ok(reservation) => fetch_reservation = Some(reservation),
+                    Ok(reservation) => reservation,
                     Err(reason) => {
                         let response = overloaded_budget(request_id, stream_id, reason);
                         write_session_frame(
@@ -1894,14 +1900,17 @@ async fn serve_connection(
                         }
                         continue;
                     }
-                }
-                WireFrame {
-                    request_id,
-                    stream_id,
-                    message: Message::FetchRequest(request),
-                }
+                };
+                (
+                    WireFrame {
+                        request_id,
+                        stream_id,
+                        message: Message::FetchRequest(request),
+                    },
+                    Some(reservation),
+                )
             }
-            value => value,
+            value => (value, None),
         };
         let Ok(permit) = Arc::clone(&requests).try_acquire_owned() else {
             let response = error(
@@ -1926,7 +1935,6 @@ async fn serve_connection(
             broker.handle_with_connection(role, frame, Some(&session_budget))
         })
         .await?;
-        drop(fetch_reservation);
         let is_fetch_response = matches!(response.message, Message::FetchResponse(_));
         let encoded = match encode_frame(&response, negotiated_limits) {
             Ok(encoded) => encoded,

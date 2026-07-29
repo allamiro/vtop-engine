@@ -15,6 +15,7 @@ use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 use uuid::Uuid;
 use vtop_broker::group_commit::GroupCommitConfig;
+use vtop_broker::memory_budget::{MemoryBudgetConfig, MemoryBudgetPool};
 use vtop_broker::replication::{
     ClusterCommittedOffset, FlowControlConfig, InProcessFollower, NetworkFollowerConfig,
     NetworkedReplicaSet, ReplicaPeerHandler, ReplicaPeerServer, ReplicaSet, ReplicaTlsMaterial,
@@ -188,6 +189,7 @@ fn harness_with(
     flow: FlowControlConfig,
     group_commit: Option<GroupCommitConfig>,
     slow_follower2: Option<(Duration, Arc<AtomicBool>)>,
+    memory: Option<Arc<MemoryBudgetPool>>,
 ) -> NetworkHarness {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -258,11 +260,12 @@ fn harness_with(
 
     let leader_tls = material(&leader_cert, &[&f1_cert, &f2_cert]);
     let replica_set = Arc::new(
-        NetworkedReplicaSet::start_on_handle(
+        NetworkedReplicaSet::start_on_handle_with_memory(
             runtime.handle().clone(),
             follower_configs,
             leader_tls,
             flow,
+            memory,
         )
         .unwrap(),
     );
@@ -308,7 +311,7 @@ fn harness_with(
 }
 
 fn harness() -> NetworkHarness {
-    harness_with(FlowControlConfig::default(), None, None)
+    harness_with(FlowControlConfig::default(), None, None, None)
 }
 
 fn produce_frame(
@@ -379,6 +382,7 @@ fn slow_non_quorum_follower_does_not_block_producer() {
         flow,
         None,
         Some((Duration::from_secs(5), Arc::clone(&hold))),
+        None,
     );
 
     let started = std::time::Instant::now();
@@ -423,7 +427,7 @@ fn reconnect_catch_up_from_retransmission_buffer() {
         ack_timeout: Duration::from_millis(500),
         ..FlowControlConfig::default()
     };
-    let h = harness_with(flow, None, None);
+    let h = harness_with(flow, None, None, None);
     let _ = produce_ok(&h.leader, h.range.clone(), 0);
     assert_eq!(h.cluster_committed.get(), 1);
 
@@ -469,6 +473,7 @@ fn fencing_still_works_with_networked_group_commit() {
             max_pending_requests: 8,
         }),
         None,
+        None,
     );
 
     let _ = produce_ok(&h.leader, h.range.clone(), 0);
@@ -486,4 +491,101 @@ fn fencing_still_works_with_networked_group_commit() {
         other => panic!("expected Fenced after lease steal, got {other:?}"),
     }
     assert_eq!(h.cluster_committed.get(), 1);
+}
+
+/// Wait for a follower stream to drop and come back after `force_reconnect`.
+fn wait_reconnect(replica_set: &NetworkedReplicaSet, node_id: Uuid) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline
+        && replica_set.follower_connected(node_id) != Some(false)
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    while std::time::Instant::now() < deadline
+        && replica_set.follower_connected(node_id) != Some(true)
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(replica_set.follower_connected(node_id), Some(true));
+}
+
+#[test]
+fn catch_up_charges_return_to_zero_after_replica_set_shutdown() {
+    let pool = MemoryBudgetPool::new(MemoryBudgetConfig::default()).unwrap();
+    let h = harness_with(
+        FlowControlConfig::default(),
+        None,
+        None,
+        Some(Arc::clone(&pool)),
+    );
+    let _ = produce_ok(&h.leader, h.range.clone(), 0);
+
+    // Fan-out charges each follower's retransmission buffer; the charges stay
+    // until a reconnect drains them.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while pool.metrics().replica_used_bytes() == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        pool.metrics().replica_used_bytes() > 0,
+        "retransmission buffers must charge catch-up bytes"
+    );
+
+    // Tearing the replica set down shuts the follower drivers down with
+    // undrained buffers; their budgets must return the outstanding catch-up
+    // charges to the shared pool instead of leaking them.
+    drop(h.leader);
+    drop(h.replica_set);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while pool.metrics().replica_used_bytes() > 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(pool.metrics().replica_used_bytes(), 0);
+    assert_eq!(pool.metrics().process_used_bytes(), 0);
+}
+
+#[test]
+fn reconnect_catch_up_charges_each_byte_once() {
+    let pool = MemoryBudgetPool::new(MemoryBudgetConfig::default()).unwrap();
+    let hold = Arc::new(AtomicBool::new(true));
+    let flow = FlowControlConfig {
+        reconnect_backoff: Duration::from_millis(20),
+        ack_timeout: Duration::from_millis(500),
+        ..FlowControlConfig::default()
+    };
+    let h = harness_with(
+        flow,
+        None,
+        Some((Duration::from_secs(5), Arc::clone(&hold))),
+        Some(Arc::clone(&pool)),
+    );
+    let _ = produce_ok(&h.leader, h.range.clone(), 0);
+
+    // Follower1 committed the batch, so reconnecting it drains its covered
+    // buffer entry and releases that charge.
+    assert!(h.replica_set.force_reconnect(FOLLOWER_1));
+    wait_reconnect(&h.replica_set, FOLLOWER_1);
+
+    // What remains charged is follower2's single buffered batch: its apply is
+    // held, so it has not committed and the entry is not covered.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while pool.metrics().replica_used_bytes() == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let baseline = pool.metrics().replica_used_bytes();
+    assert!(baseline > 0, "follower2 must hold one buffered batch");
+
+    // Reconnect follower2: the un-covered batch is re-queued and re-sent. It
+    // must be charged exactly once — the same total as before the reconnect,
+    // not once per buffered copy.
+    assert!(h.replica_set.force_reconnect(FOLLOWER_2));
+    wait_reconnect(&h.replica_set, FOLLOWER_2);
+    // Give the driver room to complete the catch-up re-send.
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        pool.metrics().replica_used_bytes(),
+        baseline,
+        "reconnect catch-up must not charge the same bytes twice"
+    );
+    hold.store(false, Ordering::SeqCst);
 }
