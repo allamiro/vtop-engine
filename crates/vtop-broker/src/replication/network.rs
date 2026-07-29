@@ -766,11 +766,13 @@ impl FollowerDriver {
                             retransmission,
                             retransmission_bytes,
                         },
-                        requests,
-                        leader_committed_offset,
-                        bytes,
-                        response_tx,
-                        catch_up_charged,
+                        OutboundBatch {
+                            requests,
+                            leader_committed_offset,
+                            bytes,
+                            response_tx,
+                            catch_up_charged,
+                        },
                     )
                     .await
                 {
@@ -843,11 +845,13 @@ impl FollowerDriver {
                                         retransmission,
                                         retransmission_bytes,
                                     },
-                                    requests,
-                                    leader_committed_offset,
-                                    bytes,
-                                    response_tx,
-                                    catch_up_charged,
+                                    OutboundBatch {
+                                        requests,
+                                        leader_committed_offset,
+                                        bytes,
+                                        response_tx,
+                                        catch_up_charged,
+                                    },
                                 )
                                 .await
                             {
@@ -865,12 +869,15 @@ impl FollowerDriver {
         &self,
         stream: &mut ClientTlsStream<TcpStream>,
         state: &mut SessionSendState<'_>,
-        requests: Arc<Vec<ReplicaAppendRequest>>,
-        leader_committed_offset: u64,
-        bytes: usize,
-        response_tx: oneshot::Sender<FollowerReplicateResult>,
-        catch_up_charged: bool,
+        batch: OutboundBatch,
     ) -> Result<(), SessionOutcome> {
+        let OutboundBatch {
+            requests,
+            leader_committed_offset,
+            bytes,
+            response_tx,
+            catch_up_charged,
+        } = batch;
         let request_id = *state.next_request_id;
         *state.next_request_id = state.next_request_id.wrapping_add(1);
         let message = if requests.len() <= 1 {
@@ -927,6 +934,16 @@ impl FollowerDriver {
         );
         Ok(())
     }
+}
+
+/// One batch handed to [`FollowerDriver::send_replicate`]. Grouped so the
+/// send path keeps a readable signature as the batch grows fields.
+struct OutboundBatch {
+    requests: Arc<Vec<ReplicaAppendRequest>>,
+    leader_committed_offset: u64,
+    bytes: usize,
+    response_tx: oneshot::Sender<FollowerReplicateResult>,
+    catch_up_charged: bool,
 }
 
 struct SessionSendState<'a> {
