@@ -335,8 +335,9 @@ Multi-writer recovery:
 • delete old SOURCE_COMMITTED rows incrementally (idle cycles, bounded
   batches), always retaining the per-path max-end_byte row so recovery
   cursor seeding is unchanged;
-• configured via engine.ledger_retention_days / ledger_prune_batch, or run
-  manually with vtopctl prune-ledger; SQLite and PostgreSQL both implemented;
+• engine.ledger_retention_days / ledger_prune_batch drive engine-side
+  pruning on SQLite; PostgreSQL denies runtime DELETE by design, so pruning
+  there is a scheduled vtopctl prune-ledger under a maintenance identity;
 • archival to cold tables / object storage remains a future extension.
 ```
 

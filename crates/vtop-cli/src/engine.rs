@@ -1069,6 +1069,19 @@ impl Engine {
         streams: StreamsConfig,
         state_store: ResolvedStateStore,
     ) -> Result<Self, VtopError> {
+        // #128: automatic pruning needs DELETE on the ledger. The documented
+        // PostgreSQL runtime identity deliberately lacks it (least
+        // privilege), so an enabled policy there would fail-and-retry
+        // forever. Fail fast and point at the maintenance path instead.
+        if config.engine.ledger_retention_days.is_some() && state_store.is_postgres() {
+            return Err(VtopError::Config(
+                "engine.ledger_retention_days requires DELETE on the ledger, which the \
+                 PostgreSQL runtime identity deliberately lacks; unset it and schedule \
+                 `vtopctl prune-ledger` with a maintenance identity instead"
+                    .into(),
+            ));
+        }
+
         let manifest_mac_key = config.resolve_manifest_mac_key()?;
         let store = connect_state_store(state_store.expose_secret()).await?;
         let backend = vtop_upload::build_backend(&config.upload).await?;

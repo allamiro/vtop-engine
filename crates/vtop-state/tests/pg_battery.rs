@@ -15,6 +15,7 @@
 
 use vtop_state::pg_store::PgStateStore;
 use vtop_state::test_battery;
+use vtop_state::StateStore;
 
 #[tokio::test]
 async fn postgres_backend_passes_battery_and_enforces_invariant_at_db() {
@@ -119,6 +120,17 @@ async fn postgres_backend_passes_battery_and_enforces_invariant_at_db() {
 
     // ---- 2. Same behavioural contract as every backend, using DML only ----
     test_battery::run_all(&store).await;
+
+    // ---- 2b. Prune contract (#128) runs as the MAINTENANCE identity ----
+    // The runtime role is denied DELETE by design (asserted above), so the
+    // owner connection exercises pruning — mirroring production, where
+    // `vtopctl prune-ledger` runs with a maintenance identity.
+    let maintenance = PgStateStore::connect(&migrator_conn).await.unwrap();
+    test_battery::run_prune_battery(&maintenance).await;
+    store
+        .prune_committed_history("2100-01-01T00:00:00+00:00", 10)
+        .await
+        .expect_err("the runtime identity must be denied ledger pruning");
 
     // ---- 3. Defense in depth: the DB trigger rejects a bypass ----
     // Write straight to the table (skipping update_batch_state's guard) to force

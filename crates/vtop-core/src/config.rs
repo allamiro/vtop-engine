@@ -535,6 +535,14 @@ impl VtopConfig {
 
     /// Enforce invariants that cannot be expressed by the type system.
     pub fn validate(&self) -> Result<(), VtopError> {
+        if self.engine.ledger_prune_batch == 0 {
+            return Err(VtopError::Config(
+                "engine.ledger_prune_batch must be at least 1; unset \
+                 engine.ledger_retention_days to disable pruning"
+                    .into(),
+            ));
+        }
+
         self.engine.state_store.validate()?;
         if self
             .manifest_mac_key_env

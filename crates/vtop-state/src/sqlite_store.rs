@@ -463,5 +463,8 @@ mod tests {
     async fn sqlite_passes_the_state_store_battery() {
         let store = SqliteStateStore::connect("sqlite::memory:").await.unwrap();
         test_battery::run_all(&store).await;
+        // SQLite has no role separation: the same handle is the maintenance
+        // identity, so the prune contract runs here directly.
+        test_battery::run_prune_battery(&store).await;
     }
 }

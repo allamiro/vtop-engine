@@ -324,9 +324,11 @@ instances never recover the same batch.
 ```
 Configured with `engine.ledger_retention_days` (disabled by default) plus
 `engine.ledger_prune_batch`; the engine prunes only on idle cycles, at most
-once a minute, one bounded batch per pass. `vtopctl prune-ledger
---older-than-days N` runs the same store operation manually on both SQLite
-and PostgreSQL. Rows in any non-committed state are never touched.
+once a minute, one bounded batch per pass. Engine-side pruning is SQLite
+only: the PostgreSQL runtime identity is deliberately denied DELETE, so the
+engine refuses the setting there and pruning runs as a scheduled `vtopctl
+prune-ledger --older-than-days N` under a maintenance identity (see
+POSTGRES_DEPLOYMENT.md). Rows in any non-committed state are never touched.
 
 ### 5.7 Why no row migration for the *Kafka* path
 For Kafka, resume position is broker-side committed offsets, so a fresh store does

@@ -76,6 +76,13 @@ pub async fn run_all(store: &dyn StateStore) {
     lists_incomplete_and_failed(store).await;
     max_committed_end_bytes_aggregates_in_store(store).await;
     claims_respect_live_leases_and_take_over_expired_ones(store).await;
+}
+
+/// #128 prune contract, separated from [`run_all`] because pruning DELETEs
+/// rows: it is a MAINTENANCE-identity operation. The PostgreSQL battery runs
+/// it with the migrator/owner connection; the runtime role is denied DELETE
+/// by design and must keep failing it.
+pub async fn run_prune_battery(store: &dyn StateStore) {
     prune_preserves_cursor_seeds_and_bounds_deletion(store).await;
 }
 

@@ -78,6 +78,8 @@ pub enum Command {
     /// Incrementally delete old SOURCE_COMMITTED ledger rows (#128). The
     /// newest committed row per source path always survives, so recovery
     /// cursor seeding is unchanged; rows in any other state are untouched.
+    /// On PostgreSQL this needs a maintenance identity with DELETE on the
+    /// ledger — the runtime role is denied DELETE by design.
     PruneLedger {
         #[arg(long)]
         config: PathBuf,
