@@ -906,6 +906,9 @@ pub struct Engine {
     /// Set by a read cycle that returned any records; drives the adaptive
     /// inter-cycle sleep in [`Engine::run`]. Reset at the top of each cycle.
     cycle_had_data: bool,
+    /// Last committed-history prune attempt (#128); pruning is idle-cycle
+    /// only and rate-limited, so a busy pipeline never pays for it.
+    last_ledger_prune: Option<std::time::Instant>,
     /// Exclusive work-dir lock held for the engine's lifetime (#66).
     /// Held only by [`Engine::new_exclusive`] instances; empty for read-only
     /// construction (#66).
@@ -1120,6 +1123,7 @@ impl Engine {
             versioned_buckets: Arc::default(),
             pending: HashMap::new(),
             cycle_had_data: false,
+            last_ledger_prune: None,
             _instance_locks: Vec::new(),
         })
     }
@@ -1829,6 +1833,36 @@ impl Engine {
     }
 
     /// Run the continuous processing loop until the shutdown signal fires.
+    /// #128: incremental committed-history retention. Disabled unless
+    /// `engine.ledger_retention_days` is set; runs only on idle cycles, at
+    /// most once a minute, one bounded batch per pass, and never touches
+    /// the per-path cursor-seed rows (the store enforces that invariant).
+    async fn maybe_prune_ledger(&mut self) {
+        let Some(days) = self.config.engine.ledger_retention_days else {
+            return;
+        };
+        let due = self
+            .last_ledger_prune
+            .map(|at| at.elapsed() >= Duration::from_secs(60))
+            .unwrap_or(true);
+        if !due {
+            return;
+        }
+        self.last_ledger_prune = Some(std::time::Instant::now());
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(i64::from(days))).to_rfc3339();
+        match self
+            .store
+            .prune_committed_history(&cutoff, self.config.engine.ledger_prune_batch)
+            .await
+        {
+            Ok(0) => {}
+            Ok(deleted) => {
+                tracing::info!(deleted, "ledger retention pruned committed history");
+            }
+            Err(error) => tracing::warn!(%error, "ledger retention prune failed"),
+        }
+    }
+
     pub async fn run(&mut self) -> Result<(), VtopError> {
         self.recover().await?;
         let types: Vec<SourceType> = self.adapters.keys().cloned().collect();
@@ -1847,6 +1881,7 @@ impl Engine {
             let backoff = if self.cycle_had_data {
                 Duration::ZERO
             } else {
+                self.maybe_prune_ledger().await;
                 idle
             };
             tokio::select! {

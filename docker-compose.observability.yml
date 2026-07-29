@@ -10,6 +10,14 @@
 # Grafana:  http://localhost:3400   (admin / admin, anonymous viewing enabled)
 # Alloy UI: http://localhost:12345  (shows which scrape targets are actually UP)
 #
+# SECURITY (issue #81): like the base lab, every published port here binds to
+# LOOPBACK by default (override with VTOP_BIND_ADDR only on a network you
+# trust), and every credential is lab-grade and overridable via .env
+# (GRAFANA_ADMIN_USER / GRAFANA_ADMIN_PASSWORD - see .env.example). Alloy's
+# read-only mount of the Docker socket is still a PRIVILEGED handle: it can
+# read every container's logs and metadata on the host. That alone makes this
+# stack lab-only.
+#
 # Ports are deliberately off the defaults (3400 not 3000): 3000/8080 are common
 # and collide with other local stacks.
 #
@@ -36,6 +44,9 @@ services:
   kafka-exporter:
     image: danielqsj/kafka-exporter:v1.9.0
     container_name: vtop-kafka-exporter
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
     command:
       - "--kafka.server=kafka:9092"
       - "--web.listen-address=:9308"
@@ -48,6 +59,9 @@ services:
   mimir:
     image: grafana/mimir:3.1.3
     container_name: vtop-mimir
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
     command: ["-config.file=/etc/mimir/mimir.yaml"]
     volumes:
       - ./observability/mimir/mimir.yaml:/etc/mimir/mimir.yaml:ro
@@ -58,6 +72,9 @@ services:
   loki:
     image: grafana/loki:3.7.3
     container_name: vtop-loki
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
     command: ["-config.file=/etc/loki/loki.yaml"]
     volumes:
       - ./observability/loki/loki.yaml:/etc/loki/loki.yaml:ro
@@ -68,6 +85,9 @@ services:
   tempo:
     image: grafana/tempo:3.0.2
     container_name: vtop-tempo
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
     command: ["-config.file=/etc/tempo/tempo.yaml"]
     volumes:
       - ./observability/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
@@ -81,13 +101,16 @@ services:
   alloy:
     image: grafana/alloy:v1.18.0
     container_name: vtop-alloy
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
     command:
       - run
       - --server.http.listen-addr=0.0.0.0:12345
       - --storage.path=/var/lib/alloy/data
       - /etc/alloy/config.alloy
     ports:
-      - "12345:12345"   # Alloy UI: shows which targets are actually UP
+      - "${VTOP_BIND_ADDR:-127.0.0.1}:12345:12345"   # Alloy UI: shows which targets are actually UP
     volumes:
       - ./observability/alloy/config.alloy:/etc/alloy/config.alloy:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
@@ -102,16 +125,22 @@ services:
   grafana:
     image: grafana/grafana:13.1.0
     container_name: vtop-grafana
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
     ports:
       # Bound to LOOPBACK deliberately. Anonymous access below grants Editor
       # rights with no sign-in, so a 0.0.0.0 bind would let anyone routable to
       # this host modify or delete every dashboard. Publishing the port and
       # granting anonymous Editor are only jointly safe if the port is not
-      # reachable off-box. Change this only if you also disable anonymous auth.
-      - "127.0.0.1:3400:3000"
+      # reachable off-box. Set VTOP_BIND_ADDR to anything but 127.0.0.1 ONLY if
+      # you also disable anonymous auth.
+      - "${VTOP_BIND_ADDR:-127.0.0.1}:3400:3000"
     environment:
-      GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: admin
+      # Lab-grade, overridable via .env. grafana-seed below authenticates with
+      # the same pair, so override BOTH here and there via these two variables.
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
       # Anonymous access with EDITOR rights: this is a local lab, so anyone who
       # opens it can edit AND save dashboards without signing in. LAB ONLY -
       # never expose this stack on a shared network (see issue #81).
@@ -153,13 +182,16 @@ services:
   grafana-seed:
     image: curlimages/curl:8.21.0
     container_name: vtop-grafana-seed
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
     depends_on:
       - grafana
     entrypoint: ["/bin/sh", "/seed-dashboards.sh"]
     environment:
       GRAFANA_URL: http://grafana:3000
-      GRAFANA_USER: admin
-      GRAFANA_PASSWORD: admin
+      GRAFANA_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GRAFANA_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
       DASHBOARD_DIR: /dashboards
       GRAFANA_FOLDER: VTOP
     volumes:

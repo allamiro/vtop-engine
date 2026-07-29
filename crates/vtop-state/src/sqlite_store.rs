@@ -334,6 +334,49 @@ impl StateStore for SqliteStateStore {
         )
         .await
     }
+
+    async fn prune_committed_history(
+        &self,
+        older_than: &str,
+        limit: u32,
+    ) -> Result<u64, VtopError> {
+        // A row is deletable only when a strictly "greater" committed row —
+        // ordered by (end_byte, updated_at, batch_id) — exists for the same
+        // source path (source_name when the marker has no path). Exactly one
+        // row per path group has no successor, so the per-path MAX(end_byte)
+        // aggregate that seeds recovery cursors is preserved verbatim.
+        let result = sqlx::query(
+            "DELETE FROM batches WHERE batch_id IN ( \
+                SELECT b.batch_id FROM batches b \
+                WHERE b.state = ?1 AND b.updated_at < ?2 \
+                  AND EXISTS ( \
+                    SELECT 1 FROM batches n \
+                    WHERE n.state = ?1 \
+                      AND n.source_type = b.source_type \
+                      AND COALESCE(json_extract(n.progress_end_json, '$.path'), n.source_name) \
+                          = COALESCE(json_extract(b.progress_end_json, '$.path'), b.source_name) \
+                      AND ( \
+                        COALESCE(CAST(json_extract(n.progress_end_json, '$.end_byte') AS INTEGER), -1) \
+                          > COALESCE(CAST(json_extract(b.progress_end_json, '$.end_byte') AS INTEGER), -1) \
+                        OR ( \
+                          COALESCE(CAST(json_extract(n.progress_end_json, '$.end_byte') AS INTEGER), -1) \
+                            = COALESCE(CAST(json_extract(b.progress_end_json, '$.end_byte') AS INTEGER), -1) \
+                          AND (n.updated_at > b.updated_at \
+                               OR (n.updated_at = b.updated_at AND n.batch_id > b.batch_id)) \
+                        ) \
+                      ) \
+                  ) \
+                LIMIT ?3 \
+            )",
+        )
+        .bind(BatchState::SourceCommitted.as_str())
+        .bind(older_than)
+        .bind(limit)
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(result.rows_affected())
+    }
 }
 
 fn parse_sqlite_opts(conn_str: &str) -> Result<SqliteConnectOptions, VtopError> {

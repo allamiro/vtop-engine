@@ -75,6 +75,20 @@ pub enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Incrementally delete old SOURCE_COMMITTED ledger rows (#128). The
+    /// newest committed row per source path always survives, so recovery
+    /// cursor seeding is unchanged; rows in any other state are untouched.
+    PruneLedger {
+        #[arg(long)]
+        config: PathBuf,
+        /// Delete committed rows whose last transition is older than this
+        /// many days.
+        #[arg(long)]
+        older_than_days: u32,
+        /// Maximum rows deleted per pass; run repeatedly to drain.
+        #[arg(long, default_value_t = 500)]
+        limit: u32,
+    },
     /// Offline verification tools for sealed native segments. Unlike every
     /// other subcommand these take no --config: an independent verifier must
     /// run from the sealed artifacts and explicit pins alone.
@@ -402,6 +416,32 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
                 );
             } else {
                 println!("state-store migration complete ({backend})");
+            }
+            Ok(())
+        }
+        Command::PruneLedger {
+            config,
+            older_than_days,
+            limit,
+        } => {
+            let cfg = VtopConfig::from_path(config)?;
+            cfg.validate()?;
+            init_tracing(
+                cli.log_level.as_deref().unwrap_or(&cfg.engine.log_level),
+                cli.json,
+            );
+            let state_store = cfg.engine.state_store.resolve()?;
+            let store = vtop_state::connect_state_store(state_store.expose_secret()).await?;
+            let cutoff = (chrono::Utc::now() - chrono::Duration::days(i64::from(*older_than_days)))
+                .to_rfc3339();
+            let deleted = store.prune_committed_history(&cutoff, *limit).await?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"status": "ok", "deleted": deleted})
+                );
+            } else {
+                println!("pruned {deleted} committed ledger row(s)");
             }
             Ok(())
         }
