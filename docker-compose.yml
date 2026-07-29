@@ -9,14 +9,28 @@
 # MinIO console: http://localhost:9001  (user: minioadmin / pass: minioadmin)
 # Kafka UI:      http://localhost:8080
 #
-# Credentials here are LAB-ONLY defaults. Never use them in production.
+# SECURITY (issue #81):
+#   * Every published port binds to LOOPBACK (127.0.0.1) by default, so the lab
+#     is not reachable from the network. To deliberately re-expose it (only on
+#     a network you trust):  VTOP_BIND_ADDR=0.0.0.0 docker compose up -d
+#   * Credentials here are LAB-ONLY defaults, overridable via .env
+#     (MINIO_ROOT_USER / MINIO_ROOT_PASSWORD — see .env.example). The loopback
+#     bind is the real boundary; these creds only keep honest processes apart.
+#     Never use them in production.
+#   * Kafka's advertised listener stays `kafka:9092` (the in-network name), so
+#     producing/consuming from the HOST via 127.0.0.1:9092 does not work — run
+#     host-side clients inside the compose network, like scripts/e2e-smoke.sh
+#     does. That was true before the loopback bind; the bind changes nothing.
 
 services:
   kafka:
     image: apache/kafka:4.3.1
     container_name: vtop-kafka
     ports:
-      - "9092:9092"
+      - "${VTOP_BIND_ADDR:-127.0.0.1}:9092:9092"
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 1024  # JVM thread count; still bounded vs unlimited
     environment:
       # KRaft single-node (no ZooKeeper). The official Apache Kafka image uses
       # KAFKA_* env vars (not the Bitnami KAFKA_CFG_* prefix) and ships the CLI
@@ -25,6 +39,11 @@ services:
       KAFKA_PROCESS_ROLES: "broker,controller"
       KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
       KAFKA_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093"
+      # Advertised listener stays the in-network name: every lab client (engine,
+      # init, exporter, kafka-ui) reaches the broker via the compose network.
+      # Host-side clients via 127.0.0.1:9092 get back `kafka:9092`, which does
+      # not resolve on the host - run them inside the network instead (see the
+      # SECURITY note at the top of this file).
       KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092"
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
       KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
@@ -42,7 +61,10 @@ services:
     image: provectuslabs/kafka-ui:latest
     container_name: vtop-kafka-ui
     ports:
-      - "8080:8080"
+      - "${VTOP_BIND_ADDR:-127.0.0.1}:8080:8080"
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 1024  # JVM
     environment:
       KAFKA_CLUSTERS_0_NAME: vtop-lab
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
@@ -56,6 +78,9 @@ services:
   kafka-init:
     image: apache/kafka:4.3.1
     container_name: vtop-kafka-init
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
     depends_on:
       kafka:
         condition: service_healthy
@@ -81,11 +106,17 @@ services:
     container_name: vtop-minio
     command: server /data --console-address ":9001"
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "${VTOP_BIND_ADDR:-127.0.0.1}:9000:9000"
+      - "${VTOP_BIND_ADDR:-127.0.0.1}:9001:9001"
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      # LAB-GRADE credentials, overridable via .env (see .env.example). If you
+      # change them, set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY to match —
+      # the engine and minio-init authenticate with the same pair.
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
       # MinIO's /minio/v2/metrics/* endpoints require a bearer token by default,
       # which returns 403 to an unauthenticated scraper and leaves every MinIO
       # dashboard panel on "No data". Making metrics public here (not only in the
@@ -106,6 +137,12 @@ services:
   minio-init:
     image: minio/mc:latest
     container_name: vtop-minio-init
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
     depends_on:
       minio:
         condition: service_healthy
@@ -113,7 +150,7 @@ services:
     command:
       - |
         set -e
-        mc alias set local http://minio:9000 minioadmin minioadmin
+        mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"
         # One bucket per data format (the engine also auto-creates missing ones
         # when upload.create_bucket=true).
         for b in telemetry-data telemetry-cef telemetry-leef telemetry-json telemetry-jsonl telemetry-syslog telemetry-raw; do
@@ -127,6 +164,9 @@ services:
       context: .
       dockerfile: docker/Dockerfile
     container_name: vtop-engine
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
     depends_on:
       kafka:
         condition: service_healthy
@@ -139,7 +179,8 @@ services:
       kafka-init:
         condition: service_completed_successfully
     environment:
-      # Lab-only credentials for the native S3 backend talking to MinIO.
+      # Lab-only credentials for the native S3 backend talking to MinIO. Must
+      # match MINIO_ROOT_USER / MINIO_ROOT_PASSWORD if you override those.
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-minioadmin}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-minioadmin}
       AWS_REGION: ${AWS_REGION:-us-east-1}
@@ -171,6 +212,9 @@ services:
     container_name: vtop-kafka-load
     profiles: ["load"]
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
     depends_on:
       kafka:
         condition: service_healthy
@@ -194,6 +238,9 @@ services:
     image: rsyslog/syslog_appliance_alpine:latest
     container_name: vtop-rsyslog
     profiles: ["syslog"]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
     volumes:
       - ./data/spool:/var/log/spool
 

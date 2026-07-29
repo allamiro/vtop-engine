@@ -329,12 +329,16 @@ Multi-writer recovery:
     lease_owner/lease_until, so two instances never recover the same batch.
 ```
 
-### 8.1 Ledger retention / pruning **[PROPOSED]**
+### 8.1 Ledger retention / pruning **[IMPLEMENTED — incremental delete, #128]**
 ```text
 • keep ACTIVE, FAILED, REPLAY_REQUIRED, and recent SOURCE_COMMITTED rows hot;
-• archive old SOURCE_COMMITTED rows to cold tables / object storage;
-• retain enough for audit, replay, and compliance;
-• prune by tenant / source / date / status.
+• delete old SOURCE_COMMITTED rows incrementally (idle cycles, bounded
+  batches), always retaining the per-path max-end_byte row so recovery
+  cursor seeding is unchanged;
+• engine.ledger_retention_days / ledger_prune_batch drive engine-side
+  pruning on SQLite; PostgreSQL denies runtime DELETE by design, so pruning
+  there is a scheduled vtopctl prune-ledger under a maintenance identity;
+• archival to cold tables / object storage remains a future extension.
 ```
 
 ---

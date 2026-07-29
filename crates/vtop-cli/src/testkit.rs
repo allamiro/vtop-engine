@@ -33,6 +33,8 @@ pub fn file_config(
             work_retention_seconds: 86_400,
             work_max_bytes: 10 * 1024 * 1024 * 1024,
             log_level: "warn".into(),
+            ledger_retention_days: None,
+            ledger_prune_batch: 500,
         },
         batching: BatchingConfig {
             max_records: 10_000,

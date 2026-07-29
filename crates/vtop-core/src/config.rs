@@ -67,6 +67,20 @@ pub struct EngineConfig {
     pub work_max_bytes: u64,
     #[serde(default = "default_log_level")]
     pub log_level: String,
+    /// Prune SOURCE_COMMITTED ledger rows older than this many days (#128).
+    /// `None` (default) disables pruning. The row carrying the highest
+    /// committed end_byte per source path is always retained, so recovery
+    /// cursor seeding is byte-for-byte unchanged by pruning.
+    #[serde(default)]
+    pub ledger_retention_days: Option<u32>,
+    /// Maximum rows deleted per prune pass. Pruning runs only on idle
+    /// cycles and in bounded batches so it never blocks the hot path.
+    #[serde(default = "default_ledger_prune_batch")]
+    pub ledger_prune_batch: u32,
+}
+
+fn default_ledger_prune_batch() -> u32 {
+    500
 }
 
 /// Serializable reference to the engine's state-store connection.
@@ -521,6 +535,14 @@ impl VtopConfig {
 
     /// Enforce invariants that cannot be expressed by the type system.
     pub fn validate(&self) -> Result<(), VtopError> {
+        if self.engine.ledger_prune_batch == 0 {
+            return Err(VtopError::Config(
+                "engine.ledger_prune_batch must be at least 1; unset \
+                 engine.ledger_retention_days to disable pruning"
+                    .into(),
+            ));
+        }
+
         self.engine.state_store.validate()?;
         if self
             .manifest_mac_key_env

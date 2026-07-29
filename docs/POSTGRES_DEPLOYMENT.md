@@ -46,6 +46,22 @@ engine:
        ON TABLE public.batches FROM vtop_runtime;
    ```
 
+   Ledger retention (#128) is a MAINTENANCE operation, not a runtime one:
+   the runtime role keeps its DELETE denial, and the engine refuses
+   `engine.ledger_retention_days` on PostgreSQL at startup. Schedule
+   `vtopctl prune-ledger --older-than-days N` (cron/systemd timer) with a
+   dedicated maintenance identity instead:
+
+   ```sql
+   GRANT CONNECT ON DATABASE vtop TO vtop_maintenance;
+   GRANT USAGE ON SCHEMA public TO vtop_maintenance;
+   GRANT SELECT, DELETE ON TABLE public.batches TO vtop_maintenance;
+   ```
+
+   The prune predicate itself protects recovery: only SOURCE_COMMITTED rows
+   below the age cutoff whose per-path max-end_byte successor survives are
+   deleted, so cursor seeding is unchanged by any prune.
+
 3. In the engine workload, make the same `VTOP_STATE_STORE` reference resolve
    to the runtime role's URL. Do not mount the migration secret into the engine
    container.

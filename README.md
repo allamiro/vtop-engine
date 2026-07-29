@@ -439,6 +439,16 @@ only schema `USAGE` and `SELECT, INSERT, UPDATE` on `batches`. See
 
 The Docker lab provides Kafka, MinIO, seeded telemetry, and the VTOP engine.
 
+**Local-only by default (issue #81):** every published port binds to
+`127.0.0.1`, so the lab is not reachable from the network. The credentials
+below are lab-grade public defaults — the loopback bind, not the password, is
+the security boundary. To deliberately re-expose the lab on a trusted network:
+`VTOP_BIND_ADDR=0.0.0.0 docker compose up -d`. All lab credentials are
+overridable via `.env` (`MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD`,
+`GRAFANA_ADMIN_USER` / `GRAFANA_ADMIN_PASSWORD` — see `.env.example`). The
+optional observability stack's Alloy mounts the host Docker socket read-only;
+treat that as a privileged handle — it can read every container's logs.
+
 | Service | Purpose |
 |---|---|
 | `kafka` | test Kafka broker |
@@ -449,13 +459,17 @@ The Docker lab provides Kafka, MinIO, seeded telemetry, and the VTOP engine.
 | `vtop-engine` | VTOP runtime |
 | `rsyslog` | optional syslog collector profile |
 
-MinIO endpoints:
+MinIO endpoints (loopback only):
 
 ```text
 API:     http://localhost:9000
 Console: http://localhost:9001
 Bucket:  telemetry-data
 ```
+
+Host-side Kafka clients cannot use `127.0.0.1:9092`: the broker advertises its
+in-network name `kafka:9092`. Run producers/consumers inside the compose
+network (as `scripts/e2e-smoke.sh` does).
 
 Start the lab:
 

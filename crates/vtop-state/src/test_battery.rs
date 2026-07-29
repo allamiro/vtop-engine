@@ -78,6 +78,14 @@ pub async fn run_all(store: &dyn StateStore) {
     claims_respect_live_leases_and_take_over_expired_ones(store).await;
 }
 
+/// #128 prune contract, separated from [`run_all`] because pruning DELETEs
+/// rows: it is a MAINTENANCE-identity operation. The PostgreSQL battery runs
+/// it with the migrator/owner connection; the runtime role is denied DELETE
+/// by design and must keep failing it.
+pub async fn run_prune_battery(store: &dyn StateStore) {
+    prune_preserves_cursor_seeds_and_bounds_deletion(store).await;
+}
+
 async fn empty_store_is_empty(store: &dyn StateStore) {
     assert!(
         store.list_batches().await.unwrap().is_empty(),
@@ -361,4 +369,152 @@ async fn claims_respect_live_leases_and_take_over_expired_ones(store: &dyn State
         !ids.contains(&"claim-dead"),
         "a batch transferred under a live lease must not bounce back: {ids:?}"
     );
+}
+
+/// #128: pruning committed history must never move a recovery cursor, never
+/// touch non-committed rows, never delete past the age cutoff, and always
+/// honor the batch limit.
+async fn prune_preserves_cursor_seeds_and_bounds_deletion(store: &dyn StateStore) {
+    let file_marker = |path: &str, end: u64| ProgressMarker::File {
+        path: path.into(),
+        inode: None,
+        start_byte: 0,
+        end_byte: end,
+        file_size: end,
+        mtime: String::new(),
+    };
+    let record = |id: &str, source_type: SourceType, name: &str, marker: ProgressMarker| {
+        let mut r = sample_record(id);
+        r.source_type = source_type;
+        r.source_name = name.into();
+        r.progress_start = marker.clone();
+        r.progress_end = marker;
+        r
+    };
+    let committed = [
+        record(
+            "pr-a10",
+            SourceType::File,
+            "dir-src",
+            file_marker("/logs/a", 10),
+        ),
+        record(
+            "pr-a20",
+            SourceType::File,
+            "dir-src",
+            file_marker("/logs/a", 20),
+        ),
+        record(
+            "pr-a30",
+            SourceType::File,
+            "dir-src",
+            file_marker("/logs/a", 30),
+        ),
+        record(
+            "pr-b05",
+            SourceType::File,
+            "dir-src",
+            file_marker("/logs/b", 5),
+        ),
+        record(
+            "pr-k01",
+            SourceType::Kafka,
+            "app_events",
+            sample_record("x").progress_end,
+        ),
+        record(
+            "pr-k02",
+            SourceType::Kafka,
+            "app_events",
+            sample_record("x").progress_end,
+        ),
+    ];
+    for rec in &committed {
+        store.save_batch_state(rec).await.unwrap();
+        for st in LEGAL_WALK {
+            store
+                .update_batch_state(&rec.batch_id, st, &BatchPatch::default())
+                .await
+                .unwrap();
+        }
+    }
+    // A VERIFIED row on the same path with a HIGHER end_byte: it must be
+    // ignored by both the seed aggregate and the prune (state protection).
+    let verified = record(
+        "pr-v40",
+        SourceType::File,
+        "dir-src",
+        file_marker("/logs/a", 40),
+    );
+    store.save_batch_state(&verified).await.unwrap();
+    for st in &LEGAL_WALK[..6] {
+        store
+            .update_batch_state("pr-v40", *st, &BatchPatch::default())
+            .await
+            .unwrap();
+    }
+
+    // The battery shares one store across checks, so earlier residue may
+    // contribute additional paths; assert on this check's paths and on
+    // before/after invariance rather than absolute contents.
+    let mut seeds_before = store
+        .max_committed_end_bytes(SourceType::File)
+        .await
+        .unwrap();
+    seeds_before.sort();
+    assert!(seeds_before.contains(&("/logs/a".to_string(), 30)));
+    assert!(seeds_before.contains(&("/logs/b".to_string(), 5)));
+
+    // Nothing is older than the epoch: age protection deletes zero rows.
+    assert_eq!(
+        store
+            .prune_committed_history("1970-01-01T00:00:00+00:00", 100)
+            .await
+            .unwrap(),
+        0
+    );
+
+    // Deletable set under a future cutoff: pr-a10, pr-a20 (path /logs/a has a
+    // greater committed row), pr-k01 (newer kafka row exists). Protected:
+    // pr-a30 and pr-b05 (per-path maxima), pr-k02 (newest for its source),
+    // pr-v40 (not SOURCE_COMMITTED).
+    let future = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+    assert_eq!(
+        store.prune_committed_history(&future, 1).await.unwrap(),
+        1,
+        "the batch limit bounds every pass"
+    );
+    // Drain in bounded passes until quiescent: incremental pruning must
+    // converge and a converged store must report zero.
+    let mut passes = 0;
+    while store.prune_committed_history(&future, 2).await.unwrap() > 0 {
+        passes += 1;
+        assert!(passes < 64, "pruning must converge");
+    }
+    assert_eq!(
+        store.prune_committed_history(&future, 100).await.unwrap(),
+        0
+    );
+
+    let mut seeds_after = store
+        .max_committed_end_bytes(SourceType::File)
+        .await
+        .unwrap();
+    seeds_after.sort();
+    assert_eq!(
+        seeds_before, seeds_after,
+        "cursor seeds are prune-invariant"
+    );
+    for survivor in ["pr-a30", "pr-b05", "pr-k02", "pr-v40"] {
+        assert!(
+            store.get_batch(survivor).await.unwrap().is_some(),
+            "{survivor} must survive"
+        );
+    }
+    for deleted in ["pr-a10", "pr-a20", "pr-k01"] {
+        assert!(
+            store.get_batch(deleted).await.unwrap().is_none(),
+            "{deleted} must be pruned"
+        );
+    }
 }

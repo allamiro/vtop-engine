@@ -491,6 +491,49 @@ impl StateStore for PgStateStore {
         )
         .await
     }
+
+    async fn prune_committed_history(
+        &self,
+        older_than: &str,
+        limit: u32,
+    ) -> Result<u64, VtopError> {
+        // Same predicate as the SQLite store: a row is deletable only when a
+        // strictly greater committed row — ordered by (end_byte, updated_at,
+        // batch_id) — exists for its source path, so the per-path
+        // MAX(end_byte) cursor seed always survives.
+        let result = with_retry(|| {
+            sqlx::query(
+                "DELETE FROM batches WHERE batch_id IN ( \
+                    SELECT b.batch_id FROM batches b \
+                    WHERE b.state = $1 AND b.updated_at < $2 \
+                      AND EXISTS ( \
+                        SELECT 1 FROM batches n \
+                        WHERE n.state = $1 \
+                          AND n.source_type = b.source_type \
+                          AND COALESCE(n.progress_end_json::jsonb ->> 'path', n.source_name) \
+                              = COALESCE(b.progress_end_json::jsonb ->> 'path', b.source_name) \
+                          AND ( \
+                            COALESCE((n.progress_end_json::jsonb ->> 'end_byte')::bigint, -1) \
+                              > COALESCE((b.progress_end_json::jsonb ->> 'end_byte')::bigint, -1) \
+                            OR ( \
+                              COALESCE((n.progress_end_json::jsonb ->> 'end_byte')::bigint, -1) \
+                                = COALESCE((b.progress_end_json::jsonb ->> 'end_byte')::bigint, -1) \
+                              AND (n.updated_at > b.updated_at \
+                                   OR (n.updated_at = b.updated_at AND n.batch_id > b.batch_id)) \
+                            ) \
+                          ) \
+                      ) \
+                    LIMIT $3 \
+                )",
+            )
+            .bind(BatchState::SourceCommitted.as_str())
+            .bind(older_than)
+            .bind(i64::from(limit))
+            .execute(&self.pool)
+        })
+        .await?;
+        Ok(result.rows_affected())
+    }
 }
 
 fn row_to_record(row: sqlx::postgres::PgRow) -> Result<BatchRecord, VtopError> {

@@ -155,6 +155,21 @@ pub trait StateStore: Send + Sync {
 
     /// Commit source progress (legal only from `VERIFIED`).
     async fn mark_source_committed(&self, batch_id: &str) -> Result<(), VtopError>;
+
+    /// Incrementally delete old `SOURCE_COMMITTED` history rows (#128).
+    ///
+    /// Deletes at most `limit` rows whose `updated_at` is lexicographically
+    /// below `older_than` (RFC3339 UTC, the format every writer uses) and
+    /// returns the number deleted. Three protections are non-negotiable:
+    /// rows in any other state are never touched; rows at or after the
+    /// cutoff are never touched; and for every source path (falling back to
+    /// `source_name` when the progress marker carries no path) the row with
+    /// the highest committed `end_byte` — ties broken by newest
+    /// `updated_at`, then `batch_id` — is always retained, so
+    /// [`StateStore::max_committed_end_bytes`] returns identical cursor
+    /// seeds before and after any prune.
+    async fn prune_committed_history(&self, older_than: &str, limit: u32)
+        -> Result<u64, VtopError>;
 }
 
 #[cfg(test)]
