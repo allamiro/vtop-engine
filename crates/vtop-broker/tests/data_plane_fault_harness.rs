@@ -274,29 +274,78 @@ impl Cluster {
         }
     }
 
+    /// Paginated: a single 64 KiB page silently truncates once the committed
+    /// prefix outgrows it, which would let completeness assertions pass on a
+    /// diverged suffix. Loop pages until `max_records` records are collected
+    /// or the log stops advancing.
     fn fetch_leader(&self, start_offset: u64, max_records: u32) -> FetchResponse {
-        let frame = WireFrame {
-            request_id: 0,
-            stream_id: 1,
-            message: Message::FetchRequest(FetchRequest {
-                range: self.range.clone(),
-                fencing_epoch: FENCING_EPOCH,
-                start_offset,
-                max_bytes: 64 * 1024,
-                max_records,
-            }),
+        let mut collected = FetchResponse {
+            records: Vec::new(),
+            next_offset: start_offset,
+            committed_high_watermark: 0,
         };
-        match self.leader().handle(Role::Consumer, frame).message {
-            Message::FetchResponse(batch) => batch,
-            Message::Error(err) => panic!("{}: fetch error {err:?}", self.ctx()),
-            other => panic!("{}: unexpected fetch response {other:?}", self.ctx()),
+        loop {
+            let remaining = max_records.saturating_sub(collected.records.len() as u32);
+            if remaining == 0 {
+                return collected;
+            }
+            let frame = WireFrame {
+                request_id: 0,
+                stream_id: 1,
+                message: Message::FetchRequest(FetchRequest {
+                    range: self.range.clone(),
+                    fencing_epoch: FENCING_EPOCH,
+                    start_offset: collected.next_offset,
+                    max_bytes: 64 * 1024,
+                    max_records: remaining,
+                }),
+            };
+            let page = match self.leader().handle(Role::Consumer, frame).message {
+                Message::FetchResponse(page) => page,
+                Message::Error(err) => panic!("{}: fetch error {err:?}", self.ctx()),
+                other => panic!("{}: unexpected fetch response {other:?}", self.ctx()),
+            };
+            let advanced = page.next_offset > collected.next_offset;
+            collected.records.extend(page.records);
+            collected.next_offset = page.next_offset;
+            collected.committed_high_watermark = page.committed_high_watermark;
+            if !advanced || collected.next_offset >= page.committed_high_watermark {
+                return collected;
+            }
         }
     }
 
+    /// Paginated for the same reason as [`Self::fetch_leader`].
     fn fetch_follower(&self, index: usize, start_offset: u64, max_records: usize) -> FetchBatch {
-        self.followers[index]
-            .fetch(start_offset, 64 * 1024, max_records)
-            .unwrap_or_else(|e| panic!("{}: follower {index} fetch: {e}", self.ctx()))
+        let mut collected: Option<FetchBatch> = None;
+        let mut cursor = start_offset;
+        loop {
+            let already = collected.as_ref().map_or(0, |b| b.records.len());
+            let remaining = max_records.saturating_sub(already);
+            if remaining == 0 {
+                return collected.expect("max_records is positive on first pass");
+            }
+            let page = self.followers[index]
+                .fetch(cursor, 64 * 1024, remaining)
+                .unwrap_or_else(|e| panic!("{}: follower {index} fetch: {e}", self.ctx()));
+            let advanced = page.next_offset > cursor;
+            cursor = page.next_offset;
+            match collected.as_mut() {
+                None => collected = Some(page),
+                Some(batch) => {
+                    batch.records.extend(page.records);
+                    batch.encoded_bytes += page.encoded_bytes;
+                    batch.next_offset = page.next_offset;
+                    batch.high_watermark = page.high_watermark;
+                }
+            }
+            let done = collected
+                .as_ref()
+                .is_some_and(|b| b.next_offset >= b.high_watermark);
+            if !advanced || done {
+                return collected.expect("first pass always stores a page");
+            }
+        }
     }
 
     /// Automatic invariant checks required by #188.
