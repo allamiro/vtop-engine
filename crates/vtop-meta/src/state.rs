@@ -273,7 +273,10 @@ pub struct TierCopyRecord {
     pub object_uri: String,
     /// Immutable version of the segment object itself. Without this pin a
     /// later overwrite of `object_uri` could redirect rehydration after local
-    /// replicas have been retired.
+    /// replicas have been retired. Stays `Option` for stored-record and
+    /// legacy-snapshot compatibility; `plan_retention` refuses deletion
+    /// authority on unpinned evidence unless the topic's explicit
+    /// unarchived-deletion policy opts out.
     pub object_version_id: Option<String>,
     /// 0..=[`MAX_TIER_VERSION_ID_BYTES`] bytes; the #135 immutable-version pin.
     pub manifest_version_id: Option<String>,
@@ -3213,7 +3216,7 @@ impl MetaStateMachine {
             segment_uuid,
         }
         .encode();
-        match self.records.get(&tier_key) {
+        let archived = match self.records.get(&tier_key) {
             Some(MetaValue::TierCopy(evidence)) => {
                 // Tier evidence is bound to immutable segment identity (the
                 // key's segment UUID plus the sealed content root), not the
@@ -3225,21 +3228,33 @@ impl MetaStateMachine {
                         "tier evidence content root does not match the sealed segment",
                     ));
                 }
+                // Deletion authority requires an immutable cold copy: without
+                // the object version pin a later overwrite of `object_uri`
+                // could redirect rehydration after the local replicas are
+                // retired. The CLI refuses to commit unpinned evidence, but
+                // the state machine is the trust boundary — a hand-built
+                // admin proposal, or a legacy snapshot record, can carry
+                // `object_version_id: None`. Unpinned evidence counts as NO
+                // archive evidence (the record itself stays as the audit
+                // anchor); the policy branch below is the operator escape
+                // hatch, exactly as if no evidence existed.
+                evidence.object_version_id.is_some()
             }
             Some(_) => unreachable!("tier-copy keys only ever hold tier-copy records"),
-            None => {
-                let policy_key = MetaKey::TopicRetentionPolicy { topic_uuid }.encode();
-                let allowed = matches!(
-                    self.records.get(&policy_key),
-                    Some(MetaValue::TopicRetentionPolicy(policy))
-                        if policy.unarchived_deletion_allowed
-                );
-                // An absent policy record is the fail-closed default.
-                if !allowed {
-                    return reject(MetadataError::invalid_transition(
-                        "retention requires verified tier evidence or an explicit unarchived-deletion policy",
-                    ));
-                }
+            None => false,
+        };
+        if !archived {
+            let policy_key = MetaKey::TopicRetentionPolicy { topic_uuid }.encode();
+            let allowed = matches!(
+                self.records.get(&policy_key),
+                Some(MetaValue::TopicRetentionPolicy(policy))
+                    if policy.unarchived_deletion_allowed
+            );
+            // An absent policy record is the fail-closed default.
+            if !allowed {
+                return reject(MetadataError::invalid_transition(
+                    "retention requires pinned tier evidence or an explicit unarchived-deletion policy",
+                ));
             }
         }
 
@@ -3400,6 +3415,8 @@ impl MetaStateMachine {
         // more replicas, so restoring Verified here would make possibly
         // deleted replicas readable again. Recovery must complete retention
         // or establish fresh verified placement evidence through repair.
+        // The command is deprecated — retained on the wire for
+        // compatibility only — and every path below fails closed.
         reject(MetadataError::invalid_transition(
             "retention cannot be cancelled after deletion is authorized",
         ))

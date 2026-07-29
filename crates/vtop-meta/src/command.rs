@@ -442,10 +442,11 @@ pub enum MetadataCommand {
         segment_uuid: Uuid,
         expected_segment_generation: u64,
     },
-    /// Revert a mistaken plan before deletion is confirmed:
-    /// `RetentionPlanned -> Verified`. Local bytes were never deleted
-    /// (deletion is only authorized between plan and confirm), so the
-    /// reversal is safe.
+    /// Deprecated: always rejected (fails closed) since #184. `PlanRetention`
+    /// is durable deletion authority and the state machine cannot prove no
+    /// worker already removed replicas, so `RetentionPlanned` is terminal —
+    /// recovery must complete retention or repair. Retained only for wire
+    /// compatibility; do not send.
     CancelRetention {
         env: CommandEnvelope,
         topic_uuid: Uuid,
