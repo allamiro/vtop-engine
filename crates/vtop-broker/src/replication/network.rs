@@ -535,6 +535,7 @@ impl FollowerChannel {
             leader_committed_offset,
             bytes,
             response_tx,
+            catch_up_charged: false,
         };
         if self.cmd_tx.try_send(cmd).is_err() {
             // Channel / window pressure: treat as a missed ack so a slow
@@ -565,6 +566,12 @@ enum FollowerCmd {
         leader_committed_offset: u64,
         bytes: usize,
         response_tx: oneshot::Sender<FollowerReplicateResult>,
+        /// True when this batch still owns a catch-up charge taken while it
+        /// sat in the retransmission buffer. The charge TRANSFERS with the
+        /// batch — releasing it while `pending` still holds the same record
+        /// buffers would let a stalled follower hide most of
+        /// `max_retransmission_bytes` from the process ceiling.
+        catch_up_charged: bool,
     },
     PropagateHwm {
         update: CommittedHwmUpdate,
@@ -616,7 +623,10 @@ impl FollowerDriver {
                 )
                 .await
             {
-                SessionOutcome::Shutdown => return,
+                SessionOutcome::Shutdown => {
+                    release_pending_catch_up(&mut pending, &self.budget);
+                    return;
+                }
                 SessionOutcome::Disconnected => {
                     self.channel.connected.store(false, Ordering::SeqCst);
                     sleep(self.flow.reconnect_backoff).await;
@@ -713,12 +723,7 @@ impl FollowerDriver {
                     // and re-taken by `push_retransmission` when a batch is
                     // actually re-sent, so every byte is charged exactly once
                     // while it occupies the retransmission buffer.
-                    drain_retransmission_to_pending(
-                        pending,
-                        retransmission,
-                        retransmission_bytes,
-                        &self.budget,
-                    );
+                    drain_retransmission_to_pending(pending, retransmission, retransmission_bytes);
                 }
                 _ => return SessionOutcome::Disconnected,
             }
@@ -736,6 +741,7 @@ impl FollowerDriver {
                     leader_committed_offset,
                     bytes,
                     response_tx,
+                    catch_up_charged,
                 }) = pending.pop_front()
                 else {
                     break;
@@ -746,6 +752,7 @@ impl FollowerDriver {
                         leader_committed_offset,
                         bytes,
                         response_tx,
+                        catch_up_charged,
                     });
                     break;
                 }
@@ -763,6 +770,7 @@ impl FollowerDriver {
                         leader_committed_offset,
                         bytes,
                         response_tx,
+                        catch_up_charged,
                     )
                     .await
                 {
@@ -813,9 +821,15 @@ impl FollowerDriver {
                             leader_committed_offset,
                             bytes,
                             response_tx,
+                            catch_up_charged,
                         }) => {
                             if !window_allows(inflight.len(), inflight_bytes, bytes, &self.flow) {
                                 // Slow follower: miss this ack rather than stall.
+                                // A transferred charge dies with the dropped
+                                // batch, so release it here.
+                                if catch_up_charged {
+                                    self.budget.release_catch_up(bytes as u64);
+                                }
                                 drop(response_tx);
                                 continue;
                             }
@@ -833,6 +847,7 @@ impl FollowerDriver {
                                     leader_committed_offset,
                                     bytes,
                                     response_tx,
+                                    catch_up_charged,
                                 )
                                 .await
                             {
@@ -854,6 +869,7 @@ impl FollowerDriver {
         leader_committed_offset: u64,
         bytes: usize,
         response_tx: oneshot::Sender<FollowerReplicateResult>,
+        catch_up_charged: bool,
     ) -> Result<(), SessionOutcome> {
         let request_id = *state.next_request_id;
         *state.next_request_id = state.next_request_id.wrapping_add(1);
@@ -879,6 +895,11 @@ impl FollowerDriver {
             message,
         };
         if write_frame(stream, &frame, REPLICA_LIMITS).await.is_err() {
+            if catch_up_charged {
+                // The batch never re-entered the buffer; its transferred
+                // charge dies with this session.
+                self.budget.release_catch_up(bytes as u64);
+            }
             drop(response_tx);
             return Err(SessionOutcome::Disconnected);
         }
@@ -892,6 +913,7 @@ impl FollowerDriver {
                 bytes,
             },
             &self.budget,
+            catch_up_charged,
         );
         *state.inflight_bytes = state.inflight_bytes.saturating_add(bytes);
         state.inflight.insert(
@@ -1010,6 +1032,10 @@ fn requeue_inflight(
             leader_committed_offset: entry.leader_committed_offset,
             bytes: entry.bytes,
             response_tx: oneshot::channel().0,
+            // Batches still held in the retransmission buffer keep their
+            // charge there (skipped above); anything reaching here was never
+            // buffered, so it carries no charge.
+            catch_up_charged: false,
         });
     }
 }
@@ -1020,9 +1046,12 @@ fn push_retransmission(
     max_bytes: usize,
     batch: BufferedBatch,
     budget: &FollowerBudget,
+    already_charged: bool,
 ) {
-    // Prefer failing closed on catch-up budget before growing the buffer.
-    if budget.try_charge_catch_up(batch.bytes as u64).is_err() {
+    // Prefer failing closed on catch-up budget before growing the buffer. A
+    // batch carrying a transferred charge is already accounted for: charging
+    // again would double-count it against the ceiling.
+    if !already_charged && budget.try_charge_catch_up(batch.bytes as u64).is_err() {
         return;
     }
     buffer.push_back(batch);
@@ -1038,25 +1067,46 @@ fn push_retransmission(
 }
 
 /// Move buffered batches back into `pending` for retransmission after a
-/// reconnect, releasing their catch-up charges. `push_retransmission`
-/// re-charges when a batch is actually re-sent, so every byte is charged
-/// exactly once while it occupies the buffer and released exactly once.
+/// reconnect, TRANSFERRING their catch-up charges with them. The bytes are
+/// still owned (the same record buffers now sit in `pending`, without
+/// producer-side inflight reservations), so releasing here would let a
+/// stalled follower keep most of `max_retransmission_bytes` unaccounted
+/// while other allocations are admitted past the process ceiling. Each
+/// charge is released exactly once: when the bytes are acknowledged,
+/// evicted from the buffer, or dropped with their session.
 fn drain_retransmission_to_pending(
     pending: &mut VecDeque<FollowerCmd>,
     buffer: &mut VecDeque<BufferedBatch>,
     buffer_bytes: &mut usize,
-    budget: &FollowerBudget,
 ) {
     while let Some(batch) = buffer.pop_back() {
         *buffer_bytes = buffer_bytes.saturating_sub(batch.bytes);
-        budget.release_catch_up(batch.bytes as u64);
         pending.push_front(FollowerCmd::Replicate {
             requests: batch.requests,
             leader_committed_offset: batch.leader_committed_offset,
             bytes: batch.bytes,
             // Catch-up has no producer waiter; durable_offset still advances.
             response_tx: oneshot::channel().0,
+            catch_up_charged: true,
         });
+    }
+}
+
+/// Release any catch-up charges still carried by queued batches. Called when
+/// a session ends so transferred charges never outlive the bytes.
+fn release_pending_catch_up(pending: &mut VecDeque<FollowerCmd>, budget: &FollowerBudget) {
+    for cmd in pending.iter_mut() {
+        if let FollowerCmd::Replicate {
+            bytes,
+            catch_up_charged,
+            ..
+        } = cmd
+        {
+            if *catch_up_charged {
+                budget.release_catch_up(*bytes as u64);
+                *catch_up_charged = false;
+            }
+        }
     }
 }
 
@@ -1199,29 +1249,32 @@ mod tests {
             1_024,
             test_batch(0, 100),
             &budget,
+            false,
         );
         assert_eq!(budget.catch_up_used_bytes(), 100);
         assert_eq!(buffer_bytes, 100);
 
-        // Reconnect: buffered entries move to pending and their catch-up
-        // charge is released; the buffer no longer holds them.
-        drain_retransmission_to_pending(&mut pending, &mut buffer, &mut buffer_bytes, &budget);
+        // Reconnect: buffered entries move to pending CARRYING their catch-up
+        // charge — the bytes are still resident, now owned by `pending`.
+        drain_retransmission_to_pending(&mut pending, &mut buffer, &mut buffer_bytes);
         assert!(buffer.is_empty());
         assert_eq!(buffer_bytes, 0);
-        assert_eq!(budget.catch_up_used_bytes(), 0);
+        assert_eq!(budget.catch_up_used_bytes(), 100);
         assert_eq!(pending.len(), 1);
 
-        // The re-send re-buffers and re-charges exactly once (no double
-        // charge, no duplicated buffer entry).
+        // The re-send re-buffers without charging again (no double charge, no
+        // duplicated buffer entry).
         let Some(FollowerCmd::Replicate {
             requests,
             leader_committed_offset,
             bytes,
+            catch_up_charged,
             ..
         }) = pending.pop_front()
         else {
             panic!("expected replicate command");
         };
+        assert!(catch_up_charged);
         push_retransmission(
             &mut buffer,
             &mut buffer_bytes,
@@ -1232,10 +1285,71 @@ mod tests {
                 bytes,
             },
             &budget,
+            catch_up_charged,
         );
         assert_eq!(budget.catch_up_used_bytes(), 100);
         assert_eq!(buffer.len(), 1);
         assert_eq!(buffer_bytes, 100);
+    }
+
+    #[test]
+    fn reconnect_drain_transfers_catch_up_charges_instead_of_releasing_them() {
+        let (_pool, budget) = test_budget();
+        let mut buffer = VecDeque::new();
+        let mut buffer_bytes = 0usize;
+        for index in 0..3 {
+            push_retransmission(
+                &mut buffer,
+                &mut buffer_bytes,
+                1_024,
+                test_batch(index, 100),
+                &budget,
+                false,
+            );
+        }
+        assert_eq!(budget.catch_up_used_bytes(), 300);
+
+        // Draining for retransmission must not release: `pending` now owns
+        // the same record buffers, so the bytes are still resident.
+        let mut pending = VecDeque::new();
+        drain_retransmission_to_pending(&mut pending, &mut buffer, &mut buffer_bytes);
+        assert_eq!(pending.len(), 3);
+        assert_eq!(buffer_bytes, 0);
+        assert_eq!(
+            budget.catch_up_used_bytes(),
+            300,
+            "charges transfer with the batches"
+        );
+        assert!(pending.iter().all(|cmd| matches!(
+            cmd,
+            FollowerCmd::Replicate {
+                catch_up_charged: true,
+                ..
+            }
+        )));
+
+        // Re-buffering a transferred batch must not double-charge it.
+        if let Some(FollowerCmd::Replicate { bytes, .. }) = pending.pop_front() {
+            push_retransmission(
+                &mut buffer,
+                &mut buffer_bytes,
+                1_024,
+                test_batch(9, bytes),
+                &budget,
+                true,
+            );
+        }
+        assert_eq!(budget.catch_up_used_bytes(), 300);
+
+        // Ending the session releases whatever the queue still carries.
+        release_pending_catch_up(&mut pending, &budget);
+        assert_eq!(budget.catch_up_used_bytes(), 100);
+        release_pending_catch_up(&mut pending, &budget);
+        assert_eq!(
+            budget.catch_up_used_bytes(),
+            100,
+            "release is idempotent per batch"
+        );
     }
 
     #[test]
@@ -1249,6 +1363,7 @@ mod tests {
             1_024,
             test_batch(0, 100),
             &budget,
+            false,
         );
         let buffered_requests = Arc::clone(&buffer.front().unwrap().requests);
         // An inflight entry the buffer does not hold (charge-failed / evicted).
