@@ -45,7 +45,51 @@ CREATE TABLE IF NOT EXISTS batches (
 );
 CREATE INDEX IF NOT EXISTS idx_batches_state ON batches(state);
 CREATE INDEX IF NOT EXISTS idx_batches_source ON batches(source_type, source_name);
+CREATE INDEX IF NOT EXISTS idx_batches_commit_cursor ON batches(
+    state,
+    source_type,
+    COALESCE(json_extract(progress_end_json, '$.path'), source_name),
+    COALESCE(CAST(json_extract(progress_end_json, '$.end_byte') AS INTEGER), -1)
+);
 "#;
+
+/// Prune predicate shared between the store method and the plan-shape test.
+/// A row is deletable only when a strictly "greater" committed row — ordered
+/// by (end_byte, updated_at, batch_id) — exists for the same source path
+/// (source_name when the marker has no path). Exactly one row per path group
+/// has no successor, so the per-path MAX(end_byte) aggregate that seeds
+/// recovery cursors is preserved verbatim.
+///
+/// The successor probe expressions must stay textually identical to the
+/// `idx_batches_commit_cursor` expressions above: SQLite matches expression
+/// indexes structurally, and without the index every candidate row rescans
+/// the entire committed set (quadratic on the engine's idle-cycle pass).
+macro_rules! prune_committed_sql {
+    () => {
+        "DELETE FROM batches WHERE batch_id IN ( \
+            SELECT b.batch_id FROM batches b \
+            WHERE b.state = ?1 AND b.updated_at < ?2 \
+              AND EXISTS ( \
+                SELECT 1 FROM batches n \
+                WHERE n.state = ?1 \
+                  AND n.source_type = b.source_type \
+                  AND COALESCE(json_extract(n.progress_end_json, '$.path'), n.source_name) \
+                      = COALESCE(json_extract(b.progress_end_json, '$.path'), b.source_name) \
+                  AND ( \
+                    COALESCE(CAST(json_extract(n.progress_end_json, '$.end_byte') AS INTEGER), -1) \
+                      > COALESCE(CAST(json_extract(b.progress_end_json, '$.end_byte') AS INTEGER), -1) \
+                    OR ( \
+                      COALESCE(CAST(json_extract(n.progress_end_json, '$.end_byte') AS INTEGER), -1) \
+                        = COALESCE(CAST(json_extract(b.progress_end_json, '$.end_byte') AS INTEGER), -1) \
+                      AND (n.updated_at > b.updated_at \
+                           OR (n.updated_at = b.updated_at AND n.batch_id > b.batch_id)) \
+                    ) \
+                  ) \
+              ) \
+            LIMIT ?3 \
+        )"
+    };
+}
 
 /// Handle to the persistent SQLite state store.
 #[derive(Clone)]
@@ -340,41 +384,13 @@ impl StateStore for SqliteStateStore {
         older_than: &str,
         limit: u32,
     ) -> Result<u64, VtopError> {
-        // A row is deletable only when a strictly "greater" committed row —
-        // ordered by (end_byte, updated_at, batch_id) — exists for the same
-        // source path (source_name when the marker has no path). Exactly one
-        // row per path group has no successor, so the per-path MAX(end_byte)
-        // aggregate that seeds recovery cursors is preserved verbatim.
-        let result = sqlx::query(
-            "DELETE FROM batches WHERE batch_id IN ( \
-                SELECT b.batch_id FROM batches b \
-                WHERE b.state = ?1 AND b.updated_at < ?2 \
-                  AND EXISTS ( \
-                    SELECT 1 FROM batches n \
-                    WHERE n.state = ?1 \
-                      AND n.source_type = b.source_type \
-                      AND COALESCE(json_extract(n.progress_end_json, '$.path'), n.source_name) \
-                          = COALESCE(json_extract(b.progress_end_json, '$.path'), b.source_name) \
-                      AND ( \
-                        COALESCE(CAST(json_extract(n.progress_end_json, '$.end_byte') AS INTEGER), -1) \
-                          > COALESCE(CAST(json_extract(b.progress_end_json, '$.end_byte') AS INTEGER), -1) \
-                        OR ( \
-                          COALESCE(CAST(json_extract(n.progress_end_json, '$.end_byte') AS INTEGER), -1) \
-                            = COALESCE(CAST(json_extract(b.progress_end_json, '$.end_byte') AS INTEGER), -1) \
-                          AND (n.updated_at > b.updated_at \
-                               OR (n.updated_at = b.updated_at AND n.batch_id > b.batch_id)) \
-                        ) \
-                      ) \
-                  ) \
-                LIMIT ?3 \
-            )",
-        )
-        .bind(BatchState::SourceCommitted.as_str())
-        .bind(older_than)
-        .bind(limit)
-        .execute(&self.pool)
-        .await
-        .map_err(map_sqlx)?;
+        let result = sqlx::query(prune_committed_sql!())
+            .bind(BatchState::SourceCommitted.as_str())
+            .bind(older_than)
+            .bind(limit)
+            .execute(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
         Ok(result.rows_affected())
     }
 }
@@ -466,5 +482,30 @@ mod tests {
         // SQLite has no role separation: the same handle is the maintenance
         // identity, so the prune contract runs here directly.
         test_battery::run_prune_battery(&store).await;
+    }
+
+    // The prune successor probe must resolve through idx_batches_commit_cursor;
+    // a correlated scan over idx_batches_state alone made a converged no-op
+    // prune quadratic in the committed row count (PR #213 review). Plan shape,
+    // not timing: EXPLAIN QUERY PLAN either names the index or it regressed.
+    #[tokio::test]
+    async fn sqlite_prune_successor_probe_uses_the_commit_cursor_index() {
+        let store = SqliteStateStore::connect("sqlite::memory:").await.unwrap();
+        let rows = sqlx::query(concat!("EXPLAIN QUERY PLAN ", prune_committed_sql!()))
+            .bind(BatchState::SourceCommitted.as_str())
+            .bind("2026-01-01T00:00:00Z")
+            .bind(500u32)
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+        let plan = rows
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            plan.contains("idx_batches_commit_cursor"),
+            "successor probe no longer uses idx_batches_commit_cursor:\n{plan}"
+        );
     }
 }

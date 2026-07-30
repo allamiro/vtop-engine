@@ -36,6 +36,17 @@ ALTER TABLE batches ADD COLUMN IF NOT EXISTS manifest_version_id TEXT;
 CREATE INDEX IF NOT EXISTS idx_batches_state ON batches(state);
 CREATE INDEX IF NOT EXISTS idx_batches_source ON batches(source_type, source_name);
 
+-- Bounds the successor probe in prune_committed_history: each candidate row
+-- resolves its successor by (state, source_type, path, end_byte) instead of
+-- rescanning every committed row. The expressions must stay identical to the
+-- ones in the prune query.
+CREATE INDEX IF NOT EXISTS idx_batches_commit_cursor ON batches(
+    state,
+    source_type,
+    (COALESCE(progress_end_json::jsonb ->> 'path', source_name)),
+    (COALESCE((progress_end_json::jsonb ->> 'end_byte')::bigint, -1))
+);
+
 -- Database-level backstop for the verify-before-source-commit invariant.
 CREATE OR REPLACE FUNCTION vtop_enforce_commit_after_verify() RETURNS trigger AS $fn$
 BEGIN

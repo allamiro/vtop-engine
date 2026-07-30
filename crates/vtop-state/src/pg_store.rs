@@ -500,7 +500,9 @@ impl StateStore for PgStateStore {
         // Same predicate as the SQLite store: a row is deletable only when a
         // strictly greater committed row — ordered by (end_byte, updated_at,
         // batch_id) — exists for its source path, so the per-path
-        // MAX(end_byte) cursor seed always survives.
+        // MAX(end_byte) cursor seed always survives. The successor probe's
+        // expressions must stay identical to idx_batches_commit_cursor in
+        // migrations/postgres/0001_state_store.sql, which bounds it.
         let result = with_retry(|| {
             sqlx::query(
                 "DELETE FROM batches WHERE batch_id IN ( \
