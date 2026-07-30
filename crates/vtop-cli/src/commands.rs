@@ -87,8 +87,10 @@ pub enum Command {
         /// many days.
         #[arg(long)]
         older_than_days: u32,
-        /// Maximum rows deleted per pass; run repeatedly to drain.
-        #[arg(long, default_value_t = 500)]
+        /// Maximum rows deleted per pass; run repeatedly to drain. Zero is
+        /// rejected: LIMIT 0 would report a "successful" prune that can never
+        /// delete anything.
+        #[arg(long, default_value_t = 500, value_parser = clap::value_parser!(u32).range(1..))]
         limit: u32,
     },
     /// Offline verification tools for sealed native segments. Unlike every
@@ -632,5 +634,46 @@ fn describe_recovery(state: BatchState) -> &'static str {
         RecoveryAction::RetrySourceCommit => "retry the source commit",
         RecoveryAction::None => "do nothing (already committed)",
         _ => "mark REPLAY_REQUIRED (source progress preserved)",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `prune-ledger --limit 0` must fail at argument parsing: the store would
+    // execute LIMIT 0 and report a "successful" zero-row prune, so a scheduled
+    // maintenance run could silently retain all history (PR #213 review).
+    #[test]
+    fn prune_ledger_rejects_a_zero_limit() {
+        let err = Cli::try_parse_from([
+            "vtopctl",
+            "prune-ledger",
+            "--config",
+            "vtop.yaml",
+            "--older-than-days",
+            "30",
+            "--limit",
+            "0",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn prune_ledger_accepts_the_default_limit() {
+        let cli = Cli::try_parse_from([
+            "vtopctl",
+            "prune-ledger",
+            "--config",
+            "vtop.yaml",
+            "--older-than-days",
+            "30",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::PruneLedger { limit, .. } => assert_eq!(limit, 500),
+            other => panic!("parsed wrong command: {other:?}"),
+        }
     }
 }
