@@ -46,7 +46,7 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
       prerelease: ${{ steps.meta.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
           # On workflow_dispatch, build the requested tag rather than the
           # default branch, so a dry-run validates the real release ref.
@@ -135,7 +135,7 @@ jobs:
           - os: macos-15-intel
             target: x86_64-apple-darwin
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
           # On workflow_dispatch, build the requested tag rather than the
           # default branch, so a dry-run validates the real release ref.
@@ -214,7 +214,7 @@ jobs:
       # job's artifact pattern).
       DOCKER_BUILD_RECORD_UPLOAD: false
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
           # On workflow_dispatch, build the requested tag rather than the
           # default branch, so a dry-run validates the real release ref.
@@ -274,7 +274,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
           # On workflow_dispatch, build the requested tag rather than the
           # default branch, so a dry-run validates the real release ref.
@@ -306,7 +306,7 @@ jobs:
       contents: write
       id-token: write # keyless cosign signing for binary archives
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
           # On workflow_dispatch, build the requested tag rather than the
           # default branch, so a dry-run validates the real release ref.
