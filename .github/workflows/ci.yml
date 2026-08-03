@@ -229,7 +229,7 @@ jobs:
         with:
           toolchain: stable
 
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -315,7 +315,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -346,7 +346,7 @@ jobs:
       - uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2
         with:
           tool: cargo-llvm-cov
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -473,7 +473,7 @@ jobs:
       - uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2
         with:
           tool: cargo-fuzz
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -600,7 +600,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: stable
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
