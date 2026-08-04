@@ -7,9 +7,20 @@
 //! strings, canonical option encoding, and trailing-byte rejection.
 //!
 //! Determinism contract: every id in a command (topic, range, segment, key,
-//! request) is proposer-supplied, never allocated by the state machine, and
-//! `issued_at_ms` is advisory — recorded for operators, never read by
-//! `apply`.
+//! request) is proposer-supplied, never allocated by the state machine.
+//!
+//! `issued_at_ms` is advisory for every command EXCEPT the lease-election pair
+//! ([`MetadataCommand::AcquireRangeLease`] and
+//! [`MetadataCommand::RenewRangeLease`], #223), where it is the time the
+//! deadline is computed from. Apply stays deterministic either way — the value
+//! is data in the replicated log, so every replica derives the same expiry —
+//! but wall-clock skew on a PROPOSER does affect lease liveness, and pretending
+//! otherwise would be the kind of comment that costs someone an afternoon.
+//!
+//! Skew is bounded in consequence, not prevented: acquisition always mints a
+//! higher fencing epoch, so a skewed candidate can take a range early and be
+//! disruptive, but can never produce two holders that both believe they may
+//! write. Expiry is liveness; the epoch is safety.
 
 use crate::keys::{MAX_GROUP_NAME_BYTES, MAX_TOPIC_NAME_BYTES};
 use crate::placement::{MAX_FAILURE_DOMAIN_BYTES, MAX_REPLICAS, MIN_PLACEMENT_WEIGHT};
@@ -70,6 +81,12 @@ const COMMAND_KIND_SET_TOPIC_RETENTION_POLICY: u16 = 24;
 const COMMAND_KIND_PLAN_RETENTION: u16 = 25;
 const COMMAND_KIND_CONFIRM_RETENTION_EXPIRED: u16 = 26;
 const COMMAND_KIND_CANCEL_RETENTION: u16 = 27;
+// Lease election (#223). `GrantRangeLease` stays exactly as it was — an
+// administrative, never-expiring grant — and these are the two commands the
+// automatic election loop uses. New kinds rather than new fields on kind 4, so
+// every pinned golden vector for the existing command stays byte-exact.
+const COMMAND_KIND_ACQUIRE_RANGE_LEASE: u16 = 28;
+const COMMAND_KIND_RENEW_RANGE_LEASE: u16 = 29;
 
 const RESPONSE_KIND_ACK: u16 = 1;
 const RESPONSE_KIND_TOPIC_CREATED: u16 = 2;
@@ -88,8 +105,12 @@ const ERROR_KIND_LIMIT: u16 = 6;
 const ERROR_KIND_LINEAGE_MISMATCH: u16 = 7;
 
 /// Common prefix of every command. `request_id` keys the exactly-once dedup
-/// table; `issued_at_ms` comes from the proposer's advisory clock and is
-/// never read by `apply`, so wall-clock skew cannot change state.
+/// table.
+///
+/// `issued_at_ms` comes from the proposer's clock. It is advisory for every
+/// command except the lease-election pair (#223), which derives a lease
+/// deadline from it — see the module docs for what that does and does not
+/// expose to clock skew.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CommandEnvelope {
     pub request_id: Uuid,
@@ -208,6 +229,40 @@ pub enum MetadataCommand {
         topic_uuid: Uuid,
         range_uuid: Uuid,
         expected_fencing_epoch: u64,
+    },
+    /// Take range leadership, respecting an unexpired lease held by someone
+    /// else (#223).
+    ///
+    /// The election path, as distinct from [`MetadataCommand::GrantRangeLease`]
+    /// — which is the administrative grant and carries no expiry. Raft makes
+    /// this linearizable, so exactly one candidate can win a term; the mint of
+    /// `fencing_epoch + 1` fences the previous holder by construction, with no
+    /// unclean-election knob to misconfigure.
+    ///
+    /// `lease_duration_ms` is added to the envelope's `issued_at_ms` to form
+    /// the deadline. Both are data in the replicated log, so every replica
+    /// computes the same expiry — the state machine never reads a local clock.
+    AcquireRangeLease {
+        env: CommandEnvelope,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        holder_node_uuid: Uuid,
+        expected_range_generation: u64,
+        lease_duration_ms: u64,
+    },
+    /// Extend the current holder's deadline without minting a new epoch, so a
+    /// live leader keeps serving across renewals (#223).
+    ///
+    /// Rejected unless the caller is the recorded holder AND names the current
+    /// epoch: a renewal from a leader that has already been fenced must fail,
+    /// or a partitioned old leader could keep its lease alive forever.
+    RenewRangeLease {
+        env: CommandEnvelope,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        holder_node_uuid: Uuid,
+        expected_fencing_epoch: u64,
+        lease_duration_ms: u64,
     },
     RegisterSealedSegment {
         env: CommandEnvelope,
@@ -463,6 +518,8 @@ impl MetadataCommand {
             | MetadataCommand::SetNodeState { env, .. }
             | MetadataCommand::CreateTopic { env, .. }
             | MetadataCommand::GrantRangeLease { env, .. }
+            | MetadataCommand::AcquireRangeLease { env, .. }
+            | MetadataCommand::RenewRangeLease { env, .. }
             | MetadataCommand::ReleaseRangeLease { env, .. }
             | MetadataCommand::RegisterSealedSegment { env, .. }
             | MetadataCommand::MarkSegmentVerified { env, .. }
@@ -553,6 +610,38 @@ impl MetadataCommand {
                 put_uuid(&mut out, *topic_uuid);
                 put_uuid(&mut out, *range_uuid);
                 put_u64(&mut out, *expected_fencing_epoch);
+            }
+            MetadataCommand::AcquireRangeLease {
+                env,
+                topic_uuid,
+                range_uuid,
+                holder_node_uuid,
+                expected_range_generation,
+                lease_duration_ms,
+            } => {
+                put_u16(&mut out, COMMAND_KIND_ACQUIRE_RANGE_LEASE);
+                encode_envelope(&mut out, env);
+                put_uuid(&mut out, *topic_uuid);
+                put_uuid(&mut out, *range_uuid);
+                put_uuid(&mut out, *holder_node_uuid);
+                put_u64(&mut out, *expected_range_generation);
+                put_u64(&mut out, *lease_duration_ms);
+            }
+            MetadataCommand::RenewRangeLease {
+                env,
+                topic_uuid,
+                range_uuid,
+                holder_node_uuid,
+                expected_fencing_epoch,
+                lease_duration_ms,
+            } => {
+                put_u16(&mut out, COMMAND_KIND_RENEW_RANGE_LEASE);
+                encode_envelope(&mut out, env);
+                put_uuid(&mut out, *topic_uuid);
+                put_uuid(&mut out, *range_uuid);
+                put_uuid(&mut out, *holder_node_uuid);
+                put_u64(&mut out, *expected_fencing_epoch);
+                put_u64(&mut out, *lease_duration_ms);
             }
             MetadataCommand::RegisterSealedSegment {
                 env,
@@ -1024,6 +1113,22 @@ impl MetadataCommand {
                 range_uuid: reader.uuid("range uuid")?,
                 holder_node_uuid: reader.uuid("holder node uuid")?,
                 expected_range_generation: reader.u64("expected range generation")?,
+            }),
+            COMMAND_KIND_ACQUIRE_RANGE_LEASE => Ok(MetadataCommand::AcquireRangeLease {
+                env: decode_envelope(reader)?,
+                topic_uuid: reader.uuid("topic uuid")?,
+                range_uuid: reader.uuid("range uuid")?,
+                holder_node_uuid: reader.uuid("holder node uuid")?,
+                expected_range_generation: reader.u64("expected range generation")?,
+                lease_duration_ms: reader.u64("lease duration ms")?,
+            }),
+            COMMAND_KIND_RENEW_RANGE_LEASE => Ok(MetadataCommand::RenewRangeLease {
+                env: decode_envelope(reader)?,
+                topic_uuid: reader.uuid("topic uuid")?,
+                range_uuid: reader.uuid("range uuid")?,
+                holder_node_uuid: reader.uuid("holder node uuid")?,
+                expected_fencing_epoch: reader.u64("expected fencing epoch")?,
+                lease_duration_ms: reader.u64("lease duration ms")?,
             }),
             COMMAND_KIND_RELEASE_RANGE_LEASE => Ok(MetadataCommand::ReleaseRangeLease {
                 env: decode_envelope(reader)?,
@@ -1978,6 +2083,22 @@ mod tests {
                 range_uuid: Uuid::from_u128(21),
                 segment_uuid: Uuid::from_u128(30),
                 expected_segment_generation: 2,
+            },
+            MetadataCommand::AcquireRangeLease {
+                env: envelope(31),
+                topic_uuid: Uuid::from_u128(20),
+                range_uuid: Uuid::from_u128(21),
+                holder_node_uuid: Uuid::from_u128(10),
+                expected_range_generation: 3,
+                lease_duration_ms: 10_000,
+            },
+            MetadataCommand::RenewRangeLease {
+                env: envelope(32),
+                topic_uuid: Uuid::from_u128(20),
+                range_uuid: Uuid::from_u128(21),
+                holder_node_uuid: Uuid::from_u128(10),
+                expected_fencing_epoch: 4,
+                lease_duration_ms: 10_000,
             },
         ]
     }
