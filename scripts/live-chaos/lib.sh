@@ -35,6 +35,13 @@ FOLLOWER1_UUID="${CHAOS_FOLLOWER1_UUID:-aaaaaaaa-0000-0000-0000-0000000000a2}"
 FOLLOWER2_UUID="${CHAOS_FOLLOWER2_UUID:-aaaaaaaa-0000-0000-0000-0000000000a3}"
 FENCING_EPOCH="${CHAOS_FENCING_EPOCH:-18}"
 TOPIC="${CHAOS_TOPIC:-chaos.v1}"
+# Metadata's UUID for the topic, distinct from the wire-level topic NAME above.
+TOPIC_UUID="${CHAOS_TOPIC_UUID:-aaaaaaaa-0000-0000-0000-0000000000b1}"
+# Lease pacing for the failover scenario (#223). Short so a scenario does not
+# sit through a production-length TTL; safety does not depend on these values.
+LEASE_DURATION_MS="${CHAOS_LEASE_DURATION_MS:-6000}"
+LEASE_RENEW_MS="${CHAOS_LEASE_RENEW_MS:-2000}"
+LEASE_POLL_MS="${CHAOS_LEASE_POLL_MS:-500}"
 
 META_HOST="${CHAOS_META_HOST:-127.0.0.1}"
 DATA_HOST="${CHAOS_DATA_HOST:-127.0.0.1}"
@@ -353,10 +360,32 @@ emit_leader_config() {
   echo "$cfg"
 }
 
-# emit_follower_config <n: 1|2> [data_dir]
+# emit_lease_yaml <meta-id> — the `lease` block that hands leadership to the
+# metadata plane (#223).
+emit_lease_yaml() {
+  local id="$1"
+  echo "lease:"
+  echo "  admin_endpoint: \"$(meta_host "$id"):$(meta_admin_port "$id")\""
+  echo "  server_name: \"localhost\""
+  echo "  topic_uuid: $TOPIC_UUID"
+  echo "  tls: { ca: $CERTS/ca.pem, cert: $CERTS/meta-$id.pem, key: $CERTS/meta-$id-key.pem }"
+  echo "  lease_duration_ms: $LEASE_DURATION_MS"
+  echo "  renew_interval_ms: $LEASE_RENEW_MS"
+  echo "  poll_interval_ms: $LEASE_POLL_MS"
+}
+
+# emit_follower_config <n: 1|2> [data_dir] [fencing_epoch]
+#
+# The epoch override exists for the lease-driven scenarios (#223): a follower
+# refuses replica appends whose epoch differs from its configured one, and
+# followers have no lease agent yet — nothing on a follower watches metadata.
+# Until the applied-state watcher lands, the harness stands in for it by
+# starting (and, across a failover, restarting) followers at the epoch
+# metadata actually granted.
 emit_follower_config() {
   local n="$1"
   local dir="${2:-$WORKDIR/data-follower-$n}"
+  local epoch="${3:-$FENCING_EPOCH}"
   local uuid cert
   case "$n" in
     1) uuid="$FOLLOWER1_UUID"; cert="data-2" ;;
@@ -369,7 +398,7 @@ emit_follower_config() {
     echo "node_uuid: $uuid"
     echo "cluster_id: $CLUSTER_ID"
     echo "data_dir: $dir"
-    echo "fencing_epoch: $FENCING_EPOCH"
+    echo "fencing_epoch: $epoch"
     emit_range_yaml
     echo "segment_id: $SEGMENT_ID"
     echo "replica_listen: \"$(replica_addr "$n")\""
@@ -392,6 +421,24 @@ emit_node_status_config() {
     echo "  - { node_uuid: $LEADER_UUID, addr: \"$(replica_addr 0)\", server_name: \"localhost\", role: leader }"
     echo "  - { node_uuid: $FOLLOWER1_UUID, addr: \"$(replica_addr 1)\", server_name: \"localhost\" }"
     echo "  - { node_uuid: $FOLLOWER2_UUID, addr: \"$(replica_addr 2)\", server_name: \"localhost\" }"
+  } > "$cfg"
+  echo "$cfg"
+}
+
+# A client config pinned to a specific fencing epoch, for proving that a stale
+# epoch is refused.
+emit_client_config_at_epoch() {
+  local epoch="$1"
+  local cfg="$WORKDIR/client-epoch-$epoch.yaml"
+  {
+    echo "cluster_id: $CLUSTER_ID"
+    echo "principal_id: $PRINCIPAL_ID"
+    echo "producer_id: $PRODUCER_ID"
+    echo "producer_epoch: 1"
+    echo "fencing_epoch: $epoch"
+    emit_range_yaml
+    echo "server_name: \"localhost\""
+    echo "tls: { ca: $CERTS/ca.pem, cert: $CERTS/data-1.pem, key: $CERTS/data-1-key.pem }"
   } > "$cfg"
   echo "$cfg"
 }
@@ -561,6 +608,120 @@ print(','.join(str(r['lag_records']) for r in d['replicas']))
   done
 }
 
+# ---------------------------------------------------------------------------
+# Range leases (#223)
+# ---------------------------------------------------------------------------
+
+# lease_field <meta-id> <jq-ish python path> — read one field of the range lease
+# through the linearizable read.
+lease_field() { # <meta-id> <python expression over `d`>
+  local id="$1" expr="$2"
+  "$VTOPCTL" --json meta range-lease --config "$(emit_admin_config "$id")" \
+    --topic-uuid "$TOPIC_UUID" --range-uuid "$RANGE_ID" 2>/dev/null \
+    | python3 -c "
+import json,sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+print($expr)
+" 2>/dev/null
+}
+
+# await_lease_holder <meta-id> <expected-holder-uuid> [timeout] — block until
+# metadata reports the range held by that node; echoes the fencing epoch.
+#
+# This is the failover assertion: it is what proves a follower actually took
+# the range rather than the range simply stopping.
+await_lease_holder() {
+  local id="$1" expected="$2" limit="${3:-$ELECTION_TIMEOUT_SECONDS}"
+  local deadline=$((SECONDS + limit)) holder epoch
+  while :; do
+    # A transient failed read — a metadata group mid-election refuses the
+    # linearizable read — consumes its share of the timeout rather than
+    # aborting the scenario under `set -e`.
+    holder="$(lease_field "$id" "d['lease']['holder_node_uuid'] if d.get('lease') else ''")" \
+      || holder=""
+    if [[ "$holder" == "$expected" ]]; then
+      epoch="$(lease_field "$id" "d['lease']['fencing_epoch']")" || epoch=""
+      if [[ -n "$epoch" ]]; then
+        echo "$epoch"
+        return 0
+      fi
+    fi
+    [[ $SECONDS -lt $deadline ]] \
+      || fail "range not held by $expected after ${limit}s (holder: ${holder:-none})"
+    sleep 0.2
+  done
+}
+
+# assert_fenced_produce <addr> <stale-epoch> <message> — a produce presenting a
+# superseded epoch must be refused BECAUSE it is fenced.
+#
+# Quorum durability, not local-fsync: a replicated leader rejects local-fsync
+# as an invalid durability before it ever reaches the epoch check, so that
+# refusal would prove nothing. And the failure must name fencing — accepting
+# any failed produce would let a connection refused or a TLS mismatch pass as
+# a fencing proof.
+assert_fenced_produce() {
+  local addr="$1" epoch="$2" message="$3"
+  if "$VTOP_NODE" produce --client-config "$(emit_client_config_at_epoch "$epoch")" \
+    --addr "$addr" --records 1 --batch 1 --durability quorum \
+    > "$WORKDIR/logs/fenced-produce.log" 2>&1; then
+    fail "$message"
+  fi
+  grep -qi "fenced" "$WORKDIR/logs/fenced-produce.log" \
+    || fail "produce failed for a reason other than fencing (see \
+$WORKDIR/logs/fenced-produce.log): $message"
+}
+
+# await_acked_floor <acked-file> <floor> — block until the producer's persisted
+# acknowledged floor reaches <floor>. The producer rewrites the file after
+# every acknowledged batch, so this is how a scenario knows a kill will land
+# mid-flight rather than after the fact.
+await_acked_floor() {
+  local file="$1" floor="$2"
+  local deadline=$((SECONDS + PROGRESS_TIMEOUT_SECONDS)) acked
+  while :; do
+    acked="$(cat "$file" 2>/dev/null)" || acked=""
+    [[ -n "$acked" && "$acked" -ge "$floor" ]] && return 0
+    [[ $SECONDS -lt $deadline ]] \
+      || fail "acknowledged floor ${acked:-0} never reached $floor within ${PROGRESS_TIMEOUT_SECONDS}s"
+    sleep 0.1
+  done
+}
+
+# follower_committed_offset <n> — a follower's durable commit boundary, from
+# its own metrics endpoint. Used after a leader kill to promote the replica
+# that actually holds the acknowledged floor: quorum produce only guarantees
+# the floor reached SOME majority, not any one particular follower.
+follower_committed_offset() {
+  local n="$1" value
+  value="$(metric_value "$(data_metrics_addr "$n")" vtop_broker_local_committed_offset)" \
+    || value=""
+  echo "${value:-0}"
+}
+
+# await_verified_floor <client-cfg> <addr> <floor> — retry verify until the
+# acknowledged floor is readable. Immediately after a failover the boundary a
+# quorum could PROVE may sit below the floor until the new leader's replication
+# stream catches the lagging follower up; the eventual assertion is the one
+# that is actually promised.
+await_verified_floor() {
+  local cfg="$1" addr="$2" floor="$3"
+  local deadline=$((SECONDS + PROGRESS_TIMEOUT_SECONDS))
+  while :; do
+    if "$VTOP_NODE" verify --client-config "$cfg" --addr "$addr" \
+      --expect-at-least "$floor" > "$WORKDIR/logs/verify-after-failover.log" 2>&1; then
+      return 0
+    fi
+    [[ $SECONDS -lt $deadline ]] \
+      || fail "post-failover verify never covered the $floor acknowledged records \
+(see $WORKDIR/logs/verify-after-failover.log)"
+    sleep 0.5
+  done
+}
+
 # assert_metric_present <addr> <metric-name> — the scrape contract, checked
 # live. A renamed metric silently blanks a dashboard panel while the node keeps
 # working perfectly, so the harness pins the names it publishes.
@@ -599,6 +760,127 @@ start_leader() {
   await_ready "$(data_metrics_addr 0)" "data-leader"
   echo "$pid"
 }
+
+# emit_leader_config_with_lease <meta-id> [label] — a leader whose fencing epoch
+# is metadata's to decide (#223), rather than a fixed configured value.
+#
+# The configured epoch is rewritten to 0: it is only the monotonic FLOOR of the
+# broker's epoch view, and metadata mints epochs from 1. Keeping the harness's
+# fixed epoch (18) would sit the floor above every real grant, so the broker
+# would ignore them all and keep serving the static epoch — the scenario would
+# then pass without metadata-driven fencing ever being exercised.
+emit_leader_config_with_lease() {
+  local id="$1" label="${2:-lease}"
+  local cfg="$WORKDIR/data-leader-$label.yaml"
+  emit_leader_config leader > /dev/null
+  {
+    sed 's/^fencing_epoch: .*/fencing_epoch: 0/' "$WORKDIR/data-leader-leader.yaml"
+    emit_lease_yaml "$id"
+  } > "$cfg"
+  echo "$cfg"
+}
+
+# start_leader_with_lease <meta-id> [label]
+start_leader_with_lease() {
+  local id="$1" label="${2:-lease}" pid cfg
+  cfg="$(emit_leader_config_with_lease "$id" "$label")"
+  pid="$(start_node "data-leader-$label" "data_node_ready" data --config "$cfg")"
+  await_ready "$(data_metrics_addr 0)" "data-leader-$label"
+  echo "$pid"
+}
+
+# start_promoted_follower <n: 1|2> <meta-id> — restart follower `n` as a
+# lease-driven leader over the data directory it already replicated into.
+#
+# This is the failover path: the replica that has the data becomes the one that
+# serves it, and its lease agent must win the range from the dead leader. Its
+# identity, certificate, and remaining-follower list are all derived from `n`;
+# the original follower process must already be stopped, or two brokers would
+# hold the same active segment.
+start_promoted_follower() {
+  local n="$1" id="$2" pid cfg uuid cert other other_uuid
+  case "$n" in
+    1) uuid="$FOLLOWER1_UUID"; cert="data-2"; other=2; other_uuid="$FOLLOWER2_UUID" ;;
+    2) uuid="$FOLLOWER2_UUID"; cert="data-3"; other=1; other_uuid="$FOLLOWER1_UUID" ;;
+    *) fail "start_promoted_follower supports followers 1 and 2, not '$n'" ;;
+  esac
+  cfg="$WORKDIR/data-promoted-$n.yaml"
+  {
+    # Same range and segment, but now serving the native port and driven by a
+    # lease rather than a fixed epoch. Epoch floor 0 for the same reason as
+    # emit_leader_config_with_lease: metadata's grants must not be ignored.
+    echo "role: leader"
+    echo "node_uuid: $uuid"
+    echo "cluster_id: $CLUSTER_ID"
+    echo "data_dir: $WORKDIR/data-follower-$n"
+    echo "fencing_epoch: 0"
+    emit_range_yaml
+    echo "segment_id: $SEGMENT_ID"
+    echo "native_listen: \"$(native_addr)\""
+    echo "replica_listen: \"$(replica_addr 0)\""
+    echo "followers:"
+    echo "  - { node_uuid: $other_uuid, addr: \"$(replica_addr "$other")\", server_name: \"localhost\" }"
+    echo "replica_tls: { ca: $CERTS/ca.pem, cert: $CERTS/$cert.pem, key: $CERTS/$cert-key.pem }"
+    echo "native_tls: { ca: $CERTS/ca.pem, cert: $CERTS/$cert.pem, key: $CERTS/$cert-key.pem }"
+    echo "principal_id: $PRINCIPAL_ID"
+    echo "observability: { listen: \"$(data_metrics_addr 0)\" }"
+    emit_lease_yaml "$id"
+  } > "$cfg"
+  pid="$(start_node "data-promoted-$n" "data_node_ready" data --config "$cfg")"
+  echo "$pid"
+}
+
+# start_fenced_old_leader <meta-id> <old-epoch> — restart the dead leader
+# against its old data directory, on DISTINCT ports, and do NOT gate on
+# /readyz.
+#
+# Distinct ports because the promoted follower now owns the native and
+# replica-0 addresses; reusing them would kill the restarted process on a bind
+# error while `await_ready` happily polled the promoted follower's endpoint —
+# the assertion would then be exercising the wrong process entirely. And no
+# /readyz gate because this node must NEVER become ready: metadata holds a
+# live lease for its rival, so its lease agent keeps the broker fenced. The
+# caller asserts exactly that.
+#
+# The held epoch is seeded with the OLD grant, exactly as a restarted operator
+# process would carry it — not 0. With 0, the stale-epoch produce would be
+# refused by a trivial epoch mismatch before the lease machinery ever ran; the
+# caller must instead wait for this node's metadata view to reflect the rival
+# grant (await_metric_at_least on vtop_broker_meta_fencing_epoch) so the
+# refusal it asserts is the one fencing actually provides.
+start_fenced_old_leader() {
+  local id="$1" old_epoch="$2" pid
+  local cfg="$WORKDIR/data-leader-restarted.yaml"
+  {
+    sed -e "s/^fencing_epoch: .*/fencing_epoch: $old_epoch/" \
+        -e "s|^native_listen: .*|native_listen: \"$(old_leader_native_addr)\"|" \
+        -e "s|^replica_listen: .*|replica_listen: \"$(replica_addr 3)\"|" \
+        -e "s|^observability: .*|observability: { listen: \"$(data_metrics_addr 3)\" }|" \
+        "$WORKDIR/data-leader-leader.yaml"
+    emit_lease_yaml "$id"
+  } > "$cfg"
+  pid="$(start_node "data-leader-restarted" "data_node_ready" data --config "$cfg")"
+  echo "$pid"
+}
+
+# await_metric_at_least <addr> <metric> <floor> <what> — block until a scraped
+# gauge reaches <floor>.
+await_metric_at_least() {
+  local addr="$1" metric="$2" floor="$3" what="$4"
+  local deadline=$((SECONDS + PROGRESS_TIMEOUT_SECONDS)) value
+  while :; do
+    value="$(metric_value "$addr" "$metric")" || value=""
+    if [[ -n "$value" && "${value%.*}" -ge "$floor" ]]; then
+      return 0
+    fi
+    [[ $SECONDS -lt $deadline ]] \
+      || fail "$what: $metric stayed at '${value:-absent}' (< $floor) for ${PROGRESS_TIMEOUT_SECONDS}s"
+    sleep 0.2
+  done
+}
+
+# The restarted old leader's native address: one past the range's real port.
+old_leader_native_addr() { echo "$DATA_HOST:$((NATIVE_PORT + 1))"; }
 
 start_standalone() {
   local pid; pid="$(start_node "data-standalone" "data_node_ready" data --config "$(emit_leader_config standalone)")"

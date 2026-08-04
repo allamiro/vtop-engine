@@ -56,6 +56,10 @@ without editing a scenario:
 | `CHAOS_NATIVE_PORT` | `9400` | Native producer/fetch port. |
 | `CHAOS_META_METRICS_BASE_PORT` | `9500` | Metadata `/metrics` ports are this base plus node ID (#224). |
 | `CHAOS_DATA_METRICS_BASE_PORT` | `9600` | Data-plane `/metrics` ports: base+0 for the leader, base+1/2 for followers. |
+| `CHAOS_TOPIC_UUID` | `aaaaaaaa-…-b1` | Metadata's UUID for the topic, distinct from the wire-level topic name. |
+| `CHAOS_LEASE_DURATION_MS` | `6000` | Range-lease TTL (#223). Short so a scenario need not sit through a production-length lease. |
+| `CHAOS_LEASE_RENEW_MS` | `2000` | Renewal interval — a third of the TTL, so two renewals can fail without a failover. |
+| `CHAOS_LEASE_POLL_MS` | `500` | How often a non-holder re-checks for a lapsed lease. |
 | `CHAOS_READY_TIMEOUT_SECONDS` | `20` | Process readiness deadline. |
 | `CHAOS_ELECTION_TIMEOUT_SECONDS` | `30` | Election and convergence deadline. |
 | `CHAOS_PROGRESS_TIMEOUT_SECONDS` | `30` | Producer-progress deadline. |
@@ -102,6 +106,7 @@ checks is a gate that silently stops working.
 | `05b-follower-fsync-failure` | One follower's live `fsync`/`fdatasync` calls return `EIO` | The failing follower remains fail-closed at its durable prefix while the healthy quorum commits; all recovered artifacts verify. |
 | `06-partition-meta-leader` | Per-node network namespaces plus `iptables` isolate the metadata leader's peer traffic | Survivors elect and commit in a higher term; the isolated leader cannot commit; after healing it steps down, converges, and refuses direct proposals. |
 | `07-clock-skew` | `CLOCK_REALTIME` on one metadata node is shifted +1 hour while monotonic time stays honest | The shim proves the applied clock offset; exactly one leader is observed; proposals commit and the skewed member converges. |
+| `09-range-leader-failover` | A range leader is `SIGKILL`ed under sustained quorum produce and a follower is restarted as a lease-driven leader over the data it already replicated (#223) | The follower acquires the lease within the TTL at a strictly higher fencing epoch; every acknowledged record is still readable byte-exactly; the restarted old leader is refused under its stale epoch; every surviving replica artifact verifies offline. |
 | `08-operational-surface` | Every node's `/metrics`, `/healthz`, and `/readyz` under a live cluster (#224) | The metric names the dashboards query are published on every role; exactly one node claims Raft leadership over `/metrics`; the committed offset agrees between `/metrics` and `vtopctl node status`; the endpoint answers `GET` only; a killed node stops answering its health gate while survivors stay ready. |
 
 The data scenarios stop each process before offline sealing. Recovery first

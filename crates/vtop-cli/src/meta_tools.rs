@@ -55,6 +55,34 @@ pub enum MetaCommand {
         #[arg(long, default_value_t = false)]
         retain_removed_as_learners: bool,
     },
+    /// Create a topic and its root range.
+    CreateTopic {
+        #[command(flatten)]
+        common: MetaCommonArgs,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        topic_uuid: Uuid,
+        #[arg(long)]
+        root_range_uuid: Uuid,
+        #[arg(long, default_value_t = 0)]
+        issued_at_ms: i64,
+        #[arg(long)]
+        request_id: Option<Uuid>,
+    },
+    /// Read a range's current lease through a linearizable fence (#223).
+    ///
+    /// The read an election makes before it acts: it reports the holder, the
+    /// epoch, and the deadline, so a candidate can tell "the leader is healthy"
+    /// apart from "my view was stale".
+    RangeLease {
+        #[command(flatten)]
+        common: MetaCommonArgs,
+        #[arg(long)]
+        topic_uuid: Uuid,
+        #[arg(long)]
+        range_uuid: Uuid,
+    },
     /// Propose `RegisterNode` through the Consensus façade.
     RegisterNode {
         #[command(flatten)]
@@ -343,6 +371,75 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
                     for MetaNodeId(id) in outgoing {
                         println!("  {id}");
                     }
+                }
+            }
+            Ok(())
+        }
+        MetaCommand::CreateTopic {
+            common,
+            name,
+            topic_uuid,
+            root_range_uuid,
+            issued_at_ms,
+            request_id,
+        } => {
+            let command = MetadataCommand::CreateTopic {
+                env: CommandEnvelope {
+                    request_id: request_id.unwrap_or_else(Uuid::new_v4),
+                    issued_at_ms,
+                },
+                name,
+                topic_uuid,
+                root_range_uuid,
+            };
+            propose_and_print(&common.config, command, json).await
+        }
+        MetaCommand::RangeLease {
+            common,
+            topic_uuid,
+            range_uuid,
+        } => {
+            let config = load_admin_config(&common.config)?;
+            let client = connect(&config)?;
+            let view = client
+                .read_range_lease(topic_uuid, range_uuid)
+                .await
+                .map_err(|error| error.to_string())?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "found": view.found,
+                        "range_generation": view.range_generation,
+                        "fencing_epoch": view.fencing_epoch,
+                        "read_at_applied_index": view.read_at_applied_index,
+                        "lease": view.lease.map(|lease| serde_json::json!({
+                            "holder_node_uuid": lease.holder_node_uuid,
+                            "fencing_epoch": lease.fencing_epoch,
+                            "expires_at_ms": lease.expires_at_ms,
+                        })),
+                    }))
+                    .map_err(|error| error.to_string())?
+                );
+            } else if !view.found {
+                println!("range not found");
+            } else {
+                match view.lease {
+                    None => println!(
+                        "range generation={} fencing_epoch={} lease=none",
+                        view.range_generation, view.fencing_epoch
+                    ),
+                    Some(lease) => println!(
+                        "range generation={} fencing_epoch={} holder={} lease_epoch={} expires_at_ms={}",
+                        view.range_generation,
+                        view.fencing_epoch,
+                        lease.holder_node_uuid,
+                        lease.fencing_epoch,
+                        lease
+                            .expires_at_ms
+                            .map(|ms| ms.to_string())
+                            .unwrap_or_else(|| "never".to_owned()),
+                    ),
                 }
             }
             Ok(())
