@@ -9,6 +9,7 @@ mod client;
 mod config;
 mod data_node;
 mod meta_node;
+mod observe;
 mod tls;
 
 use clap::{Parser, Subcommand};
@@ -115,6 +116,10 @@ fn parse_batch(value: &str) -> Result<u32, String> {
 
 #[tokio::main]
 async fn main() {
+    // Structured logs use the same `VTOP_LOG_FORMAT` contract as `vtopctl`, so
+    // node and engine lines land in Loki with one shape. Stderr only: stdout
+    // carries the ready markers the chaos harness parses.
+    vtop_observe::logging::init("info", false);
     let cli = Cli::parse();
     let outcome = run(cli).await;
     match outcome {

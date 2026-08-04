@@ -59,6 +59,21 @@ impl Default for MetaTimersConfig {
     }
 }
 
+/// The node's operational surface (#224).
+///
+/// Optional: a node with no `observability` block behaves exactly as before,
+/// which keeps every existing config file valid. When a `listen` IS given, a
+/// bind failure is fatal — the operator asked for this endpoint, and a node
+/// that silently came up unscrapeable would pass its own health gate while
+/// being invisible to the one thing meant to watch it.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservabilityConfig {
+    /// `host:port` for `/metrics`, `/healthz`, and `/readyz`. Bind it to a
+    /// private interface: the endpoint is unauthenticated by design (#78).
+    pub listen: Option<String>,
+}
+
 /// A metadata Raft node process.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -78,6 +93,8 @@ pub struct MetaNodeConfig {
     pub tls: TlsPaths,
     #[serde(default)]
     pub timers: MetaTimersConfig,
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -147,6 +164,8 @@ pub struct DataNodeConfig {
     pub native_tls: Option<TlsPaths>,
     /// Leader/standalone: the one client principal the authorizer accepts.
     pub principal_id: Option<Uuid>,
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
 }
 
 pub fn load<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {

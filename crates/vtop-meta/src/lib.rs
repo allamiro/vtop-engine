@@ -54,8 +54,8 @@ pub use placement::{
 pub use raft::{
     start_meta_node, CommitReceipt, Consensus, ConsensusError, ConsensusResult, MetaNode,
     MetaNodeTimers, MetaRaftLogStore, MetaRaftStateMachine, MetaRaftStore, MetaRaftTypeConfig,
-    OpenraftConsensus, PeerDirectory, PeerEndpoint, RaftPeerHandler, ReadFence,
-    TlsRaftNetworkFactory,
+    OpenraftConsensus, PeerDirectory, PeerEndpoint, RaftObservation, RaftPeerHandler,
+    RaftServerState, ReadFence, TlsRaftNetworkFactory,
 };
 pub use state::{
     ConsumerGroupRecord, CursorCheckpointRecord, GroupMemberRecord, GroupNameRecord, KeyRecord,

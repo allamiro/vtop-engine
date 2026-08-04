@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { workspace = true }
+prometheus = { workspace = true }
 rustls = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
@@ -21,4 +22,8 @@ uuid = { workspace = true }
 vtop-broker = { workspace = true }
 vtop-log = { workspace = true }
 vtop-meta = { workspace = true }
+vtop-observe = { workspace = true }
 vtop-protocol = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -342,6 +342,30 @@ impl MetaFencingEpoch {
             .lease_active
     }
 
+    /// Non-blocking `(fencing_epoch, lease_active)`, for observation only
+    /// (#224).
+    ///
+    /// `None` while a produce or fetch holds the lease view. That is not a
+    /// rare window: the broker locks this for the *entire* critical section,
+    /// fsync included, so a blocking read from a scrape handler would park a
+    /// runtime worker behind a stalling disk — under precisely the failure an
+    /// operator is scraping to diagnose. Concurrent scrapes would then occupy
+    /// every worker and take the endpoint down with the disk.
+    ///
+    /// Both fields come from one lock acquisition so the caller can never
+    /// observe an epoch from before a grant beside a lease bit from after it.
+    pub fn try_snapshot(&self) -> Option<(u64, bool)> {
+        let state = match self.state.try_lock() {
+            Ok(state) => state,
+            // A poisoned lock still holds a readable view, and the last known
+            // fencing state of a broker whose append path panicked is more
+            // useful than nothing.
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        Some((state.fencing_epoch, state.lease_active))
+    }
+
     /// Publish a metadata grant (including a steal that mints a newer epoch).
     ///
     /// Stale grants with a lower epoch than the view already knows are ignored
@@ -389,6 +413,18 @@ impl MetaFencingEpoch {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Hold the lease view exactly as an in-flight append does, for tests that
+    /// need to prove an observation path does not block on it.
+    ///
+    /// The guard's type is deliberately opaque: callers may only hold and drop
+    /// it, never read or mutate the state through it. Exposed because the
+    /// non-blocking contract of [`Self::try_snapshot`] is worth testing from
+    /// the crates that depend on it, not only from inside this one.
+    #[doc(hidden)]
+    pub fn hold_for_test(&self) -> impl Sized + '_ {
+        self.lock()
     }
 }
 
@@ -636,6 +672,35 @@ impl LocalBroker {
     /// cluster durability; `None` for single-node LocalFsync-only brokers.
     pub fn cluster_committed(&self) -> Option<&ClusterCommittedOffset> {
         self.cluster_committed.as_ref()
+    }
+
+    /// The range this broker leads.
+    pub fn range(&self) -> &RangeIdentity {
+        &self.range
+    }
+
+    /// Non-blocking `(local_committed_offset, next_offset)`, for observation
+    /// only (#224).
+    ///
+    /// Returns `None` while the append path holds the state lock. Metrics must
+    /// never park a runtime worker behind an in-progress fsync: under exactly
+    /// the conditions where an operator needs the endpoint most — a disk that
+    /// has stopped acknowledging writes — a blocking read would take the scrape
+    /// endpoint down along with the disk. A gauge that stops advancing is the
+    /// honest signal there; a scrape that hangs is not.
+    pub fn try_local_offsets(&self) -> Option<(u64, u64)> {
+        let state = match self.state.try_lock() {
+            Ok(state) => state,
+            // A poisoned lock still yields a readable segment view, and
+            // reporting the last durable boundary of a broker whose append path
+            // panicked is more useful than reporting nothing.
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        Some((
+            state.segment.committed_offset(),
+            state.segment.next_offset(),
+        ))
     }
 
     pub fn handle(&self, role: Role, frame: WireFrame) -> WireFrame {
@@ -2080,6 +2145,29 @@ mod tests {
     use vtop_protocol::{
         ClientHello, CommitCursorRequest, FetchRequest, ProduceRecord, ProduceRequest,
     };
+
+    /// The whole point of the non-blocking accessor: a scrape must give up
+    /// rather than queue behind a produce that is mid-fsync.
+    #[test]
+    fn a_lease_snapshot_yields_rather_than_waiting_for_the_append_path() {
+        let lease = MetaFencingEpoch::new(7);
+        assert_eq!(lease.try_snapshot(), Some((7, true)));
+
+        let held = lease.lock();
+        assert_eq!(
+            lease.try_snapshot(),
+            None,
+            "a contended view must report contention, not block the caller"
+        );
+        drop(held);
+
+        lease.clear_lease(7);
+        assert_eq!(
+            lease.try_snapshot(),
+            Some((7, false)),
+            "the epoch is retained on release; only the lease bit drops"
+        );
+    }
 
     struct TestAuthorizer {
         leaf_der: Vec<u8>,
