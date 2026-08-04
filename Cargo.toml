@@ -5,6 +5,7 @@ members = [
   "crates/vtop-log",
   "crates/vtop-protocol",
   "crates/vtop-broker",
+  "crates/vtop-node",
   "crates/vtop-meta",
   "crates/vtop-adapters",
   "crates/vtop-upload",

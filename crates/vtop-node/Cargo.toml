@@ -1,0 +1,24 @@
+[package]
+name = "vtop-node"
+description = "Live-cluster node runner and load client for the #215 chaos validation harness"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vtop-node"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+rustls = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+uuid = { workspace = true }
+vtop-broker = { workspace = true }
+vtop-log = { workspace = true }
+vtop-meta = { workspace = true }
+vtop-protocol = { workspace = true }

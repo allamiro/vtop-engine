@@ -130,42 +130,91 @@ pub(crate) fn meta_to_entry(
 
 /// Map openraft membership → MetaMembership.
 ///
-/// Joint configs (len != 1) are rejected: the durable format is a single
-/// voter set, and this PR never issues `change_membership` mid-flight.
+/// A committed membership has one config; a joint-consensus transition
+/// (`change_membership` in flight, #215) has two — the outgoing set is
+/// preserved in `joint_outgoing` so a crash mid-change recovers the exact
+/// joint quorum rules. More than two configs never occurs in openraft.
 pub(crate) fn membership_to_meta(
     membership: &Membership<NodeId, openraft::EmptyNode>,
 ) -> Result<MetaMembership, StorageError<NodeId>> {
     let configs = membership.get_joint_config();
-    if configs.len() != 1 {
-        return Err(sto_err_logs(format!(
-            "joint membership with {} configs cannot be stored in MetaMembership \
-             (single voter-set only)",
-            configs.len()
-        )));
-    }
-    let voters = configs[0]
-        .iter()
-        .copied()
-        .map(MetaNodeId)
-        .collect::<Vec<_>>();
+    let (voters, joint_outgoing) = match configs.len() {
+        1 => (config_ids(&configs[0]), None),
+        2 => (config_ids(&configs[1]), Some(config_ids(&configs[0]))),
+        other => {
+            return Err(sto_err_logs(format!(
+                "joint membership with {other} configs cannot be stored in MetaMembership"
+            )))
+        }
+    };
     let learners = membership
         .learner_ids()
         .map(|id| (MetaNodeId(id), String::new()))
         .collect::<Vec<_>>();
-    Ok(MetaMembership { voters, learners })
+    Ok(MetaMembership {
+        voters,
+        learners,
+        joint_outgoing,
+    })
+}
+
+fn config_ids(config: &BTreeSet<NodeId>) -> Vec<MetaNodeId> {
+    config.iter().copied().map(MetaNodeId).collect()
 }
 
 pub(crate) fn meta_to_membership(
     membership: &MetaMembership,
 ) -> Result<Membership<NodeId, openraft::EmptyNode>, StorageError<NodeId>> {
-    let mut voters = BTreeSet::new();
     let mut nodes = BTreeMap::new();
+    let mut target = BTreeSet::new();
     for MetaNodeId(id) in &membership.voters {
-        voters.insert(*id);
+        target.insert(*id);
         nodes.insert(*id, openraft::EmptyNode::default());
     }
+    let mut configs = Vec::new();
+    if let Some(outgoing_ids) = &membership.joint_outgoing {
+        let mut outgoing = BTreeSet::new();
+        for MetaNodeId(id) in outgoing_ids {
+            outgoing.insert(*id);
+            nodes.insert(*id, openraft::EmptyNode::default());
+        }
+        configs.push(outgoing);
+    }
+    configs.push(target);
     for (MetaNodeId(id), _) in &membership.learners {
         nodes.insert(*id, openraft::EmptyNode::default());
     }
-    Ok(Membership::new(vec![voters], nodes))
+    Ok(Membership::new(configs, nodes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn joint_membership_round_trip_preserves_both_quorum_sets() {
+        let outgoing = BTreeSet::from([1, 2, 3]);
+        let target = BTreeSet::from([1, 2, 3, 4, 5]);
+        let nodes = (1..=5)
+            .map(|id| (id, openraft::EmptyNode::default()))
+            .collect::<BTreeMap<_, _>>();
+        let membership = Membership::new(vec![outgoing.clone(), target.clone()], nodes);
+
+        let durable = membership_to_meta(&membership).unwrap();
+        assert_eq!(
+            durable.joint_outgoing,
+            Some(outgoing.iter().copied().map(MetaNodeId).collect())
+        );
+        assert_eq!(
+            durable.voters,
+            target.iter().copied().map(MetaNodeId).collect::<Vec<_>>()
+        );
+
+        let recovered = meta_to_membership(&durable).unwrap();
+        assert_eq!(
+            recovered.get_joint_config(),
+            &[outgoing, target],
+            "recovery must not collapse a joint quorum into its target set"
+        );
+    }
 }

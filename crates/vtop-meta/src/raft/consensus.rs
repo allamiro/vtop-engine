@@ -12,7 +12,8 @@ use crate::raft::convert::{membership_to_meta, to_meta_index, vote_to_hard_state
 use crate::raft::type_config::MetaRaftTypeConfig;
 use crate::transport::admin::AdminHandler;
 use crate::transport::wire::{
-    AdminProposeResponse, AdminStatusResponse, TransportError, TransportResult, WireLogId,
+    AdminMembershipResponse, AdminProposeResponse, AdminStatusResponse, TransportError,
+    TransportResult, WireLogId,
 };
 use async_trait::async_trait;
 use openraft::Raft;
@@ -138,5 +139,44 @@ impl AdminHandler for OpenraftConsensus {
             log_id: receipt.log_id,
             response: receipt.response,
         })
+    }
+
+    async fn init(&self, members: Vec<u64>) -> TransportResult<AdminMembershipResponse> {
+        let members: std::collections::BTreeSet<u64> = members.into_iter().collect();
+        self.raft
+            .initialize(members)
+            .await
+            .map_err(|error| TransportError::Protocol(error.to_string()))?;
+        self.current_membership()
+    }
+
+    async fn add_learner(&self, node_id: u64) -> TransportResult<AdminMembershipResponse> {
+        self.raft
+            .add_learner(node_id, openraft::EmptyNode {}, true)
+            .await
+            .map_err(|error| TransportError::Protocol(error.to_string()))?;
+        self.current_membership()
+    }
+
+    async fn change_membership(
+        &self,
+        voters: Vec<u64>,
+        retain_removed_as_learners: bool,
+    ) -> TransportResult<AdminMembershipResponse> {
+        let voters: std::collections::BTreeSet<u64> = voters.into_iter().collect();
+        self.raft
+            .change_membership(voters, retain_removed_as_learners)
+            .await
+            .map_err(|error| TransportError::Protocol(error.to_string()))?;
+        self.current_membership()
+    }
+}
+
+impl OpenraftConsensus {
+    fn current_membership(&self) -> TransportResult<AdminMembershipResponse> {
+        let metrics = self.raft.metrics().borrow().clone();
+        let membership = membership_to_meta(metrics.membership_config.membership())
+            .map_err(|error| TransportError::Protocol(error.to_string()))?;
+        Ok(AdminMembershipResponse { membership })
     }
 }

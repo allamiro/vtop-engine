@@ -44,6 +44,7 @@ fn membership() -> MetaMembership {
     MetaMembership {
         voters: vec![MetaNodeId(1), MetaNodeId(2), MetaNodeId(3)],
         learners: vec![(MetaNodeId(4), "n4:9200".to_owned())],
+        joint_outgoing: None,
     }
 }
 

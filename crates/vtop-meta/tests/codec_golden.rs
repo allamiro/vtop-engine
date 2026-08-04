@@ -481,6 +481,7 @@ fn v1_snapshot_file_matches_golden_vector() {
     let membership = MetaMembership {
         voters: vec![MetaNodeId(1), MetaNodeId(2), MetaNodeId(3)],
         learners: vec![(MetaNodeId(4), "n4:9200".to_owned())],
+        joint_outgoing: None,
     };
     let meta = snapshots
         .write(1, 2, membership, "golden-snap", &payload, None)
@@ -491,6 +492,33 @@ fn v1_snapshot_file_matches_golden_vector() {
     );
     let durable = &sim.snapshot().files[&meta.path];
     assert_eq!(to_hex(durable), GOLDEN_SNAPSHOT_FILE_HEX);
+}
+
+#[test]
+fn membership_codec_preserves_legacy_bytes_and_joint_quorum() {
+    let legacy = MetaMembership {
+        voters: vec![MetaNodeId(1), MetaNodeId(2), MetaNodeId(3)],
+        learners: vec![(MetaNodeId(4), "n4:9200".to_owned())],
+        joint_outgoing: None,
+    };
+    let legacy_bytes = legacy.encode().unwrap();
+    assert_eq!(
+        to_hex(&legacy_bytes),
+        "00030000000000000001000000000000000200000000000000030001000000000000000400076e343a39323030"
+    );
+    assert_eq!(MetaMembership::decode(&legacy_bytes).unwrap(), legacy);
+
+    let joint = MetaMembership {
+        voters: vec![MetaNodeId(1), MetaNodeId(2), MetaNodeId(3), MetaNodeId(4)],
+        learners: vec![(MetaNodeId(5), String::new())],
+        joint_outgoing: Some(vec![MetaNodeId(1), MetaNodeId(2), MetaNodeId(3)]),
+    };
+    let joint_bytes = joint.encode().unwrap();
+    assert_eq!(MetaMembership::decode(&joint_bytes).unwrap(), joint);
+
+    let mut unknown_extension = legacy_bytes;
+    unknown_extension.push(2);
+    assert!(MetaMembership::decode(&unknown_extension).is_err());
 }
 
 #[test]
