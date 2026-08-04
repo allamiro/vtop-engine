@@ -64,14 +64,20 @@ pub struct NodeObservability {
     /// Startup gate: flipped once the node's listeners are bound.
     pub gate: ReadinessGate,
     /// Optional live condition ANDed with the gate.
-    probe: Option<ReadinessProbe>,
+    ///
+    /// Behind a shared cell so it can be installed AFTER the endpoint is
+    /// serving, and so a process hosting more than one role (#215) can hand
+    /// every role a `&NodeObservability` rather than making one of them the
+    /// owner. The served source holds the same cell, so a probe installed late
+    /// takes effect on the next request rather than the next restart.
+    probe: Arc<std::sync::RwLock<Option<ReadinessProbe>>>,
 }
 
 /// Serves this node's registry, and its readiness as `gate AND probe`.
 struct NodeSource {
     registry: Registry,
     gate: ReadinessGate,
-    probe: Option<ReadinessProbe>,
+    probe: Arc<std::sync::RwLock<Option<ReadinessProbe>>>,
 }
 
 impl vtop_observe::MetricsSource for NodeSource {
@@ -93,7 +99,14 @@ impl vtop_observe::MetricsSource for NodeSource {
         if !gated.is_ready() {
             return gated;
         }
-        match self.probe.as_ref() {
+        let probe = match self.probe.read() {
+            Ok(guard) => guard.clone(),
+            // A poisoned probe cell means some task panicked while installing
+            // one. Reporting not-ready is the safe read: the process is in an
+            // unknown state.
+            Err(_) => return Readiness::not_ready("readiness probe state poisoned"),
+        };
+        match probe {
             Some(probe) => probe(),
             None => Readiness::Ready,
         }
@@ -122,14 +135,22 @@ impl NodeObservability {
         Ok(Self {
             registry,
             gate: ReadinessGate::starting("node is still starting"),
-            probe: None,
+            probe: Arc::new(std::sync::RwLock::new(None)),
         })
     }
 
-    /// Add a live readiness condition, evaluated on every `/readyz` request.
-    pub fn with_readiness_probe(mut self, probe: ReadinessProbe) -> Self {
-        self.probe = Some(probe);
-        self
+    /// Install a live readiness condition, evaluated on every `/readyz`
+    /// request. Takes effect immediately, including on an endpoint that is
+    /// already serving.
+    pub fn set_readiness_probe(&self, probe: ReadinessProbe) {
+        match self.probe.write() {
+            Ok(mut guard) => *guard = Some(probe),
+            Err(mut poisoned) => {
+                **poisoned.get_mut() = Some(probe);
+                drop(poisoned);
+                self.probe.clear_poison();
+            }
+        }
     }
 
     pub fn register(&self, collector: Box<dyn Collector>) -> Result<(), String> {
@@ -154,7 +175,7 @@ impl NodeObservability {
         let source = Arc::new(NodeSource {
             registry: self.registry.clone(),
             gate: self.gate.clone(),
-            probe: self.probe.clone(),
+            probe: Arc::clone(&self.probe),
         });
         let bound = vtop_observe::start(addr, source)
             .await

@@ -12,7 +12,24 @@ use vtop_meta::{
     PeerDirectory, PeerEndpoint, PeerRpcHandler, PeerServer,
 };
 
-pub async fn run(config: MetaNodeConfig) -> Result<(), String> {
+/// Run a metadata node that owns its own observability endpoint.
+pub async fn run(mut config: MetaNodeConfig) -> Result<(), String> {
+    let observability = NodeObservability::new("meta", &config.node_id.to_string())?;
+    let endpoint = config.observability.take().unwrap_or_default();
+    let metrics_addr = observability.serve(&endpoint).await?;
+    serve(config, &observability, metrics_addr).await
+}
+
+/// Run a metadata node against an observability surface someone else owns.
+///
+/// Split out so a co-located process (#215) can expose ONE endpoint covering
+/// both of its roles. An operator scraping a host should find one target, not
+/// have to know which roles happen to share it.
+pub async fn serve(
+    config: MetaNodeConfig,
+    observability: &NodeObservability,
+    metrics_addr: Option<std::net::SocketAddr>,
+) -> Result<(), String> {
     std::fs::create_dir_all(&config.data_dir)
         .map_err(|error| format!("create {}: {error}", config.data_dir.display()))?;
 
@@ -67,11 +84,9 @@ pub async fn run(config: MetaNodeConfig) -> Result<(), String> {
 
     // The operational surface comes up before the ready marker so a scraper or
     // health gate can observe the node from the same instant a script can.
-    let observability = NodeObservability::new("meta", &config.node_id.to_string())?;
     observability.register(Box::new(MetaRaftCollector::new(Arc::clone(
         &node.consensus,
     ))?))?;
-    let metrics_addr = observability.serve(&config.observability).await?;
 
     // Readiness for a metadata node is "both listeners are bound", NOT "the
     // cluster has a leader". A fresh cluster has no leader until the admin

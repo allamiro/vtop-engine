@@ -888,6 +888,71 @@ start_standalone() {
   echo "$pid"
 }
 
+# emit_colocated_config <meta-id> [peer-ids...] — one process, both planes
+# (#215): a metadata voter and a standalone data replica composed from the
+# same emitters the split-process scenarios use, under ONE observability
+# endpoint. Per-role observability blocks are stripped because the co-located
+# runner rejects them by design.
+# The colocated node <id>'s native produce/fetch address. One per host: two
+# co-located processes must not fight over one listener.
+colocated_native_addr() { echo "$DATA_HOST:$((NATIVE_PORT + $1 - 1))"; }
+
+emit_colocated_config() {
+  local id="$1"; shift
+  local cfg="$WORKDIR/colocated-$id.yaml"
+  local uuid cert
+  # Identity, directory, and ports all derive from the id: a second
+  # co-located host must not reuse the first one's segment directory or bind
+  # its listeners.
+  case "$id" in
+    1) uuid="$LEADER_UUID"; cert="data-1" ;;
+    2) uuid="$FOLLOWER1_UUID"; cert="data-2" ;;
+    3) uuid="$FOLLOWER2_UUID"; cert="data-3" ;;
+    *) fail "colocated node ids 1-3 are supported, not '$id'" ;;
+  esac
+  emit_meta_config "$id" "$@" > /dev/null
+  # `peers:` with NO entries is YAML null, which the typed config refuses, so
+  # the bare key is dropped only then; with entries it must stay, or the list
+  # items underneath would be orphaned and the YAML would not parse at all.
+  local strip_peers=()
+  [[ $# -eq 0 ]] && strip_peers=('-e' '/^peers:$/d')
+  {
+    echo "meta:"
+    sed -e '/^observability:/d' "${strip_peers[@]}" -e 's/^/  /' "$WORKDIR/meta-$id.yaml"
+    echo "data:"
+    # Each host carries an independent STANDALONE range for now: replicated
+    # ranges under co-location wait on follower-side epoch propagation (the
+    # lease watcher tracked as follow-up to #223).
+    echo "  role: standalone"
+    echo "  node_uuid: $uuid"
+    echo "  cluster_id: $CLUSTER_ID"
+    echo "  data_dir: $WORKDIR/data-colocated-$id"
+    echo "  fencing_epoch: $FENCING_EPOCH"
+    echo "  $(emit_range_yaml)"
+    echo "  segment_id: $SEGMENT_ID"
+    echo "  native_listen: \"$(colocated_native_addr "$id")\""
+    echo "  replica_listen: \"$(replica_addr $((id - 1)))\""
+    echo "  replica_tls: { ca: $CERTS/ca.pem, cert: $CERTS/$cert.pem, key: $CERTS/$cert-key.pem }"
+    echo "  native_tls: { ca: $CERTS/ca.pem, cert: $CERTS/$cert.pem, key: $CERTS/$cert-key.pem }"
+    echo "  principal_id: $PRINCIPAL_ID"
+    echo "observability: { listen: \"$(data_metrics_addr $((id - 1)))\" }"
+  } > "$cfg"
+  echo "$cfg"
+}
+
+# start_colocated_node <meta-id> [peer-ids...] — the six-to-three process
+# change, exercised for real: `vtop-node node` hosting both roles.
+#
+# Readiness is deliberately NOT awaited here: the shared /readyz is the
+# conjunction of both roles, and asserting when it opens (and when it must
+# not yet be open) is the scenario's job.
+start_colocated_node() {
+  local id="$1" pid; shift
+  pid="$(start_node "colocated-$id" "colocated_node_starting" node \
+    --config "$(emit_colocated_config "$id" "$@")")"
+  echo "$pid"
+}
+
 start_follower() {
   local n="$1" pid
   pid="$(start_node "data-follower-$n" "data_node_ready" data --config "$(emit_follower_config "$@")")"

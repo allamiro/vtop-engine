@@ -49,6 +49,10 @@ impl Readiness {
 #[derive(Clone, Debug)]
 pub struct ReadinessGate {
     state: Arc<RwLock<Readiness>>,
+    /// Startup marks still owed before [`Self::mark_ready`] opens the gate
+    /// (see [`Self::require_marks`]). Distinct from the level itself: once
+    /// the gate has opened, later flips are ordinary level writes.
+    pending_marks: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl ReadinessGate {
@@ -56,6 +60,7 @@ impl ReadinessGate {
     pub fn starting(reason: impl Into<String>) -> Self {
         Self {
             state: Arc::new(RwLock::new(Readiness::not_ready(reason))),
+            pending_marks: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
         }
     }
 
@@ -63,11 +68,38 @@ impl ReadinessGate {
     pub fn ready() -> Self {
         Self {
             state: Arc::new(RwLock::new(Readiness::Ready)),
+            pending_marks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
+    /// Declare that the gate opens only after `n` distinct [`Self::mark_ready`]
+    /// calls — the conjunction a co-located process needs, where "ready" must
+    /// mean EVERY role hosted in the process has finished starting, not
+    /// whichever one won the race to flip a shared gate. Call before the
+    /// components start.
+    pub fn require_marks(&self, n: usize) {
+        self.pending_marks
+            .store(n.max(1), std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// One component finished starting. The gate opens once every required
+    /// mark (default: one) has arrived.
     pub fn mark_ready(&self) {
-        self.set(Readiness::Ready);
+        use std::sync::atomic::Ordering;
+        let previous = self
+            .pending_marks
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |marks| {
+                Some(marks.saturating_sub(1))
+            })
+            .unwrap_or(0);
+        if previous <= 1 {
+            self.set(Readiness::Ready);
+        } else {
+            self.set(Readiness::not_ready(format!(
+                "waiting for {} more component(s) to finish starting",
+                previous - 1
+            )));
+        }
     }
 
     pub fn mark_not_ready(&self, reason: impl Into<String>) {
@@ -145,6 +177,37 @@ mod tests {
             gate.get(),
             Readiness::NotReady("lost metadata quorum".to_string())
         );
+    }
+
+    /// The conjunction a co-located process needs: with two required marks,
+    /// the first role to finish starting must NOT open the gate — a load
+    /// balancer routing on that half-ready signal reaches a process whose
+    /// other plane has no listener yet.
+    #[test]
+    fn a_gate_requiring_two_marks_opens_only_on_the_second() {
+        let gate = ReadinessGate::starting("boot");
+        gate.require_marks(2);
+
+        gate.mark_ready();
+        assert!(
+            !gate.is_ready(),
+            "one of two roles is not a ready process: {}",
+            gate.get().describe()
+        );
+        assert!(
+            gate.get().describe().contains("1 more component"),
+            "the reason must say what is still owed: {}",
+            gate.get().describe()
+        );
+
+        gate.mark_ready();
+        assert!(gate.is_ready(), "both roles up IS the conjunction");
+
+        // Post-startup the gate is an ordinary level again.
+        gate.mark_not_ready("lost quorum");
+        assert!(!gate.is_ready());
+        gate.mark_ready();
+        assert!(gate.is_ready());
     }
 
     #[test]

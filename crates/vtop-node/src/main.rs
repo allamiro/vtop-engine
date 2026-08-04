@@ -6,6 +6,7 @@
 //! correctness mechanism lives in those crates, none here.
 
 mod client;
+mod colocated;
 mod config;
 mod data_node;
 mod lease_agent;
@@ -38,6 +39,13 @@ enum Command {
     },
     /// Run a data-plane node (leader, follower, or standalone re-open).
     Data {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Run BOTH roles in one process — a metadata voter and a data-plane
+    /// replica sharing a runtime, one observability endpoint, and a fate
+    /// (#215).
+    Node {
         #[arg(long)]
         config: PathBuf,
     },
@@ -141,6 +149,10 @@ async fn run(cli: Cli) -> Result<i32, String> {
         }
         Command::Data { config } => {
             data_node::run(config::load(&config)?).await?;
+            Ok(0)
+        }
+        Command::Node { config } => {
+            colocated::run(config::load(&config)?).await?;
             Ok(0)
         }
         Command::SealActive { path } => {
