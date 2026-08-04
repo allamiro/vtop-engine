@@ -42,7 +42,10 @@ use std::sync::Arc;
 use uuid::Uuid;
 use vtop_broker::memory_budget::BudgetRejectReason;
 use vtop_broker::replication::{InProcessFollower, NetworkedReplicaSet};
-use vtop_broker::LocalBroker;
+use vtop_broker::server_metrics;
+use vtop_broker::{
+    LocalBroker, RequestKind, RequestOutcome, ServerMetrics, LATENCY_BUCKETS_MICROS,
+};
 use vtop_log::RecoveryReport;
 use vtop_meta::{OpenraftConsensus, RaftObservation, RaftServerState};
 use vtop_observe::{Readiness, ReadinessGate};
@@ -881,6 +884,216 @@ impl Collector for FollowerCollector {
 }
 
 // ---------------------------------------------------------------------------
+// Native server request path
+// ---------------------------------------------------------------------------
+
+/// Request rates, latency quantiles, and session counts from the native
+/// server's own atomics.
+///
+/// The latency families are built as protobuf by hand rather than mirrored into
+/// a `prometheus::Histogram`: the broker records bucket counts in atomics (it
+/// owns no Prometheus types by design), and there is no API to push existing
+/// counts into a `Histogram`. Emitting the family directly is the honest
+/// translation; re-observing every sample at scrape time would be a fabrication
+/// and would also lose the sum.
+pub struct ServerCollector {
+    metrics: Arc<ServerMetrics>,
+    sessions_active: IntGaugeVec,
+    requests: CounterFamily,
+    sessions_accepted: CounterFamily,
+    sessions_refused: CounterFamily,
+    produced_records: CounterFamily,
+    produced_bytes: CounterFamily,
+    fetched_records: CounterFamily,
+    fetched_bytes: CounterFamily,
+    latency_desc: Desc,
+}
+
+/// Name of the request-latency family, before the registry's `vtop_` prefix.
+const LATENCY_METRIC: &str = "broker_request_duration_seconds";
+
+impl ServerCollector {
+    pub fn new(metrics: Arc<ServerMetrics>) -> Result<Self, String> {
+        Ok(Self {
+            metrics,
+            sessions_active: gauge_vec(
+                "broker_sessions_active",
+                "Authenticated sessions currently open, by role",
+                &["role"],
+            )?,
+            requests: CounterFamily::new(
+                "broker_requests_total",
+                "Requests the broker answered, by request kind and whether it was served or \
+                 refused",
+                &["kind", "outcome"],
+            )?,
+            sessions_accepted: CounterFamily::new(
+                "broker_sessions_accepted_total",
+                "Sessions that completed authorization and negotiation, by role",
+                &["role"],
+            )?,
+            sessions_refused: CounterFamily::new(
+                "broker_sessions_refused_total",
+                "Connections that never became a session, by why they were turned away",
+                &["reason"],
+            )?,
+            produced_records: CounterFamily::new(
+                "broker_produced_records_total",
+                "Records accepted by successful produce requests",
+                &[],
+            )?,
+            produced_bytes: CounterFamily::new(
+                "broker_produced_bytes_total",
+                "Key and value bytes accepted by successful produce requests",
+                &[],
+            )?,
+            fetched_records: CounterFamily::new(
+                "broker_fetched_records_total",
+                "Records returned by successful fetch requests",
+                &[],
+            )?,
+            fetched_bytes: CounterFamily::new(
+                "broker_fetched_bytes_total",
+                "Key and value bytes returned by successful fetch requests",
+                &[],
+            )?,
+            latency_desc: Desc::new(
+                LATENCY_METRIC.to_string(),
+                "Time the broker held a request, measured around its own work and not the \
+                 socket write, so a slow consumer's backpressure cannot be mistaken for a slow \
+                 log"
+                .to_string(),
+                vec!["kind".to_string()],
+                Default::default(),
+            )
+            .map_err(|error| format!("build {LATENCY_METRIC}: {error}"))?,
+        })
+    }
+
+    fn members(&self) -> Vec<&dyn Collector> {
+        vec![&self.sessions_active]
+    }
+
+    fn refresh(&self) {
+        for role in server_metrics::ROLES {
+            self.sessions_active
+                .with_label_values(&[server_metrics::role_label(role)])
+                .set(self.metrics.sessions_active(role) as i64);
+        }
+    }
+
+    /// Counter families read straight from the server's monotonic atomics.
+    fn counter_families(&self) -> Vec<MetricFamily> {
+        vec![
+            self.requests
+                .family(RequestKind::ALL.into_iter().flat_map(|kind| {
+                    RequestOutcome::ALL.into_iter().map(move |outcome| {
+                        (
+                            vec![kind.as_str(), outcome.as_str()],
+                            self.metrics.requests_total(kind, outcome),
+                        )
+                    })
+                })),
+            self.sessions_accepted
+                .family(server_metrics::ROLES.into_iter().map(|role| {
+                    (
+                        vec![server_metrics::role_label(role)],
+                        self.metrics.sessions_accepted(role),
+                    )
+                })),
+            self.sessions_refused.family([
+                (
+                    vec!["capacity"],
+                    self.metrics.sessions_refused_at_capacity_total(),
+                ),
+                (
+                    vec!["unauthorized"],
+                    self.metrics.sessions_refused_unauthorized_total(),
+                ),
+                (
+                    vec!["handshake"],
+                    self.metrics.sessions_refused_handshake_total(),
+                ),
+            ]),
+            self.produced_records
+                .family([(Vec::new(), self.metrics.records_produced_total())]),
+            self.produced_bytes
+                .family([(Vec::new(), self.metrics.bytes_produced_total())]),
+            self.fetched_records
+                .family([(Vec::new(), self.metrics.records_fetched_total())]),
+            self.fetched_bytes
+                .family([(Vec::new(), self.metrics.bytes_fetched_total())]),
+        ]
+    }
+
+    /// Emit one histogram family carrying every request kind as a series.
+    fn latency_family(&self) -> MetricFamily {
+        let mut family = MetricFamily::default();
+        family.set_name(LATENCY_METRIC.to_string());
+        family.set_help(self.latency_desc.help.clone());
+        family.set_field_type(prometheus::proto::MetricType::HISTOGRAM);
+
+        let mut series = Vec::with_capacity(RequestKind::ALL.len());
+        for kind in RequestKind::ALL {
+            let snapshot = self.metrics.latency(kind);
+            let mut histogram = prometheus::proto::Histogram::default();
+            histogram.set_sample_count(snapshot.count);
+            histogram.set_sample_sum(snapshot.total_seconds);
+            histogram.set_bucket(
+                LATENCY_BUCKETS_MICROS
+                    .iter()
+                    .zip(snapshot.cumulative_counts.iter())
+                    .map(|(bound_micros, cumulative)| {
+                        let mut bucket = prometheus::proto::Bucket::default();
+                        // Prometheus bounds are seconds; the broker's ladder is
+                        // in microseconds because that is the resolution the
+                        // data path is measured at.
+                        bucket.set_upper_bound(*bound_micros as f64 / 1e6);
+                        bucket.set_cumulative_count(*cumulative);
+                        bucket
+                    })
+                    .collect(),
+            );
+
+            let mut label = prometheus::proto::LabelPair::default();
+            label.set_name("kind".to_string());
+            label.set_value(kind.as_str().to_string());
+            let mut metric = prometheus::proto::Metric::default();
+            metric.set_label(vec![label]);
+            metric.set_histogram(histogram);
+            series.push(metric);
+        }
+        family.set_metric(series);
+        family
+    }
+}
+
+impl Collector for ServerCollector {
+    fn desc(&self) -> Vec<&Desc> {
+        let mut descs = descs_of(&self.members());
+        descs.extend([
+            &self.requests.desc,
+            &self.sessions_accepted.desc,
+            &self.sessions_refused.desc,
+            &self.produced_records.desc,
+            &self.produced_bytes.desc,
+            &self.fetched_records.desc,
+            &self.fetched_bytes.desc,
+            &self.latency_desc,
+        ]);
+        descs
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        self.refresh();
+        let mut families = collect_all(&self.members());
+        families.extend(self.counter_families());
+        families.push(self.latency_family());
+        families
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Integrity
 // ---------------------------------------------------------------------------
 
@@ -1149,6 +1362,94 @@ mod tests {
         assert!(
             text.contains(r#"vtop_meta_raft_peer_lag_entries{peer="4"} -1"#),
             "unknown lag must read as unknown, not as the whole log: {text}"
+        );
+    }
+
+    fn server_registry(metrics: Arc<ServerMetrics>) -> Registry {
+        let registry = Registry::new_custom(Some("vtop".into()), None).unwrap();
+        registry
+            .register(Box::new(ServerCollector::new(metrics).unwrap()))
+            .unwrap();
+        registry
+    }
+
+    /// The hand-built histogram family has to satisfy the same shape a
+    /// `prometheus::Histogram` would, or `histogram_quantile()` returns nothing
+    /// and every p99 panel is empty while looking perfectly healthy.
+    #[test]
+    fn the_latency_family_is_a_well_formed_prometheus_histogram() {
+        let metrics = Arc::new(ServerMetrics::new());
+        metrics.request_completed(
+            RequestKind::Produce,
+            RequestOutcome::Ok,
+            std::time::Duration::from_micros(400),
+        );
+        let text = scrape(&server_registry(metrics));
+
+        assert!(
+            text.contains("# TYPE vtop_broker_request_duration_seconds histogram"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                r#"vtop_broker_request_duration_seconds_bucket{kind="produce",le="0.0005"} 1"#
+            ),
+            "a 400us observation belongs to the 500us bucket, in seconds: {text}"
+        );
+        assert!(
+            text.contains(r#"vtop_broker_request_duration_seconds_count{kind="produce"} 1"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"vtop_broker_request_duration_seconds_sum{kind="produce"}"#),
+            "without _sum an average is unanswerable: {text}"
+        );
+    }
+
+    /// A refusal is the system working; it must not land in the success series.
+    #[test]
+    fn served_and_refused_requests_are_counted_apart() {
+        let metrics = Arc::new(ServerMetrics::new());
+        metrics.request_completed(
+            RequestKind::Fetch,
+            RequestOutcome::Ok,
+            std::time::Duration::from_micros(30),
+        );
+        metrics.request_completed(
+            RequestKind::Produce,
+            RequestOutcome::Error,
+            std::time::Duration::from_micros(30),
+        );
+        let text = scrape(&server_registry(metrics));
+        assert!(
+            text.contains(r#"vtop_broker_requests_total{kind="fetch",outcome="ok"} 1"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"vtop_broker_requests_total{kind="produce",outcome="error"} 1"#),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn session_counts_are_exported_per_role() {
+        let metrics = Arc::new(ServerMetrics::new());
+        metrics.session_opened(vtop_protocol::Role::Producer);
+        metrics.session_opened(vtop_protocol::Role::Consumer);
+        metrics.session_closed(vtop_protocol::Role::Consumer);
+        metrics.session_refused_at_capacity();
+        let text = scrape(&server_registry(metrics));
+        assert!(
+            text.contains(r#"vtop_broker_sessions_active{role="producer"} 1"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"vtop_broker_sessions_active{role="consumer"} 0"#),
+            "a closed session must read as zero, not vanish: {text}"
+        );
+        assert!(
+            text.contains(r#"vtop_broker_sessions_refused_total{reason="capacity"} 1"#),
+            "{text}"
         );
     }
 
