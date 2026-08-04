@@ -66,7 +66,7 @@ blake3 = "1"
 # `loosen-follower-log-revert` is required by the blank-follower snapshot
 # harness (openraft panics if a wiped follower reports a lower matching
 # index); see openraft FAQ "Can I wipe out the data of ONE node".
-openraft = { version = "=0.9.24", features = ["single-term-leader", "storage-v2", "loosen-follower-log-revert"] }
+openraft = { version = "=0.9.25", features = ["single-term-leader", "storage-v2", "loosen-follower-log-revert"] }
 hex = "0.4"
 base64 = "0.23"
 uuid = { version = "1", features = ["v4", "serde"] }
