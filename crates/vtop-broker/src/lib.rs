@@ -30,6 +30,7 @@
 pub mod group_commit;
 pub mod memory_budget;
 pub mod replication;
+pub mod server_metrics;
 
 use crate::group_commit::{GroupCommitConfig, GroupCommitCoordinator, QueuedProduce};
 use crate::memory_budget::{reject_message, BudgetReservation, ConnectionBudget};
@@ -38,6 +39,9 @@ use crate::replication::{ClusterCommittedOffset, ReplicaSet};
 pub use crate::group_commit::{FlushReason, GroupCommitMetrics, GroupCommitSample};
 pub use crate::memory_budget::{
     BudgetRejectReason, MemoryBudgetConfig, MemoryBudgetMetrics, MemoryBudgetPool, OverloadAction,
+};
+pub use crate::server_metrics::{
+    LatencySnapshot, RequestKind, RequestOutcome, ServerMetrics, LATENCY_BUCKETS_MICROS,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::collections::HashMap;
@@ -1496,6 +1500,7 @@ pub struct NativeServer {
     config: ServerConfig,
     sessions: Arc<Semaphore>,
     requests: Arc<Semaphore>,
+    metrics: Arc<ServerMetrics>,
 }
 
 impl NativeServer {
@@ -1539,8 +1544,19 @@ impl NativeServer {
             acceptor: TlsAcceptor::from(Arc::new(tls_config)),
             sessions: Arc::new(Semaphore::new(config.max_sessions)),
             requests: Arc::new(Semaphore::new(config.max_inflight_requests)),
+            metrics: Arc::new(ServerMetrics::new()),
             config,
         })
+    }
+
+    /// This server's request-path counters (#224).
+    ///
+    /// Always present rather than opt-in: the recording cost is one relaxed
+    /// atomic add per request, and an optional path would mean an embedded
+    /// broker and a node disagreeing about what they can tell you. Take the
+    /// handle before [`Self::serve`], which consumes the server.
+    pub fn metrics(&self) -> &Arc<ServerMetrics> {
+        &self.metrics
     }
 
     pub async fn serve(
@@ -1563,17 +1579,21 @@ impl NativeServer {
                     let Ok(permit) = Arc::clone(&self.sessions).try_acquire_owned() else {
                         // Explicit overload: refuse the socket rather than queue
                         // unbounded accept work. No request was accepted.
+                        self.metrics.session_refused_at_capacity();
                         drop(socket);
                         continue;
                     };
-                    let acceptor = self.acceptor.clone();
-                    let broker = Arc::clone(&self.broker);
-                    let authorizer = Arc::clone(&self.authorizer);
-                    let requests = Arc::clone(&self.requests);
-                    let config = self.config.clone();
+                    let context = SessionContext {
+                        acceptor: self.acceptor.clone(),
+                        broker: Arc::clone(&self.broker),
+                        authorizer: Arc::clone(&self.authorizer),
+                        requests: Arc::clone(&self.requests),
+                        config: self.config.clone(),
+                        metrics: Arc::clone(&self.metrics),
+                    };
                     sessions.spawn(async move {
                         let _permit = permit;
-                        let _ = serve_connection(socket, peer, acceptor, broker, authorizer, requests, config).await;
+                        let _ = serve_connection(socket, peer, context).await;
                     });
                 }
             }
@@ -1602,22 +1622,111 @@ async fn write_session_frame(
     Ok(())
 }
 
-async fn serve_connection(
-    socket: TcpStream,
-    _peer: SocketAddr,
+/// Closes the active-session gauge on every exit path from the session loop.
+struct SessionGuard {
+    metrics: Arc<ServerMetrics>,
+    role: Role,
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        self.metrics.session_closed(self.role);
+    }
+}
+
+/// Records one request's outcome exactly once, on whichever path it leaves by.
+///
+/// The session loop answers a request from a dozen places: the broker's own
+/// reply, but also capacity refusals, budget rejections, authorization
+/// failures, and the encode/window checks that can turn a successful broker
+/// response into an error frame after the fact. Accounting written at the
+/// happy path alone under-counts refusals precisely when refusals are the
+/// story, and over-counts successes for a fetch the client never received.
+///
+/// So the default on drop is `Error`, and a caller must explicitly claim
+/// success. A future `continue` added to this loop is then counted correctly
+/// without anyone remembering to; the failure mode of forgetting is an
+/// over-reported error rate, which is investigated, rather than an
+/// under-reported one, which is not.
+struct RequestRecord<'a> {
+    metrics: &'a ServerMetrics,
+    kind: RequestKind,
+    started: std::time::Instant,
+    recorded: bool,
+}
+
+impl<'a> RequestRecord<'a> {
+    fn new(metrics: &'a ServerMetrics, kind: RequestKind) -> Self {
+        Self {
+            metrics,
+            kind,
+            started: std::time::Instant::now(),
+            recorded: false,
+        }
+    }
+
+    fn complete(&mut self, outcome: RequestOutcome) {
+        if self.recorded {
+            return;
+        }
+        self.recorded = true;
+        // Measured around the broker's own work, not the socket write: this is
+        // the number that answers "is the log slow", and folding a slow
+        // consumer's TCP backpressure into it would hide that answer.
+        self.metrics
+            .request_completed(self.kind, outcome, self.started.elapsed());
+    }
+}
+
+impl Drop for RequestRecord<'_> {
+    fn drop(&mut self) {
+        self.complete(RequestOutcome::Error);
+    }
+}
+
+/// Everything one session needs from the server that spawned it.
+///
+/// Bundled rather than passed as eight positional arguments: they are all
+/// clones of server-wide state with the same lifetime, and a long positional
+/// list is where a future edit swaps two `Arc`s of compatible type without the
+/// compiler noticing.
+struct SessionContext {
     acceptor: TlsAcceptor,
     broker: Arc<LocalBroker>,
     authorizer: Arc<dyn SessionAuthorizer>,
     requests: Arc<Semaphore>,
     config: ServerConfig,
+    metrics: Arc<ServerMetrics>,
+}
+
+async fn serve_connection(
+    socket: TcpStream,
+    _peer: SocketAddr,
+    context: SessionContext,
 ) -> BrokerResult<()> {
-    let mut stream = timeout(config.handshake_timeout, acceptor.accept(socket))
-        .await
-        .map_err(|_| BrokerError::Timeout("TLS handshake"))?
-        .map_err(|source| BrokerError::Io {
-            path: PathBuf::from("tls-session"),
-            source,
-        })?;
+    let SessionContext {
+        acceptor,
+        broker,
+        authorizer,
+        requests,
+        config,
+        metrics,
+    } = context;
+    let handshake = timeout(config.handshake_timeout, acceptor.accept(socket)).await;
+    let mut stream = match handshake {
+        Err(_) => {
+            metrics.session_refused_handshake();
+            return Err(BrokerError::Timeout("TLS handshake"));
+        }
+        Ok(Err(source)) => {
+            metrics.session_refused_handshake();
+            return Err(BrokerError::Io {
+                path: PathBuf::from("tls-session"),
+                source,
+            });
+        }
+        Ok(Ok(stream)) => stream,
+    };
     let peer_chain_der = stream
         .get_ref()
         .1
@@ -1630,21 +1739,33 @@ async fn serve_connection(
         max_frame_bytes: config.max_frame_bytes,
         max_records: config.max_records_per_frame,
     };
-    let frame = timeout(
+    let frame = match timeout(
         config.handshake_timeout,
         read_frame(&mut stream, initial_limits),
     )
     .await
-    .map_err(|_| BrokerError::Timeout("protocol handshake"))??;
+    {
+        Err(_) => {
+            metrics.session_refused_handshake();
+            return Err(BrokerError::Timeout("protocol handshake"));
+        }
+        Ok(Err(problem)) => {
+            metrics.session_refused_handshake();
+            return Err(problem.into());
+        }
+        Ok(Ok(frame)) => frame,
+    };
     let Some(WireFrame {
         request_id: 0,
         stream_id: 0,
         message: Message::ClientHello(hello),
     }) = frame
     else {
+        metrics.session_refused_handshake();
         return Ok(());
     };
     if !authorizer.authorize(&peer_chain_der, hello.principal_id, hello.role) {
+        metrics.session_refused_unauthorized();
         write_session_frame(
             &mut stream,
             &error(
@@ -1662,6 +1783,7 @@ async fn serve_connection(
     let (role, negotiated_limits, negotiated_window) = match negotiate(&hello, &config) {
         Ok(value) => value,
         Err((code, message)) => {
+            metrics.session_refused_handshake();
             write_session_frame(
                 &mut stream,
                 &error(0, 0, code, message),
@@ -1695,6 +1817,15 @@ async fn serve_connection(
         }),
     };
     write_session_frame(&mut stream, &ack, negotiated_limits, config.idle_timeout).await?;
+    metrics.session_opened(role);
+    // The session loop below leaves through a dozen `return` sites, several of
+    // them error paths. A guard closes the gauge on all of them; a manual
+    // decrement at each `return` is exactly the bookkeeping that goes stale on
+    // the next edit and leaves the active-session count climbing forever.
+    let _session = SessionGuard {
+        metrics: Arc::clone(&metrics),
+        role,
+    };
 
     let mut last_request_id = 0_u64;
     let mut send_credit = negotiated_window;
@@ -1725,6 +1856,9 @@ async fn serve_connection(
             };
             let request_id = frame.request_id;
             let stream_id = frame.stream_id;
+            // Defaults to Error on drop; each arm below claims success only
+            // when the client actually got the answer it asked for.
+            let mut record = RequestRecord::new(&metrics, RequestKind::of(&frame.message));
             match frame.message {
                 Message::WindowUpdate(update) => {
                     if update.additional_bytes == 0 {
@@ -1748,6 +1882,7 @@ async fn serve_connection(
                         if send_credit > 0 {
                             pause_reads = false;
                         }
+                        record.complete(RequestOutcome::Ok);
                     }
                     continue;
                 }
@@ -1763,6 +1898,7 @@ async fn serve_connection(
                         config.idle_timeout,
                     )
                     .await?;
+                    record.complete(RequestOutcome::Ok);
                     continue;
                 }
                 _ => {
@@ -1791,6 +1927,12 @@ async fn serve_connection(
             Ok(Ok(Some(frame))) => frame,
         };
         let request_id = frame.request_id;
+        // Created here, before ANY of the refusal paths below, so a capacity
+        // refusal, an authorization failure, or a budget rejection is counted
+        // as the refused request it is. This is the accounting that used to
+        // sit only on the happy path and went flat exactly when the broker was
+        // busy refusing work.
+        let mut record = RequestRecord::new(&metrics, RequestKind::of(&frame.message));
         if request_id == 0 || request_id <= last_request_id {
             let response = error(
                 request_id,
@@ -1882,6 +2024,7 @@ async fn serve_connection(
                     if send_credit > 0 {
                         pause_reads = false;
                     }
+                    record.complete(RequestOutcome::Ok);
                 }
                 continue;
             }
@@ -1901,6 +2044,7 @@ async fn serve_connection(
                     config.idle_timeout,
                 )
                 .await?;
+                record.complete(RequestOutcome::Ok);
                 continue;
             }
             WireFrame {
@@ -1993,6 +2137,23 @@ async fn serve_connection(
             .await?;
             continue;
         };
+        // Size the request before it moves into the blocking task. Produce
+        // volume is taken from the request rather than the response because
+        // the response carries only offsets, and it is recorded only once the
+        // FINAL frame is known, so neither a refused append nor a fetch the
+        // client never received is counted as accepted throughput.
+        let produced = match &frame.message {
+            Message::ProduceRequest(request) => Some((
+                request.records.len() as u64,
+                request
+                    .records
+                    .iter()
+                    .map(|record| (record.key.len() + record.value.len()) as u64)
+                    .sum::<u64>(),
+            )),
+            _ => None,
+        };
+
         let broker = Arc::clone(&broker);
         let session_budget = conn_budget.clone();
         let response = tokio::task::spawn_blocking(move || {
@@ -2000,7 +2161,23 @@ async fn serve_connection(
             broker.handle_with_connection(role, frame, Some(&session_budget))
         })
         .await?;
-        let is_fetch_response = matches!(response.message, Message::FetchResponse(_));
+        // The broker's verdict is not yet final: the encode-limit and
+        // send-credit checks below can still turn this into an error frame, so
+        // nothing is claimed until the bytes the client will actually receive
+        // are known.
+        let broker_outcome = RequestOutcome::of(&response.message);
+        let fetched = match &response.message {
+            Message::FetchResponse(fetched) => Some((
+                fetched.records.len() as u64,
+                fetched
+                    .records
+                    .iter()
+                    .map(|record| (record.key.len() + record.value.len()) as u64)
+                    .sum::<u64>(),
+            )),
+            _ => None,
+        };
+        let is_fetch_response = fetched.is_some();
         let encoded = match encode_frame(&response, negotiated_limits) {
             Ok(encoded) => encoded,
             // Only a single-record progress fetch can exceed the negotiated
@@ -2046,6 +2223,17 @@ async fn serve_connection(
             send_credit -= response_bytes;
         }
         write_session_bytes(&mut stream, &encoded, config.idle_timeout).await?;
+        // The client has the bytes: this is the first point at which the
+        // outcome and the volume are true.
+        record.complete(broker_outcome);
+        if broker_outcome == RequestOutcome::Ok {
+            if let Some((records, bytes)) = produced {
+                metrics.produced(records, bytes);
+            }
+            if let Some((records, bytes)) = fetched {
+                metrics.fetched(records, bytes);
+            }
+        }
     }
 }
 
@@ -2766,6 +2954,138 @@ mod tests {
 
         shutdown_tx.send(()).unwrap();
         server_task.await.unwrap().unwrap();
+    }
+
+    /// Refusals must be counted, not skipped.
+    ///
+    /// The accounting originally sat only on the path where the broker
+    /// answered, so `requests_total{outcome="error"}` stayed flat exactly when
+    /// the session layer was busy turning work away — an error-rate panel that
+    /// reads healthiest under the conditions that should light it up.
+    #[tokio::test]
+    async fn session_layer_refusals_are_counted_and_never_credited_as_throughput() {
+        let (_dir, broker, range) = fixture();
+        let cluster_id = Uuid::from_u128(60);
+        let principal_id = Uuid::from_u128(62);
+        let server_identity = generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let client_identity = generate_simple_self_signed(vec!["vtop-client".to_owned()]).unwrap();
+
+        let mut client_roots = rustls::RootCertStore::empty();
+        client_roots
+            .add(client_identity.cert.der().clone())
+            .unwrap();
+        let server = NativeServer::new(
+            broker,
+            ServerTlsMaterial {
+                certificate_chain: vec![server_identity.cert.der().clone()],
+                private_key: private_key(&server_identity),
+                client_roots,
+            },
+            Arc::new(TestAuthorizer {
+                leaf_der: client_identity.cert.der().as_ref().to_vec(),
+                principal_id,
+            }),
+            ServerConfig {
+                cluster_id,
+                node_id: Uuid::from_u128(61),
+                segment_format: SegmentFormat::V1,
+                max_frame_bytes: 16 * 1024,
+                max_records_per_frame: 32,
+                window_bytes: 16 * 1024,
+                max_sessions: 4,
+                max_inflight_requests: 2,
+                handshake_timeout: Duration::from_secs(2),
+                idle_timeout: Duration::from_secs(2),
+            },
+        )
+        .unwrap();
+        // Taken before `serve`, which consumes the server.
+        let metrics = Arc::clone(server.metrics());
+
+        let mut server_roots = rustls::RootCertStore::empty();
+        server_roots
+            .add(server_identity.cert.der().clone())
+            .unwrap();
+        let client_tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_root_certificates(server_roots)
+        .with_client_auth_cert(
+            vec![client_identity.cert.der().clone()],
+            private_key(&client_identity),
+        )
+        .unwrap();
+        let connector = TlsConnector::from(Arc::new(client_tls));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server_task = tokio::spawn(server.serve(listener, shutdown_rx));
+
+        let limits = ProtocolLimits {
+            max_frame_bytes: 16 * 1024,
+            max_records: 32,
+        };
+        let mut producer = connect(
+            &connector,
+            address,
+            cluster_id,
+            principal_id,
+            Role::Producer,
+            limits,
+        )
+        .await;
+
+        // Refused by the session layer before the broker ever sees it: the
+        // producer id does not match the authenticated principal.
+        write_frame(
+            &mut producer,
+            &produce(range.clone(), Uuid::from_u128(999), 9, 0, 1),
+            limits,
+        )
+        .await
+        .unwrap();
+        let rejected = read_frame(&mut producer, limits).await.unwrap().unwrap();
+        assert!(matches!(
+            rejected.message,
+            Message::Error(ErrorResponse {
+                code: ErrorCode::Unauthorized,
+                ..
+            })
+        ));
+
+        write_frame(
+            &mut producer,
+            &produce(range.clone(), principal_id, 1, 0, 2),
+            limits,
+        )
+        .await
+        .unwrap();
+        let produced = read_frame(&mut producer, limits).await.unwrap().unwrap();
+        assert!(matches!(produced.message, Message::ProduceResponse(_)));
+        drop(producer);
+
+        shutdown_tx.send(()).unwrap();
+        server_task.await.unwrap().unwrap();
+
+        assert_eq!(
+            metrics.requests_total(RequestKind::Produce, RequestOutcome::Error),
+            1,
+            "a session-layer refusal must be counted as a refused request"
+        );
+        assert_eq!(
+            metrics.requests_total(RequestKind::Produce, RequestOutcome::Ok),
+            1
+        );
+        // Both requests carried one record; only the accepted one is
+        // throughput.
+        assert_eq!(
+            metrics.records_produced_total(),
+            1,
+            "a refused append must never be credited as accepted volume"
+        );
     }
 
     #[tokio::test]

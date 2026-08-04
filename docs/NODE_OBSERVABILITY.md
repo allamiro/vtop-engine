@@ -150,6 +150,13 @@ not keep publishing the follower lag it saw at the instant of the failover.
 | `vtop_broker_group_commit_sync_nanoseconds_total` | counter | Divide by commits for mean fsync cost. |
 | `vtop_broker_group_commit_queue_wait_nanoseconds_total` | counter | Time requests waited to join a group. |
 | `vtop_broker_group_commit_last_batch_records` / `_bytes` | gauge | Size of the most recent group. |
+| `vtop_broker_requests_total{kind,outcome}` | counter | Requests answered, by kind (`produce`, `fetch`, `commit_cursor`, `fetch_cursor`, `replica_append`, `other`) and whether the broker served or refused. A refusal is often the system working — a fencing rejection is correct behaviour — so it is counted apart from a success rather than folded into one error rate. |
+| `vtop_broker_request_duration_seconds{kind}` | histogram | Time the broker held a request. **Measured around its own work, not the socket write**, so a slow consumer's TCP backpressure cannot be mistaken for a slow log. Buckets run 50µs–1s, dense where an fsync and a quorum round-trip live. |
+| `vtop_broker_produced_records_total` / `_bytes_total` | counter | Volume accepted by *successful* produce requests; a refused append is not throughput. |
+| `vtop_broker_fetched_records_total` / `_bytes_total` | counter | Volume returned by successful fetch requests. |
+| `vtop_broker_sessions_active{role}` | gauge | Authenticated sessions open now, by role. |
+| `vtop_broker_sessions_accepted_total{role}` | counter | Sessions that completed authorization and negotiation. |
+| `vtop_broker_sessions_refused_total{reason}` | counter | Connections that never became sessions: `capacity`, `unauthorized`, `handshake`. |
 | `vtop_broker_memory_used_bytes{scope}` | gauge | Bytes charged to each budget ledger (`process`, `shard`, `fetch_queue`, `replica`). |
 | `vtop_broker_memory_queue_depth` | gauge | Admissions blocked waiting for budget. |
 | `vtop_broker_memory_rejections_total{reason}` | counter | Admissions refused, by which ledger refused (#187). |
@@ -180,10 +187,7 @@ in escape sequences.
 
 ## What is not here yet
 
-* Produce/fetch **rate and latency histograms** and session counts require
-  instrumenting the broker request path; they are not derived from existing
-  state and are tracked as follow-up work on #224.
 * Proof-verification and evidence-gate counters cover segment recovery today;
   the retention/tier evidence lag metrics are follow-up work.
-* The starter Grafana dashboard and the compose scrape wiring land with the
-  same issue.
+* `vtopctl node status`, the starter Grafana dashboard, and the compose scrape
+  wiring land with the same issue.

@@ -12,6 +12,7 @@
 use crate::config::{DataNodeConfig, DataRole};
 use crate::observe::{
     BrokerCollector, FollowerCollector, NodeObservability, SegmentRecoveryCollector,
+    ServerCollector,
 };
 use crate::tls;
 use std::path::Path;
@@ -333,6 +334,10 @@ async fn run_leader(
         },
     )
     .map_err(|error| error.to_string())?;
+    // Taken before `serve`, which consumes the server.
+    observability.register(Box::new(ServerCollector::new(Arc::clone(
+        server.metrics(),
+    ))?))?;
 
     let listener = TcpListener::bind(listen)
         .await
