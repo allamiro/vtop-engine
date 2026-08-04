@@ -38,6 +38,9 @@ jobs:
       benchmarks: ${{ steps.filter.outputs.benchmarks }}
       scripts: ${{ steps.filter.outputs.scripts }}
       shell: ${{ steps.filter.outputs.shell }}
+      kafka: ${{ steps.filter.outputs.kafka }}
+      postgres: ${{ steps.filter.outputs.postgres }}
+      fuzz: ${{ steps.filter.outputs.fuzz }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
       # Pinned to a full commit SHA (v3), not the mutable tag, so an upstream
@@ -58,6 +61,73 @@ jobs:
               - '.cargo/**'
               - 'rust-toolchain*'
               - '.github/workflows/ci.yml'
+            # Narrow filters for the jobs that spin up external services or a
+            # nightly toolchain. Each lists the crates its command actually
+            # compiles, taken from `cargo tree`, rather than all of `crates/**`.
+            #
+            # Listing crates explicitly is safe here BECAUSE a crate can only
+            # gain a dependency by editing its own Cargo.toml — which is inside
+            # its own path pattern. So a closure that grows re-triggers the job
+            # that cares, and these lists cannot silently go stale. Verify one
+            # with `cargo tree -p <crate> -e normal`.
+            #
+            # Each filter also carries `.cargo/**` and `rust-toolchain*`: those
+            # change the flags, target, and linker every one of these commands
+            # compiles with, so a job that ignored them could pass on a build
+            # configuration it never used.
+
+            # `cargo test -p vtop-cli --test integration_kafka_to_minio`,
+            # plus the seeding step that runs `docker/seed-events.sh` — the
+            # generator whose output the test then asserts is non-empty.
+            #
+            # vtop-cli depends on every workspace crate EXCEPT vtop-node, so
+            # this is "everything but the cluster-node binary" — which is where
+            # a lot of #215/#224 work lands. vtop-broker and vtop-protocol are
+            # listed because PR #229 makes vtop-cli depend on them for
+            # `vtopctl node status`; they are a superset until it lands.
+            kafka:
+              - 'crates/vtop-adapters/**'
+              - 'crates/vtop-broker/**'
+              - 'crates/vtop-cli/**'
+              - 'crates/vtop-core/**'
+              - 'crates/vtop-log/**'
+              - 'crates/vtop-meta/**'
+              - 'crates/vtop-observe/**'
+              - 'crates/vtop-protocol/**'
+              - 'crates/vtop-state/**'
+              - 'crates/vtop-upload/**'
+              - 'tests/**'
+              # Executed by the job's seeding step, and its output is what the
+              # test asserts on.
+              - 'docker/seed-events.sh'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.cargo/**'
+              - 'rust-toolchain*'
+              - '.github/workflows/ci.yml'
+
+            # `cargo test -p vtop-state --features postgres,test-support
+            #  --test pg_battery`. Closure is vtop-state + vtop-core.
+            postgres:
+              - 'crates/vtop-state/**'
+              - 'crates/vtop-core/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.cargo/**'
+              - 'rust-toolchain*'
+              - '.github/workflows/ci.yml'
+
+            # The fuzz targets (detect_batch, detect_record, manifest_parse)
+            # exercise vtop-core only, and need a pinned nightly toolchain.
+            fuzz:
+              - 'fuzz/**'
+              - 'crates/vtop-core/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.cargo/**'
+              - 'rust-toolchain*'
+              - '.github/workflows/ci.yml'
+
             dashboards:
               - 'observability/**'
             benchmarks:
@@ -195,7 +265,7 @@ jobs:
   kafka-integration:
     name: kafka integration (live broker)
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: needs.changes.outputs.kafka == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     services:
@@ -454,7 +524,7 @@ jobs:
   fuzz:
     name: fuzz smoke (detect + manifest)
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: needs.changes.outputs.fuzz == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -578,7 +648,7 @@ jobs:
   postgres:
     name: postgres backend (battery)
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: needs.changes.outputs.postgres == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     services:
