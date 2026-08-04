@@ -1,0 +1,1210 @@
+{
+  "uid": "vtop-cluster",
+  "title": "VTOP Cluster \u2014 nodes",
+  "description": "The metadata Raft group and the native data plane, from each node's own /metrics endpoint (#224). Start here for a cluster incident; the 'VTOP Engine' dashboard covers the archive pipeline instead.",
+  "tags": [
+    "vtop",
+    "cluster",
+    "raft",
+    "broker"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "instance",
+        "label": "Node",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "mimir"
+        },
+        "query": {
+          "query": "label_values(vtop_node_info, instance)",
+          "refId": "instance"
+        },
+        "refresh": 2,
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Metadata group",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "collapsed": false,
+      "panels": [],
+      "id": 1
+    },
+    {
+      "type": "stat",
+      "title": "Meta nodes running",
+      "description": "Nodes whose Raft core is alive. A node can answer /healthz with a dead Raft core, which is why this is counted separately from process liveness.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "sum(vtop_meta_raft_running{instance=~\"$instance\"}) or vector(0)",
+          "legendFormat": "running"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNonNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "text": {
+          "valueSize": 22
+        },
+        "textMode": "value",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "showPercentChange": false,
+        "wideLayout": true
+      },
+      "pluginVersion": "13.1.0",
+      "id": 2
+    },
+    {
+      "type": "stat",
+      "title": "Leaders",
+      "description": "Must be exactly 1. Zero means no metadata progress is possible; two means split brain and is the more dangerous of the two.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "sum(vtop_meta_raft_state{instance=~\"$instance\",state=\"leader\"}) or vector(0)",
+          "legendFormat": "leaders"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 2
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNonNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "text": {
+          "valueSize": 22
+        },
+        "textMode": "value",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "showPercentChange": false,
+        "wideLayout": true
+      },
+      "pluginVersion": "13.1.0",
+      "id": 3
+    },
+    {
+      "type": "stat",
+      "title": "Highest term",
+      "description": "A term that climbs steadily means repeated elections \u2014 usually timers set too tight for the network, or a node that keeps losing contact.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "max(vtop_meta_raft_term{instance=~\"$instance\"}) or vector(0)",
+          "legendFormat": "term"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNonNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "text": {
+          "valueSize": 22
+        },
+        "textMode": "value",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "showPercentChange": false,
+        "wideLayout": true
+      },
+      "pluginVersion": "13.1.0",
+      "id": 4
+    },
+    {
+      "type": "stat",
+      "title": "Voters",
+      "description": "Committed membership size. This is the number a 3->5 growth scenario asserts against.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "max(vtop_meta_raft_voters{instance=~\"$instance\"}) or vector(0)",
+          "legendFormat": "voters"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNonNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "text": {
+          "valueSize": 22
+        },
+        "textMode": "value",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "showPercentChange": false,
+        "wideLayout": true
+      },
+      "pluginVersion": "13.1.0",
+      "id": 5
+    },
+    {
+      "type": "stat",
+      "title": "Learners",
+      "description": "Replicating without voting \u2014 a node being caught up before it joins quorum.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "max(vtop_meta_raft_learners{instance=~\"$instance\"}) or vector(0)",
+          "legendFormat": "learners"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNonNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "text": {
+          "valueSize": 22
+        },
+        "textMode": "value",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "showPercentChange": false,
+        "wideLayout": true
+      },
+      "pluginVersion": "13.1.0",
+      "id": 6
+    },
+    {
+      "type": "stat",
+      "title": "Quorum ack age (max ms)",
+      "description": "Milliseconds since a quorum acknowledged the leader. A value that CLIMBS on a self-declared leader is the signature of a partition: it is what separates 'isolated' from 'slow'. -1 (not leading) is filtered out.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "max(vtop_meta_raft_millis_since_quorum_ack{instance=~\"$instance\"} >= 0) or vector(0)",
+          "legendFormat": "ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNonNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "text": {
+          "valueSize": 22
+        },
+        "textMode": "value",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "showPercentChange": false,
+        "wideLayout": true
+      },
+      "pluginVersion": "13.1.0",
+      "id": 7
+    },
+    {
+      "type": "timeseries",
+      "title": "Raft log progress",
+      "description": "Last log index against last applied. A widening gap means the state machine is falling behind the log rather than the cluster falling behind its peers.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 5
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "vtop_meta_raft_last_log_index{instance=~\"$instance\"} >= 0",
+          "legendFormat": "{{instance}} log"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "vtop_meta_raft_last_applied_index{instance=~\"$instance\"} >= 0",
+          "legendFormat": "{{instance}} applied"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {},
+      "id": 8
+    },
+    {
+      "type": "timeseries",
+      "title": "Peer replication lag",
+      "description": "Entries each peer trails the leader by, published by the leader only. -1 means the peer has acknowledged nothing at all and is filtered out \u2014 unknown is not zero lag.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 5
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "vtop_meta_raft_peer_lag_entries{instance=~\"$instance\"} >= 0",
+          "legendFormat": "{{instance}} -> peer {{peer}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "options": {},
+      "id": 9
+    },
+    {
+      "type": "row",
+      "title": "Ranges and replication",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 13
+      },
+      "collapsed": false,
+      "panels": [],
+      "id": 10
+    },
+    {
+      "type": "stat",
+      "title": "Fenced leaseholders",
+      "description": "Brokers that no longer hold their range's lease. They refuse writes by design, so this is expected DURING a handover and a problem if it persists.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 14
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "count(vtop_broker_lease_active{instance=~\"$instance\"} == 0) or vector(0)",
+          "legendFormat": "fenced"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNonNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "text": {
+          "valueSize": 22
+        },
+        "textMode": "value",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "showPercentChange": false,
+        "wideLayout": true
+      },
+      "pluginVersion": "13.1.0",
+      "id": 11
+    },
+    {
+      "type": "stat",
+      "title": "Disconnected followers",
+      "description": "Followers with no live replication stream from their leader. Quorum durability degrades before produce starts failing, so this leads the incident.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 14
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "count(vtop_broker_follower_connected{instance=~\"$instance\"} == 0) or vector(0)",
+          "legendFormat": "disconnected"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNonNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "text": {
+          "valueSize": 22
+        },
+        "textMode": "value",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "showPercentChange": false,
+        "wideLayout": true
+      },
+      "pluginVersion": "13.1.0",
+      "id": 12
+    },
+    {
+      "type": "timeseries",
+      "title": "Committed offsets",
+      "description": "Each replica's durable boundary against the quorum high-water mark. A LINE THAT FLATTENS is the honest signal that writes have stalled: offsets are read non-blocking, so a stuck fsync stops the gauge advancing rather than hanging the scrape.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 14
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "vtop_broker_local_committed_offset{instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} {{topic}} durable"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "vtop_broker_cluster_committed_offset{instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} {{topic}} quorum"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {},
+      "id": 13
+    },
+    {
+      "type": "timeseries",
+      "title": "Follower lag",
+      "description": "Records each follower trails its leader's durable boundary by.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 18
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "vtop_broker_follower_lag_records{instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} -> {{follower}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "options": {},
+      "id": 14
+    },
+    {
+      "type": "row",
+      "title": "Throughput and latency",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 26
+      },
+      "collapsed": false,
+      "panels": [],
+      "id": 15
+    },
+    {
+      "type": "timeseries",
+      "title": "Request rate",
+      "description": "Served and refused are separate series on purpose: a fencing rejection is the system working, and folding it into one error rate teaches an operator to ignore the panel during a correct failover.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 27
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "sum by (kind, outcome) (rate(vtop_broker_requests_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{kind}} {{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {},
+      "id": 16
+    },
+    {
+      "type": "timeseries",
+      "title": "p99 request latency",
+      "description": "Measured around the broker's own work, NOT the socket write, so a slow consumer's backpressure cannot be mistaken for a slow log.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 27
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "histogram_quantile(0.99, sum by (kind, le) (rate(vtop_broker_request_duration_seconds_bucket{instance=~\"$instance\"}[5m])))",
+          "legendFormat": "{{kind}} p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {},
+      "id": 17
+    },
+    {
+      "type": "timeseries",
+      "title": "Record throughput",
+      "description": "Volume on SUCCESSFUL requests only; a refused append is not throughput.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 35
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "sum(rate(vtop_broker_produced_records_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "produced"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "sum(rate(vtop_broker_fetched_records_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "fetched"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {},
+      "id": 18
+    },
+    {
+      "type": "timeseries",
+      "title": "Sessions",
+      "description": "Open sessions by role, beside the connections that never became one. A rising `capacity` refusal rate means max_sessions, not a client bug.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 35
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "sum by (role) (vtop_broker_sessions_active{instance=~\"$instance\"})",
+          "legendFormat": "{{role}} active"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "sum by (reason) (rate(vtop_broker_sessions_refused_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "refused: {{reason}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {},
+      "id": 19
+    },
+    {
+      "type": "row",
+      "title": "Backpressure",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 43
+      },
+      "collapsed": false,
+      "panels": [],
+      "id": 20
+    },
+    {
+      "type": "stat",
+      "title": "Budget rejections (1h)",
+      "description": "Admissions refused by a memory budget (#187). Failing closed is correct behaviour under load; a sustained rate means the ceilings are wrong for the workload.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 44
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "sum(increase(vtop_broker_memory_rejections_total{instance=~\"$instance\"}[1h])) or vector(0)",
+          "legendFormat": "rejections"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNonNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "text": {
+          "valueSize": 22
+        },
+        "textMode": "value",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "showPercentChange": false,
+        "wideLayout": true
+      },
+      "pluginVersion": "13.1.0",
+      "id": 21
+    },
+    {
+      "type": "timeseries",
+      "title": "Memory in use",
+      "description": "Bytes charged to each budget ledger.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 9,
+        "x": 6,
+        "y": 44
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "sum by (scope) (vtop_broker_memory_used_bytes{instance=~\"$instance\"})",
+          "legendFormat": "{{scope}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "options": {},
+      "id": 22
+    },
+    {
+      "type": "timeseries",
+      "title": "Time spent waiting for budget",
+      "description": "Above 1 means more than one request-second per wall second is parked on admission \u2014 the point at which backpressure is the bottleneck rather than a safety net.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 9,
+        "x": 15,
+        "y": 44
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "sum(rate(vtop_broker_backpressure_nanoseconds_total{instance=~\"$instance\"}[5m])) / 1e9",
+          "legendFormat": "seconds waiting per second"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {},
+      "id": 23
+    },
+    {
+      "type": "row",
+      "title": "Integrity",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 52
+      },
+      "collapsed": false,
+      "panels": [],
+      "id": 24
+    },
+    {
+      "type": "stat",
+      "title": "Segments recovered",
+      "description": "Replicas that re-opened an existing segment rather than creating a fresh one. Expected after a restart.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 53
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "sum(vtop_broker_segment_recovered{instance=~\"$instance\"}) or vector(0)",
+          "legendFormat": "recovered"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNonNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "text": {
+          "valueSize": 22
+        },
+        "textMode": "value",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "showPercentChange": false,
+        "wideLayout": true
+      },
+      "pluginVersion": "13.1.0",
+      "id": 25
+    },
+    {
+      "type": "stat",
+      "title": "Recovery truncated bytes",
+      "description": "Bytes discarded past the durable boundary at open. Non-zero after a crash is expected and benign - it is the torn tail. Non-zero on EVERY restart means the fsync story is wrong, and this is the differentiator neither Kafka nor Northguard exposes.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 53
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "sum(vtop_broker_segment_recovery_truncated_bytes{instance=~\"$instance\"}) or vector(0)",
+          "legendFormat": "bytes"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNonNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "text": {
+          "valueSize": 22
+        },
+        "textMode": "value",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "showPercentChange": false,
+        "wideLayout": true
+      },
+      "pluginVersion": "13.1.0",
+      "id": 26
+    },
+    {
+      "type": "timeseries",
+      "title": "Fencing epochs",
+      "description": "Where the two diverge, that broker has been fenced: metadata has granted the range to someone else and this one must refuse writes.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 53
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "vtop_broker_meta_fencing_epoch{instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} metadata"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "vtop_broker_held_fencing_epoch{instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} held"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {},
+      "id": 27
+    }
+  ]
+}

@@ -111,6 +111,13 @@ services:
       - /etc/alloy/config.alloy
     ports:
       - "${VTOP_BIND_ADDR:-127.0.0.1}:12345:12345"   # Alloy UI: shows which targets are actually UP
+    # The node scrape targets (#224) are host ports bound by the live-chaos
+    # harness, not compose services. Docker Desktop resolves
+    # host.docker.internal natively; this mapping makes it resolve on Linux too,
+    # so the same config works in both places instead of silently scraping
+    # nothing on one of them.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./observability/alloy/config.alloy:/etc/alloy/config.alloy:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro

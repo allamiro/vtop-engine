@@ -341,6 +341,7 @@ from dashboards_kafka import kafka  # noqa: E402
 from dashboards_pipeline import pipeline as pipeline_flow  # noqa: E402
 from dashboards_flow import flow as flow_drawio  # noqa: E402
 from dashboards_vtop import engine as vtop_engine  # noqa: E402
+from dashboards_cluster import cluster as vtop_cluster  # noqa: E402
 
 
 def assign_panel_ids(dash):
@@ -369,6 +370,9 @@ if __name__ == "__main__":
     for name, d in [
         # The engine's own dashboard first: it is the one that matters.
         ("vtop-engine", vtop_engine),
+        # The cluster nodes (#215/#224): a different process answering a
+        # different question from the archive pipeline above.
+        ("vtop-cluster", vtop_cluster),
         ("vtop-pipeline-flow", pipeline_flow),
         ("vtop-flow-drawio", flow_drawio),
         ("vtop-overview", overview),

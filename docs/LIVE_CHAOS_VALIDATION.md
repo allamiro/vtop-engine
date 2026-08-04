@@ -15,8 +15,8 @@ scripts/live-chaos/run-all.sh
 For a faster local correctness pass, build the same packages without
 `--release` and run with `CHAOS_PROFILE=debug`.
 
-The Linux host needs `bash`, `openssl`, a C compiler, `unshare`, `ip`, and
-`iptables`. Unprivileged user and mount namespaces must be enabled. Each
+The Linux host needs `bash`, `openssl`, `curl`, a C compiler, `unshare`, `ip`,
+and `iptables`. Unprivileged user and mount namespaces must be enabled. Each
 scenario owns a fresh `$TMPDIR/vtop-chaos.*` directory (`/tmp` when `TMPDIR`
 is unset) and removes it on exit; `CHAOS_KEEP=1` retains generated evidence.
 A caller-supplied `CHAOS_WORKDIR` is never deleted automatically.
@@ -54,6 +54,8 @@ without editing a scenario:
 | `CHAOS_META_ADMIN_BASE_PORT` | `9200` | Metadata admin ports are this base plus node ID. |
 | `CHAOS_REPLICA_BASE_PORT` | `9300` | Replica ports are this base plus replica number. |
 | `CHAOS_NATIVE_PORT` | `9400` | Native producer/fetch port. |
+| `CHAOS_META_METRICS_BASE_PORT` | `9500` | Metadata `/metrics` ports are this base plus node ID (#224). |
+| `CHAOS_DATA_METRICS_BASE_PORT` | `9600` | Data-plane `/metrics` ports: base+0 for the leader, base+1/2 for followers. |
 | `CHAOS_READY_TIMEOUT_SECONDS` | `20` | Process readiness deadline. |
 | `CHAOS_ELECTION_TIMEOUT_SECONDS` | `30` | Election and convergence deadline. |
 | `CHAOS_PROGRESS_TIMEOUT_SECONDS` | `30` | Producer-progress deadline. |
@@ -69,6 +71,24 @@ for the documented assertions. Invalid values, port collisions, and a
 disk-full workload too small to exhaust its tmpfs fail during preflight with
 an actionable message.
 
+## Readiness gating
+
+Node startup is gated on `GET /readyz` (#224), not on a stdout ready marker.
+The marker proves a node reached the end of its startup path exactly once; the
+endpoint reports whether it is servable *right now*, which is a different and
+stronger claim — a marker cannot go back to false when a leader is fenced, a
+partition heals, or a disk fills. Scenarios that need the current state call
+`await_ready` / `await_not_ready`, and a failed gate prints the reason the node
+served rather than only an HTTP code.
+
+Nodes started inside their own network namespace (scenario `06`) are not
+reachable from the harness, so the marker remains their only available signal.
+Everywhere else the health gate is authoritative.
+
+Because those gates are now load-bearing for every other scenario, the
+endpoints themselves get a scenario: `08-operational-surface`. A gate nobody
+checks is a gate that silently stops working.
+
 ## Scenarios and assertions
 
 | Scenario | Live fault or transition | Assertions |
@@ -82,6 +102,7 @@ an actionable message.
 | `05b-follower-fsync-failure` | One follower's live `fsync`/`fdatasync` calls return `EIO` | The failing follower remains fail-closed at its durable prefix while the healthy quorum commits; all recovered artifacts verify. |
 | `06-partition-meta-leader` | Per-node network namespaces plus `iptables` isolate the metadata leader's peer traffic | Survivors elect and commit in a higher term; the isolated leader cannot commit; after healing it steps down, converges, and refuses direct proposals. |
 | `07-clock-skew` | `CLOCK_REALTIME` on one metadata node is shifted +1 hour while monotonic time stays honest | The shim proves the applied clock offset; exactly one leader is observed; proposals commit and the skewed member converges. |
+| `08-operational-surface` | Every node's `/metrics`, `/healthz`, and `/readyz` under a live cluster (#224) | The metric names the dashboards query are published on every role; exactly one node claims Raft leadership over `/metrics`; the committed offset agrees between `/metrics` and `vtopctl node status`; the endpoint answers `GET` only; a killed node stops answering its health gate while survivors stay ready. |
 
 The data scenarios stop each process before offline sealing. Recovery first
 truncates any tail beyond the durable commit boundary, then `vtopctl segment

@@ -42,6 +42,12 @@ META_PEER_BASE_PORT="${CHAOS_META_PEER_BASE_PORT:-9100}"
 META_ADMIN_BASE_PORT="${CHAOS_META_ADMIN_BASE_PORT:-9200}"
 REPLICA_BASE_PORT="${CHAOS_REPLICA_BASE_PORT:-9300}"
 NATIVE_PORT="${CHAOS_NATIVE_PORT:-9400}"
+# Observability endpoints (#224). Every node gets one so scenarios can gate on
+# /readyz instead of grepping stdout: a ready marker is a one-shot edge, and a
+# scenario that needs to know whether a node is STILL ready after a partition or
+# a disk fills has nothing to re-grep for.
+META_METRICS_BASE_PORT="${CHAOS_META_METRICS_BASE_PORT:-9500}"
+DATA_METRICS_BASE_PORT="${CHAOS_DATA_METRICS_BASE_PORT:-9600}"
 REGISTER_HOST_PREFIX="${CHAOS_REGISTER_HOST_PREFIX:-10.0.0}"
 REGISTER_PORT="${CHAOS_REGISTER_PORT:-9200}"
 READY_TIMEOUT_SECONDS="${CHAOS_READY_TIMEOUT_SECONDS:-20}"
@@ -58,6 +64,11 @@ meta_host() {
     echo "$META_HOST"
   fi
 }
+meta_metrics_port() { echo "$((META_METRICS_BASE_PORT + $1))"; }
+meta_metrics_addr() { echo "$(meta_host "$1"):$(meta_metrics_port "$1")"; }
+# 0 is the leader/standalone; 1 and 2 are the followers.
+data_metrics_port() { echo "$((DATA_METRICS_BASE_PORT + $1))"; }
+data_metrics_addr() { echo "$DATA_HOST:$(data_metrics_port "$1")"; }
 replica_port()    { echo "$((REPLICA_BASE_PORT + $1))"; }
 native_addr()     { echo "$DATA_HOST:$NATIVE_PORT"; }
 replica_addr()    { echo "$DATA_HOST:$(replica_port "$1")"; }
@@ -80,6 +91,8 @@ preflight_common_tools() {
   require_command awk "Install a POSIX awk implementation."
   require_command grep "Install a POSIX grep implementation."
   require_command sed "Install a POSIX sed implementation."
+  # Health gating (#224) polls each node's /readyz over HTTP.
+  require_command curl "Install curl; the harness gates node readiness on the /readyz endpoint."
 }
 
 require_integer_in_range() { # <name> <value> <minimum> <maximum>
@@ -98,6 +111,11 @@ preflight_settings() {
   require_integer_in_range CHAOS_META_ADMIN_BASE_PORT "$META_ADMIN_BASE_PORT" 1024 65529
   require_integer_in_range CHAOS_REPLICA_BASE_PORT "$REPLICA_BASE_PORT" 1024 65533
   require_integer_in_range CHAOS_NATIVE_PORT "$NATIVE_PORT" 1024 65535
+  # Ceilings are the highest port each family actually derives: metadata ids
+  # run 1..5 so the top base is 65535-5, and data indices run 0..2 so the top
+  # base is 65535-2. A tighter bound would reject a valid override.
+  require_integer_in_range CHAOS_META_METRICS_BASE_PORT "$META_METRICS_BASE_PORT" 1024 65530
+  require_integer_in_range CHAOS_DATA_METRICS_BASE_PORT "$DATA_METRICS_BASE_PORT" 1024 65533
   require_integer_in_range CHAOS_REGISTER_PORT "$REGISTER_PORT" 1 65535
   require_integer_in_range CHAOS_FENCING_EPOCH "$FENCING_EPOCH" 1 2147483647
   require_integer_in_range CHAOS_READY_TIMEOUT_SECONDS "$READY_TIMEOUT_SECONDS" 1 3600
@@ -107,18 +125,23 @@ preflight_settings() {
 
   local labels=() endpoints=() id existing
   for id in 1 2 3 4 5; do
-    labels+=("meta-peer-$id" "meta-admin-$id")
+    labels+=("meta-peer-$id" "meta-admin-$id" "meta-metrics-$id")
     endpoints+=(
       "$(meta_host "$id"):$(meta_peer_port "$id")"
       "$(meta_host "$id"):$(meta_admin_port "$id")"
+      "$(meta_metrics_addr "$id")"
     )
   done
-  for id in 1 2; do
+  for id in 0 1 2; do
     labels+=("replica-$id")
     endpoints+=("$(replica_addr "$id")")
   done
   labels+=("native")
   endpoints+=("$(native_addr)")
+  for id in 0 1 2; do
+    labels+=("data-metrics-$id")
+    endpoints+=("$(data_metrics_addr "$id")")
+  done
   for ((id = 0; id < ${#endpoints[@]}; id++)); do
     for ((existing = 0; existing < id; existing++)); do
       if [[ "${endpoints[$id]}" == "${endpoints[$existing]}" ]]; then
@@ -278,6 +301,7 @@ emit_meta_config() {
       echo "  - { id: $peer, addr: \"$(meta_host "$peer"):$(meta_peer_port "$peer")\", server_name: \"localhost\" }"
     done
     echo "tls: { ca: $CERTS/ca.pem, cert: $CERTS/meta-$id.pem, key: $CERTS/meta-$id-key.pem }"
+    echo "observability: { listen: \"$(meta_metrics_addr "$id")\" }"
   } > "$cfg"
   echo "$cfg"
 }
@@ -313,6 +337,9 @@ emit_leader_config() {
     emit_range_yaml
     echo "segment_id: $SEGMENT_ID"
     echo "native_listen: \"$(native_addr)\""
+    # The leader answers the replica-status RPC too, so lag is measured
+    # against its boundary rather than the furthest-ahead follower (#224).
+    echo "replica_listen: \"$(replica_addr 0)\""
     if [[ "$role" == "leader" ]]; then
       echo "followers:"
       echo "  - { node_uuid: $FOLLOWER1_UUID, addr: \"$(replica_addr 1)\", server_name: \"localhost\" }"
@@ -321,6 +348,7 @@ emit_leader_config() {
     echo "replica_tls: { ca: $CERTS/ca.pem, cert: $CERTS/data-1.pem, key: $CERTS/data-1-key.pem }"
     echo "native_tls: { ca: $CERTS/ca.pem, cert: $CERTS/data-1.pem, key: $CERTS/data-1-key.pem }"
     echo "principal_id: $PRINCIPAL_ID"
+    echo "observability: { listen: \"$(data_metrics_addr 0)\" }"
   } > "$cfg"
   echo "$cfg"
 }
@@ -346,6 +374,24 @@ emit_follower_config() {
     echo "segment_id: $SEGMENT_ID"
     echo "replica_listen: \"$(replica_addr "$n")\""
     echo "replica_tls: { ca: $CERTS/ca.pem, cert: $CERTS/$cert.pem, key: $CERTS/$cert-key.pem }"
+    echo "observability: { listen: \"$(data_metrics_addr "$n")\" }"
+  } > "$cfg"
+  echo "$cfg"
+}
+
+# Config for `vtopctl node status`: the leader plus both followers, so lag is
+# measured against the replica whose commit boundary defines the range.
+emit_node_status_config() {
+  local cfg="$WORKDIR/node-status.yaml"
+  {
+    emit_range_yaml
+    echo "ca_cert: $CERTS/ca.pem"
+    echo "client_cert: $CERTS/data-1.pem"
+    echo "client_key: $CERTS/data-1-key.pem"
+    echo "replicas:"
+    echo "  - { node_uuid: $LEADER_UUID, addr: \"$(replica_addr 0)\", server_name: \"localhost\", role: leader }"
+    echo "  - { node_uuid: $FOLLOWER1_UUID, addr: \"$(replica_addr 1)\", server_name: \"localhost\" }"
+    echo "  - { node_uuid: $FOLLOWER2_UUID, addr: \"$(replica_addr 2)\", server_name: \"localhost\" }"
   } > "$cfg"
   echo "$cfg"
 }
@@ -409,25 +455,163 @@ start_command() {
   echo "$pid"
 }
 
+# ---------------------------------------------------------------------------
+# Health gating (#224)
+# ---------------------------------------------------------------------------
+#
+# The ready MARKER on stdout proves a node reached the end of its startup path
+# exactly once. The /readyz LEVEL proves it is servable right now, which is a
+# different and stronger claim: a marker cannot go back to false when a leader
+# is fenced, a partition heals, or a disk fills. Scenarios that care about the
+# current state ask the endpoint.
+
+# probe_readyz <addr> — echoes the HTTP status; 000 when unreachable.
+#
+# curl already writes `000` and exits non-zero when it cannot connect, so an
+# `|| echo 000` fallback would concatenate a second one and yield `000000` —
+# which matches no comparison and silently turns every "wait until it stops
+# answering" into a timeout. Take curl's own output and normalise anything that
+# is not three digits.
+probe_readyz() {
+  local code
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://$1/readyz" 2>/dev/null)"
+  case "$code" in
+    [0-9][0-9][0-9]) echo "$code" ;;
+    *) echo "000" ;;
+  esac
+}
+
+# await_ready <addr> <what> [timeout-seconds] — block until /readyz is 200.
+await_ready() {
+  local addr="$1" what="$2" limit="${3:-$READY_TIMEOUT_SECONDS}"
+  local deadline=$((SECONDS + limit)) code
+  while :; do
+    code="$(probe_readyz "$addr")"
+    [[ "$code" == "200" ]] && return 0
+    [[ $SECONDS -lt $deadline ]] || break
+    sleep 0.1
+  done
+  # Serve the reason, not just the code: /readyz answers "not ready: <why>",
+  # which is the whole point of the level carrying a reason.
+  local body
+  body="$(curl -s --max-time 2 "http://$addr/readyz" 2>/dev/null || echo '<unreachable>')"
+  fail "$what not ready after ${limit}s (http $code): $body"
+}
+
+# await_not_ready <addr> <what> [timeout-seconds] — block until /readyz is NOT
+# 200. Used where a scenario asserts that a node correctly withdrew itself, e.g.
+# a leaseholder that metadata has fenced.
+await_not_ready() {
+  local addr="$1" what="$2" limit="${3:-$READY_TIMEOUT_SECONDS}"
+  local deadline=$((SECONDS + limit)) code
+  while :; do
+    code="$(probe_readyz "$addr")"
+    [[ "$code" != "200" ]] && return 0
+    [[ $SECONDS -lt $deadline ]] || break
+    sleep 0.1
+  done
+  fail "$what still reports ready after ${limit}s; it should have withdrawn"
+}
+
+# metric_value <addr> <metric-name> — the value of a single unlabelled sample,
+# or of the first sample when the metric carries labels. Prometheus text is
+# `name{labels} value`, so the value is always the last field.
+metric_value() {
+  local addr="$1" metric="$2"
+  curl -s --max-time 5 "http://$addr/metrics" 2>/dev/null \
+    | grep -m1 "^$metric" \
+    | awk '{print $NF}'
+}
+
+# count_raft_leaders <meta-ids...> — how many nodes report themselves leader.
+# Anything but 1 is an incident: 0 is an outage, 2 is split brain.
+count_raft_leaders() {
+  local id total=0 value
+  for id in "$@"; do
+    value="$(curl -s --max-time 5 "http://$(meta_metrics_addr "$id")/metrics" 2>/dev/null \
+      | awk -F' ' '/^vtop_meta_raft_state\{state="leader"\}/ {print $NF}')"
+    [[ "$value" == "1" ]] && total=$((total + 1))
+  done
+  echo "$total"
+}
+
+# await_replicas_settled <expected-offset> <config> — block until every replica
+# reports the offset, then return.
+#
+# Quorum produce acknowledges once the leader plus a MAJORITY of followers are
+# durable, so a third replica can legitimately still be catching up the instant
+# produce returns. Asserting zero lag immediately would fail a run that
+# satisfied quorum durability exactly as designed. Waiting for the tail to
+# settle is the assertion that is actually true.
+await_replicas_settled() {
+  local expected="$1" cfg="$2"
+  local deadline=$((SECONDS + PROGRESS_TIMEOUT_SECONDS)) lags
+  while :; do
+    if "$VTOPCTL" node status --config "$cfg" --json > "$WORKDIR/node-status.json" 2>&1; then
+      lags="$(python3 -c "
+import json
+d=json.load(open('$WORKDIR/node-status.json'))
+print(','.join(str(r['lag_records']) for r in d['replicas']))
+")"
+      [[ "$lags" == "0,0,0" ]] && return 0
+    fi
+    [[ $SECONDS -lt $deadline ]] \
+      || fail "replicas did not all reach offset $expected within ${PROGRESS_TIMEOUT_SECONDS}s (lags: ${lags:-unknown})"
+    sleep 0.2
+  done
+}
+
+# assert_metric_present <addr> <metric-name> — the scrape contract, checked
+# live. A renamed metric silently blanks a dashboard panel while the node keeps
+# working perfectly, so the harness pins the names it publishes.
+assert_metric_present() {
+  local addr="$1" metric="$2" body
+  body="$(curl -s --max-time 5 "http://$addr/metrics" 2>/dev/null || true)"
+  grep -q "^$metric" <<< "$body" \
+    || fail "$metric is missing from http://$addr/metrics; a renamed metric blanks its dashboard panel"
+}
+
 start_node() { # <log-name> <ready-marker> <vtop-node args...>
   local name="$1" marker="$2"; shift 2
   start_command "$name" "$marker" "$VTOP_NODE" "$@"
 }
 
 start_meta_node() { # <id> <peer-ids...>
-  local id="$1"; shift
+  local id="$1" pid; shift
   local cfg; cfg="$(emit_meta_config "$id" "$@")"
   if [[ -n "${VTOP_META_NETNS_PREFIX:-}" ]]; then
-    start_command "meta-$id" "meta_node_ready" \
-      ip netns exec "$VTOP_META_NETNS_PREFIX$id" "$VTOP_NODE" meta --config "$cfg"
+    pid="$(start_command "meta-$id" "meta_node_ready" \
+      ip netns exec "$VTOP_META_NETNS_PREFIX$id" "$VTOP_NODE" meta --config "$cfg")"
   else
-    start_node "meta-$id" "meta_node_ready" meta --config "$cfg"
+    pid="$(start_node "meta-$id" "meta_node_ready" meta --config "$cfg")"
   fi
+  # A node inside its own network namespace is not reachable from here, so the
+  # marker remains the only available signal for those. Everywhere else the
+  # health gate is authoritative.
+  if [[ -z "${VTOP_META_NETNS_PREFIX:-}" ]]; then
+    await_ready "$(meta_metrics_addr "$id")" "meta-$id"
+  fi
+  echo "$pid"
 }
 
-start_leader()      { start_node "data-leader" "data_node_ready" data --config "$(emit_leader_config leader)"; }
-start_standalone()  { start_node "data-standalone" "data_node_ready" data --config "$(emit_leader_config standalone)"; }
-start_follower()    { start_node "data-follower-$1" "data_node_ready" data --config "$(emit_follower_config "$@")"; }
+start_leader() {
+  local pid; pid="$(start_node "data-leader" "data_node_ready" data --config "$(emit_leader_config leader)")"
+  await_ready "$(data_metrics_addr 0)" "data-leader"
+  echo "$pid"
+}
+
+start_standalone() {
+  local pid; pid="$(start_node "data-standalone" "data_node_ready" data --config "$(emit_leader_config standalone)")"
+  await_ready "$(data_metrics_addr 0)" "data-standalone"
+  echo "$pid"
+}
+
+start_follower() {
+  local n="$1" pid
+  pid="$(start_node "data-follower-$n" "data_node_ready" data --config "$(emit_follower_config "$@")")"
+  await_ready "$(data_metrics_addr "$n")" "data-follower-$n"
+  echo "$pid"
+}
 
 stop_pid() { kill "$1" 2>/dev/null || true; }
 kill9_pid() { kill -9 "$1" 2>/dev/null || true; }
