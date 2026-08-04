@@ -683,6 +683,24 @@ impl LocalBroker {
         &self.range
     }
 
+    /// `(local_committed_offset, next_offset)`, waiting for the append path if
+    /// it holds the state lock.
+    ///
+    /// For request handlers, which are already allowed to queue behind an
+    /// append. Metrics collection must use [`Self::try_local_offsets`] instead:
+    /// a scrape that blocks takes the observability endpoint down with a
+    /// stalling disk.
+    pub fn local_offsets(&self) -> (u64, u64) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (
+            state.segment.committed_offset(),
+            state.segment.next_offset(),
+        )
+    }
+
     /// Non-blocking `(local_committed_offset, next_offset)`, for observation
     /// only (#224).
     ///

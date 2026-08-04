@@ -27,7 +27,9 @@ blake3 = { workspace = true }
 vtop-core = { workspace = true }
 vtop-log = { workspace = true }
 vtop-meta = { workspace = true }
+vtop-broker = { workspace = true }
 vtop-observe = { workspace = true }
+vtop-protocol = { workspace = true }
 vtop-adapters = { workspace = true, default-features = false }
 vtop-upload = { workspace = true }
 vtop-state = { workspace = true }

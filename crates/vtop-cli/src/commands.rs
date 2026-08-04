@@ -106,6 +106,14 @@ pub enum Command {
         #[command(subcommand)]
         command: crate::meta_tools::MetaCommand,
     },
+    /// Native data-plane operator client. Admin parity with `meta`: where
+    /// `meta status` reports what the metadata group believes, `node status`
+    /// reports where each replica's disk has actually got to, over the
+    /// replication plane rather than the observability endpoint.
+    Node {
+        #[command(subcommand)]
+        command: crate::node_tools::NodeCommand,
+    },
     /// Cold-tier tools for sealed native segments: resumable upload + verify,
     /// rehydrate from a version pin, and abandoned multipart cleanup. Evidence
     /// commit still goes through the meta admin endpoint.
@@ -171,6 +179,11 @@ pub async fn dispatch(cli: Cli) -> i32 {
     if let Command::Meta { command } = cli.command {
         // Re-bind so we can move `command` into the async helper.
         return crate::meta_tools::run(command, cli.json).await;
+    }
+    // Node tools speak the replication plane directly; they too bypass the
+    // archive engine.
+    if let Command::Node { command } = cli.command {
+        return crate::node_tools::run(command, cli.json).await;
     }
     // Tier tools drive an upload backend plus the meta admin endpoint; they
     // also bypass the archive engine.
@@ -436,6 +449,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
         }
         Command::Segment { .. } => unreachable!("dispatched before run_command"),
         Command::Meta { .. } => unreachable!("dispatched before run_command"),
+        Command::Node { .. } => unreachable!("dispatched before run_command"),
         Command::Tier { .. } => unreachable!("dispatched before run_command"),
     }
 }

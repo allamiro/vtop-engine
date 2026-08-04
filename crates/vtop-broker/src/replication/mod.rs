@@ -37,7 +37,7 @@ pub use fault::{
 };
 pub use network::{
     FlowControlConfig, NetworkFollowerConfig, NetworkedReplicaSet, ReplicaPeerHandler,
-    ReplicaPeerServer, ReplicaTlsMaterial,
+    ReplicaPeerServer, ReplicaStatusClient, ReplicaTlsMaterial,
 };
 
 /// Shared quorum-committed high-water mark for a range.
