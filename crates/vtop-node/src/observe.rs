@@ -648,15 +648,25 @@ impl BrokerCollector {
                 .with_label_values(&range)
                 .set(cluster.get() as i64);
         }
+        // One non-blocking snapshot for both metadata fields: reading the
+        // epoch and the lease bit through separate locks could straddle a
+        // grant and report an epoch from before it beside a lease bit from
+        // after. `None` means a produce holds the view, and the previous
+        // values stand (module docs).
+        //
+        // The metadata snapshot is read BEFORE the held epoch, deliberately.
+        // Promotion writes the held epoch first, then activates the metadata
+        // view, and both are monotonic — so a snapshot showing epoch E active
+        // proves the held epoch is already at least E, and `1` below is never
+        // reported for a broker still mid-promotion (which would claim
+        // ownership while the next produce gets refused). The reverse order
+        // could do exactly that.
+        let meta_snapshot = self.broker.meta_fencing_epoch().try_snapshot();
         let held = self.broker.held_fencing_epoch();
         self.held_fencing_epoch
             .with_label_values(&range)
             .set(held as i64);
-        // One non-blocking snapshot for both fields: reading the epoch and the
-        // lease bit through separate locks could straddle a grant and report an
-        // epoch from before it beside a lease bit from after. `None` means a
-        // produce holds the view, and the previous values stand (module docs).
-        if let Some((meta_epoch, lease_active)) = self.broker.meta_fencing_epoch().try_snapshot() {
+        if let Some((meta_epoch, lease_active)) = meta_snapshot {
             self.meta_fencing_epoch
                 .with_label_values(&range)
                 .set(meta_epoch as i64);

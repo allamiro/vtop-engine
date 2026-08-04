@@ -166,6 +166,53 @@ pub struct DataNodeConfig {
     pub principal_id: Option<Uuid>,
     #[serde(default)]
     pub observability: ObservabilityConfig,
+    /// Leader/standalone: drive range leadership from the metadata plane
+    /// (#223).
+    ///
+    /// Optional, and absent by default, so every existing config keeps its
+    /// current behaviour: a node with a fixed `fencing_epoch` and no agent.
+    /// With it configured the epoch becomes metadata's to decide, and this
+    /// process serves only while metadata says it holds the range.
+    ///
+    /// Stated limitation on REPLICATED ranges: followers validate replica
+    /// appends against their statically configured epoch and do not watch
+    /// metadata, so they must be (re)configured at the granted epoch for the
+    /// leader to reach its quorum. The follower-side watcher that removes
+    /// this requirement is follow-up work; until it lands, deployments (and
+    /// the live-chaos harness) restart followers on epoch change.
+    pub lease: Option<LeaseConfig>,
+}
+
+/// Where to reach the metadata admin endpoint, and how hard to hold the lease.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LeaseConfig {
+    /// `host:port` of any metadata node's admin listener.
+    pub admin_endpoint: String,
+    /// rustls server name the metadata node's certificate carries.
+    pub server_name: String,
+    /// Topic UUID the range belongs to, as the metadata plane knows it. This
+    /// is NOT `range.topic`, which is the wire-level topic name.
+    pub topic_uuid: Uuid,
+    /// mTLS identity for the admin endpoint. Its CN must be this node's
+    /// decimal metadata node id.
+    pub tls: TlsPaths,
+    #[serde(default = "default_lease_duration_ms")]
+    pub lease_duration_ms: u64,
+    #[serde(default = "default_renew_interval_ms")]
+    pub renew_interval_ms: u64,
+    #[serde(default = "default_poll_interval_ms")]
+    pub poll_interval_ms: u64,
+}
+
+fn default_lease_duration_ms() -> u64 {
+    15_000
+}
+fn default_renew_interval_ms() -> u64 {
+    5_000
+}
+fn default_poll_interval_ms() -> u64 {
+    2_000
 }
 
 pub fn load<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {

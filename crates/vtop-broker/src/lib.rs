@@ -48,6 +48,7 @@ use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
@@ -330,6 +331,24 @@ impl MetaFencingEpoch {
         }
     }
 
+    /// Start with `epoch` as the monotonic floor but NO active lease.
+    ///
+    /// For processes whose authority arrives later — a lease agent's first
+    /// successful acquisition — rather than from static configuration. Until
+    /// a grant is published the broker fails closed: it refuses produce and
+    /// reports itself fenced. The first [`Self::set`] at `epoch` or above
+    /// activates the view. (`epoch` is only a floor; a grant below it is
+    /// stale by definition and stays ignored.)
+    pub fn new_inactive(epoch: u64) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(MetaLeaseState {
+                fencing_epoch: epoch,
+                lease_active: false,
+                released_through: 0,
+            })),
+        }
+    }
+
     /// Latest metadata fencing epoch (whether or not a lease is live).
     pub fn get(&self) -> u64 {
         self.state
@@ -486,8 +505,14 @@ impl GroupCheckpointStore {
 
 pub struct LocalBroker {
     range: RangeIdentity,
-    /// Epoch this broker was granted as range leaseholder.
-    held_fencing_epoch: u64,
+    /// Epoch this process was granted as leaseholder.
+    ///
+    /// Atomic because leadership can be re-granted while the broker is alive
+    /// (#223): a lease agent that wins a new epoch must be able to tell the
+    /// broker, or the broker would fence itself against its own promotion —
+    /// metadata would report epoch N+1 while this field still said N, and
+    /// every produce would be refused.
+    held_fencing_epoch: AtomicU64,
     /// Latest metadata-committed fencing epoch for the range.
     meta_fencing_epoch: MetaFencingEpoch,
     segment_format: SegmentFormat,
@@ -604,7 +629,7 @@ impl LocalBroker {
         }
         Ok(Self {
             range,
-            held_fencing_epoch,
+            held_fencing_epoch: AtomicU64::new(held_fencing_epoch),
             meta_fencing_epoch,
             segment_format,
             cluster_committed,
@@ -664,7 +689,20 @@ impl LocalBroker {
 
     /// Fencing epoch this broker was granted as range leaseholder.
     pub fn held_fencing_epoch(&self) -> u64 {
-        self.held_fencing_epoch
+        self.held_fencing_epoch.load(Ordering::SeqCst)
+    }
+
+    /// Adopt an epoch this process has been granted (#223).
+    ///
+    /// Monotonic: a stale or reordered promotion cannot rewind the broker to an
+    /// epoch metadata has already superseded. Returns whether the value moved.
+    ///
+    /// The caller must publish the same epoch to [`Self::meta_fencing_epoch`].
+    /// Either order is safe — produce requires the two to be equal, so any
+    /// window between them refuses rather than admits — but leaving them
+    /// permanently unequal would silently wedge the range.
+    pub fn adopt_fencing_epoch(&self, epoch: u64) -> bool {
+        self.held_fencing_epoch.fetch_max(epoch, Ordering::SeqCst) < epoch
     }
 
     /// Shared metadata fencing-epoch handle observed by this broker.
@@ -1372,7 +1410,7 @@ impl LocalBroker {
                 "request range identity does not match this broker",
             ));
         }
-        if fencing_epoch != self.held_fencing_epoch {
+        if fencing_epoch != self.held_fencing_epoch() {
             return Err((
                 ErrorCode::Fenced,
                 "request fencing epoch does not match this broker's lease",
@@ -1380,7 +1418,7 @@ impl LocalBroker {
         }
         // Release clears lease_active without bumping the epoch; a steal
         // advances fencing_epoch. Either case fences this leaseholder.
-        if !meta.lease_active || meta.fencing_epoch != self.held_fencing_epoch {
+        if !meta.lease_active || meta.fencing_epoch != self.held_fencing_epoch() {
             return Err((
                 ErrorCode::Fenced,
                 "broker lease is inactive or fenced by a newer metadata grant",
@@ -2372,6 +2410,32 @@ mod tests {
             lease.try_snapshot(),
             Some((7, false)),
             "the epoch is retained on release; only the lease bit drops"
+        );
+    }
+
+    /// A lease-driven broker must not serve on its configured epoch before
+    /// the agent's first successful acquisition: authority comes from
+    /// metadata, and at startup metadata has said nothing yet.
+    #[test]
+    fn an_inactive_view_stays_fenced_until_the_first_grant() {
+        let lease = MetaFencingEpoch::new_inactive(3);
+        assert_eq!(
+            lease.try_snapshot(),
+            Some((3, false)),
+            "no grant has been observed; the broker must fail closed"
+        );
+
+        // A grant below the configured floor is stale by definition.
+        lease.set(2);
+        assert_eq!(lease.try_snapshot(), Some((3, false)));
+
+        // The restart case: metadata still records this node's lease at the
+        // configured epoch, and the agent's first renewal republishes it.
+        lease.set(3);
+        assert_eq!(
+            lease.try_snapshot(),
+            Some((3, true)),
+            "republishing the configured epoch must activate the view"
         );
     }
 

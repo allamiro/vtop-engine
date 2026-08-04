@@ -8,6 +8,7 @@
 mod client;
 mod config;
 mod data_node;
+mod lease_agent;
 mod meta_node;
 mod observe;
 mod tls;
