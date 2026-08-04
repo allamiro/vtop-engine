@@ -27,6 +27,34 @@ pub enum MetaCommand {
         #[command(flatten)]
         common: MetaCommonArgs,
     },
+    /// Bootstrap a fresh Raft group with these voter ids (#215). One-shot:
+    /// every listed node must be running with an empty log.
+    Init {
+        #[command(flatten)]
+        common: MetaCommonArgs,
+        /// Comma-separated voter node ids, e.g. `1,2,3`.
+        #[arg(long, value_delimiter = ',', required = true)]
+        members: Vec<u64>,
+    },
+    /// Add a learner that replicates the log without joining quorum (#215).
+    AddLearner {
+        #[command(flatten)]
+        common: MetaCommonArgs,
+        #[arg(long)]
+        node_id: u64,
+    },
+    /// Replace the voter set via joint consensus (#215). Removed voters are
+    /// fenced: they cannot commit after losing membership.
+    ChangeMembership {
+        #[command(flatten)]
+        common: MetaCommonArgs,
+        /// Comma-separated voter node ids, e.g. `1,2,3,4,5`.
+        #[arg(long, value_delimiter = ',', required = true)]
+        voters: Vec<u64>,
+        /// Keep removed voters as learners instead of dropping them.
+        #[arg(long, default_value_t = false)]
+        retain_removed_as_learners: bool,
+    },
     /// Propose `RegisterNode` through the Consensus façade.
     RegisterNode {
         #[command(flatten)]
@@ -258,30 +286,46 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
             }
             Ok(())
         }
+        MetaCommand::Init { common, members } => {
+            let config = load_admin_config(&common.config)?;
+            let client = connect(&config)?;
+            let response = client
+                .init(members)
+                .await
+                .map_err(|error| error.to_string())?;
+            print_membership_change(&response.membership, "initialized", json)
+        }
+        MetaCommand::AddLearner { common, node_id } => {
+            let config = load_admin_config(&common.config)?;
+            let client = connect(&config)?;
+            let response = client
+                .add_learner(node_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            print_membership_change(&response.membership, "learner added", json)
+        }
+        MetaCommand::ChangeMembership {
+            common,
+            voters,
+            retain_removed_as_learners,
+        } => {
+            let config = load_admin_config(&common.config)?;
+            let client = connect(&config)?;
+            let response = client
+                .change_membership(voters, retain_removed_as_learners)
+                .await
+                .map_err(|error| error.to_string())?;
+            print_membership_change(&response.membership, "membership changed", json)
+        }
         MetaCommand::Membership { common } => {
             let config = load_admin_config(&common.config)?;
             let client = connect(&config)?;
             let status = client.status().await.map_err(|error| error.to_string())?;
             if json {
-                let voters: Vec<_> = status
-                    .membership
-                    .voters
-                    .iter()
-                    .map(|MetaNodeId(id)| *id)
-                    .collect();
-                let learners: Vec<_> = status
-                    .membership
-                    .learners
-                    .iter()
-                    .map(|(MetaNodeId(id), addr)| serde_json::json!({ "id": id, "addr": addr }))
-                    .collect();
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "voters": voters,
-                        "learners": learners,
-                    }))
-                    .map_err(|error| error.to_string())?
+                    serde_json::to_string_pretty(&membership_json(&status.membership))
+                        .map_err(|error| error.to_string())?
                 );
             } else {
                 println!("voters:");
@@ -292,6 +336,12 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
                     println!("learners:");
                     for (MetaNodeId(id), addr) in &status.membership.learners {
                         println!("  {id}  {addr}");
+                    }
+                }
+                if let Some(outgoing) = &status.membership.joint_outgoing {
+                    println!("joint outgoing voters:");
+                    for MetaNodeId(id) in outgoing {
+                        println!("  {id}");
                     }
                 }
             }
@@ -498,12 +548,6 @@ pub(crate) async fn propose_and_print(
 }
 
 fn status_json(status: &AdminStatusResponse) -> serde_json::Value {
-    let voters: Vec<_> = status
-        .membership
-        .voters
-        .iter()
-        .map(|MetaNodeId(id)| *id)
-        .collect();
     serde_json::json!({
         "node_id": status.node_id.0,
         "current_term": status.current_term,
@@ -517,8 +561,50 @@ fn status_json(status: &AdminStatusResponse) -> serde_json::Value {
         "last_applied": status.last_applied.map(|WireLogId { term, index }| {
             serde_json::json!({ "term": term, "index": index })
         }),
-        "membership": { "voters": voters },
+        "membership": membership_json(&status.membership),
     })
+}
+
+fn membership_json(membership: &vtop_meta::MetaMembership) -> serde_json::Value {
+    let voters: Vec<_> = membership.voters.iter().map(|MetaNodeId(id)| *id).collect();
+    let learners: Vec<_> = membership
+        .learners
+        .iter()
+        .map(|(MetaNodeId(id), addr)| serde_json::json!({ "id": id, "addr": addr }))
+        .collect();
+    let joint_outgoing_voters = membership.joint_outgoing.as_ref().map(|outgoing| {
+        outgoing
+            .iter()
+            .map(|MetaNodeId(id)| *id)
+            .collect::<Vec<_>>()
+    });
+    serde_json::json!({
+        "voters": voters,
+        "learners": learners,
+        "joint_outgoing_voters": joint_outgoing_voters,
+    })
+}
+
+fn print_membership_change(
+    membership: &vtop_meta::MetaMembership,
+    action: &str,
+    json: bool,
+) -> Result<(), String> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": "ok",
+                "action": action,
+                "membership": membership_json(membership),
+            }))
+            .map_err(|error| error.to_string())?
+        );
+    } else {
+        let voters: Vec<_> = membership.voters.iter().map(ToString::to_string).collect();
+        println!("{action}; voters: {}", voters.join(", "));
+    }
+    Ok(())
 }
 
 fn propose_json(log_id: &WireLogId, response: &MetadataResponse) -> serde_json::Value {
@@ -555,6 +641,10 @@ fn print_status(status: &AdminStatusResponse) {
         .map(|id| id.to_string())
         .collect();
     println!("{}", voters.join(", "));
+    if let Some(outgoing) = &status.membership.joint_outgoing {
+        let outgoing: Vec<_> = outgoing.iter().map(ToString::to_string).collect();
+        println!("joint outgoing: {}", outgoing.join(", "));
+    }
 }
 
 fn print_response(response: &MetadataResponse) {

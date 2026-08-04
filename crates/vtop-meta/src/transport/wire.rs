@@ -64,6 +64,14 @@ pub const KIND_ADMIN_STATUS_RESP: u16 = 11;
 pub const KIND_ADMIN_PROPOSE_REQ: u16 = 12;
 pub const KIND_ADMIN_PROPOSE_RESP: u16 = 13;
 pub const KIND_ADMIN_ERROR: u16 = 14;
+pub const KIND_ADMIN_INIT_REQ: u16 = 15;
+pub const KIND_ADMIN_ADD_LEARNER_REQ: u16 = 16;
+pub const KIND_ADMIN_CHANGE_MEMBERSHIP_REQ: u16 = 17;
+pub const KIND_ADMIN_MEMBERSHIP_RESP: u16 = 18;
+
+/// Bound for node ids carried in one admin membership request. This is
+/// intentionally tighter than the storage codec's compatibility ceiling.
+pub const MAX_ADMIN_MEMBERSHIP_NODES: usize = 64;
 
 /// Transport / framing errors distinct from codec parse failures.
 #[derive(Debug, Error)]
@@ -665,6 +673,143 @@ impl AdminStatusResponse {
     }
 }
 
+fn put_node_id_list(out: &mut Vec<u8>, ids: &[u64], what: &'static str) -> Result<(), CodecError> {
+    if ids.len() > MAX_ADMIN_MEMBERSHIP_NODES {
+        return Err(CodecError::BoundExceeded {
+            what,
+            actual: ids.len(),
+            maximum: MAX_ADMIN_MEMBERSHIP_NODES,
+        });
+    }
+    put_u32(out, ids.len() as u32);
+    for id in ids {
+        put_u64(out, *id);
+    }
+    Ok(())
+}
+
+fn take_node_id_list(reader: &mut Reader<'_>, what: &'static str) -> Result<Vec<u64>, CodecError> {
+    let len = reader.u32(what)? as usize;
+    if len > MAX_ADMIN_MEMBERSHIP_NODES {
+        return Err(CodecError::BoundExceeded {
+            what,
+            actual: len,
+            maximum: MAX_ADMIN_MEMBERSHIP_NODES,
+        });
+    }
+    let mut ids = Vec::with_capacity(len);
+    for _ in 0..len {
+        ids.push(reader.u64(what)?);
+    }
+    Ok(ids)
+}
+
+/// Bootstrap a fresh Raft group with these voter ids (one-shot; the target
+/// node must have an empty log). #215 live-cluster surface.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdminInitRequest {
+    pub members: Vec<u64>,
+}
+
+impl AdminInitRequest {
+    pub fn encode(&self) -> Result<Vec<u8>, CodecError> {
+        let mut out = Vec::new();
+        put_node_id_list(&mut out, &self.members, "init members")?;
+        Ok(out)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut reader = Reader::new(bytes);
+        let members = take_node_id_list(&mut reader, "init members")?;
+        reader.finish()?;
+        Ok(Self { members })
+    }
+}
+
+/// Add a learner that starts replicating the log without joining quorum.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdminAddLearnerRequest {
+    pub node_id: u64,
+}
+
+impl AdminAddLearnerRequest {
+    pub fn encode(&self) -> Result<Vec<u8>, CodecError> {
+        let mut out = Vec::new();
+        put_u64(&mut out, self.node_id);
+        Ok(out)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut reader = Reader::new(bytes);
+        let node_id = reader.u64("learner id")?;
+        reader.finish()?;
+        Ok(Self { node_id })
+    }
+}
+
+/// Replace the voter set through a joint-consensus transition. Removed
+/// voters can no longer form a quorum or accept leadership proposals.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdminChangeMembershipRequest {
+    pub voters: Vec<u64>,
+    /// Keep removed voters as learners instead of dropping them entirely.
+    pub retain_removed_as_learners: bool,
+}
+
+impl AdminChangeMembershipRequest {
+    pub fn encode(&self) -> Result<Vec<u8>, CodecError> {
+        let mut out = Vec::new();
+        put_node_id_list(&mut out, &self.voters, "membership voters")?;
+        put_u8(&mut out, u8::from(self.retain_removed_as_learners));
+        Ok(out)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut reader = Reader::new(bytes);
+        let voters = take_node_id_list(&mut reader, "membership voters")?;
+        let retain = match reader.u8("retain flag")? {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(CodecError::InvalidValue {
+                    what: "retain flag",
+                    reason: "expected 0 or 1",
+                })
+            }
+        };
+        reader.finish()?;
+        Ok(Self {
+            voters,
+            retain_removed_as_learners: retain,
+        })
+    }
+}
+
+/// Shared success reply for init/add-learner/change-membership: the
+/// membership as the proposing node now sees it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdminMembershipResponse {
+    pub membership: MetaMembership,
+}
+
+impl AdminMembershipResponse {
+    pub fn encode(&self) -> Result<Vec<u8>, CodecError> {
+        let mut out = Vec::new();
+        let membership = self.membership.encode()?;
+        put_u32(&mut out, membership.len() as u32);
+        out.extend_from_slice(&membership);
+        Ok(out)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut reader = Reader::new(bytes);
+        let membership_len = reader.u32("membership len")? as usize;
+        let membership = MetaMembership::decode(reader.take(membership_len, "membership")?)?;
+        reader.finish()?;
+        Ok(Self { membership })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdminProposeRequest {
     pub command: MetadataCommand,
@@ -858,6 +1003,7 @@ mod tests {
             last_membership: MetaMembership {
                 voters: vec![MetaNodeId(1), MetaNodeId(2)],
                 learners: vec![],
+                joint_outgoing: None,
             },
             snapshot_id: "snap-1".to_owned(),
             offset: 0,
@@ -889,6 +1035,7 @@ mod tests {
             membership: MetaMembership {
                 voters: vec![MetaNodeId(1), MetaNodeId(2), MetaNodeId(3)],
                 learners: vec![],
+                joint_outgoing: None,
             },
         };
         assert_eq!(
@@ -911,6 +1058,56 @@ mod tests {
             AdminProposeRequest::decode(&propose.encode().unwrap()).unwrap(),
             propose
         );
+
+        let init = AdminInitRequest {
+            members: vec![1, 2, 3],
+        };
+        assert_eq!(
+            AdminInitRequest::decode(&init.encode().unwrap()).unwrap(),
+            init
+        );
+
+        let learner = AdminAddLearnerRequest { node_id: 4 };
+        assert_eq!(
+            AdminAddLearnerRequest::decode(&learner.encode().unwrap()).unwrap(),
+            learner
+        );
+
+        let change = AdminChangeMembershipRequest {
+            voters: vec![1, 2, 3, 4],
+            retain_removed_as_learners: true,
+        };
+        assert_eq!(
+            AdminChangeMembershipRequest::decode(&change.encode().unwrap()).unwrap(),
+            change
+        );
+
+        let membership = AdminMembershipResponse {
+            membership: MetaMembership {
+                voters: vec![MetaNodeId(1), MetaNodeId(2), MetaNodeId(3), MetaNodeId(4)],
+                learners: vec![(MetaNodeId(5), String::new())],
+                joint_outgoing: Some(vec![MetaNodeId(1), MetaNodeId(2), MetaNodeId(3)]),
+            },
+        };
+        assert_eq!(
+            AdminMembershipResponse::decode(&membership.encode().unwrap()).unwrap(),
+            membership
+        );
+
+        let oversized = AdminInitRequest {
+            members: vec![1; MAX_ADMIN_MEMBERSHIP_NODES + 1],
+        };
+        assert!(matches!(
+            oversized.encode(),
+            Err(CodecError::BoundExceeded { .. })
+        ));
+
+        let mut noncanonical_flag = change.encode().unwrap();
+        *noncanonical_flag.last_mut().unwrap() = 2;
+        assert!(matches!(
+            AdminChangeMembershipRequest::decode(&noncanonical_flag),
+            Err(CodecError::InvalidValue { .. })
+        ));
     }
 
     #[test]

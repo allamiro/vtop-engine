@@ -6,10 +6,12 @@
 
 use super::tls::{server_name, TlsMaterial};
 use super::wire::{
-    read_frame, write_frame, AdminError, AdminProposeRequest, AdminProposeResponse,
+    read_frame, write_frame, AdminAddLearnerRequest, AdminChangeMembershipRequest, AdminError,
+    AdminInitRequest, AdminMembershipResponse, AdminProposeRequest, AdminProposeResponse,
     AdminStatusRequest, AdminStatusResponse, TransportError, TransportResult, VtpmFrame,
-    KIND_ADMIN_ERROR, KIND_ADMIN_PROPOSE_REQ, KIND_ADMIN_PROPOSE_RESP, KIND_ADMIN_STATUS_REQ,
-    KIND_ADMIN_STATUS_RESP,
+    KIND_ADMIN_ADD_LEARNER_REQ, KIND_ADMIN_CHANGE_MEMBERSHIP_REQ, KIND_ADMIN_ERROR,
+    KIND_ADMIN_INIT_REQ, KIND_ADMIN_MEMBERSHIP_RESP, KIND_ADMIN_PROPOSE_REQ,
+    KIND_ADMIN_PROPOSE_RESP, KIND_ADMIN_STATUS_REQ, KIND_ADMIN_STATUS_RESP,
 };
 use crate::command::MetadataCommand;
 use crate::keys::MetaNodeId;
@@ -24,6 +26,14 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 pub trait AdminHandler: Send + Sync {
     async fn status(&self) -> TransportResult<AdminStatusResponse>;
     async fn propose(&self, command: MetadataCommand) -> TransportResult<AdminProposeResponse>;
+    /// Bootstrap a fresh group (#215 live-cluster surface).
+    async fn init(&self, members: Vec<u64>) -> TransportResult<AdminMembershipResponse>;
+    async fn add_learner(&self, node_id: u64) -> TransportResult<AdminMembershipResponse>;
+    async fn change_membership(
+        &self,
+        voters: Vec<u64>,
+        retain_removed_as_learners: bool,
+    ) -> TransportResult<AdminMembershipResponse>;
 }
 
 /// mTLS admin server.
@@ -121,6 +131,32 @@ async fn dispatch_admin(
                 payload: response.encode()?,
             })
         }
+        KIND_ADMIN_INIT_REQ => {
+            let request = AdminInitRequest::decode(&frame.payload)?;
+            let response = handler.init(request.members).await?;
+            Ok(VtpmFrame {
+                kind: KIND_ADMIN_MEMBERSHIP_RESP,
+                payload: response.encode()?,
+            })
+        }
+        KIND_ADMIN_ADD_LEARNER_REQ => {
+            let request = AdminAddLearnerRequest::decode(&frame.payload)?;
+            let response = handler.add_learner(request.node_id).await?;
+            Ok(VtpmFrame {
+                kind: KIND_ADMIN_MEMBERSHIP_RESP,
+                payload: response.encode()?,
+            })
+        }
+        KIND_ADMIN_CHANGE_MEMBERSHIP_REQ => {
+            let request = AdminChangeMembershipRequest::decode(&frame.payload)?;
+            let response = handler
+                .change_membership(request.voters, request.retain_removed_as_learners)
+                .await?;
+            Ok(VtpmFrame {
+                kind: KIND_ADMIN_MEMBERSHIP_RESP,
+                payload: response.encode()?,
+            })
+        }
         other => Err(TransportError::UnexpectedKind(other)),
     }
 }
@@ -171,6 +207,53 @@ impl AdminClient {
             .await?;
         match frame.kind {
             KIND_ADMIN_PROPOSE_RESP => Ok(AdminProposeResponse::decode(&frame.payload)?),
+            KIND_ADMIN_ERROR => {
+                let error = AdminError::decode(&frame.payload)?;
+                Err(TransportError::Protocol(error.message))
+            }
+            other => Err(TransportError::UnexpectedKind(other)),
+        }
+    }
+
+    pub async fn init(&self, members: Vec<u64>) -> TransportResult<AdminMembershipResponse> {
+        self.membership_round_trip(VtpmFrame {
+            kind: KIND_ADMIN_INIT_REQ,
+            payload: AdminInitRequest { members }.encode()?,
+        })
+        .await
+    }
+
+    pub async fn add_learner(&self, node_id: u64) -> TransportResult<AdminMembershipResponse> {
+        self.membership_round_trip(VtpmFrame {
+            kind: KIND_ADMIN_ADD_LEARNER_REQ,
+            payload: AdminAddLearnerRequest { node_id }.encode()?,
+        })
+        .await
+    }
+
+    pub async fn change_membership(
+        &self,
+        voters: Vec<u64>,
+        retain_removed_as_learners: bool,
+    ) -> TransportResult<AdminMembershipResponse> {
+        self.membership_round_trip(VtpmFrame {
+            kind: KIND_ADMIN_CHANGE_MEMBERSHIP_REQ,
+            payload: AdminChangeMembershipRequest {
+                voters,
+                retain_removed_as_learners,
+            }
+            .encode()?,
+        })
+        .await
+    }
+
+    async fn membership_round_trip(
+        &self,
+        request: VtpmFrame,
+    ) -> TransportResult<AdminMembershipResponse> {
+        let frame = self.round_trip(request).await?;
+        match frame.kind {
+            KIND_ADMIN_MEMBERSHIP_RESP => Ok(AdminMembershipResponse::decode(&frame.payload)?),
             KIND_ADMIN_ERROR => {
                 let error = AdminError::decode(&frame.payload)?;
                 Err(TransportError::Protocol(error.message))

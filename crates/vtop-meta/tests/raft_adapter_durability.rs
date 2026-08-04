@@ -1,4 +1,4 @@
-//! Codex review regressions for Raft adapter durable frontiers.
+//! Regression tests for Raft adapter durable frontiers.
 //!
 //! 1. Applied frontier limits recovery replay (uncommitted tail stays truncatable).
 //! 2. Exact purged LogId persists across reopen (not inferred from chunk layout).
@@ -85,6 +85,7 @@ fn purged_log_id_persists_exact_term_and_index_across_adapter_reopen() {
         payload: MetaLogPayload::Membership(MetaMembership {
             voters: vec![MetaNodeId(1)],
             learners: vec![],
+            joint_outgoing: None,
         }),
     };
     storage.append(&entries).unwrap();
@@ -124,6 +125,7 @@ async fn snapshot_install_discards_stale_tail_and_allows_append_at_frontier() {
         payload: MetaLogPayload::Membership(MetaMembership {
             voters: vec![MetaNodeId(1), MetaNodeId(2)],
             learners: vec![],
+            joint_outgoing: None,
         }),
     };
     leader.append(&entries).unwrap();
@@ -195,6 +197,7 @@ fn reopen_discards_stale_tail_left_by_interrupted_snapshot_install() {
         payload: MetaLogPayload::Membership(MetaMembership {
             voters: vec![MetaNodeId(1), MetaNodeId(2)],
             learners: vec![],
+            joint_outgoing: None,
         }),
     };
     leader.append(&entries).unwrap();
@@ -266,6 +269,7 @@ async fn purge_persists_frontier_before_chunk_deletion_survives_interrupt() {
         payload: MetaLogPayload::Membership(MetaMembership {
             voters: vec![MetaNodeId(1)],
             learners: vec![],
+            joint_outgoing: None,
         }),
     };
     storage.append(&storage_entries).unwrap();
@@ -332,6 +336,7 @@ async fn membership_log_id_survives_purge_without_using_applied_frontier() {
         payload: MetaLogPayload::Membership(MetaMembership {
             voters: vec![MetaNodeId(1)],
             learners: vec![],
+            joint_outgoing: None,
         }),
     };
     storage.append(&entries).unwrap();
@@ -384,6 +389,7 @@ async fn blank_follower_snapshot_install_persists_membership_log_id() {
         payload: MetaLogPayload::Membership(MetaMembership {
             voters: vec![MetaNodeId(1), MetaNodeId(2)],
             learners: vec![],
+            joint_outgoing: None,
         }),
     };
     leader.append(&entries).unwrap();
@@ -500,6 +506,7 @@ async fn membership_log_id_recovers_from_snapshot_when_sidecar_missing() {
         payload: MetaLogPayload::Membership(MetaMembership {
             voters: vec![MetaNodeId(1), MetaNodeId(2)],
             learners: vec![],
+            joint_outgoing: None,
         }),
     };
     leader.append(&entries).unwrap();

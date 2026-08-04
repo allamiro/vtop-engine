@@ -52,9 +52,10 @@ pub use placement::{
     DEFAULT_PLACEMENT_WEIGHT, MAX_FAILURE_DOMAIN_BYTES, MAX_REPLICAS, MIN_PLACEMENT_WEIGHT,
 };
 pub use raft::{
-    CommitReceipt, Consensus, ConsensusError, ConsensusResult, MetaRaftLogStore,
-    MetaRaftStateMachine, MetaRaftStore, MetaRaftTypeConfig, OpenraftConsensus, PeerDirectory,
-    PeerEndpoint, RaftPeerHandler, ReadFence, TlsRaftNetworkFactory,
+    start_meta_node, CommitReceipt, Consensus, ConsensusError, ConsensusResult, MetaNode,
+    MetaNodeTimers, MetaRaftLogStore, MetaRaftStateMachine, MetaRaftStore, MetaRaftTypeConfig,
+    OpenraftConsensus, PeerDirectory, PeerEndpoint, RaftPeerHandler, ReadFence,
+    TlsRaftNetworkFactory,
 };
 pub use state::{
     ConsumerGroupRecord, CursorCheckpointRecord, GroupMemberRecord, GroupNameRecord, KeyRecord,

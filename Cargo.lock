@@ -4093,6 +4093,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "vtop-node"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "rustls",
+ "serde",
+ "serde_yaml",
+ "tokio",
+ "tokio-rustls",
+ "uuid",
+ "vtop-broker",
+ "vtop-log",
+ "vtop-meta",
+ "vtop-protocol",
+]
+
+[[package]]
 name = "vtop-protocol"
 version = "0.1.0"
 dependencies = [

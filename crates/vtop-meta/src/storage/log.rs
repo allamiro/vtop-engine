@@ -70,8 +70,15 @@ impl Default for MetaLogConfig {
 /// like everything else: bounded counts, bounded addresses.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MetaMembership {
+    /// The target voter set (the newest joint config).
     pub voters: Vec<MetaNodeId>,
     pub learners: Vec<(MetaNodeId, String)>,
+    /// The outgoing voter set while a joint-consensus membership change is
+    /// in flight (#215 live change-membership); `None` once committed.
+    /// Encoded as optional trailing bytes so a single-config membership is
+    /// byte-identical to the pre-joint format and legacy entries decode
+    /// unchanged.
+    pub joint_outgoing: Option<Vec<MetaNodeId>>,
 }
 
 impl MetaMembership {
@@ -99,6 +106,20 @@ impl MetaMembership {
         for (node, addr) in &self.learners {
             put_u64(&mut out, node.0);
             put_bounded_str(&mut out, addr, MAX_LEARNER_ADDR_BYTES, "learner address")?;
+        }
+        if let Some(outgoing) = &self.joint_outgoing {
+            if outgoing.len() > MAX_MEMBERSHIP_NODES {
+                return Err(CodecError::BoundExceeded {
+                    what: "joint outgoing voters",
+                    actual: outgoing.len(),
+                    maximum: MAX_MEMBERSHIP_NODES,
+                });
+            }
+            put_u8(&mut out, 1);
+            put_u16(&mut out, outgoing.len() as u16);
+            for voter in outgoing {
+                put_u64(&mut out, voter.0);
+            }
         }
         Ok(out)
     }
@@ -137,7 +158,40 @@ impl MetaMembership {
             let addr = reader.bounded_str(MAX_LEARNER_ADDR_BYTES, "learner address")?;
             learners.push((node, addr));
         }
-        Ok(Self { voters, learners })
+        // Legacy single-config entries end here; a joint config appends a
+        // marker byte plus the outgoing voter set.
+        let joint_outgoing = if reader.remaining() > 0 {
+            match reader.u8("joint marker")? {
+                1 => {
+                    let outgoing_count = reader.u16("joint outgoing count")? as usize;
+                    if outgoing_count > MAX_MEMBERSHIP_NODES {
+                        return Err(CodecError::BoundExceeded {
+                            what: "joint outgoing voters",
+                            actual: outgoing_count,
+                            maximum: MAX_MEMBERSHIP_NODES,
+                        });
+                    }
+                    let mut outgoing = Vec::with_capacity(outgoing_count);
+                    for _ in 0..outgoing_count {
+                        outgoing.push(MetaNodeId(reader.u64("joint outgoing id")?));
+                    }
+                    Some(outgoing)
+                }
+                _ => {
+                    return Err(CodecError::InvalidValue {
+                        what: "joint marker",
+                        reason: "expected 1",
+                    })
+                }
+            }
+        } else {
+            None
+        };
+        Ok(Self {
+            voters,
+            learners,
+            joint_outgoing,
+        })
     }
 }
 

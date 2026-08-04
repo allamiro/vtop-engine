@@ -161,9 +161,29 @@ impl CommandPolicy {
         operation: &str,
     ) -> Result<CapturedOutput, VtopError> {
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = command.spawn().map_err(|error| {
-            VtopError::Upload(format!("spawning {} {operation}: {error}", self.backend))
-        })?;
+        let mut busy_retries = 0_u32;
+        let mut child = loop {
+            match command.spawn() {
+                Ok(child) => break child,
+                Err(error) if error.raw_os_error() == Some(26) && busy_retries < 4 => {
+                    busy_retries += 1;
+                    tokio::time::sleep(Duration::from_millis(10 * u64::from(busy_retries))).await;
+                }
+                Err(error) => {
+                    let hint = if error.kind() == std::io::ErrorKind::PermissionDenied {
+                        "; verify that the command is executable and its filesystem is not mounted noexec"
+                    } else if error.raw_os_error() == Some(26) {
+                        "; the executable remained busy after bounded retries; install/replace it atomically and retry"
+                    } else {
+                        ""
+                    };
+                    return Err(VtopError::Upload(format!(
+                        "spawning {} {operation}: {error}{hint}",
+                        self.backend
+                    )));
+                }
+            }
+        };
         let stdout = child.stdout.take().ok_or_else(|| {
             VtopError::Upload(format!("{} {operation} stdout unavailable", self.backend))
         })?;
@@ -258,23 +278,98 @@ mod tests {
         )
     }
 
-    fn executable_script(body: &str) -> (tempfile::TempDir, PathBuf) {
-        // Write to a temp name, sync, chmod, then rename into place. On some CI
-        // filesystems, exec'ing a script that was just written in-place races
-        // with the writer close and fails with ETXTBSY (os error 26).
+    fn write_executable_script(path: &std::path::Path, body: &str) -> std::io::Result<()> {
         use std::io::Write;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tool");
-        let tmp = dir.path().join("tool.tmp");
+        let tmp = path.with_extension("tmp");
         {
-            let mut file = std::fs::File::create(&tmp).unwrap();
-            write!(file, "#!/bin/sh\n{body}\n").unwrap();
-            file.sync_all().unwrap();
+            let mut file = std::fs::File::create(&tmp)?;
+            write!(file, "#!/bin/sh\n{body}\n")?;
+            file.sync_all()?;
         }
-        let mut permissions = std::fs::metadata(&tmp).unwrap().permissions();
+        let mut permissions = std::fs::metadata(&tmp)?.permissions();
         permissions.set_mode(0o700);
-        std::fs::set_permissions(&tmp, permissions).unwrap();
-        std::fs::rename(&tmp, &path).unwrap();
+        std::fs::set_permissions(&tmp, permissions)?;
+        std::fs::rename(&tmp, path)
+    }
+
+    fn executable_tempdir() -> tempfile::TempDir {
+        // Prefer an explicit override, then the test binary's filesystem, and
+        // finally the system temp directory. Hardened builders commonly mount
+        // /tmp with noexec; other builders make the target directory read-only.
+        let explicit = std::env::var_os("VTOP_TEST_EXEC_TMPDIR").map(PathBuf::from);
+        let mut candidates = Vec::new();
+        if let Some(path) = explicit.as_ref() {
+            candidates.push((path.clone(), true));
+        } else {
+            if let Ok(binary) = std::env::current_exe() {
+                if let Some(parent) = binary.parent() {
+                    // The running test binary already proves this mount allows
+                    // execution; only writability still needs to be checked.
+                    candidates.push((parent.to_path_buf(), false));
+                }
+            }
+            let system_temp = std::env::temp_dir();
+            if !candidates.iter().any(|(path, _)| path == &system_temp) {
+                candidates.push((system_temp, true));
+            }
+        }
+
+        let mut failures = Vec::new();
+        for (root, needs_exec_probe) in candidates {
+            let dir = match tempfile::Builder::new()
+                .prefix("vtop-exec-test-")
+                .tempdir_in(&root)
+            {
+                Ok(dir) => dir,
+                Err(error) => {
+                    failures.push(format!("{}: not writable ({error})", root.display()));
+                    continue;
+                }
+            };
+            if !needs_exec_probe {
+                return dir;
+            }
+            let probe = dir.path().join("exec-probe");
+            if let Err(error) = write_executable_script(&probe, "exit 0") {
+                failures.push(format!("{}: cannot create probe ({error})", root.display()));
+                continue;
+            }
+            let mut status_result = std::process::Command::new(&probe).status();
+            for delay_ms in [5, 10, 20, 40] {
+                if !matches!(&status_result, Err(error) if error.raw_os_error() == Some(26)) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(delay_ms));
+                status_result = std::process::Command::new(&probe).status();
+            }
+            match status_result {
+                Ok(status) if status.success() => {
+                    let _ = std::fs::remove_file(probe);
+                    return dir;
+                }
+                Ok(status) => failures.push(format!(
+                    "{}: executable probe exited with {status}",
+                    root.display()
+                )),
+                Err(error) => failures.push(format!(
+                    "{}: cannot execute probe ({error}); the filesystem may be mounted noexec",
+                    root.display()
+                )),
+            }
+        }
+
+        panic!(
+            "no writable, exec-enabled directory is available for command-backend test fixtures. \
+             Set VTOP_TEST_EXEC_TMPDIR to a writable directory on an exec-enabled filesystem. \
+             Checked: {}",
+            failures.join("; ")
+        );
+    }
+
+    fn executable_script(body: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = executable_tempdir();
+        let path = dir.path().join("tool");
+        write_executable_script(&path, body).unwrap();
         (dir, path)
     }
 
@@ -353,7 +448,10 @@ mod tests {
         let mut command = policy.command();
         let started = std::time::Instant::now();
         let error = policy.run(&mut command, "hang test").await.unwrap_err();
-        assert!(error.to_string().contains("timeout"));
+        assert!(
+            error.to_string().contains("timeout"),
+            "unexpected error: {error}"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(15),
             "timeout did not fire: elapsed {:?}",
@@ -363,14 +461,14 @@ mod tests {
 
     #[tokio::test]
     async fn captured_output_is_bounded() {
-        // Drive /bin/sh -c rather than a freshly written script so this check
-        // is not coupled to ETXTBSY races on some CI filesystems.
-        let path = PathBuf::from("/bin/sh");
+        // The fixture helper syncs and atomically renames the script, avoiding
+        // ETXTBSY races while also exercising the same configured-command path
+        // used by the compatibility backends.
+        let (_dir, path) = executable_script("printf '123456789'");
         let mut cfg = config(&path);
         cfg.command_max_output_bytes = 8;
         let policy = CommandPolicy::from_config(&cfg, "test").unwrap();
         let mut command = policy.command();
-        command.args(["-c", "printf '123456789'"]);
         let error = policy
             .output(&mut command, "output test")
             .await

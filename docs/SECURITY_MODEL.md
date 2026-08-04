@@ -275,6 +275,7 @@ Currently tracked (re-evaluate on every dependency bump):
 | Advisory | Crate | Why it is accepted for now |
 |----------|-------|----------------------------|
 | RUSTSEC-2023-0071 | `rsa` | Pulled only by sqlx's optional MySQL driver, which is **not enabled** (sqlite-only). Not compiled or executed in any VTOP build. No upstream fix exists. |
+| RUSTSEC-2026-0235 | `rkyv 0.7.46` | Optional `rust_decimal` feature pulled into `Cargo.lock` through `openraft → byte-unit`; the feature is not enabled and `rkyv` is absent from every build graph. Current `rust_decimal 1.42.1` still pins the vulnerable major; remove this exception when upstream adopts `rkyv >=0.8.17`. |
 | RUSTSEC-2026-0098 / -0099 / -0104 | `rustls-webpki 0.101.x` | Transitive via `aws-smithy-http-client`'s legacy `hyper-rustls 0.24` connector. Not removable by feature flags in the current AWS SDK; requires an upstream release. The modern `rustls 0.23` / `rustls-webpki 0.103` stack is also present and used by the default HTTPS path. |
 
 When the AWS SDK ships an `aws-smithy-http-client` release that drops

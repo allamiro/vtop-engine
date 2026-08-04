@@ -3,7 +3,7 @@
 # CI runs `cargo audit` and fails on any advisory NOT listed here, so new or
 # actionable vulnerabilities block the build. The advisories below are
 # unfixable transitive entries with documented justification; each MUST be
-# re-evaluated when its upstream ships a fix (see docs/SECURITY_MODEL.md §11).
+# re-evaluated when its upstream ships a fix (see docs/SECURITY_MODEL.md §13).
 
 [advisories]
 ignore = [
@@ -12,6 +12,15 @@ ignore = [
     # does not enable (sqlite-only). It is a Cargo.lock entry and is NOT
     # compiled or executed in any VTOP build (`cargo tree -i rsa` is empty).
     "RUSTSEC-2023-0071",
+
+    # rkyv 0.7.46 — archive validation can permit out-of-bounds reads for
+    # archived Rc/Arc values. It is an optional rust_decimal feature pulled
+    # into Cargo.lock through openraft -> byte-unit, but the feature is not
+    # enabled and the crate is absent from every build graph
+    # (`cargo tree --target all -i rkyv@0.7.46` is empty). rust_decimal 1.42.1
+    # still pins the vulnerable major; remove this when upstream adopts
+    # rkyv >=0.8.17.
+    "RUSTSEC-2026-0235",
 
     # rustls-webpki 0.101.x (3 advisories). Pulled transitively by
     # aws-smithy-http-client 1.1.13, whose `__rustls` feature hard-depends on
