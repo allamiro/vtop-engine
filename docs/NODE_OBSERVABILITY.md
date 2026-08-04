@@ -236,6 +236,27 @@ Behaviour worth knowing:
 * If nothing answers there is no reference at all, rather than a reference of
   zero — which would report every replica as perfectly caught up.
 
+## Scraping a live cluster
+
+`docker-compose.observability.yml` scrapes the cluster nodes at the ports the
+live-chaos harness binds on the Docker host — **not** compose services, because
+there is no `vtop-node` service in the lab compose yet and inventing one here
+would produce a scrape config that looks correct and resolves to nothing.
+
+| Target | Port | Derived from |
+|---|---|---|
+| `vtop-meta-{1,2,3}` | 9501–9503 | `CHAOS_META_METRICS_BASE_PORT` + node id |
+| `vtop-data-leader` | 9600 | `CHAOS_DATA_METRICS_BASE_PORT` + 0 |
+| `vtop-data-follower-{1,2}` | 9601–9602 | `CHAOS_DATA_METRICS_BASE_PORT` + replica index |
+
+So bringing up the observability stack and then running
+`scripts/live-chaos/scenarios/00-bringup.sh` makes every target live, and the
+"VTOP Cluster — nodes" dashboard populates. Nodes that are not running report
+DOWN in the Alloy UI, which is the honest state rather than a silent gap.
+
+Alloy's compose service maps `host.docker.internal` to the host gateway, so the
+same config works on Linux as well as Docker Desktop.
+
 ## Structured logs
 
 Both binaries honour `VTOP_LOG_FORMAT=json` (`vtopctl` also accepts `--json`),

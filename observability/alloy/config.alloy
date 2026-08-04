@@ -125,6 +125,36 @@ prometheus.scrape "vtop_engine" {
   forward_to      = [prometheus.remote_write.mimir.receiver]
 }
 
+// The native cluster nodes (#215/#224). Each `vtop-node` process serves the
+// same three endpoints as the engine; the address comes from its
+// `observability.listen` config.
+//
+// These are the ports the live-chaos harness binds on the DOCKER HOST, not
+// compose services: there is no `vtop-node` service in the lab compose yet, and
+// inventing service names here would produce a scrape config that looks correct
+// and resolves to nothing. The harness derives them as
+// CHAOS_META_METRICS_BASE_PORT + node id (9500 + 1..3) and
+// CHAOS_DATA_METRICS_BASE_PORT + replica index (9600 + 0..2, leader first), so
+// running `scripts/live-chaos/scenarios/00-bringup.sh` alongside this stack
+// makes every target below live. See docs/NODE_OBSERVABILITY.md.
+//
+// Targets are static rather than discovered because a metadata node and a data
+// node are different roles that must stay distinguishable in the `job` label
+// even when they share a host. Nodes that are not running simply report as
+// DOWN in the Alloy UI, which is the honest state.
+prometheus.scrape "vtop_nodes" {
+  targets = [
+    { __address__ = "host.docker.internal:9501", job = "vtop-meta", instance = "vtop-meta-1" },
+    { __address__ = "host.docker.internal:9502", job = "vtop-meta", instance = "vtop-meta-2" },
+    { __address__ = "host.docker.internal:9503", job = "vtop-meta", instance = "vtop-meta-3" },
+    { __address__ = "host.docker.internal:9600", job = "vtop-data", instance = "vtop-data-leader" },
+    { __address__ = "host.docker.internal:9601", job = "vtop-data", instance = "vtop-data-follower-1" },
+    { __address__ = "host.docker.internal:9602", job = "vtop-data", instance = "vtop-data-follower-2" },
+  ]
+  scrape_interval = "15s"
+  forward_to      = [prometheus.remote_write.mimir.receiver]
+}
+
 prometheus.remote_write "mimir" {
   endpoint {
     url = "http://mimir:9009/api/v1/push"
