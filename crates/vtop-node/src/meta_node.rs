@@ -2,6 +2,7 @@
 //! RPCs and the admin endpoint over mTLS TCP.
 
 use crate::config::MetaNodeConfig;
+use crate::observe::{MetaRaftCollector, NodeObservability};
 use crate::tls;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -64,10 +65,31 @@ pub async fn run(config: MetaNodeConfig) -> Result<(), String> {
     )
     .map_err(|error| error.to_string())?;
 
+    // The operational surface comes up before the ready marker so a scraper or
+    // health gate can observe the node from the same instant a script can.
+    let observability = NodeObservability::new("meta", &config.node_id.to_string())?;
+    observability.register(Box::new(MetaRaftCollector::new(Arc::clone(
+        &node.consensus,
+    ))?))?;
+    let metrics_addr = observability.serve(&config.observability).await?;
+
+    // Readiness for a metadata node is "both listeners are bound", NOT "the
+    // cluster has a leader". A fresh cluster has no leader until the admin
+    // `init` RPC lands, and that RPC arrives over the very endpoint being
+    // gated — requiring leadership here would deadlock bringup. Leadership is
+    // published as `vtop_meta_raft_state{state="leader"}` instead, where it is
+    // alertable without being a startup precondition.
+    observability.gate.mark_ready();
+
     // Scripts wait for this marker before issuing admin RPCs.
     println!(
-        "meta_node_ready id={} peer={} admin={}",
-        config.node_id, config.peer_listen, config.admin_listen
+        "meta_node_ready id={} peer={} admin={}{}",
+        config.node_id,
+        config.peer_listen,
+        config.admin_listen,
+        metrics_addr
+            .map(|addr| format!(" metrics={addr}"))
+            .unwrap_or_default()
     );
     use std::io::Write;
     std::io::stdout().flush().ok();

@@ -4014,9 +4014,6 @@ dependencies = [
  "chrono",
  "clap",
  "futures",
- "http-body-util",
- "hyper",
- "hyper-util",
  "rdkafka",
  "serde",
  "serde_json",
@@ -4030,6 +4027,7 @@ dependencies = [
  "vtop-core",
  "vtop-log",
  "vtop-meta",
+ "vtop-observe",
  "vtop-state",
  "vtop-upload",
 ]
@@ -4097,16 +4095,32 @@ name = "vtop-node"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "prometheus",
  "rustls",
  "serde",
  "serde_yaml",
+ "tempfile",
  "tokio",
  "tokio-rustls",
  "uuid",
  "vtop-broker",
  "vtop-log",
  "vtop-meta",
+ "vtop-observe",
  "vtop-protocol",
+]
+
+[[package]]
+name = "vtop-observe"
+version = "0.1.0"
+dependencies = [
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "prometheus",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

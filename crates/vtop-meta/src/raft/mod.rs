@@ -44,6 +44,7 @@ pub mod convert;
 pub mod log_store;
 pub mod network;
 pub mod node;
+pub mod observation;
 pub mod state_machine;
 pub mod store;
 pub mod type_config;
@@ -54,6 +55,7 @@ pub use consensus::{
 pub use log_store::MetaRaftLogStore;
 pub use network::{PeerDirectory, PeerEndpoint, RaftPeerHandler, TlsRaftNetworkFactory};
 pub use node::{start_meta_node, MetaNode, MetaNodeTimers};
+pub use observation::{RaftObservation, RaftServerState};
 pub use state_machine::MetaRaftStateMachine;
 pub use store::MetaRaftStore;
 pub use type_config::{MetaRaftTypeConfig, NodeId};

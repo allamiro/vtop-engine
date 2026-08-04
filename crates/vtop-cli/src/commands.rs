@@ -132,34 +132,19 @@ impl From<SourceKind> for SourceType {
     }
 }
 
-/// Initialize structured logging. Honors `--log-level`, then config, then env.
+/// Initialize structured logging.
 ///
-/// JSON is selected by `--json` OR `VTOP_LOG_FORMAT=json`. The env form lets a
-/// container opt into structured logs without changing the entrypoint, so a log
-/// pipeline (Alloy -> Loki) gets parseable `{"level":...,"records":...}` lines
-/// instead of pretty text. In pretty mode ANSI colour is emitted ONLY to a real
-/// terminal: writing escape codes to a pipe (a container's captured stderr)
-/// corrupts every downstream parser — a `level=~"WARN"` filter or `| logfmt`
-/// then matches nothing because the field names are wrapped in `\e[3m…\e[0m`.
+/// Filter precedence is `RUST_LOG`, then `--log-level`, then the config file's
+/// `engine.log_level`. `RUST_LOG` wins deliberately: it is the conventional
+/// Rust escape hatch, and an operator debugging a running deployment needs to
+/// raise verbosity without editing the config or the entrypoint that supplied
+/// the flag.
+///
+/// JSON is selected by `--json` OR `VTOP_LOG_FORMAT=json`. The encoding rules
+/// and the reasoning behind them live in [`vtop_observe::logging`], shared with
+/// the cluster nodes so engine and node lines land in Loki with one shape.
 pub fn init_tracing(level: &str, json: bool) {
-    use std::io::IsTerminal;
-    use tracing_subscriber::EnvFilter;
-    let json = json
-        || std::env::var("VTOP_LOG_FORMAT")
-            .map(|v| v.eq_ignore_ascii_case("json"))
-            .unwrap_or(false);
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level.to_lowercase()));
-    // Logs go to STDERR so they never collide with command output on STDOUT
-    // (notably the machine-readable `--json` payloads).
-    let builder = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr);
-    if json {
-        builder.json().with_current_span(false).init();
-    } else {
-        builder.with_ansi(std::io::stderr().is_terminal()).init();
-    }
+    vtop_observe::logging::init(level, json);
 }
 
 fn load(config: &Path) -> Result<(VtopConfig, StreamsConfig), VtopError> {

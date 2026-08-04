@@ -24,12 +24,10 @@ postgres = ["vtop-state/postgres"]
 
 [dependencies]
 blake3 = { workspace = true }
-http-body-util = { workspace = true }
-hyper-util = { workspace = true }
-hyper = { workspace = true }
 vtop-core = { workspace = true }
 vtop-log = { workspace = true }
 vtop-meta = { workspace = true }
+vtop-observe = { workspace = true }
 vtop-adapters = { workspace = true, default-features = false }
 vtop-upload = { workspace = true }
 vtop-state = { workspace = true }

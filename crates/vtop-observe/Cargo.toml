@@ -1,0 +1,16 @@
+[package]
+name = "vtop-observe"
+description = "Shared operational surface for VTOP processes: Prometheus scrape endpoint, health/readiness probes, and structured-log initialization."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+prometheus = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -10,6 +10,9 @@
 //! of the same directory), not failover.
 
 use crate::config::{DataNodeConfig, DataRole};
+use crate::observe::{
+    BrokerCollector, FollowerCollector, NodeObservability, SegmentRecoveryCollector,
+};
 use crate::tls;
 use std::path::Path;
 use std::sync::Arc;
@@ -24,7 +27,9 @@ use vtop_broker::{
     LocalBroker, MetaFencingEpoch, NativeServer, ProducerEpochJournal, ServerConfig,
     SessionAuthorizer,
 };
-use vtop_log::{ActiveSegment, KeyRange, RangeLineage, SegmentConfig, SegmentDescriptor};
+use vtop_log::{
+    ActiveSegment, KeyRange, RangeLineage, RecoveryReport, SegmentConfig, SegmentDescriptor,
+};
 use vtop_protocol::{RangeIdentity, Role};
 
 pub const MAX_FRAME_BYTES: u32 = 32 * 1024 * 1024;
@@ -55,12 +60,13 @@ fn open_segment(
     data_dir: &Path,
     segment_id: Uuid,
     range: &RangeIdentity,
-) -> Result<ActiveSegment, String> {
+) -> Result<(ActiveSegment, Option<RecoveryReport>), String> {
     let path = segment_path(data_dir);
     if path.exists() {
         let segment = ActiveSegment::recover(&path).map_err(|error| error.to_string())?;
-        println!("segment_recovered report={:?}", segment.recovery_report());
-        return Ok(segment);
+        let report = segment.recovery_report().clone();
+        println!("segment_recovered report={report:?}");
+        return Ok((segment, Some(report)));
     }
     let descriptor = SegmentDescriptor {
         segment_id,
@@ -79,7 +85,9 @@ fn open_segment(
         max_segment_records: 10_000_000,
         ..SegmentConfig::default()
     };
-    ActiveSegment::create(&path, descriptor, config).map_err(|error| error.to_string())
+    let segment =
+        ActiveSegment::create(&path, descriptor, config).map_err(|error| error.to_string())?;
+    Ok((segment, None))
 }
 
 /// mTLS already authenticated the chain against the harness CA; the
@@ -98,15 +106,31 @@ pub async fn run(config: DataNodeConfig) -> Result<(), String> {
     std::fs::create_dir_all(&config.data_dir)
         .map_err(|error| format!("create {}: {error}", config.data_dir.display()))?;
     let range = config.range.identity();
-    let segment = open_segment(&config.data_dir, config.segment_id, &range)?;
+    let (segment, recovery) = open_segment(&config.data_dir, config.segment_id, &range)?;
     let epochs = ProducerEpochJournal::open(config.data_dir.join("epochs"))
         .map_err(|error| error.to_string())?;
     let meta = MetaFencingEpoch::new(config.fencing_epoch);
 
+    let observability = NodeObservability::new(
+        match config.role {
+            DataRole::Follower => "data-follower",
+            DataRole::Leader => "data-leader",
+            DataRole::Standalone => "data-standalone",
+        },
+        &config.node_uuid.to_string(),
+    )?;
+    observability.register(Box::new(SegmentRecoveryCollector::new(recovery.as_ref())?))?;
+
     match config.role {
-        DataRole::Follower => run_follower(config, range, segment, epochs, meta).await,
-        DataRole::Leader => run_leader(config, range, segment, epochs, meta, true).await,
-        DataRole::Standalone => run_leader(config, range, segment, epochs, meta, false).await,
+        DataRole::Follower => {
+            run_follower(config, range, segment, epochs, meta, observability).await
+        }
+        DataRole::Leader => {
+            run_leader(config, range, segment, epochs, meta, true, observability).await
+        }
+        DataRole::Standalone => {
+            run_leader(config, range, segment, epochs, meta, false, observability).await
+        }
     }
 }
 
@@ -116,6 +140,7 @@ async fn run_follower(
     segment: ActiveSegment,
     epochs: ProducerEpochJournal,
     meta: MetaFencingEpoch,
+    observability: NodeObservability,
 ) -> Result<(), String> {
     let listen = config
         .replica_listen
@@ -133,6 +158,7 @@ async fn run_follower(
         )
         .map_err(|error| error.to_string())?,
     );
+    observability.register(Box::new(FollowerCollector::new(Arc::clone(&follower))?))?;
     let server = ReplicaPeerServer::new(
         tls::replica_material(&config.replica_tls)?,
         config.node_uuid,
@@ -142,9 +168,14 @@ async fn run_follower(
     let listener = TcpListener::bind(listen)
         .await
         .map_err(|error| format!("bind {listen}: {error}"))?;
+    let metrics_addr = observability.serve(&config.observability).await?;
+    observability.gate.mark_ready();
     println!(
-        "data_node_ready role=follower node={} replica={listen}",
-        config.node_uuid
+        "data_node_ready role=follower node={} replica={listen}{}",
+        config.node_uuid,
+        metrics_addr
+            .map(|addr| format!(" metrics={addr}"))
+            .unwrap_or_default()
     );
     use std::io::Write;
     std::io::stdout().flush().ok();
@@ -161,6 +192,7 @@ async fn run_leader(
     epochs: ProducerEpochJournal,
     meta: MetaFencingEpoch,
     replicated: bool,
+    observability: NodeObservability,
 ) -> Result<(), String> {
     let listen = config
         .native_listen
@@ -173,6 +205,12 @@ async fn run_leader(
     let principal = config
         .principal_id
         .ok_or("leader/standalone requires principal_id")?;
+
+    // Kept beside the broker: the collector needs the concrete replica set for
+    // per-follower lag, which the `dyn ReplicaSet` the broker holds does not
+    // expose.
+    let mut observed_replicas = None;
+    let mut follower_ids = Vec::new();
 
     let broker = if replicated {
         let follower_configs = config
@@ -190,7 +228,10 @@ async fn run_leader(
         if follower_configs.is_empty() {
             return Err("leader requires at least one follower".into());
         }
-        let follower_ids: Vec<Uuid> = follower_configs.iter().map(|f| f.node_id).collect();
+        follower_ids = follower_configs
+            .iter()
+            .map(|f| f.node_id)
+            .collect::<Vec<Uuid>>();
         let replica_set = Arc::new(
             NetworkedReplicaSet::start_on_handle_with_memory(
                 tokio::runtime::Handle::current(),
@@ -214,6 +255,7 @@ async fn run_leader(
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        observed_replicas = Some(Arc::clone(&replica_set));
         LocalBroker::with_replication(
             segment,
             epochs,
@@ -230,8 +272,51 @@ async fn run_leader(
             .map_err(|error| error.to_string())?
     };
 
+    let broker = Arc::new(broker);
+    observability.register(Box::new(BrokerCollector::new(
+        Arc::clone(&broker),
+        observed_replicas,
+        follower_ids,
+    )?))?;
+    // A leaseholder that metadata has fenced must stop advertising itself as
+    // ready even though its listener is still bound and its process healthy.
+    // That distinction is the whole point of separating /healthz from /readyz:
+    // the node is alive and must stay up to be inspected, but it must not be
+    // sent produce traffic it is now obliged to refuse.
+    //
+    // The predicate is the broker's own write-authorization rule, not merely
+    // "a lease exists": after a steal the metadata lease is live for the NEW
+    // holder, and reporting ready there would keep traffic pointed at the one
+    // process guaranteed to reject it.
+    //
+    // Honest scope note: no production path publishes committed metadata
+    // grants into this view yet — `MetaFencingEpoch::set`/`clear_lease` are
+    // driven by a Raft applied-state watcher that is still follow-up work (see
+    // the `MetaFencingEpoch` docs). Until that lands, this probe reports ready
+    // for the configured epoch and the fenced branch fires only under test. It
+    // is wired now so readiness becomes correct the moment the watcher does,
+    // rather than being remembered afterwards.
+    let lease = broker.meta_fencing_epoch().clone();
+    let held = broker.held_fencing_epoch();
+    let observability = observability.with_readiness_probe(Arc::new(move || {
+        // Non-blocking: a produce mid-fsync holds this view, and a readiness
+        // probe must never park a runtime worker behind a stalling disk.
+        // Treating contention as ready is the right default — the broker is
+        // demonstrably working, which is the opposite of fenced.
+        match lease.try_snapshot() {
+            None => vtop_observe::Readiness::Ready,
+            Some((epoch, true)) if epoch == held => vtop_observe::Readiness::Ready,
+            Some((epoch, true)) => vtop_observe::Readiness::not_ready(format!(
+                "metadata lease moved to epoch {epoch}; this leaseholder is fenced at {held}"
+            )),
+            Some((epoch, false)) => vtop_observe::Readiness::not_ready(format!(
+                "metadata lease released; range is fenced at epoch {epoch}"
+            )),
+        }
+    }));
+
     let server = NativeServer::new(
-        Arc::new(broker),
+        Arc::clone(&broker),
         tls::server_material(native_tls)?,
         Arc::new(PrincipalAuthorizer { principal }),
         ServerConfig {
@@ -253,10 +338,15 @@ async fn run_leader(
         .await
         .map_err(|error| format!("bind {listen}: {error}"))?;
     let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+    let metrics_addr = observability.serve(&config.observability).await?;
+    observability.gate.mark_ready();
     println!(
-        "data_node_ready role={} node={} native={listen}",
+        "data_node_ready role={} node={} native={listen}{}",
         if replicated { "leader" } else { "standalone" },
-        config.node_uuid
+        config.node_uuid,
+        metrics_addr
+            .map(|addr| format!(" metrics={addr}"))
+            .unwrap_or_default()
     );
     use std::io::Write;
     std::io::stdout().flush().ok();

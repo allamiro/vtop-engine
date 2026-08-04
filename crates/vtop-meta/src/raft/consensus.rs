@@ -9,6 +9,7 @@
 use crate::command::{MetadataCommand, MetadataResponse};
 use crate::keys::MetaNodeId;
 use crate::raft::convert::{membership_to_meta, to_meta_index, vote_to_hard_state};
+use crate::raft::observation::{RaftObservation, RaftServerState};
 use crate::raft::type_config::MetaRaftTypeConfig;
 use crate::transport::admin::AdminHandler;
 use crate::transport::wire::{
@@ -17,6 +18,7 @@ use crate::transport::wire::{
 };
 use async_trait::async_trait;
 use openraft::Raft;
+use openraft::ServerState;
 use thiserror::Error;
 
 type MemRaft = Raft<MetaRaftTypeConfig>;
@@ -63,6 +65,52 @@ impl OpenraftConsensus {
 
     pub fn raft(&self) -> &MemRaft {
         &self.raft
+    }
+
+    /// Non-blocking snapshot of this node's Raft state for the operational
+    /// surface (#224).
+    ///
+    /// Reads the latest published metrics without messaging the Raft core, so
+    /// a `/metrics` scrape can never queue behind consensus work — least of all
+    /// on the struggling node whose numbers are being asked for. Indices are
+    /// translated to the 1-based VTOP index space, matching what
+    /// `vtopctl meta status` prints; a metric and a CLI that disagree about
+    /// what "index 7" means is a bug waiting for an incident.
+    pub fn observe(&self) -> RaftObservation {
+        let metrics = self.raft.metrics().borrow().clone();
+        let membership = metrics.membership_config.membership();
+        RaftObservation {
+            node_id: MetaNodeId(metrics.id),
+            running: metrics.running_state.is_ok(),
+            current_term: metrics.current_term,
+            server_state: match metrics.state {
+                ServerState::Learner => RaftServerState::Learner,
+                ServerState::Follower => RaftServerState::Follower,
+                ServerState::Candidate => RaftServerState::Candidate,
+                ServerState::Leader => RaftServerState::Leader,
+                ServerState::Shutdown => RaftServerState::Shutdown,
+            },
+            current_leader: metrics.current_leader.map(MetaNodeId),
+            last_log_index: metrics.last_log_index.map(to_meta_index),
+            last_applied_index: metrics.last_applied.map(|id| to_meta_index(id.index)),
+            snapshot_index: metrics.snapshot.map(|id| to_meta_index(id.index)),
+            purged_index: metrics.purged.map(|id| to_meta_index(id.index)),
+            voters: membership.voter_ids().count(),
+            learners: membership.learner_ids().count(),
+            millis_since_quorum_ack: metrics.millis_since_quorum_ack,
+            peer_matched_index: metrics
+                .replication
+                .as_ref()
+                .map(|replication| {
+                    replication
+                        .iter()
+                        .map(|(peer, matched)| {
+                            (MetaNodeId(*peer), matched.map(|id| to_meta_index(id.index)))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
     }
 }
 

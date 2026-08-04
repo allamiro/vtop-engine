@@ -318,6 +318,24 @@ impl InProcessFollower {
         &self.range
     }
 
+    /// Non-blocking `(local_committed_offset, next_offset)`, for observation
+    /// only (#224).
+    ///
+    /// `None` while the replica append path holds the state lock. See
+    /// [`crate::LocalBroker::try_local_offsets`] for why a metrics read must
+    /// never block behind an fsync.
+    pub fn try_local_offsets(&self) -> Option<(u64, u64)> {
+        let state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        Some((
+            state.segment.committed_offset(),
+            state.segment.next_offset(),
+        ))
+    }
+
     /// Fetch capped at `min(local_committed, cluster_committed)`.
     pub fn fetch(
         &self,
