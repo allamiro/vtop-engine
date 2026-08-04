@@ -40,7 +40,7 @@ fn class_from_index(i: usize) -> TelemetryFormat {
 /// (real-world events often look like `<134>... CEF:0|...`), because the
 /// pipe-delimited `CEF:0|` / `LEEF:1.0|` token is a strong, specific signal.
 pub fn detect_record(record: &[u8]) -> TelemetryFormat {
-    let s = trim_ascii_start(record);
+    let s = record.trim_ascii_start();
     if s.is_empty() {
         return TelemetryFormat::Raw;
     }
@@ -59,17 +59,16 @@ pub fn detect_record(record: &[u8]) -> TelemetryFormat {
         return TelemetryFormat::Syslog;
     }
 
-    // JSON object / array per line → JSON Lines candidate. Readers normally
-    // strip `\n`, but CRLF leaves `\r` behind and callers can supply other
-    // framing whitespace. Trim only for the JSON check so CEF/LEEF/syslog
-    // detection retains its existing byte-level behavior (#105).
-    let json = trim_ascii_end(s);
+    // JSON object / array per line → JSON Lines candidate. Leading whitespace
+    // was removed above and serde_json already accepts trailing JSON
+    // whitespace (including CRLF framing), so a second manual trim loop would
+    // be redundant. CEF/LEEF/syslog retain their existing byte-level behavior.
     // The first byte alone decides the candidate kind: a valid JSON value can
     // only be an object or array if it starts with '{' or '[', and the parse
     // is the authority on everything else — a closing-delimiter pre-check is
     // redundant with the parse and only hides equivalent mutants.
-    let json_shaped = matches!(json.first(), Some(&b'{') | Some(&b'['));
-    if json_shaped && serde_json::from_slice::<serde_json::Value>(json).is_ok() {
+    let json_shaped = matches!(s.first(), Some(&b'{') | Some(&b'['));
+    if json_shaped && serde_json::from_slice::<serde_json::Value>(s).is_ok() {
         return TelemetryFormat::Jsonl;
     }
 
@@ -89,7 +88,7 @@ pub fn detect_batch(records: &[Vec<u8>]) -> TelemetryFormat {
 
     // Special case: exactly one record that is a JSON value → a JSON document.
     if records.len() == 1 {
-        let only = trim_ascii_start(&records[0]);
+        let only = records[0].trim_ascii_start();
         if serde_json::from_slice::<serde_json::Value>(only).is_ok() {
             return TelemetryFormat::Json;
         }
@@ -125,22 +124,6 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         return needle.is_empty();
     }
     haystack.windows(needle.len()).any(|w| w == needle)
-}
-
-fn trim_ascii_start(b: &[u8]) -> &[u8] {
-    let mut i = 0;
-    while i < b.len() && b[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    &b[i..]
-}
-
-fn trim_ascii_end(b: &[u8]) -> &[u8] {
-    let mut end = b.len();
-    while end > 0 && b[end - 1].is_ascii_whitespace() {
-        end -= 1;
-    }
-    &b[..end]
 }
 
 /// True if the slice begins with a syslog PRI header `<N>` / `<NN>` / `<NNN>`.
@@ -317,8 +300,8 @@ mod tests {
 
     #[test]
     fn leading_whitespace_is_trimmed_before_classifying() {
-        // The format markers are only found after trim_ascii_start advances past
-        // leading whitespace. Kills the loop-bound / `+=` mutants there.
+        // The format markers are found only after the standard slice helper
+        // advances past every leading ASCII-whitespace byte.
         assert_eq!(detect_record(b"   CEF:0|x"), TelemetryFormat::Cef);
         assert_eq!(detect_record(b"\t\n <134>msg"), TelemetryFormat::Syslog);
     }
