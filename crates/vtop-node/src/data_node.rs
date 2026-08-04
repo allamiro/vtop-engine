@@ -91,6 +91,76 @@ fn open_segment(
     Ok((segment, None))
 }
 
+/// Serves the replica-status RPC on a leader, and refuses everything else
+/// (#224).
+///
+/// A leader is a replica of its own range, so `vtopctl node status` must be
+/// able to ask it where the range's commit boundary actually is — without it,
+/// follower lag can only be measured against the furthest-ahead follower, which
+/// is a strictly weaker answer than measuring against the leader.
+///
+/// It is emphatically not a follower, though. Accepting an append here would
+/// let another process replicate into a range this one still leads, so every
+/// write path refuses rather than being left unimplemented and drifting into
+/// working by accident.
+struct LeaderStatusReplica {
+    broker: Arc<LocalBroker>,
+    node_id: Uuid,
+}
+
+impl ReplicaPeerHandler for LeaderStatusReplica {
+    fn node_id(&self) -> Uuid {
+        self.node_id
+    }
+
+    fn apply_append(
+        &self,
+        _request: &vtop_protocol::ReplicaAppendRequest,
+    ) -> Result<vtop_protocol::ReplicaAppendResponse, (vtop_protocol::ErrorCode, String)> {
+        Err(self.refuse_write())
+    }
+
+    fn apply_append_batch(
+        &self,
+        _requests: &[vtop_protocol::ReplicaAppendRequest],
+    ) -> Result<vtop_protocol::ReplicaAppendResponse, (vtop_protocol::ErrorCode, String)> {
+        Err(self.refuse_write())
+    }
+
+    fn observe_hwm(
+        &self,
+        _update: &vtop_protocol::CommittedHwmUpdate,
+    ) -> Result<(), (vtop_protocol::ErrorCode, String)> {
+        Err(self.refuse_write())
+    }
+
+    fn status(
+        &self,
+        range: &RangeIdentity,
+    ) -> Result<vtop_protocol::ReplicaStatusResponse, (vtop_protocol::ErrorCode, String)> {
+        if range != self.broker.range() {
+            return Err((
+                vtop_protocol::ErrorCode::WrongRange,
+                "replica status range identity does not match this leader".to_owned(),
+            ));
+        }
+        let (local_committed_offset, next_offset) = self.broker.local_offsets();
+        Ok(vtop_protocol::ReplicaStatusResponse {
+            local_committed_offset,
+            next_offset,
+        })
+    }
+}
+
+impl LeaderStatusReplica {
+    fn refuse_write(&self) -> (vtop_protocol::ErrorCode, String) {
+        (
+            vtop_protocol::ErrorCode::Fenced,
+            "this node leads the range and does not accept replication appends".to_owned(),
+        )
+    }
+}
+
 /// mTLS already authenticated the chain against the harness CA; the
 /// authorizer additionally pins the one configured principal.
 struct PrincipalAuthorizer {
@@ -339,6 +409,34 @@ async fn run_leader(
         server.metrics(),
     ))?))?;
 
+    // A leader that names a `replica_listen` also answers the replica-status
+    // RPC, so `vtopctl node status` can measure follower lag against the
+    // leader's own boundary rather than against the furthest-ahead follower.
+    // Status only: see LeaderStatusReplica.
+    let status_addr = match config.replica_listen.as_ref() {
+        Some(status_listen) => {
+            let status_server = ReplicaPeerServer::new(
+                tls::replica_material(&config.replica_tls)?,
+                config.node_uuid,
+                Arc::new(LeaderStatusReplica {
+                    broker: Arc::clone(&broker),
+                    node_id: config.node_uuid,
+                }) as Arc<dyn ReplicaPeerHandler>,
+            )
+            .map_err(|error| error.to_string())?;
+            let status_listener = TcpListener::bind(status_listen)
+                .await
+                .map_err(|error| format!("bind {status_listen}: {error}"))?;
+            tokio::spawn(async move {
+                if let Err(error) = status_server.serve(status_listener).await {
+                    tracing::warn!(%error, "leader replica-status server exited");
+                }
+            });
+            Some(status_listen.clone())
+        }
+        None => None,
+    };
+
     let listener = TcpListener::bind(listen)
         .await
         .map_err(|error| format!("bind {listen}: {error}"))?;
@@ -346,9 +444,12 @@ async fn run_leader(
     let metrics_addr = observability.serve(&config.observability).await?;
     observability.gate.mark_ready();
     println!(
-        "data_node_ready role={} node={} native={listen}{}",
+        "data_node_ready role={} node={} native={listen}{}{}",
         if replicated { "leader" } else { "standalone" },
         config.node_uuid,
+        status_addr
+            .map(|addr| format!(" replica_status={addr}"))
+            .unwrap_or_default(),
         metrics_addr
             .map(|addr| format!(" metrics={addr}"))
             .unwrap_or_default()

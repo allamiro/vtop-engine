@@ -13,6 +13,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,8 +28,9 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use uuid::Uuid;
 use vtop_protocol::{
     read_frame, write_frame, CommittedHwmUpdate, ErrorCode, ErrorResponse, Message, ProtocolLimits,
-    ReplicaAppendBatchRequest, ReplicaAppendRequest, ReplicaAppendResponse, ReplicaStatusRequest,
-    ReplicaStatusResponse, WireFrame, DEFAULT_MAX_FRAME_BYTES, DEFAULT_MAX_RECORDS,
+    RangeIdentity, ReplicaAppendBatchRequest, ReplicaAppendRequest, ReplicaAppendResponse,
+    ReplicaStatusRequest, ReplicaStatusResponse, WireFrame, DEFAULT_MAX_FRAME_BYTES,
+    DEFAULT_MAX_RECORDS,
 };
 
 const REPLICA_LIMITS: ProtocolLimits = ProtocolLimits {
@@ -1140,6 +1142,96 @@ fn approx_batch_bytes(requests: &[ReplicaAppendRequest]) -> usize {
         })
         .sum::<usize>()
         .max(64)
+}
+
+/// One-shot client for the replica-status RPC (#224).
+///
+/// The leader keeps a long-lived session per follower and reads status as part
+/// of its catch-up handshake. This is the operator's path instead: connect, ask
+/// one replica where its disk actually is, disconnect. Reusing the leader's
+/// dialer for that would mean starting a replication session as a side effect
+/// of running a status command.
+///
+/// The replica's certificate CN is checked against the node UUID the caller
+/// expected, so `vtopctl node status` cannot silently report a different
+/// replica's offsets after an address is reused or a config drifts.
+pub struct ReplicaStatusClient {
+    connector: TlsConnector,
+    timeout: Duration,
+}
+
+impl ReplicaStatusClient {
+    pub fn new(material: ReplicaTlsMaterial) -> BrokerResult<Self> {
+        Ok(Self {
+            connector: build_client_connector(material)?,
+            timeout: Duration::from_secs(5),
+        })
+    }
+
+    /// Deadline covering connect, handshake, and the round trip.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    pub async fn status(
+        &self,
+        addr: SocketAddr,
+        server_name: &str,
+        expected_node: Uuid,
+        range: &RangeIdentity,
+    ) -> BrokerResult<ReplicaStatusResponse> {
+        let name = rustls::pki_types::ServerName::try_from(server_name.to_owned())
+            .map_err(|error| {
+                crate::BrokerError::InvalidConfig(format!("server name {server_name:?}: {error}"))
+            })?
+            .to_owned();
+        // One deadline for the whole exchange: a replica whose disk has stopped
+        // answering will also stop answering here, and an operator running a
+        // status command during an incident needs it to return.
+        timeout(self.timeout, async {
+            let tcp = TcpStream::connect(addr)
+                .await
+                .map_err(|source| crate::BrokerError::Io {
+                    path: PathBuf::from("replica-status"),
+                    source,
+                })?;
+            let mut stream = self.connector.connect(name, tcp).await.map_err(|source| {
+                crate::BrokerError::Io {
+                    path: PathBuf::from("replica-status-tls"),
+                    source,
+                }
+            })?;
+            assert_peer_uuid(peer_certs_client(&stream), expected_node)?;
+            let frame = WireFrame {
+                request_id: 1,
+                stream_id: 0,
+                message: Message::ReplicaStatusRequest(ReplicaStatusRequest {
+                    range: range.clone(),
+                }),
+            };
+            write_frame(&mut stream, &frame, REPLICA_LIMITS).await?;
+            let reply = read_frame(&mut stream, REPLICA_LIMITS)
+                .await?
+                .ok_or_else(|| {
+                    crate::BrokerError::InvalidConfig(
+                        "replica closed the session without answering".to_owned(),
+                    )
+                })?;
+            match reply.message {
+                Message::ReplicaStatusResponse(status) => Ok(status),
+                Message::Error(error) => Err(crate::BrokerError::InvalidConfig(format!(
+                    "replica refused the status request: {:?} {}",
+                    error.code, error.message
+                ))),
+                other => Err(crate::BrokerError::InvalidConfig(format!(
+                    "unexpected reply to a status request: {other:?}"
+                ))),
+            }
+        })
+        .await
+        .map_err(|_| crate::BrokerError::Timeout("replica status"))?
+    }
 }
 
 fn build_server_acceptor(material: ReplicaTlsMaterial) -> BrokerResult<TlsAcceptor> {

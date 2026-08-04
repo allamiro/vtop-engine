@@ -173,6 +173,69 @@ alertable, not just throughput.
 | `vtop_broker_segment_recovery_truncated_bytes` | gauge | Bytes discarded past the durable boundary at open. Non-zero after a crash is expected and benign; **non-zero on every restart means the fsync story is wrong**. |
 | `vtop_broker_segment_recovery_recovered_bytes` / `_records` | gauge | What recovery accepted as durable. |
 
+## `vtopctl node status`
+
+Admin parity with `vtopctl meta status`. That command reports what the metadata
+group believes; this one reports where each replica's disk has actually got to,
+asked over the replication plane rather than the observability endpoint.
+
+That distinction is the point. `/metrics` is the right shape for dashboards and
+alerts, but it requires every node to be scraped and healthy enough to serve
+HTTP. `node status` still answers when the endpoint is unreachable or was never
+configured.
+
+```bash
+vtopctl node status --config node-client.yaml          # human-readable
+vtopctl node status --config node-client.yaml --json   # machine-readable
+```
+
+```yaml
+range:
+  topic: telemetry
+  topic_epoch: 1
+  range_id: 8b1f...-...
+  range_generation: 0
+ca_cert: /etc/vtop/pki/ca.pem
+# The operator certificate's CN must be a UUID — see the note below.
+client_cert: /etc/vtop/pki/operator.pem
+client_key: /etc/vtop/pki/operator.key
+replicas:
+  - node_uuid: 3f2a...-...     # must equal the replica certificate's CN
+    addr: "10.0.0.11:9300"
+    server_name: replica-1
+    role: leader               # optional; defaults to follower
+  - node_uuid: 7c4e...-...
+    addr: "10.0.0.12:9300"
+    server_name: replica-2
+```
+
+Behaviour worth knowing:
+
+* **Lag is measured against the declared leader**, whose commit boundary defines
+  the range. With no leader declared — or with the leader unreachable — the
+  furthest-ahead replica becomes the reference and the output *says so*, because
+  "lag against the furthest-ahead replica" is a weaker claim and must not be
+  mistaken for the stronger one.
+* **Unreachable replicas are reported, not omitted.** A partial picture is what
+  an operator needs mid-incident. The exit code is non-zero when any replica
+  failed to answer, so a script cannot read "two of three replicas" as success.
+* Each replica's certificate CN is checked against the configured `node_uuid`,
+  so a reused address cannot quietly answer for a different node.
+* **The operator certificate's own CN must be a UUID.** The replication plane
+  identifies every peer by a UUID CN and refuses anything else at the transport,
+  before a status request is read — so a certificate with a human-readable
+  subject makes every replica look unreachable. Issue the operator certificate
+  from the same CA with a UUID subject. Widening that to a named operator
+  identity is a change to the replication plane's authorization model, not
+  something a status command should introduce.
+* The **leader answers too**: a leader that names `replica_listen` serves a
+  status-only handler, so lag is measured against its boundary. Every write path
+  on that handler refuses — it is a replica of its own range, but accepting an
+  append there would let another process replicate into a range this one still
+  leads.
+* If nothing answers there is no reference at all, rather than a reference of
+  zero — which would report every replica as perfectly caught up.
+
 ## Structured logs
 
 Both binaries honour `VTOP_LOG_FORMAT=json` (`vtopctl` also accepts `--json`),
