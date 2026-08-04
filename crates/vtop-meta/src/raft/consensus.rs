@@ -7,11 +7,15 @@
 #![allow(clippy::result_large_err)]
 
 use crate::command::{MetadataCommand, MetadataResponse};
+use crate::keys::MetaKey;
 use crate::keys::MetaNodeId;
 use crate::raft::convert::{membership_to_meta, to_meta_index, vote_to_hard_state};
 use crate::raft::observation::{RaftObservation, RaftServerState};
+use crate::raft::store::MetaRaftStore;
 use crate::raft::type_config::MetaRaftTypeConfig;
+use crate::state::MetaValue;
 use crate::transport::admin::AdminHandler;
+use crate::transport::wire::{AdminLeaseView, AdminReadRangeLeaseResponse};
 use crate::transport::wire::{
     AdminMembershipResponse, AdminProposeResponse, AdminStatusResponse, TransportError,
     TransportResult, WireLogId,
@@ -20,6 +24,7 @@ use async_trait::async_trait;
 use openraft::Raft;
 use openraft::ServerState;
 use thiserror::Error;
+use uuid::Uuid;
 
 type MemRaft = Raft<MetaRaftTypeConfig>;
 
@@ -56,11 +61,22 @@ pub trait Consensus: Send + Sync {
 /// Openraft-backed [`Consensus`].
 pub struct OpenraftConsensus {
     raft: MemRaft,
+    /// Applied state, for linearizable reads (#223). Optional so the existing
+    /// harnesses that construct a consensus façade from a bare Raft handle
+    /// keep working; a read against one of those reports the store as
+    /// unavailable rather than inventing an answer.
+    store: Option<MetaRaftStore>,
 }
 
 impl OpenraftConsensus {
     pub fn new(raft: MemRaft) -> Self {
-        Self { raft }
+        Self { raft, store: None }
+    }
+
+    /// Attach the applied state so this node can serve linearizable reads.
+    pub fn with_store(mut self, store: MetaRaftStore) -> Self {
+        self.store = Some(store);
+        self
     }
 
     pub fn raft(&self) -> &MemRaft {
@@ -112,6 +128,69 @@ impl OpenraftConsensus {
                 .unwrap_or_default(),
         }
     }
+}
+
+#[async_trait]
+impl AdminReadRangeLease for OpenraftConsensus {
+    async fn read_range_lease(
+        &self,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+    ) -> ConsensusResult<AdminReadRangeLeaseResponse> {
+        let Some(store) = self.store.as_ref() else {
+            return Err(ConsensusError::Message(
+                "this node was built without applied state and cannot serve reads".to_owned(),
+            ));
+        };
+        // Fence FIRST. Reading applied state without establishing that this
+        // node is still the leader would let a deposed node answer from its
+        // own lagging copy — and a candidate acting on that would fence a
+        // leader that is perfectly healthy.
+        self.raft
+            .ensure_linearizable()
+            .await
+            .map_err(|error| ConsensusError::Message(error.to_string()))?;
+        let key = MetaKey::Range {
+            topic_uuid,
+            range_uuid,
+        };
+        Ok(store.with_storage(|storage| {
+            let read_at_applied_index = storage.last_applied();
+            match storage.state().record(&key) {
+                Some(MetaValue::Range(range)) => AdminReadRangeLeaseResponse {
+                    found: true,
+                    range_generation: range.generation,
+                    fencing_epoch: range.fencing_epoch,
+                    lease: range.lease.as_ref().map(|lease| AdminLeaseView {
+                        holder_node_uuid: lease.holder_node_uuid,
+                        fencing_epoch: lease.fencing_epoch,
+                        expires_at_ms: lease.expires_at_ms,
+                    }),
+                    read_at_applied_index,
+                },
+                // Absent and lease-less are different answers: one means the
+                // range does not exist, the other means nobody leads it.
+                _ => AdminReadRangeLeaseResponse {
+                    found: false,
+                    range_generation: 0,
+                    fencing_epoch: 0,
+                    lease: None,
+                    read_at_applied_index,
+                },
+            }
+        }))
+    }
+}
+
+/// Linearizable range-lease read, kept as its own trait so the consensus
+/// façade stays the narrow propose/status interface it was.
+#[async_trait]
+pub trait AdminReadRangeLease: Send + Sync {
+    async fn read_range_lease(
+        &self,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+    ) -> ConsensusResult<AdminReadRangeLeaseResponse>;
 }
 
 #[async_trait]
@@ -173,6 +252,15 @@ impl Consensus for OpenraftConsensus {
 
 #[async_trait]
 impl AdminHandler for OpenraftConsensus {
+    async fn read_range_lease(
+        &self,
+        request: crate::transport::wire::AdminReadRangeLeaseRequest,
+    ) -> TransportResult<AdminReadRangeLeaseResponse> {
+        AdminReadRangeLease::read_range_lease(self, request.topic_uuid, request.range_uuid)
+            .await
+            .map_err(|error| TransportError::Protocol(error.to_string()))
+    }
+
     async fn status(&self) -> TransportResult<AdminStatusResponse> {
         Consensus::status(self)
             .await

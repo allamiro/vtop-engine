@@ -29,10 +29,13 @@ use crate::command::{MetadataCommand, MetadataResponse, MAX_ERROR_DETAIL_BYTES};
 use crate::keys::MetaNodeId;
 use crate::storage::hardstate::HardState;
 use crate::storage::log::{MetaLogEntry, MetaLogPayload, MetaMembership};
-use crate::wire::{put_bounded_str, put_u16, put_u32, put_u64, put_u8, CodecError, Reader};
+use crate::wire::{
+    put_bounded_str, put_i64, put_u16, put_u32, put_u64, put_u8, put_uuid, CodecError, Reader,
+};
 use std::io;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use uuid::Uuid;
 
 /// Wire magic distinguishing meta peer/admin frames from client `VTPW`.
 pub const VTPM_MAGIC: &[u8; 4] = b"VTPM";
@@ -68,6 +71,12 @@ pub const KIND_ADMIN_INIT_REQ: u16 = 15;
 pub const KIND_ADMIN_ADD_LEARNER_REQ: u16 = 16;
 pub const KIND_ADMIN_CHANGE_MEMBERSHIP_REQ: u16 = 17;
 pub const KIND_ADMIN_MEMBERSHIP_RESP: u16 = 18;
+// Linearizable range-lease read (#223). A candidate must be able to see
+// whether a lease is still live before it tries to take one; without this it
+// can only guess and learn from a rejection, which means it cannot distinguish
+// "the leader is healthy" from "my generation was stale".
+pub const KIND_ADMIN_READ_RANGE_LEASE_REQ: u16 = 19;
+pub const KIND_ADMIN_READ_RANGE_LEASE_RESP: u16 = 20;
 
 /// Bound for node ids carried in one admin membership request. This is
 /// intentionally tighter than the storage codec's compatibility ceiling.
@@ -673,6 +682,123 @@ impl AdminStatusResponse {
     }
 }
 
+/// Which range to read the lease for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdminReadRangeLeaseRequest {
+    pub topic_uuid: Uuid,
+    pub range_uuid: Uuid,
+}
+
+impl AdminReadRangeLeaseRequest {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_uuid(&mut out, self.topic_uuid);
+        put_uuid(&mut out, self.range_uuid);
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut reader = Reader::new(bytes);
+        let request = Self {
+            topic_uuid: reader.uuid("topic uuid")?,
+            range_uuid: reader.uuid("range uuid")?,
+        };
+        reader.finish()?;
+        Ok(request)
+    }
+}
+
+/// The lease a range currently holds, as of a linearizable read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdminLeaseView {
+    pub holder_node_uuid: Uuid,
+    pub fencing_epoch: u64,
+    /// `None` for an administrative grant, which never expires.
+    pub expires_at_ms: Option<i64>,
+}
+
+/// A range's lease state plus the CAS token needed to act on it.
+///
+/// `range_generation` is carried because acquisition is a compare-and-swap
+/// against it: reading the lease without the token it must be paired with
+/// would leave a candidate guessing, which is the situation this read exists
+/// to remove.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdminReadRangeLeaseResponse {
+    /// False when the range does not exist. Distinct from "exists with no
+    /// lease", which is a range nobody currently leads.
+    pub found: bool,
+    pub range_generation: u64,
+    /// Highest epoch ever minted for the range; never rewinds, even on
+    /// release.
+    pub fencing_epoch: u64,
+    pub lease: Option<AdminLeaseView>,
+    /// The applied index the read was fenced at, so a caller can tell an
+    /// answer from a newer state machine apart from a replayed older one.
+    pub read_at_applied_index: u64,
+}
+
+impl AdminReadRangeLeaseResponse {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_u8(&mut out, u8::from(self.found));
+        put_u64(&mut out, self.range_generation);
+        put_u64(&mut out, self.fencing_epoch);
+        match &self.lease {
+            None => put_u8(&mut out, 0),
+            Some(lease) => {
+                // Presence 1 = no deadline, 2 = deadline, mirroring the
+                // durable encoding in `MetaValue::Range` so the two cannot
+                // drift apart in meaning.
+                match lease.expires_at_ms {
+                    None => put_u8(&mut out, 1),
+                    Some(_) => put_u8(&mut out, 2),
+                }
+                put_uuid(&mut out, lease.holder_node_uuid);
+                put_u64(&mut out, lease.fencing_epoch);
+                if let Some(expires_at_ms) = lease.expires_at_ms {
+                    put_i64(&mut out, expires_at_ms);
+                }
+            }
+        }
+        put_u64(&mut out, self.read_at_applied_index);
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut reader = Reader::new(bytes);
+        let found = reader.flag("found")?;
+        let range_generation = reader.u64("range generation")?;
+        let fencing_epoch = reader.u64("fencing epoch")?;
+        let lease = match reader.u8("lease presence")? {
+            0 => None,
+            presence @ (1 | 2) => Some(AdminLeaseView {
+                holder_node_uuid: reader.uuid("lease holder uuid")?,
+                fencing_epoch: reader.u64("lease fencing epoch")?,
+                expires_at_ms: match presence {
+                    2 => Some(reader.i64("lease expiry ms")?),
+                    _ => None,
+                },
+            }),
+            _ => {
+                return Err(CodecError::InvalidValue {
+                    what: "lease presence",
+                    reason: "lease presence byte must be 0, 1, or 2",
+                })
+            }
+        };
+        let read_at_applied_index = reader.u64("read at applied index")?;
+        reader.finish()?;
+        Ok(Self {
+            found,
+            range_generation,
+            fencing_epoch,
+            lease,
+            read_at_applied_index,
+        })
+    }
+}
+
 fn put_node_id_list(out: &mut Vec<u8>, ids: &[u64], what: &'static str) -> Result<(), CodecError> {
     if ids.len() > MAX_ADMIN_MEMBERSHIP_NODES {
         return Err(CodecError::BoundExceeded {
@@ -1025,6 +1151,58 @@ mod tests {
 
     #[test]
     fn admin_payloads_round_trip() {
+        let read = AdminReadRangeLeaseRequest {
+            topic_uuid: Uuid::from_u128(7),
+            range_uuid: Uuid::from_u128(8),
+        };
+        assert_eq!(
+            AdminReadRangeLeaseRequest::decode(&read.encode()).unwrap(),
+            read
+        );
+
+        // All three lease shapes: absent, administrative (no deadline), and
+        // election-granted (with one). The middle case is the one a naive
+        // codec collapses into the third.
+        for lease in [
+            None,
+            Some(AdminLeaseView {
+                holder_node_uuid: Uuid::from_u128(9),
+                fencing_epoch: 4,
+                expires_at_ms: None,
+            }),
+            Some(AdminLeaseView {
+                holder_node_uuid: Uuid::from_u128(9),
+                fencing_epoch: 4,
+                expires_at_ms: Some(1_700_000_000_000),
+            }),
+        ] {
+            let response = AdminReadRangeLeaseResponse {
+                found: true,
+                range_generation: 12,
+                fencing_epoch: 4,
+                lease,
+                read_at_applied_index: 99,
+            };
+            assert_eq!(
+                AdminReadRangeLeaseResponse::decode(&response.encode()).unwrap(),
+                response
+            );
+        }
+
+        // A range that does not exist is not the same answer as a range with
+        // no lease, and the codec must keep them apart.
+        let missing = AdminReadRangeLeaseResponse {
+            found: false,
+            range_generation: 0,
+            fencing_epoch: 0,
+            lease: None,
+            read_at_applied_index: 99,
+        };
+        assert_eq!(
+            AdminReadRangeLeaseResponse::decode(&missing.encode()).unwrap(),
+            missing
+        );
+
         let status = AdminStatusResponse {
             node_id: MetaNodeId(1),
             current_term: 4,
