@@ -11,7 +11,9 @@ name = "vtop-node"
 path = "src/main.rs"
 
 [dependencies]
+async-trait = { workspace = true }
 clap = { workspace = true }
+futures = { workspace = true }
 prometheus = { workspace = true }
 rustls = { workspace = true }
 serde = { workspace = true }

@@ -406,6 +406,30 @@ impl MetaFencingEpoch {
         state.lease_active = epoch > state.released_through;
     }
 
+    /// Locally suspend serving at `expected_epoch` WITHOUT recording a
+    /// release.
+    ///
+    /// For a holder that cannot currently serve its own live lease — a
+    /// verified promotion whose quorum probe transiently failed, say. The
+    /// broker must stop accepting writes NOW, but the epoch is still this
+    /// process's grant, and a successful retry must be able to reactivate it
+    /// with [`Self::set`]. Using [`Self::clear_lease`] here would advance
+    /// `released_through` past the epoch, turning that future reactivation
+    /// into a permanent no-op: the broker would sit fenced under its own live
+    /// lease until an external epoch change.
+    ///
+    /// A no-op for any other epoch: a stale suspension must not deactivate a
+    /// newer grant.
+    pub fn suspend(&self, expected_epoch: u64) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.fencing_epoch == expected_epoch {
+            state.lease_active = false;
+        }
+    }
+
     /// Publish a metadata release for `expected_epoch`.
     ///
     /// The fencing epoch is retained when releasing the current epoch, but no
@@ -2436,6 +2460,44 @@ mod tests {
             lease.try_snapshot(),
             Some((3, true)),
             "republishing the configured epoch must activate the view"
+        );
+    }
+
+    /// The distinction between suspending and releasing, pinned: a holder
+    /// that could not verify its promotion must stop serving, but its own
+    /// live grant must still be able to reactivate the view on retry. A
+    /// release here would wedge the range under its own lease.
+    #[test]
+    fn a_suspended_epoch_reactivates_on_the_same_grant_where_a_release_would_not() {
+        let lease = MetaFencingEpoch::new_inactive(0);
+        lease.set(5);
+        assert_eq!(lease.try_snapshot(), Some((5, true)));
+
+        lease.suspend(5);
+        assert_eq!(
+            lease.try_snapshot(),
+            Some((5, false)),
+            "a suspended holder must not serve"
+        );
+        lease.set(5);
+        assert_eq!(
+            lease.try_snapshot(),
+            Some((5, true)),
+            "the same live grant must reactivate a suspended view"
+        );
+
+        // A stale suspension must not deactivate a newer grant.
+        lease.set(6);
+        lease.suspend(5);
+        assert_eq!(lease.try_snapshot(), Some((6, true)));
+
+        // Contrast with release: the epoch is finished for good.
+        lease.clear_lease(6);
+        lease.set(6);
+        assert_eq!(
+            lease.try_snapshot(),
+            Some((6, false)),
+            "a released epoch stays finished; only a newer grant serves again"
         );
     }
 

@@ -11,6 +11,7 @@ mod data_node;
 mod lease_agent;
 mod meta_node;
 mod observe;
+mod promotion;
 mod tls;
 
 use clap::{Parser, Subcommand};
