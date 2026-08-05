@@ -112,6 +112,10 @@ pub enum LogError {
     InvalidCursor(String),
     #[error("record field {0} is not supported by this segment format version")]
     UnsupportedRecordField(&'static str),
+    #[error(
+        "cannot truncate to offset {requested}: the log ends at {next_offset} and truncation only removes records"
+    )]
+    TruncateBeyondTail { requested: u64, next_offset: u64 },
 }
 
 pub type VtopLogResult<T> = Result<T, LogError>;
@@ -465,6 +469,20 @@ pub struct RecoveryReport {
     pub records: u64,
     pub recovered_bytes: u64,
     pub truncated_bytes: u64,
+    pub next_offset: u64,
+}
+
+/// What a deliberate truncation discarded (#240).
+///
+/// Distinct from [`RecoveryReport`] on purpose: that one describes bytes lost
+/// to a torn write, which is an accident. This one describes records dropped
+/// because they were written under a leadership that no longer holds, which is
+/// a decision — and one worth logging with its cost attached.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TruncateOutcome {
+    pub records_removed: u64,
+    pub bytes_removed: u64,
+    /// The log's new tail; equals the requested truncation point.
     pub next_offset: u64,
 }
 

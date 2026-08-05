@@ -27,7 +27,7 @@ pub use types::{
     AppendOutcome, CommitStatementV1, Durability, FetchBatch, FetchedRecord, KeyRange, LogError,
     LogRecord, ParentRange, ProducerSummaryEntry, RangeLineage, RecoveryReport, SegmentCommitKey,
     SegmentConfig, SegmentConfigV2, SegmentCursor, SegmentDescriptor, SegmentDescriptorV2,
-    SegmentEvidence, SegmentId, SegmentManifest, SegmentManifestV2, VtopLogResult,
+    SegmentEvidence, SegmentId, SegmentManifest, SegmentManifestV2, TruncateOutcome, VtopLogResult,
     CHUNK_SIDECAR_MAGIC, CHUNK_TREE_SCHEME_V1, COMMIT_SCHEME_KEYED, COMMIT_SCHEME_UNKEYED,
     FORMAT_VERSION_V2, PRODUCER_SEQUENCE_WINDOW, RECORD_SCHEMA_VERSION_V2,
 };

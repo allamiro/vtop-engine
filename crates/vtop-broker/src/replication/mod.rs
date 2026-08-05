@@ -274,15 +274,22 @@ impl InProcessFollower {
     ///
     /// Seeds the held epoch only when both the vector and the log are empty;
     /// see [`crate::LocalBroker::set_fencing_epoch_journal`] for why a replica
-    /// that already holds records must report "unknown" instead.
+    /// that already holds records must report "unknown" instead. Also completes
+    /// a truncation interrupted by a crash, per
+    /// [`crate::LocalBroker::attach_epoch_journal_to_log`].
     pub fn set_fencing_epoch_journal(
         &self,
         mut journal: crate::fencing_epochs::FencingEpochJournal,
     ) {
         let epoch = self.held_fencing_epoch.load(Ordering::SeqCst);
+        let next_offset = self.next_offset();
+        if !crate::LocalBroker::attach_epoch_journal_to_log(&mut journal, next_offset) {
+            self.fencing_epoch_history_broken
+                .store(true, Ordering::SeqCst);
+        }
         // Epoch 0 is the "no grant yet" sentinel, never a writing epoch.
         if journal.latest().is_none()
-            && self.next_offset() == 0
+            && next_offset == 0
             && epoch > 0
             && journal.record(epoch, 0).is_err()
         {
@@ -293,6 +300,53 @@ impl InProcessFollower {
             .fencing_epoch_journal
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(journal);
+    }
+
+    /// Discard every record at or above `offset` and drop the epoch entries
+    /// that described them (#240).
+    ///
+    /// The follower is the replica this repair exists for: it fsyncs the
+    /// leader's appends before that leader has a quorum, so a leader deposed
+    /// mid-flight leaves records here that no quorum ever agreed to. Until they
+    /// are gone this follower refuses every append from the new leader and is
+    /// stranded — retrying forever against a mismatch that retrying cannot fix.
+    ///
+    /// See [`crate::LocalBroker::truncate_to`] for the acknowledged-records
+    /// bound and why the log is truncated before the vector.
+    pub fn truncate_to(&self, offset: u64) -> BrokerResult<vtop_log::TruncateOutcome> {
+        let high_watermark = self.cluster_committed.get();
+        if offset < high_watermark {
+            return Err(BrokerError::TruncationBelowAcknowledged {
+                requested: offset,
+                high_watermark,
+            });
+        }
+
+        let outcome = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state
+                .segment
+                .truncate_to(offset)
+                .map_err(|source| BrokerError::InvalidConfig(source.to_string()))?
+        };
+
+        let mut guard = self
+            .fencing_epoch_journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(journal) = guard.as_mut() {
+            let repaired = journal.truncate_to(offset).and_then(|_| {
+                journal.record_held_epoch_at(self.held_fencing_epoch.load(Ordering::SeqCst), offset)
+            });
+            if repaired.is_err() {
+                self.fencing_epoch_history_broken
+                    .store(true, Ordering::SeqCst);
+            }
+        }
+        Ok(outcome)
     }
 
     /// This replica's epoch history; empty means "unknown", never "no changes".
@@ -484,6 +538,16 @@ impl InProcessFollower {
                     ErrorCode::InvalidRequest,
                     "replica append batch end overflows u64".to_owned(),
                 ))?;
+            // NOTE (#240): durability through the batch end is not the same
+            // question as holding the SAME records, and this path cannot yet
+            // tell them apart — see #261. An earlier attempt compared the epoch that wrote
+            // the record against the request's fencing epoch and was wrong: a
+            // newly promoted leader inherits its predecessor's prefix and
+            // legitimately retransmits it under its own, newer epoch, so the
+            // two differ constantly during ordinary catch-up. Live chaos
+            // scenario 09 caught it — every post-failover produce lost its
+            // quorum. The real comparison needs the epoch each record was
+            // ORIGINALLY written under, which the request does not carry.
             if state.segment.committed_offset() >= batch_end {
                 return Ok(ReplicaAppendResponse {
                     local_committed_offset: state.segment.committed_offset(),
