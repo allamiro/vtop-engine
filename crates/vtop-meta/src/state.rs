@@ -22,7 +22,8 @@ use crate::placement::{
     MAX_REPLICAS, MAX_TRANSIENT_REPLICAS, MIN_PLACEMENT_WEIGHT,
 };
 use crate::wire::{
-    put_bounded_str, put_bytes32, put_u16, put_u32, put_u64, put_u8, put_uuid, CodecError, Reader,
+    put_bounded_str, put_bytes32, put_i64, put_u16, put_u32, put_u64, put_u8, put_uuid, CodecError,
+    Reader,
 };
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use uuid::Uuid;
@@ -97,6 +98,34 @@ pub struct LeaseRecord {
     pub holder_node_uuid: Uuid,
     pub fencing_epoch: u64,
     pub granted_apply_index: u64,
+    /// Absolute deadline in milliseconds, derived from the acquiring
+    /// command's `issued_at_ms` plus its requested duration (#223).
+    ///
+    /// `None` means "never expires": that is what an administrative
+    /// [`MetadataCommand::GrantRangeLease`] mints, and it is also how a lease
+    /// written before expiry existed decodes — the conservative reading of a
+    /// record from a version that had no concept of one.
+    ///
+    /// The deadline is derived from data in the replicated log, never from a
+    /// local clock, so every replica computes the same expiry. It is a
+    /// LIVENESS mechanism, not a safety one: safety comes from the fencing
+    /// epoch, which a grant always advances. A clock-skewed candidate can
+    /// therefore acquire early and be disruptive, but can never produce two
+    /// brokers that both believe they may write.
+    pub expires_at_ms: Option<i64>,
+}
+
+impl LeaseRecord {
+    /// Whether this lease is still live at `now_ms`.
+    ///
+    /// A lease with no deadline is always live; it can only be replaced by an
+    /// explicit release or an administrative grant.
+    pub fn is_live_at(&self, now_ms: i64) -> bool {
+        match self.expires_at_ms {
+            None => true,
+            Some(deadline) => now_ms < deadline,
+        }
+    }
 }
 
 /// A key range of a topic. `fencing_epoch` only ever moves forward: every
@@ -372,13 +401,23 @@ impl MetaValue {
                 if range.lineage_generation != 0 {
                     put_u64(&mut out, range.lineage_generation);
                 }
+                // Presence byte 1 is the pre-#223 lease and is still emitted
+                // whenever there is no deadline, so pinned snapshot vectors
+                // and mixed-version replicas stay byte-exact. Tag 2 appears
+                // only once a lease actually carries an expiry.
                 match &range.lease {
                     None => put_u8(&mut out, 0),
                     Some(lease) => {
-                        put_u8(&mut out, 1);
+                        match lease.expires_at_ms {
+                            None => put_u8(&mut out, 1),
+                            Some(_) => put_u8(&mut out, 2),
+                        }
                         put_uuid(&mut out, lease.holder_node_uuid);
                         put_u64(&mut out, lease.fencing_epoch);
                         put_u64(&mut out, lease.granted_apply_index);
+                        if let Some(expires_at_ms) = lease.expires_at_ms {
+                            put_i64(&mut out, expires_at_ms);
+                        }
                     }
                 }
             }
@@ -597,14 +636,28 @@ impl MetaValue {
                 } else {
                     0
                 };
-                let lease = if reader.flag("lease presence")? {
-                    Some(LeaseRecord {
+                // 0 = no lease, 1 = lease with no deadline (the pre-#223
+                // encoding, still emitted for administrative grants), 2 =
+                // lease carrying an expiry. Anything else is a record this
+                // build cannot interpret, and guessing at it would be worse
+                // than refusing.
+                let lease = match reader.u8("lease presence")? {
+                    0 => None,
+                    presence @ (1 | 2) => Some(LeaseRecord {
                         holder_node_uuid: reader.uuid("lease holder uuid")?,
                         fencing_epoch: reader.u64("lease fencing epoch")?,
                         granted_apply_index: reader.u64("lease apply index")?,
-                    })
-                } else {
-                    None
+                        expires_at_ms: match presence {
+                            2 => Some(reader.i64("lease expiry ms")?),
+                            _ => None,
+                        },
+                    }),
+                    _ => {
+                        return Err(CodecError::InvalidValue {
+                            what: "lease presence",
+                            reason: "lease presence byte must be 0, 1, or 2",
+                        })
+                    }
                 };
                 MetaValue::Range(RangeRecord {
                     generation,
@@ -902,6 +955,37 @@ impl MetaStateMachine {
                 *range_uuid,
                 *holder_node_uuid,
                 *expected_range_generation,
+            ),
+            MetadataCommand::AcquireRangeLease {
+                env,
+                topic_uuid,
+                range_uuid,
+                holder_node_uuid,
+                expected_range_generation,
+                lease_duration_ms,
+            } => self.acquire_range_lease(
+                apply_index,
+                env.issued_at_ms,
+                *topic_uuid,
+                *range_uuid,
+                *holder_node_uuid,
+                *expected_range_generation,
+                *lease_duration_ms,
+            ),
+            MetadataCommand::RenewRangeLease {
+                env,
+                topic_uuid,
+                range_uuid,
+                holder_node_uuid,
+                expected_fencing_epoch,
+                lease_duration_ms,
+            } => self.renew_range_lease(
+                env.issued_at_ms,
+                *topic_uuid,
+                *range_uuid,
+                *holder_node_uuid,
+                *expected_fencing_epoch,
+                *lease_duration_ms,
             ),
             MetadataCommand::ReleaseRangeLease {
                 topic_uuid,
@@ -1444,9 +1528,224 @@ impl MetaStateMachine {
             holder_node_uuid,
             fencing_epoch,
             granted_apply_index: apply_index,
+            // Administrative grants never expire: an operator asked for this
+            // holder explicitly, and silently handing the range to an election
+            // later would undo their decision.
+            expires_at_ms: None,
         });
         range.generation += 1;
         MetadataResponse::LeaseGranted { fencing_epoch }
+    }
+
+    /// Election path (#223): take the lease unless someone else still holds a
+    /// live one.
+    ///
+    /// Argument list mirrors the command's fields, as every other apply method
+    /// here does; grouping them into a struct would only move the same list one
+    /// indirection away from the dispatch that builds it.
+    #[allow(clippy::too_many_arguments)]
+    fn acquire_range_lease(
+        &mut self,
+        apply_index: u64,
+        now_ms: i64,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        holder_node_uuid: Uuid,
+        expected_range_generation: u64,
+        lease_duration_ms: u64,
+    ) -> MetadataResponse {
+        if lease_duration_ms == 0 {
+            return reject(MetadataError::invalid_transition(
+                "lease duration must be greater than zero; a zero-length lease \
+                 would expire before its holder could renew it",
+            ));
+        }
+        match self.record(&MetaKey::Node {
+            node_uuid: holder_node_uuid,
+        }) {
+            None => return reject(MetadataError::NotFound),
+            Some(MetaValue::Node(node)) => {
+                if node.state != NodeState::Active {
+                    return reject(MetadataError::invalid_transition(format!(
+                        "lease candidate {holder_node_uuid} is {}, not active",
+                        node.state
+                    )));
+                }
+            }
+            Some(_) => unreachable!("node keys only ever hold node records"),
+        }
+        let Some(expires_at_ms) = now_ms.checked_add_unsigned(lease_duration_ms) else {
+            return reject(MetadataError::limit(
+                "lease deadline overflows the representable time range",
+            ));
+        };
+        let range_key = MetaKey::Range {
+            topic_uuid,
+            range_uuid,
+        }
+        .encode();
+        let Some(MetaValue::Range(range)) = self.records.get_mut(&range_key) else {
+            return reject(MetadataError::NotFound);
+        };
+        if range.generation != expected_range_generation {
+            return reject(MetadataError::GenerationMismatch {
+                expected: expected_range_generation,
+                actual: range.generation,
+            });
+        }
+        // A live lease held by SOMEONE ELSE is refused. This is politeness,
+        // not safety — the epoch mint below would fence the old holder anyway
+        // — but without it any candidate could take a healthy leader's range
+        // at will and the cluster would flap.
+        //
+        // The holder renewing through this path is allowed: it is how a leader
+        // that lost track of its own epoch recovers, and it still pays a new
+        // epoch for the privilege.
+        if let Some(existing) = range.lease.as_ref() {
+            // An administrative grant is off-limits to elections entirely —
+            // even to its own holder. Letting the holder "re-acquire" it would
+            // trade the operator's permanent, deadline-less lease for an
+            // expiring one, which a rival could then take once it lapses. The
+            // same reasoning already forbids renewing such a lease; the only
+            // ways out are an explicit release or a fresh administrative grant.
+            if existing.expires_at_ms.is_none() {
+                return reject(MetadataError::invalid_transition(
+                    "range holds an administrative lease with no deadline; it cannot \
+                     be acquired by election, only released or re-granted",
+                ));
+            }
+            if existing.holder_node_uuid != holder_node_uuid && existing.is_live_at(now_ms) {
+                return reject(MetadataError::invalid_transition(format!(
+                    "range lease is held by {} and is still live",
+                    existing.holder_node_uuid
+                )));
+            }
+        }
+        // Strict monotonicity is the fencing invariant: acquisition always
+        // mints a fresh, higher epoch, so the previous holder is fenced by
+        // construction rather than by any timing assumption.
+        let Some(fencing_epoch) = range.fencing_epoch.checked_add(1) else {
+            return reject(MetadataError::limit("fencing epoch space is exhausted"));
+        };
+        range.fencing_epoch = fencing_epoch;
+        range.lease = Some(LeaseRecord {
+            holder_node_uuid,
+            fencing_epoch,
+            granted_apply_index: apply_index,
+            expires_at_ms: Some(expires_at_ms),
+        });
+        range.generation += 1;
+        MetadataResponse::LeaseGranted { fencing_epoch }
+    }
+
+    /// Extend the current holder's deadline without minting a new epoch
+    /// (#223), so a live leader keeps serving across renewals.
+    fn renew_range_lease(
+        &mut self,
+        now_ms: i64,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        holder_node_uuid: Uuid,
+        expected_fencing_epoch: u64,
+        lease_duration_ms: u64,
+    ) -> MetadataResponse {
+        if lease_duration_ms == 0 {
+            return reject(MetadataError::invalid_transition(
+                "lease duration must be greater than zero",
+            ));
+        }
+        let Some(expires_at_ms) = now_ms.checked_add_unsigned(lease_duration_ms) else {
+            return reject(MetadataError::limit(
+                "lease deadline overflows the representable time range",
+            ));
+        };
+        let range_key = MetaKey::Range {
+            topic_uuid,
+            range_uuid,
+        }
+        .encode();
+        let Some(MetaValue::Range(range)) = self.records.get_mut(&range_key) else {
+            return reject(MetadataError::NotFound);
+        };
+        let Some(lease) = range.lease.as_ref() else {
+            return reject(MetadataError::invalid_transition(
+                "range holds no lease to renew",
+            ));
+        };
+        // Both identity AND epoch must match. Checking only identity would let
+        // a partitioned old leader — already fenced by a newer grant to itself
+        // after a restart — keep extending a lease it no longer holds.
+        if lease.holder_node_uuid != holder_node_uuid {
+            return reject(MetadataError::invalid_transition(format!(
+                "range lease is held by {}, not {holder_node_uuid}",
+                lease.holder_node_uuid
+            )));
+        }
+        if lease.fencing_epoch != expected_fencing_epoch {
+            return reject(MetadataError::EpochMismatch {
+                expected: expected_fencing_epoch,
+                actual: lease.fencing_epoch,
+            });
+        }
+        // An administrative grant has no deadline and must not acquire one:
+        // renewing it would convert an operator's explicit, permanent choice
+        // into an expiring lease that an election could take later — exactly
+        // the outcome `GrantRangeLease` exists to prevent.
+        let Some(current_deadline) = lease.expires_at_ms else {
+            return reject(MetadataError::invalid_transition(
+                "range holds an administrative lease with no deadline; it cannot be \
+                 renewed, only released or re-granted",
+            ));
+        };
+        // An ALREADY-EXPIRED lease cannot be renewed back to life. Without
+        // this a stale holder could keep pushing the deadline forward forever
+        // and postpone takeover indefinitely — never advancing the epoch, so
+        // no rival could ever win. That would defeat the whole point of
+        // expiry. Once a lease lapses the only way back is acquisition, which
+        // mints a new epoch and fences whoever held it before.
+        if now_ms >= current_deadline {
+            return reject(MetadataError::invalid_transition(format!(
+                "range lease expired at {current_deadline}; acquire it instead of \
+                 renewing"
+            )));
+        }
+        // The holder must still be a node the cluster considers usable. Grant
+        // and acquire both check this; renewal skipping it would let a node
+        // marked Dead hold its range forever through heartbeats alone.
+        match self.record(&MetaKey::Node {
+            node_uuid: holder_node_uuid,
+        }) {
+            None => return reject(MetadataError::NotFound),
+            Some(MetaValue::Node(node)) => {
+                if node.state != NodeState::Active {
+                    return reject(MetadataError::invalid_transition(format!(
+                        "lease holder {holder_node_uuid} is {}, not active",
+                        node.state
+                    )));
+                }
+            }
+            Some(_) => unreachable!("node keys only ever hold node records"),
+        }
+        // Never shorten: a renewal that arrived out of order behind a longer
+        // one must not pull the deadline back in and trigger an election.
+        let extended = current_deadline.max(expires_at_ms);
+        let Some(MetaValue::Range(range)) = self.records.get_mut(&range_key) else {
+            unreachable!("the range was present a moment ago")
+        };
+        let Some(lease) = range.lease.as_mut() else {
+            unreachable!("the lease was present a moment ago")
+        };
+        lease.expires_at_ms = Some(extended);
+        // Deliberately NOT bumping `range.generation`. A renewal changes
+        // neither the holder nor the epoch — nothing another command's CAS
+        // token could be stale ABOUT — and it returns no generation for the
+        // caller to re-learn. Bumping here would make steady heartbeats
+        // silently invalidate the leader's own in-flight range CAS operations
+        // (a `RegisterSealedSegment` prepared before the renewal landed would
+        // be refused with a GenerationMismatch it could never anticipate).
+        MetadataResponse::LeaseGranted {
+            fencing_epoch: expected_fencing_epoch,
+        }
     }
 
     fn release_range_lease(
@@ -3786,6 +4085,585 @@ mod tests {
             request_id: Uuid::from_u128(request),
             issued_at_ms: 0,
         }
+    }
+
+    fn envelope_at(request: u128, issued_at_ms: i64) -> CommandEnvelope {
+        CommandEnvelope {
+            request_id: Uuid::from_u128(request),
+            issued_at_ms,
+        }
+    }
+
+    /// One active node plus one root range, the minimum a lease needs.
+    fn leaseable_range(node: u128) -> (MetaStateMachine, Uuid, Uuid, Uuid) {
+        let mut machine = MetaStateMachine::new();
+        let node_uuid = Uuid::from_u128(node);
+        let topic_uuid = Uuid::from_u128(20);
+        let range_uuid = Uuid::from_u128(21);
+        machine.apply(
+            1,
+            &MetadataCommand::RegisterNode {
+                env: envelope(1),
+                node_uuid,
+                addr: "n1:9200".to_owned(),
+                expected_generation: None,
+            },
+        );
+        machine.apply(
+            2,
+            &MetadataCommand::CreateTopic {
+                env: envelope(2),
+                name: "events.v1".to_owned(),
+                topic_uuid,
+                root_range_uuid: range_uuid,
+            },
+        );
+        (machine, node_uuid, topic_uuid, range_uuid)
+    }
+
+    fn range_of(machine: &MetaStateMachine, topic_uuid: Uuid, range_uuid: Uuid) -> RangeRecord {
+        let key = MetaKey::Range {
+            topic_uuid,
+            range_uuid,
+        };
+        match machine.record(&key) {
+            Some(MetaValue::Range(range)) => range.clone(),
+            other => panic!("expected a range record, got {other:?}"),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn acquire(
+        machine: &mut MetaStateMachine,
+        index: u64,
+        request: u128,
+        now_ms: i64,
+        holder: Uuid,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        generation: u64,
+        duration_ms: u64,
+    ) -> MetadataResponse {
+        machine.apply(
+            index,
+            &MetadataCommand::AcquireRangeLease {
+                env: envelope_at(request, now_ms),
+                topic_uuid,
+                range_uuid,
+                holder_node_uuid: holder,
+                expected_range_generation: generation,
+                lease_duration_ms: duration_ms,
+            },
+        )
+    }
+
+    /// The core liveness property: a leader that stops renewing loses the
+    /// range. Without expiry a dead leader holds it forever and no follower
+    /// can take over — which is the whole gap #223 exists to close.
+    #[test]
+    fn a_lease_can_be_taken_only_after_it_expires() {
+        let (mut machine, first, topic_uuid, range_uuid) = leaseable_range(10);
+        let second = Uuid::from_u128(11);
+        machine.apply(
+            3,
+            &MetadataCommand::RegisterNode {
+                env: envelope(3),
+                node_uuid: second,
+                addr: "n2:9200".to_owned(),
+                expected_generation: None,
+            },
+        );
+        let generation = range_of(&machine, topic_uuid, range_uuid).generation;
+        let granted = acquire(
+            &mut machine,
+            4,
+            4,
+            1_000,
+            first,
+            topic_uuid,
+            range_uuid,
+            generation,
+            5_000,
+        );
+        let MetadataResponse::LeaseGranted { fencing_epoch } = granted else {
+            panic!("expected a grant, got {granted:?}")
+        };
+
+        // Still live: a rival is refused, so a healthy leader cannot be
+        // displaced at will and the cluster does not flap.
+        let generation = range_of(&machine, topic_uuid, range_uuid).generation;
+        let refused = acquire(
+            &mut machine,
+            5,
+            5,
+            3_000,
+            second,
+            topic_uuid,
+            range_uuid,
+            generation,
+            5_000,
+        );
+        assert!(
+            matches!(refused, MetadataResponse::Rejected { .. }),
+            "a live lease must not be stealable: {refused:?}"
+        );
+
+        // Past the deadline the rival wins, and the epoch advances — which is
+        // what fences the old holder, independently of any clock agreement.
+        let taken = acquire(
+            &mut machine,
+            6,
+            6,
+            6_001,
+            second,
+            topic_uuid,
+            range_uuid,
+            generation,
+            5_000,
+        );
+        let MetadataResponse::LeaseGranted {
+            fencing_epoch: next,
+        } = taken
+        else {
+            panic!("expected a grant after expiry, got {taken:?}")
+        };
+        assert!(
+            next > fencing_epoch,
+            "acquisition must mint a higher epoch ({next} <= {fencing_epoch})"
+        );
+        let lease = range_of(&machine, topic_uuid, range_uuid).lease.unwrap();
+        assert_eq!(lease.holder_node_uuid, second);
+    }
+
+    /// Renewal keeps a leader serving without disturbing its epoch — a new
+    /// epoch on every heartbeat would fence the leader against its own
+    /// in-flight produce requests.
+    #[test]
+    fn renewal_extends_the_deadline_without_minting_an_epoch() {
+        let (mut machine, holder, topic_uuid, range_uuid) = leaseable_range(10);
+        let generation = range_of(&machine, topic_uuid, range_uuid).generation;
+        let granted = acquire(
+            &mut machine,
+            3,
+            3,
+            1_000,
+            holder,
+            topic_uuid,
+            range_uuid,
+            generation,
+            5_000,
+        );
+        let MetadataResponse::LeaseGranted { fencing_epoch } = granted else {
+            panic!("expected a grant")
+        };
+
+        let renewed = machine.apply(
+            4,
+            &MetadataCommand::RenewRangeLease {
+                env: envelope_at(4, 4_000),
+                topic_uuid,
+                range_uuid,
+                holder_node_uuid: holder,
+                expected_fencing_epoch: fencing_epoch,
+                lease_duration_ms: 5_000,
+            },
+        );
+        assert!(matches!(
+            renewed,
+            MetadataResponse::LeaseGranted { fencing_epoch: e } if e == fencing_epoch
+        ));
+        let lease = range_of(&machine, topic_uuid, range_uuid).lease.unwrap();
+        assert_eq!(lease.fencing_epoch, fencing_epoch, "epoch must not move");
+        assert_eq!(lease.expires_at_ms, Some(9_000));
+    }
+
+    /// A renewal must not consume the range's CAS token either. It changes
+    /// neither holder nor epoch and returns no generation, so bumping would
+    /// make steady heartbeats silently invalidate the leader's own in-flight
+    /// range operations — a `RegisterSealedSegment` prepared moments before a
+    /// renewal landed would be refused with a GenerationMismatch it could
+    /// never anticipate.
+    #[test]
+    fn renewal_does_not_consume_the_range_cas() {
+        let (mut machine, holder, topic_uuid, range_uuid) = leaseable_range(10);
+        let generation = range_of(&machine, topic_uuid, range_uuid).generation;
+        let granted = acquire(
+            &mut machine,
+            3,
+            3,
+            1_000,
+            holder,
+            topic_uuid,
+            range_uuid,
+            generation,
+            5_000,
+        );
+        let MetadataResponse::LeaseGranted { fencing_epoch } = granted else {
+            panic!("expected a grant")
+        };
+        let generation_after_grant = range_of(&machine, topic_uuid, range_uuid).generation;
+
+        machine.apply(
+            4,
+            &MetadataCommand::RenewRangeLease {
+                env: envelope_at(4, 4_000),
+                topic_uuid,
+                range_uuid,
+                holder_node_uuid: holder,
+                expected_fencing_epoch: fencing_epoch,
+                lease_duration_ms: 5_000,
+            },
+        );
+        assert_eq!(
+            range_of(&machine, topic_uuid, range_uuid).generation,
+            generation_after_grant,
+            "a heartbeat must not invalidate CAS tokens handed out under this lease"
+        );
+    }
+
+    /// A fenced leader must not be able to keep its lease alive. Checking only
+    /// the holder id would let a partitioned old leader renew forever.
+    #[test]
+    fn renewal_from_a_fenced_epoch_is_refused() {
+        let (mut machine, holder, topic_uuid, range_uuid) = leaseable_range(10);
+        let generation = range_of(&machine, topic_uuid, range_uuid).generation;
+        let MetadataResponse::LeaseGranted { fencing_epoch } = acquire(
+            &mut machine,
+            3,
+            3,
+            1_000,
+            holder,
+            topic_uuid,
+            range_uuid,
+            generation,
+            5_000,
+        ) else {
+            panic!("expected a grant")
+        };
+        let refused = machine.apply(
+            4,
+            &MetadataCommand::RenewRangeLease {
+                env: envelope_at(4, 2_000),
+                topic_uuid,
+                range_uuid,
+                holder_node_uuid: holder,
+                expected_fencing_epoch: fencing_epoch - 1,
+                lease_duration_ms: 5_000,
+            },
+        );
+        assert!(
+            matches!(refused, MetadataResponse::Rejected { .. }),
+            "a renewal naming a stale epoch must be refused: {refused:?}"
+        );
+    }
+
+    /// An out-of-order renewal must never pull the deadline back in and
+    /// trigger an election against a leader that is renewing correctly.
+    #[test]
+    fn a_late_short_renewal_never_shortens_the_lease() {
+        let (mut machine, holder, topic_uuid, range_uuid) = leaseable_range(10);
+        let generation = range_of(&machine, topic_uuid, range_uuid).generation;
+        let MetadataResponse::LeaseGranted { fencing_epoch } = acquire(
+            &mut machine,
+            3,
+            3,
+            1_000,
+            holder,
+            topic_uuid,
+            range_uuid,
+            generation,
+            30_000,
+        ) else {
+            panic!("expected a grant")
+        };
+        machine.apply(
+            4,
+            &MetadataCommand::RenewRangeLease {
+                env: envelope_at(4, 1_500),
+                topic_uuid,
+                range_uuid,
+                holder_node_uuid: holder,
+                expected_fencing_epoch: fencing_epoch,
+                lease_duration_ms: 1_000,
+            },
+        );
+        let lease = range_of(&machine, topic_uuid, range_uuid).lease.unwrap();
+        assert_eq!(
+            lease.expires_at_ms,
+            Some(31_000),
+            "the longer deadline must win"
+        );
+    }
+
+    /// The renewal that would defeat the whole mechanism: a stale holder
+    /// pushing its deadline forward forever, never advancing the epoch, so no
+    /// rival can ever win. Once a lease lapses the only way back is
+    /// acquisition.
+    #[test]
+    fn an_expired_lease_cannot_be_renewed_back_to_life() {
+        let (mut machine, holder, topic_uuid, range_uuid) = leaseable_range(10);
+        let generation = range_of(&machine, topic_uuid, range_uuid).generation;
+        let MetadataResponse::LeaseGranted { fencing_epoch } = acquire(
+            &mut machine,
+            3,
+            3,
+            1_000,
+            holder,
+            topic_uuid,
+            range_uuid,
+            generation,
+            5_000,
+        ) else {
+            panic!("expected a grant")
+        };
+        let refused = machine.apply(
+            4,
+            &MetadataCommand::RenewRangeLease {
+                env: envelope_at(4, 6_001),
+                topic_uuid,
+                range_uuid,
+                holder_node_uuid: holder,
+                expected_fencing_epoch: fencing_epoch,
+                lease_duration_ms: 5_000,
+            },
+        );
+        assert!(
+            matches!(refused, MetadataResponse::Rejected { .. }),
+            "an expired lease must be acquired, not renewed: {refused:?}"
+        );
+        assert_eq!(
+            range_of(&machine, topic_uuid, range_uuid)
+                .lease
+                .unwrap()
+                .expires_at_ms,
+            Some(6_000),
+            "the refused renewal must not have moved the deadline"
+        );
+    }
+
+    /// Grant and acquire both refuse a non-active holder; renewal skipping the
+    /// check would let a node marked Dead keep its range through heartbeats.
+    #[test]
+    fn a_dead_holder_cannot_renew() {
+        let (mut machine, holder, topic_uuid, range_uuid) = leaseable_range(10);
+        let generation = range_of(&machine, topic_uuid, range_uuid).generation;
+        let MetadataResponse::LeaseGranted { fencing_epoch } = acquire(
+            &mut machine,
+            3,
+            3,
+            1_000,
+            holder,
+            topic_uuid,
+            range_uuid,
+            generation,
+            5_000,
+        ) else {
+            panic!("expected a grant")
+        };
+        machine.apply(
+            4,
+            &MetadataCommand::SetNodeState {
+                env: envelope(4),
+                node_uuid: holder,
+                state: NodeState::Dead,
+                // A freshly registered node sits at generation 0.
+                expected_generation: 0,
+            },
+        );
+        assert!(
+            matches!(
+                machine.record(&MetaKey::Node { node_uuid: holder }),
+                Some(MetaValue::Node(node)) if node.state == NodeState::Dead
+            ),
+            "the holder must actually be Dead for this test to mean anything"
+        );
+        let refused = machine.apply(
+            5,
+            &MetadataCommand::RenewRangeLease {
+                env: envelope_at(5, 2_000),
+                topic_uuid,
+                range_uuid,
+                holder_node_uuid: holder,
+                expected_fencing_epoch: fencing_epoch,
+                lease_duration_ms: 5_000,
+            },
+        );
+        assert!(
+            matches!(refused, MetadataResponse::Rejected { .. }),
+            "a dead holder must not be able to renew: {refused:?}"
+        );
+    }
+
+    /// Renewing an administrative lease would give it a deadline, letting an
+    /// election take later what an operator chose permanently.
+    #[test]
+    fn an_administrative_lease_cannot_be_renewed_into_an_expiring_one() {
+        let (mut machine, holder, topic_uuid, range_uuid) = leaseable_range(10);
+        let generation = range_of(&machine, topic_uuid, range_uuid).generation;
+        machine.apply(
+            3,
+            &MetadataCommand::GrantRangeLease {
+                env: envelope(3),
+                topic_uuid,
+                range_uuid,
+                holder_node_uuid: holder,
+                expected_range_generation: generation,
+            },
+        );
+        let epoch = range_of(&machine, topic_uuid, range_uuid)
+            .lease
+            .unwrap()
+            .fencing_epoch;
+        let refused = machine.apply(
+            4,
+            &MetadataCommand::RenewRangeLease {
+                env: envelope_at(4, 1_000),
+                topic_uuid,
+                range_uuid,
+                holder_node_uuid: holder,
+                expected_fencing_epoch: epoch,
+                lease_duration_ms: 5_000,
+            },
+        );
+        assert!(
+            matches!(refused, MetadataResponse::Rejected { .. }),
+            "an administrative lease must not be renewable: {refused:?}"
+        );
+        assert_eq!(
+            range_of(&machine, topic_uuid, range_uuid)
+                .lease
+                .unwrap()
+                .expires_at_ms,
+            None,
+            "it must remain never-expiring"
+        );
+    }
+
+    /// The acquire path must refuse an administrative lease for the same
+    /// reason the renew path does: even the holder itself "re-acquiring"
+    /// would swap the operator's permanent lease for an expiring one that a
+    /// rival could take once it lapses.
+    #[test]
+    fn an_administrative_lease_cannot_be_acquired_into_an_expiring_one() {
+        let (mut machine, holder, topic_uuid, range_uuid) = leaseable_range(10);
+        let generation = range_of(&machine, topic_uuid, range_uuid).generation;
+        machine.apply(
+            3,
+            &MetadataCommand::GrantRangeLease {
+                env: envelope(3),
+                topic_uuid,
+                range_uuid,
+                holder_node_uuid: holder,
+                expected_range_generation: generation,
+            },
+        );
+        let before = range_of(&machine, topic_uuid, range_uuid).lease.unwrap();
+        let generation = range_of(&machine, topic_uuid, range_uuid).generation;
+        let refused = machine.apply(
+            4,
+            &MetadataCommand::AcquireRangeLease {
+                env: envelope_at(4, 1_000),
+                topic_uuid,
+                range_uuid,
+                holder_node_uuid: holder,
+                expected_range_generation: generation,
+                lease_duration_ms: 5_000,
+            },
+        );
+        assert!(
+            matches!(refused, MetadataResponse::Rejected { .. }),
+            "the holder must not be able to acquire over its own administrative \
+             lease: {refused:?}"
+        );
+        let after = range_of(&machine, topic_uuid, range_uuid).lease.unwrap();
+        assert_eq!(after, before, "the administrative lease must be untouched");
+        assert_eq!(after.expires_at_ms, None, "it must remain never-expiring");
+    }
+
+    /// An administrative grant is an operator decision and must not be undone
+    /// by an election later.
+    #[test]
+    fn an_administrative_grant_never_expires() {
+        let (mut machine, holder, topic_uuid, range_uuid) = leaseable_range(10);
+        let generation = range_of(&machine, topic_uuid, range_uuid).generation;
+        machine.apply(
+            3,
+            &MetadataCommand::GrantRangeLease {
+                env: envelope(3),
+                topic_uuid,
+                range_uuid,
+                holder_node_uuid: holder,
+                expected_range_generation: generation,
+            },
+        );
+        let lease = range_of(&machine, topic_uuid, range_uuid).lease.unwrap();
+        assert_eq!(lease.expires_at_ms, None);
+        assert!(
+            lease.is_live_at(i64::MAX),
+            "a lease with no deadline is live at any time"
+        );
+    }
+
+    /// A zero-length lease would expire before its holder could renew it, so
+    /// it is refused rather than granted and instantly lost.
+    #[test]
+    fn a_zero_length_lease_is_refused() {
+        let (mut machine, holder, topic_uuid, range_uuid) = leaseable_range(10);
+        let generation = range_of(&machine, topic_uuid, range_uuid).generation;
+        let refused = acquire(
+            &mut machine,
+            3,
+            3,
+            1_000,
+            holder,
+            topic_uuid,
+            range_uuid,
+            generation,
+            0,
+        );
+        assert!(matches!(refused, MetadataResponse::Rejected { .. }));
+    }
+
+    /// The durable format is a compatibility contract: a lease with no
+    /// deadline must still encode with the pre-#223 presence byte, so pinned
+    /// snapshot vectors and mixed-version replicas stay byte-exact.
+    #[test]
+    fn a_deadlineless_lease_still_encodes_with_the_legacy_presence_byte() {
+        let without = MetaValue::Range(RangeRecord {
+            generation: 3,
+            key_prefix: 0,
+            key_prefix_bits: 0,
+            fencing_epoch: 2,
+            lineage_generation: 0,
+            lease: Some(LeaseRecord {
+                holder_node_uuid: Uuid::from_u128(10),
+                fencing_epoch: 2,
+                granted_apply_index: 7,
+                expires_at_ms: None,
+            }),
+        });
+        let encoded = without.encode().unwrap();
+        assert_eq!(
+            encoded[encoded.len() - 33],
+            1,
+            "a lease without a deadline must keep presence byte 1"
+        );
+        assert_eq!(MetaValue::decode(&encoded).unwrap(), without);
+
+        let with = MetaValue::Range(RangeRecord {
+            lease: Some(LeaseRecord {
+                holder_node_uuid: Uuid::from_u128(10),
+                fencing_epoch: 2,
+                granted_apply_index: 7,
+                expires_at_ms: Some(1_234),
+            }),
+            ..match without {
+                MetaValue::Range(range) => range,
+                _ => unreachable!(),
+            }
+        });
+        let encoded = with.encode().unwrap();
+        assert_eq!(MetaValue::decode(&encoded).unwrap(), with);
     }
 
     #[test]
