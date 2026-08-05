@@ -3,8 +3,18 @@ name: CI
 on:
   push:
     branches: [main]
+  # Every pull request, not only those targeting `main`. This project stacks
+  # PRs — each slice bases on the one below it — and a `branches: [main]`
+  # filter here meant a stacked PR ran NO CI at all: it was reviewed, approved,
+  # and merged on the strength of a bot comment, with the first real signal
+  # arriving only once its parent merged and it retargeted. A base change fires
+  # `edited`, which is not in the default event set, so even that retarget did
+  # not reliably re-trigger anything.
+  #
+  # The path filters already scope the work per PR, so the added cost is the
+  # jobs a stacked slice actually needs — which is the cost of knowing whether
+  # it works.
   pull_request:
-    branches: [main]
 
 # Least privilege by default; no CI job needs write access to the repo.
 # pull-requests: read is required by dorny/paths-filter in the `changes` job —
@@ -41,6 +51,7 @@ jobs:
       kafka: ${{ steps.filter.outputs.kafka }}
       postgres: ${{ steps.filter.outputs.postgres }}
       fuzz: ${{ steps.filter.outputs.fuzz }}
+      chaos: ${{ steps.filter.outputs.chaos }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
       # Pinned to a full commit SHA (v3), not the mutable tag, so an upstream
@@ -141,7 +152,46 @@ jobs:
             shell:
               - 'docker/*.sh'
               - 'docker/tests/**'
+              # The live-chaos harness is executable shell that gates every
+              # distributed-systems claim this project makes, and it was
+              # unlinted: a change to lib.sh — sourced by every scenario —
+              # triggered nothing. That is how a scenario stayed red on main
+              # without anyone noticing.
+              - 'scripts/live-chaos/**'
               - '.github/workflows/**'
+
+            # `scripts/live-chaos/run-all.sh`. The harness drives real
+            # processes over real TLS: metadata Raft, replication, fencing,
+            # and failover.
+            #
+            # `crates/**`, not a hand-listed subset. The two binaries this job
+            # runs pull in every workspace crate — verified, not assumed:
+            #
+            #   cargo tree -p vtop-node --edges normal
+            #     → broker, log, meta, observe, protocol
+            #   cargo tree -p vtop-cli --no-default-features --edges normal
+            #     → adapters, broker, core, log, meta, observe, protocol,
+            #       state, upload
+            #
+            # An earlier version of this filter named four crates and claimed
+            # nothing else could change a scenario's outcome. That was wrong in
+            # both directions that matter: vtop-log owns the segment format the
+            # durability and recovery scenarios assert on, and vtop-protocol
+            # owns the produce/fetch wire these scenarios speak. Either could
+            # have broken the suite with this job never running.
+            #
+            # This does mean the suite runs on most Rust changes. That is the
+            # honest cost of it being the only thing that validates replication
+            # and fencing against real processes; the alternative is a gate
+            # with a hole in it, which is what the four-crate list was.
+            chaos:
+              - 'scripts/live-chaos/**'
+              - 'crates/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.cargo/**'
+              - 'rust-toolchain*'
+              - '.github/workflows/ci.yml'
   build-and-test:
     name: fmt + clippy + test + build
     needs: changes
@@ -249,6 +299,19 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/mnt" -w /mnt \
             koalaman/shellcheck:v0.11.0 docker/*.sh
+
+      # `-P scripts/live-chaos/scenarios` resolves the scenarios' dynamic
+      # `source "$(dirname …)/../lib.sh"`. Without it every scenario reports
+      # SC1091 plus spurious "may not be assigned" warnings for variables
+      # lib.sh does define — noise that would train people to ignore this job.
+      - name: shellcheck (live-chaos harness)
+        run: |
+          docker run --rm -v "$PWD:/mnt" -w /mnt \
+            koalaman/shellcheck:v0.11.0 -x -P scripts/live-chaos/scenarios \
+            scripts/live-chaos/lib.sh \
+            scripts/live-chaos/run-all.sh \
+            scripts/live-chaos/gen-certs.sh \
+            scripts/live-chaos/scenarios/*.sh
 
       - name: bats
         run: |
@@ -362,6 +425,90 @@ jobs:
         with:
           tool: cargo-deny
       - run: cargo deny check
+
+  # The live-chaos harness drives real processes over real TLS — metadata Raft,
+  # replication, fencing, promotion, failover — and until now it ran only when
+  # someone ran it by hand. That is how scenario 09 sat red on main since #236,
+  # how scenario 10 sat red since #237, and how a data node spent three issues
+  # presenting the wrong certificate to the admin endpoint: nothing looked.
+  #
+  # Scoped, not blanket. It runs only when the harness or one of the four
+  # crates whose binaries it executes changes — a docs or workflow edit does
+  # not pay for a cluster. Debug binaries, because these scenarios assert
+  # correctness rather than throughput, and a release build costs more than the
+  # runs it feeds.
+  live-chaos:
+    name: live chaos (real processes)
+    needs: changes
+    if: needs.changes.outputs.chaos == 'true'
+    runs-on: ubuntu-latest
+    # The suite is ~13 scenarios, several of which sit through election and
+    # lease timeouts by design. Generous, but bounded: a hang must fail rather
+    # than occupy a runner.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-chaos-${{ hashFiles('**/Cargo.lock') }}
+
+      # Fault injection needs unprivileged user and mount namespaces (05, 05b,
+      # 06). Ubuntu 24.04 — which `ubuntu-latest` now is — ships an AppArmor
+      # restriction on unprivileged userns that blocks them by default, so the
+      # runner needs it lifted. The sysctl is best-effort: if a future image
+      # drops the knob, the probe below is what decides, not the setting.
+      #
+      # The probe does NOT skip on failure. These scenarios self-check and fail
+      # with a remediation message, so a runner without namespaces turns this
+      # job red honestly rather than reporting success for three scenarios that
+      # never ran — which is precisely the kind of silent gap this job exists
+      # to close.
+      - name: Enable and verify unprivileged namespaces
+        run: |
+          set -euo pipefail
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || \
+            echo "note: sysctl unavailable on this image; relying on the probe"
+          unshare -rm bash -c 'mount -t tmpfs -o size=1m tmpfs /mnt && echo "mount namespaces OK"'
+
+      - name: Build harness binaries
+        run: |
+          cargo build -p vtop-node --bin vtop-node
+          cargo build -p vtop-cli --no-default-features --bin vtopctl
+
+      # CHAOS_WORKDIR is what makes the logs survive to be uploaded. Scenarios
+      # delete workdirs they generated themselves, so an artifact pointed at
+      # the default `/tmp/vtop-chaos.*` collects nothing and the upload passes
+      # empty — a diagnostic that appears to exist and is absent exactly when
+      # it is needed. Supplying the directory also sets WORKDIR_GENERATED=0,
+      # which suppresses that cleanup, so the tree is still there afterwards.
+      - name: Run the live chaos suite
+        id: chaos
+        run: CHAOS_PROFILE=debug CHAOS_WORKDIR="$RUNNER_TEMP/chaos" scripts/live-chaos/run-all.sh
+
+      # A failing scenario names a log file; without this the reason dies with
+      # the runner. `error` on empty, not `ignore`: an empty artifact means the
+      # wiring above broke, and that must be visible rather than silent.
+      #
+      # Gated on THIS step's outcome, not the job's. `failure()` is also true
+      # when the namespace probe or the build failed — cases where the suite
+      # never reached a scenario, so no logs exist and `error` would stack a
+      # spurious "no files found" on top of the real cause. The empty-artifact
+      # signal only means something once the run itself has been attempted.
+      - name: Upload scenario logs
+        if: steps.chaos.outcome == 'failure'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: live-chaos-logs
+          path: ${{ runner.temp }}/chaos/**/logs/
+          if-no-files-found: error
+          retention-days: 7
 
   # The MSRV is a tested promise, not a number in a file: this builds on exactly
   # the declared toolchain. The floor is set by sqlx 0.9 (rust-version 1.94.0),
