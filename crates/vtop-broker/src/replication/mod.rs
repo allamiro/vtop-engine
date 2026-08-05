@@ -139,6 +139,11 @@ pub struct InProcessFollower {
     /// being restarted. It only ever moves forward — see
     /// [`Self::adopt_fencing_epoch`].
     held_fencing_epoch: AtomicU64,
+    /// Which epoch wrote each stretch of this replica's log (#240). See
+    /// [`crate::LocalBroker::epoch_starts`] for why absence and breakage are
+    /// deliberately the same answer.
+    fencing_epoch_journal: Mutex<Option<crate::fencing_epochs::FencingEpochJournal>>,
+    fencing_epoch_history_broken: AtomicBool,
     meta_fencing_epoch: MetaFencingEpoch,
     segment_format: SegmentFormat,
     cluster_committed: ClusterCommittedOffset,
@@ -204,6 +209,8 @@ impl InProcessFollower {
             node_id,
             range,
             held_fencing_epoch: AtomicU64::new(held_fencing_epoch),
+            fencing_epoch_journal: Mutex::new(None),
+            fencing_epoch_history_broken: AtomicBool::new(false),
             meta_fencing_epoch,
             segment_format,
             cluster_committed,
@@ -243,7 +250,65 @@ impl InProcessFollower {
     /// rather than a regression, so the watcher driving this needs no ordering
     /// guarantees of its own.
     pub fn adopt_fencing_epoch(&self, epoch: u64) -> bool {
+        // Durable before the epoch is visible, for the same reason as on a
+        // leader: `fetch_max` is what admits appends under the new epoch, so
+        // recording after it can name a start above the first record that
+        // epoch actually accepted.
+        if epoch > self.held_fencing_epoch.load(Ordering::SeqCst) {
+            let next_offset = self.next_offset();
+            let mut guard = self
+                .fencing_epoch_journal
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(journal) = guard.as_mut() {
+                if journal.record(epoch, next_offset).is_err() {
+                    self.fencing_epoch_history_broken
+                        .store(true, Ordering::SeqCst);
+                }
+            }
+        }
         self.held_fencing_epoch.fetch_max(epoch, Ordering::SeqCst) < epoch
+    }
+
+    /// Install the durable epoch→offset vector for this replica (#240).
+    ///
+    /// Seeds the held epoch only when both the vector and the log are empty;
+    /// see [`crate::LocalBroker::set_fencing_epoch_journal`] for why a replica
+    /// that already holds records must report "unknown" instead.
+    pub fn set_fencing_epoch_journal(
+        &self,
+        mut journal: crate::fencing_epochs::FencingEpochJournal,
+    ) {
+        let epoch = self.held_fencing_epoch.load(Ordering::SeqCst);
+        // Epoch 0 is the "no grant yet" sentinel, never a writing epoch.
+        if journal.latest().is_none()
+            && self.next_offset() == 0
+            && epoch > 0
+            && journal.record(epoch, 0).is_err()
+        {
+            self.fencing_epoch_history_broken
+                .store(true, Ordering::SeqCst);
+        }
+        *self
+            .fencing_epoch_journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(journal);
+    }
+
+    /// This replica's epoch history; empty means "unknown", never "no changes".
+    pub fn epoch_starts(&self) -> Vec<crate::fencing_epochs::EpochStart> {
+        // Flag read UNDER the lock; see LocalBroker::epoch_starts.
+        let guard = self
+            .fencing_epoch_journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.fencing_epoch_history_broken.load(Ordering::SeqCst) {
+            return Vec::new();
+        }
+        guard
+            .as_ref()
+            .map(|journal| journal.entries().to_vec())
+            .unwrap_or_default()
     }
 
     pub fn set_online(&self, online: bool) {

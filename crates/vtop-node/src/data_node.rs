@@ -150,6 +150,30 @@ impl ReplicaPeerHandler for LeaderStatusReplica {
             next_offset,
         })
     }
+
+    /// A leader is a replica of its own range, so it must be able to vouch for
+    /// its own epoch history too — a promotion that could only read followers
+    /// would be reconciling against a strict subset of the range's lineage.
+    fn epoch_history(
+        &self,
+        range: &RangeIdentity,
+    ) -> Result<Vec<vtop_protocol::ReplicaEpochStart>, (vtop_protocol::ErrorCode, String)> {
+        if range != self.broker.range() {
+            return Err((
+                vtop_protocol::ErrorCode::WrongRange,
+                "epoch history range identity does not match this leader".to_owned(),
+            ));
+        }
+        Ok(self
+            .broker
+            .epoch_starts()
+            .into_iter()
+            .map(|entry| vtop_protocol::ReplicaEpochStart {
+                epoch: entry.epoch,
+                start_offset: entry.start_offset,
+            })
+            .collect())
+    }
 }
 
 impl LeaderStatusReplica {
@@ -282,6 +306,16 @@ async fn run_follower(
             config.fencing_epoch,
             meta,
             ClusterCommittedOffset::new(0),
+        )
+        .map_err(|error| error.to_string())?,
+    );
+    // Epoch history on real disk (#240): which fencing epoch wrote each
+    // stretch of this replica's log. Promotion cannot compare two replicas'
+    // offsets without it — a bare offset says where a replica is, not whose
+    // writes put it there.
+    follower.set_fencing_epoch_journal(
+        vtop_broker::fencing_epochs::FencingEpochJournal::open(
+            config.data_dir.join("fencing-epochs"),
         )
         .map_err(|error| error.to_string())?,
     );
@@ -443,6 +477,16 @@ async fn run_leader(
     };
 
     let broker = Arc::new(broker);
+    // Same epoch history a follower keeps (#240). A leader needs its own: the
+    // range's history is the union of what each replica recorded, and a leader
+    // that could not say which epoch wrote its tail is exactly the replica a
+    // future promotion cannot reconcile against.
+    broker.set_fencing_epoch_journal(
+        vtop_broker::fencing_epochs::FencingEpochJournal::open(
+            config.data_dir.join("fencing-epochs"),
+        )
+        .map_err(|error| error.to_string())?,
+    );
     // Verified promotion probes each follower's DISK over the replication
     // plane rather than reading this leader's own replication counters, which
     // on a fresh promotion have never been advanced and would report every
