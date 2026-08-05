@@ -27,6 +27,7 @@
 //! requests validate lineage against that store; membership join/leave/assign
 //! remain metadata commands (Raft-proposed in later wiring).
 
+pub mod fencing_epochs;
 pub mod group_commit;
 pub mod memory_budget;
 pub mod replication;
@@ -48,7 +49,7 @@ use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
@@ -537,6 +538,17 @@ pub struct LocalBroker {
     /// metadata would report epoch N+1 while this field still said N, and
     /// every produce would be refused.
     held_fencing_epoch: AtomicU64,
+    /// Which epoch wrote each stretch of this replica's log (#240).
+    ///
+    /// Optional because every existing constructor and in-process test builds
+    /// a broker without one, and a range that never changes leadership has no
+    /// history to record. A live node wires it; when it is absent, promotion
+    /// simply has no epoch evidence to reconcile against and must say so
+    /// rather than pretend a bare offset is comparable.
+    fencing_epoch_journal: Mutex<Option<crate::fencing_epochs::FencingEpochJournal>>,
+    /// Set if a start could not be recorded. From that point the vector has a
+    /// hole, so it is no longer safe to reconcile against.
+    fencing_epoch_history_broken: AtomicBool,
     /// Latest metadata-committed fencing epoch for the range.
     meta_fencing_epoch: MetaFencingEpoch,
     segment_format: SegmentFormat,
@@ -654,6 +666,8 @@ impl LocalBroker {
         Ok(Self {
             range,
             held_fencing_epoch: AtomicU64::new(held_fencing_epoch),
+            fencing_epoch_journal: Mutex::new(None),
+            fencing_epoch_history_broken: AtomicBool::new(false),
             meta_fencing_epoch,
             segment_format,
             cluster_committed,
@@ -726,7 +740,65 @@ impl LocalBroker {
     /// window between them refuses rather than admits — but leaving them
     /// permanently unequal would silently wedge the range.
     pub fn adopt_fencing_epoch(&self, epoch: u64) -> bool {
-        self.held_fencing_epoch.fetch_max(epoch, Ordering::SeqCst) < epoch
+        let advanced = self.held_fencing_epoch.fetch_max(epoch, Ordering::SeqCst) < epoch;
+        if advanced {
+            // Record where this epoch begins BEFORE serving under it. The
+            // vector exists to survive the crash it is meant to recover from,
+            // so a replica must never write a record under an epoch whose
+            // start offset is not already durable — otherwise recovery is back
+            // to comparing bare offsets at exactly the moment it matters.
+            let (_, next_offset) = self.local_offsets();
+            self.record_epoch_start(epoch, next_offset);
+        }
+        advanced
+    }
+
+    /// Install the durable epoch→offset vector for this replica (#240).
+    pub fn set_fencing_epoch_journal(&self, journal: crate::fencing_epochs::FencingEpochJournal) {
+        *self
+            .fencing_epoch_journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(journal);
+    }
+
+    /// This replica's epoch history.
+    ///
+    /// Empty means "no history you may reconcile against" — either none was
+    /// configured, or a start failed to record and the vector now has a hole.
+    /// Both are the same decision for a caller: an offset from this replica is
+    /// a bare number and cannot be compared by epoch. Callers must treat empty
+    /// as "unknown", never as "no leadership changes".
+    pub fn epoch_starts(&self) -> Vec<crate::fencing_epochs::EpochStart> {
+        if self.fencing_epoch_history_broken.load(Ordering::SeqCst) {
+            return Vec::new();
+        }
+        self.fencing_epoch_journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|journal| journal.entries().to_vec())
+            .unwrap_or_default()
+    }
+
+    fn record_epoch_start(&self, epoch: u64, start_offset: u64) {
+        let mut guard = self
+            .fencing_epoch_journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(journal) = guard.as_mut() {
+            if journal.record(epoch, start_offset).is_err() {
+                // Do not fail the append path over it, but do not carry on
+                // pretending the vector is complete either. From here the
+                // history has a hole, and a promotion reconciling against it
+                // could compute a truncation target that discards
+                // acknowledged records. Marking it broken makes
+                // `epoch_starts` report "unknown", which callers must already
+                // handle — a structurally unusable answer rather than a log
+                // line someone has to notice.
+                self.fencing_epoch_history_broken
+                    .store(true, Ordering::SeqCst);
+            }
+        }
     }
 
     /// Shared metadata fencing-epoch handle observed by this broker.

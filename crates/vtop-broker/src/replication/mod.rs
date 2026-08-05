@@ -139,6 +139,11 @@ pub struct InProcessFollower {
     /// being restarted. It only ever moves forward — see
     /// [`Self::adopt_fencing_epoch`].
     held_fencing_epoch: AtomicU64,
+    /// Which epoch wrote each stretch of this replica's log (#240). See
+    /// [`crate::LocalBroker::epoch_starts`] for why absence and breakage are
+    /// deliberately the same answer.
+    fencing_epoch_journal: Mutex<Option<crate::fencing_epochs::FencingEpochJournal>>,
+    fencing_epoch_history_broken: AtomicBool,
     meta_fencing_epoch: MetaFencingEpoch,
     segment_format: SegmentFormat,
     cluster_committed: ClusterCommittedOffset,
@@ -204,6 +209,8 @@ impl InProcessFollower {
             node_id,
             range,
             held_fencing_epoch: AtomicU64::new(held_fencing_epoch),
+            fencing_epoch_journal: Mutex::new(None),
+            fencing_epoch_history_broken: AtomicBool::new(false),
             meta_fencing_epoch,
             segment_format,
             cluster_committed,
@@ -243,7 +250,46 @@ impl InProcessFollower {
     /// rather than a regression, so the watcher driving this needs no ordering
     /// guarantees of its own.
     pub fn adopt_fencing_epoch(&self, epoch: u64) -> bool {
-        self.held_fencing_epoch.fetch_max(epoch, Ordering::SeqCst) < epoch
+        let advanced = self.held_fencing_epoch.fetch_max(epoch, Ordering::SeqCst) < epoch;
+        if advanced {
+            // Durable before this replica writes anything under the epoch, for
+            // the same reason as on a leader: a vector that loses its newest
+            // entry in a crash is back to bare offsets exactly when the answer
+            // matters.
+            let next_offset = self.next_offset();
+            let mut guard = self
+                .fencing_epoch_journal
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(journal) = guard.as_mut() {
+                if journal.record(epoch, next_offset).is_err() {
+                    self.fencing_epoch_history_broken
+                        .store(true, Ordering::SeqCst);
+                }
+            }
+        }
+        advanced
+    }
+
+    /// Install the durable epoch→offset vector for this replica (#240).
+    pub fn set_fencing_epoch_journal(&self, journal: crate::fencing_epochs::FencingEpochJournal) {
+        *self
+            .fencing_epoch_journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(journal);
+    }
+
+    /// This replica's epoch history; empty means "unknown", never "no changes".
+    pub fn epoch_starts(&self) -> Vec<crate::fencing_epochs::EpochStart> {
+        if self.fencing_epoch_history_broken.load(Ordering::SeqCst) {
+            return Vec::new();
+        }
+        self.fencing_epoch_journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|journal| journal.entries().to_vec())
+            .unwrap_or_default()
     }
 
     pub fn set_online(&self, online: bool) {

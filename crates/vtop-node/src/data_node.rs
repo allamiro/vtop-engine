@@ -285,6 +285,16 @@ async fn run_follower(
         )
         .map_err(|error| error.to_string())?,
     );
+    // Epoch history on real disk (#240): which fencing epoch wrote each
+    // stretch of this replica's log. Promotion cannot compare two replicas'
+    // offsets without it — a bare offset says where a replica is, not whose
+    // writes put it there.
+    follower.set_fencing_epoch_journal(
+        vtop_broker::fencing_epochs::FencingEpochJournal::open(
+            config.data_dir.join("fencing-epochs"),
+        )
+        .map_err(|error| error.to_string())?,
+    );
     observability.register(Box::new(FollowerCollector::new(Arc::clone(&follower))?))?;
 
     // With a lease configured, this follower learns its epoch from metadata
@@ -443,6 +453,16 @@ async fn run_leader(
     };
 
     let broker = Arc::new(broker);
+    // Same epoch history a follower keeps (#240). A leader needs its own: the
+    // range's history is the union of what each replica recorded, and a leader
+    // that could not say which epoch wrote its tail is exactly the replica a
+    // future promotion cannot reconcile against.
+    broker.set_fencing_epoch_journal(
+        vtop_broker::fencing_epochs::FencingEpochJournal::open(
+            config.data_dir.join("fencing-epochs"),
+        )
+        .map_err(|error| error.to_string())?,
+    );
     // Verified promotion probes each follower's DISK over the replication
     // plane rather than reading this leader's own replication counters, which
     // on a fresh promotion have never been advanced and would report every
