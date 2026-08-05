@@ -5,9 +5,36 @@
 //! type (`PeerDirectory`, `NetworkFollowerConfig`, `RangeIdentity`, …).
 
 use serde::Deserialize;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
+use vtop_meta::transport::AdminAuthorizer;
 use vtop_protocol::RangeIdentity;
+
+/// Who may submit which admin commands (#238).
+///
+/// The YAML shape lives here rather than beside the policy in `vtop-meta`:
+/// that crate is the deterministic state machine and keeps serde out of its
+/// dependencies so its wire codecs stay hand-rolled and byte-exact.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminAuthorizationConfig {
+    /// Common Names permitted to submit cluster-scoped commands — bootstrap,
+    /// membership changes, and administrative lease grants naming any holder.
+    ///
+    /// Empty means no client may change the cluster through this endpoint.
+    /// That is a real configuration for a cluster administered out of band,
+    /// not an accident to paper over with a fallback — an empty list is
+    /// enforced as written.
+    #[serde(default)]
+    pub operator_common_names: BTreeSet<String>,
+}
+
+impl AdminAuthorizationConfig {
+    pub fn authorizer(&self) -> AdminAuthorizer {
+        AdminAuthorizer::with_operators(self.operator_common_names.iter().cloned())
+    }
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -93,6 +120,19 @@ pub struct MetaNodeConfig {
     pub tls: TlsPaths,
     #[serde(default)]
     pub timers: MetaTimersConfig,
+    /// Who may submit which admin commands (#238).
+    ///
+    /// `Option` because absence is meaningful and is NOT the same as an empty
+    /// policy: absent means "authenticate but do not authorize" — every
+    /// CA-signed client may do anything, as before #238 — while
+    /// `admin_authorization: {}` means "no operators exist", so nobody may
+    /// change the cluster through this endpoint. Enforcing by default would
+    /// lock out every deployment on upgrade, including this project's own
+    /// chaos harness; a security control that ships broken gets disabled
+    /// rather than fixed. The absent case warns at startup so it stays a
+    /// deliberate choice instead of an unnoticed default.
+    #[serde(default)]
+    pub admin_authorization: Option<AdminAuthorizationConfig>,
     /// `Option` so a CO-LOCATED wrapper can tell "absent" from "present but
     /// empty": any per-role block, even `{}`, is a config error there, and
     /// detecting it needs field presence to survive deserialization.
@@ -201,7 +241,16 @@ pub struct LeaseConfig {
     /// is NOT `range.topic`, which is the wire-level topic name.
     pub topic_uuid: Uuid,
     /// mTLS identity for the admin endpoint. Its CN must be this node's
-    /// decimal metadata node id.
+    /// **`node_uuid`** — the broker's own identity, not a metadata node id.
+    ///
+    /// This block proposes `AcquireRangeLease`/`RenewRangeLease` naming this
+    /// broker as holder, so the credential must identify this broker. Admin
+    /// authorization (#238) enforces the match: a node may drive its own
+    /// lease and no one else's, and a metadata node's certificate is not a
+    /// lease credential at all. This comment previously said "decimal metadata
+    /// node id", and the live-chaos harness wired the metadata node's own
+    /// certificate here to match — which is exactly the confusion the policy
+    /// now rejects.
     pub tls: TlsPaths,
     #[serde(default = "default_lease_duration_ms")]
     pub lease_duration_ms: u64,

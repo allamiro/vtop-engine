@@ -7,6 +7,7 @@ use crate::tls;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use vtop_log::env::Env;
+use vtop_meta::transport::AdminAuthorizer;
 use vtop_meta::{
     resolve_endpoint, start_meta_node, AdminHandler, AdminServer, MetaNodeId, MetaNodeTimers,
     PeerDirectory, PeerEndpoint, PeerRpcHandler, PeerServer,
@@ -76,9 +77,27 @@ pub async fn serve(
         Arc::clone(&node.peer_handler) as Arc<dyn PeerRpcHandler>,
     )
     .map_err(|error| error.to_string())?;
-    let admin_server = AdminServer::new(
+    // An absent policy keeps the pre-#238 behaviour — any CA-signed client may
+    // do anything — so it warns rather than passing silently. The warning names
+    // the concrete exposure, not just the missing key: an operator who reads
+    // "unauthorized" without knowing what it permits has no reason to act.
+    let authorizer = match &config.admin_authorization {
+        Some(policy) => policy.authorizer(),
+        None => {
+            eprintln!(
+                "warning: admin endpoint {} is authenticated but NOT authorized: any client \
+                 holding a certificate signed by this CA — including every data node — may \
+                 change cluster membership and grant range leases. Set `admin_authorization` \
+                 to restrict cluster-scoped commands to named operator CNs.",
+                config.admin_listen
+            );
+            AdminAuthorizer::permissive()
+        }
+    };
+    let admin_server = AdminServer::with_authorization(
         tls::meta_material(&config.tls)?,
         Arc::clone(&node.consensus) as Arc<dyn AdminHandler>,
+        authorizer,
     )
     .map_err(|error| error.to_string())?;
 

@@ -22,15 +22,17 @@
 //! reproducibility.
 
 pub mod admin;
+pub mod authz;
 pub mod peer;
 pub mod tls;
 pub mod wire;
 
 pub use admin::{resolve_endpoint, stub_status, AdminClient, AdminHandler, AdminServer};
+pub use authz::{AdminAuthorizer, AdminIdentity, CommandClass, Refusal};
 pub use peer::{PeerClient, PeerRpcHandler, PeerServer};
 pub use tls::{
-    assert_peer_identity, build_client_connector, build_server_acceptor, meta_node_id_from_cert,
-    server_name, TlsMaterial,
+    assert_peer_identity, build_client_connector, build_server_acceptor, common_name_from_cert,
+    meta_node_id_from_cert, server_name, TlsMaterial,
 };
 pub use wire::{
     read_frame, write_frame, AdminAddLearnerRequest, AdminChangeMembershipRequest, AdminError,

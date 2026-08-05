@@ -105,6 +105,13 @@ pub enum TransportError {
     Closed,
     #[error("unexpected response kind {0}")]
     UnexpectedKind(u16),
+    /// The client authenticated but is not permitted to make this request
+    /// (#238). Distinct from [`TransportError::Identity`], which means the
+    /// certificate itself could not be read: this one carries a known caller
+    /// and a refused action, so an operator debugging a denial can tell
+    /// "wrong certificate" from "wrong permissions".
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
     #[error("{0}")]
     Protocol(String),
 }
