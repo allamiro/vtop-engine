@@ -505,13 +505,30 @@ jobs:
           sha256sum -- ./* > SHA256SUMS
           cat SHA256SUMS
 
+      # The changelog is generated here rather than by `generate_release_notes`
+      # because that option loses to an explicit `body`, which is why v0.1.0
+      # shipped install instructions and no list of what changed at all.
+      - name: Build changelog
+        id: changelog
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Tags are needed to find the previous release; actions/checkout does
+          # not fetch them by default even at fetch-depth 0 for a tag build.
+          git fetch --tags --force --quiet
+          {
+            echo 'notes<<CHANGELOG_EOF'
+            ./scripts/release-notes.sh "${GITHUB_REF_NAME}"
+            echo 'CHANGELOG_EOF'
+          } >>"$GITHUB_OUTPUT"
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           name: v${{ needs.verify.outputs.version }}
           tag_name: ${{ github.ref_name }}
           prerelease: ${{ needs.verify.outputs.prerelease == 'true' }}
-          generate_release_notes: true
           files: artifacts/*
           # PROSE PARAGRAPHS MUST BE ONE LINE EACH.
           #
@@ -527,27 +544,14 @@ jobs:
 
             > **Maturity:** VTOP is a **prototype / reference implementation**. The 0.x series signals that the API may still change, not that a tag is a preview — each release is signed, attested, and intended for use. Read [Known limitations](https://github.com/${{ github.repository }}/blob/main/docs/PRODUCTION_HA_PLAN.md) (§21) before depending on this in production.
 
-            ### Container image
+            ${{ steps.changelog.outputs.notes }}
+
+            ### Install
+
             ```
             docker pull ${{ env.IMAGE_NAME }}:${{ needs.verify.outputs.version }}
             ```
-            Multi-arch (`linux/amd64`, `linux/arm64`), published with SBOM + provenance attestations and signed with cosign (keyless). Verify with:
-            ```
-            cosign verify ${{ env.IMAGE_NAME }}:${{ needs.verify.outputs.version }} \
-              --certificate-identity-regexp='https://github.com/${{ github.repository }}/.*' \
-              --certificate-oidc-issuer='https://token.actions.githubusercontent.com'
-            ```
 
-            ### Binaries
-            Each archive contains `vtop-node` (the node process) and `vtopctl` (the operator CLI), for `linux` (x86_64, aarch64) and `macOS` (arm64, x86_64). Windows is not built: librdkafka is compiled from source via cmake and the Windows path is not validated.
+            Binaries for `linux` (x86_64, aarch64) and `macOS` (arm64, x86_64) are attached below, each containing `vtop-node` and `vtopctl`. Windows is not built.
 
-            Every binary archive has a keyless Sigstore bundle with the same name plus `.sigstore.json`. Verify an archive with:
-            ```
-            archive=vtop-engine-${{ needs.verify.outputs.version }}-TARGET.tar.gz
-            cosign verify-blob "$archive" \
-              --bundle "${archive}.sigstore.json" \
-              --certificate-identity "https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/${{ github.ref_name }}" \
-              --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
-            ```
-
-            Also verify downloads against `SHA256SUMS`. An SPDX SBOM is attached.
+            Every artifact is signed (keyless Sigstore) and an SPDX SBOM is attached. **[How to verify a release](https://github.com/${{ github.repository }}/blob/main/docs/RELEASE_VERIFICATION.md)** — cosign commands for the image and the archives, and what `SHA256SUMS` does and does not tell you.
