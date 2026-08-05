@@ -125,6 +125,7 @@ pub trait ReplicaPeerHandler: Send + Sync {
         &self,
         _range: &vtop_protocol::RangeIdentity,
         _fencing_epoch: u64,
+        _leader_epoch_starts: &[crate::fencing_epochs::EpochStart],
     ) -> Result<vtop_protocol::ReplicaFenceResponse, (ErrorCode, String)> {
         Err((
             ErrorCode::InvalidRequest,
@@ -197,6 +198,7 @@ impl ReplicaPeerHandler for InProcessFollower {
         &self,
         range: &vtop_protocol::RangeIdentity,
         fencing_epoch: u64,
+        leader_epoch_starts: &[crate::fencing_epochs::EpochStart],
     ) -> Result<vtop_protocol::ReplicaFenceResponse, (ErrorCode, String)> {
         if range != self.range() {
             return Err((
@@ -204,7 +206,7 @@ impl ReplicaPeerHandler for InProcessFollower {
                 "fence range identity does not match this follower".to_owned(),
             ));
         }
-        let outcome = InProcessFollower::fence(self, fencing_epoch)?;
+        let outcome = InProcessFollower::fence(self, fencing_epoch, leader_epoch_starts)?;
         Ok(vtop_protocol::ReplicaFenceResponse {
             fencing_epoch: outcome.fencing_epoch,
             local_committed_offset: outcome.local_committed_offset,
@@ -217,6 +219,7 @@ impl ReplicaPeerHandler for InProcessFollower {
                     start_offset: entry.start_offset,
                 })
                 .collect(),
+            truncated_records: outcome.truncated_records,
         })
     }
 }
@@ -326,7 +329,15 @@ fn dispatch_replica_frame(handler: &dyn ReplicaPeerHandler, frame: WireFrame) ->
             Err((code, message)) => error_message(code, message),
         },
         Message::ReplicaFenceRequest(request) => {
-            match handler.fence(&request.range, request.fencing_epoch) {
+            let leader_epoch_starts: Vec<crate::fencing_epochs::EpochStart> = request
+                .leader_epoch_starts
+                .iter()
+                .map(|entry| crate::fencing_epochs::EpochStart {
+                    epoch: entry.epoch,
+                    start_offset: entry.start_offset,
+                })
+                .collect();
+            match handler.fence(&request.range, request.fencing_epoch, &leader_epoch_starts) {
                 Ok(response) => Message::ReplicaFenceResponse(response),
                 Err((code, message)) => error_message(code, message),
             }
@@ -1410,6 +1421,7 @@ impl ReplicaStatusClient {
         expected_node: Uuid,
         range: &RangeIdentity,
         fencing_epoch: u64,
+        leader_epoch_starts: &[vtop_protocol::ReplicaEpochStart],
     ) -> BrokerResult<vtop_protocol::ReplicaFenceResponse> {
         let name = rustls::pki_types::ServerName::try_from(server_name.to_owned())
             .map_err(|error| {
@@ -1436,6 +1448,7 @@ impl ReplicaStatusClient {
                 message: Message::ReplicaFenceRequest(vtop_protocol::ReplicaFenceRequest {
                     range: range.clone(),
                     fencing_epoch,
+                    leader_epoch_starts: leader_epoch_starts.to_vec(),
                 }),
             };
             write_frame(&mut stream, &frame, REPLICA_LIMITS).await?;

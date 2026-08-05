@@ -58,6 +58,22 @@ const ENTRY_BYTES: usize = 16;
 /// "transmittable" by construction instead of by coincidence.
 const MAX_ENTRIES: usize = vtop_protocol::MAX_REPLICA_EPOCH_STARTS;
 
+/// What comparing two replicas' lineages established (#240).
+///
+/// Three outcomes, not two, because "we could not tell" and "we agree" license
+/// completely different actions and must not share a representation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lineage {
+    /// Every position both replicas recorded matches. Nothing to discard.
+    Agreed,
+    /// They disagree; everything at or above this offset is suspect and must
+    /// go before the replicas can share a log again.
+    DivergesAt(u64),
+    /// No provable common history — at least one side cannot vouch for its own
+    /// lineage. Not a licence to truncate anything.
+    Unknown,
+}
+
 /// One epoch's first offset on this replica.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EpochStart {
@@ -363,43 +379,49 @@ impl FencingEpochJournal {
         self.entries.get(index + 1).map(|next| next.start_offset)
     }
 
-    /// The highest offset below which this replica and `other` provably hold
-    /// identical records.
+    /// Compare this replica's lineage with `other`'s.
     ///
-    /// Walks both vectors while they agree. The first differing epoch bounds
-    /// divergence, and the answer is the smaller of the two start offsets for
-    /// it: below that, both replicas wrote under the same leadership in the
-    /// same order, so their records are the same records. This is the value a
-    /// follower must truncate to before it can safely follow `other`, and the
-    /// reason it cannot be computed from a high-water mark.
+    /// Walks both vectors while they agree. The FIRST epoch at which they
+    /// differ bounds divergence, and the answer is the smaller of the two start
+    /// offsets for it: below that, both replicas wrote under the same
+    /// leadership in the same order, so their records are the same records.
     ///
-    /// `None` means the vectors share no common prefix at all — the replicas
-    /// have no provably identical history, which is a lineage fault rather
-    /// than a lag problem and must not be resolved by truncating.
-    pub fn divergence_point(&self, other: &[EpochStart]) -> Option<u64> {
-        let mut agreed: Option<u64> = None;
+    /// # Why this returns a verdict and not an offset
+    ///
+    /// It used to return `Option<u64>`, and that conflated two facts which
+    /// happen to be the same type and mean opposite things. A disagreement
+    /// yields "everything at or above here is suspect" — a truncation target.
+    /// A prefix relationship yields "agreed at least this far" — a FLOOR, and
+    /// truncating to it discards records both replicas hold.
+    ///
+    /// Nothing in the signature distinguished them, and the first caller to use
+    /// the value for its intended purpose got it wrong: given a peer whose
+    /// vector was merely shorter, it read the start of the last common epoch as
+    /// a divergence point and discarded a log the two replicas entirely agreed
+    /// on. A verdict makes that mistake impossible to make quietly.
+    pub fn compare_lineage(&self, other: &[EpochStart]) -> Lineage {
+        let mut compared = 0_usize;
         for (mine, theirs) in self.entries.iter().zip(other.iter()) {
-            if mine.epoch != theirs.epoch {
-                // Different leadership at the same position in history.
-                return Some(mine.start_offset.min(theirs.start_offset));
+            if mine.epoch != theirs.epoch || mine.start_offset != theirs.start_offset {
+                // Either different leadership at the same position in history,
+                // or the same epoch beginning in two different places — which
+                // is a disagreement about what came before it.
+                return Lineage::DivergesAt(mine.start_offset.min(theirs.start_offset));
             }
-            if mine.start_offset != theirs.start_offset {
-                // Same epoch, different starting point: they disagree about
-                // what came before it.
-                return Some(mine.start_offset.min(theirs.start_offset));
-            }
-            agreed = Some(mine.start_offset);
+            compared += 1;
         }
-        // One vector is a prefix of the other; everything the shorter one
-        // covers is agreed. The caller bounds the answer by its own tail.
-        //
-        // Two EMPTY vectors are not agreement at offset 0 — they are two
-        // replicas that cannot vouch for their own history at all. Reporting a
-        // proven common prefix there would let a caller reconcile (and
-        // truncate) on the strength of mutual ignorance, which is the opposite
-        // of what empty means everywhere else in this API. `None` makes it
-        // fail closed.
-        agreed
+        // Neither vector contradicted the other. Note this covers the case
+        // where one is a PREFIX of the other, which is not divergence: the
+        // shorter replica has simply recorded less, and nothing here proves
+        // anything about the records beyond its last entry.
+        if compared == 0 {
+            // Nothing was actually compared, so nothing is proven. Two replicas
+            // that cannot vouch for their own history are not in agreement —
+            // they are mutually ignorant, and reconciling on that basis is the
+            // opposite of what an empty vector means everywhere else here.
+            return Lineage::Unknown;
+        }
+        Lineage::Agreed
     }
 
     fn sync_parent(env: &Env, path: &Path) -> BrokerResult<()> {
@@ -533,15 +555,20 @@ mod tests {
             },
         ];
         assert_eq!(
-            mine.divergence_point(&theirs),
-            Some(200),
+            mine.compare_lineage(&theirs),
+            Lineage::DivergesAt(200),
             "records below the smaller of the two differing starts were written under \
              identical leadership"
         );
     }
 
-    /// A prefix is not a divergence — the shorter replica is simply behind,
-    /// and everything it holds is agreed.
+    /// A prefix is not a divergence, and must not be reported as one.
+    ///
+    /// This assertion used to read `Some(100)` — the start of the last common
+    /// epoch — on the reasoning that everything the shorter vector covers is
+    /// agreed. True, but it is a FLOOR, and the first caller to use this value
+    /// as a truncation target read it as a ceiling and discarded records
+    /// 100..200 that both replicas hold. `Agreed` cannot be misread that way.
     #[test]
     fn a_prefix_agrees_through_its_own_tail() {
         let dir = TempDir::new().unwrap();
@@ -560,7 +587,7 @@ mod tests {
                 start_offset: 100,
             },
         ];
-        assert_eq!(mine.divergence_point(&theirs), Some(100));
+        assert_eq!(mine.compare_lineage(&theirs), Lineage::Agreed);
     }
 
     /// Same epoch number, different start: they disagree about what preceded
@@ -582,7 +609,7 @@ mod tests {
                 start_offset: 80,
             },
         ];
-        assert_eq!(mine.divergence_point(&theirs), Some(80));
+        assert_eq!(mine.compare_lineage(&theirs), Lineage::DivergesAt(80));
     }
 
     /// A crash mid-append leaves a partial entry. Everything fsynced before it
@@ -637,7 +664,7 @@ mod tests {
     fn two_unknown_histories_do_not_agree() {
         let dir = TempDir::new().unwrap();
         let mine = journal(&dir);
-        assert_eq!(mine.divergence_point(&[]), None);
+        assert_eq!(mine.compare_lineage(&[]), Lineage::Unknown);
     }
 
     /// The fragment must leave the FILE, not just memory. If it survives, the

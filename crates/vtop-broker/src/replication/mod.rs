@@ -138,6 +138,8 @@ pub struct FenceOutcome {
     pub next_offset: u64,
     /// Empty means UNKNOWN, never "no leadership changes".
     pub epoch_starts: Vec<crate::fencing_epochs::EpochStart>,
+    /// Records discarded to agree with the caller, if any.
+    pub truncated_records: u64,
 }
 
 /// Deterministic in-process follower replica.
@@ -406,7 +408,11 @@ impl InProcessFollower {
     ///
     /// **An epoch below the one already held.** Fencing moves forward only;
     /// otherwise a stale leader could un-fence a replica it had already lost.
-    pub fn fence(&self, epoch: u64) -> Result<FenceOutcome, (ErrorCode, String)> {
+    pub fn fence(
+        &self,
+        epoch: u64,
+        leader_epoch_starts: &[crate::fencing_epochs::EpochStart],
+    ) -> Result<FenceOutcome, (ErrorCode, String)> {
         let held = self.held_fencing_epoch();
         if epoch < held {
             return Err((
@@ -428,6 +434,21 @@ impl InProcessFollower {
         // Records the start durably before the epoch becomes visible, exactly
         // as the append path does.
         self.adopt_fencing_epoch(epoch);
+
+        // Reconcile WHILE STOPPED. This is the only moment it is sound: the
+        // replica has just been fenced, so nothing can append between the
+        // comparison and the truncation, and the numbers the caller acts on
+        // describe the log it will actually follow.
+        //
+        // Doing it here rather than per-append is what closes the ack-on-
+        // divergence hole (#261) at its cause. That hole exists because the
+        // catch-up path asks "am I durable through this offset?" when the
+        // question is "do I hold the SAME record there?" — a question a single
+        // append cannot answer. After this, a diverged replica has already
+        // discarded what the caller disagrees with, so the catch-up path is
+        // never reached in a diverged state and never has to answer it.
+        let truncated_records = self.reconcile_with(leader_epoch_starts)?;
+
         // Offsets and history read together, under the state lock, so the pair
         // describes one instant of one log.
         let state = self
@@ -442,7 +463,78 @@ impl InProcessFollower {
             local_committed_offset,
             next_offset,
             epoch_starts: self.epoch_starts(),
+            truncated_records,
         })
+    }
+
+    /// Discard anything written under a leadership `leader_epoch_starts` does
+    /// not share, and report how many records that cost.
+    ///
+    /// Returns 0 without touching the log whenever the answer is not provable:
+    ///
+    /// * The caller's history is EMPTY — it cannot vouch for its own lineage.
+    ///   Truncating here would delete data to satisfy a claim nobody made.
+    /// * The two vectors share no common prefix at all (`divergence_point`
+    ///   yields `None`). That is a lineage fault — two replicas of what should
+    ///   be the same range with no provably identical history — and it is not
+    ///   something truncation can repair. It needs an operator, not a deletion.
+    /// * The divergence point is at or above this replica's tail: nothing it
+    ///   holds is in dispute.
+    ///
+    /// A truncation that would cross the acknowledged high-water mark is an
+    /// ERROR, not a silent no-op. Everything below that was acknowledged to a
+    /// producer, so a caller asking for it is either wrong or reconciling
+    /// against a log that is not this range's — and the fence must fail rather
+    /// than let promotion proceed believing this replica agreed.
+    fn reconcile_with(
+        &self,
+        leader_epoch_starts: &[crate::fencing_epochs::EpochStart],
+    ) -> Result<u64, (ErrorCode, String)> {
+        if leader_epoch_starts.is_empty() {
+            return Ok(0);
+        }
+        let verdict = {
+            let guard = self
+                .fencing_epoch_journal
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if self.fencing_epoch_history_broken.load(Ordering::SeqCst) {
+                crate::fencing_epochs::Lineage::Unknown
+            } else {
+                guard
+                    .as_ref()
+                    .map_or(crate::fencing_epochs::Lineage::Unknown, |journal| {
+                        journal.compare_lineage(leader_epoch_starts)
+                    })
+            }
+        };
+        let divergence = match verdict {
+            // Agreed and Unknown are different facts with the same action:
+            // touch nothing. One says there is nothing to discard, the other
+            // says we cannot prove there is.
+            crate::fencing_epochs::Lineage::Agreed | crate::fencing_epochs::Lineage::Unknown => {
+                return Ok(0)
+            }
+            crate::fencing_epochs::Lineage::DivergesAt(offset) => offset,
+        };
+        if divergence >= self.next_offset() {
+            return Ok(0);
+        }
+        match self.truncate_to(divergence) {
+            Ok(outcome) => Ok(outcome.records_removed),
+            Err(BrokerError::TruncationBelowAcknowledged {
+                requested,
+                high_watermark,
+            }) => Err((
+                ErrorCode::InvalidRequest,
+                format!(
+                    "reconciling with the caller would discard acknowledged records: it puts \
+                     divergence at {requested}, below this replica's high-water mark \
+                     {high_watermark}"
+                ),
+            )),
+            Err(problem) => Err((ErrorCode::Storage, problem.to_string())),
+        }
     }
 
     pub fn set_online(&self, online: bool) {

@@ -376,9 +376,24 @@ pub struct ReplicaFenceRequest {
     /// any node that can reach its port, and would then refuse every append
     /// until metadata caught up to a number that may never arrive.
     pub fencing_epoch: u64,
+    /// The CALLER's own epoch history, so the replica can reconcile against it
+    /// while it is stopped (#240).
+    ///
+    /// Sent with the fence rather than fetched afterwards because reconciling
+    /// is only sound against a log that cannot move. A replica compares this
+    /// with its own vector, and anything above the point where the two provably
+    /// agree was written under a leadership the caller does not share — records
+    /// no quorum ever accepted, which must go before this replica can follow.
+    ///
+    /// Empty means the caller cannot vouch for its own history, and the replica
+    /// must then truncate NOTHING. That is the same "unknown" this project uses
+    /// everywhere else, and it fails closed: a replica that discarded records on
+    /// the strength of an unknown history would be deleting data to satisfy a
+    /// claim nobody made.
+    pub leader_epoch_starts: Vec<ReplicaEpochStart>,
 }
 
-/// What a replica looked like at the instant it was fenced.
+/// What a replica looked like at the instant it was fenced, after reconciling.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplicaFenceResponse {
     /// The epoch the replica now holds. Equal to the requested epoch on
@@ -389,6 +404,12 @@ pub struct ReplicaFenceResponse {
     /// This replica's epoch history as of the fence, ascending by epoch. Empty
     /// means UNKNOWN, exactly as in [`ReplicaEpochHistoryResponse`].
     pub epoch_starts: Vec<ReplicaEpochStart>,
+    /// How many records the replica discarded to agree with the caller, if any.
+    ///
+    /// Reported rather than silent because it is the one thing here that
+    /// destroys data. An operator reading a failover ought to be able to see
+    /// that it happened and how much, without inferring it from two offsets.
+    pub truncated_records: u64,
 }
 
 /// Lineage-aware durable consumer progress. Bound to topic epoch, range
@@ -691,12 +712,17 @@ fn encoded_payload_size(message: &Message, limits: ProtocolLimits) -> Result<usi
                 }
                 4 + value.epoch_starts.len() * 16
             }
-            Message::ReplicaFenceRequest(value) => range_size(&value.range)? + 8,
+            Message::ReplicaFenceRequest(value) => {
+                if value.leader_epoch_starts.len() > MAX_REPLICA_EPOCH_STARTS {
+                    return Err(ProtocolError::Limit("epoch history too long".to_owned()));
+                }
+                range_size(&value.range)? + 8 + 4 + value.leader_epoch_starts.len() * 16
+            }
             Message::ReplicaFenceResponse(value) => {
                 if value.epoch_starts.len() > MAX_REPLICA_EPOCH_STARTS {
                     return Err(ProtocolError::Limit("epoch history too long".to_owned()));
                 }
-                8 + 8 + 8 + 4 + value.epoch_starts.len() * 16
+                8 + 8 + 8 + 8 + 4 + value.epoch_starts.len() * 16
             }
             Message::CommitCursorRequest(value) => {
                 lineage_cursor_size(&value.cursor)?
@@ -1012,6 +1038,14 @@ fn encode_message(message: &Message, out: &mut Vec<u8>) -> Result<(), ProtocolEr
         Message::ReplicaFenceRequest(value) => {
             put_range(out, &value.range)?;
             put_u64(out, value.fencing_epoch);
+            if value.leader_epoch_starts.len() > MAX_REPLICA_EPOCH_STARTS {
+                return Err(ProtocolError::Limit("epoch history too long".to_owned()));
+            }
+            put_u32(out, value.leader_epoch_starts.len() as u32);
+            for entry in &value.leader_epoch_starts {
+                put_u64(out, entry.epoch);
+                put_u64(out, entry.start_offset);
+            }
         }
         Message::ReplicaFenceResponse(value) => {
             if value.epoch_starts.len() > MAX_REPLICA_EPOCH_STARTS {
@@ -1020,6 +1054,7 @@ fn encode_message(message: &Message, out: &mut Vec<u8>) -> Result<(), ProtocolEr
             put_u64(out, value.fencing_epoch);
             put_u64(out, value.local_committed_offset);
             put_u64(out, value.next_offset);
+            put_u64(out, value.truncated_records);
             put_u32(out, value.epoch_starts.len() as u32);
             for entry in &value.epoch_starts {
                 put_u64(out, entry.epoch);
@@ -1272,16 +1307,19 @@ fn decode_message(
         75 => Message::ReplicaFenceRequest(ReplicaFenceRequest {
             range: decoder.range()?,
             fencing_epoch: decoder.u64()?,
+            leader_epoch_starts: decode_epoch_starts(decoder)?,
         }),
         76 => {
             let fencing_epoch = decoder.u64()?;
             let local_committed_offset = decoder.u64()?;
             let next_offset = decoder.u64()?;
+            let truncated_records = decoder.u64()?;
             Message::ReplicaFenceResponse(ReplicaFenceResponse {
                 fencing_epoch,
                 local_committed_offset,
                 next_offset,
                 epoch_starts: decode_epoch_starts(decoder)?,
+                truncated_records,
             })
         }
         70 => Message::CommitCursorRequest(CommitCursorRequest {
@@ -1793,11 +1831,29 @@ mod tests {
             Message::ReplicaFenceRequest(ReplicaFenceRequest {
                 range: range(),
                 fencing_epoch: 19,
+                leader_epoch_starts: vec![
+                    ReplicaEpochStart {
+                        epoch: 18,
+                        start_offset: 0,
+                    },
+                    ReplicaEpochStart {
+                        epoch: 19,
+                        start_offset: 400,
+                    },
+                ],
+            }),
+            // A candidate that cannot vouch for its own history. Legal, and the
+            // case in which a replica must truncate nothing.
+            Message::ReplicaFenceRequest(ReplicaFenceRequest {
+                range: range(),
+                fencing_epoch: 19,
+                leader_epoch_starts: Vec::new(),
             }),
             Message::ReplicaFenceResponse(ReplicaFenceResponse {
                 fencing_epoch: 19,
                 local_committed_offset: 400,
                 next_offset: 450,
+                truncated_records: 50,
                 epoch_starts: vec![
                     ReplicaEpochStart {
                         epoch: 18,
@@ -1815,6 +1871,7 @@ mod tests {
                 fencing_epoch: 19,
                 local_committed_offset: 0,
                 next_offset: 0,
+                truncated_records: 0,
                 epoch_starts: Vec::new(),
             }),
             Message::CommitCursorRequest(CommitCursorRequest {
@@ -2035,6 +2092,7 @@ mod tests {
             Message::ReplicaFenceRequest(ReplicaFenceRequest {
                 range: range(),
                 fencing_epoch: 1,
+                leader_epoch_starts: Vec::new(),
             })
             .kind(),
             75
@@ -2045,6 +2103,7 @@ mod tests {
                 local_committed_offset: 0,
                 next_offset: 0,
                 epoch_starts: Vec::new(),
+                truncated_records: 0,
             })
             .kind(),
             76
@@ -2095,6 +2154,7 @@ mod tests {
             fencing_epoch: 3,
             local_committed_offset: 10,
             next_offset: 10,
+            truncated_records: 0,
             epoch_starts: vec![
                 ReplicaEpochStart {
                     epoch: 5,
