@@ -357,6 +357,37 @@ async fn run_leader(
     };
 
     let broker = Arc::new(broker);
+    // Verified promotion probes each follower's DISK over the replication
+    // plane rather than reading this leader's own replication counters, which
+    // on a fresh promotion have never been advanced and would report every
+    // follower at offset zero. `None` for a standalone range: there is no
+    // replica set to establish a boundary against.
+    let promotion_probe: Option<Arc<dyn crate::lease_agent::QuorumProbe>> = if replicated {
+        let endpoints = config
+            .followers
+            .iter()
+            .map(|follower| {
+                Ok(crate::lease_agent::FollowerEndpoint {
+                    node_uuid: follower.node_uuid,
+                    addr: vtop_meta::resolve_endpoint(&follower.addr)
+                        .map_err(|error| error.to_string())?,
+                    server_name: follower.server_name.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Some(Arc::new(crate::lease_agent::ReplicaPlaneProbe::new(
+            Arc::clone(&broker),
+            config.node_uuid,
+            vtop_broker::replication::ReplicaStatusClient::new(tls::replica_material(
+                &config.replica_tls,
+            )?)
+            .map_err(|error| error.to_string())?,
+            endpoints,
+            broker.range().clone(),
+        )))
+    } else {
+        None
+    };
     // Range leadership from the metadata plane (#223). Without this the
     // configured `fencing_epoch` is simply asserted and never revisited, which
     // is the pre-#223 behaviour every existing config still gets.
@@ -395,6 +426,7 @@ async fn run_leader(
             Arc::new(crate::lease_agent::BrokerLeasePublisher::new(Arc::clone(
                 &broker,
             ))),
+            promotion_probe,
         )?;
         tokio::spawn(agent.run());
     }

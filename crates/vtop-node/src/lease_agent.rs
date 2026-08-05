@@ -55,10 +55,130 @@ use vtop_meta::{AdminClient, MetadataCommand, MetadataResponse};
 /// matter — promotion, and the demotion a partitioned node discovers — can be
 /// asserted without standing up a broker, a segment, and a disk.
 pub trait LeasePublisher: Send + Sync {
-    /// This node now holds the range at `fencing_epoch`.
-    fn promote(&self, fencing_epoch: u64);
-    /// This node no longer holds the range at `fencing_epoch`.
+    /// This node now holds the range at `fencing_epoch`, with `committed_offset`
+    /// the boundary a quorum proved (`None` for a standalone range, which has
+    /// no quorum to prove anything).
+    fn promote(&self, fencing_epoch: u64, committed_offset: Option<u64>);
+    /// This node no longer holds the range at `fencing_epoch` — metadata has
+    /// moved on (a rival grant, a refused renewal, a released lease). The
+    /// epoch is finished for this process.
     fn demote(&self, fencing_epoch: u64);
+    /// This node must stop serving at `fencing_epoch` NOW, but the epoch is
+    /// still its own live grant and a retry may reactivate it — a promotion
+    /// whose quorum probe transiently failed. Distinct from [`Self::demote`]:
+    /// demotion records the epoch as finished, and a later promotion at the
+    /// same epoch would be a permanent no-op.
+    fn suspend(&self, fencing_epoch: u64);
+}
+
+/// Asks the replica set where its disks actually are.
+///
+/// Behind a trait because the real implementation makes N concurrent RPCs, and
+/// the agent's decisions must be assertable without a network.
+#[async_trait::async_trait]
+pub trait QuorumProbe: Send + Sync {
+    /// One probe per configured replica, including the leader's own view.
+    async fn probe(&self) -> Vec<crate::promotion::ReplicaProbe>;
+    /// The CONFIGURED replica-set size, not the number that answered.
+    fn replication_factor(&self) -> usize;
+}
+
+/// Probes over the replication plane, one RPC per follower.
+///
+/// Deliberately NOT `NetworkedReplicaSet::follower_durable_offset`. That
+/// accessor reads a counter this leader's own replication stream advances, and
+/// it returns `None` only when a node id is absent from the configured set — a
+/// config mismatch, never an unreachable peer. On a freshly promoted leader
+/// that stream has never run, so every follower would report `Some(0)`: a
+/// disconnected replica would be counted as holding nothing, the quorum floor
+/// would collapse to zero, and the refusal path could never fire. It would make
+/// verified promotion a no-op precisely on the failover it exists for.
+///
+/// `ReplicaStatusClient` asks the follower's disk instead, and a peer that does
+/// not answer is genuinely absent.
+pub struct ReplicaPlaneProbe {
+    broker: Arc<LocalBroker>,
+    node_uuid: Uuid,
+    client: vtop_broker::replication::ReplicaStatusClient,
+    followers: Vec<FollowerEndpoint>,
+    range: vtop_protocol::RangeIdentity,
+}
+
+/// One follower, as the leader dials it.
+#[derive(Clone, Debug)]
+pub struct FollowerEndpoint {
+    pub node_uuid: Uuid,
+    pub addr: std::net::SocketAddr,
+    pub server_name: String,
+}
+
+impl ReplicaPlaneProbe {
+    pub fn new(
+        broker: Arc<LocalBroker>,
+        node_uuid: Uuid,
+        client: vtop_broker::replication::ReplicaStatusClient,
+        followers: Vec<FollowerEndpoint>,
+        range: vtop_protocol::RangeIdentity,
+    ) -> Self {
+        Self {
+            broker,
+            node_uuid,
+            client,
+            followers,
+            range,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl QuorumProbe for ReplicaPlaneProbe {
+    async fn probe(&self) -> Vec<crate::promotion::ReplicaProbe> {
+        // The leader's own disk, read with the BLOCKING accessor. Promotion is
+        // a request handler, not a scrape: it is allowed to queue behind an
+        // append. The non-blocking variant would have the leader abstain from
+        // its own quorum under momentary lock contention, which in a 2-replica
+        // range turns a lock hold into a refused promotion.
+        let (local_committed, _) = self.broker.local_offsets();
+        let mut probes = vec![crate::promotion::ReplicaProbe {
+            node_id: self.node_uuid,
+            local_committed_offset: Some(local_committed),
+        }];
+        // Concurrent: a follower that has stopped answering must not add its
+        // full deadline to every other follower's wait.
+        let answers = futures::future::join_all(self.followers.iter().map(|follower| async move {
+            let status = self
+                .client
+                .status(
+                    follower.addr,
+                    &follower.server_name,
+                    follower.node_uuid,
+                    &self.range,
+                )
+                .await;
+            crate::promotion::ReplicaProbe {
+                node_id: follower.node_uuid,
+                local_committed_offset: match status {
+                    Ok(status) => Some(status.local_committed_offset),
+                    Err(error) => {
+                        tracing::debug!(
+                            follower = %follower.node_uuid,
+                            %error,
+                            "replica did not answer the promotion probe"
+                        );
+                        None
+                    }
+                },
+            }
+        }))
+        .await;
+        probes.extend(answers);
+        probes
+    }
+
+    fn replication_factor(&self) -> usize {
+        // The leader plus its configured followers.
+        self.followers.len() + 1
+    }
 }
 
 /// Publishes into a live broker.
@@ -73,7 +193,10 @@ impl BrokerLeasePublisher {
 }
 
 impl LeasePublisher for BrokerLeasePublisher {
-    fn promote(&self, fencing_epoch: u64) {
+    fn promote(&self, fencing_epoch: u64, committed_offset: Option<u64>) {
+        if let (Some(offset), Some(cluster)) = (committed_offset, self.broker.cluster_committed()) {
+            cluster.advance_to(offset);
+        }
         // Both values must end up equal or the broker refuses every request.
         // The order is not a safety question — produce checks equality, so any
         // window between the two writes fails closed — but both must happen.
@@ -86,6 +209,135 @@ impl LeasePublisher for BrokerLeasePublisher {
         // it records what this process was last granted, and rewinding it
         // would let a later stale grant look current.
         self.broker.meta_fencing_epoch().clear_lease(fencing_epoch);
+    }
+
+    fn suspend(&self, fencing_epoch: u64) {
+        // NOT `clear_lease`: that records the epoch in `released_through`,
+        // after which a successful re-promotion at the same epoch could never
+        // reactivate the view — the broker would stay fenced under its own
+        // live lease until an external epoch change.
+        self.broker.meta_fencing_epoch().suspend(fencing_epoch);
+    }
+}
+
+/// Owns everything about believing this node leads: verifying the boundary,
+/// publishing the epoch, and giving it up.
+///
+/// Separate from [`LeaseAgent`] so the transitions can be tested without an
+/// admin client — the interesting behaviour here is not "can we reach
+/// metadata", it is what happens when a quorum will not answer.
+struct Promoter {
+    publisher: Arc<dyn LeasePublisher>,
+    probe: Option<Arc<dyn QuorumProbe>>,
+    /// The epoch whose boundary has already been verified.
+    ///
+    /// Verification happens once per epoch TRANSITION, not once per renewal.
+    /// Re-probing a quorum every few seconds for a leader that has not changed
+    /// is pure cost.
+    verified_epoch: Option<u64>,
+    /// This node, so `establish` can check the candidate's own probe covers
+    /// the boundary it is about to publish.
+    node_uuid: Uuid,
+    range_uuid: Uuid,
+}
+
+impl Promoter {
+    /// Make this node servable at `fencing_epoch`, verifying the committed
+    /// boundary first if this epoch has not been verified yet.
+    async fn ensure(&mut self, fencing_epoch: u64) -> bool {
+        if self.verified_epoch == Some(fencing_epoch) {
+            return true;
+        }
+        let committed_offset = match self.probe.as_ref() {
+            // A standalone range has no quorum to establish against and
+            // promotes on its own durable boundary; requiring one it cannot
+            // form would make single-replica deployments unleadable.
+            None => None,
+            Some(probe) => {
+                let probes = probe.probe().await;
+                match crate::promotion::establish(
+                    &probes,
+                    probe.replication_factor(),
+                    self.node_uuid,
+                ) {
+                    crate::promotion::Promotion::Established {
+                        committed_offset,
+                        answered,
+                    } => {
+                        tracing::info!(
+                            range = %self.range_uuid,
+                            fencing_epoch,
+                            committed_offset,
+                            replicas = answered.len(),
+                            "verified promotion: committed boundary established by quorum"
+                        );
+                        Some(committed_offset)
+                    }
+                    crate::promotion::Promotion::QuorumUnavailable { answered, required } => {
+                        tracing::warn!(
+                            range = %self.range_uuid,
+                            fencing_epoch,
+                            answered,
+                            required,
+                            "refusing promotion: too few replicas could confirm the \
+                             committed boundary"
+                        );
+                        // Publish the refusal, not merely a local state flip.
+                        // Flipping state alone would leave the broker's
+                        // metadata view live while the agent stops renewing:
+                        // the lease lapses, a rival takes it, and the `Wait`
+                        // branch that normally demotes is guarded on `Held` —
+                        // so nothing would ever clear it and this node would
+                        // keep passing /readyz as a deposed leader.
+                        //
+                        // SUSPEND, though, not demote: a quorum miss is
+                        // retryable, and demotion marks the epoch released —
+                        // making the successful re-probe a promotion the view
+                        // permanently refuses, wedging the range under its own
+                        // live lease.
+                        self.suspended(fencing_epoch);
+                        return false;
+                    }
+                    crate::promotion::Promotion::LeaderBehind {
+                        committed_offset,
+                        leader_committed_offset,
+                    } => {
+                        tracing::warn!(
+                            range = %self.range_uuid,
+                            fencing_epoch,
+                            committed_offset,
+                            leader_committed_offset,
+                            "refusing promotion: this node's log does not reach the \
+                             quorum-proven boundary; letting the lease lapse so a \
+                             caught-up replica can win the range"
+                        );
+                        // Also retryable in principle: probes are a snapshot,
+                        // and a stale follower answer can transiently place
+                        // the boundary above this node's own disk.
+                        self.suspended(fencing_epoch);
+                        return false;
+                    }
+                }
+            }
+        };
+        self.publisher.promote(fencing_epoch, committed_offset);
+        self.verified_epoch = Some(fencing_epoch);
+        tracing::info!(range = %self.range_uuid, fencing_epoch, "range lease held");
+        true
+    }
+
+    fn lost(&mut self, fencing_epoch: u64) {
+        self.publisher.demote(fencing_epoch);
+        self.verified_epoch = None;
+    }
+
+    /// Stop serving at `fencing_epoch` without finishing the epoch: the lease
+    /// is still ours and the refusal that forced this may clear on retry.
+    /// `verified_epoch` resets so the next round re-probes rather than
+    /// trusting the verification that just failed.
+    fn suspended(&mut self, fencing_epoch: u64) {
+        self.publisher.suspend(fencing_epoch);
+        self.verified_epoch = None;
     }
 }
 
@@ -244,8 +496,7 @@ pub struct LeaseAgent {
     node_uuid: Uuid,
     topic_uuid: Uuid,
     range_uuid: Uuid,
-    /// Where transitions are published.
-    publisher: Arc<dyn LeasePublisher>,
+    promoter: Promoter,
     state: LeaseState,
     /// Local upper bound on how long the current hold may be trusted without
     /// hearing from metadata, in the same wall-clock the envelope carries.
@@ -278,6 +529,7 @@ impl LeaseAgent {
         topic_uuid: Uuid,
         range_uuid: Uuid,
         publisher: Arc<dyn LeasePublisher>,
+        probe: Option<Arc<dyn QuorumProbe>>,
     ) -> Result<Self, String> {
         config.validate()?;
         Ok(Self {
@@ -286,7 +538,13 @@ impl LeaseAgent {
             node_uuid,
             topic_uuid,
             range_uuid,
-            publisher,
+            promoter: Promoter {
+                publisher,
+                probe,
+                verified_epoch: None,
+                node_uuid,
+                range_uuid,
+            },
             state: LeaseState::NotHeld,
             held_until_ms: None,
         })
@@ -374,10 +632,12 @@ impl LeaseAgent {
                 // Trust exactly what metadata reported until the renewal
                 // lands; a renewal that errors out must not slide the local
                 // deadline forward on the strength of a read alone.
-                self.publish_held(
-                    fencing_epoch,
-                    view.lease.as_ref().and_then(|lease| lease.expires_at_ms),
-                );
+                let confirmed_until = view.lease.as_ref().and_then(|lease| lease.expires_at_ms);
+                if !self.publish_held(fencing_epoch, confirmed_until).await {
+                    // Could not verify the boundary; do not renew a lease this
+                    // process cannot safely serve under.
+                    return Ok(self.config.poll_interval);
+                }
                 match self.renew(fencing_epoch).await? {
                     true => {
                         let renewed_until = round_started_ms
@@ -401,7 +661,9 @@ impl LeaseAgent {
             LeaseDecision::HeldAdministratively { fencing_epoch } => {
                 // No deadline to track: an administrative lease cannot lapse,
                 // so a metadata partition never forces a local demotion.
-                self.publish_held(fencing_epoch, None);
+                if !self.publish_held(fencing_epoch, None).await {
+                    return Ok(self.config.poll_interval);
+                }
                 Ok(self.config.renew_interval)
             }
             LeaseDecision::Acquire {
@@ -416,15 +678,18 @@ impl LeaseAgent {
                 }
                 match self.acquire(expected_range_generation).await? {
                     Some(fencing_epoch) => {
-                        self.publish_held(
-                            fencing_epoch,
-                            Some(
-                                round_started_ms.saturating_add_unsigned(duration_ms(
-                                    self.config.lease_duration,
-                                )?),
-                            ),
+                        let granted_until = Some(
+                            round_started_ms
+                                .saturating_add_unsigned(duration_ms(self.config.lease_duration)?),
                         );
-                        Ok(self.config.renew_interval)
+                        if self.publish_held(fencing_epoch, granted_until).await {
+                            Ok(self.config.renew_interval)
+                        } else {
+                            // We hold the lease but cannot verify the boundary.
+                            // Metadata's deadline will hand it on if this does
+                            // not resolve; serving now would be the guess.
+                            Ok(self.config.poll_interval)
+                        }
                     }
                     // Lost the race, or our CAS token was stale. Either way the
                     // next read tells us the truth; guessing would not.
@@ -447,7 +712,7 @@ impl LeaseAgent {
                 // superseded, and it must not keep serving on it. Demotion is
                 // monotonic and idempotent, so repeating it every poll is
                 // free.
-                self.publisher.demote(fencing_epoch);
+                self.promoter.lost(fencing_epoch);
                 Ok(self.config.poll_interval)
             }
             LeaseDecision::RangeMissing => {
@@ -503,17 +768,15 @@ impl LeaseAgent {
         ))
     }
 
-    fn publish_held(&mut self, fencing_epoch: u64, held_until_ms: Option<i64>) {
-        if self.state != (LeaseState::Held { fencing_epoch }) {
-            tracing::info!(
-                range = %self.range_uuid,
-                fencing_epoch,
-                "range lease held"
-            );
+    async fn publish_held(&mut self, fencing_epoch: u64, held_until_ms: Option<i64>) -> bool {
+        if !self.promoter.ensure(fencing_epoch).await {
+            self.state = LeaseState::NotHeld;
+            self.held_until_ms = None;
+            return false;
         }
-        self.publisher.promote(fencing_epoch);
         self.state = LeaseState::Held { fencing_epoch };
         self.held_until_ms = held_until_ms;
+        true
     }
 
     fn publish_lost(&mut self, fencing_epoch: u64) {
@@ -522,7 +785,7 @@ impl LeaseAgent {
             fencing_epoch,
             "range lease lost; the broker will refuse writes under this epoch"
         );
-        self.publisher.demote(fencing_epoch);
+        self.promoter.lost(fencing_epoch);
         self.state = LeaseState::NotHeld;
         self.held_until_ms = None;
     }
@@ -687,11 +950,22 @@ mod tests {
         let broker = Arc::new(test_broker(dir.path(), 4));
         let publisher = BrokerLeasePublisher::new(Arc::clone(&broker));
 
-        publisher.promote(5);
+        publisher.promote(5, None);
         assert_eq!(broker.held_fencing_epoch(), 5);
         let (epoch, live) = broker.meta_fencing_epoch().try_snapshot().unwrap();
         assert_eq!(epoch, 5);
         assert!(live, "a promoted broker must hold a live lease");
+    }
+
+    /// A standalone broker has no replica set to establish against and must
+    /// still promote on its own durable boundary; requiring a quorum it cannot
+    /// form would make single-replica deployments unleadable.
+    #[test]
+    fn a_standalone_broker_promotes_without_a_replica_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Arc::new(test_broker(dir.path(), 4));
+        let publisher = BrokerLeasePublisher::new(Arc::clone(&broker));
+        publisher.promote(5, None);
     }
 
     /// A stale promotion arriving late must not rewind the broker onto an
@@ -702,8 +976,8 @@ mod tests {
         let broker = Arc::new(test_broker(dir.path(), 4));
         let publisher = BrokerLeasePublisher::new(Arc::clone(&broker));
 
-        publisher.promote(7);
-        publisher.promote(5);
+        publisher.promote(7, None);
+        publisher.promote(5, None);
         assert_eq!(
             broker.held_fencing_epoch(),
             7,
@@ -719,7 +993,7 @@ mod tests {
         let broker = Arc::new(test_broker(dir.path(), 4));
         let publisher = BrokerLeasePublisher::new(Arc::clone(&broker));
 
-        publisher.promote(5);
+        publisher.promote(5, None);
         publisher.demote(5);
         let (_, live) = broker.meta_fencing_epoch().try_snapshot().unwrap();
         assert!(!live, "a demoted broker must not hold a live lease");
@@ -758,6 +1032,229 @@ mod tests {
         .unwrap();
         let epochs = vtop_broker::ProducerEpochJournal::open(dir.join("epochs")).unwrap();
         LocalBroker::new(segment, epochs, range, epoch).unwrap()
+    }
+
+    fn promoter(
+        publisher: Arc<dyn LeasePublisher>,
+        probe: Option<Arc<dyn QuorumProbe>>,
+    ) -> Promoter {
+        Promoter {
+            publisher,
+            probe,
+            verified_epoch: None,
+            // Matches `at(1, ..)`: the tests' candidate is node 1.
+            node_uuid: Uuid::from_u128(1),
+            range_uuid: Uuid::from_u128(21),
+        }
+    }
+
+    #[derive(Default)]
+    struct Recorder {
+        promoted: std::sync::Mutex<Vec<(u64, Option<u64>)>>,
+        demoted: std::sync::Mutex<Vec<u64>>,
+        suspended: std::sync::Mutex<Vec<u64>>,
+    }
+
+    impl LeasePublisher for Recorder {
+        fn promote(&self, fencing_epoch: u64, committed_offset: Option<u64>) {
+            self.promoted
+                .lock()
+                .unwrap()
+                .push((fencing_epoch, committed_offset));
+        }
+        fn demote(&self, fencing_epoch: u64) {
+            self.demoted.lock().unwrap().push(fencing_epoch);
+        }
+        fn suspend(&self, fencing_epoch: u64) {
+            self.suspended.lock().unwrap().push(fencing_epoch);
+        }
+    }
+
+    struct FixedProbe {
+        probes: std::sync::Mutex<Vec<crate::promotion::ReplicaProbe>>,
+        factor: usize,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl QuorumProbe for FixedProbe {
+        async fn probe(&self) -> Vec<crate::promotion::ReplicaProbe> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.probes.lock().unwrap().clone()
+        }
+        fn replication_factor(&self) -> usize {
+            self.factor
+        }
+    }
+
+    fn fixed(probes: Vec<crate::promotion::ReplicaProbe>, factor: usize) -> Arc<FixedProbe> {
+        Arc::new(FixedProbe {
+            probes: std::sync::Mutex::new(probes),
+            factor,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    fn at(node: u128, offset: Option<u64>) -> crate::promotion::ReplicaProbe {
+        crate::promotion::ReplicaProbe {
+            node_id: Uuid::from_u128(node),
+            local_committed_offset: offset,
+        }
+    }
+
+    /// A refused promotion must PUBLISH the refusal, not merely flip local
+    /// state — but as a suspension, not a demotion.
+    ///
+    /// Two bugs pinned here, one from each direction. Flipping local state
+    /// alone left the broker's metadata view live while the agent stopped
+    /// renewing — a deposed leader that keeps passing `/readyz`. And demoting
+    /// (a release) poisoned the epoch: `clear_lease` records it in
+    /// `released_through`, so when the quorum recovered a beat later, the
+    /// successful re-promotion at the SAME epoch could never reactivate the
+    /// view, wedging the range under its own live lease.
+    #[tokio::test]
+    async fn a_refused_promotion_suspends_rather_than_stranding_or_poisoning() {
+        let recorder = Arc::new(Recorder::default());
+        let mut promoter = promoter(
+            Arc::clone(&recorder) as Arc<dyn LeasePublisher>,
+            Some(fixed(vec![at(1, Some(10)), at(2, None), at(3, None)], 3)),
+        );
+
+        assert!(!promoter.ensure(5).await, "one of three cannot promote");
+        assert!(
+            recorder.promoted.lock().unwrap().is_empty(),
+            "nothing may be published when the quorum refused"
+        );
+        assert_eq!(
+            *recorder.suspended.lock().unwrap(),
+            vec![5],
+            "the refusal must be published, or the broker keeps advertising a \
+             lease it cannot currently serve"
+        );
+        assert!(
+            recorder.demoted.lock().unwrap().is_empty(),
+            "a transient quorum miss must not release the epoch — release is \
+             permanent, and the coming retry must be able to reactivate it"
+        );
+    }
+
+    /// The recovery half of the transient-refusal story, end to end against a
+    /// real fencing view: quorum miss, then quorum back, and the broker must
+    /// actually serve again at the SAME epoch.
+    #[tokio::test]
+    async fn a_transient_quorum_miss_does_not_wedge_the_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Arc::new(test_broker(dir.path(), 0));
+        broker.meta_fencing_epoch().suspend(0);
+        let publisher: Arc<dyn LeasePublisher> =
+            Arc::new(BrokerLeasePublisher::new(Arc::clone(&broker)));
+        let probe = fixed(vec![at(1, Some(10)), at(2, None), at(3, None)], 3);
+        let mut promoter = promoter(
+            Arc::clone(&publisher),
+            Some(Arc::clone(&probe) as Arc<dyn QuorumProbe>),
+        );
+
+        assert!(!promoter.ensure(5).await);
+        let (_, live) = broker.meta_fencing_epoch().try_snapshot().unwrap();
+        assert!(!live, "the refusal must fence the broker");
+
+        // The followers come back before the lease lapses.
+        *probe.probes.lock().unwrap() = vec![at(1, Some(10)), at(2, Some(10)), at(3, Some(10))];
+        assert!(
+            promoter.ensure(5).await,
+            "the recovered quorum must verify the same epoch"
+        );
+        let (epoch, live) = broker.meta_fencing_epoch().try_snapshot().unwrap();
+        assert_eq!(epoch, 5);
+        assert!(
+            live,
+            "the same live grant must reactivate the broker; anything else wedges \
+             the range under its own lease until an external epoch change"
+        );
+    }
+
+    /// A candidate whose own log does not reach the quorum-proven boundary
+    /// must refuse AND publish that refusal: publishing the boundary instead
+    /// would let the produce fast path acknowledge writes into offsets
+    /// occupied by committed records this node never held. The refusal is a
+    /// SUSPENSION, not a demotion — probes are a snapshot, and a stale
+    /// follower answer can transiently place the boundary above this node's
+    /// disk; releasing the epoch for that would wedge the range under its own
+    /// live lease.
+    #[tokio::test]
+    async fn a_leader_behind_the_boundary_refuses_and_suspends() {
+        let recorder = Arc::new(Recorder::default());
+        let mut promoter = promoter(
+            Arc::clone(&recorder) as Arc<dyn LeasePublisher>,
+            Some(fixed(
+                vec![at(1, Some(50)), at(2, Some(90)), at(3, Some(90))],
+                3,
+            )),
+        );
+        assert!(!promoter.ensure(5).await);
+        assert!(
+            recorder.promoted.lock().unwrap().is_empty(),
+            "a boundary beyond this node's log must never be published"
+        );
+        assert_eq!(*recorder.suspended.lock().unwrap(), vec![5]);
+        assert!(
+            recorder.demoted.lock().unwrap().is_empty(),
+            "a possibly-transient refusal must not release the epoch"
+        );
+    }
+
+    /// Verification is once per epoch TRANSITION. Re-probing on every renewal
+    /// is pure cost for a leader that has not changed — and it is what made the
+    /// promotion log line fire every few seconds for the life of the process.
+    #[tokio::test]
+    async fn a_held_epoch_is_verified_once_not_on_every_renewal() {
+        let recorder = Arc::new(Recorder::default());
+        let probe = fixed(vec![at(1, Some(10)), at(2, Some(10))], 2);
+        let mut promoter = promoter(
+            Arc::clone(&recorder) as Arc<dyn LeasePublisher>,
+            Some(Arc::clone(&probe) as Arc<dyn QuorumProbe>),
+        );
+
+        for _ in 0..5 {
+            assert!(promoter.ensure(7).await);
+        }
+        assert_eq!(
+            probe.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one epoch, one verification"
+        );
+
+        // A NEW epoch is a different claim and must be verified again.
+        assert!(promoter.ensure(8).await);
+        assert_eq!(probe.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// The established boundary must reach the broker, or verification was
+    /// theatre: the whole point is that fetch stops hiding acknowledged
+    /// records after a failover.
+    #[tokio::test]
+    async fn the_established_boundary_is_published_with_the_epoch() {
+        let recorder = Arc::new(Recorder::default());
+        let mut promoter = promoter(
+            Arc::clone(&recorder) as Arc<dyn LeasePublisher>,
+            Some(fixed(
+                vec![at(1, Some(90)), at(2, Some(90)), at(3, Some(50))],
+                3,
+            )),
+        );
+        assert!(promoter.ensure(5).await);
+        assert_eq!(*recorder.promoted.lock().unwrap(), vec![(5, Some(90))]);
+    }
+
+    /// A standalone range has no quorum to establish against and must still
+    /// promote; requiring one it cannot form would make single-replica
+    /// deployments unleadable.
+    #[tokio::test]
+    async fn a_standalone_range_promotes_without_a_probe() {
+        let recorder = Arc::new(Recorder::default());
+        let mut promoter = promoter(Arc::clone(&recorder) as Arc<dyn LeasePublisher>, None);
+        assert!(promoter.ensure(5).await);
+        assert_eq!(*recorder.promoted.lock().unwrap(), vec![(5, None)]);
     }
 
     #[test]

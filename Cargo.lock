@@ -4096,7 +4096,9 @@ dependencies = [
 name = "vtop-node"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "clap",
+ "futures",
  "prometheus",
  "rustls",
  "serde",
