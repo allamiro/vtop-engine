@@ -9,8 +9,8 @@ use crate::types::{
     AppendOutcome, CommitStatementV1, Durability, FetchBatch, FetchedRecord, LogError, LogRecord,
     ProducerSummaryEntry, RecoveryReport, SegmentCommitKey, SegmentConfig, SegmentConfigV2,
     SegmentDescriptor, SegmentDescriptorV2, SegmentEvidence, SegmentManifest, SegmentManifestV2,
-    VtopLogResult, CHUNK_SIDECAR_MAGIC, CHUNK_TREE_SCHEME_V1, FORMAT_NAME, FORMAT_VERSION,
-    FORMAT_VERSION_V2, PRODUCER_SEQUENCE_WINDOW, RECORD_SCHEMA_VERSION_V2,
+    TruncateOutcome, VtopLogResult, CHUNK_SIDECAR_MAGIC, CHUNK_TREE_SCHEME_V1, FORMAT_NAME,
+    FORMAT_VERSION, FORMAT_VERSION_V2, PRODUCER_SEQUENCE_WINDOW, RECORD_SCHEMA_VERSION_V2,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -511,6 +511,132 @@ impl ActiveSegment {
 
     pub fn recovery_report(&self) -> &RecoveryReport {
         &self.recovery
+    }
+
+    /// Discard every record at or above `offset`.
+    ///
+    /// This exists for one caller: a replica that has diverged from the range's
+    /// current leadership and must drop the records it wrote under a leadership
+    /// that no longer holds, so it can be repaired instead of stranded (#240).
+    ///
+    /// It deliberately permits truncating BELOW [`Self::committed_offset`].
+    /// Locally durable is not the same as acknowledged: a follower fsyncs
+    /// appends before the leader has quorum, so the records that must be
+    /// discarded are exactly the ones this segment already considers committed.
+    /// A primitive that refused to cross its own commit point could not repair
+    /// the case it was built for. **Whether an offset is safe to discard is not
+    /// knowable here** — it depends on the cluster high-water mark, which lives
+    /// a layer up. That check belongs to the caller, and the caller must make
+    /// it; see `LocalBroker::truncate_to`.
+    ///
+    /// Derived state is rebuilt by re-reading the surviving bytes rather than
+    /// by rolling the in-memory state backwards. It is not a matter of taste:
+    /// the content accumulator is a one-way hash, and the producer sequence
+    /// states hold each producer's last sequence with no record of what
+    /// preceded it. Neither can be un-appended, and an "undo" path that tried
+    /// would be a second implementation of append semantics, free to drift from
+    /// the first.
+    pub fn truncate_to(&mut self, offset: u64) -> VtopLogResult<TruncateOutcome> {
+        self.ensure_writable()?;
+        let base = self.header.base_offset();
+        if offset > self.next_offset {
+            return Err(LogError::TruncateBeyondTail {
+                requested: offset,
+                next_offset: self.next_offset,
+            });
+        }
+        if offset < base {
+            return Err(LogError::InvalidConfig(format!(
+                "cannot truncate to offset {offset}: this segment begins at {base}"
+            )));
+        }
+        if offset == self.next_offset {
+            return Ok(TruncateOutcome {
+                records_removed: 0,
+                bytes_removed: 0,
+                next_offset: self.next_offset,
+            });
+        }
+
+        let position = position_of_offset(
+            self.file.as_mut(),
+            &self.path,
+            &self.header,
+            self.header_len,
+            &self.index,
+            offset,
+        )?;
+        let file_end = self.header_len + self.content_bytes;
+        let bytes_removed = file_end.saturating_sub(position);
+
+        // ORDER IS LOAD-BEARING. The commit-boundary sidecar is the authority
+        // that recovery trusts, and it must shrink BEFORE the file does.
+        //
+        // Crash between the two steps in this order and the file is longer than
+        // its boundary — the exact shape `inspect_active_file` already treats as
+        // a torn tail and truncates, so the next open completes the job.
+        //
+        // The other order leaves a boundary pointing past the end of the file,
+        // which recovery refuses to open at all (`CommitBoundaryMismatch`). A
+        // crash mid-truncation would permanently strand the replica — the very
+        // failure this method exists to remove, reintroduced by the repair.
+        self.persist_commit_boundary(offset, position - self.header_len)?;
+        if let Err(source) = self
+            .file
+            .set_len(position)
+            .and_then(|()| self.file.sync_data())
+        {
+            self.poisoned = true;
+            return Err(io_error(&self.path, source));
+        }
+
+        let scan = match scan_records(
+            self.file.as_mut(),
+            &self.path,
+            &self.header,
+            self.header_len,
+            Some(position),
+            false,
+        ) {
+            Ok(scan) => scan,
+            Err(error) => {
+                // The bytes are already gone. Refusing to serve from a state we
+                // could not re-derive is the only honest outcome.
+                self.poisoned = true;
+                return Err(error);
+            }
+        };
+        if scan.next_offset != offset {
+            self.poisoned = true;
+            return Err(LogError::Corrupt {
+                position,
+                reason: format!(
+                    "truncation to offset {offset} left a log ending at {}",
+                    scan.next_offset
+                ),
+            });
+        }
+        if let Err(source) = self.file.seek(SeekFrom::Start(position)) {
+            self.poisoned = true;
+            return Err(io_error(&self.path, source));
+        }
+
+        let records_removed = self.record_count.saturating_sub(scan.records);
+        self.next_offset = scan.next_offset;
+        // Everything that survives is durable: the boundary was written and the
+        // file fsynced above.
+        self.committed_offset = scan.next_offset;
+        self.record_count = scan.records;
+        self.content_bytes = position - self.header_len;
+        self.producer_states = scan.producer_states;
+        self.producer_epochs = scan.producer_epochs;
+        self.index = scan.index;
+        self.accumulator = scan.accumulator;
+        Ok(TruncateOutcome {
+            records_removed,
+            bytes_removed,
+            next_offset: self.next_offset,
+        })
     }
 
     pub fn append(
@@ -1613,6 +1739,71 @@ fn scan_records(
         index,
         accumulator,
     })
+}
+
+/// The byte position at which `target` begins.
+///
+/// The index is sparse — one entry every `index_stride` offsets — so it only
+/// narrows the search; the exact frame boundary has to be walked. A position
+/// guessed any other way would cut a record in half, and the truncation that
+/// followed would corrupt the segment rather than shorten it.
+fn position_of_offset(
+    mut file: &mut dyn StorageFile,
+    path: &Path,
+    header: &AnyHeader,
+    header_len: u64,
+    index: &[IndexEntry],
+    target: u64,
+) -> VtopLogResult<u64> {
+    if target <= header.base_offset() {
+        return Ok(header_len);
+    }
+    let entry = index
+        .iter()
+        .rev()
+        .find(|entry| entry.offset <= target)
+        .copied()
+        .unwrap_or(IndexEntry {
+            offset: header.base_offset(),
+            position: header_len,
+        });
+    file.seek(SeekFrom::Start(entry.position))
+        .map_err(|source| io_error(path, source))?;
+    let mut offset = entry.offset;
+    let mut position = entry.position;
+    while offset < target {
+        let frame = match read_frame_any(
+            header.format_version(),
+            &mut file,
+            position,
+            header.max_record_bytes(),
+        )
+        .map_err(|error| with_path(error, path))?
+        {
+            FrameRead::Complete(frame) => frame,
+            FrameRead::End | FrameRead::Torn => {
+                return Err(LogError::Corrupt {
+                    position,
+                    reason: format!(
+                        "log ends at offset {offset} while locating truncation target {target}"
+                    ),
+                });
+            }
+        };
+        let expected_relative = offset - header.base_offset();
+        if frame.relative_offset != expected_relative {
+            return Err(LogError::Corrupt {
+                position,
+                reason: format!(
+                    "record carries relative offset {}, expected {expected_relative}",
+                    frame.relative_offset
+                ),
+            });
+        }
+        position += frame.encoded_len as u64;
+        offset += 1;
+    }
+    Ok(position)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3785,5 +3976,275 @@ mod tests {
         for (index, fetched_record) in fetched.records.iter().enumerate() {
             assert_eq!(fetched_record.record.value, values[index]);
         }
+    }
+
+    /// Ten records in, five out, and the survivors are still readable — both
+    /// now and after a reopen, which is where a truncation that only edited
+    /// memory would come apart.
+    #[test]
+    fn truncation_drops_the_tail_and_survives_reopen() {
+        let directory = tempdir().unwrap();
+        let active_path = directory.path().join("truncate.active");
+        let producer = Uuid::from_u128(9);
+        {
+            let mut segment = ActiveSegment::create(&active_path, descriptor(), config()).unwrap();
+            for sequence in 0..10 {
+                segment
+                    .append(
+                        record(producer, sequence, format!("v{sequence}").as_bytes()),
+                        Durability::Fsync,
+                    )
+                    .unwrap();
+            }
+            assert_eq!(segment.next_offset(), 50);
+
+            let outcome = segment.truncate_to(45).unwrap();
+            assert_eq!(outcome.records_removed, 5);
+            assert_eq!(outcome.next_offset, 45);
+            assert!(outcome.bytes_removed > 0);
+            assert_eq!(segment.next_offset(), 45);
+            assert_eq!(segment.committed_offset(), 45);
+
+            let fetched = segment.fetch(40, 64 * 1024, 100).unwrap();
+            assert_eq!(fetched.records.len(), 5);
+            assert_eq!(fetched.records[4].record.value, b"v4".to_vec());
+        }
+
+        let reopened = ActiveSegment::recover(&active_path).unwrap();
+        assert_eq!(reopened.next_offset(), 45);
+        assert_eq!(
+            reopened.recovery_report().truncated_bytes,
+            0,
+            "the truncation was already durable; recovery should have nothing left to clean up"
+        );
+    }
+
+    /// The producer sequence state must come back with the records, not stay at
+    /// the high-water mark it reached before the truncation.
+    ///
+    /// This is the test that catches a truncation which only moved offsets. If
+    /// the state were carried forward, re-appending sequence 5 would be
+    /// rejected as a duplicate — the replica would have thrown the record away
+    /// and then refused to accept it again, which is a silent hole in the log
+    /// rather than a repair.
+    #[test]
+    fn truncation_rewinds_producer_state_so_discarded_sequences_can_be_rewritten() {
+        let directory = tempdir().unwrap();
+        let active_path = directory.path().join("producer-rewind.active");
+        let producer = Uuid::from_u128(11);
+        let mut segment = ActiveSegment::create(&active_path, descriptor(), config()).unwrap();
+        for sequence in 0..10 {
+            segment
+                .append(
+                    record(producer, sequence, format!("first-{sequence}").as_bytes()),
+                    Durability::Fsync,
+                )
+                .unwrap();
+        }
+
+        segment.truncate_to(45).unwrap();
+
+        // Sequence 5 was discarded, so it is once again the next one expected.
+        let outcome = segment
+            .append(record(producer, 5, b"rewritten"), Durability::Fsync)
+            .unwrap();
+        assert_eq!(outcome.offset(), 45);
+        assert_eq!(segment.next_offset(), 46);
+
+        let fetched = segment.fetch(45, 64 * 1024, 10).unwrap();
+        assert_eq!(fetched.records[0].record.value, b"rewritten".to_vec());
+    }
+
+    /// A truncated segment must be byte-for-byte indistinguishable from one
+    /// that only ever held the surviving records.
+    ///
+    /// The content root is a one-way hash, so this fails unless the accumulator
+    /// was genuinely rebuilt from the surviving bytes. Carrying the old hasher
+    /// forward would still produce a plausible-looking root — just one that no
+    /// longer describes the file, which nothing would notice until a proof was
+    /// checked against it.
+    #[test]
+    fn a_truncated_segment_seals_to_the_same_root_as_one_that_never_grew() {
+        let directory = tempdir().unwrap();
+        let producer = Uuid::from_u128(13);
+
+        let grew_then_shrank = directory.path().join("grew.active");
+        let mut segment = ActiveSegment::create(&grew_then_shrank, descriptor(), config()).unwrap();
+        for sequence in 0..10 {
+            segment
+                .append(
+                    record(producer, sequence, format!("v{sequence}").as_bytes()),
+                    Durability::Fsync,
+                )
+                .unwrap();
+        }
+        segment.truncate_to(45).unwrap();
+        let truncated_root = segment.seal().unwrap().manifest().blake3_root.clone();
+
+        let never_grew = directory.path().join("small.active");
+        let mut segment = ActiveSegment::create(&never_grew, descriptor(), config()).unwrap();
+        for sequence in 0..5 {
+            segment
+                .append(
+                    record(producer, sequence, format!("v{sequence}").as_bytes()),
+                    Durability::Fsync,
+                )
+                .unwrap();
+        }
+        let pristine_root = segment.seal().unwrap().manifest().blake3_root.clone();
+
+        assert_eq!(
+            truncated_root, pristine_root,
+            "a truncated log must hash as the log it now is, not as the log it used to be"
+        );
+    }
+
+    /// A crash between the two durable steps must be recoverable.
+    ///
+    /// The boundary is written before the file shrinks, so the window looks
+    /// like a file longer than its boundary — a torn tail, which recovery
+    /// already truncates. Simulated by writing the smaller boundary and
+    /// stopping there, which is exactly what a crash in that window leaves
+    /// behind.
+    #[test]
+    fn a_crash_between_the_boundary_and_the_file_completes_on_recovery() {
+        let directory = tempdir().unwrap();
+        let active_path = directory.path().join("half-truncated.active");
+        let producer = Uuid::from_u128(17);
+        let (position, header_len) = {
+            let mut segment = ActiveSegment::create(&active_path, descriptor(), config()).unwrap();
+            for sequence in 0..10 {
+                segment
+                    .append(
+                        record(producer, sequence, format!("v{sequence}").as_bytes()),
+                        Durability::Fsync,
+                    )
+                    .unwrap();
+            }
+            let position = position_of_offset(
+                segment.file.as_mut(),
+                &segment.path,
+                &segment.header,
+                segment.header_len,
+                &segment.index,
+                45,
+            )
+            .unwrap();
+            (position, segment.header_len)
+        };
+
+        let paths = SegmentPaths::from_active(&active_path).unwrap();
+        write_commit_boundary_atomic(
+            &Env::real(),
+            &paths.commit,
+            CommitBoundary {
+                segment_id: descriptor().segment_id,
+                committed_offset: 45,
+                content_bytes: position - header_len,
+            },
+        )
+        .unwrap();
+
+        let recovered = ActiveSegment::recover(&active_path).unwrap();
+        assert_eq!(
+            recovered.next_offset(),
+            45,
+            "recovery should finish the truncation the crash interrupted"
+        );
+        assert!(
+            recovered.recovery_report().truncated_bytes > 0,
+            "the bytes past the boundary should have been cleaned up on the way in"
+        );
+    }
+
+    #[test]
+    fn truncating_to_the_current_tail_changes_nothing() {
+        let directory = tempdir().unwrap();
+        let active_path = directory.path().join("noop.active");
+        let mut segment = ActiveSegment::create(&active_path, descriptor(), config()).unwrap();
+        for sequence in 0..3 {
+            segment
+                .append(
+                    record(Uuid::from_u128(19), sequence, b"v"),
+                    Durability::Fsync,
+                )
+                .unwrap();
+        }
+
+        let outcome = segment.truncate_to(43).unwrap();
+        assert_eq!(outcome.records_removed, 0);
+        assert_eq!(outcome.bytes_removed, 0);
+        assert_eq!(segment.next_offset(), 43);
+    }
+
+    /// Truncation removes records; it can never invent them.
+    #[test]
+    fn truncation_cannot_extend_the_log() {
+        let directory = tempdir().unwrap();
+        let active_path = directory.path().join("forward.active");
+        let mut segment = ActiveSegment::create(&active_path, descriptor(), config()).unwrap();
+        segment
+            .append(record(Uuid::from_u128(23), 0, b"v"), Durability::Fsync)
+            .unwrap();
+
+        assert!(matches!(
+            segment.truncate_to(99),
+            Err(LogError::TruncateBeyondTail {
+                requested: 99,
+                next_offset: 41
+            })
+        ));
+        // A refused truncation must leave the segment usable.
+        assert_eq!(segment.next_offset(), 41);
+        segment
+            .append(record(Uuid::from_u128(23), 1, b"w"), Durability::Fsync)
+            .unwrap();
+    }
+
+    /// Truncating everything away leaves a valid empty segment at its base
+    /// offset, not a broken one — a replica whose entire log diverged still has
+    /// to be able to start over.
+    #[test]
+    fn truncating_to_the_base_offset_empties_the_segment() {
+        let directory = tempdir().unwrap();
+        let active_path = directory.path().join("empty.active");
+        let producer = Uuid::from_u128(29);
+        {
+            let mut segment = ActiveSegment::create(&active_path, descriptor(), config()).unwrap();
+            for sequence in 0..4 {
+                segment
+                    .append(record(producer, sequence, b"v"), Durability::Fsync)
+                    .unwrap();
+            }
+
+            let outcome = segment.truncate_to(40).unwrap();
+            assert_eq!(outcome.records_removed, 4);
+            assert_eq!(segment.next_offset(), 40);
+            assert_eq!(segment.fetch(40, 64 * 1024, 10).unwrap().records.len(), 0);
+
+            // And it still accepts writes, starting the producer over.
+            segment
+                .append(record(producer, 0, b"again"), Durability::Fsync)
+                .unwrap();
+        }
+
+        let reopened = ActiveSegment::recover(&active_path).unwrap();
+        assert_eq!(reopened.next_offset(), 41);
+    }
+
+    /// Below the base offset is not an empty log, it is a nonsense one.
+    #[test]
+    fn truncation_below_the_base_offset_is_refused() {
+        let directory = tempdir().unwrap();
+        let active_path = directory.path().join("below-base.active");
+        let mut segment = ActiveSegment::create(&active_path, descriptor(), config()).unwrap();
+        segment
+            .append(record(Uuid::from_u128(31), 0, b"v"), Durability::Fsync)
+            .unwrap();
+
+        assert!(matches!(
+            segment.truncate_to(39),
+            Err(LogError::InvalidConfig(_))
+        ));
     }
 }

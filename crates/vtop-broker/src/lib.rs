@@ -100,6 +100,14 @@ pub enum BrokerError {
         current: u64,
         actual: u64,
     },
+    #[error(
+        "refusing to truncate to offset {requested}: records below the cluster high-water mark {high_watermark} were acknowledged to producers"
+    )]
+    TruncationBelowAcknowledged { requested: u64, high_watermark: u64 },
+    #[error(
+        "refusing to truncate an unreplicated broker: every durable record here is acknowledged"
+    )]
+    TruncationWithoutReplication,
     #[error("TLS configuration error: {0}")]
     Tls(#[from] rustls::Error),
     #[error("protocol error: {0}")]
@@ -773,12 +781,19 @@ impl LocalBroker {
     /// truncation computed from it could discard acknowledged records.
     /// Reporting "unknown" there is the honest answer, and the API already
     /// handles it.
+    ///
+    /// Also completes an interrupted truncation. See
+    /// [`Self::attach_epoch_journal_to_log`].
     pub fn set_fencing_epoch_journal(
         &self,
         mut journal: crate::fencing_epochs::FencingEpochJournal,
     ) {
+        let (_, next_offset) = self.local_offsets();
+        if !Self::attach_epoch_journal_to_log(&mut journal, next_offset) {
+            self.fencing_epoch_history_broken
+                .store(true, Ordering::SeqCst);
+        }
         if journal.latest().is_none() {
-            let (_, next_offset) = self.local_offsets();
             let epoch = self.held_fencing_epoch.load(Ordering::SeqCst);
             // Epoch 0 is the "no grant yet" sentinel a lease-driven replica
             // starts at, not an epoch that ever wrote a record. Seeding it
@@ -793,6 +808,35 @@ impl LocalBroker {
             .fencing_epoch_journal
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(journal);
+    }
+
+    /// Reconcile a freshly opened epoch vector against the log it describes,
+    /// completing a truncation that a crash interrupted (#240).
+    ///
+    /// [`Self::truncate_to`] shortens the log before the vector. A crash
+    /// between the two leaves entries whose start offset sits beyond the log's
+    /// tail — a claim to own records past the end of the file, which cannot be
+    /// true of any log and so is safe to drop on sight. Doing it here, where
+    /// the vector first meets the log, means the window closes on the next open
+    /// rather than waiting for a promotion to trip over it.
+    ///
+    /// Strictly beyond, not at: an entry AT the tail is the normal state of a
+    /// replica granted an epoch it has not yet written under, which
+    /// [`Self::adopt_fencing_epoch`] records deliberately.
+    ///
+    /// Returns false if the repair could not be made durable, in which case the
+    /// vector still overstates the log and must not be offered to a peer.
+    fn attach_epoch_journal_to_log(
+        journal: &mut crate::fencing_epochs::FencingEpochJournal,
+        next_offset: u64,
+    ) -> bool {
+        let overstates = journal
+            .latest()
+            .is_some_and(|entry| entry.start_offset > next_offset);
+        if !overstates {
+            return true;
+        }
+        journal.truncate_to(next_offset.saturating_add(1)).is_ok()
     }
 
     /// This replica's epoch history.
@@ -818,6 +862,77 @@ impl LocalBroker {
             .as_ref()
             .map(|journal| journal.entries().to_vec())
             .unwrap_or_default()
+    }
+
+    /// Discard every record at or above `offset` and drop the epoch entries
+    /// that described them (#240).
+    ///
+    /// This is the repair for a replica that diverged from the range's current
+    /// leadership: it wrote records under a leader that lost the range before
+    /// those records reached a quorum, and it cannot follow the new leader
+    /// until they are gone. Without it such a replica is stranded permanently —
+    /// it refuses every append and no amount of retrying fixes it.
+    ///
+    /// # The bound this enforces
+    ///
+    /// `offset` may never fall below the cluster high-water mark. Records below
+    /// it were acknowledged to producers, and discarding them is data loss, not
+    /// repair. This is the check the segment layer cannot make — it has no idea
+    /// what a quorum agreed to — and it is the reason the primitive is not
+    /// exposed directly.
+    ///
+    /// A broker with no replication at all refuses outright. Every durable
+    /// record on such a node is acknowledged by definition, so there is no
+    /// divergence to repair and any truncation would be pure loss.
+    ///
+    /// # Order
+    ///
+    /// The log is truncated before the epoch vector, and the crash window
+    /// between them is why. Log-first leaves entries claiming epochs that begin
+    /// past the tail — impossible on their face, so [`Self::attach_epoch_journal_to_log`]
+    /// detects and drops them on the next open. Vector-first would leave
+    /// surviving records silently re-attributed to the preceding epoch, which
+    /// is undetectable and is precisely the misattribution the vector exists to
+    /// prevent. Neither order is atomic; only one fails in a way we can see.
+    pub fn truncate_to(&self, offset: u64) -> BrokerResult<vtop_log::TruncateOutcome> {
+        let Some(cluster_committed) = self.cluster_committed.as_ref() else {
+            return Err(BrokerError::TruncationWithoutReplication);
+        };
+        let high_watermark = cluster_committed.get();
+        if offset < high_watermark {
+            return Err(BrokerError::TruncationBelowAcknowledged {
+                requested: offset,
+                high_watermark,
+            });
+        }
+
+        let outcome = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state
+                .segment
+                .truncate_to(offset)
+                .map_err(|source| BrokerError::InvalidConfig(source.to_string()))?
+        };
+
+        let mut guard = self
+            .fencing_epoch_journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(journal) = guard.as_mut() {
+            if journal.truncate_to(offset).is_err() {
+                // The records are gone and the vector still describes them. It
+                // now overstates this replica's history, so it must stop being
+                // offered as one: `epoch_starts` reports "unknown", which every
+                // caller already handles, rather than a vector a peer could
+                // reconcile against and truncate itself on the strength of.
+                self.fencing_epoch_history_broken
+                    .store(true, Ordering::SeqCst);
+            }
+        }
+        Ok(outcome)
     }
 
     fn record_epoch_start(&self, epoch: u64, start_offset: u64) {

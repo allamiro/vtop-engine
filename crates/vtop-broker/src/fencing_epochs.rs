@@ -255,12 +255,105 @@ impl FencingEpochJournal {
         Ok(())
     }
 
+    /// Drop every epoch that begins at or above `offset`, because the records
+    /// it described have been truncated away.
+    ///
+    /// The vector's entries are claims about where records sit. Truncating the
+    /// log without truncating this leaves entries pointing past the tail —
+    /// claims about records that no longer exist. A peer comparing against them
+    /// would compute a divergence point beyond the end of our log, and the next
+    /// reconciliation would be arithmetic over a fiction.
+    ///
+    /// An epoch that STRADDLES the truncation point is kept, not dropped: it
+    /// still owns the surviving records below `offset`, and its start offset is
+    /// still where it began. Only epochs that begin at or above the cut lose
+    /// their entire extent.
+    ///
+    /// Rewriting is a truncate-in-place: the surviving entries are a prefix of
+    /// the file (entries are appended in increasing start offset), so shortening
+    /// the file to the survivors' length is the whole edit. Unlike the segment,
+    /// there is no separate boundary sidecar to order against — the file length
+    /// IS the record count, so one `set_len` plus one fsync is atomic enough. A
+    /// crash before the fsync leaves the longer file, which reads back as the
+    /// pre-truncation vector: stale, but never a partial entry, because the
+    /// length only ever moves between entry boundaries.
+    pub fn truncate_to(&mut self, offset: u64) -> BrokerResult<usize> {
+        if self.poisoned {
+            return Err(Self::corrupt(
+                "a previous append failed; this journal may hold a partial record and must be \
+                 reopened before it is rewritten"
+                    .to_owned(),
+            ));
+        }
+        let keep = self
+            .entries
+            .iter()
+            .take_while(|entry| entry.start_offset < offset)
+            .count();
+        let dropped = self.entries.len() - keep;
+        if dropped == 0 {
+            return Ok(0);
+        }
+        let new_len = HEADER_BYTES + (keep as u64) * ENTRY_BYTES as u64;
+        if let Err(source) = self
+            .file
+            .set_len(new_len)
+            .and_then(|()| self.file.sync_data())
+        {
+            self.poisoned = true;
+            return Err(Self::io(&self.path, source));
+        }
+        if let Err(source) = self.file.seek(SeekFrom::Start(new_len)) {
+            self.poisoned = true;
+            return Err(Self::io(&self.path, source));
+        }
+        self.entries.truncate(keep);
+        Ok(dropped)
+    }
+
+    /// Re-anchor the currently held epoch at `offset` after a truncation.
+    ///
+    /// Truncation can remove the entry that said where the held epoch began —
+    /// it started above the cut, so its records are gone. The replica still
+    /// holds that epoch and will write under it next, but the vector no longer
+    /// says so, and the records it goes on to write would be attributed to
+    /// whichever older epoch now sits at the end of the vector. That is a
+    /// misattribution, and it is precisely what this file exists to prevent, so
+    /// truncation has to close the hole it opened.
+    ///
+    /// A no-op when the vector already ends at or above `epoch`, and for epoch
+    /// 0 — the "no grant yet" sentinel, which never wrote a record.
+    pub fn record_held_epoch_at(&mut self, epoch: u64, offset: u64) -> BrokerResult<()> {
+        if epoch == 0 {
+            return Ok(());
+        }
+        if self.entries.last().is_some_and(|last| last.epoch >= epoch) {
+            return Ok(());
+        }
+        self.record(epoch, offset)
+    }
+
     pub fn entries(&self) -> &[EpochStart] {
         &self.entries
     }
 
     pub fn latest(&self) -> Option<EpochStart> {
         self.entries.last().copied()
+    }
+
+    /// Which epoch wrote the record at `offset` on this replica.
+    ///
+    /// The entries partition the log, so the answer is the last epoch that
+    /// began at or below `offset`. `None` means this replica cannot say —
+    /// either it has no history or `offset` sits below the first epoch it
+    /// recorded — and callers must treat that as unknown rather than assuming
+    /// the oldest epoch wrote it.
+    pub fn epoch_owning(&self, offset: u64) -> Option<u64> {
+        self.entries
+            .iter()
+            .rev()
+            .find(|entry| entry.start_offset <= offset)
+            .map(|entry| entry.epoch)
     }
 
     /// Where `epoch` ends on this replica: the start of the next recorded
@@ -640,5 +733,111 @@ mod tests {
     #[test]
     fn the_local_bound_matches_the_wire_bound() {
         assert_eq!(MAX_ENTRIES, vtop_protocol::MAX_REPLICA_EPOCH_STARTS);
+    }
+
+    /// Truncation drops the epochs whose records are gone and keeps the one
+    /// that straddles the cut — it still owns everything below it.
+    #[test]
+    fn truncation_drops_epochs_above_the_cut_and_keeps_the_straddler() {
+        let dir = TempDir::new().unwrap();
+        {
+            let mut j = journal(&dir);
+            j.record(1, 0).unwrap();
+            j.record(2, 100).unwrap();
+            j.record(3, 300).unwrap();
+            j.record(4, 500).unwrap();
+
+            assert_eq!(j.truncate_to(200).unwrap(), 2, "epochs 3 and 4 are gone");
+            assert_eq!(
+                j.entries(),
+                &[
+                    EpochStart {
+                        epoch: 1,
+                        start_offset: 0
+                    },
+                    EpochStart {
+                        epoch: 2,
+                        start_offset: 100
+                    },
+                ],
+                "epoch 2 began at 100 and still owns 100..200"
+            );
+        }
+        assert_eq!(
+            journal(&dir).entries().len(),
+            2,
+            "the rewrite must be durable, not just in memory"
+        );
+    }
+
+    /// An epoch starting exactly at the cut owns nothing below it, so it goes.
+    #[test]
+    fn truncation_drops_an_epoch_starting_exactly_at_the_cut() {
+        let dir = TempDir::new().unwrap();
+        let mut j = journal(&dir);
+        j.record(1, 0).unwrap();
+        j.record(2, 100).unwrap();
+
+        assert_eq!(j.truncate_to(100).unwrap(), 1);
+        assert_eq!(j.latest().unwrap().epoch, 1);
+    }
+
+    #[test]
+    fn truncation_above_every_entry_changes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let mut j = journal(&dir);
+        j.record(1, 0).unwrap();
+        j.record(2, 100).unwrap();
+
+        assert_eq!(j.truncate_to(900).unwrap(), 0);
+        assert_eq!(j.entries().len(), 2);
+    }
+
+    /// After truncating, the journal must still be appendable — and the next
+    /// entry must land at the right byte, not after the corpses of the dropped
+    /// ones. Reopening is what proves the file was really shortened.
+    #[test]
+    fn a_truncated_journal_still_appends_at_the_right_place() {
+        let dir = TempDir::new().unwrap();
+        {
+            let mut j = journal(&dir);
+            j.record(1, 0).unwrap();
+            j.record(2, 100).unwrap();
+            j.record(3, 300).unwrap();
+            j.truncate_to(200).unwrap();
+            j.record(7, 150).unwrap();
+        }
+        assert_eq!(
+            journal(&dir).entries(),
+            &[
+                EpochStart {
+                    epoch: 1,
+                    start_offset: 0
+                },
+                EpochStart {
+                    epoch: 2,
+                    start_offset: 100
+                },
+                EpochStart {
+                    epoch: 7,
+                    start_offset: 150
+                },
+            ]
+        );
+    }
+
+    /// Truncating everything leaves an empty vector, which reads as "unknown" —
+    /// the correct answer for a replica whose entire history was discarded.
+    #[test]
+    fn truncating_to_zero_empties_the_vector() {
+        let dir = TempDir::new().unwrap();
+        {
+            let mut j = journal(&dir);
+            j.record(1, 0).unwrap();
+            j.record(2, 100).unwrap();
+            assert_eq!(j.truncate_to(0).unwrap(), 2);
+            assert!(j.latest().is_none());
+        }
+        assert!(journal(&dir).latest().is_none());
     }
 }

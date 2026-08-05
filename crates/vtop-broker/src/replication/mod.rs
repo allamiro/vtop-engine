@@ -274,15 +274,22 @@ impl InProcessFollower {
     ///
     /// Seeds the held epoch only when both the vector and the log are empty;
     /// see [`crate::LocalBroker::set_fencing_epoch_journal`] for why a replica
-    /// that already holds records must report "unknown" instead.
+    /// that already holds records must report "unknown" instead. Also completes
+    /// a truncation interrupted by a crash, per
+    /// [`crate::LocalBroker::attach_epoch_journal_to_log`].
     pub fn set_fencing_epoch_journal(
         &self,
         mut journal: crate::fencing_epochs::FencingEpochJournal,
     ) {
         let epoch = self.held_fencing_epoch.load(Ordering::SeqCst);
+        let next_offset = self.next_offset();
+        if !crate::LocalBroker::attach_epoch_journal_to_log(&mut journal, next_offset) {
+            self.fencing_epoch_history_broken
+                .store(true, Ordering::SeqCst);
+        }
         // Epoch 0 is the "no grant yet" sentinel, never a writing epoch.
         if journal.latest().is_none()
-            && self.next_offset() == 0
+            && next_offset == 0
             && epoch > 0
             && journal.record(epoch, 0).is_err()
         {
@@ -293,6 +300,69 @@ impl InProcessFollower {
             .fencing_epoch_journal
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(journal);
+    }
+
+    /// Discard every record at or above `offset` and drop the epoch entries
+    /// that described them (#240).
+    ///
+    /// The follower is the replica this repair exists for: it fsyncs the
+    /// leader's appends before that leader has a quorum, so a leader deposed
+    /// mid-flight leaves records here that no quorum ever agreed to. Until they
+    /// are gone this follower refuses every append from the new leader and is
+    /// stranded — retrying forever against a mismatch that retrying cannot fix.
+    ///
+    /// See [`crate::LocalBroker::truncate_to`] for the acknowledged-records
+    /// bound and why the log is truncated before the vector.
+    pub fn truncate_to(&self, offset: u64) -> BrokerResult<vtop_log::TruncateOutcome> {
+        let high_watermark = self.cluster_committed.get();
+        if offset < high_watermark {
+            return Err(BrokerError::TruncationBelowAcknowledged {
+                requested: offset,
+                high_watermark,
+            });
+        }
+
+        let outcome = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state
+                .segment
+                .truncate_to(offset)
+                .map_err(|source| BrokerError::InvalidConfig(source.to_string()))?
+        };
+
+        let mut guard = self
+            .fencing_epoch_journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(journal) = guard.as_mut() {
+            let repaired = journal.truncate_to(offset).and_then(|_| {
+                journal.record_held_epoch_at(self.held_fencing_epoch.load(Ordering::SeqCst), offset)
+            });
+            if repaired.is_err() {
+                self.fencing_epoch_history_broken
+                    .store(true, Ordering::SeqCst);
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Which epoch wrote the record at `offset` on this replica; `None` when
+    /// the history is unknown or has a hole.
+    fn epoch_owning(&self, offset: u64) -> Option<u64> {
+        // Flag read under the lock, as in `epoch_starts`: a vector with a hole
+        // must not answer this question, because the answer decides whether an
+        // append is a retry or a divergence.
+        let guard = self
+            .fencing_epoch_journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.fencing_epoch_history_broken.load(Ordering::SeqCst) {
+            return None;
+        }
+        guard.as_ref()?.epoch_owning(offset)
     }
 
     /// This replica's epoch history; empty means "unknown", never "no changes".
@@ -484,6 +554,40 @@ impl InProcessFollower {
                     ErrorCode::InvalidRequest,
                     "replica append batch end overflows u64".to_owned(),
                 ))?;
+            // Durability through the batch end is NOT enough to ack, and
+            // treating it as enough is how divergent data gets acknowledged
+            // (#240). "I already hold offset 5" is only a retry if it is the
+            // SAME record at offset 5. A replica that took records from a
+            // leader deposed before those records reached a quorum holds a
+            // different record there, and acking it lets the new leader count
+            // this replica toward a quorum for bytes it does not have —
+            // committed data that differs between replicas, which is the exact
+            // failure the epoch vector exists to prevent.
+            //
+            // The vector answers it: if the epoch that wrote the record at this
+            // offset is not the epoch now asking to write it, the two leaders
+            // disagree about this offset and the difference must surface as a
+            // refusal so the replica can be truncated and repaired.
+            //
+            // An UNKNOWN history keeps the old behaviour rather than failing
+            // closed. A replica with no vector cannot distinguish the two cases
+            // at all, and refusing every catch-up there would strand precisely
+            // the replicas that predate #240 — trading a rare divergence for a
+            // certain outage. Once every replica carries a vector this should
+            // become fail-closed; until then the gap is real and narrower.
+            if let Some(owner) = self.epoch_owning(request.expected_base_offset) {
+                if owner != request.fencing_epoch {
+                    return Err((
+                        ErrorCode::Fenced,
+                        format!(
+                            "follower holds offset {} written under fencing epoch {owner}, but \
+                             epoch {} is writing there: this replica has diverged and must be \
+                             truncated before it can follow",
+                            request.expected_base_offset, request.fencing_epoch
+                        ),
+                    ));
+                }
+            }
             if state.segment.committed_offset() >= batch_end {
                 return Ok(ReplicaAppendResponse {
                     local_committed_offset: state.segment.committed_offset(),
