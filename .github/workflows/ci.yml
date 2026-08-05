@@ -158,6 +158,11 @@ jobs:
               # triggered nothing. That is how a scenario stayed red on main
               # without anyone noticing.
               - 'scripts/live-chaos/**'
+              # The release-notes generator only ever runs during a tag build,
+              # where a failure means a published release with a broken body and
+              # no second chance to get it right before people see it. Lint it
+              # on the pull request instead.
+              - 'scripts/release-notes.sh'
               - '.github/workflows/**'
 
             # `scripts/live-chaos/run-all.sh`. The harness drives real
@@ -298,7 +303,7 @@ jobs:
       - name: shellcheck
         run: |
           docker run --rm -v "$PWD:/mnt" -w /mnt \
-            koalaman/shellcheck:v0.11.0 docker/*.sh
+            koalaman/shellcheck:v0.11.0 docker/*.sh scripts/release-notes.sh
 
       # `-P scripts/live-chaos/scenarios` resolves the scenarios' dynamic
       # `source "$(dirname …)/../lib.sh"`. Without it every scenario reports
