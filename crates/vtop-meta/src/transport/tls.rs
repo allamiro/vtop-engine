@@ -108,20 +108,35 @@ pub fn server_name(name: &str) -> TransportResult<ServerName<'static>> {
         .map_err(|error| TransportError::Tls(format!("server name {name:?}: {error}")))
 }
 
-/// Extract [`MetaNodeId`] from a leaf certificate's Common Name.
+/// Extract a leaf certificate's Common Name verbatim.
 ///
-/// The CN must be a decimal integer matching the Raft node id. Leading zeros
-/// and non-numeric CNs are rejected.
-pub fn meta_node_id_from_cert(der: &CertificateDer<'_>) -> TransportResult<MetaNodeId> {
+/// The CA controls this value, which is what makes it usable as an identity: a
+/// client cannot choose its own name without the CA issuing it one. Callers
+/// interpret the string (see [`crate::transport::authz::AdminIdentity`]); this
+/// function does not.
+pub fn common_name_from_cert(der: &CertificateDer<'_>) -> TransportResult<String> {
     let (_, cert) = X509Certificate::from_der(der.as_ref())
         .map_err(|error| TransportError::Identity(format!("parse leaf cert: {error}")))?;
-    let subject = cert.subject();
-    let cn = subject
+    let cn = cert
+        .subject()
         .iter_common_name()
         .next()
         .ok_or_else(|| TransportError::Identity("leaf certificate has no Common Name".to_owned()))?
         .as_str()
         .map_err(|error| TransportError::Identity(format!("CN is not UTF-8: {error}")))?;
+    Ok(cn.to_owned())
+}
+
+/// Extract [`MetaNodeId`] from a leaf certificate's Common Name.
+///
+/// The CN must parse as a decimal integer matching the Raft node id;
+/// non-numeric CNs are rejected. Note that `u64::from_str` accepts padding and
+/// a leading sign, so `"007"` and `"+7"` both denote node 7 — several CN
+/// spellings map to one id. That is harmless because the CA, not the client,
+/// chooses the CN, but anything else deriving identity from a CN must use this
+/// same parse so the two never disagree about who a certificate is.
+pub fn meta_node_id_from_cert(der: &CertificateDer<'_>) -> TransportResult<MetaNodeId> {
+    let cn = common_name_from_cert(der)?;
     let id: u64 = cn.parse().map_err(|_| {
         TransportError::Identity(format!("certificate CN {cn:?} is not a decimal MetaNodeId"))
     })?;

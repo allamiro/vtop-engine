@@ -83,7 +83,11 @@ replica_addr()    { echo "$DATA_HOST:$(replica_port "$1")"; }
 SCENARIO="${SCENARIO:-$(basename "${0%.sh}")}"
 
 log()  { printf '[%s] %s\n' "$SCENARIO" "$*"; }
-fail() { log "FAIL: $*"; exit 1; }
+# Failures go to stderr, not stdout. Helpers like `start_follower` return a pid
+# on stdout, so callers routinely capture or discard it — and a `fail` written
+# to stdout inside one of those disappears, leaving a bare `exit 1` with no
+# reason anywhere. The diagnosis matters most exactly when it is hardest to see.
+fail() { printf '[%s] FAIL: %s\n' "$SCENARIO" "$*" >&2; exit 1; }
 
 require_command() { # <command> <installation/remediation hint>
   local command="$1" hint="$2"
@@ -308,21 +312,47 @@ emit_meta_config() {
       echo "  - { id: $peer, addr: \"$(meta_host "$peer"):$(meta_peer_port "$peer")\", server_name: \"localhost\" }"
     done
     echo "tls: { ca: $CERTS/ca.pem, cert: $CERTS/meta-$id.pem, key: $CERTS/meta-$id-key.pem }"
+    # Admin authorization is opt-in (#238), and the harness leaves it off by
+    # default so every pre-existing scenario keeps exercising the unrestricted
+    # endpoint. Scenario 11 sets META_ADMIN_OPERATORS to turn it on. Note that
+    # an EMPTY value is not the same as an unset one: unset omits the block
+    # (permissive), while empty emits a block naming no operators, which is the
+    # strictest possible policy.
+    if [[ -n "${META_ADMIN_OPERATORS+x}" ]]; then
+      echo "admin_authorization:"
+      echo "  operator_common_names:"
+      local operator
+      for operator in ${META_ADMIN_OPERATORS}; do
+        echo "    - \"$operator\""
+      done
+    fi
     echo "observability: { listen: \"$(meta_metrics_addr "$id")\" }"
   } > "$cfg"
   echo "$cfg"
 }
 
-# emit_admin_config <node-id> — client config for vtopctl meta
+# emit_admin_config <node-id> — client config for vtopctl meta, operator cert
 emit_admin_config() {
+  emit_admin_config_as "$1" admin
+}
+
+# emit_admin_config_as <node-id> <cert-basename> — speak to the admin endpoint
+# as an arbitrary certificate holder.
+#
+# Exists so a scenario can present a DATA-NODE certificate to the admin
+# endpoint and prove it is refused. Without this the harness could only ever
+# test the happy path, because every admin call would use the operator cert
+# that the policy is designed to permit.
+emit_admin_config_as() {
   local id="$1"
-  local cfg="$WORKDIR/admin-$id.yaml"
+  local cert="$2"
+  local cfg="$WORKDIR/admin-$id-$cert.yaml"
   {
     echo "endpoint: \"$(meta_host "$id"):$(meta_admin_port "$id")\""
     echo "server_name: \"localhost\""
     echo "ca_cert: $CERTS/ca.pem"
-    echo "client_cert: $CERTS/admin.pem"
-    echo "client_key: $CERTS/admin-key.pem"
+    echo "client_cert: $CERTS/$cert.pem"
+    echo "client_key: $CERTS/$cert-key.pem"
   } > "$cfg"
   echo "$cfg"
 }
@@ -360,15 +390,24 @@ emit_leader_config() {
   echo "$cfg"
 }
 
-# emit_lease_yaml <meta-id> — the `lease` block that hands leadership to the
-# metadata plane (#223).
+# emit_lease_yaml <meta-id> [data-cert-basename] — the `lease` block that hands
+# leadership to the metadata plane (#223).
+#
+# The certificate is the DATA NODE's own (CN = its node UUID), not the metadata
+# node's. This block drives `AcquireRangeLease`/`RenewRangeLease` proposals
+# naming this broker as holder, so the credential it presents must be the one
+# that identifies this broker. It previously reused `meta-$id.pem` — a
+# convenience that went unnoticed because nothing inspected admin identity, and
+# which meant a data node claimed to be the metadata node it was calling.
+# Admin authorization (#238) rejects that, correctly: a metadata voter's
+# certificate is not a lease credential.
 emit_lease_yaml() {
-  local id="$1"
+  local id="$1" cert="${2:-data-1}"
   echo "lease:"
   echo "  admin_endpoint: \"$(meta_host "$id"):$(meta_admin_port "$id")\""
   echo "  server_name: \"localhost\""
   echo "  topic_uuid: $TOPIC_UUID"
-  echo "  tls: { ca: $CERTS/ca.pem, cert: $CERTS/meta-$id.pem, key: $CERTS/meta-$id-key.pem }"
+  echo "  tls: { ca: $CERTS/ca.pem, cert: $CERTS/$cert.pem, key: $CERTS/$cert-key.pem }"
   echo "  lease_duration_ms: $LEASE_DURATION_MS"
   echo "  renew_interval_ms: $LEASE_RENEW_MS"
   echo "  poll_interval_ms: $LEASE_POLL_MS"
@@ -824,7 +863,9 @@ start_promoted_follower() {
     echo "native_tls: { ca: $CERTS/ca.pem, cert: $CERTS/$cert.pem, key: $CERTS/$cert-key.pem }"
     echo "principal_id: $PRINCIPAL_ID"
     echo "observability: { listen: \"$(data_metrics_addr 0)\" }"
-    emit_lease_yaml "$id"
+    # The promoted follower acquires the lease as ITSELF, so it presents its
+    # own certificate — not the original leader's and not the metadata node's.
+    emit_lease_yaml "$id" "$cert"
   } > "$cfg"
   pid="$(start_node "data-promoted-$n" "data_node_ready" data --config "$cfg")"
   echo "$pid"
@@ -992,6 +1033,15 @@ seal_and_verify_active() { # <label> <active-path>
 meta_admin() { # <node-id> <subcommand + args...>
   local id="$1"; shift
   "$VTOPCTL" --json meta "$@" --config "$(emit_admin_config "$id")"
+}
+
+# meta_admin_as <node-id> <cert-basename> <subcommand + args...>
+#
+# Same call, different certificate. Used to prove #238 refuses a data-node
+# credential the operator credential is granted.
+meta_admin_as() {
+  local id="$1" cert="$2"; shift 2
+  "$VTOPCTL" --json meta "$@" --config "$(emit_admin_config_as "$id" "$cert")"
 }
 
 meta_status_field() { # <node-id> <jq-ish python field path>
