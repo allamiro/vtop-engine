@@ -269,6 +269,10 @@ async fn run_follower(
         .replica_listen
         .as_ref()
         .ok_or("follower requires replica_listen")?;
+    // Captured before the range moves into the follower; the watcher needs the
+    // same range id the follower was constructed for, not a second reading of
+    // the config.
+    let watched_range_id = range.range_id;
     let follower = Arc::new(
         InProcessFollower::new(
             config.node_uuid,
@@ -282,6 +286,43 @@ async fn run_follower(
         .map_err(|error| error.to_string())?,
     );
     observability.register(Box::new(FollowerCollector::new(Arc::clone(&follower))?))?;
+
+    // With a lease configured, this follower learns its epoch from metadata
+    // instead of from its config file (#239). Without one it keeps asserting
+    // the configured epoch, which is what every pre-#239 config still gets.
+    if let Some(lease) = config.lease.as_ref() {
+        // Readiness becomes a conjunction: the replica listener is bound AND
+        // the watcher has read metadata once. A follower that does not yet
+        // know its epoch refuses every append, so reporting ready before that
+        // first read advertises a replica that cannot participate — which is
+        // how a freshly started follower sat at offset 0 while its leader
+        // moved on without it.
+        observability.gate.require_marks(2);
+        let watcher = crate::lease_watcher::LeaseWatcher::new(
+            vtop_meta::AdminClient::new(
+                tls::meta_material(&lease.tls)?,
+                vtop_meta::resolve_endpoint(&lease.admin_endpoint)
+                    .map_err(|error| error.to_string())?,
+                lease.server_name.clone(),
+            )
+            .map_err(|error| error.to_string())?,
+            lease.topic_uuid,
+            watched_range_id,
+            crate::lease_watcher::LeaseWatcherConfig {
+                poll_interval: Duration::from_millis(lease.poll_interval_ms),
+                // The lease duration bounds how long a read may take before it
+                // is worth abandoning: a read outstanding longer than the lease
+                // itself can only return an epoch that has already turned over.
+                request_timeout: Duration::from_millis(lease.lease_duration_ms),
+            },
+            Arc::new(crate::lease_watcher::FollowerLeasePublisher::new(
+                Arc::clone(&follower),
+            )),
+            Some(observability.gate.clone()),
+        )?;
+        tokio::spawn(watcher.run());
+    }
+
     let server = ReplicaPeerServer::new(
         tls::replica_material(&config.replica_tls)?,
         config.node_uuid,
@@ -437,19 +478,22 @@ async fn run_leader(
     // configured `fencing_epoch` is simply asserted and never revisited, which
     // is the pre-#223 behaviour every existing config still gets.
     if let Some(lease) = config.lease.as_ref() {
-        // Stated limitation, loudly: followers validate every replica append
-        // against their STATICALLY configured epoch, and nothing on a
-        // follower watches metadata yet. On a replicated range the granted
-        // epoch therefore only works while followers are configured to match
-        // it (the live-chaos harness restarts them at the granted epoch); a
-        // grant the followers do not carry fences this leader out of its own
-        // quorum. The follower-side watcher that closes this is tracked as
-        // follow-up work.
+        // Followers learn granted epochs on their own now (#239), so a
+        // replicated range no longer needs them restarted on every grant —
+        // but only if they are actually configured to watch. A follower with
+        // no `lease` block still asserts its static epoch and will fence this
+        // leader out of its own quorum the moment metadata mints a new one.
+        //
+        // That is not something this process can check: it cannot see its
+        // followers' configs, only reach their replica ports. So the warning
+        // is now about the configuration the operator controls rather than a
+        // limitation of the code, and it names the fix.
         if replicated {
-            tracing::warn!(
+            tracing::info!(
                 range = %config.range.range_id,
-                "lease-driven leadership on a replicated range requires followers \
-                 configured at the granted epoch; no follower-side watcher exists yet"
+                "lease-driven leadership on a replicated range requires every follower to \
+                 carry a `lease` block of its own; a follower without one asserts its static \
+                 fencing_epoch and will refuse appends at a newly granted epoch"
             );
         }
         let agent = crate::lease_agent::LeaseAgent::new(
