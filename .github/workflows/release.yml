@@ -104,14 +104,28 @@ jobs:
             echo "::error::tag version ($version) != workspace Cargo.toml version ($cargo_version)"
             exit 1
           fi
-          # 0.x or any pre-release suffix (-alpha/-rc.1/...) publishes as a pre-release.
-          if [[ "$version" == 0.* || "$version" == *-* ]]; then
-            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          # A pre-release SUFFIX (-alpha, -rc.1, ...) publishes as a GitHub
+          # pre-release. A 0.x major does NOT.
+          #
+          # The two mean different things and conflating them cost us the
+          # release sidebar. Semver's 0.x says "the API may break"; GitHub's
+          # pre-release flag says "this is a preview, not the release you
+          # want". v0.1.0 is tagged, signed, SBOM'd and shipped as the
+          # recommended version — it is the second thing's opposite.
+          #
+          # The practical cost of getting this wrong: GitHub's `releases/latest`
+          # endpoint only ever resolves to a non-pre-release, so a repo with
+          # only pre-releases has NO latest release. The sidebar then degrades
+          # from a version card to a bare "N tags" link, and `gh release
+          # download` with no tag fails.
+          if [[ "$version" == *-* ]]; then
+            prerelease=true
           else
-            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            prerelease=false
           fi
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "Releasing $version (prerelease=$( [[ "$version" == 0.* || "$version" == *-* ]] && echo true || echo false ))"
+          echo "Releasing $version (prerelease=$prerelease)"
 
   # ---------------------------------------------------------------------------
   # Binaries. Each target builds on its native runner: librdkafka is compiled
@@ -329,7 +343,10 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.IMAGE_NAME }}
-          # `latest` only for stable releases; 0.x/pre-releases must not claim it.
+          # `latest` follows the current recommended release, which now
+          # includes 0.x (see the prerelease classification above). Only a
+          # pre-release SUFFIX withholds it: an -rc must never become what a
+          # bare `docker pull` resolves to.
           tags: |
             type=semver,pattern={{version}},value=v${{ needs.verify.outputs.version }}
             type=raw,value=latest,enable=${{ needs.verify.outputs.prerelease == 'false' }}
@@ -443,20 +460,25 @@ jobs:
           prerelease: ${{ needs.verify.outputs.prerelease == 'true' }}
           generate_release_notes: true
           files: artifacts/*
+          # PROSE PARAGRAPHS MUST BE ONE LINE EACH.
+          #
+          # GitHub renders release bodies with GFM `breaks: true`, so every
+          # single newline becomes a literal <br> — unlike a README, where soft
+          # wraps join into a paragraph. Hard-wrapping this block at 80 columns
+          # therefore puts a visible line break at every wrap point and the text
+          # stops short of the page width. Let the browser wrap it.
+          #
+          # Code fences are exempt: their newlines are real.
           body: |
             ## VTOP Engine v${{ needs.verify.outputs.version }}
 
-            > **Maturity:** VTOP is a **prototype / reference implementation**. 0.x tags
-            > are published as pre-releases. Read
-            > [Known limitations](https://github.com/${{ github.repository }}/blob/main/docs/PRODUCTION_HA_PLAN.md)
-            > (§21) before depending on this in production.
+            > **Maturity:** VTOP is a **prototype / reference implementation**. The 0.x series signals that the API may still change, not that a tag is a preview — each release is signed, attested, and intended for use. Read [Known limitations](https://github.com/${{ github.repository }}/blob/main/docs/PRODUCTION_HA_PLAN.md) (§21) before depending on this in production.
 
             ### Container image
             ```
             docker pull ${{ env.IMAGE_NAME }}:${{ needs.verify.outputs.version }}
             ```
-            Multi-arch (`linux/amd64`, `linux/arm64`), published with SBOM + provenance
-            attestations and signed with cosign (keyless). Verify with:
+            Multi-arch (`linux/amd64`, `linux/arm64`), published with SBOM + provenance attestations and signed with cosign (keyless). Verify with:
             ```
             cosign verify ${{ env.IMAGE_NAME }}:${{ needs.verify.outputs.version }} \
               --certificate-identity-regexp='https://github.com/${{ github.repository }}/.*' \
@@ -464,13 +486,9 @@ jobs:
             ```
 
             ### Binaries
-            Each archive contains `vtop-node` (the node process) and `vtopctl` (the
-            operator CLI), for `linux` (x86_64, aarch64) and `macOS` (arm64, x86_64).
-            Windows is not built: librdkafka is compiled from source via cmake and the
-            Windows path is not validated.
+            Each archive contains `vtop-node` (the node process) and `vtopctl` (the operator CLI), for `linux` (x86_64, aarch64) and `macOS` (arm64, x86_64). Windows is not built: librdkafka is compiled from source via cmake and the Windows path is not validated.
 
-            Every binary archive has a keyless Sigstore bundle with the same name plus
-            `.sigstore.json`. Verify an archive with:
+            Every binary archive has a keyless Sigstore bundle with the same name plus `.sigstore.json`. Verify an archive with:
             ```
             archive=vtop-engine-${{ needs.verify.outputs.version }}-TARGET.tar.gz
             cosign verify-blob "$archive" \
