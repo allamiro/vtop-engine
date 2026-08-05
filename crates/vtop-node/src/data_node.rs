@@ -173,7 +173,27 @@ impl SessionAuthorizer for PrincipalAuthorizer {
     }
 }
 
-pub async fn run(config: DataNodeConfig) -> Result<(), String> {
+/// Run a data node that owns its own observability endpoint.
+pub async fn run(mut config: DataNodeConfig) -> Result<(), String> {
+    let observability = NodeObservability::new(
+        match config.role {
+            DataRole::Follower => "data-follower",
+            DataRole::Leader => "data-leader",
+            DataRole::Standalone => "data-standalone",
+        },
+        &config.node_uuid.to_string(),
+    )?;
+    let endpoint = config.observability.take().unwrap_or_default();
+    let metrics_addr = observability.serve(&endpoint).await?;
+    serve(config, &observability, metrics_addr).await
+}
+
+/// Run a data node against a caller-owned observability surface (#215).
+pub async fn serve(
+    config: DataNodeConfig,
+    observability: &NodeObservability,
+    metrics_addr: Option<std::net::SocketAddr>,
+) -> Result<(), String> {
     std::fs::create_dir_all(&config.data_dir)
         .map_err(|error| format!("create {}: {error}", config.data_dir.display()))?;
     let range = config.range.identity();
@@ -192,25 +212,46 @@ pub async fn run(config: DataNodeConfig) -> Result<(), String> {
         MetaFencingEpoch::new(config.fencing_epoch)
     };
 
-    let observability = NodeObservability::new(
-        match config.role {
-            DataRole::Follower => "data-follower",
-            DataRole::Leader => "data-leader",
-            DataRole::Standalone => "data-standalone",
-        },
-        &config.node_uuid.to_string(),
-    )?;
     observability.register(Box::new(SegmentRecoveryCollector::new(recovery.as_ref())?))?;
 
     match config.role {
         DataRole::Follower => {
-            run_follower(config, range, segment, epochs, meta, observability).await
+            run_follower(
+                config,
+                range,
+                segment,
+                epochs,
+                meta,
+                observability,
+                metrics_addr,
+            )
+            .await
         }
         DataRole::Leader => {
-            run_leader(config, range, segment, epochs, meta, true, observability).await
+            run_leader(
+                config,
+                range,
+                segment,
+                epochs,
+                meta,
+                true,
+                observability,
+                metrics_addr,
+            )
+            .await
         }
         DataRole::Standalone => {
-            run_leader(config, range, segment, epochs, meta, false, observability).await
+            run_leader(
+                config,
+                range,
+                segment,
+                epochs,
+                meta,
+                false,
+                observability,
+                metrics_addr,
+            )
+            .await
         }
     }
 }
@@ -221,7 +262,8 @@ async fn run_follower(
     segment: ActiveSegment,
     epochs: ProducerEpochJournal,
     meta: MetaFencingEpoch,
-    observability: NodeObservability,
+    observability: &NodeObservability,
+    metrics_addr: Option<std::net::SocketAddr>,
 ) -> Result<(), String> {
     let listen = config
         .replica_listen
@@ -249,7 +291,6 @@ async fn run_follower(
     let listener = TcpListener::bind(listen)
         .await
         .map_err(|error| format!("bind {listen}: {error}"))?;
-    let metrics_addr = observability.serve(&config.observability).await?;
     observability.gate.mark_ready();
     println!(
         "data_node_ready role=follower node={} replica={listen}{}",
@@ -266,6 +307,9 @@ async fn run_follower(
         .map_err(|error| format!("replica server exited: {error}"))
 }
 
+/// Argument list mirrors what `serve` has already unpacked; grouping it into a
+/// struct would move the same list one indirection from its only caller.
+#[allow(clippy::too_many_arguments)]
 async fn run_leader(
     config: DataNodeConfig,
     range: RangeIdentity,
@@ -273,7 +317,8 @@ async fn run_leader(
     epochs: ProducerEpochJournal,
     meta: MetaFencingEpoch,
     replicated: bool,
-    observability: NodeObservability,
+    observability: &NodeObservability,
+    metrics_addr: Option<std::net::SocketAddr>,
 ) -> Result<(), String> {
     let listen = config
         .native_listen
@@ -452,13 +497,29 @@ async fn run_leader(
     // reports ready for the configured epoch, the pre-#223 behaviour.
     let lease = broker.meta_fencing_epoch().clone();
     let probe_broker = Arc::clone(&broker);
-    let observability = observability.with_readiness_probe(Arc::new(move || {
+    // Last decided verdict, served under lock contention. Fail-closed start
+    // for a lease-driven broker: until the agent's first grant is OBSERVED,
+    // contention must not read as ready — an unpromoted broker being hammered
+    // with (refused) requests is exactly when the lock is busiest. Without a
+    // lease the configured epoch is authoritative and the initial verdict is
+    // ready, the pre-#223 behaviour.
+    let last_ready = Arc::new(std::sync::atomic::AtomicBool::new(config.lease.is_none()));
+    observability.set_readiness_probe(Arc::new(move || {
         // Non-blocking: a produce mid-fsync holds this view, and a readiness
         // probe must never park a runtime worker behind a stalling disk.
-        // Treating contention as ready is the right default — the broker is
-        // demonstrably working, which is the opposite of fenced.
+        // Contention serves the LAST DECIDED verdict rather than guessing in
+        // either direction: a broker mid-append is working, and a broker that
+        // was fenced a scrape ago is still fenced.
         match lease.try_snapshot() {
-            None => vtop_observe::Readiness::Ready,
+            None => {
+                if last_ready.load(std::sync::atomic::Ordering::Relaxed) {
+                    vtop_observe::Readiness::Ready
+                } else {
+                    vtop_observe::Readiness::not_ready(
+                        "lease view contended; last decided state was fenced".to_owned(),
+                    )
+                }
+            }
             Some((epoch, live)) => {
                 // Read the held epoch inside the probe: the lease agent can
                 // promote this broker onto a new epoch at any time, and a
@@ -466,7 +527,9 @@ async fn run_leader(
                 // leader as fenced forever — draining the one process that is
                 // actually authorized to serve.
                 let held = probe_broker.held_fencing_epoch();
-                if live && epoch == held {
+                let ready = live && epoch == held;
+                last_ready.store(ready, std::sync::atomic::Ordering::Relaxed);
+                if ready {
                     vtop_observe::Readiness::Ready
                 } else if live {
                     vtop_observe::Readiness::not_ready(format!(
@@ -536,7 +599,6 @@ async fn run_leader(
         .await
         .map_err(|error| format!("bind {listen}: {error}"))?;
     let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
-    let metrics_addr = observability.serve(&config.observability).await?;
     observability.gate.mark_ready();
     println!(
         "data_node_ready role={} node={} native={listen}{}{}",

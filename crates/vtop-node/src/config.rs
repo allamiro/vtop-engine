@@ -93,8 +93,11 @@ pub struct MetaNodeConfig {
     pub tls: TlsPaths,
     #[serde(default)]
     pub timers: MetaTimersConfig,
+    /// `Option` so a CO-LOCATED wrapper can tell "absent" from "present but
+    /// empty": any per-role block, even `{}`, is a config error there, and
+    /// detecting it needs field presence to survive deserialization.
     #[serde(default)]
-    pub observability: ObservabilityConfig,
+    pub observability: Option<ObservabilityConfig>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -164,8 +167,11 @@ pub struct DataNodeConfig {
     pub native_tls: Option<TlsPaths>,
     /// Leader/standalone: the one client principal the authorizer accepts.
     pub principal_id: Option<Uuid>,
+    /// `Option` so a CO-LOCATED wrapper can tell "absent" from "present but
+    /// empty": any per-role block, even `{}`, is a config error there, and
+    /// detecting it needs field presence to survive deserialization.
     #[serde(default)]
-    pub observability: ObservabilityConfig,
+    pub observability: Option<ObservabilityConfig>,
     /// Leader/standalone: drive range leadership from the metadata plane
     /// (#223).
     ///
