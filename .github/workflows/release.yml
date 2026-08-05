@@ -27,7 +27,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  BIN_NAME: vtopctl
+  # The archive ships BOTH binaries: `vtop-node` (the metadata/data-plane node
+  # a deployment actually runs) and `vtopctl` (the operator CLI). A release
+  # with only the CLI would be a steering wheel without the car.
+  BUNDLE_NAME: vtop-engine
   IMAGE_NAME: ghcr.io/${{ github.repository }}
 
 concurrency:
@@ -169,23 +172,24 @@ jobs:
           echo "PKG_CONFIG_PATH=$(brew --prefix cyrus-sasl)/lib/pkgconfig:$(brew --prefix openssl@3)/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
 
       - name: Build
-        run: cargo build --release --bin ${{ env.BIN_NAME }} --target ${{ matrix.target }} --locked
+        run: cargo build --release --bin vtop-node --bin vtopctl --target ${{ matrix.target }} --locked
 
       - name: Package
         id: pkg
         shell: bash
         run: |
           set -euo pipefail
-          name="${BIN_NAME}-${{ needs.verify.outputs.version }}-${{ matrix.target }}"
+          name="${BUNDLE_NAME}-${{ needs.verify.outputs.version }}-${{ matrix.target }}"
           mkdir -p "dist/$name"
-          cp "target/${{ matrix.target }}/release/${BIN_NAME}" "dist/$name/"
+          cp "target/${{ matrix.target }}/release/vtop-node" "dist/$name/"
+          cp "target/${{ matrix.target }}/release/vtopctl" "dist/$name/"
           cp README.md LICENSE "dist/$name/" 2>/dev/null || true
           tar -czf "dist/$name.tar.gz" -C dist "$name"
           echo "artifact=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ${{ env.BIN_NAME }}-${{ matrix.target }}
+          name: ${{ env.BUNDLE_NAME }}-${{ matrix.target }}
           path: ${{ steps.pkg.outputs.artifact }}
           if-no-files-found: error
 
@@ -318,7 +322,7 @@ jobs:
       # release. (Belt-and-braces: the docker job also disables that upload.)
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: "{vtopctl-*,sbom}"
+          pattern: "{vtop-engine-*,sbom}"
           path: artifacts
           merge-multiple: true
 
@@ -330,7 +334,7 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          archives=(artifacts/vtopctl-*.tar.gz)
+          archives=(artifacts/vtop-engine-*.tar.gz)
           if (( ${#archives[@]} == 0 )); then
             echo "::error::no binary archives found to sign"
             exit 1
@@ -378,14 +382,15 @@ jobs:
             ```
 
             ### Binaries
-            `linux` (x86_64, aarch64) and `macOS` (arm64, x86_64). Windows is not built:
-            librdkafka is compiled from source via cmake and the Windows path is not
-            validated.
+            Each archive contains `vtop-node` (the node process) and `vtopctl` (the
+            operator CLI), for `linux` (x86_64, aarch64) and `macOS` (arm64, x86_64).
+            Windows is not built: librdkafka is compiled from source via cmake and the
+            Windows path is not validated.
 
             Every binary archive has a keyless Sigstore bundle with the same name plus
             `.sigstore.json`. Verify an archive with:
             ```
-            archive=vtopctl-${{ needs.verify.outputs.version }}-TARGET.tar.gz
+            archive=vtop-engine-${{ needs.verify.outputs.version }}-TARGET.tar.gz
             cosign verify-blob "$archive" \
               --bundle "${archive}.sigstore.json" \
               --certificate-identity "https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/${{ github.ref_name }}" \
