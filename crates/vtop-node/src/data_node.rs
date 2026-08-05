@@ -180,7 +180,17 @@ pub async fn run(config: DataNodeConfig) -> Result<(), String> {
     let (segment, recovery) = open_segment(&config.data_dir, config.segment_id, &range)?;
     let epochs = ProducerEpochJournal::open(config.data_dir.join("epochs"))
         .map_err(|error| error.to_string())?;
-    let meta = MetaFencingEpoch::new(config.fencing_epoch);
+    // With a lease configured, authority to serve comes from the metadata
+    // plane, not from static configuration — so the view starts INACTIVE and
+    // the broker fails closed until the agent's first successful acquisition
+    // or renewal publishes a grant. Without one, the configured epoch is
+    // simply asserted, which is the pre-#223 behaviour every existing config
+    // still gets.
+    let meta = if config.lease.is_some() {
+        MetaFencingEpoch::new_inactive(config.fencing_epoch)
+    } else {
+        MetaFencingEpoch::new(config.fencing_epoch)
+    };
 
     let observability = NodeObservability::new(
         match config.role {
@@ -339,11 +349,55 @@ async fn run_leader(
         )
         .map_err(|error| error.to_string())?
     } else {
-        LocalBroker::new(segment, epochs, range, config.fencing_epoch)
+        // The shared handle, not `LocalBroker::new` (which builds its own
+        // always-active view): a lease-configured standalone leader must also
+        // start fenced until the agent publishes a grant.
+        LocalBroker::with_meta_fencing_epoch(segment, epochs, range, config.fencing_epoch, meta)
             .map_err(|error| error.to_string())?
     };
 
     let broker = Arc::new(broker);
+    // Range leadership from the metadata plane (#223). Without this the
+    // configured `fencing_epoch` is simply asserted and never revisited, which
+    // is the pre-#223 behaviour every existing config still gets.
+    if let Some(lease) = config.lease.as_ref() {
+        // Stated limitation, loudly: followers validate every replica append
+        // against their STATICALLY configured epoch, and nothing on a
+        // follower watches metadata yet. On a replicated range the granted
+        // epoch therefore only works while followers are configured to match
+        // it (the live-chaos harness restarts them at the granted epoch); a
+        // grant the followers do not carry fences this leader out of its own
+        // quorum. The follower-side watcher that closes this is tracked as
+        // follow-up work.
+        if replicated {
+            tracing::warn!(
+                range = %config.range.range_id,
+                "lease-driven leadership on a replicated range requires followers \
+                 configured at the granted epoch; no follower-side watcher exists yet"
+            );
+        }
+        let agent = crate::lease_agent::LeaseAgent::new(
+            vtop_meta::AdminClient::new(
+                tls::meta_material(&lease.tls)?,
+                vtop_meta::resolve_endpoint(&lease.admin_endpoint)
+                    .map_err(|error| error.to_string())?,
+                lease.server_name.clone(),
+            )
+            .map_err(|error| error.to_string())?,
+            crate::lease_agent::LeaseAgentConfig {
+                lease_duration: Duration::from_millis(lease.lease_duration_ms),
+                renew_interval: Duration::from_millis(lease.renew_interval_ms),
+                poll_interval: Duration::from_millis(lease.poll_interval_ms),
+            },
+            config.node_uuid,
+            lease.topic_uuid,
+            config.range.range_id,
+            Arc::new(crate::lease_agent::BrokerLeasePublisher::new(Arc::clone(
+                &broker,
+            ))),
+        )?;
+        tokio::spawn(agent.run());
+    }
     observability.register(Box::new(BrokerCollector::new(
         Arc::clone(&broker),
         observed_replicas,
@@ -360,15 +414,12 @@ async fn run_leader(
     // holder, and reporting ready there would keep traffic pointed at the one
     // process guaranteed to reject it.
     //
-    // Honest scope note: no production path publishes committed metadata
-    // grants into this view yet — `MetaFencingEpoch::set`/`clear_lease` are
-    // driven by a Raft applied-state watcher that is still follow-up work (see
-    // the `MetaFencingEpoch` docs). Until that lands, this probe reports ready
-    // for the configured epoch and the fenced branch fires only under test. It
-    // is wired now so readiness becomes correct the moment the watcher does,
-    // rather than being remembered afterwards.
+    // Scope note: with a lease configured, the agent spawned above drives
+    // this view from committed metadata — grants on acquisition and renewal,
+    // releases on loss. Without one, nothing publishes into it and the probe
+    // reports ready for the configured epoch, the pre-#223 behaviour.
     let lease = broker.meta_fencing_epoch().clone();
-    let held = broker.held_fencing_epoch();
+    let probe_broker = Arc::clone(&broker);
     let observability = observability.with_readiness_probe(Arc::new(move || {
         // Non-blocking: a produce mid-fsync holds this view, and a readiness
         // probe must never park a runtime worker behind a stalling disk.
@@ -376,13 +427,25 @@ async fn run_leader(
         // demonstrably working, which is the opposite of fenced.
         match lease.try_snapshot() {
             None => vtop_observe::Readiness::Ready,
-            Some((epoch, true)) if epoch == held => vtop_observe::Readiness::Ready,
-            Some((epoch, true)) => vtop_observe::Readiness::not_ready(format!(
-                "metadata lease moved to epoch {epoch}; this leaseholder is fenced at {held}"
-            )),
-            Some((epoch, false)) => vtop_observe::Readiness::not_ready(format!(
-                "metadata lease released; range is fenced at epoch {epoch}"
-            )),
+            Some((epoch, live)) => {
+                // Read the held epoch inside the probe: the lease agent can
+                // promote this broker onto a new epoch at any time, and a
+                // value captured at startup would report a freshly re-elected
+                // leader as fenced forever — draining the one process that is
+                // actually authorized to serve.
+                let held = probe_broker.held_fencing_epoch();
+                if live && epoch == held {
+                    vtop_observe::Readiness::Ready
+                } else if live {
+                    vtop_observe::Readiness::not_ready(format!(
+                        "metadata lease moved to epoch {epoch}; this leaseholder is fenced at {held}"
+                    ))
+                } else {
+                    vtop_observe::Readiness::not_ready(format!(
+                        "metadata lease released; range is fenced at epoch {epoch}"
+                    ))
+                }
+            }
         }
     }));
 

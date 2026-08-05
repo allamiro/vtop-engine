@@ -74,7 +74,8 @@ pub use storage::snapshot::{MetaSnapshots, SnapshotMeta};
 pub use storage::{MetaStorage, MetaStorageConfig, MetaStoreError, MetaStoreResult};
 pub use transport::{
     resolve_endpoint, AdminClient, AdminHandler, AdminLeaseView, AdminProposeResponse,
-    AdminReadRangeLeaseResponse, AdminServer, AdminStatusResponse, PeerClient, PeerRpcHandler,
-    PeerServer, TlsMaterial, TransportError, TransportResult, VtpmFrame, WireLogId,
+    AdminReadRangeLeaseRequest, AdminReadRangeLeaseResponse, AdminServer, AdminStatusResponse,
+    PeerClient, PeerRpcHandler, PeerServer, TlsMaterial, TransportError, TransportResult,
+    VtpmFrame, WireLogId,
 };
 pub use wire::CodecError;
