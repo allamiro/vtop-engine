@@ -96,7 +96,20 @@ pub(crate) fn entry_to_meta(
         EntryPayload::Blank => MetaLogPayload::Blank,
         EntryPayload::Normal(command) => MetaLogPayload::Normal(command.clone()),
         EntryPayload::Membership(membership) => {
-            MetaLogPayload::Membership(membership_to_meta(membership)?)
+            let converted = membership_to_meta(membership)?;
+            // An empty membership is a valid *observation* of an uninitialized
+            // node, but never a valid durable log entry: a committed membership
+            // entry with no voters would describe a cluster no quorum can be
+            // formed in, and replaying it would strand the group. Openraft does
+            // not produce one; if that ever changes, fail here rather than
+            // persist it.
+            if converted.voters.is_empty() {
+                return Err(sto_err_logs(format!(
+                    "refusing to persist a membership log entry with no voters at index {}",
+                    entry.log_id.index
+                )));
+            }
+            MetaLogPayload::Membership(converted)
         }
     };
     Ok(MetaLogEntry {
@@ -134,16 +147,31 @@ pub(crate) fn meta_to_entry(
 /// (`change_membership` in flight, #215) has two — the outgoing set is
 /// preserved in `joint_outgoing` so a crash mid-change recovers the exact
 /// joint quorum rules. More than two configs never occurs in openraft.
+///
+/// **Zero configs is legitimate and is not an error.** It is how openraft
+/// represents a node that has never been initialized: a fresh node's startup
+/// state carries `Membership { configs: [], nodes: {} }` until `init` lands.
+/// Rejecting it here made every read path fail on an uninitialized node —
+/// `vtopctl meta status` against a just-started node reported a storage write
+/// error, which is both wrong and the first thing an operator would run.
+/// Whether an empty membership may be *persisted* is a separate question with
+/// a different answer; [`entry_to_meta`] decides that at the write boundary,
+/// where it belongs.
 pub(crate) fn membership_to_meta(
     membership: &Membership<NodeId, openraft::EmptyNode>,
 ) -> Result<MetaMembership, StorageError<NodeId>> {
     let configs = membership.get_joint_config();
     let (voters, joint_outgoing) = match configs.len() {
+        0 => (Vec::new(), None),
         1 => (config_ids(&configs[0]), None),
         2 => (config_ids(&configs[1]), Some(config_ids(&configs[0]))),
+        // Labelled as a READ failure, not a write: this converter runs on the
+        // metrics/status paths as well as the append path, and reporting
+        // "when Write Logs" from a read sent a reader looking at the storage
+        // layer for a fault that was never there.
         other => {
-            return Err(sto_err_logs(format!(
-                "joint membership with {other} configs cannot be stored in MetaMembership"
+            return Err(sto_err_read_logs(format!(
+                "membership has {other} joint configs; openraft produces at most 2"
             )))
         }
     };
@@ -216,5 +244,63 @@ mod tests {
             &[outgoing, target],
             "recovery must not collapse a joint quorum into its target set"
         );
+    }
+
+    /// A node that has never been initialized carries `configs: []`. Reading it
+    /// must describe that state, not fail — `vtopctl meta status` against a
+    /// freshly started node is the first command an operator runs, and it used
+    /// to answer with a storage *write* error.
+    #[test]
+    fn an_uninitialized_membership_reads_as_empty_rather_than_erroring() {
+        let membership: Membership<NodeId, openraft::EmptyNode> =
+            Membership::new(Vec::new(), BTreeMap::new());
+        assert!(membership.get_joint_config().is_empty(), "test premise");
+
+        let durable = membership_to_meta(&membership).expect("uninitialized is readable");
+        assert!(durable.voters.is_empty());
+        assert!(durable.learners.is_empty());
+        assert_eq!(durable.joint_outgoing, None);
+    }
+
+    /// The same value must NOT be persistable. An empty membership is a valid
+    /// observation of a node that has not been initialized, but a committed
+    /// membership entry with no voters describes a cluster in which no quorum
+    /// can ever form — replaying it would strand the group.
+    #[test]
+    fn an_empty_membership_is_refused_at_the_log_write_boundary() {
+        let entry = Entry::<MetaRaftTypeConfig> {
+            log_id: raft_log_id(1, 0),
+            payload: EntryPayload::Membership(Membership::new(Vec::new(), BTreeMap::new())),
+        };
+        let error = entry_to_meta(&entry).expect_err("an empty membership must not persist");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("no voters"),
+            "the refusal must say what is wrong: {rendered}"
+        );
+    }
+
+    /// A membership openraft never produces stays an error — but reported as a
+    /// READ fault. This converter runs on the metrics and status paths as well
+    /// as the append path, and labelling those failures "when Write Logs" sent
+    /// a reader to the storage layer for a fault that was never there.
+    #[test]
+    fn an_impossible_config_count_is_reported_as_a_read_fault() {
+        let configs = vec![
+            BTreeSet::from([1]),
+            BTreeSet::from([2]),
+            BTreeSet::from([3]),
+        ];
+        let nodes = (1..=3)
+            .map(|id| (id, openraft::EmptyNode::default()))
+            .collect::<BTreeMap<_, _>>();
+        let error = membership_to_meta(&Membership::new(configs, nodes))
+            .expect_err("three joint configs is not representable");
+        let rendered = error.to_string();
+        assert!(
+            !rendered.contains("Write"),
+            "a read-path failure must not claim a write: {rendered}"
+        );
+        assert!(rendered.contains("3 joint configs"), "{rendered}");
     }
 }
