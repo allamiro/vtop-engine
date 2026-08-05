@@ -32,7 +32,22 @@ log "colocated node up: $CN"
 await_ready "$(data_metrics_addr 0)" "colocated-node"
 log "single /readyz reports ready"
 
-meta_admin 1 init --members 1 > /dev/null || fail "metadata plane did not accept init"
+# The response must NAME the voter it just established, not merely exit 0.
+#
+# openraft publishes metrics to a watch channel asynchronously, so a read taken
+# the instant `initialize` returns can still see the pre-init state — which on a
+# fresh node is no membership at all. A single-member bootstrap needs no peer
+# round trip, so it returns fast enough to lose that race routinely: this
+# scenario is the only one that bootstraps one member, and it was the only one
+# that failed. Asserting on the reported voter is what makes the fix testable;
+# an exit code alone would pass on an answer of "voters: []".
+INIT_JSON="$(meta_admin 1 init --members 1)" \
+  || fail "metadata plane did not accept init"
+python3 -c "
+import json,sys
+voters = json.loads(sys.argv[1])['membership']['voters']
+sys.exit(0 if voters == [1] else f'init reported voters {voters}, not [1]')
+" "$INIT_JSON" || fail "init did not report the membership it established: $INIT_JSON"
 LEADER_ID="$(wait_meta_leader 1)"
 log "metadata plane serves admin RPCs (leader: node $LEADER_ID)"
 

@@ -283,7 +283,17 @@ impl AdminHandler for OpenraftConsensus {
             .initialize(members)
             .await
             .map_err(|error| TransportError::Protocol(error.to_string()))?;
-        self.current_membership()
+        // `initialize` returns once the membership is accepted by the engine,
+        // but metrics are published to their watch channel asynchronously —
+        // so reading them immediately can still observe the pre-init state, in
+        // which a node has NO membership at all. Answering a successful init
+        // with "voters: []" tells the operator their bootstrap did nothing.
+        //
+        // The race is wide open on a single-node group, where `initialize`
+        // needs no peer round trip and returns almost instantly; it is why the
+        // co-located scenario (#215), the only one that bootstraps one member,
+        // was the one that failed.
+        self.awaited_membership().await
     }
 
     async fn add_learner(&self, node_id: u64) -> TransportResult<AdminMembershipResponse> {
@@ -315,4 +325,41 @@ impl OpenraftConsensus {
             .map_err(|error| TransportError::Protocol(error.to_string()))?;
         Ok(AdminMembershipResponse { membership })
     }
+
+    /// [`Self::current_membership`], but waits for the metrics watch to publish
+    /// a membership that has voters.
+    ///
+    /// Bounded, and on expiry it returns whatever it last saw rather than
+    /// failing: the caller's operation already succeeded, so turning a slow
+    /// metrics publish into an error would report a failure that did not
+    /// happen. An empty answer after the wait is still truthful — it says the
+    /// node has not published a membership yet.
+    async fn awaited_membership(&self) -> TransportResult<AdminMembershipResponse> {
+        let mut metrics = self.raft.metrics();
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_millis(MEMBERSHIP_PUBLISH_MS);
+        loop {
+            let current = self.current_membership()?;
+            if !current.membership.voters.is_empty() {
+                return Ok(current);
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(current);
+            }
+            match tokio::time::timeout(remaining, metrics.changed()).await {
+                // A new value was published — re-read it.
+                Ok(Ok(())) => continue,
+                // Channel closed (the raft core is gone) or the wait expired.
+                // Either way, report what we last saw rather than inventing an
+                // error for an operation that already succeeded.
+                Ok(Err(_)) | Err(_) => return Ok(current),
+            }
+        }
+    }
 }
+
+/// How long an admin `init` waits for the metrics watch to publish the
+/// membership it just established. Generous relative to a local watch send
+/// (microseconds) and short relative to any admin RPC timeout.
+const MEMBERSHIP_PUBLISH_MS: u64 = 2_000;
