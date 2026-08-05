@@ -349,22 +349,6 @@ impl InProcessFollower {
         Ok(outcome)
     }
 
-    /// Which epoch wrote the record at `offset` on this replica; `None` when
-    /// the history is unknown or has a hole.
-    fn epoch_owning(&self, offset: u64) -> Option<u64> {
-        // Flag read under the lock, as in `epoch_starts`: a vector with a hole
-        // must not answer this question, because the answer decides whether an
-        // append is a retry or a divergence.
-        let guard = self
-            .fencing_epoch_journal
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if self.fencing_epoch_history_broken.load(Ordering::SeqCst) {
-            return None;
-        }
-        guard.as_ref()?.epoch_owning(offset)
-    }
-
     /// This replica's epoch history; empty means "unknown", never "no changes".
     pub fn epoch_starts(&self) -> Vec<crate::fencing_epochs::EpochStart> {
         // Flag read UNDER the lock; see LocalBroker::epoch_starts.
@@ -554,40 +538,16 @@ impl InProcessFollower {
                     ErrorCode::InvalidRequest,
                     "replica append batch end overflows u64".to_owned(),
                 ))?;
-            // Durability through the batch end is NOT enough to ack, and
-            // treating it as enough is how divergent data gets acknowledged
-            // (#240). "I already hold offset 5" is only a retry if it is the
-            // SAME record at offset 5. A replica that took records from a
-            // leader deposed before those records reached a quorum holds a
-            // different record there, and acking it lets the new leader count
-            // this replica toward a quorum for bytes it does not have —
-            // committed data that differs between replicas, which is the exact
-            // failure the epoch vector exists to prevent.
-            //
-            // The vector answers it: if the epoch that wrote the record at this
-            // offset is not the epoch now asking to write it, the two leaders
-            // disagree about this offset and the difference must surface as a
-            // refusal so the replica can be truncated and repaired.
-            //
-            // An UNKNOWN history keeps the old behaviour rather than failing
-            // closed. A replica with no vector cannot distinguish the two cases
-            // at all, and refusing every catch-up there would strand precisely
-            // the replicas that predate #240 — trading a rare divergence for a
-            // certain outage. Once every replica carries a vector this should
-            // become fail-closed; until then the gap is real and narrower.
-            if let Some(owner) = self.epoch_owning(request.expected_base_offset) {
-                if owner != request.fencing_epoch {
-                    return Err((
-                        ErrorCode::Fenced,
-                        format!(
-                            "follower holds offset {} written under fencing epoch {owner}, but \
-                             epoch {} is writing there: this replica has diverged and must be \
-                             truncated before it can follow",
-                            request.expected_base_offset, request.fencing_epoch
-                        ),
-                    ));
-                }
-            }
+            // NOTE (#240): durability through the batch end is not the same
+            // question as holding the SAME records, and this path cannot yet
+            // tell them apart — see #261. An earlier attempt compared the epoch that wrote
+            // the record against the request's fencing epoch and was wrong: a
+            // newly promoted leader inherits its predecessor's prefix and
+            // legitimately retransmits it under its own, newer epoch, so the
+            // two differ constantly during ordinary catch-up. Live chaos
+            // scenario 09 caught it — every post-failover produce lost its
+            // quorum. The real comparison needs the epoch each record was
+            // ORIGINALLY written under, which the request does not carry.
             if state.segment.committed_offset() >= batch_end {
                 return Ok(ReplicaAppendResponse {
                     local_committed_offset: state.segment.committed_offset(),
