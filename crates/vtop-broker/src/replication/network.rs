@@ -791,7 +791,16 @@ impl FollowerDriver {
                 frame = read_frame(&mut stream, REPLICA_LIMITS), if !inflight.is_empty() => {
                     match frame {
                         Ok(Some(frame)) => {
-                            handle_response(frame, &mut inflight, &mut inflight_bytes, &self.channel);
+                            if handle_response(
+                                frame,
+                                &mut inflight,
+                                &mut inflight_bytes,
+                                &self.channel,
+                            ) == ResponseOutcome::Resync
+                            {
+                                requeue_inflight(pending, &mut inflight, retransmission);
+                                return SessionOutcome::Disconnected;
+                            }
                         }
                         _ => {
                             requeue_inflight(pending, &mut inflight, retransmission);
@@ -984,14 +993,21 @@ fn window_allows(
         && inflight_bytes.saturating_add(next_bytes) <= flow.max_inflight_bytes
 }
 
+/// Whether this response means the session must re-synchronise.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResponseOutcome {
+    Continue,
+    Resync,
+}
+
 fn handle_response(
     frame: WireFrame,
     inflight: &mut HashMap<u64, Inflight>,
     inflight_bytes: &mut usize,
     channel: &FollowerChannel,
-) {
+) -> ResponseOutcome {
     let Some(entry) = inflight.remove(&frame.request_id) else {
-        return;
+        return ResponseOutcome::Continue;
     };
     *inflight_bytes = inflight_bytes.saturating_sub(entry.bytes);
     match frame.message {
@@ -1004,10 +1020,51 @@ fn handle_response(
             let _ = entry.response_tx.send(FollowerReplicateResult::Acked {
                 local_committed_offset,
             });
+            ResponseOutcome::Continue
         }
-        _ => {
-            // Error / unexpected: waiter observes closed/timeout as miss.
+        // A refusal MAY be a divergence signal rather than just a missed ack —
+        // but only some of them are, and treating them alike thrashes.
+        //
+        // This used to drop the waiter and send the next batch, which the
+        // follower refused identically — forever. A follower that misses one
+        // batch is off the leader's contiguous sequence, and every subsequent
+        // append fails the same base-offset check, so the replica was stranded
+        // permanently at whatever offset it had reached. It stayed connected,
+        // so the reconnect catch-up that exists precisely to repair this never
+        // ran. In the failure that exposed it, a replica sat at offset 0
+        // rejecting 124 consecutive batches while reporting a healthy session.
+        //
+        // Re-synchronising means dropping the session, which sends the loop
+        // through the status probe: the follower reports where it actually is,
+        // covered buffer entries are discarded, and the rest is retransmitted
+        // from its true position. `reconnect_backoff` bounds the retry, so a
+        // follower that is genuinely fenced by a newer epoch retries at a
+        // fixed cadence rather than spinning — and recovers on its own once it
+        // adopts that epoch, instead of needing a restart.
+        // `Fenced` means the follower is serving a different epoch. It will
+        // stop saying so on its own — a follower-side watcher adopts the
+        // granted epoch within a poll interval — and it stored nothing, so its
+        // position has not moved. Resyncing here would drop and re-establish
+        // the session on every batch for the whole adoption window, and with
+        // every follower doing it at once the leader cannot assemble a quorum
+        // at all: the producer stalls at zero acks rather than briefly lagging.
+        // Treat it as a plain miss and let the next batch decide.
+        Message::Error(ErrorResponse {
+            code: ErrorCode::Fenced,
+            ..
+        }) => {
             drop(entry.response_tx);
+            ResponseOutcome::Continue
+        }
+        // Anything else is divergence: the follower is refusing on its own
+        // terms, and the canonical case is a base-offset mismatch — it has
+        // fallen off the leader's contiguous sequence and every subsequent
+        // append fails the same check. That does not heal by waiting, which is
+        // exactly how a replica ended up stranded at offset 0 for 124
+        // consecutive batches while its session looked healthy.
+        _ => {
+            drop(entry.response_tx);
+            ResponseOutcome::Resync
         }
     }
 }
