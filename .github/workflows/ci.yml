@@ -162,16 +162,31 @@ jobs:
 
             # `scripts/live-chaos/run-all.sh`. The harness drives real
             # processes over real TLS: metadata Raft, replication, fencing,
-            # and failover. Its closure is the three crates whose binaries it
-            # runs plus the harness itself — a change to vtop-core or
-            # vtop-state cannot alter a scenario's outcome without going
-            # through one of these.
+            # and failover.
+            #
+            # `crates/**`, not a hand-listed subset. The two binaries this job
+            # runs pull in every workspace crate — verified, not assumed:
+            #
+            #   cargo tree -p vtop-node --edges normal
+            #     → broker, log, meta, observe, protocol
+            #   cargo tree -p vtop-cli --no-default-features --edges normal
+            #     → adapters, broker, core, log, meta, observe, protocol,
+            #       state, upload
+            #
+            # An earlier version of this filter named four crates and claimed
+            # nothing else could change a scenario's outcome. That was wrong in
+            # both directions that matter: vtop-log owns the segment format the
+            # durability and recovery scenarios assert on, and vtop-protocol
+            # owns the produce/fetch wire these scenarios speak. Either could
+            # have broken the suite with this job never running.
+            #
+            # This does mean the suite runs on most Rust changes. That is the
+            # honest cost of it being the only thing that validates replication
+            # and fencing against real processes; the alternative is a gate
+            # with a hole in it, which is what the four-crate list was.
             chaos:
               - 'scripts/live-chaos/**'
-              - 'crates/vtop-meta/**'
-              - 'crates/vtop-broker/**'
-              - 'crates/vtop-node/**'
-              - 'crates/vtop-cli/**'
+              - 'crates/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - '.cargo/**'
@@ -474,13 +489,20 @@ jobs:
       # it is needed. Supplying the directory also sets WORKDIR_GENERATED=0,
       # which suppresses that cleanup, so the tree is still there afterwards.
       - name: Run the live chaos suite
+        id: chaos
         run: CHAOS_PROFILE=debug CHAOS_WORKDIR="$RUNNER_TEMP/chaos" scripts/live-chaos/run-all.sh
 
       # A failing scenario names a log file; without this the reason dies with
       # the runner. `error` on empty, not `ignore`: an empty artifact means the
       # wiring above broke, and that must be visible rather than silent.
+      #
+      # Gated on THIS step's outcome, not the job's. `failure()` is also true
+      # when the namespace probe or the build failed — cases where the suite
+      # never reached a scenario, so no logs exist and `error` would stack a
+      # spurious "no files found" on top of the real cause. The empty-artifact
+      # signal only means something once the run itself has been attempted.
       - name: Upload scenario logs
-        if: failure()
+        if: steps.chaos.outcome == 'failure'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: live-chaos-logs
