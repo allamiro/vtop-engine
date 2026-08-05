@@ -199,6 +199,11 @@ require_mount_namespace() {
   require_command mount "Install util-linux mount support."
   local probe_dir="$WORKDIR/.vtop-mountns-probe"
   mkdir -p "$probe_dir"
+  # The single quotes are deliberate: `$1` must be expanded by the INNER bash
+  # -c, which receives $probe_dir as its positional argument. Expanding it here
+  # would inline the path into the script text and break on any path needing
+  # quoting.
+  # shellcheck disable=SC2016
   if ! unshare -rm bash -c \
     'mount -t tmpfs -o size=1m tmpfs "$1" && touch "$1/probe"' bash "$probe_dir" \
     > /dev/null 2>&1; then
@@ -296,6 +301,25 @@ require_binaries() {
 # Config emission
 # ---------------------------------------------------------------------------
 
+# install_config <path> — read a config body from stdin and put it in place
+# atomically.
+#
+# Config emitters are called per-invocation, not once: `meta_admin` re-emits
+# its client config on every call. Scenario 01 runs a proposal loop in the
+# background while the foreground drives membership changes, so two writers
+# re-emit the same path concurrently — and a plain `> "$cfg"` redirect
+# truncates in place, leaving a window where a reader parses a half-written
+# file. That surfaced as `missing field 'endpoint'`, an error about the
+# harness's own scratch file that looks like a product failure and points
+# nowhere near the race. `mv` within a directory is atomic: a reader sees
+# either the previous complete config or the new one, never a fragment.
+install_config() {
+  local path="$1" tmp
+  tmp="$(mktemp "$path.XXXXXX")" || return 1
+  cat > "$tmp"
+  mv -f "$tmp" "$path"
+}
+
 # emit_meta_config <node-id> <peer-ids...>
 emit_meta_config() {
   local id="$1"; shift
@@ -327,7 +351,7 @@ emit_meta_config() {
       done
     fi
     echo "observability: { listen: \"$(meta_metrics_addr "$id")\" }"
-  } > "$cfg"
+  } | install_config "$cfg"
   echo "$cfg"
 }
 
@@ -353,7 +377,7 @@ emit_admin_config_as() {
     echo "ca_cert: $CERTS/ca.pem"
     echo "client_cert: $CERTS/$cert.pem"
     echo "client_key: $CERTS/$cert-key.pem"
-  } > "$cfg"
+  } | install_config "$cfg"
   echo "$cfg"
 }
 
@@ -386,7 +410,7 @@ emit_leader_config() {
     echo "native_tls: { ca: $CERTS/ca.pem, cert: $CERTS/data-1.pem, key: $CERTS/data-1-key.pem }"
     echo "principal_id: $PRINCIPAL_ID"
     echo "observability: { listen: \"$(data_metrics_addr 0)\" }"
-  } > "$cfg"
+  } | install_config "$cfg"
   echo "$cfg"
 }
 
@@ -443,7 +467,7 @@ emit_follower_config() {
     echo "replica_listen: \"$(replica_addr "$n")\""
     echo "replica_tls: { ca: $CERTS/ca.pem, cert: $CERTS/$cert.pem, key: $CERTS/$cert-key.pem }"
     echo "observability: { listen: \"$(data_metrics_addr "$n")\" }"
-  } > "$cfg"
+  } | install_config "$cfg"
   echo "$cfg"
 }
 
@@ -460,7 +484,7 @@ emit_node_status_config() {
     echo "  - { node_uuid: $LEADER_UUID, addr: \"$(replica_addr 0)\", server_name: \"localhost\", role: leader }"
     echo "  - { node_uuid: $FOLLOWER1_UUID, addr: \"$(replica_addr 1)\", server_name: \"localhost\" }"
     echo "  - { node_uuid: $FOLLOWER2_UUID, addr: \"$(replica_addr 2)\", server_name: \"localhost\" }"
-  } > "$cfg"
+  } | install_config "$cfg"
   echo "$cfg"
 }
 
@@ -488,7 +512,7 @@ emit_client_config_at_epoch() {
     emit_range_yaml
     echo "server_name: \"localhost\""
     echo "tls: { ca: $CERTS/ca.pem, cert: $CERTS/data-1.pem, key: $CERTS/data-1-key.pem }"
-  } > "$cfg"
+  } | install_config "$cfg"
   echo "$cfg"
 }
 
@@ -503,7 +527,7 @@ emit_client_config() {
     emit_range_yaml
     echo "server_name: \"localhost\""
     echo "tls: { ca: $CERTS/ca.pem, cert: $CERTS/client.pem, key: $CERTS/client-key.pem }"
-  } > "$cfg"
+  } | install_config "$cfg"
   echo "$cfg"
 }
 
@@ -520,7 +544,7 @@ emit_replica_probe_config() {
     emit_range_yaml
     echo "server_name: \"localhost\""
     echo "tls: { ca: $CERTS/ca.pem, cert: $CERTS/data-1.pem, key: $CERTS/data-1-key.pem }"
-  } > "$cfg"
+  } | install_config "$cfg"
   echo "$cfg"
 }
 
@@ -833,7 +857,7 @@ emit_leader_config_with_lease() {
   {
     sed 's/^fencing_epoch: .*/fencing_epoch: 0/' "$WORKDIR/data-leader-leader.yaml"
     emit_lease_yaml "$id"
-  } > "$cfg"
+  } | install_config "$cfg"
   echo "$cfg"
 }
 
@@ -884,7 +908,7 @@ start_promoted_follower() {
     # The promoted follower acquires the lease as ITSELF, so it presents its
     # own certificate — not the original leader's and not the metadata node's.
     emit_lease_yaml "$id" "$cert"
-  } > "$cfg"
+  } | install_config "$cfg"
   pid="$(start_node "data-promoted-$n" "data_node_ready" data --config "$cfg")"
   echo "$pid"
 }
@@ -917,7 +941,7 @@ start_fenced_old_leader() {
         -e "s|^observability: .*|observability: { listen: \"$(data_metrics_addr 3)\" }|" \
         "$WORKDIR/data-leader-leader.yaml"
     emit_lease_yaml "$id"
-  } > "$cfg"
+  } | install_config "$cfg"
   pid="$(start_node "data-leader-restarted" "data_node_ready" data --config "$cfg")"
   echo "$pid"
 }
@@ -995,7 +1019,7 @@ emit_colocated_config() {
     echo "  native_tls: { ca: $CERTS/ca.pem, cert: $CERTS/$cert.pem, key: $CERTS/$cert-key.pem }"
     echo "  principal_id: $PRINCIPAL_ID"
     echo "observability: { listen: \"$(data_metrics_addr $((id - 1)))\" }"
-  } > "$cfg"
+  } | install_config "$cfg"
   echo "$cfg"
 }
 
