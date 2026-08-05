@@ -10,6 +10,7 @@ mod colocated;
 mod config;
 mod data_node;
 mod lease_agent;
+mod lease_watcher;
 mod meta_node;
 mod observe;
 mod promotion;

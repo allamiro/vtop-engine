@@ -23,7 +23,7 @@ use crate::{
     storage_producer_id, BrokerError, BrokerResult, MetaFencingEpoch, MetaLeaseState,
     ProducerEpochJournal, SegmentFormat,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 use vtop_log::{ActiveSegment, Durability, FetchBatch, LogRecord};
@@ -130,7 +130,15 @@ struct FollowerState {
 pub struct InProcessFollower {
     node_id: Uuid,
     range: RangeIdentity,
-    held_fencing_epoch: u64,
+    /// The epoch this follower currently serves.
+    ///
+    /// Atomic and monotonic rather than a fixed config value (#239): a
+    /// follower whose epoch could never change was fenced out of its own
+    /// quorum the moment metadata granted the range at a new epoch, so a
+    /// lease-driven leader could not reach durability without every follower
+    /// being restarted. It only ever moves forward — see
+    /// [`Self::adopt_fencing_epoch`].
+    held_fencing_epoch: AtomicU64,
     meta_fencing_epoch: MetaFencingEpoch,
     segment_format: SegmentFormat,
     cluster_committed: ClusterCommittedOffset,
@@ -195,7 +203,7 @@ impl InProcessFollower {
         Ok(Self {
             node_id,
             range,
-            held_fencing_epoch,
+            held_fencing_epoch: AtomicU64::new(held_fencing_epoch),
             meta_fencing_epoch,
             segment_format,
             cluster_committed,
@@ -218,6 +226,24 @@ impl InProcessFollower {
 
     pub fn meta_fencing_epoch(&self) -> &MetaFencingEpoch {
         &self.meta_fencing_epoch
+    }
+
+    /// The epoch this follower currently serves.
+    pub fn held_fencing_epoch(&self) -> u64 {
+        self.held_fencing_epoch.load(Ordering::SeqCst)
+    }
+
+    /// Move this follower to `epoch`; returns whether it advanced.
+    ///
+    /// `fetch_max` makes adoption monotonic by construction, which is the
+    /// safety property that matters: a follower that could be walked BACKWARD
+    /// to a superseded epoch would start accepting appends from a leader
+    /// metadata has already fenced, which is exactly the split-brain write the
+    /// epoch exists to prevent. A stale observation is therefore a no-op
+    /// rather than a regression, so the watcher driving this needs no ordering
+    /// guarantees of its own.
+    pub fn adopt_fencing_epoch(&self, epoch: u64) -> bool {
+        self.held_fencing_epoch.fetch_max(epoch, Ordering::SeqCst) < epoch
     }
 
     pub fn set_online(&self, online: bool) {
@@ -344,7 +370,7 @@ impl InProcessFollower {
         max_records: usize,
     ) -> BrokerResult<FetchBatch> {
         let meta = self.meta_fencing_epoch.lock();
-        check_follower_lease(&meta, self.held_fencing_epoch)?;
+        check_follower_lease(&meta, self.held_fencing_epoch())?;
         let hwm = self.cluster_committed.get();
         let mut state = self
             .state
@@ -374,7 +400,7 @@ impl InProcessFollower {
         }
         let meta = self.meta_fencing_epoch.lock();
         if let Err((code, message)) =
-            check_follower_fencing(&meta, self.held_fencing_epoch, request.fencing_epoch)
+            check_follower_fencing(&meta, self.held_fencing_epoch(), request.fencing_epoch)
         {
             return Err((code, message.to_owned()));
         }
@@ -498,7 +524,7 @@ impl InProcessFollower {
                 ));
             }
             if let Err((code, message)) =
-                check_follower_fencing(&meta, self.held_fencing_epoch, request.fencing_epoch)
+                check_follower_fencing(&meta, self.held_fencing_epoch(), request.fencing_epoch)
             {
                 return Err((code, message.to_owned()));
             }
@@ -594,7 +620,7 @@ impl InProcessFollower {
         }
         let meta = self.meta_fencing_epoch.lock();
         if let Err((code, message)) =
-            check_follower_fencing(&meta, self.held_fencing_epoch, update.fencing_epoch)
+            check_follower_fencing(&meta, self.held_fencing_epoch(), update.fencing_epoch)
         {
             return Err((code, message.to_owned()));
         }

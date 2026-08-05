@@ -220,12 +220,30 @@ pub struct DataNodeConfig {
     /// With it configured the epoch becomes metadata's to decide, and this
     /// process serves only while metadata says it holds the range.
     ///
-    /// Stated limitation on REPLICATED ranges: followers validate replica
-    /// appends against their statically configured epoch and do not watch
-    /// metadata, so they must be (re)configured at the granted epoch for the
-    /// leader to reach its quorum. The follower-side watcher that removes
-    /// this requirement is follow-up work; until it lands, deployments (and
-    /// the live-chaos harness) restart followers on epoch change.
+    /// Valid on FOLLOWERS too, and on a replicated range it is required there
+    /// (#239). A follower with this block watches metadata and adopts granted
+    /// epochs on its own; a follower without one keeps asserting its static
+    /// `fencing_epoch` and will refuse the leader's appends the moment
+    /// metadata mints a newer one — fencing that leader out of its own quorum
+    /// until someone restarts the follower with a new config.
+    ///
+    /// The two roles use the block differently. A leader ACQUIRES and RENEWS:
+    /// it is competing to hold the range. A follower only OBSERVES: it has no
+    /// claim to make, and giving followers an agent would put every replica in
+    /// the election. Only `admin_endpoint`, `server_name`, `topic_uuid`,
+    /// `tls`, and `poll_interval_ms` are read on a follower.
+    ///
+    /// Stated limitation on a REPLICATED range. A watching follower starts
+    /// fenced and adopts its epoch on the next poll, so it refuses the
+    /// leader's appends for up to one `poll_interval_ms` after a grant. Those
+    /// refusals put it behind the leader's contiguous sequence, and it rejoins
+    /// by way of the leader's resynchronisation (#255) — which can only
+    /// retransmit what the leader's buffer still holds. A follower whose gap
+    /// exceeds `max_retransmission_bytes`, or that is behind a leader promoted
+    /// after the gap opened, cannot be repaired in place and needs its data
+    /// directory restored from a peer. Segment transfer removes that
+    /// requirement and is tracked on #255; until it lands, keep
+    /// `poll_interval_ms` short on replicated ranges so the window stays small.
     pub lease: Option<LeaseConfig>,
 }
 

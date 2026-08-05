@@ -437,18 +437,28 @@ emit_lease_yaml() {
   echo "  poll_interval_ms: $LEASE_POLL_MS"
 }
 
-# emit_follower_config <n: 1|2> [data_dir] [fencing_epoch]
+# emit_follower_config <n: 1|2> [data_dir] [fencing_epoch] [watch-meta-id]
 #
-# The epoch override exists for the lease-driven scenarios (#223): a follower
-# refuses replica appends whose epoch differs from its configured one, and
-# followers have no lease agent yet — nothing on a follower watches metadata.
-# Until the applied-state watcher lands, the harness stands in for it by
-# starting (and, across a failover, restarting) followers at the epoch
-# metadata actually granted.
+# `fencing_epoch` is the epoch this follower starts at. With a WATCH-META-ID it
+# also gets a `lease` block and learns granted epochs from metadata on its own
+# (#239), which is what a replicated lease-driven range needs: without it a
+# follower asserts the configured epoch forever and fences the leader out of
+# its own quorum the moment metadata mints a newer one.
+#
+# A watching follower ignores the epoch argument and starts at 0; see below.
 emit_follower_config() {
   local n="$1"
   local dir="${2:-$WORKDIR/data-follower-$n}"
   local epoch="${3:-$FENCING_EPOCH}"
+  local watch_meta_id="${4:-}"
+  # A watching follower starts at epoch floor 0, overriding whatever was asked
+  # for. Adoption is monotonic (`fetch_max`), so a follower configured ABOVE
+  # the epoch metadata grants would never come down to meet it and would
+  # refuse every append forever — the failure looks like a fencing bug and is
+  # really a config floor. Same reasoning as emit_leader_config_with_lease.
+  if [[ -n "$watch_meta_id" ]]; then
+    epoch=0
+  fi
   local uuid cert
   case "$n" in
     1) uuid="$FOLLOWER1_UUID"; cert="data-2" ;;
@@ -467,6 +477,15 @@ emit_follower_config() {
     echo "replica_listen: \"$(replica_addr "$n")\""
     echo "replica_tls: { ca: $CERTS/ca.pem, cert: $CERTS/$cert.pem, key: $CERTS/$cert-key.pem }"
     echo "observability: { listen: \"$(data_metrics_addr "$n")\" }"
+    # Its OWN certificate, as on a leader: the watcher authenticates to the
+    # admin endpoint as this broker, and #238 refuses anything else.
+    #
+    # An `if`, not `[[ … ]] && …`: as the last statement in this group a false
+    # test would make the group exit 1, and `pipefail` turns that into a failed
+    # pipeline under `set -e` — breaking every follower that is NOT watching.
+    if [[ -n "$watch_meta_id" ]]; then
+      emit_lease_yaml "$watch_meta_id" "$cert"
+    fi
   } | install_config "$cfg"
   echo "$cfg"
 }

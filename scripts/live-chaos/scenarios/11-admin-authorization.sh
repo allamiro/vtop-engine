@@ -85,18 +85,16 @@ log "data-node cert: status still permitted"
 # enforcing endpoint, presenting the very certificate refused in step 2. It
 # must be permitted, because the holder it names is itself.
 # ---------------------------------------------------------------------------
-# Followers have no lease agent yet (#239), so the harness starts them at the
-# epoch metadata is about to mint; a fresh range's first acquisition is always
-# epoch 1, and the assertion below fails loudly if that stops being true.
-EXPECTED_FIRST_EPOCH=1
-start_follower 1 "" "$EXPECTED_FIRST_EPOCH" > /dev/null
-start_follower 2 "" "$EXPECTED_FIRST_EPOCH" > /dev/null
+# Followers watch metadata for their epoch (#239), so they need no seeding —
+# and their watchers authenticate to this very endpoint under the policy being
+# tested, which makes this scenario cover the node-scoped read path too.
+start_follower 1 "" "" "$LEADER_ID" > /dev/null
+start_follower 2 "" "" "$LEADER_ID" > /dev/null
 # Followers first: verified promotion (#223) needs a quorum of replica-status
 # answers before the leader will serve.
 start_leader_with_lease "$LEADER_ID" > /dev/null
 epoch="$(await_lease_holder "$LEADER_ID" "$LEADER_UUID")"
-[[ "$epoch" == "$EXPECTED_FIRST_EPOCH" ]] \
-  || fail "first grant minted epoch $epoch, not $EXPECTED_FIRST_EPOCH"
+[[ -n "$epoch" ]] || fail "leader did not acquire its own lease under authorization"
 log "data-node cert: acquired its own range lease at epoch $epoch"
 
 log "PASS: admin authorization enforced without breaking the lease path"
