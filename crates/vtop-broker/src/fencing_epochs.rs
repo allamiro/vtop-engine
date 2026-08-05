@@ -49,7 +49,14 @@ const ENTRY_BYTES: usize = 16;
 /// A range would need this many leadership changes to reach the bound; far
 /// past that, something is flapping and the operator needs to know rather
 /// than have the file grow without limit.
-const MAX_ENTRIES: usize = 1 << 20;
+///
+/// Deliberately the SAME bound the wire enforces, taken from there rather than
+/// chosen here. A vector exists to be compared against a peer's, so one too
+/// large to transmit cannot do the only job it has: the replica would hold a
+/// perfectly valid local history, fail to encode it, and report "unknown" to
+/// every peer forever. Sharing the constant makes "locally recoverable" imply
+/// "transmittable" by construction instead of by coincidence.
+const MAX_ENTRIES: usize = vtop_protocol::MAX_REPLICA_EPOCH_STARTS;
 
 /// One epoch's first offset on this replica.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -303,8 +310,14 @@ impl FencingEpochJournal {
     }
 
     fn sync_parent(env: &Env, path: &Path) -> BrokerResult<()> {
-        let Some(parent) = path.parent() else {
-            return Ok(());
+        // `Path::parent` of a bare filename is `Some("")`, not `None`, and
+        // syncing the empty path fails — so a journal opened at a relative name
+        // would fail on create for a reason that has nothing to do with the
+        // journal. The directory it means is the current one.
+        let parent = match path.parent() {
+            Some(parent) if parent.as_os_str().is_empty() => Path::new("."),
+            Some(parent) => parent,
+            None => return Ok(()),
         };
         env.storage
             .sync_dir(parent)
@@ -601,5 +614,31 @@ mod tests {
         assert_eq!(j.end_of_epoch(1), Some(100));
         assert_eq!(j.end_of_epoch(2), None, "the newest epoch ends at the tail");
         assert_eq!(j.end_of_epoch(9), None, "unknown epoch");
+    }
+
+    /// `Path::parent` of a bare filename is `Some("")`, which is not a
+    /// directory anything can sync. Opening by relative name must still work.
+    #[test]
+    fn a_journal_opens_at_a_bare_relative_path() {
+        let dir = TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        // Serialised against other tests only by being the single one that
+        // changes the process directory; it restores it before returning.
+        std::env::set_current_dir(dir.path()).unwrap();
+        let opened = FencingEpochJournal::open("fencing-epochs");
+        std::env::set_current_dir(previous).unwrap();
+        assert!(
+            opened.is_ok(),
+            "a bare relative path must open: {:?}",
+            opened.err()
+        );
+    }
+
+    /// The local bound and the wire bound must be the same number, so a journal
+    /// this code accepts on open can always be transmitted. If they drift, a
+    /// replica can hold a valid vector it is structurally unable to share.
+    #[test]
+    fn the_local_bound_matches_the_wire_bound() {
+        assert_eq!(MAX_ENTRIES, vtop_protocol::MAX_REPLICA_EPOCH_STARTS);
     }
 }

@@ -633,7 +633,13 @@ fn encoded_payload_size(message: &Message, limits: ProtocolLimits) -> Result<usi
             Message::ReplicaStatusResponse(_) => 8 + 8,
             Message::ReplicaEpochHistoryRequest(value) => range_size(&value.range)?,
             Message::ReplicaEpochHistoryResponse(value) => {
-                4 + value.epoch_starts.len().saturating_mul(16)
+                // Bounded HERE, not only in the writer below: this branch is
+                // what `encode_frame` reserves from, so checking downstream
+                // means an over-long history allocates before it is refused.
+                if value.epoch_starts.len() > MAX_REPLICA_EPOCH_STARTS {
+                    return Err(ProtocolError::Limit("epoch history too long".to_owned()));
+                }
+                4 + value.epoch_starts.len() * 16
             }
             Message::CommitCursorRequest(value) => {
                 lineage_cursor_size(&value.cursor)?

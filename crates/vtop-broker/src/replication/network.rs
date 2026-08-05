@@ -1333,13 +1333,16 @@ impl ReplicaStatusClient {
 
     /// Ask a replica which fencing epoch wrote each stretch of its log (#240).
     ///
-    /// A replica that refuses the request — an older peer that does not know
-    /// the message kind, or one whose vector is absent or broken — yields an
-    /// EMPTY history rather than an error. That is deliberate: "unknown" is a
-    /// state promotion must handle anyway, and turning a peer's ignorance into
-    /// a failed probe would make a mixed-version cluster unable to elect at
-    /// all. The caller must never read empty as "this replica had no
-    /// leadership changes".
+    /// A replica that cannot answer — one whose vector is absent or broken and
+    /// refuses, or an older peer that does not know the message kind and simply
+    /// drops the connection — yields an EMPTY history rather than an error.
+    /// That is deliberate: "unknown" is a state promotion must handle anyway,
+    /// and turning a peer's ignorance into a failed probe would make a
+    /// mixed-version cluster unable to elect at all. The caller must never read
+    /// empty as "this replica had no leadership changes".
+    ///
+    /// A malformed reply, a TLS failure, or a wrong peer identity is still an
+    /// error: those are faults, not answers.
     pub async fn epoch_history(
         &self,
         addr: SocketAddr,
@@ -1376,13 +1379,22 @@ impl ReplicaStatusClient {
                 ),
             };
             write_frame(&mut stream, &frame, REPLICA_LIMITS).await?;
-            let reply = read_frame(&mut stream, REPLICA_LIMITS)
-                .await?
-                .ok_or_else(|| {
-                    crate::BrokerError::InvalidConfig(
-                        "replica closed the session without answering".to_owned(),
-                    )
-                })?;
+            let Some(reply) = read_frame(&mut stream, REPLICA_LIMITS).await? else {
+                // A peer that does not know kind 67 fails in ITS read_frame,
+                // before any handler runs, and drops the connection without
+                // writing a reply. So the mixed-version case arrives here as a
+                // clean EOF, not as an Error frame — handling only the latter
+                // would promise a degraded path and not deliver one.
+                //
+                // This conflates "too old to answer" with "died mid-request",
+                // which is safe because it is not this call's job to tell them
+                // apart: liveness is established by the status probe, which
+                // still fails loudly. Both mean the same thing for the value
+                // being returned — we do not know this replica's history — and
+                // unknown only ever disables epoch reconciliation, never
+                // authorises a truncation.
+                return Ok(Vec::new());
+            };
             match reply.message {
                 Message::ReplicaEpochHistoryResponse(response) => Ok(response.epoch_starts),
                 // Refusal is "unknown", not a probe failure — see above.
