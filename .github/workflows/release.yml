@@ -163,7 +163,19 @@ jobs:
         # librdkafka needs BOTH OpenSSL and Cyrus SASL headers here, mirroring
         # libssl-dev + libsasl2-dev on the Linux legs. Without cyrus-sasl the
         # librdkafka cmake configure step can fail and block the release.
+        env:
+          # Deterministic release builds: install exactly what is asked for,
+          # without a mid-release formula update ride-along.
+          HOMEBREW_NO_AUTO_UPDATE: "1"
         run: |
+          # The runner image ships third-party taps (aws/tap) pre-tapped, and
+          # Homebrew's tap-trust model warns on every invocation while an
+          # untrusted tap is present. Nothing here uses them — REMOVE rather
+          # than trust: a tap delivers arbitrary code, and trusting one this
+          # build never reads would be pure attack surface. (Setting
+          # HOMEBREW_NO_REQUIRE_TAP_TRUST is the discouraged escape hatch and
+          # is slated for removal upstream.)
+          brew untap aws/tap 2>/dev/null || true
           brew install cmake openssl@3 cyrus-sasl
           # Homebrew prefix differs by arch (/opt/homebrew on arm64,
           # /usr/local on x86_64), so resolve it rather than hardcoding.
