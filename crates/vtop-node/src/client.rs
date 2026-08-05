@@ -140,6 +140,19 @@ pub async fn produce(config: &ClientConfig, args: ProduceArgs) -> Result<i32, St
     let started = Instant::now();
     let mut acked: u64 = 0;
     let mut request_id: u64 = 0;
+    // The log offset this producer expects next, learned from the first ack
+    // rather than derived from the producer sequence.
+    //
+    // Sequence and offset are different coordinates: a sequence is per-producer
+    // and per-producer-epoch, an offset is the range's. They coincide only when
+    // this producer wrote every record in the range, contiguously, from
+    // sequence 0. A producer resuming after a failover satisfies none of that —
+    // the range already holds records, and a bumped producer epoch restarts
+    // sequences at 0 — so asserting `offset == first_sequence + acked` failed a
+    // correct broker. Anchoring on the first observed offset keeps the invariant
+    // that matters (each ack advances the range by exactly the records acked)
+    // without assuming the range started empty or that this producer owns it.
+    let mut expected_next_offset: Option<u64> = None;
     persist_acked(args.acked_file.as_ref(), args.first_sequence)?;
     while acked < args.records {
         let count = u64::from(args.batch).min(args.records - acked);
@@ -152,7 +165,8 @@ pub async fn produce(config: &ClientConfig, args: ProduceArgs) -> Result<i32, St
             })
             .collect();
         request_id += 1;
-        let outcome: Result<(), ProduceBatchError> = async {
+        let expected_offset = expected_next_offset.map(|next| next + count);
+        let outcome: Result<u64, ProduceBatchError> = async {
             write_frame(
                 &mut session,
                 &WireFrame {
@@ -180,14 +194,16 @@ pub async fn produce(config: &ClientConfig, args: ProduceArgs) -> Result<i32, St
                 })?;
             match reply.message {
                 Message::ProduceResponse(response) => {
-                    let expected = first + count;
-                    if response.committed_next_offset != expected {
-                        return Err(ProduceBatchError::Failed(format!(
-                            "committed_next_offset {} after acking through {expected}",
-                            response.committed_next_offset
-                        )));
+                    if let Some(expected) = expected_offset {
+                        if response.committed_next_offset != expected {
+                            return Err(ProduceBatchError::Failed(format!(
+                                "committed_next_offset {} after acking {count} records; \
+                                 expected {expected}",
+                                response.committed_next_offset
+                            )));
+                        }
                     }
-                    Ok(())
+                    Ok(response.committed_next_offset)
                 }
                 Message::Error(ErrorResponse { code, message, .. }) => Err(
                     ProduceBatchError::Failed(format!("produce rejected: {code:?} {message}")),
@@ -199,7 +215,8 @@ pub async fn produce(config: &ClientConfig, args: ProduceArgs) -> Result<i32, St
         }
         .await;
         match outcome {
-            Ok(()) => {
+            Ok(committed_next_offset) => {
+                expected_next_offset = Some(committed_next_offset);
                 acked += count;
                 persist_acked(args.acked_file.as_ref(), args.first_sequence + acked)?;
                 if request_id.is_multiple_of(20) {
@@ -234,12 +251,22 @@ pub async fn produce(config: &ClientConfig, args: ProduceArgs) -> Result<i32, St
 pub struct VerifyArgs {
     pub addr: String,
     pub expect_at_least: u64,
+    /// Byte-verify content below this offset; above it, check structure only.
+    ///
+    /// Expected content is derived from the offset, which is predictable only
+    /// for records written contiguously from sequence 0 by this producer. A
+    /// range holding anything else — records from another producer, or from
+    /// this one after a producer-epoch bump restarts its sequences — has a
+    /// suffix no reader can reconstruct. `u64::MAX` verifies everything, which
+    /// is the right default for a range this producer wholly owns.
+    pub verify_content_through: u64,
     pub batch: u32,
     pub value_bytes: usize,
 }
 
-/// Fetch offset 0 → committed HWM, byte-verifying every record. Fails if the
-/// HWM is below the acknowledged floor or any record's content mismatches.
+/// Fetch offset 0 → committed HWM, checking every record's offset contiguity
+/// and byte-verifying content below `verify_content_through`. Fails if the HWM
+/// is below the acknowledged floor or a verified record's content mismatches.
 pub async fn verify(config: &ClientConfig, args: VerifyArgs) -> Result<i32, String> {
     let mut session = connect(config, &args.addr, Role::Consumer).await?;
     let mut request_id: u64 = 0;
@@ -308,8 +335,9 @@ pub async fn verify(config: &ClientConfig, args: VerifyArgs) -> Result<i32, Stri
                     record.offset
                 ));
             }
-            if record.key != next_offset.to_be_bytes()
-                || record.value != record_value(next_offset, args.value_bytes)
+            if next_offset < args.verify_content_through
+                && (record.key != next_offset.to_be_bytes()
+                    || record.value != record_value(next_offset, args.value_bytes))
             {
                 return Err(format!("record {next_offset} content mismatch"));
             }

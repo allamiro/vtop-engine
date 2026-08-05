@@ -466,14 +466,24 @@ emit_node_status_config() {
 
 # A client config pinned to a specific fencing epoch, for proving that a stale
 # epoch is refused.
+# emit_client_config_at_epoch <fencing-epoch> [producer-epoch]
+#
+# The PRODUCER epoch is overridable — distinct from the range fencing epoch —
+# because idempotent producers require gap-free sequences. Sequence state is
+# keyed on (producer_id, producer_epoch), so bumping the producer epoch opens a
+# fresh sequence space starting at 0 and fences the previous session. That is
+# the only way for this producer to resume after a failover: its id is pinned
+# to the authenticated principal, so it cannot present a different identity,
+# and promotion truncates to the verified quorum floor, so it cannot know where
+# its old sequence space now ends.
 emit_client_config_at_epoch() {
-  local epoch="$1"
-  local cfg="$WORKDIR/client-epoch-$epoch.yaml"
+  local epoch="$1" producer_epoch="${2:-1}"
+  local cfg="$WORKDIR/client-epoch-$epoch-p$producer_epoch.yaml"
   {
     echo "cluster_id: $CLUSTER_ID"
     echo "principal_id: $PRINCIPAL_ID"
     echo "producer_id: $PRODUCER_ID"
-    echo "producer_epoch: 1"
+    echo "producer_epoch: $producer_epoch"
     echo "fencing_epoch: $epoch"
     emit_range_yaml
     echo "server_name: \"localhost\""
@@ -746,12 +756,20 @@ follower_committed_offset() {
 # quorum could PROVE may sit below the floor until the new leader's replication
 # stream catches the lagging follower up; the eventual assertion is the one
 # that is actually promised.
+# The optional 4th argument bounds CONTENT verification. Records past the
+# acknowledged floor may have been written by a producer whose sequences do not
+# equal their offsets — after a failover the resuming producer bumps its epoch
+# and restarts at sequence 0 — so their bytes are not reconstructible from the
+# offset. Structure (contiguity, high watermark) is still checked throughout.
 await_verified_floor() {
-  local cfg="$1" addr="$2" floor="$3"
+  local cfg="$1" addr="$2" floor="$3" content_through="${4:-}"
   local deadline=$((SECONDS + PROGRESS_TIMEOUT_SECONDS))
+  local bound=()
+  [[ -n "$content_through" ]] && bound=(--verify-content-through "$content_through")
   while :; do
     if "$VTOP_NODE" verify --client-config "$cfg" --addr "$addr" \
-      --expect-at-least "$floor" > "$WORKDIR/logs/verify-after-failover.log" 2>&1; then
+      --expect-at-least "$floor" "${bound[@]}" \
+      > "$WORKDIR/logs/verify-after-failover.log" 2>&1; then
       return 0
     fi
     [[ $SECONDS -lt $deadline ]] \
