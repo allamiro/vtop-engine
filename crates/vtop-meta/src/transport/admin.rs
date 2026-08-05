@@ -8,10 +8,12 @@ use super::tls::{server_name, TlsMaterial};
 use super::wire::{
     read_frame, write_frame, AdminAddLearnerRequest, AdminChangeMembershipRequest, AdminError,
     AdminInitRequest, AdminMembershipResponse, AdminProposeRequest, AdminProposeResponse,
-    AdminStatusRequest, AdminStatusResponse, TransportError, TransportResult, VtpmFrame,
-    KIND_ADMIN_ADD_LEARNER_REQ, KIND_ADMIN_CHANGE_MEMBERSHIP_REQ, KIND_ADMIN_ERROR,
-    KIND_ADMIN_INIT_REQ, KIND_ADMIN_MEMBERSHIP_RESP, KIND_ADMIN_PROPOSE_REQ,
-    KIND_ADMIN_PROPOSE_RESP, KIND_ADMIN_STATUS_REQ, KIND_ADMIN_STATUS_RESP,
+    AdminReadRangeLeaseRequest, AdminReadRangeLeaseResponse, AdminStatusRequest,
+    AdminStatusResponse, TransportError, TransportResult, VtpmFrame, KIND_ADMIN_ADD_LEARNER_REQ,
+    KIND_ADMIN_CHANGE_MEMBERSHIP_REQ, KIND_ADMIN_ERROR, KIND_ADMIN_INIT_REQ,
+    KIND_ADMIN_MEMBERSHIP_RESP, KIND_ADMIN_PROPOSE_REQ, KIND_ADMIN_PROPOSE_RESP,
+    KIND_ADMIN_READ_RANGE_LEASE_REQ, KIND_ADMIN_READ_RANGE_LEASE_RESP, KIND_ADMIN_STATUS_REQ,
+    KIND_ADMIN_STATUS_RESP,
 };
 use crate::command::MetadataCommand;
 use crate::keys::MetaNodeId;
@@ -34,6 +36,16 @@ pub trait AdminHandler: Send + Sync {
         voters: Vec<u64>,
         retain_removed_as_learners: bool,
     ) -> TransportResult<AdminMembershipResponse>;
+    /// Linearizable read of a range's lease (#223).
+    ///
+    /// Linearizable, not best-effort: a candidate deciding whether to take a
+    /// range must not act on a stale view. A follower serving its own lagging
+    /// copy could report an expired lease that the leader has already renewed,
+    /// and the candidate would then fence a perfectly healthy leader.
+    async fn read_range_lease(
+        &self,
+        request: AdminReadRangeLeaseRequest,
+    ) -> TransportResult<AdminReadRangeLeaseResponse>;
 }
 
 /// mTLS admin server.
@@ -123,6 +135,14 @@ async fn dispatch_admin(
                 payload: response.encode()?,
             })
         }
+        KIND_ADMIN_READ_RANGE_LEASE_REQ => {
+            let request = AdminReadRangeLeaseRequest::decode(&frame.payload)?;
+            let response = handler.read_range_lease(request).await?;
+            Ok(VtpmFrame {
+                kind: KIND_ADMIN_READ_RANGE_LEASE_RESP,
+                payload: response.encode(),
+            })
+        }
         KIND_ADMIN_PROPOSE_REQ => {
             let request = AdminProposeRequest::decode(&frame.payload)?;
             let response = handler.propose(request.command).await?;
@@ -190,6 +210,34 @@ impl AdminClient {
             .await?;
         match frame.kind {
             KIND_ADMIN_STATUS_RESP => Ok(AdminStatusResponse::decode(&frame.payload)?),
+            KIND_ADMIN_ERROR => {
+                let error = AdminError::decode(&frame.payload)?;
+                Err(TransportError::Protocol(error.message))
+            }
+            other => Err(TransportError::UnexpectedKind(other)),
+        }
+    }
+
+    /// Read a range's lease through a linearizable fence.
+    pub async fn read_range_lease(
+        &self,
+        topic_uuid: uuid::Uuid,
+        range_uuid: uuid::Uuid,
+    ) -> TransportResult<AdminReadRangeLeaseResponse> {
+        let frame = self
+            .round_trip(VtpmFrame {
+                kind: KIND_ADMIN_READ_RANGE_LEASE_REQ,
+                payload: AdminReadRangeLeaseRequest {
+                    topic_uuid,
+                    range_uuid,
+                }
+                .encode(),
+            })
+            .await?;
+        match frame.kind {
+            KIND_ADMIN_READ_RANGE_LEASE_RESP => {
+                Ok(AdminReadRangeLeaseResponse::decode(&frame.payload)?)
+            }
             KIND_ADMIN_ERROR => {
                 let error = AdminError::decode(&frame.payload)?;
                 Err(TransportError::Protocol(error.message))

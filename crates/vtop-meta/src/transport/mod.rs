@@ -34,13 +34,15 @@ pub use tls::{
 };
 pub use wire::{
     read_frame, write_frame, AdminAddLearnerRequest, AdminChangeMembershipRequest, AdminError,
-    AdminInitRequest, AdminMembershipResponse, AdminProposeRequest, AdminProposeResponse,
+    AdminInitRequest, AdminLeaseView, AdminMembershipResponse, AdminProposeRequest,
+    AdminProposeResponse, AdminReadRangeLeaseRequest, AdminReadRangeLeaseResponse,
     AdminStatusRequest, AdminStatusResponse, PeerAppendRequest, PeerAppendResponse,
     PeerInstallRequest, PeerInstallResponse, PeerVoteRequest, PeerVoteResponse, TransportError,
     TransportResult, VtpmFrame, WireLogId, KIND_ADMIN_ADD_LEARNER_REQ,
     KIND_ADMIN_CHANGE_MEMBERSHIP_REQ, KIND_ADMIN_ERROR, KIND_ADMIN_INIT_REQ,
     KIND_ADMIN_MEMBERSHIP_RESP, KIND_ADMIN_PROPOSE_REQ, KIND_ADMIN_PROPOSE_RESP,
-    KIND_ADMIN_STATUS_REQ, KIND_ADMIN_STATUS_RESP, KIND_APPEND_REQ, KIND_APPEND_RESP,
-    KIND_INSTALL_REQ, KIND_INSTALL_RESP, KIND_VOTE_REQ, KIND_VOTE_RESP, MAX_ADMIN_MEMBERSHIP_NODES,
-    MAX_FRAME_BYTES, VTPM_MAGIC, VTPM_VERSION,
+    KIND_ADMIN_READ_RANGE_LEASE_REQ, KIND_ADMIN_READ_RANGE_LEASE_RESP, KIND_ADMIN_STATUS_REQ,
+    KIND_ADMIN_STATUS_RESP, KIND_APPEND_REQ, KIND_APPEND_RESP, KIND_INSTALL_REQ, KIND_INSTALL_RESP,
+    KIND_VOTE_REQ, KIND_VOTE_RESP, MAX_ADMIN_MEMBERSHIP_NODES, MAX_FRAME_BYTES, VTPM_MAGIC,
+    VTPM_VERSION,
 };

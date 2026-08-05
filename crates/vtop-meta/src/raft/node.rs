@@ -66,6 +66,7 @@ pub async fn start_meta_node(
     let store = MetaRaftStore::open(env, data_dir, cluster_id, MetaStorageConfig::default())
         .map_err(|error| format!("open meta store: {error}"))?;
     let log_store = MetaRaftLogStore::new(store.clone());
+    let read_store = store.clone();
     let state_machine = MetaRaftStateMachine::new(store);
     let network = TlsRaftNetworkFactory::new(node_id, directory, material);
     let config = Arc::new(
@@ -83,7 +84,9 @@ pub async fn start_meta_node(
         .await
         .map_err(|error| format!("start raft node {node_id}: {error}"))?;
     Ok(MetaNode {
-        consensus: Arc::new(OpenraftConsensus::new(raft.clone())),
+        // The store is attached so this node can serve linearizable lease
+        // reads (#223); the Raft handle alone cannot see applied state.
+        consensus: Arc::new(OpenraftConsensus::new(raft.clone()).with_store(read_store)),
         peer_handler: Arc::new(RaftPeerHandler::new(raft)),
     })
 }
