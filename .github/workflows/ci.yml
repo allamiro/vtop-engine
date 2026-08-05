@@ -467,19 +467,25 @@ jobs:
           cargo build -p vtop-node --bin vtop-node
           cargo build -p vtop-cli --no-default-features --bin vtopctl
 
+      # CHAOS_WORKDIR is what makes the logs survive to be uploaded. Scenarios
+      # delete workdirs they generated themselves, so an artifact pointed at
+      # the default `/tmp/vtop-chaos.*` collects nothing and the upload passes
+      # empty — a diagnostic that appears to exist and is absent exactly when
+      # it is needed. Supplying the directory also sets WORKDIR_GENERATED=0,
+      # which suppresses that cleanup, so the tree is still there afterwards.
       - name: Run the live chaos suite
-        run: CHAOS_PROFILE=debug scripts/live-chaos/run-all.sh
+        run: CHAOS_PROFILE=debug CHAOS_WORKDIR="$RUNNER_TEMP/chaos" scripts/live-chaos/run-all.sh
 
-      # The per-scenario logs are the whole diagnostic record: a scenario that
-      # fails names a log file, and without this the reason dies with the
-      # runner.
+      # A failing scenario names a log file; without this the reason dies with
+      # the runner. `error` on empty, not `ignore`: an empty artifact means the
+      # wiring above broke, and that must be visible rather than silent.
       - name: Upload scenario logs
-        if: always()
+        if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: live-chaos-logs
-          path: /tmp/vtop-chaos*/logs/
-          if-no-files-found: ignore
+          path: ${{ runner.temp }}/chaos/**/logs/
+          if-no-files-found: error
           retention-days: 7
 
   # The MSRV is a tested promise, not a number in a file: this builds on exactly
