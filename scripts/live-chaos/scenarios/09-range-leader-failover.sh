@@ -136,18 +136,51 @@ log "follower $OTHER_N restarted at epoch $EPOCH_AFTER to rejoin replication"
 # 2-of-2 quorum could vouch for at that instant — which sits below $ACKED
 # whenever the restarted follower is the lagging one — and quorum-acking a
 # fresh batch is what forces the replication stream to push the backlog to
-# that follower and move the boundary past the pre-kill floor. Sequences start
-# at $RECORDS, past anything the interrupted producer could have sent, so
-# producer idempotency cannot dedupe them into a no-op.
-VERIFY_CFG="$(emit_client_config_at_epoch "$EPOCH_AFTER")"
-"$VTOP_NODE" produce --client-config "$VERIFY_CFG" --addr "$(native_addr)" \
-  --records "$BATCH" --batch "$BATCH" --first-sequence "$RECORDS" \
-  --durability quorum > "$WORKDIR/logs/produce-after-failover.log" 2>&1 \
-  || fail "post-failover produce failed (see $WORKDIR/logs/produce-after-failover.log)"
+# that follower and move the boundary past the pre-kill floor.
+#
+# The batch is written under a BUMPED PRODUCER EPOCH — the mechanism for
+# resuming a producer whose session did not survive. The interrupted sequence
+# space cannot be resumed blind: sequences must be gap-free, and promotion
+# truncates to the verified quorum floor, which sits at neither $ACKED nor
+# $RECORDS, so any first-sequence the harness picks is a guess the broker
+# rejects as a gap. Nor can the client sidestep it with a fresh producer id —
+# the broker requires producer id to equal the authenticated principal.
+# Bumping the producer epoch opens a fresh sequence space (state is keyed on
+# `(producer_id, producer_epoch)`) and fences the pre-failover session, which
+# is the invariant a real client relies on after losing its own.
+#
+# (This previously sent --first-sequence $RECORDS under producer epoch 1,
+# reasoning that starting past the interrupted range avoids idempotent dedupe.
+# It does — but it also creates a sequence gap, which the broker refuses. That
+# assertion could only pass when the "mid-flight" kill happened to land after
+# the producer had already written all $RECORDS records, i.e. when the thing
+# the scenario exists to test did not actually happen.)
+VERIFY_PRODUCER_EPOCH=2
+VERIFY_CFG="$(emit_client_config_at_epoch "$EPOCH_AFTER" "$VERIFY_PRODUCER_EPOCH")"
+# Retried until the new leader can reach quorum. The follower was restarted
+# moments ago and the leader's replication stream to it is established
+# asynchronously, so the first attempt can legitimately find zero followers
+# durable — that is the stream still connecting, not a durability failure. A
+# single attempt here made the scenario depend on winning that race.
+produce_deadline=$((SECONDS + PROGRESS_TIMEOUT_SECONDS))
+until "$VTOP_NODE" produce --client-config "$VERIFY_CFG" --addr "$(native_addr)" \
+  --records "$BATCH" --batch "$BATCH" \
+  --durability quorum > "$WORKDIR/logs/produce-after-failover.log" 2>&1; do
+  [[ $SECONDS -lt $produce_deadline ]] \
+    || fail "post-failover produce never reached quorum within ${PROGRESS_TIMEOUT_SECONDS}s: \
+$(tail -1 "$WORKDIR/logs/produce-after-failover.log")"
+  sleep 0.2
+done
 log "the new leader acknowledged fresh quorum writes"
 
 # Retried while the boundary settles; the produce above guarantees it arrives.
-await_verified_floor "$VERIFY_CFG" "$(native_addr)" "$ACKED"
+#
+# Content is byte-verified through $ACKED — exactly the records the pre-kill
+# producer was told were durable, which is the claim being made. The fresh
+# batch above it came from a bumped producer epoch whose sequences restart at
+# 0, so its bytes are not derivable from its offsets; it is still checked for
+# offset contiguity and against the high watermark.
+await_verified_floor "$VERIFY_CFG" "$(native_addr)" "$ACKED" "$ACKED"
 log "every one of the $ACKED acknowledged records survived the failover, byte-exact"
 
 # --- the dead leader must not be able to write again ------------------------

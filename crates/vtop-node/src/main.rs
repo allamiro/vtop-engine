@@ -85,6 +85,17 @@ enum Command {
         /// Fail if the committed HWM is below this acknowledged floor.
         #[arg(long, default_value_t = 0)]
         expect_at_least: u64,
+        /// Byte-verify record CONTENT below this offset only; above it check
+        /// structure alone (contiguity, high watermark).
+        ///
+        /// Content is reconstructed from the offset, which is only predictable
+        /// for records this producer wrote contiguously from sequence 0. A
+        /// range that also holds records from another producer — or from this
+        /// one after a producer-epoch bump, whose sequences restart at 0 — has
+        /// a suffix whose content no reader can derive. Defaults to unbounded,
+        /// which is every existing caller.
+        #[arg(long, default_value_t = u64::MAX)]
+        verify_content_through: u64,
         #[arg(long, default_value_t = 512, value_parser = parse_batch)]
         batch: u32,
         #[arg(long, default_value_t = 128)]
@@ -188,6 +199,7 @@ async fn run(cli: Cli) -> Result<i32, String> {
             client_config,
             addr,
             expect_at_least,
+            verify_content_through,
             batch,
             value_bytes,
         } => {
@@ -197,6 +209,7 @@ async fn run(cli: Cli) -> Result<i32, String> {
                 client::VerifyArgs {
                     addr,
                     expect_at_least,
+                    verify_content_through,
                     batch,
                     value_bytes,
                 },
