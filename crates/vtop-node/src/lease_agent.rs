@@ -77,8 +77,14 @@ pub trait LeasePublisher: Send + Sync {
 /// the agent's decisions must be assertable without a network.
 #[async_trait::async_trait]
 pub trait QuorumProbe: Send + Sync {
-    /// One probe per configured replica, including the leader's own view.
-    async fn probe(&self) -> Vec<crate::promotion::ReplicaProbe>;
+    /// Fence every configured replica at `fencing_epoch` and report what each
+    /// held at that instant, including the leader's own view.
+    ///
+    /// Takes the epoch because probing without fencing reads a moving target:
+    /// the deposed leader may still be appending to a follower while the new
+    /// leader measures it. A replica that could not be fenced must report
+    /// `None` — absent from the quorum — rather than its last known offset.
+    async fn probe(&self, fencing_epoch: u64) -> Vec<crate::promotion::ReplicaProbe>;
     /// The CONFIGURED replica-set size, not the number that answered.
     fn replication_factor(&self) -> usize;
 }
@@ -132,12 +138,17 @@ impl ReplicaPlaneProbe {
 
 #[async_trait::async_trait]
 impl QuorumProbe for ReplicaPlaneProbe {
-    async fn probe(&self) -> Vec<crate::promotion::ReplicaProbe> {
+    async fn probe(&self, fencing_epoch: u64) -> Vec<crate::promotion::ReplicaProbe> {
         // The leader's own disk, read with the BLOCKING accessor. Promotion is
         // a request handler, not a scrape: it is allowed to queue behind an
         // append. The non-blocking variant would have the leader abstain from
         // its own quorum under momentary lock contention, which in a 2-replica
         // range turns a lock hold into a refused promotion.
+        //
+        // No fence RPC to itself. This process holds the epoch it is promoting
+        // at — that is what made it the candidate — so nothing else can be
+        // writing here under an older one. Dialling its own port to be told so
+        // would add a failure mode without adding a fact.
         let (local_committed, _) = self.broker.local_offsets();
         let mut probes = vec![crate::promotion::ReplicaProbe {
             node_id: self.node_uuid,
@@ -146,24 +157,33 @@ impl QuorumProbe for ReplicaPlaneProbe {
         // Concurrent: a follower that has stopped answering must not add its
         // full deadline to every other follower's wait.
         let answers = futures::future::join_all(self.followers.iter().map(|follower| async move {
-            let status = self
+            let fenced = self
                 .client
-                .status(
+                .fence(
                     follower.addr,
                     &follower.server_name,
                     follower.node_uuid,
                     &self.range,
+                    fencing_epoch,
                 )
                 .await;
             crate::promotion::ReplicaProbe {
                 node_id: follower.node_uuid,
-                local_committed_offset: match status {
-                    Ok(status) => Some(status.local_committed_offset),
+                local_committed_offset: match fenced {
+                    Ok(response) => Some(response.local_committed_offset),
                     Err(error) => {
+                        // ABSENT, not "last known offset". A replica that could
+                        // not be fenced may still be taking the deposed
+                        // leader's appends, so its offset is a measurement of
+                        // something still moving. Counting it is exactly the
+                        // bug fencing exists to close, and a replica that has
+                        // simply not yet seen the grant refuses here too —
+                        // correctly, since it is not fenced until it has.
                         tracing::debug!(
                             follower = %follower.node_uuid,
+                            fencing_epoch,
                             %error,
-                            "replica did not answer the promotion probe"
+                            "replica could not be fenced; excluded from the promotion quorum"
                         );
                         None
                     }
@@ -254,7 +274,7 @@ impl Promoter {
             // form would make single-replica deployments unleadable.
             None => None,
             Some(probe) => {
-                let probes = probe.probe().await;
+                let probes = probe.probe(fencing_epoch).await;
                 match crate::promotion::establish(
                     &probes,
                     probe.replication_factor(),
@@ -1074,12 +1094,17 @@ mod tests {
         probes: std::sync::Mutex<Vec<crate::promotion::ReplicaProbe>>,
         factor: usize,
         calls: std::sync::atomic::AtomicUsize,
+        /// Every epoch the probe was asked to fence at, in order. A probe taken
+        /// at the wrong epoch would fence nothing that matters, so the value
+        /// reaching this trait is worth asserting rather than assuming.
+        fenced_at: std::sync::Mutex<Vec<u64>>,
     }
 
     #[async_trait::async_trait]
     impl QuorumProbe for FixedProbe {
-        async fn probe(&self) -> Vec<crate::promotion::ReplicaProbe> {
+        async fn probe(&self, fencing_epoch: u64) -> Vec<crate::promotion::ReplicaProbe> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.fenced_at.lock().unwrap().push(fencing_epoch);
             self.probes.lock().unwrap().clone()
         }
         fn replication_factor(&self) -> usize {
@@ -1092,6 +1117,7 @@ mod tests {
             probes: std::sync::Mutex::new(probes),
             factor,
             calls: std::sync::atomic::AtomicUsize::new(0),
+            fenced_at: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -1200,6 +1226,56 @@ mod tests {
         assert!(
             recorder.demoted.lock().unwrap().is_empty(),
             "a possibly-transient refusal must not release the epoch"
+        );
+    }
+
+    /// The probe must fence at the epoch being promoted, not some other one.
+    ///
+    /// A fence taken at the wrong epoch stops nothing that matters: the deposed
+    /// leader writes under the epoch BELOW the one being granted, so fencing at
+    /// anything else leaves it free to keep appending while the new leader
+    /// measures. The value is easy to thread wrongly and impossible to notice
+    /// from the outside, so it is asserted rather than assumed.
+    #[tokio::test]
+    async fn the_probe_fences_at_the_epoch_being_promoted() {
+        let recorder = Arc::new(Recorder::default());
+        let probe = fixed(vec![at(1, Some(10)), at(2, Some(10))], 2);
+        let mut promoter = promoter(
+            Arc::clone(&recorder) as Arc<dyn LeasePublisher>,
+            Some(Arc::clone(&probe) as Arc<dyn QuorumProbe>),
+        );
+
+        assert!(promoter.ensure(19).await);
+        assert!(promoter.ensure(20).await);
+
+        assert_eq!(
+            *probe.fenced_at.lock().unwrap(),
+            vec![19, 20],
+            "each promotion must fence at its own epoch"
+        );
+    }
+
+    /// A replica that could not be fenced does not count toward the quorum.
+    ///
+    /// This is the safety property the fence exists for. Its offset is a
+    /// measurement of something that may still be moving — the deposed leader
+    /// can be appending to it right now — so counting it would let promotion
+    /// establish a boundary on a moving target, which is what the probe was
+    /// doing before.
+    #[tokio::test]
+    async fn a_replica_that_could_not_be_fenced_is_absent_from_the_quorum() {
+        let recorder = Arc::new(Recorder::default());
+        // Three replicas, majority 2. The leader is fenced by construction; one
+        // follower refused the fence and reports absent.
+        let mut promoter = promoter(
+            Arc::clone(&recorder) as Arc<dyn LeasePublisher>,
+            Some(fixed(vec![at(1, Some(90)), at(2, None), at(3, None)], 3)),
+        );
+
+        assert!(
+            !promoter.ensure(19).await,
+            "one fenced replica out of three cannot establish a boundary, \
+             however high the unfenced ones claim to be"
         );
     }
 

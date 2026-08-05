@@ -352,6 +352,45 @@ pub struct ReplicaEpochHistoryResponse {
 /// not allocate on a peer's say-so regardless.
 pub const MAX_REPLICA_EPOCH_STARTS: usize = 4096;
 
+/// Fence a replica at `fencing_epoch` and read it in the same breath (#240).
+///
+/// A promotion probe reads where each replica's disk is. Without fencing that
+/// is a snapshot of a moving target: the deposed leader may still be appending
+/// to a follower while the new leader reads it, so the boundary a quorum
+/// "proves" can be stale before it is published. BookKeeper fences the ensemble
+/// before ledger recovery for exactly this reason.
+///
+/// Fencing and reading are ONE message rather than two on purpose. Two would
+/// leave the offset and the epoch history describing different moments, and the
+/// pair is what truncation is computed from — a divergence point derived from
+/// an offset taken at one instant and a history taken at another is arithmetic
+/// over two different logs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplicaFenceRequest {
+    pub range: RangeIdentity,
+    /// The epoch the caller claims metadata granted it.
+    ///
+    /// The replica does NOT take this on trust. It adopts the epoch only if its
+    /// own metadata view already covers it — see the handler. A replica that
+    /// believed a peer's bare claim could be fenced to an arbitrary epoch by
+    /// any node that can reach its port, and would then refuse every append
+    /// until metadata caught up to a number that may never arrive.
+    pub fencing_epoch: u64,
+}
+
+/// What a replica looked like at the instant it was fenced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplicaFenceResponse {
+    /// The epoch the replica now holds. Equal to the requested epoch on
+    /// success; never lower, since fencing only ever moves forward.
+    pub fencing_epoch: u64,
+    pub local_committed_offset: u64,
+    pub next_offset: u64,
+    /// This replica's epoch history as of the fence, ascending by epoch. Empty
+    /// means UNKNOWN, exactly as in [`ReplicaEpochHistoryResponse`].
+    pub epoch_starts: Vec<ReplicaEpochStart>,
+}
+
 /// Lineage-aware durable consumer progress. Bound to topic epoch, range
 /// generation, segment identity/root, and record position — never a bare
 /// integer offset.
@@ -422,6 +461,8 @@ pub enum Message {
     ReplicaStatusResponse(ReplicaStatusResponse),
     ReplicaEpochHistoryRequest(ReplicaEpochHistoryRequest),
     ReplicaEpochHistoryResponse(ReplicaEpochHistoryResponse),
+    ReplicaFenceRequest(ReplicaFenceRequest),
+    ReplicaFenceResponse(ReplicaFenceResponse),
     CommitCursorRequest(CommitCursorRequest),
     CommitCursorResponse(CommitCursorResponse),
     FetchCursorRequest(FetchCursorRequest),
@@ -449,6 +490,15 @@ impl Message {
             Self::ReplicaStatusResponse(_) => 66,
             Self::ReplicaEpochHistoryRequest(_) => 67,
             Self::ReplicaEpochHistoryResponse(_) => 68,
+            // 75/76, NOT the free-looking 69/70. Kind 70 is a live legacy
+            // alias that still decodes as `CommitCursorRequest` (the form
+            // before it carried an operation identity), so taking it would make
+            // an old client's commit request decode as a fence response —
+            // silently, since both are well-formed. Allocated above every kind
+            // in use instead. 69 is left unused rather than split across the
+            // cursor block; a contiguous pair is worth one wasted number.
+            Self::ReplicaFenceRequest(_) => 75,
+            Self::ReplicaFenceResponse(_) => 76,
             Self::CommitCursorRequest(_) => 74,
             Self::CommitCursorResponse(_) => 71,
             Self::FetchCursorRequest(_) => 72,
@@ -641,6 +691,13 @@ fn encoded_payload_size(message: &Message, limits: ProtocolLimits) -> Result<usi
                 }
                 4 + value.epoch_starts.len() * 16
             }
+            Message::ReplicaFenceRequest(value) => range_size(&value.range)? + 8,
+            Message::ReplicaFenceResponse(value) => {
+                if value.epoch_starts.len() > MAX_REPLICA_EPOCH_STARTS {
+                    return Err(ProtocolError::Limit("epoch history too long".to_owned()));
+                }
+                8 + 8 + 8 + 4 + value.epoch_starts.len() * 16
+            }
             Message::CommitCursorRequest(value) => {
                 lineage_cursor_size(&value.cursor)?
                     + 16
@@ -777,6 +834,8 @@ fn decode_header(header: &[u8], limits: ProtocolLimits) -> Result<Header, Protoc
             | 72
             | 73
             | 74
+            | 75
+            | 76
     ) {
         return Err(ProtocolError::UnknownKind(kind));
     }
@@ -944,6 +1003,23 @@ fn encode_message(message: &Message, out: &mut Vec<u8>) -> Result<(), ProtocolEr
             if value.epoch_starts.len() > MAX_REPLICA_EPOCH_STARTS {
                 return Err(ProtocolError::Limit("epoch history too long".to_owned()));
             }
+            put_u32(out, value.epoch_starts.len() as u32);
+            for entry in &value.epoch_starts {
+                put_u64(out, entry.epoch);
+                put_u64(out, entry.start_offset);
+            }
+        }
+        Message::ReplicaFenceRequest(value) => {
+            put_range(out, &value.range)?;
+            put_u64(out, value.fencing_epoch);
+        }
+        Message::ReplicaFenceResponse(value) => {
+            if value.epoch_starts.len() > MAX_REPLICA_EPOCH_STARTS {
+                return Err(ProtocolError::Limit("epoch history too long".to_owned()));
+            }
+            put_u64(out, value.fencing_epoch);
+            put_u64(out, value.local_committed_offset);
+            put_u64(out, value.next_offset);
             put_u32(out, value.epoch_starts.len() as u32);
             for entry in &value.epoch_starts {
                 put_u64(out, entry.epoch);
@@ -1221,6 +1297,46 @@ fn decode_message(
                 epoch_starts.push(entry);
             }
             Message::ReplicaEpochHistoryResponse(ReplicaEpochHistoryResponse { epoch_starts })
+        }
+        75 => Message::ReplicaFenceRequest(ReplicaFenceRequest {
+            range: decoder.range()?,
+            fencing_epoch: decoder.u64()?,
+        }),
+        76 => {
+            let fencing_epoch = decoder.u64()?;
+            let local_committed_offset = decoder.u64()?;
+            let next_offset = decoder.u64()?;
+            let count = decoder.u32()? as usize;
+            // Bounded before allocating: the length is a peer's claim.
+            if count > MAX_REPLICA_EPOCH_STARTS {
+                return Err(ProtocolError::Limit("epoch history too long".to_owned()));
+            }
+            let mut epoch_starts = Vec::with_capacity(count);
+            let mut previous: Option<ReplicaEpochStart> = None;
+            for _ in 0..count {
+                let entry = ReplicaEpochStart {
+                    epoch: decoder.u64()?,
+                    start_offset: decoder.u64()?,
+                };
+                // Enforced on the way IN, not only when written. A peer's
+                // history is a claim, and a non-advancing one would yield a
+                // truncation target that discards acknowledged records.
+                if let Some(previous) = previous {
+                    if entry.epoch <= previous.epoch || entry.start_offset < previous.start_offset {
+                        return Err(ProtocolError::Limit(
+                            "epoch history does not advance".to_owned(),
+                        ));
+                    }
+                }
+                previous = Some(entry);
+                epoch_starts.push(entry);
+            }
+            Message::ReplicaFenceResponse(ReplicaFenceResponse {
+                fencing_epoch,
+                local_committed_offset,
+                next_offset,
+                epoch_starts,
+            })
         }
         70 => Message::CommitCursorRequest(CommitCursorRequest {
             // Legacy kind 70 did not carry an operation identity. Decode it
@@ -1690,6 +1806,33 @@ mod tests {
             Message::ReplicaEpochHistoryResponse(ReplicaEpochHistoryResponse {
                 epoch_starts: Vec::new(),
             }),
+            Message::ReplicaFenceRequest(ReplicaFenceRequest {
+                range: range(),
+                fencing_epoch: 19,
+            }),
+            Message::ReplicaFenceResponse(ReplicaFenceResponse {
+                fencing_epoch: 19,
+                local_committed_offset: 400,
+                next_offset: 450,
+                epoch_starts: vec![
+                    ReplicaEpochStart {
+                        epoch: 18,
+                        start_offset: 0,
+                    },
+                    ReplicaEpochStart {
+                        epoch: 19,
+                        start_offset: 400,
+                    },
+                ],
+            }),
+            // A fenced replica with an unknown history: legal, and the case
+            // promotion must refuse to reconcile rather than misread.
+            Message::ReplicaFenceResponse(ReplicaFenceResponse {
+                fencing_epoch: 19,
+                local_committed_offset: 0,
+                next_offset: 0,
+                epoch_starts: Vec::new(),
+            }),
             Message::CommitCursorRequest(CommitCursorRequest {
                 operation_id: Uuid::from_u128(52),
                 member_id: Uuid::from_u128(51),
@@ -1896,5 +2039,98 @@ mod tests {
         );
         task.await.unwrap();
         assert_eq!(read_frame(&mut reader, limits()).await.unwrap(), None);
+    }
+
+    /// Kind 70 still decodes as the legacy `CommitCursorRequest`, so the fence
+    /// messages must not have taken it. This pins the collision: a new kind
+    /// allocated at 70 would make an old client's commit request decode as a
+    /// fence response — both well-formed, so nothing would notice.
+    #[test]
+    fn the_fence_kinds_did_not_steal_the_legacy_cursor_kind() {
+        assert_eq!(
+            Message::ReplicaFenceRequest(ReplicaFenceRequest {
+                range: range(),
+                fencing_epoch: 1,
+            })
+            .kind(),
+            75
+        );
+        assert_eq!(
+            Message::ReplicaFenceResponse(ReplicaFenceResponse {
+                fencing_epoch: 1,
+                local_committed_offset: 0,
+                next_offset: 0,
+                epoch_starts: Vec::new(),
+            })
+            .kind(),
+            76
+        );
+
+        // And 70 still means what it always meant: encode a legacy commit
+        // cursor, rewrite its kind byte to 70, and confirm it comes back as a
+        // cursor request rather than a fence.
+        let frame = WireFrame {
+            request_id: 1,
+            stream_id: 0,
+            message: Message::CommitCursorRequest(CommitCursorRequest {
+                operation_id: Uuid::nil(),
+                member_id: Uuid::from_u128(51),
+                cursor: LineageCursor {
+                    group_id: Uuid::from_u128(50),
+                    topic_id: Uuid::from_u128(20),
+                    topic_epoch: 1,
+                    range_id: Uuid::from_u128(21),
+                    range_generation: 0,
+                    segment_id: Uuid::from_u128(22),
+                    segment_generation: 0,
+                    segment_root: [7_u8; 32],
+                    record_offset: 5,
+                    record_index: 0,
+                    lineage_transition_id: None,
+                    checkpoint_generation: 1,
+                },
+                expected_checkpoint_generation: None,
+            }),
+        };
+        let encoded = encode_frame(&frame, limits()).expect("encode");
+        let decoded = decode_frame(&encoded, limits()).expect("decode");
+        assert!(
+            matches!(decoded.message, Message::CommitCursorRequest(_)),
+            "kind 74 must stay a cursor request; 70 is its legacy alias and \
+             neither may collide with the fence kinds"
+        );
+    }
+
+    /// A fence response claiming a non-advancing history is refused on the way
+    /// in. The value decides a truncation target, so trusting the sender to
+    /// have validated it would let a peer hand this replica an instruction to
+    /// discard acknowledged records.
+    #[test]
+    fn a_fence_response_with_a_non_advancing_history_is_refused() {
+        let bad = Message::ReplicaFenceResponse(ReplicaFenceResponse {
+            fencing_epoch: 3,
+            local_committed_offset: 10,
+            next_offset: 10,
+            epoch_starts: vec![
+                ReplicaEpochStart {
+                    epoch: 5,
+                    start_offset: 100,
+                },
+                ReplicaEpochStart {
+                    epoch: 2,
+                    start_offset: 50,
+                },
+            ],
+        });
+        let frame = WireFrame {
+            request_id: 1,
+            stream_id: 0,
+            message: bad,
+        };
+        let encoded = encode_frame(&frame, limits()).expect("encodes");
+        assert!(matches!(
+            decode_frame(&encoded, limits()),
+            Err(ProtocolError::Limit(_))
+        ));
     }
 }

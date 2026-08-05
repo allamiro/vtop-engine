@@ -109,6 +109,30 @@ pub trait ReplicaPeerHandler: Send + Sync {
     ) -> Result<Vec<vtop_protocol::ReplicaEpochStart>, (ErrorCode, String)> {
         Ok(Vec::new())
     }
+
+    /// Fence this replica and report what it holds at that instant (#240).
+    ///
+    /// Unlike [`Self::epoch_history`], this defaults to REFUSING rather than to
+    /// a benign empty value, and the asymmetry is deliberate. An unknown
+    /// history is a fact a caller can safely act on — it means "do not
+    /// reconcile me by epoch". An unknown fence is not: the whole point is that
+    /// a fenced replica has stopped moving, and a handler that silently
+    /// reported success without fencing anything would have its offset counted
+    /// toward a promotion boundary while a deposed leader kept writing to it.
+    /// That is the bug this message exists to close, so the default must be the
+    /// answer that cannot be mistaken for success.
+    fn fence(
+        &self,
+        _range: &vtop_protocol::RangeIdentity,
+        _fencing_epoch: u64,
+    ) -> Result<vtop_protocol::ReplicaFenceResponse, (ErrorCode, String)> {
+        Err((
+            ErrorCode::InvalidRequest,
+            "this replica cannot be fenced; its offset must not be counted toward a promotion \
+             boundary"
+                .to_owned(),
+        ))
+    }
 }
 
 impl ReplicaPeerHandler for InProcessFollower {
@@ -167,6 +191,33 @@ impl ReplicaPeerHandler for InProcessFollower {
                 start_offset: entry.start_offset,
             })
             .collect())
+    }
+
+    fn fence(
+        &self,
+        range: &vtop_protocol::RangeIdentity,
+        fencing_epoch: u64,
+    ) -> Result<vtop_protocol::ReplicaFenceResponse, (ErrorCode, String)> {
+        if range != self.range() {
+            return Err((
+                ErrorCode::WrongRange,
+                "fence range identity does not match this follower".to_owned(),
+            ));
+        }
+        let outcome = InProcessFollower::fence(self, fencing_epoch)?;
+        Ok(vtop_protocol::ReplicaFenceResponse {
+            fencing_epoch: outcome.fencing_epoch,
+            local_committed_offset: outcome.local_committed_offset,
+            next_offset: outcome.next_offset,
+            epoch_starts: outcome
+                .epoch_starts
+                .into_iter()
+                .map(|entry| vtop_protocol::ReplicaEpochStart {
+                    epoch: entry.epoch,
+                    start_offset: entry.start_offset,
+                })
+                .collect(),
+        })
     }
 }
 
@@ -274,6 +325,12 @@ fn dispatch_replica_frame(handler: &dyn ReplicaPeerHandler, frame: WireFrame) ->
             Ok(response) => Message::ReplicaStatusResponse(response),
             Err((code, message)) => error_message(code, message),
         },
+        Message::ReplicaFenceRequest(request) => {
+            match handler.fence(&request.range, request.fencing_epoch) {
+                Ok(response) => Message::ReplicaFenceResponse(response),
+                Err((code, message)) => error_message(code, message),
+            }
+        }
         _ => error_message(
             ErrorCode::InvalidRequest,
             "unsupported replica peer message".to_owned(),
@@ -1329,6 +1386,91 @@ impl ReplicaStatusClient {
         })
         .await
         .map_err(|_| crate::BrokerError::Timeout("replica status"))?
+    }
+
+    /// Fence a replica and read it in the same round trip (#240).
+    ///
+    /// Every failure is an ERROR here, with no degraded path — the opposite of
+    /// [`Self::epoch_history`], and deliberately so. "Unknown history" is a
+    /// usable answer: it tells the caller not to reconcile by epoch. "Unknown
+    /// whether it is fenced" is not, because the only thing a caller does with
+    /// this reply is count the replica toward a promotion boundary, and a
+    /// replica that was never fenced may still be taking a deposed leader's
+    /// writes. Turning that into an empty or default value would put the moving
+    /// target back into the quorum by another route.
+    ///
+    /// So an older peer that does not know the message, one whose metadata view
+    /// has not yet caught up to the grant, and one that is simply unreachable
+    /// all fail alike. The caller retries, or promotes on a quorum of the
+    /// replicas it did manage to fence.
+    pub async fn fence(
+        &self,
+        addr: SocketAddr,
+        server_name: &str,
+        expected_node: Uuid,
+        range: &RangeIdentity,
+        fencing_epoch: u64,
+    ) -> BrokerResult<vtop_protocol::ReplicaFenceResponse> {
+        let name = rustls::pki_types::ServerName::try_from(server_name.to_owned())
+            .map_err(|error| {
+                crate::BrokerError::InvalidConfig(format!("server name {server_name:?}: {error}"))
+            })?
+            .to_owned();
+        timeout(self.timeout, async {
+            let tcp = TcpStream::connect(addr)
+                .await
+                .map_err(|source| crate::BrokerError::Io {
+                    path: PathBuf::from("replica-fence"),
+                    source,
+                })?;
+            let mut stream = self.connector.connect(name, tcp).await.map_err(|source| {
+                crate::BrokerError::Io {
+                    path: PathBuf::from("replica-fence-tls"),
+                    source,
+                }
+            })?;
+            assert_peer_uuid(peer_certs_client(&stream), expected_node)?;
+            let frame = WireFrame {
+                request_id: 1,
+                stream_id: 0,
+                message: Message::ReplicaFenceRequest(vtop_protocol::ReplicaFenceRequest {
+                    range: range.clone(),
+                    fencing_epoch,
+                }),
+            };
+            write_frame(&mut stream, &frame, REPLICA_LIMITS).await?;
+            let reply = read_frame(&mut stream, REPLICA_LIMITS)
+                .await?
+                .ok_or_else(|| {
+                    crate::BrokerError::InvalidConfig(
+                        "replica closed the session without answering the fence".to_owned(),
+                    )
+                })?;
+            match reply.message {
+                Message::ReplicaFenceResponse(response) => {
+                    // A replica that answered with a LOWER epoch than asked for
+                    // has not been fenced to the epoch the caller is promoting
+                    // at, whatever else it did. Counting it would be counting
+                    // an unfenced replica.
+                    if response.fencing_epoch < fencing_epoch {
+                        return Err(crate::BrokerError::InvalidConfig(format!(
+                            "replica reported epoch {} after being asked to fence at {fencing_epoch}",
+                            response.fencing_epoch
+                        )));
+                    }
+                    Ok(response)
+                }
+                Message::Error(error) => Err(crate::BrokerError::InvalidConfig(format!(
+                    "replica refused the fence: {:?} {}",
+                    error.code, error.message
+                ))),
+                other => Err(crate::BrokerError::InvalidConfig(format!(
+                    "unexpected reply to a fence request: {other:?}"
+                ))),
+            }
+        })
+        .await
+        .map_err(|_| crate::BrokerError::Timeout("replica fence"))?
     }
 
     /// Ask a replica which fencing epoch wrote each stretch of its log (#240).
