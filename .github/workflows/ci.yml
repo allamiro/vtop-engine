@@ -41,6 +41,7 @@ jobs:
       kafka: ${{ steps.filter.outputs.kafka }}
       postgres: ${{ steps.filter.outputs.postgres }}
       fuzz: ${{ steps.filter.outputs.fuzz }}
+      chaos: ${{ steps.filter.outputs.chaos }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
       # Pinned to a full commit SHA (v3), not the mutable tag, so an upstream
@@ -141,7 +142,31 @@ jobs:
             shell:
               - 'docker/*.sh'
               - 'docker/tests/**'
+              # The live-chaos harness is executable shell that gates every
+              # distributed-systems claim this project makes, and it was
+              # unlinted: a change to lib.sh — sourced by every scenario —
+              # triggered nothing. That is how a scenario stayed red on main
+              # without anyone noticing.
+              - 'scripts/live-chaos/**'
               - '.github/workflows/**'
+
+            # `scripts/live-chaos/run-all.sh`. The harness drives real
+            # processes over real TLS: metadata Raft, replication, fencing,
+            # and failover. Its closure is the three crates whose binaries it
+            # runs plus the harness itself — a change to vtop-core or
+            # vtop-state cannot alter a scenario's outcome without going
+            # through one of these.
+            chaos:
+              - 'scripts/live-chaos/**'
+              - 'crates/vtop-meta/**'
+              - 'crates/vtop-broker/**'
+              - 'crates/vtop-node/**'
+              - 'crates/vtop-cli/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.cargo/**'
+              - 'rust-toolchain*'
+              - '.github/workflows/ci.yml'
   build-and-test:
     name: fmt + clippy + test + build
     needs: changes
@@ -249,6 +274,19 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/mnt" -w /mnt \
             koalaman/shellcheck:v0.11.0 docker/*.sh
+
+      # `-P scripts/live-chaos/scenarios` resolves the scenarios' dynamic
+      # `source "$(dirname …)/../lib.sh"`. Without it every scenario reports
+      # SC1091 plus spurious "may not be assigned" warnings for variables
+      # lib.sh does define — noise that would train people to ignore this job.
+      - name: shellcheck (live-chaos harness)
+        run: |
+          docker run --rm -v "$PWD:/mnt" -w /mnt \
+            koalaman/shellcheck:v0.11.0 -x -P scripts/live-chaos/scenarios \
+            scripts/live-chaos/lib.sh \
+            scripts/live-chaos/run-all.sh \
+            scripts/live-chaos/gen-certs.sh \
+            scripts/live-chaos/scenarios/*.sh
 
       - name: bats
         run: |
@@ -362,6 +400,77 @@ jobs:
         with:
           tool: cargo-deny
       - run: cargo deny check
+
+  # The live-chaos harness drives real processes over real TLS — metadata Raft,
+  # replication, fencing, promotion, failover — and until now it ran only when
+  # someone ran it by hand. That is how scenario 09 sat red on main since #236,
+  # how scenario 10 sat red since #237, and how a data node spent three issues
+  # presenting the wrong certificate to the admin endpoint: nothing looked.
+  #
+  # Scoped, not blanket. It runs only when the harness or one of the four
+  # crates whose binaries it executes changes — a docs or workflow edit does
+  # not pay for a cluster. Debug binaries, because these scenarios assert
+  # correctness rather than throughput, and a release build costs more than the
+  # runs it feeds.
+  live-chaos:
+    name: live chaos (real processes)
+    needs: changes
+    if: needs.changes.outputs.chaos == 'true'
+    runs-on: ubuntu-latest
+    # The suite is ~13 scenarios, several of which sit through election and
+    # lease timeouts by design. Generous, but bounded: a hang must fail rather
+    # than occupy a runner.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-chaos-${{ hashFiles('**/Cargo.lock') }}
+
+      # Fault injection needs unprivileged user and mount namespaces (05, 05b,
+      # 06). Ubuntu 24.04 — which `ubuntu-latest` now is — ships an AppArmor
+      # restriction on unprivileged userns that blocks them by default, so the
+      # runner needs it lifted. The sysctl is best-effort: if a future image
+      # drops the knob, the probe below is what decides, not the setting.
+      #
+      # The probe does NOT skip on failure. These scenarios self-check and fail
+      # with a remediation message, so a runner without namespaces turns this
+      # job red honestly rather than reporting success for three scenarios that
+      # never ran — which is precisely the kind of silent gap this job exists
+      # to close.
+      - name: Enable and verify unprivileged namespaces
+        run: |
+          set -euo pipefail
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || \
+            echo "note: sysctl unavailable on this image; relying on the probe"
+          unshare -rm bash -c 'mount -t tmpfs -o size=1m tmpfs /mnt && echo "mount namespaces OK"'
+
+      - name: Build harness binaries
+        run: |
+          cargo build -p vtop-node --bin vtop-node
+          cargo build -p vtop-cli --no-default-features --bin vtopctl
+
+      - name: Run the live chaos suite
+        run: CHAOS_PROFILE=debug scripts/live-chaos/run-all.sh
+
+      # The per-scenario logs are the whole diagnostic record: a scenario that
+      # fails names a log file, and without this the reason dies with the
+      # runner.
+      - name: Upload scenario logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: live-chaos-logs
+          path: /tmp/vtop-chaos*/logs/
+          if-no-files-found: ignore
+          retention-days: 7
 
   # The MSRV is a tested promise, not a number in a file: this builds on exactly
   # the declared toolchain. The floor is set by sqlx 0.9 (rust-version 1.94.0),
