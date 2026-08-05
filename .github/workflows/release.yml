@@ -327,6 +327,15 @@ jobs:
       - name: Docker metadata
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        env:
+          # metadata-action emits each annotation ALREADY PREFIXED with its
+          # level — `getJSON` builds `${level}:${label}`, defaulting to
+          # `manifest`. The artifact we annotate here is the index, so ask for
+          # index-level strings and pass them through untouched. Adding an
+          # `index:` prefix ourselves would double it up into
+          # `index:manifest:org.opencontainers...`, which buildx accepts as an
+          # annotation key nothing ever reads.
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: index
         with:
           images: ${{ env.IMAGE_NAME }}
           # `latest` only for stable releases; 0.x/pre-releases must not claim it.
@@ -338,9 +347,53 @@ jobs:
         working-directory: /tmp/digests
         run: |
           set -euo pipefail
-          # shellcheck disable=SC2046 # word-splitting of -t args is the point
-          docker buildx imagetools create             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON")             $(printf "$IMAGE_NAME@sha256:%s " *)
+          # Annotations go on the INDEX, not just the per-arch images.
+          #
+          # `docker/metadata-action` labels each architecture's image config,
+          # which is what a single-shot buildx multi-platform build used to
+          # publish. Splitting the build (#246) made the tagged artifact a
+          # manifest list stitched by `imagetools create`, and that list carries
+          # no annotations unless they are passed here. GitHub reads
+          # `org.opencontainers.image.source` off the artifact it can see to
+          # link a GHCR package to its repository, so without this the image
+          # publishes perfectly and is simply never associated with the repo —
+          # which is why no Packages section appears in the sidebar.
+          #
+          # Built as an array, not by word-splitting a jq string: annotation
+          # VALUES contain spaces (the description) and quotes do not survive
+          # re-splitting a command substitution.
+          #
+          # Annotations are passed VERBATIM. metadata-action has already
+          # prefixed each one with its level (see the env above), so prefixing
+          # again here would produce `index:manifest:<key>=<value>` — an
+          # annotation key nothing reads.
+          args=()
+          while IFS= read -r tag; do
+            [ -n "$tag" ] && args+=(-t "$tag")
+          done < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          while IFS= read -r annotation; do
+            [ -n "$annotation" ] && args+=(--annotation "$annotation")
+          done < <(jq -r '.annotations[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          for digest in *; do
+            args+=("$IMAGE_NAME@sha256:$digest")
+          done
+          docker buildx imagetools create "${args[@]}"
           docker buildx imagetools inspect "$IMAGE_NAME:${{ needs.verify.outputs.version }}"
+
+      - name: Assert the index is linked to this repository
+        run: |
+          set -euo pipefail
+          # A silent regression here costs a whole release cycle to notice,
+          # because the image works perfectly and only the association is gone.
+          source_annotation="$(docker buildx imagetools inspect \
+            "$IMAGE_NAME:${{ needs.verify.outputs.version }}" --raw \
+            | jq -r '.annotations["org.opencontainers.image.source"] // ""')"
+          expected="https://github.com/${{ github.repository }}"
+          if [ "$source_annotation" != "$expected" ]; then
+            echo "::error::multi-arch index is missing org.opencontainers.image.source=$expected (got '$source_annotation'). GHCR will publish the image but GitHub will not link it to this repository."
+            exit 1
+          fi
+          echo "index annotated with source=$source_annotation"
 
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
