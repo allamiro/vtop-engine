@@ -3,8 +3,18 @@ name: CI
 on:
   push:
     branches: [main]
+  # Every pull request, not only those targeting `main`. This project stacks
+  # PRs — each slice bases on the one below it — and a `branches: [main]`
+  # filter here meant a stacked PR ran NO CI at all: it was reviewed, approved,
+  # and merged on the strength of a bot comment, with the first real signal
+  # arriving only once its parent merged and it retargeted. A base change fires
+  # `edited`, which is not in the default event set, so even that retarget did
+  # not reliably re-trigger anything.
+  #
+  # The path filters already scope the work per PR, so the added cost is the
+  # jobs a stacked slice actually needs — which is the cost of knowing whether
+  # it works.
   pull_request:
-    branches: [main]
 
 # Least privilege by default; no CI job needs write access to the repo.
 # pull-requests: read is required by dorny/paths-filter in the `changes` job —
