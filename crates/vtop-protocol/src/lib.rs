@@ -317,6 +317,41 @@ pub struct ReplicaStatusResponse {
     pub next_offset: u64,
 }
 
+/// One epoch's first offset on a replica (#240).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplicaEpochStart {
+    pub epoch: u64,
+    pub start_offset: u64,
+}
+
+/// Ask a replica which fencing epoch wrote each stretch of its log (#240).
+///
+/// Separate from [`ReplicaStatusRequest`] rather than a wider status response:
+/// the decoder rejects trailing bytes, so growing kind 66 would make a new
+/// leader and an old replica unable to talk at all. As its own kind, a replica
+/// that does not know the message refuses it, and the caller reads that as
+/// "history unknown" — which is already how an absent or broken vector is
+/// treated, so the degraded path is one that must work anyway.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplicaEpochHistoryRequest {
+    pub range: RangeIdentity,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplicaEpochHistoryResponse {
+    /// Ascending by epoch. Empty means UNKNOWN, never "no leadership changes":
+    /// a replica that cannot vouch for its own history must not have its
+    /// offsets reconciled by epoch.
+    pub epoch_starts: Vec<ReplicaEpochStart>,
+}
+
+/// Bound on a replica's epoch history on the wire.
+///
+/// A range needs this many leadership changes to reach it; past that the
+/// cluster has a flapping problem an operator must see, and the reader must
+/// not allocate on a peer's say-so regardless.
+pub const MAX_REPLICA_EPOCH_STARTS: usize = 4096;
+
 /// Lineage-aware durable consumer progress. Bound to topic epoch, range
 /// generation, segment identity/root, and record position — never a bare
 /// integer offset.
@@ -385,6 +420,8 @@ pub enum Message {
     ReplicaAppendBatchRequest(ReplicaAppendBatchRequest),
     ReplicaStatusRequest(ReplicaStatusRequest),
     ReplicaStatusResponse(ReplicaStatusResponse),
+    ReplicaEpochHistoryRequest(ReplicaEpochHistoryRequest),
+    ReplicaEpochHistoryResponse(ReplicaEpochHistoryResponse),
     CommitCursorRequest(CommitCursorRequest),
     CommitCursorResponse(CommitCursorResponse),
     FetchCursorRequest(FetchCursorRequest),
@@ -410,6 +447,8 @@ impl Message {
             Self::ReplicaAppendBatchRequest(_) => 63,
             Self::ReplicaStatusRequest(_) => 65,
             Self::ReplicaStatusResponse(_) => 66,
+            Self::ReplicaEpochHistoryRequest(_) => 67,
+            Self::ReplicaEpochHistoryResponse(_) => 68,
             Self::CommitCursorRequest(_) => 74,
             Self::CommitCursorResponse(_) => 71,
             Self::FetchCursorRequest(_) => 72,
@@ -592,6 +631,10 @@ fn encoded_payload_size(message: &Message, limits: ProtocolLimits) -> Result<usi
             }
             Message::ReplicaStatusRequest(value) => range_size(&value.range)?,
             Message::ReplicaStatusResponse(_) => 8 + 8,
+            Message::ReplicaEpochHistoryRequest(value) => range_size(&value.range)?,
+            Message::ReplicaEpochHistoryResponse(value) => {
+                4 + value.epoch_starts.len().saturating_mul(16)
+            }
             Message::CommitCursorRequest(value) => {
                 lineage_cursor_size(&value.cursor)?
                     + 16
@@ -721,6 +764,8 @@ fn decode_header(header: &[u8], limits: ProtocolLimits) -> Result<Header, Protoc
             | 63
             | 65
             | 66
+            | 67
+            | 68
             | 70
             | 71
             | 72
@@ -887,6 +932,17 @@ fn encode_message(message: &Message, out: &mut Vec<u8>) -> Result<(), ProtocolEr
         Message::ReplicaStatusResponse(value) => {
             put_u64(out, value.local_committed_offset);
             put_u64(out, value.next_offset);
+        }
+        Message::ReplicaEpochHistoryRequest(value) => put_range(out, &value.range)?,
+        Message::ReplicaEpochHistoryResponse(value) => {
+            if value.epoch_starts.len() > MAX_REPLICA_EPOCH_STARTS {
+                return Err(ProtocolError::Limit("epoch history too long".to_owned()));
+            }
+            put_u32(out, value.epoch_starts.len() as u32);
+            for entry in &value.epoch_starts {
+                put_u64(out, entry.epoch);
+                put_u64(out, entry.start_offset);
+            }
         }
         Message::CommitCursorRequest(value) => {
             put_uuid(out, value.operation_id);
@@ -1125,6 +1181,41 @@ fn decode_message(
             local_committed_offset: decoder.u64()?,
             next_offset: decoder.u64()?,
         }),
+        67 => Message::ReplicaEpochHistoryRequest(ReplicaEpochHistoryRequest {
+            range: decoder.range()?,
+        }),
+        68 => {
+            let count = decoder.u32()? as usize;
+            // Checked BEFORE allocating: the length is a peer's claim, and a
+            // reader that reserves on it can be made to allocate by anyone who
+            // can reach this port.
+            if count > MAX_REPLICA_EPOCH_STARTS {
+                return Err(ProtocolError::Limit("epoch history too long".to_owned()));
+            }
+            let mut epoch_starts = Vec::with_capacity(count);
+            let mut previous: Option<ReplicaEpochStart> = None;
+            for _ in 0..count {
+                let entry = ReplicaEpochStart {
+                    epoch: decoder.u64()?,
+                    start_offset: decoder.u64()?,
+                };
+                // Enforced on the wire, not just when written: a peer that
+                // sends a non-advancing history would otherwise hand this
+                // replica a truncation target that discards acknowledged
+                // records. A malformed history must be unusable, not merely
+                // suspicious.
+                if let Some(previous) = previous {
+                    if entry.epoch <= previous.epoch || entry.start_offset < previous.start_offset {
+                        return Err(ProtocolError::InvalidFrame(
+                            "epoch history does not advance".to_owned(),
+                        ));
+                    }
+                }
+                previous = Some(entry);
+                epoch_starts.push(entry);
+            }
+            Message::ReplicaEpochHistoryResponse(ReplicaEpochHistoryResponse { epoch_starts })
+        }
         70 => Message::CommitCursorRequest(CommitCursorRequest {
             // Legacy kind 70 did not carry an operation identity. Decode it
             // as nil so the broker rejects it explicitly instead of caching
@@ -1573,6 +1664,26 @@ mod tests {
                 local_committed_offset: 11,
                 next_offset: 12,
             }),
+            Message::ReplicaEpochHistoryRequest(ReplicaEpochHistoryRequest { range: range() }),
+            Message::ReplicaEpochHistoryResponse(ReplicaEpochHistoryResponse {
+                epoch_starts: vec![
+                    ReplicaEpochStart {
+                        epoch: 1,
+                        start_offset: 0,
+                    },
+                    ReplicaEpochStart {
+                        epoch: 4,
+                        start_offset: 300,
+                    },
+                ],
+            }),
+            // Empty is a legal and meaningful value on this wire: it says
+            // "history unknown". Round-tripping it matters as much as a
+            // populated vector, because it is what an older or broken replica
+            // reports and what promotion must handle.
+            Message::ReplicaEpochHistoryResponse(ReplicaEpochHistoryResponse {
+                epoch_starts: Vec::new(),
+            }),
             Message::CommitCursorRequest(CommitCursorRequest {
                 operation_id: Uuid::from_u128(52),
                 member_id: Uuid::from_u128(51),
@@ -1670,6 +1781,57 @@ mod tests {
                 expected_checkpoint_generation: Some(0),
             })
         );
+    }
+
+    /// A peer's history is a claim, and a non-advancing one would hand this
+    /// replica a truncation target that discards acknowledged records. The
+    /// wire must refuse it, not merely the writer.
+    #[test]
+    fn rejects_an_epoch_history_that_does_not_advance() {
+        let good = Message::ReplicaEpochHistoryResponse(ReplicaEpochHistoryResponse {
+            epoch_starts: vec![
+                ReplicaEpochStart {
+                    epoch: 1,
+                    start_offset: 0,
+                },
+                ReplicaEpochStart {
+                    epoch: 2,
+                    start_offset: 100,
+                },
+            ],
+        });
+        let frame = WireFrame {
+            request_id: 1,
+            stream_id: 0,
+            message: good,
+        };
+        let encoded = encode_frame(&frame, limits()).expect("encode");
+        assert!(decode_frame(&encoded, limits()).is_ok());
+
+        // Same frame with the second entry's epoch walked backwards.
+        let bad = Message::ReplicaEpochHistoryResponse(ReplicaEpochHistoryResponse {
+            epoch_starts: vec![
+                ReplicaEpochStart {
+                    epoch: 5,
+                    start_offset: 0,
+                },
+                ReplicaEpochStart {
+                    epoch: 2,
+                    start_offset: 100,
+                },
+            ],
+        });
+        let encoded = encode_frame(
+            &WireFrame {
+                request_id: 1,
+                stream_id: 0,
+                message: bad,
+            },
+            limits(),
+        )
+        .expect("encode");
+        let error = decode_frame(&encoded, limits()).expect_err("must refuse");
+        assert!(error.to_string().contains("does not advance"), "{error}");
     }
 
     #[test]

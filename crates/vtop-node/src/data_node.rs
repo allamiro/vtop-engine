@@ -150,6 +150,30 @@ impl ReplicaPeerHandler for LeaderStatusReplica {
             next_offset,
         })
     }
+
+    /// A leader is a replica of its own range, so it must be able to vouch for
+    /// its own epoch history too — a promotion that could only read followers
+    /// would be reconciling against a strict subset of the range's lineage.
+    fn epoch_history(
+        &self,
+        range: &RangeIdentity,
+    ) -> Result<Vec<vtop_protocol::ReplicaEpochStart>, (vtop_protocol::ErrorCode, String)> {
+        if range != self.broker.range() {
+            return Err((
+                vtop_protocol::ErrorCode::WrongRange,
+                "epoch history range identity does not match this leader".to_owned(),
+            ));
+        }
+        Ok(self
+            .broker
+            .epoch_starts()
+            .into_iter()
+            .map(|entry| vtop_protocol::ReplicaEpochStart {
+                epoch: entry.epoch,
+                start_offset: entry.start_offset,
+            })
+            .collect())
+    }
 }
 
 impl LeaderStatusReplica {

@@ -63,6 +63,11 @@ pub struct FencingEpochJournal {
     path: PathBuf,
     file: Box<dyn StorageFile>,
     entries: Vec<EpochStart>,
+    /// Set once a write or fsync fails. The file may hold a partial record
+    /// from that attempt, and appending after it would land the next entry at
+    /// a misaligned offset — so no further append is allowed until the journal
+    /// is reopened and revalidated.
+    poisoned: bool,
 }
 
 impl FencingEpochJournal {
@@ -82,10 +87,16 @@ impl FencingEpochJournal {
                 .and_then(|()| file.write_all(&VERSION.to_be_bytes()))
                 .and_then(|()| file.sync_data())
                 .map_err(|source| Self::io(&path, source))?;
+            // fsync of the file is not enough: without syncing the directory,
+            // a power loss can lose the directory entry itself and take the
+            // whole history with it, putting this replica back to "unknown"
+            // after a crash — the one moment the vector exists for.
+            Self::sync_parent(env, &path)?;
             return Ok(Self {
                 path,
                 file,
                 entries: Vec::new(),
+                poisoned: false,
             });
         }
         if len < HEADER_BYTES {
@@ -93,12 +104,19 @@ impl FencingEpochJournal {
                 "journal is {len} bytes, shorter than its {HEADER_BYTES}-byte header"
             )));
         }
+        // Bounded BEFORE allocating. The length comes off a file this process
+        // did not necessarily write, and reserving on it lets a malformed or
+        // truncated-then-grown journal exhaust memory during recovery — taking
+        // the broker down at exactly the moment it is trying to come back.
+        let max_bytes = HEADER_BYTES + (MAX_ENTRIES as u64) * (ENTRY_BYTES as u64);
+        if len > max_bytes {
+            return Err(Self::corrupt(format!(
+                "journal is {len} bytes; the bound for {MAX_ENTRIES} epochs is {max_bytes}"
+            )));
+        }
         let mut bytes = vec![0_u8; len as usize];
         file.seek(SeekFrom::Start(0))
             .and_then(|_| file.read_exact(&mut bytes))
-            .map_err(|source| Self::io(&path, source))?;
-        // Appends must land at the end, not where the read left the cursor.
-        file.seek(SeekFrom::End(0))
             .map_err(|source| Self::io(&path, source))?;
         if &bytes[0..8] != MAGIC {
             return Err(Self::corrupt("bad magic".to_owned()));
@@ -137,10 +155,26 @@ impl FencingEpochJournal {
                 start_offset,
             });
         }
+        // A torn tail must be removed from the FILE, not just from memory.
+        // Leaving the fragment means the next append lands after it, so every
+        // entry from then on is misaligned by however many bytes it held — and
+        // the restart after that reads (epoch, start) pairs straddling entry
+        // boundaries. That either refuses to open, permanently losing a
+        // history this code had already recovered once, or silently yields
+        // wrong offsets. Same rule the segment recovery path applies.
+        let valid_bytes = HEADER_BYTES + (whole as u64) * (ENTRY_BYTES as u64);
+        if valid_bytes != len {
+            file.set_len(valid_bytes)
+                .and_then(|()| file.sync_data())
+                .map_err(|source| Self::io(&path, source))?;
+        }
+        file.seek(SeekFrom::End(0))
+            .map_err(|source| Self::io(&path, source))?;
         Ok(Self {
             path,
             file,
             entries,
+            poisoned: false,
         })
     }
 
@@ -153,6 +187,13 @@ impl FencingEpochJournal {
     /// one epoch from two different positions, which cannot happen, and
     /// accepting it would corrupt every later comparison.
     pub fn record(&mut self, epoch: u64, start_offset: u64) -> BrokerResult<()> {
+        if self.poisoned {
+            return Err(Self::corrupt(
+                "a previous append failed; this journal may hold a partial record and must be \
+                 reopened before it is written again"
+                    .to_owned(),
+            ));
+        }
         if let Some(last) = self.entries.last().copied() {
             if epoch == last.epoch {
                 if start_offset != last.start_offset {
@@ -189,10 +230,17 @@ impl FencingEpochJournal {
         // fsync before returning: the caller is about to serve under this
         // epoch, and a vector that loses its newest entry in a crash is back
         // to comparing bare offsets exactly when the answer matters.
-        self.file
+        if let Err(source) = self
+            .file
             .write_all(&record)
             .and_then(|()| self.file.sync_data())
-            .map_err(|source| Self::io(&self.path, source))?;
+        {
+            // The file may now hold a partial record. Appending after it would
+            // misalign every later entry, so refuse further writes rather than
+            // retry onto uncertain bytes.
+            self.poisoned = true;
+            return Err(Self::io(&self.path, source));
+        }
         self.entries.push(EpochStart {
             epoch,
             start_offset,
@@ -244,11 +292,23 @@ impl FencingEpochJournal {
         }
         // One vector is a prefix of the other; everything the shorter one
         // covers is agreed. The caller bounds the answer by its own tail.
-        agreed.or(if other.is_empty() && self.entries.is_empty() {
-            Some(0)
-        } else {
-            None
-        })
+        //
+        // Two EMPTY vectors are not agreement at offset 0 — they are two
+        // replicas that cannot vouch for their own history at all. Reporting a
+        // proven common prefix there would let a caller reconcile (and
+        // truncate) on the strength of mutual ignorance, which is the opposite
+        // of what empty means everywhere else in this API. `None` makes it
+        // fail closed.
+        agreed
+    }
+
+    fn sync_parent(env: &Env, path: &Path) -> BrokerResult<()> {
+        let Some(parent) = path.parent() else {
+            return Ok(());
+        };
+        env.storage
+            .sync_dir(parent)
+            .map_err(|source| Self::io(parent, source))
     }
 
     fn io(path: &Path, source: std::io::Error) -> BrokerError {
@@ -462,6 +522,74 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("does not advance"), "{error}");
+    }
+
+    /// Two replicas that cannot vouch for their own history have not agreed
+    /// on anything. Reporting a proven prefix at 0 would let a caller truncate
+    /// on the strength of mutual ignorance.
+    #[test]
+    fn two_unknown_histories_do_not_agree() {
+        let dir = TempDir::new().unwrap();
+        let mine = journal(&dir);
+        assert_eq!(mine.divergence_point(&[]), None);
+    }
+
+    /// The fragment must leave the FILE, not just memory. If it survives, the
+    /// next append lands after it and every entry from then on is misaligned —
+    /// so the restart AFTER the recovery is the one that breaks.
+    #[test]
+    fn a_recovered_torn_tail_does_not_misalign_later_entries() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("fencing-epochs");
+        {
+            let mut j = FencingEpochJournal::open(&path).unwrap();
+            j.record(1, 0).unwrap();
+        }
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 2]); // half an entry
+        std::fs::write(&path, bytes).unwrap();
+
+        {
+            let mut recovered = FencingEpochJournal::open(&path).expect("recovers");
+            recovered.record(2, 100).expect("appends after recovery");
+        }
+        // The reopen after that is where a surviving fragment would show up.
+        let again = FencingEpochJournal::open(&path).expect("still readable");
+        assert_eq!(
+            again.entries(),
+            &[
+                EpochStart {
+                    epoch: 1,
+                    start_offset: 0
+                },
+                EpochStart {
+                    epoch: 2,
+                    start_offset: 100
+                },
+            ]
+        );
+    }
+
+    /// A file claiming more epochs than the bound must be refused before the
+    /// read allocates on its length.
+    #[test]
+    fn an_oversized_journal_is_refused_before_allocating() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("fencing-epochs");
+        {
+            let mut j = FencingEpochJournal::open(&path).unwrap();
+            j.record(1, 0).unwrap();
+        }
+        let bound = HEADER_BYTES + (MAX_ENTRIES as u64) * (ENTRY_BYTES as u64);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.resize((bound + ENTRY_BYTES as u64) as usize, 0);
+        std::fs::write(&path, bytes).unwrap();
+
+        let error = match FencingEpochJournal::open(&path) {
+            Ok(_) => panic!("an oversized journal must be refused"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("bound for"), "{error}");
     }
 
     #[test]

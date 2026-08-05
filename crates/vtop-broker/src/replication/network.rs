@@ -95,6 +95,20 @@ pub trait ReplicaPeerHandler: Send + Sync {
         &self,
         range: &vtop_protocol::RangeIdentity,
     ) -> Result<ReplicaStatusResponse, (ErrorCode, String)>;
+
+    /// Which fencing epoch wrote each stretch of this replica's log (#240).
+    ///
+    /// Defaults to empty, which means UNKNOWN rather than "no leadership
+    /// changes" — the same answer a replica gives when its vector is absent or
+    /// broken, and the same decision it licenses: do not reconcile this
+    /// replica's offsets by epoch. Defaulted so a handler that does not track
+    /// history is honest by construction instead of failing to compile.
+    fn epoch_history(
+        &self,
+        _range: &vtop_protocol::RangeIdentity,
+    ) -> Result<Vec<vtop_protocol::ReplicaEpochStart>, (ErrorCode, String)> {
+        Ok(Vec::new())
+    }
 }
 
 impl ReplicaPeerHandler for InProcessFollower {
@@ -134,6 +148,25 @@ impl ReplicaPeerHandler for InProcessFollower {
             local_committed_offset: self.local_committed_offset(),
             next_offset: self.next_offset(),
         })
+    }
+
+    fn epoch_history(
+        &self,
+        range: &vtop_protocol::RangeIdentity,
+    ) -> Result<Vec<vtop_protocol::ReplicaEpochStart>, (ErrorCode, String)> {
+        if range != self.range() {
+            return Err((
+                ErrorCode::WrongRange,
+                "epoch history range identity does not match this follower".to_owned(),
+            ));
+        }
+        Ok(InProcessFollower::epoch_starts(self)
+            .into_iter()
+            .map(|entry| vtop_protocol::ReplicaEpochStart {
+                epoch: entry.epoch,
+                start_offset: entry.start_offset,
+            })
+            .collect())
     }
 }
 
@@ -228,6 +261,14 @@ fn dispatch_replica_frame(handler: &dyn ReplicaPeerHandler, frame: WireFrame) ->
         Message::CommittedHwmUpdate(update) => {
             let _ = handler.observe_hwm(&update);
             return None;
+        }
+        Message::ReplicaEpochHistoryRequest(request) => {
+            match handler.epoch_history(&request.range) {
+                Ok(epoch_starts) => Message::ReplicaEpochHistoryResponse(
+                    vtop_protocol::ReplicaEpochHistoryResponse { epoch_starts },
+                ),
+                Err((code, message)) => error_message(code, message),
+            }
         }
         Message::ReplicaStatusRequest(request) => match handler.status(&request.range) {
             Ok(response) => Message::ReplicaStatusResponse(response),
@@ -1288,6 +1329,71 @@ impl ReplicaStatusClient {
         })
         .await
         .map_err(|_| crate::BrokerError::Timeout("replica status"))?
+    }
+
+    /// Ask a replica which fencing epoch wrote each stretch of its log (#240).
+    ///
+    /// A replica that refuses the request — an older peer that does not know
+    /// the message kind, or one whose vector is absent or broken — yields an
+    /// EMPTY history rather than an error. That is deliberate: "unknown" is a
+    /// state promotion must handle anyway, and turning a peer's ignorance into
+    /// a failed probe would make a mixed-version cluster unable to elect at
+    /// all. The caller must never read empty as "this replica had no
+    /// leadership changes".
+    pub async fn epoch_history(
+        &self,
+        addr: SocketAddr,
+        server_name: &str,
+        expected_node: Uuid,
+        range: &RangeIdentity,
+    ) -> BrokerResult<Vec<vtop_protocol::ReplicaEpochStart>> {
+        let name = rustls::pki_types::ServerName::try_from(server_name.to_owned())
+            .map_err(|error| {
+                crate::BrokerError::InvalidConfig(format!("server name {server_name:?}: {error}"))
+            })?
+            .to_owned();
+        timeout(self.timeout, async {
+            let tcp = TcpStream::connect(addr)
+                .await
+                .map_err(|source| crate::BrokerError::Io {
+                    path: PathBuf::from("replica-epoch-history"),
+                    source,
+                })?;
+            let mut stream = self.connector.connect(name, tcp).await.map_err(|source| {
+                crate::BrokerError::Io {
+                    path: PathBuf::from("replica-epoch-history-tls"),
+                    source,
+                }
+            })?;
+            assert_peer_uuid(peer_certs_client(&stream), expected_node)?;
+            let frame = WireFrame {
+                request_id: 1,
+                stream_id: 0,
+                message: Message::ReplicaEpochHistoryRequest(
+                    vtop_protocol::ReplicaEpochHistoryRequest {
+                        range: range.clone(),
+                    },
+                ),
+            };
+            write_frame(&mut stream, &frame, REPLICA_LIMITS).await?;
+            let reply = read_frame(&mut stream, REPLICA_LIMITS)
+                .await?
+                .ok_or_else(|| {
+                    crate::BrokerError::InvalidConfig(
+                        "replica closed the session without answering".to_owned(),
+                    )
+                })?;
+            match reply.message {
+                Message::ReplicaEpochHistoryResponse(response) => Ok(response.epoch_starts),
+                // Refusal is "unknown", not a probe failure — see above.
+                Message::Error(_) => Ok(Vec::new()),
+                other => Err(crate::BrokerError::InvalidConfig(format!(
+                    "unexpected reply to an epoch-history request: {other:?}"
+                ))),
+            }
+        })
+        .await
+        .map_err(|_| crate::BrokerError::Timeout("replica epoch history"))?
     }
 }
 

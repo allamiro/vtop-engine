@@ -740,21 +740,55 @@ impl LocalBroker {
     /// window between them refuses rather than admits — but leaving them
     /// permanently unequal would silently wedge the range.
     pub fn adopt_fencing_epoch(&self, epoch: u64) -> bool {
-        let advanced = self.held_fencing_epoch.fetch_max(epoch, Ordering::SeqCst) < epoch;
-        if advanced {
-            // Record where this epoch begins BEFORE serving under it. The
-            // vector exists to survive the crash it is meant to recover from,
-            // so a replica must never write a record under an epoch whose
-            // start offset is not already durable — otherwise recovery is back
-            // to comparing bare offsets at exactly the moment it matters.
+        // The start is made durable BEFORE the epoch becomes visible.
+        //
+        // `fetch_max` is what admits produce under the new epoch, so recording
+        // after it leaves a window in which a record is written under an epoch
+        // whose start offset is not yet known. The journal would then name a
+        // start ABOVE the first record that epoch actually wrote, and a later
+        // divergence comparison would attribute that record to the previous
+        // epoch — misreading the very boundary this vector exists to fix.
+        //
+        // Reading the offset first is equally deliberate: it must be the tail
+        // as of before the epoch is servable, not after.
+        if epoch > self.held_fencing_epoch.load(Ordering::SeqCst) {
             let (_, next_offset) = self.local_offsets();
             self.record_epoch_start(epoch, next_offset);
         }
-        advanced
+        self.held_fencing_epoch.fetch_max(epoch, Ordering::SeqCst) < epoch
     }
 
     /// Install the durable epoch→offset vector for this replica (#240).
-    pub fn set_fencing_epoch_journal(&self, journal: crate::fencing_epochs::FencingEpochJournal) {
+    ///
+    /// Seeds the currently held epoch when the vector is empty AND the log is
+    /// empty. Without that, a replica configured with a static epoch never
+    /// calls `adopt_fencing_epoch`, so it would report "unknown" for its
+    /// entire history and be unreconcilable forever.
+    ///
+    /// The log-empty condition is the part that matters, and it is narrower
+    /// than it looks tempting to make it: for a replica that ALREADY holds
+    /// records, this process cannot know where its held epoch began — the
+    /// records may have been written under an older one. Claiming it started
+    /// at the current tail would be a fabricated boundary, and a later
+    /// truncation computed from it could discard acknowledged records.
+    /// Reporting "unknown" there is the honest answer, and the API already
+    /// handles it.
+    pub fn set_fencing_epoch_journal(
+        &self,
+        mut journal: crate::fencing_epochs::FencingEpochJournal,
+    ) {
+        if journal.latest().is_none() {
+            let (_, next_offset) = self.local_offsets();
+            let epoch = self.held_fencing_epoch.load(Ordering::SeqCst);
+            // Epoch 0 is the "no grant yet" sentinel a lease-driven replica
+            // starts at, not an epoch that ever wrote a record. Seeding it
+            // would put a fabricated entry at the head of the vector claiming
+            // epoch 0 owns records it never wrote.
+            if next_offset == 0 && epoch > 0 && journal.record(epoch, 0).is_err() {
+                self.fencing_epoch_history_broken
+                    .store(true, Ordering::SeqCst);
+            }
+        }
         *self
             .fencing_epoch_journal
             .lock()
@@ -769,12 +803,18 @@ impl LocalBroker {
     /// a bare number and cannot be compared by epoch. Callers must treat empty
     /// as "unknown", never as "no leadership changes".
     pub fn epoch_starts(&self) -> Vec<crate::fencing_epochs::EpochStart> {
+        // Flag read UNDER the lock. Checked before it, a record that fails
+        // while this call is waiting would let a now-broken history be
+        // returned as authoritative — the partial vector this API exists to
+        // never hand out.
+        let guard = self
+            .fencing_epoch_journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if self.fencing_epoch_history_broken.load(Ordering::SeqCst) {
             return Vec::new();
         }
-        self.fencing_epoch_journal
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        guard
             .as_ref()
             .map(|journal| journal.entries().to_vec())
             .unwrap_or_default()
