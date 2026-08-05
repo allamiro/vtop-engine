@@ -1,0 +1,22 @@
+# Files that are produced by a generator, not written by hand.
+#
+# `linguist-generated=true` does three things: collapses the file in GitHub's
+# pull-request diff, excludes it from the repository's language statistics, and
+# makes cubic's AI reviewer skip it entirely. All three are correct for output —
+# reviewing generated JSON is reviewing the generator's work at one remove, and
+# the generator itself is reviewed like any other source file.
+#
+# The bar for adding a line here is that the file is REPRODUCIBLE from something
+# else in the tree. Do not use this to hide hand-written files that are merely
+# long or tedious; a marker that lies is worse than the noise it saves.
+
+# Grafana dashboards are emitted by observability/build-dashboards.py, and CI
+# regenerates them on every PR and fails on any drift, so the committed JSON
+# cannot disagree with the Python that produced it. Review the builders.
+observability/grafana/dashboards/*.json linguist-generated=true
+
+# Resolved by cargo, never edited by hand. Dependency changes are gated by
+# cargo-deny (licences, advisories, bans), cargo-audit, and the MSRV build —
+# checks that read the whole graph, which a human scrolling a lockfile diff
+# cannot do. Collapsing it keeps a dependency bump's actual intent visible.
+Cargo.lock linguist-generated=true
