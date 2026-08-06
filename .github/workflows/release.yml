@@ -467,6 +467,12 @@ jobs:
           # On workflow_dispatch, build the requested tag rather than the
           # default branch, so a dry-run validates the real release ref.
           ref: ${{ github.event.inputs.tag || github.ref }}
+          # FULL history, not the default shallow clone. The changelog is
+          # computed from `git log <previous-tag>..<tag>`, and a depth-1
+          # checkout has no commits in that range — v0.2.0 published with a
+          # single entry (its own release commit) instead of the twelve pull
+          # requests it actually contained.
+          fetch-depth: 0
 
       # Only pull the artifacts we intend to publish. build-push-action uploads a
       # `*.dockerbuild` build record by default, and an unfiltered download would
@@ -514,8 +520,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # Tags are needed to find the previous release; actions/checkout does
-          # not fetch them by default even at fetch-depth 0 for a tag build.
+          # Tags are needed to find the previous release; actions/checkout
+          # does not fetch them by default even at fetch-depth 0 for a tag
+          # build. The depth itself is set on the checkout above — fetching
+          # tags alone retrieves the refs but none of the history between
+          # them, which is what made the first attempt emit an empty range.
           git fetch --tags --force --quiet
           {
             echo 'notes<<CHANGELOG_EOF'
