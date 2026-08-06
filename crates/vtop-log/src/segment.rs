@@ -1713,7 +1713,7 @@ pub fn segment_stem(base_offset: u64) -> String {
 /// never exists without the frontier that makes it readable.
 pub fn roll_in(
     env: &Env,
-    mut active: ActiveSegment,
+    active: ActiveSegment,
     successor_id: Uuid,
 ) -> VtopLogResult<(SegmentReader, ActiveSegment)> {
     let directory = active
