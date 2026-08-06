@@ -501,6 +501,11 @@ impl ActiveSegment {
         self.header.format_version()
     }
 
+    /// First offset this segment holds.
+    pub fn base_offset(&self) -> u64 {
+        self.header.base_offset()
+    }
+
     pub fn next_offset(&self) -> u64 {
         self.next_offset
     }
@@ -1121,6 +1126,17 @@ impl SegmentReader {
         self.header.format_version()
     }
 
+    /// First offset this sealed segment holds.
+    pub fn base_offset(&self) -> u64 {
+        self.header.base_offset()
+    }
+
+    /// First offset it does NOT hold. Together with `base_offset` this is the
+    /// half-open interval a reader routes against.
+    pub fn next_offset(&self) -> u64 {
+        self.manifest_next_offset()
+    }
+
     fn manifest_next_offset(&self) -> u64 {
         match &self.manifest {
             AnyManifest::V1(manifest) => manifest.next_offset,
@@ -1159,7 +1175,24 @@ impl SegmentReader {
         max_bytes: usize,
         max_records: usize,
     ) -> VtopLogResult<FetchBatch> {
-        let high_watermark = self.manifest_next_offset();
+        self.fetch_through(start_offset, max_bytes, max_records, u64::MAX)
+    }
+
+    /// Fetch visible at or below `high_watermark`.
+    ///
+    /// A sealed segment's own frontier is not the only bound that matters. When
+    /// a range spans several segments the caller's watermark can fall INSIDE
+    /// this one, and capping only at the manifest would return records above
+    /// it — exposing data no quorum has acknowledged, which is the invariant
+    /// every read path in this system exists to hold.
+    pub fn fetch_through(
+        &mut self,
+        start_offset: u64,
+        max_bytes: usize,
+        max_records: usize,
+        high_watermark: u64,
+    ) -> VtopLogResult<FetchBatch> {
+        let high_watermark = high_watermark.min(self.manifest_next_offset());
         fetch_from_file(
             self.file.as_mut(),
             &self.path,
