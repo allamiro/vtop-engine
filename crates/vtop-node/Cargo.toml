@@ -30,3 +30,6 @@ vtop-protocol = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Only for the promotion-probe test: building a ReplicaStatusClient needs real
+# TLS material even when the point of the test is that the connection fails.
+rcgen = { workspace = true }

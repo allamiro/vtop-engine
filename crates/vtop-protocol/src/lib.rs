@@ -1266,38 +1266,9 @@ fn decode_message(
         67 => Message::ReplicaEpochHistoryRequest(ReplicaEpochHistoryRequest {
             range: decoder.range()?,
         }),
-        68 => {
-            let count = decoder.u32()? as usize;
-            // Checked BEFORE allocating: the length is a peer's claim, and a
-            // reader that reserves on it can be made to allocate by anyone who
-            // can reach this port.
-            if count > MAX_REPLICA_EPOCH_STARTS {
-                return Err(ProtocolError::Limit("epoch history too long".to_owned()));
-            }
-            let mut epoch_starts = Vec::with_capacity(count);
-            let mut previous: Option<ReplicaEpochStart> = None;
-            for _ in 0..count {
-                let entry = ReplicaEpochStart {
-                    epoch: decoder.u64()?,
-                    start_offset: decoder.u64()?,
-                };
-                // Enforced on the wire, not just when written: a peer that
-                // sends a non-advancing history would otherwise hand this
-                // replica a truncation target that discards acknowledged
-                // records. A malformed history must be unusable, not merely
-                // suspicious.
-                if let Some(previous) = previous {
-                    if entry.epoch <= previous.epoch || entry.start_offset < previous.start_offset {
-                        return Err(ProtocolError::InvalidFrame(
-                            "epoch history does not advance".to_owned(),
-                        ));
-                    }
-                }
-                previous = Some(entry);
-                epoch_starts.push(entry);
-            }
-            Message::ReplicaEpochHistoryResponse(ReplicaEpochHistoryResponse { epoch_starts })
-        }
+        68 => Message::ReplicaEpochHistoryResponse(ReplicaEpochHistoryResponse {
+            epoch_starts: decode_epoch_starts(decoder)?,
+        }),
         75 => Message::ReplicaFenceRequest(ReplicaFenceRequest {
             range: decoder.range()?,
             fencing_epoch: decoder.u64()?,
@@ -1306,36 +1277,11 @@ fn decode_message(
             let fencing_epoch = decoder.u64()?;
             let local_committed_offset = decoder.u64()?;
             let next_offset = decoder.u64()?;
-            let count = decoder.u32()? as usize;
-            // Bounded before allocating: the length is a peer's claim.
-            if count > MAX_REPLICA_EPOCH_STARTS {
-                return Err(ProtocolError::Limit("epoch history too long".to_owned()));
-            }
-            let mut epoch_starts = Vec::with_capacity(count);
-            let mut previous: Option<ReplicaEpochStart> = None;
-            for _ in 0..count {
-                let entry = ReplicaEpochStart {
-                    epoch: decoder.u64()?,
-                    start_offset: decoder.u64()?,
-                };
-                // Enforced on the way IN, not only when written. A peer's
-                // history is a claim, and a non-advancing one would yield a
-                // truncation target that discards acknowledged records.
-                if let Some(previous) = previous {
-                    if entry.epoch <= previous.epoch || entry.start_offset < previous.start_offset {
-                        return Err(ProtocolError::Limit(
-                            "epoch history does not advance".to_owned(),
-                        ));
-                    }
-                }
-                previous = Some(entry);
-                epoch_starts.push(entry);
-            }
             Message::ReplicaFenceResponse(ReplicaFenceResponse {
                 fencing_epoch,
                 local_committed_offset,
                 next_offset,
-                epoch_starts,
+                epoch_starts: decode_epoch_starts(decoder)?,
             })
         }
         70 => Message::CommitCursorRequest(CommitCursorRequest {
@@ -1371,6 +1317,44 @@ fn decode_message(
         }
         other => return Err(ProtocolError::UnknownKind(other)),
     })
+}
+
+/// Decode a bounded, strictly advancing epoch history.
+///
+/// Shared by every message that carries one (kinds 68 and 76). Written once on
+/// purpose: the first version had a copy per kind, and they had already drifted
+/// — one rejected a non-advancing history as `InvalidFrame`, the other as
+/// `Limit`, so the same malformed payload was indistinguishable to a caller
+/// depending on which message carried it.
+///
+/// Advancement is enforced on the way IN, not only where the vector is written.
+/// A peer's history is a claim, and this value decides truncation targets: a
+/// non-advancing one would hand the reader an instruction to discard
+/// acknowledged records. The length is bounded before allocating for the same
+/// reason — it is a number chosen by whoever is on the other end of the socket.
+fn decode_epoch_starts(decoder: &mut Decoder<'_>) -> Result<Vec<ReplicaEpochStart>, ProtocolError> {
+    let count = decoder.u32()? as usize;
+    if count > MAX_REPLICA_EPOCH_STARTS {
+        return Err(ProtocolError::Limit("epoch history too long".to_owned()));
+    }
+    let mut epoch_starts = Vec::with_capacity(count);
+    let mut previous: Option<ReplicaEpochStart> = None;
+    for _ in 0..count {
+        let entry = ReplicaEpochStart {
+            epoch: decoder.u64()?,
+            start_offset: decoder.u64()?,
+        };
+        if let Some(previous) = previous {
+            if entry.epoch <= previous.epoch || entry.start_offset < previous.start_offset {
+                return Err(ProtocolError::InvalidFrame(
+                    "epoch history does not advance".to_owned(),
+                ));
+            }
+        }
+        previous = Some(entry);
+        epoch_starts.push(entry);
+    }
+    Ok(epoch_starts)
 }
 
 fn checked_count(count: usize) -> Result<u32, ProtocolError> {
@@ -2066,38 +2050,38 @@ mod tests {
             76
         );
 
-        // And 70 still means what it always meant: encode a legacy commit
-        // cursor, rewrite its kind byte to 70, and confirm it comes back as a
-        // cursor request rather than a fence.
-        let frame = WireFrame {
-            request_id: 1,
-            stream_id: 0,
-            message: Message::CommitCursorRequest(CommitCursorRequest {
-                operation_id: Uuid::nil(),
-                member_id: Uuid::from_u128(51),
-                cursor: LineageCursor {
-                    group_id: Uuid::from_u128(50),
-                    topic_id: Uuid::from_u128(20),
-                    topic_epoch: 1,
-                    range_id: Uuid::from_u128(21),
-                    range_generation: 0,
-                    segment_id: Uuid::from_u128(22),
-                    segment_generation: 0,
-                    segment_root: [7_u8; 32],
-                    record_offset: 5,
-                    record_index: 0,
-                    lineage_transition_id: None,
-                    checkpoint_generation: 1,
-                },
-                expected_checkpoint_generation: None,
-            }),
-        };
-        let encoded = encode_frame(&frame, limits()).expect("encode");
-        let decoded = decode_frame(&encoded, limits()).expect("decode");
+        // And 70 still decodes as the legacy cursor commit. Decoding kind 70
+        // DIRECTLY is the whole point: the first version of this test encoded a
+        // kind-74 frame and asserted it round-tripped, which stays true no
+        // matter what kind 70 is reassigned to — it would have passed through
+        // exactly the collision it claimed to prevent.
+        let mut payload = Vec::new();
+        put_uuid(&mut payload, Uuid::from_u128(51));
+        put_lineage_cursor(
+            &mut payload,
+            &LineageCursor {
+                group_id: Uuid::from_u128(50),
+                topic_id: Uuid::from_u128(20),
+                topic_epoch: 1,
+                range_id: Uuid::from_u128(21),
+                range_generation: 0,
+                segment_id: Uuid::from_u128(30),
+                segment_generation: 0,
+                segment_root: [3; 32],
+                record_offset: 42,
+                record_index: 7,
+                lineage_transition_id: None,
+                checkpoint_generation: 0,
+            },
+        );
+        put_optional_u64(&mut payload, Some(0));
+
+        let decoded = decode_message(70, &mut Decoder::new(&payload), limits())
+            .expect("kind 70 must still decode as the legacy cursor commit");
         assert!(
-            matches!(decoded.message, Message::CommitCursorRequest(_)),
-            "kind 74 must stay a cursor request; 70 is its legacy alias and \
-             neither may collide with the fence kinds"
+            matches!(decoded, Message::CommitCursorRequest(_)),
+            "kind 70 belongs to the legacy cursor commit; a fence message must \
+             never be allocated there"
         );
     }
 
@@ -2128,9 +2112,16 @@ mod tests {
             message: bad,
         };
         let encoded = encode_frame(&frame, limits()).expect("encodes");
-        assert!(matches!(
-            decode_frame(&encoded, limits()),
-            Err(ProtocolError::Limit(_))
-        ));
+        // InvalidFrame, not Limit: the payload is malformed, not oversized.
+        // Kind 68 already said so, and the two arms disagreed until they were
+        // made to share one decoder.
+        assert!(
+            matches!(
+                decode_frame(&encoded, limits()),
+                Err(ProtocolError::InvalidFrame(_))
+            ),
+            "a non-advancing history is malformed, and must report the same \
+             way whichever message carried it"
+        );
     }
 }

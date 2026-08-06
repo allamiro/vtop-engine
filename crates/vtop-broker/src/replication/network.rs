@@ -1448,13 +1448,20 @@ impl ReplicaStatusClient {
                 })?;
             match reply.message {
                 Message::ReplicaFenceResponse(response) => {
-                    // A replica that answered with a LOWER epoch than asked for
-                    // has not been fenced to the epoch the caller is promoting
-                    // at, whatever else it did. Counting it would be counting
-                    // an unfenced replica.
-                    if response.fencing_epoch < fencing_epoch {
+                    // EXACTLY the requested epoch, not merely at least it.
+                    //
+                    // Lower is obvious: the replica is not fenced to the epoch
+                    // being promoted at. Higher is the subtle one and is just
+                    // as disqualifying — it means something granted a NEWER
+                    // epoch between this replica adopting and answering, so
+                    // this candidate has already been superseded and the
+                    // snapshot describes a log fenced under someone else's
+                    // grant. Counting it would establish a boundary from a
+                    // measurement taken for a different leader.
+                    if response.fencing_epoch != fencing_epoch {
                         return Err(crate::BrokerError::InvalidConfig(format!(
-                            "replica reported epoch {} after being asked to fence at {fencing_epoch}",
+                            "replica reported epoch {} after being asked to fence at \
+                             {fencing_epoch}; only an exact match is a fence at this epoch",
                             response.fencing_epoch
                         )));
                     }

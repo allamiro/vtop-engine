@@ -1229,6 +1229,76 @@ mod tests {
         );
     }
 
+    /// The REAL probe, not a double: a follower it cannot fence must come back
+    /// absent, so promotion cannot count it.
+    ///
+    /// The tests above use a `QuorumProbe` double, which means the mapping from
+    /// "the fence RPC failed" to "this replica is absent" — the safety property
+    /// this whole change exists for — is not exercised by any of them. A future
+    /// edit turning a fence failure back into a counted offset would leave them
+    /// all green.
+    ///
+    /// The follower here is an address with nothing listening, which is the
+    /// cheapest genuine failure: it exercises the same arm as an older peer, a
+    /// refused grant, or a crashed replica. Real TLS material is built because
+    /// the client needs it to exist, not because the handshake gets that far.
+    #[tokio::test]
+    async fn the_real_probe_reports_an_unfenceable_follower_as_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let leader_uuid = Uuid::from_u128(1);
+        let follower_uuid = Uuid::from_u128(2);
+        let broker = Arc::new(test_broker(dir.path(), 5));
+
+        let certified = rcgen::generate_simple_self_signed(vec!["replica".to_owned()]).unwrap();
+        let cert = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
+        let mut trust_roots = rustls::RootCertStore::empty();
+        trust_roots.add(cert.clone()).unwrap();
+        let client = vtop_broker::replication::ReplicaStatusClient::new(
+            vtop_broker::replication::ReplicaTlsMaterial {
+                certificate_chain: vec![cert],
+                private_key: rustls::pki_types::PrivatePkcs8KeyDer::from(
+                    certified.signing_key.serialize_der(),
+                )
+                .into(),
+                trust_roots,
+            },
+        )
+        .unwrap()
+        .with_timeout(std::time::Duration::from_millis(200));
+
+        // Port 1 on loopback: reserved, and nothing this test could race with.
+        let unreachable = "127.0.0.1:1".parse().unwrap();
+        let probe = ReplicaPlaneProbe::new(
+            Arc::clone(&broker),
+            leader_uuid,
+            client,
+            vec![FollowerEndpoint {
+                node_uuid: follower_uuid,
+                addr: unreachable,
+                server_name: "replica".to_owned(),
+            }],
+            broker.range().clone(),
+        );
+
+        let probes = probe.probe(6).await;
+        assert_eq!(probes.len(), 2, "the leader plus its one follower");
+        let follower = probes
+            .iter()
+            .find(|entry| entry.node_id == follower_uuid)
+            .expect("the follower must still appear, as absent");
+        assert_eq!(
+            follower.local_committed_offset, None,
+            "a replica that could not be fenced must be absent from the quorum, \
+             not counted at whatever offset it last reported"
+        );
+        // And the leader still counts itself: it holds the epoch by construction.
+        let leader = probes
+            .iter()
+            .find(|entry| entry.node_id == leader_uuid)
+            .expect("the leader probes its own disk");
+        assert!(leader.local_committed_offset.is_some());
+    }
+
     /// The probe must fence at the epoch being promoted, not some other one.
     ///
     /// A fence taken at the wrong epoch stops nothing that matters: the deposed
