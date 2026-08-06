@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::{Handle, Runtime};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
 use tokio_rustls::client::TlsStream as ClientTlsStream;
@@ -483,6 +483,16 @@ impl NetworkedReplicaSet {
         let mut shutdown = Vec::with_capacity(followers.len());
         for config in followers {
             let (cmd_tx, cmd_rx) = mpsc::channel(flow.max_inflight_batches.max(1) * 2);
+            // LATEST-WINS, not a queue. The committed high-water mark is a
+            // monotonic value, and a follower only ever needs the newest one —
+            // so a `watch` cell cannot fill up and cannot drop the update that
+            // matters. It used to ride the bounded command queue on a
+            // `try_send` whose result was discarded, which meant a follower
+            // under load silently stopped learning what had been acknowledged
+            // (#264). That is not cosmetic: a follower's high-water mark is the
+            // bound that stops truncation from discarding acknowledged records,
+            // so a stale one permits a truncation it should refuse.
+            let (hwm_tx, hwm_rx) = watch::channel(None::<CommittedHwmUpdate>);
             let (stop_tx, stop_rx) = mpsc::channel(1);
             let budget = Arc::new(memory.open_follower());
             let channel = Arc::new(FollowerChannel {
@@ -490,6 +500,7 @@ impl NetworkedReplicaSet {
                 durable_offset: AtomicU64::new(0),
                 connected: AtomicBool::new(false),
                 cmd_tx,
+                hwm_tx,
                 budget: Arc::clone(&budget),
             });
             let driver = FollowerDriver {
@@ -499,6 +510,7 @@ impl NetworkedReplicaSet {
                 channel: Arc::clone(&channel),
                 budget,
                 cmd_rx,
+                hwm_rx,
                 stop_rx,
             };
             handle.spawn(driver.run());
@@ -560,9 +572,10 @@ impl ReplicaSet for NetworkedReplicaSet {
 
     fn propagate_committed_hwm(&self, update: &CommittedHwmUpdate) {
         for follower in &self.followers {
-            let _ = follower.cmd_tx.try_send(FollowerCmd::PropagateHwm {
-                update: update.clone(),
-            });
+            // `send_replace` cannot fail on a full channel — there is no queue
+            // to fill. It returns the previous value, which nothing needs: a
+            // superseded high-water mark has no use.
+            follower.hwm_tx.send_replace(Some(update.clone()));
         }
     }
 }
@@ -620,6 +633,9 @@ struct FollowerChannel {
     durable_offset: AtomicU64,
     connected: AtomicBool,
     cmd_tx: mpsc::Sender<FollowerCmd>,
+    /// Newest committed high-water mark for this follower; see the construction
+    /// site for why this is a cell rather than a queued command.
+    hwm_tx: watch::Sender<Option<CommittedHwmUpdate>>,
     budget: Arc<FollowerBudget>,
 }
 
@@ -684,9 +700,6 @@ enum FollowerCmd {
         /// `max_retransmission_bytes` from the process ceiling.
         catch_up_charged: bool,
     },
-    PropagateHwm {
-        update: CommittedHwmUpdate,
-    },
     DropConnection,
 }
 
@@ -714,6 +727,7 @@ struct FollowerDriver {
     channel: Arc<FollowerChannel>,
     budget: Arc<FollowerBudget>,
     cmd_rx: mpsc::Receiver<FollowerCmd>,
+    hwm_rx: watch::Receiver<Option<CommittedHwmUpdate>>,
     stop_rx: mpsc::Receiver<()>,
 }
 
@@ -841,6 +855,32 @@ impl FollowerDriver {
         }
         self.channel.connected.store(true, Ordering::SeqCst);
 
+        // Re-send the current mark on every fresh session. `changed()` only
+        // fires on NEW values, so a follower that was down when the last update
+        // was published would otherwise sit on a stale high-water mark until
+        // the next one happened to arrive — and on a quiet range that may be
+        // never.
+        // Guard scoped and dropped before any await: a `watch` borrow is a
+        // read guard, and holding one across an await makes the whole task
+        // non-Send.
+        let current_hwm = {
+            let guard = self.hwm_rx.borrow_and_update();
+            guard.clone()
+        };
+        if let Some(update) = current_hwm {
+            let frame = WireFrame {
+                request_id: 0,
+                stream_id: 0,
+                message: Message::CommittedHwmUpdate(update),
+            };
+            if write_frame(&mut stream, &frame, REPLICA_LIMITS)
+                .await
+                .is_err()
+            {
+                return SessionOutcome::Disconnected;
+            }
+        }
+
         let mut inflight: HashMap<u64, Inflight> = HashMap::new();
         let mut inflight_bytes = 0usize;
 
@@ -917,6 +957,33 @@ impl FollowerDriver {
                         }
                     }
                 }
+                // A new high-water mark. `changed()` yields once per update and
+                // always exposes the newest value, so a burst collapses to a
+                // single frame instead of a queue that can overflow.
+                changed = self.hwm_rx.changed() => {
+                    if changed.is_err() {
+                        // Every sender is gone, which means the replica set is
+                        // being torn down. The command channel governs
+                        // lifecycle, so let that arm decide; this one simply
+                        // stops producing.
+                        std::future::pending::<()>().await;
+                    }
+                    let update = {
+                        let guard = self.hwm_rx.borrow_and_update();
+                        guard.clone()
+                    };
+                    if let Some(update) = update {
+                        let frame = WireFrame {
+                            request_id: 0,
+                            stream_id: 0,
+                            message: Message::CommittedHwmUpdate(update),
+                        };
+                        if write_frame(&mut stream, &frame, REPLICA_LIMITS).await.is_err() {
+                            requeue_inflight(pending, &mut inflight, retransmission);
+                            return SessionOutcome::Disconnected;
+                        }
+                    }
+                }
                 cmd = self.cmd_rx.recv() => {
                     match cmd {
                         None => {
@@ -926,17 +993,6 @@ impl FollowerDriver {
                         Some(FollowerCmd::DropConnection) => {
                             requeue_inflight(pending, &mut inflight, retransmission);
                             return SessionOutcome::Disconnected;
-                        }
-                        Some(FollowerCmd::PropagateHwm { update }) => {
-                            let frame = WireFrame {
-                                request_id: 0,
-                                stream_id: 0,
-                                message: Message::CommittedHwmUpdate(update),
-                            };
-                            if write_frame(&mut stream, &frame, REPLICA_LIMITS).await.is_err() {
-                                requeue_inflight(pending, &mut inflight, retransmission);
-                                return SessionOutcome::Disconnected;
-                            }
                         }
                         Some(FollowerCmd::Replicate {
                             requests,
