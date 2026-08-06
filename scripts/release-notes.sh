@@ -88,15 +88,23 @@ for number in $pulls; do
             # link is about to say. Drop only that one — see below for why the
             # others stay.
             subject=$(printf '%s' "$subject" | sed "s/ *(#${issue})\$//")
+            # Also drop it from a compound trailer like "(#240, closes #261)",
+            # which this project's subjects use. Leaving the number bare there
+            # made it the one unlinked reference in the whole changelog.
+            subject=$(printf '%s' "$subject" |
+                sed "s/, *closes *#${issue})/)/; s/(closes *#${issue}, */(/")
         done
         link=" — closes ${link#, }"
     fi
+    # Tidy a trailer left empty or dangling by the strips above.
+    subject=$(printf '%s' "$subject" | sed 's/ *()$//; s/(, /(/; s/, )/)/')
     # A reference the PR does NOT close is a different fact — "relates to",
-    # "partially addresses" — and dropping it would lose it. Make it a link
-    # instead so it is at least reachable. BRE `[0-9][0-9]*` rather than `\+`
-    # so this behaves the same under BSD sed as under GNU.
+    # "partially addresses" — and dropping it would lose it. Link every one
+    # that survives, including inside a compound trailer: a bare "#240" beside
+    # linked ones reads as an oversight. BRE `[0-9][0-9]*` rather than `\+` so
+    # this behaves the same under BSD sed as under GNU.
     subject=$(printf '%s' "$subject" |
-        sed "s|(#\([0-9][0-9]*\))|([#\1](https://github.com/${repo}/issues/\1))|g")
+        sed "s|#\([0-9][0-9]*\)|[#\1](https://github.com/${repo}/issues/\1)|g")
 
     printf '%s\t- %s ([#%s](https://github.com/%s/pull/%s))%s\n' \
         "$component" "$subject" "$number" "$repo" "$number" "$link" >>"$entries"
