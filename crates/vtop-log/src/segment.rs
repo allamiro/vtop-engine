@@ -1730,7 +1730,8 @@ pub fn roll_in(
     // for the offset it ends at.
     if successor_path == active.path {
         return Err(LogError::InvalidDescriptor(format!(
-            "rolling {} would reuse its own name: it ends at offset {base_offset}, which is              where its successor must begin",
+            "rolling {} would reuse its own name: it ends at offset {base_offset}, where its \
+             successor must begin",
             active.path.display()
         )));
     }
@@ -4675,6 +4676,31 @@ mod tests {
                 .reasons
                 .contains(&crate::QuarantineReason::OrphanSidecars)),
             "an incomplete roll must be visible: {:?}",
+            catalog.quarantined
+        );
+    }
+
+    /// `write_atomic` names an in-progress sidecar `.{stem}.producers.<uuid>.tmp`.
+    /// If the temp matcher does not recognise it, an interrupted roll is
+    /// reported as a corrupt range rather than an incomplete write — a
+    /// materially different thing for an operator to be told.
+    #[test]
+    fn a_half_written_producer_sidecar_reads_as_an_incomplete_write() {
+        let directory = tempdir().unwrap();
+        fs::write(
+            directory
+                .path()
+                .join(format!(".{}.producers.abcd.tmp", segment_stem(99))),
+            b"partial",
+        )
+        .unwrap();
+
+        let catalog = crate::StartupCatalog::discover(directory.path()).unwrap();
+        assert!(
+            catalog.quarantined.iter().any(|bundle| bundle
+                .reasons
+                .contains(&crate::QuarantineReason::IncompleteAtomicWrite)),
+            "a partial sidecar is an interrupted write, not corruption: {:?}",
             catalog.quarantined
         );
     }

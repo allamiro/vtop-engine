@@ -296,9 +296,20 @@ fn classify_artifact(path: &Path) -> Option<ArtifactClassification> {
     let name = path.file_name()?.to_str()?;
     if name.starts_with('.')
         && name.ends_with(".tmp")
-        && [".commit.", ".index.", ".manifest.json.", ".chunks."]
-            .iter()
-            .any(|marker| name.contains(marker))
+        && [
+            ".commit.",
+            ".index.",
+            ".manifest.json.",
+            ".chunks.",
+            // `write_atomic` names an in-progress sidecar
+            // `.{stem}.producers.<uuid>.tmp`. Without this a half-written
+            // frontier is classified as a real artifact, and an interrupted
+            // roll is reported as a corrupt range rather than an incomplete
+            // write.
+            ".producers.",
+        ]
+        .iter()
+        .any(|marker| name.contains(marker))
     {
         return Some(ArtifactClassification {
             base: path.to_path_buf(),

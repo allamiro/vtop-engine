@@ -227,15 +227,17 @@ impl ProducerSnapshot {
                 .checked_sub(first_sequence)
                 .and_then(|span| span.checked_add(1))
                 .ok_or_else(|| corrupt("producer sequence span overflows"))?;
-            if record_count > span {
+            // EQUAL, not merely within. Producer sequences are gap-free — the
+            // append path refuses a gap with `SequenceGap` — so a run from
+            // `first_sequence` to `latest_sequence` contains exactly `span`
+            // records. A count below it describes a run with a hole, which this
+            // code cannot have written, and recovery continuing from it would
+            // carry that hole into every sealed manifest summary derived from
+            // it afterwards.
+            if record_count != span {
                 return Err(corrupt(&format!(
                     "producer {producer} claims {record_count} records across sequences \
-                     {first_sequence}..={latest_sequence}, which spans only {span}"
-                )));
-            }
-            if record_count == 0 && !seen.is_empty() {
-                return Err(corrupt(&format!(
-                    "producer {producer} remembers sequences but claims no records"
+                     {first_sequence}..={latest_sequence}, which spans exactly {span}"
                 )));
             }
             if producers
@@ -451,6 +453,69 @@ mod tests {
         let mut broken = snapshot();
         let key = (Uuid::from_u128(1), 0);
         broken.producers.get_mut(&key).unwrap().first_sequence = 99;
+        assert!(matches!(
+            ProducerSnapshot::decode(&broken.encode().unwrap()),
+            Err(LogError::Corrupt { .. })
+        ));
+    }
+
+    /// Producer sequences are gap-free, so a count BELOW its span describes a
+    /// run with a hole — which the append path cannot produce. Recovery
+    /// continuing from it would carry that hole into every sealed manifest
+    /// summary derived from it afterwards.
+    #[test]
+    fn a_record_count_below_its_sequence_span_is_refused() {
+        let mut broken = snapshot();
+        let key = (Uuid::from_u128(1), 0);
+        // Sequences 0..=3 is four records; claim three.
+        broken.producers.get_mut(&key).unwrap().record_count = 3;
+        assert!(matches!(
+            ProducerSnapshot::decode(&broken.encode().unwrap()),
+            Err(LogError::Corrupt { .. })
+        ));
+    }
+
+    #[test]
+    fn a_record_count_above_its_sequence_span_is_refused() {
+        let mut broken = snapshot();
+        let key = (Uuid::from_u128(1), 0);
+        broken.producers.get_mut(&key).unwrap().record_count = 99;
+        assert!(matches!(
+            ProducerSnapshot::decode(&broken.encode().unwrap()),
+            Err(LogError::Corrupt { .. })
+        ));
+    }
+
+    /// A remembered sequence outside the frontier answers a retry for a record
+    /// the producer never wrote at that point, so duplicate detection would
+    /// return an offset that is not the record's.
+    #[test]
+    fn a_retry_entry_outside_the_frontier_is_refused() {
+        let mut broken = snapshot();
+        let key = (Uuid::from_u128(1), 0);
+        broken
+            .producers
+            .get_mut(&key)
+            .unwrap()
+            .seen
+            .push(SnapshotSeen {
+                sequence: 99,
+                offset: 990,
+                content_hash: [9; 32],
+            });
+        assert!(matches!(
+            ProducerSnapshot::decode(&broken.encode().unwrap()),
+            Err(LogError::Corrupt { .. })
+        ));
+    }
+
+    /// The epoch map is what fences a stale producer. State at an epoch the map
+    /// does not cover would let a superseded producer keep appending, because
+    /// the check that would stop it consults a map that never heard of it.
+    #[test]
+    fn state_at_an_epoch_the_map_does_not_cover_is_refused() {
+        let mut broken = snapshot();
+        broken.epochs.remove(&Uuid::from_u128(1));
         assert!(matches!(
             ProducerSnapshot::decode(&broken.encode().unwrap()),
             Err(LogError::Corrupt { .. })
