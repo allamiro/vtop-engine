@@ -197,6 +197,47 @@ impl ProducerSnapshot {
                      {latest_sequence}"
                 )));
             }
+            // Every remembered sequence must lie inside the frontier it claims.
+            // A `seen` entry above `latest_sequence` would answer a retry for a
+            // record the producer has not reached, and one below
+            // `first_sequence` for a record this run never wrote — either way
+            // duplicate detection returns an offset that is not the record's.
+            if let Some(first) = seen.first() {
+                if first.sequence < first_sequence {
+                    return Err(corrupt(&format!(
+                        "producer {producer} remembers sequence {} below its first {first_sequence}",
+                        first.sequence
+                    )));
+                }
+            }
+            if let Some(last) = seen.last() {
+                if last.sequence > latest_sequence {
+                    return Err(corrupt(&format!(
+                        "producer {producer} remembers sequence {} above its latest \
+                         {latest_sequence}",
+                        last.sequence
+                    )));
+                }
+            }
+            // `record_count` is a summary of the same run, and the append path
+            // increments it. A count exceeding the sequence span it describes
+            // cannot have been produced by that path, and carrying it forward
+            // corrupts every sealed manifest summary computed from it after.
+            let span = latest_sequence
+                .checked_sub(first_sequence)
+                .and_then(|span| span.checked_add(1))
+                .ok_or_else(|| corrupt("producer sequence span overflows"))?;
+            if record_count > span {
+                return Err(corrupt(&format!(
+                    "producer {producer} claims {record_count} records across sequences \
+                     {first_sequence}..={latest_sequence}, which spans only {span}"
+                )));
+            }
+            if record_count == 0 && !seen.is_empty() {
+                return Err(corrupt(&format!(
+                    "producer {producer} remembers sequences but claims no records"
+                )));
+            }
             if producers
                 .insert(
                     (producer, epoch),
@@ -216,6 +257,26 @@ impl ProducerSnapshot {
         }
         if !reader.is_finished() {
             return Err(corrupt("trailing bytes after the last producer"));
+        }
+        // The epoch map is what fences a stale producer. A frontier naming an
+        // epoch the map does not cover would let a producer whose epoch had
+        // been superseded keep appending, because the check that would have
+        // stopped it consults a map that never heard of it.
+        for (producer, epoch) in producers.keys() {
+            match epochs.get(producer) {
+                None => {
+                    return Err(corrupt(&format!(
+                        "producer {producer} has state at epoch {epoch} but no epoch entry"
+                    )))
+                }
+                Some(latest) if latest < epoch => {
+                    return Err(corrupt(&format!(
+                        "producer {producer} has state at epoch {epoch}, above its recorded \
+                         latest epoch {latest}"
+                    )))
+                }
+                Some(_) => {}
+            }
         }
         Ok(Self { producers, epochs })
     }

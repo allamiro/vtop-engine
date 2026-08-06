@@ -1723,6 +1723,17 @@ pub fn roll_in(
         .to_path_buf();
     let base_offset = active.next_offset();
     let successor_path = directory.join(format!("{}.active", segment_stem(base_offset)));
+    // A successor sharing its predecessor's stem would share every sidecar with
+    // it, and `seal` would then refuse the NEXT roll because the target name is
+    // taken. Reachable two ways: rolling a segment that holds nothing (its
+    // next_offset equals its base), and rolling one whose file was already named
+    // for the offset it ends at.
+    if successor_path == active.path {
+        return Err(LogError::InvalidDescriptor(format!(
+            "rolling {} would reuse its own name: it ends at offset {base_offset}, which is              where its successor must begin",
+            active.path.display()
+        )));
+    }
     let successor_paths = SegmentPaths::from_active(&successor_path)?;
 
     let v2 =
@@ -1746,8 +1757,13 @@ pub fn roll_in(
 
     let frontier = snapshot_of(&active.producer_states, &active.producer_epochs);
     let inherited = frontier.clone();
-    let states = std::mem::take(&mut active.producer_states);
-    let epochs = std::mem::take(&mut active.producer_epochs);
+    // CLONED, not taken. `seal_v2` derives the sealed manifest's producer
+    // summary from these maps, so emptying them first produced a manifest that
+    // disagreed with the segment's own records and every v2 roll failed with
+    // `ManifestMismatch`. The v1 path does not read them, which is why tests
+    // covering only v1 said this worked.
+    let states = active.producer_states.clone();
+    let epochs = active.producer_epochs.clone();
 
     let sealed = active.seal()?;
     if !frontier.is_empty() {
@@ -4584,5 +4600,82 @@ mod tests {
             "a segment that inherited nothing must not write a frontier"
         );
         assert_eq!(ActiveSegment::recover(&path).unwrap().next_offset(), 41);
+    }
+
+    /// REGRESSION. Rolling a v2 segment failed with `ManifestMismatch`.
+    ///
+    /// `seal_v2` derives the sealed manifest's producer summary from the
+    /// segment's producer maps, and the first version emptied those maps before
+    /// sealing — so the manifest disagreed with the records it described. The
+    /// v1 seal path does not read them, which is exactly why a test suite
+    /// covering only v1 reported this as working.
+    #[test]
+    fn a_v2_segment_rolls_without_a_manifest_mismatch() {
+        let directory = tempdir().unwrap();
+        let producer = Uuid::from_u128(71);
+        let path = directory
+            .path()
+            .join(format!("{}.active", segment_stem(42)));
+        let mut active = ActiveSegment::create_v2(&path, descriptor_v2(), config_v2()).unwrap();
+        for sequence in 0..3 {
+            active
+                .append(record_v2(producer, 1, sequence, b"v"), Durability::Fsync)
+                .unwrap();
+        }
+
+        let (sealed, mut successor) =
+            roll_in(&Env::real(), active, Uuid::from_u128(700)).expect("a v2 roll must succeed");
+        assert_eq!(sealed.manifest_v2().unwrap().next_offset, 45);
+        assert_eq!(successor.descriptor_v2().unwrap().base_offset, 45);
+
+        // And the successor continues the same producer sequence.
+        successor
+            .append(record_v2(producer, 1, 3, b"after"), Durability::Fsync)
+            .unwrap();
+        assert_eq!(successor.next_offset(), 46);
+    }
+
+    /// A successor must never share its predecessor's filename: they would
+    /// share every sidecar, and the next `seal` would refuse because the target
+    /// name is taken.
+    #[test]
+    fn rolling_a_segment_that_would_reuse_its_own_name_is_refused() {
+        let directory = tempdir().unwrap();
+        // Named for offset 40 and holding nothing, so its successor would begin
+        // at 40 as well.
+        let path = directory
+            .path()
+            .join(format!("{}.active", segment_stem(40)));
+        let active = ActiveSegment::create(&path, descriptor(), config()).unwrap();
+
+        assert!(matches!(
+            roll_in(&Env::real(), active, Uuid::from_u128(800)),
+            Err(LogError::InvalidDescriptor(_))
+        ));
+    }
+
+    /// A `.producers` sidecar written for a successor that was never created is
+    /// an orphan, and discovery must SAY so. An unrecognised extension is
+    /// ignored, which would make a half-finished roll look like a healthy
+    /// range.
+    #[test]
+    fn an_orphaned_producer_sidecar_is_quarantined() {
+        let directory = tempdir().unwrap();
+        fs::write(
+            directory
+                .path()
+                .join(format!("{}.producers", segment_stem(99))),
+            b"whatever",
+        )
+        .unwrap();
+
+        let catalog = crate::StartupCatalog::discover(directory.path()).unwrap();
+        assert!(
+            catalog.quarantined.iter().any(|bundle| bundle
+                .reasons
+                .contains(&crate::QuarantineReason::OrphanSidecars)),
+            "an incomplete roll must be visible: {:?}",
+            catalog.quarantined
+        );
     }
 }
