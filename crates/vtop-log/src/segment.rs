@@ -501,6 +501,11 @@ impl ActiveSegment {
         self.header.format_version()
     }
 
+    /// First offset this segment holds.
+    pub fn base_offset(&self) -> u64 {
+        self.header.base_offset()
+    }
+
     pub fn next_offset(&self) -> u64 {
         self.next_offset
     }
@@ -1119,6 +1124,17 @@ impl SegmentReader {
 
     pub fn format_version(&self) -> u16 {
         self.header.format_version()
+    }
+
+    /// First offset this sealed segment holds.
+    pub fn base_offset(&self) -> u64 {
+        self.header.base_offset()
+    }
+
+    /// First offset it does NOT hold. Together with `base_offset` this is the
+    /// half-open interval a reader routes against.
+    pub fn next_offset(&self) -> u64 {
+        self.manifest_next_offset()
     }
 
     fn manifest_next_offset(&self) -> u64 {
