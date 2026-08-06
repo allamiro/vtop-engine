@@ -81,22 +81,45 @@ for number in $pulls; do
     closes=$(printf '%s' "$json" | jq -r '.closingIssuesReferences[]?.number' | sort -un)
     link=""
     if [ -n "$closes" ]; then
+        trailer_edited=0
         for issue in $closes; do
             link="${link}, [#${issue}](https://github.com/${repo}/issues/${issue})"
             printf '%s\n' "$issue" >>"$issues"
             # A subject ending in the issue it closes repeats what the "closes"
             # link is about to say. Drop only that one — see below for why the
             # others stay.
+            before=$subject
             subject=$(printf '%s' "$subject" | sed "s/ *(#${issue})\$//")
+            # Also drop it from a compound trailer like "(#240, closes #261)",
+            # which this project's subjects use. Leaving the number bare there
+            # made it the one unlinked reference in the whole changelog.
+            subject=$(printf '%s' "$subject" |
+                sed "s/, *closes *#${issue})/)/; s/(closes *#${issue}, */(/")
+            [ "$subject" = "$before" ] || trailer_edited=1
         done
         link=" — closes ${link#, }"
+        # Tidy ONLY a trailer this loop actually edited. Running it
+        # unconditionally would rewrite legitimate titles — one ending in
+        # `foo()`, or containing a trailing-comma expression — for a cleanup
+        # that had nothing to do with them.
+        if [ "$trailer_edited" = 1 ]; then
+            subject=$(printf '%s' "$subject" | sed 's/ *()$//; s/(, /(/; s/, )/)/')
+        fi
     fi
     # A reference the PR does NOT close is a different fact — "relates to",
-    # "partially addresses" — and dropping it would lose it. Make it a link
-    # instead so it is at least reachable. BRE `[0-9][0-9]*` rather than `\+`
-    # so this behaves the same under BSD sed as under GNU.
+    # "partially addresses" — and dropping it would lose it. Link every one
+    # that survives, including inside a compound trailer: a bare "#240" beside
+    # linked ones reads as an oversight.
+    #
+    # Anchored to a STANDALONE reference — start of line, a space, or an
+    # opening paren before the `#`. Matching a bare `#digits` anywhere would
+    # rewrite the fragment in a URL (`.../page#123`) and nest a link inside one
+    # a title already carried. Two passes rather than a BRE alternation, which
+    # is a GNU extension BSD sed does not accept.
+    url="https://github.com/${repo}/issues"
     subject=$(printf '%s' "$subject" |
-        sed "s|(#\([0-9][0-9]*\))|([#\1](https://github.com/${repo}/issues/\1))|g")
+        sed "s|\([ (]\)#\([0-9][0-9]*\)|\1[#\2](${url}/\2)|g" |
+        sed "s|^#\([0-9][0-9]*\)|[#\1](${url}/\1)|")
 
     printf '%s\t- %s ([#%s](https://github.com/%s/pull/%s))%s\n' \
         "$component" "$subject" "$number" "$repo" "$number" "$link" >>"$entries"
