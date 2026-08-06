@@ -235,6 +235,7 @@ struct ArtifactBundle {
     index: Option<PathBuf>,
     manifest: Option<PathBuf>,
     chunks: Option<PathBuf>,
+    producers: Option<PathBuf>,
     has_non_regular: bool,
 }
 
@@ -247,6 +248,7 @@ impl ArtifactBundle {
             ArtifactKind::Index => &mut self.index,
             ArtifactKind::Manifest => &mut self.manifest,
             ArtifactKind::Chunks => &mut self.chunks,
+            ArtifactKind::Producers => &mut self.producers,
             ArtifactKind::Temporary => unreachable!("temporary files are not bundled"),
         };
         *destination = Some(path);
@@ -261,6 +263,7 @@ impl ArtifactBundle {
             self.index.as_ref(),
             self.manifest.as_ref(),
             self.chunks.as_ref(),
+            self.producers.as_ref(),
         ]
         .into_iter()
         .flatten()
@@ -279,6 +282,8 @@ enum ArtifactKind {
     Index,
     Manifest,
     Chunks,
+    /// The producer frontier a rolled segment inherited (#270).
+    Producers,
     Temporary,
 }
 
@@ -291,9 +296,20 @@ fn classify_artifact(path: &Path) -> Option<ArtifactClassification> {
     let name = path.file_name()?.to_str()?;
     if name.starts_with('.')
         && name.ends_with(".tmp")
-        && [".commit.", ".index.", ".manifest.json.", ".chunks."]
-            .iter()
-            .any(|marker| name.contains(marker))
+        && [
+            ".commit.",
+            ".index.",
+            ".manifest.json.",
+            ".chunks.",
+            // `write_atomic` names an in-progress sidecar
+            // `.{stem}.producers.<uuid>.tmp`. Without this a half-written
+            // frontier is classified as a real artifact, and an interrupted
+            // roll is reported as a corrupt range rather than an incomplete
+            // write.
+            ".producers.",
+        ]
+        .iter()
+        .any(|marker| name.contains(marker))
     {
         return Some(ArtifactClassification {
             base: path.to_path_buf(),
@@ -315,6 +331,11 @@ fn classify_artifact(path: &Path) -> Option<ArtifactClassification> {
         Some(extension) if extension == OsStr::new("commit") => ArtifactKind::Commit,
         Some(extension) if extension == OsStr::new("index") => ArtifactKind::Index,
         Some(extension) if extension == OsStr::new("chunks") => ArtifactKind::Chunks,
+        // Registered so an incomplete roll is VISIBLE. A `.producers` written
+        // for a successor that was never created is an orphan sidecar, and
+        // discovery only reports what it recognises — an unclassified file is
+        // ignored, so the half-finished roll would look like a healthy range.
+        Some(extension) if extension == OsStr::new("producers") => ArtifactKind::Producers,
         _ => return None,
     };
     Some(ArtifactClassification {
