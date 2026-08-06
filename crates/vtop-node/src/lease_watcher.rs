@@ -73,6 +73,14 @@ impl LeasePublisher for FollowerLeasePublisher {
         self.follower.meta_fencing_epoch().set(fencing_epoch);
     }
 
+    fn prove_epoch_quorum(&self, _fencing_epoch: u64, _committed_offset: u64) -> bool {
+        // A follower never publishes a boundary — `promote` above ignores the
+        // committed offset entirely, because a follower's boundary is whatever
+        // it has durably replicated. There is nothing here to prove to a
+        // quorum, so this is vacuously true rather than a skipped check.
+        true
+    }
+
     fn demote(&self, fencing_epoch: u64) {
         // Only the metadata view is cleared. The held epoch stays where it is:
         // it records the newest epoch this follower has seen, and rewinding it

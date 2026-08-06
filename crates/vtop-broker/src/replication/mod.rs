@@ -742,6 +742,36 @@ impl InProcessFollower {
                 ),
             ));
         }
+        if request.records.is_empty() {
+            // A NEW-EPOCH MARKER (Raft §5.4.2). It carries no data; acking it
+            // is the assertion "I hold everything below this offset, durably,
+            // and I am serving the epoch you sent". Reaching here means the
+            // fencing check passed and this replica's tail is exactly the
+            // offset in question, so the only thing left to establish is local
+            // durability.
+            //
+            // Written as an empty append rather than a control RECORD on
+            // purpose. A control record would need a durable representation the
+            // v1 segment format cannot carry — its frame has no attribute bits
+            // — so it would force the whole data plane onto v2, and it would
+            // then be visible to every consumer unless the fetch path learned
+            // to filter it. An empty batch proves the same fact and writes
+            // nothing.
+            let committed = state.segment.committed_offset();
+            if committed < request.expected_base_offset {
+                return Err((
+                    ErrorCode::InvalidRequest,
+                    format!(
+                        "new-epoch marker at {} is not durable here; this replica is committed \
+                         only through {committed}",
+                        request.expected_base_offset
+                    ),
+                ));
+            }
+            return Ok(ReplicaAppendResponse {
+                local_committed_offset: committed,
+            });
+        }
         if let Err(problem) = state
             .producer_epochs
             .accept(request.producer_id, request.producer_epoch)

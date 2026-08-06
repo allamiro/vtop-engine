@@ -956,6 +956,63 @@ impl LocalBroker {
         }
     }
 
+    /// Prove a quorum holds everything through `boundary` UNDER `fencing_epoch`
+    /// (Raft §5.4.2).
+    ///
+    /// # Why a boundary established by counting is not enough
+    ///
+    /// Promotion computes a boundary by asking replicas where their disks are
+    /// and taking the offset a majority can vouch for. Those records were
+    /// written under a PREVIOUS epoch, and Raft §5.4.2 is precisely the rule
+    /// that a leader must not conclude such an entry is committed merely
+    /// because a majority stores it. The majority that holds it need not be the
+    /// majority that survives, and the arithmetic cannot tell the difference.
+    ///
+    /// Concretely, and reachable here: a leader acknowledges a record on a
+    /// quorum of two, dies, and the surviving pair produces a k-th largest
+    /// offset BELOW that record. The candidate is not behind that lower
+    /// boundary, so it promotes, and the replica still holding the record
+    /// reconciles it away. A record acknowledged to a producer is gone. The
+    /// acknowledged-records bound would normally refuse that truncation, but it
+    /// reads the follower's own high-water mark — and that is propagated with a
+    /// `try_send` whose result is discarded, so it can be arbitrarily stale.
+    ///
+    /// # What the marker establishes
+    ///
+    /// An empty append at `boundary` under the new epoch. A replica acks it
+    /// only if its tail is exactly `boundary` and it is durable through it, so
+    /// a quorum of acks proves a majority holds every record below the boundary
+    /// AND is serving the current epoch. That is the Raft-safe form: prior
+    /// entries commit implicitly once something in the new term commits.
+    ///
+    /// An empty batch rather than a control RECORD because a record needs a
+    /// durable representation the v1 segment format cannot carry — its frame
+    /// has no attribute bits — so it would force the entire data plane onto v2,
+    /// and would then be visible to every consumer unless the fetch path
+    /// learned to filter it. This proves the same fact and writes nothing.
+    ///
+    /// Returns `true` for an unreplicated broker: there is no quorum to prove
+    /// anything to, and its own durable log is the whole truth.
+    pub fn prove_epoch_quorum(&self, fencing_epoch: u64, boundary: u64) -> bool {
+        let Some(replicas) = self.replicas.as_ref() else {
+            return true;
+        };
+        let marker = ReplicaAppendRequest {
+            range: self.range.clone(),
+            fencing_epoch,
+            leader_node_id: self.node_id,
+            expected_base_offset: boundary,
+            // No records, so no producer identity is asserted. Nil rather than
+            // a real producer keeps this out of every replica's idempotency
+            // state, which the marker has no business touching.
+            producer_id: Uuid::nil(),
+            producer_epoch: 0,
+            first_sequence: 0,
+            records: Vec::new(),
+        };
+        replicas.replicate_append(&marker, boundary).has_quorum()
+    }
+
     /// Shared metadata fencing-epoch handle observed by this broker.
     pub fn meta_fencing_epoch(&self) -> &MetaFencingEpoch {
         &self.meta_fencing_epoch

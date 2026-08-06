@@ -69,6 +69,14 @@ pub trait LeasePublisher: Send + Sync {
     /// demotion records the epoch as finished, and a later promotion at the
     /// same epoch would be a permanent no-op.
     fn suspend(&self, fencing_epoch: u64);
+    /// Prove a quorum holds everything through `committed_offset` UNDER
+    /// `fencing_epoch`, before that boundary is published (Raft §5.4.2).
+    ///
+    /// Deliberately has NO default. It is a safety gate, and a default would
+    /// mean every future implementor silently opts out of it by writing
+    /// nothing — the same trap as a fence handler that reports success without
+    /// fencing. There are three implementors; each states its own reason.
+    fn prove_epoch_quorum(&self, fencing_epoch: u64, committed_offset: u64) -> bool;
 }
 
 /// Asks the replica set where its disks actually are.
@@ -251,6 +259,11 @@ impl LeasePublisher for BrokerLeasePublisher {
         self.broker.meta_fencing_epoch().set(fencing_epoch);
     }
 
+    fn prove_epoch_quorum(&self, fencing_epoch: u64, committed_offset: u64) -> bool {
+        self.broker
+            .prove_epoch_quorum(fencing_epoch, committed_offset)
+    }
+
     fn demote(&self, fencing_epoch: u64) {
         // Only the metadata view is cleared. The held epoch stays where it is:
         // it records what this process was last granted, and rewinding it
@@ -367,6 +380,28 @@ impl Promoter {
                 }
             }
         };
+        // RAFT §5.4.2. The boundary above was established by counting replicas
+        // over records written under a PREVIOUS epoch, which is exactly what a
+        // new leader may not treat as committed. Prove a quorum holds it under
+        // THIS epoch before publishing it as the high-water mark; until that
+        // lands, the boundary is a candidate and nothing may be exposed on its
+        // strength.
+        if let Some(offset) = committed_offset {
+            if !self.publisher.prove_epoch_quorum(fencing_epoch, offset) {
+                tracing::warn!(
+                    range = %self.range_uuid,
+                    fencing_epoch,
+                    committed_offset = offset,
+                    "refusing promotion: no quorum could confirm the established boundary \
+                     under this epoch, so publishing it would commit prior-epoch records by \
+                     replica count alone"
+                );
+                // Suspended, not demoted: the epoch is still this node's live
+                // grant and a retry can succeed once replicas catch up.
+                self.suspended(fencing_epoch);
+                return false;
+            }
+        }
         self.publisher.promote(fencing_epoch, committed_offset);
         self.verified_epoch = Some(fencing_epoch);
         tracing::info!(range = %self.range_uuid, fencing_epoch, "range lease held");
@@ -1095,14 +1130,41 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
     struct Recorder {
         promoted: std::sync::Mutex<Vec<(u64, Option<u64>)>>,
         demoted: std::sync::Mutex<Vec<u64>>,
         suspended: std::sync::Mutex<Vec<u64>>,
+        /// Whether the new-epoch marker reaches a quorum. `true` by default so
+        /// existing tests describe a healthy cluster; the refusal path sets it
+        /// false.
+        epoch_quorum: std::sync::atomic::AtomicBool,
+        /// Every (epoch, boundary) the gate was asked about, so a test can
+        /// assert it was asked BEFORE the boundary was published rather than
+        /// merely that it was asked.
+        proved: std::sync::Mutex<Vec<(u64, u64)>>,
+    }
+
+    impl Default for Recorder {
+        fn default() -> Self {
+            Self {
+                promoted: std::sync::Mutex::new(Vec::new()),
+                demoted: std::sync::Mutex::new(Vec::new()),
+                suspended: std::sync::Mutex::new(Vec::new()),
+                epoch_quorum: std::sync::atomic::AtomicBool::new(true),
+                proved: std::sync::Mutex::new(Vec::new()),
+            }
+        }
     }
 
     impl LeasePublisher for Recorder {
+        fn prove_epoch_quorum(&self, fencing_epoch: u64, committed_offset: u64) -> bool {
+            self.proved
+                .lock()
+                .unwrap()
+                .push((fencing_epoch, committed_offset));
+            self.epoch_quorum.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
         fn promote(&self, fencing_epoch: u64, committed_offset: Option<u64>) {
             self.promoted
                 .lock()
@@ -1324,6 +1386,84 @@ mod tests {
             .find(|entry| entry.node_id == leader_uuid)
             .expect("the leader probes its own disk");
         assert!(leader.local_committed_offset.is_some());
+    }
+
+    /// RAFT §5.4.2. A boundary established by counting replicas over
+    /// prior-epoch records must not be published until a quorum confirms it
+    /// under the CURRENT epoch.
+    ///
+    /// Without this the reachable failure is: a leader acknowledges a record on
+    /// a quorum of two and dies; the surviving pair yields a k-th largest
+    /// offset below that record; the candidate is not behind that lower
+    /// boundary so it promotes; and the replica still holding the record
+    /// reconciles it away. A record acknowledged to a producer is gone.
+    #[tokio::test]
+    async fn a_boundary_is_not_published_until_a_quorum_confirms_it_under_this_epoch() {
+        let recorder = Arc::new(Recorder::default());
+        recorder
+            .epoch_quorum
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut promoter = promoter(
+            Arc::clone(&recorder) as Arc<dyn LeasePublisher>,
+            Some(fixed(vec![at(1, Some(90)), at(2, Some(90))], 2)),
+        );
+
+        assert!(
+            !promoter.ensure(19).await,
+            "no quorum under this epoch means the boundary stays a candidate"
+        );
+        assert!(
+            recorder.promoted.lock().unwrap().is_empty(),
+            "nothing may be published on the strength of a boundary the current \
+             epoch could not confirm"
+        );
+        assert_eq!(
+            *recorder.suspended.lock().unwrap(),
+            vec![19],
+            "suspended, not demoted: the epoch is still this node's live grant \
+             and a retry can succeed once replicas catch up"
+        );
+    }
+
+    /// The gate must run BEFORE the boundary is published, not alongside it.
+    ///
+    /// Asserting only that it was called would pass even if the publication
+    /// happened first and the proof afterwards, which is the ordering bug this
+    /// exists to prevent — the window in which a consumer can read a record no
+    /// quorum has confirmed under the current epoch.
+    #[tokio::test]
+    async fn the_boundary_is_proved_before_it_is_published() {
+        let recorder = Arc::new(Recorder::default());
+        let mut promoter = promoter(
+            Arc::clone(&recorder) as Arc<dyn LeasePublisher>,
+            Some(fixed(vec![at(1, Some(90)), at(2, Some(90))], 2)),
+        );
+
+        assert!(promoter.ensure(19).await);
+        assert_eq!(
+            *recorder.proved.lock().unwrap(),
+            vec![(19, 90)],
+            "the exact epoch and boundary being published must be what was proved"
+        );
+        assert_eq!(*recorder.promoted.lock().unwrap(), vec![(19, Some(90))]);
+    }
+
+    /// A standalone range has no quorum to prove anything to, and must not be
+    /// blocked by a gate that cannot apply to it.
+    #[tokio::test]
+    async fn a_standalone_range_promotes_without_a_marker() {
+        let recorder = Arc::new(Recorder::default());
+        recorder
+            .epoch_quorum
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut promoter = promoter(Arc::clone(&recorder) as Arc<dyn LeasePublisher>, None);
+
+        assert!(
+            promoter.ensure(19).await,
+            "a range with no replica set establishes no boundary, so there is \
+             nothing to prove"
+        );
+        assert!(recorder.proved.lock().unwrap().is_empty());
     }
 
     /// The probe must fence at the epoch being promoted, not some other one.

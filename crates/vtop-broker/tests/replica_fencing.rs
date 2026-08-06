@@ -381,3 +381,85 @@ fn a_reconciliation_below_the_acknowledged_mark_fails_the_fence() {
         "and nothing may have been discarded on the way to refusing"
     );
 }
+
+/// The marker is an empty append: acking it asserts "I hold everything below
+/// this offset, durably, under the epoch you sent". Nothing is written.
+#[test]
+fn a_new_epoch_marker_acks_when_the_replica_holds_the_boundary() {
+    let h = follower();
+    for offset in 0..5 {
+        append_at(&h, OLD_EPOCH, OLD_LEADER, offset).unwrap();
+    }
+
+    let marker = ReplicaAppendRequest {
+        range: h.range.clone(),
+        fencing_epoch: OLD_EPOCH,
+        leader_node_id: OLD_LEADER,
+        expected_base_offset: 5,
+        producer_id: Uuid::nil(),
+        producer_epoch: 0,
+        first_sequence: 0,
+        records: Vec::new(),
+    };
+    let ack = h
+        .node
+        .apply_append(&marker)
+        .expect("the replica holds 0..5");
+    assert_eq!(ack.local_committed_offset, 5);
+    assert_eq!(
+        h.node.next_offset(),
+        5,
+        "a marker proves a fact; it must not add a record"
+    );
+}
+
+/// A replica that does NOT hold the boundary refuses the marker, which is what
+/// keeps the quorum honest — the count would otherwise include a replica that
+/// cannot vouch for the records below it.
+#[test]
+fn a_new_epoch_marker_is_refused_by_a_replica_short_of_the_boundary() {
+    let h = follower();
+    for offset in 0..3 {
+        append_at(&h, OLD_EPOCH, OLD_LEADER, offset).unwrap();
+    }
+
+    let marker = ReplicaAppendRequest {
+        range: h.range.clone(),
+        fencing_epoch: OLD_EPOCH,
+        leader_node_id: OLD_LEADER,
+        expected_base_offset: 5,
+        producer_id: Uuid::nil(),
+        producer_epoch: 0,
+        first_sequence: 0,
+        records: Vec::new(),
+    };
+    assert!(
+        h.node.apply_append(&marker).is_err(),
+        "a replica two records short of the boundary must not vouch for it"
+    );
+}
+
+/// The marker is fenced like any other append: a stale leader cannot use it to
+/// prove a quorum for an epoch it no longer holds.
+#[test]
+fn a_new_epoch_marker_from_a_stale_epoch_is_refused() {
+    let h = follower();
+    append_at(&h, OLD_EPOCH, OLD_LEADER, 0).unwrap();
+    h.meta.set(NEW_EPOCH);
+    h.node.fence(NEW_EPOCH, &[]).unwrap();
+
+    let marker = ReplicaAppendRequest {
+        range: h.range.clone(),
+        fencing_epoch: OLD_EPOCH,
+        leader_node_id: OLD_LEADER,
+        expected_base_offset: 1,
+        producer_id: Uuid::nil(),
+        producer_epoch: 0,
+        first_sequence: 0,
+        records: Vec::new(),
+    };
+    assert_eq!(
+        h.node.apply_append(&marker).map(|_| ()).map_err(|e| e.0),
+        Err(ErrorCode::Fenced)
+    );
+}
