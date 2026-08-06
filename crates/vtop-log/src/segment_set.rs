@@ -342,10 +342,13 @@ impl SegmentSet {
             .ok_or_else(|| {
                 LogError::InvalidCursor(format!("offset {offset} is not in this range"))
             })?;
-        // A sealed segment's own fetch caps at its manifest frontier, which is
-        // what we want: the read stops at the boundary and the loop above moves
-        // to the next segment.
-        self.sealed[index].fetch(offset, max_bytes, max_records)
+        // The caller's watermark is passed through, not just the segment's own
+        // frontier. A watermark falling INSIDE a sealed segment would otherwise
+        // be ignored and the read would return records above it — the one thing
+        // a fetch path must never do. The segment still caps at its own
+        // manifest, so the read stops at the boundary and the loop above moves
+        // on to the next segment.
+        self.sealed[index].fetch_through(offset, max_bytes, max_records, high_watermark)
     }
 }
 
@@ -552,5 +555,57 @@ mod tests {
         assert!(SegmentSet::open_in(&Env::real(), directory.path())
             .unwrap()
             .is_none());
+    }
+
+    /// REGRESSION. A high-water mark falling INSIDE a sealed segment must still
+    /// bound the read.
+    ///
+    /// `SegmentReader::fetch` caps at the segment's own manifest frontier, and
+    /// routing to it without passing the caller's watermark returned records
+    /// above that watermark — exposing data no quorum had acknowledged.
+    ///
+    /// The earlier watermark test passed only because the boundary happened to
+    /// fall favourably for the value it chose. This one finds the first sealed
+    /// segment's real end and puts the watermark strictly inside it, so it
+    /// cannot pass by luck.
+    #[test]
+    fn a_watermark_inside_a_sealed_segment_still_bounds_the_read() {
+        let directory = tempdir().unwrap();
+        let producer = Uuid::from_u128(23);
+        let mut set =
+            SegmentSet::create_in(&Env::real(), directory.path(), descriptor(), config()).unwrap();
+        for sequence in 0..40 {
+            set.append_group(
+                &[record(producer, sequence)],
+                Durability::Fsync,
+                Uuid::from_u128(7000 + sequence as u128),
+            )
+            .unwrap();
+        }
+
+        let first_sealed_end = set
+            .sealed()
+            .first()
+            .expect("40 records must have rolled")
+            .next_offset();
+        assert!(
+            first_sealed_end > 1,
+            "need a sealed segment holding at least two records"
+        );
+        // Strictly inside the first sealed segment.
+        let watermark = first_sealed_end - 1;
+
+        let batch = set.fetch_through(0, 1 << 20, 1000, watermark).unwrap();
+        assert_eq!(
+            batch.records.len() as u64,
+            watermark,
+            "a read must stop at the caller's watermark even when it falls inside \
+             a sealed segment"
+        );
+        assert!(
+            batch.records.iter().all(|r| r.offset < watermark),
+            "no record at or above the watermark may be returned"
+        );
+        assert_eq!(batch.next_offset, watermark);
     }
 }
