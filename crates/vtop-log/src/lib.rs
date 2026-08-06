@@ -9,6 +9,7 @@ mod catalog;
 mod codec;
 mod codec_v2;
 pub mod env;
+mod producer_snapshot;
 pub mod proof;
 mod segment;
 pub mod sim;
@@ -20,8 +21,8 @@ pub use catalog::{
 };
 pub use codec_v2::RECORD_FRAME_OVERHEAD_BYTES_V2;
 pub use segment::{
-    rebuild_chunk_index, rebuild_chunk_index_in, rebuild_index, rebuild_index_in, ActiveSegment,
-    SegmentReader,
+    rebuild_chunk_index, rebuild_chunk_index_in, rebuild_index, rebuild_index_in, roll_in,
+    segment_stem, ActiveSegment, SegmentReader,
 };
 pub use types::{
     AppendOutcome, CommitStatementV1, Durability, FetchBatch, FetchedRecord, KeyRange, LogError,

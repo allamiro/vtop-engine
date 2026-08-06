@@ -293,6 +293,10 @@ pub struct ActiveSegment {
     poisoned: bool,
     sealed: bool,
     recovery: RecoveryReport,
+    /// What this segment inherited from its predecessor. Empty for a range's
+    /// first segment. Kept because any rescan of this file — truncation, for
+    /// one — must seed from the same frontier the original scan did.
+    inherited: crate::producer_snapshot::ProducerSnapshot,
 }
 
 impl ActiveSegment {
@@ -392,6 +396,7 @@ impl ActiveSegment {
                 truncated_bytes: 0,
                 next_offset: base_offset,
             },
+            inherited: crate::producer_snapshot::ProducerSnapshot::default(),
         })
     }
 
@@ -410,7 +415,10 @@ impl ActiveSegment {
             .storage
             .open(&path, OpenMode::ReadWrite)
             .map_err(|source| io_error(&path, source))?;
-        let inspection = inspect_active_file(env.storage.as_ref(), file.as_mut(), &path)?;
+        let paths = SegmentPaths::from_active(&path)?;
+        let inherited = read_producer_snapshot(env, &paths)?;
+        let inspection =
+            inspect_active_file(env.storage.as_ref(), file.as_mut(), &path, &inherited)?;
         let header = inspection.header;
         let header_len = inspection.header_len;
         let mut scan = inspection.scan;
@@ -445,6 +453,7 @@ impl ActiveSegment {
             poisoned: false,
             sealed: false,
             recovery: report,
+            inherited,
         })
     }
 
@@ -597,6 +606,7 @@ impl ActiveSegment {
             self.header_len,
             Some(position),
             false,
+            &self.inherited,
         ) {
             Ok(scan) => scan,
             Err(error) => {
@@ -1042,7 +1052,9 @@ impl SegmentReader {
             .storage
             .open(&path, OpenMode::Read)
             .map_err(|source| io_error(&path, source))?;
-        let inspection = inspect_sealed_file(env.storage.as_ref(), file.as_mut(), &path)?;
+        let inherited = read_producer_snapshot(env, &SegmentPaths::from_segment(&path)?)?;
+        let inspection =
+            inspect_sealed_file(env.storage.as_ref(), file.as_mut(), &path, &inherited)?;
         let header = inspection.header;
         let header_len = inspection.header_len;
         let scan = inspection.scan;
@@ -1174,7 +1186,16 @@ pub fn rebuild_index_in(env: &Env, path: impl AsRef<Path>) -> VtopLogResult<()> 
         .open(path, OpenMode::Read)
         .map_err(|source| io_error(path, source))?;
     let (header, header_len) = read_header_with_path(file.as_mut(), path)?;
-    let scan = scan_records(file.as_mut(), path, &header, header_len, None, false)?;
+    let inherited = read_producer_snapshot(env, &paths)?;
+    let scan = scan_records(
+        file.as_mut(),
+        path,
+        &header,
+        header_len,
+        None,
+        false,
+        &inherited,
+    )?;
     write_index_atomic(env, &paths.index, &scan.index)
 }
 
@@ -1198,18 +1219,28 @@ pub fn rebuild_chunk_index_in(env: &Env, path: impl AsRef<Path>) -> VtopLogResul
         ));
     };
     let chunk_size = v2_header.config.chunk_size;
-    let scan = scan_records(file.as_mut(), path, &header, header_len, None, false)?;
+    let inherited = read_producer_snapshot(env, &paths)?;
+    let scan = scan_records(
+        file.as_mut(),
+        path,
+        &header,
+        header_len,
+        None,
+        false,
+        &inherited,
+    )?;
     let (leaves, _) = scan.accumulator.finalize();
     write_chunk_sidecar_atomic(env, &paths.chunks, chunk_size, &leaves)
 }
 
 pub(crate) fn inspect_active_segment(env: &Env, path: &Path) -> VtopLogResult<SegmentInspection> {
-    SegmentPaths::from_active(path)?;
+    let paths = SegmentPaths::from_active(path)?;
+    let inherited = read_producer_snapshot(env, &paths)?;
     let mut file = env
         .storage
         .open(path, OpenMode::Read)
         .map_err(|source| io_error(path, source))?;
-    let inspection = inspect_active_file(env.storage.as_ref(), file.as_mut(), path)?;
+    let inspection = inspect_active_file(env.storage.as_ref(), file.as_mut(), path, &inherited)?;
     Ok(SegmentInspection {
         descriptor: inspection.header.v1_descriptor_view(),
         format_version: inspection.header.format_version(),
@@ -1226,7 +1257,8 @@ pub(crate) fn inspect_sealed_segment(env: &Env, path: &Path) -> VtopLogResult<Se
         .storage
         .open(path, OpenMode::Read)
         .map_err(|source| io_error(path, source))?;
-    let inspection = inspect_sealed_file(env.storage.as_ref(), file.as_mut(), path)?;
+    let inherited = read_producer_snapshot(env, &SegmentPaths::from_segment(path)?)?;
+    let inspection = inspect_sealed_file(env.storage.as_ref(), file.as_mut(), path, &inherited)?;
     Ok(SegmentInspection {
         descriptor: inspection.header.v1_descriptor_view(),
         format_version: inspection.header.format_version(),
@@ -1244,6 +1276,7 @@ fn inspect_active_file(
     storage: &dyn Storage,
     file: &mut dyn StorageFile,
     path: &Path,
+    inherited: &crate::producer_snapshot::ProducerSnapshot,
 ) -> VtopLogResult<ActiveFileInspection> {
     let paths = SegmentPaths::from_active(path)?;
     let (header, header_len) = read_header_with_path(file, path)?;
@@ -1267,7 +1300,15 @@ fn inspect_active_file(
             "committed byte end {committed_end} exceeds file length {actual_len}"
         )));
     }
-    let scan = scan_records(file, path, &header, header_len, Some(committed_end), false)?;
+    let scan = scan_records(
+        file,
+        path,
+        &header,
+        header_len,
+        Some(committed_end),
+        false,
+        inherited,
+    )?;
     if scan.next_offset != boundary.committed_offset
         || scan.valid_end != committed_end
         || scan.valid_end - header_len != boundary.content_bytes
@@ -1288,10 +1329,11 @@ fn inspect_sealed_file(
     storage: &dyn Storage,
     file: &mut dyn StorageFile,
     path: &Path,
+    inherited: &crate::producer_snapshot::ProducerSnapshot,
 ) -> VtopLogResult<SealedFileInspection> {
     let paths = SegmentPaths::from_segment(path)?;
     let (header, header_len) = read_header_with_path(file, path)?;
-    let mut scan = scan_records(file, path, &header, header_len, None, false)?;
+    let mut scan = scan_records(file, path, &header, header_len, None, false, inherited)?;
     let manifest_bytes = storage
         .read(&paths.manifest)
         .map_err(|source| io_error(&paths.manifest, source))?;
@@ -1604,6 +1646,196 @@ fn merge_producer_deltas(
     }
 }
 
+/// Read the frontier a segment inherited, if it has one.
+///
+/// Absent is not an error: a range's FIRST segment inherits nothing, and every
+/// range that existed before rolling is exactly that. An empty frontier is what
+/// the scan used to assume unconditionally, so this is backward compatible by
+/// construction.
+fn read_producer_snapshot(
+    env: &Env,
+    paths: &SegmentPaths,
+) -> VtopLogResult<crate::producer_snapshot::ProducerSnapshot> {
+    if !env
+        .storage
+        .exists(&paths.producers)
+        .map_err(|source| io_error(&paths.producers, source))?
+    {
+        return Ok(crate::producer_snapshot::ProducerSnapshot::default());
+    }
+    let bytes = env
+        .storage
+        .read(&paths.producers)
+        .map_err(|source| io_error(&paths.producers, source))?;
+    crate::producer_snapshot::ProducerSnapshot::decode(&bytes)
+}
+
+/// Filename stem for the segment beginning at `base_offset`.
+///
+/// Rolling needs distinct stems. `seal` renames `{stem}.active` to
+/// `{stem}.segment` and refuses to overwrite an existing one, so a range that
+/// rolled twice under a fixed stem would collide on the second seal — which is
+/// why a range has been one file that grows forever.
+///
+/// Zero-padded to 20 digits so lexical order matches numeric order: discovery
+/// sorts paths as strings, and `range-9` sorting after `range-10` would present
+/// a range's segments out of order once it passed its tenth roll.
+pub fn segment_stem(base_offset: u64) -> String {
+    format!("range-{base_offset:020}")
+}
+
+/// Seal `active` and open its successor at the offset where it ended.
+///
+/// This is what makes a range a SEQUENCE of segments rather than one file, and
+/// it is the prerequisite for everything needing an immutable prefix:
+/// transferring a segment to repair a replica, retention, and naming the
+/// segments either side of a leadership transition.
+///
+/// The successor inherits the predecessor's limits and lineage, takes a fresh
+/// segment id, and begins at the predecessor's `next_offset` — contiguous,
+/// because discovery rejects overlapping intervals and a gap is unreadable.
+///
+/// # The sidecar is written BEFORE the successor exists
+///
+/// Producer sequences belong to the range; validation of them is per segment.
+/// So the successor must carry the frontier it inherited, durably, or a scan of
+/// it during recovery re-derives producer state from its own bytes and rejects
+/// every sequence that began in its predecessor.
+///
+/// Ordering is deliberate at both steps. The predecessor is sealed before the
+/// successor is created: a crash between them leaves a sealed segment and no
+/// active one, which reads as a range whose tail is closed — recoverable by
+/// opening a new active at its end. The reverse leaves two active segments,
+/// which discovery quarantines as `MultipleActiveSegments`, because it cannot
+/// know which one a writer was using.
+///
+/// And the sidecar is written before the successor's own file, so a successor
+/// never exists without the frontier that makes it readable.
+pub fn roll_in(
+    env: &Env,
+    mut active: ActiveSegment,
+    successor_id: Uuid,
+) -> VtopLogResult<(SegmentReader, ActiveSegment)> {
+    let directory = active
+        .path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let base_offset = active.next_offset();
+    let successor_path = directory.join(format!("{}.active", segment_stem(base_offset)));
+    let successor_paths = SegmentPaths::from_active(&successor_path)?;
+
+    let v2 =
+        active
+            .descriptor_v2()
+            .cloned()
+            .zip(active.config_v2())
+            .map(|(mut descriptor, config)| {
+                descriptor.segment_id = successor_id;
+                descriptor.base_offset = base_offset;
+                (descriptor, config)
+            });
+    let v1 = if v2.is_none() {
+        let mut descriptor = active.descriptor().clone();
+        descriptor.segment_id = successor_id;
+        descriptor.base_offset = base_offset;
+        Some((descriptor, active.config()))
+    } else {
+        None
+    };
+
+    let frontier = snapshot_of(&active.producer_states, &active.producer_epochs);
+    let inherited = frontier.clone();
+    let states = std::mem::take(&mut active.producer_states);
+    let epochs = std::mem::take(&mut active.producer_epochs);
+
+    let sealed = active.seal()?;
+    if !frontier.is_empty() {
+        write_atomic(env, &successor_paths.producers, &frontier.encode()?)?;
+    }
+    let mut successor = match (v1, v2) {
+        (Some((descriptor, config)), _) => {
+            ActiveSegment::create_in(env, &successor_path, descriptor, config)?
+        }
+        (_, Some((descriptor, config))) => {
+            ActiveSegment::create_v2_in(env, &successor_path, descriptor, config)?
+        }
+        (None, None) => unreachable!("a segment is either v1 or v2"),
+    };
+    // In memory as well as on disk: the successor serves appends immediately,
+    // before anything re-reads the sidecar.
+    successor.producer_states = states;
+    successor.producer_epochs = epochs;
+    successor.inherited = inherited;
+    Ok((sealed, successor))
+}
+
+/// Rehydrate in-memory producer state from an inherited frontier.
+fn inherited_states(
+    inherited: &crate::producer_snapshot::ProducerSnapshot,
+) -> HashMap<ProducerKey, ProducerState> {
+    inherited
+        .producers
+        .iter()
+        .map(|((producer_id, producer_epoch), entry)| {
+            (
+                (*producer_id, *producer_epoch),
+                ProducerState {
+                    latest_sequence: entry.latest_sequence,
+                    first_sequence: entry.first_sequence,
+                    record_count: entry.record_count,
+                    seen: entry
+                        .seen
+                        .iter()
+                        .map(|seen| {
+                            (
+                                seen.sequence,
+                                SeenRecord {
+                                    offset: seen.offset,
+                                    content_hash: blake3::Hash::from(seen.content_hash),
+                                },
+                            )
+                        })
+                        .collect(),
+                },
+            )
+        })
+        .collect()
+}
+
+/// The frontier a successor segment must inherit, taken from a live segment.
+fn snapshot_of(
+    states: &HashMap<ProducerKey, ProducerState>,
+    epochs: &HashMap<Uuid, u64>,
+) -> crate::producer_snapshot::ProducerSnapshot {
+    crate::producer_snapshot::ProducerSnapshot {
+        producers: states
+            .iter()
+            .map(|((producer_id, producer_epoch), state)| {
+                (
+                    (*producer_id, *producer_epoch),
+                    crate::producer_snapshot::SnapshotEntry {
+                        latest_sequence: state.latest_sequence,
+                        first_sequence: state.first_sequence,
+                        record_count: state.record_count,
+                        seen: state
+                            .seen
+                            .iter()
+                            .map(|(sequence, seen)| crate::producer_snapshot::SnapshotSeen {
+                                sequence: *sequence,
+                                offset: seen.offset,
+                                content_hash: *seen.content_hash.as_bytes(),
+                            })
+                            .collect(),
+                    },
+                )
+            })
+            .collect(),
+        epochs: epochs.iter().map(|(id, epoch)| (*id, *epoch)).collect(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn scan_records(
     mut file: &mut dyn StorageFile,
     path: &Path,
@@ -1611,6 +1843,11 @@ fn scan_records(
     header_len: u64,
     logical_end: Option<u64>,
     permit_torn_tail: bool,
+    // The frontier this segment inherited from its predecessor. Empty for a
+    // range's first segment. Without it, a scan re-derives producer state from
+    // this file's bytes alone and rejects any sequence that began in another
+    // one — which is every producer, after the first roll.
+    inherited: &crate::producer_snapshot::ProducerSnapshot,
 ) -> VtopLogResult<ScanResult> {
     file.seek(SeekFrom::Start(header_len))
         .map_err(|source| io_error(path, source))?;
@@ -1624,8 +1861,8 @@ fn scan_records(
     let mut position = header_len;
     let mut next_offset = header.base_offset();
     let mut records = 0_u64;
-    let mut producer_states = HashMap::new();
-    let mut producer_epochs = HashMap::new();
+    let mut producer_states = inherited_states(inherited);
+    let mut producer_epochs: HashMap<Uuid, u64> = inherited.epochs.clone().into_iter().collect();
     let mut index = Vec::new();
     let mut accumulator = ContentAccumulator::for_header(header);
 
@@ -2346,6 +2583,9 @@ pub(crate) struct SegmentPaths {
     pub(crate) manifest: PathBuf,
     pub(crate) commit: PathBuf,
     pub(crate) chunks: PathBuf,
+    /// The producer frontier this segment INHERITED, if it has a predecessor.
+    /// Absent for a range's first segment, which inherits nothing.
+    pub(crate) producers: PathBuf,
 }
 
 impl SegmentPaths {
@@ -2381,6 +2621,7 @@ impl SegmentPaths {
             manifest: parent.join(format!("{stem}.manifest.json")),
             commit: parent.join(format!("{stem}.commit")),
             chunks: parent.join(format!("{stem}.chunks")),
+            producers: parent.join(format!("{stem}.producers")),
         })
     }
 }
@@ -4246,5 +4487,102 @@ mod tests {
             segment.truncate_to(39),
             Err(LogError::InvalidConfig(_))
         ));
+    }
+
+    /// THE TEST THAT MADE THIS NECESSARY. A rolled range must survive a
+    /// restart.
+    ///
+    /// Carrying producer state across a roll in memory is enough to keep
+    /// APPENDS working, and that is what the first attempt did. It then failed
+    /// at discovery: a scan re-derives producer state from a segment's own
+    /// bytes, so a segment whose first record continues a sequence that began
+    /// in its predecessor was rejected as
+    /// `Corrupt: producer … must start at sequence 0, got 3`. The range worked
+    /// until the process restarted, then refused to open — the worst shape of
+    /// failure, because it passes every test that does not restart.
+    #[test]
+    fn a_rolled_range_reopens_after_a_restart() {
+        let directory = tempdir().unwrap();
+        let producer = Uuid::from_u128(53);
+        let first = directory
+            .path()
+            .join(format!("{}.active", segment_stem(40)));
+
+        let successor_path = {
+            let mut active = ActiveSegment::create(&first, descriptor(), config()).unwrap();
+            for sequence in 0..3 {
+                active
+                    .append(record(producer, sequence, b"v"), Durability::Fsync)
+                    .unwrap();
+            }
+            let (_sealed, mut successor) =
+                roll_in(&Env::real(), active, Uuid::from_u128(500)).unwrap();
+            // Continues the SAME producer sequence into the new segment.
+            successor
+                .append(record(producer, 3, b"after"), Durability::Fsync)
+                .unwrap();
+            successor.path.clone()
+        };
+
+        // The restart. Without the sidecar this is the step that failed.
+        let reopened = ActiveSegment::recover(&successor_path)
+            .expect("a rolled segment must be readable on its own");
+        assert_eq!(reopened.next_offset(), 44);
+
+        // And discovery sees one coherent range rather than a corrupt file.
+        let catalog = crate::StartupCatalog::discover(directory.path()).unwrap();
+        assert!(
+            catalog.quarantined.is_empty(),
+            "a rolled range must not look corrupt to discovery: {:?}",
+            catalog.quarantined
+        );
+        assert_eq!(catalog.entries.len(), 2);
+    }
+
+    /// The inherited frontier is what makes the successor accept a continuing
+    /// sequence — and reject one that skips.
+    #[test]
+    fn a_successor_enforces_sequence_continuity_it_inherited() {
+        let directory = tempdir().unwrap();
+        let producer = Uuid::from_u128(59);
+        let path = directory
+            .path()
+            .join(format!("{}.active", segment_stem(40)));
+        let mut active = ActiveSegment::create(&path, descriptor(), config()).unwrap();
+        for sequence in 0..3 {
+            active
+                .append(record(producer, sequence, b"v"), Durability::Fsync)
+                .unwrap();
+        }
+        let (_sealed, mut successor) = roll_in(&Env::real(), active, Uuid::from_u128(600)).unwrap();
+
+        // A gap is still a gap across a roll.
+        assert!(matches!(
+            successor.append(record(producer, 5, b"gap"), Durability::Fsync),
+            Err(LogError::SequenceGap { expected: 3, .. })
+        ));
+        // And the next sequence is accepted.
+        successor
+            .append(record(producer, 3, b"next"), Durability::Fsync)
+            .unwrap();
+    }
+
+    /// A range's FIRST segment inherits nothing and writes no sidecar, so every
+    /// range that existed before rolling keeps opening exactly as it did.
+    #[test]
+    fn a_first_segment_has_no_inherited_frontier() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("range.active");
+        {
+            let mut active = ActiveSegment::create(&path, descriptor(), config()).unwrap();
+            active
+                .append(record(Uuid::from_u128(61), 0, b"v"), Durability::Fsync)
+                .unwrap();
+        }
+        assert!(
+            !directory.path().join("range.producers").exists(),
+            "a segment that inherited nothing must not write a frontier"
+        );
+        assert_eq!(ActiveSegment::recover(&path).unwrap().next_offset(), 41);
     }
 }
