@@ -154,6 +154,21 @@ impl QuorumProbe for ReplicaPlaneProbe {
             node_id: self.node_uuid,
             local_committed_offset: Some(local_committed),
         }];
+        // This candidate's own lineage, sent with every fence so each replica
+        // can reconcile against it while it is stopped. Empty when this node
+        // cannot vouch for its own history, in which case no replica truncates
+        // anything — the honest outcome, since there is nothing to reconcile
+        // against.
+        let leader_epoch_starts: Vec<vtop_protocol::ReplicaEpochStart> = self
+            .broker
+            .epoch_starts()
+            .into_iter()
+            .map(|entry| vtop_protocol::ReplicaEpochStart {
+                epoch: entry.epoch,
+                start_offset: entry.start_offset,
+            })
+            .collect();
+        let leader_epoch_starts = &leader_epoch_starts;
         // Concurrent: a follower that has stopped answering must not add its
         // full deadline to every other follower's wait.
         let answers = futures::future::join_all(self.followers.iter().map(|follower| async move {
@@ -165,12 +180,24 @@ impl QuorumProbe for ReplicaPlaneProbe {
                     follower.node_uuid,
                     &self.range,
                     fencing_epoch,
+                    leader_epoch_starts,
                 )
                 .await;
             crate::promotion::ReplicaProbe {
                 node_id: follower.node_uuid,
                 local_committed_offset: match fenced {
-                    Ok(response) => Some(response.local_committed_offset),
+                    Ok(response) => {
+                        if response.truncated_records > 0 {
+                            tracing::warn!(
+                                follower = %follower.node_uuid,
+                                fencing_epoch,
+                                records = response.truncated_records,
+                                "replica discarded records written under a leadership this \
+                                 candidate does not share"
+                            );
+                        }
+                        Some(response.local_committed_offset)
+                    }
                     Err(error) => {
                         // ABSENT, not "last known offset". A replica that could
                         // not be fenced may still be taking the deposed

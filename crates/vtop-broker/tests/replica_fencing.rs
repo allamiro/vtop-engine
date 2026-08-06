@@ -6,14 +6,19 @@
 //! published. BookKeeper fences the ensemble before ledger recovery for exactly
 //! this reason.
 //!
-//! These tests pin the three things that make the fence worth having: it stops
-//! the old leader, it refuses to be talked into an epoch metadata never granted,
+//! These tests pin the things that make the fence worth having: it stops the
+//! old leader, it refuses to be talked into an epoch metadata never granted,
 //! and it never moves backwards.
+//!
+//! They pass an EMPTY caller history throughout, except where reconciliation is
+//! the subject. Empty means "the caller cannot vouch for its own lineage", under
+//! which a replica truncates nothing — so these stay tests of fencing alone,
+//! with reconciliation held out as a separate variable.
 
 use std::sync::Arc;
 use tempfile::TempDir;
 use uuid::Uuid;
-use vtop_broker::fencing_epochs::FencingEpochJournal;
+use vtop_broker::fencing_epochs::{EpochStart, FencingEpochJournal};
 use vtop_broker::replication::{ClusterCommittedOffset, InProcessFollower};
 use vtop_broker::{MetaFencingEpoch, ProducerEpochJournal};
 use vtop_log::{ActiveSegment, KeyRange, RangeLineage, SegmentConfig, SegmentDescriptor};
@@ -113,7 +118,7 @@ fn fencing_stops_the_deposed_leader_from_writing() {
 
     // Metadata grants the new epoch, and the new leader fences.
     h.meta.set(NEW_EPOCH);
-    let fenced = h.node.fence(NEW_EPOCH).expect("fence should succeed");
+    let fenced = h.node.fence(NEW_EPOCH, &[]).expect("fence should succeed");
     assert_eq!(fenced.fencing_epoch, NEW_EPOCH);
     assert_eq!(fenced.next_offset, 1);
 
@@ -125,7 +130,7 @@ fn fencing_stops_the_deposed_leader_from_writing() {
     );
 
     // And the measurement still describes the log: nothing moved.
-    let again = h.node.fence(NEW_EPOCH).unwrap();
+    let again = h.node.fence(NEW_EPOCH, &[]).unwrap();
     assert_eq!(
         again.next_offset, fenced.next_offset,
         "a fenced replica must not move under the new leader's feet"
@@ -144,7 +149,7 @@ fn a_fence_above_the_granted_epoch_is_refused() {
     // Metadata has granted nothing beyond OLD_EPOCH.
     let refused = h
         .node
-        .fence(9_999)
+        .fence(9_999, &[])
         .expect_err("must not adopt an epoch metadata never granted");
     assert_eq!(refused.0, ErrorCode::Fenced);
     assert!(
@@ -165,10 +170,10 @@ fn a_fence_above_the_granted_epoch_is_refused() {
 #[test]
 fn a_fence_succeeds_once_the_grant_is_visible() {
     let h = follower();
-    assert!(h.node.fence(NEW_EPOCH).is_err());
+    assert!(h.node.fence(NEW_EPOCH, &[]).is_err());
 
     h.meta.set(NEW_EPOCH);
-    let fenced = h.node.fence(NEW_EPOCH).expect("now it is granted");
+    let fenced = h.node.fence(NEW_EPOCH, &[]).expect("now it is granted");
     assert_eq!(fenced.fencing_epoch, NEW_EPOCH);
 }
 
@@ -178,11 +183,11 @@ fn a_fence_succeeds_once_the_grant_is_visible() {
 fn a_fence_below_the_held_epoch_is_refused() {
     let h = follower();
     h.meta.set(NEW_EPOCH);
-    h.node.fence(NEW_EPOCH).unwrap();
+    h.node.fence(NEW_EPOCH, &[]).unwrap();
 
     let refused = h
         .node
-        .fence(OLD_EPOCH)
+        .fence(OLD_EPOCH, &[])
         .expect_err("a stale leader must not roll the fence back");
     assert_eq!(refused.0, ErrorCode::Fenced);
     assert_eq!(
@@ -198,11 +203,11 @@ fn a_fence_below_the_held_epoch_is_refused() {
 fn re_fencing_at_the_held_epoch_succeeds() {
     let h = follower();
     h.meta.set(NEW_EPOCH);
-    h.node.fence(NEW_EPOCH).unwrap();
+    h.node.fence(NEW_EPOCH, &[]).unwrap();
 
     let again = h
         .node
-        .fence(NEW_EPOCH)
+        .fence(NEW_EPOCH, &[])
         .expect("a retry at the same epoch is idempotent, not a rollback");
     assert_eq!(again.fencing_epoch, NEW_EPOCH);
 }
@@ -219,7 +224,7 @@ fn the_fence_reports_offsets_and_history_from_one_instant() {
     append_at(&h, OLD_EPOCH, OLD_LEADER, 1).unwrap();
 
     h.meta.set(NEW_EPOCH);
-    let fenced = h.node.fence(NEW_EPOCH).unwrap();
+    let fenced = h.node.fence(NEW_EPOCH, &[]).unwrap();
 
     assert_eq!(fenced.next_offset, 2);
     assert_eq!(
@@ -231,5 +236,148 @@ fn the_fence_reports_offsets_and_history_from_one_instant() {
         fenced.epoch_starts.last().map(|entry| entry.start_offset),
         Some(2),
         "the new epoch begins at the tail as it stood when the fence landed"
+    );
+}
+
+/// THE POINT OF THE WHOLE ARC (#261). A replica that took records from a leader
+/// deposed before those records reached a quorum discards them during the
+/// fence, so it is already in agreement by the time the new leader reads it.
+///
+/// Before this, that replica would ACK the new leader's writes as duplicates —
+/// answering "I have something at offset 5" when the question was "do you have
+/// THAT record at offset 5?" — and be counted toward a quorum for bytes it did
+/// not hold. Reconciling while stopped means the catch-up path is never reached
+/// in a diverged state and never has to answer a question it cannot.
+#[test]
+fn a_diverged_replica_discards_the_deposed_leaders_records_while_fenced() {
+    let h = follower();
+    for offset in 0..10 {
+        append_at(&h, OLD_EPOCH, OLD_LEADER, offset).unwrap();
+    }
+    // Only the first five reached a quorum.
+    h.node.cluster_committed().advance_to(5);
+
+    // The new leader shares epoch 18 from 0, but its own epoch 19 began at 5 —
+    // it never saw the five records this replica took after the quorum stopped
+    // following.
+    let leader_history = [
+        EpochStart {
+            epoch: OLD_EPOCH,
+            start_offset: 0,
+        },
+        EpochStart {
+            epoch: NEW_EPOCH,
+            start_offset: 5,
+        },
+    ];
+
+    h.meta.set(NEW_EPOCH);
+    let fenced = h.node.fence(NEW_EPOCH, &leader_history).unwrap();
+
+    assert_eq!(fenced.truncated_records, 5, "the disputed tail is gone");
+    assert_eq!(
+        fenced.next_offset, 5,
+        "and the offset the caller counts is the reconciled one, not the \
+         pre-truncation one"
+    );
+
+    // The new leader's write at 5 now lands as a genuine append rather than
+    // being swallowed as a duplicate.
+    assert!(append_at(&h, NEW_EPOCH, Uuid::from_u128(0xA9), 5).is_ok());
+    assert_eq!(h.node.next_offset(), 6);
+}
+
+/// A caller that cannot vouch for its own history truncates nothing.
+///
+/// Deleting records to satisfy a claim nobody made is the failure mode this
+/// whole mechanism exists to avoid, so "unknown" must mean "leave it alone"
+/// here exactly as it does everywhere else.
+#[test]
+fn an_unknown_caller_history_truncates_nothing() {
+    let h = follower();
+    for offset in 0..10 {
+        append_at(&h, OLD_EPOCH, OLD_LEADER, offset).unwrap();
+    }
+
+    h.meta.set(NEW_EPOCH);
+    let fenced = h.node.fence(NEW_EPOCH, &[]).unwrap();
+
+    assert_eq!(fenced.truncated_records, 0);
+    assert_eq!(fenced.next_offset, 10, "the log is untouched");
+}
+
+/// A replica that agrees with the caller keeps everything.
+///
+/// REGRESSION. The first version of this wiped the log: the replica adopts the
+/// new epoch during the fence, so its vector gains an entry the caller's
+/// shorter vector does not have, and the comparison then reported the start of
+/// the last common epoch — offset 0 — as though it were a divergence point.
+/// Four records both replicas held were discarded to "reconcile" two logs that
+/// did not disagree about anything.
+#[test]
+fn an_agreeing_replica_is_not_truncated() {
+    let h = follower();
+    for offset in 0..4 {
+        append_at(&h, OLD_EPOCH, OLD_LEADER, offset).unwrap();
+    }
+
+    h.meta.set(NEW_EPOCH);
+    let fenced = h
+        .node
+        .fence(
+            NEW_EPOCH,
+            &[EpochStart {
+                epoch: OLD_EPOCH,
+                start_offset: 0,
+            }],
+        )
+        .unwrap();
+
+    assert_eq!(fenced.truncated_records, 0);
+    assert_eq!(fenced.next_offset, 4);
+}
+
+/// A reconciliation that would cross the acknowledged high-water mark FAILS the
+/// fence rather than silently doing nothing.
+///
+/// Those records were acknowledged to a producer. A caller asking for them is
+/// either wrong or reconciling against a log that is not this range's, and
+/// either way promotion must not go on believing this replica agreed. Failing
+/// the fence takes it out of the quorum, which is the honest outcome.
+#[test]
+fn a_reconciliation_below_the_acknowledged_mark_fails_the_fence() {
+    let h = follower();
+    for offset in 0..10 {
+        append_at(&h, OLD_EPOCH, OLD_LEADER, offset).unwrap();
+    }
+    // Everything through 8 was acknowledged.
+    h.node.cluster_committed().advance_to(8);
+
+    // A caller claiming its own epoch 19 began at 2 puts divergence below that.
+    let leader_history = [
+        EpochStart {
+            epoch: OLD_EPOCH,
+            start_offset: 0,
+        },
+        EpochStart {
+            epoch: NEW_EPOCH,
+            start_offset: 2,
+        },
+    ];
+
+    h.meta.set(NEW_EPOCH);
+    let refused = h
+        .node
+        .fence(NEW_EPOCH, &leader_history)
+        .expect_err("must not discard acknowledged records");
+    assert!(
+        refused.1.contains("acknowledged"),
+        "the refusal should name what it is protecting: {}",
+        refused.1
+    );
+    assert_eq!(
+        h.node.next_offset(),
+        10,
+        "and nothing may have been discarded on the way to refusing"
     );
 }
