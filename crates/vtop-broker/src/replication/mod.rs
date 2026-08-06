@@ -126,6 +126,20 @@ struct FollowerState {
     producer_epochs: ProducerEpochJournal,
 }
 
+/// What a replica held at the instant it was fenced (#240).
+///
+/// Distinct from a status read: a status is a measurement of something that may
+/// still be moving, this is a measurement of something that has been stopped.
+/// Only the second can be counted toward a promotion boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FenceOutcome {
+    pub fencing_epoch: u64,
+    pub local_committed_offset: u64,
+    pub next_offset: u64,
+    /// Empty means UNKNOWN, never "no leadership changes".
+    pub epoch_starts: Vec<crate::fencing_epochs::EpochStart>,
+}
+
 /// Deterministic in-process follower replica.
 pub struct InProcessFollower {
     node_id: Uuid,
@@ -363,6 +377,72 @@ impl InProcessFollower {
             .as_ref()
             .map(|journal| journal.entries().to_vec())
             .unwrap_or_default()
+    }
+
+    /// Fence this replica at `epoch` and report what it holds at that instant
+    /// (#240).
+    ///
+    /// A promotion probe that merely READS a replica is reading a moving
+    /// target: the deposed leader may still be appending here while the new
+    /// leader takes its measurement, so the boundary a quorum "proves" can be
+    /// stale before it is published. Fencing first stops the old leader — its
+    /// appends carry the previous epoch and are refused — and the reply is
+    /// taken from a log that can no longer move underneath it.
+    ///
+    /// Fencing and reading are one operation for the same reason. Offsets and
+    /// the epoch history are what a truncation target is computed from, and
+    /// taking them in two calls would describe two different moments.
+    ///
+    /// # What this refuses, and why it is not paranoia
+    ///
+    /// **An epoch metadata has not granted, as far as this replica knows.** The
+    /// caller's claim is not evidence. A replica that adopted a bare claim
+    /// could be fenced to any epoch by anything that can reach its port, and
+    /// would then refuse every append until metadata reached a number that may
+    /// never arrive — a permanent outage from one compromised or buggy peer.
+    /// So the ceiling is this replica's own metadata view, which the lease
+    /// watcher maintains (#239). A caller that has genuinely just been granted
+    /// the epoch only has to wait for this replica to see the same grant.
+    ///
+    /// **An epoch below the one already held.** Fencing moves forward only;
+    /// otherwise a stale leader could un-fence a replica it had already lost.
+    pub fn fence(&self, epoch: u64) -> Result<FenceOutcome, (ErrorCode, String)> {
+        let held = self.held_fencing_epoch();
+        if epoch < held {
+            return Err((
+                ErrorCode::Fenced,
+                format!("fence request at epoch {epoch} is below this replica's held epoch {held}"),
+            ));
+        }
+        let granted = self.meta_fencing_epoch.lock().fencing_epoch;
+        if epoch > granted {
+            return Err((
+                ErrorCode::Fenced,
+                format!(
+                    "this replica has not observed a grant for epoch {epoch}; its metadata view \
+                     is at {granted}. Retry once it catches up — a replica must not fence itself \
+                     on a caller's word alone"
+                ),
+            ));
+        }
+        // Records the start durably before the epoch becomes visible, exactly
+        // as the append path does.
+        self.adopt_fencing_epoch(epoch);
+        // Offsets and history read together, under the state lock, so the pair
+        // describes one instant of one log.
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let local_committed_offset = state.segment.committed_offset();
+        let next_offset = state.segment.next_offset();
+        drop(state);
+        Ok(FenceOutcome {
+            fencing_epoch: self.held_fencing_epoch(),
+            local_committed_offset,
+            next_offset,
+            epoch_starts: self.epoch_starts(),
+        })
     }
 
     pub fn set_online(&self, online: bool) {

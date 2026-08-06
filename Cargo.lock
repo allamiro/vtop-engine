@@ -4100,6 +4100,7 @@ dependencies = [
  "clap",
  "futures",
  "prometheus",
+ "rcgen",
  "rustls",
  "serde",
  "serde_yaml",

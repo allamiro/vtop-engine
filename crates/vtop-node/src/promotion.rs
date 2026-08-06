@@ -19,32 +19,39 @@
 //!
 //! # Known limitations, stated plainly
 //!
-//! This establishes a floor; it is not yet a complete recovery protocol, and
-//! three gaps are worth naming so nobody reads more safety into it than is
-//! here:
+//! This establishes a floor; it is not yet a complete recovery protocol. What
+//! is closed and what is not, so nobody reads more safety into it than is here:
 //!
-//! * **Offsets are not epoch-qualified.** A [`ReplicaProbe`] carries a bare
-//!   offset, and two replicas reporting 90 may not hold the same record at 90.
-//!   Kafka shipped exactly this bug and fixed it in KIP-101 by giving every
-//!   replica a leader-epoch → start-offset vector and truncating against the
-//!   epoch rather than the high-water mark.
-//! * **Followers are never truncated.** A replica holding uncommitted records
-//!   above the established boundary keeps them. This code correctly refuses to
-//!   *expose* them, but if that replica later wins the lease they resurface.
-//! * **Followers are not fenced before being probed.** BookKeeper's ledger
-//!   recovery fences the ensemble first, precisely so the read is not a
-//!   snapshot of a moving target. Here the epoch mint fences clients, but a
-//!   deposed leader can still be appending to followers while the new leader
-//!   reads them.
+//! **Closed: the probe no longer reads a moving target.** Every replica is
+//! fenced and read in ONE round trip (#240), which is what BookKeeper's ledger
+//! recovery does before it reads an ensemble. A replica that could not be
+//! fenced reports absent rather than its last known offset, so it does not
+//! count toward the quorum — an offset now either comes from a log that has
+//! been stopped, or it does not come at all. A replica whose own metadata view
+//! has not yet caught up to the grant refuses the fence, correctly, since it is
+//! not fenced until it has; the candidate retries, or promotes on the replicas
+//! it did fence.
 //!
-//! There is also a subtler one from Raft §5.4.2: a new leader must not commit
+//! **Closed: replicas can say which epoch wrote which stretch of their log.**
+//! The KIP-101 vector is durable per replica and travels on the fence reply.
+//!
+//! **Open: promotion does not yet USE that vector.** A [`ReplicaProbe`] still
+//! carries a bare offset, so two replicas reporting 90 are still compared as
+//! numbers here even though each can now prove whose writes put it there.
+//!
+//! **Open: followers are never truncated by an election.** A replica holding
+//! uncommitted records above the established boundary keeps them. This code
+//! correctly refuses to *expose* them, but if that replica later wins the lease
+//! they resurface. The truncation primitive exists and is bounded; what is
+//! missing is this module driving it from the divergence point.
+//!
+//! **Open, and subtler, from Raft §5.4.2:** a new leader must not commit
 //! entries from a previous term by counting replicas. The Raft-safe form is to
 //! append a marker in the new epoch and let prior entries commit implicitly
 //! once that is quorum-acked. VTOP gets the epoch for free from the lease mint;
 //! the marker record does not exist yet.
 //!
-//! Closing those needs new wire messages and a marker record type — a
-//! multi-PR arc, tracked separately. What is here is the floor computation and
+//! What is here is the floor computation, a fenced read to compute it from, and
 //! an honest refusal when a quorum cannot be reached.
 //!
 //! # Why the quorum floor, and not the maximum
