@@ -24,7 +24,12 @@ WORKDIR /build
 COPY . .
 # --locked: the image must build exactly the dependency set in Cargo.lock; a
 # lockfile drift is a build FAILURE here, never a silent re-resolution.
-RUN cargo build --release --locked --bin vtopctl
+# BOTH binaries, matching what the release archives ship. The image used to
+# build only vtopctl, which made it a steering wheel without the car: the
+# Helm chart runs `vtop-node node`, so every pod exec'd a binary that was not
+# there. Anyone reaching for the container — which is what a Kubernetes
+# deployment does — got the operator CLI and no engine.
+RUN cargo build --release --locked --bin vtopctl --bin vtop-node
 
 # ---- Runtime stage ---------------------------------------------------------
 FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS runtime
@@ -38,6 +43,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && useradd --system --uid 10001 --create-home vtop
 
 COPY --from=builder /build/target/release/vtopctl /usr/local/bin/vtopctl
+COPY --from=builder /build/target/release/vtop-node /usr/local/bin/vtop-node
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 

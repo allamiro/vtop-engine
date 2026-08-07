@@ -1,0 +1,36 @@
+# Headless Service: gives every pod the stable DNS name the Raft peer list is
+# built from (<pod>.<this-service>.<ns>.svc.<domain>) and lets clients address
+# a SPECIFIC pod's native produce/fetch plane — each pod is an independent
+# standalone range, so per-pod addressing is the correct client model here.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "vtop.headlessServiceName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vtop.labels" . | nindent 4 }}
+    vtop.allamiro.io/service: headless
+spec:
+  clusterIP: None
+  # Peers must resolve each other BEFORE the cluster is bootstrapped and
+  # ready — readiness is the conjunction of both roles, and a fresh quorum
+  # cannot form if DNS withholds the very peers it needs to form it.
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "vtop.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: meta-peer
+      port: {{ .Values.ports.metaPeer }}
+      targetPort: meta-peer
+    - name: meta-admin
+      port: {{ .Values.ports.metaAdmin }}
+      targetPort: meta-admin
+    - name: replica
+      port: {{ .Values.ports.replica }}
+      targetPort: replica
+    - name: native
+      port: {{ .Values.ports.native }}
+      targetPort: native
+    - name: obs
+      port: {{ .Values.ports.observability }}
+      targetPort: obs

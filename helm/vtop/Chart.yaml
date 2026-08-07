@@ -1,0 +1,24 @@
+apiVersion: v2
+name: vtop
+description: >-
+  VTOP co-located cluster nodes (`vtop-node node`, #215/#237): a StatefulSet
+  where every pod hosts both a metadata Raft voter and a data-plane replica in
+  one process, with one observability endpoint per pod and mutual TLS on every
+  plane. TLS material is never defaulted — you must supply your own Secrets.
+type: application
+# Chart version (the packaging), independent of the application version below.
+version: 0.1.0
+# Must track the workspace version in Cargo.toml; the GHCR image tags follow it.
+appVersion: "0.2.0"
+kubeVersion: ">=1.25.0-0"
+home: https://github.com/allamiro/vtop-engine
+sources:
+  - https://github.com/allamiro/vtop-engine
+maintainers:
+  - name: Tamir Suliman
+    email: allamiro@gmail.com
+keywords:
+  - vtop
+  - raft
+  - log
+  - streaming

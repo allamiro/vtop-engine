@@ -1,0 +1,384 @@
+# Default values for the vtop chart.
+#
+# The chart deploys `vtop-node node` — the CO-LOCATED process (#215/#237) that
+# hosts a metadata Raft voter and a data-plane replica in one process — as a
+# StatefulSet. Each pod's config is rendered per ordinal into the ConfigMap;
+# the container derives its ordinal from its hostname and picks its own file.
+#
+# The rendered config must match the binary's schema EXACTLY: every config
+# struct is `#[serde(deny_unknown_fields)]`, so an unknown or misplaced key is
+# a startup failure, not a warning. In particular, a co-located node takes ONE
+# top-level `observability` block; per-role blocks are rejected by design.
+# This chart only ever emits the accepted shape.
+
+# Number of co-located nodes. Three is the smallest metadata Raft group that
+# survives one failure; even counts add fault-tolerance nothing (a 4-voter
+# quorum is 3, same tolerance as 3 voters) so prefer 3 or 5.
+replicaCount: 3
+
+image:
+  # The image must contain the `vtop-node` binary (see `binary` below).
+  #
+  # HONEST CAVEAT: as of appVersion 0.2.0 the image built by docker/Dockerfile
+  # and published to ghcr.io/allamiro/vtop-engine ships ONLY `vtopctl` (the
+  # operator CLI), not `vtop-node`. Until the published image includes
+  # `vtop-node`, point `repository`/`tag` at an image you built that does —
+  # the release archives on GitHub ship both binaries. The chart keeps the
+  # GHCR coordinates as the default because that is where the project's image
+  # lives; it does not pretend the 0.2.0 image can run this workload.
+  repository: ghcr.io/allamiro/vtop-engine
+  # Defaults to the chart's appVersion when empty. Never use `latest` in
+  # production: a StatefulSet that re-pulls a moved tag rolls the cluster onto
+  # code you did not choose.
+  tag: ""
+  pullPolicy: IfNotPresent
+  # Name (resolved on PATH) or absolute path of the vtop-node binary inside
+  # the image.
+  binary: vtop-node
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# The cluster's DNS domain — only used to build stable per-pod peer FQDNs
+# (<pod>.<headless-svc>.<namespace>.svc.<clusterDomain>). Change it only if
+# your cluster was installed with a non-default domain.
+clusterDomain: cluster.local
+
+# ---------------------------------------------------------------------------
+# Cluster identity — REQUIRED, no defaults.
+#
+# These are deliberately empty: identity is coupled to the certificates you
+# mint (the meta plane authenticates peers by certificate CN = decimal node
+# id; the data/replica plane by CN = broker UUID). A baked-in default here
+# would silently mismatch your certificates and fail at the TLS layer with a
+# far worse error than the one the chart gives you up front.
+# ---------------------------------------------------------------------------
+cluster:
+  # UUID shared by every node in the cluster. REQUIRED.
+  id: ""
+  # One broker UUID per replica, indexed by pod ordinal: nodeUuids[0] is pod
+  # <fullname>-0's data-plane identity. REQUIRED, length >= replicaCount.
+  # Each UUID must equal the CN of that pod's data-plane certificate.
+  nodeUuids: []
+
+# ---------------------------------------------------------------------------
+# TLS — REQUIRED, never defaulted.
+#
+# This chart ships NO credentials of any kind and refuses to render without
+# your Secret names (a lab compose once shipped default credentials — issue
+# #81 — and this chart exists on the other side of that lesson). Mint your own
+# CA and per-node leaves; scripts/live-chaos/gen-certs.sh in the repo shows
+# the exact shape (ECDSA P-256, serverAuth+clientAuth, CN rules below).
+#
+# Secret contract (both Secrets; they MAY be the same Secret):
+#   ca.pem                    the cluster CA bundle
+#   node-<ordinal>.pem        leaf certificate for pod <fullname>-<ordinal>
+#   node-<ordinal>-key.pem    its private key
+#
+# CN rules the binary enforces:
+#   metaSecretName leaves:  CN = the DECIMAL meta node id, i.e. ordinal+1
+#                           ("node-0.pem" carries CN=1, "node-1.pem" CN=2, …)
+#   dataSecretName leaves:  CN = cluster.nodeUuids[ordinal]
+# Every leaf needs a SAN matching the server name peers dial — by default the
+# pod's headless-service FQDN (see tls.serverName).
+#
+# cert-manager can mint these (one Certificate per ordinal, commonName as
+# above, dnsNames = the pod FQDNs, secret keys remapped or copied into this
+# layout), but the chart deliberately does not depend on cert-manager — it
+# consumes plain Secrets from wherever you issue them.
+# ---------------------------------------------------------------------------
+tls:
+  # Name of an existing Secret with the metadata-plane material. REQUIRED.
+  metaSecretName: ""
+  # Name of an existing Secret with the data/replica-plane material. REQUIRED.
+  dataSecretName: ""
+  # rustls server name used when dialing peers. Empty (recommended) uses each
+  # peer's own headless FQDN, so certificates need that FQDN as a SAN. Set a
+  # single shared name only if all your leaves carry one common SAN.
+  serverName: ""
+
+# ---------------------------------------------------------------------------
+# Metadata role (`meta:` block of the rendered config).
+# ---------------------------------------------------------------------------
+meta:
+  # Raft timers, in milliseconds. Defaults mirror the binary's own defaults.
+  # Election timeouts must comfortably exceed heartbeat interval; widen them
+  # on networks with jittery pod-to-pod latency before shrinking anything.
+  timers:
+    electionTimeoutMinMs: 300
+    electionTimeoutMaxMs: 600
+    heartbeatIntervalMs: 60
+  # Admin authorization (#238). SEMANTICS ARE THREE-VALUED upstream:
+  #   - block absent (enabled: false): authenticate but do not authorize —
+  #     every CA-signed client may do anything; the node WARNS at startup so
+  #     this stays a deliberate choice.
+  #   - block present with names: only those CNs may run cluster-scoped
+  #     commands (bootstrap, membership, administrative lease grants).
+  #   - block present and EMPTY: nobody may — a real configuration for a
+  #     cluster administered out of band, enforced as written.
+  adminAuthorization:
+    enabled: false
+    # Certificate Common Names permitted to run cluster-scoped admin commands.
+    operatorCommonNames: []
+
+# ---------------------------------------------------------------------------
+# Data role (`data:` block of the rendered config).
+#
+# Each pod runs an independent STANDALONE range: the same shape the upstream
+# co-located harness runs (scripts/live-chaos/lib.sh), because replicated
+# ranges under co-location wait on follower-side epoch propagation upstream.
+# The chart does not offer a leader/follower topology it cannot back.
+# ---------------------------------------------------------------------------
+data:
+  # Static fencing epoch each node starts at. With `lease.enabled` this is
+  # only the monotonic FLOOR of the node's epoch view; metadata mints epochs
+  # from 1, so leave this at 0/1 when the lease drives leadership — a floor
+  # above real grants makes the node ignore them all.
+  fencingEpoch: 1
+  # Identity of the range each node serves. REQUIRED (no defaults — these are
+  # protocol-visible identities, verified end to end).
+  range:
+    # Wire-level topic NAME (distinct from any metadata topic UUID).
+    topic: ""
+    topicEpoch: 1
+    # Range UUID. REQUIRED.
+    rangeId: ""
+    rangeGeneration: 0
+  # Segment UUID. REQUIRED.
+  segmentId: ""
+  # The ONE client principal the produce/fetch authorizer accepts; must equal
+  # the CN of your client certificate. REQUIRED — defaulting it would be a
+  # baked-in credential.
+  principalId: ""
+  # Drive range leadership from the metadata plane (#223) instead of the
+  # static fencing epoch. Off by default to match the upstream co-located
+  # harness. The lease credential is the node's own data-plane certificate
+  # (CN = its node UUID) — the chart wires exactly that, because admin
+  # authorization rejects anything else.
+  lease:
+    enabled: false
+    # Any metadata admin endpoint. The default is this same process's local
+    # admin listener — legitimate under co-location: the data plane reaches
+    # metadata over the network path even when it is the same process.
+    adminEndpoint: "127.0.0.1:9200"
+    # Server name for the admin endpoint's certificate. Empty uses
+    # tls.serverName, falling back to the pod's own headless FQDN.
+    serverName: ""
+    # Metadata's UUID for the topic — NOT data.range.topic (the wire name).
+    # REQUIRED when lease.enabled.
+    topicUuid: ""
+    leaseDurationMs: 15000
+    renewIntervalMs: 5000
+    # Keep short: a follower's un-adopted epoch window (and thus its resync
+    # exposure) is bounded by this.
+    pollIntervalMs: 2000
+
+# Container ports. Every pod has its own IP, so the chaos harness's per-node
+# port offsets are unnecessary here — each pod binds the same well-known
+# ports, which match the harness's base-port conventions.
+ports:
+  metaPeer: 9100
+  metaAdmin: 9200
+  replica: 9300
+  native: 9400
+  # /metrics, /healthz, /readyz. UNAUTHENTICATED by design (#78): keep it off
+  # any public network — enable networkPolicy below or restrict at the mesh.
+  observability: 9500
+
+# Structured logs to stderr. `json` is what a Loki/ELK pipeline wants; set to
+# "" to keep the binary's pretty format.
+logFormat: json
+
+service:
+  # Client-facing ClusterIP service. It carries the observability port
+  # unconditionally, and the admin port only if you opt in below. The native
+  # produce/fetch plane is never here: it is per-pod (each pod is an
+  # independent standalone range), so a round-robin Service would send a
+  # client to a random range. Address pods directly via the headless service:
+  # <fullname>-<ordinal>.<fullname>-headless.<ns>.svc.<domain>.
+  type: ClusterIP
+  annotations: {}
+  # Publish the metadata admin port on this load-balanced Service.
+  #
+  # OFF by default because it cannot work with per-pod certificates. Every pod
+  # presents a certificate whose SAN is that pod's headless FQDN, so a client
+  # routed to an arbitrary pod has no name to verify against and the TLS
+  # handshake fails before vtopctl sends anything. That is a broken bootstrap,
+  # not a warning.
+  #
+  # Turn it on only if your certificates ALSO carry this Service's DNS name
+  # (<fullname>.<namespace>.svc.<domain>) as a shared SAN, and set
+  # `server_name` in your vtopctl config to that name. The chart cannot
+  # inspect your certificates, so it will not assume this for you.
+  exposeMetaAdmin: false
+
+persistence:
+  # Two volumes per pod, matching the two `data_dir`s in the config. Sizing:
+  # the meta Raft log is small; the data segments are your payload.
+  meta:
+    size: 10Gi
+    # Empty string uses the cluster default StorageClass.
+    storageClass: ""
+    accessModes: [ReadWriteOnce]
+  data:
+    size: 50Gi
+    storageClass: ""
+    accessModes: [ReadWriteOnce]
+
+# Conservative defaults: enough for a small quorum node, small enough not to
+# strand pods on modest clusters. Raise data-plane throughput deployments.
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    cpu: "2"
+    memory: 2Gi
+
+# Probes hit the observability endpoint. Wired honestly:
+#   startup   /healthz — the endpoint binds before recovery finishes, and a
+#             node re-opening large segments needs time before liveness may
+#             judge it. periodSeconds*failureThreshold is the recovery budget.
+#   liveness  /healthz — process liveness only; ALWAYS 200 while the accept
+#             loop turns, deliberately ignoring the node's opinion of itself
+#             (a wedged node must stay up to be inspected).
+#   readiness /readyz — a LEVEL with a reason (503 "not ready: <why>"), the
+#             conjunction of BOTH roles on a co-located node. A fenced
+#             leaseholder going unready is CORRECT behaviour — every write
+#             sent to it is one it must refuse. Do not "fix" that with looser
+#             probes; read the reason in the response body instead.
+probes:
+  startup:
+    enabled: true
+    periodSeconds: 5
+    failureThreshold: 60
+    timeoutSeconds: 2
+  readiness:
+    periodSeconds: 5
+    failureThreshold: 3
+    timeoutSeconds: 2
+    successThreshold: 1
+  liveness:
+    periodSeconds: 10
+    failureThreshold: 3
+    timeoutSeconds: 2
+
+# Quorum protection: at most one voter down voluntarily. With 3 replicas,
+# losing 2 loses the metadata quorum — do not raise this.
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+# Optional NetworkPolicy. Off by default because a deny-by-default policy in
+# a cluster whose CNI ignores NetworkPolicy would be false comfort; enable it
+# where the CNI enforces it. The observability port is unauthenticated, so
+# this is the primary control for it inside the cluster.
+networkPolicy:
+  enabled: false
+  # Peers allowed to scrape the observability port. Each entry is a
+  # NetworkPolicyPeer (podSelector/namespaceSelector/ipBlock). EMPTY list
+  # allows ALL sources on that port — stated here so nobody assumes the
+  # opposite.
+  metricsFrom: []
+  # Peers allowed to reach the admin + native client planes. Empty means NO
+  # external clients (cluster-internal traffic between vtop pods is always
+  # allowed; both planes still require mTLS regardless).
+  clientFrom: []
+  # Where DNS egress is allowed. The peer list is FQDNs, so name resolution is
+  # a hard dependency — but a rule with no destination admits port 53 to
+  # EVERYWHERE, which turns a default-deny egress policy into one with a
+  # standing hole, and DNS is the classic exfiltration channel.
+  #
+  # Defaults to kube-dns in kube-system, which covers most clusters. Point it
+  # at your resolver if yours differs; setting it to [] restores the
+  # unrestricted behaviour and is not recommended.
+  dnsTo:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+  # Extra egress rules appended verbatim (e.g. to reach an external metadata
+  # admin endpoint when data.lease.adminEndpoint is not local).
+  extraEgress: []
+
+metrics:
+  # Well-known scrape annotations on the pods (prometheus.io/scrape|port|path).
+  # Harmless where unused; many stacks honor them out of the box.
+  prometheusAnnotations: true
+  # Prometheus Operator ServiceMonitor. Requires the CRD: the template fails
+  # with a clear message when monitoring.coreos.com/v1 is absent rather than
+  # installing an object nothing reconciles. (`helm template` offline only
+  # knows core APIs — pass --api-versions monitoring.coreos.com/v1 there.)
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    scrapeTimeout: ""
+    # Extra labels for the ServiceMonitor (e.g. release: prometheus) so your
+    # Prometheus's selector picks it up.
+    labels: {}
+
+serviceAccount:
+  # A dedicated ServiceAccount with automountServiceAccountToken: false —
+  # vtop-node never talks to the Kubernetes API, so no pod should carry a
+  # token that could.
+  create: true
+  name: ""
+  annotations: {}
+
+# The image runs as the unprivileged `vtop` user (uid 10001). fsGroup makes
+# the PVCs writable by it; OnRootMismatch avoids a full recursive chown on
+# every restart of a large data volume.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+# The binary writes only its two data_dirs (both PVC mounts), so the root
+# filesystem stays read-only.
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+# Empty uses the chart's default: PREFERRED anti-affinity spreading pods
+# across nodes. Set your own (e.g. required anti-affinity, or zone spreading
+# via topologySpreadConstraints) for real quorum safety — co-scheduling two
+# voters on one node turns a node failure into a quorum loss.
+affinity: {}
+topologySpreadConstraints: []
+priorityClassName: ""
+
+# How long Kubernetes waits after SIGTERM before SIGKILL.
+#
+# STATED PLAINLY: vtop-node installs no signal handler, so SIGTERM is ignored
+# and every pod deletion, rolling update, and node drain ends in SIGKILL after
+# this many seconds. The wait buys a clean shutdown from nothing — it only
+# delays the inevitable.
+#
+# That is safe rather than merely tolerable: durability here does not depend on
+# an orderly exit. A record is acknowledged only once it is fsynced, recovery
+# truncates any torn tail, and live-chaos scenario 04 kills the leader with
+# SIGKILL mid-produce and verifies every acknowledged record survives
+# byte-exact. Restart takes the crash-recovery path by design.
+#
+# What it costs is time: 60 seconds of waiting per pod on every rollout. Lower
+# it if you would rather roll faster, since nothing is using the interval.
+# Signal-aware shutdown is tracked separately; when it lands this value starts
+# meaning what it says.
+terminationGracePeriodSeconds: 60
+
+extraEnv: []
+extraVolumes: []
+extraVolumeMounts: []

@@ -1,0 +1,17 @@
+# One fully rendered config per pod ordinal, all in one ConfigMap. Rendering
+# per ordinal at template time (rather than sed-substituting placeholders in
+# an initContainer) keeps every byte of every node's config visible in
+# `helm template` output and covered by the pod template's checksum/config
+# annotation — a config change rolls the StatefulSet.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "vtop.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vtop.labels" . | nindent 4 }}
+data:
+{{- range $i := until (int .Values.replicaCount) }}
+  node-{{ $i }}.yaml: |
+{{ include "vtop.nodeConfig" (dict "root" $ "ordinal" $i) | indent 4 }}
+{{- end }}

@@ -1,0 +1,32 @@
+{{- if .Values.metrics.serviceMonitor.enabled }}
+{{- if not (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1") }}
+{{- fail "\n\nmetrics.serviceMonitor.enabled is true but this cluster does not expose monitoring.coreos.com/v1 (Prometheus Operator CRDs). Install the CRDs first, or disable the ServiceMonitor and rely on metrics.prometheusAnnotations. (For offline `helm template`, pass --api-versions monitoring.coreos.com/v1.)" }}
+{{- end }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "vtop.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vtop.labels" . | nindent 4 }}
+    {{- with .Values.metrics.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "vtop.selectorLabels" . | nindent 6 }}
+      # Select only the client Service; matching the headless Service too
+      # would scrape every pod twice.
+      vtop.allamiro.io/service: client
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  endpoints:
+    - port: obs
+      path: /metrics
+      interval: {{ .Values.metrics.serviceMonitor.interval }}
+      {{- with .Values.metrics.serviceMonitor.scrapeTimeout }}
+      scrapeTimeout: {{ . }}
+      {{- end }}
+{{- end }}

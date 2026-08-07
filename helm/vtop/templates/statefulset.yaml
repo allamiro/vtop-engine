@@ -1,0 +1,235 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "vtop.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vtop.labels" . | nindent 4 }}
+spec:
+  replicas: {{ int .Values.replicaCount }}
+  serviceName: {{ include "vtop.headlessServiceName" . }}
+  # Parallel: quorum members should come up together. OrderedReady would also
+  # work (readiness does not require a Raft leader), but serializing quorum
+  # bringup only slows recovery for no safety gain.
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "vtop.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "vtop.selectorLabels" . | nindent 8 }}
+        {{- /* Chart-managed selector labels are rendered above and must win:
+               a user label that redefined either of them would leave the
+               StatefulSet unable to match the pods it creates. */}}
+        {{- with (omit .Values.podLabels "app.kubernetes.io/name" "app.kubernetes.io/instance") }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # A config edit changes this hash and rolls the set; without it a
+        # ConfigMap update would sit unapplied until the next unrelated roll.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if .Values.metrics.prometheusAnnotations }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.ports.observability | quote }}
+        prometheus.io/path: /metrics
+        {{- end }}
+        {{- /* Same for the chart-managed annotations. checksum/config is what
+               rolls the set when the ConfigMap changes; a user value that
+               replaced it would silently disable config-triggered rollouts,
+               and pods would keep running against a config that no longer
+               exists. */}}
+        {{- with (omit .Values.podAnnotations "checksum/config" "prometheus.io/scrape" "prometheus.io/port" "prometheus.io/path") }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "vtop.serviceAccountName" . }}
+      # vtop-node never calls the Kubernetes API; a mounted token would be
+      # pure attack surface on a pod that also serves unauthenticated HTTP.
+      automountServiceAccountToken: false
+      # No preStop hook, and no pretence of a graceful stop: vtop-node installs
+      # no signal handler, so this interval is time spent waiting before
+      # SIGKILL. Safe by design — acknowledgement follows fsync and recovery
+      # truncates a torn tail — but it is the crash path, not a clean one.
+      terminationGracePeriodSeconds: {{ int .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.affinity }}
+      affinity:
+        {{- toYaml .Values.affinity | nindent 8 }}
+      {{- else }}
+      # Default: PREFER spreading voters across nodes. Preferred rather than
+      # required so a small/dev cluster can still schedule; for production
+      # quorum safety set .Values.affinity to a REQUIRED anti-affinity — two
+      # voters on one node turn a node failure into a quorum loss.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "vtop.selectorLabels" . | nindent 20 }}
+      {{- end }}
+      containers:
+        - name: vtop-node
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # Ordinal-derived identity: a StatefulSet pod's hostname is
+          # "<statefulset>-<ordinal>", so the shell strips everything up to
+          # the last "-" and selects the per-ordinal config rendered into the
+          # ConfigMap. From that ordinal the config fixes the meta Raft
+          # node_id (ordinal+1), the data-plane node UUID
+          # (cluster.nodeUuids[ordinal]), and the TLS leaf filenames.
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              ordinal="${HOSTNAME##*-}"
+              exec {{ .Values.image.binary }} node --config "/etc/vtop/config/node-${ordinal}.yaml"
+          env:
+            {{- if .Values.logFormat }}
+            # Structured stderr logs; stdout stays reserved for the binary's
+            # machine-readable ready markers.
+            - name: VTOP_LOG_FORMAT
+              value: {{ .Values.logFormat | quote }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: meta-peer
+              containerPort: {{ .Values.ports.metaPeer }}
+            - name: meta-admin
+              containerPort: {{ .Values.ports.metaAdmin }}
+            - name: replica
+              containerPort: {{ .Values.ports.replica }}
+            - name: native
+              containerPort: {{ .Values.ports.native }}
+            - name: obs
+              containerPort: {{ .Values.ports.observability }}
+          {{- if .Values.probes.startup.enabled }}
+          # /healthz binds before segment recovery finishes; the startup
+          # budget (periodSeconds * failureThreshold) is what protects a node
+          # re-opening large ranges from being killed mid-recovery.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: obs
+            periodSeconds: {{ int .Values.probes.startup.periodSeconds }}
+            failureThreshold: {{ int .Values.probes.startup.failureThreshold }}
+            timeoutSeconds: {{ int .Values.probes.startup.timeoutSeconds }}
+          {{- end }}
+          # /readyz is a LEVEL with a reason and, on a co-located node, the
+          # CONJUNCTION of both roles. A fenced leaseholder going unready is
+          # the system working — do not loosen this probe to "fix" it; read
+          # the reason in the 503 body instead.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: obs
+            periodSeconds: {{ int .Values.probes.readiness.periodSeconds }}
+            failureThreshold: {{ int .Values.probes.readiness.failureThreshold }}
+            timeoutSeconds: {{ int .Values.probes.readiness.timeoutSeconds }}
+            successThreshold: {{ int .Values.probes.readiness.successThreshold }}
+          # /healthz is process liveness ONLY — always 200 while the accept
+          # loop turns, deliberately ignoring readiness: a wedged node must
+          # stay up to be inspected, and restarting an unready-but-live node
+          # would destroy the evidence /readyz exists to serve.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: obs
+            periodSeconds: {{ int .Values.probes.liveness.periodSeconds }}
+            failureThreshold: {{ int .Values.probes.liveness.failureThreshold }}
+            timeoutSeconds: {{ int .Values.probes.liveness.timeoutSeconds }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/vtop/config
+              readOnly: true
+            - name: tls-meta
+              mountPath: /etc/vtop/tls/meta
+              readOnly: true
+            - name: tls-data
+              mountPath: /etc/vtop/tls/data
+              readOnly: true
+            - name: meta
+              mountPath: /var/lib/vtop/meta
+            - name: data
+              mountPath: /var/lib/vtop/data
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "vtop.fullname" . }}
+        # User-supplied Secrets only — the render fails above if unnamed.
+        - name: tls-meta
+          secret:
+            # Quoted: an unquoted name that happens to be `true`, `no`, or a
+            # bare number is decoded as a boolean or int, and the manifest is
+            # rejected on a type error rather than on anything meaningful.
+            secretName: {{ include "vtop.metaSecretName" . | quote }}
+            defaultMode: 0440
+        - name: tls-data
+          secret:
+            secretName: {{ include "vtop.dataSecretName" . | quote }}
+            defaultMode: 0440
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+  # Two claims per pod, matching the two data_dirs of the co-located process.
+  volumeClaimTemplates:
+    - metadata:
+        name: meta
+        labels:
+          {{- include "vtop.selectorLabels" . | nindent 10 }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.meta.accessModes | nindent 10 }}
+        {{- with .Values.persistence.meta.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.meta.size }}
+    - metadata:
+        name: data
+        labels:
+          {{- include "vtop.selectorLabels" . | nindent 10 }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.data.accessModes | nindent 10 }}
+        {{- with .Values.persistence.data.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.data.size }}

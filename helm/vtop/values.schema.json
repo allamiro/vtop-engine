@@ -1,0 +1,252 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "vtop chart values",
+  "type": "object",
+  "additionalProperties": false,
+  "$defs": {
+    "uuidOrEmpty": {
+      "type": "string",
+      "pattern": "^$|^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+      "description": "A UUID, or empty (presence is enforced at render time by required/fail with a targeted message)."
+    },
+    "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+    "nonNegInt": { "type": "integer", "minimum": 0 },
+    "posInt": { "type": "integer", "minimum": 1 },
+    "volumeSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "size": { "type": "string", "minLength": 1 },
+        "storageClass": { "type": "string" },
+        "accessModes": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  },
+  "properties": {
+    "global": { "type": "object" },
+    "replicaCount": { "$ref": "#/$defs/posInt" },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "binary"],
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string" },
+        "pullPolicy": { "enum": ["Always", "IfNotPresent", "Never"] },
+        "binary": { "type": "string", "minLength": 1 }
+      }
+    },
+    "imagePullSecrets": { "type": "array", "items": { "type": "object" } },
+    "nameOverride": { "type": "string" },
+    "fullnameOverride": { "type": "string" },
+    "clusterDomain": { "type": "string", "minLength": 1 },
+    "cluster": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": { "$ref": "#/$defs/uuidOrEmpty" },
+        "nodeUuids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+          }
+        }
+      }
+    },
+    "tls": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "metaSecretName": { "type": "string" },
+        "dataSecretName": { "type": "string" },
+        "serverName": { "type": "string" }
+      }
+    },
+    "meta": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "timers": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "electionTimeoutMinMs": { "$ref": "#/$defs/posInt" },
+            "electionTimeoutMaxMs": { "$ref": "#/$defs/posInt" },
+            "heartbeatIntervalMs": { "$ref": "#/$defs/posInt" }
+          }
+        },
+        "adminAuthorization": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "operatorCommonNames": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
+      }
+    },
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "fencingEpoch": { "$ref": "#/$defs/nonNegInt" },
+        "range": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "topic": { "type": "string" },
+            "topicEpoch": { "$ref": "#/$defs/nonNegInt" },
+            "rangeId": { "$ref": "#/$defs/uuidOrEmpty" },
+            "rangeGeneration": { "$ref": "#/$defs/nonNegInt" }
+          }
+        },
+        "segmentId": { "$ref": "#/$defs/uuidOrEmpty" },
+        "principalId": { "$ref": "#/$defs/uuidOrEmpty" },
+        "lease": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "adminEndpoint": { "type": "string", "minLength": 1 },
+            "serverName": { "type": "string" },
+            "topicUuid": { "$ref": "#/$defs/uuidOrEmpty" },
+            "leaseDurationMs": { "$ref": "#/$defs/posInt" },
+            "renewIntervalMs": { "$ref": "#/$defs/posInt" },
+            "pollIntervalMs": { "$ref": "#/$defs/posInt" }
+          }
+        }
+      }
+    },
+    "ports": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "metaPeer": { "$ref": "#/$defs/port" },
+        "metaAdmin": { "$ref": "#/$defs/port" },
+        "replica": { "$ref": "#/$defs/port" },
+        "native": { "$ref": "#/$defs/port" },
+        "observability": { "$ref": "#/$defs/port" }
+      }
+    },
+    "logFormat": { "enum": ["", "json"] },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "enum": ["ClusterIP", "NodePort", "LoadBalancer"] },
+        "annotations": { "type": "object" },
+        "exposeMetaAdmin": { "type": "boolean" }
+      }
+    },
+    "persistence": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "meta": { "$ref": "#/$defs/volumeSpec" },
+        "data": { "$ref": "#/$defs/volumeSpec" }
+      }
+    },
+    "resources": { "type": "object" },
+    "probes": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "startup": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "periodSeconds": { "$ref": "#/$defs/posInt" },
+            "failureThreshold": { "$ref": "#/$defs/posInt" },
+            "timeoutSeconds": { "$ref": "#/$defs/posInt" }
+          }
+        },
+        "readiness": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "periodSeconds": { "$ref": "#/$defs/posInt" },
+            "failureThreshold": { "$ref": "#/$defs/posInt" },
+            "timeoutSeconds": { "$ref": "#/$defs/posInt" },
+            "successThreshold": { "$ref": "#/$defs/posInt" }
+          }
+        },
+        "liveness": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "periodSeconds": { "$ref": "#/$defs/posInt" },
+            "failureThreshold": { "$ref": "#/$defs/posInt" },
+            "timeoutSeconds": { "$ref": "#/$defs/posInt" }
+          }
+        }
+      }
+    },
+    "podDisruptionBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "maxUnavailable": { "$ref": "#/$defs/posInt" }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "metricsFrom": { "type": "array", "items": { "type": "object" } },
+        "clientFrom": { "type": "array", "items": { "type": "object" } },
+        "dnsTo": { "type": "array", "items": { "type": "object" } },
+        "extraEgress": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "prometheusAnnotations": { "type": "boolean" },
+        "serviceMonitor": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "interval": { "type": "string" },
+            "scrapeTimeout": { "type": "string" },
+            "labels": { "type": "object" }
+          }
+        }
+      }
+    },
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "create": { "type": "boolean" },
+        "name": { "type": "string" },
+        "annotations": { "type": "object" }
+      }
+    },
+    "podSecurityContext": { "type": "object" },
+    "containerSecurityContext": { "type": "object" },
+    "podAnnotations": { "type": "object" },
+    "podLabels": { "type": "object" },
+    "nodeSelector": { "type": "object" },
+    "tolerations": { "type": "array" },
+    "affinity": { "type": "object" },
+    "topologySpreadConstraints": { "type": "array" },
+    "priorityClassName": { "type": "string" },
+    "terminationGracePeriodSeconds": { "$ref": "#/$defs/posInt" },
+    "extraEnv": { "type": "array" },
+    "extraVolumes": { "type": "array" },
+    "extraVolumeMounts": { "type": "array" }
+  }
+}

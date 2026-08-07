@@ -1,0 +1,61 @@
+{{- $fullname := include "vtop.fullname" . -}}
+{{- $ns := .Release.Namespace -}}
+{{- $ids := list -}}
+{{- range $j := until (int .Values.replicaCount) }}{{ $ids = append $ids (add1 $j) }}{{ end -}}
+vtop {{ .Chart.AppVersion }} — {{ int .Values.replicaCount }} co-located node(s) as StatefulSet {{ $fullname }}.
+
+1. Watch the pods come up:
+
+     kubectl -n {{ $ns }} get pods -l app.kubernetes.io/instance={{ .Release.Name }},app.kubernetes.io/name={{ include "vtop.name" . }} -w
+
+2. Readiness is a LEVEL with reasons, not a startup marker. /readyz on port
+   {{ .Values.ports.observability }} answers 200 "ready" or 503 "not ready: <reason>", and on a
+   co-located node it is the CONJUNCTION of both roles. Read the reason:
+
+     kubectl -n {{ $ns }} port-forward pod/{{ $fullname }}-0 {{ .Values.ports.observability }}:{{ .Values.ports.observability }} &
+     curl -s http://127.0.0.1:{{ .Values.ports.observability }}/readyz
+
+   Fresh pods report Ready before a Raft leader exists — that is by design
+   (requiring leadership would deadlock bootstrap, which arrives over the
+   admin endpoint being gated). And a node that later goes UNREADY because it
+   was fenced is the system WORKING: every write sent to it is one it must
+   refuse. Do not loosen the probes; read the reason.
+
+3. Bootstrap the metadata Raft group ONCE per cluster lifetime (all nodes
+   running, empty logs). Run vtopctl against any admin endpoint with an
+   operator certificate signed by your cluster CA:
+
+     kubectl -n {{ $ns }} port-forward pod/{{ $fullname }}-0 {{ .Values.ports.metaAdmin }}:{{ .Values.ports.metaAdmin }} &
+     vtopctl meta init --members {{ join "," $ids }} --config admin.yaml
+     vtopctl meta status --config admin.yaml
+
+   Forward a SPECIFIC POD, not the Service. Each pod presents a certificate
+   whose SAN is that pod's own headless FQDN, so a load-balanced endpoint
+   gives the client no name it can verify and TLS fails before vtopctl sends
+   anything. admin.yaml must therefore carry BOTH:
+
+     endpoint: localhost:{{ .Values.ports.metaAdmin }}
+     server_name: {{ $fullname }}-0.{{ include "vtop.headlessServiceName" . }}.{{ $ns }}.svc.{{ .Values.clusterDomain }}
+
+   plus ca_cert/client_cert/client_key for your operator credentials.
+   `server_name` defaults to "localhost", which will NOT match — set it.
+
+   Node ids are pod ordinal+1: {{ $fullname }}-0 is meta node 1, and so on.
+{{- if .Values.meta.adminAuthorization.enabled }}
+
+   NOTE: admin authorization is ENABLED — only these certificate CNs may run
+   cluster-scoped commands: {{ .Values.meta.adminAuthorization.operatorCommonNames | toJson }}
+{{- end }}
+
+4. Metrics: Prometheus text on http://<pod>:{{ .Values.ports.observability }}/metrics
+   {{- if .Values.metrics.serviceMonitor.enabled }} (ServiceMonitor installed).{{ else }}{{ if .Values.metrics.prometheusAnnotations }} (pods carry prometheus.io/* scrape annotations).{{ end }}{{ end }}
+   The endpoint is UNAUTHENTICATED (#78)
+   {{- if .Values.networkPolicy.enabled }} — NetworkPolicy is enabled and restricts it.{{ else }} — consider networkPolicy.enabled=true to restrict it in-cluster.{{ end }}
+
+5. Per-pod planes (each pod is an independent standalone range): address a
+   specific pod through the headless Service, e.g.
+
+     {{ $fullname }}-0.{{ include "vtop.headlessServiceName" . }}.{{ $ns }}.svc.{{ .Values.clusterDomain }}:{{ .Values.ports.native }}
+
+Full docs, including the TLS Secret contract: helm/vtop/README.md in the
+chart sources.
