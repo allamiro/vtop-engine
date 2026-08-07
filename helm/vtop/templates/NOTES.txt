@@ -48,5 +48,16 @@ vtop {{ .Chart.AppVersion }} — {{ int .Values.replicaCount }} co-located node(
 
      {{ $fullname }}-0.{{ include "vtop.headlessServiceName" . }}.{{ $ns }}.svc.{{ .Values.clusterDomain }}:{{ .Values.ports.native }}
 
+{{- if .Values.pipeline.enabled }}
+
+6. The archive pipeline (`vtopctl run`) is enabled as Deployment
+   {{ include "vtop.pipeline.fullname" . }} — one replica by design (a
+   pod-local ledger; a second replica would double-ingest). It reads
+   operator-provided Kafka/S3 endpoints from its ConfigMap and S3
+   credentials only from Secret {{ .Values.pipeline.s3.existingSecret | default "(none configured)" }}.
+
+     kubectl -n {{ $ns }} logs deploy/{{ include "vtop.pipeline.fullname" . }} -f
+{{- end }}
+
 Full docs, including the TLS Secret contract: helm/vtop/README.md in the
 chart sources.

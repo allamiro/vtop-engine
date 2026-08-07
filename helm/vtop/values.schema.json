@@ -24,6 +24,25 @@
           "items": { "type": "string", "minLength": 1 }
         }
       }
+    },
+    "pipelineVolume": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "create": { "type": "boolean" },
+        "existingClaim": { "type": "string" },
+        "size": { "type": "string", "minLength": 1 },
+        "storageClass": { "type": "string" },
+        "accessModes": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "envString": {
+      "enum": ["", "true", "false"],
+      "description": "A boolean-shaped environment value, or empty to omit the variable."
     }
   },
   "properties": {
@@ -245,6 +264,61 @@
     "terminationGracePeriodSeconds": { "$ref": "#/$defs/posInt" },
     "extraEnv": { "type": "array" },
     "extraVolumes": { "type": "array" },
-    "extraVolumeMounts": { "type": "array" }
+    "extraVolumeMounts": { "type": "array" },
+    "pipeline": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "config": {
+          "type": "object",
+          "description": "The `vtopctl run` engine config, passed through verbatim (examples/config.yaml is the reference shape). Required non-empty when enabled — enforced at render time with a targeted message."
+        },
+        "rustLog": { "type": "string", "minLength": 1 },
+        "logFormat": { "enum": ["", "json"] },
+        "metricsAddr": {
+          "type": "string",
+          "pattern": "^$|^.+:[0-9]{1,5}$",
+          "description": "VTOP_METRICS_ADDR (host:port), or empty for no listener — opt-in like the binary."
+        },
+        "s3": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "existingSecret": { "type": "string" },
+            "region": { "type": "string" },
+            "endpointUrl": { "type": "string" },
+            "forcePathStyle": { "$ref": "#/$defs/envString" },
+            "verifyTls": { "$ref": "#/$defs/envString" }
+          }
+        },
+        "input": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "existingClaim": { "type": "string" },
+            "hostPath": { "type": "object" }
+          }
+        },
+        "persistence": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "spool": { "$ref": "#/$defs/pipelineVolume" },
+            "work": { "$ref": "#/$defs/pipelineVolume" },
+            "state": { "$ref": "#/$defs/pipelineVolume" }
+          }
+        },
+        "resources": { "type": "object" },
+        "podAnnotations": { "type": "object" },
+        "podLabels": { "type": "object" },
+        "nodeSelector": { "type": "object" },
+        "tolerations": { "type": "array" },
+        "affinity": { "type": "object" },
+        "extraEnv": { "type": "array" },
+        "extraVolumes": { "type": "array" },
+        "extraVolumeMounts": { "type": "array" }
+      }
+    }
   }
 }

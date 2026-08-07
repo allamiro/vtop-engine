@@ -1,0 +1,45 @@
+# CI render for the OPTIONAL pipeline workload, layered on top of
+# default-values.yaml. Exercises the branches the default render cannot:
+# the Deployment/ConfigMap/PVCs, the metrics opt-in (port parsing, scrape
+# annotations, probes), the S3 env wiring with an operator-named credential
+# Secret, and an existingClaim volume. The config block follows
+# examples/config.yaml — the reference shape for pipeline.config.
+pipeline:
+  enabled: true
+  config:
+    engine:
+      name: vtop-engine
+      tenant: default
+      state_store: "sqlite:///data/state/vtop-state.db"
+      work_dir: /data/work
+    sources:
+      kafka:
+        enabled: true
+        bootstrap_servers:
+          - kafka.example.svc:9092
+        consumer_group: vtop-engine
+        enable_auto_commit: false
+      file:
+        enabled: true
+        paths:
+          - /data/input/*.log
+      syslog_spool:
+        enabled: true
+        paths:
+          - /data/spool/*.log
+    upload:
+      backend: s3_native
+      bucket: "telemetry-{format}"
+      endpoint_url: https://s3.example
+      region: us-east-1
+      force_path_style: true
+  metricsAddr: "0.0.0.0:9090"
+  s3:
+    existingSecret: vtop-pipeline-s3
+    region: us-east-1
+    endpointUrl: https://s3.example
+    forcePathStyle: "true"
+    verifyTls: "true"
+  persistence:
+    spool:
+      existingClaim: collector-spool

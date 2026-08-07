@@ -1,0 +1,214 @@
+{{- if .Values.pipeline.enabled }}
+{{- $backend := include "vtop.pipeline.s3Backend" . }}
+# The archive pipeline (`vtopctl run`): file/syslog-spool/Kafka sources ->
+# verified batches -> S3-compatible storage. This is the workload
+# docker-compose.yml runs as `vtop-engine`, translated — minus the lab's
+# vendored Kafka/MinIO (operator-provided endpoints, named in
+# pipeline.config) and minus its default credentials (issue #81; see
+# pipeline.s3.existingSecret).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "vtop.pipeline.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vtop.pipeline.labels" . | nindent 4 }}
+spec:
+  # Exactly one, not a value: the state store is a pod-local SQLite DB and
+  # the file/spool sources are directory globs, so a second replica would
+  # double-ingest every source and race the ledger. The chart does not offer
+  # a scale-out topology the engine cannot back.
+  replicas: 1
+  strategy:
+    # Recreate, not RollingUpdate: the PVCs are ReadWriteOnce and two engine
+    # generations sharing one ledger during a rolling window would both
+    # claim the same offsets.
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "vtop.pipeline.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "vtop.pipeline.selectorLabels" . | nindent 8 }}
+        {{- with .Values.pipeline.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # A config edit changes this hash and rolls the pipeline; without it
+        # a ConfigMap update would sit unapplied until an unrelated roll.
+        checksum/config: {{ include (print $.Template.BasePath "/pipeline/configmap.yaml") . | sha256sum }}
+        {{- if and .Values.pipeline.metricsAddr .Values.metrics.prometheusAnnotations }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ include "vtop.pipeline.metricsPort" . | quote }}
+        prometheus.io/path: /metrics
+        {{- end }}
+        {{- with .Values.pipeline.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "vtop.serviceAccountName" . }}
+      # Same stance as the nodes: vtopctl never calls the Kubernetes API.
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ int .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # Same security posture as the node workload: unprivileged uid 10001,
+      # no privilege escalation (compose's no-new-privileges), read-only
+      # rootfs, all capabilities dropped, RuntimeDefault seccomp. The data
+      # directories are volumes, so the rootfs stays read-only here too.
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.pipeline.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.pipeline.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.pipeline.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: pipeline
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # No command override: the image's entrypoint (docker/entrypoint.sh)
+          # already checks the data directories are writable, then execs
+          # `vtopctl run --config $VTOP_CONFIG` — the chart just points
+          # VTOP_CONFIG at the rendered ConfigMap.
+          env:
+            - name: VTOP_CONFIG
+              value: /etc/vtop/pipeline/config.yaml
+            - name: RUST_LOG
+              value: {{ .Values.pipeline.rustLog | quote }}
+            {{- if .Values.pipeline.logFormat }}
+            # Structured JSON logs: the log-derived Grafana panels parse the
+            # fields (level, records, *_ms, byte counts); ANSI pretty text
+            # breaks them.
+            - name: VTOP_LOG_FORMAT
+              value: {{ .Values.pipeline.logFormat | quote }}
+            {{- end }}
+            {{- if .Values.pipeline.metricsAddr }}
+            # Opt-in, mirroring the binary: nothing listens unless set.
+            - name: VTOP_METRICS_ADDR
+              value: {{ .Values.pipeline.metricsAddr | quote }}
+            {{- end }}
+            {{- if and $backend (ne $backend "mock") }}
+            # S3 credentials come ONLY from an operator-named Secret — the
+            # render refuses to proceed without one (see the helper) rather
+            # than repeat the compose lab's minioadmin defaults (issue #81).
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vtop.pipeline.s3SecretName" . }}
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vtop.pipeline.s3SecretName" . }}
+                  key: AWS_SECRET_ACCESS_KEY
+            {{- end }}
+            {{- with .Values.pipeline.s3.region }}
+            - name: AWS_REGION
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.pipeline.s3.endpointUrl }}
+            - name: VTOP_S3_ENDPOINT_URL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.pipeline.s3.forcePathStyle }}
+            - name: VTOP_S3_FORCE_PATH_STYLE
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.pipeline.s3.verifyTls }}
+            - name: VTOP_S3_VERIFY_TLS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.pipeline.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if .Values.pipeline.metricsAddr }}
+          ports:
+            - name: metrics
+              containerPort: {{ include "vtop.pipeline.metricsPort" . }}
+          # Probes only when the endpoint exists: with metricsAddr unset the
+          # engine listens on nothing, and probing an invented port would
+          # crash-loop a healthy pipeline. The endpoint is the same
+          # vtop-observe surface the nodes serve: /healthz is process
+          # liveness, /readyz answers 503 until the metrics registry (and
+          # thus the engine) has initialized.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            periodSeconds: 5
+            failureThreshold: 3
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            periodSeconds: 10
+            failureThreshold: 3
+            timeoutSeconds: 2
+          {{- end }}
+          resources:
+            {{- toYaml .Values.pipeline.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/vtop/pipeline
+              readOnly: true
+            # The same container paths the compose lab mounts, which is what
+            # examples/config.yaml (the reference pipeline.config) points at.
+            - name: input
+              mountPath: /data/input
+            - name: spool
+              mountPath: /data/spool
+            - name: work
+              mountPath: /data/work
+            - name: state
+              mountPath: /data/state
+            {{- with .Values.pipeline.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "vtop.pipeline.fullname" . }}
+        # Input is the operator's: a PVC a collector writes into, a hostPath
+        # node agents drop files on, or (neither) an emptyDir the file
+        # source honestly finds empty.
+        - name: input
+          {{- if .Values.pipeline.input.existingClaim }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.pipeline.input.existingClaim }}
+          {{- else if .Values.pipeline.input.hostPath }}
+          hostPath:
+            {{- toYaml .Values.pipeline.input.hostPath | nindent 12 }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- range $dir := list "spool" "work" "state" }}
+        {{- $spec := index $.Values.pipeline.persistence $dir }}
+        - name: {{ $dir }}
+          {{- if $spec.existingClaim }}
+          persistentVolumeClaim:
+            claimName: {{ $spec.existingClaim }}
+          {{- else if $spec.create }}
+          persistentVolumeClaim:
+            claimName: {{ include "vtop.pipeline.fullname" $ }}-{{ $dir }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- end }}
+        {{- with .Values.pipeline.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+{{- end }}

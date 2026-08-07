@@ -52,6 +52,7 @@ jobs:
       postgres: ${{ steps.filter.outputs.postgres }}
       fuzz: ${{ steps.filter.outputs.fuzz }}
       chaos: ${{ steps.filter.outputs.chaos }}
+      helm: ${{ steps.filter.outputs.helm }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
       # Pinned to a full commit SHA (v3), not the mutable tag, so an upstream
@@ -149,6 +150,16 @@ jobs:
               - 'docker/**'
               - '.dockerignore'
               - 'examples/**'
+            # The chart is a released artifact with a rendered-config contract
+            # (the per-ordinal node configs) and a refusal contract (identities
+            # and credentials are never defaulted). Both are enforced by the
+            # helm job below on every chart change. The workflow file rides
+            # along for the usual reason: the job's own steps ARE part of the
+            # contract it enforces.
+            helm:
+              - 'helm/**'
+              - '.github/workflows/ci.yml'
+
             shell:
               - 'docker/*.sh'
               - 'docker/tests/**'

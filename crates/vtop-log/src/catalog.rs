@@ -1,5 +1,6 @@
 use crate::env::Env;
 use crate::segment::{inspect_active_segment, inspect_sealed_segment, SegmentInspection};
+use crate::adopt_intent::{AdoptIntent, ADOPT_INTENT_FILE};
 use crate::truncate_intent::{TruncateIntent, TRUNCATE_INTENT_FILE};
 use crate::{LogError, SegmentDescriptor, SegmentId, VtopLogResult};
 use std::collections::{BTreeMap, BTreeSet};
@@ -72,6 +73,10 @@ pub enum QuarantineReason {
     /// does not decode names an intent that cannot be honoured, and acting on
     /// a guess would delete segments.
     InvalidTruncateIntent(String),
+    /// A `range.adopt-intent` marker that cannot be decoded — the adoption
+    /// analogue of an invalid truncation marker, refused for the same reason:
+    /// acting on a guess would delete a tail and move segments (#270).
+    InvalidAdoptIntent(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,6 +95,11 @@ pub struct StartupCatalog {
     /// entries above describe the directory as it stands, doomed segments
     /// included. `SegmentSet::open_in` is what finishes the truncation.
     pub truncate_intent: Option<PathBuf>,
+    /// A valid `range.adopt-intent` marker, if one is present: a sealed-
+    /// segment adoption that was interrupted mid-flight (#270). Reported
+    /// under the same read-only contract as `truncate_intent`;
+    /// `SegmentSet::open_in` is what finishes the adoption.
+    pub adopt_intent: Option<PathBuf>,
 }
 
 impl StartupCatalog {
@@ -116,6 +126,7 @@ impl StartupCatalog {
         let mut bundles = BTreeMap::<PathBuf, ArtifactBundle>::new();
         let mut quarantined = Vec::new();
         let mut truncate_intent = None;
+        let mut adopt_intent = None;
         for entry in discovered {
             let Some(classification) = classify_artifact(&entry.path) else {
                 continue;
@@ -138,6 +149,27 @@ impl StartupCatalog {
                     Err(error) => quarantined.push(QuarantinedArtifacts {
                         paths: vec![entry.path],
                         reasons: vec![QuarantineReason::InvalidTruncateIntent(error.to_string())],
+                    }),
+                }
+                continue;
+            }
+            if classification.kind == ArtifactKind::AdoptIntent {
+                // Same read-only posture as the truncation marker: validated
+                // so a caller reading only the catalog knows whether it can
+                // be acted on, never acted on here.
+                let decoded = env
+                    .storage
+                    .read(&entry.path)
+                    .map_err(|source| LogError::Io {
+                        path: entry.path.clone(),
+                        source,
+                    })
+                    .and_then(|bytes| AdoptIntent::decode(&bytes));
+                match decoded {
+                    Ok(_) => adopt_intent = Some(entry.path),
+                    Err(error) => quarantined.push(QuarantinedArtifacts {
+                        paths: vec![entry.path],
+                        reasons: vec![QuarantineReason::InvalidAdoptIntent(error.to_string())],
                     }),
                 }
                 continue;
@@ -286,8 +318,8 @@ impl ArtifactBundle {
             ArtifactKind::Chunks => &mut self.chunks,
             ArtifactKind::Producers => &mut self.producers,
             ArtifactKind::Temporary => unreachable!("temporary files are not bundled"),
-            ArtifactKind::TruncateIntent => {
-                unreachable!("the truncation marker is range-level, not part of a bundle")
+            ArtifactKind::TruncateIntent | ArtifactKind::AdoptIntent => {
+                unreachable!("intent markers are range-level, not part of a bundle")
             }
         };
         *destination = Some(path);
@@ -328,6 +360,9 @@ enum ArtifactKind {
     /// unclassified file is ignored, and ignoring the marker would report a
     /// half-truncated range as merely broken instead of finishable.
     TruncateIntent,
+    /// The range-level marker of a sealed-segment adoption in flight (#270),
+    /// registered for the same reason as the truncation marker.
+    AdoptIntent,
     Temporary,
 }
 
@@ -355,6 +390,8 @@ fn classify_artifact(path: &Path) -> Option<ArtifactClassification> {
             // interrupted: `.range.truncate-intent.<uuid>.tmp` is an
             // incomplete write, not an intent.
             ".truncate-intent.",
+            // And for an adoption marker's interrupted atomic write (#270).
+            ".adopt-intent.",
         ]
         .iter()
         .any(|marker| name.contains(marker))
@@ -371,6 +408,12 @@ fn classify_artifact(path: &Path) -> Option<ArtifactClassification> {
         return Some(ArtifactClassification {
             base: path.to_path_buf(),
             kind: ArtifactKind::TruncateIntent,
+        });
+    }
+    if name == ADOPT_INTENT_FILE {
+        return Some(ArtifactClassification {
+            base: path.to_path_buf(),
+            kind: ArtifactKind::AdoptIntent,
         });
     }
     if let Some(stem) = name.strip_suffix(".manifest.json") {

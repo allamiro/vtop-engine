@@ -337,3 +337,108 @@ terminationGracePeriodSeconds: 60
 extraEnv: []
 extraVolumes: []
 extraVolumeMounts: []
+
+# ---------------------------------------------------------------------------
+# OPTIONAL second workload: the archive PIPELINE (`vtopctl run`) — the same
+# engine docker-compose.yml runs as its `vtop-engine` service. It tails file
+# and syslog-spool directories and Kafka topics, seals verified batches, and
+# uploads them to S3-compatible storage. Off by default; nothing below
+# renders unless enabled.
+#
+# The compose lab's Kafka, MinIO, and UI containers are NOT vendored here:
+# the pipeline expects OPERATOR-PROVIDED Kafka bootstrap servers and an S3
+# endpoint, named inside pipeline.config. Unlike the node workload, the
+# published ghcr.io/allamiro/vtop-engine image DOES ship `vtopctl` (its
+# entrypoint execs it — docker/entrypoint.sh), so the default image runs
+# this workload as-is.
+# ---------------------------------------------------------------------------
+pipeline:
+  enabled: false
+  # The engine config, passed through VERBATIM into a ConfigMap the
+  # container reads via VTOP_CONFIG. examples/config.yaml in the repository
+  # is the reference shape; the schema is strict (deny_unknown_fields), so
+  # an unknown key is a startup failure, not a warning. Secrets NEVER belong
+  # in this block (the config format itself refuses inline credentials) —
+  # S3 credentials come exclusively from pipeline.s3.existingSecret below.
+  # The chart mounts the four data directories at the same paths the compose
+  # lab uses (/data/input, /data/spool, /data/work, /data/state), which is
+  # what examples/config.yaml points at. REQUIRED when enabled.
+  config: {}
+  # RUST_LOG for the engine process.
+  rustLog: info
+  # VTOP_LOG_FORMAT. `json` because the log-derived Grafana panels parse
+  # structured fields (level, records, *_ms, byte counts) — ANSI-coloured
+  # pretty text breaks them. Set "" to keep the pretty format.
+  logFormat: json
+  # VTOP_METRICS_ADDR. Opt-in like the binary itself: empty means nothing
+  # listens. Set e.g. "0.0.0.0:9090" to expose /metrics, /healthz, /readyz
+  # (the same vtop-observe surface the nodes serve); the chart then wires
+  # the standard scrape annotations (under metrics.prometheusAnnotations)
+  # and probes against it.
+  metricsAddr: ""
+  s3:
+    # Name of an EXISTING Secret with AWS_ACCESS_KEY_ID and
+    # AWS_SECRET_ACCESS_KEY keys. REQUIRED whenever pipeline.config names an
+    # S3 upload backend: the compose lab defaults these to
+    # minioadmin/minioadmin, which is exactly the issue-#81 pattern (default
+    # credentials shipped inside a deployable artifact) this chart refuses
+    # to repeat — so there is no default and the render fails without yours.
+    existingSecret: ""
+    # AWS_REGION / VTOP_S3_ENDPOINT_URL / VTOP_S3_FORCE_PATH_STYLE /
+    # VTOP_S3_VERIFY_TLS as plain values; "" omits the variable. The two
+    # booleans are strings because they are environment values.
+    region: ""
+    endpointUrl: ""
+    forcePathStyle: ""
+    verifyTls: ""
+  # Where input files come from is LEFT TO THE OPERATOR: name a PVC your
+  # collector writes into, or a hostPath where node-local agents drop files
+  # (hostPath pins you to whatever node holds the data — prefer a PVC). With
+  # neither, an emptyDir is mounted and the file source simply finds
+  # nothing, which is honest for a Kafka-only pipeline.
+  input:
+    existingClaim: ""
+    hostPath: {}
+  # The remaining three directories the compose service mounts. Each either
+  # binds an existing PVC, creates one (create: true), or falls back to a
+  # pod-lifetime emptyDir. `state` holds the offset/ledger DB — losing it
+  # re-ingests and re-uploads everything the sources still hold — and `work`
+  # holds staged batches, so both default to real volumes. `spool` defaults
+  # to emptyDir because a spool only matters when something feeds it (mount
+  # your collector's volume via existingClaim when it does).
+  persistence:
+    spool:
+      create: false
+      existingClaim: ""
+      size: 10Gi
+      storageClass: ""
+      accessModes: [ReadWriteOnce]
+    work:
+      create: true
+      existingClaim: ""
+      size: 20Gi
+      storageClass: ""
+      accessModes: [ReadWriteOnce]
+    state:
+      create: true
+      existingClaim: ""
+      size: 5Gi
+      storageClass: ""
+      accessModes: [ReadWriteOnce]
+  # Modest defaults: compression is the engine's main CPU cost; raise for
+  # heavy Kafka backlogs.
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  extraEnv: []
+  extraVolumes: []
+  extraVolumeMounts: []

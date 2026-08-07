@@ -1,0 +1,30 @@
+{{- if .Values.pipeline.enabled }}
+{{- $root := . }}
+{{- range $dir := list "spool" "work" "state" }}
+{{- $spec := index $root.Values.pipeline.persistence $dir }}
+{{- if and $spec.create (not $spec.existingClaim) }}
+---
+# Standalone PVC (not a volumeClaimTemplate): the pipeline is a Deployment,
+# and its data must outlive any one pod — `state` is the offset/ledger DB
+# whose loss re-ingests everything the sources still hold. Deleting the
+# release keeps the claim, which is the right default for data that renders
+# uploads exactly-once.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "vtop.pipeline.fullname" $root }}-{{ $dir }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "vtop.pipeline.labels" $root | nindent 4 }}
+spec:
+  accessModes:
+    {{- toYaml $spec.accessModes | nindent 4 }}
+  {{- with $spec.storageClass }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ $spec.size }}
+{{- end }}
+{{- end }}
+{{- end }}

@@ -17,6 +17,8 @@ one fate. Default: 3 replicas — the smallest quorum that survives one failure.
 | PodDisruptionBudget | `maxUnavailable: 1` — quorum protection for voluntary disruption. |
 | NetworkPolicy (optional) | Default-deny with the topology's exact allowances. |
 | ServiceMonitor (optional) | Requires the Prometheus Operator CRDs; render fails clearly without them. |
+| Deployment `<fullname>-pipeline` (optional) | The archive pipeline (`vtopctl run`) — see below; off by default. |
+| ConfigMap / PVCs `<fullname>-pipeline*` (optional) | Its config and spool/work/state volumes. |
 
 ## How a pod knows who it is (ordinal → identity)
 
@@ -140,6 +142,42 @@ Then bootstrap the Raft group once (see the post-install NOTES):
 `vtopctl meta init --members 1,2,3 --config admin.yaml` against the
 port-forwarded admin Service.
 
+## Optional: the archive pipeline (`vtopctl run`)
+
+`pipeline.enabled=true` adds a second, independent workload: the archive
+engine the repository's `docker-compose.yml` runs as its `vtop-engine`
+service — file/syslog-spool/Kafka sources → verified batches →
+S3-compatible storage — as a single-replica Deployment (the state store is a
+pod-local SQLite ledger and the file sources are directory globs, so a
+second replica would double-ingest; the chart does not offer that).
+
+The compose lab's Kafka, MinIO, and UI containers are **not vendored**: the
+pipeline expects **operator-provided** Kafka bootstrap servers and an S3
+endpoint, named inside `pipeline.config` — a verbatim passthrough of the
+engine config (`examples/config.yaml` in the repository is the reference
+shape; the schema is strict, and the chart mounts `/data/input`,
+`/data/spool`, `/data/work`, `/data/state` exactly where that file points).
+
+S3 credentials come **only** from `pipeline.s3.existingSecret` — an existing
+Secret with `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` keys, required
+whenever the config names an S3 upload backend. The compose lab defaults to
+`minioadmin`/`minioadmin`; that is the issue #81 pattern (default
+credentials inside a deployable artifact), and the render refuses rather
+than repeat it:
+
+```
+helm template vtop helm/vtop ... --set pipeline.enabled=true
+# Error: ... S3 credentials are required and never defaulted: ...
+```
+
+Metrics are opt-in like the binary: set `pipeline.metricsAddr` (e.g.
+`0.0.0.0:9090`) and the chart exposes the port, adds the scrape
+annotations, and wires probes against the same `/metrics`/`/healthz`/
+`/readyz` surface the nodes serve. Where input files come from is left to
+the operator: `pipeline.input.existingClaim` (a PVC your collector writes
+into) or `pipeline.input.hostPath`; with neither, the file source reads an
+empty emptyDir.
+
 ## Values
 
 | Key | Default | Description |
@@ -199,6 +237,18 @@ port-forwarded admin Service.
 | `priorityClassName` | `""` | |
 | `terminationGracePeriodSeconds` | `60` | Clean-shutdown fsync budget. |
 | `extraEnv` / `extraVolumes` / `extraVolumeMounts` | `[]` | Escape hatches. |
+| `pipeline.enabled` | `false` | The optional `vtopctl run` archive pipeline (section above). |
+| `pipeline.config` | `{}` — **required when enabled** | Engine config, verbatim; `examples/config.yaml` is the reference shape. No secrets in it. |
+| `pipeline.rustLog` | `info` | `RUST_LOG`. |
+| `pipeline.logFormat` | `json` | `VTOP_LOG_FORMAT`; the log-derived Grafana panels parse JSON. `""` keeps pretty logs. |
+| `pipeline.metricsAddr` | `""` | `VTOP_METRICS_ADDR`; empty = no listener, no probes, no annotations. |
+| `pipeline.s3.existingSecret` | — **required with an S3 backend** | Secret with `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`. Never defaulted (#81). |
+| `pipeline.s3.region` / `endpointUrl` / `forcePathStyle` / `verifyTls` | `""` | Plain env values (`AWS_REGION`, `VTOP_S3_*`); `""` omits the variable. |
+| `pipeline.input.existingClaim` / `hostPath` | `""` / `{}` | Where input files come from — operator's choice; neither mounts an emptyDir. |
+| `pipeline.persistence.{spool,work,state}` | spool emptyDir; work/state PVCs | Each: `create`, `existingClaim`, `size`, `storageClass`, `accessModes`. `state` is the offset/ledger DB — keep it on a real volume. |
+| `pipeline.resources` | 250m/256Mi → 1/1Gi | |
+| `pipeline.podAnnotations` / `podLabels` / `nodeSelector` / `tolerations` / `affinity` | `{}`/`{}`/`{}`/`[]`/`{}` | |
+| `pipeline.extraEnv` / `extraVolumes` / `extraVolumeMounts` | `[]` | Escape hatches. |
 
 ## Observability
 

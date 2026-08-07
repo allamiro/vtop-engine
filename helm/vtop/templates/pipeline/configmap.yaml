@@ -1,0 +1,18 @@
+{{- if .Values.pipeline.enabled }}
+# The pipeline's engine config, passed through VERBATIM from
+# pipeline.config (examples/config.yaml in the repository is the reference
+# shape). Rendered whole at template time for the same reason as the node
+# configs: every byte is visible in `helm template` output and covered by
+# the Deployment's checksum/config annotation, so a config edit rolls the
+# pipeline instead of sitting unapplied.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "vtop.pipeline.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vtop.pipeline.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+{{ include "vtop.pipeline.config" . | indent 4 }}
+{{- end }}

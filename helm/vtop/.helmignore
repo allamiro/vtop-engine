@@ -1,4 +1,7 @@
 # Patterns to ignore when building packages.
+# ci/ holds render-matrix values for CI only — dummy identities that must
+# never ship inside the packaged chart where they could look like defaults.
+ci/
 .DS_Store
 .git/
 .gitignore

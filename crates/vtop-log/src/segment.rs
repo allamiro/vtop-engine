@@ -1364,6 +1364,29 @@ pub(crate) fn inspect_sealed_segment(env: &Env, path: &Path) -> VtopLogResult<Se
     })
 }
 
+/// The producer frontier at the END of a sealed segment: what it inherited,
+/// advanced by every record it holds. This is exactly the frontier a segment
+/// beginning at its `next_offset` must inherit — `roll_in` takes the same
+/// value from the live tail's in-memory state; this derives it from disk for
+/// a segment this process never appended to, which is what adoption of a
+/// TRANSFERRED prefix has (#270).
+pub(crate) fn sealed_end_frontier(
+    env: &Env,
+    path: &Path,
+) -> VtopLogResult<crate::producer_snapshot::ProducerSnapshot> {
+    let paths = SegmentPaths::from_segment(path)?;
+    let inherited = read_producer_snapshot(env, &paths)?;
+    let mut file = env
+        .storage
+        .open(path, OpenMode::Read)
+        .map_err(|source| io_error(path, source))?;
+    let inspection = inspect_sealed_file(env.storage.as_ref(), file.as_mut(), path, &inherited)?;
+    Ok(snapshot_of(
+        &inspection.scan.producer_states,
+        &inspection.scan.producer_epochs,
+    ))
+}
+
 fn inspect_active_file(
     storage: &dyn Storage,
     file: &mut dyn StorageFile,

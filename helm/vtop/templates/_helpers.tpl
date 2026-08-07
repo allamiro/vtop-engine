@@ -205,3 +205,71 @@ data:
 observability:
   listen: "0.0.0.0:{{ $v.ports.observability }}"
 {{- end }}
+
+{{/*
+Pipeline (`vtopctl run`) names and labels. The pipeline gets its OWN
+app.kubernetes.io/name — not just a component label — so nothing that selects
+the node pods (client Service, headless Service, PodDisruptionBudget,
+NetworkPolicy) can ever match a pipeline pod: those selectors are
+name+instance only, and a shared name would round-robin admin traffic into a
+workload that serves none of those planes.
+*/}}
+{{- define "vtop.pipeline.fullname" -}}
+{{- printf "%s-pipeline" (include "vtop.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end }}
+
+{{- define "vtop.pipeline.selectorLabels" -}}
+app.kubernetes.io/name: {{ printf "%s-pipeline" (include "vtop.name" .) | trunc 63 | trimSuffix "-" }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
+
+{{- define "vtop.pipeline.labels" -}}
+helm.sh/chart: {{ include "vtop.chart" . }}
+{{ include "vtop.pipeline.selectorLabels" . }}
+{{- if .Chart.AppVersion }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+{{- end }}
+app.kubernetes.io/component: pipeline
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- end }}
+
+{{/*
+The pipeline's engine config, passed through VERBATIM. Required non-empty:
+an enabled pipeline with no config would start an engine with no sources and
+no upload target, which is a deployment mistake the render should catch, not
+the pod logs.
+*/}}
+{{- define "vtop.pipeline.config" -}}
+{{- if not .Values.pipeline.config -}}
+{{- fail "\n\npipeline.config is required when pipeline.enabled: the `vtopctl run` engine config, passed through verbatim (examples/config.yaml in the repository is the reference shape; the schema is strict). Secrets never belong in it — S3 credentials come from pipeline.s3.existingSecret." -}}
+{{- end -}}
+{{- toYaml .Values.pipeline.config -}}
+{{- end }}
+
+{{/*
+The upload backend named by pipeline.config (empty when the config has no
+upload block). Read here once so the credential requirement below and the
+env wiring in the Deployment cannot disagree about what was configured.
+*/}}
+{{- define "vtop.pipeline.s3Backend" -}}
+{{- dig "upload" "backend" "" (.Values.pipeline.config | default dict) -}}
+{{- end }}
+
+{{/*
+S3 credential Secret. `required` (not a default) for the same reason as the
+TLS Secrets above: the compose lab this pipeline comes from defaults to
+minioadmin/minioadmin, which is exactly the issue-#81 pattern — default
+credentials shipped inside a deployable artifact — that this chart exists to
+refuse.
+*/}}
+{{- define "vtop.pipeline.s3SecretName" -}}
+{{- required (printf "\n\nS3 credentials are required and never defaulted: pipeline.config names an S3 upload backend (upload.backend: %s), so set pipeline.s3.existingSecret to an existing Secret carrying AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY. The compose lab's minioadmin defaults are the issue-#81 pattern this chart refuses to repeat. See helm/vtop/README.md." (include "vtop.pipeline.s3Backend" .)) .Values.pipeline.s3.existingSecret -}}
+{{- end }}
+
+{{/*
+Port component of pipeline.metricsAddr, for the container port, the scrape
+annotation, and the probes — parsed once so they cannot drift.
+*/}}
+{{- define "vtop.pipeline.metricsPort" -}}
+{{- splitList ":" .Values.pipeline.metricsAddr | last -}}
+{{- end }}
