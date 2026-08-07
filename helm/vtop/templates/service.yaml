@@ -1,0 +1,31 @@
+# Client-facing Service. Deliberately carries ONLY the admin and
+# observability planes: any meta node's admin endpoint can serve vtopctl, and
+# metrics scraping is target-agnostic — but the native produce/fetch plane is
+# per-pod (each pod is an independent standalone range), and a round-robin
+# Service there would hand clients a random range. Use the headless Service
+# for per-pod native access.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "vtop.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vtop.labels" . | nindent 4 }}
+    # Distinguishes this Service from the headless one so the ServiceMonitor
+    # selects exactly one and pods are not scraped twice.
+    vtop.allamiro.io/service: client
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "vtop.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: meta-admin
+      port: {{ .Values.ports.metaAdmin }}
+      targetPort: meta-admin
+    - name: obs
+      port: {{ .Values.ports.observability }}
+      targetPort: obs

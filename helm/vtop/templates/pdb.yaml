@@ -1,0 +1,18 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+# Quorum protection against VOLUNTARY disruption (drains, upgrades): with
+# maxUnavailable 1, a 3-voter metadata group always keeps its majority. This
+# budget cannot protect against involuntary failures — that is what the
+# anti-affinity/topology-spread values are for.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "vtop.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vtop.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: {{ int .Values.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "vtop.selectorLabels" . | nindent 6 }}
+{{- end }}

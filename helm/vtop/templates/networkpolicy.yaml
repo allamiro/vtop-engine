@@ -1,0 +1,69 @@
+{{- if .Values.networkPolicy.enabled }}
+# Default-deny for vtop pods, then allow exactly what the topology needs.
+# This is the primary in-cluster control for the observability endpoint,
+# which is unauthenticated by design (#78) — mTLS protects every other plane
+# regardless of network policy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "vtop.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vtop.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "vtop.selectorLabels" . | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    # Cluster-internal traffic between vtop pods: Raft peer RPC, replica
+    # plane, and the local planes pods dial on each other.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "vtop.selectorLabels" . | nindent 14 }}
+      ports:
+        - port: {{ .Values.ports.metaPeer }}
+        - port: {{ .Values.ports.metaAdmin }}
+        - port: {{ .Values.ports.replica }}
+        - port: {{ .Values.ports.native }}
+        - port: {{ .Values.ports.observability }}
+    # Metrics scraping. An EMPTY networkPolicy.metricsFrom allows all sources
+    # on this one port (a scraper we cannot name is the common case); narrow
+    # it to your monitoring namespace when you can name it.
+    - {{- if .Values.networkPolicy.metricsFrom }}
+      from:
+        {{- toYaml .Values.networkPolicy.metricsFrom | nindent 8 }}
+      {{- end }}
+      ports:
+        - port: {{ .Values.ports.observability }}
+    {{- with .Values.networkPolicy.clientFrom }}
+    # Operator/client access: vtopctl against the admin plane and produce/
+    # fetch clients against the native plane. Both planes still demand mTLS.
+    - from:
+        {{- toYaml . | nindent 8 }}
+      ports:
+        - port: {{ $.Values.ports.metaAdmin }}
+        - port: {{ $.Values.ports.native }}
+    {{- end }}
+  egress:
+    # Peers dial each other on the same well-known ports.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "vtop.selectorLabels" . | nindent 14 }}
+      ports:
+        - port: {{ .Values.ports.metaPeer }}
+        - port: {{ .Values.ports.metaAdmin }}
+        - port: {{ .Values.ports.replica }}
+        - port: {{ .Values.ports.native }}
+    # DNS: the peer list is FQDNs, so name resolution is a hard dependency.
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    {{- with .Values.networkPolicy.extraEgress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}
