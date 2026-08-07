@@ -15,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 # MSRV: the floor is now set by sqlx 0.9, which declares rust-version 1.94.0
 # (it raised the previous 1.91.1 floor that the aws-sdk crates set). Verified by
@@ -95,15 +95,15 @@ rcgen = "0.14"
 # path locally, and the version is what a published crate would resolve. Without
 # it these are wildcard dependencies, which crates.io rejects outright - so the
 # workspace could not actually be published as declared.
-vtop-core = { path = "crates/vtop-core", version = "0.2.0" }
-vtop-log = { path = "crates/vtop-log", version = "0.2.0" }
-vtop-protocol = { path = "crates/vtop-protocol", version = "0.2.0" }
-vtop-broker = { path = "crates/vtop-broker", version = "0.2.0" }
-vtop-meta = { path = "crates/vtop-meta", version = "0.2.0" }
-vtop-observe = { path = "crates/vtop-observe", version = "0.2.0" }
-vtop-adapters = { path = "crates/vtop-adapters", version = "0.2.0", default-features = false }
-vtop-upload = { path = "crates/vtop-upload", version = "0.2.0" }
-vtop-state = { path = "crates/vtop-state", version = "0.2.0" }
+vtop-core = { path = "crates/vtop-core", version = "0.2.1" }
+vtop-log = { path = "crates/vtop-log", version = "0.2.1" }
+vtop-protocol = { path = "crates/vtop-protocol", version = "0.2.1" }
+vtop-broker = { path = "crates/vtop-broker", version = "0.2.1" }
+vtop-meta = { path = "crates/vtop-meta", version = "0.2.1" }
+vtop-observe = { path = "crates/vtop-observe", version = "0.2.1" }
+vtop-adapters = { path = "crates/vtop-adapters", version = "0.2.1", default-features = false }
+vtop-upload = { path = "crates/vtop-upload", version = "0.2.1" }
+vtop-state = { path = "crates/vtop-state", version = "0.2.1" }
 
 [profile.release]
 opt-level = 3
