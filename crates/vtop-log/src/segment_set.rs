@@ -281,35 +281,38 @@ impl SegmentSet {
         Ok(())
     }
 
-    /// Discard every record at or above `offset`, across as many segments as
-    /// that spans.
+    /// Discard every record at or above `offset`.
     ///
     /// The repair for a replica that diverged from its range's current
-    /// leadership (#240). A single segment could always do this; a range that
-    /// rolls needs it to reach across segments, because the divergence point
-    /// need not lie in the tail.
+    /// leadership (#240).
     ///
-    /// # What it handles, and what it refuses
+    /// # Only cuts inside the tail, deliberately
     ///
-    /// Sealed segments lying entirely at or above `offset` are deleted: every
-    /// record they hold is above the cut, so nothing of them survives.
+    /// A cut that would delete or replace a sealed segment is REFUSED. It is
+    /// not a missing feature so much as a missing crash-recovery story, and the
+    /// three ways it goes wrong are worth naming because each one produces a
+    /// range that will not reopen:
     ///
-    /// A cut inside the ACTIVE segment then truncates it in place, which is the
-    /// existing single-segment path.
+    /// * Deleting the tail and creating its replacement cannot be ordered
+    ///   safely without a durable record of the intent. Replacement-first
+    ///   leaves two active segments, which discovery quarantines; delete-first
+    ///   leaves none, which nothing can distinguish from a range whose tail was
+    ///   lost. Recovery has to be able to FINISH an interrupted truncation, and
+    ///   that needs a marker this format does not yet have.
+    /// * A partial failure part-way through deleting segments leaves this value
+    ///   describing a range that no longer exists on disk, while the caller has
+    ///   only been handed an error.
+    /// * The replacement tail would begin with no inherited producer frontier,
+    ///   so the next append from a producer already in the retained prefix is
+    ///   rejected as `FirstSequence` — the same failure the `.producers`
+    ///   sidecar exists to prevent, reintroduced somewhere new.
     ///
-    /// A cut inside a SEALED segment is refused. Honouring it means un-sealing:
-    /// renaming `.segment` back to `.active`, removing the manifest that
-    /// vouches for its contents, and truncating what was until that moment an
-    /// immutable, verifiable artifact. That is a real operation and it belongs
-    /// here eventually, but it deserves its own crash-ordering argument rather
-    /// than being folded in as a special case — a half-unsealed segment is a
-    /// file whose manifest disagrees with its bytes, which is exactly what
-    /// discovery quarantines.
-    ///
-    /// The refusal is not currently reachable in the running system: nothing
-    /// rolls yet, so every range is one active segment and every cut lands in
-    /// it. It becomes reachable the moment rolling is switched on, which is why
-    /// it is an explicit error rather than an omission.
+    /// None of this is reachable in the running system today: nothing rolls,
+    /// so every range is one active segment and every cut lands inside it. That
+    /// is exactly why it refuses rather than doing something partial — the
+    /// refusal is unreachable now and correct later, whereas a half-implemented
+    /// cross-segment truncation would be silently wrong the moment rolling is
+    /// switched on.
     pub fn truncate_to(&mut self, offset: u64) -> VtopLogResult<crate::TruncateOutcome> {
         if offset > self.next_offset() {
             return Err(LogError::TruncateBeyondTail {
@@ -317,122 +320,16 @@ impl SegmentSet {
                 next_offset: self.next_offset(),
             });
         }
-        if offset < self.base_offset() {
+        if offset < self.tail().base_offset() {
             return Err(LogError::InvalidConfig(format!(
-                "cannot truncate to offset {offset}: this range begins at {}",
-                self.base_offset()
+                "cannot truncate to offset {offset}: it is below the active segment's start \
+                 {}, and truncating across sealed segments needs a durable record of the \
+                 intent so an interrupted repair can be finished rather than leaving a range \
+                 that cannot reopen",
+                self.tail().base_offset()
             )));
         }
-
-        // A cut inside a sealed segment needs un-sealing; see above.
-        if let Some(reader) = self
-            .sealed
-            .iter()
-            .find(|reader| offset > reader.base_offset() && offset < reader.next_offset())
-        {
-            return Err(LogError::InvalidConfig(format!(
-                "cannot truncate to offset {offset}: it falls inside sealed segment                  {}..{}, and un-sealing is not implemented",
-                reader.base_offset(),
-                reader.next_offset()
-            )));
-        }
-
-        // Drop whole sealed segments at or above the cut, newest first, so an
-        // interruption always leaves a contiguous prefix rather than a hole.
-        let mut records_removed = 0_u64;
-        let mut bytes_removed = 0_u64;
-        while let Some(reader) = self.sealed.last() {
-            if reader.base_offset() < offset {
-                break;
-            }
-            let removed = reader.next_offset() - reader.base_offset();
-            let paths = reader.paths()?;
-            let reader = self.sealed.pop().expect("checked by the loop condition");
-            drop(reader);
-            for path in paths {
-                if self
-                    .env
-                    .storage
-                    .exists(&path)
-                    .map_err(|source| LogError::Io {
-                        path: path.clone(),
-                        source,
-                    })?
-                {
-                    self.env
-                        .storage
-                        .remove_file(&path)
-                        .map_err(|source| LogError::Io {
-                            path: path.clone(),
-                            source,
-                        })?;
-                }
-            }
-            records_removed += removed;
-        }
-
-        // The tail. If the cut is at or below where it begins, everything it
-        // holds is above the cut and it is replaced by an empty segment there.
-        let outcome = if offset < self.tail().base_offset() {
-            let removed = self.tail().next_offset() - self.tail().base_offset();
-            records_removed += removed;
-            self.replace_tail_at(offset)?;
-            crate::TruncateOutcome {
-                records_removed,
-                bytes_removed,
-                next_offset: offset,
-            }
-        } else {
-            let outcome = self.tail_mut().truncate_to(offset)?;
-            records_removed += outcome.records_removed;
-            bytes_removed += outcome.bytes_removed;
-            crate::TruncateOutcome {
-                records_removed,
-                bytes_removed,
-                next_offset: outcome.next_offset,
-            }
-        };
-        Ok(outcome)
-    }
-
-    /// Discard the tail entirely and open an empty one beginning at `offset`.
-    fn replace_tail_at(&mut self, offset: u64) -> VtopLogResult<()> {
-        let old = self
-            .active
-            .take()
-            .expect("the tail is absent only during a roll or a truncation");
-        let paths = old.paths()?;
-        let descriptor = old.v1_descriptor_view();
-        let config = old.config();
-        drop(old);
-        for path in paths {
-            if self
-                .env
-                .storage
-                .exists(&path)
-                .map_err(|source| LogError::Io {
-                    path: path.clone(),
-                    source,
-                })?
-            {
-                self.env
-                    .storage
-                    .remove_file(&path)
-                    .map_err(|source| LogError::Io {
-                        path: path.clone(),
-                        source,
-                    })?;
-            }
-        }
-        let mut descriptor = descriptor;
-        descriptor.base_offset = offset;
-        let path = self
-            .directory
-            .join(format!("{}.active", segment_stem(offset)));
-        self.active = Some(ActiveSegment::create_in(
-            &self.env, &path, descriptor, config,
-        )?);
-        Ok(())
+        self.tail_mut().truncate_to(offset)
     }
 
     /// Read from `start_offset`, crossing segment boundaries as needed.
@@ -779,8 +676,7 @@ mod tests {
             .unwrap();
         }
         let sealed_before = set.sealed().len();
-        let tail_base = set.active().base_offset();
-        let cut = tail_base + 1;
+        let cut = set.active().base_offset() + 1;
 
         let outcome = set.truncate_to(cut).unwrap();
         assert_eq!(outcome.next_offset, cut);
@@ -790,37 +686,9 @@ mod tests {
             sealed_before,
             "a cut inside the tail must not disturb sealed segments"
         );
-    }
 
-    /// A cut at a segment boundary drops every sealed segment above it, and all
-    /// of each one's files — a leftover sidecar is an orphan, which discovery
-    /// quarantines, so a partial delete would turn a repair into a range that
-    /// refuses to open.
-    #[test]
-    fn a_cut_at_a_boundary_drops_whole_segments_and_all_their_files() {
-        let directory = tempdir().unwrap();
-        let producer = Uuid::from_u128(31);
-        let mut set =
-            SegmentSet::create_in(&Env::real(), directory.path(), descriptor(), config()).unwrap();
-        for sequence in 0..40 {
-            set.append_group(
-                &[record(producer, sequence)],
-                Durability::Fsync,
-                Uuid::from_u128(9000 + sequence as u128),
-            )
-            .unwrap();
-        }
-        assert!(set.sealed().len() >= 2, "need several sealed segments");
-
-        // Cut exactly where the second sealed segment begins.
-        let cut = set.sealed()[1].base_offset();
-        let outcome = set.truncate_to(cut).unwrap();
-
-        assert_eq!(outcome.next_offset, cut);
-        assert_eq!(set.next_offset(), cut);
-        assert_eq!(set.sealed().len(), 1, "everything above the cut is gone");
-
-        // The range still opens: no orphaned sidecars were left behind.
+        // And the range reopens, which is what proves nothing was left
+        // inconsistent on disk.
         drop(set);
         let reopened = SegmentSet::open_in(&Env::real(), directory.path())
             .unwrap()
@@ -828,12 +696,14 @@ mod tests {
         assert_eq!(reopened.next_offset(), cut);
     }
 
-    /// A cut inside a SEALED segment is refused rather than half-done.
-    /// Honouring it means un-sealing — renaming the file back and removing the
-    /// manifest that vouches for its contents — and a half-unsealed segment is
-    /// one whose manifest disagrees with its bytes, which discovery quarantines.
+    /// A cut below the tail is refused rather than half-done.
+    ///
+    /// Honouring it means deleting and replacing segments, and that cannot be
+    /// ordered crash-safely without a durable record of the intent:
+    /// replacement-first leaves two active segments, delete-first leaves none,
+    /// and either way the range will not reopen.
     #[test]
-    fn a_cut_inside_a_sealed_segment_is_refused() {
+    fn a_cut_below_the_tail_is_refused() {
         let directory = tempdir().unwrap();
         let producer = Uuid::from_u128(37);
         let mut set =
@@ -846,12 +716,11 @@ mod tests {
             )
             .unwrap();
         }
-        let first = &set.sealed()[0];
-        assert!(first.next_offset() - first.base_offset() > 1);
-        let inside = first.base_offset() + 1;
+        assert!(!set.sealed().is_empty(), "need at least one sealed segment");
+        let below = set.sealed()[0].base_offset();
 
         assert!(matches!(
-            set.truncate_to(inside),
+            set.truncate_to(below),
             Err(LogError::InvalidConfig(_))
         ));
         assert_eq!(
