@@ -125,10 +125,16 @@ meta:
 # ---------------------------------------------------------------------------
 # Data role (`data:` block of the rendered config).
 #
-# Each pod runs an independent STANDALONE range: the same shape the upstream
-# co-located harness runs (scripts/live-chaos/lib.sh), because replicated
-# ranges under co-location wait on follower-side epoch propagation upstream.
-# The chart does not offer a leader/follower topology it cannot back.
+# `topology` below selects the shape. It defaults to STANDALONE — every pod an
+# independent range, the same shape the upstream co-located harness runs
+# (scripts/live-chaos/lib.sh) — and `replicated` gives one range across the
+# pods with a leader and followers.
+#
+# This block used to say the chart "does not offer a leader/follower topology
+# it cannot back", because replicated ranges were waiting on follower-side
+# epoch propagation upstream. That landed (#239), along with the rest of the
+# recovery arc (#240). What is still not backed is automatic FAILOVER, which
+# is a narrower claim and is documented on `topology` itself.
 # ---------------------------------------------------------------------------
 data:
   # Static fencing epoch each node starts at. With `lease.enabled` this is
