@@ -281,6 +281,57 @@ impl SegmentSet {
         Ok(())
     }
 
+    /// Discard every record at or above `offset`.
+    ///
+    /// The repair for a replica that diverged from its range's current
+    /// leadership (#240).
+    ///
+    /// # Only cuts inside the tail, deliberately
+    ///
+    /// A cut that would delete or replace a sealed segment is REFUSED. It is
+    /// not a missing feature so much as a missing crash-recovery story, and the
+    /// three ways it goes wrong are worth naming because each one produces a
+    /// range that will not reopen:
+    ///
+    /// * Deleting the tail and creating its replacement cannot be ordered
+    ///   safely without a durable record of the intent. Replacement-first
+    ///   leaves two active segments, which discovery quarantines; delete-first
+    ///   leaves none, which nothing can distinguish from a range whose tail was
+    ///   lost. Recovery has to be able to FINISH an interrupted truncation, and
+    ///   that needs a marker this format does not yet have.
+    /// * A partial failure part-way through deleting segments leaves this value
+    ///   describing a range that no longer exists on disk, while the caller has
+    ///   only been handed an error.
+    /// * The replacement tail would begin with no inherited producer frontier,
+    ///   so the next append from a producer already in the retained prefix is
+    ///   rejected as `FirstSequence` — the same failure the `.producers`
+    ///   sidecar exists to prevent, reintroduced somewhere new.
+    ///
+    /// None of this is reachable in the running system today: nothing rolls,
+    /// so every range is one active segment and every cut lands inside it. That
+    /// is exactly why it refuses rather than doing something partial — the
+    /// refusal is unreachable now and correct later, whereas a half-implemented
+    /// cross-segment truncation would be silently wrong the moment rolling is
+    /// switched on.
+    pub fn truncate_to(&mut self, offset: u64) -> VtopLogResult<crate::TruncateOutcome> {
+        if offset > self.next_offset() {
+            return Err(LogError::TruncateBeyondTail {
+                requested: offset,
+                next_offset: self.next_offset(),
+            });
+        }
+        if offset < self.tail().base_offset() {
+            return Err(LogError::InvalidConfig(format!(
+                "cannot truncate to offset {offset}: it is below the active segment's start \
+                 {}, and truncating across sealed segments needs a durable record of the \
+                 intent so an interrupted repair can be finished rather than leaving a range \
+                 that cannot reopen",
+                self.tail().base_offset()
+            )));
+        }
+        self.tail_mut().truncate_to(offset)
+    }
+
     /// Read from `start_offset`, crossing segment boundaries as needed.
     ///
     /// Visibility is clamped at `high_watermark` exactly as a single segment
@@ -607,5 +658,94 @@ mod tests {
             "no record at or above the watermark may be returned"
         );
         assert_eq!(batch.next_offset, watermark);
+    }
+
+    /// A cut inside the tail is the single-segment case, unchanged.
+    #[test]
+    fn a_cut_inside_the_tail_truncates_only_the_tail() {
+        let directory = tempdir().unwrap();
+        let producer = Uuid::from_u128(29);
+        let mut set =
+            SegmentSet::create_in(&Env::real(), directory.path(), descriptor(), config()).unwrap();
+        for sequence in 0..40 {
+            set.append_group(
+                &[record(producer, sequence)],
+                Durability::Fsync,
+                Uuid::from_u128(8000 + sequence as u128),
+            )
+            .unwrap();
+        }
+        let sealed_before = set.sealed().len();
+        let cut = set.active().base_offset() + 1;
+
+        let outcome = set.truncate_to(cut).unwrap();
+        assert_eq!(outcome.next_offset, cut);
+        assert_eq!(set.next_offset(), cut);
+        assert_eq!(
+            set.sealed().len(),
+            sealed_before,
+            "a cut inside the tail must not disturb sealed segments"
+        );
+
+        // And the range reopens, which is what proves nothing was left
+        // inconsistent on disk.
+        drop(set);
+        let reopened = SegmentSet::open_in(&Env::real(), directory.path())
+            .unwrap()
+            .expect("the truncated range must still open");
+        assert_eq!(reopened.next_offset(), cut);
+    }
+
+    /// A cut below the tail is refused rather than half-done.
+    ///
+    /// Honouring it means deleting and replacing segments, and that cannot be
+    /// ordered crash-safely without a durable record of the intent:
+    /// replacement-first leaves two active segments, delete-first leaves none,
+    /// and either way the range will not reopen.
+    #[test]
+    fn a_cut_below_the_tail_is_refused() {
+        let directory = tempdir().unwrap();
+        let producer = Uuid::from_u128(37);
+        let mut set =
+            SegmentSet::create_in(&Env::real(), directory.path(), descriptor(), config()).unwrap();
+        for sequence in 0..40 {
+            set.append_group(
+                &[record(producer, sequence)],
+                Durability::Fsync,
+                Uuid::from_u128(10_000 + sequence as u128),
+            )
+            .unwrap();
+        }
+        assert!(!set.sealed().is_empty(), "need at least one sealed segment");
+        let below = set.sealed()[0].base_offset();
+
+        assert!(matches!(
+            set.truncate_to(below),
+            Err(LogError::InvalidConfig(_))
+        ));
+        assert_eq!(
+            set.next_offset(),
+            40,
+            "a refused truncation must leave the range untouched"
+        );
+    }
+
+    /// Truncation removes records; it can never invent them.
+    #[test]
+    fn truncating_a_range_beyond_its_tail_is_refused() {
+        let directory = tempdir().unwrap();
+        let mut set =
+            SegmentSet::create_in(&Env::real(), directory.path(), descriptor(), config()).unwrap();
+        set.append_group(
+            &[record(Uuid::from_u128(41), 0)],
+            Durability::Fsync,
+            Uuid::from_u128(11_000),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            set.truncate_to(99),
+            Err(LogError::TruncateBeyondTail { requested: 99, .. })
+        ));
     }
 }

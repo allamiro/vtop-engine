@@ -501,6 +501,26 @@ impl ActiveSegment {
         self.header.format_version()
     }
 
+    /// Every file this segment owns; see [`SegmentReader::paths`].
+    pub fn paths(&self) -> VtopLogResult<Vec<PathBuf>> {
+        let paths = SegmentPaths::from_active(&self.path)?;
+        Ok(vec![
+            paths.segment,
+            paths.index,
+            paths.manifest,
+            paths.commit,
+            paths.chunks,
+            paths.producers,
+            self.path.clone(),
+        ])
+    }
+
+    /// The v1-shaped identity of this segment; a v2 descriptor projects onto
+    /// its common prefix.
+    pub fn v1_descriptor_view(&self) -> SegmentDescriptor {
+        self.header.v1_descriptor_view()
+    }
+
     /// First offset this segment holds.
     pub fn base_offset(&self) -> u64 {
         self.header.base_offset()
@@ -1124,6 +1144,23 @@ impl SegmentReader {
 
     pub fn format_version(&self) -> u16 {
         self.header.format_version()
+    }
+
+    /// Every file this sealed segment owns.
+    ///
+    /// A caller removing a segment must remove all of it: a leftover sidecar is
+    /// an orphan, which discovery quarantines — so a partial delete turns a
+    /// tidy-up into a range that refuses to open.
+    pub fn paths(&self) -> VtopLogResult<Vec<PathBuf>> {
+        let paths = SegmentPaths::from_segment(&self.path)?;
+        Ok(vec![
+            paths.segment,
+            paths.index,
+            paths.manifest,
+            paths.commit,
+            paths.chunks,
+            paths.producers,
+        ])
     }
 
     /// First offset this sealed segment holds.
