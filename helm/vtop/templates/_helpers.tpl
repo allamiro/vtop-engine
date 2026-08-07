@@ -174,10 +174,36 @@ meta:
     operator_common_names: {{ toJson $v.meta.adminAuthorization.operatorCommonNames }}
 {{- end }}
 data:
-  # Standalone: each pod serves an independent range, the shape the upstream
-  # co-located harness runs. Replicated ranges under co-location wait on
-  # follower-side epoch propagation upstream.
+  {{- /* TOPOLOGY. The binary has always supported leader/follower/standalone,
+         and the live-chaos harness configures all three; only this chart used
+         to hardcode one. It no longer does — `data.topology` selects the shape.
+
+         standalone (default): every pod serves an INDEPENDENT range. Three
+         replicas are three separate logs, which is why quorum durability is
+         refused and why a pod nobody produced to stays empty.
+
+         replicated: ONE range across the pods. `data.leaderOrdinal` leads and
+         names the others as followers; everyone else follows. This is the only
+         shape that exercises replication, fencing and promotion — see the
+         failover caveat in values.yaml, which is a real limitation and not a
+         detail. */ -}}
+  {{- if eq $v.data.topology "replicated" }}
+  {{- if eq (int $i) (int $v.data.leaderOrdinal) }}
+  role: leader
+  followers:
+    {{- range $ordinal := until (int $root.Values.replicaCount) }}
+    {{- if ne $ordinal (int $v.data.leaderOrdinal) }}
+    - node_uuid: {{ index $v.cluster.nodeUuids $ordinal }}
+      addr: "{{ include "vtop.peerServerName" (dict "root" $root "ordinal" $ordinal) }}:{{ $v.ports.replica }}"
+      server_name: "{{ include "vtop.peerServerName" (dict "root" $root "ordinal" $ordinal) }}"
+    {{- end }}
+    {{- end }}
+  {{- else }}
+  role: follower
+  {{- end }}
+  {{- else }}
   role: standalone
+  {{- end }}
   # Must equal the CN of node-{{ $i }}.pem in the data-plane Secret.
   node_uuid: {{ $nodeUuid }}
   cluster_id: {{ $clusterId }}
