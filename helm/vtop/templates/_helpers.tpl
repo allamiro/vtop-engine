@@ -128,6 +128,15 @@ so this template never emits them. Expects (dict "root" $ "ordinal" <int>).
 {{- $clusterId := required "\n\ncluster.id is required: the cluster UUID shared by every node. The chart does not default identities — they must match the certificates you minted." $v.cluster.id -}}
 {{- $nodeUuid := "" -}}
 {{- if gt (len $v.cluster.nodeUuids) $i -}}
+{{- /* Distinct per ordinal. Two pods sharing a broker UUID share an IDENTITY:
+       with data.lease.enabled they present the same one to the metadata plane
+       and race each other for the same range lease, so the StatefulSet is not
+       a cluster of replicas but two claimants wearing one name. The
+       certificate CN convention makes it worse — one certificate would be
+       valid for both. */ -}}
+{{- if ne (len (uniq $v.cluster.nodeUuids)) (len $v.cluster.nodeUuids) -}}
+{{- fail (printf "\n\ncluster.nodeUuids contains duplicates: %v. Each pod ordinal needs its OWN broker UUID — two pods sharing one identity would present the same identity to the metadata plane and race the same range lease." $v.cluster.nodeUuids) -}}
+{{- end -}}
 {{- $nodeUuid = index $v.cluster.nodeUuids $i -}}
 {{- else -}}
 {{- fail (printf "\n\ncluster.nodeUuids has %d entries but replicaCount is %d: provide one broker UUID per replica, indexed by pod ordinal. Each must equal the CN of that pod's data-plane certificate." (len $v.cluster.nodeUuids) (int $v.replicaCount)) -}}

@@ -193,11 +193,14 @@ spec:
         # User-supplied Secrets only — the render fails above if unnamed.
         - name: tls-meta
           secret:
-            secretName: {{ include "vtop.metaSecretName" . }}
+            # Quoted: an unquoted name that happens to be `true`, `no`, or a
+            # bare number is decoded as a boolean or int, and the manifest is
+            # rejected on a type error rather than on anything meaningful.
+            secretName: {{ include "vtop.metaSecretName" . | quote }}
             defaultMode: 0440
         - name: tls-data
           secret:
-            secretName: {{ include "vtop.dataSecretName" . }}
+            secretName: {{ include "vtop.dataSecretName" . | quote }}
             defaultMode: 0440
         {{- with .Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}
@@ -212,7 +215,7 @@ spec:
         accessModes:
           {{- toYaml .Values.persistence.meta.accessModes | nindent 10 }}
         {{- with .Values.persistence.meta.storageClass }}
-        storageClassName: {{ . }}
+        storageClassName: {{ . | quote }}
         {{- end }}
         resources:
           requests:
@@ -225,7 +228,7 @@ spec:
         accessModes:
           {{- toYaml .Values.persistence.data.accessModes | nindent 10 }}
         {{- with .Values.persistence.data.storageClass }}
-        storageClassName: {{ . }}
+        storageClassName: {{ . | quote }}
         {{- end }}
         resources:
           requests:
