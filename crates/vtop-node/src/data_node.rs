@@ -28,8 +28,10 @@ use vtop_broker::{
     LocalBroker, MetaFencingEpoch, NativeServer, ProducerEpochJournal, ServerConfig,
     SessionAuthorizer,
 };
+use vtop_log::env::Env;
 use vtop_log::{
     ActiveSegment, KeyRange, RangeLineage, RecoveryReport, SegmentConfig, SegmentDescriptor,
+    SegmentSet,
 };
 use vtop_protocol::{RangeIdentity, Role};
 
@@ -37,13 +39,14 @@ pub const MAX_FRAME_BYTES: u32 = 32 * 1024 * 1024;
 pub const MAX_RECORDS: u32 = 65_536;
 pub const WINDOW_BYTES: u64 = 32 * 1024 * 1024;
 
-fn segment_path(data_dir: &Path) -> std::path::PathBuf {
-    data_dir.join("range.active")
-}
-
 /// Recover a quiesced active segment, discard any tail beyond its durable
 /// commit boundary, and publish the sealed bundle consumed by `vtopctl
 /// segment verify`.
+///
+/// On a rolled range this is handed the TAIL's path — its predecessors are
+/// already sealed and verify as-is. Recovery seeds the tail's inherited
+/// producer frontier from its `.producers` sidecar, so sealing a rolled
+/// tail needs nothing beyond what sealing the first segment ever did.
 pub fn seal_active(path: &Path) -> Result<(), String> {
     let segment = ActiveSegment::recover(path).map_err(|error| error.to_string())?;
     let committed = segment.committed_offset();
@@ -55,19 +58,32 @@ pub fn seal_active(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Create the segment on first start, recover it on every restart. The
-/// recover path is exactly what the kill/disk chaos scenarios exercise.
-fn open_segment(
+/// Open the range through the startup catalog on every restart; create its
+/// first segment on first start.
+///
+/// Opening through the catalog (#270) is what picks up a rolled range —
+/// sealed segments plus the tail, read as one — instead of a single
+/// hardcoded filename. It is also where a quarantined bundle refuses
+/// startup with its reason named: a node must never silently serve
+/// whichever subset of an ambiguous directory still looks healthy.
+///
+/// A pre-#270 directory holding only the legacy single `range.active`
+/// opens the same way, as a set of one — discovery keys segments by their
+/// contents, not their stems — so no migration step exists to get wrong.
+/// New ranges take offset-based stems (`range-<base>.active`), the naming
+/// rolling itself produces.
+fn open_range(
     data_dir: &Path,
     segment_id: Uuid,
     range: &RangeIdentity,
-) -> Result<(ActiveSegment, Option<RecoveryReport>), String> {
-    let path = segment_path(data_dir);
-    if path.exists() {
-        let segment = ActiveSegment::recover(&path).map_err(|error| error.to_string())?;
-        let report = segment.recovery_report().clone();
+) -> Result<(SegmentSet, Option<RecoveryReport>), String> {
+    let env = Env::real();
+    if let Some(set) = SegmentSet::open_in(&env, data_dir).map_err(|error| error.to_string())? {
+        // The tail is the only segment recovery had judgement calls to make
+        // about; sealed segments either validate or quarantine.
+        let report = set.active().recovery_report().clone();
         println!("segment_recovered report={report:?}");
-        return Ok((segment, Some(report)));
+        return Ok((set, Some(report)));
     }
     let descriptor = SegmentDescriptor {
         segment_id,
@@ -86,9 +102,9 @@ fn open_segment(
         max_segment_records: 10_000_000,
         ..SegmentConfig::default()
     };
-    let segment =
-        ActiveSegment::create(&path, descriptor, config).map_err(|error| error.to_string())?;
-    Ok((segment, None))
+    let set = SegmentSet::create_in(&env, data_dir, descriptor, config)
+        .map_err(|error| error.to_string())?;
+    Ok((set, None))
 }
 
 /// Serves the replica-status RPC on a leader, and refuses everything else
@@ -221,7 +237,7 @@ pub async fn serve(
     std::fs::create_dir_all(&config.data_dir)
         .map_err(|error| format!("create {}: {error}", config.data_dir.display()))?;
     let range = config.range.identity();
-    let (segment, recovery) = open_segment(&config.data_dir, config.segment_id, &range)?;
+    let (set, recovery) = open_range(&config.data_dir, config.segment_id, &range)?;
     let epochs = ProducerEpochJournal::open(config.data_dir.join("epochs"))
         .map_err(|error| error.to_string())?;
     // With a lease configured, authority to serve comes from the metadata
@@ -243,7 +259,7 @@ pub async fn serve(
             run_follower(
                 config,
                 range,
-                segment,
+                set,
                 epochs,
                 meta,
                 observability,
@@ -255,7 +271,7 @@ pub async fn serve(
             run_leader(
                 config,
                 range,
-                segment,
+                set,
                 epochs,
                 meta,
                 true,
@@ -268,7 +284,7 @@ pub async fn serve(
             run_leader(
                 config,
                 range,
-                segment,
+                set,
                 epochs,
                 meta,
                 false,
@@ -283,7 +299,7 @@ pub async fn serve(
 async fn run_follower(
     config: DataNodeConfig,
     range: RangeIdentity,
-    segment: ActiveSegment,
+    set: SegmentSet,
     epochs: ProducerEpochJournal,
     meta: MetaFencingEpoch,
     observability: &NodeObservability,
@@ -300,7 +316,7 @@ async fn run_follower(
     let follower = Arc::new(
         InProcessFollower::new(
             config.node_uuid,
-            segment,
+            set,
             epochs,
             range,
             config.fencing_epoch,
@@ -388,7 +404,7 @@ async fn run_follower(
 async fn run_leader(
     config: DataNodeConfig,
     range: RangeIdentity,
-    segment: ActiveSegment,
+    set: SegmentSet,
     epochs: ProducerEpochJournal,
     meta: MetaFencingEpoch,
     replicated: bool,
@@ -458,7 +474,7 @@ async fn run_leader(
         }
         observed_replicas = Some(Arc::clone(&replica_set));
         LocalBroker::with_replication(
-            segment,
+            set,
             epochs,
             range,
             config.fencing_epoch,
@@ -472,7 +488,7 @@ async fn run_leader(
         // The shared handle, not `LocalBroker::new` (which builds its own
         // always-active view): a lease-configured standalone leader must also
         // start fenced until the agent publishes a grant.
-        LocalBroker::with_meta_fencing_epoch(segment, epochs, range, config.fencing_epoch, meta)
+        LocalBroker::with_meta_fencing_epoch(set, epochs, range, config.fencing_epoch, meta)
             .map_err(|error| error.to_string())?
     };
 
@@ -704,4 +720,176 @@ async fn run_leader(
     let result = server.serve(listener, shutdown_rx).await;
     drop(shutdown);
     result.map_err(|error| format!("native server exited: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vtop_log::{Durability, LogRecord};
+
+    fn test_range() -> RangeIdentity {
+        RangeIdentity {
+            topic: "events.v1".to_owned(),
+            topic_epoch: 1,
+            range_id: Uuid::from_u128(0xC1),
+            range_generation: 0,
+        }
+    }
+
+    fn record(sequence: u64) -> LogRecord {
+        LogRecord {
+            producer_id: Uuid::from_u128(0xB1),
+            producer_epoch: 0,
+            sequence,
+            timestamp_millis: 1_700_000_000_000,
+            attributes: 0,
+            key: b"key".to_vec(),
+            value: format!("value-{sequence}").into_bytes(),
+        }
+    }
+
+    /// A fresh directory creates the range's first segment under the
+    /// offset-based stem — the naming rolling itself produces — so a new
+    /// node's layout and a rolled node's layout follow one contract.
+    #[test]
+    fn a_fresh_directory_creates_the_first_segment_under_the_offset_stem() {
+        let dir = tempfile::tempdir().unwrap();
+        let range = test_range();
+        let (set, recovery) = open_range(dir.path(), Uuid::from_u128(0xD1), &range).unwrap();
+        assert!(recovery.is_none(), "nothing existed to recover");
+        assert_eq!(set.next_offset(), 0);
+        assert!(
+            dir.path()
+                .join("range-00000000000000000000.active")
+                .exists(),
+            "the first segment must take the stem its base offset names"
+        );
+    }
+
+    /// A data directory from before the broker opened through the catalog —
+    /// one legacy `range.active`, nothing else — opens as a set of one with
+    /// its records intact. This is the compatibility contract: no migration
+    /// step, because discovery keys segments by their contents, not their
+    /// stems.
+    #[test]
+    fn a_legacy_single_file_directory_opens_as_a_set_of_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let range = test_range();
+        let descriptor = SegmentDescriptor {
+            segment_id: Uuid::from_u128(0xD2),
+            topic: range.topic.clone(),
+            topic_epoch: range.topic_epoch,
+            lineage: RangeLineage {
+                range_id: range.range_id,
+                generation: range.range_generation,
+                key_range: KeyRange::full(),
+                parents: Vec::new(),
+            },
+            base_offset: 0,
+        };
+        {
+            let mut segment = ActiveSegment::create(
+                dir.path().join("range.active"),
+                descriptor,
+                SegmentConfig::default(),
+            )
+            .unwrap();
+            for sequence in 0..3 {
+                segment
+                    .append_group(&[record(sequence)], Durability::Fsync)
+                    .unwrap();
+            }
+        }
+
+        let (set, recovery) = open_range(dir.path(), Uuid::from_u128(0xD3), &range).unwrap();
+        assert!(recovery.is_some(), "the legacy segment was recovered");
+        assert_eq!(set.next_offset(), 3);
+        assert!(set.sealed().is_empty(), "a legacy layout is a set of one");
+    }
+
+    /// The offline seal used by `vtopctl segment verify` and the chaos
+    /// harness works on a rolled range: it seals the TAIL, and the segments
+    /// the range sealed while running are already the artifacts verification
+    /// consumes. Recovery of the tail seeds its inherited producer frontier
+    /// from the `.producers` sidecar, which is what makes a mid-range tail
+    /// recoverable in isolation at all.
+    #[test]
+    fn seal_active_seals_the_tail_of_a_rolled_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let range = test_range();
+        let descriptor = SegmentDescriptor {
+            segment_id: Uuid::from_u128(0xD5),
+            topic: range.topic.clone(),
+            topic_epoch: range.topic_epoch,
+            lineage: RangeLineage {
+                range_id: range.range_id,
+                generation: range.range_generation,
+                key_range: KeyRange::full(),
+                parents: Vec::new(),
+            },
+            base_offset: 0,
+        };
+        let sealed_while_running = {
+            let mut set = SegmentSet::create_in(
+                &Env::real(),
+                dir.path(),
+                descriptor,
+                SegmentConfig {
+                    // Small enough that 40 records roll several times.
+                    max_record_bytes: 256,
+                    max_group_bytes: 512,
+                    max_segment_bytes: 512,
+                    max_segment_records: 100,
+                    index_stride: 2,
+                },
+            )
+            .unwrap();
+            for sequence in 0..40 {
+                set.append_group_minting(&[record(sequence)], Durability::Fsync)
+                    .unwrap();
+            }
+            assert!(!set.sealed().is_empty(), "the range must have rolled");
+            set.sealed().len()
+        };
+
+        let tails: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "active"))
+            .collect();
+        assert_eq!(tails.len(), 1, "a quiesced range has exactly one tail");
+
+        seal_active(&tails[0]).unwrap();
+        assert!(
+            tails[0].with_extension("segment").exists(),
+            "sealing must publish the tail as a sealed segment"
+        );
+        let sealed_now = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "segment"))
+            .count();
+        assert_eq!(
+            sealed_now,
+            sealed_while_running + 1,
+            "the segments sealed while running are untouched; only the tail was added"
+        );
+    }
+
+    /// A quarantined bundle refuses startup with the reason in the error —
+    /// never a node silently serving whichever subset still looks healthy.
+    #[test]
+    fn a_quarantined_bundle_refuses_startup_naming_the_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("stray.active"), b"not a segment").unwrap();
+
+        let Err(problem) = open_range(dir.path(), Uuid::from_u128(0xD4), &test_range()) else {
+            panic!("a quarantined bundle must refuse startup");
+        };
+        assert!(
+            problem.contains("InvalidArtifact") && problem.contains("stray.active"),
+            "the refusal must name the reason and the path: {problem}"
+        );
+    }
 }

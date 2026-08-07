@@ -91,12 +91,32 @@ log "healthy follower holds the full stream; quorum math is honest"
 kill -STOP "$F2_PID"
 F2_VERIFY_DIR="$WORKDIR/verify-follower-2"
 mkdir -p "$F2_VERIFY_DIR"
-cp "/proc/$F2_PID/root$F2_DIR/range.active" "$F2_VERIFY_DIR/range.active"
-cp "/proc/$F2_PID/root$F2_DIR/range.commit" "$F2_VERIFY_DIR/range.commit"
+# The storage layer names the tail now (#270) — a range is a set of segments
+# named by base offset — so ask the frozen follower's directory what the tail
+# is called instead of assuming a fixed name.
+F2_MATCHES=()
+for candidate in "/proc/$F2_PID/root$F2_DIR"/*.active; do
+  [[ -f "$candidate" ]] && F2_MATCHES+=("$candidate")
+done
+# Exactly one, same guard as seal_and_verify_active: zero means the tail is
+# missing, more than one is a state discovery would quarantine — either way
+# the copy below would assess the wrong artifact.
+[[ ${#F2_MATCHES[@]} -eq 1 ]] \
+  || fail "follower-2 expected exactly one active segment through /proc, found ${#F2_MATCHES[@]}"
+F2_ACTIVE="${F2_MATCHES[0]}"
+F2_STEM="$(basename "${F2_ACTIVE%.active}")"
+cp "$F2_ACTIVE" "$F2_VERIFY_DIR/$F2_STEM.active"
+# Named finding rather than an opaque cp failure under `set -e`: a follower
+# that never minted a durable commit boundary is a legitimate storage state,
+# but this scenario produced a healthy stream before the disk filled, so a
+# missing boundary here means the assertion below would be meaningless.
+[[ -f "/proc/$F2_PID/root$F2_DIR/$F2_STEM.commit" ]] \
+  || fail "follower-2 has no durable commit boundary ($F2_STEM.commit missing through /proc)"
+cp "/proc/$F2_PID/root$F2_DIR/$F2_STEM.commit" "$F2_VERIFY_DIR/$F2_STEM.commit"
 
 stop_node_now "$LEADER_PID"
 stop_node_now "$F1_PID"
 stop_node_now "$F2_PID"
-seal_and_verify_active leader "$WORKDIR/data-leader/range.active"
-seal_and_verify_active follower-1 "$WORKDIR/data-follower-1/range.active"
-seal_and_verify_active follower-2-diskfull "$F2_VERIFY_DIR/range.active"
+seal_and_verify_active leader "$WORKDIR/data-leader"
+seal_and_verify_active follower-1 "$WORKDIR/data-follower-1"
+seal_and_verify_active follower-2-diskfull "$F2_VERIFY_DIR"

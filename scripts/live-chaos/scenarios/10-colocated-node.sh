@@ -77,5 +77,5 @@ await_ready "$(data_metrics_addr 0)" "colocated-node-restarted"
 log "process killed and restarted; every acknowledged record survived, byte-exact"
 
 stop_node_now "$CN2"
-seal_and_verify_active colocated "$WORKDIR/data-colocated-1/range.active"
+seal_and_verify_active colocated "$WORKDIR/data-colocated-1"
 log "sealed artifact verifies offline"

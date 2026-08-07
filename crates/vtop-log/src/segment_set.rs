@@ -93,9 +93,28 @@ impl SegmentSet {
         }
         let catalog = StartupCatalog::discover_in(env, &directory)?;
         if !catalog.quarantined.is_empty() {
+            // Name every quarantined bundle and its reasons in the refusal.
+            // This error is what an operator sees at startup, and "N
+            // bundles are quarantined" gives them nothing to act on — the
+            // reason is the difference between deleting a stray .tmp file
+            // and restoring from a replica.
+            let details = catalog
+                .quarantined
+                .iter()
+                .map(|bundle| {
+                    let paths = bundle
+                        .paths
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("[{paths}: {:?}]", bundle.reasons)
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
             return Err(LogError::InvalidDescriptor(format!(
                 "range at {} has {} quarantined artifact bundle(s); refusing to open a subset \
-                 of an ambiguous range",
+                 of an ambiguous range: {details}",
                 directory.display(),
                 catalog.quarantined.len()
             )));
@@ -168,6 +187,34 @@ impl SegmentSet {
             sealed: Vec::new(),
             active: Some(active),
         })
+    }
+
+    /// Append a group, minting the successor's identity from this set's own
+    /// environment if the append forces a roll.
+    ///
+    /// [`Self::append_group`] takes the successor id as a parameter because
+    /// crash sweeps need it deterministic per step. A broker's produce path
+    /// has no meaningful id to choose, and threading a UUID through every
+    /// produce call just to discard it when no roll happens would put the
+    /// minting far from the one place that already owns an rng — the same
+    /// place cross-segment truncation mints its replacement id.
+    pub fn append_group_minting(
+        &mut self,
+        records: &[LogRecord],
+        durability: Durability,
+    ) -> VtopLogResult<Vec<crate::AppendOutcome>> {
+        let successor_id = Uuid::from_u128(self.env.rng.next_u128());
+        self.append_group(records, durability, successor_id)
+    }
+
+    /// Advance the tail's durable commit boundary.
+    ///
+    /// Sealed segments are durable by construction — sealing commits first —
+    /// so committing a range is exactly committing its tail. This exists so a
+    /// follower batching appends under one durability barrier does not have
+    /// to know which segment the barrier lands on.
+    pub fn commit(&mut self) -> VtopLogResult<u64> {
+        self.tail_mut().commit()
     }
 
     /// Every segment must begin where the previous one ended.
@@ -267,6 +314,23 @@ impl SegmentSet {
     /// roll would leave half of a producer's commit group either side of a
     /// boundary, and the two halves could then be transferred, truncated, or
     /// retained independently of each other.
+    /// Append to the tail WITHOUT rolling at the bound; the limit errors
+    /// surface exactly as a single-segment range reported them.
+    ///
+    /// For callers whose durability is being deliberately withheld — the
+    /// fault harness's fsync hold. A roll seals the tail, and sealing makes
+    /// bytes durable, which would silently commit records the injection
+    /// promised were still at risk of dying with a crash. Refusing at the
+    /// bound keeps that promise exact; nothing in production appends through
+    /// this.
+    pub fn append_group_tail_only(
+        &mut self,
+        records: &[LogRecord],
+        durability: Durability,
+    ) -> VtopLogResult<Vec<crate::AppendOutcome>> {
+        self.tail_mut().append_group(records, durability)
+    }
+
     pub fn append_group(
         &mut self,
         records: &[LogRecord],
@@ -559,6 +623,37 @@ impl SegmentSet {
         // manifest, so the read stops at the boundary and the loop above moves
         // on to the next segment.
         self.sealed[index].fetch_through(offset, max_bytes, max_records, high_watermark)
+    }
+}
+
+/// An already-open tail is a set of one.
+///
+/// The broker grew up over a single `ActiveSegment`, and every constructor
+/// and harness that hands one over is describing exactly the range this
+/// conversion produces: no sealed prefix, one tail. Making it a `From` lets
+/// those callers keep their shape while the node hands over a catalog-opened
+/// set instead — the conversion is lossless, whereas the reverse (a set down
+/// to its tail) would silently discard sealed segments and is deliberately
+/// not provided.
+///
+/// The environment and directory come from the segment itself, not from the
+/// caller: a tail opened against the simulator must roll its successor onto
+/// the simulator, and its parent directory is by definition where its range
+/// lives.
+impl From<ActiveSegment> for SegmentSet {
+    fn from(active: ActiveSegment) -> Self {
+        let env = active.env().clone();
+        let directory = active
+            .path()
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        Self {
+            env,
+            directory,
+            sealed: Vec::new(),
+            active: Some(active),
+        }
     }
 }
 
@@ -1354,6 +1449,115 @@ mod tests {
         assert_eq!(set.next_offset(), cut);
         assert!(!marker_debris.exists(), "marker debris must be swept");
         assert!(!sidecar_debris.exists(), "sidecar debris must be swept");
+    }
+
+    /// The fault harness's fsync hold appends through the non-rolling path:
+    /// a roll seals the tail and sealing makes bytes durable, which would
+    /// silently commit records the injection promised were still at risk.
+    /// At the bound that path must refuse — never roll.
+    #[test]
+    fn the_tail_only_append_refuses_at_the_bound_instead_of_rolling() {
+        let directory = tempdir().unwrap();
+        let producer = Uuid::from_u128(72);
+        let mut set =
+            SegmentSet::create_in(&Env::real(), directory.path(), descriptor(), config()).unwrap();
+        let mut refused = false;
+        for sequence in 0..200 {
+            match set.append_group_tail_only(&[record(producer, sequence)], Durability::Fsync) {
+                Ok(_) => {}
+                Err(LogError::SegmentByteLimit { .. })
+                | Err(LogError::SegmentRecordLimit { .. }) => {
+                    refused = true;
+                    break;
+                }
+                Err(other) => panic!("unexpected refusal: {other:?}"),
+            }
+        }
+        assert!(refused, "the bound must eventually refuse");
+        assert!(
+            set.sealed().is_empty(),
+            "a tail-only append must never seal: sealing would commit bytes a \
+             fault injection is deliberately holding out of durability"
+        );
+    }
+
+    /// A data directory holding only the legacy single `range.active` — every
+    /// deployment before the broker opened through the catalog — opens as a
+    /// set of one, keeps its records, and ROLLS: the sealed prefix keeps the
+    /// legacy stem, the successor takes an offset-based one, and the two read
+    /// as one range. No migration step, because none is needed: discovery is
+    /// stem-agnostic and rolling derives the successor's name from its base
+    /// offset, never from its predecessor's.
+    #[test]
+    fn a_legacy_single_file_range_opens_as_a_set_of_one_and_rolls() {
+        let directory = tempdir().unwrap();
+        let producer = Uuid::from_u128(71);
+        let legacy = directory.path().join("range.active");
+        {
+            let mut segment =
+                ActiveSegment::create_in(&Env::real(), &legacy, descriptor(), config()).unwrap();
+            for sequence in 0..3 {
+                segment
+                    .append_group(&[record(producer, sequence)], Durability::Fsync)
+                    .unwrap();
+            }
+        }
+
+        let mut set = SegmentSet::open_in(&Env::real(), directory.path())
+            .unwrap()
+            .expect("the legacy layout is a valid range of one segment");
+        assert_eq!(set.next_offset(), 3);
+        assert!(set.sealed().is_empty());
+
+        // Write past the bound: the legacy file seals under its own name and
+        // the successor opens under the offset-based stem.
+        for sequence in 3..40 {
+            set.append_group_minting(&[record(producer, sequence)], Durability::Fsync)
+                .unwrap();
+        }
+        assert!(!set.sealed().is_empty(), "the range must have rolled");
+        assert!(
+            directory.path().join("range.segment").exists(),
+            "the legacy tail seals under its legacy stem"
+        );
+
+        // And the mixed-stem range reopens and reads as one.
+        drop(set);
+        let mut reopened = SegmentSet::open_in(&Env::real(), directory.path())
+            .unwrap()
+            .expect("a mixed legacy/offset-stem range must reopen");
+        assert_eq!(reopened.next_offset(), 40);
+        let batch = reopened.fetch_through(0, 1 << 20, 100, 40).unwrap();
+        assert_eq!(batch.records.len(), 40);
+        reopened
+            .append_group_minting(&[record(producer, 40)], Durability::Fsync)
+            .unwrap();
+    }
+
+    /// A quarantined bundle refuses the open WITH its reason in the error.
+    /// "N bundles are quarantined" gives an operator nothing to act on; the
+    /// reason is the difference between deleting a stray temp file and
+    /// restoring from a replica.
+    #[test]
+    fn a_quarantine_refusal_names_the_reason_and_the_path() {
+        let directory = tempdir().unwrap();
+        let producer = Uuid::from_u128(73);
+        build_rolled_range(directory.path(), producer);
+        let stray = directory.path().join("stray.active");
+        std::fs::write(&stray, b"not a segment").unwrap();
+
+        let Err(problem) = SegmentSet::open_in(&Env::real(), directory.path()) else {
+            panic!("a quarantined bundle must refuse the open");
+        };
+        let message = problem.to_string();
+        assert!(
+            message.contains("InvalidArtifact"),
+            "the refusal must carry the quarantine reason: {message}"
+        );
+        assert!(
+            message.contains("stray.active"),
+            "the refusal must name the offending path: {message}"
+        );
     }
 
     /// A marker that does not decode names an intent that cannot be honoured.

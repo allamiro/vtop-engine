@@ -204,6 +204,6 @@ stop_node_now "$OLD"
 # --- artifacts must independently verify ------------------------------------
 stop_node_now "$NEW"
 stop_node_now "$OTHER_PID"
-seal_and_verify_active new-leader "$WORKDIR/data-follower-$PROMOTE_N/range.active"
-seal_and_verify_active other-follower "$WORKDIR/data-follower-$OTHER_N/range.active"
+seal_and_verify_active new-leader "$WORKDIR/data-follower-$PROMOTE_N"
+seal_and_verify_active other-follower "$WORKDIR/data-follower-$OTHER_N"
 log "all surviving replica artifacts verify offline"

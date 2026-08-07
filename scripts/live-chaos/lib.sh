@@ -1077,10 +1077,50 @@ stop_node_now() { # <pid>
   done
 }
 
-seal_and_verify_active() { # <label> <active-path>
-  local label="$1" active="$2" sealed="${2%.active}.segment"
-  [[ -f "$active" ]] || fail "$label active segment missing: $active"
-  "$VTOP_NODE" seal-active --path "$active" > "$WORKDIR/logs/verify-$label.log" 2>&1 \
+# seal_and_verify_active <label> <data-dir>
+#
+# The tail's filename belongs to the storage layer now (#270): a range is a
+# set of segments named by base offset, and only the storage layer knows what
+# it called the tail. So scenarios hand over the DATA DIRECTORY and this
+# helper asks it. Every caller passes a directory — scenario 05 included,
+# which copies the frozen follower's whole directory out through /proc.
+#
+# Segments the range already sealed before shutdown verify as-is, before the
+# tail: a sealed prefix that fails verification is a finding the tail's
+# freshly minted artifacts must not bury.
+#
+# Exactly one *.active tail is the quiesced norm. ZERO is also survivable —
+# a SIGKILL can land between sealing the old tail and creating its successor
+# — and the durable sealed prefix is still assessable then, so it is
+# verified and reported rather than failing before any evidence is looked
+# at. More than one active is a real anomaly (discovery would quarantine it)
+# and fails.
+seal_and_verify_active() {
+  local label="$1" target="$2" active
+  : > "$WORKDIR/logs/verify-$label.log"
+  [[ -d "$target" ]] || fail "$label expects a data directory, got: $target"
+  local matches=() sealed_count=0
+  for candidate in "$target"/*.active; do
+    [[ -f "$candidate" ]] && matches+=("$candidate")
+  done
+  [[ ${#matches[@]} -le 1 ]] \
+    || fail "$label found ${#matches[@]} active segments in $target; discovery would quarantine this"
+  for prior in "$target"/*.segment; do
+    [[ -f "$prior" ]] || continue
+    "$VTOPCTL" segment verify "$prior" --require self >> "$WORKDIR/logs/verify-$label.log" 2>&1 \
+      || fail "$label pre-sealed segment verify failed: $(tail -5 "$WORKDIR/logs/verify-$label.log")"
+    log "$label pre-sealed $(basename "$prior") passed vtopctl segment verify"
+    sealed_count=$((sealed_count + 1))
+  done
+  if [[ ${#matches[@]} -eq 0 ]]; then
+    [[ "$sealed_count" -gt 0 ]] \
+      || fail "$label found neither an active tail nor sealed segments in $target"
+    log "$label has no active tail (kill landed mid-roll); sealed prefix verified"
+    return 0
+  fi
+  active="${matches[0]}"
+  local sealed="${active%.active}.segment"
+  "$VTOP_NODE" seal-active --path "$active" >> "$WORKDIR/logs/verify-$label.log" 2>&1 \
     || fail "$label seal failed: $(tail -3 "$WORKDIR/logs/verify-$label.log")"
   "$VTOPCTL" segment verify "$sealed" --require self >> "$WORKDIR/logs/verify-$label.log" 2>&1 \
     || fail "$label segment verify failed: $(tail -5 "$WORKDIR/logs/verify-$label.log")"

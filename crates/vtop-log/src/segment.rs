@@ -501,6 +501,21 @@ impl ActiveSegment {
         self.header.format_version()
     }
 
+    /// The environment this segment performs its I/O through. Exposed inside
+    /// the crate so [`crate::SegmentSet`] can wrap an already-open tail
+    /// without being handed a second `Env` that might disagree with the one
+    /// the tail was actually opened under — a sim-backed segment wrapped with
+    /// the real filesystem would roll its successor onto the wrong storage.
+    pub(crate) fn env(&self) -> &Env {
+        &self.env
+    }
+
+    /// Where this segment's file lives; the parent directory is where a roll
+    /// puts its successor.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Every file this segment owns; see [`SegmentReader::paths`].
     pub fn paths(&self) -> VtopLogResult<Vec<PathBuf>> {
         let paths = SegmentPaths::from_active(&self.path)?;
