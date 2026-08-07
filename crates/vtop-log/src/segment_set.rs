@@ -281,6 +281,160 @@ impl SegmentSet {
         Ok(())
     }
 
+    /// Discard every record at or above `offset`, across as many segments as
+    /// that spans.
+    ///
+    /// The repair for a replica that diverged from its range's current
+    /// leadership (#240). A single segment could always do this; a range that
+    /// rolls needs it to reach across segments, because the divergence point
+    /// need not lie in the tail.
+    ///
+    /// # What it handles, and what it refuses
+    ///
+    /// Sealed segments lying entirely at or above `offset` are deleted: every
+    /// record they hold is above the cut, so nothing of them survives.
+    ///
+    /// A cut inside the ACTIVE segment then truncates it in place, which is the
+    /// existing single-segment path.
+    ///
+    /// A cut inside a SEALED segment is refused. Honouring it means un-sealing:
+    /// renaming `.segment` back to `.active`, removing the manifest that
+    /// vouches for its contents, and truncating what was until that moment an
+    /// immutable, verifiable artifact. That is a real operation and it belongs
+    /// here eventually, but it deserves its own crash-ordering argument rather
+    /// than being folded in as a special case — a half-unsealed segment is a
+    /// file whose manifest disagrees with its bytes, which is exactly what
+    /// discovery quarantines.
+    ///
+    /// The refusal is not currently reachable in the running system: nothing
+    /// rolls yet, so every range is one active segment and every cut lands in
+    /// it. It becomes reachable the moment rolling is switched on, which is why
+    /// it is an explicit error rather than an omission.
+    pub fn truncate_to(&mut self, offset: u64) -> VtopLogResult<crate::TruncateOutcome> {
+        if offset > self.next_offset() {
+            return Err(LogError::TruncateBeyondTail {
+                requested: offset,
+                next_offset: self.next_offset(),
+            });
+        }
+        if offset < self.base_offset() {
+            return Err(LogError::InvalidConfig(format!(
+                "cannot truncate to offset {offset}: this range begins at {}",
+                self.base_offset()
+            )));
+        }
+
+        // A cut inside a sealed segment needs un-sealing; see above.
+        if let Some(reader) = self
+            .sealed
+            .iter()
+            .find(|reader| offset > reader.base_offset() && offset < reader.next_offset())
+        {
+            return Err(LogError::InvalidConfig(format!(
+                "cannot truncate to offset {offset}: it falls inside sealed segment                  {}..{}, and un-sealing is not implemented",
+                reader.base_offset(),
+                reader.next_offset()
+            )));
+        }
+
+        // Drop whole sealed segments at or above the cut, newest first, so an
+        // interruption always leaves a contiguous prefix rather than a hole.
+        let mut records_removed = 0_u64;
+        let mut bytes_removed = 0_u64;
+        while let Some(reader) = self.sealed.last() {
+            if reader.base_offset() < offset {
+                break;
+            }
+            let removed = reader.next_offset() - reader.base_offset();
+            let paths = reader.paths()?;
+            let reader = self.sealed.pop().expect("checked by the loop condition");
+            drop(reader);
+            for path in paths {
+                if self
+                    .env
+                    .storage
+                    .exists(&path)
+                    .map_err(|source| LogError::Io {
+                        path: path.clone(),
+                        source,
+                    })?
+                {
+                    self.env
+                        .storage
+                        .remove_file(&path)
+                        .map_err(|source| LogError::Io {
+                            path: path.clone(),
+                            source,
+                        })?;
+                }
+            }
+            records_removed += removed;
+        }
+
+        // The tail. If the cut is at or below where it begins, everything it
+        // holds is above the cut and it is replaced by an empty segment there.
+        let outcome = if offset < self.tail().base_offset() {
+            let removed = self.tail().next_offset() - self.tail().base_offset();
+            records_removed += removed;
+            self.replace_tail_at(offset)?;
+            crate::TruncateOutcome {
+                records_removed,
+                bytes_removed,
+                next_offset: offset,
+            }
+        } else {
+            let outcome = self.tail_mut().truncate_to(offset)?;
+            records_removed += outcome.records_removed;
+            bytes_removed += outcome.bytes_removed;
+            crate::TruncateOutcome {
+                records_removed,
+                bytes_removed,
+                next_offset: outcome.next_offset,
+            }
+        };
+        Ok(outcome)
+    }
+
+    /// Discard the tail entirely and open an empty one beginning at `offset`.
+    fn replace_tail_at(&mut self, offset: u64) -> VtopLogResult<()> {
+        let old = self
+            .active
+            .take()
+            .expect("the tail is absent only during a roll or a truncation");
+        let paths = old.paths()?;
+        let descriptor = old.v1_descriptor_view();
+        let config = old.config();
+        drop(old);
+        for path in paths {
+            if self
+                .env
+                .storage
+                .exists(&path)
+                .map_err(|source| LogError::Io {
+                    path: path.clone(),
+                    source,
+                })?
+            {
+                self.env
+                    .storage
+                    .remove_file(&path)
+                    .map_err(|source| LogError::Io {
+                        path: path.clone(),
+                        source,
+                    })?;
+            }
+        }
+        let mut descriptor = descriptor;
+        descriptor.base_offset = offset;
+        let path = self
+            .directory
+            .join(format!("{}.active", segment_stem(offset)));
+        self.active = Some(ActiveSegment::create_in(
+            &self.env, &path, descriptor, config,
+        )?);
+        Ok(())
+    }
+
     /// Read from `start_offset`, crossing segment boundaries as needed.
     ///
     /// Visibility is clamped at `high_watermark` exactly as a single segment
@@ -607,5 +761,122 @@ mod tests {
             "no record at or above the watermark may be returned"
         );
         assert_eq!(batch.next_offset, watermark);
+    }
+
+    /// A cut inside the tail is the single-segment case, unchanged.
+    #[test]
+    fn a_cut_inside_the_tail_truncates_only_the_tail() {
+        let directory = tempdir().unwrap();
+        let producer = Uuid::from_u128(29);
+        let mut set =
+            SegmentSet::create_in(&Env::real(), directory.path(), descriptor(), config()).unwrap();
+        for sequence in 0..40 {
+            set.append_group(
+                &[record(producer, sequence)],
+                Durability::Fsync,
+                Uuid::from_u128(8000 + sequence as u128),
+            )
+            .unwrap();
+        }
+        let sealed_before = set.sealed().len();
+        let tail_base = set.active().base_offset();
+        let cut = tail_base + 1;
+
+        let outcome = set.truncate_to(cut).unwrap();
+        assert_eq!(outcome.next_offset, cut);
+        assert_eq!(set.next_offset(), cut);
+        assert_eq!(
+            set.sealed().len(),
+            sealed_before,
+            "a cut inside the tail must not disturb sealed segments"
+        );
+    }
+
+    /// A cut at a segment boundary drops every sealed segment above it, and all
+    /// of each one's files — a leftover sidecar is an orphan, which discovery
+    /// quarantines, so a partial delete would turn a repair into a range that
+    /// refuses to open.
+    #[test]
+    fn a_cut_at_a_boundary_drops_whole_segments_and_all_their_files() {
+        let directory = tempdir().unwrap();
+        let producer = Uuid::from_u128(31);
+        let mut set =
+            SegmentSet::create_in(&Env::real(), directory.path(), descriptor(), config()).unwrap();
+        for sequence in 0..40 {
+            set.append_group(
+                &[record(producer, sequence)],
+                Durability::Fsync,
+                Uuid::from_u128(9000 + sequence as u128),
+            )
+            .unwrap();
+        }
+        assert!(set.sealed().len() >= 2, "need several sealed segments");
+
+        // Cut exactly where the second sealed segment begins.
+        let cut = set.sealed()[1].base_offset();
+        let outcome = set.truncate_to(cut).unwrap();
+
+        assert_eq!(outcome.next_offset, cut);
+        assert_eq!(set.next_offset(), cut);
+        assert_eq!(set.sealed().len(), 1, "everything above the cut is gone");
+
+        // The range still opens: no orphaned sidecars were left behind.
+        drop(set);
+        let reopened = SegmentSet::open_in(&Env::real(), directory.path())
+            .unwrap()
+            .expect("the truncated range must still open");
+        assert_eq!(reopened.next_offset(), cut);
+    }
+
+    /// A cut inside a SEALED segment is refused rather than half-done.
+    /// Honouring it means un-sealing — renaming the file back and removing the
+    /// manifest that vouches for its contents — and a half-unsealed segment is
+    /// one whose manifest disagrees with its bytes, which discovery quarantines.
+    #[test]
+    fn a_cut_inside_a_sealed_segment_is_refused() {
+        let directory = tempdir().unwrap();
+        let producer = Uuid::from_u128(37);
+        let mut set =
+            SegmentSet::create_in(&Env::real(), directory.path(), descriptor(), config()).unwrap();
+        for sequence in 0..40 {
+            set.append_group(
+                &[record(producer, sequence)],
+                Durability::Fsync,
+                Uuid::from_u128(10_000 + sequence as u128),
+            )
+            .unwrap();
+        }
+        let first = &set.sealed()[0];
+        assert!(first.next_offset() - first.base_offset() > 1);
+        let inside = first.base_offset() + 1;
+
+        assert!(matches!(
+            set.truncate_to(inside),
+            Err(LogError::InvalidConfig(_))
+        ));
+        assert_eq!(
+            set.next_offset(),
+            40,
+            "a refused truncation must leave the range untouched"
+        );
+    }
+
+    /// Truncation removes records; it can never invent them.
+    #[test]
+    fn truncating_a_range_beyond_its_tail_is_refused() {
+        let directory = tempdir().unwrap();
+        let mut set =
+            SegmentSet::create_in(&Env::real(), directory.path(), descriptor(), config()).unwrap();
+        set.append_group(
+            &[record(Uuid::from_u128(41), 0)],
+            Durability::Fsync,
+            Uuid::from_u128(11_000),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            set.truncate_to(99),
+            Err(LogError::TruncateBeyondTail { requested: 99, .. })
+        ));
     }
 }
