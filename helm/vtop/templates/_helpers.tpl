@@ -174,9 +174,18 @@ meta:
     operator_common_names: {{ toJson $v.meta.adminAuthorization.operatorCommonNames }}
 {{- end }}
 data:
-  # Standalone: each pod serves an independent range, the shape the upstream
-  # co-located harness runs. Replicated ranges under co-location wait on
-  # follower-side epoch propagation upstream.
+  # Standalone: each pod serves an INDEPENDENT range. Three replicas here are
+  # three separate logs, not three copies of one — which is why
+  # `--durability quorum` is refused ("Quorum durability requires a configured
+  # replica set") and why a pod nobody produced to stays empty.
+  #
+  # This used to say replicated ranges were waiting on follower-side epoch
+  # propagation upstream. That landed (#239), along with the rest of the
+  # recovery arc (#240), so the engine is no longer the constraint. The chart
+  # is: `role` is a static per-node field, so a replicated range means
+  # rendering ordinal 0 as leader with a followers list and the rest as
+  # followers — and a StatefulSet cannot re-render a role when leadership
+  # moves. Tracked with the shape that would work in #284.
   role: standalone
   # Must equal the CN of node-{{ $i }}.pem in the data-plane Secret.
   node_uuid: {{ $nodeUuid }}
