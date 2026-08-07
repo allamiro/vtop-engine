@@ -1,5 +1,6 @@
 use crate::env::Env;
 use crate::segment::{inspect_active_segment, inspect_sealed_segment, SegmentInspection};
+use crate::truncate_intent::{TruncateIntent, TRUNCATE_INTENT_FILE};
 use crate::{LogError, SegmentDescriptor, SegmentId, VtopLogResult};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
@@ -66,6 +67,11 @@ pub enum QuarantineReason {
         range_id: Uuid,
         range_generation: u64,
     },
+    /// A `range.truncate-intent` marker that cannot be decoded. A valid
+    /// marker is an in-flight truncation the next open finishes; one that
+    /// does not decode names an intent that cannot be honoured, and acting on
+    /// a guess would delete segments.
+    InvalidTruncateIntent(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -78,6 +84,12 @@ pub struct QuarantinedArtifacts {
 pub struct StartupCatalog {
     pub entries: Vec<CatalogEntry>,
     pub quarantined: Vec<QuarantinedArtifacts>,
+    /// A valid `range.truncate-intent` marker, if one is present: a
+    /// cross-segment truncation that was interrupted mid-flight. Discovery
+    /// only REPORTS it — it never moves or deletes anything — and the layout
+    /// entries above describe the directory as it stands, doomed segments
+    /// included. `SegmentSet::open_in` is what finishes the truncation.
+    pub truncate_intent: Option<PathBuf>,
 }
 
 impl StartupCatalog {
@@ -103,10 +115,33 @@ impl StartupCatalog {
 
         let mut bundles = BTreeMap::<PathBuf, ArtifactBundle>::new();
         let mut quarantined = Vec::new();
+        let mut truncate_intent = None;
         for entry in discovered {
             let Some(classification) = classify_artifact(&entry.path) else {
                 continue;
             };
+            if classification.kind == ArtifactKind::TruncateIntent {
+                // Validated here so a caller reading only the catalog knows
+                // whether the marker can be acted on, but never acted on
+                // here: discovery is read-only, and finishing a truncation
+                // deletes segments.
+                let decoded = env
+                    .storage
+                    .read(&entry.path)
+                    .map_err(|source| LogError::Io {
+                        path: entry.path.clone(),
+                        source,
+                    })
+                    .and_then(|bytes| TruncateIntent::decode(&bytes));
+                match decoded {
+                    Ok(_) => truncate_intent = Some(entry.path),
+                    Err(error) => quarantined.push(QuarantinedArtifacts {
+                        paths: vec![entry.path],
+                        reasons: vec![QuarantineReason::InvalidTruncateIntent(error.to_string())],
+                    }),
+                }
+                continue;
+            }
             if classification.kind == ArtifactKind::Temporary {
                 quarantined.push(QuarantinedArtifacts {
                     paths: vec![entry.path],
@@ -206,6 +241,7 @@ impl StartupCatalog {
         Ok(Self {
             entries,
             quarantined,
+            truncate_intent,
         })
     }
 }
@@ -250,6 +286,9 @@ impl ArtifactBundle {
             ArtifactKind::Chunks => &mut self.chunks,
             ArtifactKind::Producers => &mut self.producers,
             ArtifactKind::Temporary => unreachable!("temporary files are not bundled"),
+            ArtifactKind::TruncateIntent => {
+                unreachable!("the truncation marker is range-level, not part of a bundle")
+            }
         };
         *destination = Some(path);
         self.has_non_regular |= !is_regular;
@@ -284,6 +323,11 @@ enum ArtifactKind {
     Chunks,
     /// The producer frontier a rolled segment inherited (#270).
     Producers,
+    /// The range-level marker of a cross-segment truncation in flight
+    /// (#270). Registered so an interrupted truncation is VISIBLE: an
+    /// unclassified file is ignored, and ignoring the marker would report a
+    /// half-truncated range as merely broken instead of finishable.
+    TruncateIntent,
     Temporary,
 }
 
@@ -307,6 +351,10 @@ fn classify_artifact(path: &Path) -> Option<ArtifactClassification> {
             // roll is reported as a corrupt range rather than an incomplete
             // write.
             ".producers.",
+            // Same shape for a truncation marker whose atomic write was
+            // interrupted: `.range.truncate-intent.<uuid>.tmp` is an
+            // incomplete write, not an intent.
+            ".truncate-intent.",
         ]
         .iter()
         .any(|marker| name.contains(marker))
@@ -314,6 +362,15 @@ fn classify_artifact(path: &Path) -> Option<ArtifactClassification> {
         return Some(ArtifactClassification {
             base: path.to_path_buf(),
             kind: ArtifactKind::Temporary,
+        });
+    }
+    // Exact name, not extension: the marker is one fixed range-level file,
+    // and anything else ending in `.truncate-intent` is no more this crate's
+    // business than a stray README.
+    if name == TRUNCATE_INTENT_FILE {
+        return Some(ArtifactClassification {
+            base: path.to_path_buf(),
+            kind: ArtifactKind::TruncateIntent,
         });
     }
     if let Some(stem) = name.strip_suffix(".manifest.json") {
@@ -1081,6 +1138,44 @@ mod tests {
 
         drop(SegmentReader::open(directory.path().join("rebuildable.segment")).unwrap());
         assert_eq!(fs::read(&chunks).unwrap(), pristine);
+    }
+
+    /// A valid truncation marker is reported, never quarantined: it is an
+    /// in-flight repair the next open finishes, and the segments beside it —
+    /// doomed or not — are still described as they stand, because discovery
+    /// only reads.
+    #[test]
+    fn a_valid_truncation_intent_is_reported_not_quarantined() {
+        let directory = tempdir().unwrap();
+        let mut segment = ActiveSegment::create(
+            directory.path().join("range-00000000000000000000.active"),
+            descriptor(20, 0),
+            config(),
+        )
+        .unwrap();
+        segment
+            .append(record(200, 0, b"kept"), Durability::Fsync)
+            .unwrap();
+        drop(segment);
+        let marker = directory.path().join(super::TRUNCATE_INTENT_FILE);
+        let intent = TruncateIntent {
+            target_offset: 1,
+            replacement: descriptor(21, 1),
+            config: config(),
+            doomed: vec![crate::truncate_intent::DoomedSegment {
+                segment_id: Uuid::from_u128(22),
+                base_offset: 1,
+            }],
+            inherited: Default::default(),
+        };
+        fs::write(&marker, intent.encode().unwrap()).unwrap();
+
+        let catalog = StartupCatalog::discover(directory.path()).unwrap();
+
+        assert!(catalog.quarantined.is_empty(), "{:?}", catalog.quarantined);
+        assert_eq!(catalog.entries.len(), 1);
+        assert_eq!(catalog.truncate_intent, Some(marker.clone()));
+        assert!(marker.exists(), "discovery must not consume the marker");
     }
 
     #[test]

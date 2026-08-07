@@ -14,6 +14,7 @@ pub mod proof;
 mod segment;
 mod segment_set;
 pub mod sim;
+mod truncate_intent;
 mod types;
 pub mod verify;
 

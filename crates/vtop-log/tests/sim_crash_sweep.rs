@@ -14,7 +14,7 @@ use vtop_log::sim::{FaultPlan, SimStorage, TraceEntry, TraceKind};
 use vtop_log::{
     ActiveSegment, AppendOutcome, CatalogSegmentState, Durability, FetchedRecord, LogError,
     LogRecord, QuarantineReason, RangeLineage, SegmentConfig, SegmentDescriptor, SegmentReader,
-    StartupCatalog, PRODUCER_SEQUENCE_WINDOW,
+    SegmentSet, StartupCatalog, PRODUCER_SEQUENCE_WINDOW,
 };
 
 const SEED: u64 = 0x5eed_0093;
@@ -788,6 +788,140 @@ fn sim_single_byte_corruption_of_sealed_artifacts_is_never_silently_accepted() {
         let catalog = discover_read_only(&sim, &env, "sealed commit flip");
         assert_eq!(catalog.entries.len(), 1);
         assert_eq!(catalog.entries[0].state, CatalogSegmentState::Sealed);
+    }
+}
+
+fn range_config() -> SegmentConfig {
+    SegmentConfig {
+        max_record_bytes: 256,
+        max_group_bytes: 512,
+        // Small enough that the workload rolls several times, so the
+        // truncation crosses real segment boundaries.
+        max_segment_bytes: 512,
+        max_segment_records: 100,
+        index_stride: 2,
+    }
+}
+
+fn range_descriptor() -> SegmentDescriptor {
+    SegmentDescriptor {
+        segment_id: Uuid::from_u128(1),
+        topic: "events.v1".to_owned(),
+        topic_epoch: 7,
+        lineage: RangeLineage::root(Uuid::from_u128(100)),
+        base_offset: 0,
+    }
+}
+
+/// One producer whose sequences equal their offsets, so "the next sequence"
+/// after any surviving frontier is just the range's next offset.
+fn range_record(sequence: u64) -> LogRecord {
+    LogRecord {
+        producer_id: Uuid::from_u128(400),
+        producer_epoch: 0,
+        sequence,
+        timestamp_millis: 1_700_000_000_000 + sequence as i64,
+        attributes: 0,
+        key: b"key".to_vec(),
+        value: format!("value-{sequence:04}").into_bytes(),
+    }
+}
+
+fn build_rolled_range(env: &Env) -> SegmentSet {
+    let mut set =
+        SegmentSet::create_in(env, Path::new(ROOT), range_descriptor(), range_config()).unwrap();
+    for sequence in 0..30 {
+        set.append_group(
+            &[range_record(sequence)],
+            Durability::Fsync,
+            Uuid::from_u128(1000 + sequence as u128),
+        )
+        .unwrap();
+    }
+    assert!(
+        set.sealed().len() >= 2,
+        "the workload must roll at least twice"
+    );
+    set
+}
+
+/// Cross-segment truncation sweep: crash before every storage operation of a
+/// below-tail truncate. The durable intent marker means every reachable
+/// crash state must reopen as either the fully truncated range or the fully
+/// intact one — never a quarantined in-between — with no marker left behind
+/// and the producer able to continue at whichever frontier survived.
+#[test]
+fn sim_cross_segment_truncation_completes_or_never_starts_at_every_crash_boundary() {
+    // Clean run: learn the cut and which operations belong to the truncation.
+    let (cut, full_end, truncate_start, truncate_end) = {
+        let sim = SimStorage::new();
+        sim.create_dir_all(Path::new(ROOT));
+        let env = sim.env(SEED);
+        let mut set = build_rolled_range(&env);
+        let cut = set.sealed()[1].base_offset();
+        let full_end = set.next_offset();
+        let start = sim.op_count();
+        set.truncate_to(cut).unwrap();
+        (cut, full_end, start, sim.op_count())
+    };
+
+    for op in truncate_start..truncate_end {
+        let context = format!("crash-before op={op} seed={SEED:#x}");
+        let sim = SimStorage::new();
+        sim.create_dir_all(Path::new(ROOT));
+        let env = sim.env(SEED);
+        let mut set = build_rolled_range(&env);
+        assert_eq!(
+            set.sealed()[1].base_offset(),
+            cut,
+            "workload must be deterministic ({context})"
+        );
+        sim.set_fault(FaultPlan::CrashBefore(op));
+        assert!(
+            set.truncate_to(cut).is_err(),
+            "the crash must surface ({context})"
+        );
+        assert!(sim.has_crashed(), "{context}");
+        drop(set);
+        sim.reboot();
+
+        let mut reopened = SegmentSet::open_in(&env, Path::new(ROOT))
+            .unwrap_or_else(|error| panic!("every crash state must reopen ({context}): {error}"))
+            .unwrap_or_else(|| panic!("the range disappeared ({context})"));
+        let next = reopened.next_offset();
+        assert!(
+            next == cut || next == full_end,
+            "the range must be fully truncated or fully intact, found next={next} ({context})"
+        );
+        let catalog = discover_read_only(&sim, &env, &context);
+        assert!(
+            catalog.truncate_intent.is_none(),
+            "no marker may survive a reopen ({context})"
+        );
+
+        // The producer continues at whichever frontier survived — the
+        // inherited-frontier oracle. Offsets equal sequences here.
+        reopened
+            .append_group(
+                &[range_record(next)],
+                Durability::Fsync,
+                Uuid::from_u128(90_000),
+            )
+            .unwrap_or_else(|error| {
+                panic!("the producer must continue after recovery ({context}): {error}")
+            });
+        assert_eq!(reopened.next_offset(), next + 1, "{context}");
+        let batch = reopened
+            .fetch_through(0, usize::MAX, usize::MAX, next + 1)
+            .unwrap();
+        assert_eq!(
+            batch.records.len() as u64,
+            next + 1,
+            "the surviving range must be contiguous ({context})"
+        );
+        for (index, fetched) in batch.records.iter().enumerate() {
+            assert_eq!(fetched.offset, index as u64, "{context}");
+        }
     }
 }
 
