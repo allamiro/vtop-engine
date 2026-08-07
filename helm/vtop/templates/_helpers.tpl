@@ -6,18 +6,29 @@ Chart name.
 {{- end }}
 
 {{/*
-Fully qualified app name, DNS-truncated. StatefulSet pod hostnames append
-"-<ordinal>" and must still fit, hence the conservative truncation.
+Fully qualified app name.
+
+Truncated to 54, not 63, and the 9 characters held back are load-bearing:
+
+  * the headless Service appends "-headless" (9 chars). Truncating THAT to 63
+    after building it from a 63-char base yields the same string as the client
+    Service, so a long release name silently produces two Services with one
+    name and the chart fails to install.
+  * StatefulSet pod names append "-<ordinal>", and the
+    statefulset.kubernetes.io/pod-name label is itself capped at 63.
+
+Reserving the space up front is the only way both stay inside the limit; a
+second trunc after concatenating cannot recover characters already dropped.
 */}}
 {{- define "vtop.fullname" -}}
 {{- if .Values.fullnameOverride -}}
-{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
+{{- .Values.fullnameOverride | trunc 54 | trimSuffix "-" -}}
 {{- else -}}
 {{- $name := default .Chart.Name .Values.nameOverride -}}
 {{- if contains $name .Release.Name -}}
-{{- .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- .Release.Name | trunc 54 | trimSuffix "-" -}}
 {{- else -}}
-{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" -}}
+{{- printf "%s-%s" .Release.Name $name | trunc 54 | trimSuffix "-" -}}
 {{- end -}}
 {{- end -}}
 {{- end }}
@@ -31,7 +42,7 @@ The headless Service that gives every pod a stable DNS identity for Raft
 peer addressing and per-pod client access.
 */}}
 {{- define "vtop.headlessServiceName" -}}
-{{- printf "%s-headless" (include "vtop.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- printf "%s-headless" (include "vtop.fullname" .) | trimSuffix "-" -}}
 {{- end }}
 
 {{/*
