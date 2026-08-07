@@ -353,20 +353,63 @@ fn produce_ok(broker: &LocalBroker, range: RangeIdentity, sequence: u64) -> Prod
     }
 }
 
+/// Poll until `condition` holds or `deadline` elapses.
+///
+/// The alternative — a fixed settling sleep — is what flaked once under a
+/// full-workspace parallel run (#273): a pause that is generous when this
+/// file runs alone is a race when every test binary competes for CPU. A
+/// deadline turns scheduler jitter into waiting; the caller's assert still
+/// fails loudly, with current state, if the condition never holds.
+fn await_within(deadline: Duration, mut condition: impl FnMut() -> bool) -> bool {
+    let end = std::time::Instant::now() + deadline;
+    loop {
+        if condition() {
+            return true;
+        }
+        if std::time::Instant::now() >= end {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn networked_quorum_acks_and_propagates_hwm() {
-    let h = harness();
+    // This test asserts the happy-path PROPAGATION property, not timing, so
+    // it owns a generous ack timeout: the 2s default was the other half of
+    // the #273 flake surface — under full-workspace load a quorum ack that
+    // normally lands in milliseconds can graze a tight deadline. Tests that
+    // assert timing behaviour set their own budgets.
+    let h = harness_with(
+        FlowControlConfig {
+            ack_timeout: Duration::from_secs(10),
+            ..FlowControlConfig::default()
+        },
+        None,
+        None,
+        None,
+    );
     let first = produce_ok(&h.leader, h.range.clone(), 0);
     assert_eq!(first.outcomes[0].offset, 0);
     assert_eq!(first.committed_next_offset, 1);
     assert_eq!(h.cluster_committed.get(), 1);
 
-    // Give HWM propagation a moment on the async streams.
-    std::thread::sleep(Duration::from_millis(50));
-    assert_eq!(h.followers[0].cluster_committed().get(), 1);
-    assert_eq!(h.followers[1].cluster_committed().get(), 1);
-    assert_eq!(h.replica_set.follower_durable_offset(FOLLOWER_1), Some(1));
-    assert_eq!(h.replica_set.follower_durable_offset(FOLLOWER_2), Some(1));
+    // HWM propagation rides the async streams; wait for it with a deadline
+    // rather than assuming a settling time (#273).
+    assert!(
+        await_within(Duration::from_secs(5), || {
+            h.followers[0].cluster_committed().get() == 1
+                && h.followers[1].cluster_committed().get() == 1
+                && h.replica_set.follower_durable_offset(FOLLOWER_1) == Some(1)
+                && h.replica_set.follower_durable_offset(FOLLOWER_2) == Some(1)
+        }),
+        "HWM did not propagate to both followers within 5s: \
+         follower0_hwm={} follower1_hwm={} durable1={:?} durable2={:?}",
+        h.followers[0].cluster_committed().get(),
+        h.followers[1].cluster_committed().get(),
+        h.replica_set.follower_durable_offset(FOLLOWER_1),
+        h.replica_set.follower_durable_offset(FOLLOWER_2),
+    );
 }
 
 #[test]
