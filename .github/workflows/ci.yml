@@ -271,6 +271,18 @@ jobs:
       - name: Build engine image
         run: docker build -f docker/Dockerfile -t vtop-engine:ci .
 
+      # The build succeeding says nothing about what is INSIDE. The image
+      # shipped for two releases containing only vtopctl, so the Helm chart —
+      # which runs `vtop-node node` — could not start a single pod against it,
+      # and nothing noticed because no check ever looked.
+      - name: The image contains the binaries a deployment needs
+        run: |
+          set -euo pipefail
+          for binary in vtop-node vtopctl; do
+            docker run --rm --entrypoint "$binary" vtop-engine:ci --version \
+              || { echo "::error::$binary is missing from the image or will not run"; exit 1; }
+          done
+
   audit:
     name: supply-chain (cargo audit)
     needs: changes
