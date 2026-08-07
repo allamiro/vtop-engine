@@ -307,6 +307,57 @@ jobs:
   # array indexing, a port off-by-one, and PARTITIONS=0 passing validation only
   # to fail Kafka topic creation silently), so they are linted and tested like
   # any other code.
+  helm-deploy:
+    name: helm (deploy to kind)
+    needs: changes
+    if: needs.changes.outputs.helm == 'true' || needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+
+      - uses: azure/setup-helm@b9e51907a09c216f16ebe8536097933489208112 # v4.3.0
+        with:
+          version: v3.16.3
+
+      - uses: helm/kind-action@a1b0e391336a6ee6713a0583f8c6240d70863de3 # v1.12.0
+        with:
+          cluster_name: vtop-ci
+
+      - name: Build the engine image
+        run: docker build -f docker/Dockerfile -t vtop-engine:local .
+
+      # Taken OUT of the image rather than compiled again. The image already
+      # contains both binaries — that is the property #281 was about — so
+      # extracting them proves the SHIPPED artifact is the one under test, and
+      # skips a second full Rust build.
+      - name: Take vtopctl and vtop-node out of the image under test
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin"
+          container="$(docker create vtop-engine:local)"
+          for binary in vtopctl vtop-node; do
+            docker cp "$container:/usr/local/bin/$binary" "$RUNNER_TEMP/bin/$binary"
+          done
+          docker rm "$container" >/dev/null
+          chmod +x "$RUNNER_TEMP/bin"/*
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Load the image into kind
+        run: kind load docker-image vtop-engine:local --name vtop-ci
+
+      # The half the static checks cannot reach: pods Ready, Raft bootstrapped,
+      # records streamed and counted, and every record surviving a killed pod.
+      - name: Deploy the chart and verify it works
+        run: scripts/k8s-smoke.sh vtop-ci vtop
+
+      - name: Cluster state on failure
+        if: failure()
+        run: |
+          kubectl -n vtop-ci get pods -o wide || true
+          kubectl -n vtop-ci describe pods || true
+          kubectl -n vtop-ci logs -l app.kubernetes.io/instance=vtop --tail=60 --all-containers || true
+
   helm:
     name: helm (lint + render + refusals)
     needs: changes
