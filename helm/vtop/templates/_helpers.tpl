@@ -174,10 +174,55 @@ meta:
     operator_common_names: {{ toJson $v.meta.adminAuthorization.operatorCommonNames }}
 {{- end }}
 data:
-  # Standalone: each pod serves an independent range, the shape the upstream
-  # co-located harness runs. Replicated ranges under co-location wait on
-  # follower-side epoch propagation upstream.
+  {{- /* TOPOLOGY. The binary has always supported leader/follower/standalone,
+         and the live-chaos harness configures all three; only this chart used
+         to hardcode one. It no longer does — `data.topology` selects the shape.
+
+         standalone (default): every pod serves an INDEPENDENT range. Three
+         replicas are three separate logs, which is why quorum durability is
+         refused and why a pod nobody produced to stays empty.
+
+         replicated: ONE range across the pods. `data.leaderOrdinal` leads and
+         names the others as followers; everyone else follows. This is the only
+         shape that exercises replication, fencing and promotion — see the
+         failover caveat in values.yaml, which is a real limitation and not a
+         detail. */ -}}
+  {{- if eq $v.data.topology "replicated" }}
+  {{- /* Both of these render perfectly well and then cannot work, which is the
+         worst kind of configuration error: a leaderOrdinal outside the replica
+         set leaves EVERY pod a follower and the range with no leader at all,
+         and a single-replica replicated install gives a leader with no
+         followers, which is standalone wearing the wrong name. */ -}}
+  {{- if ge (int $v.data.leaderOrdinal) (int $v.replicaCount) }}
+  {{- fail (printf "\n\ndata.leaderOrdinal is %d but replicaCount is %d: the leader must be one of the pods, or the range has no leader at all." (int $v.data.leaderOrdinal) (int $v.replicaCount)) }}
+  {{- end }}
+  {{- if lt (int $v.replicaCount) 2 }}
+  {{- fail (printf "\n\ndata.topology is \"replicated\" but replicaCount is %d: a replicated range needs at least one follower. Use topology \"standalone\" for a single node." (int $v.replicaCount)) }}
+  {{- end }}
+  {{- if eq (int $i) (int $v.data.leaderOrdinal) }}
+  role: leader
+  followers:
+    {{- range $ordinal := until (int $root.Values.replicaCount) }}
+    {{- if ne $ordinal (int $v.data.leaderOrdinal) }}
+    {{- /* addr is the pod's OWN FQDN, never `vtop.peerServerName`. That helper
+           returns tls.serverName when a shared SAN is configured, and using it
+           here would make the leader dial one shared name for every follower —
+           a load-balanced endpoint, or the same pod repeatedly — instead of
+           each specific replica. The socket destination and the name verified
+           on the certificate are different questions; only the second may be
+           shared. The metadata peer list above already draws this distinction.
+        */ -}}
+    - node_uuid: {{ index $v.cluster.nodeUuids $ordinal }}
+      addr: "{{ include "vtop.podFqdn" (dict "root" $root "ordinal" $ordinal) }}:{{ $v.ports.replica }}"
+      server_name: "{{ include "vtop.peerServerName" (dict "root" $root "ordinal" $ordinal) }}"
+    {{- end }}
+    {{- end }}
+  {{- else }}
+  role: follower
+  {{- end }}
+  {{- else }}
   role: standalone
+  {{- end }}
   # Must equal the CN of node-{{ $i }}.pem in the data-plane Secret.
   node_uuid: {{ $nodeUuid }}
   cluster_id: {{ $clusterId }}
