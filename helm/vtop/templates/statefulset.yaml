@@ -21,10 +21,7 @@ spec:
     metadata:
       labels:
         {{- include "vtop.selectorLabels" . | nindent 8 }}
-        {{- /* Chart-managed selector labels are rendered above and must win:
-               a user label that redefined either of them would leave the
-               StatefulSet unable to match the pods it creates. */}}
-        {{- with (omit .Values.podLabels "app.kubernetes.io/name" "app.kubernetes.io/instance") }}
+        {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
       annotations:
@@ -36,12 +33,7 @@ spec:
         prometheus.io/port: {{ .Values.ports.observability | quote }}
         prometheus.io/path: /metrics
         {{- end }}
-        {{- /* Same for the chart-managed annotations. checksum/config is what
-               rolls the set when the ConfigMap changes; a user value that
-               replaced it would silently disable config-triggered rollouts,
-               and pods would keep running against a config that no longer
-               exists. */}}
-        {{- with (omit .Values.podAnnotations "checksum/config" "prometheus.io/scrape" "prometheus.io/port" "prometheus.io/path") }}
+        {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
@@ -49,10 +41,6 @@ spec:
       # vtop-node never calls the Kubernetes API; a mounted token would be
       # pure attack surface on a pod that also serves unauthenticated HTTP.
       automountServiceAccountToken: false
-      # No preStop hook, and no pretence of a graceful stop: vtop-node installs
-      # no signal handler, so this interval is time spent waiting before
-      # SIGKILL. Safe by design — acknowledgement follows fsync and recovery
-      # truncates a torn tail — but it is the crash path, not a clean one.
       terminationGracePeriodSeconds: {{ int .Values.terminationGracePeriodSeconds }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
@@ -193,14 +181,11 @@ spec:
         # User-supplied Secrets only — the render fails above if unnamed.
         - name: tls-meta
           secret:
-            # Quoted: an unquoted name that happens to be `true`, `no`, or a
-            # bare number is decoded as a boolean or int, and the manifest is
-            # rejected on a type error rather than on anything meaningful.
-            secretName: {{ include "vtop.metaSecretName" . | quote }}
+            secretName: {{ include "vtop.metaSecretName" . }}
             defaultMode: 0440
         - name: tls-data
           secret:
-            secretName: {{ include "vtop.dataSecretName" . | quote }}
+            secretName: {{ include "vtop.dataSecretName" . }}
             defaultMode: 0440
         {{- with .Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}
@@ -215,7 +200,7 @@ spec:
         accessModes:
           {{- toYaml .Values.persistence.meta.accessModes | nindent 10 }}
         {{- with .Values.persistence.meta.storageClass }}
-        storageClassName: {{ . | quote }}
+        storageClassName: {{ . }}
         {{- end }}
         resources:
           requests:
@@ -228,7 +213,7 @@ spec:
         accessModes:
           {{- toYaml .Values.persistence.data.accessModes | nindent 10 }}
         {{- with .Values.persistence.data.storageClass }}
-        storageClassName: {{ . | quote }}
+        storageClassName: {{ . }}
         {{- end }}
         resources:
           requests:

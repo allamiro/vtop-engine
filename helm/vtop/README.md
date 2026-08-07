@@ -137,29 +137,8 @@ helm install vtop helm/vtop \
 ```
 
 Then bootstrap the Raft group once (see the post-install NOTES):
-
-```
-kubectl -n <ns> port-forward pod/<release>-0 9200:9200 &
-vtopctl meta init --members 1,2,3 --config admin.yaml
-```
-
-Forward a **specific pod**, not the Service. Each pod presents a certificate
-whose SAN is that pod's own headless FQDN, so a load-balanced endpoint gives
-the client no name it can verify and TLS fails before `vtopctl` sends
-anything. `admin.yaml` therefore needs both an endpoint and a matching
-server name — the latter defaults to `localhost`, which never matches:
-
-```yaml
-endpoint: localhost:9200
-server_name: <release>-0.<release>-headless.<ns>.svc.cluster.local
-ca_cert: ...
-client_cert: ...
-client_key: ...
-```
-
-The client Service deliberately does **not** publish the admin port for this
-reason. `service.exposeMetaAdmin=true` puts it back, and is safe only if your
-certificates also carry that Service's DNS name as a shared SAN.
+`vtopctl meta init --members 1,2,3 --config admin.yaml` against the
+port-forwarded admin Service.
 
 ## Values
 

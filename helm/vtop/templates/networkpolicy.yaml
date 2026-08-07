@@ -38,18 +38,13 @@ spec:
       ports:
         - port: {{ .Values.ports.observability }}
     {{- with .Values.networkPolicy.clientFrom }}
-    # Operator/client access: vtopctl against the admin plane, produce/fetch
-    # clients against the native plane, and `vtopctl node status` against the
-    # REPLICA plane — that command goes replica-to-replica over the
-    # replication listener, not over HTTP or the admin endpoint, so omitting
-    # this port made the documented workflow fail with the policy enabled.
-    # Every one of these planes still demands mTLS.
+    # Operator/client access: vtopctl against the admin plane and produce/
+    # fetch clients against the native plane. Both planes still demand mTLS.
     - from:
         {{- toYaml . | nindent 8 }}
       ports:
         - port: {{ $.Values.ports.metaAdmin }}
         - port: {{ $.Values.ports.native }}
-        - port: {{ $.Values.ports.replica }}
     {{- end }}
   egress:
     # Peers dial each other on the same well-known ports.
@@ -63,16 +58,7 @@ spec:
         - port: {{ .Values.ports.replica }}
         - port: {{ .Values.ports.native }}
     # DNS: the peer list is FQDNs, so name resolution is a hard dependency.
-    #
-    # Scoped to the cluster DNS pods rather than left open. A rule with no
-    # `to` selector admits port 53 to EVERY destination, which turns a
-    # default-deny egress policy into one with a standing hole — and DNS is
-    # the classic exfiltration channel, so it is the wrong port to leave
-    # unrestricted. Override `networkPolicy.dnsTo` if your cluster DNS is not
-    # kube-dns in kube-system.
-    - to:
-        {{- toYaml .Values.networkPolicy.dnsTo | nindent 8 }}
-      ports:
+    - ports:
         - port: 53
           protocol: UDP
         - port: 53

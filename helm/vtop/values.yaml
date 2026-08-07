@@ -191,27 +191,13 @@ ports:
 logFormat: json
 
 service:
-  # Client-facing ClusterIP service. It carries the observability port
-  # unconditionally, and the admin port only if you opt in below. The native
-  # produce/fetch plane is never here: it is per-pod (each pod is an
-  # independent standalone range), so a round-robin Service would send a
-  # client to a random range. Address pods directly via the headless service:
-  # <fullname>-<ordinal>.<fullname>-headless.<ns>.svc.<domain>.
+  # Client-facing ClusterIP service. It carries ONLY the admin and
+  # observability ports: the native produce/fetch plane is per-pod (each pod
+  # is an independent standalone range), so a round-robin Service there would
+  # send a client to a random range. Address pods directly via the headless
+  # service: <fullname>-<ordinal>.<fullname>-headless.<ns>.svc.<domain>.
   type: ClusterIP
   annotations: {}
-  # Publish the metadata admin port on this load-balanced Service.
-  #
-  # OFF by default because it cannot work with per-pod certificates. Every pod
-  # presents a certificate whose SAN is that pod's headless FQDN, so a client
-  # routed to an arbitrary pod has no name to verify against and the TLS
-  # handshake fails before vtopctl sends anything. That is a broken bootstrap,
-  # not a warning.
-  #
-  # Turn it on only if your certificates ALSO carry this Service's DNS name
-  # (<fullname>.<namespace>.svc.<domain>) as a shared SAN, and set
-  # `server_name` in your vtopctl config to that name. The chart cannot
-  # inspect your certificates, so it will not assume this for you.
-  exposeMetaAdmin: false
 
 persistence:
   # Two volumes per pod, matching the two `data_dir`s in the config. Sizing:
@@ -285,21 +271,6 @@ networkPolicy:
   # external clients (cluster-internal traffic between vtop pods is always
   # allowed; both planes still require mTLS regardless).
   clientFrom: []
-  # Where DNS egress is allowed. The peer list is FQDNs, so name resolution is
-  # a hard dependency — but a rule with no destination admits port 53 to
-  # EVERYWHERE, which turns a default-deny egress policy into one with a
-  # standing hole, and DNS is the classic exfiltration channel.
-  #
-  # Defaults to kube-dns in kube-system, which covers most clusters. Point it
-  # at your resolver if yours differs; setting it to [] restores the
-  # unrestricted behaviour and is not recommended.
-  dnsTo:
-    - namespaceSelector:
-        matchLabels:
-          kubernetes.io/metadata.name: kube-system
-      podSelector:
-        matchLabels:
-          k8s-app: kube-dns
   # Extra egress rules appended verbatim (e.g. to reach an external metadata
   # admin endpoint when data.lease.adminEndpoint is not local).
   extraEgress: []
@@ -360,23 +331,7 @@ affinity: {}
 topologySpreadConstraints: []
 priorityClassName: ""
 
-# How long Kubernetes waits after SIGTERM before SIGKILL.
-#
-# STATED PLAINLY: vtop-node installs no signal handler, so SIGTERM is ignored
-# and every pod deletion, rolling update, and node drain ends in SIGKILL after
-# this many seconds. The wait buys a clean shutdown from nothing — it only
-# delays the inevitable.
-#
-# That is safe rather than merely tolerable: durability here does not depend on
-# an orderly exit. A record is acknowledged only once it is fsynced, recovery
-# truncates any torn tail, and live-chaos scenario 04 kills the leader with
-# SIGKILL mid-produce and verifies every acknowledged record survives
-# byte-exact. Restart takes the crash-recovery path by design.
-#
-# What it costs is time: 60 seconds of waiting per pod on every rollout. Lower
-# it if you would rather roll faster, since nothing is using the interval.
-# Signal-aware shutdown is tracked separately; when it lands this value starts
-# meaning what it says.
+# Long enough for a clean shutdown fsync; the pod is SIGKILLed after this.
 terminationGracePeriodSeconds: 60
 
 extraEnv: []

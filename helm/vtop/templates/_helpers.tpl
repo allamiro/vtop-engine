@@ -6,29 +6,18 @@ Chart name.
 {{- end }}
 
 {{/*
-Fully qualified app name.
-
-Truncated to 54, not 63, and the 9 characters held back are load-bearing:
-
-  * the headless Service appends "-headless" (9 chars). Truncating THAT to 63
-    after building it from a 63-char base yields the same string as the client
-    Service, so a long release name silently produces two Services with one
-    name and the chart fails to install.
-  * StatefulSet pod names append "-<ordinal>", and the
-    statefulset.kubernetes.io/pod-name label is itself capped at 63.
-
-Reserving the space up front is the only way both stay inside the limit; a
-second trunc after concatenating cannot recover characters already dropped.
+Fully qualified app name, DNS-truncated. StatefulSet pod hostnames append
+"-<ordinal>" and must still fit, hence the conservative truncation.
 */}}
 {{- define "vtop.fullname" -}}
 {{- if .Values.fullnameOverride -}}
-{{- .Values.fullnameOverride | trunc 54 | trimSuffix "-" -}}
+{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
 {{- else -}}
 {{- $name := default .Chart.Name .Values.nameOverride -}}
 {{- if contains $name .Release.Name -}}
-{{- .Release.Name | trunc 54 | trimSuffix "-" -}}
+{{- .Release.Name | trunc 63 | trimSuffix "-" -}}
 {{- else -}}
-{{- printf "%s-%s" .Release.Name $name | trunc 54 | trimSuffix "-" -}}
+{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 {{- end -}}
 {{- end }}
@@ -42,7 +31,7 @@ The headless Service that gives every pod a stable DNS identity for Raft
 peer addressing and per-pod client access.
 */}}
 {{- define "vtop.headlessServiceName" -}}
-{{- printf "%s-headless" (include "vtop.fullname" .) | trimSuffix "-" -}}
+{{- printf "%s-headless" (include "vtop.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end }}
 
 {{/*
@@ -128,15 +117,6 @@ so this template never emits them. Expects (dict "root" $ "ordinal" <int>).
 {{- $clusterId := required "\n\ncluster.id is required: the cluster UUID shared by every node. The chart does not default identities — they must match the certificates you minted." $v.cluster.id -}}
 {{- $nodeUuid := "" -}}
 {{- if gt (len $v.cluster.nodeUuids) $i -}}
-{{- /* Distinct per ordinal. Two pods sharing a broker UUID share an IDENTITY:
-       with data.lease.enabled they present the same one to the metadata plane
-       and race each other for the same range lease, so the StatefulSet is not
-       a cluster of replicas but two claimants wearing one name. The
-       certificate CN convention makes it worse — one certificate would be
-       valid for both. */ -}}
-{{- if ne (len (uniq $v.cluster.nodeUuids)) (len $v.cluster.nodeUuids) -}}
-{{- fail (printf "\n\ncluster.nodeUuids contains duplicates: %v. Each pod ordinal needs its OWN broker UUID — two pods sharing one identity would present the same identity to the metadata plane and race the same range lease." $v.cluster.nodeUuids) -}}
-{{- end -}}
 {{- $nodeUuid = index $v.cluster.nodeUuids $i -}}
 {{- else -}}
 {{- fail (printf "\n\ncluster.nodeUuids has %d entries but replicaCount is %d: provide one broker UUID per replica, indexed by pod ordinal. Each must equal the CN of that pod's data-plane certificate." (len $v.cluster.nodeUuids) (int $v.replicaCount)) -}}

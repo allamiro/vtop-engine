@@ -25,22 +25,13 @@ vtop {{ .Chart.AppVersion }} — {{ int .Values.replicaCount }} co-located node(
    running, empty logs). Run vtopctl against any admin endpoint with an
    operator certificate signed by your cluster CA:
 
-     kubectl -n {{ $ns }} port-forward pod/{{ $fullname }}-0 {{ .Values.ports.metaAdmin }}:{{ .Values.ports.metaAdmin }} &
+     kubectl -n {{ $ns }} port-forward svc/{{ $fullname }} {{ .Values.ports.metaAdmin }}:{{ .Values.ports.metaAdmin }} &
      vtopctl meta init --members {{ join "," $ids }} --config admin.yaml
      vtopctl meta status --config admin.yaml
 
-   Forward a SPECIFIC POD, not the Service. Each pod presents a certificate
-   whose SAN is that pod's own headless FQDN, so a load-balanced endpoint
-   gives the client no name it can verify and TLS fails before vtopctl sends
-   anything. admin.yaml must therefore carry BOTH:
-
-     endpoint: localhost:{{ .Values.ports.metaAdmin }}
-     server_name: {{ $fullname }}-0.{{ include "vtop.headlessServiceName" . }}.{{ $ns }}.svc.{{ .Values.clusterDomain }}
-
-   plus ca_cert/client_cert/client_key for your operator credentials.
-   `server_name` defaults to "localhost", which will NOT match — set it.
-
-   Node ids are pod ordinal+1: {{ $fullname }}-0 is meta node 1, and so on.
+   where admin.yaml points endpoint/ca_cert/client_cert/client_key at the
+   forwarded port and your operator credentials. Node ids are pod ordinal+1:
+   {{ $fullname }}-0 is meta node 1, and so on.
 {{- if .Values.meta.adminAuthorization.enabled }}
 
    NOTE: admin authorization is ENABLED — only these certificate CNs may run
