@@ -535,6 +535,13 @@ impl ActiveSegment {
         self.committed_offset
     }
 
+    /// Bytes of encoded record frames currently in the file. Cross-segment
+    /// truncation reports the size of what it removes, and the tail is the
+    /// one doomed segment with no sealed manifest to read that from.
+    pub(crate) fn content_bytes(&self) -> u64 {
+        self.content_bytes
+    }
+
     /// Durably commit every accepted append with one storage barrier.
     pub fn commit(&mut self) -> VtopLogResult<u64> {
         self.ensure_writable()?;
@@ -2608,7 +2615,7 @@ fn read_index(storage: &dyn Storage, path: &Path) -> VtopLogResult<Vec<IndexEntr
         .collect())
 }
 
-fn write_atomic(env: &Env, path: &Path, bytes: &[u8]) -> VtopLogResult<()> {
+pub(crate) fn write_atomic(env: &Env, path: &Path, bytes: &[u8]) -> VtopLogResult<()> {
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -2657,7 +2664,7 @@ fn with_path(error: LogError, path: &Path) -> LogError {
     }
 }
 
-fn io_error(path: &Path, source: std::io::Error) -> LogError {
+pub(crate) fn io_error(path: &Path, source: std::io::Error) -> LogError {
     LogError::Io {
         path: path.to_path_buf(),
         source,

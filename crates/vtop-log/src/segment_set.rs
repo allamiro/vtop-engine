@@ -30,7 +30,9 @@
 //! retained independently.
 
 use crate::env::Env;
-use crate::segment::{roll_in, segment_stem, ActiveSegment, SegmentReader};
+use crate::producer_snapshot::ProducerSnapshot;
+use crate::segment::{io_error, roll_in, segment_stem, write_atomic, ActiveSegment, SegmentReader};
+use crate::truncate_intent::{DoomedSegment, TruncateIntent, TRUNCATE_INTENT_FILE};
 use crate::{
     CatalogSegmentState, Durability, FetchBatch, FetchedRecord, LogError, LogRecord,
     SegmentDescriptor, StartupCatalog, VtopLogResult,
@@ -45,9 +47,12 @@ pub struct SegmentSet {
     /// Sealed segments in ascending offset order, contiguous with each other
     /// and with `active`.
     sealed: Vec<SegmentReader>,
-    /// `Option` only so the tail can be moved out by value during a roll, which
-    /// `roll_in` requires. It is `None` for the duration of that call and
-    /// nowhere else; an earlier version parked a throwaway segment in the range
+    /// `Option` only so the tail can be moved out by value: during a roll,
+    /// which `roll_in` requires, and during a cross-segment truncation, which
+    /// deletes the file the tail has open. It is `None` for the duration of
+    /// those calls — and permanently if either fails part-way, which every
+    /// accessor treats as a programming error rather than a state to serve
+    /// from. An earlier version parked a throwaway segment in the range
     /// directory instead, and its orphaned sidecars made discovery quarantine
     /// the whole range on the next open.
     active: Option<ActiveSegment>,
@@ -63,6 +68,29 @@ impl SegmentSet {
     /// hole in it while reporting success.
     pub fn open_in(env: &Env, directory: impl AsRef<Path>) -> VtopLogResult<Option<Self>> {
         let directory = directory.as_ref().to_path_buf();
+        // A truncation that died between its marker and its final rename is
+        // not an ambiguous layout: the marker says exactly which segments
+        // were doomed and what replaces them. Finish it BEFORE reading the
+        // layout, so the discovery below sees the completed range instead of
+        // quarantining the half-made one. A marker that does not decode is
+        // different — it names an intent that cannot be honoured — so it
+        // falls through to discovery, which quarantines it by name, and the
+        // open refuses like any other ambiguity.
+        let marker = directory.join(TRUNCATE_INTENT_FILE);
+        if env
+            .storage
+            .exists(&marker)
+            .map_err(|source| io_error(&marker, source))?
+        {
+            let decoded = env
+                .storage
+                .read(&marker)
+                .map_err(|source| io_error(&marker, source))
+                .and_then(|bytes| TruncateIntent::decode(&bytes));
+            if let Ok(intent) = decoded {
+                finish_truncation(env, &directory, &intent)?;
+            }
+        }
         let catalog = StartupCatalog::discover_in(env, &directory)?;
         if !catalog.quarantined.is_empty() {
             return Err(LogError::InvalidDescriptor(format!(
@@ -210,17 +238,19 @@ impl SegmentSet {
         self.tail_mut()
     }
 
-    /// The tail. Present except transiently inside [`Self::roll`].
+    /// The tail. Present except transiently inside [`Self::roll`] and
+    /// [`Self::truncate_to`]'s cross-segment path — or permanently after
+    /// either fails, which poisons the set.
     fn tail(&self) -> &ActiveSegment {
         self.active
             .as_ref()
-            .expect("the tail is absent only during a roll")
+            .expect("the tail is absent only mid-roll, mid-truncation, or after one failed")
     }
 
     fn tail_mut(&mut self) -> &mut ActiveSegment {
         self.active
             .as_mut()
-            .expect("the tail is absent only during a roll")
+            .expect("the tail is absent only mid-roll, mid-truncation, or after one failed")
     }
 
     /// Append a group, rolling if it does not fit in the tail.
@@ -269,7 +299,7 @@ impl SegmentSet {
         let active = self
             .active
             .take()
-            .expect("the tail is absent only during a roll");
+            .expect("the tail is absent only mid-roll, mid-truncation, or after one failed");
         // If this fails the tail stays `None`, which every accessor treats as a
         // programming error rather than a state to serve from. That is
         // deliberate: a set whose roll failed part-way has no coherent tail, and
@@ -286,33 +316,10 @@ impl SegmentSet {
     /// The repair for a replica that diverged from its range's current
     /// leadership (#240).
     ///
-    /// # Only cuts inside the tail, deliberately
-    ///
-    /// A cut that would delete or replace a sealed segment is REFUSED. It is
-    /// not a missing feature so much as a missing crash-recovery story, and the
-    /// three ways it goes wrong are worth naming because each one produces a
-    /// range that will not reopen:
-    ///
-    /// * Deleting the tail and creating its replacement cannot be ordered
-    ///   safely without a durable record of the intent. Replacement-first
-    ///   leaves two active segments, which discovery quarantines; delete-first
-    ///   leaves none, which nothing can distinguish from a range whose tail was
-    ///   lost. Recovery has to be able to FINISH an interrupted truncation, and
-    ///   that needs a marker this format does not yet have.
-    /// * A partial failure part-way through deleting segments leaves this value
-    ///   describing a range that no longer exists on disk, while the caller has
-    ///   only been handed an error.
-    /// * The replacement tail would begin with no inherited producer frontier,
-    ///   so the next append from a producer already in the retained prefix is
-    ///   rejected as `FirstSequence` — the same failure the `.producers`
-    ///   sidecar exists to prevent, reintroduced somewhere new.
-    ///
-    /// None of this is reachable in the running system today: nothing rolls,
-    /// so every range is one active segment and every cut lands inside it. That
-    /// is exactly why it refuses rather than doing something partial — the
-    /// refusal is unreachable now and correct later, whereas a half-implemented
-    /// cross-segment truncation would be silently wrong the moment rolling is
-    /// switched on.
+    /// A cut inside the tail is the single-segment case, unchanged. A cut
+    /// below the tail deletes whole segments and replaces the tail, which is
+    /// only crash-safe under a durable intent marker; see
+    /// [`Self::truncate_across_segments`] for the protocol.
     pub fn truncate_to(&mut self, offset: u64) -> VtopLogResult<crate::TruncateOutcome> {
         if offset > self.next_offset() {
             return Err(LogError::TruncateBeyondTail {
@@ -321,15 +328,167 @@ impl SegmentSet {
             });
         }
         if offset < self.tail().base_offset() {
-            return Err(LogError::InvalidConfig(format!(
-                "cannot truncate to offset {offset}: it is below the active segment's start \
-                 {}, and truncating across sealed segments needs a durable record of the \
-                 intent so an interrupted repair can be finished rather than leaving a range \
-                 that cannot reopen",
-                self.tail().base_offset()
-            )));
+            return self.truncate_across_segments(offset);
         }
         self.tail_mut().truncate_to(offset)
+    }
+
+    /// Honour a cut below the tail: delete every segment at or above the cut
+    /// and open a replacement tail there.
+    ///
+    /// # The marker is what makes this survivable
+    ///
+    /// Deleting the tail and creating its replacement cannot be ordered
+    /// crash-safely on their own. Replacement-first leaves two active
+    /// segments, which discovery quarantines; delete-first leaves none, which
+    /// nothing can distinguish from a range whose tail was lost. So the
+    /// intent is made durable FIRST — `range.truncate-intent`, at the range
+    /// directory level, because a marker inside a segment being deleted would
+    /// not survive the thing it protects. From that point an interruption at
+    /// any step is finishable: [`finish_truncation`] is idempotent and
+    /// [`Self::open_in`] runs it before reading the layout.
+    ///
+    /// # Cuts land on sealed-segment boundaries, deliberately
+    ///
+    /// A cut strictly inside a sealed segment would need the retained part of
+    /// an immutable file rewritten into the replacement tail — a different
+    /// repair, with its own recovery story, that deleting whole segments does
+    /// not need. Refusing it loudly beats a half-implemented version of it.
+    ///
+    /// # The replacement inherits the retained prefix's producer frontier
+    ///
+    /// The first doomed segment begins at the cut, so the frontier IT
+    /// inherited — its `.producers` sidecar — is exactly the producer state
+    /// of everything retained. Those bytes are embedded in the marker (the
+    /// sidecar itself shares a filename stem with the doomed segment and dies
+    /// with it) and become the replacement's own sidecar. Without this, the
+    /// next append from a producer already in the retained prefix would be
+    /// rejected as `FirstSequence` — the exact failure `.producers` exists to
+    /// prevent.
+    ///
+    /// # On failure the set poisons
+    ///
+    /// Once the marker is durable, the directory changes underneath this
+    /// value, and an error part-way would leave it describing segments that
+    /// no longer exist on disk. Ownership of the tail is therefore given up
+    /// before any file is touched and only restored on success — the same
+    /// posture as a failed [`Self::roll`], where every accessor treats the
+    /// missing tail as a programming error rather than a state to serve
+    /// from. Refusing to serve is safe precisely BECAUSE the marker is
+    /// durable: the next open finishes the truncation instead of reopening
+    /// the wreckage.
+    fn truncate_across_segments(&mut self, offset: u64) -> VtopLogResult<crate::TruncateOutcome> {
+        // The marker records a v1 segment identity. A v2 range would need the
+        // v2 descriptor fields carried too; until the format does, refuse
+        // loudly rather than have recovery rebuild a tail with the wrong
+        // identity.
+        if self.tail().descriptor_v2().is_some()
+            || self.sealed.iter().any(|r| r.descriptor_v2().is_some())
+        {
+            return Err(LogError::InvalidConfig(
+                "cannot truncate a v2 range across segments: the truncation intent marker \
+                 records a v1 segment identity"
+                    .to_owned(),
+            ));
+        }
+        let Some(cut_index) = self
+            .sealed
+            .iter()
+            .position(|reader| reader.base_offset() == offset)
+        else {
+            return Err(LogError::InvalidConfig(format!(
+                "cannot truncate to offset {offset}: it is below the active segment's start \
+                 {} and does not land on a sealed segment boundary; a cut inside a sealed \
+                 segment would need the retained part of an immutable file rewritten, which \
+                 is a different repair than deleting whole segments",
+                self.tail().base_offset()
+            )));
+        };
+
+        // Read the inherited frontier back from the sidecar rather than
+        // trusting memory: these are the bytes that survive, and recovery
+        // will have nothing else. Absent reads as empty, exactly as it does
+        // for a range's first segment.
+        let producers_path = self
+            .directory
+            .join(format!("{}.producers", segment_stem(offset)));
+        let inherited = if self
+            .env
+            .storage
+            .exists(&producers_path)
+            .map_err(|source| io_error(&producers_path, source))?
+        {
+            let bytes = self
+                .env
+                .storage
+                .read(&producers_path)
+                .map_err(|source| io_error(&producers_path, source))?;
+            ProducerSnapshot::decode(&bytes)?
+        } else {
+            ProducerSnapshot::default()
+        };
+
+        let mut replacement = self.tail().v1_descriptor_view();
+        replacement.segment_id = Uuid::from_u128(self.env.rng.next_u128());
+        replacement.base_offset = offset;
+        let mut doomed: Vec<DoomedSegment> = self.sealed[cut_index..]
+            .iter()
+            .map(|reader| DoomedSegment {
+                segment_id: reader.manifest().descriptor.segment_id,
+                base_offset: reader.base_offset(),
+            })
+            .collect();
+        doomed.push(DoomedSegment {
+            segment_id: self.tail().v1_descriptor_view().segment_id,
+            base_offset: self.tail().base_offset(),
+        });
+        let intent = TruncateIntent {
+            target_offset: offset,
+            replacement,
+            config: self.tail().config(),
+            doomed,
+            inherited,
+        };
+        let records_removed = self.next_offset() - offset;
+        let bytes_removed = self.sealed[cut_index..]
+            .iter()
+            .map(|reader| reader.manifest().content_bytes)
+            .sum::<u64>()
+            + self.tail().content_bytes();
+
+        // Nothing above changed any state, so every refusal so far left the
+        // range untouched. This write is the point of no return: once the
+        // marker is durable the truncation WILL complete — in this call, or
+        // in the next open if this process dies first.
+        write_atomic(
+            &self.env,
+            &self.directory.join(TRUNCATE_INTENT_FILE),
+            &intent.encode()?,
+        )?;
+
+        // Close every handle onto doomed files before deleting them, and
+        // give up the tail so a failure below leaves the set refusing to
+        // serve rather than serving a range that is no longer on disk.
+        drop(
+            self.active
+                .take()
+                .expect("the tail is absent only mid-roll, mid-truncation, or after one failed"),
+        );
+        self.sealed.truncate(cut_index);
+        finish_truncation(&self.env, &self.directory, &intent)?;
+        // Reopen through recovery rather than keeping a create-time handle:
+        // recovery is the path that seeds producer state from the sidecar,
+        // so the in-memory tail and the on-disk one cannot disagree about
+        // what was inherited.
+        let replacement_path = self
+            .directory
+            .join(format!("{}.active", segment_stem(offset)));
+        self.active = Some(ActiveSegment::recover_in(&self.env, &replacement_path)?);
+        Ok(crate::TruncateOutcome {
+            records_removed,
+            bytes_removed,
+            next_offset: offset,
+        })
     }
 
     /// Read from `start_offset`, crossing segment boundaries as needed.
@@ -401,6 +560,131 @@ impl SegmentSet {
         // on to the next segment.
         self.sealed[index].fetch_through(offset, max_bytes, max_records, high_watermark)
     }
+}
+
+/// Carry a durably recorded truncation to completion.
+///
+/// Idempotent by construction: every step either deletes something that may
+/// already be gone or recreates the replacement from what the marker says, so
+/// it can run after a crash at ANY point — including inside a previous run of
+/// itself. That is why the replacement is deleted and rebuilt even when a
+/// prior attempt already created it: the marker is the one source of truth,
+/// and rebuilding from it is what makes "how far did the last attempt get"
+/// a question nobody has to answer. Nothing is lost by the rebuild — the
+/// replacement cannot have accepted an append until the marker is gone.
+///
+/// Removing the marker is the commit point, and its removal is made durable
+/// before returning: a resurrected marker would re-run this function and
+/// delete a replacement that HAS accepted appends by then.
+fn finish_truncation(env: &Env, directory: &Path, intent: &TruncateIntent) -> VtopLogResult<()> {
+    // Sweep debris of an interrupted attempt first. A crash inside one of
+    // this function's own atomic writes can leave a `.{name}.{uuid}.tmp`
+    // behind, and the discovery that follows would quarantine it as an
+    // incomplete write — leaving the range unopenable even though the
+    // truncation itself completed. Only debris this truncation could have
+    // produced is touched.
+    remove_truncation_debris(env, directory, intent)?;
+    for doomed in &intent.doomed {
+        remove_segment_files(env, directory, doomed.base_offset)?;
+    }
+    // Deletions must be durable before anything is built on top of them: a
+    // crash after the marker clears but before a deletion lands would leave
+    // a doomed segment beside the replacement with no marker left to explain
+    // it.
+    env.storage
+        .sync_dir(directory)
+        .map_err(|source| io_error(directory, source))?;
+
+    let stem = segment_stem(intent.target_offset);
+    if !intent.inherited.is_empty() {
+        // Sidecar before the segment file, matching `roll_in`: a tail must
+        // never exist without the frontier that makes it readable.
+        write_atomic(
+            env,
+            &directory.join(format!("{stem}.producers")),
+            &intent.inherited.encode()?,
+        )?;
+    }
+    let replacement_path = directory.join(format!("{stem}.active"));
+    drop(ActiveSegment::create_in(
+        env,
+        &replacement_path,
+        intent.replacement.clone(),
+        intent.config,
+    )?);
+
+    let marker = directory.join(TRUNCATE_INTENT_FILE);
+    env.storage
+        .remove_file(&marker)
+        .map_err(|source| io_error(&marker, source))?;
+    env.storage
+        .sync_dir(directory)
+        .map_err(|source| io_error(directory, source))
+}
+
+/// Delete every file a segment beginning at `base_offset` could own, present
+/// or not. Whether it was active or sealed at the crash is unknowable and
+/// does not matter; a leftover sidecar is an orphan, which discovery
+/// quarantines, so a partial delete would turn the repair into a range that
+/// refuses to open.
+fn remove_segment_files(env: &Env, directory: &Path, base_offset: u64) -> VtopLogResult<()> {
+    let stem = segment_stem(base_offset);
+    for name in [
+        format!("{stem}.active"),
+        format!("{stem}.segment"),
+        format!("{stem}.commit"),
+        format!("{stem}.index"),
+        format!("{stem}.manifest.json"),
+        format!("{stem}.chunks"),
+        format!("{stem}.producers"),
+    ] {
+        let path = directory.join(name);
+        if env
+            .storage
+            .exists(&path)
+            .map_err(|source| io_error(&path, source))?
+        {
+            env.storage
+                .remove_file(&path)
+                .map_err(|source| io_error(&path, source))?;
+        }
+    }
+    Ok(())
+}
+
+/// Delete leftover `.{name}.{uuid}.tmp` files from an interrupted attempt at
+/// THIS truncation: the marker's own, or a sidecar of a doomed stem (the
+/// replacement shares the first doomed stem, so its debris is covered too).
+/// Anything else's temporary files are not this repair's to judge.
+fn remove_truncation_debris(
+    env: &Env,
+    directory: &Path,
+    intent: &TruncateIntent,
+) -> VtopLogResult<()> {
+    let stems: Vec<String> = intent
+        .doomed
+        .iter()
+        .map(|doomed| format!(".{}.", segment_stem(doomed.base_offset)))
+        .collect();
+    let marker_prefix = format!(".{TRUNCATE_INTENT_FILE}.");
+    let entries = env
+        .storage
+        .read_dir(directory)
+        .map_err(|source| io_error(directory, source))?;
+    for entry in entries {
+        let Some(name) = entry.path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !(name.starts_with('.') && name.ends_with(".tmp")) {
+            continue;
+        }
+        if name.starts_with(&marker_prefix) || stems.iter().any(|stem| name.starts_with(stem)) {
+            env.storage
+                .remove_file(&entry.path)
+                .map_err(|source| io_error(&entry.path, source))?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -696,14 +980,15 @@ mod tests {
         assert_eq!(reopened.next_offset(), cut);
     }
 
-    /// A cut below the tail is refused rather than half-done.
+    /// A cut below the tail that does not land on a sealed segment boundary
+    /// is refused rather than half-done.
     ///
-    /// Honouring it means deleting and replacing segments, and that cannot be
-    /// ordered crash-safely without a durable record of the intent:
-    /// replacement-first leaves two active segments, delete-first leaves none,
-    /// and either way the range will not reopen.
+    /// Honouring it would mean rewriting the retained part of an immutable
+    /// sealed segment into the replacement tail — a different repair from
+    /// deleting whole segments, with its own recovery story the intent
+    /// marker does not carry.
     #[test]
-    fn a_cut_below_the_tail_is_refused() {
+    fn a_cut_inside_a_sealed_segment_is_refused() {
         let directory = tempdir().unwrap();
         let producer = Uuid::from_u128(37);
         let mut set =
@@ -717,10 +1002,14 @@ mod tests {
             .unwrap();
         }
         assert!(!set.sealed().is_empty(), "need at least one sealed segment");
-        let below = set.sealed()[0].base_offset();
+        let inside = set.sealed()[0].base_offset() + 1;
+        assert!(
+            inside < set.sealed()[0].next_offset(),
+            "the cut must fall strictly inside the first sealed segment"
+        );
 
         assert!(matches!(
-            set.truncate_to(below),
+            set.truncate_to(inside),
             Err(LogError::InvalidConfig(_))
         ));
         assert_eq!(
@@ -728,6 +1017,18 @@ mod tests {
             40,
             "a refused truncation must leave the range untouched"
         );
+        assert!(
+            !directory.path().join(TRUNCATE_INTENT_FILE).exists(),
+            "a refusal must not leave an intent marker behind"
+        );
+        // Still fully usable: the refusal happened before anything changed.
+        set.append_group(
+            &[record(producer, 40)],
+            Durability::Fsync,
+            Uuid::from_u128(10_999),
+        )
+        .unwrap();
+        assert_eq!(set.next_offset(), 41);
     }
 
     /// Truncation removes records; it can never invent them.
@@ -747,5 +1048,345 @@ mod tests {
             set.truncate_to(99),
             Err(LogError::TruncateBeyondTail { requested: 99, .. })
         ));
+    }
+
+    /// Write a rolled range to `directory` and return the second sealed
+    /// segment's base offset — a cut there leaves a non-empty retained prefix,
+    /// so the frontier the replacement must inherit is non-trivial.
+    fn build_rolled_range(directory: &Path, producer: Uuid) -> u64 {
+        let mut set = SegmentSet::create_in(&Env::real(), directory, descriptor(), config())
+            .expect("the range must be creatable");
+        for sequence in 0..40 {
+            set.append_group(
+                &[record(producer, sequence)],
+                Durability::Fsync,
+                Uuid::from_u128(30_000 + sequence as u128),
+            )
+            .unwrap();
+        }
+        assert!(
+            set.sealed().len() >= 2,
+            "the workload must roll at least twice"
+        );
+        set.sealed()[1].base_offset()
+    }
+
+    /// The intent the live path would write for a cut at `target`: doomed
+    /// segments from the catalog, frontier from the sidecar of the segment at
+    /// the cut. Staging it by hand lets a test park the on-disk state at any
+    /// point of the protocol.
+    fn staged_intent(directory: &Path, target: u64) -> TruncateIntent {
+        let catalog = StartupCatalog::discover_in(&Env::real(), directory).unwrap();
+        assert!(catalog.quarantined.is_empty(), "{:?}", catalog.quarantined);
+        let doomed = catalog
+            .entries
+            .iter()
+            .filter(|entry| entry.descriptor.base_offset >= target)
+            .map(|entry| DoomedSegment {
+                segment_id: entry.descriptor.segment_id,
+                base_offset: entry.descriptor.base_offset,
+            })
+            .collect::<Vec<_>>();
+        let producers = directory.join(format!("{}.producers", segment_stem(target)));
+        let inherited = if producers.exists() {
+            ProducerSnapshot::decode(&std::fs::read(&producers).unwrap()).unwrap()
+        } else {
+            ProducerSnapshot::default()
+        };
+        let mut replacement = descriptor();
+        replacement.segment_id = Uuid::from_u128(777);
+        replacement.base_offset = target;
+        TruncateIntent {
+            target_offset: target,
+            replacement,
+            config: config(),
+            doomed,
+            inherited,
+        }
+    }
+
+    /// A cut at a sealed segment boundary removes whole segments and replaces
+    /// the tail — and, the regression this feature exists to prevent: the
+    /// replacement inherits the retained prefix's producer frontier, so a
+    /// producer already in the range continues without `FirstSequence`.
+    #[test]
+    fn a_cut_at_a_sealed_boundary_removes_whole_segments() {
+        let directory = tempdir().unwrap();
+        let producer = Uuid::from_u128(43);
+        let mut set =
+            SegmentSet::create_in(&Env::real(), directory.path(), descriptor(), config()).unwrap();
+        for sequence in 0..40 {
+            set.append_group(
+                &[record(producer, sequence)],
+                Durability::Fsync,
+                Uuid::from_u128(12_000 + sequence as u128),
+            )
+            .unwrap();
+        }
+        assert!(set.sealed().len() >= 2, "need at least two sealed segments");
+        let cut = set.sealed()[1].base_offset();
+
+        let outcome = set.truncate_to(cut).unwrap();
+        assert_eq!(outcome.next_offset, cut);
+        assert_eq!(outcome.records_removed, 40 - cut);
+        assert!(outcome.bytes_removed > 0);
+        assert_eq!(set.next_offset(), cut);
+        assert_eq!(set.base_offset(), 0);
+        assert_eq!(
+            set.sealed().len(),
+            1,
+            "only segments at or above the cut may be removed"
+        );
+        assert!(
+            !directory.path().join(TRUNCATE_INTENT_FILE).exists(),
+            "the marker must be cleared once the truncation completes"
+        );
+
+        // The producer's frontier survived the cut: its next sequence is
+        // accepted, not rejected as a first-sequence violation.
+        set.append_group(
+            &[record(producer, cut)],
+            Durability::Fsync,
+            Uuid::from_u128(13_000),
+        )
+        .unwrap();
+        assert_eq!(set.next_offset(), cut + 1);
+
+        // Contiguity across the surviving boundary.
+        let batch = set.fetch_through(0, 1 << 20, 1000, cut + 1).unwrap();
+        assert_eq!(batch.records.len() as u64, cut + 1);
+        for (index, fetched) in batch.records.iter().enumerate() {
+            assert_eq!(fetched.offset, index as u64);
+        }
+
+        // And it reopens, which is what proves nothing was left inconsistent
+        // on disk.
+        drop(set);
+        let mut reopened = SegmentSet::open_in(&Env::real(), directory.path())
+            .unwrap()
+            .expect("the truncated range must still open");
+        assert_eq!(reopened.next_offset(), cut + 1);
+        reopened
+            .append_group(
+                &[record(producer, cut + 1)],
+                Durability::Fsync,
+                Uuid::from_u128(13_001),
+            )
+            .unwrap();
+    }
+
+    /// Recovery completes a truncation that died right after its marker
+    /// became durable, before any file was touched.
+    #[test]
+    fn recovery_completes_a_truncation_that_wrote_only_the_marker() {
+        let directory = tempdir().unwrap();
+        let producer = Uuid::from_u128(47);
+        let cut = build_rolled_range(directory.path(), producer);
+        let intent = staged_intent(directory.path(), cut);
+        std::fs::write(
+            directory.path().join(TRUNCATE_INTENT_FILE),
+            intent.encode().unwrap(),
+        )
+        .unwrap();
+
+        let mut set = SegmentSet::open_in(&Env::real(), directory.path())
+            .unwrap()
+            .expect("the range must open with the truncation completed");
+        assert_eq!(set.next_offset(), cut);
+        assert!(!directory.path().join(TRUNCATE_INTENT_FILE).exists());
+        // The frontier travelled through the marker: the producer continues.
+        set.append_group(
+            &[record(producer, cut)],
+            Durability::Fsync,
+            Uuid::from_u128(14_000),
+        )
+        .unwrap();
+        assert_eq!(set.next_offset(), cut + 1);
+    }
+
+    /// Recovery completes a truncation that died after creating the
+    /// replacement but before deleting anything — the replacement-first crash
+    /// whose two active segments discovery quarantines when no marker
+    /// explains them.
+    #[test]
+    fn recovery_completes_a_truncation_interrupted_after_creating_the_replacement() {
+        let directory = tempdir().unwrap();
+        let producer = Uuid::from_u128(53);
+        let cut = build_rolled_range(directory.path(), producer);
+        let intent = staged_intent(directory.path(), cut);
+        let stem = segment_stem(cut);
+        if !intent.inherited.is_empty() {
+            std::fs::write(
+                directory.path().join(format!("{stem}.producers")),
+                intent.inherited.encode().unwrap(),
+            )
+            .unwrap();
+        }
+        drop(
+            ActiveSegment::create_in(
+                &Env::real(),
+                directory.path().join(format!("{stem}.active")),
+                intent.replacement.clone(),
+                intent.config,
+            )
+            .unwrap(),
+        );
+        // Without the marker this layout is exactly the ambiguity the whole
+        // protocol exists to remove: two active segments, and a stem holding
+        // both a sealed segment and an active file.
+        assert!(
+            SegmentSet::open_in(&Env::real(), directory.path()).is_err(),
+            "the staged state must be unopenable without the marker"
+        );
+
+        std::fs::write(
+            directory.path().join(TRUNCATE_INTENT_FILE),
+            intent.encode().unwrap(),
+        )
+        .unwrap();
+        let mut set = SegmentSet::open_in(&Env::real(), directory.path())
+            .unwrap()
+            .expect("with the marker the same state must open, completed");
+        assert_eq!(set.next_offset(), cut);
+        assert!(!directory.path().join(TRUNCATE_INTENT_FILE).exists());
+        set.append_group(
+            &[record(producer, cut)],
+            Durability::Fsync,
+            Uuid::from_u128(15_000),
+        )
+        .unwrap();
+        assert_eq!(set.next_offset(), cut + 1);
+    }
+
+    /// Recovery clears a marker whose work was already done: deletions and
+    /// replacement both landed, only the final unlink was lost.
+    #[test]
+    fn recovery_clears_a_marker_whose_work_is_already_done() {
+        let directory = tempdir().unwrap();
+        let producer = Uuid::from_u128(59);
+        let cut = build_rolled_range(directory.path(), producer);
+        let intent = staged_intent(directory.path(), cut);
+        for doomed in &intent.doomed {
+            let stem = segment_stem(doomed.base_offset);
+            for suffix in [
+                "active",
+                "segment",
+                "commit",
+                "index",
+                "manifest.json",
+                "chunks",
+                "producers",
+            ] {
+                let _ = std::fs::remove_file(directory.path().join(format!("{stem}.{suffix}")));
+            }
+        }
+        let stem = segment_stem(cut);
+        if !intent.inherited.is_empty() {
+            std::fs::write(
+                directory.path().join(format!("{stem}.producers")),
+                intent.inherited.encode().unwrap(),
+            )
+            .unwrap();
+        }
+        drop(
+            ActiveSegment::create_in(
+                &Env::real(),
+                directory.path().join(format!("{stem}.active")),
+                intent.replacement.clone(),
+                intent.config,
+            )
+            .unwrap(),
+        );
+        std::fs::write(
+            directory.path().join(TRUNCATE_INTENT_FILE),
+            intent.encode().unwrap(),
+        )
+        .unwrap();
+
+        let mut set = SegmentSet::open_in(&Env::real(), directory.path())
+            .unwrap()
+            .expect("the range must open with the marker cleared");
+        assert_eq!(set.next_offset(), cut);
+        assert!(!directory.path().join(TRUNCATE_INTENT_FILE).exists());
+        // The replacement was rebuilt from the marker, so it carries the
+        // marker's identity — proof that completion is deterministic rather
+        // than minting a new segment per attempt.
+        assert_eq!(
+            set.active().descriptor().segment_id,
+            intent.replacement.segment_id
+        );
+        set.append_group(
+            &[record(producer, cut)],
+            Durability::Fsync,
+            Uuid::from_u128(16_000),
+        )
+        .unwrap();
+        assert_eq!(set.next_offset(), cut + 1);
+    }
+
+    /// Completion sweeps debris of its own interrupted atomic writes.
+    /// Otherwise discovery would quarantine the finished range for an
+    /// incomplete write that no longer matters.
+    #[test]
+    fn recovery_sweeps_debris_of_its_own_interrupted_writes() {
+        let directory = tempdir().unwrap();
+        let producer = Uuid::from_u128(61);
+        let cut = build_rolled_range(directory.path(), producer);
+        let intent = staged_intent(directory.path(), cut);
+        let marker_debris = directory
+            .path()
+            .join(".range.truncate-intent.00000000-0000-0000-0000-000000000001.tmp");
+        let sidecar_debris = directory.path().join(format!(
+            ".{}.producers.00000000-0000-0000-0000-000000000002.tmp",
+            segment_stem(cut)
+        ));
+        std::fs::write(&marker_debris, b"debris").unwrap();
+        std::fs::write(&sidecar_debris, b"debris").unwrap();
+        std::fs::write(
+            directory.path().join(TRUNCATE_INTENT_FILE),
+            intent.encode().unwrap(),
+        )
+        .unwrap();
+
+        let set = SegmentSet::open_in(&Env::real(), directory.path())
+            .unwrap()
+            .expect("the range must open with the truncation completed");
+        assert_eq!(set.next_offset(), cut);
+        assert!(!marker_debris.exists(), "marker debris must be swept");
+        assert!(!sidecar_debris.exists(), "sidecar debris must be swept");
+    }
+
+    /// A marker that does not decode names an intent that cannot be honoured.
+    /// It is quarantined by name and the open refuses — recovery never
+    /// guesses at which segments to delete.
+    #[test]
+    fn a_corrupt_marker_quarantines_instead_of_guessing() {
+        let directory = tempdir().unwrap();
+        let producer = Uuid::from_u128(67);
+        build_rolled_range(directory.path(), producer);
+        std::fs::write(
+            directory.path().join(TRUNCATE_INTENT_FILE),
+            b"not an intent",
+        )
+        .unwrap();
+
+        let catalog = StartupCatalog::discover_in(&Env::real(), directory.path()).unwrap();
+        assert!(catalog.truncate_intent.is_none());
+        assert!(
+            catalog.quarantined.iter().any(|item| item
+                .reasons
+                .iter()
+                .any(|reason| matches!(reason, crate::QuarantineReason::InvalidTruncateIntent(_)))),
+            "{:?}",
+            catalog.quarantined
+        );
+        assert!(
+            !catalog.entries.is_empty(),
+            "the segments themselves are intact and stay cataloged"
+        );
+        assert!(
+            SegmentSet::open_in(&Env::real(), directory.path()).is_err(),
+            "an undecodable intent must refuse the open, not be acted on"
+        );
     }
 }
