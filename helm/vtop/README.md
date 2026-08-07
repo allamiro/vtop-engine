@@ -95,6 +95,34 @@ kubectl create secret generic vtop-meta-tls \
 chart deliberately does not depend on it — it consumes plain Secrets from
 wherever you issue them.
 
+## First start: expect one or two restarts
+
+Nodes resolve their peers' DNS names at startup and **exit** if resolution
+fails. `podManagementPolicy: Parallel` and `publishNotReadyAddresses: true` are
+both set so peers can find each other before any of them is Ready — but at the
+instant the first container runs, its peers may not have endpoints yet.
+
+So on a cold install the first pods typically restart once or twice, back off,
+and settle. Observed on a fresh 3-replica install: two pods restarted twice,
+one never restarted, and all three reached Ready inside a minute.
+
+This is a startup-ordering cost, not a fault. It resolves itself, and nothing
+is lost — but do not read `RESTARTS 2` on a fresh install as a broken deploy,
+and do not loosen the probes to hide it. Signal-aware startup retry is tracked
+alongside #280.
+
+## Verifying a real deployment
+
+`scripts/k8s-smoke.sh` installs the chart against a live cluster and asserts
+what rendering cannot: pods reach Ready, the Raft group bootstraps and elects a
+leader, records stream and the committed offset matches what was produced, each
+pod is an independent range, and every record survives a force-deleted pod.
+
+```
+docker build -f docker/Dockerfile -t vtop-engine:local .
+scripts/k8s-smoke.sh              # namespace vtop-smoke, release vtop
+```
+
 ## Probes — wired honestly
 
 | Probe | Endpoint | Semantics |
