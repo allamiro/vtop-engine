@@ -354,8 +354,23 @@ jobs:
             echo "refused without $what"
           }
           refuses "any identities"
-          refuses "TLS secret names" --set cluster.id=11111111-2222-3333-4444-555555555555
+          # Every other identity supplied, so rendering REACHES the TLS check
+          # instead of aborting earlier. The first version of this step set only
+          # cluster.id and stopped at the nodeUuids length check — helm exits
+          # non-zero either way, so the step passed while never once exercising
+          # the contract it names. A regression that silently stopped refusing
+          # TLS would have sailed through it.
+          refuses "TLS secret names" \
+            --set cluster.id=11111111-2222-3333-4444-555555555555 \
+            --set 'cluster.nodeUuids={aaaaaaaa-0000-0000-0000-0000000000a1,aaaaaaaa-0000-0000-0000-0000000000a2,aaaaaaaa-0000-0000-0000-0000000000a3}' \
+            --set data.range.topic=telemetry \
+            --set data.range.rangeId=aaaaaaaa-0000-0000-0000-0000000000c1 \
+            --set data.segmentId=aaaaaaaa-0000-0000-0000-0000000000d1 \
+            --set data.principalId=aaaaaaaa-0000-0000-0000-0000000000ce
           refuses "a matching nodeUuids count" -f helm/vtop/ci/default-values.yaml --set replicaCount=5
+          refuses "distinct broker UUIDs" \
+            -f helm/vtop/ci/default-values.yaml \
+            --set 'cluster.nodeUuids={aaaaaaaa-0000-0000-0000-0000000000a1,aaaaaaaa-0000-0000-0000-0000000000a1,aaaaaaaa-0000-0000-0000-0000000000a3}'
 
       # Long names are where DNS limits and collisions appear, and both were
       # real: the headless Service used to truncate to the same string as the
