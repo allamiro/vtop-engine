@@ -52,6 +52,7 @@ jobs:
       postgres: ${{ steps.filter.outputs.postgres }}
       fuzz: ${{ steps.filter.outputs.fuzz }}
       chaos: ${{ steps.filter.outputs.chaos }}
+      helm: ${{ steps.filter.outputs.helm }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
       # Pinned to a full commit SHA (v3), not the mutable tag, so an upstream
@@ -149,6 +150,18 @@ jobs:
               - 'docker/**'
               - '.dockerignore'
               - 'examples/**'
+            # The chart is a released artifact with two contracts worth gating:
+            # it must RENDER valid manifests, and it must REFUSE to render
+            # without identities. The second is the security property — #81
+            # exists because a lab compose shipped default credentials — and a
+            # refusal that quietly stopped refusing would look exactly like
+            # success.
+            #
+            # The workflow file rides along because the job's own steps are
+            # part of the contract they enforce.
+            helm:
+              - 'helm/**'
+              - '.github/workflows/ci.yml'
             shell:
               - 'docker/*.sh'
               - 'docker/tests/**'
@@ -282,6 +295,103 @@ jobs:
   # array indexing, a port off-by-one, and PARTITIONS=0 passing validation only
   # to fail Kafka topic creation silently), so they are linted and tested like
   # any other code.
+  helm:
+    name: helm (lint + render + refusals)
+    needs: changes
+    if: needs.changes.outputs.helm == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+
+      - uses: azure/setup-helm@b9e51907a09c216f16ebe8536097933489208112 # v4.3.0
+        with:
+          version: v3.16.3
+
+      - name: helm lint
+        run: helm lint helm/vtop -f helm/vtop/ci/default-values.yaml
+
+      - name: Render the documented happy path
+        run: |
+          set -euo pipefail
+          helm template vtop helm/vtop -f helm/vtop/ci/default-values.yaml > /tmp/rendered.yaml
+          # A chart that renders NOTHING also exits zero, so count the output
+          # rather than trusting the status code.
+          manifests=$(grep -c '^kind:' /tmp/rendered.yaml)
+          echo "rendered $manifests manifests"
+          test "$manifests" -ge 5
+
+      # Stdlib only, deliberately. A YAML library would have to be installed,
+      # and an install step that quietly fails leaves a check that no longer
+      # checks anything while still reporting success. Helm's output is
+      # predictable enough that scanning it is honest.
+      - name: Every manifest carries a kind and an apiVersion
+        run: |
+          python3 - "/tmp/rendered.yaml" <<'PYEOF'
+          import re, sys
+          docs = [d for d in open(sys.argv[1]).read().split('\n---\n') if d.strip()]
+          for doc in docs:
+              kind = re.search(r'^kind: (\S+)', doc, re.M)
+              api = re.search(r'^apiVersion: (\S+)', doc, re.M)
+              assert kind, f'manifest without a kind:\n{doc[:200]}'
+              assert api, f'{kind.group(1)} without an apiVersion'
+          print(f'{len(docs)} manifests carry kind and apiVersion')
+          PYEOF
+
+      # THE SECURITY CONTRACT. The chart never defaults an identity or a
+      # credential; #81 exists because a lab compose shipped defaults. A
+      # refusal that stopped refusing would render a cluster whose nodes all
+      # share whatever the chart invented, and it would look like success.
+      - name: Identities are still never defaulted
+        run: |
+          set -euo pipefail
+          refuses() {
+            what="$1"; shift
+            if helm template vtop helm/vtop "$@" >/dev/null 2>&1; then
+              echo "::error::the chart rendered without $what; identities must never be defaulted"
+              exit 1
+            fi
+            echo "refused without $what"
+          }
+          refuses "any identities"
+          refuses "TLS secret names" --set cluster.id=11111111-2222-3333-4444-555555555555
+          refuses "a matching nodeUuids count" -f helm/vtop/ci/default-values.yaml --set replicaCount=5
+
+      # Long names are where DNS limits and collisions appear, and both were
+      # real: the headless Service used to truncate to the same string as the
+      # client Service, so a long release name rendered two Services with one
+      # name.
+      - name: Names stay distinct and inside DNS limits
+        run: |
+          set -euo pipefail
+          long=$(printf 'a%.0s' $(seq 1 53))
+          helm template "$long" helm/vtop -f helm/vtop/ci/default-values.yaml > /tmp/long.yaml
+          python3 - "/tmp/long.yaml" <<'PYEOF'
+          import re, sys
+          docs = [d for d in open(sys.argv[1]).read().split('\n---\n') if d.strip()]
+          services, checked = [], 0
+          for doc in docs:
+              kind = re.search(r'^kind: (\S+)', doc, re.M)
+              name = re.search(r'^  name: (\S+)', doc, re.M)
+              if not (kind and name):
+                  continue
+              kind, name = kind.group(1), name.group(1)
+              checked += 1
+              assert len(name) <= 63, f'{kind} name is {len(name)} chars: {name}'
+              if kind == 'Service':
+                  services.append(name)
+              if kind == 'StatefulSet':
+                  # Pods append "-<ordinal>", and the pod-name label is capped
+                  # at 63 as well.
+                  assert len(name) + 4 <= 63, f'pod names would exceed 63: {name}'
+          assert checked, 'no named manifests found; the scan matched nothing'
+          assert len(services) == len(set(services)), f'Service names collide: {services}'
+          print(f'{checked} named manifests, {len(services)} Services, all distinct and in limits')
+          PYEOF
+
+      - name: helm package
+        run: helm package helm/vtop --destination /tmp/chart
+
   shell:
     name: shellcheck + bats
     needs: changes

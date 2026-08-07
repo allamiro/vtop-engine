@@ -1,0 +1,21 @@
+# CI render identities. The chart refuses to render without identities and
+# Secret names (they are never defaulted — issue #81), so CI supplies
+# syntactically valid dummies to prove the chart's happy path renders and
+# validates. These mirror the working invocation documented in
+# helm/vtop/README.md; nothing here is a credential — the Secret names refer
+# to objects that do not exist anywhere.
+cluster:
+  id: 11111111-2222-3333-4444-555555555555
+  nodeUuids:
+    - aaaaaaaa-0000-0000-0000-0000000000a1
+    - aaaaaaaa-0000-0000-0000-0000000000a2
+    - aaaaaaaa-0000-0000-0000-0000000000a3
+tls:
+  metaSecretName: vtop-meta-tls
+  dataSecretName: vtop-data-tls
+data:
+  range:
+    topic: telemetry
+    rangeId: aaaaaaaa-0000-0000-0000-0000000000c1
+  segmentId: aaaaaaaa-0000-0000-0000-0000000000d1
+  principalId: aaaaaaaa-0000-0000-0000-0000000000ce
