@@ -21,7 +21,10 @@ spec:
     metadata:
       labels:
         {{- include "vtop.selectorLabels" . | nindent 8 }}
-        {{- with .Values.podLabels }}
+        {{- /* Chart-managed selector labels are rendered above and must win:
+               a user label that redefined either of them would leave the
+               StatefulSet unable to match the pods it creates. */}}
+        {{- with (omit .Values.podLabels "app.kubernetes.io/name" "app.kubernetes.io/instance") }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
       annotations:
@@ -33,7 +36,12 @@ spec:
         prometheus.io/port: {{ .Values.ports.observability | quote }}
         prometheus.io/path: /metrics
         {{- end }}
-        {{- with .Values.podAnnotations }}
+        {{- /* Same for the chart-managed annotations. checksum/config is what
+               rolls the set when the ConfigMap changes; a user value that
+               replaced it would silently disable config-triggered rollouts,
+               and pods would keep running against a config that no longer
+               exists. */}}
+        {{- with (omit .Values.podAnnotations "checksum/config" "prometheus.io/scrape" "prometheus.io/port" "prometheus.io/path") }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
@@ -41,6 +49,10 @@ spec:
       # vtop-node never calls the Kubernetes API; a mounted token would be
       # pure attack surface on a pod that also serves unauthenticated HTTP.
       automountServiceAccountToken: false
+      # No preStop hook, and no pretence of a graceful stop: vtop-node installs
+      # no signal handler, so this interval is time spent waiting before
+      # SIGKILL. Safe by design — acknowledgement follows fsync and recovery
+      # truncates a torn tail — but it is the crash path, not a clean one.
       terminationGracePeriodSeconds: {{ int .Values.terminationGracePeriodSeconds }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:

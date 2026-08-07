@@ -142,7 +142,8 @@
       "additionalProperties": false,
       "properties": {
         "type": { "enum": ["ClusterIP", "NodePort", "LoadBalancer"] },
-        "annotations": { "type": "object" }
+        "annotations": { "type": "object" },
+        "exposeMetaAdmin": { "type": "boolean" }
       }
     },
     "persistence": {
@@ -204,6 +205,7 @@
         "enabled": { "type": "boolean" },
         "metricsFrom": { "type": "array", "items": { "type": "object" } },
         "clientFrom": { "type": "array", "items": { "type": "object" } },
+        "dnsTo": { "type": "array", "items": { "type": "object" } },
         "extraEgress": { "type": "array", "items": { "type": "object" } }
       }
     },

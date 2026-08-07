@@ -1,9 +1,24 @@
-# Client-facing Service. Deliberately carries ONLY the admin and
-# observability planes: any meta node's admin endpoint can serve vtopctl, and
-# metrics scraping is target-agnostic — but the native produce/fetch plane is
-# per-pod (each pod is an independent standalone range), and a round-robin
-# Service there would hand clients a random range. Use the headless Service
-# for per-pod native access.
+# Client-facing Service.
+#
+# Carries the observability plane unconditionally: metrics scraping is
+# target-agnostic, so round-robin is exactly right for it.
+#
+# It does NOT carry the admin plane by default, and that is a correctness
+# constraint rather than caution. Every pod presents its own certificate,
+# whose SAN is that pod's headless FQDN — so a client reaching a
+# Service-selected pod cannot know which name to verify against, and TLS
+# fails before `vtopctl meta init` sends a byte. A load-balanced endpoint and
+# per-pod certificate identity are incompatible unless the operator issues
+# certificates that ALSO carry this Service's DNS name as a shared SAN, which
+# the chart cannot verify and must not assume.
+#
+# Set `service.exposeMetaAdmin: true` once your certificates carry that shared
+# SAN. Otherwise bootstrap against a specific pod through the headless
+# Service, which NOTES.txt prints.
+#
+# The native produce/fetch plane is never here: it is per-pod (each pod is an
+# independent standalone range), and a round-robin Service would hand clients
+# a random range.
 apiVersion: v1
 kind: Service
 metadata:
@@ -23,9 +38,11 @@ spec:
   selector:
     {{- include "vtop.selectorLabels" . | nindent 4 }}
   ports:
+    {{- if .Values.service.exposeMetaAdmin }}
     - name: meta-admin
       port: {{ .Values.ports.metaAdmin }}
       targetPort: meta-admin
+    {{- end }}
     - name: obs
       port: {{ .Values.ports.observability }}
       targetPort: obs
