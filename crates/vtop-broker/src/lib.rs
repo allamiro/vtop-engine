@@ -60,7 +60,7 @@ use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
 use vtop_log::env::{Env, OpenMode, Storage, StorageFile};
-use vtop_log::{ActiveSegment, AppendOutcome, Durability, LogRecord};
+use vtop_log::{AppendOutcome, Durability, LogRecord, SegmentSet};
 use vtop_meta::{
     CommandEnvelope, MetaKey, MetaStateMachine, MetaValue, MetadataCommand, MetadataError,
     MetadataResponse,
@@ -295,7 +295,13 @@ pub enum SegmentFormat {
 }
 
 struct BrokerState {
-    segment: ActiveSegment,
+    /// The range as a SEQUENCE of segments (#270), not one file: appends land
+    /// on the tail and roll it at its configured bound, fetches cross
+    /// sealed/active boundaries. Held as a set here — rather than the node
+    /// swapping segments under the broker — because rolling happens INSIDE
+    /// the append critical section, under the same lock as the fencing check
+    /// and the fsync.
+    segment: SegmentSet,
     producer_epochs: ProducerEpochJournal,
 }
 
@@ -581,8 +587,14 @@ impl LocalBroker {
     ///
     /// Prefer [`Self::with_meta_fencing_epoch`] when the broker should observe
     /// live metadata grants (so a newer grant fences this instance).
+    ///
+    /// `segment` is anything that converts into a [`SegmentSet`]: a
+    /// catalog-opened set from a node, or a bare `ActiveSegment` from a
+    /// harness, which becomes a set of one. The conversion is where the two
+    /// meet — a broker always serves a set, and a single segment is just the
+    /// set every range starts as.
     pub fn new(
-        segment: ActiveSegment,
+        segment: impl Into<SegmentSet>,
         producer_epochs: ProducerEpochJournal,
         range: RangeIdentity,
         fencing_epoch: u64,
@@ -602,7 +614,7 @@ impl LocalBroker {
     /// fetch succeed only while that value still equals
     /// [`MetaFencingEpoch::get`] and the request carries the same epoch.
     pub fn with_meta_fencing_epoch(
-        segment: ActiveSegment,
+        segment: impl Into<SegmentSet>,
         producer_epochs: ProducerEpochJournal,
         range: RangeIdentity,
         held_fencing_epoch: u64,
@@ -627,7 +639,7 @@ impl LocalBroker {
     /// `Fsync`.
     #[allow(clippy::too_many_arguments)]
     pub fn with_replication(
-        segment: ActiveSegment,
+        segment: impl Into<SegmentSet>,
         producer_epochs: ProducerEpochJournal,
         range: RangeIdentity,
         held_fencing_epoch: u64,
@@ -636,16 +648,20 @@ impl LocalBroker {
         cluster_committed: Option<ClusterCommittedOffset>,
         replicas: Option<Arc<dyn ReplicaSet>>,
     ) -> BrokerResult<Self> {
-        // The format is derived from the segment itself so the broker's
+        let segment: SegmentSet = segment.into();
+        // The format is derived from the tail itself so the broker's
         // produce-time behavior can never disagree with the on-disk frames.
-        let segment_format = if segment.format_version() == vtop_log::FORMAT_VERSION_V2 {
+        // The tail speaks for the set: it is the only segment appends land
+        // on, and rolling preserves format, so a set never mixes formats
+        // forward from here.
+        let segment_format = if segment.active().format_version() == vtop_log::FORMAT_VERSION_V2 {
             SegmentFormat::V2
         } else {
             SegmentFormat::V1
         };
         let identity_matches = match segment_format {
             SegmentFormat::V1 => {
-                let descriptor = segment.descriptor();
+                let descriptor = segment.active().descriptor();
                 descriptor.topic == range.topic
                     && descriptor.topic_epoch == range.topic_epoch
                     && descriptor.lineage.range_id == range.range_id
@@ -653,6 +669,7 @@ impl LocalBroker {
             }
             SegmentFormat::V2 => {
                 let descriptor = segment
+                    .active()
                     .descriptor_v2()
                     .expect("v2 format was detected from this segment");
                 descriptor.topic == range.topic
@@ -1450,7 +1467,15 @@ impl LocalBroker {
                     .collect();
             }
 
-            match state.segment.append_group(&records, Durability::Fsync) {
+            // `append_group_minting` rolls the tail at its configured bound
+            // and retries the whole group in the successor, so a producer at
+            // the bound sees an ack, not `SegmentByteLimit` — that error now
+            // reaches a client only for a group larger than a whole segment,
+            // which is a configuration problem no roll can fix.
+            match state
+                .segment
+                .append_group_minting(&records, Durability::Fsync)
+            {
                 Ok(outcomes) => {
                     let leader_committed = state.segment.committed_offset();
                     let mut wire_by_member = Vec::with_capacity(batch.len());
@@ -2634,7 +2659,7 @@ mod tests {
     use tempfile::TempDir;
     use tokio_rustls::TlsConnector;
     use vtop_log::{
-        KeyRange, RangeLineage, SegmentConfig, SegmentConfigV2, SegmentDescriptor,
+        ActiveSegment, KeyRange, RangeLineage, SegmentConfig, SegmentConfigV2, SegmentDescriptor,
         SegmentDescriptorV2,
     };
     use vtop_protocol::{

@@ -26,7 +26,7 @@ use crate::{
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
-use vtop_log::{ActiveSegment, Durability, FetchBatch, LogRecord};
+use vtop_log::{Durability, FetchBatch, LogRecord, SegmentSet};
 use vtop_protocol::{
     CommittedHwmUpdate, ErrorCode, ProduceRecord, RangeIdentity, ReplicaAppendRequest,
     ReplicaAppendResponse,
@@ -122,7 +122,12 @@ pub trait ReplicaSet: Send + Sync {
 }
 
 struct FollowerState {
-    segment: ActiveSegment,
+    /// A follower holds the same shape as its leader (#270): a segment SET
+    /// whose tail rolls at its own configured bound. It must — the leader
+    /// replicates by offset, not by file, so a follower that could not roll
+    /// would refuse the append that pushes it past the bound and drop out of
+    /// every quorum from then on.
+    segment: SegmentSet,
     producer_epochs: ProducerEpochJournal,
 }
 
@@ -175,19 +180,22 @@ pub struct InProcessFollower {
 impl InProcessFollower {
     pub fn new(
         node_id: Uuid,
-        segment: ActiveSegment,
+        segment: impl Into<SegmentSet>,
         producer_epochs: ProducerEpochJournal,
         range: RangeIdentity,
         held_fencing_epoch: u64,
         meta_fencing_epoch: MetaFencingEpoch,
         cluster_committed: ClusterCommittedOffset,
     ) -> BrokerResult<Self> {
-        // Validate that the segment's embedded identity matches the range
-        // this follower is being constructed for. A mismatch means the
-        // caller supplied a segment for a different range, which would
-        // silently accept appends under the wrong identity.
+        let segment: SegmentSet = segment.into();
+        // Validate that the tail's embedded identity matches the range this
+        // follower is being constructed for. A mismatch means the caller
+        // supplied a segment for a different range, which would silently
+        // accept appends under the wrong identity. The tail vouches for its
+        // sealed prefix: discovery quarantines a directory whose segments
+        // disagree about their lineage before a set can be opened from it.
         let (seg_topic, seg_topic_epoch, seg_range_id, seg_generation) =
-            if let Some(desc) = segment.descriptor_v2() {
+            if let Some(desc) = segment.active().descriptor_v2() {
                 (
                     desc.topic.as_str(),
                     desc.topic_epoch,
@@ -195,7 +203,7 @@ impl InProcessFollower {
                     desc.lineage.generation,
                 )
             } else {
-                let desc = segment.descriptor();
+                let desc = segment.active().descriptor();
                 (
                     desc.topic.as_str(),
                     desc.topic_epoch,
@@ -216,7 +224,7 @@ impl InProcessFollower {
             )));
         }
 
-        let segment_format = if segment.format_version() == vtop_log::FORMAT_VERSION_V2 {
+        let segment_format = if segment.active().format_version() == vtop_log::FORMAT_VERSION_V2 {
             SegmentFormat::V2
         } else {
             SegmentFormat::V1
@@ -576,11 +584,12 @@ impl InProcessFollower {
     /// recovering the same paths. The follower Arc stays in the replica set.
     pub fn swap_storage(
         &self,
-        segment: ActiveSegment,
+        segment: impl Into<SegmentSet>,
         producer_epochs: ProducerEpochJournal,
-    ) -> BrokerResult<(ActiveSegment, ProducerEpochJournal)> {
+    ) -> BrokerResult<(SegmentSet, ProducerEpochJournal)> {
+        let segment: SegmentSet = segment.into();
         let (seg_topic, seg_topic_epoch, seg_range_id, seg_generation) =
-            if let Some(desc) = segment.descriptor_v2() {
+            if let Some(desc) = segment.active().descriptor_v2() {
                 (
                     desc.topic.as_str(),
                     desc.topic_epoch,
@@ -588,7 +597,7 @@ impl InProcessFollower {
                     desc.lineage.generation,
                 )
             } else {
-                let desc = segment.descriptor();
+                let desc = segment.active().descriptor();
                 (
                     desc.topic.as_str(),
                     desc.topic_epoch,
@@ -772,7 +781,19 @@ impl InProcessFollower {
         } else {
             Durability::Fsync
         };
-        match state.segment.append_group(&records, durability) {
+        // Rolls at the follower's own bound, mirroring the leader: the leader
+        // replicates offsets, not files, so where each replica's boundaries
+        // fall is local to that replica. EXCEPT under an fsync hold — a roll
+        // seals the tail, and sealing makes bytes durable, which would
+        // silently commit records the fault injection promised were still at
+        // risk. Under a hold the bound refuses instead, the pre-roll
+        // behaviour, so the harness's crash-loss guarantee stays exact.
+        let appended = if self.hold_fsync() {
+            state.segment.append_group_tail_only(&records, durability)
+        } else {
+            state.segment.append_group_minting(&records, durability)
+        };
+        match appended {
             Ok(_) => Ok(ReplicaAppendResponse {
                 local_committed_offset: state.segment.committed_offset(),
             }),
@@ -883,7 +904,22 @@ impl InProcessFollower {
                 Ok(records) => records,
                 Err(message) => return Err((ErrorCode::InvalidRequest, message.to_owned())),
             };
-            if let Err(problem) = state.segment.append_group(&records, Durability::Buffered) {
+            // A roll mid-batch commits the sealed tail early, which
+            // strengthens the shared durability barrier for a HEALTHY
+            // follower: nothing is acknowledged before the final commit
+            // below. Under an fsync hold that same early commit would break
+            // the injection's promise that held bytes die with a crash, so
+            // the bound refuses instead of rolling there.
+            let appended = if self.hold_fsync() {
+                state
+                    .segment
+                    .append_group_tail_only(&records, Durability::Buffered)
+            } else {
+                state
+                    .segment
+                    .append_group_minting(&records, Durability::Buffered)
+            };
+            if let Err(problem) = appended {
                 return Err((
                     match problem {
                         vtop_log::LogError::FirstSequence { .. }
