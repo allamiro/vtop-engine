@@ -1,10 +1,12 @@
 //! Independent offline verification of sealed segments.
 //!
 //! The verifier re-derives every claim from the immutable sealed artifacts
-//! alone: the segment file, its manifest, and the `.chunks` sidecar. Mutable
-//! broker metadata (commit boundaries, producer-epoch journals) is
-//! deliberately never an input, so a verdict cannot be steered by state an
-//! attacker could rewrite after sealing. Unlike [`crate::SegmentReader`],
+//! alone: the segment file, its manifest, its `.chunks` sidecar, and the
+//! `.producers` frontier it inherited at roll time (#271) — without which
+//! every rolled segment would be rejected for continuing sequences that began
+//! one file earlier. Mutable broker metadata (commit boundaries,
+//! producer-epoch journals) is deliberately never an input, so a verdict
+//! cannot be steered by state an attacker could rewrite after sealing. Unlike [`crate::SegmentReader`],
 //! which refuses to open a damaged segment at the first inconsistency, the
 //! verifier collects every failed check into a [`VerifyReport`] so an
 //! operator sees all of the damage at once; only an unreadable or
@@ -158,6 +160,22 @@ pub fn verify_sealed_segment_in(
     expectations: &VerifyExpectations,
 ) -> VtopLogResult<VerifyReport> {
     let paths = SegmentPaths::from_segment(path)?;
+    verify_sealed_segment_at(env, &paths, expectations)
+}
+
+/// [`verify_sealed_segment_in`] against explicitly named sibling paths.
+///
+/// The transfer receiver (#270) runs this exact verification over staged
+/// artifacts before they get real names, so the paths cannot be derived from
+/// a `.segment` stem there. Splitting the entry point — rather than having
+/// the receiver run a "similar" check — is what makes "the receiver validates
+/// rather than trusts" the same claim as "`vtopctl segment verify` passes".
+pub(crate) fn verify_sealed_segment_at(
+    env: &Env,
+    paths: &SegmentPaths,
+    expectations: &VerifyExpectations,
+) -> VtopLogResult<VerifyReport> {
+    let path = paths.segment.as_path();
     let mut file = env
         .storage
         .open(path, OpenMode::Read)
@@ -170,8 +188,16 @@ pub fn verify_sealed_segment_in(
         read_header(&mut reader)?
     };
 
+    // The frontier this segment inherited from its predecessor, absent for a
+    // range's first segment. Immutable sealed input, not broker metadata: the
+    // sidecar is written once at roll time and the manifest's producer summary
+    // is derived from the same state, so verification without it would reject
+    // every rolled segment for continuing sequences that began one file
+    // earlier — the exact failure `.producers` exists to prevent (#271).
+    let inherited = crate::segment::read_producer_snapshot(env, paths)?;
+
     let mut checks = Vec::new();
-    let scan = match scan_frames(file.as_mut(), &header, header_len) {
+    let scan = match scan_frames(file.as_mut(), &header, header_len, &inherited) {
         Ok(outcome) => {
             checks.push(CheckOutcome::pass(
                 CHECK_FRAME_SCAN,
@@ -191,7 +217,7 @@ pub fn verify_sealed_segment_in(
     let (achieved, record_count, content_bytes, chunk_count) = match &header {
         AnyHeader::V1(v1_header) => verify_v1(
             env,
-            &paths,
+            paths,
             v1_header,
             scan.as_ref(),
             expectations,
@@ -199,7 +225,7 @@ pub fn verify_sealed_segment_in(
         ),
         AnyHeader::V2(v2_header) => verify_v2(
             env,
-            &paths,
+            paths,
             v2_header,
             scan.as_ref(),
             expectations,
@@ -363,6 +389,7 @@ fn scan_frames(
     mut file: &mut dyn StorageFile,
     header: &AnyHeader,
     header_len: u64,
+    inherited: &crate::producer_snapshot::ProducerSnapshot,
 ) -> Result<ScanOutcome, String> {
     let (base_offset, max_record_bytes, mut digest) = match header {
         AnyHeader::V1(header) => (
@@ -384,9 +411,23 @@ fn scan_frames(
 
     let mut position = header_len;
     let mut records = 0_u64;
-    // Latest sequence per (producer, epoch) and newest epoch per producer.
-    let mut sequences: HashMap<(Uuid, u64), u64> = HashMap::new();
-    let mut epochs: HashMap<Uuid, u64> = HashMap::new();
+    // Latest sequence per (producer, epoch) and newest epoch per producer,
+    // SEEDED from the inherited frontier. A rolled segment legitimately opens
+    // with a producer mid-sequence; only a producer the frontier does not
+    // vouch for must start at zero. Records appended in THIS segment are
+    // counted separately so the producer summary can restate what sealing
+    // wrote: cumulative counts from the frontier plus this file's own.
+    let mut sequences: HashMap<(Uuid, u64), u64> = inherited
+        .producers
+        .iter()
+        .map(|(key, entry)| (*key, entry.latest_sequence))
+        .collect();
+    let mut epochs: HashMap<Uuid, u64> = inherited
+        .epochs
+        .iter()
+        .map(|(producer, epoch)| (*producer, *epoch))
+        .collect();
+    let mut appended: HashMap<(Uuid, u64), u64> = HashMap::new();
     while position < file_len {
         let frame = match header {
             AnyHeader::V1(_) => read_frame(&mut file, position, max_record_bytes),
@@ -441,6 +482,7 @@ fn scan_frames(
             _ => {}
         }
         sequences.insert(key, record.sequence);
+        *appended.entry(key).or_insert(0) += 1;
         epochs
             .entry(record.producer_id)
             .and_modify(|latest| *latest = (*latest).max(record.producer_epoch))
@@ -453,16 +495,31 @@ fn scan_frames(
     let mut producer_summary: Vec<ProducerSummaryEntry> = sequences
         .iter()
         .map(|((producer_id, producer_epoch), latest)| {
-            // Every (producer, epoch) run starts at sequence zero and
-            // advances by one, as enforced above, and the seal path
-            // summarizes the full run (not just the bounded retry window),
-            // so coverage is exactly 0..=latest.
-            ProducerSummaryEntry {
-                producer_id: *producer_id,
-                producer_epoch: *producer_epoch,
-                first_sequence: 0,
-                last_sequence: *latest,
-                record_count: latest + 1,
+            // Sealing summarizes the CUMULATIVE run: `roll_in` carries full
+            // producer state into the successor, so a rolled segment's
+            // manifest counts records back to the range's first file. The
+            // recomputation must add this file's appends onto the inherited
+            // frontier, or verification of any rolled segment would flag a
+            // summary the sealer wrote correctly. A producer the frontier
+            // does not know started at zero here (enforced above), so its
+            // run is exactly its appends.
+            let key = (*producer_id, *producer_epoch);
+            let segment_appends = appended.get(&key).copied().unwrap_or(0);
+            match inherited.producers.get(&key) {
+                Some(entry) => ProducerSummaryEntry {
+                    producer_id: *producer_id,
+                    producer_epoch: *producer_epoch,
+                    first_sequence: entry.first_sequence,
+                    last_sequence: *latest,
+                    record_count: entry.record_count + segment_appends,
+                },
+                None => ProducerSummaryEntry {
+                    producer_id: *producer_id,
+                    producer_epoch: *producer_epoch,
+                    first_sequence: 0,
+                    last_sequence: *latest,
+                    record_count: segment_appends,
+                },
             }
         })
         .collect();

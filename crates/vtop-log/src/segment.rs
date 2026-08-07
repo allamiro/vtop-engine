@@ -67,7 +67,7 @@ struct SeenRecord {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct IndexEntry {
+pub(crate) struct IndexEntry {
     offset: u64,
     position: u64,
 }
@@ -1168,6 +1168,21 @@ impl SegmentReader {
         self.header.format_version()
     }
 
+    /// This segment's identity, format-independent.
+    ///
+    /// Transfer requests name sealed segments by id rather than by offset or
+    /// path (#270): an id is minted once and never reused, so a request that
+    /// names one can never be silently satisfied by a different segment that
+    /// later occupies the same offsets.
+    pub fn segment_id(&self) -> Uuid {
+        self.header.segment_id()
+    }
+
+    /// Where this sealed segment's primary file lives.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Every file this sealed segment owns.
     ///
     /// A caller removing a segment must remove all of it: a leftover sidecar is
@@ -1325,6 +1340,41 @@ pub fn rebuild_chunk_index_in(env: &Env, path: impl AsRef<Path>) -> VtopLogResul
     write_chunk_sidecar_atomic(env, &paths.chunks, chunk_size, &leaves)
 }
 
+/// Validate a sealed segment whose artifacts live at explicitly named paths,
+/// and write its rebuildable sidecars (`.index`, and `.chunks` for v2) beside
+/// them.
+///
+/// This is the transfer receiver's validation step (#270). The paths are
+/// explicit because staged artifacts sit under temporary names that discovery
+/// ignores — validation has to happen BEFORE the bytes get real names, or a
+/// crash mid-validation would leave an unvalidated segment looking like a
+/// sealed one. The checks are exactly the ones `SegmentReader::open_in`
+/// performs, because "safe to rename into place" must mean nothing weaker
+/// than "would open".
+pub(crate) fn validate_sealed_and_rebuild_sidecars_at(
+    env: &Env,
+    paths: &SegmentPaths,
+) -> VtopLogResult<()> {
+    let mut file = env
+        .storage
+        .open(&paths.segment, OpenMode::Read)
+        .map_err(|source| io_error(&paths.segment, source))?;
+    let inherited = read_producer_snapshot(env, paths)?;
+    let inspection = inspect_sealed_file_at(
+        env.storage.as_ref(),
+        file.as_mut(),
+        &paths.segment,
+        paths,
+        &inherited,
+    )?;
+    if let (AnyManifest::V2(manifest), Some(leaves)) =
+        (&inspection.manifest, &inspection.chunk_leaves)
+    {
+        write_chunk_sidecar_atomic(env, &paths.chunks, manifest.chunk_size, leaves)?;
+    }
+    write_index_atomic(env, &paths.index, &inspection.scan.index)
+}
+
 pub(crate) fn inspect_active_segment(env: &Env, path: &Path) -> VtopLogResult<SegmentInspection> {
     let paths = SegmentPaths::from_active(path)?;
     let inherited = read_producer_snapshot(env, &paths)?;
@@ -1424,6 +1474,22 @@ fn inspect_sealed_file(
     inherited: &crate::producer_snapshot::ProducerSnapshot,
 ) -> VtopLogResult<SealedFileInspection> {
     let paths = SegmentPaths::from_segment(path)?;
+    inspect_sealed_file_at(storage, file, path, &paths, inherited)
+}
+
+/// [`inspect_sealed_file`] against explicitly named sibling paths.
+///
+/// Split out for the transfer receiver (#270): staged artifacts live under
+/// temporary names discovery ignores, so their siblings cannot be derived
+/// from a `.segment` stem — but the validation must be exactly the one a real
+/// open performs, or "validated then renamed" would mean less than "opened".
+fn inspect_sealed_file_at(
+    storage: &dyn Storage,
+    file: &mut dyn StorageFile,
+    path: &Path,
+    paths: &SegmentPaths,
+    inherited: &crate::producer_snapshot::ProducerSnapshot,
+) -> VtopLogResult<SealedFileInspection> {
     let (header, header_len) = read_header_with_path(file, path)?;
     let mut scan = scan_records(file, path, &header, header_len, None, false, inherited)?;
     let manifest_bytes = storage
@@ -1744,7 +1810,7 @@ fn merge_producer_deltas(
 /// range that existed before rolling is exactly that. An empty frontier is what
 /// the scan used to assume unconditionally, so this is backward compatible by
 /// construction.
-fn read_producer_snapshot(
+pub(crate) fn read_producer_snapshot(
     env: &Env,
     paths: &SegmentPaths,
 ) -> VtopLogResult<crate::producer_snapshot::ProducerSnapshot> {
@@ -2529,7 +2595,7 @@ fn encode_chunk_sidecar(chunk_size: u32, leaves: &[blake3::Hash]) -> Vec<u8> {
     bytes
 }
 
-fn write_chunk_sidecar_atomic(
+pub(crate) fn write_chunk_sidecar_atomic(
     env: &Env,
     path: &Path,
     chunk_size: u32,
@@ -2585,7 +2651,11 @@ pub(crate) fn read_chunk_sidecar(
     Ok((chunk_size, leaves))
 }
 
-fn write_index_atomic(env: &Env, path: &Path, entries: &[IndexEntry]) -> VtopLogResult<()> {
+pub(crate) fn write_index_atomic(
+    env: &Env,
+    path: &Path,
+    entries: &[IndexEntry],
+) -> VtopLogResult<()> {
     let mut bytes = Vec::with_capacity(16 + entries.len() * 16);
     bytes.extend_from_slice(INDEX_MAGIC);
     bytes.extend_from_slice(&(entries.len() as u64).to_be_bytes());

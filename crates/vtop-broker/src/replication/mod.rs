@@ -18,6 +18,7 @@
 
 pub mod fault;
 pub mod network;
+pub mod transfer;
 
 use crate::{
     storage_producer_id, BrokerError, BrokerResult, MetaFencingEpoch, MetaLeaseState,
@@ -39,6 +40,7 @@ pub use network::{
     FlowControlConfig, NetworkFollowerConfig, NetworkedReplicaSet, ReplicaPeerHandler,
     ReplicaPeerServer, ReplicaStatusClient, ReplicaTlsMaterial,
 };
+pub use transfer::{LeaderSegmentTransferHandler, SegmentTransferClient};
 
 /// Shared quorum-committed high-water mark for a range.
 ///

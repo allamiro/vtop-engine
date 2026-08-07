@@ -294,6 +294,20 @@ pub enum SegmentFormat {
     V2,
 }
 
+/// One sealed segment of a leader's range, snapshotted for transfer (#270).
+///
+/// Carries the primary path rather than open handles: sealed files are
+/// immutable, so a path taken under the state lock can be read after it
+/// drops, and the transfer plane's sibling-artifact naming stays owned by
+/// `vtop_log::sealed_artifact_path`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SealedSegmentHandle {
+    pub segment_id: Uuid,
+    pub base_offset: u64,
+    pub next_offset: u64,
+    pub segment_path: std::path::PathBuf,
+}
+
 struct BrokerState {
     /// The range as a SEQUENCE of segments (#270), not one file: appends land
     /// on the tail and roll it at its configured bound, fetches cross
@@ -987,6 +1001,51 @@ impl LocalBroker {
     /// The range this broker leads.
     pub fn range(&self) -> &RangeIdentity {
         &self.range
+    }
+
+    /// This broker's node identity, as embedded in replica append requests.
+    pub fn node_id(&self) -> Uuid {
+        self.node_id
+    }
+
+    /// Snapshot of the sealed prefix for transfer serving (#270).
+    ///
+    /// Taken under the state lock so the listing describes one instant, then
+    /// served WITHOUT it: sealed files are immutable, so the paths stay valid
+    /// after the lock drops, and a transfer reading gigabytes must not park
+    /// the append path behind its disk reads. The active tail is deliberately
+    /// not represented — bytes read from a file still being appended to can
+    /// be superseded by a truncation before the transfer finishes.
+    pub fn sealed_segment_handles(&self) -> Vec<SealedSegmentHandle> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state
+            .segment
+            .sealed()
+            .iter()
+            .map(|reader| SealedSegmentHandle {
+                segment_id: reader.segment_id(),
+                base_offset: reader.base_offset(),
+                next_offset: reader.next_offset(),
+                segment_path: reader.path().to_path_buf(),
+            })
+            .collect()
+    }
+
+    /// The active tail's segment id, so a transfer refusal can NAME what was
+    /// asked for instead of reporting a tail request as merely unknown.
+    pub fn active_segment_id(&self) -> Uuid {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let active = state.segment.active();
+        match active.descriptor_v2() {
+            Some(descriptor) => descriptor.segment_id,
+            None => active.descriptor().segment_id,
+        }
     }
 
     /// `(local_committed_offset, next_offset)`, waiting for the append path if

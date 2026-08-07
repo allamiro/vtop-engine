@@ -33,7 +33,7 @@ use vtop_protocol::{
     DEFAULT_MAX_RECORDS,
 };
 
-const REPLICA_LIMITS: ProtocolLimits = ProtocolLimits {
+pub(crate) const REPLICA_LIMITS: ProtocolLimits = ProtocolLimits {
     max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
     max_records: DEFAULT_MAX_RECORDS,
 };
@@ -132,6 +132,35 @@ pub trait ReplicaPeerHandler: Send + Sync {
             "this replica cannot be fenced; its offset must not be counted toward a promotion \
              boundary"
                 .to_owned(),
+        ))
+    }
+
+    /// Which sealed segments of `range` this peer serves for transfer (#270).
+    ///
+    /// Defaults to refusing, like [`Self::fence`] and unlike
+    /// [`Self::epoch_history`], because there is no benign empty answer here:
+    /// an empty listing means "nothing sealed", and a peer that reported it
+    /// without holding the range would send a repairing follower away
+    /// believing there was nothing to fetch.
+    fn list_sealed_segments(
+        &self,
+        _range: &vtop_protocol::RangeIdentity,
+        _fencing_epoch: u64,
+    ) -> Result<Vec<vtop_protocol::SealedSegmentEntry>, (ErrorCode, String)> {
+        Err((
+            ErrorCode::InvalidRequest,
+            "this peer does not serve sealed-segment transfer".to_owned(),
+        ))
+    }
+
+    /// Bounded read of one artifact of one sealed segment (#270).
+    fn fetch_segment_chunk(
+        &self,
+        _request: &vtop_protocol::FetchSegmentChunkRequest,
+    ) -> Result<vtop_protocol::FetchSegmentChunkResponse, (ErrorCode, String)> {
+        Err((
+            ErrorCode::InvalidRequest,
+            "this peer does not serve sealed-segment transfer".to_owned(),
         ))
     }
 }
@@ -326,6 +355,20 @@ fn dispatch_replica_frame(handler: &dyn ReplicaPeerHandler, frame: WireFrame) ->
         }
         Message::ReplicaStatusRequest(request) => match handler.status(&request.range) {
             Ok(response) => Message::ReplicaStatusResponse(response),
+            Err((code, message)) => error_message(code, message),
+        },
+        Message::ListSealedSegmentsRequest(request) => {
+            match handler.list_sealed_segments(&request.range, request.fencing_epoch) {
+                Ok(segments) => {
+                    Message::ListSealedSegmentsResponse(vtop_protocol::ListSealedSegmentsResponse {
+                        segments,
+                    })
+                }
+                Err((code, message)) => error_message(code, message),
+            }
+        }
+        Message::FetchSegmentChunkRequest(request) => match handler.fetch_segment_chunk(&request) {
+            Ok(response) => Message::FetchSegmentChunkResponse(response),
             Err((code, message)) => error_message(code, message),
         },
         Message::ReplicaFenceRequest(request) => {
@@ -1644,7 +1687,7 @@ fn build_server_acceptor(material: ReplicaTlsMaterial) -> BrokerResult<TlsAccept
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
-fn build_client_connector(material: ReplicaTlsMaterial) -> BrokerResult<TlsConnector> {
+pub(crate) fn build_client_connector(material: ReplicaTlsMaterial) -> BrokerResult<TlsConnector> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let config = ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])?
@@ -1653,7 +1696,9 @@ fn build_client_connector(material: ReplicaTlsMaterial) -> BrokerResult<TlsConne
     Ok(TlsConnector::from(Arc::new(config)))
 }
 
-fn peer_certs_client(stream: &ClientTlsStream<TcpStream>) -> Option<Vec<CertificateDer<'static>>> {
+pub(crate) fn peer_certs_client(
+    stream: &ClientTlsStream<TcpStream>,
+) -> Option<Vec<CertificateDer<'static>>> {
     let (_, conn) = stream.get_ref();
     conn.peer_certificates().map(|certs| certs.to_vec())
 }
@@ -1667,7 +1712,7 @@ fn peer_uuid_from_server_stream(stream: &ServerTlsStream<TcpStream>) -> BrokerRe
     uuid_from_cert(leaf)
 }
 
-fn assert_peer_uuid(
+pub(crate) fn assert_peer_uuid(
     certs: Option<Vec<CertificateDer<'static>>>,
     expected: Uuid,
 ) -> BrokerResult<()> {
