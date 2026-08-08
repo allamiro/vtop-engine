@@ -11,6 +11,14 @@
 # shipped without `vtop-node` at all (#281), so every pod would have
 # CrashLoopBackOff'd, and nothing in the static checks could have noticed.
 #
+# Three shapes, in one run, each in its own namespace:
+#
+#   $NS               the STANDALONE default — three independent ranges
+#   ${NS}-neighbour   a second release, to prove namespaces are isolated
+#   ${NS}-replicated  ONE range across three pods: the only shape that
+#                     exercises replication, fencing and promotion
+#
+
 # Usage:  scripts/k8s-smoke.sh [namespace] [release]
 #
 # Requires: a reachable cluster, kubectl, helm, openssl, and a locally built
@@ -24,6 +32,7 @@ IMAGE_REPO="${IMAGE_REPO:-vtop-engine}"
 IMAGE_TAG="${IMAGE_TAG:-local}"
 DOMAIN="${CLUSTER_DOMAIN:-cluster.local}"
 NEIGHBOUR_NS="${NS}-neighbour"
+REPLICATED_NS="${NS}-replicated"
 WORK="$(mktemp -d)"
 CERTS="$WORK/certs"
 HEADLESS="${REL}-headless"
@@ -31,6 +40,9 @@ HEADLESS="${REL}-headless"
 CLUSTER_ID=11111111-2222-3333-4444-555555555555
 PRINCIPAL=aaaaaaaa-0000-0000-0000-0000000000ce
 RANGE_ID=aaaaaaaa-0000-0000-0000-0000000000c1
+# Metadata's identity for the topic, distinct from the wire name "telemetry".
+# Must match data.lease.topicUuid in helm/vtop/ci/replicated-values.yaml.
+TOPIC_UUID=aaaaaaaa-0000-0000-0000-0000000000f1
 UUID_0=aaaaaaaa-0000-0000-0000-0000000000a1
 UUID_1=aaaaaaaa-0000-0000-0000-0000000000a2
 UUID_2=aaaaaaaa-0000-0000-0000-0000000000a3
@@ -46,6 +58,8 @@ cleanup() {
     kubectl delete namespace "$NS" --wait=false >/dev/null 2>&1 || true
     helm uninstall "$REL" -n "$NEIGHBOUR_NS" >/dev/null 2>&1 || true
     kubectl delete namespace "$NEIGHBOUR_NS" --wait=false >/dev/null 2>&1 || true
+    helm uninstall "$REL" -n "$REPLICATED_NS" >/dev/null 2>&1 || true
+    kubectl delete namespace "$REPLICATED_NS" --wait=false >/dev/null 2>&1 || true
   fi
   rm -rf "$WORK"
 }
@@ -294,5 +308,211 @@ forward "${REL}-0" 19602 9500
 still="$(committed_offset 19602)"
 [ "$still" = "$EXPECTED" ] || fail "producing to $NEIGHBOUR_NS changed $NS from $EXPECTED to $still; the namespaces are not isolated"
 log "namespaces are isolated: neighbour holds $n_offset, $NS still holds $still"
+
+# ---------------------------------------------------------------------------
+# THE REPLICATED TOPOLOGY.
+#
+# Everything above runs the STANDALONE default, where three replicas are three
+# separate logs. That shape cannot exercise replication, fencing or promotion —
+# it is why `--durability quorum` is refused there and why pod 1 stays empty.
+#
+# So the entire #240 epoch arc was reachable only from the live-chaos harness,
+# and #286 gave the chart a `replicated` topology that nothing ever deployed.
+# It rendered. Rendering is not evidence; that is the lesson #281 taught, where
+# a chart rendered perfectly and every pod CrashLoopBackOff'd because the image
+# had no engine in it.
+#
+# The assertions here are chosen to be the INVERSE of the standalone ones
+# above, because that is what proves the topology took effect rather than
+# merely being accepted: quorum durability succeeds where it was refused, and
+# a follower nobody produced to holds the records instead of staying empty.
+log "installing the REPLICATED topology into $REPLICATED_NS"
+kubectl create namespace "$REPLICATED_NS" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+
+i=0
+for uuid in "$UUID_0" "$UUID_1" "$UUID_2"; do
+  fqdn="${REL}-${i}.${HEADLESS}.${REPLICATED_NS}.svc.${DOMAIN}"
+  mkcert "$((i+1))" "$fqdn" "r-meta-node-${i}"
+  mkcert "$uuid" "$fqdn" "r-data-node-${i}"
+  i=$((i+1))
+done
+mkcert "operator" "operator" "r-operator"
+mkcert "$PRINCIPAL" "${REL}-0.${HEADLESS}.${REPLICATED_NS}.svc.${DOMAIN}" "r-client"
+
+for plane in meta data; do
+  kubectl -n "$REPLICATED_NS" create secret generic "${REL}-${plane}-tls" \
+    --from-file=ca.pem="$CERTS/ca.pem" \
+    --from-file=node-0.pem="$CERTS/r-${plane}-node-0.pem" --from-file=node-0-key.pem="$CERTS/r-${plane}-node-0-key.pem" \
+    --from-file=node-1.pem="$CERTS/r-${plane}-node-1.pem" --from-file=node-1-key.pem="$CERTS/r-${plane}-node-1-key.pem" \
+    --from-file=node-2.pem="$CERTS/r-${plane}-node-2.pem" --from-file=node-2-key.pem="$CERTS/r-${plane}-node-2-key.pem" \
+    --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+done
+
+helm upgrade --install "$REL" helm/vtop -n "$REPLICATED_NS" \
+  -f helm/vtop/ci/replicated-values.yaml \
+  --set "tls.metaSecretName=${REL}-meta-tls" \
+  --set "tls.dataSecretName=${REL}-data-tls" \
+  --set "image.repository=${IMAGE_REPO}" \
+  --set "image.tag=${IMAGE_TAG}" \
+  --set image.pullPolicy=IfNotPresent \
+  --timeout 5m >/dev/null
+
+# A cold replicated install restarts a few times on purpose: followers fail
+# closed until `meta init` has run, and the leader exits if its followers'
+# DNS has not caught up. Both are documented in values.yaml as deliberate. So
+# the metadata group is bootstrapped FIRST and readiness is waited on after,
+# rather than waiting on a state the design says will not hold yet.
+#
+# RUNNING, not Ready, and the distinction is the whole point. A replicated
+# leader cannot become Ready until it holds the range lease, and it cannot hold
+# the lease until the metadata group has been initialised — so waiting for
+# Ready here deadlocks against the very step that would break the deadlock.
+# The standalone install above can wait for Ready because a standalone range
+# needs no lease at all.
+log "waiting for the leader's process to be up, then bootstrapping metadata"
+for _ in $(seq 1 60); do
+  phase="$(kubectl -n "$REPLICATED_NS" get "pod/${REL}-0" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+  [ "$phase" = "Running" ] && break
+  sleep 3
+done
+[ "${phase:-}" = "Running" ] \
+  || { kubectl -n "$REPLICATED_NS" get pods; fail "the replicated leader's pod never reached Running (phase='${phase:-none}')"; }
+
+# The forward is re-established on EVERY attempt, which the standalone path
+# does not need to do. Two things are moving here that are settled there: the
+# admin listener binds a moment after the process starts (a single early
+# attempt fails as `tls handshake eof`, which reads like a certificate problem
+# and is not one), and a cold replicated install restarts a few times while
+# follower DNS settles — every restart kills the port-forward for good, so a
+# retry through a dead forward just repeats `connection refused` until it gives
+# up. A fresh local port per attempt avoids racing the previous one's teardown.
+r_init=""
+r_port=19700
+for _ in $(seq 1 30); do
+  r_port=$((r_port + 1))
+  cat > "$WORK/r-admin.yaml" <<EOF
+endpoint: localhost:${r_port}
+server_name: ${REL}-0.${HEADLESS}.${REPLICATED_NS}.svc.${DOMAIN}
+ca_cert: $CERTS/ca.pem
+client_cert: $CERTS/r-operator.pem
+client_key: $CERTS/r-operator-key.pem
+EOF
+  forward_ns "$REPLICATED_NS" "${REL}-0" "$r_port" 9200
+  if vtopctl meta init --members 1,2,3 --config "$WORK/r-admin.yaml" >/dev/null 2>&1; then
+    r_init="yes"; break
+  fi
+done
+[ -n "$r_init" ] || {
+  vtopctl meta init --members 1,2,3 --config "$WORK/r-admin.yaml" || true
+  kubectl -n "$REPLICATED_NS" get pods || true
+  kubectl -n "$REPLICATED_NS" logs "${REL}-0" --tail=20 || true
+  fail "meta init never succeeded in the replicated namespace"
+}
+
+r_leader=""
+for _ in $(seq 1 20); do
+  status="$(vtopctl meta status --config "$WORK/r-admin.yaml" 2>/dev/null || true)"
+  if printf '%s' "$status" | grep -q "server_state:.*Leader"; then r_leader="yes"; break; fi
+  sleep 2
+done
+[ -n "$r_leader" ] || { printf '%s\n' "${status:-<no status>}"; fail "no Raft leader in the replicated namespace"; }
+
+# THE RANGE MUST EXIST IN METADATA BEFORE ANYONE CAN HOLD A LEASE ON IT.
+#
+# `meta init` only bootstraps the Raft group. A lease-driven leader asks
+# metadata for a lease on a specific range, and a range metadata has never
+# heard of cannot be leased — so the leader never becomes ready and reports
+# `not ready: metadata lease released; range is fenced at epoch 1`, which names
+# the symptom and not the cause. The live-chaos harness does these two steps
+# explicitly (scenarios/09-range-leader-failover.sh) and says why; a chart
+# install needs exactly the same two, which is what makes this a documented
+# post-install step rather than something the chart can do for you.
+#
+# `topic_uuid` is metadata's identity for the topic and must match the
+# `data.lease.topicUuid` the pods were rendered with; `root-range-uuid` is
+# `data.range.rangeId`. Getting either wrong produces a lease request for a
+# range nobody created, which fails the same indistinguishable way.
+#
+# Tried against every pod rather than assuming pod 0. These are writes, so they
+# must reach the RAFT leader, and which pod that is depends on an election —
+# a non-leader answers "has to forward request to", so a run that happened to
+# elect node 2 would fail for a reason that reads like a configuration error.
+meta_admin_any() { # description -- args...
+  what="$1"; shift
+  for ordinal in 0 1 2; do
+    r_port=$((r_port + 1))
+    cat > "$WORK/r-admin-${ordinal}.yaml" <<EOF
+endpoint: localhost:${r_port}
+server_name: ${REL}-${ordinal}.${HEADLESS}.${REPLICATED_NS}.svc.${DOMAIN}
+ca_cert: $CERTS/ca.pem
+client_cert: $CERTS/r-operator.pem
+client_key: $CERTS/r-operator-key.pem
+EOF
+    forward_ns "$REPLICATED_NS" "${REL}-${ordinal}" "$r_port" 9200
+    if vtopctl "$@" --config "$WORK/r-admin-${ordinal}.yaml" >/dev/null 2>&1; then
+      log "$what (via ${REL}-${ordinal})"
+      return 0
+    fi
+  done
+  fail "$what failed against every metadata pod"
+}
+
+meta_admin_any "created the topic and its root range in metadata" \
+  meta create-topic --name telemetry \
+  --topic-uuid "$TOPIC_UUID" --root-range-uuid "$RANGE_ID"
+
+for uuid in "$UUID_0" "$UUID_1" "$UUID_2"; do
+  meta_admin_any "registered data node $uuid" \
+    meta register-node --node-uuid "$uuid" --addr "${REL}-0.${HEADLESS}.${REPLICATED_NS}.svc.${DOMAIN}:9300"
+done
+
+log "waiting for the whole replicated range to become Ready"
+kubectl -n "$REPLICATED_NS" wait --for=condition=ready pod -l "app.kubernetes.io/instance=${REL}" \
+  --timeout=240s >/dev/null || {
+    kubectl -n "$REPLICATED_NS" get pods
+    for o in 0 1 2; do echo "--- ${REL}-$o ---"; kubectl -n "$REPLICATED_NS" logs "${REL}-$o" --tail=30 || true; done
+    fail "the replicated range never became Ready"
+  }
+
+# THE ASSERTION THIS WHOLE VARIANT EXISTS FOR. Quorum durability is refused
+# outright on a standalone range — "Quorum durability requires a configured
+# replica set" — so a produce that SUCCEEDS with it is proof the leader really
+# has followers and really reached a majority of them. Nothing else in CI
+# establishes that.
+log "producing with QUORUM durability, which a standalone range refuses"
+forward_ns "$REPLICATED_NS" "${REL}-0" 19701 9400
+r_fqdn="${REL}-0.${HEADLESS}.${REPLICATED_NS}.svc.${DOMAIN}"
+sed "s|^server_name: .*|server_name: \"${r_fqdn}\"|; s|cert: $CERTS/client.pem|cert: $CERTS/r-client.pem|; s|key: $CERTS/client-key.pem|key: $CERTS/r-client-key.pem|; s/^producer_epoch: .*/producer_epoch: 1/" \
+  "$WORK/client.yaml" > "$WORK/r-client.yaml"
+
+R_EXPECTED=60
+vtop-node produce --client-config "$WORK/r-client.yaml" \
+  --addr "127.0.0.1:19701" --records "$R_EXPECTED" --batch 10 \
+  --durability quorum >/dev/null \
+  || fail "quorum produce failed; the range is not actually replicated"
+log "quorum produce accepted $R_EXPECTED records"
+
+forward_ns "$REPLICATED_NS" "${REL}-0" 19702 9500
+r_got="$(committed_offset 19702)"
+[ "$r_got" = "$R_EXPECTED" ] || fail "leader should hold $R_EXPECTED records, reports '${r_got:-none}'"
+
+# The inverse of the standalone check above, and the reason both are worth
+# having: there, a pod nobody produced to MUST be empty; here it must hold
+# every record. Quorum only proves a majority acked — with three replicas that
+# is the leader plus one, so checking BOTH followers is a strictly stronger
+# claim than the produce call already made.
+#
+# Read as local_committed_offset rather than next_offset: the first is what
+# the follower has FSYNCED, the second only what it has been assigned. Quorum
+# durability is a claim about disks, so the assertion should be too.
+for ordinal in 1 2; do
+  forward_ns "$REPLICATED_NS" "${REL}-${ordinal}" "1971${ordinal}" 9500
+  f_offset="$(committed_offset "1971${ordinal}")"
+  [ "${f_offset:-0}" = "$R_EXPECTED" ] \
+    || fail "follower $ordinal has durably applied '${f_offset:-0}' of $R_EXPECTED records; replication is not reaching it"
+  log "follower $ordinal has durably applied all $R_EXPECTED records"
+done
+
+log "replication verified in Kubernetes: quorum durability works and both followers hold the data"
 
 log "PASS"
