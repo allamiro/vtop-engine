@@ -361,12 +361,28 @@ jobs:
       - name: Deploy the chart and verify it works
         run: scripts/k8s-smoke.sh vtop-ci vtop
 
+      # EVERY namespace the smoke test uses, and the node itself.
+      #
+      # This dumped only `vtop-ci` while the test had grown two more namespaces,
+      # so a failure in the replicated shape captured the state of a namespace
+      # that was fine. Node capacity is here because the failure it hid was a
+      # Pending pod: the chart requests 500m CPU each and a two-vCPU runner
+      # cannot host seven, which surfaces as a DNS error three layers away from
+      # its cause.
       - name: Cluster state on failure
         if: failure()
         run: |
-          kubectl -n vtop-ci get pods -o wide || true
-          kubectl -n vtop-ci describe pods || true
-          kubectl -n vtop-ci logs -l app.kubernetes.io/instance=vtop --tail=60 --all-containers || true
+          echo "=== node capacity and allocation ==="
+          kubectl describe node | sed -n '/Allocated resources/,/^Events/p' || true
+          kubectl get pods -A -o wide || true
+          for ns in vtop-ci vtop-ci-neighbour vtop-ci-replicated; do
+            echo "=== $ns ==="
+            kubectl -n "$ns" get pods -o wide || true
+            # Pending pods have no logs and no events of their own worth
+            # printing; the scheduler's refusal is on the pod, so describe first.
+            kubectl -n "$ns" describe pods || true
+            kubectl -n "$ns" logs -l app.kubernetes.io/instance=vtop --tail=60 --all-containers || true
+          done
 
   helm:
     name: helm (lint + render + refusals)

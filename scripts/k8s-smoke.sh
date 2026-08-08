@@ -318,6 +318,33 @@ still="$(committed_offset 19602)"
 log "namespaces are isolated: neighbour holds $n_offset, $NS still holds $still"
 
 # ---------------------------------------------------------------------------
+# RECLAIM THE NODE before the last shape.
+#
+# Everything above has been asserted and has nothing left to prove, and it is
+# holding four pods. The chart requests 500m CPU per pod, so seven pods want 3.5
+# CPU — more than a two-vCPU CI runner has once system pods are counted. The
+# third replicated pod then sits Pending forever, its FQDN never resolves, and
+# the leader exits with "failed to lookup address information".
+#
+# That failure reads as DNS and is really scheduling, which is why it survived a
+# retry budget being tripled: waiting cannot schedule a pod the node has no room
+# for. Tearing down what is finished is both the fix and the honest shape for a
+# sequential test — each topology is verified, then released.
+log "releasing the standalone and neighbour namespaces before the replicated shape"
+helm uninstall "$REL" -n "$NS" >/dev/null 2>&1 || true
+helm uninstall "$REL" -n "$NEIGHBOUR_NS" >/dev/null 2>&1 || true
+kubectl delete namespace "$NS" "$NEIGHBOUR_NS" --wait=true --timeout=180s >/dev/null 2>&1 || true
+# Deleting the namespace returns before the kubelet has finished releasing the
+# pods, and it is the RELEASE that frees the capacity. Wait for the node to
+# actually have it back rather than assuming.
+for _ in $(seq 1 60); do
+  remaining="$(kubectl get pods -A -l "app.kubernetes.io/instance=${REL}" --no-headers 2>/dev/null | grep -vc "^$" || true)"
+  [ "${remaining:-0}" = "0" ] && break
+  sleep 2
+done
+log "node capacity reclaimed"
+
+# ---------------------------------------------------------------------------
 # THE REPLICATED TOPOLOGY.
 #
 # Everything above runs the STANDALONE default, where three replicas are three
