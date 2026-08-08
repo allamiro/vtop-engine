@@ -293,6 +293,29 @@ jobs:
               || { echo "::error::$binary is missing from the image or will not run"; exit 1; }
           done
 
+      # The TOOLS, not only the binaries. `vtop-node` itself went missing from
+      # this image and shipped in a release (#281) because nothing asserted its
+      # presence; the troubleshooting tools are one Dockerfile edit away from
+      # going the same way, and their absence is only discovered mid-incident.
+      #
+      # `curl` earns its place because /metrics, /healthz and /readyz are plain
+      # HTTP and nothing else in the image can read them — `vtopctl` speaks VTPM
+      # and the replica plane over mTLS. `getent` is the DNS check (same
+      # nsswitch path the engine resolves peers through) and comes from libc.
+      - name: The image contains the tools an operator needs to debug it
+        run: |
+          set -euo pipefail
+          for tool in curl nc getent openssl; do
+            docker run --rm --entrypoint sh vtop-engine:ci -c "command -v $tool >/dev/null" \
+              || { echo "::error::$tool is missing from the image; an operator cannot diagnose a node without it (see #295)"; exit 1; }
+          done
+          # Present is not the same as working: a curl that cannot execute is
+          # exactly as useful as no curl, and only running it proves the
+          # difference.
+          docker run --rm --entrypoint curl vtop-engine:ci --version \
+            || { echo "::error::curl is present but will not run"; exit 1; }
+          echo "image carries curl, nc, getent and openssl"
+
   audit:
     name: supply-chain (cargo audit)
     needs: changes
