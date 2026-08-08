@@ -211,7 +211,14 @@ data:
            each specific replica. The socket destination and the name verified
            on the certificate are different questions; only the second may be
            shared. The metadata peer list above already draws this distinction.
-        */ -}}
+
+           This comment must NOT close with a right-chomping delimiter. A
+           right-chomp here swallows the newline and indent that follow, so the
+           first list item lands on the "followers:" line as
+           "followers:- node_uuid: ..." and every later one glues onto its
+           predecessor. That renders without error, survives any grep-shaped
+           check, and produces a config the binary refuses to parse: the leader
+           CrashLoopBackOffs with "unknown field followers:- node_uuid". */}}
     - node_uuid: {{ index $v.cluster.nodeUuids $ordinal }}
       addr: "{{ include "vtop.podFqdn" (dict "root" $root "ordinal" $ordinal) }}:{{ $v.ports.replica }}"
       server_name: "{{ include "vtop.peerServerName" (dict "root" $root "ordinal" $ordinal) }}"
