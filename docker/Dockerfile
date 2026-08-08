@@ -82,6 +82,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libcurl4 \
         curl \
         netcat-openbsd \
+        # DECLARED, not inherited. `/usr/bin/openssl` is in the image today only
+        # because `ca-certificates` depends on it — `libssl3` above provides the
+        # shared library, not the binary. CI asserts openssl is present, so
+        # leaving it transitive means the assertion is backed by somebody else's
+        # dependency: consolidate or swap the CA package and the check breaks at
+        # the exact moment the toolset silently slips, which is the failure these
+        # assertions exist to catch.
+        openssl \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --create-home vtop
 
