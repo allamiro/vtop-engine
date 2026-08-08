@@ -543,13 +543,49 @@ done
   fail "meta init never succeeded in the replicated namespace"
 }
 
-r_leader=""
-for _ in $(seq 1 20); do
-  status="$(vtopctl meta status --config "$WORK/r-admin.yaml" 2>/dev/null || true)"
-  if printf '%s' "$status" | grep -q "server_state:.*Leader"; then r_leader="yes"; break; fi
+# A forward per metadata pod: needed to find WHICH one leads, and then to reach
+# the leader after a redirect. Allocated before the probe below because that
+# probe queries every pod by port.
+peer_ports=()
+for ordinal in 0 1 2; do
+  alloc_port
+  peer_ports+=("$r_port")
+  forward_ns "$REPLICATED_NS" "${REL}-${ordinal}" "$r_port" 9200
+done
+
+# Find WHICH pod leads, and then deliberately aim everything at one that does
+# NOT.
+#
+# Waiting for pod 0 to report Leader and then sending every command to pod 0 was
+# a test that could not fail: the first hop always reached the leader, so
+# removing redirect support entirely would still have passed, and a run that
+# elected a different leader would have failed before reaching the assertion.
+# The redirect is the thing under test, so the primary endpoint has to be a
+# follower.
+leader_ordinal=""
+for _ in $(seq 1 30); do
+  for ordinal in 0 1 2; do
+    cat > "$WORK/probe-${ordinal}.yaml" <<EOF
+endpoint: localhost:${peer_ports[$ordinal]}
+server_name: ${REL}-${ordinal}.${HEADLESS}.${REPLICATED_NS}.svc.${DOMAIN}
+ca_cert: $CERTS/ca.pem
+client_cert: $CERTS/r-operator.pem
+client_key: $CERTS/r-operator-key.pem
+EOF
+    status="$(vtopctl meta status --config "$WORK/probe-${ordinal}.yaml" 2>/dev/null || true)"
+    if printf '%s' "$status" | grep -q "server_state:.*Leader"; then
+      leader_ordinal="$ordinal"
+      break
+    fi
+  done
+  [ -n "$leader_ordinal" ] && break
   sleep 2
 done
-[ -n "$r_leader" ] || { printf '%s\n' "${status:-<no status>}"; fail "no Raft leader in the replicated namespace"; }
+[ -n "$leader_ordinal" ] || fail "no Raft leader in the replicated namespace"
+
+# Any ordinal that is not the leader. With three nodes there is always one.
+follower_ordinal=$(( (leader_ordinal + 1) % 3 ))
+log "metadata leader is pod $leader_ordinal; aiming every admin write at pod $follower_ordinal so the redirect is exercised"
 
 # THE RANGE MUST EXIST IN METADATA BEFORE ANYONE CAN HOLD A LEASE ON IT.
 #
@@ -579,17 +615,10 @@ done
 # depending on which node won the election. That workaround is gone now the CLI
 # follows the redirect itself — and its absence is the assertion, because the
 # commands below are aimed at pod 0 whether or not pod 0 leads.
-peer_ports=()
-for ordinal in 0 1 2; do
-  alloc_port
-  peer_ports+=("$r_port")
-  forward_ns "$REPLICATED_NS" "${REL}-${ordinal}" "$r_port" 9200
-done
-
 {
   cat <<EOF
-endpoint: localhost:${peer_ports[0]}
-server_name: ${REL}-0.${HEADLESS}.${REPLICATED_NS}.svc.${DOMAIN}
+endpoint: localhost:${peer_ports[$follower_ordinal]}
+server_name: ${REL}-${follower_ordinal}.${HEADLESS}.${REPLICATED_NS}.svc.${DOMAIN}
 ca_cert: $CERTS/ca.pem
 client_cert: $CERTS/r-operator.pem
 client_key: $CERTS/r-operator-key.pem
