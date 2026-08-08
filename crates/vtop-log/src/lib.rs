@@ -28,7 +28,9 @@ pub use segment::{
     segment_stem, ActiveSegment, SegmentReader,
 };
 pub use segment_set::SegmentSet;
-pub use transfer::{sealed_artifact_path, SegmentReceiver, StagedSegment, TransferArtifact};
+pub use transfer::{
+    sealed_artifact_path, SegmentPresence, SegmentReceiver, StagedSegment, TransferArtifact,
+};
 pub use types::{
     AppendOutcome, CommitStatementV1, Durability, FetchBatch, FetchedRecord, KeyRange, LogError,
     LogRecord, ParentRange, ProducerSummaryEntry, RangeLineage, RecoveryReport, SegmentCommitKey,

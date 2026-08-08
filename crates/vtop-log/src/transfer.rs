@@ -86,6 +86,19 @@ pub fn sealed_artifact_path(
     })
 }
 
+/// What occupies the name a sealed segment would take in a receiver's
+/// directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SegmentPresence {
+    /// Nothing there; stage and install.
+    Absent,
+    /// This exact segment, whole and verified. Skip it — this is what makes a
+    /// resumed transfer cheap.
+    Matching,
+    /// Something else, or something unreadable. Discard it, then fetch.
+    Foreign,
+}
+
 /// Lands transferred sealed segments in a directory it owns.
 ///
 /// "Owns" is load-bearing: the sweep in [`Self::open`] deletes torn
@@ -187,24 +200,19 @@ impl SegmentReceiver {
             .map_err(|source| io_error(&self.directory, source))
     }
 
-    /// Whether the segment the sender is offering is ALREADY here.
+    /// What, if anything, occupies the name the sender's segment would take.
     ///
     /// The primary is the completion witness because it renames last: its
     /// presence means the whole bundle published and verified.
     ///
-    /// Takes the expected identity, not just the offset, because a resumed
-    /// transfer must not accept a file merely for having the right name. A
-    /// segment at this base offset can belong to a previous incarnation of the
-    /// range — a different `segment_id` after a rebuild, a lineage that was
-    /// truncated and rewritten — and treating "a file exists here" as "the
-    /// requested segment is here" would leave the receiver holding somebody
-    /// else's history while reporting a completed transfer.
-    ///
-    /// An unreadable or mismatched file is reported as NOT complete, so the
-    /// transfer re-fetches and overwrites it. That is the safe direction:
-    /// re-sending bytes costs bandwidth, keeping the wrong ones costs
-    /// correctness.
-    pub fn is_complete(&self, base_offset: u64, segment_id: Uuid) -> VtopLogResult<bool> {
+    /// Three answers rather than a boolean, because "not the segment we want"
+    /// and "nothing here" call for different actions and conflating them
+    /// strands the repair. A caller that only learns "not complete" will stage
+    /// the bytes and then be refused by [`StagedSegment::install`], which will
+    /// not overwrite a sealed segment — so the very case this mechanism exists
+    /// for, a follower whose directory holds a stale or torn segment at that
+    /// offset, could never be repaired.
+    pub fn presence(&self, base_offset: u64, segment_id: Uuid) -> VtopLogResult<SegmentPresence> {
         let path = self
             .directory
             .join(format!("{}.segment", segment_stem(base_offset)));
@@ -214,14 +222,61 @@ impl SegmentReceiver {
             .exists(&path)
             .map_err(|source| io_error(&path, source))?
         {
-            return Ok(false);
+            return Ok(SegmentPresence::Absent);
         }
         match SegmentReader::open_in(&self.env, &path) {
-            Ok(reader) => Ok(reader.segment_id() == segment_id),
-            // Present but unopenable: a torn or half-installed artifact from an
-            // interrupted run. Re-fetch rather than reason about it.
-            Err(_) => Ok(false),
+            Ok(reader) if reader.segment_id() == segment_id => Ok(SegmentPresence::Matching),
+            // Identity, not just the name. A segment at this base offset can
+            // belong to a previous incarnation of the range — a different
+            // `segment_id` after a rebuild, a lineage truncated and rewritten
+            // — and treating "a file exists here" as "the requested segment is
+            // here" would leave the receiver holding somebody else's history
+            // while reporting a completed transfer.
+            Ok(_) => Ok(SegmentPresence::Foreign),
+            // Present but unopenable: a torn or half-installed artifact from
+            // an interrupted run. Replace rather than reason about it.
+            Err(_) => Ok(SegmentPresence::Foreign),
         }
+    }
+
+    /// Remove the whole bundle at `base_offset`, so a transfer can replace it.
+    ///
+    /// Only ever called for a [`SegmentPresence::Foreign`] bundle, and only in
+    /// a directory the receiver owns — everything here is re-fetchable from
+    /// the leader, which is the entire reason discarding is safe. It would not
+    /// be in a live range.
+    ///
+    /// The PRIMARY goes first, the inverse of publication order. A crash
+    /// part-way through then leaves sidecars without a primary, which is the
+    /// one torn shape [`SegmentReceiver::open`]'s sweep already removes.
+    /// Removing sidecars first would leave a primary whose frontier and index
+    /// are gone — a segment that looks real to discovery and cannot be read.
+    pub fn discard(&self, base_offset: u64) -> VtopLogResult<()> {
+        let stem = segment_stem(base_offset);
+        let mut names = vec![format!("{stem}.segment")];
+        names.extend(
+            ["index", "chunks", "manifest.json", "producers", "commit"]
+                .into_iter()
+                .map(|suffix| format!("{stem}.{suffix}")),
+        );
+        for name in names {
+            let path = self.directory.join(name);
+            if self
+                .env
+                .storage
+                .exists(&path)
+                .map_err(|source| io_error(&path, source))?
+            {
+                self.env
+                    .storage
+                    .remove_file(&path)
+                    .map_err(|source| io_error(&path, source))?;
+            }
+        }
+        self.env
+            .storage
+            .sync_dir(&self.directory)
+            .map_err(|source| io_error(&self.directory, source))
     }
 
     /// Start staging one sealed segment.
@@ -504,11 +559,28 @@ impl StagedSegment {
             self.directory.join(format!("{}.manifest.json", self.stem)),
         ));
         renames.push((staged_paths.segment.clone(), final_segment.clone()));
+        // A rename that fails part-way leaves the sidecars ahead of it under
+        // REAL names. A crash there is fine — the primary renames last, so
+        // discovery sees orphan sidecars and the next `open` sweeps them — but
+        // an in-process failure has no such sweep coming, and `install`
+        // reports failure while the directory keeps the debris. So the
+        // destinations already claimed are released here, in reverse, before
+        // the error is returned.
+        //
+        // Reverse order is the same reasoning as everywhere else in this file:
+        // it walks back toward the state the directory was in, never through
+        // one where a primary exists without what makes it readable.
+        let mut published: Vec<PathBuf> = Vec::new();
         for (from, to) in renames {
-            self.env
-                .storage
-                .rename(&from, &to)
-                .map_err(|source| io_error(&to, source))?;
+            if let Err(source) = self.env.storage.rename(&from, &to) {
+                let failure = io_error(&to, source);
+                for claimed in published.into_iter().rev() {
+                    let _ = self.env.storage.remove_file(&claimed);
+                }
+                let _ = self.env.storage.sync_dir(&self.directory);
+                return Err(failure);
+            }
+            published.push(to);
         }
         self.env
             .storage
@@ -887,6 +959,98 @@ mod tests {
         assert!(
             leftovers.is_empty(),
             "a failed install must not leave rebuilt sidecars behind: {leftovers:?}"
+        );
+    }
+
+    /// A rename failing PART-WAY through publication releases the names it
+    /// already claimed.
+    ///
+    /// The crash case is already safe and stays that way: the primary renames
+    /// last, so a crash leaves orphan sidecars, and the next
+    /// [`SegmentReceiver::open`] sweeps them. An in-process failure has no
+    /// such sweep coming — `install` returns an error and the caller carries
+    /// on — so the directory would keep real, discoverable `{stem}.index` and
+    /// `{stem}.manifest.json` files for a segment that was never published,
+    /// while `install` reported that nothing happened.
+    ///
+    /// Injected at the LAST rename, which is the primary: the strongest form,
+    /// with every other destination already claimed.
+    #[test]
+    fn a_publication_failing_part_way_releases_the_names_it_already_claimed() {
+        use crate::sim::{FaultPlan, SimStorage, TraceKind};
+
+        let source_dir = tempdir().unwrap();
+        let set = rolled_range(source_dir.path());
+        let reader = &set.sealed()[0];
+        let base_offset = reader.base_offset();
+        let artifacts: Vec<(TransferArtifact, Vec<u8>)> = [
+            TransferArtifact::Segment,
+            TransferArtifact::Manifest,
+            TransferArtifact::Producers,
+        ]
+        .into_iter()
+        .filter_map(|artifact| {
+            let path = sealed_artifact_path(reader.path(), artifact).ok()?;
+            path.exists().then(|| (artifact, fs::read(&path).unwrap()))
+        })
+        .collect();
+
+        let destination = Path::new("/transfer");
+        let stage = |sim: &SimStorage| {
+            sim.create_dir_all(destination);
+            let env = sim.env(11);
+            let receiver = SegmentReceiver::open(&env, destination).unwrap();
+            let mut staged = receiver.begin(base_offset).unwrap();
+            for (artifact, bytes) in &artifacts {
+                staged.append_artifact(*artifact, bytes).unwrap();
+                staged.finish_artifact(*artifact).unwrap();
+            }
+            (env, staged)
+        };
+
+        let rehearsal = SimStorage::new();
+        let (_, staged) = stage(&rehearsal);
+        staged.install().unwrap();
+        // Publication renames only — a `write_atomic` temp is the one rename
+        // source beginning "..", see the test above.
+        let publications: Vec<u64> = rehearsal
+            .trace()
+            .into_iter()
+            .filter(|entry| entry.kind == TraceKind::Rename)
+            .filter(|entry| {
+                !entry
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".."))
+            })
+            .map(|entry| entry.index)
+            .collect();
+        assert!(
+            publications.len() >= 2,
+            "the test needs an earlier rename to have already succeeded, got {publications:?}"
+        );
+
+        let injected = SimStorage::new();
+        let (env, staged) = stage(&injected);
+        injected.set_fault(FaultPlan::FailOp {
+            op: *publications.last().expect("checked above"),
+            kind: std::io::ErrorKind::PermissionDenied,
+        });
+        staged
+            .install()
+            .expect_err("the injected rename failure must fail the install");
+
+        let leftovers = env
+            .storage
+            .read_dir(destination)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.path.display().to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "a failed publication must not leave real sidecars behind: {leftovers:?}"
         );
     }
 

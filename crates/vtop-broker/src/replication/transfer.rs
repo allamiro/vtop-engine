@@ -31,7 +31,9 @@ use tokio::time::timeout;
 use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::TlsConnector;
 use uuid::Uuid;
-use vtop_log::{sealed_artifact_path, SegmentReceiver, StagedSegment, TransferArtifact};
+use vtop_log::{
+    sealed_artifact_path, SegmentPresence, SegmentReceiver, StagedSegment, TransferArtifact,
+};
 use vtop_protocol::{
     read_frame, write_frame, ErrorCode, FetchSegmentChunkRequest, FetchSegmentChunkResponse,
     ListSealedSegmentsRequest, Message, RangeIdentity, SealedSegmentEntry, SegmentArtifact,
@@ -60,7 +62,35 @@ impl LeaderSegmentTransferHandler {
     /// same split-brain write the epoch exists to prevent, delivered as
     /// files instead of appends.
     fn check_fencing(&self, request_epoch: u64) -> Result<(), (ErrorCode, String)> {
-        let held = self.broker.held_fencing_epoch();
+        // ONE snapshot, under ONE lock, and the HELD epoch sampled last.
+        //
+        // Reading `lease_active()` and `get()` through separate acquisitions
+        // let a release land between them, so the pair examined here never
+        // existed as a state: a live lease from before the release and a
+        // matching epoch from after it, and a deposed leader serves repair
+        // bytes.
+        //
+        // Sampling `held` last is the other half, and it is not cosmetic.
+        // `adopt_fencing_epoch` and the metadata publish are deliberately
+        // allowed to land in either order — produce refuses whenever the two
+        // disagree, so the window refuses rather than admits. Reading `held`
+        // FIRST reopened exactly that window here: adopt moves held to 6 while
+        // metadata still reads 5, and a stale `held` of 5 then matches a
+        // `granted` of 5, admitting a request under an epoch this leader has
+        // already superseded. Both values are monotonic, so taking `held`
+        // after `granted` can only ever make them disagree — which is the
+        // direction that refuses.
+        //
+        // This check runs per chunk, not once per transfer, so a lease lost
+        // mid-transfer stops the very next chunk rather than at the end.
+        let (granted, lease_active, held) = {
+            let state = self.broker.meta_fencing_epoch().lock();
+            (
+                state.fencing_epoch,
+                state.lease_active,
+                self.broker.held_fencing_epoch(),
+            )
+        };
         if request_epoch != held {
             return Err((
                 ErrorCode::Fenced,
@@ -70,18 +100,6 @@ impl LeaderSegmentTransferHandler {
                 ),
             ));
         }
-        // ONE snapshot, under ONE lock. Reading `lease_active()` and `get()`
-        // through separate acquisitions lets a release land between them, so
-        // the pair examined here never existed as a state: the check can see a
-        // live lease from before the release and a matching epoch from after
-        // it, and a deposed leader serves repair bytes.
-        //
-        // This check runs per chunk, not once per transfer, so a lease lost
-        // mid-transfer stops the very next chunk rather than at the end.
-        let (granted, lease_active) = {
-            let state = self.broker.meta_fencing_epoch().lock();
-            (state.fencing_epoch, state.lease_active)
-        };
         if !lease_active || granted != held {
             return Err((
                 ErrorCode::Fenced,
@@ -112,7 +130,7 @@ impl LeaderSegmentTransferHandler {
     /// copy it was never going to be able to finish.
     ///
     /// The receiver's retry is the whole transfer, not the chunk, and it is
-    /// idempotent — `is_complete` skips what already landed and verified — so
+    /// idempotent — `presence` skips what already landed and verified — so
     /// there is nothing to resume into a hole.
     fn sealed_handle(&self, segment_id: Uuid) -> Result<SealedSegmentHandle, (ErrorCode, String)> {
         if let Some(handle) = self
@@ -146,10 +164,18 @@ impl LeaderSegmentTransferHandler {
 
 /// Byte size of `path`, where absence is a NAMED size of zero only for the
 /// frontier — any other artifact of a sealed segment must exist.
+///
+/// ABSENCE means `NotFound` and nothing else. Treating every error as absence
+/// reported a permission or I/O failure on the leader's own disk as "this
+/// segment inherited no frontier", which is a claim about the DATA rather than
+/// about this process's ability to read it. The receiver would then transfer a
+/// rolled segment without the frontier it needs, and be told by verification
+/// that the segment is broken — with the leader's storage fault nowhere in the
+/// account.
 fn artifact_size(path: &std::path::Path, required: bool) -> Result<u64, (ErrorCode, String)> {
     match std::fs::metadata(path) {
         Ok(metadata) => Ok(metadata.len()),
-        Err(_) if !required => Ok(0),
+        Err(source) if !required && source.kind() == std::io::ErrorKind::NotFound => Ok(0),
         Err(source) => Err((
             ErrorCode::Storage,
             format!("cannot stat sealed artifact {}: {source}", path.display()),
@@ -399,11 +425,29 @@ impl SegmentTransferClient {
             // base offset can be from a previous incarnation of the range, and
             // skipping the fetch would leave this replica holding somebody
             // else's history while the transfer reported success.
-            if receiver
-                .is_complete(entry.base_offset, entry.segment_id)
+            //
+            // Foreign is DISCARDED here rather than left for `install` to trip
+            // over. `install` refuses to replace a sealed segment — sealed
+            // means immutable, and that refusal is right — so without an
+            // explicit discard the two halves contradicted each other: the
+            // resume check said "re-fetch and overwrite", publication said
+            // "this name is taken", and a follower holding a stale or torn
+            // segment at that offset could never be repaired, which is the
+            // case this whole mechanism exists for. Replacement is safe only
+            // because the receiver owns this directory and every byte in it is
+            // re-fetchable, so it is named as its own step rather than being
+            // smuggled into publication.
+            match receiver
+                .presence(entry.base_offset, entry.segment_id)
                 .map_err(receiver_error)?
             {
-                continue;
+                SegmentPresence::Matching => continue,
+                SegmentPresence::Absent => {}
+                SegmentPresence::Foreign => {
+                    receiver
+                        .discard(entry.base_offset)
+                        .map_err(receiver_error)?;
+                }
             }
             let mut staged = receiver.begin(entry.base_offset).map_err(receiver_error)?;
             for (wire, local, expected) in [

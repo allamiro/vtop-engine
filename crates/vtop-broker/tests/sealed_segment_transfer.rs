@@ -471,3 +471,162 @@ fn a_transfer_torn_mid_artifact_leaves_the_directory_clean_and_resumable() {
     assert!(catalog.quarantined.is_empty(), "{:?}", catalog.quarantined);
     assert_eq!(catalog.entries.len(), installed.len());
 }
+
+/// A directory already holding a FOREIGN segment at the same base offset is
+/// repaired, not stranded.
+///
+/// This is the case the mechanism exists for — a replica whose data directory
+/// holds a previous incarnation of the range, or a segment torn by an
+/// interrupted run — and it was the one case that could not be repaired. The
+/// resume check reports a mismatched or unreadable primary as "not here, so
+/// fetch it", while `install` refuses to replace a sealed segment, because
+/// sealed means immutable. Each half is right and together they deadlocked:
+/// the transfer would stage the whole prefix and then abort on publication,
+/// every time, forever.
+///
+/// Replacement is now an explicit discard, and it is only safe because the
+/// receiver owns the directory and every byte in it is re-fetchable.
+#[test]
+fn a_foreign_segment_at_the_same_offset_is_replaced_rather_than_stranding_the_repair() {
+    let h = harness();
+    let handles = h.leader.sealed_segment_handles();
+    let victim = &handles[0];
+    let stem = segment_stem(victim.base_offset);
+
+    // Two shapes of "wrong bundle occupying the name", run through the same
+    // path: one that opens and disagrees about identity, and one that does not
+    // open at all.
+    for (label, opens, plant) in [
+        (
+            "a segment from a previous incarnation of the range",
+            true,
+            Box::new(|dir: &std::path::Path, stem: &str| {
+                // A real, valid, self-consistent segment — with a different
+                // segment_id. It opens fine; only its identity is wrong.
+                let foreign = TempDir::new().unwrap();
+                let mut set = SegmentSet::create_in(
+                    &Env::real(),
+                    foreign.path(),
+                    SegmentDescriptor {
+                        segment_id: Uuid::from_u128(0xDEAD),
+                        topic: range_identity().topic,
+                        topic_epoch: range_identity().topic_epoch,
+                        lineage: RangeLineage {
+                            range_id: range_identity().range_id,
+                            generation: range_identity().range_generation,
+                            key_range: KeyRange::full(),
+                            parents: Vec::new(),
+                        },
+                        base_offset: 0,
+                    },
+                    SegmentConfig {
+                        max_segment_records: 4,
+                        ..SegmentConfig::default()
+                    },
+                )
+                .unwrap();
+                for sequence in 0..12 {
+                    set.append_group_minting(
+                        &[vtop_log::LogRecord {
+                            producer_id: PRODUCER,
+                            producer_epoch: 0,
+                            sequence,
+                            timestamp_millis: 1_700_000_000_000,
+                            attributes: 0,
+                            key: b"k".to_vec(),
+                            value: b"v".to_vec(),
+                        }],
+                        vtop_log::Durability::Fsync,
+                    )
+                    .unwrap();
+                }
+                let source = foreign.path().join(format!("{}.segment", segment_stem(0)));
+                assert!(source.exists(), "the fixture must have rolled");
+                for suffix in ["segment", "manifest.json", "index"] {
+                    let from = source.with_extension("").with_extension(suffix);
+                    let from = if suffix == "manifest.json" {
+                        foreign
+                            .path()
+                            .join(format!("{}.manifest.json", segment_stem(0)))
+                    } else {
+                        from
+                    };
+                    if from.exists() {
+                        std::fs::copy(&from, dir.join(format!("{stem}.{suffix}"))).unwrap();
+                    }
+                }
+            }) as Box<dyn Fn(&std::path::Path, &str)>,
+        ),
+        (
+            "a torn primary that does not open at all",
+            false,
+            Box::new(|dir: &std::path::Path, stem: &str| {
+                std::fs::write(dir.join(format!("{stem}.segment")), b"not a segment").unwrap();
+                std::fs::write(dir.join(format!("{stem}.manifest.json")), b"{}").unwrap();
+            }) as Box<dyn Fn(&std::path::Path, &str)>,
+        ),
+    ] {
+        let destination = TempDir::new().unwrap();
+        plant(destination.path(), &stem);
+        assert!(
+            destination.path().join(format!("{stem}.segment")).exists(),
+            "{label}: the fixture must actually occupy the name"
+        );
+        // Pin WHICH branch of the presence check each case exercises. Without
+        // this both fixtures could quietly be the same "does not open" case,
+        // and the identity comparison — the reason `presence` takes a
+        // segment_id at all — would go untested.
+        let planted = SegmentReader::open(destination.path().join(format!("{stem}.segment")));
+        assert_eq!(
+            planted.is_ok(),
+            opens,
+            "{label}: fixture must exercise the intended branch"
+        );
+        if let Ok(planted) = planted {
+            assert_ne!(
+                planted.segment_id(),
+                victim.segment_id,
+                "{label}: a foreign segment must differ in IDENTITY, not just in bytes"
+            );
+        }
+
+        let receiver = SegmentReceiver::open(&Env::real(), destination.path()).unwrap();
+        let installed = h
+            .runtime
+            .block_on(h.client.transfer_sealed_prefix(
+                h.addr,
+                "localhost",
+                LEADER,
+                &h.range,
+                FENCING_EPOCH,
+                &receiver,
+            ))
+            .unwrap_or_else(|error| panic!("{label}: repair must not be stranded: {error}"));
+
+        // The whole prefix landed, including the offset that was occupied.
+        assert_eq!(installed.len(), handles.len(), "{label}");
+        let received =
+            SegmentReader::open(destination.path().join(format!("{stem}.segment"))).unwrap();
+        assert_eq!(
+            received.segment_id(),
+            victim.segment_id,
+            "{label}: the leader's segment must have replaced the foreign one"
+        );
+        let catalog = StartupCatalog::discover(destination.path()).unwrap();
+        assert!(
+            catalog.quarantined.is_empty(),
+            "{label}: {:?}",
+            catalog.quarantined
+        );
+        assert_eq!(catalog.entries.len(), handles.len(), "{label}");
+
+        // And a second run over the now-correct directory is a no-op: every
+        // segment is Matching, so nothing is re-fetched or discarded.
+        let receiver = SegmentReceiver::open(&Env::real(), destination.path()).unwrap();
+        let again = transfer(&h, &receiver).unwrap();
+        assert!(
+            again.is_empty(),
+            "{label}: a matching directory must transfer nothing, got {again:?}"
+        );
+    }
+}
