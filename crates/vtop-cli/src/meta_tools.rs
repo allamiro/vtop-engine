@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 use vtop_meta::command::{CommandEnvelope, NodeState, MAX_NODE_ADDR_BYTES};
 use vtop_meta::{
-    resolve_endpoint, AdminClient, AdminStatusResponse, MetaNodeId, MetadataCommand,
-    MetadataResponse, TlsMaterial, WireLogId,
+    resolve_endpoint, AdminCandidate, AdminClient, AdminStatusResponse, MetaNodeId,
+    MetadataCommand, MetadataResponse, TlsMaterial, WireLogId,
 };
 
 #[derive(Subcommand, Debug)]
@@ -239,7 +239,7 @@ pub struct MetaCommonArgs {
 
 #[derive(Debug, Deserialize)]
 struct MetaAdminConfig {
-    /// `host:port` of the admin mTLS listener.
+    /// `host:port` of the admin mTLS listener to ask FIRST.
     endpoint: String,
     /// rustls server name (usually matches a SAN on the server cert).
     #[serde(default = "default_server_name")]
@@ -247,6 +247,34 @@ struct MetaAdminConfig {
     ca_cert: PathBuf,
     client_cert: PathBuf,
     client_key: PathBuf,
+    /// Every other metadata node this command may be redirected to (#292).
+    ///
+    /// Reads and writes on this plane must reach the RAFT LEADER, and a
+    /// non-leader answers with a redirect naming who to ask. With a single
+    /// endpoint there is nowhere to go, so `vtopctl meta create-topic` against
+    /// whichever node an operator happened to name fails outright roughly two
+    /// times in three — and which node leads depends on an election, so it is
+    /// not even stable between invocations.
+    ///
+    /// Optional and empty by default: a single-node group's only node is
+    /// always its leader, so every existing config keeps working untouched.
+    #[serde(default)]
+    peers: Vec<MetaAdminPeer>,
+}
+
+/// One more metadata node `vtopctl` may follow a redirect to.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetaAdminPeer {
+    /// The metadata node id, as Raft knows it. Required, because a redirect
+    /// names an id: without it the client can only rotate through peers
+    /// hopefully rather than going straight to the leader it was told about.
+    node_id: u64,
+    endpoint: String,
+    /// Empty uses the top-level `server_name`, which is right under a shared
+    /// SAN and wrong with per-node certificates — so it is per peer here.
+    #[serde(default)]
+    server_name: String,
 }
 
 fn default_server_name() -> String {
@@ -278,12 +306,33 @@ fn load_admin_config(path: &Path) -> Result<MetaAdminConfig, String> {
 }
 
 fn connect(config: &MetaAdminConfig) -> Result<AdminClient, String> {
-    let endpoint = resolve_endpoint(&config.endpoint).map_err(|error| error.to_string())?;
     let material =
         TlsMaterial::from_pem_files(&config.client_cert, &config.client_key, &config.ca_cert)
             .map_err(|error| error.to_string())?;
-    AdminClient::new(material, endpoint, config.server_name.clone())
-        .map_err(|error| error.to_string())
+    // The configured endpoint first — it is what the operator named, and under
+    // co-location it is usually the closest node — then everywhere a redirect
+    // could point.
+    let mut candidates = vec![AdminCandidate {
+        // No id for the primary: it is tried first regardless, and a redirect
+        // naming it matches whichever peer entry covers the same node.
+        node_id: None,
+        endpoint: resolve_endpoint(&config.endpoint).map_err(|error| error.to_string())?,
+        server_name: config.server_name.clone(),
+        plaintext: false,
+    }];
+    for peer in &config.peers {
+        candidates.push(AdminCandidate {
+            node_id: Some(MetaNodeId(peer.node_id)),
+            endpoint: resolve_endpoint(&peer.endpoint).map_err(|error| error.to_string())?,
+            server_name: if peer.server_name.is_empty() {
+                config.server_name.clone()
+            } else {
+                peer.server_name.clone()
+            },
+            plaintext: false,
+        });
+    }
+    AdminClient::with_candidates(material, candidates).map_err(|error| error.to_string())
 }
 
 /// Dispatch `vtopctl meta` and return a process exit code.

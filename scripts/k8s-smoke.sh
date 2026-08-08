@@ -571,32 +571,52 @@ done
 # must reach the RAFT leader, and which pod that is depends on an election —
 # a non-leader answers "has to forward request to", so a run that happened to
 # elect node 2 would fail for a reason that reads like a configuration error.
-meta_admin_any() { # description -- args...
-  what="$1"; shift
-  for ordinal in 0 1 2; do
-    r_port=$((r_port + 1))
-    cat > "$WORK/r-admin-${ordinal}.yaml" <<EOF
-endpoint: localhost:${r_port}
-server_name: ${REL}-${ordinal}.${HEADLESS}.${REPLICATED_NS}.svc.${DOMAIN}
+# ONE endpoint, with every peer listed so a redirect can be followed.
+#
+# This used to try all three pods in turn, because `vtopctl` built a
+# single-endpoint client: a write must reach the RAFT LEADER, a non-leader
+# refuses, and with nowhere to go the command failed roughly two times in three
+# depending on which node won the election. That workaround is gone now the CLI
+# follows the redirect itself — and its absence is the assertion, because the
+# commands below are aimed at pod 0 whether or not pod 0 leads.
+peer_ports=()
+for ordinal in 0 1 2; do
+  alloc_port
+  peer_ports+=("$r_port")
+  forward_ns "$REPLICATED_NS" "${REL}-${ordinal}" "$r_port" 9200
+done
+
+{
+  cat <<EOF
+endpoint: localhost:${peer_ports[0]}
+server_name: ${REL}-0.${HEADLESS}.${REPLICATED_NS}.svc.${DOMAIN}
 ca_cert: $CERTS/ca.pem
 client_cert: $CERTS/r-operator.pem
 client_key: $CERTS/r-operator-key.pem
+peers:
 EOF
-    forward_ns "$REPLICATED_NS" "${REL}-${ordinal}" "$r_port" 9200
-    if vtopctl "$@" --config "$WORK/r-admin-${ordinal}.yaml" >/dev/null 2>&1; then
-      log "$what (via ${REL}-${ordinal})"
-      return 0
-    fi
+  for ordinal in 0 1 2; do
+    cat <<EOF
+  - node_id: $((ordinal + 1))
+    endpoint: localhost:${peer_ports[$ordinal]}
+    server_name: ${REL}-${ordinal}.${HEADLESS}.${REPLICATED_NS}.svc.${DOMAIN}
+EOF
   done
-  fail "$what failed against every metadata pod"
+} > "$WORK/r-admin-multi.yaml"
+
+meta_admin() { # description -- args...
+  what="$1"; shift
+  vtopctl "$@" --config "$WORK/r-admin-multi.yaml" >/dev/null \
+    || fail "$what failed even though every metadata peer was listed and reachable"
+  log "$what"
 }
 
-meta_admin_any "created the topic and its root range in metadata" \
+meta_admin "created the topic and its root range in metadata" \
   meta create-topic --name telemetry \
   --topic-uuid "$TOPIC_UUID" --root-range-uuid "$RANGE_ID"
 
 for uuid in "$UUID_0" "$UUID_1" "$UUID_2"; do
-  meta_admin_any "registered data node $uuid" \
+  meta_admin "registered data node $uuid" \
     meta register-node --node-uuid "$uuid" --addr "${REL}-0.${HEADLESS}.${REPLICATED_NS}.svc.${DOMAIN}:9300"
 done
 
