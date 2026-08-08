@@ -171,6 +171,16 @@ jobs:
               # triggered nothing. That is how a scenario stayed red on main
               # without anyone noticing.
               - 'scripts/live-chaos/**'
+              # The two smoke scripts that gate the DEPLOYMENT paths. Listed
+              # here as well as under `scripts` because the two filters drive
+              # different jobs: `scripts` gates the e2e/compose work, `shell`
+              # gates the lint. Adding them to the shellcheck step without
+              # adding them here meant a PR touching only a smoke script skipped
+              # the shellcheck job entirely — so the lint would never once run
+              # against the files it was added for, which is the same
+              # unlinted-shell hole the live-chaos entry below exists to close.
+              - 'scripts/k8s-smoke.sh'
+              - 'scripts/e2e-smoke.sh'
               # The release-notes generator only ever runs during a tag build,
               # where a failure means a published release with a broken body and
               # no second chance to get it right before people see it. Lint it
@@ -351,12 +361,28 @@ jobs:
       - name: Deploy the chart and verify it works
         run: scripts/k8s-smoke.sh vtop-ci vtop
 
+      # EVERY namespace the smoke test uses, and the node itself.
+      #
+      # This dumped only `vtop-ci` while the test had grown two more namespaces,
+      # so a failure in the replicated shape captured the state of a namespace
+      # that was fine. Node capacity is here because the failure it hid was a
+      # Pending pod: the chart requests 500m CPU each and a two-vCPU runner
+      # cannot host seven, which surfaces as a DNS error three layers away from
+      # its cause.
       - name: Cluster state on failure
         if: failure()
         run: |
-          kubectl -n vtop-ci get pods -o wide || true
-          kubectl -n vtop-ci describe pods || true
-          kubectl -n vtop-ci logs -l app.kubernetes.io/instance=vtop --tail=60 --all-containers || true
+          echo "=== node capacity and allocation ==="
+          kubectl describe node | sed -n '/Allocated resources/,/^Events/p' || true
+          kubectl get pods -A -o wide || true
+          for ns in vtop-ci vtop-ci-neighbour vtop-ci-replicated; do
+            echo "=== $ns ==="
+            kubectl -n "$ns" get pods -o wide || true
+            # Pending pods have no logs and no events of their own worth
+            # printing; the scheduler's refusal is on the pod, so describe first.
+            kubectl -n "$ns" describe pods || true
+            kubectl -n "$ns" logs -l app.kubernetes.io/instance=vtop --tail=60 --all-containers || true
+          done
 
   helm:
     name: helm (lint + render + refusals)
@@ -435,6 +461,117 @@ jobs:
             -f helm/vtop/ci/default-values.yaml \
             --set 'cluster.nodeUuids={aaaaaaaa-0000-0000-0000-0000000000a1,aaaaaaaa-0000-0000-0000-0000000000a1,aaaaaaaa-0000-0000-0000-0000000000a3}'
 
+      # The REPLICATED shape, which until now nothing rendered at all — not
+      # here, and not in the live smoke test either. It is the only topology
+      # that exercises replication, fencing and promotion, so it was the one
+      # shape that mattered most and was covered least.
+      - name: The replicated topology renders the shape it claims
+        run: |
+          set -euo pipefail
+          helm template vtop helm/vtop -f helm/vtop/ci/replicated-values.yaml > /tmp/replicated.yaml
+          # Ruby, not python3, for one reason: this must PARSE the config, and
+          # python3's stdlib has no YAML. The first version of this check used
+          # regexes, and it passed against a render whose followers list was
+          # glued onto the previous line — `followers:- node_uuid: ...` — which
+          # the binary refuses to parse and which put the leader into
+          # CrashLoopBackOff. Every pattern-shaped assertion matched happily.
+          # Only parsing catches that class, and ruby is preinstalled on the
+          # runner, so this stays a stdlib-only check with no install step to
+          # fail silently.
+          ruby -ryaml -e '
+            docs = YAML.load_stream(File.read("/tmp/replicated.yaml")).compact
+            cm = docs.find { |d| d["kind"] == "ConfigMap" && d["data"]&.keys&.any? { |k| k.start_with?("node-") } }
+            abort "no node ConfigMap in the render" unless cm
+
+            configs = {}
+            cm["data"].each do |name, body|
+              # An explicit capture rather than ruby global match variables:
+              # actionlint runs shellcheck over these blocks, and a dollar-digit
+              # inside single quotes reads as a shell positional that will not
+              # expand (SC2016). It is a ruby capture, but code that looks like a
+              # shell bug in a shell-linted context is worth not writing — and
+              # this comment cannot name the sigil either, for the same reason.
+              matched = name.match(/\Anode-(\d)\.yaml\z/)
+              next unless matched
+              # THE ASSERTION THAT MATTERS. A config that does not parse is not
+              # a config; everything below is only meaningful once this holds.
+              begin
+                configs[matched[1]] = YAML.safe_load(body)
+              rescue => e
+                abort "#{name} is not valid YAML, so the pod cannot start: #{e.message}"
+              end
+            end
+            abort "expected three node configs, got #{configs.keys.sort}" unless configs.size == 3
+
+            roles = configs.transform_values { |c| c.fetch("data").fetch("role") }
+            expected = {"0" => "leader", "1" => "follower", "2" => "follower"}
+            abort "roles are #{roles}, expected #{expected}" unless roles == expected
+
+            followers = configs["0"]["data"].fetch("followers")
+            abort "leader must name both followers, got #{followers.inspect}" unless followers.size == 2
+
+            # Each follower dialled at its OWN address. A shared SAN once
+            # collapsed every follower to one name here, so the leader
+            # replicated to the same pod twice and "quorum" meant one replica.
+            addrs = followers.map { |f| f.fetch("addr") }
+            abort "followers collapsed to one address: #{addrs}" unless addrs.uniq.size == 2
+            %w[1 2].each_with_index do |ordinal, idx|
+              want = "vtop-#{ordinal}.vtop-headless.default.svc.cluster.local:9300"
+              abort "follower addr #{addrs.sort[idx]} != #{want}" unless addrs.sort[idx] == want
+            end
+
+            # Followers cannot adopt a granted epoch without the lease watcher,
+            # so a replicated range without one serves until the epoch moves
+            # and then stops — the failure mode hardest to attribute to a cause.
+            %w[1 2].each do |ordinal|
+              abort "follower #{ordinal} has no lease block" unless configs[ordinal]["data"]["lease"]
+            end
+
+            # One range, not a mixture. A stray standalone pod would serve its
+            # own log while the others replicate, and renders perfectly.
+            abort "a replicated render must contain no standalone pod" if roles.values.include?("standalone")
+
+            puts "replicated topology parses: one leader, two distinct leased followers"
+          '
+
+      # The guards on the replicated shape. Both were added with the topology
+      # itself and NEITHER was tested: a guard that stops guarding renders a
+      # cluster that cannot work and reports success, which is the same trap
+      # the identity refusals above exist to avoid.
+      - name: The replicated topology still refuses what cannot work
+        run: |
+          set -euo pipefail
+          # Asserts the REASON, not just a non-zero exit. Helm exits non-zero
+          # for any failure, so a check that only looks at the status can pass
+          # while aborting somewhere else entirely — which is exactly how the
+          # TLS refusal above once tested nothing.
+          refuses_because() {
+            expected="$1"; shift
+            if output=$(helm template vtop helm/vtop "$@" 2>&1); then
+              echo "::error::rendered successfully; expected a refusal mentioning: $expected"
+              exit 1
+            fi
+            if ! printf '%s' "$output" | grep -qF "$expected"; then
+              echo "::error::refused, but not for the expected reason."
+              echo "::error::wanted: $expected"
+              printf '%s\n' "$output" | tail -5
+              exit 1
+            fi
+            echo "refused because: $expected"
+          }
+
+          # A leader outside the replica set leaves EVERY pod a follower.
+          refuses_because "the leader must be one of the pods" \
+            -f helm/vtop/ci/replicated-values.yaml --set data.leaderOrdinal=3
+
+          # A single-replica replicated range is standalone wearing the wrong
+          # name. nodeUuids is shortened to match, so this reaches the
+          # topology check instead of stopping at the UUID-count check.
+          refuses_because "a replicated range needs at least one follower" \
+            -f helm/vtop/ci/replicated-values.yaml \
+            --set replicaCount=1 \
+            --set 'cluster.nodeUuids={aaaaaaaa-0000-0000-0000-0000000000a1}'
+
       # Long names are where DNS limits and collisions appear, and both were
       # real: the headless Service used to truncate to the same string as the
       # client Service, so a long release name rendered two Services with one
@@ -491,7 +628,8 @@ jobs:
       - name: shellcheck
         run: |
           docker run --rm -v "$PWD:/mnt" -w /mnt \
-            koalaman/shellcheck:v0.11.0 docker/*.sh scripts/release-notes.sh
+            koalaman/shellcheck:v0.11.0 docker/*.sh scripts/release-notes.sh \
+            scripts/k8s-smoke.sh scripts/e2e-smoke.sh
 
       # `-P scripts/live-chaos/scenarios` resolves the scenarios' dynamic
       # `source "$(dirname …)/../lib.sh"`. Without it every scenario reports

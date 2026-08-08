@@ -1,0 +1,34 @@
+# The REPLICATED shape: one range across the pods, ordinal 0 leading.
+#
+# Separate from `default-values.yaml` rather than a `--set` on top of it,
+# because a replicated range is not the default plus a flag — it also needs
+# `lease.enabled` and a `topicUuid`, and a replicated install without the lease
+# stalls the moment the epoch moves. Keeping the whole shape in one file means
+# CI exercises a configuration somebody could actually copy.
+#
+# Nothing here is a credential; the Secret names refer to objects that exist
+# only in the smoke test's namespace.
+cluster:
+  id: 11111111-2222-3333-4444-555555555555
+  nodeUuids:
+    - aaaaaaaa-0000-0000-0000-0000000000a1
+    - aaaaaaaa-0000-0000-0000-0000000000a2
+    - aaaaaaaa-0000-0000-0000-0000000000a3
+tls:
+  metaSecretName: vtop-meta-tls
+  dataSecretName: vtop-data-tls
+data:
+  range:
+    topic: telemetry
+    rangeId: aaaaaaaa-0000-0000-0000-0000000000c1
+  segmentId: aaaaaaaa-0000-0000-0000-0000000000d1
+  principalId: aaaaaaaa-0000-0000-0000-0000000000ce
+  topology: replicated
+  leaderOrdinal: 0
+  lease:
+    # Required under `replicated`: followers adopt granted epochs by watching
+    # the metadata plane (#239). Without it the range serves until the epoch
+    # moves and then stops, which is the failure mode hardest to attribute.
+    enabled: true
+    # Metadata's UUID for the topic, NOT the wire name in data.range.topic.
+    topicUuid: aaaaaaaa-0000-0000-0000-0000000000f1

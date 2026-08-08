@@ -58,6 +58,40 @@ pub fn seal_active(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Build the lease client with every metadata node it may be redirected to.
+///
+/// `admin_endpoint` is asked first and the peers are where a redirect leads.
+/// Both matter: a client with only the first cannot follow a redirect at all,
+/// and a client that ignored the first would stop preferring the local
+/// endpoint under co-location, where it is genuinely the cheapest hop.
+fn lease_admin_client(
+    lease: &crate::config::LeaseConfig,
+) -> Result<vtop_meta::AdminClient, String> {
+    let mut candidates = vec![vtop_meta::AdminCandidate {
+        // The configured endpoint's node id is not stated, and is not needed:
+        // it is tried first regardless. A redirect naming it will match a peer
+        // entry if one is configured for the same node.
+        node_id: None,
+        endpoint: vtop_meta::resolve_endpoint(&lease.admin_endpoint)
+            .map_err(|error| error.to_string())?,
+        server_name: lease.server_name.clone(),
+    }];
+    for peer in &lease.admin_peers {
+        candidates.push(vtop_meta::AdminCandidate {
+            node_id: Some(vtop_meta::MetaNodeId(peer.node_id)),
+            endpoint: vtop_meta::resolve_endpoint(&peer.endpoint)
+                .map_err(|error| error.to_string())?,
+            server_name: if peer.server_name.is_empty() {
+                lease.server_name.clone()
+            } else {
+                peer.server_name.clone()
+            },
+        });
+    }
+    vtop_meta::AdminClient::with_candidates(tls::meta_material(&lease.tls)?, candidates)
+        .map_err(|error| error.to_string())
+}
+
 /// Open the range through the startup catalog on every restart; create its
 /// first segment on first start.
 ///
@@ -349,13 +383,7 @@ async fn run_follower(
         // moved on without it.
         observability.gate.require_marks(2);
         let watcher = crate::lease_watcher::LeaseWatcher::new(
-            vtop_meta::AdminClient::new(
-                tls::meta_material(&lease.tls)?,
-                vtop_meta::resolve_endpoint(&lease.admin_endpoint)
-                    .map_err(|error| error.to_string())?,
-                lease.server_name.clone(),
-            )
-            .map_err(|error| error.to_string())?,
+            lease_admin_client(lease)?,
             lease.topic_uuid,
             watched_range_id,
             crate::lease_watcher::LeaseWatcherConfig {
@@ -557,13 +585,7 @@ async fn run_leader(
             );
         }
         let agent = crate::lease_agent::LeaseAgent::new(
-            vtop_meta::AdminClient::new(
-                tls::meta_material(&lease.tls)?,
-                vtop_meta::resolve_endpoint(&lease.admin_endpoint)
-                    .map_err(|error| error.to_string())?,
-                lease.server_name.clone(),
-            )
-            .map_err(|error| error.to_string())?,
+            lease_admin_client(lease)?,
             crate::lease_agent::LeaseAgentConfig {
                 lease_duration: Duration::from_millis(lease.lease_duration_ms),
                 renew_interval: Duration::from_millis(lease.renew_interval_ms),

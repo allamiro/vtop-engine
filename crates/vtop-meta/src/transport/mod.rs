@@ -27,7 +27,9 @@ pub mod peer;
 pub mod tls;
 pub mod wire;
 
-pub use admin::{resolve_endpoint, stub_status, AdminClient, AdminHandler, AdminServer};
+pub use admin::{
+    resolve_endpoint, stub_status, AdminCandidate, AdminClient, AdminHandler, AdminServer,
+};
 pub use authz::{AdminAuthorizer, AdminIdentity, CommandClass, Refusal};
 pub use peer::{PeerClient, PeerRpcHandler, PeerServer};
 pub use tls::{

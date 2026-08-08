@@ -211,7 +211,14 @@ data:
            each specific replica. The socket destination and the name verified
            on the certificate are different questions; only the second may be
            shared. The metadata peer list above already draws this distinction.
-        */ -}}
+
+           This comment must NOT close with a right-chomping delimiter. A
+           right-chomp here swallows the newline and indent that follow, so the
+           first list item lands on the "followers:" line as
+           "followers:- node_uuid: ..." and every later one glues onto its
+           predecessor. That renders without error, survives any grep-shaped
+           check, and produces a config the binary refuses to parse: the leader
+           CrashLoopBackOffs with "unknown field followers:- node_uuid". */}}
     - node_uuid: {{ index $v.cluster.nodeUuids $ordinal }}
       addr: "{{ include "vtop.podFqdn" (dict "root" $root "ordinal" $ordinal) }}:{{ $v.ports.replica }}"
       server_name: "{{ include "vtop.peerServerName" (dict "root" $root "ordinal" $ordinal) }}"
@@ -264,6 +271,28 @@ data:
     lease_duration_ms: {{ int $v.data.lease.leaseDurationMs }}
     renew_interval_ms: {{ int $v.data.lease.renewIntervalMs }}
     poll_interval_ms: {{ int $v.data.lease.pollIntervalMs }}
+    {{- /* EVERY metadata node, so a redirect can be followed (#292).
+
+           `admin_endpoint` above is where to ask FIRST — under co-location that
+           is this pod's own metadata process, which is the cheapest hop. It is
+           not necessarily the RAFT LEADER, though, and only the leader can
+           serve a lease read or a lease proposal. Without somewhere else to go,
+           every pod that did not happen to co-locate the leader failed closed
+           forever and never became ready, which made the replicated topology
+           unusable and made WHICH pod worked depend on an election.
+
+           Rendered unconditionally rather than behind a topology check: a
+           standalone range with a lease has exactly the same problem, and a
+           single-replica install renders a one-entry list that changes nothing.
+
+           Metadata node ids are 1-based ordinals, matching the peer list
+           above and the CNs in the metadata Secret. */}}
+    admin_peers:
+      {{- range $ordinal := until (int $root.Values.replicaCount) }}
+      - node_id: {{ add1 $ordinal }}
+        endpoint: "{{ include "vtop.podFqdn" (dict "root" $root "ordinal" $ordinal) }}:{{ $v.ports.metaAdmin }}"
+        server_name: "{{ include "vtop.peerServerName" (dict "root" $root "ordinal" $ordinal) }}"
+      {{- end }}
 {{- end }}
 # ONE endpoint for the whole process — top level, never per role. It is
 # unauthenticated (#78): keep it off public networks (see networkPolicy).

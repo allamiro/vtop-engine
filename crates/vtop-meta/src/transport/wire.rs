@@ -114,6 +114,18 @@ pub enum TransportError {
     Unauthorized(String),
     #[error("{0}")]
     Protocol(String),
+    /// The peer refused because it does not lead; ask `leader` instead.
+    ///
+    /// Its own variant rather than a [`TransportError::Protocol`] carrying the
+    /// same words, because this is the one refusal a client can DO something
+    /// about, and only a type makes that actionable. Folded into `Protocol` it
+    /// was indistinguishable from a genuine rejection, so no caller ever
+    /// retried and a non-leader was a permanent dead end (#292).
+    #[error("{message}")]
+    NotLeader {
+        message: String,
+        leader: Option<MetaNodeId>,
+    },
 }
 
 pub type TransportResult<T> = Result<T, TransportError>;
@@ -993,6 +1005,28 @@ impl AdminProposeResponse {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdminError {
     pub message: String,
+    /// Set when the refusal was "you asked the wrong node": the metadata node
+    /// the caller should ask instead, or `None` when even the answering node
+    /// does not know who leads.
+    ///
+    /// A MACHINE-READABLE redirect. The message has always said as much in
+    /// prose, and prose is not something a client can act on without matching
+    /// English against a consensus-engine version it does not control — so nothing
+    /// did, and every request from a node that was not co-located with the
+    /// Raft leader failed permanently (#292).
+    ///
+    /// An id rather than an address, because an id is all Raft has: this type
+    /// config uses `EmptyNode`, so no peer address exists to send. The caller
+    /// resolves it against the peer list it was configured with.
+    pub not_leader: Option<NotLeaderHint>,
+}
+
+/// Who to ask instead, when a node refuses because it does not lead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NotLeaderHint {
+    /// `None` means the answering node has no leader either — a genuine
+    /// election gap, which a caller should retry rather than redirect.
+    pub leader: Option<MetaNodeId>,
 }
 
 impl AdminError {
@@ -1004,20 +1038,147 @@ impl AdminError {
             MAX_ERROR_DETAIL_BYTES,
             "admin error",
         )?;
+        // NOTHING APPENDED when there is no redirect, which keeps the common
+        // case byte-identical to the pre-#292 encoding.
+        //
+        // This is not tidiness, it is version skew. An older decoder ends with
+        // `finish()`, which rejects trailing bytes — so unconditionally
+        // appending a tag would make an old client fail to read EVERY admin
+        // error, not just a redirect. It would lose the message at exactly the
+        // moment the message is the only thing it has. Emitting the extension
+        // only when there is something to say means an old client keeps working
+        // for every ordinary error, and the one frame it cannot read is the one
+        // it could never have acted on anyway.
+        //
+        // Two tags rather than one, so "a redirect to a known node" and "a
+        // redirect with no leader yet" stay distinct. Collapsing them would make
+        // an election gap look like a routing decision, and a client would chase
+        // a leader that does not exist.
+        match self.not_leader {
+            None => {}
+            Some(NotLeaderHint { leader: None }) => out.push(1),
+            Some(NotLeaderHint { leader: Some(id) }) => {
+                out.push(2);
+                out.extend_from_slice(&id.0.to_be_bytes());
+            }
+        }
         Ok(out)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
         let mut reader = Reader::new(bytes);
         let message = reader.bounded_str(MAX_ERROR_DETAIL_BYTES, "admin error")?;
+        // TOLERANT of the older encoding, which had no redirect at all. A
+        // frame that stops here is a pre-#292 peer, and "it did not tell us"
+        // is exactly `None` — the same thing that field means for any error
+        // that is not a redirect. Refusing it instead would turn a version skew
+        // into an unreadable error, which is the worst moment to lose the
+        // message.
+        let not_leader = if reader.remaining() == 0 {
+            None
+        } else {
+            match reader.u8("admin error redirect tag")? {
+                // 0 was emitted by an earlier revision of this branch to mean
+                // "not a redirect". Nothing writes it now — absence carries that
+                // meaning — but it decodes, so a peer built from that revision
+                // stays readable.
+                0 => None,
+                1 => Some(NotLeaderHint { leader: None }),
+                2 => Some(NotLeaderHint {
+                    leader: Some(MetaNodeId(reader.u64("admin error leader id")?)),
+                }),
+                other => {
+                    return Err(CodecError::UnknownTag {
+                        what: "admin error redirect",
+                        tag: u32::from(other),
+                    })
+                }
+            }
+        };
         reader.finish()?;
-        Ok(Self { message })
+        Ok(Self {
+            message,
+            not_leader,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The redirect round-trips in all three of its states, and an OLD frame
+    /// still decodes.
+    ///
+    /// Old frames matter because the field is additive: a pre-#292 peer sends
+    /// a message and nothing else, and refusing that would turn a version skew
+    /// into an unreadable error — at the exact moment the message is what you
+    /// need. "It did not tell us" is `None`, the same as any non-redirect.
+    #[test]
+    fn admin_error_round_trips_its_redirect_and_still_reads_the_older_encoding() {
+        for not_leader in [
+            None,
+            Some(NotLeaderHint { leader: None }),
+            Some(NotLeaderHint {
+                leader: Some(MetaNodeId(7)),
+            }),
+        ] {
+            let error = AdminError {
+                message: "nope".to_owned(),
+                not_leader,
+            };
+            let decoded = AdminError::decode(&error.encode().unwrap()).unwrap();
+            assert_eq!(decoded, error);
+        }
+
+        // BYTE-IDENTICAL to the pre-#292 encoding when there is no redirect,
+        // which is what keeps an older peer able to read ordinary errors. If
+        // this ever regresses, every old client loses every error message.
+        let mut legacy_shape = Vec::new();
+        put_bounded_str(
+            &mut legacy_shape,
+            "nope",
+            MAX_ERROR_DETAIL_BYTES,
+            "admin error",
+        )
+        .unwrap();
+        assert_eq!(
+            AdminError {
+                message: "nope".to_owned(),
+                not_leader: None,
+            }
+            .encode()
+            .unwrap(),
+            legacy_shape,
+            "a non-redirect error must encode exactly as it did before the \
+             redirect field existed, or an older decoder rejects it as trailing \
+             bytes and loses the message"
+        );
+
+        // The pre-#292 encoding: a bounded string and nothing after it.
+        let mut legacy = Vec::new();
+        put_bounded_str(
+            &mut legacy,
+            "older peer",
+            MAX_ERROR_DETAIL_BYTES,
+            "admin error",
+        )
+        .unwrap();
+        let decoded = AdminError::decode(&legacy).expect("an older frame must still decode");
+        assert_eq!(decoded.message, "older peer");
+        assert_eq!(
+            decoded.not_leader, None,
+            "an older peer told us nothing about leadership, which is not the \
+             same as telling us it leads"
+        );
+
+        // And an unknown tag is still refused rather than guessed at.
+        let mut bogus = Vec::new();
+        put_bounded_str(&mut bogus, "x", MAX_ERROR_DETAIL_BYTES, "admin error").unwrap();
+        bogus.push(9);
+        assert!(AdminError::decode(&bogus).is_err());
+    }
+
     use crate::command::{CommandEnvelope, NodeState};
     use uuid::Uuid;
 

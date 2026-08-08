@@ -10,11 +10,11 @@ use super::wire::{
     read_frame, write_frame, AdminAddLearnerRequest, AdminChangeMembershipRequest, AdminError,
     AdminInitRequest, AdminMembershipResponse, AdminProposeRequest, AdminProposeResponse,
     AdminReadRangeLeaseRequest, AdminReadRangeLeaseResponse, AdminStatusRequest,
-    AdminStatusResponse, TransportError, TransportResult, VtpmFrame, KIND_ADMIN_ADD_LEARNER_REQ,
-    KIND_ADMIN_CHANGE_MEMBERSHIP_REQ, KIND_ADMIN_ERROR, KIND_ADMIN_INIT_REQ,
-    KIND_ADMIN_MEMBERSHIP_RESP, KIND_ADMIN_PROPOSE_REQ, KIND_ADMIN_PROPOSE_RESP,
-    KIND_ADMIN_READ_RANGE_LEASE_REQ, KIND_ADMIN_READ_RANGE_LEASE_RESP, KIND_ADMIN_STATUS_REQ,
-    KIND_ADMIN_STATUS_RESP,
+    AdminStatusResponse, NotLeaderHint, TransportError, TransportResult, VtpmFrame,
+    KIND_ADMIN_ADD_LEARNER_REQ, KIND_ADMIN_CHANGE_MEMBERSHIP_REQ, KIND_ADMIN_ERROR,
+    KIND_ADMIN_INIT_REQ, KIND_ADMIN_MEMBERSHIP_RESP, KIND_ADMIN_PROPOSE_REQ,
+    KIND_ADMIN_PROPOSE_RESP, KIND_ADMIN_READ_RANGE_LEASE_REQ, KIND_ADMIN_READ_RANGE_LEASE_RESP,
+    KIND_ADMIN_STATUS_REQ, KIND_ADMIN_STATUS_RESP,
 };
 use crate::command::MetadataCommand;
 use crate::keys::MetaNodeId;
@@ -128,10 +128,19 @@ async fn serve_admin_connection(
         };
         let response = match dispatch_admin(handler.as_ref(), &authorizer, &identity, frame).await {
             Ok(frame) => frame,
+            // The redirect survives the trip to the wire. Building the frame
+            // from `to_string()` alone is where it used to be lost: the server
+            // knew which node to name and sent only prose about it.
             Err(error) => VtpmFrame {
                 kind: KIND_ADMIN_ERROR,
                 payload: AdminError {
                     message: truncate_error(&error.to_string()),
+                    not_leader: match &error {
+                        TransportError::NotLeader { leader, .. } => {
+                            Some(NotLeaderHint { leader: *leader })
+                        }
+                        _ => None,
+                    },
                 }
                 .encode()?,
             },
@@ -238,11 +247,31 @@ fn authorize(outcome: Result<(), Refusal>) -> TransportResult<()> {
     outcome.map_err(|refusal| TransportError::Unauthorized(refusal.message()))
 }
 
+/// One metadata node this client may talk to.
+#[derive(Clone, Debug)]
+pub struct AdminCandidate {
+    /// Known when the candidate came from a configured peer list, which is
+    /// what lets a redirect be followed to a SPECIFIC node rather than by
+    /// rotating hopefully through all of them.
+    pub node_id: Option<MetaNodeId>,
+    pub endpoint: SocketAddr,
+    pub server_name: String,
+}
+
 /// Client for the admin endpoint.
+///
+/// Holds every metadata node it may ask, not one. Reads and writes on this
+/// plane must reach the Raft LEADER; a non-leader refuses, and with a single
+/// fixed endpoint that refusal was terminal — which is why a co-located
+/// deployment only worked on whichever pod happened to co-locate the leader,
+/// and which pod that is depends on an election (#292).
 pub struct AdminClient {
     connector: TlsConnector,
-    server_name: String,
-    endpoint: SocketAddr,
+    candidates: Vec<AdminCandidate>,
+    /// Index of the candidate that last answered as leader. Steady state is
+    /// therefore one round trip, not a scan: leadership changes rarely, so
+    /// remembering the answer is what keeps this from taxing every request.
+    preferred: std::sync::atomic::AtomicUsize,
 }
 
 impl AdminClient {
@@ -251,10 +280,35 @@ impl AdminClient {
         endpoint: SocketAddr,
         server_name: impl Into<String>,
     ) -> TransportResult<Self> {
+        Self::with_candidates(
+            material,
+            vec![AdminCandidate {
+                node_id: None,
+                endpoint,
+                server_name: server_name.into(),
+            }],
+        )
+    }
+
+    /// Build a client that can follow a redirect to any of `candidates`.
+    ///
+    /// Refuses an empty list rather than constructing a client that can reach
+    /// nothing: the failure would otherwise surface on first use as an
+    /// unhelpful "no candidates" at a point far from the configuration that
+    /// caused it.
+    pub fn with_candidates(
+        material: TlsMaterial,
+        candidates: Vec<AdminCandidate>,
+    ) -> TransportResult<Self> {
+        if candidates.is_empty() {
+            return Err(TransportError::Protocol(
+                "an admin client needs at least one metadata endpoint".to_owned(),
+            ));
+        }
         Ok(Self {
             connector: super::tls::build_client_connector(material)?,
-            server_name: server_name.into(),
-            endpoint,
+            candidates,
+            preferred: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -367,17 +421,123 @@ impl AdminClient {
         }
     }
 
+    /// Send `request`, following a leader redirect if the answer is one.
+    ///
+    /// A redirect names a node id, not an address — Raft has no address to give
+    /// (`EmptyNode`) — so it is resolved against the configured candidates. When
+    /// the named node is not among them, or the answering node knows of no
+    /// leader at all, this falls back to trying the remaining candidates in
+    /// order: an election gap is a "come back shortly", not a routing decision,
+    /// and chasing a leader that does not exist yet would be worse than asking
+    /// around.
+    ///
+    /// Bounded by the number of candidates, so a cluster mid-election cannot
+    /// turn one request into an unbounded chase. The last redirect is what gets
+    /// returned if they all refuse, because "none of these is the leader" is the
+    /// useful message — not a connection error from whichever one happened to
+    /// be tried last.
     async fn round_trip(&self, request: VtpmFrame) -> TransportResult<VtpmFrame> {
-        let tcp = TcpStream::connect(self.endpoint).await?;
-        let name = server_name(&self.server_name)?;
+        use std::sync::atomic::Ordering;
+
+        let mut index = self.preferred.load(Ordering::Relaxed) % self.candidates.len();
+        // VISITED, not a counter. Counting attempts bounds the work but does not
+        // guarantee coverage, and the difference is a real failure: during an
+        // election two followers can hold stale views of each other, so A names
+        // B and B names A. Following those hints alternates A→B→A and burns the
+        // whole budget without ever contacting C — which may be the leader,
+        // configured in the same list. The request then fails for want of
+        // trying, which is the very outage this exists to prevent.
+        let mut visited = vec![false; self.candidates.len()];
+        let mut last_error: Option<TransportError> = None;
+
+        while let Some(current) = self.next_unvisited(index, &visited) {
+            index = current;
+            visited[index] = true;
+            let candidate = &self.candidates[index];
+            match self.attempt(candidate, &request).await {
+                Ok(frame) => {
+                    // A frame is not automatically success: a non-leader
+                    // answers with KIND_ADMIN_ERROR, and the redirect inside it
+                    // is the whole point of this loop.
+                    if let Some(hint) = redirect_of(&frame) {
+                        // Remember nothing on a redirect — this candidate just
+                        // told us it is the wrong one. Steer to the node it
+                        // named only if that node is still unvisited; otherwise
+                        // fall through to the next one that is, so a bouncing
+                        // pair cannot trap the walk.
+                        let named = hint
+                            .leader
+                            .and_then(|leader| self.index_of(leader))
+                            .filter(|found| !visited[*found]);
+                        last_error = Some(TransportError::NotLeader {
+                            message: format!(
+                                "{} is not the metadata leader{}",
+                                candidate.endpoint,
+                                match hint.leader {
+                                    Some(id) => format!("; it named node {id}"),
+                                    None => "; and knows of no leader".to_owned(),
+                                }
+                            ),
+                            leader: hint.leader,
+                        });
+                        index = named.unwrap_or(index);
+                        continue;
+                    }
+                    self.preferred.store(index, Ordering::Relaxed);
+                    return Ok(frame);
+                }
+                // An unreachable candidate is worth moving past for the same
+                // reason as a redirect: one node being down must not make the
+                // cluster unusable when the others can answer.
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            TransportError::Protocol("no metadata endpoint could be reached".to_owned())
+        }))
+    }
+
+    /// `from` if it has not been tried, else the next unvisited candidate in
+    /// ring order, else `None` once every candidate has been asked exactly once.
+    fn next_unvisited(&self, from: usize, visited: &[bool]) -> Option<usize> {
+        (0..self.candidates.len())
+            .map(|offset| (from + offset) % self.candidates.len())
+            .find(|index| !visited[*index])
+    }
+
+    fn index_of(&self, leader: MetaNodeId) -> Option<usize> {
+        self.candidates
+            .iter()
+            .position(|candidate| candidate.node_id == Some(leader))
+    }
+
+    async fn attempt(
+        &self,
+        candidate: &AdminCandidate,
+        request: &VtpmFrame,
+    ) -> TransportResult<VtpmFrame> {
+        let tcp = TcpStream::connect(candidate.endpoint).await?;
+        let name = server_name(&candidate.server_name)?;
         let mut stream = self
             .connector
             .connect(name, tcp)
             .await
             .map_err(|error| TransportError::Tls(format!("admin connect: {error}")))?;
-        write_frame(&mut stream, &request).await?;
+        write_frame(&mut stream, request).await?;
         read_frame(&mut stream).await
     }
+}
+
+/// The redirect an error frame carries, if it is one.
+///
+/// A frame that fails to decode is deliberately NOT treated as a redirect: the
+/// callers decode it again and report the real parse failure, which is more
+/// useful than silently trying the next node on a malformed reply.
+fn redirect_of(frame: &VtpmFrame) -> Option<NotLeaderHint> {
+    if frame.kind != KIND_ADMIN_ERROR {
+        return None;
+    }
+    AdminError::decode(&frame.payload).ok()?.not_leader
 }
 
 /// Convenience: build a static status response for tests / stubs.
@@ -501,6 +661,356 @@ mod tests {
             expected_range_generation: 0,
             lease_duration_ms: 5_000,
         }
+    }
+
+    /// A non-leader redirects, and the client goes to the node it names.
+    ///
+    /// This is #292 end to end. Reads and writes on this plane must reach the
+    /// Raft leader, and a non-leader has always refused them — but the refusal
+    /// arrived as the consensus engine's Display text folded into a generic
+    /// protocol error,
+    /// so no caller could act on it. In Kubernetes every pod pointed its lease
+    /// client at its own co-located metadata node, and only the one that
+    /// happened to co-locate the leader ever worked: two of three replicas
+    /// failed closed permanently, and which one survived depended on an
+    /// election.
+    ///
+    /// Two live endpoints, because the bug only exists between nodes: one
+    /// answers as a follower naming node 2, the other serves. The assertion is
+    /// that the request SUCCEEDS after being pointed elsewhere, and that the
+    /// follower is not asked twice.
+    #[tokio::test]
+    async fn a_client_follows_a_redirect_to_the_node_the_follower_names() {
+        let pki = SharedPki::new();
+        let leader_id = MetaNodeId(2);
+        let follower = Arc::new(NotLeaderHandler {
+            leader: Some(leader_id),
+            asked: AtomicUsize::new(0),
+        });
+        let (follower_addr, follower_task) = live_handler(&pki, Arc::clone(&follower)).await;
+        let (leader_addr, leader_task) =
+            live_handler(&pki, Arc::new(CountingHandler::default())).await;
+
+        let client = AdminClient::with_candidates(
+            pki.client_material(),
+            vec![
+                AdminCandidate {
+                    node_id: Some(MetaNodeId(1)),
+                    endpoint: follower_addr,
+                    server_name: "localhost".to_owned(),
+                },
+                AdminCandidate {
+                    node_id: Some(leader_id),
+                    endpoint: leader_addr,
+                    server_name: "localhost".to_owned(),
+                },
+            ],
+        )
+        .unwrap();
+
+        // The follower is FIRST in the list, so this only succeeds by being
+        // redirected. Before the fix it returned the follower's refusal.
+        let status = client
+            .status()
+            .await
+            .expect("a redirect must be followed, not reported as a failure");
+        assert_eq!(status.node_id, MetaNodeId(1));
+        assert_eq!(
+            follower.asked.load(Ordering::SeqCst),
+            1,
+            "the follower must be asked exactly once, then abandoned"
+        );
+
+        // And the leader is remembered: a second request must not pay for the
+        // redirect again, or every call would scan the cluster.
+        client.status().await.expect("the second request works too");
+        assert_eq!(
+            follower.asked.load(Ordering::SeqCst),
+            1,
+            "the client must remember which node answered as leader"
+        );
+
+        follower_task.abort();
+        leader_task.abort();
+    }
+
+    /// Two followers naming each other must not trap the walk before the real
+    /// leader is tried.
+    ///
+    /// During an election, peer views go stale in both directions: A believes B
+    /// leads and B believes A does. Following those hints alternates A→B→A, and
+    /// a loop that merely COUNTS attempts spends its whole budget on the pair
+    /// while C — configured in the same list, and actually the leader — is never
+    /// contacted. The request then fails for want of trying, which is the outage
+    /// this whole mechanism exists to prevent.
+    ///
+    /// So coverage is tracked, not attempts: every candidate is asked at most
+    /// once and at least once before giving up.
+    #[tokio::test]
+    async fn two_followers_naming_each_other_do_not_starve_the_third_candidate() {
+        let pki = SharedPki::new();
+        let a = Arc::new(NotLeaderHandler {
+            leader: Some(MetaNodeId(2)),
+            asked: AtomicUsize::new(0),
+        });
+        let b = Arc::new(NotLeaderHandler {
+            leader: Some(MetaNodeId(1)),
+            asked: AtomicUsize::new(0),
+        });
+        let (a_addr, a_task) = live_handler(&pki, Arc::clone(&a)).await;
+        let (b_addr, b_task) = live_handler(&pki, Arc::clone(&b)).await;
+        let (c_addr, c_task) = live_handler(&pki, Arc::new(CountingHandler::default())).await;
+
+        let client = AdminClient::with_candidates(
+            pki.client_material(),
+            vec![
+                AdminCandidate {
+                    node_id: Some(MetaNodeId(1)),
+                    endpoint: a_addr,
+                    server_name: "localhost".to_owned(),
+                },
+                AdminCandidate {
+                    node_id: Some(MetaNodeId(2)),
+                    endpoint: b_addr,
+                    server_name: "localhost".to_owned(),
+                },
+                AdminCandidate {
+                    node_id: Some(MetaNodeId(3)),
+                    endpoint: c_addr,
+                    server_name: "localhost".to_owned(),
+                },
+            ],
+        )
+        .unwrap();
+
+        client
+            .status()
+            .await
+            .expect("the third candidate must be reached despite the bouncing pair");
+
+        // Each of the bouncing pair asked exactly once: bounded, and not
+        // re-asked just because it was named again.
+        assert_eq!(a.asked.load(Ordering::SeqCst), 1, "A must be asked once");
+        assert_eq!(b.asked.load(Ordering::SeqCst), 1, "B must be asked once");
+
+        a_task.abort();
+        b_task.abort();
+        c_task.abort();
+    }
+
+    /// A redirect naming nobody is an ELECTION GAP, not a routing decision.
+    ///
+    /// `leader: None` means the answering node has no leader either. Treating
+    /// it as a redirect to a specific node would send the client chasing one
+    /// that does not exist, so it falls back to the others — one of which may
+    /// have a newer view.
+    #[tokio::test]
+    async fn a_redirect_with_no_known_leader_still_tries_the_other_nodes() {
+        let pki = SharedPki::new();
+        let blind = Arc::new(NotLeaderHandler {
+            leader: None,
+            asked: AtomicUsize::new(0),
+        });
+        let (blind_addr, blind_task) = live_handler(&pki, Arc::clone(&blind)).await;
+        let (leader_addr, leader_task) =
+            live_handler(&pki, Arc::new(CountingHandler::default())).await;
+
+        let client = AdminClient::with_candidates(
+            pki.client_material(),
+            vec![
+                AdminCandidate {
+                    node_id: Some(MetaNodeId(1)),
+                    endpoint: blind_addr,
+                    server_name: "localhost".to_owned(),
+                },
+                AdminCandidate {
+                    node_id: Some(MetaNodeId(2)),
+                    endpoint: leader_addr,
+                    server_name: "localhost".to_owned(),
+                },
+            ],
+        )
+        .unwrap();
+
+        client
+            .status()
+            .await
+            .expect("an unknown leader must not stop the client trying the rest");
+        assert_eq!(blind.asked.load(Ordering::SeqCst), 1);
+
+        blind_task.abort();
+        leader_task.abort();
+    }
+
+    /// When NO node leads, the client reports THAT — not a connection error
+    /// from whichever one it happened to try last.
+    #[tokio::test]
+    async fn all_nodes_refusing_reports_the_redirect_rather_than_the_last_hop() {
+        let pki = SharedPki::new();
+        let first = Arc::new(NotLeaderHandler {
+            leader: None,
+            asked: AtomicUsize::new(0),
+        });
+        let second = Arc::new(NotLeaderHandler {
+            leader: None,
+            asked: AtomicUsize::new(0),
+        });
+        let (first_addr, t1) = live_handler(&pki, Arc::clone(&first)).await;
+        let (second_addr, t2) = live_handler(&pki, Arc::clone(&second)).await;
+
+        let client = AdminClient::with_candidates(
+            pki.client_material(),
+            vec![
+                AdminCandidate {
+                    node_id: Some(MetaNodeId(1)),
+                    endpoint: first_addr,
+                    server_name: "localhost".to_owned(),
+                },
+                AdminCandidate {
+                    node_id: Some(MetaNodeId(2)),
+                    endpoint: second_addr,
+                    server_name: "localhost".to_owned(),
+                },
+            ],
+        )
+        .unwrap();
+
+        let error = client.status().await.expect_err("nobody leads");
+        assert!(
+            matches!(error, TransportError::NotLeader { .. }),
+            "a cluster with no leader must say so: {error}"
+        );
+        assert!(
+            error.to_string().contains("knows of no leader"),
+            "and say it in a way an operator can act on: {error}"
+        );
+        // Every candidate tried exactly once: bounded, so a cluster
+        // mid-election cannot turn one request into an unbounded chase.
+        assert_eq!(first.asked.load(Ordering::SeqCst), 1);
+        assert_eq!(second.asked.load(Ordering::SeqCst), 1);
+
+        t1.abort();
+        t2.abort();
+    }
+
+    /// A metadata node that does not lead: every request is refused with a
+    /// redirect, exactly as the consensus façade now does when the engine
+    /// reports a forward-to-leader.
+    struct NotLeaderHandler {
+        leader: Option<MetaNodeId>,
+        asked: AtomicUsize,
+    }
+
+    impl NotLeaderHandler {
+        fn refuse<T>(&self) -> TransportResult<T> {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            Err(TransportError::NotLeader {
+                message: match self.leader {
+                    Some(id) => format!("not the metadata leader; ask node {id}"),
+                    None => "not the metadata leader; no leader is known yet".to_owned(),
+                },
+                leader: self.leader,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl AdminHandler for NotLeaderHandler {
+        async fn status(&self) -> TransportResult<AdminStatusResponse> {
+            self.refuse()
+        }
+        async fn propose(&self, _: MetadataCommand) -> TransportResult<AdminProposeResponse> {
+            self.refuse()
+        }
+        async fn init(&self, _: Vec<u64>) -> TransportResult<AdminMembershipResponse> {
+            self.refuse()
+        }
+        async fn add_learner(&self, _: u64) -> TransportResult<AdminMembershipResponse> {
+            self.refuse()
+        }
+        async fn change_membership(
+            &self,
+            _: Vec<u64>,
+            _: bool,
+        ) -> TransportResult<AdminMembershipResponse> {
+            self.refuse()
+        }
+        async fn read_range_lease(
+            &self,
+            _: AdminReadRangeLeaseRequest,
+        ) -> TransportResult<AdminReadRangeLeaseResponse> {
+            self.refuse()
+        }
+    }
+
+    /// One CA-less PKI shared by every endpoint in a test.
+    ///
+    /// `mint_leaf` generates a fresh self-signed leaf per call, so two
+    /// endpoints minted separately present different certificates and one
+    /// client cannot trust both. The redirect tests need exactly that — two
+    /// endpoints, one client — so the DER is minted once and materials are
+    /// rebuilt from it per endpoint (`PrivateKeyDer` is not `Clone`).
+    struct SharedPki {
+        server_leaf: rustls::pki_types::CertificateDer<'static>,
+        server_key: Vec<u8>,
+        client_leaf: rustls::pki_types::CertificateDer<'static>,
+        client_key: Vec<u8>,
+    }
+
+    impl SharedPki {
+        fn new() -> Self {
+            let (server_leaf, server_key) = mint_leaf("localhost");
+            let (client_leaf, client_key) = mint_leaf("operator");
+            Self {
+                server_leaf,
+                server_key: server_key.secret_pkcs8_der().to_vec(),
+                client_leaf,
+                client_key: client_key.secret_pkcs8_der().to_vec(),
+            }
+        }
+
+        fn server_material(&self) -> TlsMaterial {
+            let mut roots = RootCertStore::empty();
+            roots.add(self.client_leaf.clone()).unwrap();
+            TlsMaterial {
+                certificate_chain: vec![self.server_leaf.clone()],
+                private_key: PrivatePkcs8KeyDer::from(self.server_key.clone()).into(),
+                trust_roots: roots,
+            }
+        }
+
+        fn client_material(&self) -> TlsMaterial {
+            let mut roots = RootCertStore::empty();
+            roots.add(self.server_leaf.clone()).unwrap();
+            TlsMaterial {
+                certificate_chain: vec![self.client_leaf.clone()],
+                private_key: PrivatePkcs8KeyDer::from(self.client_key.clone()).into(),
+                trust_roots: roots,
+            }
+        }
+    }
+
+    /// Stand up an admin endpoint over a caller-supplied handler, returning the
+    /// CONCRETE handler so a test can read its counters.
+    async fn live_handler<H>(
+        pki: &SharedPki,
+        handler: Arc<H>,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>)
+    where
+        H: AdminHandler + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = AdminServer::new(
+            pki.server_material(),
+            Arc::clone(&handler) as Arc<dyn AdminHandler>,
+        )
+        .unwrap();
+        let task = tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        (addr, task)
     }
 
     /// Stand up a real mTLS admin endpoint and return a client speaking as `cn`.
