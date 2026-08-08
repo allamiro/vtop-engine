@@ -32,6 +32,8 @@ use uuid::Uuid;
 
 /// Full frame scan: offsets, per-(producer, epoch) sequence rules, checksums.
 pub const CHECK_FRAME_SCAN: &str = "frame-scan";
+/// The inherited `.producers` frontier is present-and-decodable, or absent.
+pub const CHECK_PRODUCER_FRONTIER: &str = "producer-frontier";
 /// Recomputed content root (v2 chunk tree, v1 linear digest) vs the manifest.
 pub const CHECK_CONTENT_ROOT: &str = "content-root";
 /// `.chunks` sidecar leaves fold to the recomputed content root (v2 only).
@@ -194,9 +196,45 @@ pub(crate) fn verify_sealed_segment_at(
     // is derived from the same state, so verification without it would reject
     // every rolled segment for continuing sequences that began one file
     // earlier — the exact failure `.producers` exists to prevent (#271).
-    let inherited = crate::segment::read_producer_snapshot(env, paths)?;
-
+    //
+    // A DAMAGED frontier is reported, not raised. Returning `Err` here made
+    // the verifier refuse to produce a verdict on exactly the artifact it was
+    // asked to judge: `vtopctl segment verify` printed an I/O-shaped error
+    // instead of a report, and the transfer receiver lost the per-check detail
+    // that says WHICH artifact the peer sent damaged. Verification's product is
+    // a report; damage in an input is a finding, not an excuse to have none.
+    //
+    // A damaged frontier verifies on as an EMPTY one, so the frame scan then
+    // reports the sequence discontinuity it causes. Both findings are true and
+    // both are useful: one names the corrupt file, the other names what reading
+    // the segment without it costs.
     let mut checks = Vec::new();
+    let inherited = match crate::segment::read_producer_snapshot(env, paths) {
+        Ok(inherited) => {
+            checks.push(CheckOutcome::pass(
+                CHECK_PRODUCER_FRONTIER,
+                if inherited.is_empty() {
+                    "no inherited frontier (a range's first segment)".to_owned()
+                } else {
+                    format!("{} inherited producer(s)", inherited.producers.len())
+                },
+            ));
+            inherited
+        }
+        Err(problem) => {
+            checks.push(CheckOutcome::fail(
+                CHECK_PRODUCER_FRONTIER,
+                format!(
+                    "cannot read the inherited frontier at {}: {problem}; verifying as though \
+                     the segment inherited nothing, so any sequence that began in a predecessor \
+                     will also be reported by {CHECK_FRAME_SCAN}",
+                    paths.producers.display()
+                ),
+            ));
+            crate::producer_snapshot::ProducerSnapshot::default()
+        }
+    };
+
     let scan = match scan_frames(file.as_mut(), &header, header_len, &inherited) {
         Ok(outcome) => {
             checks.push(CheckOutcome::pass(
@@ -511,7 +549,18 @@ fn scan_frames(
                     producer_epoch: *producer_epoch,
                     first_sequence: entry.first_sequence,
                     last_sequence: *latest,
-                    record_count: entry.record_count + segment_appends,
+                    // CHECKED. The inherited count comes off a `.producers`
+                    // file, which a verifier must treat as suspect — that is
+                    // its whole job. Unchecked, a corrupt frontier panics the
+                    // verifier in a checked build and silently wraps in a
+                    // release one, turning a file it was asked to judge into
+                    // either a crash or a wrong answer.
+                    //
+                    // Saturating rather than failing here keeps the comparison
+                    // meaningful: a saturated count cannot match the manifest,
+                    // so the summary check below reports the mismatch as a
+                    // finding — which is what a verifier owes its caller.
+                    record_count: entry.record_count.saturating_add(segment_appends),
                 },
                 None => ProducerSummaryEntry {
                     producer_id: *producer_id,

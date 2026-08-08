@@ -33,7 +33,7 @@
 
 use crate::env::{Env, OpenMode, StorageFile};
 use crate::segment::{
-    io_error, segment_stem, validate_sealed_and_rebuild_sidecars_at, SegmentPaths,
+    io_error, segment_stem, validate_sealed_and_rebuild_sidecars_at, SegmentPaths, SegmentReader,
 };
 use crate::verify::{verify_sealed_segment_at, VerifyExpectations, VerifyLevel};
 use crate::{LogError, VtopLogResult};
@@ -187,18 +187,41 @@ impl SegmentReceiver {
             .map_err(|source| io_error(&self.directory, source))
     }
 
-    /// Whether the segment beginning at `base_offset` already landed here.
+    /// Whether the segment the sender is offering is ALREADY here.
     ///
     /// The primary is the completion witness because it renames last: its
     /// presence means the whole bundle published and verified.
-    pub fn is_complete(&self, base_offset: u64) -> VtopLogResult<bool> {
+    ///
+    /// Takes the expected identity, not just the offset, because a resumed
+    /// transfer must not accept a file merely for having the right name. A
+    /// segment at this base offset can belong to a previous incarnation of the
+    /// range — a different `segment_id` after a rebuild, a lineage that was
+    /// truncated and rewritten — and treating "a file exists here" as "the
+    /// requested segment is here" would leave the receiver holding somebody
+    /// else's history while reporting a completed transfer.
+    ///
+    /// An unreadable or mismatched file is reported as NOT complete, so the
+    /// transfer re-fetches and overwrites it. That is the safe direction:
+    /// re-sending bytes costs bandwidth, keeping the wrong ones costs
+    /// correctness.
+    pub fn is_complete(&self, base_offset: u64, segment_id: Uuid) -> VtopLogResult<bool> {
         let path = self
             .directory
             .join(format!("{}.segment", segment_stem(base_offset)));
-        self.env
+        if !self
+            .env
             .storage
             .exists(&path)
-            .map_err(|source| io_error(&path, source))
+            .map_err(|source| io_error(&path, source))?
+        {
+            return Ok(false);
+        }
+        match SegmentReader::open_in(&self.env, &path) {
+            Ok(reader) => Ok(reader.segment_id() == segment_id),
+            // Present but unopenable: a torn or half-installed artifact from an
+            // interrupted run. Re-fetch rather than reason about it.
+            Err(_) => Ok(false),
+        }
     }
 
     /// Start staging one sealed segment.
@@ -208,6 +231,7 @@ impl SegmentReceiver {
             directory: self.directory.clone(),
             stem: segment_stem(base_offset),
             staged: Default::default(),
+            rebuilt: Vec::new(),
         })
     }
 }
@@ -226,6 +250,18 @@ pub struct StagedSegment {
     directory: PathBuf,
     stem: String,
     staged: [Option<StagedArtifact>; 3],
+    /// Staging paths this receiver creates ITSELF during `install`: the
+    /// rebuilt `.index` / `.chunks` caches, and the synthesized frontier and
+    /// commit names.
+    ///
+    /// Tracked separately from `staged` because nothing ever writes to them
+    /// through this struct — they are named here and filled in by the rebuild
+    /// — and an untracked file is one nothing cleans up. An install failing
+    /// after the rebuild used to leave real, durable `.transfer-index` and
+    /// `.transfer-chunks` bytes behind: invisible to discovery, so harmless to
+    /// correctness, but accumulating for the life of the directory across
+    /// every failed repair attempt.
+    rebuilt: Vec<PathBuf>,
 }
 
 impl StagedSegment {
@@ -279,14 +315,26 @@ impl StagedSegment {
         let staged = self.staged[artifact.slot()].as_mut().ok_or_else(|| {
             LogError::InvalidDescriptor(format!("{} artifact was never received", artifact.label()))
         })?;
-        let Some(mut file) = staged.file.take() else {
+        let Some(file) = staged.file.as_mut() else {
             return Err(LogError::InvalidDescriptor(format!(
                 "{} artifact was already finished",
                 artifact.label()
             )));
         };
+        // SYNC FIRST, then drop the handle. `file.is_none()` is what `install`
+        // reads as "these bytes are durable", so taking the handle before the
+        // fsync succeeded made a FAILED sync indistinguishable from a
+        // successful one: the error was returned, but a caller that retried was
+        // told the artifact was "already finished", and publication would then
+        // rename bytes no barrier had ever covered.
+        //
+        // Keeping the handle on failure also leaves the retry meaningful — the
+        // same artifact can be synced again rather than being permanently
+        // stuck in a state it cannot leave.
         file.sync_data()
-            .map_err(|source| io_error(&staged.path, source))
+            .map_err(|source| io_error(&staged.path, source))?;
+        staged.file.take();
+        Ok(())
     }
 
     /// Validate the staged bytes, rebuild the derived sidecars, and publish.
@@ -358,31 +406,41 @@ impl StagedSegment {
                 .as_ref()
                 .map(|staged| staged.path.clone())
         };
+        let received_segment = staged_path(TransferArtifact::Segment).expect("checked above");
+        let received_manifest = staged_path(TransferArtifact::Manifest).expect("checked above");
+        let received_producers = staged_path(TransferArtifact::Producers);
         // Rebuilt sidecars stage under the same ignorable naming; the commit
         // path is a name that never exists (sealed validation reads no
         // commit boundary), present only so the struct is total.
+        //
+        // Every path this block INVENTS is recorded in `rebuilt` before it can
+        // be written to, so a failure anywhere below has something to delete.
+        // Recording them at construction rather than after the rebuild is the
+        // point: the rebuild is exactly what may fail part-way, and a path
+        // registered only on success is registered only when it is not needed.
+        let mut invented = |suffix: &str| {
+            let path = self.directory.join(format!(
+                ".{}.transfer-{suffix}.{}.tmp",
+                self.stem,
+                Uuid::from_u128(self.env.rng.next_u128())
+            ));
+            self.rebuilt.push(path.clone());
+            path
+        };
+        let index = invented("index");
+        let chunks = invented("chunks");
+        let commit = invented("commit");
+        let producers = match received_producers {
+            Some(received) => received,
+            None => invented("producers"),
+        };
         let staged_paths = SegmentPaths {
-            segment: staged_path(TransferArtifact::Segment).expect("checked above"),
-            manifest: staged_path(TransferArtifact::Manifest).expect("checked above"),
-            producers: staged_path(TransferArtifact::Producers).unwrap_or_else(|| {
-                self.directory
-                    .join(self.staged_name(TransferArtifact::Producers))
-            }),
-            index: self.directory.join(format!(
-                ".{}.transfer-index.{}.tmp",
-                self.stem,
-                Uuid::from_u128(self.env.rng.next_u128())
-            )),
-            chunks: self.directory.join(format!(
-                ".{}.transfer-chunks.{}.tmp",
-                self.stem,
-                Uuid::from_u128(self.env.rng.next_u128())
-            )),
-            commit: self.directory.join(format!(
-                ".{}.transfer-commit.{}.tmp",
-                self.stem,
-                Uuid::from_u128(self.env.rng.next_u128())
-            )),
+            segment: received_segment,
+            manifest: received_manifest,
+            producers,
+            index,
+            chunks,
+            commit,
         };
 
         // Open-grade validation plus sidecar rebuild, then the operator-grade
@@ -456,8 +514,13 @@ impl StagedSegment {
             .storage
             .sync_dir(&self.directory)
             .map_err(|source| io_error(&self.directory, source))?;
-        // Renames consumed the staged files; nothing is left to clean.
+        // Renames consumed the staged files; nothing is left to clean. The
+        // rebuilt list is cleared too — its entries were either renamed above
+        // or are names the rebuild never created (`commit` always, `chunks`
+        // for v1, `producers` for a first segment), and deleting a path just
+        // published under a real name would undo the publication.
         self.staged = Default::default();
+        self.rebuilt.clear();
         Ok(final_segment)
     }
 
@@ -472,6 +535,12 @@ impl StagedSegment {
             // an open file.
             staged.file.take();
             let _ = self.env.storage.remove_file(&staged.path);
+        }
+        // The sidecars this receiver rebuilt for itself. Most of these names
+        // never became files — the errors ignored here are overwhelmingly "no
+        // such file", which is the outcome being aimed at anyway.
+        for path in self.rebuilt.drain(..) {
+            let _ = self.env.storage.remove_file(&path);
         }
         self.staged = Default::default();
     }
@@ -726,6 +795,101 @@ mod tests {
         );
     }
 
+    /// An install that fails AFTER the sidecar rebuild must leave nothing —
+    /// including the `.index` and `.chunks` the receiver rebuilt for ITSELF.
+    ///
+    /// The tampered-bytes test above fails during open-grade validation, which
+    /// is BEFORE anything is rebuilt; it passed just as happily while those
+    /// files were untracked, because at that point there were none to leak.
+    /// The leak only exists past that point, so the failure has to be injected
+    /// past it: at the first PUBLICATION rename, with every rebuilt sidecar on
+    /// disk under a staging name and nothing yet published.
+    ///
+    /// Two identical simulated runs, same seed and so the same operation
+    /// sequence. The first learns which global op index that rename is; the
+    /// second fails exactly that op.
+    #[test]
+    fn an_install_failing_after_the_rebuild_removes_the_rebuilt_sidecars_too() {
+        use crate::sim::{FaultPlan, SimStorage, TraceKind};
+
+        let source_dir = tempdir().unwrap();
+        let set = rolled_range(source_dir.path());
+        let reader = &set.sealed()[0];
+        let base_offset = reader.base_offset();
+        let artifacts: Vec<(TransferArtifact, Vec<u8>)> = [
+            TransferArtifact::Segment,
+            TransferArtifact::Manifest,
+            TransferArtifact::Producers,
+        ]
+        .into_iter()
+        .filter_map(|artifact| {
+            let path = sealed_artifact_path(reader.path(), artifact).ok()?;
+            path.exists().then(|| (artifact, fs::read(&path).unwrap()))
+        })
+        .collect();
+
+        let destination = Path::new("/transfer");
+        let stage = |sim: &SimStorage| {
+            sim.create_dir_all(destination);
+            let env = sim.env(11);
+            let receiver = SegmentReceiver::open(&env, destination).unwrap();
+            let mut staged = receiver.begin(base_offset).unwrap();
+            for (artifact, bytes) in &artifacts {
+                staged.append_artifact(*artifact, bytes).unwrap();
+                staged.finish_artifact(*artifact).unwrap();
+            }
+            (env, staged)
+        };
+
+        // Run one: unobstructed, to learn where publication begins.
+        //
+        // Not every rename is a publication. `write_atomic` renames its own
+        // temp into place while REBUILDING a sidecar, and those come first;
+        // failing one of those would abort inside the rebuild and prove
+        // nothing. They are distinguishable by name: a `write_atomic` temp is
+        // ".{target}.{uuid}.tmp" over a target that is already a dotted
+        // staging name, so it is the only rename source beginning "..".
+        let rehearsal = SimStorage::new();
+        let (_, staged) = stage(&rehearsal);
+        staged.install().unwrap();
+        let first_publication = rehearsal
+            .trace()
+            .into_iter()
+            .filter(|entry| entry.kind == TraceKind::Rename)
+            .find(|entry| {
+                !entry
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".."))
+            })
+            .expect("a successful install publishes by renaming")
+            .index;
+
+        // Run two: the same script, with that rename failing.
+        let injected = SimStorage::new();
+        let (env, staged) = stage(&injected);
+        injected.set_fault(FaultPlan::FailOp {
+            op: first_publication,
+            kind: std::io::ErrorKind::PermissionDenied,
+        });
+        staged
+            .install()
+            .expect_err("the injected rename failure must fail the install");
+
+        let leftovers = env
+            .storage
+            .read_dir(destination)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.path.display().to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "a failed install must not leave rebuilt sidecars behind: {leftovers:?}"
+        );
+    }
+
     /// The v2 path end to end: a rolled v2 range verifies (the manifest's
     /// producer summary is CUMULATIVE across rolls, which the seeded verifier
     /// must reconstruct) and transfers, with the receiver rebuilding the
@@ -818,6 +982,55 @@ mod tests {
             .entries
             .iter()
             .all(|entry| entry.format_version == 2));
+    }
+
+    /// A damaged `.producers` is REPORTED, not raised.
+    ///
+    /// Verification's product is a verdict on artifacts that may be damaged —
+    /// that is the entire job — so returning `Err` when one of them is
+    /// damaged left the caller with no verdict at all: `vtopctl segment
+    /// verify` printed a decode error instead of a report, and the transfer
+    /// receiver lost the per-check detail naming which artifact the peer sent
+    /// broken.
+    #[test]
+    fn a_damaged_producer_frontier_is_a_finding_not_an_error() {
+        let source_dir = tempdir().unwrap();
+        let set = rolled_range(source_dir.path());
+        // The SECOND sealed segment: the first inherits nothing and so has no
+        // frontier to damage.
+        let reader = &set.sealed()[1];
+        let frontier = sealed_artifact_path(reader.path(), TransferArtifact::Producers).unwrap();
+        assert!(
+            frontier.exists(),
+            "a rolled segment must have inherited one"
+        );
+        // Truncated mid-header: decodable magic, nothing after it.
+        fs::write(&frontier, &fs::read(&frontier).unwrap()[..9]).unwrap();
+
+        let report = crate::verify::verify_sealed_segment(
+            reader.path(),
+            &VerifyExpectations {
+                require: VerifyLevel::SelfConsistent,
+                ..VerifyExpectations::default()
+            },
+        )
+        .expect("damage in an input is a finding, not a reason to have no report");
+        assert!(!report.passed(), "a damaged frontier must not pass");
+        let frontier_check = report
+            .checks
+            .iter()
+            .find(|check| check.name == crate::verify::CHECK_PRODUCER_FRONTIER)
+            .expect("the report must name the frontier explicitly");
+        assert!(!frontier_check.passed, "{}", frontier_check.detail);
+        // And the consequence is reported too, rather than only the cause: a
+        // segment read without its frontier has sequences beginning nowhere.
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == crate::verify::CHECK_FRAME_SCAN && !check.passed),
+            "the scan must also report what reading without the frontier costs"
+        );
     }
 
     /// A rolled segment — producers mid-sequence, frontier in `.producers` —

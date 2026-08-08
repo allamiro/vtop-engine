@@ -492,8 +492,11 @@ pub struct ListSealedSegmentsRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListSealedSegmentsResponse {
-    /// Ascending by `base_offset`; the decoder refuses anything else, because
-    /// ordering here is a claim the receiver routes offsets by.
+    /// A CONTIGUOUS ascending run: each entry begins exactly where the
+    /// previous one ended, and none is empty. The decoder refuses anything
+    /// else, because this is not a list the receiver reads — it is the map it
+    /// routes offsets by, and a gap or an overlap in it is a range that cannot
+    /// be read across even though every file in it verifies.
     pub segments: Vec<SealedSegmentEntry>,
 }
 
@@ -1553,7 +1556,7 @@ fn decode_message(
                 ));
             }
             let mut segments = Vec::with_capacity(count);
-            let mut previous_base: Option<u64> = None;
+            let mut previous_next: Option<u64> = None;
             for _ in 0..count {
                 let entry = SealedSegmentEntry {
                     segment_id: decoder.uuid()?,
@@ -1565,12 +1568,15 @@ fn decode_message(
                 };
                 // The listing is a peer's claim and the receiver routes
                 // offsets by it, so its shape is enforced on the way IN, like
-                // the epoch history: strictly ascending base offsets, an
-                // interval that does not run backwards, and primaries that
-                // exist. A zero-byte `.segment` or manifest cannot have been
-                // sealed by this code, so a listing claiming one is
-                // malformed, not merely surprising.
-                if entry.next_offset < entry.base_offset
+                // the epoch history: primaries that exist, a non-empty
+                // interval, and a prefix that is genuinely CONTIGUOUS.
+                //
+                // A zero-byte `.segment` or manifest cannot have been sealed
+                // by this code, and neither can a segment holding no offsets:
+                // a roll only happens because records were written, so
+                // `next_offset == base_offset` describes a file this system
+                // does not produce.
+                if entry.next_offset <= entry.base_offset
                     || entry.segment_bytes == 0
                     || entry.manifest_bytes == 0
                 {
@@ -1578,14 +1584,28 @@ fn decode_message(
                         "sealed segment entry is malformed".to_owned(),
                     ));
                 }
-                if let Some(previous) = previous_base {
-                    if entry.base_offset <= previous {
-                        return Err(ProtocolError::InvalidFrame(
-                            "sealed segment listing does not advance".to_owned(),
-                        ));
+                // Ascending was not enough. Segments roll, so the sealed
+                // prefix a leader serves is contiguous by construction: each
+                // interval begins exactly where its predecessor ended. Merely
+                // requiring the base offsets to increase accepted listings
+                // with GAPS (offsets no listed segment holds) and OVERLAPS
+                // (offsets two of them claim), and every file in such a
+                // listing verifies individually — the damage is only visible
+                // in how they fit together, which is to say only here.
+                //
+                // A receiver that installed one would hold a range it cannot
+                // read across: a fetch walking the prefix either falls into a
+                // hole or reads the same offsets twice.
+                if let Some(previous) = previous_next {
+                    if entry.base_offset != previous {
+                        return Err(ProtocolError::InvalidFrame(format!(
+                            "sealed segment listing is not contiguous: an entry begins at \
+                             {} where the previous one ended at {previous}",
+                            entry.base_offset
+                        )));
                     }
                 }
-                previous_base = Some(entry.base_offset);
+                previous_next = Some(entry.next_offset);
                 segments.push(entry);
             }
             Message::ListSealedSegmentsResponse(ListSealedSegmentsResponse { segments })
@@ -1609,12 +1629,15 @@ fn decode_message(
         }
         80 => {
             let total_bytes = decoder.u64()?;
-            let bytes = decoder.bytes()?;
-            if bytes.len() > MAX_SEGMENT_CHUNK_BYTES as usize {
-                return Err(ProtocolError::Limit(format!(
-                    "segment chunk exceeds {MAX_SEGMENT_CHUNK_BYTES} bytes"
-                )));
-            }
+            // Bounded on the LENGTH PREFIX, before the copy. Decoding first
+            // and measuring afterwards enforced the limit on what was kept,
+            // not on what was allocated: a peer could name any size the
+            // negotiated frame cap allows — 8 MiB by default, 64 MiB at the
+            // ceiling — and the receiver would allocate all of it, then refuse
+            // it. The per-chunk memory bound this constant advertises has to
+            // hold against a hostile sender, which is the only sender it
+            // matters for.
+            let bytes = decoder.bounded_bytes(MAX_SEGMENT_CHUNK_BYTES as usize, "segment chunk")?;
             Message::FetchSegmentChunkResponse(FetchSegmentChunkResponse { total_bytes, bytes })
         }
         other => return Err(ProtocolError::UnknownKind(other)),
@@ -1880,6 +1903,17 @@ impl<'a> Decoder<'a> {
     }
     fn bytes(&mut self) -> Result<Vec<u8>, ProtocolError> {
         let length = self.u32()? as usize;
+        Ok(self.take(length)?.to_vec())
+    }
+    /// [`Self::bytes`] with the limit applied to the length prefix rather than
+    /// to the result, so an oversized field is refused before it is copied.
+    fn bounded_bytes(&mut self, maximum: usize, what: &str) -> Result<Vec<u8>, ProtocolError> {
+        let length = self.u32()? as usize;
+        if length > maximum {
+            return Err(ProtocolError::Limit(format!(
+                "{what} is {length} bytes; maximum is {maximum}"
+            )));
+        }
         Ok(self.take(length)?.to_vec())
     }
     fn string(&mut self, maximum: usize) -> Result<String, ProtocolError> {
@@ -2467,8 +2501,9 @@ mod tests {
 
     /// The listing is what a receiver routes offsets by, so its shape is a
     /// wire invariant, not a server courtesy: out-of-order entries, an
-    /// interval running backwards, and zero-byte primaries are all refused on
-    /// the way IN.
+    /// interval running backwards or holding nothing, zero-byte primaries,
+    /// and — the ones a per-file check can never catch — GAPS and OVERLAPS
+    /// between entries are all refused on the way IN.
     #[test]
     fn a_malformed_sealed_segment_listing_is_refused_on_decode() {
         let entry = |base: u64, next: u64| SealedSegmentEntry {
@@ -2480,8 +2515,15 @@ mod tests {
             producers_bytes: 0,
         };
         let cases: Vec<(Vec<SealedSegmentEntry>, &str)> = vec![
-            (vec![entry(100, 200), entry(0, 100)], "does not advance"),
-            (vec![entry(0, 100), entry(0, 100)], "does not advance"),
+            (vec![entry(100, 200), entry(0, 100)], "not contiguous"),
+            (vec![entry(0, 100), entry(0, 100)], "not contiguous"),
+            // A GAP: offsets 100..150 belong to no listed segment.
+            (vec![entry(0, 100), entry(150, 200)], "not contiguous"),
+            // An OVERLAP: offsets 50..100 are claimed twice.
+            (vec![entry(0, 100), entry(50, 200)], "not contiguous"),
+            // An EMPTY interval — a segment that rolled holding nothing.
+            (vec![entry(0, 0)], "malformed"),
+            (vec![entry(0, 100), entry(100, 100)], "malformed"),
             (vec![entry(100, 50)], "malformed"),
             (
                 vec![SealedSegmentEntry {
@@ -2583,6 +2625,22 @@ mod tests {
             encode_frame(&frame(oversized), limits()),
             Err(ProtocolError::Limit(_))
         ));
+
+        // And refused on DECODE from the length prefix alone, without the
+        // bytes ever being present. The payload here carries a header that
+        // CLAIMS an oversized chunk and no body at all: if the limit were
+        // still applied after the copy, this would fail as a truncated frame
+        // (having tried to take the bytes) rather than as a limit.
+        let mut payload = Vec::new();
+        put_u64(&mut payload, MAX_SEGMENT_CHUNK_BYTES as u64 + 1);
+        put_u32(&mut payload, MAX_SEGMENT_CHUNK_BYTES + 1);
+        let refused = decode_message(80, &mut Decoder::new(&payload), limits())
+            .expect_err("an oversized chunk must be refused before it is allocated");
+        assert!(
+            matches!(refused, ProtocolError::Limit(_)),
+            "the bound must be read off the length prefix, not off the decoded \
+             bytes: {refused}"
+        );
 
         // An over-long listing is refused at encode time too — this is the
         // branch `encode_frame` reserves memory from.

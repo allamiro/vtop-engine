@@ -70,8 +70,19 @@ impl LeaderSegmentTransferHandler {
                 ),
             ));
         }
-        let meta = self.broker.meta_fencing_epoch();
-        if !meta.lease_active() || meta.get() != held {
+        // ONE snapshot, under ONE lock. Reading `lease_active()` and `get()`
+        // through separate acquisitions lets a release land between them, so
+        // the pair examined here never existed as a state: the check can see a
+        // live lease from before the release and a matching epoch from after
+        // it, and a deposed leader serves repair bytes.
+        //
+        // This check runs per chunk, not once per transfer, so a lease lost
+        // mid-transfer stops the very next chunk rather than at the end.
+        let (granted, lease_active) = {
+            let state = self.broker.meta_fencing_epoch().lock();
+            (state.fencing_epoch, state.lease_active)
+        };
+        if !lease_active || granted != held {
             return Err((
                 ErrorCode::Fenced,
                 "this leader's lease is inactive or fenced by a newer metadata grant".to_owned(),
@@ -371,8 +382,12 @@ impl SegmentTransferClient {
         };
         let mut installed = Vec::new();
         for entry in listing {
+            // Identity, not just the offset. A segment already present at this
+            // base offset can be from a previous incarnation of the range, and
+            // skipping the fetch would leave this replica holding somebody
+            // else's history while the transfer reported success.
             if receiver
-                .is_complete(entry.base_offset)
+                .is_complete(entry.base_offset, entry.segment_id)
                 .map_err(receiver_error)?
             {
                 continue;
