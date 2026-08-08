@@ -217,8 +217,16 @@ EXPECTED=$((ROUNDS * PER_ROUND))
 log "streamed $EXPECTED records"
 
 # ---------------------------------------------------------------------------
+# An unreachable endpoint is an EMPTY answer here, never a dead script.
+#
+# `set -euo pipefail` is on, so a bare `curl -sf` that fails takes the whole
+# pipeline down with it, and a caller that meant to RETRY never gets the chance —
+# the script exits mid-loop with no message, which is the same silent abort the
+# port allocator above documents. Callers compare the result to an expected
+# value and fail with it in the message, so an empty string reports "the endpoint
+# did not answer" exactly where it happened.
 committed_offset() {
-  curl -sf "localhost:$1/metrics" \
+  { curl -sf "localhost:$1/metrics" || true; } \
     | awk '/^vtop_broker_local_committed_offset\{/ { print $NF }' | head -1
 }
 
@@ -405,8 +413,24 @@ alloc_port() {
   r_port=$((r_port + 1))
 }
 
+# 90 attempts, not 30. Each costs the 4s forward settle plus the attempt, so
+# this is roughly six minutes of patience against roughly two before.
+#
+# The budget is not arbitrary and the earlier one was tuned to the wrong
+# cluster. A cold replicated install restarts while follower DNS settles — the
+# leader exits with "failed to lookup address information" until the headless
+# Service publishes every peer, which the chart documents as expected. On
+# Docker Desktop that resolves in well under a minute, so 30 attempts looked
+# generous; on kind it does not, and CI failed here with `Connection refused`
+# while the pod was still in that loop. Waiting for `phase=Running` cannot help:
+# a crash-looping pod reports Running almost immediately and keeps restarting,
+# killing each forward as it goes.
+#
+# So the loop is the wait. It re-establishes the forward every attempt and keeps
+# going until the process stays up long enough to answer, which is the actual
+# condition being waited for.
 r_init=""
-for _ in $(seq 1 30); do
+for _ in $(seq 1 90); do
   r_port=$((r_port + 1))
   cat > "$WORK/r-admin.yaml" <<EOF
 endpoint: localhost:${r_port}
