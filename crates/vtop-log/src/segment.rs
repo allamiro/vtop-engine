@@ -1945,6 +1945,92 @@ pub fn roll_in(
     Ok((sealed, successor))
 }
 
+/// Open a new active tail immediately after a SEALED segment, inheriting the
+/// producer frontier that segment ends with.
+///
+/// This is `roll_in` for a range whose tail is not in memory. A received prefix
+/// (#270) is sealed segments and nothing else, and `SegmentSet::open_in`
+/// refuses to open one — correctly, because minting a successor is a writer's
+/// decision and a reader must not make it silently. Adoption is the writer that
+/// gets to make it.
+///
+/// The frontier is the part that cannot be shortcut. A sealed segment's
+/// `.producers` sidecar holds what it INHERITED, not what it ends with, so the
+/// successor's starting state is the predecessor's inherited frontier advanced
+/// by the predecessor's own records — which is exactly what the scan already
+/// computes on the way to validating the file. Reading the sidecar alone would
+/// rewind every producer to where the last segment began, and the append path
+/// would then reject the producer's next record as a sequence gap.
+pub(crate) fn open_successor_in(
+    env: &Env,
+    sealed_path: &Path,
+    successor_id: Uuid,
+) -> VtopLogResult<ActiveSegment> {
+    let paths = SegmentPaths::from_segment(sealed_path)?;
+    let inherited = read_producer_snapshot(env, &paths)?;
+    let mut file = env
+        .storage
+        .open(sealed_path, OpenMode::Read)
+        .map_err(|source| io_error(sealed_path, source))?;
+    let inspection =
+        inspect_sealed_file(env.storage.as_ref(), file.as_mut(), sealed_path, &inherited)?;
+    drop(file);
+
+    let base_offset = inspection.scan.next_offset;
+    let directory = sealed_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let successor_path = directory.join(format!("{}.active", segment_stem(base_offset)));
+    // No name-collision guard here, unlike `roll_in`, and the difference is
+    // worth stating because copying one in would be reasonable and wrong.
+    // `roll_in` compares two `.active` paths, so an empty segment really can
+    // produce a successor with its predecessor's name. Here the predecessor is
+    // a `.segment` primary and the successor is always `.active` — the equality
+    // could never hold — and `adopt_in` has already refused any directory
+    // containing an active segment, so there is nothing for the name to collide
+    // with. A guard that cannot fire reads as protection that is not there.
+
+    let frontier = snapshot_of(
+        &inspection.scan.producer_states,
+        &inspection.scan.producer_epochs,
+    );
+    let states = inspection.scan.producer_states.clone();
+    let epochs = inspection.scan.producer_epochs.clone();
+
+    // Frontier BEFORE the tail exists, matching `roll_in`: a tail that is
+    // visible without the sidecar that makes its sequences readable is a range
+    // that cannot be reopened.
+    if !frontier.is_empty() {
+        write_atomic(
+            env,
+            &SegmentPaths::from_active(&successor_path)?.producers,
+            &frontier.encode()?,
+        )?;
+    }
+
+    let mut successor = match inspection.header {
+        AnyHeader::V2(header) => {
+            let mut descriptor = header.descriptor.clone();
+            descriptor.segment_id = successor_id;
+            descriptor.base_offset = base_offset;
+            ActiveSegment::create_v2_in(env, &successor_path, descriptor, header.config)?
+        }
+        AnyHeader::V1(header) => {
+            let mut descriptor = header.descriptor.clone();
+            descriptor.segment_id = successor_id;
+            descriptor.base_offset = base_offset;
+            ActiveSegment::create_in(env, &successor_path, descriptor, header.config)?
+        }
+    };
+    // In memory as well as on disk, so the tail serves appends before anything
+    // re-reads the sidecar.
+    successor.producer_states = states;
+    successor.producer_epochs = epochs;
+    successor.inherited = frontier;
+    Ok(successor)
+}
+
 /// Rehydrate in-memory producer state from an inherited frontier.
 fn inherited_states(
     inherited: &crate::producer_snapshot::ProducerSnapshot,

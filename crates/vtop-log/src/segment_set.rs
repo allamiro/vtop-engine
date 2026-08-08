@@ -34,11 +34,91 @@ use crate::producer_snapshot::ProducerSnapshot;
 use crate::segment::{io_error, roll_in, segment_stem, write_atomic, ActiveSegment, SegmentReader};
 use crate::truncate_intent::{DoomedSegment, TruncateIntent, TRUNCATE_INTENT_FILE};
 use crate::{
-    CatalogSegmentState, Durability, FetchBatch, FetchedRecord, LogError, LogRecord,
+    CatalogEntry, CatalogSegmentState, Durability, FetchBatch, FetchedRecord, LogError, LogRecord,
     SegmentDescriptor, StartupCatalog, VtopLogResult,
 };
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
+
+/// Finish a truncation that died between its marker and its final rename.
+///
+/// Shared by [`SegmentSet::open_in`] and [`SegmentSet::adopt_in`] because both
+/// read a layout, and reading one with an unfinished truncation in it sees the
+/// half-made range rather than the completed one. Adoption skipping this was a
+/// way to LOSE WRITES, not merely to read something stale: it would mint a tail
+/// over a prefix the marker still condemns, serve appends into it, and the next
+/// `open_in` would finish the intent and delete exactly that tail.
+///
+/// A marker that does not decode is deliberately left alone. It names an intent
+/// that cannot be honoured, so it falls through to discovery, which quarantines
+/// it by name and makes the caller refuse — which is the right outcome for a
+/// range nobody can prove the shape of.
+fn finish_pending_truncation(env: &Env, directory: &Path) -> VtopLogResult<()> {
+    let marker = directory.join(TRUNCATE_INTENT_FILE);
+    if !env
+        .storage
+        .exists(&marker)
+        .map_err(|source| io_error(&marker, source))?
+    {
+        return Ok(());
+    }
+    let decoded = env
+        .storage
+        .read(&marker)
+        .map_err(|source| io_error(&marker, source))
+        .and_then(|bytes| TruncateIntent::decode(&bytes));
+    if let Ok(intent) = decoded {
+        finish_truncation(env, directory, &intent)?;
+    }
+    Ok(())
+}
+
+/// Every segment in a range directory must belong to the SAME range.
+///
+/// Discovery does not cover this. `mark_conflicting_lineage` groups candidates
+/// BY range and flags disagreement within a group, so segments from two
+/// different ranges are two clean groups and nothing is quarantined. Offsets
+/// alone then look fine — two ranges can trivially hold contiguous offsets —
+/// and a set stitched from both would serve one range's records under the
+/// other's identity, with the tail inheriting whichever descriptor happened to
+/// be last.
+///
+/// The v1-shaped catalog descriptor is the right thing to compare: a v2
+/// descriptor projects onto its common prefix, so this is format-independent.
+fn validate_single_lineage(entries: &[CatalogEntry], directory: &Path) -> VtopLogResult<()> {
+    let mut first: Option<&SegmentDescriptor> = None;
+    for entry in entries {
+        let descriptor = &entry.descriptor;
+        match first {
+            None => first = Some(descriptor),
+            Some(first)
+                if first.topic == descriptor.topic
+                    && first.topic_epoch == descriptor.topic_epoch
+                    && first.lineage.range_id == descriptor.lineage.range_id
+                    && first.lineage.generation == descriptor.lineage.generation
+                    && first.lineage.key_range == descriptor.lineage.key_range => {}
+            Some(first) => {
+                return Err(LogError::InvalidDescriptor(format!(
+                    "range at {} mixes lineages: {} belongs to topic {:?} epoch {} range {}/{} \
+                     while {} belongs to topic {:?} epoch {} range {}/{}. These are different \
+                     ranges and must not be served as one.",
+                    directory.display(),
+                    entry.path.display(),
+                    descriptor.topic,
+                    descriptor.topic_epoch,
+                    descriptor.lineage.range_id,
+                    descriptor.lineage.generation,
+                    "the first segment",
+                    first.topic,
+                    first.topic_epoch,
+                    first.lineage.range_id,
+                    first.lineage.generation,
+                )))
+            }
+        }
+    }
+    Ok(())
+}
 
 /// One range's segments, ordered and contiguous.
 pub struct SegmentSet {
@@ -76,21 +156,7 @@ impl SegmentSet {
         // different — it names an intent that cannot be honoured — so it
         // falls through to discovery, which quarantines it by name, and the
         // open refuses like any other ambiguity.
-        let marker = directory.join(TRUNCATE_INTENT_FILE);
-        if env
-            .storage
-            .exists(&marker)
-            .map_err(|source| io_error(&marker, source))?
-        {
-            let decoded = env
-                .storage
-                .read(&marker)
-                .map_err(|source| io_error(&marker, source))
-                .and_then(|bytes| TruncateIntent::decode(&bytes));
-            if let Ok(intent) = decoded {
-                finish_truncation(env, &directory, &intent)?;
-            }
-        }
+        finish_pending_truncation(env, &directory)?;
         let catalog = StartupCatalog::discover_in(env, &directory)?;
         if !catalog.quarantined.is_empty() {
             // Name every quarantined bundle and its reasons in the refusal.
@@ -122,6 +188,9 @@ impl SegmentSet {
         if catalog.entries.is_empty() {
             return Ok(None);
         }
+        // The same check adoption needs, for the same reason: `validate_contiguous`
+        // below compares OFFSETS, and two different ranges can abut perfectly.
+        validate_single_lineage(&catalog.entries, &directory)?;
 
         let mut sealed_paths: Vec<(u64, PathBuf)> = Vec::new();
         let mut active_path: Option<PathBuf> = None;
@@ -169,6 +238,115 @@ impl SegmentSet {
         };
         set.validate_contiguous()?;
         Ok(Some(set))
+    }
+
+    /// Open a received sealed prefix and mint the tail it needs to serve.
+    ///
+    /// The last unmet piece of #270. Segment transfer lands sealed segments and
+    /// nothing else, and [`Self::open_in`] refuses a range whose tail is
+    /// sealed:
+    ///
+    /// > range at {} has no active segment; its tail was sealed without a
+    /// > successor
+    ///
+    /// That refusal is right and stays: a reader must not decide to extend a
+    /// range it was only asked to read. Adoption is the writer that gets to
+    /// decide, and this is the one place that decision is made.
+    ///
+    /// REFUSES A DIRECTORY THAT ALREADY HAS A TAIL, rather than adopting around
+    /// it. A tail means the range is already live, and minting a second one
+    /// would produce two writers for the same offsets — a split range that
+    /// discovery would then quarantine, if it were lucky enough to notice.
+    /// `open_in` is the call for that directory.
+    pub fn adopt_in(
+        env: &Env,
+        directory: impl AsRef<Path>,
+        successor_id: Uuid,
+    ) -> VtopLogResult<Self> {
+        let directory = directory.as_ref().to_path_buf();
+        // BEFORE discovery, exactly as `open_in` does. An unfinished truncation
+        // makes the layout below the half-made one, and minting a tail over a
+        // prefix the marker still condemns would lose writes: the next
+        // `open_in` finishes the intent and deletes that very tail, with
+        // whatever was appended to it.
+        finish_pending_truncation(env, &directory)?;
+        let catalog = StartupCatalog::discover_in(env, &directory)?;
+        if !catalog.quarantined.is_empty() {
+            return Err(LogError::InvalidDescriptor(format!(
+                "range at {} has {} quarantined artifact bundle(s); refusing to adopt an \
+                 ambiguous range, because a tail minted onto a prefix with a hole in it would \
+                 make the hole permanent",
+                directory.display(),
+                catalog.quarantined.len()
+            )));
+        }
+        // One range, not several that happen to abut. Offsets alone cannot tell
+        // the difference and discovery does not look across ranges at all.
+        validate_single_lineage(&catalog.entries, &directory)?;
+
+        let mut sealed_paths: Vec<(u64, PathBuf)> = Vec::new();
+        for entry in &catalog.entries {
+            match entry.state {
+                CatalogSegmentState::Sealed => {
+                    sealed_paths.push((entry.descriptor.base_offset, entry.path.clone()))
+                }
+                CatalogSegmentState::Active => {
+                    return Err(LogError::InvalidDescriptor(format!(
+                        "range at {} already has an active segment at {}; adoption mints a tail \
+                         and this range has one, so a second would give the same offsets two \
+                         writers. Use `open_in` for a range that is already live.",
+                        directory.display(),
+                        entry.path.display()
+                    )))
+                }
+            }
+        }
+        if sealed_paths.is_empty() {
+            return Err(LogError::InvalidDescriptor(format!(
+                "range at {} holds no sealed segments; there is nothing to adopt and no offset \
+                 to begin a tail at. Use `create_in` for a new range.",
+                directory.display()
+            )));
+        }
+        sealed_paths.sort_by_key(|(base, _)| *base);
+
+        let mut sealed = Vec::with_capacity(sealed_paths.len());
+        for (_, path) in &sealed_paths {
+            sealed.push(SegmentReader::open_in(env, path)?);
+        }
+        // Contiguity BEFORE the tail is minted. The wire decoder refuses a
+        // gapped listing (#292) and discovery refuses an ambiguous directory,
+        // but neither covers bytes that arrived by other means — a restored
+        // backup, a hand-copied directory. Minting a tail onto a prefix with a
+        // hole would bless the hole: the range opens from then on, and the
+        // missing offsets are simply never served.
+        for pair in sealed.windows(2) {
+            if pair[0].next_offset() != pair[1].base_offset() {
+                return Err(LogError::InvalidDescriptor(format!(
+                    "cannot adopt {}: sealed segments are not contiguous — {} ends at offset {} \
+                     but {} begins at {}. Adopting would make the gap permanent.",
+                    directory.display(),
+                    pair[0].path().display(),
+                    pair[0].next_offset(),
+                    pair[1].path().display(),
+                    pair[1].base_offset()
+                )));
+            }
+        }
+
+        let last = sealed.last().expect("checked non-empty above");
+        let active = crate::segment::open_successor_in(env, last.path(), successor_id)?;
+
+        let set = Self {
+            env: env.clone(),
+            directory,
+            sealed,
+            active: Some(active),
+        };
+        // The same invariant `open_in` ends on, so an adopted range and a
+        // reopened one are the same thing by the time either is returned.
+        set.validate_contiguous()?;
+        Ok(set)
     }
 
     /// Create a range's first segment.
@@ -1592,5 +1770,324 @@ mod tests {
             SegmentSet::open_in(&Env::real(), directory.path()).is_err(),
             "an undecodable intent must refuse the open, not be acted on"
         );
+    }
+
+    /// A range that is only a sealed prefix — what segment transfer produces —
+    /// is adopted, served, and reopens as an ordinary range.
+    ///
+    /// The last unmet piece of #270. `open_in` refuses this directory by
+    /// design, so before adoption existed a transferred prefix was bytes on
+    /// disk that nothing could turn back into a replica.
+    ///
+    /// The producer sequence is the assertion that matters. A sealed segment's
+    /// `.producers` holds what it INHERITED, not what it ends with, so a tail
+    /// seeded from that sidecar would rewind every producer to where the last
+    /// segment began and the next append would be rejected as a sequence gap.
+    /// This continues the same producer across the adoption boundary, which is
+    /// only possible if the frontier came from the scan.
+    #[test]
+    fn a_sealed_prefix_is_adopted_into_a_range_that_serves_and_reopens() {
+        let source = tempdir().unwrap();
+        let env = Env::real();
+        let producer = Uuid::from_u128(0x9001);
+
+        // A leader-shaped range: rolled several times, one producer throughout.
+        let mut leader =
+            SegmentSet::create_in(&env, source.path(), descriptor(), config()).unwrap();
+        for sequence in 0..24 {
+            leader
+                .append_group_minting(&[record(producer, sequence)], Durability::Fsync)
+                .unwrap();
+        }
+        assert!(leader.sealed().len() >= 2, "the fixture must roll");
+        let sealed_count = leader.sealed().len();
+        let prefix_end = leader.sealed()[sealed_count - 1].next_offset();
+
+        // The receiver's directory: the SEALED PREFIX ONLY, which is exactly
+        // what a transfer lands — the tail is never shipped.
+        let received = tempdir().unwrap();
+        for reader in leader.sealed() {
+            for artifact in reader.paths().unwrap() {
+                if artifact.exists() {
+                    let name = artifact.file_name().unwrap();
+                    std::fs::copy(&artifact, received.path().join(name)).unwrap();
+                }
+            }
+        }
+
+        // Precondition: this is the refusal adoption exists to answer.
+        let refused = SegmentSet::open_in(&env, received.path())
+            .map(|_| ())
+            .expect_err("a prefix without a tail must not open as a range");
+        assert!(
+            refused.to_string().contains("no active segment"),
+            "{refused}"
+        );
+
+        let mut adopted =
+            SegmentSet::adopt_in(&env, received.path(), Uuid::from_u128(0xADD1)).unwrap();
+        assert_eq!(adopted.sealed().len(), sealed_count);
+        assert_eq!(
+            adopted.next_offset(),
+            prefix_end,
+            "the tail must begin where the prefix ended, not at zero"
+        );
+
+        // THE POINT: the producer continues from where the PREFIX left it —
+        // which is not where the leader left it, because the leader's unsealed
+        // tail never ships. One record per group here, so the next sequence is
+        // the offset the prefix ended at; deriving it rather than hardcoding is
+        // what makes this an assertion about the frontier instead of about the
+        // fixture.
+        //
+        // A tail seeded from the last sealed segment's inherited sidecar would
+        // rewind to where that segment BEGAN and reject the very first append
+        // as a gap. Asked for 24 while the frontier sat at 19, this reported
+        // `SequenceGap { expected: 20, actual: 24 }` — the mechanism working,
+        // and the reason the expected value is computed here.
+        let appended = 6;
+        for sequence in prefix_end..prefix_end + appended {
+            adopted
+                .append_group_minting(&[record(producer, sequence)], Durability::Fsync)
+                .expect("the adopted tail must continue the producer's sequence");
+        }
+
+        // And it is an ordinary range afterwards: reopens without adoption, and
+        // every record from both sides reads back in one call.
+        drop(adopted);
+        let reopened = SegmentSet::open_in(&env, received.path())
+            .unwrap()
+            .expect("an adopted range reopens like any other");
+        assert_eq!(reopened.next_offset(), prefix_end + appended);
+        let mut reopened = reopened;
+        let through = reopened.next_offset();
+        let batch = reopened.fetch_through(0, 1 << 20, 100, through).unwrap();
+        assert_eq!(
+            batch.records.len() as u64,
+            prefix_end + appended,
+            "every record, across the adoption boundary"
+        );
+        for (index, fetched) in batch.records.iter().enumerate() {
+            assert_eq!(fetched.offset, index as u64);
+        }
+    }
+
+    /// Adoption refuses a range that already has a tail.
+    ///
+    /// Minting a second tail would give the same offsets two writers, which is
+    /// a split range that discovery quarantines only if it happens to notice.
+    /// Refusing names the alternative rather than leaving the caller to guess.
+    #[test]
+    fn adoption_refuses_a_range_that_is_already_live() {
+        let directory = tempdir().unwrap();
+        let env = Env::real();
+        drop(SegmentSet::create_in(&env, directory.path(), descriptor(), config()).unwrap());
+
+        let refused = SegmentSet::adopt_in(&env, directory.path(), Uuid::from_u128(0xADD2))
+            .map(|_| ())
+            .expect_err("a live range must not be adopted");
+        assert!(
+            refused
+                .to_string()
+                .contains("already has an active segment"),
+            "{refused}"
+        );
+        assert!(
+            refused.to_string().contains("open_in"),
+            "and name the alternative: {refused}"
+        );
+    }
+
+    /// A gapped prefix is refused rather than blessed.
+    ///
+    /// The wire decoder refuses a gapped listing (#292) and discovery refuses
+    /// an ambiguous directory, but neither covers bytes that arrived some other
+    /// way — a restored backup, a hand-copied directory. Minting a tail onto a
+    /// hole makes the hole permanent: the range opens from then on and the
+    /// missing offsets are simply never served.
+    #[test]
+    fn adoption_refuses_a_prefix_with_a_hole_in_it() {
+        let source = tempdir().unwrap();
+        let env = Env::real();
+        let producer = Uuid::from_u128(0x9002);
+        let mut leader =
+            SegmentSet::create_in(&env, source.path(), descriptor(), config()).unwrap();
+        for sequence in 0..36 {
+            leader
+                .append_group_minting(&[record(producer, sequence)], Durability::Fsync)
+                .unwrap();
+        }
+        assert!(
+            leader.sealed().len() >= 3,
+            "need three to drop a middle one"
+        );
+
+        // Copy the prefix, SKIPPING one segment in the middle.
+        let received = tempdir().unwrap();
+        let skip = leader.sealed()[1].base_offset();
+        for reader in leader.sealed() {
+            if reader.base_offset() == skip {
+                continue;
+            }
+            for artifact in reader.paths().unwrap() {
+                if artifact.exists() {
+                    let name = artifact.file_name().unwrap();
+                    std::fs::copy(&artifact, received.path().join(name)).unwrap();
+                }
+            }
+        }
+
+        let refused = SegmentSet::adopt_in(&env, received.path(), Uuid::from_u128(0xADD3))
+            .map(|_| ())
+            .expect_err("a gapped prefix must not be adopted");
+        let text = refused.to_string();
+        assert!(
+            text.contains("not contiguous") || text.contains("quarantined"),
+            "the refusal must name the gap: {text}"
+        );
+    }
+
+    /// Two different ranges that happen to abut must not be adopted as one.
+    ///
+    /// Offsets cannot tell them apart, and discovery does not look: it groups
+    /// candidates BY range and flags disagreement within a group, so segments
+    /// from two ranges are two clean groups and nothing is quarantined. Stitched
+    /// together, the set would serve one range's records under the other's
+    /// identity and the tail would inherit whichever descriptor came last.
+    #[test]
+    fn adoption_refuses_segments_from_two_different_ranges() {
+        let env = Env::real();
+        let producer = Uuid::from_u128(0x9003);
+
+        // Range A: sealed prefix starting at 0.
+        let a = tempdir().unwrap();
+        let mut set_a = SegmentSet::create_in(&env, a.path(), descriptor(), config()).unwrap();
+        for sequence in 0..24 {
+            set_a
+                .append_group_minting(&[record(producer, sequence)], Durability::Fsync)
+                .unwrap();
+        }
+        assert!(!set_a.sealed().is_empty());
+
+        // Range B: a DIFFERENT range id, whose first segment begins exactly
+        // where A's prefix ends — the case offset checks cannot see.
+        let b = tempdir().unwrap();
+        let mut foreign = descriptor();
+        foreign.lineage.range_id = Uuid::from_u128(0xBEEF);
+        // A distinct segment id as well as a distinct range: sharing one would
+        // be caught by discovery as `DuplicateSegmentId`, and the test would
+        // pass on a refusal that has nothing to do with lineage. My first
+        // version did exactly that.
+        foreign.segment_id = Uuid::from_u128(0xB001);
+        foreign.base_offset = set_a.sealed().last().unwrap().next_offset();
+        let mut set_b = SegmentSet::create_in(&env, b.path(), foreign, config()).unwrap();
+        for sequence in 0..24 {
+            set_b
+                .append_group_minting(&[record(producer, sequence)], Durability::Fsync)
+                .unwrap();
+        }
+        assert!(!set_b.sealed().is_empty());
+
+        let mixed = tempdir().unwrap();
+        for reader in set_a.sealed().iter().chain(set_b.sealed().iter()) {
+            for artifact in reader.paths().unwrap() {
+                if artifact.exists() {
+                    let name = artifact.file_name().unwrap();
+                    std::fs::copy(&artifact, mixed.path().join(name)).unwrap();
+                }
+            }
+        }
+
+        // The premise: discovery is HAPPY with this directory. If it
+        // quarantined, the refusal below would prove nothing about lineage.
+        let catalog = StartupCatalog::discover(mixed.path()).unwrap();
+        assert!(
+            catalog.quarantined.is_empty(),
+            "discovery must not object, or this tests the wrong thing: {:?}",
+            catalog.quarantined
+        );
+
+        let refused = SegmentSet::adopt_in(&env, mixed.path(), Uuid::from_u128(0xADD4))
+            .map(|_| ())
+            .expect_err("segments from two ranges must not be adopted as one");
+        assert!(
+            refused.to_string().contains("mixes lineages"),
+            "the refusal must name the cause: {refused}"
+        );
+    }
+
+    /// Adoption must finish an in-flight truncation before reading the layout.
+    ///
+    /// This is a way to LOSE WRITES, not merely to read something stale.
+    /// Adopting over a live marker mints a tail on a prefix the marker still
+    /// condemns; the tail then accepts appends, and the next `open_in` finishes
+    /// the intent and deletes exactly that tail, with everything written to it.
+    #[test]
+    fn adoption_finishes_a_pending_truncation_instead_of_building_on_it() {
+        let env = Env::real();
+        let producer = Uuid::from_u128(0x9004);
+        let source = tempdir().unwrap();
+        let mut set = SegmentSet::create_in(&env, source.path(), descriptor(), config()).unwrap();
+        for sequence in 0..24 {
+            set.append_group_minting(&[record(producer, sequence)], Durability::Fsync)
+                .unwrap();
+        }
+        assert!(set.sealed().len() >= 2);
+
+        // A received prefix, plus a marker condemning its last sealed segment —
+        // the shape a transfer interrupted by a truncation leaves behind.
+        let received = tempdir().unwrap();
+        for reader in set.sealed() {
+            for artifact in reader.paths().unwrap() {
+                if artifact.exists() {
+                    let name = artifact.file_name().unwrap();
+                    std::fs::copy(&artifact, received.path().join(name)).unwrap();
+                }
+            }
+        }
+        let doomed = set.sealed().last().unwrap();
+        let cut = doomed.base_offset();
+        let mut replacement = descriptor();
+        replacement.segment_id = Uuid::from_u128(0xDEAD);
+        replacement.base_offset = cut;
+        let intent = TruncateIntent {
+            target_offset: cut,
+            replacement,
+            config: config(),
+            doomed: vec![DoomedSegment {
+                segment_id: doomed.segment_id(),
+                base_offset: doomed.base_offset(),
+            }],
+            inherited: Default::default(),
+        };
+        std::fs::write(
+            received.path().join(TRUNCATE_INTENT_FILE),
+            intent.encode().unwrap(),
+        )
+        .unwrap();
+
+        // Whatever adoption decides, it must not leave the marker live with a
+        // tail built on top of it. Either it finishes the truncation and adopts
+        // the surviving prefix, or it refuses — both are safe; carrying on is
+        // not.
+        match SegmentSet::adopt_in(&env, received.path(), Uuid::from_u128(0xADD5)) {
+            Ok(adopted) => {
+                assert!(
+                    !received.path().join(TRUNCATE_INTENT_FILE).exists(),
+                    "a tail was minted while the marker is still live; the next open would \
+                     finish the truncation and delete it"
+                );
+                assert!(
+                    adopted.next_offset() <= doomed.next_offset(),
+                    "the adopted tail must not begin past what the truncation condemned"
+                );
+            }
+            Err(error) => {
+                assert!(
+                    !error.to_string().is_empty(),
+                    "a refusal must say why: {error}"
+                );
+            }
+        }
     }
 }
