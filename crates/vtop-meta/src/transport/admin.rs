@@ -5,6 +5,7 @@
 //! façade. Openraft types never cross this boundary.
 
 use super::authz::{AdminAuthorizer, AdminIdentity, Refusal};
+use super::maybe_tls::MaybeTls;
 use super::tls::{server_name, TlsMaterial};
 use super::wire::{
     read_frame, write_frame, AdminAddLearnerRequest, AdminChangeMembershipRequest, AdminError,
@@ -49,11 +50,25 @@ pub trait AdminHandler: Send + Sync {
     ) -> TransportResult<AdminReadRangeLeaseResponse>;
 }
 
-/// mTLS admin server.
+/// Admin server, with or without TLS.
 pub struct AdminServer {
-    acceptor: TlsAcceptor,
+    /// `None` means PLAINTEXT. Not a missing acceptor to be filled in later —
+    /// the absence is the configuration, decided before any connection exists.
+    acceptor: Option<TlsAcceptor>,
     handler: Arc<dyn AdminHandler>,
     authorizer: Arc<AdminAuthorizer>,
+    /// Only consulted when `acceptor` is `None`; TLS endpoints carry identity
+    /// and are bound wherever the operator chooses.
+    exposure: PlaintextExposure,
+}
+
+/// How far a PLAINTEXT admin endpoint may be reachable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlaintextExposure {
+    /// The default, and a refusal rather than a warning: loopback or nothing.
+    LoopbackOnly,
+    /// Explicitly acknowledged at the call site.
+    AnyInterface,
 }
 
 impl AdminServer {
@@ -72,13 +87,97 @@ impl AdminServer {
         authorizer: AdminAuthorizer,
     ) -> TransportResult<Self> {
         Ok(Self {
-            acceptor: super::tls::build_server_acceptor(material)?,
+            acceptor: Some(super::tls::build_server_acceptor(material)?),
             handler,
             authorizer: Arc::new(authorizer),
+            // Unused for a TLS endpoint, which carries caller identity.
+            exposure: PlaintextExposure::LoopbackOnly,
         })
     }
 
+    /// Serve the admin plane WITHOUT TLS, on the loopback interface only (#294).
+    ///
+    /// For local development, CI, and single-node evaluation, where requiring a
+    /// minted PKI to start the engine at all is a real barrier and encrypting a
+    /// loopback socket buys nothing.
+    ///
+    /// REFUSES AN ENFORCING AUTHORIZER, and this is the load-bearing part.
+    /// Admin authorization identifies callers by the Common Name of their
+    /// client certificate; with no TLS there is no certificate, so there is no
+    /// CN, so there is no identity to match a policy against. Accepting the
+    /// combination would mean an operator who had configured
+    /// `admin_authorization` — deliberately, to restrict cluster commands —
+    /// would silently get an endpoint where every caller is permitted. A policy
+    /// that cannot be enforced must not be accepted quietly; #81 exists because
+    /// something defaulted a credential, and this is the same class of mistake
+    /// wearing different clothes.
+    pub fn plaintext(
+        handler: Arc<dyn AdminHandler>,
+        authorizer: AdminAuthorizer,
+    ) -> TransportResult<Self> {
+        if authorizer.is_enforcing() {
+            return Err(TransportError::Identity(
+                "admin_authorization names operator CNs, but a plaintext admin endpoint has no \
+                 client certificate and therefore no CN to match: the policy could not be \
+                 enforced and every caller would be permitted. Either enable TLS on this plane \
+                 or remove the authorization policy."
+                    .to_owned(),
+            ));
+        }
+        Ok(Self {
+            acceptor: None,
+            handler,
+            authorizer: Arc::new(authorizer),
+            exposure: PlaintextExposure::LoopbackOnly,
+        })
+    }
+
+    /// Plaintext admin on a NON-LOOPBACK address, acknowledged explicitly.
+    ///
+    /// Separate constructor rather than a boolean, because the risk deserves a
+    /// name at the call site. A plaintext admin endpoint has no client
+    /// certificate, so no caller identity, so no authorization is possible —
+    /// `authorize_cluster` permits everyone when no operators are configured,
+    /// which is correct for an unconfigured endpoint and catastrophic for an
+    /// exposed one. Anything that reaches this port can run `meta init`,
+    /// change membership, and propose arbitrary commands.
+    ///
+    /// On loopback that is a development convenience and the blast radius is
+    /// the machine. Bound to a routable address it is an unauthenticated
+    /// control plane, and nothing about the config would have said so — which
+    /// is why the default refuses and this exists to be typed deliberately.
+    pub fn plaintext_on_any_interface(
+        handler: Arc<dyn AdminHandler>,
+        authorizer: AdminAuthorizer,
+    ) -> TransportResult<Self> {
+        let mut server = Self::plaintext(handler, authorizer)?;
+        server.exposure = PlaintextExposure::AnyInterface;
+        Ok(server)
+    }
+
     pub async fn serve(self, listener: TcpListener) -> TransportResult<()> {
+        // CHECKED AT BIND TIME, not per connection: the question is about the
+        // address this endpoint is reachable on, and answering it once means a
+        // misconfigured deployment fails to start rather than serving until the
+        // first unwanted caller arrives.
+        if self.acceptor.is_none() {
+            let bound = listener.local_addr()?;
+            if self.exposure == PlaintextExposure::LoopbackOnly && !bound.ip().is_loopback() {
+                return Err(TransportError::Identity(format!(
+                    "refusing to serve a plaintext admin endpoint on {bound}: it is not a \
+                     loopback address, and a plaintext endpoint has no client certificate and \
+                     therefore no caller identity — every peer that can reach this port could \
+                     run `meta init`, change membership, and propose arbitrary commands. Bind \
+                     to 127.0.0.1 for local use, enable TLS to expose it, or construct the \
+                     server with `plaintext_on_any_interface` if that is genuinely intended."
+                )));
+            }
+            eprintln!(
+                "warning: admin endpoint {bound} is PLAINTEXT and UNAUTHENTICATED: it carries no \
+                 client certificate, so no caller identity exists and admin authorization cannot \
+                 apply. Every reachable peer may change cluster membership and grant range leases."
+            );
+        }
         loop {
             let (tcp, _) = listener.accept().await?;
             let acceptor = self.acceptor.clone();
@@ -92,33 +191,43 @@ impl AdminServer {
 }
 
 async fn serve_admin_connection(
-    acceptor: TlsAcceptor,
+    acceptor: Option<TlsAcceptor>,
     tcp: TcpStream,
     handler: Arc<dyn AdminHandler>,
     authorizer: Arc<AdminAuthorizer>,
 ) -> TransportResult<()> {
-    let mut stream = acceptor
-        .accept(tcp)
-        .await
-        .map_err(|error| TransportError::Tls(format!("admin accept: {error}")))?;
+    let mut stream = match acceptor {
+        Some(acceptor) => MaybeTls::Tls(Box::new(
+            acceptor
+                .accept(tcp)
+                .await
+                .map_err(|error| TransportError::Tls(format!("admin accept: {error}")))?
+                .into(),
+        )),
+        None => MaybeTls::Plain(tcp),
+    };
     // Identity is established once, from the certificate the handshake already
     // verified, and is fixed for the connection's lifetime. Deriving it
     // per-frame would invite a caller to influence it through frame content;
     // here the only input is the chain the CA signed.
-    let identity = {
-        let (_, connection) = stream.get_ref();
-        let leaf = connection
-            .peer_certificates()
-            .and_then(|certs| certs.first())
-            .ok_or_else(|| {
-                // The acceptor is built with a WebPki *client* verifier, so a
-                // certificate-less handshake never completes and this is
-                // unreachable in practice. Refusing beats unwrapping: if a
-                // future config change made client certs optional, the failure
-                // must be a closed connection, not an unauthenticated one.
-                TransportError::Identity("admin client presented no certificate".to_owned())
-            })?;
-        AdminIdentity::from_common_name(&super::tls::common_name_from_cert(leaf)?)
+    let identity = match stream.peer_certificates().and_then(|certs| certs.first()) {
+        Some(leaf) => AdminIdentity::from_common_name(&super::tls::common_name_from_cert(leaf)?),
+        // No TLS, therefore no certificate, therefore NO IDENTITY. Reached only
+        // on a plaintext endpoint, which `AdminServer::plaintext` has already
+        // refused to build with an enforcing authorizer — so the permissive
+        // authorizer is the only one that can see this, and it treats every
+        // caller alike anyway. The identity is still explicit rather than
+        // invented, because it is what a log line or a refusal will name.
+        //
+        // Under TLS this branch is unreachable: the acceptor carries a WebPki
+        // client verifier, so a certificate-less handshake never completes.
+        None if !stream.is_encrypted() => AdminIdentity::Anonymous,
+        None => {
+            return Err(TransportError::Identity(
+                "admin client completed a TLS handshake without presenting a certificate"
+                    .to_owned(),
+            ))
+        }
     };
     loop {
         let frame = match read_frame(&mut stream).await {
@@ -256,6 +365,13 @@ pub struct AdminCandidate {
     pub node_id: Option<MetaNodeId>,
     pub endpoint: SocketAddr,
     pub server_name: String,
+    /// Speak to this endpoint WITHOUT TLS (#294).
+    ///
+    /// Per candidate rather than per client because a cluster can legitimately
+    /// be mid-migration, with some nodes converted and some not. A single flag
+    /// would force the whole group to move at once, which is exactly the
+    /// pressure that produces a big-bang change nobody can roll back.
+    pub plaintext: bool,
 }
 
 /// Client for the admin endpoint.
@@ -266,7 +382,10 @@ pub struct AdminCandidate {
 /// deployment only worked on whichever pod happened to co-locate the leader,
 /// and which pod that is depends on an election (#292).
 pub struct AdminClient {
-    connector: TlsConnector,
+    /// `None` when every candidate is plaintext: a client that never speaks
+    /// TLS should not require the material to build a connector it will not
+    /// use, or plaintext would still need a certificate to start.
+    connector: Option<TlsConnector>,
     candidates: Vec<AdminCandidate>,
     /// Index of the candidate that last answered as leader. Steady state is
     /// therefore one round trip, not a scan: leadership changes rarely, so
@@ -286,6 +405,7 @@ impl AdminClient {
                 node_id: None,
                 endpoint,
                 server_name: server_name.into(),
+                plaintext: false,
             }],
         )
     }
@@ -300,13 +420,49 @@ impl AdminClient {
         material: TlsMaterial,
         candidates: Vec<AdminCandidate>,
     ) -> TransportResult<Self> {
+        Self::build(Some(material), candidates)
+    }
+
+    /// A client that speaks to plaintext endpoints only (#294).
+    ///
+    /// Takes no TLS material, deliberately: requiring a certificate to talk to
+    /// an endpoint that will never ask for one would leave plaintext needing a
+    /// PKI anyway, which defeats the point of having the mode.
+    pub fn plaintext(candidates: Vec<AdminCandidate>) -> TransportResult<Self> {
+        if let Some(needs_tls) = candidates.iter().find(|candidate| !candidate.plaintext) {
+            return Err(TransportError::Tls(format!(
+                "endpoint {} expects TLS but this client was built without any material; \
+                 build it with `with_candidates` instead, or mark the endpoint plaintext",
+                needs_tls.endpoint
+            )));
+        }
+        Self::build(None, candidates)
+    }
+
+    fn build(
+        material: Option<TlsMaterial>,
+        candidates: Vec<AdminCandidate>,
+    ) -> TransportResult<Self> {
         if candidates.is_empty() {
             return Err(TransportError::Protocol(
                 "an admin client needs at least one metadata endpoint".to_owned(),
             ));
         }
+        // Built only when something will use it. A TLS candidate with no
+        // material is refused HERE rather than at first use, so a
+        // misconfiguration surfaces at construction instead of as a connection
+        // failure at an unrelated moment.
+        let connector = match material {
+            Some(material) => Some(super::tls::build_client_connector(material)?),
+            None => None,
+        };
+        if connector.is_none() && candidates.iter().any(|candidate| !candidate.plaintext) {
+            return Err(TransportError::Tls(
+                "a TLS endpoint was configured without any TLS material".to_owned(),
+            ));
+        }
         Ok(Self {
-            connector: super::tls::build_client_connector(material)?,
+            connector,
             candidates,
             preferred: std::sync::atomic::AtomicUsize::new(0),
         })
@@ -517,12 +673,24 @@ impl AdminClient {
         request: &VtpmFrame,
     ) -> TransportResult<VtpmFrame> {
         let tcp = TcpStream::connect(candidate.endpoint).await?;
-        let name = server_name(&candidate.server_name)?;
-        let mut stream = self
-            .connector
-            .connect(name, tcp)
-            .await
-            .map_err(|error| TransportError::Tls(format!("admin connect: {error}")))?;
+        let mut stream = if candidate.plaintext {
+            MaybeTls::Plain(tcp)
+        } else {
+            let connector = self.connector.as_ref().ok_or_else(|| {
+                // Unreachable: `build` refuses this combination. Written as a
+                // refusal anyway, because the alternative is an unwrap that
+                // turns a configuration mistake into a panic in a server.
+                TransportError::Tls("no TLS material for a TLS endpoint".to_owned())
+            })?;
+            let name = server_name(&candidate.server_name)?;
+            MaybeTls::Tls(Box::new(
+                connector
+                    .connect(name, tcp)
+                    .await
+                    .map_err(|error| TransportError::Tls(format!("admin connect: {error}")))?
+                    .into(),
+            ))
+        };
         write_frame(&mut stream, request).await?;
         read_frame(&mut stream).await
     }
@@ -663,6 +831,211 @@ mod tests {
         }
     }
 
+    /// The admin plane over a bare TCP socket: no certificates anywhere (#294).
+    ///
+    /// This is the first plane made optional, and the one an operator meets
+    /// first through `vtopctl`. Until now the engine could not be started at
+    /// all without minting a PKI, which is a real barrier for local
+    /// development, CI, and evaluation — and encrypting a loopback socket buys
+    /// nothing.
+    ///
+    /// The assertion is a real REQUEST AND RESPONSE, not a successful connect.
+    /// A handshake-free socket that then failed to frame would look like
+    /// success to anything weaker.
+    #[tokio::test]
+    async fn the_admin_plane_serves_a_request_over_plaintext() {
+        let handler = Arc::new(CountingHandler::default());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = AdminServer::plaintext(
+            Arc::clone(&handler) as Arc<dyn AdminHandler>,
+            AdminAuthorizer::permissive(),
+        )
+        .expect("a permissive plaintext endpoint is allowed");
+        let task = tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // NO TLS MATERIAL on the client either. Requiring a certificate to talk
+        // to an endpoint that never asks for one would leave plaintext needing
+        // a PKI anyway, which is the whole thing being removed.
+        let client = AdminClient::plaintext(vec![AdminCandidate {
+            node_id: Some(MetaNodeId(1)),
+            endpoint: addr,
+            server_name: String::new(),
+            plaintext: true,
+        }])
+        .unwrap();
+
+        let status = client
+            .status()
+            .await
+            .expect("a plaintext admin endpoint must answer a status request");
+        assert_eq!(status.node_id, MetaNodeId(1));
+
+        // A write too, so this covers the propose path and not only the read
+        // one — they take different routes through dispatch.
+        client.propose(acquire(NODE_A)).await.unwrap_err();
+        assert_eq!(handler.proposals.load(Ordering::SeqCst), 1);
+
+        task.abort();
+    }
+
+    /// A plaintext endpoint REFUSES an enforcing authorization policy.
+    ///
+    /// This is the load-bearing refusal of the whole slice. Admin authorization
+    /// identifies callers by the Common Name of their client certificate; with
+    /// no TLS there is no certificate, so no CN, so nothing for the policy to
+    /// match. Accepting the pair would hand an operator who had deliberately
+    /// restricted cluster commands an endpoint where every caller is permitted
+    /// — a policy that silently does not apply, which is worse than no policy
+    /// because it reads as protection in the config.
+    #[tokio::test]
+    async fn a_plaintext_admin_endpoint_refuses_a_policy_it_could_not_enforce() {
+        let refused = AdminServer::plaintext(
+            Arc::new(CountingHandler::default()) as Arc<dyn AdminHandler>,
+            AdminAuthorizer::with_operators(["ops-alice".to_owned()]),
+        )
+        .map(|_| ())
+        .expect_err("an unenforceable policy must not be accepted quietly");
+
+        let text = refused.to_string();
+        assert!(
+            text.contains("no client certificate"),
+            "the refusal must name the cause: {text}"
+        );
+        assert!(
+            text.contains("enable TLS") && text.contains("remove the authorization policy"),
+            "and both ways out, since either is a legitimate choice: {text}"
+        );
+    }
+
+    /// An anonymous caller is never an operator.
+    ///
+    /// Unreachable today — a plaintext endpoint refuses to be built with an
+    /// enforcing policy, so the two never meet — but asserted rather than left
+    /// to that argument. The day those facts drift apart, this is what decides
+    /// whether a policy holds, and a `match` arm that returned `true` would be
+    /// an identity invented in order to authorize it.
+    #[test]
+    fn an_anonymous_caller_is_never_an_operator() {
+        let authorizer = AdminAuthorizer::with_operators(["ops-alice".to_owned()]);
+        assert!(
+            authorizer
+                .authorize_cluster(&AdminIdentity::Anonymous)
+                .is_err(),
+            "a caller that presented no claim must not pass an operator check"
+        );
+        // And it describes itself as what it is, since this string lands in
+        // refusals an operator has to interpret.
+        assert!(AdminIdentity::Anonymous
+            .describe()
+            .contains("unauthenticated"));
+    }
+
+    /// A plaintext admin endpoint REFUSES a non-loopback address by default.
+    ///
+    /// The refusal above covers a policy that could not be enforced. This
+    /// covers the other half, which is worse: NO policy at all. A plaintext
+    /// endpoint has no client certificate, so no caller identity, so
+    /// `authorize_cluster` permits everyone — correct for an unconfigured
+    /// endpoint and catastrophic for an exposed one. Anything that reaches the
+    /// port could run `meta init`, change membership, and propose arbitrary
+    /// commands, and nothing in the configuration would have said so.
+    ///
+    /// Checked at BIND time rather than per connection: a misconfigured
+    /// deployment should fail to start, not serve until the first unwanted
+    /// caller arrives.
+    #[tokio::test]
+    async fn a_plaintext_admin_endpoint_refuses_a_routable_address() {
+        let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let server = AdminServer::plaintext(
+            Arc::new(CountingHandler::default()) as Arc<dyn AdminHandler>,
+            AdminAuthorizer::permissive(),
+        )
+        .unwrap();
+
+        let refused = server
+            .serve(listener)
+            .await
+            .expect_err("an unauthenticated admin port must not bind to a routable address");
+        let text = refused.to_string();
+        assert!(
+            text.contains("not a loopback address"),
+            "the refusal must name the cause: {text}"
+        );
+        assert!(
+            text.contains("meta init") && text.contains("membership"),
+            "and what a reachable caller could do, since that is the reason: {text}"
+        );
+        assert!(
+            text.contains("127.0.0.1")
+                && text.contains("enable TLS")
+                && text.contains("plaintext_on_any_interface"),
+            "and all three ways out, since each is legitimate in a different \
+             situation: {text}"
+        );
+    }
+
+    /// Loopback is allowed, which is the case the mode exists for.
+    ///
+    /// Paired with the refusal above deliberately: a guard that refused
+    /// everything would pass that test while making the feature useless, and
+    /// only asserting both pins the boundary rather than the direction.
+    #[tokio::test]
+    async fn a_plaintext_admin_endpoint_serves_on_loopback() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = AdminServer::plaintext(
+            Arc::new(CountingHandler::default()) as Arc<dyn AdminHandler>,
+            AdminAuthorizer::permissive(),
+        )
+        .unwrap();
+        let task = tokio::spawn(async move { server.serve(listener).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let client = AdminClient::plaintext(vec![AdminCandidate {
+            node_id: Some(MetaNodeId(1)),
+            endpoint: addr,
+            server_name: String::new(),
+            plaintext: true,
+        }])
+        .unwrap();
+        assert_eq!(client.status().await.unwrap().node_id, MetaNodeId(1));
+
+        task.abort();
+    }
+
+    /// The escape hatch works, and has to be typed to get it.
+    ///
+    /// Some deployments genuinely want this — a trusted network segment, a
+    /// sidecar-terminated mesh. The point is not to forbid it but to make it
+    /// impossible to arrive at by accident.
+    #[tokio::test]
+    async fn a_routable_plaintext_endpoint_is_available_when_asked_for_explicitly() {
+        let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = AdminServer::plaintext_on_any_interface(
+            Arc::new(CountingHandler::default()) as Arc<dyn AdminHandler>,
+            AdminAuthorizer::permissive(),
+        )
+        .unwrap();
+        let task = tokio::spawn(async move { server.serve(listener).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let client = AdminClient::plaintext(vec![AdminCandidate {
+            node_id: Some(MetaNodeId(1)),
+            endpoint: format!("127.0.0.1:{port}").parse().unwrap(),
+            server_name: String::new(),
+            plaintext: true,
+        }])
+        .unwrap();
+        assert_eq!(client.status().await.unwrap().node_id, MetaNodeId(1));
+
+        task.abort();
+    }
+
     /// A non-leader redirects, and the client goes to the node it names.
     ///
     /// This is #292 end to end. Reads and writes on this plane must reach the
@@ -698,11 +1071,13 @@ mod tests {
                     node_id: Some(MetaNodeId(1)),
                     endpoint: follower_addr,
                     server_name: "localhost".to_owned(),
+                    plaintext: false,
                 },
                 AdminCandidate {
                     node_id: Some(leader_id),
                     endpoint: leader_addr,
                     server_name: "localhost".to_owned(),
+                    plaintext: false,
                 },
             ],
         )
@@ -768,16 +1143,19 @@ mod tests {
                     node_id: Some(MetaNodeId(1)),
                     endpoint: a_addr,
                     server_name: "localhost".to_owned(),
+                    plaintext: false,
                 },
                 AdminCandidate {
                     node_id: Some(MetaNodeId(2)),
                     endpoint: b_addr,
                     server_name: "localhost".to_owned(),
+                    plaintext: false,
                 },
                 AdminCandidate {
                     node_id: Some(MetaNodeId(3)),
                     endpoint: c_addr,
                     server_name: "localhost".to_owned(),
+                    plaintext: false,
                 },
             ],
         )
@@ -822,11 +1200,13 @@ mod tests {
                     node_id: Some(MetaNodeId(1)),
                     endpoint: blind_addr,
                     server_name: "localhost".to_owned(),
+                    plaintext: false,
                 },
                 AdminCandidate {
                     node_id: Some(MetaNodeId(2)),
                     endpoint: leader_addr,
                     server_name: "localhost".to_owned(),
+                    plaintext: false,
                 },
             ],
         )
@@ -865,11 +1245,13 @@ mod tests {
                     node_id: Some(MetaNodeId(1)),
                     endpoint: first_addr,
                     server_name: "localhost".to_owned(),
+                    plaintext: false,
                 },
                 AdminCandidate {
                     node_id: Some(MetaNodeId(2)),
                     endpoint: second_addr,
                     server_name: "localhost".to_owned(),
+                    plaintext: false,
                 },
             ],
         )
