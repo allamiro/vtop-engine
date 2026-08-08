@@ -32,7 +32,27 @@ pub enum FaultPlan {
         op: u64,
         kind: io::ErrorKind,
     },
+    /// Operation `op` and EVERY operation after it fail with `kind`, without
+    /// crashing: a disk that goes bad and stays bad.
+    ///
+    /// [`FaultPlan::FailOp`] can only ever test a failure that something else
+    /// gets to clean up after, because the cleanup itself always succeeds.
+    /// That makes the interesting question — what a caller is told when the
+    /// recovery path ALSO fails — unreachable, and error paths that are never
+    /// exercised are the ones that lie.
+    FailOpsFrom {
+        op: u64,
+        kind: io::ErrorKind,
+    },
 }
+
+// NOTE FOR THE NEXT VARIANT ADDED HERE: the fault dispatch lives in TWO places.
+// `SimState::begin_op` covers opens, reads, renames, unlinks, fsyncs and the
+// rest; `SimFile::write` carries its own copy, because a torn write needs the
+// buffer and the handle's position, which `begin_op` does not have. A variant
+// handled in only one of them applies to only some operations — and a fault
+// that does not fully apply makes every test built on it pass for the wrong
+// reason. `FailOpsFrom` shipped that way for exactly one review round.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TraceKind {
@@ -163,6 +183,9 @@ impl SimState {
                 Err(io::Error::other("simulated crash before operation"))
             }
             FaultPlan::FailOp { op, kind } if op == index => {
+                Err(io::Error::new(kind, "injected storage failure"))
+            }
+            FaultPlan::FailOpsFrom { op, kind } if index >= op => {
                 Err(io::Error::new(kind, "injected storage failure"))
             }
             _ => Ok(index),
@@ -555,6 +578,14 @@ impl Write for SimFile {
             FaultPlan::FailOp { op, kind } if op == index => {
                 return Err(io::Error::new(kind, "injected storage failure"));
             }
+            // Writes do NOT go through `begin_op`, so every plan has to be
+            // handled twice — here and there. A variant added only there
+            // reaches opens, renames, unlinks and fsyncs while writes keep
+            // succeeding, which is not a disk any hardware produces: a test
+            // built on it passes because its fault never fully applied.
+            FaultPlan::FailOpsFrom { op, kind } if index >= op => {
+                return Err(io::Error::new(kind, "injected storage failure"));
+            }
             _ => {}
         }
         let op = DataOp::Write {
@@ -828,6 +859,67 @@ mod tests {
         sim.reboot();
         let recovered = ActiveSegment::recover_in(&env, root.join("crash.active")).unwrap();
         assert_eq!(recovered.next_offset(), 40);
+    }
+
+    /// `FailOpsFrom` says EVERY operation, and writes are an operation.
+    ///
+    /// They are also the one kind that does not route through `begin_op` — the
+    /// dispatch is duplicated in `SimFile::write` — so the variant shipped
+    /// failing opens, renames, unlinks and fsyncs while writes kept succeeding.
+    /// That is not a disk any hardware produces, and a rollback or
+    /// write-failure test built on it would have passed because its fault never
+    /// fully applied.
+    #[test]
+    fn fail_ops_from_stops_writes_too_not_only_the_operations_begin_op_sees() {
+        use std::io::Write;
+
+        let sim = SimStorage::new();
+        sim.create_dir_all(Path::new("/log"));
+        let env = sim.env(3);
+        let mut file = env
+            .storage
+            .open(Path::new("/log/bad-disk"), crate::env::OpenMode::CreateNew)
+            .unwrap();
+        // Healthy first, so the failure below is attributable to the fault
+        // rather than to the handle never having worked.
+        file.write_all(b"before")
+            .expect("a healthy disk accepts writes");
+
+        sim.set_fault(FaultPlan::FailOpsFrom {
+            op: sim.op_count(),
+            kind: io::ErrorKind::PermissionDenied,
+        });
+
+        let refused = file
+            .write_all(b"after")
+            .expect_err("a disk that has gone bad must refuse writes");
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+
+        // And the operations `begin_op` does see are refused as well, so this
+        // pins BOTH halves of the dispatch rather than swapping which one is
+        // broken.
+        assert!(
+            file.sync_data().is_err(),
+            "the same fault must refuse an fsync"
+        );
+        assert!(
+            env.storage
+                .rename(Path::new("/log/bad-disk"), Path::new("/log/moved"))
+                .is_err(),
+            "the same fault must refuse a rename"
+        );
+        assert!(
+            env.storage.remove_file(Path::new("/log/bad-disk")).is_err(),
+            "the same fault must refuse an unlink"
+        );
+
+        // Not a crash: the point of this variant is a disk that keeps failing
+        // while the process stays up, which is what makes a recovery path
+        // observable at all.
+        assert!(
+            !sim.has_crashed(),
+            "FailOpsFrom must not crash the simulation"
+        );
     }
 
     #[test]

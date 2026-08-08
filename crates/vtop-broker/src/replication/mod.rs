@@ -8,8 +8,14 @@
 //! [`InProcessReplicaSet`] is the deterministic harness backend. Production
 //! wiring uses [`network::NetworkedReplicaSet`]: persistent mTLS streams,
 //! pipelined batches, per-follower flow-control windows, reconnect, and a
-//! bounded retransmission buffer for basic catch-up. Full sealed-segment
-//! transfer / repair remains a follow-up.
+//! bounded retransmission buffer for basic catch-up.
+//!
+//! [`transfer`] is what catches a follower that fell BELOW that buffer, and so
+//! has no way back through the append path at all: the leader serves its
+//! immutable sealed prefix — `.segment`, `.manifest.json`, `.producers`,
+//! verbatim — over the same peer plane, and the receiver rebuilds the derived
+//! sidecars itself and verifies before anything is published. Adoption of the
+//! received set by a running follower is the remaining follow-up.
 //!
 //! [`fault::FaultInjectingReplicaSet`] layers controllable network delivery
 //! faults (loss / duplicate / reorder / delay) over the in-process set for
@@ -18,6 +24,7 @@
 
 pub mod fault;
 pub mod network;
+pub mod transfer;
 
 use crate::{
     storage_producer_id, BrokerError, BrokerResult, MetaFencingEpoch, MetaLeaseState,
@@ -39,6 +46,7 @@ pub use network::{
     FlowControlConfig, NetworkFollowerConfig, NetworkedReplicaSet, ReplicaPeerHandler,
     ReplicaPeerServer, ReplicaStatusClient, ReplicaTlsMaterial,
 };
+pub use transfer::{LeaderSegmentTransferHandler, SegmentTransferClient};
 
 /// Shared quorum-committed high-water mark for a range.
 ///

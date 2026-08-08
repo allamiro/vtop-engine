@@ -412,6 +412,120 @@ pub struct ReplicaFenceResponse {
     pub truncated_records: u64,
 }
 
+/// Bound on how many sealed segments one listing reply may carry.
+///
+/// A range needs this many rolls for its sealed prefix to reach the bound, at
+/// which point retention is overdue and an operator should be looking at it —
+/// and the reader must not allocate on a peer's say-so regardless, exactly as
+/// with [`MAX_REPLICA_EPOCH_STARTS`].
+pub const MAX_SEALED_SEGMENT_LISTING: usize = 4096;
+
+/// Bound on one sealed-artifact chunk on the wire.
+///
+/// Well under the default frame cap so a chunk response never needs a larger
+/// negotiated frame than the replica plane already uses, and small enough
+/// that a repairing follower's memory per in-flight chunk stays boring.
+pub const MAX_SEGMENT_CHUNK_BYTES: u32 = 1024 * 1024;
+
+/// Which file of a sealed segment a transfer request names.
+///
+/// Only the three artifacts that cannot be rebuilt from each other cross the
+/// wire: the segment bytes, the manifest that pins them, and the inherited
+/// producer frontier. `.index` and `.chunks` are deliberately NOT listed —
+/// they are receiver-rebuildable caches, and shipping them would hand the
+/// receiver bytes it has no way to distrust.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SegmentArtifact {
+    /// The immutable `.segment` record file.
+    Segment = 1,
+    /// The canonical `.manifest.json` sealed beside it.
+    Manifest = 2,
+    /// The `.producers` frontier the segment inherited, when it has one.
+    Producers = 3,
+}
+
+impl SegmentArtifact {
+    fn decode(value: u8) -> Result<Self, ProtocolError> {
+        match value {
+            1 => Ok(Self::Segment),
+            2 => Ok(Self::Manifest),
+            3 => Ok(Self::Producers),
+            _ => Err(ProtocolError::InvalidFrame(format!(
+                "unknown segment artifact {value}"
+            ))),
+        }
+    }
+}
+
+/// One sealed segment a leader offers for transfer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SealedSegmentEntry {
+    pub segment_id: Uuid,
+    pub base_offset: u64,
+    /// First offset the segment does NOT hold; with `base_offset` this is the
+    /// half-open interval a receiver slots it into.
+    pub next_offset: u64,
+    pub segment_bytes: u64,
+    pub manifest_bytes: u64,
+    /// Zero means ABSENT, not empty: a range's first segment inherits no
+    /// frontier and has no `.producers` file, and an empty snapshot is never
+    /// written (`roll_in` skips it). The receiver must not fetch this
+    /// artifact when the size is zero.
+    pub producers_bytes: u64,
+}
+
+/// Ask a leader which sealed segments of `range` it can serve (#270).
+///
+/// Sealed prefix ONLY, by contract: the active tail is still being appended
+/// to, and bytes read from it can be superseded by a truncation before the
+/// transfer finishes. The leader refuses a fetch that names its tail rather
+/// than serving a snapshot that may already be a lie.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListSealedSegmentsRequest {
+    pub range: RangeIdentity,
+    /// Range-leader fencing epoch, checked exactly as the append plane checks
+    /// it: a transfer from a deposed leader would repair a follower onto a
+    /// history the cluster has already moved past.
+    pub fencing_epoch: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListSealedSegmentsResponse {
+    /// A CONTIGUOUS ascending run: each entry begins exactly where the
+    /// previous one ended, and none is empty. The decoder refuses anything
+    /// else, because this is not a list the receiver reads — it is the map it
+    /// routes offsets by, and a gap or an overlap in it is a range that cannot
+    /// be read across even though every file in it verifies.
+    pub segments: Vec<SealedSegmentEntry>,
+}
+
+/// Read `length` bytes of one artifact of one sealed segment at `offset`.
+///
+/// Bounded offset/length reads rather than whole files, so one frame cap
+/// serves segments of any size and a slow transfer never holds a
+/// segment-sized buffer on either side.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FetchSegmentChunkRequest {
+    pub range: RangeIdentity,
+    pub fencing_epoch: u64,
+    pub segment_id: Uuid,
+    pub artifact: SegmentArtifact,
+    pub offset: u64,
+    /// In `1..=`[`MAX_SEGMENT_CHUNK_BYTES`]; the wire refuses the rest.
+    pub length: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FetchSegmentChunkResponse {
+    /// Total artifact size. Constant across a transfer because sealed
+    /// artifacts are immutable — a receiver that sees it change mid-transfer
+    /// is talking to a directory being rewritten and must abandon the copy.
+    pub total_bytes: u64,
+    /// May be shorter than requested only at end of file.
+    pub bytes: Vec<u8>,
+}
+
 /// Lineage-aware durable consumer progress. Bound to topic epoch, range
 /// generation, segment identity/root, and record position — never a bare
 /// integer offset.
@@ -488,6 +602,10 @@ pub enum Message {
     CommitCursorResponse(CommitCursorResponse),
     FetchCursorRequest(FetchCursorRequest),
     FetchCursorResponse(FetchCursorResponse),
+    ListSealedSegmentsRequest(ListSealedSegmentsRequest),
+    ListSealedSegmentsResponse(ListSealedSegmentsResponse),
+    FetchSegmentChunkRequest(FetchSegmentChunkRequest),
+    FetchSegmentChunkResponse(FetchSegmentChunkResponse),
 }
 
 impl Message {
@@ -524,6 +642,13 @@ impl Message {
             Self::CommitCursorResponse(_) => 71,
             Self::FetchCursorRequest(_) => 72,
             Self::FetchCursorResponse(_) => 73,
+            // Contiguous above the fence pair, continuing the replica-plane
+            // block. Nothing below 77 is free: 70 is the live legacy cursor
+            // alias and 69 stays unused beside it on purpose (see above).
+            Self::ListSealedSegmentsRequest(_) => 77,
+            Self::ListSealedSegmentsResponse(_) => 78,
+            Self::FetchSegmentChunkRequest(_) => 79,
+            Self::FetchSegmentChunkResponse(_) => 80,
         }
     }
 }
@@ -736,6 +861,30 @@ fn encoded_payload_size(message: &Message, limits: ProtocolLimits) -> Result<usi
                 None => 1,
                 Some(cursor) => 1 + lineage_cursor_size(cursor)?,
             },
+            Message::ListSealedSegmentsRequest(value) => range_size(&value.range)? + 8,
+            Message::ListSealedSegmentsResponse(value) => {
+                // Bounded HERE, not only in the writer: this branch is what
+                // `encode_frame` reserves from, exactly as with the epoch
+                // history above.
+                if value.segments.len() > MAX_SEALED_SEGMENT_LISTING {
+                    return Err(ProtocolError::Limit(
+                        "sealed segment listing too long".to_owned(),
+                    ));
+                }
+                4 + value.segments.len() * (16 + 8 + 8 + 8 + 8 + 8)
+            }
+            Message::FetchSegmentChunkRequest(value) => {
+                validate_chunk_length(value.length)?;
+                range_size(&value.range)? + 8 + 16 + 1 + 8 + 4
+            }
+            Message::FetchSegmentChunkResponse(value) => {
+                if value.bytes.len() > MAX_SEGMENT_CHUNK_BYTES as usize {
+                    return Err(ProtocolError::Limit(format!(
+                        "segment chunk exceeds {MAX_SEGMENT_CHUNK_BYTES} bytes"
+                    )));
+                }
+                8 + bytes_size(&value.bytes)?
+            }
         };
     if total > limits.max_payload_bytes() {
         return Err(ProtocolError::Limit(format!(
@@ -862,6 +1011,10 @@ fn decode_header(header: &[u8], limits: ProtocolLimits) -> Result<Header, Protoc
             | 74
             | 75
             | 76
+            | 77
+            | 78
+            | 79
+            | 80
     ) {
         return Err(ProtocolError::UnknownKind(kind));
     }
@@ -1082,6 +1235,44 @@ fn encode_message(message: &Message, out: &mut Vec<u8>) -> Result<(), ProtocolEr
                 put_lineage_cursor(out, cursor);
             }
         },
+        Message::ListSealedSegmentsRequest(value) => {
+            put_range(out, &value.range)?;
+            put_u64(out, value.fencing_epoch);
+        }
+        Message::ListSealedSegmentsResponse(value) => {
+            if value.segments.len() > MAX_SEALED_SEGMENT_LISTING {
+                return Err(ProtocolError::Limit(
+                    "sealed segment listing too long".to_owned(),
+                ));
+            }
+            put_u32(out, value.segments.len() as u32);
+            for entry in &value.segments {
+                put_uuid(out, entry.segment_id);
+                put_u64(out, entry.base_offset);
+                put_u64(out, entry.next_offset);
+                put_u64(out, entry.segment_bytes);
+                put_u64(out, entry.manifest_bytes);
+                put_u64(out, entry.producers_bytes);
+            }
+        }
+        Message::FetchSegmentChunkRequest(value) => {
+            validate_chunk_length(value.length)?;
+            put_range(out, &value.range)?;
+            put_u64(out, value.fencing_epoch);
+            put_uuid(out, value.segment_id);
+            put_u8(out, value.artifact as u8);
+            put_u64(out, value.offset);
+            put_u32(out, value.length);
+        }
+        Message::FetchSegmentChunkResponse(value) => {
+            if value.bytes.len() > MAX_SEGMENT_CHUNK_BYTES as usize {
+                return Err(ProtocolError::Limit(format!(
+                    "segment chunk exceeds {MAX_SEGMENT_CHUNK_BYTES} bytes"
+                )));
+            }
+            put_u64(out, value.total_bytes);
+            put_bytes(out, &value.bytes)?;
+        }
     }
     Ok(())
 }
@@ -1353,8 +1544,116 @@ fn decode_message(
             };
             Message::FetchCursorResponse(FetchCursorResponse { cursor })
         }
+        77 => Message::ListSealedSegmentsRequest(ListSealedSegmentsRequest {
+            range: decoder.range()?,
+            fencing_epoch: decoder.u64()?,
+        }),
+        78 => {
+            let count = decoder.u32()? as usize;
+            if count > MAX_SEALED_SEGMENT_LISTING {
+                return Err(ProtocolError::Limit(
+                    "sealed segment listing too long".to_owned(),
+                ));
+            }
+            let mut segments = Vec::with_capacity(count);
+            let mut previous_next: Option<u64> = None;
+            for _ in 0..count {
+                let entry = SealedSegmentEntry {
+                    segment_id: decoder.uuid()?,
+                    base_offset: decoder.u64()?,
+                    next_offset: decoder.u64()?,
+                    segment_bytes: decoder.u64()?,
+                    manifest_bytes: decoder.u64()?,
+                    producers_bytes: decoder.u64()?,
+                };
+                // The listing is a peer's claim and the receiver routes
+                // offsets by it, so its shape is enforced on the way IN, like
+                // the epoch history: primaries that exist, a non-empty
+                // interval, and a prefix that is genuinely CONTIGUOUS.
+                //
+                // A zero-byte `.segment` or manifest cannot have been sealed
+                // by this code, and neither can a segment holding no offsets:
+                // a roll only happens because records were written, so
+                // `next_offset == base_offset` describes a file this system
+                // does not produce.
+                if entry.next_offset <= entry.base_offset
+                    || entry.segment_bytes == 0
+                    || entry.manifest_bytes == 0
+                {
+                    return Err(ProtocolError::InvalidFrame(
+                        "sealed segment entry is malformed".to_owned(),
+                    ));
+                }
+                // Ascending was not enough. Segments roll, so the sealed
+                // prefix a leader serves is contiguous by construction: each
+                // interval begins exactly where its predecessor ended. Merely
+                // requiring the base offsets to increase accepted listings
+                // with GAPS (offsets no listed segment holds) and OVERLAPS
+                // (offsets two of them claim), and every file in such a
+                // listing verifies individually — the damage is only visible
+                // in how they fit together, which is to say only here.
+                //
+                // A receiver that installed one would hold a range it cannot
+                // read across: a fetch walking the prefix either falls into a
+                // hole or reads the same offsets twice.
+                if let Some(previous) = previous_next {
+                    if entry.base_offset != previous {
+                        return Err(ProtocolError::InvalidFrame(format!(
+                            "sealed segment listing is not contiguous: an entry begins at \
+                             {} where the previous one ended at {previous}",
+                            entry.base_offset
+                        )));
+                    }
+                }
+                previous_next = Some(entry.next_offset);
+                segments.push(entry);
+            }
+            Message::ListSealedSegmentsResponse(ListSealedSegmentsResponse { segments })
+        }
+        79 => {
+            let range = decoder.range()?;
+            let fencing_epoch = decoder.u64()?;
+            let segment_id = decoder.uuid()?;
+            let artifact = SegmentArtifact::decode(decoder.u8()?)?;
+            let offset = decoder.u64()?;
+            let length = decoder.u32()?;
+            validate_chunk_length(length)?;
+            Message::FetchSegmentChunkRequest(FetchSegmentChunkRequest {
+                range,
+                fencing_epoch,
+                segment_id,
+                artifact,
+                offset,
+                length,
+            })
+        }
+        80 => {
+            let total_bytes = decoder.u64()?;
+            // Bounded on the LENGTH PREFIX, before the copy. Decoding first
+            // and measuring afterwards enforced the limit on what was kept,
+            // not on what was allocated: a peer could name any size the
+            // negotiated frame cap allows — 8 MiB by default, 64 MiB at the
+            // ceiling — and the receiver would allocate all of it, then refuse
+            // it. The per-chunk memory bound this constant advertises has to
+            // hold against a hostile sender, which is the only sender it
+            // matters for.
+            let bytes = decoder.bounded_bytes(MAX_SEGMENT_CHUNK_BYTES as usize, "segment chunk")?;
+            Message::FetchSegmentChunkResponse(FetchSegmentChunkResponse { total_bytes, bytes })
+        }
         other => return Err(ProtocolError::UnknownKind(other)),
     })
+}
+
+/// A chunk read must ask for something and must fit one frame; both bounds
+/// hold on encode AND decode because either end of the socket may be the
+/// hostile one.
+fn validate_chunk_length(length: u32) -> Result<(), ProtocolError> {
+    if length == 0 || length > MAX_SEGMENT_CHUNK_BYTES {
+        return Err(ProtocolError::Limit(format!(
+            "segment chunk length must be in 1..={MAX_SEGMENT_CHUNK_BYTES}"
+        )));
+    }
+    Ok(())
 }
 
 /// Decode a bounded, strictly advancing epoch history.
@@ -1604,6 +1903,17 @@ impl<'a> Decoder<'a> {
     }
     fn bytes(&mut self) -> Result<Vec<u8>, ProtocolError> {
         let length = self.u32()? as usize;
+        Ok(self.take(length)?.to_vec())
+    }
+    /// [`Self::bytes`] with the limit applied to the length prefix rather than
+    /// to the result, so an oversized field is refused before it is copied.
+    fn bounded_bytes(&mut self, maximum: usize, what: &str) -> Result<Vec<u8>, ProtocolError> {
+        let length = self.u32()? as usize;
+        if length > maximum {
+            return Err(ProtocolError::Limit(format!(
+                "{what} is {length} bytes; maximum is {maximum}"
+            )));
+        }
         Ok(self.take(length)?.to_vec())
     }
     fn string(&mut self, maximum: usize) -> Result<String, ProtocolError> {
@@ -1918,6 +2228,51 @@ mod tests {
                 }),
             }),
             Message::FetchCursorResponse(FetchCursorResponse { cursor: None }),
+            Message::ListSealedSegmentsRequest(ListSealedSegmentsRequest {
+                range: range(),
+                fencing_epoch: 11,
+            }),
+            Message::ListSealedSegmentsResponse(ListSealedSegmentsResponse {
+                segments: vec![
+                    SealedSegmentEntry {
+                        segment_id: Uuid::from_u128(0x71),
+                        base_offset: 0,
+                        next_offset: 100,
+                        segment_bytes: 4096,
+                        manifest_bytes: 512,
+                        // Absent: a range's FIRST sealed segment inherited no
+                        // frontier. Round-tripping this matters because it is
+                        // what every pre-rolling range reports.
+                        producers_bytes: 0,
+                    },
+                    SealedSegmentEntry {
+                        segment_id: Uuid::from_u128(0x72),
+                        base_offset: 100,
+                        next_offset: 250,
+                        segment_bytes: 8192,
+                        manifest_bytes: 600,
+                        producers_bytes: 96,
+                    },
+                ],
+            }),
+            // Empty is legal: a range that has never rolled has nothing
+            // sealed, and the receiver must read that as "nothing to
+            // transfer", not as a broken reply.
+            Message::ListSealedSegmentsResponse(ListSealedSegmentsResponse {
+                segments: Vec::new(),
+            }),
+            Message::FetchSegmentChunkRequest(FetchSegmentChunkRequest {
+                range: range(),
+                fencing_epoch: 11,
+                segment_id: Uuid::from_u128(0x71),
+                artifact: SegmentArtifact::Producers,
+                offset: 64,
+                length: 32,
+            }),
+            Message::FetchSegmentChunkResponse(FetchSegmentChunkResponse {
+                total_bytes: 96,
+                bytes: vec![7; 32],
+            }),
         ];
         for (request_id, message) in messages.into_iter().enumerate() {
             let frame = WireFrame {
@@ -2142,6 +2497,196 @@ mod tests {
             "kind 70 belongs to the legacy cursor commit; a fence message must \
              never be allocated there"
         );
+    }
+
+    /// The listing is what a receiver routes offsets by, so its shape is a
+    /// wire invariant, not a server courtesy: out-of-order entries, an
+    /// interval running backwards or holding nothing, zero-byte primaries,
+    /// and — the ones a per-file check can never catch — GAPS and OVERLAPS
+    /// between entries are all refused on the way IN.
+    #[test]
+    fn a_malformed_sealed_segment_listing_is_refused_on_decode() {
+        let entry = |base: u64, next: u64| SealedSegmentEntry {
+            segment_id: Uuid::from_u128(base as u128 + 1),
+            base_offset: base,
+            next_offset: next,
+            segment_bytes: 100,
+            manifest_bytes: 100,
+            producers_bytes: 0,
+        };
+        let cases: Vec<(Vec<SealedSegmentEntry>, &str)> = vec![
+            (vec![entry(100, 200), entry(0, 100)], "not contiguous"),
+            (vec![entry(0, 100), entry(0, 100)], "not contiguous"),
+            // A GAP: offsets 100..150 belong to no listed segment.
+            (vec![entry(0, 100), entry(150, 200)], "not contiguous"),
+            // An OVERLAP: offsets 50..100 are claimed twice.
+            (vec![entry(0, 100), entry(50, 200)], "not contiguous"),
+            // An EMPTY interval — a segment that rolled holding nothing.
+            (vec![entry(0, 0)], "malformed"),
+            (vec![entry(0, 100), entry(100, 100)], "malformed"),
+            (vec![entry(100, 50)], "malformed"),
+            (
+                vec![SealedSegmentEntry {
+                    segment_bytes: 0,
+                    ..entry(0, 100)
+                }],
+                "malformed",
+            ),
+            (
+                vec![SealedSegmentEntry {
+                    manifest_bytes: 0,
+                    ..entry(0, 100)
+                }],
+                "malformed",
+            ),
+        ];
+        for (segments, expected) in cases {
+            // Encode by hand: the encoder does not police shape (the sizes
+            // above are the leader's own stat calls), the DECODER does.
+            let mut payload = Vec::new();
+            put_u32(&mut payload, segments.len() as u32);
+            for entry in &segments {
+                put_uuid(&mut payload, entry.segment_id);
+                put_u64(&mut payload, entry.base_offset);
+                put_u64(&mut payload, entry.next_offset);
+                put_u64(&mut payload, entry.segment_bytes);
+                put_u64(&mut payload, entry.manifest_bytes);
+                put_u64(&mut payload, entry.producers_bytes);
+            }
+            let error = decode_message(78, &mut Decoder::new(&payload), limits())
+                .expect_err("malformed listing must refuse");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    /// Chunk length bounds hold on BOTH ends of the socket: a zero-length
+    /// read is a request for nothing, and an over-length one is an allocation
+    /// instruction from a peer.
+    #[test]
+    fn chunk_length_and_size_bounds_are_enforced_both_ways() {
+        let request = |length: u32| {
+            Message::FetchSegmentChunkRequest(FetchSegmentChunkRequest {
+                range: range(),
+                fencing_epoch: 1,
+                segment_id: Uuid::from_u128(9),
+                artifact: SegmentArtifact::Segment,
+                offset: 0,
+                length,
+            })
+        };
+        let frame = |message| WireFrame {
+            request_id: 1,
+            stream_id: 0,
+            message,
+        };
+        assert!(matches!(
+            encode_frame(&frame(request(0)), limits()),
+            Err(ProtocolError::Limit(_))
+        ));
+        assert!(matches!(
+            encode_frame(&frame(request(MAX_SEGMENT_CHUNK_BYTES + 1)), limits()),
+            Err(ProtocolError::Limit(_))
+        ));
+
+        // A decoded over-length request is refused even though the encoder
+        // would never produce one: hand-build the payload.
+        let mut payload = Vec::new();
+        put_range(&mut payload, &range()).unwrap();
+        put_u64(&mut payload, 1);
+        put_uuid(&mut payload, Uuid::from_u128(9));
+        put_u8(&mut payload, SegmentArtifact::Segment as u8);
+        put_u64(&mut payload, 0);
+        put_u32(&mut payload, MAX_SEGMENT_CHUNK_BYTES + 1);
+        assert!(matches!(
+            decode_message(79, &mut Decoder::new(&payload), limits()),
+            Err(ProtocolError::Limit(_))
+        ));
+
+        // An unknown artifact code is malformed, not a limit.
+        let mut payload = Vec::new();
+        put_range(&mut payload, &range()).unwrap();
+        put_u64(&mut payload, 1);
+        put_uuid(&mut payload, Uuid::from_u128(9));
+        put_u8(&mut payload, 9);
+        put_u64(&mut payload, 0);
+        put_u32(&mut payload, 16);
+        assert!(matches!(
+            decode_message(79, &mut Decoder::new(&payload), limits()),
+            Err(ProtocolError::InvalidFrame(_))
+        ));
+
+        // Oversized outbound chunk bytes are refused before the frame is
+        // materialized, same as an oversized produce payload.
+        let oversized = Message::FetchSegmentChunkResponse(FetchSegmentChunkResponse {
+            total_bytes: MAX_SEGMENT_CHUNK_BYTES as u64 + 1,
+            bytes: vec![0; MAX_SEGMENT_CHUNK_BYTES as usize + 1],
+        });
+        assert!(matches!(
+            encode_frame(&frame(oversized), limits()),
+            Err(ProtocolError::Limit(_))
+        ));
+
+        // And refused on DECODE from the length prefix alone, without the
+        // bytes ever being present. The payload here carries a header that
+        // CLAIMS an oversized chunk and no body at all: if the limit were
+        // still applied after the copy, this would fail as a truncated frame
+        // (having tried to take the bytes) rather than as a limit.
+        let mut payload = Vec::new();
+        put_u64(&mut payload, MAX_SEGMENT_CHUNK_BYTES as u64 + 1);
+        put_u32(&mut payload, MAX_SEGMENT_CHUNK_BYTES + 1);
+        let refused = decode_message(80, &mut Decoder::new(&payload), limits())
+            .expect_err("an oversized chunk must be refused before it is allocated");
+        assert!(
+            matches!(refused, ProtocolError::Limit(_)),
+            "the bound must be read off the length prefix, not off the decoded \
+             bytes: {refused}"
+        );
+
+        // An over-long listing is refused at encode time too — this is the
+        // branch `encode_frame` reserves memory from.
+        let listing = Message::ListSealedSegmentsResponse(ListSealedSegmentsResponse {
+            segments: (0..=MAX_SEALED_SEGMENT_LISTING as u64)
+                .map(|index| SealedSegmentEntry {
+                    segment_id: Uuid::from_u128(index as u128 + 1),
+                    base_offset: index,
+                    next_offset: index + 1,
+                    segment_bytes: 1,
+                    manifest_bytes: 1,
+                    producers_bytes: 0,
+                })
+                .collect(),
+        });
+        assert!(matches!(
+            encode_frame(
+                &frame(listing),
+                ProtocolLimits {
+                    max_frame_bytes: ABSOLUTE_MAX_FRAME_BYTES,
+                    max_records: 8,
+                }
+            ),
+            Err(ProtocolError::Limit(_))
+        ));
+    }
+
+    /// A truncated transfer frame is refused at the field where it runs out,
+    /// like every other message family.
+    #[test]
+    fn truncated_transfer_frames_are_refused() {
+        let frame = WireFrame {
+            request_id: 1,
+            stream_id: 0,
+            message: Message::FetchSegmentChunkResponse(FetchSegmentChunkResponse {
+                total_bytes: 96,
+                bytes: vec![7; 32],
+            }),
+        };
+        let encoded = encode_frame(&frame, limits()).unwrap();
+        // Cut the payload short; the header's declared length no longer
+        // matches, and a re-declared shorter length still fails inside the
+        // byte-string field.
+        for cut in [encoded.len() - 1, encoded.len() - 16, HEADER_LEN + 9] {
+            assert!(decode_frame(&encoded[..cut], limits()).is_err(), "{cut}");
+        }
     }
 
     /// A fence response claiming a non-advancing history is refused on the way
