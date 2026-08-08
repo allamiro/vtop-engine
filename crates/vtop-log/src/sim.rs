@@ -32,6 +32,18 @@ pub enum FaultPlan {
         op: u64,
         kind: io::ErrorKind,
     },
+    /// Operation `op` and EVERY operation after it fail with `kind`, without
+    /// crashing: a disk that goes bad and stays bad.
+    ///
+    /// [`FaultPlan::FailOp`] can only ever test a failure that something else
+    /// gets to clean up after, because the cleanup itself always succeeds.
+    /// That makes the interesting question — what a caller is told when the
+    /// recovery path ALSO fails — unreachable, and error paths that are never
+    /// exercised are the ones that lie.
+    FailOpsFrom {
+        op: u64,
+        kind: io::ErrorKind,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -163,6 +175,9 @@ impl SimState {
                 Err(io::Error::other("simulated crash before operation"))
             }
             FaultPlan::FailOp { op, kind } if op == index => {
+                Err(io::Error::new(kind, "injected storage failure"))
+            }
+            FaultPlan::FailOpsFrom { op, kind } if index >= op => {
                 Err(io::Error::new(kind, "injected storage failure"))
             }
             _ => Ok(index),

@@ -574,11 +574,57 @@ impl StagedSegment {
         for (from, to) in renames {
             if let Err(source) = self.env.storage.rename(&from, &to) {
                 let failure = io_error(&to, source);
+                // A rollback that ITSELF fails must not be reported as the
+                // rename failure alone. The two leave the directory in
+                // completely different states: the rename failure alone means
+                // nothing was published, while a failed unlink means real,
+                // discoverable sidecars are sitting there without a primary —
+                // which `StartupCatalog` quarantines, refusing to open the
+                // range. A caller told only "rename failed" will believe the
+                // directory is as it was and retry into a quarantine.
+                //
+                // The same goes for the directory fsync: unlinks that are not
+                // durable can reappear after a crash, so a range that opened
+                // fine can quarantine on the next boot instead.
+                //
+                // Note the asymmetry with `remove_staged`, which ignores its
+                // failures on purpose: staged names are ignorable by
+                // construction, so leftover staging debris is harmless and the
+                // next `SegmentReceiver::open` sweeps it. These names are not
+                // ignorable — that is exactly what publishing them means.
+                let mut stranded: Vec<PathBuf> = Vec::new();
                 for claimed in published.into_iter().rev() {
-                    let _ = self.env.storage.remove_file(&claimed);
+                    if self.env.storage.remove_file(&claimed).is_err() {
+                        stranded.push(claimed);
+                    }
                 }
-                let _ = self.env.storage.sync_dir(&self.directory);
-                return Err(failure);
+                let undurable = self.env.storage.sync_dir(&self.directory).is_err();
+                if stranded.is_empty() && !undurable {
+                    return Err(failure);
+                }
+                let residue = if stranded.is_empty() {
+                    "the releases could not be made durable, so they may reappear after a \
+                     crash"
+                        .to_owned()
+                } else {
+                    format!(
+                        "these names could not be released: {}",
+                        stranded
+                            .iter()
+                            .map(|path| path.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                return Err(LogError::Io {
+                    path: self.directory.clone(),
+                    source: std::io::Error::other(format!(
+                        "publication failed ({failure}) and rolling it back did not fully \
+                         succeed: {residue}. The directory may now hold sidecars without a \
+                         primary, which discovery quarantines; reopen the receiver to sweep \
+                         it before transferring again"
+                    )),
+                });
             }
             published.push(to);
         }
@@ -1051,6 +1097,116 @@ mod tests {
         assert!(
             leftovers.is_empty(),
             "a failed publication must not leave real sidecars behind: {leftovers:?}"
+        );
+    }
+
+    /// When the ROLLBACK also fails, the caller is told that — not just that a
+    /// rename failed.
+    ///
+    /// The two states are nothing alike. A rename failure alone means nothing
+    /// was published and the directory is as it was. A rollback that could not
+    /// unlink means real, discoverable sidecars are sitting there without a
+    /// primary, which [`crate::StartupCatalog`] quarantines — so the range
+    /// refuses to open. A caller told only "rename failed" believes the first
+    /// and walks into the second.
+    #[test]
+    fn a_rollback_that_also_fails_says_so_instead_of_reporting_only_the_rename() {
+        use crate::sim::{FaultPlan, SimStorage, TraceKind};
+
+        let source_dir = tempdir().unwrap();
+        let set = rolled_range(source_dir.path());
+        let reader = &set.sealed()[0];
+        let base_offset = reader.base_offset();
+        let artifacts: Vec<(TransferArtifact, Vec<u8>)> = [
+            TransferArtifact::Segment,
+            TransferArtifact::Manifest,
+            TransferArtifact::Producers,
+        ]
+        .into_iter()
+        .filter_map(|artifact| {
+            let path = sealed_artifact_path(reader.path(), artifact).ok()?;
+            path.exists().then(|| (artifact, fs::read(&path).unwrap()))
+        })
+        .collect();
+
+        let destination = Path::new("/transfer");
+        let stage = |sim: &SimStorage| {
+            sim.create_dir_all(destination);
+            let env = sim.env(11);
+            let receiver = SegmentReceiver::open(&env, destination).unwrap();
+            let mut staged = receiver.begin(base_offset).unwrap();
+            for (artifact, bytes) in &artifacts {
+                staged.append_artifact(*artifact, bytes).unwrap();
+                staged.finish_artifact(*artifact).unwrap();
+            }
+            (env, staged)
+        };
+
+        let rehearsal = SimStorage::new();
+        let (_, staged) = stage(&rehearsal);
+        staged.install().unwrap();
+        let publications: Vec<u64> = rehearsal
+            .trace()
+            .into_iter()
+            .filter(|entry| entry.kind == TraceKind::Rename)
+            .filter(|entry| {
+                !entry
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".."))
+            })
+            .map(|entry| entry.index)
+            .collect();
+
+        // The disk goes bad at the last publication rename and STAYS bad, so
+        // the unlinks the rollback attempts fail too. `FailOp` cannot express
+        // this — its cleanup always succeeds — which is why the error path
+        // being tested here had never run.
+        let injected = SimStorage::new();
+        let (env, staged) = stage(&injected);
+        injected.set_fault(FaultPlan::FailOpsFrom {
+            op: *publications.last().expect("a successful install publishes"),
+            kind: std::io::ErrorKind::PermissionDenied,
+        });
+        let error = staged.install().expect_err("the install must fail");
+
+        let text = error.to_string();
+        assert!(
+            text.contains("rolling it back did not fully succeed"),
+            "the caller must learn the directory is in an uncertain state, not \
+             just that a rename failed: {text}"
+        );
+        assert!(
+            text.contains("could not be released"),
+            "the refusal must NAME the files still holding real names: {text}"
+        );
+        assert!(
+            text.contains("reopen the receiver"),
+            "and say what will fix it: {text}"
+        );
+
+        // The premise: those names really are still there, and really do
+        // quarantine. Without this the assertions above could pass over an
+        // error message describing damage that did not happen.
+        injected.set_fault(FaultPlan::None);
+        let leftovers = env
+            .storage
+            .read_dir(destination)
+            .unwrap()
+            .into_iter()
+            .filter_map(|entry| {
+                let name = entry.path.file_name()?.to_str()?.to_owned();
+                (!name.starts_with('.')).then_some(name)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !leftovers.is_empty(),
+            "the test premise is that real names survived; none did"
+        );
+        assert!(
+            leftovers.iter().all(|name| !name.ends_with(".segment")),
+            "and never a primary — the sidecars are orphaned, not the reverse: {leftovers:?}"
         );
     }
 
