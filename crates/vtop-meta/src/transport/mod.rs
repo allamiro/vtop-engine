@@ -23,6 +23,7 @@
 
 pub mod admin;
 pub mod authz;
+mod maybe_tls;
 pub mod peer;
 pub mod tls;
 pub mod wire;
@@ -31,6 +32,7 @@ pub use admin::{
     resolve_endpoint, stub_status, AdminCandidate, AdminClient, AdminHandler, AdminServer,
 };
 pub use authz::{AdminAuthorizer, AdminIdentity, CommandClass, Refusal};
+pub use maybe_tls::MaybeTls;
 pub use peer::{PeerClient, PeerRpcHandler, PeerServer};
 pub use tls::{
     assert_peer_identity, build_client_connector, build_server_acceptor, common_name_from_cert,

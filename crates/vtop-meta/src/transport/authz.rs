@@ -54,6 +54,12 @@ pub enum AdminIdentity {
     MetaNode(u64),
     /// Anything else — an operator certificate, identified by its CN string.
     Named(String),
+    /// No certificate was presented, because the connection carries no TLS
+    /// (#294). Distinct from every other variant on purpose: those name a
+    /// caller the CA vouched for, and this one names the absence of any claim
+    /// at all. It can only arise on a plaintext endpoint, which refuses to be
+    /// built with an enforcing policy — so this is never a way around one.
+    Anonymous,
 }
 
 impl AdminIdentity {
@@ -84,6 +90,7 @@ impl AdminIdentity {
             AdminIdentity::Node(uuid) => format!("node {uuid}"),
             AdminIdentity::MetaNode(id) => format!("meta node {id}"),
             AdminIdentity::Named(name) => format!("operator {name:?}"),
+            AdminIdentity::Anonymous => "an unauthenticated caller (plaintext endpoint)".to_owned(),
         }
     }
 }
@@ -205,6 +212,15 @@ impl AdminAuthorizer {
             AdminIdentity::Node(uuid) => uuid.to_string(),
             AdminIdentity::MetaNode(id) => id.to_string(),
             AdminIdentity::Named(name) => name.clone(),
+            // NEVER an operator. An anonymous caller has presented no claim at
+            // all, so there is no CN for the configured set to contain, and
+            // matching it against anything would be inventing an identity to
+            // authorize. Unreachable in practice — a plaintext endpoint refuses
+            // to be built with an enforcing policy, and `operators` is `Some`
+            // only when one is — but it is written as a refusal rather than
+            // left to the type system, because the day those two facts drift
+            // apart is the day this decides whether a policy holds.
+            AdminIdentity::Anonymous => return false,
         };
         operators.contains(&cn)
     }
