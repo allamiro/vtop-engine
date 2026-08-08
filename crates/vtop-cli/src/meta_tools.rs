@@ -305,6 +305,22 @@ fn load_admin_config(path: &Path) -> Result<MetaAdminConfig, String> {
     serde_yaml::from_str(&text).map_err(|error| format!("parse {}: {error}", path.display()))
 }
 
+/// Report that the configured endpoint was not the leader.
+///
+/// To stderr, so it never contaminates `--json` output that a script parses.
+/// Worth saying at all because it is actionable: an operator pointing at a node
+/// that is never the leader is paying an extra round trip on every command, and
+/// nothing else would tell them.
+fn note_redirects(client: &AdminClient) {
+    let followed = client.redirects_followed();
+    if followed > 0 {
+        eprintln!(
+            "note: followed {followed} leader redirect(s); the configured endpoint is not the \
+             metadata leader"
+        );
+    }
+}
+
 fn connect(config: &MetaAdminConfig) -> Result<AdminClient, String> {
     let material =
         TlsMaterial::from_pem_files(&config.client_cert, &config.client_key, &config.ca_cert)
@@ -352,6 +368,7 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
             let config = load_admin_config(&common.config)?;
             let client = connect(&config)?;
             let status = client.status().await.map_err(|error| error.to_string())?;
+            note_redirects(&client);
             if json {
                 println!(
                     "{}",
@@ -398,6 +415,7 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
             let config = load_admin_config(&common.config)?;
             let client = connect(&config)?;
             let status = client.status().await.map_err(|error| error.to_string())?;
+            note_redirects(&client);
             if json {
                 println!(
                     "{}",
@@ -674,6 +692,7 @@ pub(crate) async fn propose_and_print(
         .propose(command)
         .await
         .map_err(|error| error.to_string())?;
+    note_redirects(&client);
     if json {
         println!(
             "{}",

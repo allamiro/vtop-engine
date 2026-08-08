@@ -613,8 +613,10 @@ log "metadata leader is pod $leader_ordinal; aiming every admin write at pod $fo
 # single-endpoint client: a write must reach the RAFT LEADER, a non-leader
 # refuses, and with nowhere to go the command failed roughly two times in three
 # depending on which node won the election. That workaround is gone now the CLI
-# follows the redirect itself — and its absence is the assertion, because the
-# commands below are aimed at pod 0 whether or not pod 0 leads.
+# follows the redirect itself. The commands below are aimed at a pod that is NOT
+# the leader, and the assertion after them is that a redirect was actually
+# observed — not merely that the writes succeeded, which they would have done
+# anyway if the endpoint happened to lead.
 {
   cat <<EOF
 endpoint: localhost:${peer_ports[$follower_ordinal]}
@@ -633,10 +635,24 @@ EOF
   done
 } > "$WORK/r-admin-multi.yaml"
 
+# OBSERVES the redirect rather than inferring it from a role snapshot.
+#
+# Picking a follower up front is necessary but not sufficient: leadership can
+# move between the probe and the request, and then the "follower" is the leader,
+# the command succeeds on its first hop, and the test passes without exercising
+# anything. `vtopctl` reports the redirects it actually followed, so this checks
+# what happened instead of what was arranged.
+redirects_seen=0
 meta_admin() { # description -- args...
   what="$1"; shift
-  vtopctl "$@" --config "$WORK/r-admin-multi.yaml" >/dev/null \
-    || fail "$what failed even though every metadata peer was listed and reachable"
+  # stderr carries the note; stdout is the command's own output.
+  if ! note="$(vtopctl "$@" --config "$WORK/r-admin-multi.yaml" 2>&1 >/dev/null)"; then
+    printf '%s\n' "$note"
+    fail "$what failed even though every metadata peer was listed and reachable"
+  fi
+  if printf '%s' "$note" | grep -q "followed .* leader redirect"; then
+    redirects_seen=$((redirects_seen + 1))
+  fi
   log "$what"
 }
 
@@ -648,6 +664,15 @@ for uuid in "$UUID_0" "$UUID_1" "$UUID_2"; do
   meta_admin "registered data node $uuid" \
     meta register-node --node-uuid "$uuid" --addr "${REL}-0.${HEADLESS}.${REPLICATED_NS}.svc.${DOMAIN}:9300"
 done
+
+# THE ASSERTION. Without it this suite would pass against a `vtopctl` that
+# cannot follow a redirect at all, provided the endpoint happened to be the
+# leader — which is how the first version of this test was wrong.
+[ "$redirects_seen" -gt 0 ] \
+  || fail "no admin command followed a leader redirect, so redirect support was never exercised: \
+either the endpoint was the leader after all (leadership moved between the probe and the request) \
+or vtopctl is not following redirects"
+log "observed $redirects_seen leader redirect(s): admin writes reached the leader from a follower endpoint"
 
 log "waiting for the whole replicated range to become Ready"
 await_pods_exist "$REPLICATED_NS" 3
