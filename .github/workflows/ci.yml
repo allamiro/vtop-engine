@@ -459,11 +459,18 @@ jobs:
 
             configs = {}
             cm["data"].each do |name, body|
-              next unless name =~ /\Anode-(\d)\.yaml\z/
+              # An explicit capture rather than ruby global match variables:
+              # actionlint runs shellcheck over these blocks, and a dollar-digit
+              # inside single quotes reads as a shell positional that will not
+              # expand (SC2016). It is a ruby capture, but code that looks like a
+              # shell bug in a shell-linted context is worth not writing — and
+              # this comment cannot name the sigil either, for the same reason.
+              matched = name.match(/\Anode-(\d)\.yaml\z/)
+              next unless matched
               # THE ASSERTION THAT MATTERS. A config that does not parse is not
               # a config; everything below is only meaningful once this holds.
               begin
-                configs[$1] = YAML.safe_load(body)
+                configs[matched[1]] = YAML.safe_load(body)
               rescue => e
                 abort "#{name} is not valid YAML, so the pod cannot start: #{e.message}"
               end
@@ -595,7 +602,8 @@ jobs:
       - name: shellcheck
         run: |
           docker run --rm -v "$PWD:/mnt" -w /mnt \
-            koalaman/shellcheck:v0.11.0 docker/*.sh scripts/release-notes.sh
+            koalaman/shellcheck:v0.11.0 docker/*.sh scripts/release-notes.sh \
+            scripts/k8s-smoke.sh scripts/e2e-smoke.sh
 
       # `-P scripts/live-chaos/scenarios` resolves the scenarios' dynamic
       # `source "$(dirname …)/../lib.sh"`. Without it every scenario reports
