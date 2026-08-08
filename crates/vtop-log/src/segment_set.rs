@@ -34,11 +34,91 @@ use crate::producer_snapshot::ProducerSnapshot;
 use crate::segment::{io_error, roll_in, segment_stem, write_atomic, ActiveSegment, SegmentReader};
 use crate::truncate_intent::{DoomedSegment, TruncateIntent, TRUNCATE_INTENT_FILE};
 use crate::{
-    CatalogSegmentState, Durability, FetchBatch, FetchedRecord, LogError, LogRecord,
+    CatalogEntry, CatalogSegmentState, Durability, FetchBatch, FetchedRecord, LogError, LogRecord,
     SegmentDescriptor, StartupCatalog, VtopLogResult,
 };
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
+
+/// Finish a truncation that died between its marker and its final rename.
+///
+/// Shared by [`SegmentSet::open_in`] and [`SegmentSet::adopt_in`] because both
+/// read a layout, and reading one with an unfinished truncation in it sees the
+/// half-made range rather than the completed one. Adoption skipping this was a
+/// way to LOSE WRITES, not merely to read something stale: it would mint a tail
+/// over a prefix the marker still condemns, serve appends into it, and the next
+/// `open_in` would finish the intent and delete exactly that tail.
+///
+/// A marker that does not decode is deliberately left alone. It names an intent
+/// that cannot be honoured, so it falls through to discovery, which quarantines
+/// it by name and makes the caller refuse — which is the right outcome for a
+/// range nobody can prove the shape of.
+fn finish_pending_truncation(env: &Env, directory: &Path) -> VtopLogResult<()> {
+    let marker = directory.join(TRUNCATE_INTENT_FILE);
+    if !env
+        .storage
+        .exists(&marker)
+        .map_err(|source| io_error(&marker, source))?
+    {
+        return Ok(());
+    }
+    let decoded = env
+        .storage
+        .read(&marker)
+        .map_err(|source| io_error(&marker, source))
+        .and_then(|bytes| TruncateIntent::decode(&bytes));
+    if let Ok(intent) = decoded {
+        finish_truncation(env, directory, &intent)?;
+    }
+    Ok(())
+}
+
+/// Every segment in a range directory must belong to the SAME range.
+///
+/// Discovery does not cover this. `mark_conflicting_lineage` groups candidates
+/// BY range and flags disagreement within a group, so segments from two
+/// different ranges are two clean groups and nothing is quarantined. Offsets
+/// alone then look fine — two ranges can trivially hold contiguous offsets —
+/// and a set stitched from both would serve one range's records under the
+/// other's identity, with the tail inheriting whichever descriptor happened to
+/// be last.
+///
+/// The v1-shaped catalog descriptor is the right thing to compare: a v2
+/// descriptor projects onto its common prefix, so this is format-independent.
+fn validate_single_lineage(entries: &[CatalogEntry], directory: &Path) -> VtopLogResult<()> {
+    let mut first: Option<&SegmentDescriptor> = None;
+    for entry in entries {
+        let descriptor = &entry.descriptor;
+        match first {
+            None => first = Some(descriptor),
+            Some(first)
+                if first.topic == descriptor.topic
+                    && first.topic_epoch == descriptor.topic_epoch
+                    && first.lineage.range_id == descriptor.lineage.range_id
+                    && first.lineage.generation == descriptor.lineage.generation
+                    && first.lineage.key_range == descriptor.lineage.key_range => {}
+            Some(first) => {
+                return Err(LogError::InvalidDescriptor(format!(
+                    "range at {} mixes lineages: {} belongs to topic {:?} epoch {} range {}/{} \
+                     while {} belongs to topic {:?} epoch {} range {}/{}. These are different \
+                     ranges and must not be served as one.",
+                    directory.display(),
+                    entry.path.display(),
+                    descriptor.topic,
+                    descriptor.topic_epoch,
+                    descriptor.lineage.range_id,
+                    descriptor.lineage.generation,
+                    "the first segment",
+                    first.topic,
+                    first.topic_epoch,
+                    first.lineage.range_id,
+                    first.lineage.generation,
+                )))
+            }
+        }
+    }
+    Ok(())
+}
 
 /// One range's segments, ordered and contiguous.
 pub struct SegmentSet {
@@ -76,21 +156,7 @@ impl SegmentSet {
         // different — it names an intent that cannot be honoured — so it
         // falls through to discovery, which quarantines it by name, and the
         // open refuses like any other ambiguity.
-        let marker = directory.join(TRUNCATE_INTENT_FILE);
-        if env
-            .storage
-            .exists(&marker)
-            .map_err(|source| io_error(&marker, source))?
-        {
-            let decoded = env
-                .storage
-                .read(&marker)
-                .map_err(|source| io_error(&marker, source))
-                .and_then(|bytes| TruncateIntent::decode(&bytes));
-            if let Ok(intent) = decoded {
-                finish_truncation(env, &directory, &intent)?;
-            }
-        }
+        finish_pending_truncation(env, &directory)?;
         let catalog = StartupCatalog::discover_in(env, &directory)?;
         if !catalog.quarantined.is_empty() {
             // Name every quarantined bundle and its reasons in the refusal.
@@ -122,6 +188,9 @@ impl SegmentSet {
         if catalog.entries.is_empty() {
             return Ok(None);
         }
+        // The same check adoption needs, for the same reason: `validate_contiguous`
+        // below compares OFFSETS, and two different ranges can abut perfectly.
+        validate_single_lineage(&catalog.entries, &directory)?;
 
         let mut sealed_paths: Vec<(u64, PathBuf)> = Vec::new();
         let mut active_path: Option<PathBuf> = None;
@@ -195,6 +264,12 @@ impl SegmentSet {
         successor_id: Uuid,
     ) -> VtopLogResult<Self> {
         let directory = directory.as_ref().to_path_buf();
+        // BEFORE discovery, exactly as `open_in` does. An unfinished truncation
+        // makes the layout below the half-made one, and minting a tail over a
+        // prefix the marker still condemns would lose writes: the next
+        // `open_in` finishes the intent and deletes that very tail, with
+        // whatever was appended to it.
+        finish_pending_truncation(env, &directory)?;
         let catalog = StartupCatalog::discover_in(env, &directory)?;
         if !catalog.quarantined.is_empty() {
             return Err(LogError::InvalidDescriptor(format!(
@@ -205,6 +280,9 @@ impl SegmentSet {
                 catalog.quarantined.len()
             )));
         }
+        // One range, not several that happen to abut. Offsets alone cannot tell
+        // the difference and discovery does not look across ranges at all.
+        validate_single_lineage(&catalog.entries, &directory)?;
 
         let mut sealed_paths: Vec<(u64, PathBuf)> = Vec::new();
         for entry in &catalog.entries {
@@ -1867,5 +1945,149 @@ mod tests {
             text.contains("not contiguous") || text.contains("quarantined"),
             "the refusal must name the gap: {text}"
         );
+    }
+
+    /// Two different ranges that happen to abut must not be adopted as one.
+    ///
+    /// Offsets cannot tell them apart, and discovery does not look: it groups
+    /// candidates BY range and flags disagreement within a group, so segments
+    /// from two ranges are two clean groups and nothing is quarantined. Stitched
+    /// together, the set would serve one range's records under the other's
+    /// identity and the tail would inherit whichever descriptor came last.
+    #[test]
+    fn adoption_refuses_segments_from_two_different_ranges() {
+        let env = Env::real();
+        let producer = Uuid::from_u128(0x9003);
+
+        // Range A: sealed prefix starting at 0.
+        let a = tempdir().unwrap();
+        let mut set_a = SegmentSet::create_in(&env, a.path(), descriptor(), config()).unwrap();
+        for sequence in 0..24 {
+            set_a
+                .append_group_minting(&[record(producer, sequence)], Durability::Fsync)
+                .unwrap();
+        }
+        assert!(!set_a.sealed().is_empty());
+
+        // Range B: a DIFFERENT range id, whose first segment begins exactly
+        // where A's prefix ends — the case offset checks cannot see.
+        let b = tempdir().unwrap();
+        let mut foreign = descriptor();
+        foreign.lineage.range_id = Uuid::from_u128(0xBEEF);
+        // A distinct segment id as well as a distinct range: sharing one would
+        // be caught by discovery as `DuplicateSegmentId`, and the test would
+        // pass on a refusal that has nothing to do with lineage. My first
+        // version did exactly that.
+        foreign.segment_id = Uuid::from_u128(0xB001);
+        foreign.base_offset = set_a.sealed().last().unwrap().next_offset();
+        let mut set_b = SegmentSet::create_in(&env, b.path(), foreign, config()).unwrap();
+        for sequence in 0..24 {
+            set_b
+                .append_group_minting(&[record(producer, sequence)], Durability::Fsync)
+                .unwrap();
+        }
+        assert!(!set_b.sealed().is_empty());
+
+        let mixed = tempdir().unwrap();
+        for reader in set_a.sealed().iter().chain(set_b.sealed().iter()) {
+            for artifact in reader.paths().unwrap() {
+                if artifact.exists() {
+                    let name = artifact.file_name().unwrap();
+                    std::fs::copy(&artifact, mixed.path().join(name)).unwrap();
+                }
+            }
+        }
+
+        // The premise: discovery is HAPPY with this directory. If it
+        // quarantined, the refusal below would prove nothing about lineage.
+        let catalog = StartupCatalog::discover(mixed.path()).unwrap();
+        assert!(
+            catalog.quarantined.is_empty(),
+            "discovery must not object, or this tests the wrong thing: {:?}",
+            catalog.quarantined
+        );
+
+        let refused = SegmentSet::adopt_in(&env, mixed.path(), Uuid::from_u128(0xADD4))
+            .map(|_| ())
+            .expect_err("segments from two ranges must not be adopted as one");
+        assert!(
+            refused.to_string().contains("mixes lineages"),
+            "the refusal must name the cause: {refused}"
+        );
+    }
+
+    /// Adoption must finish an in-flight truncation before reading the layout.
+    ///
+    /// This is a way to LOSE WRITES, not merely to read something stale.
+    /// Adopting over a live marker mints a tail on a prefix the marker still
+    /// condemns; the tail then accepts appends, and the next `open_in` finishes
+    /// the intent and deletes exactly that tail, with everything written to it.
+    #[test]
+    fn adoption_finishes_a_pending_truncation_instead_of_building_on_it() {
+        let env = Env::real();
+        let producer = Uuid::from_u128(0x9004);
+        let source = tempdir().unwrap();
+        let mut set = SegmentSet::create_in(&env, source.path(), descriptor(), config()).unwrap();
+        for sequence in 0..24 {
+            set.append_group_minting(&[record(producer, sequence)], Durability::Fsync)
+                .unwrap();
+        }
+        assert!(set.sealed().len() >= 2);
+
+        // A received prefix, plus a marker condemning its last sealed segment —
+        // the shape a transfer interrupted by a truncation leaves behind.
+        let received = tempdir().unwrap();
+        for reader in set.sealed() {
+            for artifact in reader.paths().unwrap() {
+                if artifact.exists() {
+                    let name = artifact.file_name().unwrap();
+                    std::fs::copy(&artifact, received.path().join(name)).unwrap();
+                }
+            }
+        }
+        let doomed = set.sealed().last().unwrap();
+        let cut = doomed.base_offset();
+        let mut replacement = descriptor();
+        replacement.segment_id = Uuid::from_u128(0xDEAD);
+        replacement.base_offset = cut;
+        let intent = TruncateIntent {
+            target_offset: cut,
+            replacement,
+            config: config(),
+            doomed: vec![DoomedSegment {
+                segment_id: doomed.segment_id(),
+                base_offset: doomed.base_offset(),
+            }],
+            inherited: Default::default(),
+        };
+        std::fs::write(
+            received.path().join(TRUNCATE_INTENT_FILE),
+            intent.encode().unwrap(),
+        )
+        .unwrap();
+
+        // Whatever adoption decides, it must not leave the marker live with a
+        // tail built on top of it. Either it finishes the truncation and adopts
+        // the surviving prefix, or it refuses — both are safe; carrying on is
+        // not.
+        match SegmentSet::adopt_in(&env, received.path(), Uuid::from_u128(0xADD5)) {
+            Ok(adopted) => {
+                assert!(
+                    !received.path().join(TRUNCATE_INTENT_FILE).exists(),
+                    "a tail was minted while the marker is still live; the next open would \
+                     finish the truncation and delete it"
+                );
+                assert!(
+                    adopted.next_offset() <= doomed.next_offset(),
+                    "the adopted tail must not begin past what the truncation condemned"
+                );
+            }
+            Err(error) => {
+                assert!(
+                    !error.to_string().is_empty(),
+                    "a refusal must say why: {error}"
+                );
+            }
+        }
     }
 }

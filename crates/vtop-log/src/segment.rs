@@ -1982,16 +1982,14 @@ pub(crate) fn open_successor_in(
         .unwrap_or_else(|| Path::new("."))
         .to_path_buf();
     let successor_path = directory.join(format!("{}.active", segment_stem(base_offset)));
-    // The same collision `roll_in` refuses, for the same reason: a successor
-    // sharing its predecessor's stem shares every sidecar with it, and the next
-    // seal would find its target name already taken.
-    if successor_path == *sealed_path {
-        return Err(LogError::InvalidDescriptor(format!(
-            "adopting {} would reuse its own name: it ends at offset {base_offset}, where its \
-             successor must begin",
-            sealed_path.display()
-        )));
-    }
+    // No name-collision guard here, unlike `roll_in`, and the difference is
+    // worth stating because copying one in would be reasonable and wrong.
+    // `roll_in` compares two `.active` paths, so an empty segment really can
+    // produce a successor with its predecessor's name. Here the predecessor is
+    // a `.segment` primary and the successor is always `.active` — the equality
+    // could never hold — and `adopt_in` has already refused any directory
+    // containing an active segment, so there is nothing for the name to collide
+    // with. A guard that cannot fire reads as protection that is not there.
 
     let frontier = snapshot_of(
         &inspection.scan.producer_states,
