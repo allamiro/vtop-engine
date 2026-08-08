@@ -337,11 +337,31 @@ kubectl delete namespace "$NS" "$NEIGHBOUR_NS" --wait=true --timeout=180s >/dev/
 # Deleting the namespace returns before the kubelet has finished releasing the
 # pods, and it is the RELEASE that frees the capacity. Wait for the node to
 # actually have it back rather than assuming.
+#
+# A FAILED QUERY IS NOT ZERO PODS. `|| true` was the right shape for reading an
+# offset — an empty answer there means "unknown", and the caller compares it and
+# fails with it. Here the natural default is actively wrong: 0 means "all clear",
+# so swallowing a kubectl failure would report reclaimed capacity that was never
+# measured, and the run would walk straight into the Pending-pod failure this
+# exists to prevent. Same technique, opposite consequence.
+#
+# So a query failure keeps `remaining` unknown and the loop retries, and running
+# out of attempts FAILS with the count actually observed rather than announcing
+# success on a deadline.
+remaining="unknown"
 for _ in $(seq 1 60); do
-  remaining="$(kubectl get pods -A -l "app.kubernetes.io/instance=${REL}" --no-headers 2>/dev/null | grep -vc "^$" || true)"
-  [ "${remaining:-0}" = "0" ] && break
+  if pods="$(kubectl get pods -A -l "app.kubernetes.io/instance=${REL}" --no-headers 2>/dev/null)"; then
+    # `grep -c .` counts non-empty lines and exits 1 when there are none, which
+    # is a count of zero and not an error.
+    remaining="$(printf '%s' "$pods" | grep -c . || true)"
+    [ "$remaining" = "0" ] && break
+  else
+    remaining="unknown"
+  fi
   sleep 2
 done
+[ "$remaining" = "0" ] \
+  || fail "capacity was not reclaimed after 120s: $remaining pod(s) still present (\"unknown\" means the cluster stopped answering). Installing the replicated shape now would leave a pod Pending on a node that has no room for it."
 log "node capacity reclaimed"
 
 # ---------------------------------------------------------------------------
