@@ -100,14 +100,29 @@ forward() { # pod localport remoteport
 # to the thing under test. Found by running the whole suite against a freshly
 # built image rather than by reading.
 await_pods_exist() { # namespace count
+  # A FAILED QUERY IS NOT ZERO PODS — the same rule the capacity wait below
+  # states, and which the first version of this helper broke in the very next
+  # function. Retrying is right either way, so the gap is not behaviour but
+  # ATTRIBUTION: if the API server stopped answering, reading 0 for two minutes
+  # and then blaming the StatefulSet accuses a component that was never
+  # observed doing anything. `seen` records whether any query ever succeeded,
+  # so the two failures get the two different messages they deserve.
+  seen=0
   for _ in $(seq 1 60); do
-    have="$(kubectl -n "$1" get pods -l "app.kubernetes.io/instance=${REL}" \
-      --no-headers 2>/dev/null | grep -c . || true)"
-    [ "${have:-0}" -ge "$2" ] && return 0
+    if pods="$(kubectl -n "$1" get pods -l "app.kubernetes.io/instance=${REL}" \
+      --no-headers 2>/dev/null)"; then
+      seen=1
+      have="$(printf '%s' "$pods" | grep -c . || true)"
+      [ "${have:-0}" -ge "$2" ] && return 0
+    fi
     sleep 2
   done
   kubectl -n "$1" get pods || true
-  fail "namespace $1 never produced $2 pod(s); the StatefulSet did not create them"
+  if [ "$seen" = "0" ]; then
+    fail "namespace $1 never answered a pod query in 120s; the cluster stopped responding, so \
+whether the StatefulSet created anything is unknown"
+  fi
+  fail "namespace $1 never produced $2 pod(s) in 120s; the StatefulSet did not create them"
 }
 
 # ---------------------------------------------------------------------------
