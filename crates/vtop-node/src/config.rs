@@ -230,8 +230,15 @@ pub struct DataNodeConfig {
     /// The two roles use the block differently. A leader ACQUIRES and RENEWS:
     /// it is competing to hold the range. A follower only OBSERVES: it has no
     /// claim to make, and giving followers an agent would put every replica in
-    /// the election. Only `admin_endpoint`, `server_name`, `topic_uuid`,
-    /// `tls`, and `poll_interval_ms` are read on a follower.
+    /// the election. Only `admin_endpoint`, `admin_peers`, `server_name`,
+    /// `topic_uuid`, `tls`, and `poll_interval_ms` are read on a follower.
+    ///
+    /// `admin_peers` is in that list and is not optional in practice on a
+    /// replicated range: a follower's watcher must reach the Raft LEADER to read
+    /// the lease at all, and under co-location its `admin_endpoint` is its own
+    /// node, which usually is not the leader. Omitting the peers is what left
+    /// two of three replicas failing closed forever (#292), and it stays wrong
+    /// after any leader movement, not just at startup.
     ///
     /// Stated limitation on a REPLICATED range. A watching follower starts
     /// fenced and adopts its epoch on the next poll, so it refuses the

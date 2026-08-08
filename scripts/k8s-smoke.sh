@@ -386,8 +386,26 @@ done
 # follower DNS settles — every restart kills the port-forward for good, so a
 # retry through a dead forward just repeats `connection refused` until it gives
 # up. A fresh local port per attempt avoids racing the previous one's teardown.
-r_init=""
+# ONE monotonic allocator for every port in this section. The init retry loop
+# below allocates dynamically, and the produce / metrics checks after it used to
+# use FIXED ports that fell inside the range the loop had already walked. When
+# the loop happened to land on one of them, the later `port-forward` failed to
+# bind and the request went to the surviving init forward — pod-0:9200 instead of
+# :9400 — which reads as a confusing produce failure or, worse, a false pass.
+# Nothing here may pick a port by hand.
+#
+# Sets `r_port`; it does NOT echo it. A `$(next_port)` command substitution runs
+# in a SUBSHELL, so the increment inside it is discarded and every call returns
+# the same number — which reintroduced the very collision this allocator exists
+# to prevent, and did it silently: two forwards on one port means `curl -sf` hits
+# the wrong listener, fails, and `set -e` aborts the script with no message at
+# all. Caught by running the test rather than by reading it.
 r_port=19700
+alloc_port() {
+  r_port=$((r_port + 1))
+}
+
+r_init=""
 for _ in $(seq 1 30); do
   r_port=$((r_port + 1))
   cat > "$WORK/r-admin.yaml" <<EOF
@@ -480,20 +498,22 @@ kubectl -n "$REPLICATED_NS" wait --for=condition=ready pod -l "app.kubernetes.io
 # has followers and really reached a majority of them. Nothing else in CI
 # establishes that.
 log "producing with QUORUM durability, which a standalone range refuses"
-forward_ns "$REPLICATED_NS" "${REL}-0" 19701 9400
+alloc_port; produce_port="$r_port"
+forward_ns "$REPLICATED_NS" "${REL}-0" "$produce_port" 9400
 r_fqdn="${REL}-0.${HEADLESS}.${REPLICATED_NS}.svc.${DOMAIN}"
 sed "s|^server_name: .*|server_name: \"${r_fqdn}\"|; s|cert: $CERTS/client.pem|cert: $CERTS/r-client.pem|; s|key: $CERTS/client-key.pem|key: $CERTS/r-client-key.pem|; s/^producer_epoch: .*/producer_epoch: 1/" \
   "$WORK/client.yaml" > "$WORK/r-client.yaml"
 
 R_EXPECTED=60
 vtop-node produce --client-config "$WORK/r-client.yaml" \
-  --addr "127.0.0.1:19701" --records "$R_EXPECTED" --batch 10 \
+  --addr "127.0.0.1:${produce_port}" --records "$R_EXPECTED" --batch 10 \
   --durability quorum >/dev/null \
   || fail "quorum produce failed; the range is not actually replicated"
 log "quorum produce accepted $R_EXPECTED records"
 
-forward_ns "$REPLICATED_NS" "${REL}-0" 19702 9500
-r_got="$(committed_offset 19702)"
+alloc_port; leader_metrics_port="$r_port"
+forward_ns "$REPLICATED_NS" "${REL}-0" "$leader_metrics_port" 9500
+r_got="$(committed_offset "$leader_metrics_port")"
 [ "$r_got" = "$R_EXPECTED" ] || fail "leader should hold $R_EXPECTED records, reports '${r_got:-none}'"
 
 # The inverse of the standalone check above, and the reason both are worth
@@ -505,11 +525,29 @@ r_got="$(committed_offset 19702)"
 # Read as local_committed_offset rather than next_offset: the first is what
 # the follower has FSYNCED, the second only what it has been assigned. Quorum
 # durability is a claim about disks, so the assertion should be too.
+#
+# POLLED, not asserted once, and the reason is the same arithmetic that makes
+# checking both followers worthwhile. Quorum means a MAJORITY acked — with three
+# replicas, the leader plus one. So a perfectly healthy write can return while
+# the third replica is still catching up, and an immediate assertion on both
+# followers tests the timing rather than the replication. That is a flake, and
+# it would have failed intermittently in CI while looking like a real
+# replication bug.
+#
+# A deadline rather than a fixed sleep: it reports the state that matters and
+# fails with the offset it actually observed, so a genuine stall is still
+# diagnosable instead of hidden behind a wait that was long enough.
 for ordinal in 1 2; do
-  forward_ns "$REPLICATED_NS" "${REL}-${ordinal}" "1971${ordinal}" 9500
-  f_offset="$(committed_offset "1971${ordinal}")"
+  alloc_port; metrics_port="$r_port"
+  forward_ns "$REPLICATED_NS" "${REL}-${ordinal}" "$metrics_port" 9500
+  f_offset=""
+  for _ in $(seq 1 30); do
+    f_offset="$(committed_offset "$metrics_port")"
+    [ "${f_offset:-0}" = "$R_EXPECTED" ] && break
+    sleep 2
+  done
   [ "${f_offset:-0}" = "$R_EXPECTED" ] \
-    || fail "follower $ordinal has durably applied '${f_offset:-0}' of $R_EXPECTED records; replication is not reaching it"
+    || fail "follower $ordinal has durably applied '${f_offset:-0}' of $R_EXPECTED records after 60s; replication is not reaching it"
   log "follower $ordinal has durably applied all $R_EXPECTED records"
 done
 

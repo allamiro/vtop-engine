@@ -440,11 +440,19 @@ impl AdminClient {
         use std::sync::atomic::Ordering;
 
         let mut index = self.preferred.load(Ordering::Relaxed) % self.candidates.len();
-        let mut attempted = 0_usize;
+        // VISITED, not a counter. Counting attempts bounds the work but does not
+        // guarantee coverage, and the difference is a real failure: during an
+        // election two followers can hold stale views of each other, so A names
+        // B and B names A. Following those hints alternates A→B→A and burns the
+        // whole budget without ever contacting C — which may be the leader,
+        // configured in the same list. The request then fails for want of
+        // trying, which is the very outage this exists to prevent.
+        let mut visited = vec![false; self.candidates.len()];
         let mut last_error: Option<TransportError> = None;
 
-        while attempted < self.candidates.len() {
-            attempted += 1;
+        while let Some(current) = self.next_unvisited(index, &visited) {
+            index = current;
+            visited[index] = true;
             let candidate = &self.candidates[index];
             match self.attempt(candidate, &request).await {
                 Ok(frame) => {
@@ -453,11 +461,14 @@ impl AdminClient {
                     // is the whole point of this loop.
                     if let Some(hint) = redirect_of(&frame) {
                         // Remember nothing on a redirect — this candidate just
-                        // told us it is the wrong one.
-                        let next = hint
+                        // told us it is the wrong one. Steer to the node it
+                        // named only if that node is still unvisited; otherwise
+                        // fall through to the next one that is, so a bouncing
+                        // pair cannot trap the walk.
+                        let named = hint
                             .leader
                             .and_then(|leader| self.index_of(leader))
-                            .filter(|found| *found != index);
+                            .filter(|found| !visited[*found]);
                         last_error = Some(TransportError::NotLeader {
                             message: format!(
                                 "{} is not the metadata leader{}",
@@ -469,7 +480,7 @@ impl AdminClient {
                             ),
                             leader: hint.leader,
                         });
-                        index = next.unwrap_or((index + 1) % self.candidates.len());
+                        index = named.unwrap_or(index);
                         continue;
                     }
                     self.preferred.store(index, Ordering::Relaxed);
@@ -478,15 +489,20 @@ impl AdminClient {
                 // An unreachable candidate is worth moving past for the same
                 // reason as a redirect: one node being down must not make the
                 // cluster unusable when the others can answer.
-                Err(error) => {
-                    last_error = Some(error);
-                    index = (index + 1) % self.candidates.len();
-                }
+                Err(error) => last_error = Some(error),
             }
         }
         Err(last_error.unwrap_or_else(|| {
             TransportError::Protocol("no metadata endpoint could be reached".to_owned())
         }))
+    }
+
+    /// `from` if it has not been tried, else the next unvisited candidate in
+    /// ring order, else `None` once every candidate has been asked exactly once.
+    fn next_unvisited(&self, from: usize, visited: &[bool]) -> Option<usize> {
+        (0..self.candidates.len())
+            .map(|offset| (from + offset) % self.candidates.len())
+            .find(|index| !visited[*index])
     }
 
     fn index_of(&self, leader: MetaNodeId) -> Option<usize> {
@@ -716,6 +732,70 @@ mod tests {
 
         follower_task.abort();
         leader_task.abort();
+    }
+
+    /// Two followers naming each other must not trap the walk before the real
+    /// leader is tried.
+    ///
+    /// During an election, peer views go stale in both directions: A believes B
+    /// leads and B believes A does. Following those hints alternates A→B→A, and
+    /// a loop that merely COUNTS attempts spends its whole budget on the pair
+    /// while C — configured in the same list, and actually the leader — is never
+    /// contacted. The request then fails for want of trying, which is the outage
+    /// this whole mechanism exists to prevent.
+    ///
+    /// So coverage is tracked, not attempts: every candidate is asked at most
+    /// once and at least once before giving up.
+    #[tokio::test]
+    async fn two_followers_naming_each_other_do_not_starve_the_third_candidate() {
+        let pki = SharedPki::new();
+        let a = Arc::new(NotLeaderHandler {
+            leader: Some(MetaNodeId(2)),
+            asked: AtomicUsize::new(0),
+        });
+        let b = Arc::new(NotLeaderHandler {
+            leader: Some(MetaNodeId(1)),
+            asked: AtomicUsize::new(0),
+        });
+        let (a_addr, a_task) = live_handler(&pki, Arc::clone(&a)).await;
+        let (b_addr, b_task) = live_handler(&pki, Arc::clone(&b)).await;
+        let (c_addr, c_task) = live_handler(&pki, Arc::new(CountingHandler::default())).await;
+
+        let client = AdminClient::with_candidates(
+            pki.client_material(),
+            vec![
+                AdminCandidate {
+                    node_id: Some(MetaNodeId(1)),
+                    endpoint: a_addr,
+                    server_name: "localhost".to_owned(),
+                },
+                AdminCandidate {
+                    node_id: Some(MetaNodeId(2)),
+                    endpoint: b_addr,
+                    server_name: "localhost".to_owned(),
+                },
+                AdminCandidate {
+                    node_id: Some(MetaNodeId(3)),
+                    endpoint: c_addr,
+                    server_name: "localhost".to_owned(),
+                },
+            ],
+        )
+        .unwrap();
+
+        client
+            .status()
+            .await
+            .expect("the third candidate must be reached despite the bouncing pair");
+
+        // Each of the bouncing pair asked exactly once: bounded, and not
+        // re-asked just because it was named again.
+        assert_eq!(a.asked.load(Ordering::SeqCst), 1, "A must be asked once");
+        assert_eq!(b.asked.load(Ordering::SeqCst), 1, "B must be asked once");
+
+        a_task.abort();
+        b_task.abort();
+        c_task.abort();
     }
 
     /// A redirect naming nobody is an ELECTION GAP, not a routing decision.
