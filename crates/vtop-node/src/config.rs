@@ -276,6 +276,38 @@ pub struct LeaseConfig {
     pub renew_interval_ms: u64,
     #[serde(default = "default_poll_interval_ms")]
     pub poll_interval_ms: u64,
+    /// Every metadata node this range may ask, so a redirect can be followed.
+    ///
+    /// `admin_endpoint` above is where to ASK FIRST; these are where to go when
+    /// that node says it is not the leader. Reads and writes on the metadata
+    /// plane must reach the Raft leader, so with one endpoint and no
+    /// alternatives a non-leader is a dead end — which is precisely what
+    /// happened in Kubernetes, where every pod pointed `admin_endpoint` at its
+    /// own co-located metadata node and only the one that happened to
+    /// co-locate the leader ever worked (#292).
+    ///
+    /// Optional, and empty means today's behaviour exactly: one endpoint, no
+    /// redirect following. That keeps every single-node and harness config
+    /// working untouched, since a single-voter group's only node is always its
+    /// leader.
+    #[serde(default)]
+    pub admin_peers: Vec<LeaseAdminPeer>,
+}
+
+/// One metadata node a lease client may be redirected to.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LeaseAdminPeer {
+    /// The metadata node id, as Raft knows it. Required, because a redirect
+    /// names an id: without it the client can only rotate through peers
+    /// hopefully instead of going straight to the leader it was told about.
+    pub node_id: u64,
+    pub endpoint: String,
+    /// rustls server name for this peer's certificate. Empty uses the
+    /// `server_name` above, which is correct when a shared SAN is configured
+    /// and wrong when certificates are per-pod — so it is per-peer here.
+    #[serde(default)]
+    pub server_name: String,
 }
 
 fn default_lease_duration_ms() -> u64 {

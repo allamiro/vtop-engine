@@ -73,9 +73,9 @@ pub use storage::membership_log_id::MembershipLogId;
 pub use storage::snapshot::{MetaSnapshots, SnapshotMeta};
 pub use storage::{MetaStorage, MetaStorageConfig, MetaStoreError, MetaStoreResult};
 pub use transport::{
-    resolve_endpoint, AdminClient, AdminHandler, AdminLeaseView, AdminProposeResponse,
-    AdminReadRangeLeaseRequest, AdminReadRangeLeaseResponse, AdminServer, AdminStatusResponse,
-    PeerClient, PeerRpcHandler, PeerServer, TlsMaterial, TransportError, TransportResult,
-    VtpmFrame, WireLogId,
+    resolve_endpoint, AdminCandidate, AdminClient, AdminHandler, AdminLeaseView,
+    AdminProposeResponse, AdminReadRangeLeaseRequest, AdminReadRangeLeaseResponse, AdminServer,
+    AdminStatusResponse, PeerClient, PeerRpcHandler, PeerServer, TlsMaterial, TransportError,
+    TransportResult, VtpmFrame, WireLogId,
 };
 pub use wire::CodecError;

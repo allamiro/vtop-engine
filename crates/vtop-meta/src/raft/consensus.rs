@@ -12,7 +12,7 @@ use crate::keys::MetaNodeId;
 use crate::raft::convert::{membership_to_meta, to_meta_index, vote_to_hard_state};
 use crate::raft::observation::{RaftObservation, RaftServerState};
 use crate::raft::store::MetaRaftStore;
-use crate::raft::type_config::MetaRaftTypeConfig;
+use crate::raft::type_config::{MetaRaftTypeConfig, NodeId};
 use crate::state::MetaValue;
 use crate::transport::admin::AdminHandler;
 use crate::transport::wire::{AdminLeaseView, AdminReadRangeLeaseResponse};
@@ -46,9 +46,83 @@ pub struct ReadFence {
 pub enum ConsensusError {
     #[error("{0}")]
     Message(String),
+    /// This node is not the leader, so it cannot serve the request; ask the
+    /// node named here instead.
+    ///
+    /// TYPED, rather than folded into [`ConsensusError::Message`] with every
+    /// other failure. Reads and writes on this plane must reach the Raft
+    /// leader, and a non-leader has always refused them — but it refused with
+    /// openraft's Display text, so a caller could only recognise the condition
+    /// by matching English. Nothing did, and the consequence was that a
+    /// co-located deployment worked on exactly one node: the lease watcher on
+    /// every other replica asked its own local metadata node forever, failed
+    /// closed, and never became ready (#292).
+    ///
+    /// `leader` is an id and not an address on purpose — that is all Raft
+    /// knows. Openraft's own node metadata here is `EmptyNode`, so resolving
+    /// the id to an endpoint is the caller's job, from the peer list it was
+    /// configured with.
+    #[error("not the metadata leader{}", match .leader {
+        Some(id) => format!("; ask node {id}"),
+        None => "; no leader is known yet".to_owned(),
+    })]
+    NotLeader { leader: Option<MetaNodeId> },
 }
 
 pub type ConsensusResult<T> = Result<T, ConsensusError>;
+
+/// The redirect a non-leader answers a WRITE with.
+///
+/// Every Raft call site used to be `error.to_string()`, which is why the
+/// distinction was invisible: openraft carries the redirect as a structured
+/// `ForwardToLeader` and that threw it away, leaving a caller nothing to act
+/// on but prose.
+///
+/// Matched on the concrete variant rather than through openraft's generic
+/// `forward_to_leader` helper, whose `TryAsRef` bound is a private trait — so
+/// the generic form does not compile outside the crate. Two small functions
+/// that name the variant are also plainer to read than a bound nobody can
+/// satisfy.
+pub(crate) fn classify_write_error(
+    error: openraft::error::RaftError<
+        NodeId,
+        openraft::error::ClientWriteError<NodeId, openraft::EmptyNode>,
+    >,
+) -> ConsensusError {
+    match &error {
+        openraft::error::RaftError::APIError(
+            openraft::error::ClientWriteError::ForwardToLeader(forward),
+        ) => not_leader(forward),
+        _ => ConsensusError::Message(error.to_string()),
+    }
+}
+
+/// The same redirect, for a linearizable READ.
+pub(crate) fn classify_read_error(
+    error: openraft::error::RaftError<
+        NodeId,
+        openraft::error::CheckIsLeaderError<NodeId, openraft::EmptyNode>,
+    >,
+) -> ConsensusError {
+    match &error {
+        openraft::error::RaftError::APIError(
+            openraft::error::CheckIsLeaderError::ForwardToLeader(forward),
+        ) => not_leader(forward),
+        _ => ConsensusError::Message(error.to_string()),
+    }
+}
+
+/// The id, deliberately, and not `leader_node`: this type config uses
+/// `EmptyNode`, so Raft holds no address for a peer and reporting one would be
+/// an invention. Resolving the id to an endpoint belongs to the caller, which
+/// has the configured peer list.
+fn not_leader(
+    forward: &openraft::error::ForwardToLeader<NodeId, openraft::EmptyNode>,
+) -> ConsensusError {
+    ConsensusError::NotLeader {
+        leader: forward.leader_id.map(MetaNodeId),
+    }
+}
 
 /// Narrow consensus interface from the native broker architecture.
 #[async_trait]
@@ -149,7 +223,7 @@ impl AdminReadRangeLease for OpenraftConsensus {
         self.raft
             .ensure_linearizable()
             .await
-            .map_err(|error| ConsensusError::Message(error.to_string()))?;
+            .map_err(classify_read_error)?;
         let key = MetaKey::Range {
             topic_uuid,
             range_uuid,
@@ -200,7 +274,7 @@ impl Consensus for OpenraftConsensus {
             .raft
             .client_write(command)
             .await
-            .map_err(|error| ConsensusError::Message(error.to_string()))?;
+            .map_err(classify_write_error)?;
         let log_id = response.log_id;
         let meta_index = to_meta_index(log_id.index);
         let bytes = response.data;
@@ -238,7 +312,7 @@ impl Consensus for OpenraftConsensus {
         self.raft
             .ensure_linearizable()
             .await
-            .map_err(|error| ConsensusError::Message(error.to_string()))?;
+            .map_err(classify_read_error)?;
         let metrics = self.raft.metrics().borrow().clone();
         Ok(ReadFence {
             term: metrics.current_term,
@@ -250,6 +324,23 @@ impl Consensus for OpenraftConsensus {
     }
 }
 
+/// Carry [`ConsensusError::NotLeader`] across into the transport layer instead
+/// of flattening it to prose.
+///
+/// This is the second place the redirect used to be lost. Classifying the
+/// openraft error correctly is useless if the very next `map_err` turns it back
+/// into a string, which is what `TransportError::Protocol(error.to_string())`
+/// did at every one of these call sites.
+fn to_transport_error(error: ConsensusError) -> TransportError {
+    match error {
+        ConsensusError::NotLeader { leader } => TransportError::NotLeader {
+            message: ConsensusError::NotLeader { leader }.to_string(),
+            leader,
+        },
+        other => TransportError::Protocol(other.to_string()),
+    }
+}
+
 #[async_trait]
 impl AdminHandler for OpenraftConsensus {
     async fn read_range_lease(
@@ -258,19 +349,17 @@ impl AdminHandler for OpenraftConsensus {
     ) -> TransportResult<AdminReadRangeLeaseResponse> {
         AdminReadRangeLease::read_range_lease(self, request.topic_uuid, request.range_uuid)
             .await
-            .map_err(|error| TransportError::Protocol(error.to_string()))
+            .map_err(to_transport_error)
     }
 
     async fn status(&self) -> TransportResult<AdminStatusResponse> {
-        Consensus::status(self)
-            .await
-            .map_err(|error| TransportError::Protocol(error.to_string()))
+        Consensus::status(self).await.map_err(to_transport_error)
     }
 
     async fn propose(&self, command: MetadataCommand) -> TransportResult<AdminProposeResponse> {
         let receipt = Consensus::propose(self, command)
             .await
-            .map_err(|error| TransportError::Protocol(error.to_string()))?;
+            .map_err(to_transport_error)?;
         Ok(AdminProposeResponse {
             log_id: receipt.log_id,
             response: receipt.response,
