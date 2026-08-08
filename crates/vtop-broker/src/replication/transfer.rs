@@ -101,6 +101,19 @@ impl LeaderSegmentTransferHandler {
         Ok(())
     }
 
+    /// Resolve a sealed segment by IDENTITY, freshly, on every chunk.
+    ///
+    /// Not once per transfer, and not by the path the listing implied. A
+    /// truncation can remove a sealed segment while a transfer is walking it,
+    /// and the listing is a snapshot that stops being true the moment it is
+    /// sent. Re-resolving by `segment_id` against the current sealed prefix is
+    /// what makes that fail CLOSED: the segment is simply no longer there, the
+    /// chunk is refused as `WrongLineage`, and the receiver abandons a partial
+    /// copy it was never going to be able to finish.
+    ///
+    /// The receiver's retry is the whole transfer, not the chunk, and it is
+    /// idempotent — `is_complete` skips what already landed and verified — so
+    /// there is nothing to resume into a hole.
     fn sealed_handle(&self, segment_id: Uuid) -> Result<SealedSegmentHandle, (ErrorCode, String)> {
         if let Some(handle) = self
             .broker
