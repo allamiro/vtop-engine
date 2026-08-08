@@ -82,6 +82,34 @@ forward() { # pod localport remoteport
   sleep 4
 }
 
+# Wait for the StatefulSet to CREATE its pods before waiting for them to be
+# ready.
+#
+# `kubectl wait` does not wait for resources to appear: given a label selector
+# that currently matches nothing it fails immediately with "no matching
+# resources found". `helm upgrade --install` returns once the objects are
+# accepted by the API server, not once the StatefulSet controller has produced
+# pods, so there is a window — usually a fraction of a second, occasionally
+# longer — where the selector matches nothing and the readiness wait dies
+# instantly with a message that reads like the pods will never come:
+#
+#     error: no matching resources found
+#     vtop-0   0/1   Pending   0   0s
+#
+# Timing-dependent, so it passes almost always and fails for reasons unrelated
+# to the thing under test. Found by running the whole suite against a freshly
+# built image rather than by reading.
+await_pods_exist() { # namespace count
+  for _ in $(seq 1 60); do
+    have="$(kubectl -n "$1" get pods -l "app.kubernetes.io/instance=${REL}" \
+      --no-headers 2>/dev/null | grep -c . || true)"
+    [ "${have:-0}" -ge "$2" ] && return 0
+    sleep 2
+  done
+  kubectl -n "$1" get pods || true
+  fail "namespace $1 never produced $2 pod(s); the StatefulSet did not create them"
+}
+
 # ---------------------------------------------------------------------------
 # Identities. The chart refuses to render without them by design (#81), so a
 # smoke test has to mint a real CA and per-ordinal leaves with the CNs and SANs
@@ -145,6 +173,7 @@ helm upgrade --install "$REL" helm/vtop -n "$NS" \
 # readiness directly reports the state that matters instead of failing on a
 # transient one.
 log "waiting for all three pods to become Ready"
+await_pods_exist "$NS" 3
 kubectl -n "$NS" wait --for=condition=ready pod -l "app.kubernetes.io/instance=${REL}" \
   --timeout=180s >/dev/null || {
     kubectl -n "$NS" get pods
@@ -294,6 +323,7 @@ helm upgrade --install "$REL" helm/vtop -n "$NEIGHBOUR_NS" \
   --set image.pullPolicy=IfNotPresent \
   --timeout 5m >/dev/null
 
+await_pods_exist "$NEIGHBOUR_NS" 1
 kubectl -n "$NEIGHBOUR_NS" wait --for=condition=ready pod -l "app.kubernetes.io/instance=${REL}" \
   --timeout=180s >/dev/null || fail "the neighbour release never became Ready"
 
@@ -556,6 +586,7 @@ for uuid in "$UUID_0" "$UUID_1" "$UUID_2"; do
 done
 
 log "waiting for the whole replicated range to become Ready"
+await_pods_exist "$REPLICATED_NS" 3
 kubectl -n "$REPLICATED_NS" wait --for=condition=ready pod -l "app.kubernetes.io/instance=${REL}" \
   --timeout=240s >/dev/null || {
     kubectl -n "$REPLICATED_NS" get pods
