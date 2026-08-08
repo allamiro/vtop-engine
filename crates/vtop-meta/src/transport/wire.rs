@@ -1038,13 +1038,24 @@ impl AdminError {
             MAX_ERROR_DETAIL_BYTES,
             "admin error",
         )?;
-        // Two bytes rather than one, so "not a redirect", "a redirect to a
-        // known node", and "a redirect with no leader yet" stay three distinct
-        // answers. Collapsing the last two would make an election gap look
-        // like a routing decision, and a client would chase a leader that does
-        // not exist.
+        // NOTHING APPENDED when there is no redirect, which keeps the common
+        // case byte-identical to the pre-#292 encoding.
+        //
+        // This is not tidiness, it is version skew. An older decoder ends with
+        // `finish()`, which rejects trailing bytes — so unconditionally
+        // appending a tag would make an old client fail to read EVERY admin
+        // error, not just a redirect. It would lose the message at exactly the
+        // moment the message is the only thing it has. Emitting the extension
+        // only when there is something to say means an old client keeps working
+        // for every ordinary error, and the one frame it cannot read is the one
+        // it could never have acted on anyway.
+        //
+        // Two tags rather than one, so "a redirect to a known node" and "a
+        // redirect with no leader yet" stay distinct. Collapsing them would make
+        // an election gap look like a routing decision, and a client would chase
+        // a leader that does not exist.
         match self.not_leader {
-            None => out.push(0),
+            None => {}
             Some(NotLeaderHint { leader: None }) => out.push(1),
             Some(NotLeaderHint { leader: Some(id) }) => {
                 out.push(2);
@@ -1067,6 +1078,10 @@ impl AdminError {
             None
         } else {
             match reader.u8("admin error redirect tag")? {
+                // 0 was emitted by an earlier revision of this branch to mean
+                // "not a redirect". Nothing writes it now — absence carries that
+                // meaning — but it decodes, so a peer built from that revision
+                // stays readable.
                 0 => None,
                 1 => Some(NotLeaderHint { leader: None }),
                 2 => Some(NotLeaderHint {
@@ -1115,6 +1130,30 @@ mod tests {
             let decoded = AdminError::decode(&error.encode().unwrap()).unwrap();
             assert_eq!(decoded, error);
         }
+
+        // BYTE-IDENTICAL to the pre-#292 encoding when there is no redirect,
+        // which is what keeps an older peer able to read ordinary errors. If
+        // this ever regresses, every old client loses every error message.
+        let mut legacy_shape = Vec::new();
+        put_bounded_str(
+            &mut legacy_shape,
+            "nope",
+            MAX_ERROR_DETAIL_BYTES,
+            "admin error",
+        )
+        .unwrap();
+        assert_eq!(
+            AdminError {
+                message: "nope".to_owned(),
+                not_leader: None,
+            }
+            .encode()
+            .unwrap(),
+            legacy_shape,
+            "a non-redirect error must encode exactly as it did before the \
+             redirect field existed, or an older decoder rejects it as trailing \
+             bytes and loses the message"
+        );
 
         // The pre-#292 encoding: a bounded string and nothing after it.
         let mut legacy = Vec::new();

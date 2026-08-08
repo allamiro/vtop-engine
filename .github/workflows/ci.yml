@@ -171,6 +171,16 @@ jobs:
               # triggered nothing. That is how a scenario stayed red on main
               # without anyone noticing.
               - 'scripts/live-chaos/**'
+              # The two smoke scripts that gate the DEPLOYMENT paths. Listed
+              # here as well as under `scripts` because the two filters drive
+              # different jobs: `scripts` gates the e2e/compose work, `shell`
+              # gates the lint. Adding them to the shellcheck step without
+              # adding them here meant a PR touching only a smoke script skipped
+              # the shellcheck job entirely — so the lint would never once run
+              # against the files it was added for, which is the same
+              # unlinted-shell hole the live-chaos entry below exists to close.
+              - 'scripts/k8s-smoke.sh'
+              - 'scripts/e2e-smoke.sh'
               # The release-notes generator only ever runs during a tag build,
               # where a failure means a published release with a broken body and
               # no second chance to get it right before people see it. Lint it
