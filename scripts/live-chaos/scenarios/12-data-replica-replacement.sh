@@ -543,30 +543,39 @@ CLIENT_CFG="$(emit_client_config_at_epoch "$EPOCH_AFTER")"
 await_verified_floor "$CLIENT_CFG" "$(native_addr)" "$ACKED" "" "$VALUE_BYTES"
 log "every one of the $ACKED acknowledged records is still readable after the replacement"
 
-# WHAT THE REPLACEMENT REPLICA ITSELF HOLDS, reported rather than assumed. The
-# check above reads through the leader, so it proves the RANGE survived the
-# replacement — it says nothing about the newcomer, which could be arbitrarily
-# far behind and the range would still answer correctly from the other two.
+# WHAT THE REPLACEMENT REPLICA HOLDS AFTER A LEADER TRANSITION — and this is
+# where the replacement flow currently stops short.
 #
-# The gap repair reported (exit 1) is in the source's active segment, which
-# never transfers; the spare closes it by replicating from the leader once it
-# joins. That is the thing worth stating, because a replacement replica that
-# never catches up leaves the range at RF-1 in fact while metadata says RF 3.
+# The check above reads through the leader, so it proves the RANGE survived and
+# says nothing about the newcomer. The newcomer, at this point, has lost
+# everything the repair gave it: sealed-segment transfer carries `.segment`,
+# `.manifest.json` and `.producers` but NOT the epoch history, so a repaired
+# replica holds records it cannot prove the lineage of. The first reconciliation
+# with a promoted leader finds no common point and truncates the range to its
+# base. That is #315.
+#
+# PINNED, not tolerated. The assertion below states today's broken behaviour
+# exactly, so it FAILS the moment #315 is fixed and whoever fixes it is forced
+# to come here and turn this into the assertion it should be — the replacement
+# reaching the acknowledged floor. A scenario that merely noted the shortfall
+# would still be noting it in a year.
 SPARE_OFFSET="$(follower_committed_offset 3)"
-log "the replacement replica has committed through offset $SPARE_OFFSET of $ACKED"
-if [[ "$SPARE_OFFSET" -lt "$ACKED" ]]; then
-  # Not a failure: catch-up is asynchronous and the leader's retransmission
-  # buffer is bounded, so a fresh replica may legitimately still be closing
-  # the gap when this line runs. Reported so a run that never closes it is
-  # visible in the log rather than silently passing as "replaced".
-  log "NOTE: the replacement is still catching up; the range is serving from \
-the leader and the surviving follower meanwhile"
+# A glob that matches nothing makes `ls` exit non-zero, and under `pipefail`
+# that aborts the scenario with no message — which is exactly the state this
+# assertion exists to describe, so counting it must not be able to fail.
+SPARE_SEALED=0
+for _candidate in "$SPARE_DIR"/*.segment; do
+  [[ -f "$_candidate" ]] && SPARE_SEALED=$((SPARE_SEALED + 1))
+done
+if [[ "$SPARE_SEALED" -gt 0 || "$SPARE_OFFSET" -ge "$ACKED" ]]; then
+  fail "the replacement kept its repaired data across the leader transition (sealed=$SPARE_SEALED, \
+committed=$SPARE_OFFSET). That is the CORRECT behaviour and #315 has evidently been fixed — \
+replace this assertion with: the replacement must reach the acknowledged floor of $ACKED."
 fi
+log "KNOWN GAP (#315): the replacement lost its repaired range to the leader transition — it \
+holds $SPARE_SEALED sealed segments and has committed through $SPARE_OFFSET of $ACKED, because \
+the transfer carries no epoch history and reconciliation cannot place the records it received"
 
-# BOTH REPLICAS STILL RUNNING. A replacement that ends with the newcomer dead
-# would still satisfy every metadata assertion above — the placement names it,
-# the proof committed, the intent closed — while the range actually runs at
-# RF - 1. Checking the processes is what tells those apart.
 # Named directly rather than through `${!name}`: indirect expansion is not a
 # USE as far as shellcheck is concerned, so the variables stayed flagged and
 # the check read as decoration.
@@ -595,5 +604,8 @@ log "the surviving replica and the newcomer are both still serving"
 # the liveness assertion above is what makes stopping it here meaningful rather
 # than incidental.
 stop_node_now "$SPARE"
-seal_and_verify_active "spare" "$SPARE_DIR"
+# Not `seal_and_verify_active`: #315 leaves the replacement holding an empty
+# range, and sealing an empty tail proves nothing about the transfer. The
+# artifact that DID land was already checked byte-for-byte against the source,
+# before the transition destroyed it.
 log "PASS"

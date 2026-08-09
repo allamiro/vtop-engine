@@ -38,10 +38,13 @@ than an acknowledged gap.
 **Not in it:** a lost replica had no road back. The transfer plane did not
 exist.
 
-## v0.3.0 — the durability keystone
+## v0.3.0 — verified sealed-segment transfer and evidence-gated retirement
 
-The theme is **a replica that is lost can be replaced, and the replacement is
-proven before the original is retired.**
+The theme is **a sealed segment can move between replicas verbatim, and the
+copy is proven before the original is retired.**
+
+It stops short of a replacement that resumes serving. See the limitations
+below — that boundary is the most important thing on this page.
 
 - **#270** — segment rolling at runtime, verbatim sealed-segment transfer, and
   follower adoption. A sealed segment moves byte-for-byte; the receiver
@@ -85,6 +88,15 @@ reopen quietly.
 
 ### Known limitations in v0.3.0
 
+- **A repaired replica does not survive a leader transition (#315).** The
+  transfer carries `.segment`, `.manifest.json` and `.producers` but not the
+  epoch history, so a repaired replica holds records whose lineage it cannot
+  prove. The first reconciliation with a promoted leader truncates its range to
+  the base. Repair therefore populates a directory and hands an operator the
+  bytes; it does not yet bring a replica back into service. This is the
+  boundary of what "replacement" means in this release.
+- Only sealed segments transfer, so a gap remains in the leader's active
+  segment that the retransmission buffer may be unable to replay (#306).
 - Replacement is **operator-driven**. A follower learns only that it was
   refused; the leader is what knows its retransmission buffer no longer covers
   the gap. Where that signal belongs is a separate design question, deliberately
