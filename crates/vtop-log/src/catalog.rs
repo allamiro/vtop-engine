@@ -90,6 +90,26 @@ pub struct StartupCatalog {
     /// entries above describe the directory as it stands, doomed segments
     /// included. `SegmentSet::open_in` is what finishes the truncation.
     pub truncate_intent: Option<PathBuf>,
+    /// Interrupted atomic writes: `.{stem}.<kind>.<uuid>.tmp` files whose
+    /// rename never happened.
+    ///
+    /// REPORTED, NOT QUARANTINED. These used to be quarantined, and a range
+    /// with any quarantined bundle refuses to open — so a `kill -9` landing
+    /// inside a commit write left a node that would not start, and the remedy
+    /// was an operator deleting a file whose name gave them no way to know
+    /// that deleting it was safe (#310).
+    ///
+    /// It is safe by construction. `write_atomic` writes the temp, fsyncs, and
+    /// renames over the real name; if the process died before the rename then
+    /// the committed state is either the previous file or no file, and in
+    /// neither case does the temp carry anything. Quarantine is the right
+    /// answer for an artifact that MIGHT hold records — a half-written
+    /// segment, an undecodable manifest — and the wrong one for the losing
+    /// side of a rename, which the `<uuid>.tmp` naming already identifies.
+    ///
+    /// Discovery still only reports, keeping its promise above.
+    /// `SegmentSet::open_in` removes them, because it owns the directory.
+    pub temporary: Vec<PathBuf>,
 }
 
 impl StartupCatalog {
@@ -115,6 +135,7 @@ impl StartupCatalog {
 
         let mut bundles = BTreeMap::<PathBuf, ArtifactBundle>::new();
         let mut quarantined = Vec::new();
+        let mut temporary = Vec::new();
         let mut truncate_intent = None;
         for entry in discovered {
             let Some(classification) = classify_artifact(&entry.path) else {
@@ -143,10 +164,7 @@ impl StartupCatalog {
                 continue;
             }
             if classification.kind == ArtifactKind::Temporary {
-                quarantined.push(QuarantinedArtifacts {
-                    paths: vec![entry.path],
-                    reasons: vec![QuarantineReason::IncompleteAtomicWrite],
-                });
+                temporary.push(entry.path);
                 continue;
             }
             bundles.entry(classification.base).or_default().insert(
@@ -240,6 +258,7 @@ impl StartupCatalog {
         });
         Ok(Self {
             entries,
+            temporary,
             quarantined,
             truncate_intent,
         })
@@ -950,7 +969,7 @@ mod tests {
     }
 
     #[test]
-    fn quarantines_conflicting_primaries_orphans_and_atomic_temporary_files() {
+    fn quarantines_conflicting_primaries_and_orphans_but_reports_interrupted_writes() {
         let directory = tempdir().unwrap();
         let active = directory.path().join("both.active");
         let sealed = directory.path().join("both.segment");
@@ -970,7 +989,20 @@ mod tests {
         let catalog = StartupCatalog::discover(directory.path()).unwrap();
 
         assert!(catalog.entries.is_empty());
-        assert_eq!(catalog.quarantined.len(), 3);
+        // TWO, not three. An interrupted atomic write is reported separately
+        // and no longer quarantines the range — quarantine is for artifacts
+        // that might hold records, and the losing side of a rename does not
+        // (#310).
+        assert_eq!(catalog.quarantined.len(), 2);
+        assert_eq!(
+            catalog.temporary.len(),
+            1,
+            "the interrupted write must still be REPORTED, so the opener can remove it"
+        );
+        assert!(catalog.temporary[0]
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".tmp")));
         assert!(catalog
             .quarantined
             .iter()
@@ -983,12 +1015,17 @@ mod tests {
             .any(|item| has_reason(item, |reason| {
                 matches!(reason, QuarantineReason::OrphanSidecars)
             })));
-        assert!(catalog
-            .quarantined
-            .iter()
-            .any(|item| has_reason(item, |reason| {
-                matches!(reason, QuarantineReason::IncompleteAtomicWrite)
-            })));
+        assert!(
+            !catalog
+                .quarantined
+                .iter()
+                .any(|item| has_reason(item, |reason| matches!(
+                    reason,
+                    QuarantineReason::IncompleteAtomicWrite
+                ))),
+            "an interrupted atomic write must not quarantine the range: it made a kill -9 during \
+             a commit write leave a node that would not start"
+        );
     }
 
     fn descriptor_v2(segment_id: u128, base_offset: u64) -> crate::SegmentDescriptorV2 {

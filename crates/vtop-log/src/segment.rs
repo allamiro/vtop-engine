@@ -4944,11 +4944,15 @@ mod tests {
         .unwrap();
 
         let catalog = crate::StartupCatalog::discover(directory.path()).unwrap();
+        assert_eq!(
+            catalog.temporary.len(),
+            1,
+            "a partial sidecar is an interrupted write, reported so the opener can remove it"
+        );
         assert!(
-            catalog.quarantined.iter().any(|bundle| bundle
-                .reasons
-                .contains(&crate::QuarantineReason::IncompleteAtomicWrite)),
-            "a partial sidecar is an interrupted write, not corruption: {:?}",
+            catalog.quarantined.is_empty(),
+            "and it must NOT quarantine the range — that is what left a node unable to start \
+             after a crash landed inside a write (#310): {:?}",
             catalog.quarantined
         );
     }

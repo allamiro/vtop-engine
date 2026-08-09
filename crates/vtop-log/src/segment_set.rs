@@ -183,6 +183,32 @@ fn refuse_if_condemned(env: &Env, directory: &Path) -> VtopLogResult<()> {
     )))
 }
 
+/// Delete the losing halves of interrupted atomic writes.
+///
+/// Discovery only reports them (see `StartupCatalog::temporary`); this is the
+/// path that owns the directory, so this is where they go. A `.tmp` whose
+/// rename never happened carries nothing committed — the real file is either
+/// the previous version or absent — so removing it cannot lose anything, and
+/// leaving it made a range refuse to open after a crash landed inside a write
+/// (#310).
+///
+/// A failure to remove one is NOT fatal. The range is openable either way, and
+/// refusing to start over an undeletable stray file would reintroduce the
+/// outage this removes.
+fn sweep_interrupted_writes(env: &Env, catalog: &StartupCatalog) {
+    for path in &catalog.temporary {
+        // Printed rather than traced: this crate carries no logging
+        // dependency, and a line on stderr is enough for a condition an
+        // operator will otherwise never see.
+        if let Err(error) = env.storage.remove_file(path) {
+            eprintln!(
+                "could not remove interrupted atomic write {}: {error}",
+                path.display()
+            );
+        }
+    }
+}
+
 impl SegmentSet {
     /// Open every segment of the range in `directory`.
     ///
@@ -206,6 +232,7 @@ impl SegmentSet {
         // open refuses like any other ambiguity.
         finish_pending_truncation(env, &directory)?;
         let catalog = StartupCatalog::discover_in(env, &directory)?;
+        sweep_interrupted_writes(env, &catalog);
         if !catalog.quarantined.is_empty() {
             // Name every quarantined bundle and its reasons in the refusal.
             // This error is what an operator sees at startup, and "N
@@ -320,6 +347,7 @@ impl SegmentSet {
         // whatever was appended to it.
         finish_pending_truncation(env, &directory)?;
         let catalog = StartupCatalog::discover_in(env, &directory)?;
+        sweep_interrupted_writes(env, &catalog);
         if !catalog.quarantined.is_empty() {
             return Err(LogError::InvalidDescriptor(format!(
                 "range at {} has {} quarantined artifact bundle(s); refusing to adopt an \
@@ -2142,5 +2170,53 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A range whose commit write was interrupted still opens, and the debris
+    /// is gone afterwards.
+    ///
+    /// This is #310, and the reason it is written by hand rather than by
+    /// killing a process: the real failure needs a `kill -9` to land inside
+    /// `write_atomic`, between the temp file and the rename. A test that waits
+    /// for that window reproduces the bug perhaps one run in ten, which is how
+    /// it reached a release — it looked like a flaky scenario.
+    ///
+    /// Creating the temp directly is exactly the state the crash leaves, and
+    /// asserts on it every run.
+    #[test]
+    fn an_interrupted_commit_write_does_not_stop_a_range_opening() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::real();
+        let mut set = SegmentSet::create_in(
+            &env,
+            dir.path(),
+            descriptor(),
+            crate::SegmentConfig::default(),
+        )
+        .unwrap();
+        let producer = Uuid::from_u128(1);
+        set.append_group(&[record(producer, 0)], Durability::Fsync, Uuid::new_v4())
+            .unwrap();
+        drop(set);
+
+        // The losing half of an atomic commit write: fsynced, never renamed.
+        let debris = dir
+            .path()
+            .join(".range-00000000000000000000.commit.052480a2-9d38-4915-b5c1-773eb42625a7.tmp");
+        std::fs::write(&debris, b"half a commit record").unwrap();
+
+        let reopened = SegmentSet::open_in(&env, dir.path())
+            .expect("an interrupted commit write must not make a range unopenable")
+            .expect("the range exists");
+        assert_eq!(
+            reopened.next_offset(),
+            1,
+            "the record written before the interruption is still there"
+        );
+        assert!(
+            !debris.exists(),
+            "the opener owns the directory, so it should have swept the debris rather than \
+             leaving an operator to delete a file whose name cannot tell them that is safe"
+        );
     }
 }
