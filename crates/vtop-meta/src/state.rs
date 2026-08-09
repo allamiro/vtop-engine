@@ -3721,7 +3721,15 @@ impl MetaStateMachine {
         ))
     }
 
-    fn active_placement_candidates(&self) -> Vec<PlacementCandidate> {
+    /// The nodes a placement may be built from, as the state machine sees them.
+    ///
+    /// `pub(crate)` so a linearizable read can compute the placement the
+    /// algorithm WOULD choose (#308). An operator can see neither this set nor
+    /// the rendezvous, and `commit_segment_placement` compares their proposal
+    /// against it positionally — so without a way to ask, a first placement
+    /// could only be reached by guessing an order and resubmitting until one
+    /// was accepted.
+    pub(crate) fn active_placement_candidates(&self) -> Vec<PlacementCandidate> {
         let mut candidates = Vec::new();
         for (key_bytes, value) in &self.records {
             let Ok(MetaKey::Node { node_uuid }) = MetaKey::decode(key_bytes) else {

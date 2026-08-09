@@ -30,7 +30,8 @@ use crate::keys::MetaNodeId;
 use crate::storage::hardstate::HardState;
 use crate::storage::log::{MetaLogEntry, MetaLogPayload, MetaMembership};
 use crate::wire::{
-    put_bounded_str, put_i64, put_u16, put_u32, put_u64, put_u8, put_uuid, CodecError, Reader,
+    put_bounded_str, put_bytes32, put_i64, put_u16, put_u32, put_u64, put_u8, put_uuid, CodecError,
+    Reader,
 };
 use std::io;
 use thiserror::Error;
@@ -77,6 +78,8 @@ pub const KIND_ADMIN_MEMBERSHIP_RESP: u16 = 18;
 // "the leader is healthy" from "my generation was stale".
 pub const KIND_ADMIN_READ_RANGE_LEASE_REQ: u16 = 19;
 pub const KIND_ADMIN_READ_RANGE_LEASE_RESP: u16 = 20;
+pub const KIND_ADMIN_READ_SEGMENT_PLACEMENT_REQ: u16 = 21;
+pub const KIND_ADMIN_READ_SEGMENT_PLACEMENT_RESP: u16 = 22;
 
 /// Bound for node ids carried in one admin membership request. This is
 /// intentionally tighter than the storage codec's compatibility ceiling.
@@ -700,6 +703,323 @@ impl AdminStatusResponse {
         })
     }
 }
+
+/// The segment record itself, as of the same fenced read.
+///
+/// CARRIED ALONGSIDE THE PLACEMENT because the flow needs both and they are
+/// different records. All four replacement commands take
+/// `--expected-segment-generation` as well as
+/// `--expected-placement-generation`, and returning only the latter left the
+/// caller exactly where they started for the other half: retaining a prior
+/// `Ack` or guessing until a write was accepted.
+///
+/// `content_root` is here so an operator can compare the proof they are about
+/// to submit against what metadata already believes, before spending a round
+/// trip through consensus to be told they disagree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdminSegmentView {
+    pub segment_generation: u64,
+    pub base_offset: u64,
+    pub next_offset: u64,
+    pub content_root: [u8; 32],
+    /// The same tags the durable encoding uses, so the two cannot drift apart
+    /// in meaning.
+    pub state_tag: u8,
+    pub sealed_by_epoch: u64,
+}
+
+impl AdminSegmentView {
+    /// The state name an operator reads, or `None` for a tag this build does
+    /// not know.
+    ///
+    /// `None` rather than a guess: a newer leader can commit a state this
+    /// binary has never heard of, and printing the nearest known name would be
+    /// a confident lie about a segment's lifecycle.
+    pub fn state_name(&self) -> Option<&'static str> {
+        Some(match self.state_tag {
+            1 => "SealedUnverified",
+            2 => "Verified",
+            3 => "Repairing",
+            4 => "RetirePlanned",
+            5 => "Retired",
+            6 => "Quarantined",
+            7 => "RetentionPlanned",
+            8 => "RetentionExpired",
+            _ => return None,
+        })
+    }
+}
+
+/// Which segment to read the placement for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdminReadSegmentPlacementRequest {
+    pub topic_uuid: Uuid,
+    pub range_uuid: Uuid,
+    pub segment_uuid: Uuid,
+    /// Ask what the deterministic placement WOULD be at this factor. Zero
+    /// means "do not compute one".
+    ///
+    /// Necessary because `CommitSegmentPlacement` compares a proposal
+    /// positionally against `select_replicas` over the currently Active nodes,
+    /// and an operator can see neither the candidate set nor the algorithm. A
+    /// FIRST placement was therefore uncomputable from outside: there was no
+    /// prior placement to read, and the only route to the right list was to
+    /// guess an order and resubmit until one was accepted.
+    pub for_replication_factor: u8,
+}
+
+impl AdminReadSegmentPlacementRequest {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_uuid(&mut out, self.topic_uuid);
+        put_uuid(&mut out, self.range_uuid);
+        put_uuid(&mut out, self.segment_uuid);
+        put_u8(&mut out, self.for_replication_factor);
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut reader = Reader::new(bytes);
+        let request = Self {
+            topic_uuid: reader.uuid("topic uuid")?,
+            range_uuid: reader.uuid("range uuid")?,
+            segment_uuid: reader.uuid("segment uuid")?,
+            for_replication_factor: reader.u8("for replication factor")?,
+        };
+        reader.finish()?;
+        Ok(request)
+    }
+}
+
+/// An open rebalance move, if one is in flight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdminRebalanceIntentView {
+    pub from_node_uuid: Uuid,
+    pub to_node_uuid: Uuid,
+    pub placement_generation_at_proposal: u64,
+}
+
+/// A segment's placement plus the tokens needed to act on it.
+///
+/// Carries the generation because every command in the replacement flow is a
+/// compare-and-swap against it, and the replica list IN PLACEMENT ORDER
+/// because `CommitSegmentPlacement` compares proposals positionally. Reading
+/// either without the other leaves the caller guessing at half the input,
+/// which is the situation this read exists to remove.
+///
+/// The open intent is here for the same reason. It is not decoration: while
+/// one stands, the segment refuses placement updates, further proposals and
+/// retention planning, so an operator who cannot see it has no way to tell a
+/// stale generation from a blocked segment — the two produce similar-looking
+/// rejections and want opposite responses.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdminReadSegmentPlacementResponse {
+    /// False when no placement has been committed for this segment. Distinct
+    /// from a placement that exists with an empty replica list, which would be
+    /// a placement somebody committed and then emptied.
+    pub found: bool,
+    pub generation: u64,
+    /// The durability TARGET, never inferred from the list length: the list
+    /// runs at RF + 1 while a rebalance is in flight and below it after a
+    /// plain retirement.
+    pub declared_replication_factor: u8,
+    /// In placement order. `CommitSegmentPlacement` compares positionally, so
+    /// the order is part of the value rather than a presentation detail.
+    pub replica_nodes: Vec<Uuid>,
+    pub rebalance_intent: Option<AdminRebalanceIntentView>,
+    /// The segment record. `None` when no segment by that id exists, which is
+    /// a different answer from a segment with no placement.
+    pub segment: Option<AdminSegmentView>,
+    /// What the deterministic placement would be at the requested factor, or
+    /// why it cannot be computed.
+    ///
+    /// `None` when the request did not ask. `Err` carries the algorithm's own
+    /// refusal — most often too few distinct failure domains, which is the
+    /// answer an operator most needs, because the remedy is
+    /// `set-node-placement-attrs` on nodes that currently have no domain and
+    /// nothing else in the flow would have said so.
+    pub proposal: Option<Result<Vec<Uuid>, String>>,
+    /// The applied index the read was fenced at, so a caller can tell an
+    /// answer from a newer state machine apart from a replayed older one.
+    pub read_at_applied_index: u64,
+}
+
+impl AdminReadSegmentPlacementResponse {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_u8(&mut out, u8::from(self.found));
+        put_u64(&mut out, self.generation);
+        put_u8(&mut out, self.declared_replication_factor);
+        put_u32(&mut out, self.replica_nodes.len() as u32);
+        for node in &self.replica_nodes {
+            put_uuid(&mut out, *node);
+        }
+        match &self.rebalance_intent {
+            None => put_u8(&mut out, 0),
+            Some(intent) => {
+                put_u8(&mut out, 1);
+                put_uuid(&mut out, intent.from_node_uuid);
+                put_uuid(&mut out, intent.to_node_uuid);
+                put_u64(&mut out, intent.placement_generation_at_proposal);
+            }
+        }
+        match &self.segment {
+            None => put_u8(&mut out, 0),
+            Some(segment) => {
+                put_u8(&mut out, 1);
+                put_u64(&mut out, segment.segment_generation);
+                put_u64(&mut out, segment.base_offset);
+                put_u64(&mut out, segment.next_offset);
+                put_bytes32(&mut out, &segment.content_root);
+                put_u8(&mut out, segment.state_tag);
+                put_u64(&mut out, segment.sealed_by_epoch);
+            }
+        }
+        match &self.proposal {
+            None => put_u8(&mut out, 0),
+            Some(Ok(nodes)) => {
+                put_u8(&mut out, 1);
+                put_u32(&mut out, nodes.len() as u32);
+                for node in nodes {
+                    put_uuid(&mut out, *node);
+                }
+            }
+            Some(Err(reason)) => {
+                put_u8(&mut out, 2);
+                // TRUNCATED rather than refused. `encode` has no error channel,
+                // and this string is diagnostic prose from the placement
+                // algorithm — a reason clipped at 512 bytes still tells the
+                // operator which remedy they need, while a failure to encode
+                // would replace a usable answer with none at all. Cut on a char
+                // boundary so the result stays valid UTF-8.
+                let mut clipped = reason.as_str();
+                while clipped.len() > MAX_PROPOSAL_REASON {
+                    clipped = &clipped[..clipped
+                        .char_indices()
+                        .take_while(|(index, _)| *index < MAX_PROPOSAL_REASON)
+                        .last()
+                        .map_or(0, |(index, _)| index)];
+                }
+                let _ = put_bounded_str(
+                    &mut out,
+                    clipped,
+                    MAX_PROPOSAL_REASON,
+                    "placement proposal refusal",
+                );
+            }
+        }
+        put_u64(&mut out, self.read_at_applied_index);
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut reader = Reader::new(bytes);
+        let found = reader.flag("found")?;
+        let generation = reader.u64("placement generation")?;
+        let declared_replication_factor = reader.u8("declared replication factor")?;
+        let count = reader.u32("replica count")?;
+        // CHECKED BEFORE THE LOOP, not inside it. Rejecting only after the
+        // first 1024 UUIDs have been read makes the bound a limit on what is
+        // decoded rather than on what may be CLAIMED — a peer sending an
+        // absurd count with no body still gets the decoder to allocate and
+        // work through it, and the refusal it eventually earns is "truncated",
+        // which describes the symptom rather than the lie.
+        if count > MAX_REPLICA_NODES {
+            return Err(CodecError::BoundExceeded {
+                what: "replica node list",
+                actual: count as usize,
+                maximum: MAX_REPLICA_NODES as usize,
+            });
+        }
+        let mut replica_nodes = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            replica_nodes.push(reader.uuid("replica node uuid")?);
+        }
+        let rebalance_intent = match reader.u8("rebalance intent presence")? {
+            0 => None,
+            1 => Some(AdminRebalanceIntentView {
+                from_node_uuid: reader.uuid("rebalance from uuid")?,
+                to_node_uuid: reader.uuid("rebalance to uuid")?,
+                placement_generation_at_proposal: reader.u64("rebalance placement generation")?,
+            }),
+            other => {
+                return Err(CodecError::UnknownTag {
+                    what: "rebalance intent presence",
+                    tag: u32::from(other),
+                })
+            }
+        };
+        let segment = match reader.u8("segment presence")? {
+            0 => None,
+            1 => Some(AdminSegmentView {
+                segment_generation: reader.u64("segment generation")?,
+                base_offset: reader.u64("segment base offset")?,
+                next_offset: reader.u64("segment next offset")?,
+                content_root: reader.bytes32("segment content root")?,
+                state_tag: reader.u8("segment state tag")?,
+                sealed_by_epoch: reader.u64("segment sealed by epoch")?,
+            }),
+            other => {
+                return Err(CodecError::UnknownTag {
+                    what: "segment presence",
+                    tag: u32::from(other),
+                })
+            }
+        };
+        let proposal = match reader.u8("proposal presence")? {
+            0 => None,
+            1 => {
+                let count = reader.u32("proposed replica count")?;
+                if count > MAX_REPLICA_NODES {
+                    return Err(CodecError::BoundExceeded {
+                        what: "proposed replica node list",
+                        actual: count as usize,
+                        maximum: MAX_REPLICA_NODES as usize,
+                    });
+                }
+                let mut nodes = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    nodes.push(reader.uuid("proposed replica node uuid")?);
+                }
+                Some(Ok(nodes))
+            }
+            2 => Some(Err(
+                reader.bounded_str(MAX_PROPOSAL_REASON, "placement proposal refusal")?
+            )),
+            other => {
+                return Err(CodecError::UnknownTag {
+                    what: "proposal presence",
+                    tag: u32::from(other),
+                })
+            }
+        };
+        let read_at_applied_index = reader.u64("read at applied index")?;
+        reader.finish()?;
+        Ok(Self {
+            found,
+            generation,
+            declared_replication_factor,
+            replica_nodes,
+            rebalance_intent,
+            segment,
+            proposal,
+            read_at_applied_index,
+        })
+    }
+}
+
+/// A ceiling on the replica list a peer may claim to be sending.
+///
+/// Not a policy limit on replication factor — it is far above any real one.
+/// It exists so `decode` cannot be told to reserve an enormous vector before
+/// it has read anything that would justify the size.
+const MAX_REPLICA_NODES: u32 = 1024;
+
+/// A ceiling on the placement algorithm's refusal text.
+///
+/// Generous for a sentence naming failure domains, and small enough that a
+/// peer cannot make a reader hold an unbounded string.
+const MAX_PROPOSAL_REASON: usize = 512;
 
 /// Which range to read the lease for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1474,5 +1794,132 @@ mod tests {
             PeerAppendResponse::decode(&[9]),
             Err(CodecError::UnknownTag { .. })
         ));
+    }
+
+    /// Every field survives a round trip, including the two the replacement
+    /// flow cannot work without.
+    ///
+    /// The replica list is checked for ORDER, not just membership: the state
+    /// machine compares proposals positionally, so a codec that preserved the
+    /// set while permuting it would break every multi-replica placement while
+    /// looking correct in any test that sorted first.
+    #[test]
+    fn a_segment_placement_response_round_trips_with_its_order_intact() {
+        let response = AdminReadSegmentPlacementResponse {
+            found: true,
+            generation: 9,
+            declared_replication_factor: 3,
+            replica_nodes: vec![
+                Uuid::from_u128(0x33),
+                Uuid::from_u128(0x11),
+                Uuid::from_u128(0x22),
+            ],
+            rebalance_intent: Some(AdminRebalanceIntentView {
+                from_node_uuid: Uuid::from_u128(0x11),
+                to_node_uuid: Uuid::from_u128(0x44),
+                placement_generation_at_proposal: 8,
+            }),
+            segment: Some(AdminSegmentView {
+                segment_generation: 4,
+                base_offset: 1_000,
+                next_offset: 2_000,
+                content_root: [0xAB; 32],
+                state_tag: 2,
+                sealed_by_epoch: 6,
+            }),
+            proposal: Some(Ok(vec![Uuid::from_u128(0x22), Uuid::from_u128(0x33)])),
+            read_at_applied_index: 4_321,
+        };
+        let decoded = AdminReadSegmentPlacementResponse::decode(&response.encode()).unwrap();
+        assert_eq!(decoded, response);
+        assert_eq!(
+            decoded.replica_nodes,
+            vec![
+                Uuid::from_u128(0x33),
+                Uuid::from_u128(0x11),
+                Uuid::from_u128(0x22)
+            ],
+            "placement order is the value, not a presentation detail"
+        );
+
+        // No intent, no placement: the shape an operator sees before the first
+        // commit, and the one most likely to be mis-encoded because it is all
+        // zeroes and absences.
+        let empty = AdminReadSegmentPlacementResponse {
+            found: false,
+            generation: 0,
+            declared_replication_factor: 0,
+            replica_nodes: Vec::new(),
+            rebalance_intent: None,
+            segment: None,
+            proposal: Some(Err(
+                "only 1 distinct failure domain for 3 replicas".to_owned()
+            )),
+            read_at_applied_index: 7,
+        };
+        assert_eq!(
+            AdminReadSegmentPlacementResponse::decode(&empty.encode()).unwrap(),
+            empty
+        );
+    }
+
+    /// A claimed replica count far beyond any real one is refused before the
+    /// decoder allocates on the strength of it.
+    #[test]
+    fn a_placement_response_claiming_an_absurd_replica_count_is_refused() {
+        let mut bytes = Vec::new();
+        put_u8(&mut bytes, 1);
+        put_u64(&mut bytes, 1);
+        put_u8(&mut bytes, 3);
+        put_u32(&mut bytes, u32::MAX);
+        let error = AdminReadSegmentPlacementResponse::decode(&bytes)
+            .expect_err("a length no cluster could produce must not be trusted");
+        assert!(
+            matches!(error, CodecError::BoundExceeded { .. }),
+            "expected a bound error, got {error}"
+        );
+    }
+
+    #[test]
+    fn a_segment_placement_request_round_trips() {
+        let request = AdminReadSegmentPlacementRequest {
+            topic_uuid: Uuid::from_u128(1),
+            range_uuid: Uuid::from_u128(2),
+            segment_uuid: Uuid::from_u128(3),
+            for_replication_factor: 3,
+        };
+        assert_eq!(
+            AdminReadSegmentPlacementRequest::decode(&request.encode()).unwrap(),
+            request
+        );
+    }
+
+    /// An unknown state tag is reported as unknown rather than mapped to the
+    /// nearest name a stale binary happens to know.
+    ///
+    /// A newer leader can commit a lifecycle state this build has never heard
+    /// of. Guessing would tell an operator a segment is `Verified` when it is
+    /// something else entirely — and they would act on it.
+    #[test]
+    fn an_unknown_segment_state_tag_is_not_guessed_at() {
+        let known = AdminSegmentView {
+            segment_generation: 1,
+            base_offset: 0,
+            next_offset: 1,
+            content_root: [0; 32],
+            state_tag: 4,
+            sealed_by_epoch: 1,
+        };
+        assert_eq!(known.state_name(), Some("RetirePlanned"));
+
+        let future = AdminSegmentView {
+            state_tag: 99,
+            ..known
+        };
+        assert_eq!(
+            future.state_name(),
+            None,
+            "a tag from a newer leader must read as unknown, not as the nearest known state"
+        );
     }
 }
