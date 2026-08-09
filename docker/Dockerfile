@@ -8,7 +8,7 @@
 # was tested (#80). To refresh: `docker buildx imagetools inspect rust:1-bookworm`
 # (and the same for debian:bookworm-slim below), update BOTH digest and the
 # comment date, and let CI rebuild. Digests captured 2026-07-18.
-FROM rust:1-bookworm@sha256:77fac8b98f9f46062bb680b6d25d5bcaabfc400143952ebc572e924bcbedc3fa AS builder
+FROM rust:1-bookworm@sha256:77fac8b98f9f46062bb680b6d25d5bcaabfc400143952ebc572e924bcbedc3fa AS chef
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake \
@@ -20,7 +20,33 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
+# Pinned like every other input here: an unpinned `cargo install` re-resolves
+# on every cache miss and would change the recipe format under us.
+RUN cargo install cargo-chef --locked --version 0.1.68
+
 WORKDIR /build
+
+# ---- Dependency plan --------------------------------------------------------
+# The recipe is derived from the manifests alone, so this stage's OUTPUT changes
+# only when a dependency changes — even though its input is the whole tree.
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ---- Dependency build -------------------------------------------------------
+# WHY THIS SPLIT EXISTS. `COPY . . && cargo build` puts every dependency in a
+# layer keyed on the source tree, so editing one line of Rust rebuilt all of
+# them — including librdkafka, which the "cmake-build" feature compiles FROM
+# SOURCE with a C toolchain. That was the bulk of a ~6 minute image build, paid
+# three times per CI run (the image job, the Helm job, and the compose lab),
+# and it was the critical path.
+#
+# Keyed on the recipe instead, this layer survives every change that does not
+# touch Cargo.toml or Cargo.lock — which is nearly every commit.
+FROM chef AS builder
+COPY --from=planner /build/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
+
 COPY . .
 # --locked: the image must build exactly the dependency set in Cargo.lock; a
 # lockfile drift is a build FAILURE here, never a silent re-resolution.
