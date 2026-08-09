@@ -213,10 +213,11 @@ fn encode_record_any(
     header: &AnyHeader,
     record: &LogRecord,
     relative_offset: u64,
+    max_record_bytes: u32,
 ) -> VtopLogResult<Vec<u8>> {
     match header {
-        AnyHeader::V1(v1) => encode_record(record, relative_offset, v1.config.max_record_bytes),
-        AnyHeader::V2(v2) => encode_record_v2(record, relative_offset, v2.config.max_record_bytes),
+        AnyHeader::V1(_) => encode_record(record, relative_offset, max_record_bytes),
+        AnyHeader::V2(_) => encode_record_v2(record, relative_offset, max_record_bytes),
     }
 }
 
@@ -302,7 +303,7 @@ pub struct ActiveSegment {
     /// one more group land — and if traffic then stopped, the range would sit
     /// on an oversized active segment that never seals and so never transfers,
     /// which is the outcome the whole setting exists to avoid.
-    roll_cap: Option<(u64, u64)>,
+    roll_cap: Option<crate::SegmentConfig>,
     /// What this segment inherited from its predecessor. Empty for a range's
     /// first segment. Kept because any rescan of this file — truncation, for
     /// one — must seed from the same frontier the original scan did.
@@ -567,21 +568,41 @@ impl ActiveSegment {
     /// Only ever lowers: a header limit is a property of the bytes already
     /// written, so raising it here would let a segment grow past what its own
     /// format was created to hold.
-    pub(crate) fn set_roll_cap(&mut self, max_bytes: u64, max_records: u64) {
-        self.roll_cap = Some((max_bytes, max_records));
+    pub(crate) fn set_roll_cap(&mut self, config: crate::SegmentConfig) {
+        self.roll_cap = Some(config);
     }
 
     fn effective_max_segment_bytes(&self) -> u64 {
-        match self.roll_cap {
-            Some((bytes, _)) => bytes.min(self.header.max_segment_bytes()),
+        match &self.roll_cap {
+            Some(cap) => cap.max_segment_bytes.min(self.header.max_segment_bytes()),
             None => self.header.max_segment_bytes(),
         }
     }
 
     fn effective_max_segment_records(&self) -> u64 {
-        match self.roll_cap {
-            Some((_, records)) => records.min(self.header.max_segment_records()),
+        match &self.roll_cap {
+            Some(cap) => cap
+                .max_segment_records
+                .min(self.header.max_segment_records()),
             None => self.header.max_segment_records(),
+        }
+    }
+
+    fn effective_max_group_bytes(&self) -> u64 {
+        match &self.roll_cap {
+            Some(cap) => cap.max_group_bytes.min(self.header.max_group_bytes()),
+            None => self.header.max_group_bytes(),
+        }
+    }
+
+    /// APPLIED TO WRITES ONLY. The read path keeps the header's bound, because
+    /// it decodes bytes this segment already holds — narrowing it there would
+    /// make a tail refuse to read records it legitimately accepted under the
+    /// limit in force when they were written.
+    fn effective_max_record_bytes(&self) -> u32 {
+        match &self.roll_cap {
+            Some(cap) => cap.max_record_bytes.min(self.header.max_record_bytes()),
+            None => self.header.max_record_bytes(),
         }
     }
 
@@ -791,17 +812,22 @@ impl ActiveSegment {
                         LogError::InvalidDescriptor("segment offset space exhausted".to_owned())
                     })?;
                     let relative_offset = offset - self.header.base_offset();
-                    let encoded = encode_record_any(&self.header, record, relative_offset)?;
+                    let encoded = encode_record_any(
+                        &self.header,
+                        record,
+                        relative_offset,
+                        self.effective_max_record_bytes(),
+                    )?;
                     group_bytes = group_bytes.checked_add(encoded.len() as u64).ok_or(
                         LogError::GroupTooLarge {
                             actual: u64::MAX,
-                            maximum: self.header.max_group_bytes(),
+                            maximum: self.effective_max_group_bytes(),
                         },
                     )?;
-                    if group_bytes > self.header.max_group_bytes() {
+                    if group_bytes > self.effective_max_group_bytes() {
                         return Err(LogError::GroupTooLarge {
                             actual: group_bytes,
-                            maximum: self.header.max_group_bytes(),
+                            maximum: self.effective_max_group_bytes(),
                         });
                     }
                     remember_pending_sequence(

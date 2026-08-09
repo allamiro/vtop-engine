@@ -632,8 +632,11 @@ impl SegmentSet {
         // range's tail enforces its own header, so without this the range goes
         // on filling to its original limit and the setting does nothing on
         // exactly the deployments that need it.
-        self.tail_mut()
-            .set_roll_cap(config.max_segment_bytes, config.max_segment_records);
+        // ALL FOUR bounds, not only the segment pair. A tail created under a
+        // 16 MiB record limit went on accepting a 2 MiB record after the node
+        // was reconfigured to 1 MiB, so the newly exposed limits simply were
+        // not in force until the range happened to roll.
+        self.tail_mut().set_roll_cap(config);
         Ok(())
     }
 
@@ -2366,5 +2369,70 @@ mod tests {
 
         set.set_roll_config(v1_only)
             .expect("a v1 range must accept a configuration v1 considers valid");
+    }
+
+    /// A lowered record limit binds the CURRENT tail, not just its successors.
+    ///
+    /// The tail validates each record against its own header, so a range
+    /// created under a generous limit went on accepting oversized records
+    /// after the node was reconfigured — the new limit was not in force until
+    /// the range happened to roll, which on a quiet range may be never.
+    ///
+    /// The read bound deliberately stays at the header's value; narrowing that
+    /// would make a tail refuse to decode records it legitimately accepted.
+    #[test]
+    fn a_lowered_record_limit_binds_the_tail_it_was_applied_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::real();
+        let mut set = SegmentSet::create_in(
+            &env,
+            dir.path(),
+            descriptor(),
+            crate::SegmentConfig {
+                max_record_bytes: 8 * 1024,
+                max_group_bytes: 64 * 1024,
+                max_segment_bytes: 1 << 20,
+                max_segment_records: 1_000,
+                ..crate::SegmentConfig::default()
+            },
+        )
+        .unwrap();
+
+        let producer = Uuid::from_u128(1);
+        let big = |sequence: u64| {
+            let mut entry = record(producer, sequence);
+            entry.value = vec![b'v'; 4 * 1024];
+            entry
+        };
+        // The premise: this record is legal under the limit the tail was born
+        // with, so the refusal below is caused by the override and nothing else.
+        set.append_group(&[big(0)], Durability::Buffered, Uuid::new_v4())
+            .expect("a 4 KiB record fits an 8 KiB limit");
+
+        set.set_roll_config(crate::SegmentConfig {
+            max_record_bytes: 1024,
+            max_group_bytes: 2048,
+            max_segment_bytes: 1 << 20,
+            max_segment_records: 1_000,
+            ..crate::SegmentConfig::default()
+        })
+        .expect("a valid combination");
+
+        let error = set
+            .append_group(&[big(1)], Durability::Buffered, Uuid::new_v4())
+            .expect_err("the same record must now be refused, on the same tail");
+        assert!(
+            matches!(error, LogError::RecordTooLarge { .. }),
+            "expected the record bound to reject it, got {error}"
+        );
+
+        // And the record written under the old limit is still part of the
+        // range: the cap governs what may be WRITTEN from now on, not what the
+        // segment already holds.
+        assert_eq!(
+            set.next_offset(),
+            1,
+            "the refused append must not have removed what was already accepted"
+        );
     }
 }
