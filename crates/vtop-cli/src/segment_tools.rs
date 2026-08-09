@@ -278,6 +278,17 @@ pub fn report_json(path: &Path, report: &VerifyReport, exit_code: i32) -> serde_
         "record_count": report.record_count,
         "content_bytes": report.content_bytes,
         "chunk_count": report.chunk_count,
+        // The segment's IDENTITY, which is what `meta register-sealed-segment`
+        // and `meta commit-replacement-proof` need and what nothing emitted.
+        // Re-derived from the frames by the scan, so it states what the bytes
+        // say rather than what the manifest claims.
+        "base_offset": report.base_offset,
+        "next_offset": report.next_offset,
+        "content_root": report
+            .content_root
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
         "achieved": level_name(report.achieved),
         "checks": report.checks.iter().map(|check| serde_json::json!({
             "name": check.name,
@@ -388,6 +399,16 @@ fn print_human_report(
             check.detail
         );
     }
+    println!(
+        "  offsets: [{}, {})  content root: {}",
+        report.base_offset,
+        report.next_offset,
+        report
+            .content_root
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
     println!(
         "  level: {} (required: {}) -> exit {exit_code}",
         level_name(report.achieved),
@@ -577,6 +598,9 @@ mod tests {
             record_count: 1,
             content_bytes: 100,
             chunk_count: 1,
+            base_offset: 0,
+            next_offset: 1,
+            content_root: [0_u8; 32],
             achieved: VerifyLevel::SelfConsistent,
             checks,
         }

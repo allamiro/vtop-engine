@@ -324,15 +324,16 @@ impl AdminReadSegmentPlacement for OpenraftConsensus {
             // machine no longer agrees with — refused, and for a reason
             // nothing in the answer would explain.
             let proposal = (for_replication_factor > 0).then(|| {
+                let candidates = storage.state().active_placement_candidates();
                 crate::placement::select_replicas(
                     segment_uuid,
-                    &storage.state().active_placement_candidates(),
+                    &candidates,
                     usize::from(for_replication_factor),
                     // The same rule `commit_segment_placement` applies, not a
                     // guess at it: distinctness is required above RF 1.
                     for_replication_factor > 1,
                 )
-                .map_err(|error| error.to_string())
+                .map_err(|error| refusal_with_remedy(&error, &candidates, for_replication_factor))
             });
             placement_view(
                 storage.state().record(&placement_key),
@@ -343,6 +344,63 @@ impl AdminReadSegmentPlacement for OpenraftConsensus {
             )
         }))
     }
+}
+
+/// The algorithm's refusal, plus the remedy for THIS refusal.
+///
+/// Written here rather than in the CLI because only this side knows why the
+/// selection failed. The error crosses the wire as text, so a client can do no
+/// better than print one remedy for every failure — and it did: it advised
+/// setting failure domains even when the factor was out of range, or when
+/// there were simply too few nodes. Advice that cannot work, printed
+/// immediately after the real reason, is worse than no advice, because an
+/// operator will try it before doubting it.
+fn refusal_with_remedy(
+    error: &crate::placement::PlacementError,
+    candidates: &[crate::placement::PlacementCandidate],
+    for_replication_factor: u8,
+) -> String {
+    use crate::placement::PlacementError;
+    let remedy = match error {
+        // Nothing about the cluster can make an out-of-range factor work.
+        PlacementError::InvalidReplicationFactor(_) => {
+            "Choose a replication factor within the supported range.".to_owned()
+        }
+        PlacementError::InsufficientEligibleNodes { requested, .. } => {
+            let distinct: std::collections::BTreeSet<&str> = candidates
+                .iter()
+                .map(|candidate| candidate.failure_domain.as_str())
+                .collect();
+            // THE TWO CASES LOOK THE SAME in the error and want different
+            // actions. Enough nodes but too few distinct domains is the one an
+            // operator hits after building a cluster through the CLI, where
+            // `register-node` leaves the domain empty — and no amount of
+            // adding nodes fixes it.
+            if candidates.len() >= *requested && distinct.len() < *requested {
+                let blank = candidates
+                    .iter()
+                    .filter(|candidate| candidate.failure_domain.trim().is_empty())
+                    .count();
+                format!(
+                    "There are {} eligible node(s) but only {} distinct failure domain(s), and a \
+                     placement above RF 1 needs one per replica. {} node(s) have no domain set at \
+                     all — `register-node` leaves it empty. Set one on each with \
+                     `set-node-placement-attrs`, then ask again.",
+                    candidates.len(),
+                    distinct.len(),
+                    blank
+                )
+            } else {
+                format!(
+                    "Only {} node(s) are eligible for placement — Active, with a placement weight \
+                     above zero. Register or reactivate enough nodes to satisfy a factor of {}.",
+                    candidates.len(),
+                    for_replication_factor
+                )
+            }
+        }
+    };
+    format!("{error}. {remedy}")
 }
 
 /// Shape two metadata records into the answer an operator acts on.
