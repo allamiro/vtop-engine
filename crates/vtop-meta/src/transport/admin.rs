@@ -10,11 +10,13 @@ use super::tls::{server_name, TlsMaterial};
 use super::wire::{
     read_frame, write_frame, AdminAddLearnerRequest, AdminChangeMembershipRequest, AdminError,
     AdminInitRequest, AdminMembershipResponse, AdminProposeRequest, AdminProposeResponse,
-    AdminReadRangeLeaseRequest, AdminReadRangeLeaseResponse, AdminStatusRequest,
-    AdminStatusResponse, NotLeaderHint, TransportError, TransportResult, VtpmFrame,
-    KIND_ADMIN_ADD_LEARNER_REQ, KIND_ADMIN_CHANGE_MEMBERSHIP_REQ, KIND_ADMIN_ERROR,
-    KIND_ADMIN_INIT_REQ, KIND_ADMIN_MEMBERSHIP_RESP, KIND_ADMIN_PROPOSE_REQ,
-    KIND_ADMIN_PROPOSE_RESP, KIND_ADMIN_READ_RANGE_LEASE_REQ, KIND_ADMIN_READ_RANGE_LEASE_RESP,
+    AdminReadRangeLeaseRequest, AdminReadRangeLeaseResponse, AdminReadSegmentPlacementRequest,
+    AdminReadSegmentPlacementResponse, AdminStatusRequest, AdminStatusResponse, NotLeaderHint,
+    TransportError, TransportResult, VtpmFrame, KIND_ADMIN_ADD_LEARNER_REQ,
+    KIND_ADMIN_CHANGE_MEMBERSHIP_REQ, KIND_ADMIN_ERROR, KIND_ADMIN_INIT_REQ,
+    KIND_ADMIN_MEMBERSHIP_RESP, KIND_ADMIN_PROPOSE_REQ, KIND_ADMIN_PROPOSE_RESP,
+    KIND_ADMIN_READ_RANGE_LEASE_REQ, KIND_ADMIN_READ_RANGE_LEASE_RESP,
+    KIND_ADMIN_READ_SEGMENT_PLACEMENT_REQ, KIND_ADMIN_READ_SEGMENT_PLACEMENT_RESP,
     KIND_ADMIN_STATUS_REQ, KIND_ADMIN_STATUS_RESP,
 };
 use crate::command::MetadataCommand;
@@ -48,6 +50,11 @@ pub trait AdminHandler: Send + Sync {
         &self,
         request: AdminReadRangeLeaseRequest,
     ) -> TransportResult<AdminReadRangeLeaseResponse>;
+
+    async fn read_segment_placement(
+        &self,
+        request: AdminReadSegmentPlacementRequest,
+    ) -> TransportResult<AdminReadSegmentPlacementResponse>;
 }
 
 /// Admin server, with or without TLS.
@@ -310,6 +317,19 @@ async fn dispatch_admin(
                 payload: response.encode(),
             })
         }
+        KIND_ADMIN_READ_SEGMENT_PLACEMENT_REQ => {
+            let request = AdminReadSegmentPlacementRequest::decode(&frame.payload)?;
+            // A READ, not a command. The placement it returns is the input to
+            // commands the caller may well not be allowed to issue, and
+            // requiring command authority to look would push operators toward
+            // holding a stronger certificate than the task needs.
+            authorize(authorizer.authorize_read(identity))?;
+            let response = handler.read_segment_placement(request).await?;
+            Ok(VtpmFrame {
+                kind: KIND_ADMIN_READ_SEGMENT_PLACEMENT_RESP,
+                payload: response.encode(),
+            })
+        }
         KIND_ADMIN_PROPOSE_REQ => {
             let request = AdminProposeRequest::decode(&frame.payload)?;
             authorize(authorizer.authorize_command(identity, &request.command))?;
@@ -513,6 +533,38 @@ impl AdminClient {
         match frame.kind {
             KIND_ADMIN_READ_RANGE_LEASE_RESP => {
                 Ok(AdminReadRangeLeaseResponse::decode(&frame.payload)?)
+            }
+            KIND_ADMIN_ERROR => {
+                let error = AdminError::decode(&frame.payload)?;
+                Err(TransportError::Protocol(error.message))
+            }
+            other => Err(TransportError::UnexpectedKind(other)),
+        }
+    }
+
+    /// Read a segment's placement through a linearizable fence.
+    pub async fn read_segment_placement(
+        &self,
+        topic_uuid: uuid::Uuid,
+        range_uuid: uuid::Uuid,
+        segment_uuid: uuid::Uuid,
+        for_replication_factor: u8,
+    ) -> TransportResult<AdminReadSegmentPlacementResponse> {
+        let frame = self
+            .round_trip(VtpmFrame {
+                kind: KIND_ADMIN_READ_SEGMENT_PLACEMENT_REQ,
+                payload: AdminReadSegmentPlacementRequest {
+                    topic_uuid,
+                    range_uuid,
+                    segment_uuid,
+                    for_replication_factor,
+                }
+                .encode(),
+            })
+            .await?;
+        match frame.kind {
+            KIND_ADMIN_READ_SEGMENT_PLACEMENT_RESP => {
+                Ok(AdminReadSegmentPlacementResponse::decode(&frame.payload)?)
             }
             KIND_ADMIN_ERROR => {
                 let error = AdminError::decode(&frame.payload)?;
@@ -774,6 +826,22 @@ mod tests {
     impl AdminHandler for CountingHandler {
         async fn status(&self) -> TransportResult<AdminStatusResponse> {
             Ok(stub_status(MetaNodeId(1)))
+        }
+
+        async fn read_segment_placement(
+            &self,
+            _request: AdminReadSegmentPlacementRequest,
+        ) -> TransportResult<AdminReadSegmentPlacementResponse> {
+            Ok(AdminReadSegmentPlacementResponse {
+                found: false,
+                generation: 0,
+                declared_replication_factor: 0,
+                replica_nodes: Vec::new(),
+                rebalance_intent: None,
+                segment: None,
+                proposal: None,
+                read_at_applied_index: 0,
+            })
         }
 
         async fn propose(
@@ -1385,6 +1453,12 @@ mod tests {
     #[async_trait]
     impl AdminHandler for NotLeaderHandler {
         async fn status(&self) -> TransportResult<AdminStatusResponse> {
+            self.refuse()
+        }
+        async fn read_segment_placement(
+            &self,
+            _: AdminReadSegmentPlacementRequest,
+        ) -> TransportResult<AdminReadSegmentPlacementResponse> {
             self.refuse()
         }
         async fn propose(&self, _: MetadataCommand) -> TransportResult<AdminProposeResponse> {

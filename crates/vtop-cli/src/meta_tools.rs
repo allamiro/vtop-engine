@@ -155,6 +155,49 @@ pub enum MetaCommand {
         #[arg(long)]
         request_id: Option<Uuid>,
     },
+    /// Read a segment's placement, generation, and any open rebalance (#308).
+    ///
+    /// THE READ EVERY OTHER COMMAND IN THIS FLOW DEPENDS ON. They all take
+    /// `--expected-placement-generation`, and `commit-segment-placement`
+    /// additionally needs the replica set in placement order. Without this,
+    /// those values could only be obtained by having watched the `Ack` that
+    /// produced them — so after a restart, a handover, or an incident the only
+    /// route was to guess and submit rejected writes until one landed. That is
+    /// a poor interface for a routine operation and an actively bad one during
+    /// an incident, which is when replacements happen.
+    ///
+    /// Reports the open rebalance intent too. It matters as much as the
+    /// generation: while one stands the segment refuses placement updates,
+    /// further proposals, and retention planning, and a stale generation and a
+    /// blocked segment produce similar-looking rejections that want opposite
+    /// responses — one is "read again and retry", the other is
+    /// "cancel-rebalance first".
+    ///
+    /// Linearizable, so the answer cannot come from a deposed node's lagging
+    /// copy. A placement read that can lag is worse than none, because a
+    /// compare-and-swap built on it fails exactly like somebody else's
+    /// concurrent write.
+    GetPlacement {
+        #[command(flatten)]
+        common: MetaCommonArgs,
+        #[arg(long)]
+        topic_uuid: Uuid,
+        #[arg(long)]
+        range_uuid: Uuid,
+        #[arg(long)]
+        segment_uuid: Uuid,
+        /// Also report the placement the algorithm WOULD choose at this
+        /// factor.
+        ///
+        /// The only way to build a FIRST placement. `commit-segment-placement`
+        /// compares a proposal positionally against a rendezvous over the
+        /// currently Active nodes, and an operator can see neither the
+        /// candidate set nor the algorithm — so without asking, the only route
+        /// to the right list was to guess an order and resubmit until one was
+        /// accepted.
+        #[arg(long)]
+        for_replication_factor: Option<u8>,
+    },
     /// Set a node's placement attributes (#180).
     ///
     /// A PREREQUISITE for any multi-replica placement, and easy to miss.
@@ -883,6 +926,43 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
             };
             propose_and_print(&common.config, command, json).await
         }
+        MetaCommand::GetPlacement {
+            common,
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+            for_replication_factor,
+        } => {
+            if for_replication_factor == Some(0) {
+                return Err(
+                    "--for-replication-factor is 0; zero replicas is not a placement, and the \
+                     flag is how you ask for one — omit it entirely to skip the proposal"
+                        .to_owned(),
+                );
+            }
+            let config = load_admin_config(&common.config)?;
+            let client = connect(&config)?;
+            let placement = client
+                .read_segment_placement(
+                    topic_uuid,
+                    range_uuid,
+                    segment_uuid,
+                    for_replication_factor.unwrap_or(0),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            note_redirects(&client);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&placement_json(&placement))
+                        .map_err(|error| error.to_string())?
+                );
+            } else {
+                print_placement(&placement);
+            }
+            Ok(())
+        }
         MetaCommand::SetNodePlacementAttrs {
             common,
             node_uuid,
@@ -1298,6 +1378,181 @@ fn propose_json(log_id: &WireLogId, response: &MetadataResponse) -> serde_json::
     })
 }
 
+fn placement_json(
+    placement: &vtop_meta::transport::AdminReadSegmentPlacementResponse,
+) -> serde_json::Value {
+    serde_json::json!({
+        "found": placement.found,
+        "generation": placement.generation,
+        "declared_replication_factor": placement.declared_replication_factor,
+        "replica_nodes": placement
+            .replica_nodes
+            .iter()
+            .map(|node| node.to_string())
+            .collect::<Vec<_>>(),
+        "rebalance_intent": placement.rebalance_intent.map(|intent| serde_json::json!({
+            "from_node_uuid": intent.from_node_uuid.to_string(),
+            "to_node_uuid": intent.to_node_uuid.to_string(),
+            "placement_generation_at_proposal": intent.placement_generation_at_proposal,
+        })),
+        "segment": placement.segment.map(|segment| serde_json::json!({
+            "segment_generation": segment.segment_generation,
+            "base_offset": segment.base_offset,
+            "next_offset": segment.next_offset,
+            "content_root": hex_lower(&segment.content_root),
+            "state": segment.state_name(),
+            "state_tag": segment.state_tag,
+            "sealed_by_epoch": segment.sealed_by_epoch,
+        })),
+        "proposal": match &placement.proposal {
+            None => serde_json::Value::Null,
+            Some(Ok(nodes)) => serde_json::json!({
+                "replica_nodes": nodes.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+            }),
+            Some(Err(reason)) => serde_json::json!({ "error": reason }),
+        },
+        "read_at_applied_index": placement.read_at_applied_index,
+    })
+}
+
+fn hex_lower(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn print_segment(segment: &Option<vtop_meta::transport::AdminSegmentView>) {
+    let Some(segment) = segment else {
+        println!("segment              : no segment record");
+        return;
+    };
+    println!("segment generation   : {}", segment.segment_generation);
+    println!(
+        "segment state        : {}",
+        // An unknown tag is reported as unknown rather than mapped to the
+        // nearest name: a newer leader can commit a state this binary has
+        // never heard of, and guessing would be a confident lie about where
+        // the segment is in its lifecycle.
+        match segment.state_name() {
+            Some(name) => name.to_owned(),
+            None => format!("unknown (tag {})", segment.state_tag),
+        }
+    );
+    println!(
+        "segment offsets      : [{}, {}) sealed by epoch {}",
+        segment.base_offset, segment.next_offset, segment.sealed_by_epoch
+    );
+    println!(
+        "segment content root : {}",
+        hex_lower(&segment.content_root)
+    );
+}
+
+fn print_proposal(proposal: &Option<Result<Vec<Uuid>, String>>) {
+    print!("{}", proposal_text(proposal));
+}
+
+/// Rendered rather than printed straight out, so a test can assert the
+/// first-placement branch actually emits it.
+///
+/// That branch returns early, and an edit adding this call to it silently
+/// failed to apply once — leaving the ordered list reachable only under
+/// `--json`, in the one workflow that has no prior placement to read and so
+/// nothing else to go on.
+fn proposal_text(proposal: &Option<Result<Vec<Uuid>, String>>) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    match proposal {
+        None => {}
+        Some(Ok(nodes)) => {
+            let _ = writeln!(
+                out,
+                "proposed placement   : {} node(s), in this order",
+                nodes.len()
+            );
+            for (position, node) in nodes.iter().enumerate() {
+                let _ = writeln!(out, "  [{position}] {node}");
+            }
+            let _ = writeln!(
+                out,
+                "  Pass these to commit-segment-placement as --replica-node, IN THIS ORDER. \
+                 The comparison is positional."
+            );
+        }
+        Some(Err(reason)) => {
+            let _ = writeln!(out, "proposed placement   : REFUSED — {reason}");
+            let _ = writeln!(
+                out,
+                "  A placement above RF 1 needs replicas in distinct failure domains, and \
+                 register-node leaves the domain empty. Set one on each node with \
+                 set-node-placement-attrs, then ask again."
+            );
+        }
+    }
+    out
+}
+
+fn print_placement(placement: &vtop_meta::transport::AdminReadSegmentPlacementResponse) {
+    if !placement.found {
+        println!("no placement committed for this segment");
+        // The distinction an operator needs immediately: a first placement
+        // takes NO expected generation, and passing 0 for one is a different
+        // proposal that will be refused.
+        println!(
+            "  commit-segment-placement takes no --expected-placement-generation for a first \
+             placement"
+        );
+        if let Some(intent) = placement.rebalance_intent {
+            println!(
+                "  WARNING: a rebalance intent exists ({} -> {}) with no placement; \
+                 cancel-rebalance before proposing one",
+                intent.from_node_uuid, intent.to_node_uuid
+            );
+        }
+        // BOTH printed before returning. This branch is the whole reason the
+        // proposal exists — a first placement has nothing to read back — so
+        // returning without it left the one workflow that needs it able to see
+        // the answer only in `--json`.
+        print_segment(&placement.segment);
+        print_proposal(&placement.proposal);
+        println!(
+            "  read at applied index: {}",
+            placement.read_at_applied_index
+        );
+        return;
+    }
+    println!("placement generation : {}", placement.generation);
+    println!(
+        "replication factor   : {} (declared)",
+        placement.declared_replication_factor
+    );
+    // NUMBERED, because the order is the value. `commit-segment-placement`
+    // compares positionally, so an operator retyping this list out of order
+    // gets a refusal that says nothing about ordering.
+    println!(
+        "replicas             : {} node(s), in placement order",
+        placement.replica_nodes.len()
+    );
+    for (position, node) in placement.replica_nodes.iter().enumerate() {
+        println!("  [{position}] {node}");
+    }
+    match placement.rebalance_intent {
+        None => println!("rebalance            : none open"),
+        Some(intent) => {
+            println!(
+                "rebalance            : OPEN, {} -> {} (proposed at placement generation {})",
+                intent.from_node_uuid, intent.to_node_uuid, intent.placement_generation_at_proposal
+            );
+            println!(
+                "  While this stands the segment refuses placement updates, further rebalance \
+                 proposals, and retention planning. Finish the move, or cancel-rebalance to \
+                 release it."
+            );
+        }
+    }
+    print_segment(&placement.segment);
+    print_proposal(&placement.proposal);
+    println!("read at applied index: {}", placement.read_at_applied_index);
+}
+
 fn print_status(status: &AdminStatusResponse) {
     println!("node_id:        {}", status.node_id);
     println!("term:           {}", status.current_term);
@@ -1529,6 +1784,27 @@ client_key: /tmp/client.key
             cancel.err().map(|error| error.to_string())
         );
 
+        // The read that unblocks the rest. It takes no generation — it is what
+        // an operator runs to LEARN one — so a required CAS flag here would
+        // recreate the chicken-and-egg it exists to break.
+        let get = Harness::try_parse_from([
+            "vtopctl",
+            "get-placement",
+            "--config",
+            "/nonexistent/meta.yaml",
+            "--topic-uuid",
+            &node(1).to_string(),
+            "--range-uuid",
+            &node(2).to_string(),
+            "--segment-uuid",
+            &node(3).to_string(),
+        ]);
+        assert!(
+            get.is_ok(),
+            "{:?}",
+            get.err().map(|error| error.to_string())
+        );
+
         let attrs = Harness::try_parse_from([
             "vtopctl",
             "set-node-placement-attrs",
@@ -1569,5 +1845,53 @@ client_key: /tmp/client.key
             no_weight.is_err(),
             "the weight must be stated, because this command overwrites it either way"
         );
+    }
+
+    /// The first-placement branch renders the proposal.
+    ///
+    /// Pinned because the human-readable path returns early and an edit to it
+    /// silently did not apply, leaving the ordered list reachable only through
+    /// `--json` — in the one workflow that has no prior placement to read and
+    /// therefore nothing else to go on.
+    #[test]
+    fn the_proposal_is_rendered_in_order_with_its_positional_warning() {
+        let text = proposal_text(&Some(Ok(vec![node(7), node(3), node(5)])));
+        let positions: Vec<usize> = ["[0]", "[1]", "[2]"]
+            .iter()
+            .map(|marker| text.find(marker).expect("every replica must be numbered"))
+            .collect();
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "the list must be rendered in placement order:\n{text}"
+        );
+        assert!(
+            text.contains(&node(7).to_string())
+                && text.find(&node(7).to_string()) < text.find(&node(3).to_string()),
+            "the first proposed replica must print first:\n{text}"
+        );
+        assert!(
+            text.contains("IN THIS ORDER"),
+            "the order is compared positionally, so saying so is the point:\n{text}"
+        );
+    }
+
+    /// A refusal names the remedy, not just the problem.
+    #[test]
+    fn a_refused_proposal_points_at_the_command_that_fixes_it() {
+        let text = proposal_text(&Some(Err(
+            "only 1 distinct failure domain for 3 replicas".to_owned()
+        )));
+        assert!(text.contains("only 1 distinct failure domain"), "{text}");
+        assert!(
+            text.contains("set-node-placement-attrs"),
+            "nothing else in the flow would tell an operator which command sets a domain:\n{text}"
+        );
+    }
+
+    /// No request, no output — the proposal must not invent a placement for a
+    /// caller who did not ask what one would be.
+    #[test]
+    fn no_proposal_renders_nothing() {
+        assert!(proposal_text(&None).is_empty());
     }
 }

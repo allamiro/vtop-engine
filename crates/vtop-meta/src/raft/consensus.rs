@@ -15,7 +15,10 @@ use crate::raft::store::MetaRaftStore;
 use crate::raft::type_config::{MetaRaftTypeConfig, NodeId};
 use crate::state::MetaValue;
 use crate::transport::admin::AdminHandler;
-use crate::transport::wire::{AdminLeaseView, AdminReadRangeLeaseResponse};
+use crate::transport::wire::{
+    AdminLeaseView, AdminReadRangeLeaseResponse, AdminReadSegmentPlacementResponse,
+    AdminRebalanceIntentView, AdminSegmentView,
+};
 use crate::transport::wire::{
     AdminMembershipResponse, AdminProposeResponse, AdminStatusResponse, TransportError,
     TransportResult, WireLogId,
@@ -268,6 +271,173 @@ pub trait AdminReadRangeLease: Send + Sync {
 }
 
 #[async_trait]
+impl AdminReadSegmentPlacement for OpenraftConsensus {
+    async fn read_segment_placement(
+        &self,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        segment_uuid: Uuid,
+        for_replication_factor: u8,
+    ) -> ConsensusResult<AdminReadSegmentPlacementResponse> {
+        let Some(store) = self.store.as_ref() else {
+            return Err(ConsensusError::Message(
+                "this node was built without applied state and cannot serve reads".to_owned(),
+            ));
+        };
+        // Fence FIRST, exactly as the lease read does. A placement read that
+        // can lag is worse than none: every command in the replacement flow is
+        // a compare-and-swap against the generation this returns, so a stale
+        // answer fails in a way indistinguishable from somebody else's
+        // concurrent write — and the operator's correct response to those two
+        // is opposite.
+        self.raft
+            .ensure_linearizable()
+            .await
+            .map_err(classify_read_error)?;
+        let placement_key = MetaKey::SegmentPlacement {
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+        };
+        let intent_key = MetaKey::SegmentRebalanceIntent {
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+        };
+        // THE THIRD RECORD, read under the same fence as the other two. All
+        // four replacement commands take `--expected-segment-generation` as
+        // well as the placement generation, and returning only the placement
+        // left the caller exactly where they started for the other half.
+        let segment_key = MetaKey::Segment {
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+        };
+        Ok(store.with_storage(|storage| {
+            // BOTH under one fence. Read separately they could straddle an
+            // apply, and the pairing is the whole point: a generation without
+            // the intent that blocks it describes a segment that will reject
+            // the very command the generation was fetched for.
+            // COMPUTED HERE, under the same fence as the records. A proposal
+            // derived from a different snapshot of the node set than the
+            // generation it is paired with would be a placement the state
+            // machine no longer agrees with — refused, and for a reason
+            // nothing in the answer would explain.
+            let proposal = (for_replication_factor > 0).then(|| {
+                crate::placement::select_replicas(
+                    segment_uuid,
+                    &storage.state().active_placement_candidates(),
+                    usize::from(for_replication_factor),
+                    // The same rule `commit_segment_placement` applies, not a
+                    // guess at it: distinctness is required above RF 1.
+                    for_replication_factor > 1,
+                )
+                .map_err(|error| error.to_string())
+            });
+            placement_view(
+                storage.state().record(&placement_key),
+                storage.state().record(&intent_key),
+                storage.state().record(&segment_key),
+                proposal,
+                storage.last_applied(),
+            )
+        }))
+    }
+}
+
+/// Shape two metadata records into the answer an operator acts on.
+///
+/// A free function so the mapping can be tested without standing up a Raft
+/// cluster. It is small, but three of its decisions are load-bearing and none
+/// is visible in the types: absent is distinct from empty, the intent is
+/// reported even with no placement, and the replica order is passed through
+/// untouched.
+fn placement_view(
+    placement: Option<&MetaValue>,
+    intent: Option<&MetaValue>,
+    segment: Option<&MetaValue>,
+    proposal: Option<Result<Vec<Uuid>, String>>,
+    read_at_applied_index: u64,
+) -> AdminReadSegmentPlacementResponse {
+    let segment = match segment {
+        Some(MetaValue::Segment(segment)) => Some(AdminSegmentView {
+            segment_generation: segment.segment_generation,
+            base_offset: segment.base_offset,
+            next_offset: segment.next_offset,
+            content_root: segment.content_root,
+            // The durable tags, not a parallel numbering — a second mapping
+            // would be free to drift from the one on disk.
+            state_tag: match segment.state {
+                crate::state::SegmentState::SealedUnverified => 1,
+                crate::state::SegmentState::Verified => 2,
+                crate::state::SegmentState::Repairing => 3,
+                crate::state::SegmentState::RetirePlanned => 4,
+                crate::state::SegmentState::Retired => 5,
+                crate::state::SegmentState::Quarantined => 6,
+                crate::state::SegmentState::RetentionPlanned => 7,
+                crate::state::SegmentState::RetentionExpired => 8,
+            },
+            sealed_by_epoch: segment.sealed_by_epoch,
+        }),
+        _ => None,
+    };
+    let rebalance_intent = match intent {
+        Some(MetaValue::RebalanceIntent(intent)) => Some(AdminRebalanceIntentView {
+            from_node_uuid: intent.from_node_uuid,
+            to_node_uuid: intent.to_node_uuid,
+            placement_generation_at_proposal: intent.placement_generation_at_proposal,
+        }),
+        _ => None,
+    };
+    match placement {
+        Some(MetaValue::SegmentPlacement(placement)) => AdminReadSegmentPlacementResponse {
+            found: true,
+            generation: placement.generation,
+            declared_replication_factor: placement.declared_replication_factor,
+            // NOT sorted, NOT deduplicated. `commit_segment_placement` compares
+            // proposals positionally against the rendezvous result, so any
+            // tidying here would hand back a list that cannot be resubmitted.
+            replica_nodes: placement.replica_nodes.clone(),
+            rebalance_intent,
+            segment,
+            proposal,
+            read_at_applied_index,
+        },
+        // Absent is not "committed but empty". A caller proposing a FIRST
+        // placement passes no expected generation at all, and reporting 0 for
+        // both cases would leave them unable to tell which they are looking at
+        // — the two need different commands.
+        _ => AdminReadSegmentPlacementResponse {
+            found: false,
+            generation: 0,
+            declared_replication_factor: 0,
+            replica_nodes: Vec::new(),
+            // Reported even with no placement. An intent without one is a
+            // segment that will refuse the first placement proposal, and an
+            // operator told only "not found" would retry it forever.
+            rebalance_intent,
+            segment,
+            proposal,
+            read_at_applied_index,
+        },
+    }
+}
+
+/// Linearizable segment-placement read, kept as its own trait for the same
+/// reason as the lease read: the consensus facade stays a narrow
+/// propose/status interface.
+#[async_trait]
+pub trait AdminReadSegmentPlacement: Send + Sync {
+    async fn read_segment_placement(
+        &self,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        segment_uuid: Uuid,
+        for_replication_factor: u8,
+    ) -> ConsensusResult<AdminReadSegmentPlacementResponse>;
+}
+
+#[async_trait]
 impl Consensus for OpenraftConsensus {
     async fn propose(&self, command: MetadataCommand) -> ConsensusResult<CommitReceipt> {
         let response = self
@@ -350,6 +520,21 @@ impl AdminHandler for OpenraftConsensus {
         AdminReadRangeLease::read_range_lease(self, request.topic_uuid, request.range_uuid)
             .await
             .map_err(to_transport_error)
+    }
+
+    async fn read_segment_placement(
+        &self,
+        request: crate::transport::wire::AdminReadSegmentPlacementRequest,
+    ) -> TransportResult<AdminReadSegmentPlacementResponse> {
+        AdminReadSegmentPlacement::read_segment_placement(
+            self,
+            request.topic_uuid,
+            request.range_uuid,
+            request.segment_uuid,
+            request.for_replication_factor,
+        )
+        .await
+        .map_err(to_transport_error)
     }
 
     async fn status(&self) -> TransportResult<AdminStatusResponse> {
@@ -547,5 +732,121 @@ mod tests {
             TransportError::NotLeader { leader, .. } => assert_eq!(leader, Some(MetaNodeId(5))),
             other => panic!("expected a transport-level redirect, got {other}"),
         }
+    }
+
+    /// A committed placement is reported with its order and its declared
+    /// factor intact, and the factor is NOT inferred from the list length.
+    ///
+    /// Those two differ on purpose during a move — the list runs at RF + 1
+    /// while a rebalance is open — so a view that derived one from the other
+    /// would report the target as 3 mid-move and send an operator to
+    /// commit-segment-placement with the wrong number.
+    #[test]
+    fn a_committed_placement_reports_its_order_and_its_declared_factor() {
+        let placement = MetaValue::SegmentPlacement(crate::state::SegmentPlacementRecord {
+            generation: 7,
+            declared_replication_factor: 2,
+            // Three nodes at a declared factor of two: a move is in flight.
+            replica_nodes: vec![node(3), node(1), node(2)],
+            committed_apply_index: 40,
+        });
+        let view = placement_view(Some(&placement), None, None, None, 99);
+
+        assert!(view.found);
+        assert_eq!(view.generation, 7);
+        assert_eq!(
+            view.declared_replication_factor, 2,
+            "the declared target must survive a list that is temporarily longer than it"
+        );
+        assert_eq!(
+            view.replica_nodes,
+            vec![node(3), node(1), node(2)],
+            "order is compared positionally by the state machine, so it must be returned as-is"
+        );
+        assert_eq!(view.read_at_applied_index, 99);
+    }
+
+    /// No placement is not the same answer as a placement at generation 0.
+    #[test]
+    fn an_absent_placement_is_distinguishable_from_one_at_generation_zero() {
+        let view = placement_view(None, None, None, None, 12);
+        assert!(
+            !view.found,
+            "a first placement takes no expected generation at all, so the caller has to be able \
+             to tell this case from a committed one"
+        );
+        assert_eq!(view.generation, 0);
+        assert!(view.replica_nodes.is_empty());
+    }
+
+    /// An open rebalance is reported even when no placement exists.
+    ///
+    /// That pairing is the reason the two records are read together. An intent
+    /// standing over an uncommitted placement blocks the very proposal an
+    /// operator would make next, and "not found" alone would send them round
+    /// that loop indefinitely.
+    #[test]
+    fn an_open_rebalance_is_reported_even_with_no_placement() {
+        let intent = MetaValue::RebalanceIntent(crate::state::RebalanceIntentRecord {
+            from_node_uuid: node(1),
+            to_node_uuid: node(4),
+            proposed_at_apply_index: 30,
+            placement_generation_at_proposal: 6,
+        });
+        let view = placement_view(None, Some(&intent), None, None, 31);
+
+        assert!(!view.found);
+        let reported = view
+            .rebalance_intent
+            .expect("the intent blocks the next proposal, so it must be reported regardless");
+        assert_eq!(reported.from_node_uuid, node(1));
+        assert_eq!(reported.to_node_uuid, node(4));
+        assert_eq!(reported.placement_generation_at_proposal, 6);
+    }
+
+    /// The proposal is what makes a FIRST placement possible, so it is
+    /// reported alongside "not found" rather than instead of it.
+    ///
+    /// Both halves matter and they say different things: `found: false` tells
+    /// the operator to omit `--expected-placement-generation` entirely, and
+    /// the proposal tells them which nodes to name and in what order. Either
+    /// alone leaves the command unbuildable.
+    #[test]
+    fn a_proposal_accompanies_a_not_found_placement() {
+        let view = placement_view(None, None, None, Some(Ok(vec![node(2), node(1)])), 5);
+        assert!(!view.found);
+        assert_eq!(
+            view.proposal,
+            Some(Ok(vec![node(2), node(1)])),
+            "the order is the answer; a set would not be usable"
+        );
+    }
+
+    /// A refusal from the algorithm is carried through rather than flattened
+    /// into an absent proposal.
+    ///
+    /// "No proposal" and "a proposal is impossible because no node has a
+    /// failure domain" want completely different actions, and the second is
+    /// the one an operator hits after building a cluster through the CLI,
+    /// where `register-node` leaves the domain empty.
+    #[test]
+    fn a_refused_proposal_carries_its_reason() {
+        let view = placement_view(
+            None,
+            None,
+            None,
+            Some(Err(
+                "only 1 distinct failure domain for 3 replicas".to_owned()
+            )),
+            5,
+        );
+        match view.proposal {
+            Some(Err(reason)) => assert!(reason.contains("failure domain"), "{reason}"),
+            other => panic!("the reason must survive, got {other:?}"),
+        }
+    }
+
+    fn node(n: u8) -> Uuid {
+        Uuid::from_bytes([n; 16])
     }
 }
