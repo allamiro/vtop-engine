@@ -155,6 +155,242 @@ pub enum MetaCommand {
         #[arg(long)]
         request_id: Option<Uuid>,
     },
+    /// Set a node's placement attributes (#180).
+    ///
+    /// A PREREQUISITE for any multi-replica placement, and easy to miss.
+    /// `register-node` leaves `failure_domain` empty, and
+    /// `CommitSegmentPlacement` requires DISTINCT failure domains whenever the
+    /// replication factor exceeds one — so a cluster built entirely through
+    /// this CLI cannot commit a placement for RF > 1 until every node has been
+    /// given one. The rejection arrives from the state machine and names the
+    /// domains rather than the command that should have set them, which is a
+    /// hard trail to follow backwards.
+    ///
+    /// The domain is whatever failure the deployment wants replicas spread
+    /// across: a rack, an availability zone, a host. Metadata does not
+    /// interpret it beyond requiring distinctness.
+    SetNodePlacementAttrs {
+        #[command(flatten)]
+        common: MetaCommonArgs,
+        #[arg(long)]
+        node_uuid: Uuid,
+        /// Rack, zone, host — whatever the deployment wants replicas spread
+        /// across. Two replicas of a segment never share one.
+        #[arg(long)]
+        failure_domain: String,
+        /// Relative share of placements this node attracts. Equal weights
+        /// spread evenly.
+        #[arg(long, default_value_t = 1)]
+        placement_weight: u32,
+        #[arg(long)]
+        expected_generation: u64,
+        #[arg(long, default_value_t = 0)]
+        issued_at_ms: i64,
+        #[arg(long)]
+        request_id: Option<Uuid>,
+    },
+    /// Open a rebalance move, adding a destination replica before the source
+    /// retires (#181).
+    ///
+    /// THE STEP THAT MAKES REPLACEMENT POSSIBLE at full replication factor.
+    /// `plan-replica-retirement` requires the placement to contain BOTH the
+    /// retiring source and the verified destination, and
+    /// `commit-segment-placement` cannot produce that: it refuses a list whose
+    /// length differs from the declared factor. This is what adds the
+    /// destination, so the segment runs at RF + 1 for the duration of the move
+    /// and never at RF - 1 — the whole point being that durability does not dip
+    /// while a replica is being replaced.
+    ///
+    /// The move then completes through the ordinary flow:
+    /// `commit-replacement-proof`, `plan-replica-retirement`,
+    /// `confirm-replica-retired`.
+    ProposeRebalance {
+        #[command(flatten)]
+        common: MetaCommonArgs,
+        #[arg(long)]
+        topic_uuid: Uuid,
+        #[arg(long)]
+        range_uuid: Uuid,
+        #[arg(long)]
+        segment_uuid: Uuid,
+        /// The replica being replaced. Stays in the placement until it is
+        /// retired.
+        #[arg(long)]
+        from_node_uuid: Uuid,
+        /// The replica taking over. Added now, proven later.
+        #[arg(long)]
+        to_node_uuid: Uuid,
+        #[arg(long)]
+        expected_placement_generation: u64,
+        #[arg(long, default_value_t = 0)]
+        issued_at_ms: i64,
+        #[arg(long)]
+        request_id: Option<Uuid>,
+    },
+    /// Abandon an open rebalance, releasing the segment (#181).
+    ///
+    /// THE WAY OUT when a move cannot finish. `propose-rebalance` writes an
+    /// intent that persists until the move completes or is cancelled, and while
+    /// it stands the segment refuses placement updates, further rebalance
+    /// proposals, and retention planning. A destination that dies mid-copy, or
+    /// bytes that fail verification, therefore leaves the segment locked — and
+    /// the failure that caused it is exactly the situation in which an operator
+    /// least wants a second, silent problem.
+    ///
+    /// Cancelling releases the segment and leaves the ORIGINAL replica set
+    /// untouched, because the source never stopped serving: the destination is
+    /// added by the proposal and only retired into by
+    /// `plan-replica-retirement`. Nothing durable is given up by cancelling a
+    /// move that did not finish.
+    CancelRebalance {
+        #[command(flatten)]
+        common: MetaCommonArgs,
+        #[arg(long)]
+        topic_uuid: Uuid,
+        #[arg(long)]
+        range_uuid: Uuid,
+        #[arg(long)]
+        segment_uuid: Uuid,
+        #[arg(long)]
+        expected_placement_generation: u64,
+        #[arg(long, default_value_t = 0)]
+        issued_at_ms: i64,
+        #[arg(long)]
+        request_id: Option<Uuid>,
+    },
+    /// Record which nodes hold a sealed segment (#180).
+    ///
+    /// `--replication-factor` is an INDEPENDENT durability target, not a count
+    /// of the list: the state machine refuses a placement whose declared factor
+    /// and actual replicas disagree, because a placement that silently records
+    /// fewer replicas than it promises is a durability claim nobody made.
+    CommitSegmentPlacement {
+        #[command(flatten)]
+        common: MetaCommonArgs,
+        #[arg(long)]
+        topic_uuid: Uuid,
+        #[arg(long)]
+        range_uuid: Uuid,
+        #[arg(long)]
+        segment_uuid: Uuid,
+        #[arg(long)]
+        replication_factor: u8,
+        /// Repeat once per replica, IN THE ORDER METADATA COMPUTES.
+        ///
+        /// This is a confirmation, not a choice. `apply` derives the replica
+        /// set deterministically by rendezvous over the currently Active nodes
+        /// and compares the proposal POSITIONALLY against it — the same UUIDs
+        /// in a different order are refused, as is any set the algorithm would
+        /// not have chosen. Supplying a list here states which placement the
+        /// proposer believes is current, so a proposal built against a stale
+        /// view of the cluster fails instead of silently committing a
+        /// different one.
+        #[arg(long = "replica-node", required = true)]
+        replica_nodes: Vec<Uuid>,
+        #[arg(long)]
+        expected_segment_generation: u64,
+        /// Omit for the FIRST placement of this segment; supply the current
+        /// generation to CAS-update an existing one. Omitting it against an
+        /// existing placement is refused rather than treated as zero — the two
+        /// are different intentions and only one of them is safe.
+        #[arg(long)]
+        expected_placement_generation: Option<u64>,
+        #[arg(long, default_value_t = 0)]
+        issued_at_ms: i64,
+        #[arg(long)]
+        request_id: Option<Uuid>,
+    },
+    /// Commit evidence that a replacement replica really holds the segment
+    /// (#181).
+    ///
+    /// THE EVIDENCE MUST COME FROM A VERIFIER, not from an operator retyping
+    /// numbers. `--content-root` and `--expected-length-bytes` are what
+    /// `vtopctl segment verify` reports for the destination copy; a proof
+    /// asserting a root nobody computed is worse than no proof, because the
+    /// state machine believes it and will then permit a retirement on its
+    /// strength.
+    CommitReplacementProof {
+        #[command(flatten)]
+        common: MetaCommonArgs,
+        #[arg(long)]
+        topic_uuid: Uuid,
+        #[arg(long)]
+        range_uuid: Uuid,
+        #[arg(long)]
+        segment_uuid: Uuid,
+        #[arg(long)]
+        expected_segment_generation: u64,
+        /// Sealed content root as 64 hex characters, as verified on the
+        /// DESTINATION replica.
+        #[arg(long, value_parser = parse_hash32)]
+        content_root: [u8; 32],
+        #[arg(long)]
+        expected_length_bytes: u64,
+        /// The replica the bytes came from.
+        #[arg(long)]
+        source_node_uuid: Uuid,
+        /// The replica that now holds them.
+        #[arg(long)]
+        destination_node_uuid: Uuid,
+        #[arg(long)]
+        fencing_epoch: u64,
+        /// Who performed the verification. Recorded for audit: a proof is only
+        /// as good as the identity that stands behind it.
+        #[arg(long)]
+        verifier_node_uuid: Uuid,
+        #[arg(long)]
+        verified_term: u64,
+        #[arg(long, default_value_t = 0)]
+        issued_at_ms: i64,
+        #[arg(long)]
+        request_id: Option<Uuid>,
+    },
+    /// Plan a replica's retirement (#181). REFUSED unless a matching
+    /// replacement proof has already committed — which is the entire point:
+    /// the copy must be proven before the original is allowed to go.
+    PlanReplicaRetirement {
+        #[command(flatten)]
+        common: MetaCommonArgs,
+        #[arg(long)]
+        topic_uuid: Uuid,
+        #[arg(long)]
+        range_uuid: Uuid,
+        #[arg(long)]
+        segment_uuid: Uuid,
+        #[arg(long)]
+        retiring_node_uuid: Uuid,
+        #[arg(long)]
+        expected_segment_generation: u64,
+        #[arg(long)]
+        fencing_epoch: u64,
+        #[arg(long, default_value_t = 0)]
+        issued_at_ms: i64,
+        #[arg(long)]
+        request_id: Option<Uuid>,
+    },
+    /// Confirm a planned retirement actually happened (#181).
+    ///
+    /// Run AFTER the bytes are physically gone. This consumes the replacement
+    /// proof, so proposing it before the deletion would leave metadata
+    /// believing a replica is retired while its data is still on disk.
+    ConfirmReplicaRetired {
+        #[command(flatten)]
+        common: MetaCommonArgs,
+        #[arg(long)]
+        topic_uuid: Uuid,
+        #[arg(long)]
+        range_uuid: Uuid,
+        #[arg(long)]
+        segment_uuid: Uuid,
+        #[arg(long)]
+        retiring_node_uuid: Uuid,
+        #[arg(long)]
+        expected_segment_generation: u64,
+        #[arg(long, default_value_t = 0)]
+        issued_at_ms: i64,
+        #[arg(long)]
+        request_id: Option<Uuid>,
+    },
     /// Propose `SetTopicRetentionPolicy` (create with no
     /// --expected-generation; CAS-update with one).
     SetRetentionPolicy {
@@ -368,6 +604,84 @@ pub async fn run(command: MetaCommand, json: bool) -> i32 {
     }
 }
 
+/// Client-side refusals for the replacement flow.
+///
+/// Free functions rather than inline blocks so a test can reach them: the
+/// dispatch arms they came from need a configured cluster to enter, which would
+/// make the only coverage of these messages an end-to-end one. The checks are
+/// the part most likely to rot — each duplicates a rule the state machine also
+/// enforces, and a duplicated rule that drifts is worse than no rule at all,
+/// because the two disagree about the same command.
+fn check_failure_domain(failure_domain: &str) -> Result<(), String> {
+    if failure_domain.trim().is_empty() {
+        return Err(
+            "--failure-domain is empty; an empty domain is what every node has BEFORE this \
+             command runs, so setting it to empty would leave multi-replica placements refused \
+             for the same reason they are refused now"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn check_rebalance_endpoints(from: Uuid, to: Uuid) -> Result<(), String> {
+    if from == to {
+        return Err(format!(
+            "--from-node-uuid and --to-node-uuid are both {from}; a rebalance moves a replica to \
+             a DIFFERENT node, and moving it to itself would add nothing while locking the \
+             placement behind an intent"
+        ));
+    }
+    Ok(())
+}
+
+/// Checked HERE as well as in the state machine, because a refusal that arrives
+/// after a round trip through consensus is a worse experience for the same
+/// mistake — and the state machine's message cannot say which flag to change.
+fn check_replica_set(replication_factor: u8, replica_nodes: &[Uuid]) -> Result<(), String> {
+    if replica_nodes.len() != usize::from(replication_factor) {
+        return Err(format!(
+            "--replication-factor is {replication_factor} but {} --replica-node value(s) were \
+             given; the declared durability target and the replicas that back it must agree, or \
+             the placement promises something nobody committed to",
+            replica_nodes.len()
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for node in replica_nodes {
+        if !seen.insert(*node) {
+            return Err(format!(
+                "--replica-node {node} appears more than once; one node cannot be two replicas, \
+                 and counting it twice would overstate the durability this placement records"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn check_replacement_proof(
+    expected_length_bytes: u64,
+    source: Uuid,
+    destination: Uuid,
+) -> Result<(), String> {
+    if expected_length_bytes == 0 {
+        return Err(
+            "--expected-length-bytes is 0; a sealed segment always has bytes, so a proof \
+             asserting an empty one is evidence of nothing and would be refused after a round \
+             trip through consensus"
+                .to_owned(),
+        );
+    }
+    if source == destination {
+        return Err(format!(
+            "--source-node-uuid and --destination-node-uuid are both {source}; a replacement \
+             proof asserts that a SECOND replica now holds the segment, and a node cannot be \
+             evidence of itself"
+        ));
+    }
+    Ok(())
+}
+
 async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
     match command {
         MetaCommand::Status { common } => {
@@ -559,6 +873,194 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
                 node_uuid,
                 state,
                 expected_generation,
+            };
+            propose_and_print(&common.config, command, json).await
+        }
+        MetaCommand::SetNodePlacementAttrs {
+            common,
+            node_uuid,
+            failure_domain,
+            placement_weight,
+            expected_generation,
+            issued_at_ms,
+            request_id,
+        } => {
+            check_failure_domain(&failure_domain)?;
+            let command = MetadataCommand::SetNodePlacementAttrs {
+                env: CommandEnvelope {
+                    request_id: request_id.unwrap_or_else(Uuid::new_v4),
+                    issued_at_ms,
+                },
+                node_uuid,
+                failure_domain,
+                placement_weight,
+                expected_generation,
+            };
+            propose_and_print(&common.config, command, json).await
+        }
+        MetaCommand::ProposeRebalance {
+            common,
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+            from_node_uuid,
+            to_node_uuid,
+            expected_placement_generation,
+            issued_at_ms,
+            request_id,
+        } => {
+            check_rebalance_endpoints(from_node_uuid, to_node_uuid)?;
+            let command = MetadataCommand::ProposeRebalance {
+                env: CommandEnvelope {
+                    request_id: request_id.unwrap_or_else(Uuid::new_v4),
+                    issued_at_ms,
+                },
+                topic_uuid,
+                range_uuid,
+                segment_uuid,
+                from_node_uuid,
+                to_node_uuid,
+                expected_placement_generation,
+            };
+            propose_and_print(&common.config, command, json).await
+        }
+        MetaCommand::CancelRebalance {
+            common,
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+            expected_placement_generation,
+            issued_at_ms,
+            request_id,
+        } => {
+            let command = MetadataCommand::CancelRebalance {
+                env: CommandEnvelope {
+                    request_id: request_id.unwrap_or_else(Uuid::new_v4),
+                    issued_at_ms,
+                },
+                topic_uuid,
+                range_uuid,
+                segment_uuid,
+                expected_placement_generation,
+            };
+            propose_and_print(&common.config, command, json).await
+        }
+        MetaCommand::CommitSegmentPlacement {
+            common,
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+            replication_factor,
+            replica_nodes,
+            expected_segment_generation,
+            expected_placement_generation,
+            issued_at_ms,
+            request_id,
+        } => {
+            check_replica_set(replication_factor, &replica_nodes)?;
+            let command = MetadataCommand::CommitSegmentPlacement {
+                env: CommandEnvelope {
+                    request_id: request_id.unwrap_or_else(Uuid::new_v4),
+                    issued_at_ms,
+                },
+                topic_uuid,
+                range_uuid,
+                segment_uuid,
+                replication_factor,
+                replica_nodes,
+                expected_segment_generation,
+                expected_placement_generation,
+            };
+            propose_and_print(&common.config, command, json).await
+        }
+        MetaCommand::CommitReplacementProof {
+            common,
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+            expected_segment_generation,
+            content_root,
+            expected_length_bytes,
+            source_node_uuid,
+            destination_node_uuid,
+            fencing_epoch,
+            verifier_node_uuid,
+            verified_term,
+            issued_at_ms,
+            request_id,
+        } => {
+            check_replacement_proof(
+                expected_length_bytes,
+                source_node_uuid,
+                destination_node_uuid,
+            )?;
+            let command = MetadataCommand::CommitReplacementProof {
+                env: CommandEnvelope {
+                    request_id: request_id.unwrap_or_else(Uuid::new_v4),
+                    issued_at_ms,
+                },
+                topic_uuid,
+                range_uuid,
+                segment_uuid,
+                expected_segment_generation,
+                content_root,
+                expected_length_bytes,
+                source_node_uuid,
+                destination_node_uuid,
+                fencing_epoch,
+                // One variant today. Named rather than defaulted so adding a
+                // second forces every call site to say which it means.
+                verification_method: vtop_meta::VerificationMethod::AuthenticatedContentRoot,
+                verifier_node_uuid,
+                verified_term,
+            };
+            propose_and_print(&common.config, command, json).await
+        }
+        MetaCommand::PlanReplicaRetirement {
+            common,
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+            retiring_node_uuid,
+            expected_segment_generation,
+            fencing_epoch,
+            issued_at_ms,
+            request_id,
+        } => {
+            let command = MetadataCommand::PlanReplicaRetirement {
+                env: CommandEnvelope {
+                    request_id: request_id.unwrap_or_else(Uuid::new_v4),
+                    issued_at_ms,
+                },
+                topic_uuid,
+                range_uuid,
+                segment_uuid,
+                retiring_node_uuid,
+                expected_segment_generation,
+                fencing_epoch,
+            };
+            propose_and_print(&common.config, command, json).await
+        }
+        MetaCommand::ConfirmReplicaRetired {
+            common,
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+            retiring_node_uuid,
+            expected_segment_generation,
+            issued_at_ms,
+            request_id,
+        } => {
+            let command = MetadataCommand::ConfirmReplicaRetired {
+                env: CommandEnvelope {
+                    request_id: request_id.unwrap_or_else(Uuid::new_v4),
+                    issued_at_ms,
+                },
+                topic_uuid,
+                range_uuid,
+                segment_uuid,
+                retiring_node_uuid,
+                expected_segment_generation,
             };
             propose_and_print(&common.config, command, json).await
         }
@@ -874,5 +1376,168 @@ client_key: /tmp/client.key
         let config: MetaAdminConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.endpoint, "127.0.0.1:9701");
         assert_eq!(config.server_name, "localhost");
+    }
+
+    /// A node UUID that differs per index, so a test that means "two nodes"
+    /// cannot accidentally pass by using one.
+    fn node(n: u8) -> Uuid {
+        Uuid::from_bytes([n; 16])
+    }
+
+    #[test]
+    fn a_placement_whose_replica_count_contradicts_its_factor_is_refused() {
+        // The premise: the same list at the matching factor IS accepted, so the
+        // rejection below is about the disagreement and not about the list.
+        check_replica_set(2, &[node(1), node(2)]).expect("a matching set is the accepted case");
+
+        let error = check_replica_set(3, &[node(1), node(2)])
+            .expect_err("declaring RF 3 while naming two replicas must not reach consensus");
+        assert!(
+            error.contains("--replication-factor is 3") && error.contains("2 --replica-node"),
+            "the message must name BOTH numbers so the operator knows which to change: {error}"
+        );
+    }
+
+    #[test]
+    fn a_node_listed_twice_cannot_stand_in_for_two_replicas() {
+        let error = check_replica_set(2, &[node(1), node(1)])
+            .expect_err("one node counted twice overstates durability");
+        assert!(error.contains("appears more than once"), "{error}");
+    }
+
+    #[test]
+    fn a_proof_is_refused_when_it_is_evidence_of_nothing() {
+        // Zero bytes: nothing is being asserted.
+        let error = check_replacement_proof(0, node(1), node(2))
+            .expect_err("an empty segment is not evidence a replica holds anything");
+        assert!(error.contains("--expected-length-bytes is 0"), "{error}");
+
+        // Same node twice: something is asserted, but not by a second party.
+        let error = check_replacement_proof(4096, node(1), node(1))
+            .expect_err("a node cannot be evidence of itself");
+        assert!(error.contains("cannot be evidence of itself"), "{error}");
+
+        check_replacement_proof(4096, node(1), node(2))
+            .expect("a non-empty segment on a different node is the whole point of the command");
+    }
+
+    #[test]
+    fn a_rebalance_that_moves_a_replica_to_itself_is_refused() {
+        check_rebalance_endpoints(node(1), node(1)).expect_err("a move to itself moves nothing");
+        check_rebalance_endpoints(node(1), node(2)).expect("distinct endpoints are a real move");
+    }
+
+    #[test]
+    fn a_blank_failure_domain_is_refused_rather_than_stored() {
+        // Whitespace matters here: "  " is not a domain, but it is not empty
+        // either, and storing it would satisfy a naive distinctness check while
+        // meaning nothing to an operator reading it back.
+        for blank in ["", "   ", "\t"] {
+            check_failure_domain(blank)
+                .expect_err("a blank domain leaves RF > 1 refused for the same reason as before");
+        }
+        check_failure_domain("rack-a").expect("a real domain is the accepted case");
+    }
+
+    /// The four replacement-flow commands parse, and the arguments they need in
+    /// order to be honest are REQUIRED rather than defaulted.
+    ///
+    /// Worth pinning: every one of these takes an expected-generation, and a
+    /// default would turn a concurrency check into a formality that always
+    /// passes — the operator would stop supplying the value they are supposed
+    /// to have read.
+    #[test]
+    fn the_replacement_commands_require_the_generations_they_check_against() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct Harness {
+            #[command(subcommand)]
+            command: MetaCommand,
+        }
+
+        let ok = Harness::try_parse_from([
+            "vtopctl",
+            "propose-rebalance",
+            "--config",
+            "/nonexistent/meta.yaml",
+            "--topic-uuid",
+            &node(1).to_string(),
+            "--range-uuid",
+            &node(2).to_string(),
+            "--segment-uuid",
+            &node(3).to_string(),
+            "--from-node-uuid",
+            &node(4).to_string(),
+            "--to-node-uuid",
+            &node(5).to_string(),
+            "--expected-placement-generation",
+            "7",
+        ]);
+        assert!(ok.is_ok(), "{:?}", ok.err().map(|error| error.to_string()));
+
+        // Same command with the generation dropped: refused at parse time.
+        let missing = Harness::try_parse_from([
+            "vtopctl",
+            "propose-rebalance",
+            "--config",
+            "/nonexistent/meta.yaml",
+            "--topic-uuid",
+            &node(1).to_string(),
+            "--range-uuid",
+            &node(2).to_string(),
+            "--segment-uuid",
+            &node(3).to_string(),
+            "--from-node-uuid",
+            &node(4).to_string(),
+            "--to-node-uuid",
+            &node(5).to_string(),
+        ]);
+        assert!(
+            missing.is_err(),
+            "expected-placement-generation must be supplied, not assumed"
+        );
+
+        // The cancellation path is what keeps a failed move from locking the
+        // segment for good, so it must be reachable — and it takes the same
+        // generation guard, since cancelling the WRONG open move is its own way
+        // to lose a placement.
+        let cancel = Harness::try_parse_from([
+            "vtopctl",
+            "cancel-rebalance",
+            "--config",
+            "/nonexistent/meta.yaml",
+            "--topic-uuid",
+            &node(1).to_string(),
+            "--range-uuid",
+            &node(2).to_string(),
+            "--segment-uuid",
+            &node(3).to_string(),
+            "--expected-placement-generation",
+            "9",
+        ]);
+        assert!(
+            cancel.is_ok(),
+            "{:?}",
+            cancel.err().map(|error| error.to_string())
+        );
+
+        let attrs = Harness::try_parse_from([
+            "vtopctl",
+            "set-node-placement-attrs",
+            "--config",
+            "/nonexistent/meta.yaml",
+            "--node-uuid",
+            &node(1).to_string(),
+            "--failure-domain",
+            "rack-a",
+            "--expected-generation",
+            "3",
+        ]);
+        assert!(
+            attrs.is_ok(),
+            "{:?}",
+            attrs.err().map(|error| error.to_string())
+        );
     }
 }
