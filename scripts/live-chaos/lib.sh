@@ -127,13 +127,15 @@ preflight_settings() {
     || fail "CHAOS_PROFILE contains unsupported characters: '$CHAOS_PROFILE'"
   require_integer_in_range CHAOS_META_PEER_BASE_PORT "$META_PEER_BASE_PORT" 1024 65529
   require_integer_in_range CHAOS_META_ADMIN_BASE_PORT "$META_ADMIN_BASE_PORT" 1024 65529
-  require_integer_in_range CHAOS_REPLICA_BASE_PORT "$REPLICA_BASE_PORT" 1024 65533
+  require_integer_in_range CHAOS_REPLICA_BASE_PORT "$REPLICA_BASE_PORT" 1024 65532
   require_integer_in_range CHAOS_NATIVE_PORT "$NATIVE_PORT" 1024 65535
   # Ceilings are the highest port each family actually derives: metadata ids
-  # run 1..5 so the top base is 65535-5, and data indices run 0..2 so the top
-  # base is 65535-2. A tighter bound would reject a valid override.
+  # run 1..5 so the top base is 65535-5, and data indices run 0..3 — index 3 is
+  # the replacement replica (#242) — so the top base is 65535-3. A tighter bound
+  # would reject a valid override; a looser one accepts a base whose highest
+  # derived port is above 65535 and fails much later as an invalid address.
   require_integer_in_range CHAOS_META_METRICS_BASE_PORT "$META_METRICS_BASE_PORT" 1024 65530
-  require_integer_in_range CHAOS_DATA_METRICS_BASE_PORT "$DATA_METRICS_BASE_PORT" 1024 65533
+  require_integer_in_range CHAOS_DATA_METRICS_BASE_PORT "$DATA_METRICS_BASE_PORT" 1024 65532
   require_integer_in_range CHAOS_REGISTER_PORT "$REGISTER_PORT" 1 65535
   require_integer_in_range CHAOS_FENCING_EPOCH "$FENCING_EPOCH" 1 2147483647
   require_integer_in_range CHAOS_READY_TIMEOUT_SECONDS "$READY_TIMEOUT_SECONDS" 1 3600
@@ -150,13 +152,13 @@ preflight_settings() {
       "$(meta_metrics_addr "$id")"
     )
   done
-  for id in 0 1 2; do
+  for id in 0 1 2 3; do
     labels+=("replica-$id")
     endpoints+=("$(replica_addr "$id")")
   done
   labels+=("native")
   endpoints+=("$(native_addr)")
-  for id in 0 1 2; do
+  for id in 0 1 2 3; do
     labels+=("data-metrics-$id")
     endpoints+=("$(data_metrics_addr "$id")")
   done

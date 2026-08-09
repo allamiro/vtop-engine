@@ -52,9 +52,12 @@ export CHAOS_MAX_SEGMENT_BYTES="${CHAOS_MAX_SEGMENT_BYTES:-$((BATCH * 512))}"
 DOMAIN_PREFIX="${CHAOS_REPLACEMENT_DOMAIN_PREFIX:-rack}"
 require_integer_in_range CHAOS_REPLACEMENT_RECORDS "$RECORDS" 1 100000000
 require_integer_in_range CHAOS_REPLACEMENT_BATCH "$BATCH" 1 "$RECORDS"
-# At least 2, or there is no second replica for a replacement to mean anything;
-# at most 3, because the harness mints exactly three original data nodes.
-require_integer_in_range CHAOS_REPLACEMENT_RF "$RF" 2 3
+# Exactly 3. A lower factor would still register all three original nodes, so
+# rendezvous would place only some of them and the node this scenario retires
+# might not be in the placement at all — `propose-rebalance` rejects a source
+# that is not a current replica, and the failure would look like a bug in the
+# replacement flow rather than in the scenario's own arithmetic.
+require_integer_in_range CHAOS_REPLACEMENT_RF "$RF" 3 3
 DURING_MOVE=$((RF + 1))
 # A first registration, so the generation starts at the base the state machine
 # expects. Overridable rather than fixed in the command line below.
@@ -88,7 +91,7 @@ register_with_domain() {
   local uuid="$1" n="$2" suffix="$3"
   local domain="$DOMAIN_PREFIX-$suffix"
   local ack="$WORKDIR/ack-register-$suffix.json"
-  meta_admin "$LEADER_ID" register-node --json \
+  meta_admin "$LEADER_ID" register-node \
     --node-uuid "$uuid" --addr "$(replica_addr "$n")" > "$ack" \
     || fail "could not register data node $uuid"
   local generation
@@ -192,7 +195,7 @@ log "sealed segment registered in metadata"
 # against what was registered, so this cannot bless a segment as something it
 # is not.
 SEG_AFTER_REGISTER="$WORKDIR/placement-after-register.json"
-meta_admin "$LEADER_ID" get-placement --json \
+meta_admin "$LEADER_ID" get-placement \
   --topic-uuid "$TOPIC_UUID" --range-uuid "$RANGE_ID" --segment-uuid "$SEG_UUID" \
   > "$SEG_AFTER_REGISTER" || fail "could not read the segment after registering it"
 meta_admin "$LEADER_ID" mark-segment-verified \
@@ -210,7 +213,7 @@ log "segment marked verified against the root the bytes produced"
 # a first placement could only be reached by guessing an order and resubmitting
 # until one was accepted.
 PLACEMENT_JSON="$WORKDIR/placement-initial.json"
-meta_admin "$LEADER_ID" get-placement --json \
+meta_admin "$LEADER_ID" get-placement \
   --topic-uuid "$TOPIC_UUID" --range-uuid "$RANGE_ID" --segment-uuid "$SEG_UUID" \
   --for-replication-factor "$RF" > "$PLACEMENT_JSON" \
   || fail "could not read the placement proposal"
@@ -237,7 +240,7 @@ log "placement committed at the factor and order metadata chose"
 # The order must round-trip. A placement that came back permuted would be
 # refused by every later command, and the refusal would say nothing about why.
 COMMITTED="$WORKDIR/placement-committed.json"
-meta_admin "$LEADER_ID" get-placement --json \
+meta_admin "$LEADER_ID" get-placement \
   --topic-uuid "$TOPIC_UUID" --range-uuid "$RANGE_ID" --segment-uuid "$SEG_UUID" \
   > "$COMMITTED" || fail "could not read the committed placement"
 READ_BACK="$(json_field "$COMMITTED" '" ".join(d["replica_nodes"])')"
@@ -265,7 +268,7 @@ log "rebalance opened: $FOLLOWER1_UUID -> $SPARE_UUID"
 # RF - 1. That is the whole reason the flow has a rebalance step rather than a
 # swap.
 MOVING="$WORKDIR/placement-moving.json"
-meta_admin "$LEADER_ID" get-placement --json \
+meta_admin "$LEADER_ID" get-placement \
   --topic-uuid "$TOPIC_UUID" --range-uuid "$RANGE_ID" --segment-uuid "$SEG_UUID" \
   > "$MOVING" || fail "could not read the placement mid-move"
 MOVING_COUNT="$(json_field "$MOVING" 'len(d["replica_nodes"])')"
@@ -366,7 +369,7 @@ log "replacement proof committed"
 
 # --- now retirement is accepted ---------------------------------------------
 PROVEN="$WORKDIR/placement-proven.json"
-meta_admin "$LEADER_ID" get-placement --json \
+meta_admin "$LEADER_ID" get-placement \
   --topic-uuid "$TOPIC_UUID" --range-uuid "$RANGE_ID" --segment-uuid "$SEG_UUID" \
   > "$PROVEN" || fail "could not read the placement after the proof"
 
@@ -379,7 +382,7 @@ meta_admin "$LEADER_ID" plan-replica-retirement \
 log "retirement planned, on the strength of committed evidence"
 
 PLANNED="$WORKDIR/placement-planned.json"
-meta_admin "$LEADER_ID" get-placement --json \
+meta_admin "$LEADER_ID" get-placement \
   --topic-uuid "$TOPIC_UUID" --range-uuid "$RANGE_ID" --segment-uuid "$SEG_UUID" \
   > "$PLANNED" || fail "could not read the placement after planning"
 meta_admin "$LEADER_ID" confirm-replica-retired \
@@ -391,7 +394,7 @@ log "retirement confirmed"
 
 # --- the placement names the newcomer, not the dead replica -----------------
 FINAL="$WORKDIR/placement-final.json"
-meta_admin "$LEADER_ID" get-placement --json \
+meta_admin "$LEADER_ID" get-placement \
   --topic-uuid "$TOPIC_UUID" --range-uuid "$RANGE_ID" --segment-uuid "$SEG_UUID" \
   > "$FINAL" || fail "could not read the final placement"
 FINAL_NODES="$(json_field "$FINAL" '" ".join(d["replica_nodes"])')"
@@ -425,7 +428,13 @@ log "the replacement replica is running against the repaired directory"
 stop_node_now "$LEADER"
 LEADER=$(start_leader_with_replicas "$LEADER_ID" post-replacement 2 3)
 await_lease_holder "$LEADER_ID" "$LEADER_UUID" > /dev/null
-log "leader restarted with the post-replacement replica set (follower 2 and the newcomer)"
+# RE-READ, not reused. The old lease can expire while the leader restarts, in
+# which case the replacement process reacquires at a NEW epoch — and a client
+# config pinned to the original one is fenced on every request, so the
+# verification below would time out having proven nothing about the data.
+EPOCH_AFTER="$(lease_field "$LEADER_ID" 'd["lease"]["fencing_epoch"]')"
+log "leader restarted with the post-replacement replica set, holding epoch $EPOCH_AFTER"
+CLIENT_CFG="$(emit_client_config_at_epoch "$EPOCH_AFTER")"
 
 await_verified_floor "$CLIENT_CFG" "$(native_addr)" "$ACKED"
 log "every one of the $ACKED acknowledged records is still readable after the replacement"
@@ -441,10 +450,26 @@ assert_running() { # <label> <pid>
   kill -0 "$2" 2>/dev/null \
     || fail "$1 (pid $2) is not running at the end of the replacement; the placement says RF $RF \
 but the range is short a replica"
+  # `kill -0` ALSO SUCCEEDS FOR A ZOMBIE — a process that has exited and not
+  # been reaped still has a pid entry — which is exactly the RF-1 case this
+  # check exists to catch. The state is what distinguishes them.
+  local state
+  state="$(ps -o stat= -p "$2" 2>/dev/null | tr -d ' ')"
+  case "$state" in
+    Z*) fail "$1 (pid $2) has exited and not been reaped (state $state); the placement says RF \
+$RF but the range is short a replica" ;;
+  esac
 }
 assert_running "the surviving follower" "$F2"
 assert_running "the replacement replica" "$SPARE"
 log "the surviving replica and the newcomer are both still serving"
 
+# STOPPED FIRST. `seal_and_verify_active` performs offline recovery and seals
+# the active file in place; run against a live follower it races that
+# follower's own descriptor, which can write through the rename and invalidate
+# the manifest it just produced. Every other scenario stops the node first, and
+# the liveness assertion above is what makes stopping it here meaningful rather
+# than incidental.
+stop_node_now "$SPARE"
 seal_and_verify_active "spare" "$SPARE_DIR"
 log "PASS"

@@ -124,6 +124,11 @@ fn validate_single_lineage(entries: &[CatalogEntry], directory: &Path) -> VtopLo
 pub struct SegmentSet {
     env: Env,
     directory: PathBuf,
+    /// Thresholds for the next successor, when they should differ from the
+    /// current tail's. `None` means inherit, which is what every path did
+    /// unconditionally before — and why changing a node's roll thresholds had
+    /// no effect on a directory that already existed.
+    roll_config: Option<crate::SegmentConfig>,
     /// Sealed segments in ascending offset order, contiguous with each other
     /// and with `active`.
     sealed: Vec<SegmentReader>,
@@ -279,6 +284,7 @@ impl SegmentSet {
         let active = ActiveSegment::recover_in(env, &active_path)?;
 
         let set = Self {
+            roll_config: None,
             env: env.clone(),
             directory,
             sealed,
@@ -387,6 +393,7 @@ impl SegmentSet {
         let active = crate::segment::open_successor_in(env, last.path(), successor_id)?;
 
         let set = Self {
+            roll_config: None,
             env: env.clone(),
             directory,
             sealed,
@@ -409,6 +416,7 @@ impl SegmentSet {
         let path = directory.join(format!("{}.active", segment_stem(descriptor.base_offset)));
         let active = ActiveSegment::create_in(env, &path, descriptor, config)?;
         Ok(Self {
+            roll_config: None,
             env: env.clone(),
             directory,
             sealed: Vec::new(),
@@ -580,6 +588,17 @@ impl SegmentSet {
     }
 
     /// Seal the tail and open a successor at its end.
+    /// Apply new roll thresholds from the next successor onward.
+    ///
+    /// The CURRENT tail keeps the thresholds baked into its header — that file
+    /// is already written — so this changes when the range rolls next, not
+    /// retroactively. Without it, a reopened range carries its original
+    /// thresholds forever and changing them in a node's config does nothing on
+    /// any directory that already exists.
+    pub fn set_roll_config(&mut self, config: crate::SegmentConfig) {
+        self.roll_config = Some(config);
+    }
+
     pub fn roll(&mut self, successor_id: Uuid) -> VtopLogResult<()> {
         // A segment holding nothing would seal into an empty sealed segment and
         // an identically-based successor, so rolling it is a no-op that costs a
@@ -596,7 +615,7 @@ impl SegmentSet {
         // deliberate: a set whose roll failed part-way has no coherent tail, and
         // continuing to answer reads from a half-rolled range would be worse
         // than stopping.
-        let (sealed, successor) = roll_in(&self.env, active, successor_id)?;
+        let (sealed, successor) = roll_in(&self.env, active, successor_id, self.roll_config)?;
         self.active = Some(successor);
         self.sealed.push(sealed);
         Ok(())
@@ -876,6 +895,7 @@ impl From<ActiveSegment> for SegmentSet {
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf();
         Self {
+            roll_config: None,
             env,
             directory,
             sealed: Vec::new(),

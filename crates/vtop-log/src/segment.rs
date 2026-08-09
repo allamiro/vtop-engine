@@ -1873,6 +1873,13 @@ pub fn roll_in(
     env: &Env,
     active: ActiveSegment,
     successor_id: Uuid,
+    // Thresholds for the SUCCESSOR, when they should differ from the segment
+    // being sealed. A segment's config lives in its header, so a running range
+    // carries its original thresholds from tail to successor forever. Without
+    // an override here, changing them in a node's config has no effect on any
+    // directory that already exists — which is every deployment that would
+    // want to change them.
+    config_override: Option<crate::SegmentConfig>,
 ) -> VtopLogResult<(SegmentReader, ActiveSegment)> {
     let directory = active
         .path
@@ -1903,13 +1910,31 @@ pub fn roll_in(
             .map(|(mut descriptor, config)| {
                 descriptor.segment_id = successor_id;
                 descriptor.base_offset = base_offset;
+                // FIELD BY FIELD, not a wholesale swap: a v2 config also
+                // carries `chunk_size`, which belongs to the segment format
+                // rather than to an operator's roll policy. Replacing the
+                // whole struct would silently reset it.
+                let config = match config_override {
+                    Some(over) => crate::SegmentConfigV2 {
+                        max_record_bytes: over.max_record_bytes,
+                        max_group_bytes: over.max_group_bytes,
+                        max_segment_bytes: over.max_segment_bytes,
+                        max_segment_records: over.max_segment_records,
+                        index_stride: over.index_stride,
+                        chunk_size: config.chunk_size,
+                    },
+                    None => config,
+                };
                 (descriptor, config)
             });
     let v1 = if v2.is_none() {
         let mut descriptor = active.descriptor().clone();
         descriptor.segment_id = successor_id;
         descriptor.base_offset = base_offset;
-        Some((descriptor, active.config()))
+        Some((
+            descriptor,
+            config_override.unwrap_or_else(|| active.config()),
+        ))
     } else {
         None
     };
@@ -4781,7 +4806,7 @@ mod tests {
                     .unwrap();
             }
             let (_sealed, mut successor) =
-                roll_in(&Env::real(), active, Uuid::from_u128(500)).unwrap();
+                roll_in(&Env::real(), active, Uuid::from_u128(500), None).unwrap();
             // Continues the SAME producer sequence into the new segment.
             successor
                 .append(record(producer, 3, b"after"), Durability::Fsync)
@@ -4819,7 +4844,8 @@ mod tests {
                 .append(record(producer, sequence, b"v"), Durability::Fsync)
                 .unwrap();
         }
-        let (_sealed, mut successor) = roll_in(&Env::real(), active, Uuid::from_u128(600)).unwrap();
+        let (_sealed, mut successor) =
+            roll_in(&Env::real(), active, Uuid::from_u128(600), None).unwrap();
 
         // A gap is still a gap across a roll.
         assert!(matches!(
@@ -4872,8 +4898,8 @@ mod tests {
                 .unwrap();
         }
 
-        let (sealed, mut successor) =
-            roll_in(&Env::real(), active, Uuid::from_u128(700)).expect("a v2 roll must succeed");
+        let (sealed, mut successor) = roll_in(&Env::real(), active, Uuid::from_u128(700), None)
+            .expect("a v2 roll must succeed");
         assert_eq!(sealed.manifest_v2().unwrap().next_offset, 45);
         assert_eq!(successor.descriptor_v2().unwrap().base_offset, 45);
 
@@ -4898,7 +4924,7 @@ mod tests {
         let active = ActiveSegment::create(&path, descriptor(), config()).unwrap();
 
         assert!(matches!(
-            roll_in(&Env::real(), active, Uuid::from_u128(800)),
+            roll_in(&Env::real(), active, Uuid::from_u128(800), None),
             Err(LogError::InvalidDescriptor(_))
         ));
     }

@@ -132,7 +132,24 @@ fn open_range(
     roll: SegmentRoll,
 ) -> Result<(SegmentSet, Option<RecoveryReport>), String> {
     let env = Env::real();
-    if let Some(set) = SegmentSet::open_in(&env, data_dir).map_err(|error| error.to_string())? {
+    if let Some(mut set) = SegmentSet::open_in(&env, data_dir).map_err(|error| error.to_string())? {
+        // APPLIED ON REOPEN TOO, not only when the range is created. A
+        // segment's thresholds live in its header and propagate from tail to
+        // successor, so without this a directory that already exists carries
+        // its original values forever — and changing them in the config would
+        // do nothing on every deployment that has ever run. Since only sealed
+        // segments transfer, that is precisely the case where an operator
+        // lowers the threshold to make repair possible.
+        //
+        // The current tail keeps what its header says; this takes effect from
+        // the next roll, which is the earliest a written header can change.
+        set.set_roll_config(vtop_log::SegmentConfig {
+            max_segment_bytes: roll.max_bytes,
+            max_segment_records: roll.max_records,
+            max_group_bytes: roll.max_group_bytes,
+            max_record_bytes: roll.max_record_bytes,
+            ..vtop_log::SegmentConfig::default()
+        });
         // The tail is the only segment recovery had judgement calls to make
         // about; sealed segments either validate or quarantine.
         let report = set.active().recovery_report().clone();
