@@ -253,10 +253,14 @@ pub struct DataNodeConfig {
     pub max_group_bytes: u64,
     /// Bytes a single record may reach.
     ///
-    /// The third of a coupled set: the engine requires
-    /// `max_record_bytes` <= `max_group_bytes` <= `max_segment_bytes`, so
-    /// lowering the roll threshold means lowering all three. They were all
-    /// constants, which made the roll threshold unreachable in practice.
+    /// The third of a coupled set. The engine requires
+    /// `max_record_bytes` PLUS FRAME OVERHEAD to fit in `max_group_bytes`,
+    /// and `max_group_bytes` to fit in `max_segment_bytes` — so equal values
+    /// are refused, and the refusal arrives as a node that will not start with
+    /// a message about group sizing, some way from the config that caused it.
+    /// Lowering the roll threshold therefore means lowering all three, with
+    /// headroom. They were all constants, which made the roll threshold
+    /// unreachable in practice.
     #[serde(default = "default_max_record_bytes")]
     pub max_record_bytes: u32,
     /// Node UUIDs allowed to pull this leader's sealed segments, beyond its
