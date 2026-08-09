@@ -543,13 +543,49 @@ done
   fail "meta init never succeeded in the replicated namespace"
 }
 
-r_leader=""
-for _ in $(seq 1 20); do
-  status="$(vtopctl meta status --config "$WORK/r-admin.yaml" 2>/dev/null || true)"
-  if printf '%s' "$status" | grep -q "server_state:.*Leader"; then r_leader="yes"; break; fi
+# A forward per metadata pod: needed to find WHICH one leads, and then to reach
+# the leader after a redirect. Allocated before the probe below because that
+# probe queries every pod by port.
+peer_ports=()
+for ordinal in 0 1 2; do
+  alloc_port
+  peer_ports+=("$r_port")
+  forward_ns "$REPLICATED_NS" "${REL}-${ordinal}" "$r_port" 9200
+done
+
+# Find WHICH pod leads, and then deliberately aim everything at one that does
+# NOT.
+#
+# Waiting for pod 0 to report Leader and then sending every command to pod 0 was
+# a test that could not fail: the first hop always reached the leader, so
+# removing redirect support entirely would still have passed, and a run that
+# elected a different leader would have failed before reaching the assertion.
+# The redirect is the thing under test, so the primary endpoint has to be a
+# follower.
+leader_ordinal=""
+for _ in $(seq 1 30); do
+  for ordinal in 0 1 2; do
+    cat > "$WORK/probe-${ordinal}.yaml" <<EOF
+endpoint: localhost:${peer_ports[$ordinal]}
+server_name: ${REL}-${ordinal}.${HEADLESS}.${REPLICATED_NS}.svc.${DOMAIN}
+ca_cert: $CERTS/ca.pem
+client_cert: $CERTS/r-operator.pem
+client_key: $CERTS/r-operator-key.pem
+EOF
+    status="$(vtopctl meta status --config "$WORK/probe-${ordinal}.yaml" 2>/dev/null || true)"
+    if printf '%s' "$status" | grep -q "server_state:.*Leader"; then
+      leader_ordinal="$ordinal"
+      break
+    fi
+  done
+  [ -n "$leader_ordinal" ] && break
   sleep 2
 done
-[ -n "$r_leader" ] || { printf '%s\n' "${status:-<no status>}"; fail "no Raft leader in the replicated namespace"; }
+[ -n "$leader_ordinal" ] || fail "no Raft leader in the replicated namespace"
+
+# Any ordinal that is not the leader. With three nodes there is always one.
+follower_ordinal=$(( (leader_ordinal + 1) % 3 ))
+log "metadata leader is pod $leader_ordinal; aiming every admin write at pod $follower_ordinal so the redirect is exercised"
 
 # THE RANGE MUST EXIST IN METADATA BEFORE ANYONE CAN HOLD A LEASE ON IT.
 #
@@ -571,34 +607,72 @@ done
 # must reach the RAFT leader, and which pod that is depends on an election —
 # a non-leader answers "has to forward request to", so a run that happened to
 # elect node 2 would fail for a reason that reads like a configuration error.
-meta_admin_any() { # description -- args...
-  what="$1"; shift
-  for ordinal in 0 1 2; do
-    r_port=$((r_port + 1))
-    cat > "$WORK/r-admin-${ordinal}.yaml" <<EOF
-endpoint: localhost:${r_port}
-server_name: ${REL}-${ordinal}.${HEADLESS}.${REPLICATED_NS}.svc.${DOMAIN}
+# ONE endpoint, with every peer listed so a redirect can be followed.
+#
+# This used to try all three pods in turn, because `vtopctl` built a
+# single-endpoint client: a write must reach the RAFT LEADER, a non-leader
+# refuses, and with nowhere to go the command failed roughly two times in three
+# depending on which node won the election. That workaround is gone now the CLI
+# follows the redirect itself. The commands below are aimed at a pod that is NOT
+# the leader, and the assertion after them is that a redirect was actually
+# observed — not merely that the writes succeeded, which they would have done
+# anyway if the endpoint happened to lead.
+{
+  cat <<EOF
+endpoint: localhost:${peer_ports[$follower_ordinal]}
+server_name: ${REL}-${follower_ordinal}.${HEADLESS}.${REPLICATED_NS}.svc.${DOMAIN}
 ca_cert: $CERTS/ca.pem
 client_cert: $CERTS/r-operator.pem
 client_key: $CERTS/r-operator-key.pem
+peers:
 EOF
-    forward_ns "$REPLICATED_NS" "${REL}-${ordinal}" "$r_port" 9200
-    if vtopctl "$@" --config "$WORK/r-admin-${ordinal}.yaml" >/dev/null 2>&1; then
-      log "$what (via ${REL}-${ordinal})"
-      return 0
-    fi
+  for ordinal in 0 1 2; do
+    cat <<EOF
+  - node_id: $((ordinal + 1))
+    endpoint: localhost:${peer_ports[$ordinal]}
+    server_name: ${REL}-${ordinal}.${HEADLESS}.${REPLICATED_NS}.svc.${DOMAIN}
+EOF
   done
-  fail "$what failed against every metadata pod"
+} > "$WORK/r-admin-multi.yaml"
+
+# OBSERVES the redirect rather than inferring it from a role snapshot.
+#
+# Picking a follower up front is necessary but not sufficient: leadership can
+# move between the probe and the request, and then the "follower" is the leader,
+# the command succeeds on its first hop, and the test passes without exercising
+# anything. `vtopctl` reports the redirects it actually followed, so this checks
+# what happened instead of what was arranged.
+redirects_seen=0
+meta_admin() { # description -- args...
+  what="$1"; shift
+  # stderr carries the note; stdout is the command's own output.
+  if ! note="$(vtopctl "$@" --config "$WORK/r-admin-multi.yaml" 2>&1 >/dev/null)"; then
+    printf '%s\n' "$note"
+    fail "$what failed even though every metadata peer was listed and reachable"
+  fi
+  if printf '%s' "$note" | grep -q "followed .* leader redirect"; then
+    redirects_seen=$((redirects_seen + 1))
+  fi
+  log "$what"
 }
 
-meta_admin_any "created the topic and its root range in metadata" \
+meta_admin "created the topic and its root range in metadata" \
   meta create-topic --name telemetry \
   --topic-uuid "$TOPIC_UUID" --root-range-uuid "$RANGE_ID"
 
 for uuid in "$UUID_0" "$UUID_1" "$UUID_2"; do
-  meta_admin_any "registered data node $uuid" \
+  meta_admin "registered data node $uuid" \
     meta register-node --node-uuid "$uuid" --addr "${REL}-0.${HEADLESS}.${REPLICATED_NS}.svc.${DOMAIN}:9300"
 done
+
+# THE ASSERTION. Without it this suite would pass against a `vtopctl` that
+# cannot follow a redirect at all, provided the endpoint happened to be the
+# leader — which is how the first version of this test was wrong.
+[ "$redirects_seen" -gt 0 ] \
+  || fail "no admin command followed a leader redirect, so redirect support was never exercised: \
+either the endpoint was the leader after all (leadership moved between the probe and the request) \
+or vtopctl is not following redirects"
+log "observed $redirects_seen leader redirect(s): admin writes reached the leader from a follower endpoint"
 
 log "waiting for the whole replicated range to become Ready"
 await_pods_exist "$REPLICATED_NS" 3
