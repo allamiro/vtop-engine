@@ -56,7 +56,11 @@ export CHAOS_TRANSFER_PEERS="${CHAOS_TRANSFER_PEERS:-$SPARE_UUID}"
 # framing. The multiple is slack for that framing, not a guess at it.
 VALUE_BYTES="${CHAOS_REPLACEMENT_VALUE_BYTES:-128}"
 require_integer_in_range CHAOS_REPLACEMENT_VALUE_BYTES "$VALUE_BYTES" 1 1048576
-RECORD_CEILING=$((VALUE_BYTES * 4))
+# Fixed slack for key and framing, not a multiple of the value: a multiple
+# grows the segment threshold faster than the data does, so a larger value
+# width stopped the range rolling at all and the scenario had nothing to
+# transfer.
+RECORD_CEILING=$((VALUE_BYTES + 512))
 export CHAOS_MAX_RECORD_BYTES="${CHAOS_MAX_RECORD_BYTES:-$RECORD_CEILING}"
 # A group holds a whole batch, PLUS one record's worth of headroom: the engine
 # requires a group to fit a maximal record plus frame overhead, so a group sized
@@ -65,7 +69,25 @@ export CHAOS_MAX_GROUP_BYTES="${CHAOS_MAX_GROUP_BYTES:-$(((BATCH + 1) * RECORD_C
 # Twice the group, so the range rolls every couple of batches. The assertion
 # below fails loudly if this stops producing a sealed segment rather than
 # letting the scenario continue against an unrolled range.
-export CHAOS_MAX_SEGMENT_BYTES="${CHAOS_MAX_SEGMENT_BYTES:-$((CHAOS_MAX_GROUP_BYTES * 2))}"
+# One batch per segment, so the number of rolls tracks RECORDS/BATCH and stays
+# the same whatever the records weigh.
+export CHAOS_MAX_SEGMENT_BYTES="${CHAOS_MAX_SEGMENT_BYTES:-$CHAOS_MAX_GROUP_BYTES}"
+# CHECKED AFTER DERIVING, not by guessing a bound on the inputs. Each override
+# is individually reasonable and the combination need not be: a 1 MiB value at
+# the default batch derives a group far above the engine's 256 MiB ceiling, and
+# the node then refuses to start with a message about group sizing rather than
+# about the two settings that produced it.
+ENGINE_MAX_GROUP_BYTES=$((256 * 1024 * 1024))
+[[ "$CHAOS_MAX_GROUP_BYTES" -le "$ENGINE_MAX_GROUP_BYTES" ]] \
+  || fail "CHAOS_REPLACEMENT_VALUE_BYTES=$VALUE_BYTES with batch $BATCH derives a group limit of \
+$CHAOS_MAX_GROUP_BYTES bytes, above the engine maximum of $ENGINE_MAX_GROUP_BYTES. Lower either."
+[[ "$CHAOS_MAX_SEGMENT_BYTES" -le $((8 * 1024 * 1024 * 1024)) ]] \
+  || fail "the derived segment limit $CHAOS_MAX_SEGMENT_BYTES exceeds the engine maximum"
+# A whole batch also has to fit one produce request.
+NODE_MAX_FRAME_BYTES=$((32 * 1024 * 1024))
+[[ $((BATCH * CHAOS_MAX_RECORD_BYTES)) -le "$NODE_MAX_FRAME_BYTES" ]] \
+  || fail "batch $BATCH of up to $CHAOS_MAX_RECORD_BYTES-byte records exceeds the node frame \
+limit of $NODE_MAX_FRAME_BYTES bytes; lower CHAOS_REPLACEMENT_BATCH or CHAOS_REPLACEMENT_VALUE_BYTES"
 DOMAIN_PREFIX="${CHAOS_REPLACEMENT_DOMAIN_PREFIX:-rack}"
 require_integer_in_range CHAOS_REPLACEMENT_RECORDS "$RECORDS" 1 100000000
 # Bounded by the PROTOCOL, not just by the record count: the produce path caps
@@ -475,8 +497,28 @@ EPOCH_AFTER="$(await_lease_holder "$LEADER_ID" "$LEADER_UUID")"
 log "leader restarted with the post-replacement replica set, holding epoch $EPOCH_AFTER"
 CLIENT_CFG="$(emit_client_config_at_epoch "$EPOCH_AFTER")"
 
-await_verified_floor "$CLIENT_CFG" "$(native_addr)" "$ACKED"
+await_verified_floor "$CLIENT_CFG" "$(native_addr)" "$ACKED" "" "$VALUE_BYTES"
 log "every one of the $ACKED acknowledged records is still readable after the replacement"
+
+# WHAT THE REPLACEMENT REPLICA ITSELF HOLDS, reported rather than assumed. The
+# check above reads through the leader, so it proves the RANGE survived the
+# replacement — it says nothing about the newcomer, which could be arbitrarily
+# far behind and the range would still answer correctly from the other two.
+#
+# The gap repair reported (exit 1) is in the source's active segment, which
+# never transfers; the spare closes it by replicating from the leader once it
+# joins. That is the thing worth stating, because a replacement replica that
+# never catches up leaves the range at RF-1 in fact while metadata says RF 3.
+SPARE_OFFSET="$(follower_committed_offset 3)"
+log "the replacement replica has committed through offset $SPARE_OFFSET of $ACKED"
+if [[ "$SPARE_OFFSET" -lt "$ACKED" ]]; then
+  # Not a failure: catch-up is asynchronous and the leader's retransmission
+  # buffer is bounded, so a fresh replica may legitimately still be closing
+  # the gap when this line runs. Reported so a run that never closes it is
+  # visible in the log rather than silently passing as "replaced".
+  log "NOTE: the replacement is still catching up; the range is serving from \
+the leader and the surviving follower meanwhile"
+fi
 
 # BOTH REPLICAS STILL RUNNING. A replacement that ends with the newcomer dead
 # would still satisfy every metadata assertion above — the placement names it,

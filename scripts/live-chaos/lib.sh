@@ -858,7 +858,7 @@ follower_committed_offset() {
 # and restarts at sequence 0 — so their bytes are not reconstructible from the
 # offset. Structure (contiguity, high watermark) is still checked throughout.
 await_verified_floor() {
-  local cfg="$1" addr="$2" floor="$3" content_through="${4:-}"
+  local cfg="$1" addr="$2" floor="$3" content_through="${4:-}" value_bytes="${5:-}"
   local deadline=$((SECONDS + PROGRESS_TIMEOUT_SECONDS))
   # `${bound[@]+"${bound[@]}"}` at the use site, not a bare `"${bound[@]}"`:
   # bash 3.2 — which is what macOS ships — treats an EMPTY array expansion as
@@ -868,6 +868,12 @@ await_verified_floor() {
   # skipped and the scenario reported PASS.
   local bound=()
   [[ -n "$content_through" ]] && bound=(--verify-content-through "$content_through")
+  # THE WIDTH THE RECORDS WERE WRITTEN AT. `verify` reconstructs each expected
+  # value from the offset, so a scenario that produced at a non-default width
+  # compares real bytes against 128-byte expectations and never converges — it
+  # times out reporting a durability failure that is really an argument
+  # mismatch.
+  [[ -n "$value_bytes" ]] && bound+=(--value-bytes "$value_bytes")
   while :; do
     if "$VTOP_NODE" verify --client-config "$cfg" --addr "$addr" \
       --expect-at-least "$floor" ${bound[@]+"${bound[@]}"} \
