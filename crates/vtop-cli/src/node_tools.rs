@@ -428,6 +428,113 @@ async fn run_inner(command: NodeCommand, json: bool) -> Result<i32, String> {
     }
 }
 
+/// The three files `node repair` writes into a destination, and the only names
+/// exempt from the emptiness check.
+///
+/// EXACT NAMES, not a `.vtop-repair-` prefix. A prefix exempts files this
+/// command never wrote — and since log discovery ignores anything it does not
+/// recognise, a destination someone else left `.vtop-repair-notes` in would
+/// pass as empty and be repaired over. The exemption exists for bookkeeping
+/// this command is known to have created, so it should name exactly that.
+const OWNER_MARKER: &str = ".vtop-repair-owned";
+/// DEFINED BY THE LOG, not by this command. Every opener enforces it —
+/// `SegmentSet::open_in` and `adopt_in` both refuse — so a condemned directory
+/// cannot be served by a node that was merely restarted, which is what a
+/// supervisor or a rescheduled pod does without asking anyone. Repair writes
+/// the verdict; it does not own it.
+const DIVERGED_MARKER: &str = vtop_log::CONDEMNED_MARKER;
+const LOCK_FILE: &str = ".vtop-repair-lock";
+
+/// Whether a destination holds anything other than repair's own bookkeeping.
+///
+/// REPAIR'S OWN FILES DO NOT COUNT AS CONTENT. The lock is taken before the
+/// marker is written, so a process that dies in between would otherwise leave a
+/// directory that is non-empty and unmarked — refused forever for holding
+/// nothing but a file this command created. Filtering by prefix keeps the order
+/// of those two writes from mattering at all, which is better than getting the
+/// order right once.
+fn directory_is_occupied(into: &Path, entries: std::fs::ReadDir) -> Result<bool, String> {
+    for entry in entries {
+        // PROPAGATED, never skipped. A per-entry failure — a stale NFS handle, a
+        // transient I/O error — silently dropped would end the scan early and
+        // report a directory holding old sealed artifacts as empty. A later,
+        // luckier scan would then repair over them, which is precisely the
+        // history-clobbering this check exists to prevent. An unreadable
+        // directory is a condition to report, not to interpret.
+        let entry = entry.map_err(|error| {
+            format!(
+                "list {}: {error}. Refusing to judge whether the directory is empty from a \
+                 partial listing — an entry this scan could not read may be a sealed segment, \
+                 and repairing over one would report success onto records the source no longer \
+                 has.",
+                into.display()
+            )
+        })?;
+        match entry.file_name().to_str() {
+            Some(OWNER_MARKER | DIVERGED_MARKER | LOCK_FILE) => continue,
+            // Non-UTF-8 is somebody else's file by definition — this command
+            // only ever writes ASCII names — so it counts.
+            _ => return Ok(true),
+        }
+    }
+    Ok(false)
+}
+
+/// Write the divergence verdict so it survives losing the host.
+///
+/// FSYNCED, file and parent directory both. `write` returning says the page
+/// cache holds the bytes, not the disk — so a crash moments later can leave the
+/// adopted tail and the ownership marker (written long before, with time to
+/// reach the platter) while this file never existed. The next run then reads a
+/// marked directory with an adopted range, takes the completed-repair branch,
+/// and tells the operator to start a replica holding the disowned suffix.
+///
+/// That is the exact outcome this whole mechanism exists to prevent, and a
+/// power loss during a storage incident is not an exotic pairing — it is the
+/// same class of event that produced the divergence.
+fn record_divergence(diverged: &Path, detail: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let mut file = std::fs::File::create(diverged)?;
+    file.write_all(detail.as_bytes())?;
+    file.sync_all()?;
+    // The DIRECTORY ENTRY needs its own sync: the contents can be durable while
+    // the name pointing at them is not, which loses the file just as
+    // completely.
+    let parent = diverged
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty());
+    if let Some(parent) = parent {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Refuse a directory an earlier repair condemned as diverged.
+///
+/// A free function so a test can reach it without a cluster. The verdict is the
+/// only piece of repair state that must survive the process that reached it:
+/// by the time divergence is detected the tail is already adopted and the
+/// ownership marker already says the directory is reusable, so a later run sees
+/// two facts that read as a finished repair and would tell the operator to
+/// start the replica — the single action the verdict exists to forbid.
+fn check_prior_divergence(into: &Path, diverged: &Path) -> Result<(), String> {
+    if !diverged.exists() {
+        return Ok(());
+    }
+    let detail = std::fs::read_to_string(diverged).unwrap_or_default();
+    Err(format!(
+        "{} was found to have DIVERGED from its source by an earlier repair, and that verdict \
+         stands until the directory is cleared. Do not start a replica against it: it holds \
+         records the source no longer has, and serving them would hand out a history the range \
+         has disowned. Delete {} and repair again once the source is stable.\n\nThe earlier \
+         finding was:\n{}",
+        into.display(),
+        into.display(),
+        detail.trim()
+    ))
+}
+
 /// How far the repaired prefix is behind the source, or why the question has no
 /// answer.
 ///
@@ -511,11 +618,19 @@ async fn repair(
     // So a marker file records that a repair owns this directory. Its presence
     // means these bytes came from a repair and nothing else, which is exactly
     // the condition under which resuming is safe.
-    const OWNER_MARKER: &str = ".vtop-repair-owned";
     let marker = into.join(OWNER_MARKER);
+    let diverged = into.join(DIVERGED_MARKER);
     match std::fs::read_dir(into) {
-        Ok(mut entries) => {
-            if entries.next().is_some() && !marker.exists() {
+        Ok(entries) => {
+            // REPAIR'S OWN BOOKKEEPING DOES NOT COUNT AS CONTENT. The lock is
+            // taken before the marker is written, so a process that dies in
+            // between would otherwise leave a directory that is non-empty and
+            // unmarked — refused forever by the branch below, for holding
+            // nothing but a file this command created. Exempting the three
+            // names it writes keeps the order of those two writes from
+            // mattering at all, which beats getting the order right once.
+            let occupied = directory_is_occupied(into, entries)?;
+            if occupied && !marker.exists() {
                 return Err(format!(
                     "{} is not empty and was not created by a previous repair. Repair rebuilds a \
                      range from scratch and must not run over existing data: a stopped replica's \
@@ -533,6 +648,52 @@ async fn repair(
         }
         Err(error) => return Err(format!("read {}: {error}", into.display())),
     }
+    // ONE REPAIR AT A TIME PER DESTINATION. The ownership marker makes a
+    // directory reusable, which is what a resume needs, and by itself that is
+    // also what lets a SECOND repair start while the first is still running.
+    // Both would then transfer against their own listing of the source; if the
+    // source rolls in between, the later one installs a newly sealed segment at
+    // a base offset the earlier one has already adopted a tail over, leaving two
+    // primaries for the same offsets in a directory the first command may still
+    // report as repaired.
+    //
+    // `flock` rather than a lock file's existence, because an advisory lock is
+    // released by the kernel when the process dies. A presence-based lock
+    // survives a crash and turns every interrupted repair into a directory that
+    // needs a manual unlock — reintroducing, on the recovery path, exactly the
+    // "delete it and start over" the marker exists to avoid.
+    let lock_handle = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(into.join(LOCK_FILE))
+        .map_err(|error| format!("open the repair lock in {}: {error}", into.display()))?;
+    rustix::fs::flock(
+        &lock_handle,
+        rustix::fs::FlockOperation::NonBlockingLockExclusive,
+    )
+    .map_err(|error| {
+        format!(
+            "another repair is already running against {} ({error}). Two repairs sharing a \
+                 destination transfer against their own listings of the source, and if it rolls \
+                 between them the later one installs a segment at an offset the earlier one has \
+                 already adopted over — leaving two primaries for the same records. Wait for the \
+                 running repair to finish.",
+            into.display()
+        )
+    })?;
+
+    // A DIVERGENCE VERDICT OUTLIVES THE COMMAND THAT REACHED IT. When the final
+    // check finds the source behind this prefix, the tail has already been
+    // adopted — so without this the next run sees a marked directory with an
+    // adopted range and takes the branch below, which says the repair finished
+    // and to start the replica. That is precisely the action the divergence
+    // check exists to prevent: it would serve a suffix the source disowned.
+    //
+    // A rejected verdict must therefore be recorded where the next invocation
+    // will look, and only clearing the directory clears it.
+    check_prior_divergence(into, &diverged)?;
+
     // A MARKED directory that already holds an adopted tail is a different
     // situation from a marked one that does not, and the two want opposite
     // answers. Without the tail, the last run stopped partway and resuming is
@@ -687,6 +848,12 @@ async fn repair(
                         "segments_installed": installed.len(),
                         "sealed_segments": sealed,
                         "next_offset": next_offset,
+                        // BOTH null, not just the gap. Automation reading this
+                        // asks for a field that is always present in the success
+                        // shape; dropping one on the error path makes the two
+                        // shapes different objects and a consumer indexing the
+                        // field fails on the branch it most needs to handle.
+                        "source_next_offset": serde_json::Value::Null,
                         "remaining_gap": serde_json::Value::Null,
                         "error": message,
                     })
@@ -704,12 +871,30 @@ async fn repair(
             return Ok(2);
         }
     };
-    let gap = remaining_gap(source_tip, next_offset).map_err(|error| {
-        format!(
-            "{error} Delete {} and repair again once {from} is stable.",
-            into.display()
-        )
-    })?;
+    let gap = match remaining_gap(source_tip, next_offset) {
+        Ok(gap) => gap,
+        Err(error) => {
+            // RECORDED BEFORE RETURNING, because the tail is already adopted and
+            // the marker already says this directory is reusable. Without a
+            // durable verdict the next invocation reads those two facts as a
+            // finished repair and tells the operator to start the replica —
+            // undoing this diagnosis with the one instruction it forbids.
+            let detail = format!("{error}\n(source {from}, checked against offset {next_offset})");
+            if let Err(write_error) = record_divergence(&diverged, &detail) {
+                return Err(format!(
+                    "{error} Delete {} and repair again once {from} is stable. (This verdict could \
+                     ALSO not be recorded in the directory — {write_error} — so a later repair \
+                     will not know about it. Delete the directory now rather than relying on being \
+                     warned again.)",
+                    into.display()
+                ));
+            }
+            return Err(format!(
+                "{error} Delete {} and repair again once {from} is stable.",
+                into.display()
+            ));
+        }
+    };
 
     if json {
         println!(
@@ -942,5 +1127,99 @@ replicas: []
         );
         // One record apart is still divergence. The check is not a tolerance.
         assert!(remaining_gap(939, 940).is_err());
+    }
+
+    /// A recorded divergence verdict outlives the command that reached it.
+    ///
+    /// This is the case that made the fix necessary: divergence is detected
+    /// AFTER the tail is adopted, so the directory then looks exactly like a
+    /// finished repair — marked, with an active segment. Without a durable
+    /// verdict the next run reads it that way and tells the operator to start
+    /// the replica, which would serve the very suffix the source disowned.
+    #[test]
+    fn a_recorded_divergence_verdict_refuses_a_later_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let diverged = dir.path().join(".vtop-repair-diverged");
+
+        check_prior_divergence(dir.path(), &diverged)
+            .expect("a directory nothing has condemned is repairable");
+
+        std::fs::write(
+            &diverged,
+            b"the source is at offset 900 but the adopted prefix ends at 940",
+        )
+        .unwrap();
+        let error = check_prior_divergence(dir.path(), &diverged)
+            .expect_err("a condemned directory must not be repaired or started");
+        assert!(
+            error.contains("Do not start a replica"),
+            "the verdict must contradict the start guidance explicitly: {error}"
+        );
+        assert!(
+            error.contains("offset 900"),
+            "the original finding must be carried forward, not just its existence: {error}"
+        );
+    }
+
+    /// Repair's own bookkeeping is not content; anything else is.
+    #[test]
+    fn only_files_repair_did_not_write_make_a_directory_occupied() {
+        let dir = tempfile::tempdir().unwrap();
+        let occupied =
+            |path: &Path| directory_is_occupied(path, std::fs::read_dir(path).unwrap()).unwrap();
+
+        assert!(!occupied(dir.path()), "an empty directory is repairable");
+
+        // All three of repair's own files, including the lock that is created
+        // BEFORE the marker — the window a crash can leave behind.
+        for name in [
+            ".vtop-repair-owned",
+            ".vtop-repair-lock",
+            ".vtop-repair-diverged",
+        ] {
+            std::fs::write(dir.path().join(name), b"").unwrap();
+        }
+        assert!(
+            !occupied(dir.path()),
+            "a directory holding only files this command wrote must stay repairable, or a crash \
+             between taking the lock and writing the marker strands it forever"
+        );
+
+        // A file that merely LOOKS like repair bookkeeping is not. This command
+        // writes exactly three names, and log discovery ignores whatever it
+        // does not recognise — so exempting the prefix would let a destination
+        // somebody else left notes in pass as empty and be repaired over.
+        std::fs::write(dir.path().join(".vtop-repair-notes"), b"not ours").unwrap();
+        assert!(
+            occupied(dir.path()),
+            "only the three names this command writes are exempt, not the prefix"
+        );
+        std::fs::remove_file(dir.path().join(".vtop-repair-notes")).unwrap();
+
+        std::fs::write(
+            dir.path().join("00000000000000000000.segment"),
+            b"real data",
+        )
+        .unwrap();
+        assert!(
+            occupied(dir.path()),
+            "a sealed segment is somebody's history and must block an unmarked repair"
+        );
+    }
+
+    /// The verdict is on the disk, not merely in the page cache.
+    #[test]
+    fn the_divergence_verdict_is_written_durably() {
+        let dir = tempfile::tempdir().unwrap();
+        let diverged = dir.path().join(".vtop-repair-diverged");
+        record_divergence(&diverged, "source at 900, prefix ends at 940").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&diverged).unwrap(),
+            "source at 900, prefix ends at 940"
+        );
+        // And the precheck built on it agrees, so the two halves are wired
+        // together rather than each correct alone.
+        check_prior_divergence(dir.path(), &diverged)
+            .expect_err("a recorded verdict must refuse the next repair");
     }
 }

@@ -732,6 +732,11 @@ fn a_repair_ownership_marker_does_not_quarantine_the_range() {
         b"vtop repair\n",
     )
     .unwrap();
+    // The lock outlives the run that took it — an advisory `flock` leaves the
+    // file behind — so it is present in every repaired directory a node is
+    // then started against. Quarantining it would turn a completed repair into
+    // an unopenable range.
+    std::fs::write(h.destination.path().join(".vtop-repair-lock"), b"").unwrap();
 
     let catalog = StartupCatalog::discover(h.destination.path()).unwrap();
     assert!(
@@ -742,4 +747,49 @@ fn a_repair_ownership_marker_does_not_quarantine_the_range() {
 
     SegmentSet::adopt_in(&Env::real(), h.destination.path(), Uuid::from_u128(0xAA11))
         .expect("a marked directory must still adopt");
+}
+
+/// A condemned range refuses to open, so a node cannot simply be restarted
+/// into serving a history its source disowned.
+///
+/// The verdict is written by `vtopctl node repair`, but an operator following
+/// the documented workflow — repair, then start the replica — never runs repair
+/// a second time, and neither does a supervisor or a rescheduled pod. If the
+/// check lived only in the CLI the marker would bind nobody who actually starts
+/// the node, which is everybody.
+#[test]
+fn a_condemned_range_refuses_to_open_and_to_be_adopted() {
+    let h = harness();
+    let receiver = SegmentReceiver::open(&Env::real(), h.destination.path()).unwrap();
+    transfer(&h, &receiver).unwrap();
+
+    // Healthy first, so the refusal below is caused by the verdict and not by a
+    // directory that could never have opened.
+    SegmentSet::adopt_in(&Env::real(), h.destination.path(), Uuid::from_u128(0xC0DE))
+        .expect("the transferred prefix must be adoptable before it is condemned");
+
+    std::fs::write(
+        h.destination.path().join(vtop_log::CONDEMNED_MARKER),
+        b"the source is at offset 900 but the adopted prefix already ends at 940",
+    )
+    .unwrap();
+
+    let message = match SegmentSet::open_in(&Env::real(), h.destination.path()) {
+        Ok(_) => panic!("a condemned range must not open for serving"),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        message.contains("CONDEMNED"),
+        "the refusal must say why, not read as a layout problem: {message}"
+    );
+    assert!(
+        message.contains("offset 900"),
+        "the original finding must reach whoever is looking at the failure: {message}"
+    );
+
+    // And adoption too, so a second repair cannot quietly re-bless it.
+    assert!(
+        SegmentSet::adopt_in(&Env::real(), h.destination.path(), Uuid::from_u128(0xBEEF)).is_err(),
+        "a condemned range must not be adoptable either"
+    );
 }

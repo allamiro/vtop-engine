@@ -180,7 +180,14 @@ pub enum MetaCommand {
         failure_domain: String,
         /// Relative share of placements this node attracts. Equal weights
         /// spread evenly.
-        #[arg(long, default_value_t = 1)]
+        ///
+        /// REQUIRED, with no default, because the command replaces the domain
+        /// and the weight together. A default of 1 would mean that correcting a
+        /// typo in a failure domain silently resets a node weighted above 1
+        /// back to 1 — changing deterministic placement and capacity
+        /// distribution as a side effect of an edit that named neither. Pass
+        /// the node's current weight to keep it.
+        #[arg(long)]
         placement_weight: u32,
         #[arg(long)]
         expected_generation: u64,
@@ -1531,6 +1538,8 @@ client_key: /tmp/client.key
             &node(1).to_string(),
             "--failure-domain",
             "rack-a",
+            "--placement-weight",
+            "4",
             "--expected-generation",
             "3",
         ]);
@@ -1538,6 +1547,27 @@ client_key: /tmp/client.key
             attrs.is_ok(),
             "{:?}",
             attrs.err().map(|error| error.to_string())
+        );
+
+        // Weight omitted: refused, because the command replaces domain AND
+        // weight atomically. Defaulting it would make a domain correction
+        // silently reset a node weighted above 1, changing placement as a side
+        // effect of an edit that named only the domain.
+        let no_weight = Harness::try_parse_from([
+            "vtopctl",
+            "set-node-placement-attrs",
+            "--config",
+            "/nonexistent/meta.yaml",
+            "--node-uuid",
+            &node(1).to_string(),
+            "--failure-domain",
+            "rack-a",
+            "--expected-generation",
+            "3",
+        ]);
+        assert!(
+            no_weight.is_err(),
+            "the weight must be stated, because this command overwrites it either way"
         );
     }
 }

@@ -45,6 +45,7 @@ anyhow = { workspace = true }
 chrono = { workspace = true }
 async-trait = { workspace = true }
 uuid = { workspace = true }
+rustix = { workspace = true }
 rdkafka = { workspace = true, optional = true }
 
 [dev-dependencies]
