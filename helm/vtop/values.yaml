@@ -19,13 +19,12 @@ replicaCount: 3
 image:
   # The image must contain the `vtop-node` binary (see `binary` below).
   #
-  # HONEST CAVEAT: as of appVersion 0.2.0 the image built by docker/Dockerfile
-  # and published to ghcr.io/allamiro/vtop-engine ships ONLY `vtopctl` (the
-  # operator CLI), not `vtop-node`. Until the published image includes
-  # `vtop-node`, point `repository`/`tag` at an image you built that does —
-  # the release archives on GitHub ship both binaries. The chart keeps the
-  # GHCR coordinates as the default because that is where the project's image
-  # lives; it does not pretend the 0.2.0 image can run this workload.
+  # The published image ships both `vtopctl` and `vtop-node` since 0.2.1, so
+  # the default works without an override. It did not in 0.2.0 — the image
+  # carried only the operator CLI, so the StatefulSet ran a command that was
+  # not there — which is why CI now asserts both binaries are present in every
+  # image it builds, and why the chart's appVersion is checked against the
+  # workspace version so a default install cannot resolve to an older tag.
   repository: ghcr.io/allamiro/vtop-engine
   # Defaults to the chart's appVersion when empty. Never use `latest` in
   # production: a StatefulSet that re-pulls a moved tag rolls the cluster onto

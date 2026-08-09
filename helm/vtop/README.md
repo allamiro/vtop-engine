@@ -139,15 +139,18 @@ arrives over the very admin endpoint being gated; requiring leadership would
 deadlock bringup). Leadership is observable as
 `vtop_meta_raft_state{state="leader"}` instead.
 
-## Image caveat (read before installing)
+## Image
 
-`image.repository` defaults to `ghcr.io/allamiro/vtop-engine`, but as of
-appVersion 0.2.0 the image built by `docker/Dockerfile` ships **only
-`vtopctl`**, not `vtop-node`. Until the published image includes `vtop-node`,
-point `image.repository`/`image.tag` at an image that does (the GitHub
-release archives contain both binaries), and set `image.binary` if it lives
-somewhere unusual. The chart states this rather than pretending the current
-image can run the workload.
+`image.repository` defaults to `ghcr.io/allamiro/vtop-engine`, and the image
+tag defaults to the chart's `appVersion`. Since 0.2.1 that image ships **both**
+`vtopctl` and `vtop-node`, so a default install runs the published artifact and
+needs no override. Set `image.binary` only if you point at an image that keeps
+`vtop-node` somewhere unusual.
+
+This section previously told you to build your own image, because the 0.2.0
+image shipped only `vtopctl` and the StatefulSet's command was therefore not
+in it. That is fixed, and CI now asserts both binaries are present in the
+image it builds.
 
 ## Install
 
