@@ -447,6 +447,23 @@ jobs:
         with:
           version: v3.16.3
 
+      # THE DEFAULT INSTALL PULLS `appVersion`. `statefulset.yaml` defaults the
+      # image tag to `.Chart.AppVersion`, so a chart whose appVersion lags the
+      # workspace ships users an older image than the release they downloaded —
+      # and it drifted silently for two releases before anything noticed. The
+      # failure is nasty because the chart installs cleanly and the pods run the
+      # wrong binaries.
+      - name: The chart's appVersion tracks the workspace version
+        run: |
+          set -euo pipefail
+          workspace="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          chart="$(sed -n 's/^appVersion: "\(.*\)"$/\1/p' helm/vtop/Chart.yaml)"
+          if [ "$workspace" != "$chart" ]; then
+            echo "::error::helm/vtop/Chart.yaml appVersion ($chart) != workspace version ($workspace). A default chart install resolves its image tag from appVersion, so it would deploy $chart while the release says $workspace."
+            exit 1
+          fi
+          echo "appVersion $chart matches the workspace"
+
       - name: helm lint
         run: helm lint helm/vtop -f helm/vtop/ci/default-values.yaml
 

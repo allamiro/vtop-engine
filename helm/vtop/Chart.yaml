@@ -7,9 +7,9 @@ description: >-
   plane. TLS material is never defaulted — you must supply your own Secrets.
 type: application
 # Chart version (the packaging), independent of the application version below.
-version: 0.1.0
+version: 0.1.1
 # Must track the workspace version in Cargo.toml; the GHCR image tags follow it.
-appVersion: "0.2.0"
+appVersion: "0.3.0"
 kubeVersion: ">=1.25.0-0"
 home: https://github.com/allamiro/vtop-engine
 sources:
