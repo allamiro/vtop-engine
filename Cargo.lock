@@ -4015,6 +4015,7 @@ dependencies = [
  "clap",
  "futures",
  "rdkafka",
+ "rustix",
  "serde",
  "serde_json",
  "serde_yaml",

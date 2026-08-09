@@ -27,7 +27,7 @@ pub use segment::{
     rebuild_chunk_index, rebuild_chunk_index_in, rebuild_index, rebuild_index_in, roll_in,
     segment_stem, ActiveSegment, SegmentReader,
 };
-pub use segment_set::SegmentSet;
+pub use segment_set::{SegmentSet, CONDEMNED_MARKER};
 pub use transfer::{
     sealed_artifact_path, SegmentPresence, SegmentReceiver, StagedSegment, TransferArtifact,
 };

@@ -138,6 +138,51 @@ pub struct SegmentSet {
     active: Option<ActiveSegment>,
 }
 
+/// The file a repair writes when it finds a destination diverged from its
+/// source, and the reason any opener must refuse the range.
+///
+/// WRITTEN BY `vtopctl node repair`, ENFORCED HERE. Divergence is detected only
+/// after the transferred prefix has been adopted, so a condemned directory is
+/// structurally indistinguishable from a healthy one — contiguous sealed
+/// segments and a live tail. Nothing in the layout records that its history was
+/// disowned by the source, and discovery ignores names it does not recognise,
+/// so the range opens and serves.
+///
+/// Leaving the check in the CLI would mean the verdict only binds an operator
+/// who happens to run repair again. A supervisor restarting the node, a
+/// Kubernetes pod rescheduling, or an operator following the ordinary "repair,
+/// then start it" workflow would all serve records the range no longer has.
+/// The condemnation belongs to the DIRECTORY, so it is enforced wherever a
+/// directory is opened.
+pub const CONDEMNED_MARKER: &str = ".vtop-repair-diverged";
+
+/// Refuse a range an earlier repair condemned.
+fn refuse_if_condemned(env: &Env, directory: &Path) -> VtopLogResult<()> {
+    let marker = directory.join(CONDEMNED_MARKER);
+    if !env
+        .storage
+        .exists(&marker)
+        .map_err(|source| io_error(&marker, source))?
+    {
+        return Ok(());
+    }
+    let detail = env
+        .storage
+        .read(&marker)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .unwrap_or_default();
+    Err(LogError::InvalidDescriptor(format!(
+        "range at {} was CONDEMNED by an earlier repair: it holds records its source no longer \
+         has, so serving it would hand out a history the range has disowned. This is not a \
+         layout problem and the range will open cleanly once the verdict is removed — do not \
+         remove it without understanding why it is there. Rebuild the directory from a replica \
+         that is current.\n\nThe finding was:\n{}",
+        directory.display(),
+        detail.trim()
+    )))
+}
+
 impl SegmentSet {
     /// Open every segment of the range in `directory`.
     ///
@@ -148,6 +193,9 @@ impl SegmentSet {
     /// hole in it while reporting success.
     pub fn open_in(env: &Env, directory: impl AsRef<Path>) -> VtopLogResult<Option<Self>> {
         let directory = directory.as_ref().to_path_buf();
+        // BEFORE anything else, including the truncation replay: a condemned
+        // range must not be repaired into shape and then opened.
+        refuse_if_condemned(env, &directory)?;
         // A truncation that died between its marker and its final rename is
         // not an ambiguous layout: the marker says exactly which segments
         // were doomed and what replaces them. Finish it BEFORE reading the
@@ -264,6 +312,7 @@ impl SegmentSet {
         successor_id: Uuid,
     ) -> VtopLogResult<Self> {
         let directory = directory.as_ref().to_path_buf();
+        refuse_if_condemned(env, &directory)?;
         // BEFORE discovery, exactly as `open_in` does. An unfinished truncation
         // makes the layout below the half-made one, and minting a tail over a
         // prefix the marker still condemns would lose writes: the next
