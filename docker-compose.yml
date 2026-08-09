@@ -163,6 +163,12 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile
+    # NAMED rather than derived. Without this the tag is `<project>-<service>`,
+    # where the project defaults to the checkout directory name — so CI can only
+    # pre-build the image by guessing a name that changes if the directory does.
+    # Pinning it lets CI build once with a shared layer cache and lets compose
+    # find it already present instead of building a second time.
+    image: vtop-engine:local
     container_name: vtop-engine
     security_opt:
       - no-new-privileges:true

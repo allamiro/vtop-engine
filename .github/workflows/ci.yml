@@ -278,8 +278,23 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      # THE ONLY JOB THAT WRITES THE CACHE. Three jobs build this image and they
+      # run in parallel, so having each export would mean three concurrent
+      # writers to one scope for identical layers. This one exports; the Helm
+      # and compose jobs import. They therefore warm from the PREVIOUS run
+      # rather than from this one, which is what makes the saving repeatable
+      # instead of dependent on job ordering.
       - name: Build engine image
-        run: docker build -f docker/Dockerfile -t vtop-engine:ci .
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: docker/Dockerfile
+          tags: vtop-engine:ci
+          load: true
+          cache-from: type=gha,scope=ci-image
+          cache-to: type=gha,scope=ci-image,mode=max
 
       # The build succeeding says nothing about what is INSIDE. The image
       # shipped for two releases containing only vtopctl, so the Helm chart —
@@ -357,8 +372,20 @@ jobs:
         with:
           cluster_name: vtop-ci
 
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      # Imports only — see the note on the image job. `load: true` is required
+      # because the next step pulls the binaries back OUT of this image and
+      # `kind load` needs it in the daemon, neither of which can read a build
+      # that only exists in the buildx cache.
       - name: Build the engine image
-        run: docker build -f docker/Dockerfile -t vtop-engine:local .
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: docker/Dockerfile
+          tags: vtop-engine:local
+          load: true
+          cache-from: type=gha,scope=ci-image
 
       # Taken OUT of the image rather than compiled again. The image already
       # contains both binaries — that is the property #281 was about — so
@@ -1001,8 +1028,20 @@ jobs:
       # Build the engine image once, up front: the script's `compose up` would
       # otherwise build it inside the timed wait loop and could time out on a
       # cold cache rather than on a real failure.
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      # Built here rather than by `docker compose build` so it can read the same
+      # cache as the other two jobs; compose then finds the tag already in the
+      # daemon and builds nothing. The tag must match what compose would have
+      # produced, or compose rebuilds it and the cache buys nothing.
       - name: Build the engine image
-        run: docker compose build vtop-engine
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: docker/Dockerfile
+          tags: vtop-engine:local
+          load: true
+          cache-from: type=gha,scope=ci-image
 
       - name: Run the end-to-end smoke test
         env:
