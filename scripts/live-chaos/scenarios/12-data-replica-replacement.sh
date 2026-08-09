@@ -430,5 +430,17 @@ log "leader restarted with the post-replacement replica set (follower 2 and the 
 await_verified_floor "$CLIENT_CFG" "$(native_addr)" "$ACKED"
 log "every one of the $ACKED acknowledged records is still readable after the replacement"
 
+# BOTH REPLICAS STILL RUNNING. A replacement that ends with the newcomer dead
+# would still satisfy every metadata assertion above — the placement names it,
+# the proof committed, the intent closed — while the range actually runs at
+# RF - 1. Checking the processes is what tells those apart.
+for pid_name in F2 SPARE; do
+  pid="${!pid_name}"
+  kill -0 "$pid" 2>/dev/null \
+    || fail "$pid_name (pid $pid) is not running at the end of the replacement; the placement \
+says RF $RF but the range is short a replica"
+done
+log "the surviving replica and the newcomer are both still serving"
+
 seal_and_verify_active "spare" "$SPARE_DIR"
 log "PASS"
