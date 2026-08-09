@@ -331,6 +331,8 @@ benchmarks/        benchmark and performance test support
 Full architecture documentation:
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- [docs/ROADMAP.md](docs/ROADMAP.md) — what each release does, and what it
+  deliberately does not do yet
 
 ---
 
