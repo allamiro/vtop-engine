@@ -434,12 +434,16 @@ log "every one of the $ACKED acknowledged records is still readable after the re
 # would still satisfy every metadata assertion above — the placement names it,
 # the proof committed, the intent closed — while the range actually runs at
 # RF - 1. Checking the processes is what tells those apart.
-for pid_name in F2 SPARE; do
-  pid="${!pid_name}"
-  kill -0 "$pid" 2>/dev/null \
-    || fail "$pid_name (pid $pid) is not running at the end of the replacement; the placement \
-says RF $RF but the range is short a replica"
-done
+# Named directly rather than through `${!name}`: indirect expansion is not a
+# USE as far as shellcheck is concerned, so the variables stayed flagged and
+# the check read as decoration.
+assert_running() { # <label> <pid>
+  kill -0 "$2" 2>/dev/null \
+    || fail "$1 (pid $2) is not running at the end of the replacement; the placement says RF $RF \
+but the range is short a replica"
+}
+assert_running "the surviving follower" "$F2"
+assert_running "the replacement replica" "$SPARE"
 log "the surviving replica and the newcomer are both still serving"
 
 seal_and_verify_active "spare" "$SPARE_DIR"
