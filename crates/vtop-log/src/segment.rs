@@ -213,11 +213,10 @@ fn encode_record_any(
     header: &AnyHeader,
     record: &LogRecord,
     relative_offset: u64,
-    max_record_bytes: u32,
 ) -> VtopLogResult<Vec<u8>> {
     match header {
-        AnyHeader::V1(_) => encode_record(record, relative_offset, max_record_bytes),
-        AnyHeader::V2(_) => encode_record_v2(record, relative_offset, max_record_bytes),
+        AnyHeader::V1(v1) => encode_record(record, relative_offset, v1.config.max_record_bytes),
+        AnyHeader::V2(v2) => encode_record_v2(record, relative_offset, v2.config.max_record_bytes),
     }
 }
 
@@ -294,16 +293,6 @@ pub struct ActiveSegment {
     poisoned: bool,
     sealed: bool,
     recovery: RecoveryReport,
-    /// A roll threshold lower than this segment's own header, when the node
-    /// has been reconfigured since the segment was created.
-    ///
-    /// Applied through the SAME prospective checks the header limits use, so a
-    /// group that would cross it is refused before it is written rather than
-    /// noticed afterwards. Checking the tail's current totals instead would let
-    /// one more group land — and if traffic then stopped, the range would sit
-    /// on an oversized active segment that never seals and so never transfers,
-    /// which is the outcome the whole setting exists to avoid.
-    roll_cap: Option<crate::SegmentConfig>,
     /// What this segment inherited from its predecessor. Empty for a range's
     /// first segment. Kept because any rescan of this file — truncation, for
     /// one — must seed from the same frontier the original scan did.
@@ -386,7 +375,6 @@ impl ActiveSegment {
         )?;
         let accumulator = ContentAccumulator::for_header(&header);
         Ok(Self {
-            roll_cap: None,
             env: env.clone(),
             path,
             file,
@@ -449,7 +437,6 @@ impl ActiveSegment {
             next_offset: scan.next_offset,
         };
         Ok(Self {
-            roll_cap: None,
             env: env.clone(),
             path,
             file,
@@ -561,49 +548,6 @@ impl ActiveSegment {
     /// The first offset not yet durably committed on this node.
     pub fn committed_offset(&self) -> u64 {
         self.committed_offset
-    }
-
-    /// Cap this segment's roll thresholds below what its header says.
-    ///
-    /// Only ever lowers: a header limit is a property of the bytes already
-    /// written, so raising it here would let a segment grow past what its own
-    /// format was created to hold.
-    pub(crate) fn set_roll_cap(&mut self, config: crate::SegmentConfig) {
-        self.roll_cap = Some(config);
-    }
-
-    fn effective_max_segment_bytes(&self) -> u64 {
-        match &self.roll_cap {
-            Some(cap) => cap.max_segment_bytes.min(self.header.max_segment_bytes()),
-            None => self.header.max_segment_bytes(),
-        }
-    }
-
-    fn effective_max_segment_records(&self) -> u64 {
-        match &self.roll_cap {
-            Some(cap) => cap
-                .max_segment_records
-                .min(self.header.max_segment_records()),
-            None => self.header.max_segment_records(),
-        }
-    }
-
-    fn effective_max_group_bytes(&self) -> u64 {
-        match &self.roll_cap {
-            Some(cap) => cap.max_group_bytes.min(self.header.max_group_bytes()),
-            None => self.header.max_group_bytes(),
-        }
-    }
-
-    /// APPLIED TO WRITES ONLY. The read path keeps the header's bound, because
-    /// it decodes bytes this segment already holds — narrowing it there would
-    /// make a tail refuse to read records it legitimately accepted under the
-    /// limit in force when they were written.
-    fn effective_max_record_bytes(&self) -> u32 {
-        match &self.roll_cap {
-            Some(cap) => cap.max_record_bytes.min(self.header.max_record_bytes()),
-            None => self.header.max_record_bytes(),
-        }
     }
 
     /// Bytes of encoded record frames currently in the file. Cross-segment
@@ -812,22 +756,17 @@ impl ActiveSegment {
                         LogError::InvalidDescriptor("segment offset space exhausted".to_owned())
                     })?;
                     let relative_offset = offset - self.header.base_offset();
-                    let encoded = encode_record_any(
-                        &self.header,
-                        record,
-                        relative_offset,
-                        self.effective_max_record_bytes(),
-                    )?;
+                    let encoded = encode_record_any(&self.header, record, relative_offset)?;
                     group_bytes = group_bytes.checked_add(encoded.len() as u64).ok_or(
                         LogError::GroupTooLarge {
                             actual: u64::MAX,
-                            maximum: self.effective_max_group_bytes(),
+                            maximum: self.header.max_group_bytes(),
                         },
                     )?;
-                    if group_bytes > self.effective_max_group_bytes() {
+                    if group_bytes > self.header.max_group_bytes() {
                         return Err(LogError::GroupTooLarge {
                             actual: group_bytes,
-                            maximum: self.effective_max_group_bytes(),
+                            maximum: self.header.max_group_bytes(),
                         });
                     }
                     remember_pending_sequence(
@@ -857,11 +796,11 @@ impl ActiveSegment {
                     attempted: u64::MAX,
                     maximum: self.header.max_segment_bytes(),
                 })?;
-        if attempted_bytes > self.effective_max_segment_bytes() {
+        if attempted_bytes > self.header.max_segment_bytes() {
             return Err(LogError::SegmentByteLimit {
                 current: self.content_bytes,
                 attempted: attempted_bytes,
-                maximum: self.effective_max_segment_bytes(),
+                maximum: self.header.max_segment_bytes(),
             });
         }
         let attempted_records = self.record_count.checked_add(pending.len() as u64).ok_or(
@@ -870,10 +809,10 @@ impl ActiveSegment {
                 maximum: self.header.max_segment_records(),
             },
         )?;
-        if attempted_records > self.effective_max_segment_records() {
+        if attempted_records > self.header.max_segment_records() {
             return Err(LogError::SegmentRecordLimit {
                 attempted: attempted_records,
-                maximum: self.effective_max_segment_records(),
+                maximum: self.header.max_segment_records(),
             });
         }
         let write_start = self
@@ -1934,13 +1873,6 @@ pub fn roll_in(
     env: &Env,
     active: ActiveSegment,
     successor_id: Uuid,
-    // Thresholds for the SUCCESSOR, when they should differ from the segment
-    // being sealed. A segment's config lives in its header, so a running range
-    // carries its original thresholds from tail to successor forever. Without
-    // an override here, changing them in a node's config has no effect on any
-    // directory that already exists — which is every deployment that would
-    // want to change them.
-    config_override: Option<crate::SegmentConfig>,
 ) -> VtopLogResult<(SegmentReader, ActiveSegment)> {
     let directory = active
         .path
@@ -1971,31 +1903,13 @@ pub fn roll_in(
             .map(|(mut descriptor, config)| {
                 descriptor.segment_id = successor_id;
                 descriptor.base_offset = base_offset;
-                // FIELD BY FIELD, not a wholesale swap: a v2 config also
-                // carries `chunk_size`, which belongs to the segment format
-                // rather than to an operator's roll policy. Replacing the
-                // whole struct would silently reset it.
-                let config = match config_override {
-                    Some(over) => crate::SegmentConfigV2 {
-                        max_record_bytes: over.max_record_bytes,
-                        max_group_bytes: over.max_group_bytes,
-                        max_segment_bytes: over.max_segment_bytes,
-                        max_segment_records: over.max_segment_records,
-                        index_stride: over.index_stride,
-                        chunk_size: config.chunk_size,
-                    },
-                    None => config,
-                };
                 (descriptor, config)
             });
     let v1 = if v2.is_none() {
         let mut descriptor = active.descriptor().clone();
         descriptor.segment_id = successor_id;
         descriptor.base_offset = base_offset;
-        Some((
-            descriptor,
-            config_override.unwrap_or_else(|| active.config()),
-        ))
+        Some((descriptor, active.config()))
     } else {
         None
     };
@@ -4867,7 +4781,7 @@ mod tests {
                     .unwrap();
             }
             let (_sealed, mut successor) =
-                roll_in(&Env::real(), active, Uuid::from_u128(500), None).unwrap();
+                roll_in(&Env::real(), active, Uuid::from_u128(500)).unwrap();
             // Continues the SAME producer sequence into the new segment.
             successor
                 .append(record(producer, 3, b"after"), Durability::Fsync)
@@ -4905,8 +4819,7 @@ mod tests {
                 .append(record(producer, sequence, b"v"), Durability::Fsync)
                 .unwrap();
         }
-        let (_sealed, mut successor) =
-            roll_in(&Env::real(), active, Uuid::from_u128(600), None).unwrap();
+        let (_sealed, mut successor) = roll_in(&Env::real(), active, Uuid::from_u128(600)).unwrap();
 
         // A gap is still a gap across a roll.
         assert!(matches!(
@@ -4959,8 +4872,8 @@ mod tests {
                 .unwrap();
         }
 
-        let (sealed, mut successor) = roll_in(&Env::real(), active, Uuid::from_u128(700), None)
-            .expect("a v2 roll must succeed");
+        let (sealed, mut successor) =
+            roll_in(&Env::real(), active, Uuid::from_u128(700)).expect("a v2 roll must succeed");
         assert_eq!(sealed.manifest_v2().unwrap().next_offset, 45);
         assert_eq!(successor.descriptor_v2().unwrap().base_offset, 45);
 
@@ -4985,7 +4898,7 @@ mod tests {
         let active = ActiveSegment::create(&path, descriptor(), config()).unwrap();
 
         assert!(matches!(
-            roll_in(&Env::real(), active, Uuid::from_u128(800), None),
+            roll_in(&Env::real(), active, Uuid::from_u128(800)),
             Err(LogError::InvalidDescriptor(_))
         ));
     }

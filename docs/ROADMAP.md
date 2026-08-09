@@ -95,8 +95,10 @@ reopen quietly.
 - Sealed-segment transfer is authorized against the leader's followers plus an
   explicit `transfer_peers` list. A replacement must be named there for the
   duration of its repair, and removed after.
-- Lowering a roll threshold takes effect from the next roll. The current tail
-  keeps the limits written into its header, because that file already exists.
+- Roll thresholds apply to ranges **as they are created**. A directory that
+  already exists keeps the thresholds written into its segment headers, so
+  changing them in a node's config has no effect on it. Reconfiguring an
+  existing range is #314.
 
 ## v0.3.1 — the papercuts this release exposed
 

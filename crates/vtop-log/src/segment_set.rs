@@ -124,11 +124,6 @@ fn validate_single_lineage(entries: &[CatalogEntry], directory: &Path) -> VtopLo
 pub struct SegmentSet {
     env: Env,
     directory: PathBuf,
-    /// Thresholds for the next successor, when they should differ from the
-    /// current tail's. `None` means inherit, which is what every path did
-    /// unconditionally before — and why changing a node's roll thresholds had
-    /// no effect on a directory that already existed.
-    roll_config: Option<crate::SegmentConfig>,
     /// Sealed segments in ascending offset order, contiguous with each other
     /// and with `active`.
     sealed: Vec<SegmentReader>,
@@ -284,7 +279,6 @@ impl SegmentSet {
         let active = ActiveSegment::recover_in(env, &active_path)?;
 
         let set = Self {
-            roll_config: None,
             env: env.clone(),
             directory,
             sealed,
@@ -393,7 +387,6 @@ impl SegmentSet {
         let active = crate::segment::open_successor_in(env, last.path(), successor_id)?;
 
         let set = Self {
-            roll_config: None,
             env: env.clone(),
             directory,
             sealed,
@@ -416,7 +409,6 @@ impl SegmentSet {
         let path = directory.join(format!("{}.active", segment_stem(descriptor.base_offset)));
         let active = ActiveSegment::create_in(env, &path, descriptor, config)?;
         Ok(Self {
-            roll_config: None,
             env: env.clone(),
             directory,
             sealed: Vec::new(),
@@ -572,26 +564,8 @@ impl SegmentSet {
         durability: Durability,
         successor_id: Uuid,
     ) -> VtopLogResult<Vec<crate::AppendOutcome>> {
-        // The tail carries the configured cap (see `set_roll_config`), so its
-        // OWN prospective check refuses a group that would cross it and this
-        // path rolls exactly as it does for an inherited limit. Deciding from
-        // the tail's current totals instead would let one more group land, and
-        // if traffic stopped there the range would sit on an oversized active
-        // segment that never seals — so never transfers, which is the outcome
-        // the setting exists to avoid.
         match self.tail_mut().append_group(records, durability) {
             Err(LogError::SegmentByteLimit { .. }) | Err(LogError::SegmentRecordLimit { .. }) => {}
-            // A RAISED limit needs a roll too, not just a lowered one. The cap
-            // on the current tail only ever narrows, because its header
-            // describes bytes already written and the read path decodes them
-            // against it. So a group or record that the NEW configuration
-            // permits but the old header does not is refused here — and the
-            // successor, created under the new configuration, would accept it.
-            // Without this a workload of larger records wedges permanently on
-            // a tail that can never grow into them.
-            Err(LogError::RecordTooLarge { actual, .. })
-                if self.roll_would_admit_record(actual) => {}
-            Err(LogError::GroupTooLarge { actual, .. }) if self.roll_would_admit_group(actual) => {}
             other => return other,
         }
         // An empty tail that still cannot hold the group means the group is
@@ -605,65 +579,11 @@ impl SegmentSet {
         self.tail_mut().append_group(records, durability)
     }
 
-    /// Whether a successor created under the configured override would accept
-    /// a record this tail refused.
-    fn roll_would_admit_record(&self, actual: usize) -> bool {
-        self.roll_config
-            .is_some_and(|config| actual <= config.max_record_bytes as usize)
-    }
-
-    /// The same question for a whole group.
-    fn roll_would_admit_group(&self, actual: u64) -> bool {
-        self.roll_config
-            .is_some_and(|config| actual <= config.max_group_bytes)
-    }
-
     /// Seal the tail and open a successor at its end.
-    /// Apply new roll thresholds from the next successor onward.
     ///
-    /// The CURRENT tail keeps the thresholds baked into its header — that file
-    /// is already written — so this changes when the range rolls next, not
-    /// retroactively. Without it, a reopened range carries its original
-    /// thresholds forever and changing them in a node's config does nothing on
-    /// any directory that already exists.
-    pub fn set_roll_config(&mut self, config: crate::SegmentConfig) -> VtopLogResult<()> {
-        // VALIDATED HERE, not at the roll. `roll_in` seals the current tail
-        // before creating the successor, so an invalid combination rejected
-        // there leaves the set tail-less and the directory holding only sealed
-        // segments — which `open_in` refuses on the next start. A config typo
-        // would take the range down instead of being refused at startup.
-        let config = config.validate()?;
-        // VALIDATED FOR THE FORMAT THIS RANGE ACTUALLY USES. `roll_in` maps the
-        // override into a `SegmentConfigV2` only for a v2 tail, and the two
-        // frame overheads differ (102 against 92) — so validating both would
-        // reject a perfectly good v1 configuration the moment the node
-        // restarts, and validating only v1 lets a combination in the gap
-        // strand a v2 range at its next roll. A successor inherits its
-        // predecessor's format, so the tail is the right thing to ask.
-        if self.tail().descriptor_v2().is_some() {
-            crate::SegmentConfigV2 {
-                max_record_bytes: config.max_record_bytes,
-                max_group_bytes: config.max_group_bytes,
-                max_segment_bytes: config.max_segment_bytes,
-                max_segment_records: config.max_segment_records,
-                index_stride: config.index_stride,
-                chunk_size: crate::SegmentConfigV2::default().chunk_size,
-            }
-            .validate()?;
-        }
-        self.roll_config = Some(config);
-        // APPLIED TO THE CURRENT TAIL as well as to successors. A reopened
-        // range's tail enforces its own header, so without this the range goes
-        // on filling to its original limit and the setting does nothing on
-        // exactly the deployments that need it.
-        // ALL FOUR bounds, not only the segment pair. A tail created under a
-        // 16 MiB record limit went on accepting a 2 MiB record after the node
-        // was reconfigured to 1 MiB, so the newly exposed limits simply were
-        // not in force until the range happened to roll.
-        self.tail_mut().set_roll_cap(config);
-        Ok(())
-    }
-
+    /// The successor inherits its predecessor's configuration, including its
+    /// roll thresholds: a segment's limits live in its header, and a range
+    /// carries them forward from the moment it was created.
     pub fn roll(&mut self, successor_id: Uuid) -> VtopLogResult<()> {
         // A segment holding nothing would seal into an empty sealed segment and
         // an identically-based successor, so rolling it is a no-op that costs a
@@ -680,7 +600,7 @@ impl SegmentSet {
         // deliberate: a set whose roll failed part-way has no coherent tail, and
         // continuing to answer reads from a half-rolled range would be worse
         // than stopping.
-        let (sealed, successor) = roll_in(&self.env, active, successor_id, self.roll_config)?;
+        let (sealed, successor) = roll_in(&self.env, active, successor_id)?;
         self.active = Some(successor);
         self.sealed.push(sealed);
         Ok(())
@@ -960,7 +880,6 @@ impl From<ActiveSegment> for SegmentSet {
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf();
         Self {
-            roll_config: None,
             env,
             directory,
             sealed: Vec::new(),
@@ -2223,298 +2142,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// A reopened range rolls at the NEW threshold, not the one baked into the
-    /// tail it inherited.
-    ///
-    /// This is the whole point of the setting. A segment enforces the limits in
-    /// its own header, so without the pre-append check a range reopened with a
-    /// lower threshold goes on filling to its original limit — and an operator
-    /// who lowered it to produce transferable sealed segments sees nothing
-    /// happen, on exactly the deployments that need it.
-    #[test]
-    fn a_reopened_range_rolls_at_the_configured_threshold_not_its_inherited_one() {
-        let dir = tempfile::tempdir().unwrap();
-        let env = Env::real();
-        let mut set = SegmentSet::create_in(
-            &env,
-            dir.path(),
-            descriptor(),
-            crate::SegmentConfig {
-                // Generous relative to what this test writes, standing in for
-                // the 8 GiB a real range is born with. The group and record
-                // bounds come down with it because the engine requires
-                // record <= group <= segment.
-                max_segment_bytes: 1 << 20,
-                max_segment_records: 1_000_000,
-                max_group_bytes: 8 * 1024,
-                max_record_bytes: 4 * 1024,
-                ..crate::SegmentConfig::default()
-            },
-        )
-        .unwrap();
-
-        // Enough to exceed the override below, nowhere near the header's limit.
-        let producer = Uuid::from_u128(1);
-        for index in 0..8_u64 {
-            let mut entry = record(producer, index);
-            entry.value = vec![b'v'; 256];
-            set.append_group(&[entry], Durability::Buffered, Uuid::new_v4())
-                .unwrap();
-        }
-        assert!(
-            set.sealed().is_empty(),
-            "the inherited limit is far away, so nothing should have rolled yet"
-        );
-
-        // Now ask for a threshold the tail has already passed.
-        set.set_roll_config(crate::SegmentConfig {
-            max_segment_bytes: 1024,
-            max_segment_records: 1_000_000,
-            max_group_bytes: 1024,
-            max_record_bytes: 512,
-            ..crate::SegmentConfig::default()
-        })
-        .expect("a valid combination");
-
-        let mut entry = record(producer, 8);
-        entry.value = vec![b'v'; 256];
-        set.append_group(&[entry], Durability::Buffered, Uuid::new_v4())
-            .unwrap();
-        assert_eq!(
-            set.sealed().len(),
-            1,
-            "the append that would cross the configured limit must roll first"
-        );
-        // THE SUCCESSOR is what the cap governs. The first sealed segment was
-        // filled under the inherited limit and is already larger than the
-        // override, so asserting on it proves nothing — an earlier version of
-        // this test did exactly that and passed while checking only offsets.
-        //
-        // Write past the cap into the fresh tail and require it to roll again,
-        // which is only true if the cap is enforced prospectively on a segment
-        // created under it.
-        let sealed_before = set.sealed().len();
-        for index in 9..24_u64 {
-            let mut entry = record(producer, index);
-            entry.value = vec![b'v'; 256];
-            set.append_group(&[entry], Durability::Buffered, Uuid::new_v4())
-                .unwrap();
-        }
-        assert!(
-            set.sealed().len() > sealed_before,
-            "a segment created under the cap must itself roll at the cap, not at the inherited \
-             limit it never had"
-        );
-    }
-
-    /// An invalid override is refused where it is set, not at the roll.
-    ///
-    /// Refusing at the roll would be destructive rather than merely late:
-    /// `roll_in` seals the tail before creating the successor, so the range
-    /// would be left with no tail and `open_in` would refuse it on restart. A
-    /// config typo must not be able to take a range down.
-    #[test]
-    fn an_invalid_roll_override_is_refused_before_it_can_strand_a_range() {
-        let dir = tempfile::tempdir().unwrap();
-        let env = Env::real();
-        let mut set = SegmentSet::create_in(
-            &env,
-            dir.path(),
-            descriptor(),
-            crate::SegmentConfig::default(),
-        )
-        .unwrap();
-        let error = set
-            .set_roll_config(crate::SegmentConfig {
-                // A segment smaller than a group can never accept a full group.
-                max_segment_bytes: 1024,
-                max_group_bytes: 64 * 1024,
-                ..crate::SegmentConfig::default()
-            })
-            .expect_err("a segment smaller than a group is not a usable combination");
-        assert!(
-            matches!(error, LogError::InvalidConfig(_)),
-            "expected a config error, got {error}"
-        );
-        assert!(
-            set.sealed().is_empty(),
-            "a refused override must not have disturbed the range"
-        );
-    }
-
-    /// A v1 range accepts a v1-valid override, even one v2 would refuse.
-    ///
-    /// The two formats have different frame overheads (92 against 102), so a
-    /// configuration can be legal for one and not the other. Validating both
-    /// unconditionally — which an earlier fix here did — rejects a working v1
-    /// deployment the moment it restarts, turning a validation meant to
-    /// prevent stranding into a reason the node will not start.
-    #[test]
-    fn a_v1_range_accepts_an_override_only_v2_would_refuse() {
-        let dir = tempfile::tempdir().unwrap();
-        let env = Env::real();
-        let mut set = SegmentSet::create_in(
-            &env,
-            dir.path(),
-            descriptor(),
-            crate::SegmentConfig::default(),
-        )
-        .unwrap();
-        assert!(
-            set.tail().descriptor_v2().is_none(),
-            "this fixture must be v1 for the distinction to mean anything"
-        );
-
-        // Exactly v1's bound: a group that fits one maximal record plus v1
-        // framing, and ten bytes short of what v2 would demand.
-        let record_bytes = 1024_u32;
-        let v1_only = crate::SegmentConfig {
-            max_record_bytes: record_bytes,
-            max_group_bytes: u64::from(record_bytes) + 92,
-            max_segment_bytes: u64::from(record_bytes) + 92,
-            max_segment_records: 1_000,
-            ..crate::SegmentConfig::default()
-        };
-        assert!(
-            crate::SegmentConfigV2 {
-                max_record_bytes: v1_only.max_record_bytes,
-                max_group_bytes: v1_only.max_group_bytes,
-                max_segment_bytes: v1_only.max_segment_bytes,
-                max_segment_records: v1_only.max_segment_records,
-                index_stride: v1_only.index_stride,
-                chunk_size: crate::SegmentConfigV2::default().chunk_size,
-            }
-            .validate()
-            .is_err(),
-            "the premise: v2 must reject this, or the test proves nothing"
-        );
-
-        set.set_roll_config(v1_only)
-            .expect("a v1 range must accept a configuration v1 considers valid");
-    }
-
-    /// A lowered record limit binds the CURRENT tail, not just its successors.
-    ///
-    /// The tail validates each record against its own header, so a range
-    /// created under a generous limit went on accepting oversized records
-    /// after the node was reconfigured — the new limit was not in force until
-    /// the range happened to roll, which on a quiet range may be never.
-    ///
-    /// The read bound deliberately stays at the header's value; narrowing that
-    /// would make a tail refuse to decode records it legitimately accepted.
-    #[test]
-    fn a_lowered_record_limit_binds_the_tail_it_was_applied_to() {
-        let dir = tempfile::tempdir().unwrap();
-        let env = Env::real();
-        let mut set = SegmentSet::create_in(
-            &env,
-            dir.path(),
-            descriptor(),
-            crate::SegmentConfig {
-                max_record_bytes: 8 * 1024,
-                max_group_bytes: 64 * 1024,
-                max_segment_bytes: 1 << 20,
-                max_segment_records: 1_000,
-                ..crate::SegmentConfig::default()
-            },
-        )
-        .unwrap();
-
-        let producer = Uuid::from_u128(1);
-        let big = |sequence: u64| {
-            let mut entry = record(producer, sequence);
-            entry.value = vec![b'v'; 4 * 1024];
-            entry
-        };
-        // The premise: this record is legal under the limit the tail was born
-        // with, so the refusal below is caused by the override and nothing else.
-        set.append_group(&[big(0)], Durability::Buffered, Uuid::new_v4())
-            .expect("a 4 KiB record fits an 8 KiB limit");
-
-        set.set_roll_config(crate::SegmentConfig {
-            max_record_bytes: 1024,
-            max_group_bytes: 2048,
-            max_segment_bytes: 1 << 20,
-            max_segment_records: 1_000,
-            ..crate::SegmentConfig::default()
-        })
-        .expect("a valid combination");
-
-        let error = set
-            .append_group(&[big(1)], Durability::Buffered, Uuid::new_v4())
-            .expect_err("the same record must now be refused, on the same tail");
-        assert!(
-            matches!(error, LogError::RecordTooLarge { .. }),
-            "expected the record bound to reject it, got {error}"
-        );
-
-        // And the record written under the old limit is still part of the
-        // range: the cap governs what may be WRITTEN from now on, not what the
-        // segment already holds.
-        assert_eq!(
-            set.next_offset(),
-            1,
-            "the refused append must not have removed what was already accepted"
-        );
-    }
-
-    /// A RAISED record limit takes effect by rolling, not by wedging the tail.
-    ///
-    /// The cap on a live tail only ever narrows, because its header describes
-    /// bytes already written and the read path decodes them against it. That
-    /// makes a raised limit invisible to the current tail — so without a roll,
-    /// a workload of larger records is refused forever on a segment that can
-    /// never grow into them.
-    #[test]
-    fn a_raised_record_limit_rolls_into_a_successor_that_accepts_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let env = Env::real();
-        let mut set = SegmentSet::create_in(
-            &env,
-            dir.path(),
-            descriptor(),
-            crate::SegmentConfig {
-                max_record_bytes: 1024,
-                max_group_bytes: 2048,
-                max_segment_bytes: 1 << 20,
-                max_segment_records: 1_000,
-                ..crate::SegmentConfig::default()
-            },
-        )
-        .unwrap();
-
-        let producer = Uuid::from_u128(1);
-        let big = |sequence: u64| {
-            let mut entry = record(producer, sequence);
-            entry.value = vec![b'v'; 4 * 1024];
-            entry
-        };
-        // The premise: too large for the tail as created.
-        set.append_group(&[big(0)], Durability::Buffered, Uuid::new_v4())
-            .expect_err("a 4 KiB record must not fit a 1 KiB limit");
-
-        set.set_roll_config(crate::SegmentConfig {
-            max_record_bytes: 16 * 1024,
-            max_group_bytes: 64 * 1024,
-            max_segment_bytes: 1 << 20,
-            max_segment_records: 1_000,
-            ..crate::SegmentConfig::default()
-        })
-        .expect("a valid combination");
-
-        // Something has to be in the tail for a roll to be meaningful: an
-        // empty one is never rolled.
-        set.append_group(&[record(producer, 0)], Durability::Buffered, Uuid::new_v4())
-            .expect("a small record still fits");
-
-        set.append_group(&[big(1)], Durability::Buffered, Uuid::new_v4())
-            .expect("the raised limit must be reached by rolling into a successor");
-        assert_eq!(
-            set.sealed().len(),
-            1,
-            "reaching the raised limit means sealing the tail that could not hold it"
-        );
     }
 }
