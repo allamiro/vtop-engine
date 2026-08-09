@@ -630,3 +630,116 @@ fn a_foreign_segment_at_the_same_offset_is_replaced_rather_than_stranding_the_re
         );
     }
 }
+
+/// THE CLAIM OF #301, end to end: a transferred prefix becomes a range that
+/// serves.
+///
+/// Transfer alone is not repair. A received prefix is bytes `SegmentSet::open_in`
+/// refuses to open — its tail was sealed without a successor — so a replica
+/// pointed at one would fail to start with an error about a missing active
+/// segment, having successfully downloaded everything it needed. Repair is
+/// transfer AND adoption, which is why `vtopctl node repair` does both in one
+/// invocation rather than leaving the second to the operator.
+///
+/// The assertion is that every record the leader sealed is readable from the
+/// rebuilt directory, and that the range accepts an append afterwards — a
+/// replica that could be read but not written to would still be dead.
+#[test]
+fn a_transferred_prefix_becomes_a_range_that_serves_and_accepts_appends() {
+    let h = harness();
+    let receiver = SegmentReceiver::open(&Env::real(), h.destination.path()).unwrap();
+    let installed = transfer(&h, &receiver).unwrap();
+    assert!(!installed.is_empty(), "the fixture must transfer something");
+
+    let handles = h.leader.sealed_segment_handles();
+    let prefix_end = handles.last().expect("sealed prefix").next_offset;
+
+    // Precondition: this is the refusal repair exists to resolve. Without it
+    // the assertions below would prove nothing about adoption.
+    let refused = SegmentSet::open_in(&Env::real(), h.destination.path())
+        .map(|_| ())
+        .expect_err("a prefix without a tail must not open as a range");
+    assert!(
+        refused.to_string().contains("no active segment"),
+        "{refused}"
+    );
+
+    let mut repaired = SegmentSet::adopt_in(
+        &Env::real(),
+        h.destination.path(),
+        Uuid::from_u128(0xC0FFEE),
+    )
+    .expect("the transferred prefix must adopt into a servable range");
+    assert_eq!(
+        repaired.next_offset(),
+        prefix_end,
+        "the tail must begin where the leader's sealed prefix ended"
+    );
+
+    // Every record the leader sealed, readable in one call from the rebuilt
+    // directory — which is what "repaired" has to mean.
+    let batch = repaired
+        .fetch_through(0, 1 << 20, 10_000, prefix_end)
+        .expect("a repaired range must serve reads");
+    assert_eq!(
+        batch.records.len() as u64,
+        prefix_end,
+        "every sealed record must be readable after repair"
+    );
+    for (index, record) in batch.records.iter().enumerate() {
+        assert_eq!(record.offset, index as u64, "offsets must be contiguous");
+    }
+
+    // And writable: a replica that reads but cannot accept an append has not
+    // rejoined anything.
+    repaired
+        .append_group_minting(
+            &[vtop_log::LogRecord {
+                producer_id: Uuid::from_u128(0xD00D),
+                producer_epoch: 0,
+                sequence: 0,
+                timestamp_millis: 1_700_000_000_000,
+                attributes: 0,
+                key: b"post-repair".to_vec(),
+                value: b"v".to_vec(),
+            }],
+            vtop_log::Durability::Fsync,
+        )
+        .expect("a repaired range must accept appends");
+    assert_eq!(repaired.next_offset(), prefix_end + 1);
+}
+
+/// A repair's ownership marker must not make the range unopenable.
+///
+/// `vtopctl node repair` writes a marker file into the destination so a retry
+/// can tell "a previous repair owns this" from "somebody else's data", which is
+/// what makes resuming an interrupted transfer safe. That file then sits in a
+/// directory discovery scans, and discovery QUARANTINES anything it cannot
+/// account for — a range with a quarantined bundle refuses to open at all. So
+/// the marker would have turned a resumable repair into an unopenable range,
+/// which is a worse failure than the one it prevents.
+///
+/// Asserted rather than assumed, because the failure would appear only on the
+/// retry path — the case that is hardest to reach and least often exercised.
+#[test]
+fn a_repair_ownership_marker_does_not_quarantine_the_range() {
+    let h = harness();
+    let receiver = SegmentReceiver::open(&Env::real(), h.destination.path()).unwrap();
+    transfer(&h, &receiver).unwrap();
+
+    std::fs::write(
+        h.destination.path().join(".vtop-repair-owned"),
+        b"vtop repair\n",
+    )
+    .unwrap();
+
+    let catalog = StartupCatalog::discover(h.destination.path()).unwrap();
+    assert!(
+        catalog.quarantined.is_empty(),
+        "the marker must be ignorable, not quarantining: {:?}",
+        catalog.quarantined
+    );
+
+    SegmentSet::adopt_in(&Env::real(), h.destination.path(), Uuid::from_u128(0xAA11))
+        .expect("a marked directory must still adopt");
+}

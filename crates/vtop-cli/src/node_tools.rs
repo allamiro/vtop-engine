@@ -21,7 +21,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
-use vtop_broker::replication::{ReplicaStatusClient, ReplicaTlsMaterial};
+use vtop_broker::replication::{ReplicaStatusClient, ReplicaTlsMaterial, SegmentTransferClient};
+use vtop_log::env::Env;
+use vtop_log::{SegmentReceiver, SegmentSet};
 use vtop_meta::{resolve_endpoint, TlsMaterial};
 use vtop_protocol::RangeIdentity;
 
@@ -37,6 +39,40 @@ pub enum NodeCommand {
         /// made, so a perfectly healthy cluster would be reported entirely
         /// unreachable.
         #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        timeout_seconds: u64,
+    },
+    /// Rebuild a replica's data directory from a leader's sealed prefix (#301).
+    ///
+    /// The road back for a replica that fell below the leader's retransmission
+    /// window. The leader can only replay what its bounded buffer still holds,
+    /// so a follower behind that window cannot catch up through the append path
+    /// at any speed — the records it needs are gone from memory. #270 built the
+    /// transfer plane for exactly this and nothing invoked it.
+    ///
+    /// OPERATES ON A STOPPED NODE'S DIRECTORY, deliberately. The receiver
+    /// sweeps debris on the grounds that everything it holds is re-fetchable
+    /// from the leader, and that reasoning does not hold for a range being
+    /// appended to — a mid-roll orphan there is recovery state, not rubbish. So
+    /// this refuses a live range rather than racing it, and the workflow is:
+    /// stop the replica (or start with an empty disk), repair, start it.
+    Repair {
+        #[command(flatten)]
+        common: NodeCommonArgs,
+        /// The replica to pull from. Must be a node that HOLDS the range —
+        /// normally the leader, which is the only one obliged to serve a
+        /// transfer.
+        #[arg(long)]
+        from: Uuid,
+        /// The data directory to rebuild. Created if absent.
+        #[arg(long)]
+        into: PathBuf,
+        /// Fencing epoch the transfer is requested under. A transfer served by
+        /// a deposed leader would repair this replica onto a history the
+        /// cluster has already moved past, so the epoch is checked per chunk on
+        /// the serving side and must match what metadata granted.
+        #[arg(long)]
+        fencing_epoch: u64,
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
         timeout_seconds: u64,
     },
 }
@@ -371,7 +407,350 @@ async fn run_inner(command: NodeCommand, json: bool) -> Result<i32, String> {
                 reports.iter().any(|report| report.outcome.is_err()),
             ))
         }
+        NodeCommand::Repair {
+            common,
+            from,
+            into,
+            fencing_epoch,
+            timeout_seconds,
+        } => {
+            let config = load_config(&common.config)?;
+            repair(
+                &config,
+                from,
+                &into,
+                fencing_epoch,
+                Duration::from_secs(timeout_seconds),
+                json,
+            )
+            .await
+        }
     }
+}
+
+/// How far the repaired prefix is behind the source, or why the question has no
+/// answer.
+///
+/// A free function so the arithmetic can be tested without a cluster. It is one
+/// subtraction, and it decides whether the operator is told to start the
+/// replica or to delete the directory — too much weight for a line that
+/// otherwise only ever runs at the end of a live repair.
+fn remaining_gap(source_tip: u64, adopted_next_offset: u64) -> Result<u64, String> {
+    // NOT `saturating_sub`. A source tip BELOW the adopted prefix means the
+    // source was truncated or replaced between the final chunk and the status
+    // call, so the directory holds a suffix the source no longer has.
+    // Saturating that to zero turns the most serious result this command can
+    // produce — a replica carrying records the range has disowned — into the
+    // one that reads as perfect success, and the operator is told to start it.
+    if source_tip < adopted_next_offset {
+        return Err(format!(
+            "the source is at offset {source_tip} but the adopted prefix already ends at \
+             {adopted_next_offset}, so this directory holds {} record(s) the source does not. \
+             That cannot happen while a repair is merely behind: the source was truncated or \
+             replaced between the last chunk and this check, and the transferred prefix belongs \
+             to a history that no longer exists. Starting a replica from it would serve records \
+             the range has disowned.",
+            adopted_next_offset - source_tip
+        ));
+    }
+    Ok(source_tip - adopted_next_offset)
+}
+
+/// Pull a leader's sealed prefix into `into` and adopt it into a servable
+/// range.
+///
+/// Two steps that must not be split across invocations. A transferred prefix on
+/// its own is bytes `SegmentSet::open_in` refuses to open — its tail was sealed
+/// without a successor — so a repair that stopped after the transfer would
+/// leave a directory a node cannot start against, and the operator with no
+/// signal that anything was missing.
+///
+/// The exit codes are distinct because the remedies are: `0` the replica is
+/// current, `1` it is behind by a measured gap, `2` the prefix is adopted but
+/// the gap could not be measured. Only `0` means "start it and stop looking",
+/// and `2` in particular must not be read as a failed transfer — repeating the
+/// repair is the wrong response to it.
+async fn repair(
+    config: &NodeClientConfig,
+    from: Uuid,
+    into: &Path,
+    fencing_epoch: u64,
+    timeout: Duration,
+    json: bool,
+) -> Result<i32, String> {
+    let source = config
+        .replicas
+        .iter()
+        .find(|replica| replica.node_uuid == from)
+        .ok_or_else(|| {
+            format!(
+                "no replica {from} in {}; --from must name a node the config lists, \
+                 because its address and certificate name come from there",
+                common_config_hint()
+            )
+        })?;
+
+    // EMPTY, or a directory a previous repair owned. Not "empty" alone, and not
+    // "anything goes".
+    //
+    // Two failures make an unconditional overwrite unsafe. A stopped replica's
+    // directory still holds its `.active` file, so repairing in place would
+    // race or clobber real data — and the receiver cannot tell a stopped
+    // process from a running one. And a directory carrying sealed bundles the
+    // leader has since truncated away would adopt them, reporting a successful
+    // repair onto records the current leader does not have.
+    //
+    // But refusing every non-empty directory throws away the transfer's own
+    // idempotent resume: an interrupted repair leaves staged debris and
+    // installed bundles, and `transfer_sealed_prefix` is built to skip what
+    // already landed and verified. Making an operator delete a partially
+    // transferred prefix and re-download it after any transient network
+    // failure is a real cost on a large range, and it grows with the size of
+    // the thing being repaired — precisely when a retry matters most.
+    //
+    // So a marker file records that a repair owns this directory. Its presence
+    // means these bytes came from a repair and nothing else, which is exactly
+    // the condition under which resuming is safe.
+    const OWNER_MARKER: &str = ".vtop-repair-owned";
+    let marker = into.join(OWNER_MARKER);
+    match std::fs::read_dir(into) {
+        Ok(mut entries) => {
+            if entries.next().is_some() && !marker.exists() {
+                return Err(format!(
+                    "{} is not empty and was not created by a previous repair. Repair rebuilds a \
+                     range from scratch and must not run over existing data: a stopped replica's \
+                     own directory still holds its active segment, and segments left by \
+                     something else may have been truncated away by the leader since — adopting \
+                     those would report success onto records the leader no longer has. Repair \
+                     into a fresh directory and start the replica against that.",
+                    into.display()
+                ));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(into)
+                .map_err(|error| format!("create {}: {error}", into.display()))?;
+        }
+        Err(error) => return Err(format!("read {}: {error}", into.display())),
+    }
+    // A MARKED directory that already holds an adopted tail is a different
+    // situation from a marked one that does not, and the two want opposite
+    // answers. Without the tail, the last run stopped partway and resuming is
+    // exactly right. With it, the last run FINISHED: the range is live, and
+    // `SegmentReceiver::open` refuses to sweep it — correctly, because sweeping
+    // a live range deletes recovery state. That refusal reads as an internal
+    // complaint about a directory the operator was told they could reuse, so it
+    // is caught here where the reason can be stated instead.
+    //
+    // This matters because re-running repair is the natural reflex when a gap
+    // is reported, and it is the wrong move: a gap lives in the source's ACTIVE
+    // segment, which never transfers, so no second repair can shrink it. Only
+    // the replica catching up from the leader can.
+    if marker.exists() {
+        let adopted = std::fs::read_dir(into)
+            .map_err(|error| format!("read {}: {error}", into.display()))?
+            .filter_map(Result::ok)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.ends_with(".active"))
+            });
+        if let Some(entry) = adopted {
+            return Err(format!(
+                "{} was repaired already — it holds an adopted range with an active segment at \
+                 {}, so this repair finished and running it again would re-seed a live range. If \
+                 a gap was reported, another repair cannot close it: those records are in the \
+                 source's active segment, which never transfers, and only the replica catching \
+                 up from the leader will bring them over. Start the replica against this \
+                 directory. If it is refused for a base-offset mismatch then the gap was too \
+                 large to catch up, and the remedy is a fresh repair into an EMPTY directory \
+                 rather than a second one over this.",
+                into.display(),
+                entry.path().display()
+            ));
+        }
+    }
+    // Written BEFORE any bytes land, so an interruption at any point after this
+    // leaves a directory a retry recognises. Writing it afterwards would make
+    // the very failures worth resuming from unresumable.
+    std::fs::write(&marker, b"vtop repair destination\n")
+        .map_err(|error| format!("mark {} as repair-owned: {error}", into.display()))?;
+
+    let material =
+        TlsMaterial::from_pem_files(&config.client_cert, &config.client_key, &config.ca_cert)
+            .map_err(|error| error.to_string())?;
+    // Loaded twice because building a connector CONSUMES the material, and the
+    // gap check below needs its own client.
+    let status_material =
+        TlsMaterial::from_pem_files(&config.client_cert, &config.client_key, &config.ca_cert)
+            .map_err(|error| error.to_string())?;
+    let client = SegmentTransferClient::new(ReplicaTlsMaterial {
+        certificate_chain: material.certificate_chain,
+        private_key: material.private_key,
+        trust_roots: material.trust_roots,
+    })
+    .map_err(|error| error.to_string())?
+    .with_request_timeout(timeout);
+
+    let env = Env::real();
+    // Refuses a directory holding an active segment, which is the guard that
+    // keeps this from being run against a live range.
+    let receiver = SegmentReceiver::open(&env, into).map_err(|error| {
+        format!(
+            "{error}: repair rebuilds a directory rather than joining one, so the replica \
+             must be stopped, or starting from an empty disk, before it runs"
+        )
+    })?;
+    let addr = resolve_endpoint(&source.addr).map_err(|error| error.to_string())?;
+    let installed = client
+        .transfer_sealed_prefix(
+            addr,
+            &source.server_name,
+            source.node_uuid,
+            &config.range.identity(),
+            fencing_epoch,
+            &receiver,
+        )
+        .await
+        .map_err(|error| format!("transfer from {from}: {error}"))?;
+
+    // ADOPT, so the result is a range and not a pile of segments. The successor
+    // id is minted here because nothing else in this command owns one, and a
+    // fresh id is correct: this tail has never existed anywhere else.
+    let set = SegmentSet::adopt_in(&env, into, Uuid::new_v4()).map_err(|error| {
+        format!(
+            "adopt the transferred prefix in {}: {error}",
+            into.display()
+        )
+    })?;
+    let sealed = set.sealed().len();
+    let next_offset = set.next_offset();
+    drop(set);
+
+    // A REPAIR CAN LEAVE THE REPLICA STILL STRANDED, and saying "repaired"
+    // without checking would be the most expensive kind of wrong answer.
+    //
+    // Only SEALED segments transfer — the active tail is still being appended
+    // to, so its bytes can be superseded by a truncation mid-copy. But the tail
+    // is bounded at 8 GiB by default while the leader's retransmission buffer
+    // is 8 MiB, a factor of a thousand. So the rebuilt replica starts at the
+    // end of the sealed prefix and the leader may be far beyond it, inside a
+    // tail that catch-up cannot replay. The replica restarts, is refused for a
+    // base-offset mismatch, and an operator who was told "repaired" has no
+    // reason to look here.
+    //
+    // The gap is measured and reported rather than assumed away. This asks the
+    // source where it actually is instead of trusting the listing, because the
+    // listing describes the sealed prefix and the question is about the tail.
+    let status_client = ReplicaStatusClient::new(ReplicaTlsMaterial {
+        certificate_chain: status_material.certificate_chain,
+        private_key: status_material.private_key,
+        trust_roots: status_material.trust_roots,
+    })
+    .map_err(|error| error.to_string())?
+    .with_timeout(timeout);
+    let source_tip = status_client
+        .status(
+            addr,
+            &source.server_name,
+            source.node_uuid,
+            &config.range.identity(),
+        )
+        .await
+        .map(|status| status.next_offset);
+
+    // THE PREFIX IS ALREADY ADOPTED by the time this runs, so a status failure
+    // is not a failed repair and must not be reported as one. Returning an
+    // error here said "the prefix landed, but..." and exited as though the
+    // command had not worked, which pushes an operator toward deleting the
+    // directory and re-downloading a prefix that is intact — the most expensive
+    // wrong move available, and its cost grows with the size of the range.
+    //
+    // What actually happened is narrower: the range is servable and the gap is
+    // UNKNOWN. That deserves a non-zero exit, because an unmeasured gap is not
+    // a measured zero, but the guidance is to measure it rather than to repeat
+    // the transfer.
+    let source_tip = match source_tip {
+        Ok(tip) => tip,
+        Err(error) => {
+            let message = format!(
+                "the prefix landed and was adopted, but {from}'s current offset could not be \
+                 read, so whether the replica can still catch up is UNKNOWN: {error}"
+            );
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "from": from.to_string(),
+                        "directory": into.display().to_string(),
+                        "segments_installed": installed.len(),
+                        "sealed_segments": sealed,
+                        "next_offset": next_offset,
+                        "remaining_gap": serde_json::Value::Null,
+                        "error": message,
+                    })
+                );
+            } else {
+                eprintln!("warning: {message}");
+                eprintln!(
+                    "The directory is repaired and servable. Do NOT repair it again — that would \
+                     re-download an intact prefix. Read {from}'s offset with `vtopctl node \
+                     status` and compare it against {next_offset}, or start the replica: if the \
+                     gap is too large it is refused for a base-offset mismatch rather than \
+                     serving records it does not have."
+                );
+            }
+            return Ok(2);
+        }
+    };
+    let gap = remaining_gap(source_tip, next_offset).map_err(|error| {
+        format!(
+            "{error} Delete {} and repair again once {from} is stable.",
+            into.display()
+        )
+    })?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "from": from.to_string(),
+                "directory": into.display().to_string(),
+                "segments_installed": installed.len(),
+                "sealed_segments": sealed,
+                "next_offset": next_offset,
+                "source_next_offset": source_tip,
+                "remaining_gap": gap,
+            })
+        );
+    } else {
+        println!("repaired {} from {from}", into.display());
+        println!("  segments transferred : {}", installed.len());
+        println!("  sealed segments      : {sealed}");
+        println!("  tail begins at offset: {next_offset}");
+        println!("  source is at offset  : {source_tip}");
+        println!("  remaining gap        : {gap} record(s)");
+        if gap == 0 {
+            println!("start the replica against this directory to resume replication");
+        } else {
+            println!(
+                "\nThe {gap} record(s) between this prefix and {from}'s current position are in \
+                 its ACTIVE segment, which does not transfer — a tail is still being appended to, \
+                 so its bytes can be superseded by a truncation mid-copy. They must be replayed \
+                 from the leader's retransmission buffer when the replica starts, and that buffer \
+                 is bounded (8 MiB by default). If the gap exceeds it the replica will be refused \
+                 for a base-offset mismatch and this repair will not have been enough."
+            );
+        }
+    }
+    // NON-ZERO when a gap remains. A script must not read "the transfer
+    // succeeded" as "the replica is back", and a human should have to look.
+    Ok(i32::from(gap > 0))
+}
+
+fn common_config_hint() -> &'static str {
+    "the node client config"
 }
 
 #[cfg(test)]
@@ -532,5 +911,36 @@ replicas: []
         )
         .unwrap();
         assert!(load_config(&path).unwrap_err().contains("no replicas"));
+    }
+
+    /// A source ahead of the prefix is the ordinary case, and the gap is exact.
+    #[test]
+    fn the_gap_is_the_distance_from_the_adopted_prefix_to_the_source() {
+        assert_eq!(remaining_gap(1_000, 940).unwrap(), 60);
+        assert_eq!(
+            remaining_gap(940, 940).unwrap(),
+            0,
+            "a source sitting exactly at the prefix end is caught up, not behind"
+        );
+    }
+
+    /// A source BEHIND the adopted prefix is refused rather than reported as
+    /// caught up.
+    ///
+    /// This is the case `saturating_sub` silently turned into success: the
+    /// destination holds records the source disowned, and clamping to zero made
+    /// the worst outcome the command can reach indistinguishable from the best
+    /// one — the operator is told to start a replica that would serve a history
+    /// the range no longer has.
+    #[test]
+    fn a_source_behind_the_adopted_prefix_is_refused_not_clamped_to_zero() {
+        let error = remaining_gap(900, 940)
+            .expect_err("a prefix ahead of its own source is divergence, not progress");
+        assert!(
+            error.contains("40 record(s) the source does not"),
+            "the message must quantify the divergence so the operator can judge it: {error}"
+        );
+        // One record apart is still divergence. The check is not a tolerance.
+        assert!(remaining_gap(939, 940).is_err());
     }
 }
