@@ -403,6 +403,15 @@ LENGTH_BYTES="$(wc -c < "$SEALED_COPY" | tr -d ' ')"
 [[ "$LENGTH_BYTES" -gt 0 ]] || fail "the transferred copy is empty"
 log "the copy verifies against metadata's content root ${CONTENT_ROOT:0:16}…, $LENGTH_BYTES bytes"
 
+# THE RAFT TERM, read from metadata — not the range's fencing epoch. They are
+# different numbers that happen to coincide while nothing has re-elected, and
+# `verified_term` is the consensus term the proof is audited against. Passing
+# the epoch would commit a proof that records a term nobody was ever in, and
+# the run would still pass.
+META_TERM="$(meta_status_field "$LEADER_ID" '["current_term"]')"
+[[ -n "$META_TERM" ]] || fail "could not read the metadata leader's current term for the proof"
+log "proof will record metadata term $META_TERM (range fencing epoch is $EPOCH)"
+
 # THE PROOF NAMES THE REPLICA BEING REPLACED, not the node the bytes came from.
 # `commit_replacement_proof` requires the source to equal the open intent's
 # `from`, and the intent is the move F1 -> spare. The bytes were pulled from
@@ -416,7 +425,7 @@ meta_admin "$LEADER_ID" commit-replacement-proof \
   --expected-segment-generation "$(json_field "$MOVING" 'd["segment"]["segment_generation"]')" \
   --content-root "$CONTENT_ROOT" --expected-length-bytes "$LENGTH_BYTES" \
   --source-node-uuid "$FOLLOWER1_UUID" --destination-node-uuid "$SPARE_UUID" \
-  --fencing-epoch "$EPOCH" --verifier-node-uuid "$LEADER_UUID" --verified-term "$EPOCH" \
+  --fencing-epoch "$EPOCH" --verifier-node-uuid "$LEADER_UUID" --verified-term "$META_TERM" \
   > "$WORKDIR/logs/commit-proof.log" 2>&1 \
   || fail "the replacement proof was refused: $(tail -3 "$WORKDIR/logs/commit-proof.log")"
 log "replacement proof committed"
@@ -439,6 +448,16 @@ PLANNED="$WORKDIR/placement-planned.json"
 meta_admin "$LEADER_ID" get-placement \
   --topic-uuid "$TOPIC_UUID" --range-uuid "$RANGE_ID" --segment-uuid "$SEG_UUID" \
   > "$PLANNED" || fail "could not read the placement after planning"
+# THE PHYSICAL EFFECT, before the record of it. `confirm-replica-retired`
+# asserts the local bytes are gone; confirming while they sit on disk records
+# something untrue and the scenario would pass having exercised the bookkeeping
+# and not the retirement. The node is already stopped, so this is what an
+# operator reclaiming the disk actually does.
+rm -rf "$WORKDIR/data-follower-1"
+[[ ! -d "$WORKDIR/data-follower-1" ]] \
+  || fail "the retired replica's data directory is still present"
+log "the retired replica's bytes are deleted, as the confirmation is about to assert"
+
 meta_admin "$LEADER_ID" confirm-replica-retired \
   --topic-uuid "$TOPIC_UUID" --range-uuid "$RANGE_ID" --segment-uuid "$SEG_UUID" \
   --retiring-node-uuid "$FOLLOWER1_UUID" \
@@ -461,7 +480,31 @@ FINAL_COUNT="$(json_field "$FINAL" 'len(d["replica_nodes"])')"
   || fail "expected the placement back at RF = $RF after the move, got $FINAL_COUNT"
 [[ "$(json_field "$FINAL" 'd["rebalance_intent"] is None')" == "True" ]] \
   || fail "the rebalance intent is still open after the move completed; the segment stays locked"
-log "final placement is back at RF 3, names the replacement, and holds no open intent"
+log "final placement is back at RF $RF, names the replacement, and holds no open intent"
+
+# MARKED DEAD, or it stays a placement candidate. `active_placement_candidates`
+# takes every Active node, so a replica this scenario declared gone for good
+# would be selected for the NEXT segment's placement — recording durability on
+# a node that does not exist. Retiring it from one segment says nothing about
+# the registry.
+DEAD_GEN="$(json_field "$WORKDIR/ack-register-b.json" 'd["generation"]')"
+meta_admin "$LEADER_ID" set-node-state \
+  --node-uuid "$FOLLOWER1_UUID" --state dead \
+  --expected-generation "$((DEAD_GEN + 1))" \
+  > "$WORKDIR/logs/mark-dead.log" 2>&1 \
+  || fail "could not mark the lost replica dead: $(tail -3 "$WORKDIR/logs/mark-dead.log")"
+
+# And it is really out: a placement proposal at the same factor must no longer
+# be able to name it.
+CANDIDATES="$WORKDIR/placement-after-dead.json"
+meta_admin "$LEADER_ID" get-placement \
+  --topic-uuid "$TOPIC_UUID" --range-uuid "$RANGE_ID" --segment-uuid "$SEG_UUID" \
+  --for-replication-factor "$RF" > "$CANDIDATES" \
+  || fail "could not re-read the placement proposal after marking the node dead"
+if grep -q "$FOLLOWER1_UUID" <<< "$(json_field "$CANDIDATES" 'd["proposal"]')"; then
+  fail "the lost replica is still a placement candidate after being marked dead"
+fi
+log "the lost replica is marked dead and no longer proposed for placement"
 
 # --- nothing acknowledged was lost ------------------------------------------
 # The leader is restarted with the NEW replica set, because the follower list
