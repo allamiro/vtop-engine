@@ -1013,11 +1013,16 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
             issued_at_ms,
             request_id,
         } => {
-            if next_offset <= base_offset {
+            // `<`, matching the state machine — NOT `<=`. An empty sealed
+            // segment is legal: `ActiveSegment::seal` produces one, so sealing
+            // an untouched tail is a real artifact an operator can hold, and
+            // refusing to register it here would be this CLI inventing a rule
+            // the engine does not have. Only a REVERSED range is impossible.
+            if next_offset < base_offset {
                 return Err(format!(
-                    "--next-offset {next_offset} is not above --base-offset {base_offset}; a \
-                     sealed segment holds at least one record, so an empty or reversed range is \
-                     evidence the offsets came from somewhere other than the segment"
+                    "--next-offset {next_offset} is below --base-offset {base_offset}; a segment \
+                     cannot end before it begins, so these offsets did not come from the segment \
+                     being registered"
                 ));
             }
             let command = MetadataCommand::RegisterSealedSegment {
