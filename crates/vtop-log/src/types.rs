@@ -374,7 +374,16 @@ impl Default for SegmentConfig {
 }
 
 impl SegmentConfig {
-    pub(crate) fn validate(self) -> VtopLogResult<Self> {
+    /// Public so a caller can reject a bad combination BEFORE it is stored as
+    /// a roll override.
+    ///
+    /// Validation used to happen only inside `create_in`, which for an
+    /// override means at the roll — and `roll_in` seals the tail before it
+    /// creates the successor. An invalid combination there leaves the set with
+    /// no tail and the directory holding only sealed segments, which
+    /// `open_in` then refuses: a config typo would take the range down rather
+    /// than being refused at startup.
+    pub fn validate(self) -> VtopLogResult<Self> {
         if self.max_record_bytes == 0 || self.max_record_bytes > MAX_RECORD_BYTES {
             return Err(LogError::InvalidConfig(format!(
                 "max_record_bytes must be in 1..={MAX_RECORD_BYTES}"
@@ -579,7 +588,9 @@ impl Default for SegmentConfigV2 {
 }
 
 impl SegmentConfigV2 {
-    pub(crate) fn validate(self) -> VtopLogResult<Self> {
+    /// Public for the same reason as the v1 validator: a roll override has to
+    /// be refused where it is set, and `roll_in` may turn it into either form.
+    pub fn validate(self) -> VtopLogResult<Self> {
         if self.max_record_bytes == 0 || self.max_record_bytes > MAX_RECORD_BYTES {
             return Err(LogError::InvalidConfig(format!(
                 "max_record_bytes must be in 1..={MAX_RECORD_BYTES}"

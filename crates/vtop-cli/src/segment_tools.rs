@@ -14,8 +14,9 @@ use vtop_log::proof::{ChunkParams, ChunkProof, Side};
 use vtop_log::verify::{
     chunk_proof, level_name, verify_sealed_segment, VerifyExpectations, VerifyLevel, VerifyReport,
     CHECK_CHUNK_SIDECAR, CHECK_CONTENT_ROOT, CHECK_FRAME_SCAN, CHECK_MANIFEST_CANONICAL,
-    CHECK_MANIFEST_CONSISTENCY, CHECK_MANIFEST_DIGEST_PIN, CHECK_REQUIRED_LEVEL, CHECK_ROOT_PIN,
-    CHECK_STATEMENT_DIGEST, CHECK_STATEMENT_ECHO, CHECK_STATEMENT_MAC,
+    CHECK_MANIFEST_CONSISTENCY, CHECK_MANIFEST_DIGEST_PIN, CHECK_PRODUCER_FRONTIER,
+    CHECK_REQUIRED_LEVEL, CHECK_ROOT_PIN, CHECK_STATEMENT_DIGEST, CHECK_STATEMENT_ECHO,
+    CHECK_STATEMENT_MAC,
 };
 use vtop_log::{LogError, SegmentCommitKey, CHUNK_TREE_SCHEME_V1};
 
@@ -241,7 +242,14 @@ pub fn pair_key_sources(
 /// mismatch, which outranks an authentication failure, which outranks merely
 /// falling short of the required level.
 pub fn exit_code_for(report: &VerifyReport) -> i32 {
-    const CORRUPTION_CHECKS: [&str; 7] = [
+    const CORRUPTION_CHECKS: [&str; 8] = [
+        // A DAMAGED PRODUCER FRONTIER IS A DAMAGED ARTIFACT. The records may
+        // scan clean, but this command now emits the content root and offsets
+        // that `meta register-sealed-segment` and `commit-replacement-proof`
+        // consume — so a zero exit here is what automation reads as "these
+        // values are trustworthy". Leaving the frontier out let a segment with
+        // a corrupt sidecar hand over evidence under a successful exit.
+        CHECK_PRODUCER_FRONTIER,
         CHECK_FRAME_SCAN,
         CHECK_CONTENT_ROOT,
         CHECK_CHUNK_SIDECAR,
@@ -278,6 +286,17 @@ pub fn report_json(path: &Path, report: &VerifyReport, exit_code: i32) -> serde_
         "record_count": report.record_count,
         "content_bytes": report.content_bytes,
         "chunk_count": report.chunk_count,
+        // The segment's IDENTITY, which is what `meta register-sealed-segment`
+        // and `meta commit-replacement-proof` need and what nothing emitted.
+        // Re-derived from the frames by the scan, so it states what the bytes
+        // say rather than what the manifest claims.
+        "base_offset": report.base_offset,
+        "next_offset": report.next_offset,
+        "content_root": report
+            .content_root
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
         "achieved": level_name(report.achieved),
         "checks": report.checks.iter().map(|check| serde_json::json!({
             "name": check.name,
@@ -388,6 +407,16 @@ fn print_human_report(
             check.detail
         );
     }
+    println!(
+        "  offsets: [{}, {})  content root: {}",
+        report.base_offset,
+        report.next_offset,
+        report
+            .content_root
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
     println!(
         "  level: {} (required: {}) -> exit {exit_code}",
         level_name(report.achieved),
@@ -577,6 +606,9 @@ mod tests {
             record_count: 1,
             content_bytes: 100,
             chunk_count: 1,
+            base_offset: 0,
+            next_offset: 1,
+            content_root: [0_u8; 32],
             achieved: VerifyLevel::SelfConsistent,
             checks,
         }

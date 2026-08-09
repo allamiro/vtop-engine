@@ -155,6 +155,79 @@ pub enum MetaCommand {
         #[arg(long)]
         request_id: Option<Uuid>,
     },
+    /// Register a sealed segment in metadata (#180).
+    ///
+    /// THE FIRST STEP OF THE WHOLE SEGMENT LIFECYCLE, and it had no CLI. A
+    /// placement, a replacement proof, a retirement and a retention decision
+    /// all name a segment metadata must already know about — `NotFound`
+    /// otherwise — so without this the rest of the flow was unreachable for
+    /// any segment a real node had actually sealed.
+    ///
+    /// The offsets and the content root come from `vtopctl segment verify`,
+    /// which re-derives them from the frames. Registering figures a node has
+    /// not verified would put a root in metadata that the bytes do not
+    /// support, and every later proof compares against it.
+    RegisterSealedSegment {
+        #[command(flatten)]
+        common: MetaCommonArgs,
+        #[arg(long)]
+        topic_uuid: Uuid,
+        #[arg(long)]
+        range_uuid: Uuid,
+        #[arg(long)]
+        segment_uuid: Uuid,
+        #[arg(long)]
+        segment_generation: u64,
+        #[arg(long)]
+        base_offset: u64,
+        #[arg(long)]
+        next_offset: u64,
+        /// Sealed content root as 64 hex characters, from `segment verify`.
+        #[arg(long, value_parser = parse_hash32)]
+        content_root: [u8; 32],
+        /// The fencing epoch the sealing leader held. A segment sealed under a
+        /// deposed epoch belongs to a history the cluster moved past.
+        #[arg(long)]
+        sealed_by_epoch: u64,
+        #[arg(long)]
+        expected_range_generation: u64,
+        #[arg(long, default_value_t = 0)]
+        issued_at_ms: i64,
+        #[arg(long)]
+        request_id: Option<Uuid>,
+    },
+    /// Record that a sealed segment's bytes were verified (#180).
+    ///
+    /// THE SECOND LINK, and it had no CLI either. `commit-segment-placement`
+    /// refuses a segment that is not yet Verified — "placement requires a
+    /// verified segment" — so registering one was not enough to place it, and
+    /// the chain register → verify → place was broken at both of its first two
+    /// links.
+    ///
+    /// The root is checked against the registered one, so this cannot bless a
+    /// segment as something it is not: it asserts that a node READ these bytes
+    /// and got this root, which is why it is a separate step from registering
+    /// the claim.
+    MarkSegmentVerified {
+        #[command(flatten)]
+        common: MetaCommonArgs,
+        #[arg(long)]
+        topic_uuid: Uuid,
+        #[arg(long)]
+        range_uuid: Uuid,
+        #[arg(long)]
+        segment_uuid: Uuid,
+        /// The root `vtopctl segment verify` re-derived from the frames. Must
+        /// equal what was registered.
+        #[arg(long, value_parser = parse_hash32)]
+        content_root: [u8; 32],
+        #[arg(long)]
+        expected_generation: u64,
+        #[arg(long, default_value_t = 0)]
+        issued_at_ms: i64,
+        #[arg(long)]
+        request_id: Option<Uuid>,
+    },
     /// Read a segment's placement, generation, and any open rebalance (#308).
     ///
     /// THE READ EVERY OTHER COMMAND IN THIS FLOW DEPENDS ON. They all take
@@ -725,8 +798,8 @@ fn check_replacement_proof(
     if source == destination {
         return Err(format!(
             "--source-node-uuid and --destination-node-uuid are both {source}; a replacement \
-             proof asserts that a SECOND replica now holds the segment, and a node cannot be \
-             evidence of itself"
+             proof asserts that the destination now holds what the source held, and a node \
+             cannot be its own replacement"
         ));
     }
     Ok(())
@@ -922,6 +995,72 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
                 },
                 node_uuid,
                 state,
+                expected_generation,
+            };
+            propose_and_print(&common.config, command, json).await
+        }
+        MetaCommand::RegisterSealedSegment {
+            common,
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+            segment_generation,
+            base_offset,
+            next_offset,
+            content_root,
+            sealed_by_epoch,
+            expected_range_generation,
+            issued_at_ms,
+            request_id,
+        } => {
+            // `<`, matching the state machine — NOT `<=`. An empty sealed
+            // segment is legal: `ActiveSegment::seal` produces one, so sealing
+            // an untouched tail is a real artifact an operator can hold, and
+            // refusing to register it here would be this CLI inventing a rule
+            // the engine does not have. Only a REVERSED range is impossible.
+            if next_offset < base_offset {
+                return Err(format!(
+                    "--next-offset {next_offset} is below --base-offset {base_offset}; a segment \
+                     cannot end before it begins, so these offsets did not come from the segment \
+                     being registered"
+                ));
+            }
+            let command = MetadataCommand::RegisterSealedSegment {
+                env: CommandEnvelope {
+                    request_id: request_id.unwrap_or_else(Uuid::new_v4),
+                    issued_at_ms,
+                },
+                topic_uuid,
+                range_uuid,
+                segment_uuid,
+                segment_generation,
+                base_offset,
+                next_offset,
+                content_root,
+                sealed_by_epoch,
+                expected_range_generation,
+            };
+            propose_and_print(&common.config, command, json).await
+        }
+        MetaCommand::MarkSegmentVerified {
+            common,
+            topic_uuid,
+            range_uuid,
+            segment_uuid,
+            content_root,
+            expected_generation,
+            issued_at_ms,
+            request_id,
+        } => {
+            let command = MetadataCommand::MarkSegmentVerified {
+                env: CommandEnvelope {
+                    request_id: request_id.unwrap_or_else(Uuid::new_v4),
+                    issued_at_ms,
+                },
+                topic_uuid,
+                range_uuid,
+                segment_uuid,
+                content_root,
                 expected_generation,
             };
             propose_and_print(&common.config, command, json).await
@@ -1375,6 +1514,22 @@ fn propose_json(log_id: &WireLogId, response: &MetadataResponse) -> serde_json::
     serde_json::json!({
         "log_id": { "term": log_id.term, "index": log_id.index },
         "response": format!("{response:?}"),
+        // THE GENERATION AS A FIELD, not only inside a Debug string. Almost
+        // every command that follows one of these takes the resulting
+        // generation as its compare-and-swap token, so a caller scripting the
+        // flow had to either scrape `{response:?}` or hardcode a value it
+        // assumed — and a hardcoded CAS token fails silently the first time
+        // the record was touched by anything else.
+        //
+        // Null for responses that carry no generation, so a consumer can tell
+        // "this command does not produce one" from "the field is missing".
+        "generation": match response {
+            MetadataResponse::Ack { generation }
+            | MetadataResponse::GroupCreated { generation, .. } => {
+                serde_json::json!(generation)
+            }
+            _ => serde_json::Value::Null,
+        },
     })
 }
 
@@ -1478,13 +1633,15 @@ fn proposal_text(proposal: &Option<Result<Vec<Uuid>, String>>) -> String {
             );
         }
         Some(Err(reason)) => {
+            // PRINTED VERBATIM. The remedy comes from metadata, which is the
+            // only side that knows why the selection failed — whether the
+            // factor was out of range, whether there were too few nodes, or
+            // whether there were enough nodes in too few domains. This side
+            // used to append one remedy for all three, so it confidently told
+            // operators to set failure domains when the real problem was an
+            // unsupported factor. Advice that cannot work, printed right after
+            // the real reason, is worse than none: it gets tried first.
             let _ = writeln!(out, "proposed placement   : REFUSED — {reason}");
-            let _ = writeln!(
-                out,
-                "  A placement above RF 1 needs replicas in distinct failure domains, and \
-                 register-node leaves the domain empty. Set one on each node with \
-                 set-node-placement-attrs, then ask again."
-            );
         }
     }
     out
@@ -1674,10 +1831,17 @@ client_key: /tmp/client.key
             .expect_err("an empty segment is not evidence a replica holds anything");
         assert!(error.contains("--expected-length-bytes is 0"), "{error}");
 
-        // Same node twice: something is asserted, but not by a second party.
+        // Same node twice: the proof would say a replica replaced itself.
+        //
+        // Worth being precise about what the source MEANS here, because the
+        // help used to say the wrong thing: it names the replica being
+        // REPLACED — the state machine requires it to equal the open
+        // rebalance's `from` — not the node the bytes were physically copied
+        // from. Those differ whenever the replica being replaced is the dead
+        // one, which is the ordinary case.
         let error = check_replacement_proof(4096, node(1), node(1))
-            .expect_err("a node cannot be evidence of itself");
-        assert!(error.contains("cannot be evidence of itself"), "{error}");
+            .expect_err("a node cannot be its own replacement");
+        assert!(error.contains("cannot be its own replacement"), "{error}");
 
         check_replacement_proof(4096, node(1), node(2))
             .expect("a non-empty segment on a different node is the whole point of the command");
@@ -1875,17 +2039,33 @@ client_key: /tmp/client.key
         );
     }
 
-    /// A refusal names the remedy, not just the problem.
+    /// A refusal is reported exactly as metadata gave it, remedy included.
+    ///
+    /// This side must not append guidance of its own. It cannot tell an
+    /// out-of-range factor from too few nodes from too few domains — the error
+    /// arrives as text — and it used to print the failure-domain remedy for
+    /// all three, which is confidently wrong advice in two of them.
     #[test]
-    fn a_refused_proposal_points_at_the_command_that_fixes_it() {
+    fn a_refusal_is_printed_verbatim_without_invented_guidance() {
         let text = proposal_text(&Some(Err(
-            "only 1 distinct failure domain for 3 replicas".to_owned()
+            "replication factor 9 must be 1..=7. Choose a replication factor within the \
+             supported range."
+                .to_owned(),
         )));
-        assert!(text.contains("only 1 distinct failure domain"), "{text}");
+        assert!(text.contains("replication factor 9"), "{text}");
         assert!(
-            text.contains("set-node-placement-attrs"),
-            "nothing else in the flow would tell an operator which command sets a domain:\n{text}"
+            !text.contains("set-node-placement-attrs"),
+            "an out-of-range factor is not fixed by setting failure domains, and saying so \
+             sends the operator to a command that cannot help:\n{text}"
         );
+
+        // And when the remedy IS about domains, it still arrives — from the
+        // side that knows.
+        let domains = proposal_text(&Some(Err(
+            "2 of 3 replicas placeable. Set one on each with `set-node-placement-attrs`."
+                .to_owned(),
+        )));
+        assert!(domains.contains("set-node-placement-attrs"), "{domains}");
     }
 
     /// No request, no output — the proposal must not invent a placement for a

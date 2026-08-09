@@ -9,6 +9,13 @@
 //! a torn transfer that leaves the directory clean and resumable.
 
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
+
+/// The identity a direct handler call presents.
+///
+/// The handler itself serves whoever reaches it — authorization lives on the
+/// node that installs it — so this only has to be a stable UUID, not a
+/// permitted one.
+const TEST_PEER: Uuid = Uuid::from_u128(0xF00D);
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::fs;
 use std::net::SocketAddr;
@@ -289,22 +296,20 @@ fn the_leader_refuses_by_name_what_the_transfer_plane_does_not_serve() {
 
     // Unknown segment: named as absent lineage, not as a bad request.
     let (code, message) = handler
-        .fetch_segment_chunk(&fetch(
-            Uuid::from_u128(0xDEAD),
-            FENCING_EPOCH,
-            h.range.clone(),
-        ))
+        .fetch_segment_chunk(
+            TEST_PEER,
+            &fetch(Uuid::from_u128(0xDEAD), FENCING_EPOCH, h.range.clone()),
+        )
         .unwrap_err();
     assert_eq!(code, ErrorCode::WrongLineage);
     assert!(message.contains("no sealed segment"), "{message}");
 
     // The active tail: a segment the leader HAS, refused as what it is.
     let (code, message) = handler
-        .fetch_segment_chunk(&fetch(
-            h.leader.active_segment_id(),
-            FENCING_EPOCH,
-            h.range.clone(),
-        ))
+        .fetch_segment_chunk(
+            TEST_PEER,
+            &fetch(h.leader.active_segment_id(), FENCING_EPOCH, h.range.clone()),
+        )
         .unwrap_err();
     assert_eq!(code, ErrorCode::InvalidRequest);
     assert!(message.contains("active tail"), "{message}");
@@ -314,21 +319,23 @@ fn the_leader_refuses_by_name_what_the_transfer_plane_does_not_serve() {
     wrong_range.range_id = Uuid::from_u128(0xFFF);
     let sealed = h.leader.sealed_segment_handles();
     let (code, _) = handler
-        .fetch_segment_chunk(&fetch(sealed[0].segment_id, FENCING_EPOCH, wrong_range))
+        .fetch_segment_chunk(
+            TEST_PEER,
+            &fetch(sealed[0].segment_id, FENCING_EPOCH, wrong_range),
+        )
         .unwrap_err();
     assert_eq!(code, ErrorCode::WrongRange);
 
     // Stale epoch, and the same refusal on the listing.
     let (code, _) = handler
-        .fetch_segment_chunk(&fetch(
-            sealed[0].segment_id,
-            FENCING_EPOCH - 1,
-            h.range.clone(),
-        ))
+        .fetch_segment_chunk(
+            TEST_PEER,
+            &fetch(sealed[0].segment_id, FENCING_EPOCH - 1, h.range.clone()),
+        )
         .unwrap_err();
     assert_eq!(code, ErrorCode::Fenced);
     let (code, _) = handler
-        .list_sealed_segments(&h.range, FENCING_EPOCH - 1)
+        .list_sealed_segments(TEST_PEER, &h.range, FENCING_EPOCH - 1)
         .unwrap_err();
     assert_eq!(code, ErrorCode::Fenced);
 
@@ -339,10 +346,13 @@ fn the_leader_refuses_by_name_what_the_transfer_plane_does_not_serve() {
         .min_by_key(|handle| handle.base_offset)
         .unwrap();
     let (code, message) = handler
-        .fetch_segment_chunk(&FetchSegmentChunkRequest {
-            artifact: SegmentArtifact::Producers,
-            ..fetch(first.segment_id, FENCING_EPOCH, h.range.clone())
-        })
+        .fetch_segment_chunk(
+            TEST_PEER,
+            &FetchSegmentChunkRequest {
+                artifact: SegmentArtifact::Producers,
+                ..fetch(first.segment_id, FENCING_EPOCH, h.range.clone())
+            },
+        )
         .unwrap_err();
     assert_eq!(code, ErrorCode::InvalidRequest);
     assert!(
@@ -402,20 +412,22 @@ impl ReplicaPeerHandler for FailingLeader {
     }
     fn list_sealed_segments(
         &self,
+        peer: Uuid,
         range: &RangeIdentity,
         fencing_epoch: u64,
     ) -> Result<Vec<SealedSegmentEntry>, (ErrorCode, String)> {
-        self.inner.list_sealed_segments(range, fencing_epoch)
+        self.inner.list_sealed_segments(peer, range, fencing_epoch)
     }
     fn fetch_segment_chunk(
         &self,
+        peer: Uuid,
         request: &FetchSegmentChunkRequest,
     ) -> Result<FetchSegmentChunkResponse, (ErrorCode, String)> {
         if self.allowed.fetch_sub(1, Ordering::SeqCst) == 0 {
             self.allowed.store(0, Ordering::SeqCst);
             return Err((ErrorCode::Storage, "injected transfer fault".to_owned()));
         }
-        self.inner.fetch_segment_chunk(request)
+        self.inner.fetch_segment_chunk(peer, request)
     }
 }
 

@@ -130,6 +130,20 @@ pub struct VerifyReport {
     pub record_count: u64,
     pub content_bytes: u64,
     pub chunk_count: u64,
+    /// First offset this segment holds.
+    ///
+    /// REPORTED, because registering or proving a sealed segment needs its
+    /// identity and nothing else emitted it. `RegisterSealedSegment` and
+    /// `CommitReplacementProof` both take the offsets and the content root,
+    /// and an operator holding only the file had no way to read them out — so
+    /// the commands existed and could not be filled in.
+    pub base_offset: u64,
+    /// One past the last offset this segment holds.
+    pub next_offset: u64,
+    /// Chunk-tree root (v2) or linear BLAKE3 digest (v1), re-derived from the
+    /// frames rather than copied from the manifest — so it is what the BYTES
+    /// say, which is the only thing worth putting in a proof.
+    pub content_root: [u8; 32],
     /// Highest level the artifacts and expectations support; failing checks
     /// are reported independently and always outweigh the achieved level.
     pub achieved: VerifyLevel,
@@ -300,6 +314,19 @@ pub(crate) fn verify_sealed_segment_at(
         record_count,
         content_bytes,
         chunk_count,
+        base_offset: match &header {
+            AnyHeader::V1(header) => header.descriptor.base_offset,
+            AnyHeader::V2(header) => header.descriptor.base_offset,
+        },
+        // `None` when the scan could not run — a truncated or unreadable
+        // segment. Zeroes there would be a content root somebody could put in
+        // a proof, so the absence is reported as a base offset of its own
+        // rather than an invented digest; every caller of these fields also
+        // checks that the verification passed.
+        next_offset: scan.as_ref().map_or(0, |scan| scan.next_offset),
+        content_root: scan
+            .as_ref()
+            .map_or([0_u8; 32], |scan| *scan.root.as_bytes()),
         achieved,
         checks,
     })

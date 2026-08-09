@@ -182,6 +182,23 @@ pub struct FollowerPeerConfig {
     pub server_name: String,
 }
 
+/// The previous hardcoded roll thresholds, now the defaults.
+pub(crate) fn default_max_segment_bytes() -> u64 {
+    8 * 1024 * 1024 * 1024
+}
+
+pub(crate) fn default_max_segment_records() -> u64 {
+    10_000_000
+}
+
+pub(crate) fn default_max_group_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+
+pub(crate) fn default_max_record_bytes() -> u32 {
+    16 * 1024 * 1024
+}
+
 /// A data-plane node process (one range, mirroring the library harnesses).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -212,6 +229,53 @@ pub struct DataNodeConfig {
     /// detecting it needs field presence to survive deserialization.
     #[serde(default)]
     pub observability: Option<ObservabilityConfig>,
+    /// Bytes a segment may reach before the range rolls to a new one.
+    ///
+    /// CONFIGURABLE, because segment size is an operational choice and it was
+    /// a constant. It decides how much of a range is SEALED — and only sealed
+    /// segments transfer, so a deployment that never rolls is one where
+    /// `vtopctl node repair` has nothing to move and a lost replica has no
+    /// road back. The default is the previous hardcoded 8 GiB, so an existing
+    /// config behaves exactly as it did.
+    #[serde(default = "default_max_segment_bytes")]
+    pub max_segment_bytes: u64,
+    /// Records a segment may reach before the range rolls, whichever bound is
+    /// reached first.
+    #[serde(default = "default_max_segment_records")]
+    pub max_segment_records: u64,
+    /// Bytes one record group may reach.
+    ///
+    /// Exposed alongside the segment bound because the two are coupled: the
+    /// engine refuses a segment smaller than a group, so lowering the roll
+    /// threshold without this simply fails to start. Left at the library
+    /// default when unset.
+    #[serde(default = "default_max_group_bytes")]
+    pub max_group_bytes: u64,
+    /// Bytes a single record may reach.
+    ///
+    /// The third of a coupled set. The engine requires
+    /// `max_record_bytes` PLUS FRAME OVERHEAD to fit in `max_group_bytes`,
+    /// and `max_group_bytes` to fit in `max_segment_bytes` — so equal values
+    /// are refused, and the refusal arrives as a node that will not start with
+    /// a message about group sizing, some way from the config that caused it.
+    /// Lowering the roll threshold therefore means lowering all three, with
+    /// headroom. They were all constants, which made the roll threshold
+    /// unreachable in practice.
+    #[serde(default = "default_max_record_bytes")]
+    pub max_record_bytes: u32,
+    /// Node UUIDs allowed to pull this leader's sealed segments, beyond its
+    /// own followers.
+    ///
+    /// A sealed-segment fetch hands over a whole range's bytes, so "any
+    /// certificate this cluster trusts" is the wrong granularity for it even
+    /// though it is the right one for an append. Followers are allowed
+    /// implicitly — they already hold the data. A REPLACEMENT is not: it is
+    /// being repaired precisely because it is not yet a follower, so it has to
+    /// be named here for the duration of the repair, and removed after.
+    ///
+    /// Empty by default, which means followers only.
+    #[serde(default)]
+    pub transfer_peers: Vec<Uuid>,
     /// Leader/standalone: drive range leadership from the metadata plane
     /// (#223).
     ///

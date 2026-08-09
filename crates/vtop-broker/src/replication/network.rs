@@ -144,6 +144,7 @@ pub trait ReplicaPeerHandler: Send + Sync {
     /// believing there was nothing to fetch.
     fn list_sealed_segments(
         &self,
+        _peer: Uuid,
         _range: &vtop_protocol::RangeIdentity,
         _fencing_epoch: u64,
     ) -> Result<Vec<vtop_protocol::SealedSegmentEntry>, (ErrorCode, String)> {
@@ -156,6 +157,7 @@ pub trait ReplicaPeerHandler: Send + Sync {
     /// Bounded read of one artifact of one sealed segment (#270).
     fn fetch_segment_chunk(
         &self,
+        _peer: Uuid,
         _request: &vtop_protocol::FetchSegmentChunkRequest,
     ) -> Result<vtop_protocol::FetchSegmentChunkResponse, (ErrorCode, String)> {
         Err((
@@ -307,15 +309,15 @@ async fn serve_follower_connection(
             source,
         })?;
     let peer_id = peer_uuid_from_server_stream(&stream)?;
-    // Authenticate the leader cert; local_id is the follower's own identity.
-    let _ = (peer_id, local_id);
+    // `local_id` is this node's own identity, unused on the serving side.
+    let _ = local_id;
     loop {
         let frame = match read_frame(&mut stream, REPLICA_LIMITS).await {
             Ok(Some(frame)) => frame,
             Ok(None) => return Ok(()),
             Err(problem) => return Err(problem.into()),
         };
-        let response = dispatch_replica_frame(handler.as_ref(), frame);
+        let response = dispatch_replica_frame(handler.as_ref(), peer_id, frame);
         if let Some(response) = response {
             write_frame(&mut stream, &response, REPLICA_LIMITS)
                 .await
@@ -324,72 +326,85 @@ async fn serve_follower_connection(
     }
 }
 
-fn dispatch_replica_frame(handler: &dyn ReplicaPeerHandler, frame: WireFrame) -> Option<WireFrame> {
+/// `peer` is the UUID the client certificate carries, already authenticated by
+/// the TLS layer.
+///
+/// PASSED TO THE TRANSFER RPCS, not discarded. It used to be dropped at the
+/// accept site, which was harmless while every peer refused transfer and is
+/// not once one serves it: a sealed-segment fetch hands over a whole range's
+/// bytes, so "any certificate this cluster trusts" is the wrong granularity
+/// for it even though it is the right one for an append.
+fn dispatch_replica_frame(
+    handler: &dyn ReplicaPeerHandler,
+    peer: Uuid,
+    frame: WireFrame,
+) -> Option<WireFrame> {
     let WireFrame {
         request_id,
         stream_id,
         message,
     } = frame;
-    let message = match message {
-        Message::ReplicaAppendRequest(request) => match handler.apply_append(&request) {
-            Ok(response) => Message::ReplicaAppendResponse(response),
-            Err((code, message)) => error_message(code, message),
-        },
-        Message::ReplicaAppendBatchRequest(batch) => {
-            match handler.apply_append_batch(&batch.requests) {
+    let message =
+        match message {
+            Message::ReplicaAppendRequest(request) => match handler.apply_append(&request) {
                 Ok(response) => Message::ReplicaAppendResponse(response),
                 Err((code, message)) => error_message(code, message),
-            }
-        }
-        Message::CommittedHwmUpdate(update) => {
-            let _ = handler.observe_hwm(&update);
-            return None;
-        }
-        Message::ReplicaEpochHistoryRequest(request) => {
-            match handler.epoch_history(&request.range) {
-                Ok(epoch_starts) => Message::ReplicaEpochHistoryResponse(
-                    vtop_protocol::ReplicaEpochHistoryResponse { epoch_starts },
-                ),
-                Err((code, message)) => error_message(code, message),
-            }
-        }
-        Message::ReplicaStatusRequest(request) => match handler.status(&request.range) {
-            Ok(response) => Message::ReplicaStatusResponse(response),
-            Err((code, message)) => error_message(code, message),
-        },
-        Message::ListSealedSegmentsRequest(request) => {
-            match handler.list_sealed_segments(&request.range, request.fencing_epoch) {
-                Ok(segments) => {
-                    Message::ListSealedSegmentsResponse(vtop_protocol::ListSealedSegmentsResponse {
-                        segments,
-                    })
+            },
+            Message::ReplicaAppendBatchRequest(batch) => {
+                match handler.apply_append_batch(&batch.requests) {
+                    Ok(response) => Message::ReplicaAppendResponse(response),
+                    Err((code, message)) => error_message(code, message),
                 }
-                Err((code, message)) => error_message(code, message),
             }
-        }
-        Message::FetchSegmentChunkRequest(request) => match handler.fetch_segment_chunk(&request) {
-            Ok(response) => Message::FetchSegmentChunkResponse(response),
-            Err((code, message)) => error_message(code, message),
-        },
-        Message::ReplicaFenceRequest(request) => {
-            let leader_epoch_starts: Vec<crate::fencing_epochs::EpochStart> = request
-                .leader_epoch_starts
-                .iter()
-                .map(|entry| crate::fencing_epochs::EpochStart {
-                    epoch: entry.epoch,
-                    start_offset: entry.start_offset,
-                })
-                .collect();
-            match handler.fence(&request.range, request.fencing_epoch, &leader_epoch_starts) {
-                Ok(response) => Message::ReplicaFenceResponse(response),
-                Err((code, message)) => error_message(code, message),
+            Message::CommittedHwmUpdate(update) => {
+                let _ = handler.observe_hwm(&update);
+                return None;
             }
-        }
-        _ => error_message(
-            ErrorCode::InvalidRequest,
-            "unsupported replica peer message".to_owned(),
-        ),
-    };
+            Message::ReplicaEpochHistoryRequest(request) => {
+                match handler.epoch_history(&request.range) {
+                    Ok(epoch_starts) => Message::ReplicaEpochHistoryResponse(
+                        vtop_protocol::ReplicaEpochHistoryResponse { epoch_starts },
+                    ),
+                    Err((code, message)) => error_message(code, message),
+                }
+            }
+            Message::ReplicaStatusRequest(request) => match handler.status(&request.range) {
+                Ok(response) => Message::ReplicaStatusResponse(response),
+                Err((code, message)) => error_message(code, message),
+            },
+            Message::ListSealedSegmentsRequest(request) => {
+                match handler.list_sealed_segments(peer, &request.range, request.fencing_epoch) {
+                    Ok(segments) => Message::ListSealedSegmentsResponse(
+                        vtop_protocol::ListSealedSegmentsResponse { segments },
+                    ),
+                    Err((code, message)) => error_message(code, message),
+                }
+            }
+            Message::FetchSegmentChunkRequest(request) => {
+                match handler.fetch_segment_chunk(peer, &request) {
+                    Ok(response) => Message::FetchSegmentChunkResponse(response),
+                    Err((code, message)) => error_message(code, message),
+                }
+            }
+            Message::ReplicaFenceRequest(request) => {
+                let leader_epoch_starts: Vec<crate::fencing_epochs::EpochStart> = request
+                    .leader_epoch_starts
+                    .iter()
+                    .map(|entry| crate::fencing_epochs::EpochStart {
+                        epoch: entry.epoch,
+                        start_offset: entry.start_offset,
+                    })
+                    .collect();
+                match handler.fence(&request.range, request.fencing_epoch, &leader_epoch_starts) {
+                    Ok(response) => Message::ReplicaFenceResponse(response),
+                    Err((code, message)) => error_message(code, message),
+                }
+            }
+            _ => error_message(
+                ErrorCode::InvalidRequest,
+                "unsupported replica peer message".to_owned(),
+            ),
+        };
     Some(WireFrame {
         request_id,
         stream_id,

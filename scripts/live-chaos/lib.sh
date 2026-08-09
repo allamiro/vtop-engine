@@ -33,6 +33,13 @@ PRODUCER_ID="$PRINCIPAL_ID"
 LEADER_UUID="${CHAOS_LEADER_UUID:-aaaaaaaa-0000-0000-0000-0000000000a1}"
 FOLLOWER1_UUID="${CHAOS_FOLLOWER1_UUID:-aaaaaaaa-0000-0000-0000-0000000000a2}"
 FOLLOWER2_UUID="${CHAOS_FOLLOWER2_UUID:-aaaaaaaa-0000-0000-0000-0000000000a3}"
+# The replacement replica (#242). Registered only when it joins, which is the
+# real sequence: a spare is brought in AFTER a replica is lost, not held in the
+# cluster waiting. That ordering matters to the scenario, because the
+# deterministic placement is computed over the nodes registered AT THE TIME —
+# a spare present from the start would be a candidate for the original
+# placement and there would be nothing to replace it into.
+SPARE_UUID="${CHAOS_SPARE_UUID:-aaaaaaaa-0000-0000-0000-0000000000a4}"
 FENCING_EPOCH="${CHAOS_FENCING_EPOCH:-18}"
 TOPIC="${CHAOS_TOPIC:-chaos.v1}"
 # Metadata's UUID for the topic, distinct from the wire-level topic NAME above.
@@ -120,13 +127,15 @@ preflight_settings() {
     || fail "CHAOS_PROFILE contains unsupported characters: '$CHAOS_PROFILE'"
   require_integer_in_range CHAOS_META_PEER_BASE_PORT "$META_PEER_BASE_PORT" 1024 65529
   require_integer_in_range CHAOS_META_ADMIN_BASE_PORT "$META_ADMIN_BASE_PORT" 1024 65529
-  require_integer_in_range CHAOS_REPLICA_BASE_PORT "$REPLICA_BASE_PORT" 1024 65533
+  require_integer_in_range CHAOS_REPLICA_BASE_PORT "$REPLICA_BASE_PORT" 1024 65532
   require_integer_in_range CHAOS_NATIVE_PORT "$NATIVE_PORT" 1024 65535
   # Ceilings are the highest port each family actually derives: metadata ids
-  # run 1..5 so the top base is 65535-5, and data indices run 0..2 so the top
-  # base is 65535-2. A tighter bound would reject a valid override.
+  # run 1..5 so the top base is 65535-5, and data indices run 0..3 — index 3 is
+  # the replacement replica (#242) — so the top base is 65535-3. A tighter bound
+  # would reject a valid override; a looser one accepts a base whose highest
+  # derived port is above 65535 and fails much later as an invalid address.
   require_integer_in_range CHAOS_META_METRICS_BASE_PORT "$META_METRICS_BASE_PORT" 1024 65530
-  require_integer_in_range CHAOS_DATA_METRICS_BASE_PORT "$DATA_METRICS_BASE_PORT" 1024 65533
+  require_integer_in_range CHAOS_DATA_METRICS_BASE_PORT "$DATA_METRICS_BASE_PORT" 1024 65532
   require_integer_in_range CHAOS_REGISTER_PORT "$REGISTER_PORT" 1 65535
   require_integer_in_range CHAOS_FENCING_EPOCH "$FENCING_EPOCH" 1 2147483647
   require_integer_in_range CHAOS_READY_TIMEOUT_SECONDS "$READY_TIMEOUT_SECONDS" 1 3600
@@ -143,13 +152,13 @@ preflight_settings() {
       "$(meta_metrics_addr "$id")"
     )
   done
-  for id in 0 1 2; do
+  for id in 0 1 2 3; do
     labels+=("replica-$id")
     endpoints+=("$(replica_addr "$id")")
   done
   labels+=("native")
   endpoints+=("$(native_addr)")
-  for id in 0 1 2; do
+  for id in 0 1 2 3; do
     labels+=("data-metrics-$id")
     endpoints+=("$(data_metrics_addr "$id")")
   done
@@ -282,7 +291,7 @@ init_workdir() {
     || fail "cannot create log directory under $WORKDIR; set CHAOS_WORKDIR to a writable filesystem"
   CERTS="$WORKDIR/certs"
   "$SCRIPT_DIR/gen-certs.sh" "$CERTS" 1 2 3 4 5 6 -- \
-    "$LEADER_UUID" "$FOLLOWER1_UUID" "$FOLLOWER2_UUID" > /dev/null
+    "$LEADER_UUID" "$FOLLOWER1_UUID" "$FOLLOWER2_UUID" "$SPARE_UUID" > /dev/null
   log "workdir=$WORKDIR"
 }
 
@@ -395,6 +404,30 @@ emit_leader_config() {
     echo "cluster_id: $CLUSTER_ID"
     echo "data_dir: $WORKDIR/data-leader"
     echo "fencing_epoch: $FENCING_EPOCH"
+    # Left at the engine default unless a scenario asks otherwise. A scenario
+    # that needs SEALED segments — the only kind that transfer — sets this small
+    # so the range rolls under its own load instead of being sealed offline,
+    # which is both closer to a real deployment and the only way a leader stays
+    # servable while it happens.
+    [[ -n "${CHAOS_MAX_SEGMENT_BYTES:-}" ]] \
+      && echo "max_segment_bytes: $CHAOS_MAX_SEGMENT_BYTES"
+    [[ -n "${CHAOS_MAX_SEGMENT_RECORDS:-}" ]] \
+      && echo "max_segment_records: $CHAOS_MAX_SEGMENT_RECORDS"
+    [[ -n "${CHAOS_MAX_GROUP_BYTES:-}" ]] \
+      && echo "max_group_bytes: $CHAOS_MAX_GROUP_BYTES"
+    [[ -n "${CHAOS_MAX_RECORD_BYTES:-}" ]] \
+      && echo "max_record_bytes: $CHAOS_MAX_RECORD_BYTES"
+    # Nodes allowed to pull sealed segments beyond this leader's followers. A
+    # replacement replica needs naming here for the duration of its repair: it
+    # is being repaired precisely because it is not a follower yet.
+    if [[ -n "${CHAOS_TRANSFER_PEERS:-}" ]]; then
+      echo "transfer_peers:"
+      local peer
+      for peer in ${CHAOS_TRANSFER_PEERS}; do
+        echo "  - $peer"
+      done
+    fi
+    true
     emit_range_yaml
     echo "segment_id: $SEGMENT_ID"
     echo "native_listen: \"$(native_addr)\""
@@ -463,6 +496,7 @@ emit_follower_config() {
   case "$n" in
     1) uuid="$FOLLOWER1_UUID"; cert="data-2" ;;
     2) uuid="$FOLLOWER2_UUID"; cert="data-3" ;;
+    3) uuid="$SPARE_UUID"; cert="data-4" ;;
     *) fail "unknown follower $n" ;;
   esac
   local cfg="$WORKDIR/data-follower-$n.yaml"
@@ -472,6 +506,25 @@ emit_follower_config() {
     echo "cluster_id: $CLUSTER_ID"
     echo "data_dir: $dir"
     echo "fencing_epoch: $epoch"
+    [[ -n "${CHAOS_MAX_SEGMENT_BYTES:-}" ]] \
+      && echo "max_segment_bytes: $CHAOS_MAX_SEGMENT_BYTES"
+    [[ -n "${CHAOS_MAX_SEGMENT_RECORDS:-}" ]] \
+      && echo "max_segment_records: $CHAOS_MAX_SEGMENT_RECORDS"
+    [[ -n "${CHAOS_MAX_GROUP_BYTES:-}" ]] \
+      && echo "max_group_bytes: $CHAOS_MAX_GROUP_BYTES"
+    [[ -n "${CHAOS_MAX_RECORD_BYTES:-}" ]] \
+      && echo "max_record_bytes: $CHAOS_MAX_RECORD_BYTES"
+    # Nodes allowed to pull sealed segments beyond this leader's followers. A
+    # replacement replica needs naming here for the duration of its repair: it
+    # is being repaired precisely because it is not a follower yet.
+    if [[ -n "${CHAOS_TRANSFER_PEERS:-}" ]]; then
+      echo "transfer_peers:"
+      local peer
+      for peer in ${CHAOS_TRANSFER_PEERS}; do
+        echo "  - $peer"
+      done
+    fi
+    true
     emit_range_yaml
     echo "segment_id: $SEGMENT_ID"
     echo "replica_listen: \"$(replica_addr "$n")\""
@@ -805,13 +858,25 @@ follower_committed_offset() {
 # and restarts at sequence 0 — so their bytes are not reconstructible from the
 # offset. Structure (contiguity, high watermark) is still checked throughout.
 await_verified_floor() {
-  local cfg="$1" addr="$2" floor="$3" content_through="${4:-}"
+  local cfg="$1" addr="$2" floor="$3" content_through="${4:-}" value_bytes="${5:-}"
   local deadline=$((SECONDS + PROGRESS_TIMEOUT_SECONDS))
+  # `${bound[@]+"${bound[@]}"}` at the use site, not a bare `"${bound[@]}"`:
+  # bash 3.2 — which is what macOS ships — treats an EMPTY array expansion as
+  # an unbound variable under `set -u`. The scenarios that always pass a
+  # content bound never hit it, so it sat here until one that does not came
+  # along, and it aborted a subshell rather than the run: the verification was
+  # skipped and the scenario reported PASS.
   local bound=()
   [[ -n "$content_through" ]] && bound=(--verify-content-through "$content_through")
+  # THE WIDTH THE RECORDS WERE WRITTEN AT. `verify` reconstructs each expected
+  # value from the offset, so a scenario that produced at a non-default width
+  # compares real bytes against 128-byte expectations and never converges — it
+  # times out reporting a durability failure that is really an argument
+  # mismatch.
+  [[ -n "$value_bytes" ]] && bound+=(--value-bytes "$value_bytes")
   while :; do
     if "$VTOP_NODE" verify --client-config "$cfg" --addr "$addr" \
-      --expect-at-least "$floor" "${bound[@]}" \
+      --expect-at-least "$floor" ${bound[@]+"${bound[@]}"} \
       > "$WORKDIR/logs/verify-after-failover.log" 2>&1; then
       return 0
     fi
@@ -876,6 +941,90 @@ emit_leader_config_with_lease() {
   {
     sed 's/^fencing_epoch: .*/fencing_epoch: 0/' "$WORKDIR/data-leader-leader.yaml"
     emit_lease_yaml "$id"
+  } | install_config "$cfg"
+  echo "$cfg"
+}
+
+# emit_leader_config_with_replicas <meta-id> <label> <follower-n...> — a
+# lease-driven leader whose follower list is chosen rather than fixed (#242).
+#
+# THE REPLICA SET IS STATIC CONFIG, which is the operational fact a replacement
+# has to work around: retiring a replica in metadata does not remove it from
+# the leader's follower list, and adding one does not put it there. The leader
+# must be restarted with the new set. That is worth exercising rather than
+# hiding, because an operator who retires a replica and does not restart the
+# leader still has a leader replicating to a node metadata no longer counts.
+emit_leader_config_with_replicas() {
+  local id="$1" label="$2"; shift 2
+  local cfg="$WORKDIR/data-leader-$label.yaml"
+  emit_leader_config leader > /dev/null
+  {
+    # Drop the fixed follower block, then re-emit the one asked for. Filtered
+    # rather than rewritten so every other line of the base config — TLS,
+    # listeners, principal — stays byte-identical to what the other scenarios
+    # run.
+    #
+    # `awk`, not a `sed` range: GNU and BSD sed disagree about `{...}` inside an
+    # address range, and the BSD failure is a parse error that leaves the
+    # config missing whichever fields the range swallowed — which surfaces
+    # three steps later as "missing field `role`".
+    awk '
+      /^fencing_epoch:/ { print "fencing_epoch: 0"; next }
+      /^followers:/     { skip = 1; next }
+      skip && /^[^ \t-]/ { skip = 0 }
+      !skip             { print }
+    ' "$WORKDIR/data-leader-leader.yaml"
+    echo "followers:"
+    local n uuid
+    for n in "$@"; do
+      case "$n" in
+        1) uuid="$FOLLOWER1_UUID" ;;
+        2) uuid="$FOLLOWER2_UUID" ;;
+        3) uuid="$SPARE_UUID" ;;
+        *) fail "unknown follower $n" ;;
+      esac
+      echo "  - { node_uuid: $uuid, addr: \"$(replica_addr "$n")\", server_name: \"localhost\" }"
+    done
+    emit_lease_yaml "$id"
+  } | install_config "$cfg"
+  echo "$cfg"
+}
+
+# start_leader_with_replicas <meta-id> <label> <follower-n...>
+start_leader_with_replicas() {
+  local id="$1" label="$2"; shift 2
+  local pid cfg
+  cfg="$(emit_leader_config_with_replicas "$id" "$label" "$@")"
+  pid="$(start_node "data-leader-$label" "data_node_ready" data --config "$cfg")"
+  await_ready "$(data_metrics_addr 0)" "data-leader-$label"
+  echo "$pid"
+}
+
+# emit_repair_config <source-n> — a `vtopctl node repair` client config naming
+# the replica to pull from.
+emit_repair_config() {
+  # SEPARATE STATEMENTS: `local a=1 b="$a"` expands every argument before it
+  # assigns any of them, so `$a` is still unbound there — and under `set -u`
+  # that aborts the whole scenario with a line number and no context.
+  local n="$1"
+  local cfg="$WORKDIR/node-repair-$n.yaml"
+  local uuid
+  case "$n" in
+    0) uuid="$LEADER_UUID" ;;
+    1) uuid="$FOLLOWER1_UUID" ;;
+    2) uuid="$FOLLOWER2_UUID" ;;
+    *) fail "unknown repair source $n" ;;
+  esac
+  {
+    emit_range_yaml
+    echo "ca_cert: $CERTS/ca.pem"
+    # The SPARE's own certificate: the replica listener identifies every peer
+    # by its UUID CN before dispatching a frame, so a repair pulling bytes for
+    # the spare must authenticate as the spare.
+    echo "client_cert: $CERTS/data-4.pem"
+    echo "client_key: $CERTS/data-4-key.pem"
+    echo "replicas:"
+    echo "  - { node_uuid: $uuid, addr: \"$(replica_addr "$n")\", server_name: \"localhost\", role: leader }"
   } | install_config "$cfg"
   echo "$cfg"
 }
@@ -1130,6 +1279,25 @@ seal_and_verify_active() {
 # ---------------------------------------------------------------------------
 # Admin helpers (vtopctl meta against node <id>)
 # ---------------------------------------------------------------------------
+
+# json_field <file> <python expression over `d`> — read one value out of a
+# JSON document a `vtopctl --json` call produced.
+#
+# Every command in the replacement flow takes a compare-and-swap token that the
+# PREVIOUS command returned, so a scenario driving that flow has to read values
+# back rather than assume them. A hardcoded generation works right up until
+# anything else touches the record, and then fails as a rejected write with
+# nothing in the message to say the token was stale.
+#
+# Fails loudly on a missing field rather than printing an empty string: an
+# empty CAS argument is refused by the CLI with a parse error three steps later,
+# which is a long way from the read that actually went wrong.
+json_field() {
+  local file="$1" expression="$2" value
+  value="$(python3 -c "import json; d=json.load(open('$file')); print($expression)" 2>/dev/null)" \
+    || fail "could not read [$expression] from $file: $(head -c 400 "$file")"
+  echo "$value"
+}
 
 meta_admin() { # <node-id> <subcommand + args...>
   local id="$1"; shift

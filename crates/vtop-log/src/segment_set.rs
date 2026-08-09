@@ -580,6 +580,10 @@ impl SegmentSet {
     }
 
     /// Seal the tail and open a successor at its end.
+    ///
+    /// The successor inherits its predecessor's configuration, including its
+    /// roll thresholds: a segment's limits live in its header, and a range
+    /// carries them forward from the moment it was created.
     pub fn roll(&mut self, successor_id: Uuid) -> VtopLogResult<()> {
         // A segment holding nothing would seal into an empty sealed segment and
         // an identically-based successor, so rolling it is a no-op that costs a
