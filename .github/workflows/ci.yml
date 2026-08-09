@@ -162,6 +162,11 @@ jobs:
             helm:
               - 'helm/**'
               - '.github/workflows/ci.yml'
+              # The chart's appVersion has to track the workspace version, and
+              # the workspace version can only change HERE. Without this the
+              # helm job is skipped by exactly the PR that bumps it — the one
+              # case the check exists for.
+              - 'Cargo.toml'
             shell:
               - 'docker/*.sh'
               - 'docker/tests/**'
@@ -446,6 +451,30 @@ jobs:
       - uses: azure/setup-helm@b9e51907a09c216f16ebe8536097933489208112 # v4.3.0
         with:
           version: v3.16.3
+
+      # THE DEFAULT INSTALL PULLS `appVersion`. `statefulset.yaml` defaults the
+      # image tag to `.Chart.AppVersion`, so a chart whose appVersion lags the
+      # workspace ships users an older image than the release they downloaded —
+      # and it drifted silently for two releases before anything noticed. The
+      # failure is nasty because the chart installs cleanly and the pods run the
+      # wrong binaries.
+      - name: The chart's appVersion tracks the workspace version
+        run: |
+          set -euo pipefail
+          workspace="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          chart="$(sed -n 's/^appVersion: "\(.*\)"$/\1/p' helm/vtop/Chart.yaml)"
+          # BOTH must be found. If a reformat breaks either anchor, both go
+          # empty and `"" != ""` is false — the check would pass by extracting
+          # nothing, which is the failure mode it exists to prevent.
+          if [ -z "$workspace" ] || [ -z "$chart" ]; then
+            echo "::error::could not read the versions to compare (workspace='$workspace', chart='$chart'). One of the anchors in Cargo.toml or helm/vtop/Chart.yaml has moved; fix this check rather than removing it."
+            exit 1
+          fi
+          if [ "$workspace" != "$chart" ]; then
+            echo "::error::helm/vtop/Chart.yaml appVersion ($chart) != workspace version ($workspace). A default chart install resolves its image tag from appVersion, so it would deploy $chart while the release says $workspace."
+            exit 1
+          fi
+          echo "appVersion $chart matches the workspace"
 
       - name: helm lint
         run: helm lint helm/vtop -f helm/vtop/ci/default-values.yaml
