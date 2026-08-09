@@ -417,6 +417,16 @@ emit_leader_config() {
       && echo "max_group_bytes: $CHAOS_MAX_GROUP_BYTES"
     [[ -n "${CHAOS_MAX_RECORD_BYTES:-}" ]] \
       && echo "max_record_bytes: $CHAOS_MAX_RECORD_BYTES"
+    # Nodes allowed to pull sealed segments beyond this leader's followers. A
+    # replacement replica needs naming here for the duration of its repair: it
+    # is being repaired precisely because it is not a follower yet.
+    if [[ -n "${CHAOS_TRANSFER_PEERS:-}" ]]; then
+      echo "transfer_peers:"
+      local peer
+      for peer in ${CHAOS_TRANSFER_PEERS}; do
+        echo "  - $peer"
+      done
+    fi
     true
     emit_range_yaml
     echo "segment_id: $SEGMENT_ID"
@@ -504,6 +514,16 @@ emit_follower_config() {
       && echo "max_group_bytes: $CHAOS_MAX_GROUP_BYTES"
     [[ -n "${CHAOS_MAX_RECORD_BYTES:-}" ]] \
       && echo "max_record_bytes: $CHAOS_MAX_RECORD_BYTES"
+    # Nodes allowed to pull sealed segments beyond this leader's followers. A
+    # replacement replica needs naming here for the duration of its repair: it
+    # is being repaired precisely because it is not a follower yet.
+    if [[ -n "${CHAOS_TRANSFER_PEERS:-}" ]]; then
+      echo "transfer_peers:"
+      local peer
+      for peer in ${CHAOS_TRANSFER_PEERS}; do
+        echo "  - $peer"
+      done
+    fi
     true
     emit_range_yaml
     echo "segment_id: $SEGMENT_ID"

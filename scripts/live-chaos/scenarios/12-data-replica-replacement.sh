@@ -43,6 +43,10 @@ RF="${CHAOS_REPLACEMENT_RF:-3}"
 # The group must hold a whole produce batch: an append larger than the group is
 # rejected outright, so the bound is derived from BATCH rather than picked, and
 # stays correct when the batch is overridden.
+# The replacement is not a follower when it is repaired, so the leader has to
+# be told it may pull. Set before any leader starts, because the allowlist is
+# read from the config at construction.
+export CHAOS_TRANSFER_PEERS="${CHAOS_TRANSFER_PEERS:-$SPARE_UUID}"
 export CHAOS_MAX_RECORD_BYTES="${CHAOS_MAX_RECORD_BYTES:-$((BATCH * 64))}"
 export CHAOS_MAX_GROUP_BYTES="${CHAOS_MAX_GROUP_BYTES:-$((BATCH * 256))}"
 # Twice the group, so the range rolls every couple of batches. The assertion
@@ -120,7 +124,11 @@ log "metadata knows the topic and $RF data nodes, each in its own failure domain
 # --- data plane -------------------------------------------------------------
 EXPECTED_FIRST_EPOCH=1
 F1=$(start_follower 1 "" "$EXPECTED_FIRST_EPOCH")
-F2=$(start_follower 2 "" "$EXPECTED_FIRST_EPOCH")
+# F2 WATCHES METADATA. It has to survive the replacement, and the epoch moves
+# several times on the way through — a follower pinned to the epoch it was born
+# at refuses every append once metadata mints a newer one, so the restarted
+# leader could never form a quorum with it.
+F2=$(start_follower 2 "" "" "$LEADER_ID")
 LEADER=$(start_leader_with_lease "$LEADER_ID" replacement)
 log "data plane up: leader plus two followers"
 

@@ -234,6 +234,10 @@ impl ReplicaPeerHandler for LeaderSegmentTransferHandler {
 
     fn list_sealed_segments(
         &self,
+        // This handler serves whoever reaches it; the authorization decision
+        // belongs to the node that installs it, which is the only place that
+        // knows which peers are legitimate repair destinations.
+        _peer: Uuid,
         range: &RangeIdentity,
         fencing_epoch: u64,
     ) -> Result<Vec<SealedSegmentEntry>, (ErrorCode, String)> {
@@ -271,6 +275,7 @@ impl ReplicaPeerHandler for LeaderSegmentTransferHandler {
 
     fn fetch_segment_chunk(
         &self,
+        _peer: Uuid,
         request: &FetchSegmentChunkRequest,
     ) -> Result<FetchSegmentChunkResponse, (ErrorCode, String)> {
         self.check_range(&request.range)?;

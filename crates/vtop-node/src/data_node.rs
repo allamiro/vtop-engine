@@ -208,6 +208,12 @@ struct LeaderStatusReplica {
     /// `epoch_history`, which the transfer handler does not, and a leader must
     /// keep doing both.
     transfer: LeaderSegmentTransferHandler,
+    /// Who may pull sealed segments from this leader.
+    ///
+    /// Its own followers, plus whatever `transfer_peers` names. A replacement
+    /// replica is in the second set and not the first: it is being repaired
+    /// because it is not a follower yet.
+    transfer_allowed: std::collections::BTreeSet<Uuid>,
 }
 
 impl ReplicaPeerHandler for LeaderStatusReplica {
@@ -284,21 +290,47 @@ impl ReplicaPeerHandler for LeaderStatusReplica {
     // code that was supposed to fix it sat right there.
     fn list_sealed_segments(
         &self,
+        peer: Uuid,
         range: &vtop_protocol::RangeIdentity,
         fencing_epoch: u64,
     ) -> Result<Vec<vtop_protocol::SealedSegmentEntry>, (vtop_protocol::ErrorCode, String)> {
-        self.transfer.list_sealed_segments(range, fencing_epoch)
+        self.authorize_transfer(peer)?;
+        self.transfer
+            .list_sealed_segments(peer, range, fencing_epoch)
     }
 
     fn fetch_segment_chunk(
         &self,
+        peer: Uuid,
         request: &vtop_protocol::FetchSegmentChunkRequest,
     ) -> Result<vtop_protocol::FetchSegmentChunkResponse, (vtop_protocol::ErrorCode, String)> {
-        self.transfer.fetch_segment_chunk(request)
+        // CHECKED ON EVERY CHUNK, not only on the listing. A listing and a
+        // fetch are separate requests on a connection that may be reused, and
+        // authorizing only the cheap one would leave the expensive one — the
+        // one that actually moves bytes — open.
+        self.authorize_transfer(peer)?;
+        self.transfer.fetch_segment_chunk(peer, request)
     }
 }
 
 impl LeaderStatusReplica {
+    /// Refuse a sealed-segment transfer to a peer that is neither a follower
+    /// nor a named repair destination.
+    fn authorize_transfer(&self, peer: Uuid) -> Result<(), (vtop_protocol::ErrorCode, String)> {
+        if self.transfer_allowed.contains(&peer) {
+            return Ok(());
+        }
+        Err((
+            vtop_protocol::ErrorCode::InvalidRequest,
+            format!(
+                "{peer} is not authorized to pull sealed segments from this leader. A transfer \
+                 hands over a whole range's bytes, so it is limited to this leader's followers \
+                 and to the node UUIDs named in `transfer_peers`. Add the replacement replica \
+                 there for the duration of its repair."
+            ),
+        ))
+    }
+
     fn refuse_write(&self) -> (vtop_protocol::ErrorCode, String) {
         (
             vtop_protocol::ErrorCode::Fenced,
@@ -788,6 +820,12 @@ async fn run_leader(
                     broker: Arc::clone(&broker),
                     node_id: config.node_uuid,
                     transfer: LeaderSegmentTransferHandler::new(Arc::clone(&broker)),
+                    transfer_allowed: config
+                        .followers
+                        .iter()
+                        .map(|follower| follower.node_uuid)
+                        .chain(config.transfer_peers.iter().copied())
+                        .collect(),
                 }) as Arc<dyn ReplicaPeerHandler>,
             )
             .map_err(|error| error.to_string())?;

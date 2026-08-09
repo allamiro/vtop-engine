@@ -14,8 +14,9 @@ use vtop_log::proof::{ChunkParams, ChunkProof, Side};
 use vtop_log::verify::{
     chunk_proof, level_name, verify_sealed_segment, VerifyExpectations, VerifyLevel, VerifyReport,
     CHECK_CHUNK_SIDECAR, CHECK_CONTENT_ROOT, CHECK_FRAME_SCAN, CHECK_MANIFEST_CANONICAL,
-    CHECK_MANIFEST_CONSISTENCY, CHECK_MANIFEST_DIGEST_PIN, CHECK_REQUIRED_LEVEL, CHECK_ROOT_PIN,
-    CHECK_STATEMENT_DIGEST, CHECK_STATEMENT_ECHO, CHECK_STATEMENT_MAC,
+    CHECK_MANIFEST_CONSISTENCY, CHECK_MANIFEST_DIGEST_PIN, CHECK_PRODUCER_FRONTIER,
+    CHECK_REQUIRED_LEVEL, CHECK_ROOT_PIN, CHECK_STATEMENT_DIGEST, CHECK_STATEMENT_ECHO,
+    CHECK_STATEMENT_MAC,
 };
 use vtop_log::{LogError, SegmentCommitKey, CHUNK_TREE_SCHEME_V1};
 
@@ -241,7 +242,14 @@ pub fn pair_key_sources(
 /// mismatch, which outranks an authentication failure, which outranks merely
 /// falling short of the required level.
 pub fn exit_code_for(report: &VerifyReport) -> i32 {
-    const CORRUPTION_CHECKS: [&str; 7] = [
+    const CORRUPTION_CHECKS: [&str; 8] = [
+        // A DAMAGED PRODUCER FRONTIER IS A DAMAGED ARTIFACT. The records may
+        // scan clean, but this command now emits the content root and offsets
+        // that `meta register-sealed-segment` and `commit-replacement-proof`
+        // consume — so a zero exit here is what automation reads as "these
+        // values are trustworthy". Leaving the frontier out let a segment with
+        // a corrupt sidecar hand over evidence under a successful exit.
+        CHECK_PRODUCER_FRONTIER,
         CHECK_FRAME_SCAN,
         CHECK_CONTENT_ROOT,
         CHECK_CHUNK_SIDECAR,

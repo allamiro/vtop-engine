@@ -259,6 +259,19 @@ pub struct DataNodeConfig {
     /// constants, which made the roll threshold unreachable in practice.
     #[serde(default = "default_max_record_bytes")]
     pub max_record_bytes: u32,
+    /// Node UUIDs allowed to pull this leader's sealed segments, beyond its
+    /// own followers.
+    ///
+    /// A sealed-segment fetch hands over a whole range's bytes, so "any
+    /// certificate this cluster trusts" is the wrong granularity for it even
+    /// though it is the right one for an append. Followers are allowed
+    /// implicitly — they already hold the data. A REPLACEMENT is not: it is
+    /// being repaired precisely because it is not yet a follower, so it has to
+    /// be named here for the duration of the repair, and removed after.
+    ///
+    /// Empty by default, which means followers only.
+    #[serde(default)]
+    pub transfer_peers: Vec<Uuid>,
     /// Leader/standalone: drive range leadership from the metadata plane
     /// (#223).
     ///
