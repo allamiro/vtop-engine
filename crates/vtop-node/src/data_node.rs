@@ -21,8 +21,8 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use uuid::Uuid;
 use vtop_broker::replication::{
-    ClusterCommittedOffset, FlowControlConfig, InProcessFollower, NetworkFollowerConfig,
-    NetworkedReplicaSet, ReplicaPeerHandler, ReplicaPeerServer, ReplicaSet,
+    ClusterCommittedOffset, FlowControlConfig, InProcessFollower, LeaderSegmentTransferHandler,
+    NetworkFollowerConfig, NetworkedReplicaSet, ReplicaPeerHandler, ReplicaPeerServer, ReplicaSet,
 };
 use vtop_broker::{
     LocalBroker, MetaFencingEpoch, NativeServer, ProducerEpochJournal, ServerConfig,
@@ -106,6 +106,20 @@ fn lease_admin_client(
 /// startup with its reason named: a node must never silently serve
 /// whichever subset of an ambiguous directory still looks healthy.
 ///
+/// When a range rolls to a new segment. Passed rather than read from a
+/// constant so a deployment can choose it: only SEALED segments transfer, so a
+/// node that never rolls is one where `vtopctl node repair` has nothing to move
+/// and a lost replica has no road back.
+#[derive(Clone, Copy, Debug)]
+pub struct SegmentRoll {
+    pub max_bytes: u64,
+    pub max_records: u64,
+    /// Carried with the roll bounds because the engine refuses a segment
+    /// smaller than a group: setting one without the other does not start.
+    pub max_group_bytes: u64,
+    pub max_record_bytes: u32,
+}
+
 /// A pre-#270 directory holding only the legacy single `range.active`
 /// opens the same way, as a set of one — discovery keys segments by their
 /// contents, not their stems — so no migration step exists to get wrong.
@@ -115,6 +129,7 @@ fn open_range(
     data_dir: &Path,
     segment_id: Uuid,
     range: &RangeIdentity,
+    roll: SegmentRoll,
 ) -> Result<(SegmentSet, Option<RecoveryReport>), String> {
     let env = Env::real();
     if let Some(set) = SegmentSet::open_in(&env, data_dir).map_err(|error| error.to_string())? {
@@ -137,8 +152,10 @@ fn open_range(
         base_offset: 0,
     };
     let config = SegmentConfig {
-        max_segment_bytes: 8 * 1024 * 1024 * 1024,
-        max_segment_records: 10_000_000,
+        max_segment_bytes: roll.max_bytes,
+        max_segment_records: roll.max_records,
+        max_group_bytes: roll.max_group_bytes,
+        max_record_bytes: roll.max_record_bytes,
         ..SegmentConfig::default()
     };
     let set = SegmentSet::create_in(&env, data_dir, descriptor, config)
@@ -161,6 +178,19 @@ fn open_range(
 struct LeaderStatusReplica {
     broker: Arc<LocalBroker>,
     node_id: Uuid,
+    /// SEALED-SEGMENT TRANSFER, delegated (#270/#301).
+    ///
+    /// Nothing installed this handler, so every leader answered "this peer
+    /// does not serve sealed-segment transfer" and `vtopctl node repair` could
+    /// not work against any real cluster. The transfer plane, its client, its
+    /// CLI and its tests all existed; the one line that put the server on a
+    /// running node did not, and the tests wired it up themselves so nothing
+    /// noticed.
+    ///
+    /// Delegated rather than substituted: this handler also answers
+    /// `epoch_history`, which the transfer handler does not, and a leader must
+    /// keep doing both.
+    transfer: LeaderSegmentTransferHandler,
 }
 
 impl ReplicaPeerHandler for LeaderStatusReplica {
@@ -229,6 +259,26 @@ impl ReplicaPeerHandler for LeaderStatusReplica {
             })
             .collect())
     }
+
+    // INSIDE THE TRAIT IMPL, deliberately noted: these first landed in an
+    // inherent `impl` block, where they compiled cleanly, shadowed nothing,
+    // and left the trait's refusing defaults in place — so the leader went on
+    // answering "this peer does not serve sealed-segment transfer" while the
+    // code that was supposed to fix it sat right there.
+    fn list_sealed_segments(
+        &self,
+        range: &vtop_protocol::RangeIdentity,
+        fencing_epoch: u64,
+    ) -> Result<Vec<vtop_protocol::SealedSegmentEntry>, (vtop_protocol::ErrorCode, String)> {
+        self.transfer.list_sealed_segments(range, fencing_epoch)
+    }
+
+    fn fetch_segment_chunk(
+        &self,
+        request: &vtop_protocol::FetchSegmentChunkRequest,
+    ) -> Result<vtop_protocol::FetchSegmentChunkResponse, (vtop_protocol::ErrorCode, String)> {
+        self.transfer.fetch_segment_chunk(request)
+    }
 }
 
 impl LeaderStatusReplica {
@@ -276,7 +326,17 @@ pub async fn serve(
     std::fs::create_dir_all(&config.data_dir)
         .map_err(|error| format!("create {}: {error}", config.data_dir.display()))?;
     let range = config.range.identity();
-    let (set, recovery) = open_range(&config.data_dir, config.segment_id, &range)?;
+    let (set, recovery) = open_range(
+        &config.data_dir,
+        config.segment_id,
+        &range,
+        SegmentRoll {
+            max_bytes: config.max_segment_bytes,
+            max_records: config.max_segment_records,
+            max_group_bytes: config.max_group_bytes,
+            max_record_bytes: config.max_record_bytes,
+        },
+    )?;
     let epochs = ProducerEpochJournal::open(config.data_dir.join("epochs"))
         .map_err(|error| error.to_string())?;
     // With a lease configured, authority to serve comes from the metadata
@@ -710,6 +770,7 @@ async fn run_leader(
                 Arc::new(LeaderStatusReplica {
                     broker: Arc::clone(&broker),
                     node_id: config.node_uuid,
+                    transfer: LeaderSegmentTransferHandler::new(Arc::clone(&broker)),
                 }) as Arc<dyn ReplicaPeerHandler>,
             )
             .map_err(|error| error.to_string())?;
@@ -751,6 +812,18 @@ async fn run_leader(
 
 #[cfg(test)]
 mod tests {
+    /// The production roll thresholds, so these tests exercise the same
+    /// rolling behaviour a real node has rather than a size chosen to make
+    /// them pass.
+    fn test_roll() -> SegmentRoll {
+        SegmentRoll {
+            max_bytes: crate::config::default_max_segment_bytes(),
+            max_records: crate::config::default_max_segment_records(),
+            max_group_bytes: crate::config::default_max_group_bytes(),
+            max_record_bytes: crate::config::default_max_record_bytes(),
+        }
+    }
+
     use super::*;
     use vtop_log::{Durability, LogRecord};
 
@@ -782,7 +855,8 @@ mod tests {
     fn a_fresh_directory_creates_the_first_segment_under_the_offset_stem() {
         let dir = tempfile::tempdir().unwrap();
         let range = test_range();
-        let (set, recovery) = open_range(dir.path(), Uuid::from_u128(0xD1), &range).unwrap();
+        let (set, recovery) =
+            open_range(dir.path(), Uuid::from_u128(0xD1), &range, test_roll()).unwrap();
         assert!(recovery.is_none(), "nothing existed to recover");
         assert_eq!(set.next_offset(), 0);
         assert!(
@@ -828,7 +902,8 @@ mod tests {
             }
         }
 
-        let (set, recovery) = open_range(dir.path(), Uuid::from_u128(0xD3), &range).unwrap();
+        let (set, recovery) =
+            open_range(dir.path(), Uuid::from_u128(0xD3), &range, test_roll()).unwrap();
         assert!(recovery.is_some(), "the legacy segment was recovered");
         assert_eq!(set.next_offset(), 3);
         assert!(set.sealed().is_empty(), "a legacy layout is a set of one");
@@ -911,7 +986,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("stray.active"), b"not a segment").unwrap();
 
-        let Err(problem) = open_range(dir.path(), Uuid::from_u128(0xD4), &test_range()) else {
+        let Err(problem) = open_range(
+            dir.path(),
+            Uuid::from_u128(0xD4),
+            &test_range(),
+            test_roll(),
+        ) else {
             panic!("a quarantined bundle must refuse startup");
         };
         assert!(
