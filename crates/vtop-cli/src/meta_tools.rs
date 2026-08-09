@@ -307,6 +307,12 @@ fn load_admin_config(path: &Path) -> Result<MetaAdminConfig, String> {
 
 /// Report that the configured endpoint was not the leader.
 ///
+/// Called from EVERY arm that builds a client, not just the ones that obviously
+/// write. `init`, `add-learner`, `change-membership` and the lease read all go
+/// through the same dispatch loop and can all be redirected, so leaving them out
+/// made the diagnostic quietly untrue for exactly the commands an operator runs
+/// while something is already going wrong.
+///
 /// To stderr, so it never contaminates `--json` output that a script parses.
 /// Worth saying at all because it is actionable: an operator pointing at a node
 /// that is never the leader is paying an extra round trip on every command, and
@@ -387,6 +393,7 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
                 .init(members)
                 .await
                 .map_err(|error| error.to_string())?;
+            note_redirects(&client);
             print_membership_change(&response.membership, "initialized", json)
         }
         MetaCommand::AddLearner { common, node_id } => {
@@ -396,6 +403,7 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
                 .add_learner(node_id)
                 .await
                 .map_err(|error| error.to_string())?;
+            note_redirects(&client);
             print_membership_change(&response.membership, "learner added", json)
         }
         MetaCommand::ChangeMembership {
@@ -409,6 +417,7 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
                 .change_membership(voters, retain_removed_as_learners)
                 .await
                 .map_err(|error| error.to_string())?;
+            note_redirects(&client);
             print_membership_change(&response.membership, "membership changed", json)
         }
         MetaCommand::Membership { common } => {
@@ -472,6 +481,7 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
                 .read_range_lease(topic_uuid, range_uuid)
                 .await
                 .map_err(|error| error.to_string())?;
+            note_redirects(&client);
             if json {
                 println!(
                     "{}",

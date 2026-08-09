@@ -1195,6 +1195,73 @@ mod tests {
         c_task.abort();
     }
 
+    /// A MEMBERSHIP CHANGE through a follower is redirected too.
+    ///
+    /// `propose` and the linearizable read were classified as redirectable when
+    /// the client learned to follow them; `add_learner` and `change_membership`
+    /// were not, and still flattened every engine error to a generic protocol
+    /// failure. So `vtopctl meta add-learner` against a follower failed outright
+    /// while `propose` against the same node was quietly redirected — an
+    /// inconsistency invisible from outside, because both look like "the command
+    /// failed".
+    ///
+    /// Membership changes are exactly the commands an operator runs while
+    /// something is already wrong, which is the worst time for the endpoint they
+    /// happened to name to matter.
+    #[tokio::test]
+    async fn a_membership_change_is_redirected_like_any_other_write() {
+        let pki = SharedPki::new();
+        let leader_id = MetaNodeId(2);
+        let follower = Arc::new(NotLeaderHandler {
+            leader: Some(leader_id),
+            asked: AtomicUsize::new(0),
+        });
+        let (follower_addr, follower_task) = live_handler(&pki, Arc::clone(&follower)).await;
+        let leader = Arc::new(CountingHandler::default());
+        let (leader_addr, leader_task) = live_handler(&pki, Arc::clone(&leader)).await;
+
+        let client = AdminClient::with_candidates(
+            pki.client_material(),
+            vec![
+                AdminCandidate {
+                    node_id: Some(MetaNodeId(1)),
+                    endpoint: follower_addr,
+                    server_name: "localhost".to_owned(),
+                    plaintext: false,
+                },
+                AdminCandidate {
+                    node_id: Some(leader_id),
+                    endpoint: leader_addr,
+                    server_name: "localhost".to_owned(),
+                    plaintext: false,
+                },
+            ],
+        )
+        .unwrap();
+
+        // The follower is first, so reaching the backend at all means the
+        // redirect was followed. `CountingHandler` answers membership RPCs with
+        // "handler reached", which is the marker that the request arrived.
+        let error = client
+            .change_membership(vec![1, 2], false)
+            .await
+            .expect_err("CountingHandler reports reaching the backend as an error");
+        assert!(
+            error.to_string().contains("handler reached"),
+            "a membership change must reach the leader after a redirect: {error}"
+        );
+        assert_eq!(leader.membership_changes.load(Ordering::SeqCst), 1);
+        assert_eq!(follower.asked.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            client.redirects_followed(),
+            1,
+            "and the client must report the redirect it followed"
+        );
+
+        follower_task.abort();
+        leader_task.abort();
+    }
+
     /// A redirect naming nobody is an ELECTION GAP, not a routing decision.
     ///
     /// `leader: None` means the answering node has no leader either. Treating

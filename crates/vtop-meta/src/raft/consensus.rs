@@ -368,6 +368,11 @@ impl AdminHandler for OpenraftConsensus {
 
     async fn init(&self, members: Vec<u64>) -> TransportResult<AdminMembershipResponse> {
         let members: std::collections::BTreeSet<u64> = members.into_iter().collect();
+        // NOT classified as a possible redirect, and that is correct rather
+        // than an oversight: `InitializeError` has only `NotAllowed` and
+        // `NotInMembers`. Bootstrap is valid solely on an uninitialised node,
+        // so there is no leader for it to be forwarded to — a redirect here
+        // would be an invented answer.
         self.raft
             .initialize(members)
             .await
@@ -386,10 +391,15 @@ impl AdminHandler for OpenraftConsensus {
     }
 
     async fn add_learner(&self, node_id: u64) -> TransportResult<AdminMembershipResponse> {
+        // A membership change is a WRITE and redirects like any other. This
+        // flattened to a protocol error until now, so `vtopctl meta add-learner`
+        // against a follower failed outright while `propose` against the same
+        // node was quietly redirected — the inconsistency being invisible
+        // because both look like "the command failed" from the outside.
         self.raft
             .add_learner(node_id, openraft::EmptyNode {}, true)
             .await
-            .map_err(|error| TransportError::Protocol(error.to_string()))?;
+            .map_err(|error| to_transport_error(classify_write_error(error)))?;
         self.current_membership()
     }
 
@@ -399,10 +409,12 @@ impl AdminHandler for OpenraftConsensus {
         retain_removed_as_learners: bool,
     ) -> TransportResult<AdminMembershipResponse> {
         let voters: std::collections::BTreeSet<u64> = voters.into_iter().collect();
+        // Same as `add_learner`: a write, and a redirect is the answer a
+        // follower owes the caller.
         self.raft
             .change_membership(voters, retain_removed_as_learners)
             .await
-            .map_err(|error| TransportError::Protocol(error.to_string()))?;
+            .map_err(|error| to_transport_error(classify_write_error(error)))?;
         self.current_membership()
     }
 }
@@ -452,3 +464,88 @@ impl OpenraftConsensus {
 /// membership it just established. Generous relative to a local watch send
 /// (microseconds) and short relative to any admin RPC timeout.
 const MEMBERSHIP_PUBLISH_MS: u64 = 2_000;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn forward_to(node: u64) -> openraft::error::ForwardToLeader<NodeId, openraft::EmptyNode> {
+        openraft::error::ForwardToLeader {
+            leader_id: Some(node),
+            leader_node: Some(openraft::EmptyNode {}),
+        }
+    }
+
+    /// A write refused for want of leadership classifies as a REDIRECT, not as
+    /// a generic protocol failure.
+    ///
+    /// This is the server half of #292, and the half a transport test cannot
+    /// see: those drive a stub handler, so flattening the classification here
+    /// leaves them passing while every real membership change against a
+    /// follower fails. `add_learner` and `change_membership` both route through
+    /// this function, and both flattened until now — so `meta add-learner`
+    /// against a follower failed outright while `propose` against the same node
+    /// was quietly redirected.
+    #[test]
+    fn a_write_refused_for_leadership_classifies_as_a_redirect() {
+        let error = openraft::error::RaftError::APIError(
+            openraft::error::ClientWriteError::ForwardToLeader(forward_to(7)),
+        );
+        match classify_write_error(error) {
+            ConsensusError::NotLeader { leader } => assert_eq!(leader, Some(MetaNodeId(7))),
+            other => panic!("expected a redirect, got {other:?}"),
+        }
+    }
+
+    /// A linearizable READ refused for the same reason classifies the same way.
+    #[test]
+    fn a_read_refused_for_leadership_classifies_as_a_redirect() {
+        let error = openraft::error::RaftError::APIError(
+            openraft::error::CheckIsLeaderError::ForwardToLeader(forward_to(3)),
+        );
+        match classify_read_error(error) {
+            ConsensusError::NotLeader { leader } => assert_eq!(leader, Some(MetaNodeId(3))),
+            other => panic!("expected a redirect, got {other:?}"),
+        }
+    }
+
+    /// Everything else stays a plain message.
+    ///
+    /// The classifier must not turn unrelated failures into redirects: a client
+    /// told to ask someone else about a problem that is not about leadership
+    /// would rotate through every candidate collecting the same error, and
+    /// report the last one instead of the real first one.
+    #[test]
+    fn an_unrelated_failure_is_not_reported_as_a_redirect() {
+        let error: openraft::error::RaftError<
+            NodeId,
+            openraft::error::ClientWriteError<NodeId, openraft::EmptyNode>,
+        > = openraft::error::RaftError::APIError(
+            openraft::error::ClientWriteError::ChangeMembershipError(
+                openraft::error::ChangeMembershipError::EmptyMembership(
+                    openraft::error::EmptyMembership {},
+                ),
+            ),
+        );
+        assert!(matches!(
+            classify_write_error(error),
+            ConsensusError::Message(_)
+        ));
+    }
+
+    /// The redirect survives the hop into the transport layer.
+    ///
+    /// Classifying correctly and then rebuilding the error as a generic
+    /// protocol failure one line later is exactly how this was lost the first
+    /// time, so the conversion is pinned separately from the classification.
+    #[test]
+    fn the_redirect_survives_conversion_into_a_transport_error() {
+        let converted = to_transport_error(ConsensusError::NotLeader {
+            leader: Some(MetaNodeId(5)),
+        });
+        match converted {
+            TransportError::NotLeader { leader, .. } => assert_eq!(leader, Some(MetaNodeId(5))),
+            other => panic!("expected a transport-level redirect, got {other}"),
+        }
+    }
+}
