@@ -55,7 +55,13 @@ export CHAOS_MAX_GROUP_BYTES="${CHAOS_MAX_GROUP_BYTES:-$((BATCH * 256))}"
 export CHAOS_MAX_SEGMENT_BYTES="${CHAOS_MAX_SEGMENT_BYTES:-$((BATCH * 512))}"
 DOMAIN_PREFIX="${CHAOS_REPLACEMENT_DOMAIN_PREFIX:-rack}"
 require_integer_in_range CHAOS_REPLACEMENT_RECORDS "$RECORDS" 1 100000000
-require_integer_in_range CHAOS_REPLACEMENT_BATCH "$BATCH" 1 "$RECORDS"
+# Bounded by the PROTOCOL, not just by the record count: the produce path caps
+# a request at MAX_RECORDS, so a larger batch cannot be encoded at all and the
+# scenario would exit before reaching anything it exists to test.
+PRODUCE_MAX_RECORDS="${CHAOS_PRODUCE_MAX_RECORDS:-65536}"
+BATCH_CEILING="$RECORDS"
+[[ "$BATCH_CEILING" -gt "$PRODUCE_MAX_RECORDS" ]] && BATCH_CEILING="$PRODUCE_MAX_RECORDS"
+require_integer_in_range CHAOS_REPLACEMENT_BATCH "$BATCH" 1 "$BATCH_CEILING"
 # Exactly 3. A lower factor would still register all three original nodes, so
 # rendezvous would place only some of them and the node this scenario retires
 # might not be in the placement at all — `propose-rebalance` rejects a source
@@ -440,7 +446,14 @@ await_lease_holder "$LEADER_ID" "$LEADER_UUID" > /dev/null
 # which case the replacement process reacquires at a NEW epoch — and a client
 # config pinned to the original one is fenced on every request, so the
 # verification below would time out having proven nothing about the data.
-EPOCH_AFTER="$(lease_field "$LEADER_ID" 'd["lease"]["fencing_epoch"]')"
+# THROUGH await_lease_holder, not a raw read. `lease_field` returns empty on a
+# transient metadata refusal, and under `set -e` that aborts the scenario — so
+# a momentary election hiccup right after the restart would kill the durability
+# check for a reason having nothing to do with the data it verifies.
+EPOCH_AFTER="$(await_lease_holder "$LEADER_ID" "$LEADER_UUID" > /dev/null; \
+  lease_field "$LEADER_ID" 'd["lease"]["fencing_epoch"]')"
+[[ -n "$EPOCH_AFTER" ]] \
+  || fail "the restarted leader holds the lease but its epoch could not be read"
 log "leader restarted with the post-replacement replica set, holding epoch $EPOCH_AFTER"
 CLIENT_CFG="$(emit_client_config_at_epoch "$EPOCH_AFTER")"
 

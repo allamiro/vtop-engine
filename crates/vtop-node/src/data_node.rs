@@ -143,13 +143,24 @@ fn open_range(
         //
         // The current tail keeps what its header says; this takes effect from
         // the next roll, which is the earliest a written header can change.
+        // PROPAGATED, so a bad combination refuses the node at startup rather
+        // than at the first roll. Rejecting it at the roll would be worse than
+        // useless: `roll_in` seals the tail before it creates the successor,
+        // so the range would be left with no tail and refuse to open again.
         set.set_roll_config(vtop_log::SegmentConfig {
             max_segment_bytes: roll.max_bytes,
             max_segment_records: roll.max_records,
             max_group_bytes: roll.max_group_bytes,
             max_record_bytes: roll.max_record_bytes,
             ..vtop_log::SegmentConfig::default()
-        });
+        })
+        .map_err(|error| {
+            format!(
+                "the configured segment roll thresholds are not a valid combination: {error}. \
+                 max_record_bytes plus frame overhead must fit in max_group_bytes, which must \
+                 fit in max_segment_bytes."
+            )
+        })?;
         // The tail is the only segment recovery had judgement calls to make
         // about; sealed segments either validate or quarantine.
         let report = set.active().recovery_report().clone();
