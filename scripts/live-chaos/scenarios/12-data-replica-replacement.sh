@@ -58,7 +58,12 @@ require_integer_in_range CHAOS_REPLACEMENT_RECORDS "$RECORDS" 1 100000000
 # Bounded by the PROTOCOL, not just by the record count: the produce path caps
 # a request at MAX_RECORDS, so a larger batch cannot be encoded at all and the
 # scenario would exit before reaching anything it exists to test.
-PRODUCE_MAX_RECORDS="${CHAOS_PRODUCE_MAX_RECORDS:-65536}"
+#
+# NOT overridable. Making the ceiling an environment variable would let an
+# operator raise it above the limit the binary still enforces, which restores
+# the exact failure the cap was added to prevent — a bound you can opt out of
+# is not a bound.
+PRODUCE_MAX_RECORDS=65536
 BATCH_CEILING="$RECORDS"
 [[ "$BATCH_CEILING" -gt "$PRODUCE_MAX_RECORDS" ]] && BATCH_CEILING="$PRODUCE_MAX_RECORDS"
 require_integer_in_range CHAOS_REPLACEMENT_BATCH "$BATCH" 1 "$BATCH_CEILING"
@@ -446,14 +451,14 @@ await_lease_holder "$LEADER_ID" "$LEADER_UUID" > /dev/null
 # which case the replacement process reacquires at a NEW epoch — and a client
 # config pinned to the original one is fenced on every request, so the
 # verification below would time out having proven nothing about the data.
-# THROUGH await_lease_holder, not a raw read. `lease_field` returns empty on a
-# transient metadata refusal, and under `set -e` that aborts the scenario — so
-# a momentary election hiccup right after the restart would kill the durability
-# check for a reason having nothing to do with the data it verifies.
-EPOCH_AFTER="$(await_lease_holder "$LEADER_ID" "$LEADER_UUID" > /dev/null; \
-  lease_field "$LEADER_ID" 'd["lease"]["fencing_epoch"]')"
+# THE EPOCH await_lease_holder ALREADY RETURNED, not a second read. It echoes
+# the epoch from inside its own retry loop, so taking its value keeps the read
+# under that loop's deadline. A separate `lease_field` afterwards sits outside
+# it and returns empty on a transient metadata refusal, which under `set -e`
+# aborts the durability check for a reason having nothing to do with the data.
+EPOCH_AFTER="$(await_lease_holder "$LEADER_ID" "$LEADER_UUID")"
 [[ -n "$EPOCH_AFTER" ]] \
-  || fail "the restarted leader holds the lease but its epoch could not be read"
+  || fail "the restarted leader holds the lease but reported no epoch"
 log "leader restarted with the post-replacement replica set, holding epoch $EPOCH_AFTER"
 CLIENT_CFG="$(emit_client_config_at_epoch "$EPOCH_AFTER")"
 

@@ -293,6 +293,16 @@ pub struct ActiveSegment {
     poisoned: bool,
     sealed: bool,
     recovery: RecoveryReport,
+    /// A roll threshold lower than this segment's own header, when the node
+    /// has been reconfigured since the segment was created.
+    ///
+    /// Applied through the SAME prospective checks the header limits use, so a
+    /// group that would cross it is refused before it is written rather than
+    /// noticed afterwards. Checking the tail's current totals instead would let
+    /// one more group land — and if traffic then stopped, the range would sit
+    /// on an oversized active segment that never seals and so never transfers,
+    /// which is the outcome the whole setting exists to avoid.
+    roll_cap: Option<(u64, u64)>,
     /// What this segment inherited from its predecessor. Empty for a range's
     /// first segment. Kept because any rescan of this file — truncation, for
     /// one — must seed from the same frontier the original scan did.
@@ -375,6 +385,7 @@ impl ActiveSegment {
         )?;
         let accumulator = ContentAccumulator::for_header(&header);
         Ok(Self {
+            roll_cap: None,
             env: env.clone(),
             path,
             file,
@@ -437,6 +448,7 @@ impl ActiveSegment {
             next_offset: scan.next_offset,
         };
         Ok(Self {
+            roll_cap: None,
             env: env.clone(),
             path,
             file,
@@ -553,6 +565,29 @@ impl ActiveSegment {
     /// Bytes of encoded record frames currently in the file. Cross-segment
     /// truncation reports the size of what it removes, and the tail is the
     /// one doomed segment with no sealed manifest to read that from.
+    /// Cap this segment's roll thresholds below what its header says.
+    ///
+    /// Only ever lowers: a header limit is a property of the bytes already
+    /// written, so raising it here would let a segment grow past what its own
+    /// format was created to hold.
+    pub(crate) fn set_roll_cap(&mut self, max_bytes: u64, max_records: u64) {
+        self.roll_cap = Some((max_bytes, max_records));
+    }
+
+    fn effective_max_segment_bytes(&self) -> u64 {
+        match self.roll_cap {
+            Some((bytes, _)) => bytes.min(self.header.max_segment_bytes()),
+            None => self.header.max_segment_bytes(),
+        }
+    }
+
+    fn effective_max_segment_records(&self) -> u64 {
+        match self.roll_cap {
+            Some((_, records)) => records.min(self.header.max_segment_records()),
+            None => self.header.max_segment_records(),
+        }
+    }
+
     pub(crate) fn content_bytes(&self) -> u64 {
         self.content_bytes
     }
@@ -796,11 +831,11 @@ impl ActiveSegment {
                     attempted: u64::MAX,
                     maximum: self.header.max_segment_bytes(),
                 })?;
-        if attempted_bytes > self.header.max_segment_bytes() {
+        if attempted_bytes > self.effective_max_segment_bytes() {
             return Err(LogError::SegmentByteLimit {
                 current: self.content_bytes,
                 attempted: attempted_bytes,
-                maximum: self.header.max_segment_bytes(),
+                maximum: self.effective_max_segment_bytes(),
             });
         }
         let attempted_records = self.record_count.checked_add(pending.len() as u64).ok_or(
@@ -809,10 +844,10 @@ impl ActiveSegment {
                 maximum: self.header.max_segment_records(),
             },
         )?;
-        if attempted_records > self.header.max_segment_records() {
+        if attempted_records > self.effective_max_segment_records() {
             return Err(LogError::SegmentRecordLimit {
                 attempted: attempted_records,
-                maximum: self.header.max_segment_records(),
+                maximum: self.effective_max_segment_records(),
             });
         }
         let write_start = self

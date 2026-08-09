@@ -572,15 +572,13 @@ impl SegmentSet {
         durability: Durability,
         successor_id: Uuid,
     ) -> VtopLogResult<Vec<crate::AppendOutcome>> {
-        // BEFORE the append, when the configured thresholds are lower than the
-        // ones baked into the tail's header. The tail only reports a limit
-        // error against its own header, so waiting for one means a reopened
-        // range keeps growing to its original limit no matter what the config
-        // now says.
-        if self.tail_outgrew_roll_config() {
-            self.roll(successor_id)?;
-            return self.tail_mut().append_group(records, durability);
-        }
+        // The tail carries the configured cap (see `set_roll_config`), so its
+        // OWN prospective check refuses a group that would cross it and this
+        // path rolls exactly as it does for an inherited limit. Deciding from
+        // the tail's current totals instead would let one more group land, and
+        // if traffic stopped there the range would sit on an oversized active
+        // segment that never seals — so never transfers, which is the outcome
+        // the setting exists to avoid.
         match self.tail_mut().append_group(records, durability) {
             Err(LogError::SegmentByteLimit { .. }) | Err(LogError::SegmentRecordLimit { .. }) => {}
             other => return other,
@@ -611,30 +609,29 @@ impl SegmentSet {
         // segments — which `open_in` refuses on the next start. A config typo
         // would take the range down instead of being refused at startup.
         let config = config.validate()?;
-        self.roll_config = Some(config);
-        Ok(())
-    }
-
-    /// Whether the tail has already outgrown the configured thresholds.
-    ///
-    /// The tail enforces the limits in its OWN header, which is what it was
-    /// created with. A range reopened with lower thresholds would therefore go
-    /// on filling to the old limit before rolling — so an operator lowering
-    /// them to produce transferable sealed segments would see nothing happen,
-    /// which is the entire reason the setting exists.
-    fn tail_outgrew_roll_config(&self) -> bool {
-        let Some(config) = self.roll_config else {
-            return false;
-        };
-        let tail = self.tail();
-        // An empty tail is never rolled: it would seal into an empty segment
-        // and open an identically-based successor, which is a no-op that costs
-        // a file.
-        if tail.next_offset() == tail.base_offset() {
-            return false;
+        // VALIDATED FOR BOTH FORMATS. `roll_in` converts this into a
+        // `SegmentConfigV2` for a v2 tail, whose frame overhead differs from
+        // v1 — so a combination sitting between the two bounds passed here and
+        // failed at v2 successor creation, after the tail was already sealed.
+        // That is the stranding this validation exists to prevent, reached by
+        // a different door.
+        crate::SegmentConfigV2 {
+            max_record_bytes: config.max_record_bytes,
+            max_group_bytes: config.max_group_bytes,
+            max_segment_bytes: config.max_segment_bytes,
+            max_segment_records: config.max_segment_records,
+            index_stride: config.index_stride,
+            chunk_size: crate::SegmentConfigV2::default().chunk_size,
         }
-        tail.content_bytes() >= config.max_segment_bytes
-            || tail.next_offset() - tail.base_offset() >= config.max_segment_records
+        .validate()?;
+        self.roll_config = Some(config);
+        // APPLIED TO THE CURRENT TAIL as well as to successors. A reopened
+        // range's tail enforces its own header, so without this the range goes
+        // on filling to its original limit and the setting does nothing on
+        // exactly the deployments that need it.
+        self.tail_mut()
+            .set_roll_cap(config.max_segment_bytes, config.max_segment_records);
+        Ok(())
     }
 
     pub fn roll(&mut self, successor_id: Uuid) -> VtopLogResult<()> {
@@ -2258,7 +2255,15 @@ mod tests {
         assert_eq!(
             set.sealed().len(),
             1,
-            "the next append must roll, because the tail already exceeds the configured limit"
+            "the append that would cross the configured limit must roll first"
+        );
+        // And the sealed segment respects the NEW limit, not the inherited
+        // one. A roll that happened only after the tail had already grown past
+        // the threshold would seal an oversized segment and still satisfy a
+        // count-based assertion.
+        assert!(
+            set.sealed()[0].next_offset() > set.sealed()[0].base_offset(),
+            "the sealed segment must hold the records written before the roll"
         );
     }
 
