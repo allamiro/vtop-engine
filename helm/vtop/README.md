@@ -197,7 +197,7 @@ certificates also carry that Service's DNS name as a shared SAN.
 | Key | Default | Description |
 |---|---|---|
 | `replicaCount` | `3` | Co-located nodes. Prefer odd counts (a 4th voter adds no fault tolerance). |
-| `image.repository` | `ghcr.io/allamiro/vtop-engine` | Must contain `vtop-node` — see the caveat above. |
+| `image.repository` | `ghcr.io/allamiro/vtop-engine` | Must contain `vtop-node`; the published image has since 0.2.1, so the default needs no override. |
 | `image.tag` | `""` (appVersion) | Never use a moving tag in production. |
 | `image.pullPolicy` | `IfNotPresent` | |
 | `image.binary` | `vtop-node` | Name on PATH or absolute path inside the image. |
