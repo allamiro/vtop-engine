@@ -64,7 +64,7 @@ Worth recording, because it changed how the milestone was finished.
 
 Writing #242 — the first thing to drive the replacement flow end to end on real
 processes — found **ten gaps**, each invisible until something tried to use the
-feature rather than test its parts:
+feature rather than test its parts. The four that mattered most:
 
 - `vtopctl node repair` **could not work at all**. No node installed
   `LeaderSegmentTransferHandler`; only the tests constructed it, so every layer

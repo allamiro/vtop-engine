@@ -562,9 +562,6 @@ impl ActiveSegment {
         self.committed_offset
     }
 
-    /// Bytes of encoded record frames currently in the file. Cross-segment
-    /// truncation reports the size of what it removes, and the tail is the
-    /// one doomed segment with no sealed manifest to read that from.
     /// Cap this segment's roll thresholds below what its header says.
     ///
     /// Only ever lowers: a header limit is a property of the bytes already
@@ -588,6 +585,9 @@ impl ActiveSegment {
         }
     }
 
+    /// Bytes of encoded record frames currently in the file. Cross-segment
+    /// truncation reports the size of what it removes, and the tail is the
+    /// one doomed segment with no sealed manifest to read that from.
     pub(crate) fn content_bytes(&self) -> u64 {
         self.content_bytes
     }

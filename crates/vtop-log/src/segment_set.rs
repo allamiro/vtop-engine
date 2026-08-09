@@ -609,21 +609,24 @@ impl SegmentSet {
         // segments — which `open_in` refuses on the next start. A config typo
         // would take the range down instead of being refused at startup.
         let config = config.validate()?;
-        // VALIDATED FOR BOTH FORMATS. `roll_in` converts this into a
-        // `SegmentConfigV2` for a v2 tail, whose frame overhead differs from
-        // v1 — so a combination sitting between the two bounds passed here and
-        // failed at v2 successor creation, after the tail was already sealed.
-        // That is the stranding this validation exists to prevent, reached by
-        // a different door.
-        crate::SegmentConfigV2 {
-            max_record_bytes: config.max_record_bytes,
-            max_group_bytes: config.max_group_bytes,
-            max_segment_bytes: config.max_segment_bytes,
-            max_segment_records: config.max_segment_records,
-            index_stride: config.index_stride,
-            chunk_size: crate::SegmentConfigV2::default().chunk_size,
+        // VALIDATED FOR THE FORMAT THIS RANGE ACTUALLY USES. `roll_in` maps the
+        // override into a `SegmentConfigV2` only for a v2 tail, and the two
+        // frame overheads differ (102 against 92) — so validating both would
+        // reject a perfectly good v1 configuration the moment the node
+        // restarts, and validating only v1 lets a combination in the gap
+        // strand a v2 range at its next roll. A successor inherits its
+        // predecessor's format, so the tail is the right thing to ask.
+        if self.tail().descriptor_v2().is_some() {
+            crate::SegmentConfigV2 {
+                max_record_bytes: config.max_record_bytes,
+                max_group_bytes: config.max_group_bytes,
+                max_segment_bytes: config.max_segment_bytes,
+                max_segment_records: config.max_segment_records,
+                index_stride: config.index_stride,
+                chunk_size: crate::SegmentConfigV2::default().chunk_size,
+            }
+            .validate()?;
         }
-        .validate()?;
         self.roll_config = Some(config);
         // APPLIED TO THE CURRENT TAIL as well as to successors. A reopened
         // range's tail enforces its own header, so without this the range goes
@@ -2257,13 +2260,25 @@ mod tests {
             1,
             "the append that would cross the configured limit must roll first"
         );
-        // And the sealed segment respects the NEW limit, not the inherited
-        // one. A roll that happened only after the tail had already grown past
-        // the threshold would seal an oversized segment and still satisfy a
-        // count-based assertion.
+        // THE SUCCESSOR is what the cap governs. The first sealed segment was
+        // filled under the inherited limit and is already larger than the
+        // override, so asserting on it proves nothing — an earlier version of
+        // this test did exactly that and passed while checking only offsets.
+        //
+        // Write past the cap into the fresh tail and require it to roll again,
+        // which is only true if the cap is enforced prospectively on a segment
+        // created under it.
+        let sealed_before = set.sealed().len();
+        for index in 9..24_u64 {
+            let mut entry = record(producer, index);
+            entry.value = vec![b'v'; 256];
+            set.append_group(&[entry], Durability::Buffered, Uuid::new_v4())
+                .unwrap();
+        }
         assert!(
-            set.sealed()[0].next_offset() > set.sealed()[0].base_offset(),
-            "the sealed segment must hold the records written before the roll"
+            set.sealed().len() > sealed_before,
+            "a segment created under the cap must itself roll at the cap, not at the inherited \
+             limit it never had"
         );
     }
 
@@ -2300,5 +2315,56 @@ mod tests {
             set.sealed().is_empty(),
             "a refused override must not have disturbed the range"
         );
+    }
+
+    /// A v1 range accepts a v1-valid override, even one v2 would refuse.
+    ///
+    /// The two formats have different frame overheads (92 against 102), so a
+    /// configuration can be legal for one and not the other. Validating both
+    /// unconditionally — which an earlier fix here did — rejects a working v1
+    /// deployment the moment it restarts, turning a validation meant to
+    /// prevent stranding into a reason the node will not start.
+    #[test]
+    fn a_v1_range_accepts_an_override_only_v2_would_refuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::real();
+        let mut set = SegmentSet::create_in(
+            &env,
+            dir.path(),
+            descriptor(),
+            crate::SegmentConfig::default(),
+        )
+        .unwrap();
+        assert!(
+            set.tail().descriptor_v2().is_none(),
+            "this fixture must be v1 for the distinction to mean anything"
+        );
+
+        // Exactly v1's bound: a group that fits one maximal record plus v1
+        // framing, and ten bytes short of what v2 would demand.
+        let record_bytes = 1024_u32;
+        let v1_only = crate::SegmentConfig {
+            max_record_bytes: record_bytes,
+            max_group_bytes: u64::from(record_bytes) + 92,
+            max_segment_bytes: u64::from(record_bytes) + 92,
+            max_segment_records: 1_000,
+            ..crate::SegmentConfig::default()
+        };
+        assert!(
+            crate::SegmentConfigV2 {
+                max_record_bytes: v1_only.max_record_bytes,
+                max_group_bytes: v1_only.max_group_bytes,
+                max_segment_bytes: v1_only.max_segment_bytes,
+                max_segment_records: v1_only.max_segment_records,
+                index_stride: v1_only.index_stride,
+                chunk_size: crate::SegmentConfigV2::default().chunk_size,
+            }
+            .validate()
+            .is_err(),
+            "the premise: v2 must reject this, or the test proves nothing"
+        );
+
+        set.set_roll_config(v1_only)
+            .expect("a v1 range must accept a configuration v1 considers valid");
     }
 }
