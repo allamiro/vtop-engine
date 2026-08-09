@@ -47,12 +47,25 @@ RF="${CHAOS_REPLACEMENT_RF:-3}"
 # be told it may pull. Set before any leader starts, because the allowlist is
 # read from the config at construction.
 export CHAOS_TRANSFER_PEERS="${CHAOS_TRANSFER_PEERS:-$SPARE_UUID}"
-export CHAOS_MAX_RECORD_BYTES="${CHAOS_MAX_RECORD_BYTES:-$((BATCH * 64))}"
-export CHAOS_MAX_GROUP_BYTES="${CHAOS_MAX_GROUP_BYTES:-$((BATCH * 256))}"
+# The record bound is sized from the RECORD, not from how many of them go in a
+# batch — those are unrelated, and deriving one from the other made
+# CHAOS_REPLACEMENT_BATCH=1 produce a 64-byte limit for a 136-byte record, so
+# the first produce was rejected before the scenario reached anything it tests.
+#
+# The producer writes an 8-byte key and `--value-bytes` of value; the rest is
+# framing. The multiple is slack for that framing, not a guess at it.
+VALUE_BYTES="${CHAOS_REPLACEMENT_VALUE_BYTES:-128}"
+require_integer_in_range CHAOS_REPLACEMENT_VALUE_BYTES "$VALUE_BYTES" 1 1048576
+RECORD_CEILING=$((VALUE_BYTES * 4))
+export CHAOS_MAX_RECORD_BYTES="${CHAOS_MAX_RECORD_BYTES:-$RECORD_CEILING}"
+# A group holds a whole batch, PLUS one record's worth of headroom: the engine
+# requires a group to fit a maximal record plus frame overhead, so a group sized
+# to exactly one record is refused — which is what a batch of 1 produced.
+export CHAOS_MAX_GROUP_BYTES="${CHAOS_MAX_GROUP_BYTES:-$(((BATCH + 1) * RECORD_CEILING))}"
 # Twice the group, so the range rolls every couple of batches. The assertion
 # below fails loudly if this stops producing a sealed segment rather than
 # letting the scenario continue against an unrolled range.
-export CHAOS_MAX_SEGMENT_BYTES="${CHAOS_MAX_SEGMENT_BYTES:-$((BATCH * 512))}"
+export CHAOS_MAX_SEGMENT_BYTES="${CHAOS_MAX_SEGMENT_BYTES:-$((CHAOS_MAX_GROUP_BYTES * 2))}"
 DOMAIN_PREFIX="${CHAOS_REPLACEMENT_DOMAIN_PREFIX:-rack}"
 require_integer_in_range CHAOS_REPLACEMENT_RECORDS "$RECORDS" 1 100000000
 # Bounded by the PROTOCOL, not just by the record count: the produce path caps
@@ -156,7 +169,7 @@ log "lease held by $HOLDER at epoch $EPOCH"
 ACKED_FILE="$WORKDIR/acked"
 CLIENT_CFG="$(emit_client_config_at_epoch "$EPOCH")"
 "$VTOP_NODE" produce --client-config "$CLIENT_CFG" --addr "$(native_addr)" \
-  --records "$RECORDS" --batch "$BATCH" --durability quorum \
+  --records "$RECORDS" --batch "$BATCH" --value-bytes "$VALUE_BYTES" --durability quorum \
   --acked-file "$ACKED_FILE" > "$WORKDIR/logs/produce.log" 2>&1 \
   || fail "the quorum produce failed: $(tail -5 "$WORKDIR/logs/produce.log")"
 await_acked_floor "$ACKED_FILE" "$RECORDS"

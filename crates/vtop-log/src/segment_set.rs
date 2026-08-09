@@ -581,6 +581,17 @@ impl SegmentSet {
         // the setting exists to avoid.
         match self.tail_mut().append_group(records, durability) {
             Err(LogError::SegmentByteLimit { .. }) | Err(LogError::SegmentRecordLimit { .. }) => {}
+            // A RAISED limit needs a roll too, not just a lowered one. The cap
+            // on the current tail only ever narrows, because its header
+            // describes bytes already written and the read path decodes them
+            // against it. So a group or record that the NEW configuration
+            // permits but the old header does not is refused here — and the
+            // successor, created under the new configuration, would accept it.
+            // Without this a workload of larger records wedges permanently on
+            // a tail that can never grow into them.
+            Err(LogError::RecordTooLarge { actual, .. })
+                if self.roll_would_admit_record(actual) => {}
+            Err(LogError::GroupTooLarge { actual, .. }) if self.roll_would_admit_group(actual) => {}
             other => return other,
         }
         // An empty tail that still cannot hold the group means the group is
@@ -592,6 +603,19 @@ impl SegmentSet {
         }
         self.roll(successor_id)?;
         self.tail_mut().append_group(records, durability)
+    }
+
+    /// Whether a successor created under the configured override would accept
+    /// a record this tail refused.
+    fn roll_would_admit_record(&self, actual: usize) -> bool {
+        self.roll_config
+            .is_some_and(|config| actual <= config.max_record_bytes as usize)
+    }
+
+    /// The same question for a whole group.
+    fn roll_would_admit_group(&self, actual: u64) -> bool {
+        self.roll_config
+            .is_some_and(|config| actual <= config.max_group_bytes)
     }
 
     /// Seal the tail and open a successor at its end.
@@ -2433,6 +2457,64 @@ mod tests {
             set.next_offset(),
             1,
             "the refused append must not have removed what was already accepted"
+        );
+    }
+
+    /// A RAISED record limit takes effect by rolling, not by wedging the tail.
+    ///
+    /// The cap on a live tail only ever narrows, because its header describes
+    /// bytes already written and the read path decodes them against it. That
+    /// makes a raised limit invisible to the current tail — so without a roll,
+    /// a workload of larger records is refused forever on a segment that can
+    /// never grow into them.
+    #[test]
+    fn a_raised_record_limit_rolls_into_a_successor_that_accepts_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::real();
+        let mut set = SegmentSet::create_in(
+            &env,
+            dir.path(),
+            descriptor(),
+            crate::SegmentConfig {
+                max_record_bytes: 1024,
+                max_group_bytes: 2048,
+                max_segment_bytes: 1 << 20,
+                max_segment_records: 1_000,
+                ..crate::SegmentConfig::default()
+            },
+        )
+        .unwrap();
+
+        let producer = Uuid::from_u128(1);
+        let big = |sequence: u64| {
+            let mut entry = record(producer, sequence);
+            entry.value = vec![b'v'; 4 * 1024];
+            entry
+        };
+        // The premise: too large for the tail as created.
+        set.append_group(&[big(0)], Durability::Buffered, Uuid::new_v4())
+            .expect_err("a 4 KiB record must not fit a 1 KiB limit");
+
+        set.set_roll_config(crate::SegmentConfig {
+            max_record_bytes: 16 * 1024,
+            max_group_bytes: 64 * 1024,
+            max_segment_bytes: 1 << 20,
+            max_segment_records: 1_000,
+            ..crate::SegmentConfig::default()
+        })
+        .expect("a valid combination");
+
+        // Something has to be in the tail for a roll to be meaningful: an
+        // empty one is never rolled.
+        set.append_group(&[record(producer, 0)], Durability::Buffered, Uuid::new_v4())
+            .expect("a small record still fits");
+
+        set.append_group(&[big(1)], Durability::Buffered, Uuid::new_v4())
+            .expect("the raised limit must be reached by rolling into a successor");
+        assert_eq!(
+            set.sealed().len(),
+            1,
+            "reaching the raised limit means sealing the tail that could not hold it"
         );
     }
 }
