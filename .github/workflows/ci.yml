@@ -52,6 +52,7 @@ jobs:
       postgres: ${{ steps.filter.outputs.postgres }}
       fuzz: ${{ steps.filter.outputs.fuzz }}
       chaos: ${{ steps.filter.outputs.chaos }}
+      upgrade: ${{ steps.filter.outputs.upgrade }}
       helm: ${{ steps.filter.outputs.helm }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
@@ -170,6 +171,8 @@ jobs:
             shell:
               - 'docker/*.sh'
               - 'docker/tests/**'
+              # Executable CI test code (#291), linted like the rest.
+              - 'scripts/upgrade-compat.sh'
               # The live-chaos harness is executable shell that gates every
               # distributed-systems claim this project makes, and it was
               # unlinted: a change to lib.sh — sourced by every scenario —
@@ -224,6 +227,19 @@ jobs:
               - 'Cargo.lock'
               - '.cargo/**'
               - 'rust-toolchain*'
+              - '.github/workflows/ci.yml'
+            upgrade:
+              # The on-disk format contract (#291): any crate change can move
+              # the format, the toolchain/cargo config changes the HEAD binary
+              # that opens the fixtures, and the script itself is executable
+              # test code.
+              - 'crates/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.cargo/**'
+              - 'rust-toolchain*'
+              - 'scripts/upgrade-compat.sh'
+              - 'scripts/live-chaos/gen-certs.sh'
               - '.github/workflows/ci.yml'
   build-and-test:
     name: fmt + clippy + test + build
@@ -708,7 +724,7 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/mnt" -w /mnt \
             koalaman/shellcheck:v0.11.0 docker/*.sh scripts/release-notes.sh \
-            scripts/k8s-smoke.sh scripts/e2e-smoke.sh
+            scripts/k8s-smoke.sh scripts/e2e-smoke.sh scripts/upgrade-compat.sh
 
       # `-P scripts/live-chaos/scenarios` resolves the scenarios' dynamic
       # `source "$(dirname …)/../lib.sh"`. Without it every scenario reports
@@ -918,6 +934,105 @@ jobs:
           name: live-chaos-logs
           path: ${{ runner.temp }}/chaos/**/logs/
           if-no-files-found: error
+          retention-days: 7
+
+  # A data directory written by an old release must open under the current
+  # build (#291). Every other durability test writes its fixtures with the
+  # code under test, so the on-disk format was only ever validated against
+  # itself — the one bug class an operator meets mid-upgrade and cannot fix
+  # forward. Two legs: v0.2.1 writes the single-`range.active` shape (the
+  # exact compatibility claim `open_range` makes), v0.3.0 writes rolled
+  # sealed segments. Downgrade is NOT tested and NOT supported — stated in
+  # ROADMAP.md rather than left as an untested assumption.
+  upgrade-compat:
+    name: upgrade compat (old directories open under HEAD)
+    needs: changes
+    if: needs.changes.outputs.upgrade == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          # The whole point is building OTHER releases: the worktrees below
+          # check out release tags, which a shallow clone does not have.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-upgrade-${{ hashFiles('**/Cargo.lock') }}
+      # The tag list is DERIVED, not hardcoded: the newest patch release of
+      # every minor series since the native data plane shipped (v0.2+ — the
+      # v0.1.x CLI predates the produce/verify surface this script drives).
+      # A new release therefore joins the matrix the moment its tag exists,
+      # so the immediately preceding release — the upgrade path most
+      # operators actually take — cannot silently fall out of coverage.
+      - name: Select the released tags to replay
+        id: tags
+        run: |
+          set -euo pipefail
+          tags="$(git tag --list 'v0.*' --sort=version:refname \
+            | awk -F. '($1 "." $2) != "v0.1" { latest[$1 "." $2] = $0 } END { for (m in latest) print latest[m] }' \
+            | sort -V | tr '\n' ' ')"
+          [[ -n "${tags// /}" ]] || { echo "no release tags found"; exit 1; }
+          echo "list=$tags" >> "$GITHUB_OUTPUT"
+          echo "replaying: $tags"
+      # Release tags are immutable, so their builds are cached essentially
+      # forever: after the first run this job pays only the HEAD build.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target-old
+          key: ${{ runner.os }}-upgrade-old-tags-${{ steps.tags.outputs.list }}
+
+      - name: Build HEAD vtop-node
+        run: cargo build -p vtop-node --bin vtop-node
+
+      - name: Build the released tags
+        run: |
+          set -euo pipefail
+          for tag in ${{ steps.tags.outputs.list }}; do
+            if [[ -x "target-old/$tag/debug/vtop-node" ]]; then
+              echo "$tag build cached"
+              continue
+            fi
+            git worktree add "../wt-$tag" "$tag"
+            (cd "../wt-$tag" && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target-old/$tag" \
+              cargo build -p vtop-node --bin vtop-node)
+            git worktree remove --force "../wt-$tag"
+          done
+
+      - name: Each released directory opens under HEAD
+        run: |
+          set -euo pipefail
+          port=9700
+          for tag in ${{ steps.tags.outputs.list }}; do
+            # The rolling profile's threshold keys exist from v0.3.0 (#313);
+            # older releases refuse unknown config keys, which is itself the
+            # compatibility contract, so they replay the legacy single-file
+            # shape — the exact claim open_range makes.
+            profile=legacy
+            case "$tag" in
+              v0.[3-9].*|v[1-9]*) profile=rolling ;;
+            esac
+            UPGRADE_KEEP=1 UPGRADE_WORKDIR="$GITHUB_WORKSPACE/upgrade-$tag" \
+            UPGRADE_NATIVE_PORT="$port" \
+              scripts/upgrade-compat.sh "$tag" \
+                "target-old/$tag/debug/vtop-node" target/debug/vtop-node "$profile"
+            port=$((port + 20))
+          done
+
+      - name: Upload fixture logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: upgrade-compat-logs
+          path: upgrade-v0*/logs
+          if-no-files-found: ignore
           retention-days: 7
 
   # The MSRV is a tested promise, not a number in a file: this builds on exactly
