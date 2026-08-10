@@ -1,4 +1,5 @@
 use crate::env::Env;
+use crate::retention_intent::{RetentionIntent, RETENTION_INTENT_FILE};
 use crate::segment::{inspect_active_segment, inspect_sealed_segment, SegmentInspection};
 use crate::truncate_intent::{TruncateIntent, TRUNCATE_INTENT_FILE};
 use crate::{LogError, SegmentDescriptor, SegmentId, VtopLogResult};
@@ -72,6 +73,10 @@ pub enum QuarantineReason {
     /// does not decode names an intent that cannot be honoured, and acting on
     /// a guess would delete segments.
     InvalidTruncateIntent(String),
+    /// A retention marker exists but cannot be decoded (#290). Same rule as
+    /// the truncation marker: it names an intent that cannot be honoured, so
+    /// the range must not open on a guess about which prefix is doomed.
+    InvalidRetentionIntent(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,6 +95,10 @@ pub struct StartupCatalog {
     /// entries above describe the directory as it stands, doomed segments
     /// included. `SegmentSet::open_in` is what finishes the truncation.
     pub truncate_intent: Option<PathBuf>,
+    /// A decodable retention marker (#290): a sealed-prefix reclamation was
+    /// interrupted and the opener must finish it. Same read-only contract as
+    /// `truncate_intent`.
+    pub retention_intent: Option<PathBuf>,
     /// Interrupted atomic writes: `.{stem}.<kind>.<uuid>.tmp` files whose
     /// rename never happened.
     ///
@@ -137,6 +146,7 @@ impl StartupCatalog {
         let mut quarantined = Vec::new();
         let mut temporary = Vec::new();
         let mut truncate_intent = None;
+        let mut retention_intent = None;
         for entry in discovered {
             let Some(classification) = classify_artifact(&entry.path) else {
                 continue;
@@ -159,6 +169,25 @@ impl StartupCatalog {
                     Err(error) => quarantined.push(QuarantinedArtifacts {
                         paths: vec![entry.path],
                         reasons: vec![QuarantineReason::InvalidTruncateIntent(error.to_string())],
+                    }),
+                }
+                continue;
+            }
+            if classification.kind == ArtifactKind::RetentionIntent {
+                // Same read-only validation as the truncation marker above.
+                let decoded = env
+                    .storage
+                    .read(&entry.path)
+                    .map_err(|source| LogError::Io {
+                        path: entry.path.clone(),
+                        source,
+                    })
+                    .and_then(|bytes| RetentionIntent::decode(&bytes));
+                match decoded {
+                    Ok(_) => retention_intent = Some(entry.path),
+                    Err(error) => quarantined.push(QuarantinedArtifacts {
+                        paths: vec![entry.path],
+                        reasons: vec![QuarantineReason::InvalidRetentionIntent(error.to_string())],
                     }),
                 }
                 continue;
@@ -261,6 +290,7 @@ impl StartupCatalog {
             temporary,
             quarantined,
             truncate_intent,
+            retention_intent,
         })
     }
 }
@@ -308,6 +338,9 @@ impl ArtifactBundle {
             ArtifactKind::TruncateIntent => {
                 unreachable!("the truncation marker is range-level, not part of a bundle")
             }
+            ArtifactKind::RetentionIntent => {
+                unreachable!("the retention marker is range-level, not part of a bundle")
+            }
         };
         *destination = Some(path);
         self.has_non_regular |= !is_regular;
@@ -347,6 +380,10 @@ enum ArtifactKind {
     /// unclassified file is ignored, and ignoring the marker would report a
     /// half-truncated range as merely broken instead of finishable.
     TruncateIntent,
+    /// The range-level marker of a sealed-prefix retention in flight (#290).
+    /// Registered for the same reason as the truncation marker: ignoring it
+    /// would report a half-reclaimed range as broken instead of finishable.
+    RetentionIntent,
     Temporary,
 }
 
@@ -392,6 +429,8 @@ fn interrupted_atomic_write(name: &str) -> bool {
         // interrupted: `.range.truncate-intent.<uuid>.tmp` is an
         // incomplete write, not an intent.
         ".truncate-intent",
+        // And the retention marker's interrupted write, same shape (#290).
+        ".retention-intent",
     ]
     .iter()
     .any(|suffix| target.ends_with(suffix))
@@ -412,6 +451,12 @@ fn classify_artifact(path: &Path) -> Option<ArtifactClassification> {
         return Some(ArtifactClassification {
             base: path.to_path_buf(),
             kind: ArtifactKind::TruncateIntent,
+        });
+    }
+    if name == RETENTION_INTENT_FILE {
+        return Some(ArtifactClassification {
+            base: path.to_path_buf(),
+            kind: ArtifactKind::RetentionIntent,
         });
     }
     if let Some(stem) = name.strip_suffix(".manifest.json") {

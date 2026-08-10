@@ -466,6 +466,13 @@ async fn run_follower(
         )
         .map_err(|error| error.to_string())?,
     );
+    if let Some(retention) = &config.retention {
+        // Followers reclaim by their own policy exactly as they roll at
+        // their own bound: the leader replicates offsets, not files (#290).
+        follower.set_retention(Some(vtop_log::RetentionPolicy {
+            max_total_bytes: retention.max_total_bytes,
+        }));
+    }
     observability.register(Box::new(FollowerCollector::new(Arc::clone(&follower))?))?;
 
     // With a lease configured, this follower learns its epoch from metadata
@@ -628,6 +635,11 @@ async fn run_leader(
         )
         .map_err(|error| error.to_string())?,
     );
+    if let Some(retention) = &config.retention {
+        broker.set_retention(Some(vtop_log::RetentionPolicy {
+            max_total_bytes: retention.max_total_bytes,
+        }));
+    }
     // Verified promotion probes each follower's DISK over the replication
     // plane rather than reading this leader's own replication counters, which
     // on a fresh promotion have never been advanced and would report every

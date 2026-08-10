@@ -126,6 +126,16 @@ reopen quietly.
   with no history now answers "unknown" at a fence instead of fabricating a
   lone entry that compared as divergence-at-zero. Scenario 12 asserts the
   repair outlives the failover instead of pinning the loss.
+- **#290** — a range no longer grows until the disk does not. A size-bounded
+  retention policy (`retention.max_total_bytes` in node config) reclaims whole
+  sealed segments oldest-first under a durable intent marker — the #276
+  pattern, so an interrupted reclamation finishes instead of quarantining the
+  range — and never past the acknowledged floor. A consumer at a reclaimed
+  offset gets a nameable `OffsetRetained` refusal instead of a silent skip
+  forward, and a transfer chunk for a reclaimed segment fails closed as
+  `WrongLineage` (#278's re-resolution, now asserted for retention). Age
+  bounds need a durable per-segment seal time no manifest records yet — a
+  format change deferred to its own slice.
 - **#240 remainder** — the election-restriction question (Raft dissertation §5.4.1), then the signed
   leadership-transition record.
 

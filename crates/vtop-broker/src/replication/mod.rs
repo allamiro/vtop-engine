@@ -176,6 +176,8 @@ pub struct InProcessFollower {
     meta_fencing_epoch: MetaFencingEpoch,
     segment_format: SegmentFormat,
     cluster_committed: ClusterCommittedOffset,
+    /// Sealed-prefix retention bound in bytes; 0 = disabled (#290).
+    retention_max_total_bytes: std::sync::atomic::AtomicU64,
     state: Mutex<FollowerState>,
     online: AtomicBool,
     /// When set, appends land with [`Durability::Buffered`] and are not
@@ -246,6 +248,7 @@ impl InProcessFollower {
             meta_fencing_epoch,
             segment_format,
             cluster_committed,
+            retention_max_total_bytes: std::sync::atomic::AtomicU64::new(0),
             state: Mutex::new(FollowerState {
                 segment,
                 producer_epochs,
@@ -309,6 +312,35 @@ impl InProcessFollower {
     /// that already holds records must report "unknown" instead. Also completes
     /// a truncation interrupted by a crash, per
     /// [`crate::LocalBroker::attach_epoch_journal_to_log`].
+    /// Bound this replica's disk in bytes; `None` disables retention (#290).
+    /// Followers reclaim by their own policy exactly as they roll at their
+    /// own bound: the leader replicates offsets, not files.
+    pub fn set_retention(&self, policy: Option<vtop_log::RetentionPolicy>) {
+        self.retention_max_total_bytes.store(
+            policy.map(|policy| policy.max_total_bytes).unwrap_or(0),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+
+    /// One retention pass under the held state lock; failures reported, not
+    /// returned, for the same reason as on the leader — the append was
+    /// already durable, and the next open finishes an interrupted pass.
+    fn run_retention(&self, segment: &mut vtop_log::SegmentSet) {
+        let max_total_bytes = self
+            .retention_max_total_bytes
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if max_total_bytes == 0 {
+            return;
+        }
+        let floor = self.cluster_committed.get().min(segment.committed_offset());
+        if let Err(problem) = segment.retain(&vtop_log::RetentionPolicy { max_total_bytes }, floor)
+        {
+            eprintln!(
+                "follower retention failed and will be retried after the next append: {problem}"
+            );
+        }
+    }
+
     pub fn set_fencing_epoch_journal(
         &self,
         mut journal: crate::fencing_epochs::FencingEpochJournal,
@@ -807,9 +839,17 @@ impl InProcessFollower {
             state.segment.append_group_minting(&records, durability)
         };
         match appended {
-            Ok(_) => Ok(ReplicaAppendResponse {
-                local_committed_offset: state.segment.committed_offset(),
-            }),
+            Ok(_) => {
+                // Not under an fsync hold: the branch above already refused
+                // to roll there, and retention deletes files, which is even
+                // less compatible with "held bytes die with a crash".
+                if !self.hold_fsync() {
+                    self.run_retention(&mut state.segment);
+                }
+                Ok(ReplicaAppendResponse {
+                    local_committed_offset: state.segment.committed_offset(),
+                })
+            }
             Err(problem) => Err((
                 match problem {
                     vtop_log::LogError::FirstSequence { .. }
@@ -954,9 +994,14 @@ impl InProcessFollower {
             });
         }
         match state.segment.commit() {
-            Ok(local_committed_offset) => Ok(ReplicaAppendResponse {
-                local_committed_offset,
-            }),
+            Ok(local_committed_offset) => {
+                // One pass per batch, after the commit, and never under an
+                // fsync hold — the hold path returned above (#290).
+                self.run_retention(&mut state.segment);
+                Ok(ReplicaAppendResponse {
+                    local_committed_offset,
+                })
+            }
             Err(problem) => Err((ErrorCode::Storage, problem.to_string())),
         }
     }

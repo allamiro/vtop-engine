@@ -583,6 +583,10 @@ pub struct LocalBroker {
     /// Quorum-committed high-water mark. When set, fetch never exposes above it
     /// and `Durability::Quorum` produce waits for it to cover the append.
     cluster_committed: Option<ClusterCommittedOffset>,
+    /// Sealed-prefix retention bound in bytes; 0 = retention disabled (#290).
+    /// Atomic so operators can set it after construction without a lock, and
+    /// the produce path can read it inside the state-lock critical section.
+    retention_max_total_bytes: std::sync::atomic::AtomicU64,
     /// Optional follower fan-out for quorum produce.
     replicas: Option<Arc<dyn ReplicaSet>>,
     /// Leader identity embedded in replica append requests.
@@ -709,6 +713,7 @@ impl LocalBroker {
             fencing_epoch_history_broken: AtomicBool::new(false),
             meta_fencing_epoch,
             segment_format,
+            retention_max_total_bytes: std::sync::atomic::AtomicU64::new(0),
             cluster_committed,
             replicas,
             node_id,
@@ -815,6 +820,44 @@ impl LocalBroker {
     ///
     /// Also completes an interrupted truncation. See
     /// [`Self::attach_epoch_journal_to_log`].
+    /// Bound this range's disk in bytes; `None` disables retention (#290).
+    ///
+    /// Takes effect on the next produce that appends. The bound covers
+    /// encoded record frames (sealed content plus the active tail), and only
+    /// segments wholly below the acknowledged floor are ever reclaimed.
+    pub fn set_retention(&self, policy: Option<vtop_log::RetentionPolicy>) {
+        self.retention_max_total_bytes.store(
+            policy.map(|policy| policy.max_total_bytes).unwrap_or(0),
+            Ordering::SeqCst,
+        );
+    }
+
+    /// Run one retention pass under the state lock the caller already holds.
+    ///
+    /// A failed pass is REPORTED, never returned: the append it follows was
+    /// already acknowledged, and an interrupted retention is finished by the
+    /// next open — refusing the produce over reclamation trouble would turn
+    /// a disk-space policy into an availability incident.
+    fn run_retention(&self, segment: &mut SegmentSet) {
+        let max_total_bytes = self.retention_max_total_bytes.load(Ordering::SeqCst);
+        if max_total_bytes == 0 {
+            return;
+        }
+        let local = segment.committed_offset();
+        let floor = self
+            .cluster_committed
+            .as_ref()
+            .map(|committed| committed.get().min(local))
+            .unwrap_or(local);
+        if let Err(problem) = segment.retain(&vtop_log::RetentionPolicy { max_total_bytes }, floor)
+        {
+            eprintln!(
+                "retention on {} failed and will be retried after the next append: {problem}",
+                self.range.topic
+            );
+        }
+    }
+
     pub fn set_fencing_epoch_journal(
         &self,
         mut journal: crate::fencing_epochs::FencingEpochJournal,
@@ -1184,12 +1227,17 @@ impl LocalBroker {
                             committed_high_watermark: batch.high_watermark,
                         }),
                     },
-                    Err(problem) => error(
-                        request_id,
-                        stream_id,
-                        ErrorCode::Storage,
-                        &problem.to_string(),
-                    ),
+                    Err(problem) => {
+                        // A reclaimed offset is a consumer decision, not a
+                        // storage fault; give it the code that says so (#290).
+                        let code = match &problem {
+                            vtop_log::LogError::OffsetBelowRange { .. } => {
+                                ErrorCode::OffsetRetained
+                            }
+                            _ => ErrorCode::Storage,
+                        };
+                        error(request_id, stream_id, code, &problem.to_string())
+                    }
                 }
             }
             Message::CommitCursorRequest(request) => {
@@ -1536,6 +1584,10 @@ impl LocalBroker {
                 .append_group_minting(&records, Durability::Fsync)
             {
                 Ok(outcomes) => {
+                    // Reclaim AFTER the append that may have rolled, under
+                    // the same lock, so the sealed prefix never outlives the
+                    // policy by more than one group (#290).
+                    self.run_retention(&mut state.segment);
                     let leader_committed = state.segment.committed_offset();
                     let mut wire_by_member = Vec::with_capacity(batch.len());
                     let mut cursor = 0usize;
