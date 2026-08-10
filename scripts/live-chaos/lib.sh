@@ -1387,7 +1387,11 @@ meta_admin_read() {
     remaining=$((deadline - SECONDS))
     [[ $remaining -ge 1 ]] || remaining=1
     code=0
-    timeout "$remaining" \
+    # --kill-after makes the bound a guarantee, not a request: on expiry
+    # `timeout` only sends TERM, and a process that does not die on TERM
+    # would still be waited on indefinitely — the exact stall this bound
+    # exists to rule out.
+    timeout --kill-after=1 "$remaining" \
       "$VTOPCTL" --json meta "$@" --config "$(emit_admin_config "$id")" \
       > "$out" 2> "$out.stderr" || code=$?
     [[ $code -eq 0 ]] && return 0
