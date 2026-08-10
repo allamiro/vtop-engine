@@ -111,6 +111,10 @@ preflight_common_tools() {
   require_command sed "Install a POSIX sed implementation."
   # Health gating (#224) polls each node's /readyz over HTTP.
   require_command curl "Install curl; the harness gates node readiness on the /readyz endpoint."
+  # meta_admin_read bounds each attempt with GNU timeout: the admin transport
+  # has no per-request deadline of its own, so a wedged endpoint would
+  # otherwise hold the read past the deadline it advertises.
+  require_command timeout "Install GNU coreutils."
 }
 
 require_integer_in_range() { # <name> <value> <minimum> <maximum>
@@ -1368,14 +1372,28 @@ meta_admin_as() {
 # precisely because resubmitting a write that may already have committed is
 # ambiguous; a retrying wrapper around a write would launder that ambiguity
 # away instead of surfacing it.
+#
+# Each ATTEMPT is bounded too, not only the loop: the admin transport awaits
+# connect, TLS and the response frame with no deadline of its own, so an
+# endpoint that accepts the connection and then stalls would hold a one-shot
+# attempt — and with it this whole read — past the deadline the helper
+# advertises. `timeout` cannot spawn a shell function, so the bound wraps
+# meta_admin's body inlined, kept identical deliberately.
 meta_admin_read() {
   local out="$1" id="$2"; shift 2
-  local deadline=$((SECONDS + PROGRESS_TIMEOUT_SECONDS)) attempts=0
+  local deadline=$((SECONDS + PROGRESS_TIMEOUT_SECONDS)) attempts=0 remaining code
   while :; do
     attempts=$((attempts + 1))
-    meta_admin "$id" "$@" > "$out" 2> "$out.stderr" && return 0
+    remaining=$((deadline - SECONDS))
+    [[ $remaining -ge 1 ]] || remaining=1
+    code=0
+    timeout "$remaining" \
+      "$VTOPCTL" --json meta "$@" --config "$(emit_admin_config "$id")" \
+      > "$out" 2> "$out.stderr" || code=$?
+    [[ $code -eq 0 ]] && return 0
     if [[ $SECONDS -ge $deadline ]]; then
-      log "metadata refused [$1] $attempts time(s) over ${PROGRESS_TIMEOUT_SECONDS}s; \
+      log "metadata refused [$1] $attempts time(s) over ${PROGRESS_TIMEOUT_SECONDS}s \
+(last exit $code; 124 means the attempt hit its time bound rather than answering); \
 last refusal: $(tail -c 300 "$out.stderr" | tr '\n' ' ')"
       return 1
     fi
