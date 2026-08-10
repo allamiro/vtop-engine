@@ -1,16 +1,24 @@
-# VTOP Engine — Production-Grade HA Plan
+# VTOP Engine — Production HA Design
 
-> Status: **Proposal / design doc** (no code changes implied by this document).
-> Audience: engineers, operators, and decision-makers taking VTOP from a single-node
-> prototype to an enterprise, highly-available archive engine.
+> Status: **Design & reference document** for taking the VTOP *engine* (the
+> telemetry-object transfer pipeline: `vtop-core`, `vtop-state`,
+> `vtop-adapters`, `vtop-upload`, `vtopctl engine`) from a single-process
+> deployment to a highly-available fleet, without weakening the core guarantee.
 >
-> This document distinguishes **current behavior** (what the code does today) from
-> **proposed behavior** (what production HA requires). Claims that depend on unbuilt
-> work are marked **[PROPOSED]**. Wording is intentionally qualified ("safe under
-> these assumptions", "requires validation").
+> This document holds the **architecture, invariants, and operational
+> reference**. The phased implementation plan, per-phase status, risk register,
+> readiness checklist, and open decisions live in the companion
+> [`PRODUCTION_HA_ROADMAP.md`](PRODUCTION_HA_ROADMAP.md) — the two documents do
+> not repeat each other.
 >
-> A companion document, [`PRODUCTION_HA_ROADMAP.md`](PRODUCTION_HA_ROADMAP.md),
-> contains an alternate, roadmap-first presentation of the same material.
+> Claims that depend on unbuilt work are marked **[PROPOSED]**; claims about
+> shipped behavior are marked **[IMPLEMENTED]**. Wording is intentionally
+> qualified ("safe under these assumptions", "requires validation").
+>
+> Scope note: this document is about the **engine pipeline**. The distributed
+> VTOP *cluster* (`vtop-meta` Raft metadata, `vtop-node`, `vtop-broker`,
+> `vtop-log` sealed-segment replication) is a separate plane with its own
+> narrative roadmap in [`ROADMAP.md`](ROADMAP.md).
 
 ---
 
@@ -25,36 +33,31 @@
 8. Deployment topologies
 9. Docker Compose vs. real hardware
 10. Hardware sizing
-11. Phased implementation plan
-12. **Production Roadmap (table)**
-13. **Database choice matrix**
-14. Configuration & environment reference
-15. Observability
-16. Failure modes & recovery
-17. Backup, restore & disaster recovery
-18. Security hardening
-19. **Risk register**
-20. **Operator runbook & rollback procedures**
-21. **Known limitations**
-22. **Production-readiness checklist**
-23. Open decisions
-24. TL;DR
+11. Database choice matrix
+12. Configuration & environment reference
+13. Observability
+14. Failure modes & recovery
+15. Backup, restore & disaster recovery
+16. Security hardening
+17. Operator runbook & rollback procedures
+18. Known limitations
+19. TL;DR
 
 ---
 
 ## 1. Scope, goals, assumptions
 
 ### 1.1 What we are building toward
-Take VTOP from a **single-process prototype** (SQLite ledger, one engine) to a
-**horizontally scalable, highly-available** telemetry-object transfer engine,
-**without weakening the core guarantee**:
+Take the VTOP engine from a **single-process deployment** (one engine, its own
+ledger) to a **horizontally scalable, highly-available** telemetry-object
+transfer engine, **without weakening the core guarantee**:
 
 > **SOURCE_COMMITTED is forbidden until VERIFIED is true.**
 
 ### 1.2 Non-negotiable invariants
 - **Verify-before-commit** — source progress (Kafka offset / file byte cursor /
-  spool position) advances only after the object **and** manifest are uploaded and
-  verified.
+  spool position) advances only after the object **and** manifest are uploaded
+  and verified.
 - **Replay safety** — a crash at any stage is recoverable with **no data loss**.
 - **Delivery semantics (accurate):** today the system is **at-least-once with
   possible duplicate objects** (§1.5, §6). *Idempotent at the archive layer*
@@ -65,14 +68,14 @@ Take VTOP from a **single-process prototype** (SQLite ledger, one engine) to a
 - Not a datastore for the telemetry itself — object storage is the archive.
 
 ### 1.4 Assumptions
-This plan is "safe under these assumptions"; where one fails, the relevant section
-calls out the consequence.
-- **Kafka is the primary production ingress** (file/syslog are secondary; their HA
-  is optional, Phase 7).
+This plan is "safe under these assumptions"; where one fails, the relevant
+section calls out the consequence.
+- **Kafka is the primary production ingress** (file/syslog are secondary; their
+  HA is optional and built only if required).
 - Source systems **retain data long enough for replay** (Kafka retention; files
   retained + fingerprinted; syslog durably spooled before ingest).
 - **Object keys and manifests should be deterministic** for safe retry — **not**
-  true today (§1.5); a **[PROPOSED]** change (Phase 4).
+  true today (§1.5); a **[PROPOSED]** change.
 - Object storage provides **read-after-write consistency** on the verification
   path (true for S3 and MinIO today).
 - **Secrets are injected externally** via a secret manager (never in `config.yaml`).
@@ -87,8 +90,9 @@ calls out the consequence.
 | Replay outcome | Re-processing writes a **new object** (new key) → **duplicate object, no overwrite, no loss** | Retry resolves to the **same** object/version; duplicates impossible **[PROPOSED]** |
 | File/syslog cursor | Lives **only in the state store** (rebuilt from `SOURCE_COMMITTED` rows) | Same, but **migrate/drain on backend switch** (§5.4) |
 | Kafka offset | Committed to the **broker** after VERIFIED (resumes broker-side) | Same; consumer-group mode for multi-instance **[PROPOSED]** |
-| Concurrency | Single process, **sequential** loop | N replicas via Kafka consumer groups **[PROPOSED]** |
-| State backend | **SQLite only** | Pluggable; Postgres-compatible for HA **[PROPOSED]** |
+| Concurrency | Single process, **single-instance lock enforced at startup** (#66) | N replicas via Kafka consumer groups **[PROPOSED]** |
+| State backend | **SQLite and PostgreSQL** (feature-gated) behind the `StateStore` trait **[IMPLEMENTED]** | Same; Postgres-compatible store is the production path |
+| Metrics | Prometheus endpoint, opt-in via `VTOP_METRICS_ADDR` **[IMPLEMENTED]** | Same, plus traces and alerting (§13) |
 
 ---
 
@@ -99,29 +103,31 @@ VTOP has a clean **two-plane** design; understanding it keeps the HA design smal
 | Plane | Holds | Component | Scale/HA story |
 |---|---|---|---|
 | **Data plane** | telemetry bytes | Object storage (S3 / MinIO) | Durable + HA-capable; add Object Lock (WORM) |
-| **Control plane** | batch lifecycle ledger | **State store** (SQLite today) | The single thing blocking horizontal scale |
+| **Control plane** | batch lifecycle ledger | **State store** (SQLite dev / Postgres prod) | The single thing blocking horizontal scale |
 
 ```
-                         ┌──────────────────────────────────────────┐
-  sources               │                VTOP engine                 │      archive
- ┌─────────┐  read      │  discover → batch → seal → compress →       │  put ┌──────────┐
- │ Kafka   │──────────► │  checksum → upload object → upload manifest │─────►│  S3 /    │
- │ files   │            │  → VERIFY → COMMIT source progress          │      │  MinIO   │
- │ syslog  │            └───────────────┬────────────────────────────┘      │ (WORM)   │
- └─────────┘                            │ ~9 small state writes/batch        └──────────┘
-                                        ▼
-                              ┌────────────────────┐
-                              │   STATE STORE       │  ← SQLite (dev) / Postgres-compat (prod)
-                              │ replay ledger,      │
-                              │ enforces invariant  │
-                              └────────────────────┘
+  sources                        VTOP engine                               archive
+ ┌─────────┐  read   ┌─────────────────────────────────────────────┐  put   ┌──────────┐
+ │ Kafka   │────────►│ discover → batch → seal → compress →        │───────►│ S3 /     │
+ │ files   │         │ checksum → upload object → upload manifest  │        │ MinIO    │
+ │ syslog  │         │ → VERIFY → COMMIT source progress           │        │ (WORM)   │
+ └─────────┘         └──────────────────────┬──────────────────────┘        └──────────┘
+                                            │ ~9 small state writes/batch
+                                            ▼
+                             ┌──────────────────────────────┐
+                             │         STATE STORE          │
+                             │ replay ledger; enforces the  │
+                             │ verify-before-commit rule    │
+                             └──────────────────────────────┘
+                               SQLite (dev) · Postgres-compatible (prod)
 ```
 
 **Codebase facts that shape the plan:**
 - ~**9 tiny state writes/batch** (`save → sealed → compressed → checksummed →
   object_uploaded → manifest_uploaded → verified → source_committed`) + a recovery
   scan (`list_incomplete`) at startup.
-- The run loop is **single-process and sequential** today.
+- The run loop is **single-process**, and the engine takes an exclusive
+  instance lock at startup (§18).
 - The **bottleneck is S3 upload**, not the state store.
 - **Object keys are non-deterministic** (§1.5) — central to §6.
 
@@ -163,11 +169,11 @@ The honest, minimal set — **one** durable store, not a zoo.
 
 | Need | Component | Required? | Notes |
 |---|---|---|---|
-| Durable shared ledger | **ONE** Postgres-compatible DB | **Yes** | PostgreSQL, **or** YugabyteDB/CockroachDB for a self-HA store. Pick one (§13). |
-| Work distribution + failover (Kafka) | **Kafka consumer groups** | **Required for HA** | Single-node Kafka **reading exists today**; **fleet consumer-group mode is [PROPOSED]** (Phase 5). Kafka is the coordinator — no extra coordination DB for the Kafka path. |
+| Durable shared ledger | **ONE** Postgres-compatible DB | **Yes** | PostgreSQL, **or** YugabyteDB/CockroachDB for a self-HA store. Pick one (§11). Backend **[IMPLEMENTED]**. |
+| Work distribution + failover (Kafka) | **Kafka consumer groups** | **Required for HA** | Single-node Kafka **reading exists today**; **fleet consumer-group mode is [PROPOSED]**. Kafka is the coordinator — no extra coordination DB for the Kafka path. |
 | Durable data plane | **S3 / MinIO** | **Yes (have it)** | Distributed MinIO (erasure-coded) or S3; Object Lock for WORM. |
-| Orchestration / heal / scale | **Kubernetes (+ KEDA)** | **Yes for HA** | Restarts, rolling upgrades, lag-based autoscale. |
-| Observability | **Prometheus + Grafana + OpenTelemetry** | **Yes** | Metrics, dashboards, traces, alerts. |
+| Orchestration / heal / scale | **Kubernetes (+ KEDA)** | **Yes for HA** | Restarts, rolling upgrades, lag-based autoscale. An engine chart is **[PROPOSED]** — the existing `helm/vtop` chart deploys the *cluster*, not the engine (§8). |
+| Observability | **Prometheus + Grafana (+ traces)** | **Yes** | Metrics endpoint **[IMPLEMENTED]**; dashboards in `observability/`; traces **[PROPOSED]** (§13). |
 | Secrets | **Vault / external-secrets / k8s Secrets** | Recommended | Creds already injected via env. |
 | File/syslog HA ownership | **etcd / Consul** (leases) | **Only if** file/syslog must be HA-distributed | The only thing Kafka groups don't solve. |
 
@@ -177,11 +183,16 @@ The honest, minimal set — **one** durable store, not a zoo.
 - **etcd** — skip unless distributed file/syslog ingestion is required.
 
 > If Kafka is the primary ingress, enterprise HA is essentially **one new database
-> + the `StateStore` abstraction + k8s/Prometheus**.
+> + the `StateStore` abstraction + k8s/Prometheus** — and the database and
+> abstraction are already built.
 
 ---
 
-## 5. The `StateStore` abstraction (the one piece of real work)
+## 5. The `StateStore` abstraction **[IMPLEMENTED]**
+
+Shipped in `crates/vtop-state`: the trait, a SQLite backend, a PostgreSQL
+backend behind `--features postgres`, and a shared backend-agnostic test
+battery.
 
 ### 5.1 Backend selection = a config or secret reference
 The engine reads `engine.state_store`; a factory dispatches on the resolved
@@ -192,8 +203,7 @@ secret reference so credentials never enter serializable config.
 |---|---|
 | Dev / single appliance | `sqlite:///data/state/vtop-state.db` |
 | Production (Postgres) | `{ env: VTOP_STATE_STORE }` → `postgres://…?sslmode=verify-full` |
-| Production (Yugabyte) | `{ file: /run/secrets/vtop-state-store }` → `postgres://…?sslmode=verify-full` |
-
+| Production (Yugabyte/Cockroach) | `{ file: /run/secrets/vtop-state-store }` → `postgres://…?sslmode=verify-full` |
 
 ### 5.2 The trait (one source of truth for the invariant)
 - Abstracts: `save_batch_state`, `update_batch_state`, `mark_verified`,
@@ -212,10 +222,10 @@ secret reference so credentials never enter serializable config.
 | Placeholders | `?` | `$1, $2, …` |
 | Insert | plain `INSERT` | plain `INSERT` |
 | Migrations | SQLite initializes locally | `vtopctl migrate` with a separate privileged identity; runtime executes no DDL |
-| **Conflict retry** | none | **retry on SQLSTATE `40001`** (distributed serialization) |
+| **Conflict retry** | none | **retry on SQLSTATE `40001`** (distributed serialization) **[IMPLEMENTED]** |
 | Build | default | behind Cargo `--features postgres` |
 
-### 5.4 Backend-switching policy (corrected — NOT "no migration ever")
+### 5.4 Backend-switching policy (NOT "no migration ever")
 The state store is a replay ledger, **but the file/syslog byte cursor lives only in
 it** (rebuilt from `SOURCE_COMMITTED` rows by `seed_committed_offsets`). Kafka
 offsets live in the broker. Therefore:
@@ -236,9 +246,15 @@ Backend switching policy:
 import into the new store (or accept Kafka reprocessing for Kafka-only) → validate →
 keep the old store until validation passes (rollback path).
 
-### 5.5 Database schema & constraints (defense in depth) **[PROPOSED]**
-Even though `vtop-core` enforces the invariant, the database must too. Note the
-constraints are **state-aware** so they are directly implementable:
+**Why no row migration for the *Kafka* path:** resume position is broker-side
+committed offsets, so a fresh store does not lose Kafka progress (it
+re-discovers). This is the *only* path where "no migration" holds.
+
+### 5.5 Database schema & constraints (defense in depth) **[IMPLEMENTED]**
+Applied by `vtopctl migrate` under a deployment identity; the engine role gets
+only schema `USAGE` plus `SELECT, INSERT, UPDATE` on `batches`, and the live
+battery proves DDL, `DELETE`, and `TRUNCATE` remain denied. The constraints are
+**state-aware**:
 
 ```sql
 CREATE TABLE batches (
@@ -271,7 +287,7 @@ CREATE TABLE batches (
   updated_at          TIMESTAMPTZ NOT NULL,
   verified_at         TIMESTAMPTZ,
   source_committed_at TIMESTAMPTZ,
-  -- File/syslog HA (Phase 7)
+  -- File/syslog HA (optional phase)
   lease_owner         TEXT,
   lease_until         TIMESTAMPTZ,
 
@@ -308,9 +324,9 @@ CREATE INDEX ix_incomplete   ON batches (state)
   WHERE state NOT IN ('SOURCE_COMMITTED','FAILED');   -- hot incomplete set
 ```
 
-**Multi-writer recovery:** claim incomplete rows with
+**Multi-writer recovery [PROPOSED]:** claim incomplete rows with
 `SELECT … FOR UPDATE SKIP LOCKED`, or via `lease_owner`/`lease_until`, so two
-instances never recover the same batch.
+instances never recover the same batch. Required before fleet mode.
 
 ### 5.6 Ledger retention / pruning **[IMPLEMENTED — incremental delete, #128]**
 ```text
@@ -328,12 +344,8 @@ once a minute, one bounded batch per pass. Engine-side pruning is SQLite
 only: the PostgreSQL runtime identity is deliberately denied DELETE, so the
 engine refuses the setting there and pruning runs as a scheduled `vtopctl
 prune-ledger --older-than-days N` under a maintenance identity (see
-POSTGRES_DEPLOYMENT.md). Rows in any non-committed state are never touched.
-
-### 5.7 Why no row migration for the *Kafka* path
-For Kafka, resume position is broker-side committed offsets, so a fresh store does
-not lose Kafka progress (it re-discovers). This is the *only* path where "no
-migration" holds — see §5.4 for the file/syslog exception.
+[`POSTGRES_DEPLOYMENT.md`](POSTGRES_DEPLOYMENT.md)).
+Rows in any non-committed state are never touched.
 
 ---
 
@@ -412,7 +424,7 @@ success. Until then, replay produces a duplicate object (no loss).
   (`VTOP_KAFKA_GROUP_MODE = assign | subscribe`). Subscribe-once also avoids the
   original stall because committed offsets exist after the first verified batch.
 
-### 7.3 Rebalance requirements (Phase 5 correctness)
+### 7.3 Rebalance requirements (fleet-mode correctness)
 ```text
 - disable auto-commit; manual commit only after VERIFIED;
 - handle partition REVOCATION cleanly:
@@ -442,23 +454,32 @@ One engine, **SQLite**, single MinIO, single Kafka (KRaft). The current lab.
 ### Tier 1 — Single engine + external Postgres (small prod, durable store)
 One engine, **Postgres** ledger (backable, survives engine host restart), S3/MinIO.
 One engine (no horizontal scale) but a proper durable store. **Testable on one
-machine** (add a `postgres` Compose service).
+machine** (add a `postgres` Compose service). **Available today** — the Postgres
+backend is implemented (§5); see
+[`POSTGRES_DEPLOYMENT.md`](POSTGRES_DEPLOYMENT.md).
 
-### Tier 2 — HA fleet, Kafka-primary (recommended enterprise baseline)
+### Tier 2 — HA fleet, Kafka-primary (recommended enterprise baseline) **[PROPOSED]**
 ```
-        ┌── engine-1 ─┐
- Kafka ─┼── engine-2 ─┼──► S3 / MinIO (WORM)
- (group)└── engine-3 ─┘          │
-            │  │  │              │
-            └──┴──┴──► Postgres / Yugabyte / Cockroach (one logical store, HA)
-   metrics ─► Prometheus ─► Grafana ;  traces ─► OTel ;  autoscale ◄─ KEDA (lag)
+         ┌── engine-1 ─┐
+ Kafka ──┼── engine-2 ─┼──► S3 / MinIO (WORM)
+ (group) └── engine-3 ─┘
+              │
+              ▼
+   Postgres / Yugabyte / Cockroach (one logical store, HA)
+
+   metrics ─► Prometheus ─► Grafana ; traces ─► OTel ; autoscale ◄─ KEDA (lag)
 ```
 N replicas on Kubernetes; Kafka consumer-group mode (§7.2); one Postgres-compatible
 store; distributed MinIO/S3 + Object Lock; KEDA autoscale on lag (§7.4). File/syslog
 **not HA** here (disabled or pinned to one replica). Needs real multi-node infra;
 rehearsable on single-node k8s, true HA needs ≥3 nodes.
 
-### Tier 3 — Full HA incl. file/syslog (only if required)
+> **Chart caveat:** the repository's `helm/vtop` chart deploys the co-located
+> VTOP *cluster* (`vtop-node` metadata + data planes), **not** the engine
+> pipeline. An engine chart (Deployment/probes/KEDA) is future work tracked in
+> the roadmap.
+
+### Tier 3 — Full HA incl. file/syslog (only if required) **[PROPOSED]**
 Tier 2 **+ etcd/Consul leases** so each file/spool is owned by one replica, with
 takeover resuming from the durable state-store cursor.
 ```text
@@ -474,9 +495,9 @@ Replayability differs by source — design accordingly:
 | If your reality is… | Use |
 |---|---|
 | Laptop / demo | Tier 0 (Compose, SQLite) |
-| Small prod, one engine, want backups | Tier 1 (Postgres) |
-| Enterprise, Kafka is primary | **Tier 2** (k8s fleet) |
-| Enterprise + distributed file/syslog | Tier 3 (+ etcd) |
+| Small prod, one engine, want backups | Tier 1 (Postgres) — available today |
+| Enterprise, Kafka is primary | **Tier 2** (k8s fleet) — pending fleet mode |
+| Enterprise + distributed file/syslog | Tier 3 (+ etcd) — pending |
 
 ---
 
@@ -489,7 +510,7 @@ Replayability differs by source — design accordingly:
 | Postgres backend + retry-on-`40001` | ✅ (single Postgres) | |
 | Yugabyte/Cockroach **wire** compatibility | ✅ (single container) | |
 | Distributed-store **HA** (survive DB node loss) | ⚠️ partial | ✅ (≥3 DB nodes) |
-| Multi-engine Kafka consumer-group distribution | ❌ **not until Phase 5** — single instance per state store, enforced at startup (#66/#93) | ✅ (after Phase 5, on k8s) |
+| Multi-engine Kafka consumer-group distribution | ❌ **not yet** — single instance per state store, enforced at startup (#66/#93) | ✅ (after fleet mode, on k8s) |
 | Engine failover / rebalance under node loss | ⚠️ (kill a container) | ✅ (k8s, ≥3 nodes) |
 | KEDA lag autoscaling | | ✅ (k8s) |
 | etcd file-lease ownership + takeover | ⚠️ (rehearsal) | ✅ (k8s, ≥3 nodes) |
@@ -516,94 +537,7 @@ fast SSD/NVMe. Distributed SQL needs **3 nodes minimum** + NVMe.
 
 ---
 
-## 11. Phased implementation plan
-
-Each phase ships independently. Phases 1–2 are zero-behavior-change groundwork. Full
-roadmap detail (dependencies, test plans, rollback) is in §12.
-
-### Phase 0 — Baseline hardening of the current prototype
-- **Objective:** make the current SQLite + Kafka + MinIO Compose deployment
-  **measurable and reproducible** before any architectural change.
-- **Tasks:** document current state-machine behavior; add crash/replay tests; add
-  **duplicate-object measurement**; add benchmark datasets; record baseline
-  throughput, upload latency, replay rate, verification latency; confirm
-  `require_strong_verification: true` behavior.
-- **Exit:** current behavior reproducible; crash **before** VERIFIED → replay; crash
-  **after** VERIFIED but before source commit → safe; duplicate-object behavior
-  measured and documented.
-
-### Phase 1 — Extract the `StateStore` trait  ✅ DONE
-- Trait + SQLite impl; engine holds `Box<dyn StateStore>`; scheme factory (SQLite).
-- **Exit:** all existing tests pass; behavior identical; `sqlite://` works.
-
-### Phase 2 — Centralize invariant + shared test battery  ✅ DONE
-- Move verify-before-commit guard into `vtop-core`; backend-agnostic test battery.
-- **Exit:** one invariant implementation; battery green on SQLite.
-
-### Phase 3 — Postgres backend + DB constraints (`--features postgres`)  ✅ DONE
-- `PgStateStore` (PgPool, `$N`, Postgres DDL); **schema constraints from §5.5**;
-  **retry-on-`40001`**; run the battery against Postgres.
-- PostgreSQL DDL is an explicit `vtopctl migrate` deployment step. The engine
-  role receives only schema `USAGE` plus `SELECT, INSERT, UPDATE` on `batches`;
-  the live battery proves DDL, `DELETE`, and `TRUNCATE` remain denied.
-- **Exit:** identical behavior SQLite/Postgres; `postgres://` selectable; DB
-  enforces the invariant too.
-
-### Phase 4 — Deterministic keys + idempotent retry
-- Deterministic / content-addressed object keys; "existing verified object =
-  success"; record `version_id`. (Before Kafka fleet mode so replays don't
-  duplicate.)
-- **Exit:** replaying a batch produces **no duplicate object**; Object Lock safe.
-
-### Phase 5 — Kafka consumer-group (multi-instance) mode
-- Long-lived `subscribe` + manual commit-after-verify; revocation handling (§7.3);
-  config toggle `assign|subscribe`.
-- **Exit:** two replicas split partitions; killing one rebalances; no double-commit.
-
-### Phase 6 — Operability (k8s + observability)
-- Helm; liveness/readiness; Prometheus endpoint; OTel traces; Grafana; Alertmanager;
-  KEDA on lag (§7.4 bounds).
-- **Exit:** rolling upgrade w/o loss; autoscale on lag; alerts fire.
-
-### Phase 7 — File/syslog HA (optional)
-- etcd/Consul leases; takeover from state-store cursor; durable-spool requirement
-  for syslog; chaos tests.
-- **Exit:** owner death transfers ownership with no gap/duplication.
-
-### Phase 8 — Hardening / DR
-- Object Lock/WORM profile; Vault; multipart + concurrent uploads; multi-writer
-  recovery (`SELECT … FOR UPDATE SKIP LOCKED` / lease column); retention/pruning
-  (§5.6); backup/DR (§17); security baseline (§18).
-
----
-
-## 12. Production Roadmap
-
-Dependency-ordered, with priority, test plan, exit criteria, and rollback per phase.
-Priority: **P0** = prerequisite for any HA; **P1** = required for the Tier-2
-baseline; **P2** = situational/optional.
-
-| Phase | Objective | Pri | Depends on | Main work | Test plan | Exit criteria | Rollback |
-|---|---|---|---|---|---|---|---|
-| 0 | Baseline hardening | P0 | current code | crash/replay tests, benchmarks, structured logs, dup-object measurement | Compose end-to-end + fault injection | reproducible baseline; crash semantics confirmed | stay on current SQLite build |
-| 1 | `StateStore` trait | P0 | 0 | trait + SQLite impl + scheme factory | existing test suite | no behavior change; `sqlite://` works | revert trait extraction (pure refactor) |
-| 2 | Shared invariant tests | P0 | 1 | move guard to core; backend-agnostic battery | invalid-transition + replay tests | one invariant impl; battery green | keep SQLite path |
-| 3 | Postgres backend | P1 | 2 | `PgStateStore`, migrations, §5.5 constraints, retry-`40001` | SQLite/Postgres parity; constraint-violation tests | `postgres://` works; DB enforces invariant | switch back to `sqlite://` (drain first) |
-| 4 | Deterministic keys | P1 | 3 | idempotent object naming; existing-verified = success; record version_id | replay same batch; Object Lock test | no duplicate objects; Object Lock safe | `VTOP_OBJECT_KEY_MODE=legacy` |
-| 5 | Kafka fleet mode | P1 | 4 | `subscribe` + manual commit + rebalance handling | two replicas + kill test | safe rebalance; no double-commit | `VTOP_KAFKA_GROUP_MODE=assign`, 1 replica |
-| 6 | Kubernetes ops + observability | P1 | 3,4,5 | Helm, probes, metrics, traces, alerts, KEDA | rolling upgrade under load; pod-kill | no loss on rollout; autoscale within partition bound | Helm rollback; disable metrics endpoint |
-| 7 | File/syslog HA | P2 | 3,6 | etcd leases + cursor takeover | owner-death test | no gaps/duplication on takeover | pin source to one replica |
-| 8 | Hardening / DR | P1 | 6 | backup, restore, WORM, retention, security | DR drill; divergence checker | documented RPO/RTO; security baseline met | restore previous release |
-
-```
- Phase dependency graph
-   0 ─► 1 ─► 2 ─► 3 ─► 4 ─► 5 ─► 6 ─► (7 optional, 8) 
-   base  trait  inv   PG   keys  kafka  k8s     fileHA / hardening+DR
-```
-
----
-
-## 13. Database choice matrix
+## 11. Database choice matrix
 
 No option is universally best — compare against your priorities.
 
@@ -617,18 +551,20 @@ No option is universally best — compare against your priorities.
 clear requirement for distributed SQL **and** the operational skill to run it.
 Because all three speak the Postgres wire protocol, the `StateStore` Postgres backend
 works against any of them — the choice is a connection-string + ops decision, made
-once, and **requires validation** under your write rate.
+once, and **requires validation** under your write rate. The retry-on-`40001`
+path needed by the distributed options is already implemented (§5.3).
 
 ---
 
-## 14. Configuration & environment reference
+## 12. Configuration & environment reference
 
-### 14.1 Current config (`config.yaml`) — implemented
+### 12.1 Current config (`config.yaml`) — implemented
 | Key | Meaning |
 |---|---|
 | `engine.name` / `engine.tenant` | identity; default tenant |
 | `engine.state_store` | backend selector: inline `sqlite://…`, or `{ env: … }` / `{ file: … }` secret reference for PostgreSQL |
 | `engine.work_dir` / `log_level` | scratch dir; verbosity |
+| `engine.ledger_retention_days` / `ledger_prune_batch` | committed-row retention (§5.6; SQLite engine-side only) |
 | `batching.max_records` / `max_bytes` / `max_batch_age_seconds` | seal thresholds |
 | `compression.type` / `level` | `gzip` \| `zstd` \| `none` |
 | `checksum.algorithm` | `sha256` \| `blake3` \| disabled |
@@ -645,12 +581,13 @@ once, and **requires validation** under your write rate.
 | `upload.require_strong_verification` | defaults true — false explicitly permits size-only commit |
 | `partitioning.template` | object key layout |
 
-### 14.2 Current environment variables — implemented
+### 12.2 Current environment variables — implemented
 | Variable | Purpose |
 |---|---|
 | `VTOP_CONFIG` | path to `config.yaml` |
 | `RUST_LOG` | log filter |
 | `VTOP_STATE_STORE` | PostgreSQL URL when named by `engine.state_store.env`; remote URLs require `sslmode=verify-full` |
+| `VTOP_METRICS_ADDR` | opt-in Prometheus metrics + readiness endpoint (e.g. `0.0.0.0:9090`); nothing listens unless set |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | S3 credentials |
 | `AWS_REGION` | S3 region |
 | `VTOP_S3_ENDPOINT_URL` | S3/MinIO endpoint |
@@ -658,43 +595,63 @@ once, and **requires validation** under your write rate.
 | `VTOP_S3_VERIFY_TLS` | TLS verification toggle (off = lab only) |
 | *(Kafka SASL)* | password read from the **env var named** in `sasl_password_env` |
 
-### 14.3 Proposed environment variables (HA phases) **[PROPOSED]**
-| Variable | Phase | Purpose |
-|---|---|---|
-| `VTOP_PG_MAX_CONNECTIONS` | 3 | Postgres pool size per replica |
-| `VTOP_PG_STATEMENT_TIMEOUT_MS` | 3 | guard stuck statements |
-| `VTOP_STATE_RETRY_MAX` | 3 | max retries on SQLSTATE `40001` |
-| `VTOP_OBJECT_KEY_MODE` | 4 | `legacy` \| `deterministic` \| `content-addressed` |
-| `VTOP_KAFKA_GROUP_MODE` | 5 | `assign` (single-node) \| `subscribe` (fleet) |
-| `VTOP_METRICS_ADDR` | 6 | Prometheus endpoint (e.g. `0.0.0.0:9090`) |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | 6 | OpenTelemetry collector |
-| `VTOP_INSTANCE_ID` | 5/7 | stable replica identity (group member / lease owner) |
-| `VTOP_ETCD_ENDPOINTS` | 7 | etcd/Consul endpoints for leases |
-| `VTOP_LEASE_TTL_SECONDS` | 7 | source-ownership lease TTL |
+### 12.3 Proposed environment variables (future HA work) **[PROPOSED]**
+| Variable | Purpose |
+|---|---|
+| `VTOP_PG_MAX_CONNECTIONS` | Postgres pool size per replica |
+| `VTOP_PG_STATEMENT_TIMEOUT_MS` | guard stuck statements |
+| `VTOP_OBJECT_KEY_MODE` | `legacy` \| `deterministic` \| `content-addressed` |
+| `VTOP_KAFKA_GROUP_MODE` | `assign` (single-node) \| `subscribe` (fleet) |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | OpenTelemetry collector |
+| `VTOP_INSTANCE_ID` | stable replica identity (group member / lease owner) |
+| `VTOP_ETCD_ENDPOINTS` | etcd/Consul endpoints for leases |
+| `VTOP_LEASE_TTL_SECONDS` | source-ownership lease TTL |
 
 > Secrets (DB password, S3 keys, Kafka SASL) **must** come from a secret manager,
 > never `config.yaml`.
 
 ---
 
-## 15. Observability
-- **Metrics (Prometheus):** batches/sec; records/sec; bytes in/out; compression
-  ratio; per-stage latency; upload latency; **verification-failure rate**; **replay
-  / REPLAY_REQUIRED rate**; Kafka **consumer lag**; state-store write latency;
-  in-flight batches; failed batches; **duplicate-object rate** (until Phase 4).
-- **Traces (OpenTelemetry):** one span per batch, child spans per stage (already
-  emitted as structured events).
-- **Dashboards (Grafana) + Alerts (Alertmanager):** verification failures > 0;
-  replay-rate spike; lag growth; store write-latency SLO breach; no committed
-  batches in N minutes.
+## 13. Observability
+
+**Implemented today:**
+- **Prometheus metrics endpoint** — opt-in via `VTOP_METRICS_ADDR`
+  (`crates/vtop-observe`, served by `vtopctl`), including a readiness probe.
+- **Structured per-stage events** — one logical span per batch with child
+  events per pipeline stage.
+- **Dashboard tooling** — the `observability/` directory carries a
+  Grafana/Loki/Mimir/Tempo/Alloy compose stack
+  (`docker-compose.observability.yml`) and generated dashboards for the
+  pipeline, Kafka, and flow views.
+
+**Still needed for production [PROPOSED]:**
+- **Alerting rules** (Alertmanager): verification failures > 0; replay-rate
+  spike; lag growth; store write-latency SLO breach; no committed batches in N
+  minutes.
+- **OpenTelemetry trace export** from the engine (the Tempo backend is already
+  in the stack; the engine does not yet emit OTLP).
+- Metric coverage review: **verification-failure rate**, **replay /
+  REPLAY_REQUIRED rate**, Kafka **consumer lag**, state-store write latency,
+  **duplicate-object rate** (needed until deterministic keys land).
 
 ---
 
-## 16. Failure modes & recovery semantics
+## 14. Failure modes & recovery semantics
+
+```text
+Recovery scan at startup, per incomplete row:
+
+  DISCOVERED … MANIFEST_UPLOADED   → replay from last committed source position
+  VERIFIED (not yet committed)     → retry the source commit only
+  SOURCE_COMMITTED                 → nothing to do
+
+Invariant preserved: source progress is NEVER advanced for unverified data.
+```
+
 | Failure | Behavior | Why it's safe |
 |---|---|---|
 | Engine crash mid-batch | `recover()`: pre-VERIFIED → replay from last committed source position; VERIFIED-but-not-committed → retry commit | Progress never advanced for unverified data |
-| Replay after crash | **Today:** new object key → duplicate object (no loss). **Phase 4:** same key, existing verified = success | At-least-once now; idempotent after Phase 4 |
+| Replay after crash | **Today:** new object key → duplicate object (no loss). **After deterministic keys:** same key, existing verified = success | At-least-once now; idempotent later |
 | State store unavailable | Cannot transition → stops committing (fails safe) | No commit-before-verify possible |
 | Kafka rebalance (fleet) | Revoked partitions: finish/abandon in-flight, no commit; reassigned replica resumes from committed offset | Offsets commit only post-verify |
 | File-owner replica dies (Tier 3) | Lease expires; another replica resumes from stored byte cursor | Cursor in shared durable store |
@@ -702,7 +659,7 @@ once, and **requires validation** under your write rate.
 
 ---
 
-## 17. Backup, restore & disaster recovery **[PROPOSED]**
+## 15. Backup, restore & disaster recovery **[PROPOSED]**
 ```text
 - State store: Postgres PITR (WAL archiving) or distributed-SQL backup policy.
 - Object store: bucket replication or MinIO/S3 backup policy; Object Lock retention.
@@ -716,41 +673,36 @@ once, and **requires validation** under your write rate.
 
 ---
 
-## 18. Security hardening **[PROPOSED baseline]**
+## 16. Security hardening
+
+**Already in place:**
+- Least-privilege database identities: the runtime role cannot run DDL,
+  `DELETE`, or `TRUNCATE`; migrations and pruning use separate identities (§5.5–5.6).
+- Remote PostgreSQL URLs must use `sslmode=verify-full`.
+- Secrets referenced by env/file, never serialized into config (§5.1, §12).
+- Hardened external-upload-tool invocation: explicit binary path, timeout,
+  output bounds, and an environment allowlist (§12.1).
+- Release pipeline publishes **SBOM, cosign signatures, and `SHA256SUMS`**;
+  `cargo-deny` runs in CI.
+
+**Production baseline still to apply [PROPOSED]:**
 ```text
 - TLS for Kafka, DB, object store, and the metrics endpoint.
 - IAM/bucket policy scoped to required prefixes only (least privilege).
 - Separate credentials per environment and per tenant.
-- Secrets via Vault / Kubernetes Secrets / external-secrets — never config.yaml.
+- Secrets via Vault / Kubernetes Secrets / external-secrets.
 - Server-side encryption / KMS where available; encryption in transit everywhere.
 - Audit logs for object-store writes and state-store changes.
 - Kubernetes NetworkPolicies isolating engine ↔ DB ↔ Kafka ↔ object store.
 - Restricted admin access; least-privilege RBAC.
-- Signed container images (e.g. cosign) if applicable.
-- Vulnerability scanning (image + dependency) in CI; SBOM per release.
+- Vulnerability scanning (image + dependency) each release cycle.
 ```
 
 ---
 
-## 19. Risk register
-| Risk | Impact | Mitigation | Phase | Owner |
-|---|---|---|---|---|
-| Object Lock prevents overwrite-based retry | Retries fail / stuck batches | Deterministic keys + "existing verified = success" / version_id (§6.2) | 4 | Engineering (storage) |
-| Kafka rebalance during in-flight batch | Duplicate work / spurious revocation | Revocation handler; tune poll/session timeouts; cooperative rebalancing (§7.3) | 5 | Engineering (ingest) |
-| State database unavailable | Engine cannot commit | Fail safe (stop committing); HA store; alerts | 3,6 | Platform |
-| Object uploaded but manifest upload failed | Batch stuck pre-VERIFIED | Retry manifest; verify existing object; bounded `retry_count` → FAILED | 0,3 | Engineering (pipeline) |
-| Manifest uploaded but source-commit failed | Possible replay | Recovery retries commit; deterministic keys make replay idempotent | 4 | Engineering (engine) |
-| File cursor lost during backend switch | File reprocessing / duplicates | Drain + cursor migration + validation + rollback (§5.4) | 3 | Platform / Ops |
-| Syslog UDP packet loss | Silent data loss | Ingest only from durable spool; document UDP limits (§8) | 7 | Engineering / Ops |
-| KEDA scales beyond useful partition count | Wasted replicas, no throughput gain | Bound max replicas to partition count (§7.4) | 6 | Platform |
-| State-store growth without retention | Ledger bloat, slow scans | Retention/pruning policy; archive cold rows (§5.6) | 8 | Ops |
-| Distributed-SQL serialization retries (`40001`) | Latency spikes under contention | Retry-on-`40001`; capacity test; store choice (§13) | 3 | Engineering (state) |
+## 17. Operator runbook & rollback procedures
 
----
-
-## 20. Operator runbook & rollback procedures
-
-Short procedures now; expand into a full ops runbook before go-live (Phase 8/10).
+Short procedures now; expand into a full ops runbook before go-live.
 
 - **Engine restart:** `docker compose restart vtop-engine` (Tier 0) or
   `kubectl rollout restart deploy/vtop-engine` (Tier 2). On start, the recovery scan
@@ -764,6 +716,8 @@ Short procedures now; expand into a full ops runbook before go-live (Phase 8/10)
 - **Drain before a backend switch (§5.4):** stop sources → wait until no `incomplete`
   rows remain → export file/syslog cursors → switch `engine.state_store` → import
   cursors → validate → keep the old store until validation passes.
+- **Prune the PostgreSQL ledger:** run `vtopctl prune-ledger --older-than-days N`
+  on a schedule under the maintenance identity (§5.6).
 - **Restore from DB backup:** restore Postgres PITR → verify object store →
   start the engine (recovery scan re-reconciles) → run the divergence checker.
 - **Reconcile state store vs object storage:** list `SOURCE_COMMITTED` rows and
@@ -771,110 +725,55 @@ Short procedures now; expand into a full ops runbook before go-live (Phase 8/10)
   objects (row but no object) for remediation.
 - **Rotate credentials (S3 / Kafka / DB):** update the secret in the secret manager
   → rolling-restart engines → confirm new connections succeed → revoke old creds.
-- **Scale engine replicas:** `kubectl scale deploy/vtop-engine --replicas=N`, with
-  `N ≤ active partition count` for the topic (§7.4); KEDA can automate within bounds.
+- **Scale engine replicas [after fleet mode]:**
+  `kubectl scale deploy/vtop-engine --replicas=N`, with `N ≤ active partition
+  count` for the topic (§7.4); KEDA can automate within bounds.
 - **Respond to a verification-failure alert:** check the failing backend (object
   store reachability, checksum mismatch), confirm `require_strong_verification`, and
   hold commits (the engine already refuses to commit unverified batches).
 
 ---
 
-## 21. Known limitations (current code)
+## 18. Known limitations (current code)
 - **SINGLE-INSTANCE ONLY — enforced at startup (#66).** The engine takes an
   exclusive OS lock on its work directory and refuses to start beside another
   engine on the same host. There is no claim/lease/fencing in the state store
-  yet (#93, Phase 5), so two engines over the same store would both recover the
+  yet (#93), so two engines over the same store would both recover the
   same incomplete batches and both commit source progress — duplicate ingestion
   at best, double-commit at worst. The work-dir lock CANNOT see an engine on a
   different host pointed at the same Postgres; that configuration is
   unsupported and warned about at startup. Do not scale replicas.
 - **Non-deterministic object keys** — replay can create **duplicate objects** (no
-  loss). Fixed by deterministic/content-addressed keys (Phase 4).
-- **Engine loop is single-process / sequential** — no horizontal scale until
-  Phase 5 (Kafka consumer-group mode).
-- **File/syslog HA is not solved without leases** — single-owner only until Phase 7.
+  loss). Fixed by deterministic/content-addressed keys (roadmap Phase 4).
+- **Engine loop is single-process** — no horizontal scale until Kafka
+  consumer-group fleet mode lands (roadmap Phase 5).
+- **File/syslog HA is not solved without leases** — single-owner only.
 - **UDP syslog cannot be made lossless** without durable spooling before VTOP.
 - **Whole-file mode can cause memory spikes** — it loads the whole file into memory;
   size accordingly or keep large inputs line-oriented.
+- **No engine Helm chart** — `helm/vtop` deploys the cluster plane, not the
+  engine pipeline (§8).
 
 ---
 
-## 22. Production-readiness checklist
-```text
-Correctness & invariant
-  [ ] require_strong_verification remains true
-  [ ] deterministic or content-addressed object keys enabled
-  [ ] Object Lock behavior tested (retry never overwrites a locked object)
-  [ ] crash before VERIFIED → replay; crash after VERIFIED/before COMMIT → safe
-  [ ] DB constraints enforce no commit before verify (state-aware CHECKs)
-
-State store
-  [ ] Postgres-compatible state store deployed
-  [ ] StateStore trait + shared test battery green on SQLite AND Postgres
-  [ ] retry-on-40001 implemented and load-tested
-  [ ] schema constraints + indexes (UNIQUE source range; state index)
-  [ ] multi-writer recovery (FOR UPDATE SKIP LOCKED or leases)
-  [x] retention/pruning policy defined (engine.ledger_retention_days, #128)
-
-Kafka / scaling
-  [ ] Kafka auto-commit disabled; commit only after VERIFIED
-  [ ] rebalance/revocation handling tested
-  [ ] KEDA min/max replicas bounded by partition count
-
-Object storage
-  [ ] distributed MinIO / S3; Object Lock policy; retention configured
-
-Operability
-  [ ] Prometheus metrics enabled; Grafana dashboards; alerts configured
-  [ ] OpenTelemetry traces; health/readiness endpoints; SLOs documented
-  [ ] k8s: probes, resource limits, PDB, NetworkPolicy, rolling-upgrade runbook
-
-Security
-  [ ] TLS for Kafka, DB, object store, and metrics
-  [ ] secrets from Vault / k8s Secrets / external-secrets (none in config.yaml)
-  [ ] least-privilege IAM; per-env/per-tenant credentials; encryption at rest
-  [ ] image signing; vuln scan; SBOM
-
-Resilience / DR
-  [ ] crash/replay tests passed
-  [ ] backup/restore tested; object-store ↔ state-store reconciliation tested
-  [ ] DR runbook approved; RPO/RTO documented
-  [ ] risk register reviewed; each risk has an owner
-```
-
----
-
-## 23. Open decisions (need a human call)
-1. **Primary ingress:** Kafka-only (stop at Tier 2) **or** file/syslog at scale
-   (Tier 3 + etcd, Phase 7)?
-2. **Store choice:** PostgreSQL + Patroni vs Yugabyte/Cockroach (§13) — familiar ops
-   + low latency vs self-healing DB HA.
-3. **Object-key scheme:** adopt deterministic / content-addressed keys (Phase 4)?
-   Required for idempotency + Object Lock safety.
-4. **Compliance:** is Object Lock / WORM mandatory (audit/regulatory)? If yes it
-   becomes baseline, not optional.
-5. **State-write latency target & RPO/RTO:** drives store choice, retry tuning, and
-   backup design.
-6. **Scope/timeline:** which target tier (1, 2, or 3) is in scope for the first
-   production release?
-
----
-
-## 24. TL;DR
+## 19. TL;DR
 - **One** durable Postgres-compatible store; **no Redis**; etcd only for distributed
   file/syslog.
-- The **`StateStore` trait (Phase 1)** is the single real prerequisite; after it,
-  SQLite ↔ Postgres ↔ Yugabyte/Cockroach is a **config-string** choice (§13).
-- **Two current-behavior caveats the design must fix for production:**
+- The **`StateStore` abstraction is built and shipped**: SQLite ↔ Postgres ↔
+  Yugabyte/Cockroach is now a **config-string** choice (§5, §11), with the
+  invariant enforced in core logic **and** database constraints, and
+  retry-on-`40001` in place. Tier 1 (single engine + Postgres) is deployable
+  today.
+- **Two current-behavior caveats the design must still fix for fleet HA:**
   (a) object keys are **non-deterministic** → replay makes **duplicates**; fix with
-  **deterministic keys (Phase 4)** for idempotency + Object Lock safety.
-  (b) file/syslog cursors live **only in the state store** → **migrate/drain** on
-  backend switch (Kafka is broker-side and safe).
+  **deterministic keys** for idempotency + Object Lock safety.
+  (b) the engine is **single-instance by design** until Kafka consumer-group
+  fleet mode and multi-writer recovery land.
 - **VERIFIED is defined precisely (§3); strong content-derived verification is
   the default and production must not opt out.**
-- **Kafka consumer groups + k8s + Prometheus** deliver HA for the Kafka path with
-  minimal new infrastructure (fleet mode is **[PROPOSED]**, Phase 5).
+- File/syslog cursors live **only in the state store** → **migrate/drain** on
+  backend switch (Kafka is broker-side and safe).
 - **Correctness and backend portability are fully Docker-Compose-testable on one
   machine;** only true HA behavior needs multi-node Kubernetes.
-- See **§12 Production Roadmap**, **§19 Risk register**, **§20 Operator runbook**,
-  and **§22 Readiness checklist** for execution.
+- For phase-by-phase status, risks, and the readiness checklist, see
+  [`PRODUCTION_HA_ROADMAP.md`](PRODUCTION_HA_ROADMAP.md).
