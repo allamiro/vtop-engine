@@ -31,6 +31,7 @@
 
 use crate::env::Env;
 use crate::producer_snapshot::ProducerSnapshot;
+use crate::retention_intent::{RetainedSegment, RetentionIntent, RETENTION_INTENT_FILE};
 use crate::segment::{io_error, roll_in, segment_stem, write_atomic, ActiveSegment, SegmentReader};
 use crate::truncate_intent::{DoomedSegment, TruncateIntent, TRUNCATE_INTENT_FILE};
 use crate::{
@@ -71,6 +72,86 @@ fn finish_pending_truncation(env: &Env, directory: &Path) -> VtopLogResult<()> {
         finish_truncation(env, directory, &intent)?;
     }
     Ok(())
+}
+
+/// Finish a sealed-prefix retention that a crash interrupted (#290).
+///
+/// Same contract as [`finish_pending_truncation`]: a decodable marker is
+/// completed, an undecodable one is deliberately left for discovery to
+/// quarantine by name — deleting segments on the strength of bytes that were
+/// not written whole by this code is exactly what the checksum exists to
+/// prevent.
+fn finish_pending_retention(env: &Env, directory: &Path) -> VtopLogResult<()> {
+    let marker = directory.join(RETENTION_INTENT_FILE);
+    if !env
+        .storage
+        .exists(&marker)
+        .map_err(|source| io_error(&marker, source))?
+    {
+        return Ok(());
+    }
+    let decoded = env
+        .storage
+        .read(&marker)
+        .map_err(|source| io_error(&marker, source))
+        .and_then(|bytes| RetentionIntent::decode(&bytes));
+    if let Ok(intent) = decoded {
+        finish_retention(env, directory, &intent)?;
+    }
+    Ok(())
+}
+
+/// The deletion half of a retention: idempotent, so it serves both the live
+/// path and crash recovery.
+///
+/// Deletes every doomed stem's files (present or not), makes the unlinks
+/// durable, then removes the marker — in that order, so a crash at any point
+/// leaves either a marker whose work can be re-run or a directory with no
+/// trace of the retention. The doomed segments' `.producers` sidecars go
+/// with them: a sealed segment's frontier is inherited by its successor's
+/// sidecar at roll time, so the oldest SURVIVING segment already carries
+/// everything the deleted prefix contributed.
+fn finish_retention(env: &Env, directory: &Path, intent: &RetentionIntent) -> VtopLogResult<()> {
+    for doomed in &intent.doomed {
+        remove_segment_files(env, directory, doomed.base_offset)?;
+    }
+    env.storage
+        .sync_dir(directory)
+        .map_err(|source| io_error(directory, source))?;
+    let marker = directory.join(RETENTION_INTENT_FILE);
+    if env
+        .storage
+        .exists(&marker)
+        .map_err(|source| io_error(&marker, source))?
+    {
+        env.storage
+            .remove_file(&marker)
+            .map_err(|source| io_error(&marker, source))?;
+        env.storage
+            .sync_dir(directory)
+            .map_err(|source| io_error(directory, source))?;
+    }
+    Ok(())
+}
+
+/// What a range keeps, expressed as a disk bound (#290).
+///
+/// Size only, deliberately: an age bound needs a durable per-segment seal
+/// time, which no manifest version records yet — adding one is a format
+/// change that belongs to its own slice, not a side effect of this one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetentionPolicy {
+    /// Total bytes of encoded record frames the range may hold (sealed
+    /// content plus the active tail's current frames) before the oldest
+    /// sealed segments become eligible for reclamation.
+    pub max_total_bytes: u64,
+}
+
+/// What one retention pass reclaimed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RetentionOutcome {
+    pub segments_removed: usize,
+    pub bytes_removed: u64,
 }
 
 /// Every segment in a range directory must belong to the SAME range.
@@ -245,6 +326,11 @@ impl SegmentSet {
         // falls through to discovery, which quarantines it by name, and the
         // open refuses like any other ambiguity.
         finish_pending_truncation(env, &directory)?;
+        // AFTER the truncation replay, same reasoning: a retention that died
+        // between its marker and its final unlink is not an ambiguous layout —
+        // the marker says exactly which prefix is doomed. Finish it before
+        // discovery so the catalog sees the completed range (#290).
+        finish_pending_retention(env, &directory)?;
         let catalog = StartupCatalog::discover_in(env, &directory)?;
         sweep_interrupted_writes(env, &directory, &catalog);
         if !catalog.quarantined.is_empty() {
@@ -360,6 +446,11 @@ impl SegmentSet {
         // `open_in` finishes the intent and deletes that very tail, with
         // whatever was appended to it.
         finish_pending_truncation(env, &directory)?;
+        // AFTER the truncation replay, same reasoning: a retention that died
+        // between its marker and its final unlink is not an ambiguous layout —
+        // the marker says exactly which prefix is doomed. Finish it before
+        // discovery so the catalog sees the completed range (#290).
+        finish_pending_retention(env, &directory)?;
         let catalog = StartupCatalog::discover_in(env, &directory)?;
         sweep_interrupted_writes(env, &directory, &catalog);
         if !catalog.quarantined.is_empty() {
@@ -648,6 +739,102 @@ impl SegmentSet {
         Ok(())
     }
 
+    /// Reclaim sealed segments from the FRONT of the range until the policy
+    /// is satisfied (#290).
+    ///
+    /// Deletion is only ever a strict prefix drop of whole sealed segments —
+    /// the tail is never touched, and the surviving front stays contiguous
+    /// with everything above it. Eligibility is doubly bounded:
+    ///
+    /// * by the POLICY: segments are dropped oldest-first only while the
+    ///   range's total bytes (sealed content plus the tail's current frames)
+    ///   exceed `max_total_bytes`;
+    /// * by the FLOOR: a segment whose `next_offset` exceeds `floor` is never
+    ///   dropped, whatever the policy says. The caller passes the offset
+    ///   below which records are acknowledged (cluster-committed); data that
+    ///   only this replica may hold is not reclaimable disk, it is the
+    ///   durability the quorum was promised.
+    ///
+    /// Crash-safe under a durable intent marker, exactly as cross-segment
+    /// truncation is: the marker is written before the first unlink, and an
+    /// interrupted retention is finished by the next open rather than leaving
+    /// a partially-deleted front bundle that discovery would quarantine.
+    ///
+    /// A dropped segment's producer frontier survives by construction — it
+    /// was inherited into its successor's `.producers` sidecar at roll time —
+    /// and a consumer whose cursor points into the reclaimed prefix gets
+    /// [`LogError::OffsetBelowRange`] from [`Self::fetch_through`], not a
+    /// silent skip.
+    pub fn retain(
+        &mut self,
+        policy: &RetentionPolicy,
+        floor: u64,
+    ) -> VtopLogResult<RetentionOutcome> {
+        // FINISH BEFORE STARTING. A previous pass may have failed between its
+        // marker and its last unlink; the caller keeps serving and calls
+        // retain again on a later append. Writing a fresh marker over the
+        // unfinished one would forget its doomed list — files half-deleted
+        // under the old intent would be orphans no recovery ever revisits,
+        // and discovery would quarantine the range for them. Completing the
+        // old intent first makes the live path self-healing, exactly as the
+        // next open would be; if the finish fails again, the error propagates
+        // and the OLD marker stays authoritative for the next attempt.
+        finish_pending_retention(&self.env, &self.directory)?;
+        let sealed_bytes: u64 = self
+            .sealed
+            .iter()
+            .map(|reader| reader.manifest().content_bytes)
+            .sum();
+        let total = sealed_bytes + self.tail().content_bytes();
+        if total <= policy.max_total_bytes {
+            return Ok(RetentionOutcome::default());
+        }
+        let mut cut = 0_usize;
+        let mut bytes_removed = 0_u64;
+        for reader in &self.sealed {
+            if total - bytes_removed <= policy.max_total_bytes {
+                break;
+            }
+            if reader.next_offset() > floor {
+                break;
+            }
+            bytes_removed += reader.manifest().content_bytes;
+            cut += 1;
+        }
+        if cut == 0 {
+            return Ok(RetentionOutcome::default());
+        }
+        let doomed: Vec<RetainedSegment> = self.sealed[..cut]
+            .iter()
+            .map(|reader| RetainedSegment {
+                segment_id: reader.segment_id(),
+                base_offset: reader.base_offset(),
+            })
+            .collect();
+        let new_base = self
+            .sealed
+            .get(cut)
+            .map(|reader| reader.base_offset())
+            .unwrap_or_else(|| self.tail().base_offset());
+        let intent = RetentionIntent { new_base, doomed };
+        // POINT OF NO RETURN. Once the marker is durable the retention is
+        // promised: a crash after this line is finished by the next open.
+        write_atomic(
+            &self.env,
+            &self.directory.join(RETENTION_INTENT_FILE),
+            &intent.encode()?,
+        )?;
+        // In-memory state first, so a failure while unlinking leaves this set
+        // agreeing with what recovery will produce rather than serving
+        // readers over deleted files.
+        self.sealed.drain(..cut);
+        finish_retention(&self.env, &self.directory, &intent)?;
+        Ok(RetentionOutcome {
+            segments_removed: cut,
+            bytes_removed,
+        })
+    }
+
     /// Discard every record at or above `offset`.
     ///
     /// The repair for a replica that diverged from its range's current
@@ -833,6 +1020,13 @@ impl SegmentSet {
     /// Visibility is clamped at `high_watermark` exactly as a single segment
     /// clamps it, so a set never exposes more than the same records would have
     /// been in one file.
+    ///
+    /// A `start_offset` below the range's first offset is an ERROR, not a
+    /// clamp. This used to silently skip forward, which was survivable when a
+    /// range could only begin where it was created — but retention (#290)
+    /// moves the front, and a consumer whose cursor points into a reclaimed
+    /// prefix must be told records are gone, not handed the new front as if
+    /// nothing were missing.
     pub fn fetch_through(
         &mut self,
         start_offset: u64,
@@ -840,10 +1034,17 @@ impl SegmentSet {
         max_records: usize,
         high_watermark: u64,
     ) -> VtopLogResult<FetchBatch> {
+        let earliest = self.base_offset();
+        if start_offset < earliest {
+            return Err(LogError::OffsetBelowRange {
+                requested: start_offset,
+                earliest,
+            });
+        }
         let high_watermark = high_watermark.min(self.committed_offset());
         let mut records: Vec<FetchedRecord> = Vec::new();
         let mut encoded_bytes = 0_usize;
-        let mut cursor = start_offset.max(self.base_offset());
+        let mut cursor = start_offset;
 
         while cursor < high_watermark && records.len() < max_records && encoded_bytes < max_bytes {
             let remaining_bytes = max_bytes - encoded_bytes;
@@ -2267,5 +2468,283 @@ mod tests {
             unrelated.exists(),
             "a file that is not an interrupted atomic write must survive the sweep untouched"
         );
+    }
+
+    /// The claim of #290: a bounded range reclaims its oldest sealed
+    /// segments, stays contiguous, still serves everything it kept, and
+    /// leaves no marker or orphan behind.
+    #[test]
+    fn retention_reclaims_the_oldest_sealed_segments_until_the_bound_holds() {
+        let dir = tempdir().unwrap();
+        let producer = Uuid::from_u128(0xAA);
+        build_rolled_range(dir.path(), producer);
+        let mut set = SegmentSet::open_in(&Env::real(), dir.path())
+            .unwrap()
+            .expect("the range exists");
+        let before = set.sealed().len();
+        assert!(before >= 2);
+        let front_stem = segment_stem(set.sealed()[0].base_offset());
+        let next_offset = set.next_offset();
+
+        // A bound below the current total, with everything acknowledged.
+        let outcome = set
+            .retain(
+                &RetentionPolicy {
+                    max_total_bytes: 600,
+                },
+                next_offset,
+            )
+            .expect("retention must succeed");
+
+        assert!(outcome.segments_removed >= 1, "{outcome:?}");
+        assert_eq!(set.sealed().len(), before - outcome.segments_removed);
+        let new_base = set.base_offset();
+        assert!(new_base > 0, "the front moved");
+        // Everything kept is still readable across the surviving boundaries.
+        let batch = set
+            .fetch_through(new_base, 1 << 20, 10_000, next_offset)
+            .unwrap();
+        assert_eq!(batch.records.len() as u64, next_offset - new_base);
+        // The reclaimed files are gone, marker included; discovery accepts
+        // the directory with zero quarantines.
+        assert!(!dir.path().join(format!("{front_stem}.segment")).exists());
+        assert!(!dir.path().join(RETENTION_INTENT_FILE).exists());
+        drop(set);
+        let catalog = StartupCatalog::discover_in(&Env::real(), dir.path()).unwrap();
+        assert!(catalog.quarantined.is_empty(), "{:?}", catalog.quarantined);
+        // And the range reopens.
+        SegmentSet::open_in(&Env::real(), dir.path())
+            .unwrap()
+            .expect("a retained range must still open");
+    }
+
+    /// Data the quorum has not acknowledged is not reclaimable disk. A floor
+    /// inside the first sealed segment must keep everything.
+    #[test]
+    fn retention_never_reclaims_past_the_acknowledged_floor() {
+        let dir = tempdir().unwrap();
+        let producer = Uuid::from_u128(0xAB);
+        build_rolled_range(dir.path(), producer);
+        let mut set = SegmentSet::open_in(&Env::real(), dir.path())
+            .unwrap()
+            .expect("the range exists");
+        let before = set.sealed().len();
+        let floor_inside_first = set.sealed()[0].next_offset() - 1;
+
+        let outcome = set
+            .retain(&RetentionPolicy { max_total_bytes: 0 }, floor_inside_first)
+            .expect("a fully-bounded retention is still a success");
+
+        assert_eq!(
+            outcome.segments_removed, 0,
+            "nothing below the policy bound is eligible above the floor"
+        );
+        assert_eq!(set.sealed().len(), before);
+    }
+
+    /// A crash between the marker and the unlinks must finish on the next
+    /// open, not quarantine the range.
+    #[test]
+    fn recovery_completes_a_retention_that_wrote_only_the_marker() {
+        let dir = tempdir().unwrap();
+        let producer = Uuid::from_u128(0xAC);
+        build_rolled_range(dir.path(), producer);
+        let set = SegmentSet::open_in(&Env::real(), dir.path())
+            .unwrap()
+            .expect("the range exists");
+        let doomed_front = crate::retention_intent::RetainedSegment {
+            segment_id: set.sealed()[0].segment_id(),
+            base_offset: set.sealed()[0].base_offset(),
+        };
+        let new_base = set.sealed()[1].base_offset();
+        let expected_sealed = set.sealed().len() - 1;
+        let next_offset = set.next_offset();
+        drop(set);
+        // The exact on-disk state of a crash straight after the point of no
+        // return: marker durable, nothing deleted yet.
+        let intent = RetentionIntent {
+            new_base,
+            doomed: vec![doomed_front],
+        };
+        write_atomic(
+            &Env::real(),
+            &dir.path().join(RETENTION_INTENT_FILE),
+            &intent.encode().unwrap(),
+        )
+        .unwrap();
+
+        let mut reopened = SegmentSet::open_in(&Env::real(), dir.path())
+            .unwrap()
+            .expect("recovery must finish the retention and open the range");
+        assert_eq!(reopened.sealed().len(), expected_sealed);
+        assert_eq!(reopened.base_offset(), new_base);
+        assert!(!dir.path().join(RETENTION_INTENT_FILE).exists());
+        assert!(!dir
+            .path()
+            .join(format!(
+                "{}.segment",
+                segment_stem(doomed_front.base_offset)
+            ))
+            .exists());
+        let batch = reopened
+            .fetch_through(new_base, 1 << 20, 10_000, next_offset)
+            .unwrap();
+        assert_eq!(batch.records.len() as u64, next_offset - new_base);
+    }
+
+    /// A marker that does not decode names an intent that cannot be honoured;
+    /// the range must refuse to open on a guess.
+    #[test]
+    fn a_corrupt_retention_marker_quarantines_instead_of_guessing() {
+        let dir = tempdir().unwrap();
+        let producer = Uuid::from_u128(0xAD);
+        build_rolled_range(dir.path(), producer);
+        std::fs::write(dir.path().join(RETENTION_INTENT_FILE), b"not a marker").unwrap();
+
+        let refused = SegmentSet::open_in(&Env::real(), dir.path());
+        assert!(
+            refused.is_err(),
+            "an unhonourable retention intent must refuse the open"
+        );
+        let catalog = StartupCatalog::discover_in(&Env::real(), dir.path()).unwrap();
+        assert!(
+            catalog
+                .quarantined
+                .iter()
+                .any(|item| item.reasons.iter().any(|reason| matches!(
+                    reason,
+                    crate::QuarantineReason::InvalidRetentionIntent(_)
+                ))),
+            "{:?}",
+            catalog.quarantined
+        );
+    }
+
+    /// The nameable error #290 requires: a cursor pointing into the reclaimed
+    /// prefix is told the records are gone, not silently skipped to the new
+    /// front.
+    #[test]
+    fn a_fetch_below_the_retained_base_names_the_missing_prefix() {
+        let dir = tempdir().unwrap();
+        let producer = Uuid::from_u128(0xAE);
+        build_rolled_range(dir.path(), producer);
+        let mut set = SegmentSet::open_in(&Env::real(), dir.path())
+            .unwrap()
+            .expect("the range exists");
+        let next_offset = set.next_offset();
+        set.retain(
+            &RetentionPolicy {
+                max_total_bytes: 600,
+            },
+            next_offset,
+        )
+        .unwrap();
+        let earliest = set.base_offset();
+        assert!(earliest > 0);
+
+        let refused = set.fetch_through(0, 1 << 20, 10_000, next_offset);
+        match refused {
+            Err(LogError::OffsetBelowRange {
+                requested,
+                earliest: named,
+            }) => {
+                assert_eq!(requested, 0);
+                assert_eq!(named, earliest);
+            }
+            other => panic!("a retained offset must be a nameable error, got {other:?}"),
+        }
+    }
+
+    /// The exact state a FAILED pass leaves behind: marker durable, the
+    /// in-memory front already drained, deletions incomplete, and the error
+    /// swallowed by a caller that keeps serving. A later pass must finish
+    /// that intent before writing its own — replacing it would forget the
+    /// old doomed list and leave its half-deleted files as orphans no
+    /// recovery ever revisits.
+    #[test]
+    fn a_new_retention_pass_finishes_an_unfinished_marker_first() {
+        let dir = tempdir().unwrap();
+        let producer = Uuid::from_u128(0xB0);
+        build_rolled_range(dir.path(), producer);
+        let mut set = SegmentSet::open_in(&Env::real(), dir.path())
+            .unwrap()
+            .expect("the range exists");
+        let front = crate::retention_intent::RetainedSegment {
+            segment_id: set.sealed()[0].segment_id(),
+            base_offset: set.sealed()[0].base_offset(),
+        };
+        let front_stem = segment_stem(front.base_offset);
+        let new_base = set.sealed()[1].base_offset();
+        let intent = RetentionIntent {
+            new_base,
+            doomed: vec![front],
+        };
+        write_atomic(
+            &Env::real(),
+            &dir.path().join(RETENTION_INTENT_FILE),
+            &intent.encode().unwrap(),
+        )
+        .unwrap();
+        // What drain(..cut) had already done before the failure.
+        set.sealed.remove(0);
+
+        // A later pass whose own policy is satisfied must STILL finish the
+        // unfinished intent rather than ignoring or replacing it.
+        let outcome = set
+            .retain(
+                &RetentionPolicy {
+                    max_total_bytes: u64::MAX,
+                },
+                u64::MAX,
+            )
+            .expect("the pass must complete the pending intent");
+        assert_eq!(outcome.segments_removed, 0, "its own policy dooms nothing");
+        assert!(
+            !dir.path().join(format!("{front_stem}.segment")).exists(),
+            "the OLD intent's deletions must have been finished"
+        );
+        assert!(!dir.path().join(RETENTION_INTENT_FILE).exists());
+        drop(set);
+        let reopened = SegmentSet::open_in(&Env::real(), dir.path())
+            .unwrap()
+            .expect("no orphans, no quarantine");
+        assert_eq!(reopened.base_offset(), new_base);
+    }
+
+    /// The frontier of a reclaimed segment survives in its successor's
+    /// sidecar, so the same producer continues its sequence across a
+    /// retention — worth a test, not an assumption (#290).
+    #[test]
+    fn the_producer_frontier_survives_a_retention() {
+        let dir = tempdir().unwrap();
+        let producer = Uuid::from_u128(0xAF);
+        build_rolled_range(dir.path(), producer);
+        let mut set = SegmentSet::open_in(&Env::real(), dir.path())
+            .unwrap()
+            .expect("the range exists");
+        let next_offset = set.next_offset();
+        set.retain(
+            &RetentionPolicy {
+                max_total_bytes: 600,
+            },
+            next_offset,
+        )
+        .unwrap();
+        drop(set);
+
+        // Reopen (as a restart would) and continue the same producer at its
+        // next sequence: the inherited frontier must admit it, and a replay
+        // of an already-accepted sequence must still be recognized as such.
+        let mut reopened = SegmentSet::open_in(&Env::real(), dir.path())
+            .unwrap()
+            .expect("a retained range must reopen");
+        reopened
+            .append_group(
+                &[record(producer, 40)],
+                Durability::Fsync,
+                Uuid::from_u128(40_000),
+            )
+            .expect("the producer's sequence must continue across the retention");
+        assert_eq!(reopened.next_offset(), next_offset + 1);
     }
 }

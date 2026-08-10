@@ -140,6 +140,11 @@ pub enum ErrorCode {
     CheckpointConflict = 11,
     /// Topic epoch, range generation, or segment lineage did not match.
     WrongLineage = 12,
+    /// The requested offset is below the range's earliest: the records were
+    /// reclaimed by retention (#290). Distinct from `Storage` because the
+    /// remedy is a consumer decision (reset to earliest, or alert on the data
+    /// loss), not an operator investigating a fault.
+    OffsetRetained = 13,
 }
 
 impl ErrorCode {
@@ -157,6 +162,7 @@ impl ErrorCode {
             10 => Ok(Self::ProtocolViolation),
             11 => Ok(Self::CheckpointConflict),
             12 => Ok(Self::WrongLineage),
+            13 => Ok(Self::OffsetRetained),
             _ => Err(ProtocolError::InvalidFrame(format!(
                 "unknown error code {value}"
             ))),
