@@ -75,7 +75,9 @@ As of **August 2026** (repo at v0.3.0):
 - PostgreSQL backend behind `--features postgres`: `PgStateStore`, state-aware
   DB constraints, retry-on-SQLSTATE-`40001`, `vtopctl migrate` under a
   separate privileged identity, runtime role denied DDL/`DELETE`/`TRUNCATE`
-  (Phase 3). **Tier 1 (single engine + Postgres) is deployable today.**
+  (Phase 3). **Tier 1 (single engine + Postgres) is deployable today from a
+  source build with `--features postgres`** — release binaries and the Docker
+  image do not yet enable the feature.
 - Ledger retention/pruning: `engine.ledger_retention_days` incremental delete
   on SQLite; `vtopctl prune-ledger` under a maintenance identity on
   PostgreSQL (#128, part of Phase 8).
@@ -324,11 +326,26 @@ keep the old store until validation passes (rollback path).
 committed offsets, so a fresh store does not lose Kafka progress (it
 re-discovers). This is the *only* path where "no migration" holds.
 
-### 6.5 Database schema & constraints (defense in depth) **[IMPLEMENTED]**
-Applied by `vtopctl migrate` under a deployment identity; the engine role gets
-only schema `USAGE` plus `SELECT, INSERT, UPDATE` on `batches`, and the live
-battery proves DDL, `DELETE`, and `TRUNCATE` remain denied. The constraints are
-**state-aware**:
+### 6.5 Database schema & constraints (defense in depth) **[IMPLEMENTED — with one gap]**
+
+**What ships today**
+(`crates/vtop-state/migrations/postgres/0001_state_store.sql`, applied by
+`vtopctl migrate` under a deployment identity): the `batches` table with a
+CHECK-constrained state enum, an **invariant trigger** that rejects
+`source_committed` without verification (the commit rule at the database
+layer), state / source / commit-cursor indexes, and the privilege split — the
+engine role gets only schema `USAGE` plus `SELECT, INSERT, UPDATE` on
+`batches`, and the live battery proves DDL, `DELETE`, and `TRUNCATE` remain
+denied. Progress markers are stored as JSON columns
+(`progress_start_json` / `progress_end_json`).
+
+**The gap:** the **UNIQUE source-range dedup indexes below are [PROPOSED]**,
+not shipped — they require the marker components as real columns rather than
+JSON. Until they exist, duplicate ranges are prevented by the single-instance
+lock and ledger logic, **not** by the database; they must land with the
+Phase 5 multi-writer work.
+
+The schema below is the **reference/target** shape (state-aware constraints):
 
 ```sql
 CREATE TABLE batches (
@@ -535,9 +552,11 @@ One engine, **SQLite**, single MinIO, single Kafka (KRaft). The current lab.
 ### Tier 1 — Single engine + external Postgres (small prod, durable store)
 One engine, **Postgres** ledger (backable, survives engine host restart), S3/MinIO.
 One engine (no horizontal scale) but a proper durable store. **Testable on one
-machine** (add a `postgres` Compose service). **Available today** — the Postgres
-backend is implemented (§6); see
-[`POSTGRES_DEPLOYMENT.md`](POSTGRES_DEPLOYMENT.md).
+machine** (add a `postgres` Compose service). **Available today from source** —
+the Postgres backend is implemented (§6) but feature-gated: build `vtopctl`
+with `--features postgres`. The published release binaries and Docker image do
+**not** yet enable the feature and reject `postgres://` state stores at
+runtime. See [`POSTGRES_DEPLOYMENT.md`](POSTGRES_DEPLOYMENT.md).
 
 ### Tier 2 — HA fleet, Kafka-primary (recommended enterprise baseline) **[PROPOSED]**
 ```
@@ -575,7 +594,7 @@ Replayability differs by source — design accordingly:
 | If your reality is… | Use |
 |---|---|
 | Laptop / demo | Tier 0 (Compose, SQLite) |
-| Small prod, one engine, want backups | Tier 1 (Postgres) — available today |
+| Small prod, one engine, want backups | Tier 1 (Postgres) — available today via a `--features postgres` source build |
 | Enterprise, Kafka is primary | **Tier 2** (k8s fleet) — pending fleet mode |
 | Enterprise + distributed file/syslog | Tier 3 (+ etcd) — pending |
 
@@ -847,12 +866,19 @@ Phases are dependency-ordered and independently shippable. Deterministic keys
 replay each other's work, replays must stop producing duplicate objects.
 
 ```text
-  0 ──► 1 ──► 2 ──► 3 ──► 4 ──► 5 ──► 6 ──► 7 ──► 8 ──► (9 optional) ──► 10
-  base  trait  inv   PG   keys  fleet  obs   k8s  DR/sec    file HA     review
-  ✅     ✅    ✅    ✅    ⬜     ⬜     ◐     ⬜    ◐          ⬜           ⬜
+  Critical path:   0 ──► 1 ──► 2 ──► 3 ──► 4 ──► 5 ──► 7 ──► 10
+                  base  trait  inv   PG   keys  fleet  k8s  review
 
-  ✅ done   ◐ partial   ⬜ not started
+  Parallel tracks: 0 ──► 6  observability & alerting (independent; most
+                             valuable alongside Phase 5)
+                   3 ──► 8  retention / backup / DR / security
+                 3,7 ──► 9  file/syslog HA (optional, gated on §24.1)
+
+  Status: 0–3 ✅ done · 6, 8 ◐ partial · 4, 5, 7, 9, 10 ⬜ not started
 ```
+
+(True dependencies per phase are in the §21 table; the critical path shows
+what blocks the Tier 2 fleet, not a claim that every phase blocks the next.)
 
 ### Phase 0 — Baseline hardening ✅ DONE
 Made the single-node SQLite + Kafka + MinIO Compose deployment measurable and
@@ -871,8 +897,9 @@ SQLite.
 
 ### Phase 3 — Postgres backend + DB constraints ✅ DONE
 `PgStateStore` (PgPool, `$N` placeholders) behind `--features postgres`;
-schema constraints from §6.5; bounded retry on SQLSTATE `40001`; battery
-green on Postgres. DDL is an explicit `vtopctl migrate` step under a
+the shipped subset of §6.5 (state-enum CHECK + commit-rule invariant trigger +
+state/source indexes — the UNIQUE range indexes remain §6.5's open gap);
+bounded retry on SQLSTATE `40001`; battery green on Postgres. DDL is an explicit `vtopctl migrate` step under a
 deployment identity; the live battery proves the runtime role cannot run DDL,
 `DELETE`, or `TRUNCATE`. See [`POSTGRES_DEPLOYMENT.md`](POSTGRES_DEPLOYMENT.md).
 
@@ -901,8 +928,10 @@ deployment identity; the live battery proves the runtime role cannot run DDL,
   `VTOP_KAFKA_GROUP_MODE=assign|subscribe`; revocation handling; poll/session/
   heartbeat tuning; **multi-writer recovery** in the state store
   (`SELECT … FOR UPDATE SKIP LOCKED` or `lease_owner`/`lease_until`, #93);
-  retire the single-instance restriction (#66) for subscribe mode;
-  `VTOP_INSTANCE_ID` for stable member identity.
+  the **UNIQUE source-range dedup indexes** (§6.5's open gap — requires
+  promoting marker components out of the JSON columns); retire the
+  single-instance restriction (#66) for subscribe mode; `VTOP_INSTANCE_ID`
+  for stable member identity.
 - **Test plan:** two replicas share a topic; kill one; assert rebalance, no
   double-commit, no commit-before-verify, and no double-recovery of the same
   incomplete batch.
@@ -1004,7 +1033,7 @@ deployment identity; the live battery proves the runtime role cannot run DDL,
 |---|---|---|---|---|
 | Object Lock prevents overwrite-based retry | Retries fail / stuck batches | Deterministic keys + "existing verified = success" / version_id (§7.2) | 4 | open |
 | Kafka rebalance during in-flight batch | Duplicate work / spurious revocation | Revocation handler; tune poll/session timeouts; cooperative rebalancing (§8.3) | 5 | open |
-| Two engines over one store double-recover | Duplicate ingestion / double-commit | Today: startup instance lock (#66) refuses it; fleet mode adds claim/fencing (#93) | 5 | mitigated (blocked, not solved) |
+| Two engines over one store double-recover | Duplicate ingestion / double-commit | **Same host only:** the startup instance lock (#66) refuses it. **Cross-host over shared Postgres it cannot detect** — unsupported and warned at startup (§19); open until claim/fencing lands (#93) | 5 | partially mitigated (same-host only) |
 | State database unavailable | Engine cannot commit | Fails safe (stops committing); HA store; alerts | 3,6 | mitigated |
 | Object uploaded but manifest upload failed | Batch stuck pre-VERIFIED | Retry manifest; verify existing object; bounded `retry_count` → FAILED | 0,3 | mitigated |
 | Manifest uploaded but source-commit failed | Possible replay | Recovery retries commit; deterministic keys make replay idempotent | 4 | partially mitigated (duplicates until 4) |
@@ -1033,7 +1062,8 @@ Correctness & invariant
 State store
   [x] StateStore trait + shared test battery green on SQLite AND Postgres
   [x] retry-on-40001 implemented                                       (load test pending)
-  [x] schema constraints + indexes (UNIQUE source range; state index)
+  [x] state-enum CHECK + commit-rule invariant trigger + state/source indexes
+  [ ] UNIQUE source-range dedup indexes (markers are JSON columns today) (Phase 5)
   [x] runtime role denied DDL/DELETE/TRUNCATE; migrate/prune identities split
   [x] retention/pruning policy (engine.ledger_retention_days, #128)
   [ ] multi-writer recovery (FOR UPDATE SKIP LOCKED or leases)         (Phase 5)
@@ -1118,7 +1148,8 @@ proven by a scenario that drives real processes, not only by unit coverage.
   Yugabyte/Cockroach is now a **config-string** choice (§6, §12), with the
   invariant enforced in core logic **and** database constraints, and
   retry-on-`40001` in place. **Tier 1 (single engine + Postgres) is deployable
-  today.**
+  today from a `--features postgres` source build** (release artifacts don't
+  yet enable the feature).
 - **Two current-behavior caveats the design must still fix for fleet HA:**
   (a) object keys are **non-deterministic** → replay makes **duplicates**; fix with
   **deterministic keys** (Phase 4) for idempotency + Object Lock safety —
