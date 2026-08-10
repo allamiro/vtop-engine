@@ -781,21 +781,38 @@ print($expr)
 await_lease_holder() {
   local id="$1" expected="$2" limit="${3:-$ELECTION_TIMEOUT_SECONDS}"
   local deadline=$((SECONDS + limit)) holder epoch
+  # The failure evidence #318 needed and did not have: a bare
+  # "holder: none" cannot distinguish reads that kept FAILING from
+  # metadata that truly held no lease, and those verdicts point at
+  # different bugs. Count both, and remember every distinct holder
+  # observed, so a recurrence carries its own diagnosis.
+  local reads_ok=0 reads_failed=0 observed=""
   while :; do
     # A transient failed read — a metadata group mid-election refuses the
     # linearizable read — consumes its share of the timeout rather than
     # aborting the scenario under `set -e`.
-    holder="$(lease_field "$id" "d['lease']['holder_node_uuid'] if d.get('lease') else ''")" \
-      || holder=""
+    if holder="$(lease_field "$id" "d['lease']['holder_node_uuid'] if d.get('lease') else ''")"; then
+      reads_ok=$((reads_ok + 1))
+      local tag="${holder:-none}"
+      [[ " $observed " == *" $tag "* ]] || observed="$observed $tag"
+    else
+      holder=""
+      reads_failed=$((reads_failed + 1))
+    fi
     if [[ "$holder" == "$expected" ]]; then
-      epoch="$(lease_field "$id" "d['lease']['fencing_epoch']")" || epoch=""
-      if [[ -n "$epoch" ]]; then
+      # The epoch follow-up is a metadata read too: a run where the holder
+      # answers but this one keeps failing must count as read failures, or
+      # the evidence points away from the exact fault it is reporting.
+      if epoch="$(lease_field "$id" "d['lease']['fencing_epoch']")" && [[ -n "$epoch" ]]; then
         echo "$epoch"
         return 0
+      else
+        reads_failed=$((reads_failed + 1))
       fi
     fi
     [[ $SECONDS -lt $deadline ]] \
-      || fail "range not held by $expected after ${limit}s (holder: ${holder:-none})"
+      || fail "range not held by $expected after ${limit}s (last holder: ${holder:-none}; \
+${reads_ok} reads answered, ${reads_failed} failed; holders observed:${observed:- none})"
     sleep 0.2
   done
 }
