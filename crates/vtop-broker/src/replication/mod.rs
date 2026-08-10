@@ -575,6 +575,28 @@ impl InProcessFollower {
         if divergence >= self.next_offset() {
             return Ok(0);
         }
+        // A divergence verdict BELOW this replica's earliest offset points at
+        // records retention reclaimed (#290): the epoch entries that produced
+        // it describe history whose records neither party can compare any
+        // more, and the truncation it would mandate is below the acknowledged
+        // floor by construction — retention never reclaims above it. Failing
+        // the fence over that would exclude a valid replica from every
+        // promotion for a dispute about data it no longer holds. The honest
+        // verdict is the journal-less one: unprovable, touch nothing. (The
+        // journal is deliberately NOT compacted at retention: re-anchoring
+        // surviving epochs at each replica's own retained base would give the
+        // same epoch different start offsets on different replicas and
+        // manufacture exactly the false divergence this guards against.)
+        let base_offset = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.segment.base_offset()
+        };
+        if divergence < base_offset {
+            return Ok(0);
+        }
         match self.truncate_to(divergence) {
             Ok(outcome) => Ok(outcome.records_removed),
             Err(BrokerError::TruncationBelowAcknowledged {
