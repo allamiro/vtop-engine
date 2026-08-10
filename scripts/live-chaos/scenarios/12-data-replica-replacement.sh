@@ -564,21 +564,31 @@ done
 [[ "$SPARE_SEALED" -gt 0 ]] \
   || fail "the replacement lost its sealed segments to the leader transition; the repaired \
 range was truncated, which is #315 reopened"
-# The committed offset must REACH THE ACKNOWLEDGED FLOOR, not merely survive:
-# a replica that kept its bytes but cannot rejoin replication is repaired in
-# name only. Deadline-polled, because the new leader's stream has to catch the
-# newcomer up before its boundary moves.
+# The committed offset must HOLD THE SEALED-PREFIX END, not merely leave files
+# on disk: a truncation would drag the boundary back toward the base even if a
+# directory listing still showed segments. Deadline-polled, because the
+# restarted leader's HWM stream has to reach the newcomer before its boundary
+# is republished.
+#
+# The bound is $SEG_NEXT — the end of the sealed prefix the repair installed —
+# and NOT the acknowledged floor of $ACKED. The records in ($SEG_NEXT, $ACKED]
+# live in the leader's active tail, which only the append path can deliver,
+# and a restarted leader's retransmission buffer is empty: that remaining gap
+# is #306's boundary, stated below rather than silently waited on.
 SPARE_DEADLINE=$((SECONDS + PROGRESS_TIMEOUT_SECONDS))
 SPARE_OFFSET="$(follower_committed_offset 3)"
-while [[ "$SPARE_OFFSET" -lt "$ACKED" ]]; do
+while [[ "$SPARE_OFFSET" -lt "$SEG_NEXT" ]]; do
   [[ $SECONDS -lt $SPARE_DEADLINE ]] \
-    || fail "the replacement kept its data (sealed=$SPARE_SEALED) but its committed offset \
-stalled at $SPARE_OFFSET of $ACKED; it survived the transition without rejoining replication"
+    || fail "the replacement kept $SPARE_SEALED sealed segment(s) but its committed offset \
+reads $SPARE_OFFSET, below the sealed-prefix end of $SEG_NEXT; the repaired range was \
+truncated or never re-served, which is #315 reopened"
   sleep 1
   SPARE_OFFSET="$(follower_committed_offset 3)"
 done
-log "the replacement survived the leader transition with $SPARE_SEALED sealed segment(s) and \
-committed through $SPARE_OFFSET >= $ACKED — the repair outlives the failover that used to erase it"
+log "the replacement survived the leader transition with $SPARE_SEALED sealed segment(s), \
+committed through $SPARE_OFFSET >= $SEG_NEXT — the repair outlives the failover that used to \
+erase it. The $((ACKED - SEG_NEXT)) tail records above the sealed prefix remain out of its \
+reach until #306 gives the gap a road back"
 
 # Named directly rather than through `${!name}`: indirect expansion is not a
 # USE as far as shellcheck is concerned, so the variables stayed flagged and
