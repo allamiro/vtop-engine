@@ -111,6 +111,10 @@ preflight_common_tools() {
   require_command sed "Install a POSIX sed implementation."
   # Health gating (#224) polls each node's /readyz over HTTP.
   require_command curl "Install curl; the harness gates node readiness on the /readyz endpoint."
+  # meta_admin_read bounds each attempt with GNU timeout: the admin transport
+  # has no per-request deadline of its own, so a wedged endpoint would
+  # otherwise hold the read past the deadline it advertises.
+  require_command timeout "Install GNU coreutils."
 }
 
 require_integer_in_range() { # <name> <value> <minimum> <maximum>
@@ -1348,6 +1352,57 @@ meta_admin() { # <node-id> <subcommand + args...>
 meta_admin_as() {
   local id="$1" cert="$2"; shift 2
   "$VTOPCTL" --json meta "$@" --config "$(emit_admin_config_as "$id" "$cert")"
+}
+
+# meta_admin_read <output-file> <node-id> <subcommand + args...> — a metadata
+# admin READ, deadline-polled into <output-file>.
+#
+# Linearizable reads go through ReadIndex: the leader must hear from a quorum
+# before it may answer, and on a loaded runner that round can momentarily find
+# only the leader itself. The refusal is CORRECT — the read could not be
+# proven linearizable at that instant — but it is a fact about the instant,
+# not about the cluster, and a one-shot caller once turned it into a scenario
+# failure 76 milliseconds after the write it was reading back (#326). So the
+# transient is absorbed under the suite's deadline like every other
+# observation of the cluster, and a read that keeps failing until the deadline
+# logs what it observed — attempts made, last refusal — before the caller's
+# own fail names what the read was for.
+#
+# READS ONLY. Every mutating admin command carries a compare-and-swap token
+# precisely because resubmitting a write that may already have committed is
+# ambiguous; a retrying wrapper around a write would launder that ambiguity
+# away instead of surfacing it.
+#
+# Each ATTEMPT is bounded too, not only the loop: the admin transport awaits
+# connect, TLS and the response frame with no deadline of its own, so an
+# endpoint that accepts the connection and then stalls would hold a one-shot
+# attempt — and with it this whole read — past the deadline the helper
+# advertises. `timeout` cannot spawn a shell function, so the bound wraps
+# meta_admin's body inlined, kept identical deliberately.
+meta_admin_read() {
+  local out="$1" id="$2"; shift 2
+  local deadline=$((SECONDS + PROGRESS_TIMEOUT_SECONDS)) attempts=0 remaining code
+  while :; do
+    attempts=$((attempts + 1))
+    remaining=$((deadline - SECONDS))
+    [[ $remaining -ge 1 ]] || remaining=1
+    code=0
+    # --kill-after makes the bound a guarantee, not a request: on expiry
+    # `timeout` only sends TERM, and a process that does not die on TERM
+    # would still be waited on indefinitely — the exact stall this bound
+    # exists to rule out.
+    timeout --kill-after=1 "$remaining" \
+      "$VTOPCTL" --json meta "$@" --config "$(emit_admin_config "$id")" \
+      > "$out" 2> "$out.stderr" || code=$?
+    [[ $code -eq 0 ]] && return 0
+    if [[ $SECONDS -ge $deadline ]]; then
+      log "metadata refused [$1] $attempts time(s) over ${PROGRESS_TIMEOUT_SECONDS}s \
+(last exit $code; 124 means the attempt hit its time bound rather than answering); \
+last refusal: $(tail -c 300 "$out.stderr" | tr '\n' ' ')"
+      return 1
+    fi
+    sleep 0.2
+  done
 }
 
 meta_status_field() { # <node-id> <jq-ish python field path>

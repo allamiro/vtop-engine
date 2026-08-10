@@ -178,11 +178,14 @@ F2=$(start_follower 2 "" "" "$LEADER_ID")
 LEADER=$(start_leader_with_lease "$LEADER_ID" replacement)
 log "data plane up: leader plus two followers"
 
-HOLDER="$(await_lease_holder "$LEADER_ID" "$LEADER_UUID")"
-EPOCH="$(lease_field "$LEADER_ID" 'd["lease"]["fencing_epoch"]')"
+# THE EPOCH await_lease_holder ALREADY RETURNED, not a second read — the same
+# rule the post-replacement restart below states: a separate `lease_field`
+# sits outside the helper's retry loop, and a momentary metadata refusal
+# turns it into an abort about nothing the scenario tests (#326).
+EPOCH="$(await_lease_holder "$LEADER_ID" "$LEADER_UUID")"
 [[ "$EPOCH" == "$EXPECTED_FIRST_EPOCH" ]] \
   || fail "expected the first acquisition to mint epoch $EXPECTED_FIRST_EPOCH, got $EPOCH"
-log "lease held by $HOLDER at epoch $EPOCH"
+log "lease held by $LEADER_UUID at epoch $EPOCH"
 
 # A COMPLETED produce, not an interrupted one. Scenario 09 already covers the
 # race between a dying producer and an election; what this scenario needs is a
@@ -248,10 +251,14 @@ log "sealed segment registered in metadata"
 # here is the one `segment verify` re-derived above, and metadata compares it
 # against what was registered, so this cannot bless a segment as something it
 # is not.
+# DEADLINE-POLLED, like every observation of the cluster this suite makes: a
+# linearizable read taken 76ms after the register once found the leader's
+# ReadIndex round with only its own answer on a loaded runner, and the one-shot
+# read turned that instant into a scenario failure (#326).
 SEG_AFTER_REGISTER="$WORKDIR/placement-after-register.json"
-meta_admin "$LEADER_ID" get-placement \
+meta_admin_read "$SEG_AFTER_REGISTER" "$LEADER_ID" get-placement \
   --topic-uuid "$TOPIC_UUID" --range-uuid "$RANGE_ID" --segment-uuid "$SEG_UUID" \
-  > "$SEG_AFTER_REGISTER" || fail "could not read the segment after registering it"
+  || fail "could not read the segment after registering it"
 meta_admin "$LEADER_ID" mark-segment-verified \
   --topic-uuid "$TOPIC_UUID" --range-uuid "$RANGE_ID" --segment-uuid "$SEG_UUID" \
   --content-root "$SEG_ROOT" \
@@ -267,9 +274,9 @@ log "segment marked verified against the root the bytes produced"
 # a first placement could only be reached by guessing an order and resubmitting
 # until one was accepted.
 PLACEMENT_JSON="$WORKDIR/placement-initial.json"
-meta_admin "$LEADER_ID" get-placement \
+meta_admin_read "$PLACEMENT_JSON" "$LEADER_ID" get-placement \
   --topic-uuid "$TOPIC_UUID" --range-uuid "$RANGE_ID" --segment-uuid "$SEG_UUID" \
-  --for-replication-factor "$RF" > "$PLACEMENT_JSON" \
+  --for-replication-factor "$RF" \
   || fail "could not read the placement proposal"
 
 
@@ -294,9 +301,9 @@ log "placement committed at the factor and order metadata chose"
 # The order must round-trip. A placement that came back permuted would be
 # refused by every later command, and the refusal would say nothing about why.
 COMMITTED="$WORKDIR/placement-committed.json"
-meta_admin "$LEADER_ID" get-placement \
+meta_admin_read "$COMMITTED" "$LEADER_ID" get-placement \
   --topic-uuid "$TOPIC_UUID" --range-uuid "$RANGE_ID" --segment-uuid "$SEG_UUID" \
-  > "$COMMITTED" || fail "could not read the committed placement"
+  || fail "could not read the committed placement"
 READ_BACK="$(json_field "$COMMITTED" '" ".join(d["replica_nodes"])')"
 [[ "$READ_BACK" == "$PROPOSED" ]] \
   || fail "the committed placement came back in a different order: proposed [$PROPOSED], read [$READ_BACK]"
@@ -322,9 +329,9 @@ log "rebalance opened: $FOLLOWER1_UUID -> $SPARE_UUID"
 # RF - 1. That is the whole reason the flow has a rebalance step rather than a
 # swap.
 MOVING="$WORKDIR/placement-moving.json"
-meta_admin "$LEADER_ID" get-placement \
+meta_admin_read "$MOVING" "$LEADER_ID" get-placement \
   --topic-uuid "$TOPIC_UUID" --range-uuid "$RANGE_ID" --segment-uuid "$SEG_UUID" \
-  > "$MOVING" || fail "could not read the placement mid-move"
+  || fail "could not read the placement mid-move"
 MOVING_COUNT="$(json_field "$MOVING" 'len(d["replica_nodes"])')"
 [[ "$MOVING_COUNT" == "$DURING_MOVE" ]] \
   || fail "expected RF+1 = $DURING_MOVE replicas while the move is open, got $MOVING_COUNT"
@@ -432,9 +439,9 @@ log "replacement proof committed"
 
 # --- now retirement is accepted ---------------------------------------------
 PROVEN="$WORKDIR/placement-proven.json"
-meta_admin "$LEADER_ID" get-placement \
+meta_admin_read "$PROVEN" "$LEADER_ID" get-placement \
   --topic-uuid "$TOPIC_UUID" --range-uuid "$RANGE_ID" --segment-uuid "$SEG_UUID" \
-  > "$PROVEN" || fail "could not read the placement after the proof"
+  || fail "could not read the placement after the proof"
 
 meta_admin "$LEADER_ID" plan-replica-retirement \
   --topic-uuid "$TOPIC_UUID" --range-uuid "$RANGE_ID" --segment-uuid "$SEG_UUID" \
@@ -445,9 +452,9 @@ meta_admin "$LEADER_ID" plan-replica-retirement \
 log "retirement planned, on the strength of committed evidence"
 
 PLANNED="$WORKDIR/placement-planned.json"
-meta_admin "$LEADER_ID" get-placement \
+meta_admin_read "$PLANNED" "$LEADER_ID" get-placement \
   --topic-uuid "$TOPIC_UUID" --range-uuid "$RANGE_ID" --segment-uuid "$SEG_UUID" \
-  > "$PLANNED" || fail "could not read the placement after planning"
+  || fail "could not read the placement after planning"
 # THE PHYSICAL EFFECT, before the record of it. `confirm-replica-retired`
 # asserts the local bytes are gone; confirming while they sit on disk records
 # something untrue and the scenario would pass having exercised the bookkeeping
@@ -467,9 +474,9 @@ log "retirement confirmed"
 
 # --- the placement names the newcomer, not the dead replica -----------------
 FINAL="$WORKDIR/placement-final.json"
-meta_admin "$LEADER_ID" get-placement \
+meta_admin_read "$FINAL" "$LEADER_ID" get-placement \
   --topic-uuid "$TOPIC_UUID" --range-uuid "$RANGE_ID" --segment-uuid "$SEG_UUID" \
-  > "$FINAL" || fail "could not read the final placement"
+  || fail "could not read the final placement"
 FINAL_NODES="$(json_field "$FINAL" '" ".join(d["replica_nodes"])')"
 grep -q "$SPARE_UUID" <<< "$FINAL_NODES" \
   || fail "the replacement is not in the final placement: $FINAL_NODES"
@@ -497,9 +504,9 @@ meta_admin "$LEADER_ID" set-node-state \
 # And it is really out: a placement proposal at the same factor must no longer
 # be able to name it.
 CANDIDATES="$WORKDIR/placement-after-dead.json"
-meta_admin "$LEADER_ID" get-placement \
+meta_admin_read "$CANDIDATES" "$LEADER_ID" get-placement \
   --topic-uuid "$TOPIC_UUID" --range-uuid "$RANGE_ID" --segment-uuid "$SEG_UUID" \
-  --for-replication-factor "$RF" > "$CANDIDATES" \
+  --for-replication-factor "$RF" \
   || fail "could not re-read the placement proposal after marking the node dead"
 if grep -q "$FOLLOWER1_UUID" <<< "$(json_field "$CANDIDATES" 'd["proposal"]')"; then
   fail "the lost replica is still a placement candidate after being marked dead"
