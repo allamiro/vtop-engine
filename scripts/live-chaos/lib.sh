@@ -1350,6 +1350,39 @@ meta_admin_as() {
   "$VTOPCTL" --json meta "$@" --config "$(emit_admin_config_as "$id" "$cert")"
 }
 
+# meta_admin_read <output-file> <node-id> <subcommand + args...> — a metadata
+# admin READ, deadline-polled into <output-file>.
+#
+# Linearizable reads go through ReadIndex: the leader must hear from a quorum
+# before it may answer, and on a loaded runner that round can momentarily find
+# only the leader itself. The refusal is CORRECT — the read could not be
+# proven linearizable at that instant — but it is a fact about the instant,
+# not about the cluster, and a one-shot caller once turned it into a scenario
+# failure 76 milliseconds after the write it was reading back (#326). So the
+# transient is absorbed under the suite's deadline like every other
+# observation of the cluster, and a read that keeps failing until the deadline
+# logs what it observed — attempts made, last refusal — before the caller's
+# own fail names what the read was for.
+#
+# READS ONLY. Every mutating admin command carries a compare-and-swap token
+# precisely because resubmitting a write that may already have committed is
+# ambiguous; a retrying wrapper around a write would launder that ambiguity
+# away instead of surfacing it.
+meta_admin_read() {
+  local out="$1" id="$2"; shift 2
+  local deadline=$((SECONDS + PROGRESS_TIMEOUT_SECONDS)) attempts=0
+  while :; do
+    attempts=$((attempts + 1))
+    meta_admin "$id" "$@" > "$out" 2> "$out.stderr" && return 0
+    if [[ $SECONDS -ge $deadline ]]; then
+      log "metadata refused [$1] $attempts time(s) over ${PROGRESS_TIMEOUT_SECONDS}s; \
+last refusal: $(tail -c 300 "$out.stderr" | tr '\n' ' ')"
+      return 1
+    fi
+    sleep 0.2
+  done
+}
+
 meta_status_field() { # <node-id> <jq-ish python field path>
   local id="$1" field="$2"
   meta_admin "$id" status | python3 -c "
