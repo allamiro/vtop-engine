@@ -334,29 +334,44 @@ fn a_replica_with_records_but_no_history_is_not_truncated() {
         "precondition: records without history"
     );
 
+    let real_history = [
+        EpochStart {
+            epoch: OLD_EPOCH,
+            start_offset: 0,
+        },
+        EpochStart {
+            epoch: NEW_EPOCH,
+            start_offset: 10,
+        },
+    ];
     h.meta.set(NEW_EPOCH);
-    let fenced = h
-        .node
-        .fence(
-            NEW_EPOCH,
-            &[
-                EpochStart {
-                    epoch: OLD_EPOCH,
-                    start_offset: 0,
-                },
-                EpochStart {
-                    epoch: NEW_EPOCH,
-                    start_offset: 10,
-                },
-            ],
-        )
-        .unwrap();
+    let fenced = h.node.fence(NEW_EPOCH, &real_history).unwrap();
 
     assert_eq!(
         fenced.truncated_records, 0,
         "a claim this replica cannot check must not delete what it holds"
     );
     assert_eq!(fenced.next_offset, 10, "the records survive the fence");
+    // The unknown-ness is DURABLE, not a one-fence grace: the adoption must
+    // not have fabricated a first entry, so the caller sees an empty vector
+    // (the documented "unknown" signal) rather than a lone (epoch, tail)
+    // entry it could compute divergence-at-zero from.
+    assert!(
+        fenced.epoch_starts.is_empty(),
+        "records without history must REPORT unknown, got {:?}",
+        fenced.epoch_starts
+    );
+
+    // And a second transition reaches the same verdict — the first fence's
+    // adoption must not have armed the truncation it skipped.
+    h.meta.set(NEW_EPOCH + 1);
+    let fenced_again = h.node.fence(NEW_EPOCH + 1, &real_history).unwrap();
+    assert_eq!(
+        fenced_again.truncated_records, 0,
+        "unknown must persist across fences until a real history is installed"
+    );
+    assert_eq!(fenced_again.next_offset, 10);
+    assert!(fenced_again.epoch_starts.is_empty());
 }
 
 /// A replica that agrees with the caller keeps everything.

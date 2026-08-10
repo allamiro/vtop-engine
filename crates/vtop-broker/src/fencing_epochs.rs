@@ -203,6 +203,39 @@ impl FencingEpochJournal {
 
     /// Record that `epoch` begins at `start_offset` on this replica.
     ///
+    /// Record an epoch adoption, honoring what the journal already knows.
+    ///
+    /// The append path's [`Self::record`] is the right tool when this replica
+    /// itself is living through the epoch change. Adoption — a lease watcher
+    /// or fence observing the current epoch — has two extra cases that
+    /// `record` must refuse but adoption must survive (#315):
+    ///
+    /// * **The epoch is already in the vector.** An installed history from a
+    ///   repair ends with the source's current epoch at the offset it truly
+    ///   began; the replica then re-observes that same epoch at its own tail.
+    ///   Re-recording at the tail would be refused as a conflicting start and
+    ///   latch the journal broken — destroying the transferred lineage at the
+    ///   first metadata poll. The recorded start is the truth; the adoption
+    ///   is a no-op.
+    /// * **The vector is empty over a log that has records.** A first entry
+    ///   at a non-zero tail is not lineage, it is ignorance dressed as
+    ///   history: a lone `(epoch, tail)` entry compares as divergence at
+    ///   offset zero against any real vector, and the reconciliation it
+    ///   feeds would truncate everything below it. The journal stays empty —
+    ///   honestly "unknown" — until a complete history is installed or the
+    ///   log is truncated to its base. This mirrors the seeding rule in
+    ///   `set_fencing_epoch_journal`, now held on every adoption instead of
+    ///   only the first attach.
+    pub fn record_adoption(&mut self, epoch: u64, start_offset: u64) -> BrokerResult<()> {
+        if self.entries.iter().any(|entry| entry.epoch == epoch) {
+            return Ok(());
+        }
+        if self.entries.is_empty() && start_offset > 0 {
+            return Ok(());
+        }
+        self.record(epoch, start_offset)
+    }
+
     /// Idempotent for an epoch already recorded, so a replica that re-observes
     /// its own current epoch — which a polling watcher does constantly — does
     /// not append a duplicate. Recording the SAME epoch at a different offset
@@ -474,25 +507,49 @@ impl FencingEpochJournal {
 /// would poison the journal at the next epoch adoption, because `record`
 /// refuses a new entry whose start offset is below the last one's.
 ///
-/// Idempotent for a re-run repair fetching the same history (`record` accepts
-/// an epoch already present at the same offset). A conflicting prior install
-/// — same epoch, different offset — fails loudly instead of merging.
+/// Idempotent for a re-run repair fetching the same history. A conflicting
+/// prior install fails loudly instead of merging — and the comparison covers
+/// **every** overlapping entry, not only the last: `record`'s own guards
+/// treat an incoming epoch below the journal's latest as a stale observation
+/// and ignore it, which here would let a repair resumed against a different
+/// source silently retain the previous source's divergent entry as if it were
+/// this history's. The overlap must be an exact prefix or nothing installs.
 pub fn install_transferred_history(
     env: &Env,
     path: impl AsRef<Path>,
     entries: &[EpochStart],
     tail: u64,
 ) -> BrokerResult<usize> {
+    let incoming: Vec<EpochStart> = entries
+        .iter()
+        .take_while(|entry| entry.start_offset < tail)
+        .copied()
+        .collect();
     let mut journal = FencingEpochJournal::open_in(env, &path)?;
-    let mut installed = 0;
-    for entry in entries {
-        if entry.start_offset >= tail {
-            break;
-        }
-        journal.record(entry.epoch, entry.start_offset)?;
-        installed += 1;
+    let existing = journal.entries().to_vec();
+    if existing.len() > incoming.len() {
+        return Err(BrokerError::EpochJournalCorrupt(format!(
+            "fencing-epoch journal: {} entries already installed but the source offers only {} \
+             within the sealed prefix; this directory was repaired from a different history — \
+             delete it and repair from scratch",
+            existing.len(),
+            incoming.len()
+        )));
     }
-    Ok(installed)
+    for (have, want) in existing.iter().zip(&incoming) {
+        if have != want {
+            return Err(BrokerError::EpochJournalCorrupt(format!(
+                "fencing-epoch journal: epoch {} already installed starting at {}, but the \
+                 source says epoch {} starts at {}; a resumed repair may not mix two sources' \
+                 lineages — delete the directory and repair from scratch",
+                have.epoch, have.start_offset, want.epoch, want.start_offset
+            )));
+        }
+    }
+    for entry in &incoming[existing.len()..] {
+        journal.record(entry.epoch, entry.start_offset)?;
+    }
+    Ok(incoming.len())
 }
 
 #[cfg(test)]
@@ -572,6 +629,73 @@ mod tests {
             conflicting.is_err(),
             "same epoch at a different offset is a lineage conflict, not a merge"
         );
+    }
+
+    /// The conflict check covers EVERY overlapping entry, not just the last.
+    /// `record` treats an incoming epoch below the journal's latest as a
+    /// stale observation and ignores it — which, unguarded, would let a
+    /// repair resumed against a different source keep the previous source's
+    /// divergent entry while reporting success.
+    #[test]
+    fn a_conflict_in_an_earlier_installed_epoch_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("fencing-epochs");
+
+        install_transferred_history(&Env::real(), &path, &starts(&[(1, 0), (2, 250)]), 500)
+            .expect("first install");
+        let different_source =
+            install_transferred_history(&Env::real(), &path, &starts(&[(1, 100), (2, 250)]), 500);
+
+        assert!(
+            different_source.is_err(),
+            "epoch 1's start differs from what was installed; two sources' lineages must not mix"
+        );
+        // And a journal already holding MORE than the new source offers is a
+        // different history too, not a prefix to silently keep.
+        let shorter = install_transferred_history(&Env::real(), &path, &starts(&[(1, 0)]), 500);
+        assert!(
+            shorter.is_err(),
+            "a shorter offering cannot vouch for what is already installed"
+        );
+    }
+
+    /// Adoption honors what the journal already knows: re-observing an epoch
+    /// the installed history contains must not re-anchor it at this replica's
+    /// tail — that refusal used to latch the journal broken at the repaired
+    /// replica's first metadata poll, destroying the transferred lineage.
+    #[test]
+    fn adopting_an_epoch_the_history_already_contains_is_a_no_op() {
+        let dir = TempDir::new().unwrap();
+        let mut j = journal(&dir);
+        j.record(1, 0).unwrap();
+
+        j.record_adoption(1, 1400)
+            .expect("re-observing the current epoch at the tail must not be refused");
+        assert_eq!(
+            j.entries(),
+            &starts(&[(1, 0)])[..],
+            "the installed start is the truth; the tail is not"
+        );
+        // A genuinely new epoch still records normally.
+        j.record_adoption(2, 1400).unwrap();
+        assert_eq!(j.entries(), &starts(&[(1, 0), (2, 1400)])[..]);
+    }
+
+    /// A first entry over a log that already has records is ignorance dressed
+    /// as history; adoption leaves the journal empty — durably "unknown" —
+    /// instead of writing a lone entry that compares as divergence-at-zero.
+    #[test]
+    fn adoption_does_not_fabricate_a_first_entry_over_existing_records() {
+        let dir = TempDir::new().unwrap();
+        let mut j = journal(&dir);
+
+        j.record_adoption(5, 900)
+            .expect("staying unknown is a success, not an error");
+        assert!(j.entries().is_empty(), "no lineage may be invented");
+        // A fresh replica adopting at offset zero is real lineage, not
+        // fabrication.
+        j.record_adoption(5, 0).unwrap();
+        assert_eq!(j.entries(), &starts(&[(5, 0)])[..]);
     }
 
     #[test]

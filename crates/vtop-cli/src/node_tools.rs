@@ -23,7 +23,7 @@ use std::time::Duration;
 use uuid::Uuid;
 use vtop_broker::replication::{ReplicaStatusClient, ReplicaTlsMaterial, SegmentTransferClient};
 use vtop_log::env::Env;
-use vtop_log::{SegmentReader, SegmentReceiver, SegmentSet};
+use vtop_log::{SegmentReceiver, SegmentSet};
 use vtop_meta::{resolve_endpoint, TlsMaterial};
 use vtop_protocol::RangeIdentity;
 
@@ -563,31 +563,6 @@ fn remaining_gap(source_tip: u64, adopted_next_offset: u64) -> Result<u64, Strin
     Ok(source_tip - adopted_next_offset)
 }
 
-/// The end of the sealed prefix in `directory`: the highest `next_offset`
-/// across its `.segment` files, or `None` when there are none.
-///
-/// Measured from disk rather than from a transfer's return value because a
-/// re-run repair skips segments a previous run already installed — the
-/// transferred epoch history must be bounded by everything the directory
-/// holds, not by what this invocation happened to move.
-fn sealed_prefix_end(env: &Env, directory: &Path) -> Result<Option<u64>, String> {
-    let mut end = None;
-    let entries = fs::read_dir(directory)
-        .map_err(|error| format!("read {}: {error}", directory.display()))?;
-    for entry in entries {
-        let entry = entry.map_err(|error| format!("read {}: {error}", directory.display()))?;
-        let path = entry.path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("segment") {
-            continue;
-        }
-        let reader = SegmentReader::open_in(env, &path)
-            .map_err(|error| format!("open {}: {error}", path.display()))?;
-        let next = reader.next_offset();
-        end = Some(end.map_or(next, |current: u64| current.max(next)));
-    }
-    Ok(end)
-}
-
 /// Pull a leader's sealed prefix into `into` and adopt it into a servable
 /// range.
 ///
@@ -838,11 +813,42 @@ async fn repair(
         // "repaired" replica that cannot prove its history is the very state
         // this command exists to remove.
         .map_err(|error| format!("epoch history from {from}: {error}"))?;
-    // The history is bounded by the sealed prefix this directory actually
-    // holds — measured from the segments on disk rather than this run's
-    // transfer list, because a re-run may have skipped segments a previous
-    // run already installed.
-    let sealed_end = sealed_prefix_end(&env, into)?;
+    // THE HISTORY IS BOUNDED AND FENCED by a second, fenced listing. The
+    // epoch-history request itself carries no fencing epoch, so on its own
+    // the repair could pair segment bytes from one source state with lineage
+    // from another — a source deposed between the last chunk and the fetch.
+    // Epochs are strictly monotonic, so a fenced call SUCCEEDING here proves
+    // the source held the credential epoch across the transfer, the history
+    // fetch, and this moment. The listing also supplies the sealed-prefix
+    // end without re-scanning the transferred segments on disk: after a
+    // successful transfer the directory's sealed set equals this listing.
+    let listing = client
+        .list_sealed_segments(
+            addr,
+            &source.server_name,
+            source.node_uuid,
+            &config.range.identity(),
+            fencing_epoch,
+        )
+        .await
+        .map_err(|error| {
+            format!(
+                "the source no longer serves epoch {fencing_epoch} ({error}); the fetched \
+                 history cannot be trusted to describe the transferred bytes — repair again \
+                 once the source is stable"
+            )
+        })?;
+    let sealed_end = listing.iter().map(|entry| entry.next_offset).max();
+    if let Some(newest) = history.last() {
+        if newest.epoch > fencing_epoch {
+            return Err(format!(
+                "the source's history reaches epoch {} but this repair was authorized under \
+                 epoch {fencing_epoch}; the source has moved on — repair again with a current \
+                 fencing epoch",
+                newest.epoch
+            ));
+        }
+    }
     if history.is_empty() {
         // A legal answer (the client's contract maps a peer that does not
         // know the request to an empty vector), but it leaves this replica

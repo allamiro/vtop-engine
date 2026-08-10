@@ -972,7 +972,7 @@ impl LocalBroker {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(journal) = guard.as_mut() {
-            if journal.record(epoch, start_offset).is_err() {
+            if journal.record_adoption(epoch, start_offset).is_err() {
                 // Do not fail the append path over it, but do not carry on
                 // pretending the vector is complete either. From here the
                 // history has a hole, and a promotion reconciling against it
