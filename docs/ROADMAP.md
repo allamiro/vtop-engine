@@ -160,6 +160,7 @@ reopen quietly.
   untested assumption. A directory written by release N+1 may hold artifacts
   release N cannot interpret (retention markers, epoch journals with
   adoption semantics N predates), and no test defends the reverse path.
+
 One observation rode along without becoming a fix: scenario 09 once left a
 promotion unacquired within its deadline (#318). The flake has not recurred —
 twenty clean runs on the fix branch, plus every CI run since — so the release
