@@ -122,8 +122,30 @@ lease deadline of ${LEASE_SECONDS}s; the release evidently did not take effect"
 log "follower $PROMOTE_N took the released range at epoch $EPOCH_AFTER in ${ACQUIRE_TOOK}s"
 
 # --- nothing acknowledged was lost ------------------------------------------
-CLIENT_AFTER="$(emit_client_config_at_epoch "$EPOCH_AFTER")"
-await_verified_floor "$CLIENT_AFTER" "$(native_addr)" "$ACKED"
+# The same post-promotion ritual as scenario 09, for the same reasons: the
+# remaining follower still validates replica appends at the OLD epoch, so it
+# is restarted at the granted one (standing in for a configured watcher), and
+# fresh quorum traffic under a bumped producer epoch is what advances the
+# proven boundary — nothing else moves it, and without it the verify below
+# waits on a floor the new leader can never publish.
+stop_node_now "$OTHER_PID"
+OTHER_PID=$(start_follower "$OTHER_N" "" "$EPOCH_AFTER")
+log "follower $OTHER_N restarted at epoch $EPOCH_AFTER to rejoin replication"
+
+VERIFY_PRODUCER_EPOCH=2
+VERIFY_CFG="$(emit_client_config_at_epoch "$EPOCH_AFTER" "$VERIFY_PRODUCER_EPOCH")"
+produce_deadline=$((SECONDS + PROGRESS_TIMEOUT_SECONDS))
+until "$VTOP_NODE" produce --client-config "$VERIFY_CFG" --addr "$(native_addr)" \
+  --records "$BATCH" --batch "$BATCH" \
+  --durability quorum > "$WORKDIR/logs/produce-after-handoff.log" 2>&1; do
+  [[ $SECONDS -lt $produce_deadline ]] \
+    || fail "post-handoff produce never reached quorum within ${PROGRESS_TIMEOUT_SECONDS}s: \
+$(tail -1 "$WORKDIR/logs/produce-after-handoff.log")"
+  sleep 0.2
+done
+log "the new leader acknowledged fresh quorum writes"
+
+await_verified_floor "$VERIFY_CFG" "$(native_addr)" "$ACKED" "$ACKED"
 log "every one of the $ACKED acknowledged records is readable after the orderly handoff"
 
 # --- the follower drains the same way ---------------------------------------
