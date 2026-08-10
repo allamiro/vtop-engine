@@ -288,9 +288,9 @@ other="$(curl -sf localhost:19501/metrics | awk '/^vtop_broker_next_offset\{/ { 
 log "pod 1 is empty, confirming per-pod independent ranges"
 
 # ---------------------------------------------------------------------------
-# The durability claim, on Kubernetes. Force-deleted with no grace period,
-# which is the SIGKILL path every stop takes today (#280) — so this is the
-# ordinary shutdown behaviour, not an extreme.
+# The durability claim, on Kubernetes. Force-deleted with no grace period —
+# deliberately the SIGKILL path, NOT the orderly SIGTERM drain #280 added:
+# durability must never depend on the clean path being taken.
 log "force-deleting ${REL}-0 and checking the records survive"
 kubectl -n "$NS" delete pod "${REL}-0" --grace-period=0 --force >/dev/null 2>&1
 sleep 5

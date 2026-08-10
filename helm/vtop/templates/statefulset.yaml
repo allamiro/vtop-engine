@@ -49,10 +49,12 @@ spec:
       # vtop-node never calls the Kubernetes API; a mounted token would be
       # pure attack surface on a pod that also serves unauthenticated HTTP.
       automountServiceAccountToken: false
-      # No preStop hook, and no pretence of a graceful stop: vtop-node installs
-      # no signal handler, so this interval is time spent waiting before
-      # SIGKILL. Safe by design — acknowledgement follows fsync and recovery
-      # truncates a torn tail — but it is the crash path, not a clean one.
+      # No preStop hook needed: vtop-node handles SIGTERM (#280). Kubernetes'
+      # signal drains the listeners, releases the range lease so failover
+      # starts immediately instead of waiting out the lease deadline, and
+      # writes the final commit boundary. This interval is the budget for
+      # that drain, and SIGKILL after it remains safe — acknowledgement
+      # follows fsync and recovery truncates a torn tail.
       terminationGracePeriodSeconds: {{ int .Values.terminationGracePeriodSeconds }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:

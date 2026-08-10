@@ -126,6 +126,16 @@ reopen quietly.
   with no history now answers "unknown" at a fence instead of fabricating a
   lone entry that compared as divergence-at-zero. Scenario 12 asserts the
   repair outlives the failover instead of pinning the loss.
+- **#280** — every orderly stop is no longer a crash stop. vtop-node handles
+  SIGTERM/SIGINT: the listeners drain, a departing leader RELEASES its range
+  lease (the `ReleaseRangeLease` verb existed; nothing in production called
+  it) so failover starts immediately instead of waiting out the lease
+  deadline, and the final commit boundary is written so the next open has no
+  torn tail to truncate. The helm chart's terminationGracePeriodSeconds now
+  means what its name says. Scenario 13 proves the drain on real processes
+  and fails if SIGTERM is ever ignored again. Durability still never depends
+  on the clean path — the k8s smoke test keeps force-deleting pods to prove
+  it.
 - **#240 remainder** — the election-restriction question (Raft dissertation §5.4.1), then the signed
   leadership-transition record.
 

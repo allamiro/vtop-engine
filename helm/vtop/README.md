@@ -249,7 +249,7 @@ certificates also carry that Service's DNS name as a shared SAN.
 | `podAnnotations` / `podLabels` / `nodeSelector` / `tolerations` / `topologySpreadConstraints` | `{}`/`{}`/`{}`/`[]`/`[]` | |
 | `affinity` | `{}` | Empty gets the chart's default **preferred** anti-affinity; set required anti-affinity for real quorum safety. |
 | `priorityClassName` | `""` | |
-| `terminationGracePeriodSeconds` | `60` | Clean-shutdown fsync budget. |
+| `terminationGracePeriodSeconds` | `60` | Drain budget for the SIGTERM handler (#280): listeners close, the lease is released, the final commit boundary lands. |
 | `extraEnv` / `extraVolumes` / `extraVolumeMounts` | `[]` | Escape hatches. |
 
 ## Observability

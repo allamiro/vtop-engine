@@ -597,11 +597,19 @@ impl LeaseAgent {
         })
     }
 
-    /// Run until the process stops. Never returns on success: losing a lease
-    /// is a state transition, not a reason to exit — the node stays up so it
-    /// can be inspected and can win the range back.
-    pub async fn run(mut self) -> ! {
+    /// Run until the process stops or `shutdown` fires (#280).
+    ///
+    /// Losing a lease is a state transition, not a reason to exit — the node
+    /// stays up so it can be inspected and can win the range back. Shutdown
+    /// is different: a departing holder RELEASES the range instead of letting
+    /// the lease lapse, so failover starts as soon as the holder leaves
+    /// rather than after a metadata deadline the departed leader can no
+    /// longer make use of.
+    pub async fn run(mut self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
         loop {
+            if *shutdown.borrow() {
+                break;
+            }
             let delay = match self.step().await {
                 Ok(delay) => delay,
                 Err(error) => {
@@ -631,8 +639,55 @@ impl LeaseAgent {
                     self.config.poll_interval
                 }
             };
-            tokio::time::sleep(delay).await;
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = shutdown.changed() => {}
+            }
         }
+        self.release().await;
+    }
+
+    /// Hand the range back on the way out (#280) — the operational half of an
+    /// orderly stop. Best-effort by design: a refusal means the lease was
+    /// already lost or taken, and blocking exit on metadata would trade a
+    /// prompt failover for a hung shutdown, the exact inversion of the goal.
+    async fn release(&mut self) {
+        let LeaseState::Held { fencing_epoch } = self.state else {
+            return;
+        };
+        let proposal = self
+            .bounded(
+                "propose release",
+                self.admin.propose(MetadataCommand::ReleaseRangeLease {
+                    env: envelope(),
+                    topic_uuid: self.topic_uuid,
+                    range_uuid: self.range_uuid,
+                    expected_fencing_epoch: fencing_epoch,
+                }),
+            )
+            .await;
+        match proposal {
+            Ok(response) => match response.response {
+                MetadataResponse::Ack { .. } => tracing::info!(
+                    range = %self.range_uuid,
+                    fencing_epoch,
+                    "range lease released for shutdown; failover need not wait out the deadline"
+                ),
+                other => tracing::warn!(
+                    range = %self.range_uuid,
+                    fencing_epoch,
+                    ?other,
+                    "lease release refused; the lease will lapse on its deadline"
+                ),
+            },
+            Err(error) => tracing::warn!(
+                %error,
+                range = %self.range_uuid,
+                fencing_epoch,
+                "lease release failed; the lease will lapse on its deadline"
+            ),
+        }
+        self.publish_lost(fencing_epoch);
     }
 
     /// Every admin round trip is bounded by this. A blackholed endpoint (as

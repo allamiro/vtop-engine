@@ -162,11 +162,52 @@ fn spawn_leader_server(
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = ReplicaPeerServer::new(material, LEADER, handler).unwrap();
+        // Held for the runtime's lifetime: dropping the sender would stop
+        // the server mid-test (#280).
+        let (_shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
         let handle = tokio::spawn(async move {
-            let _ = server.serve(listener).await;
+            let _shutdown = _shutdown;
+            let _ = server.serve(listener, shutdown_rx).await;
         });
         (addr, handle.abort_handle())
     })
+}
+
+/// The replica plane drains and RETURNS on shutdown instead of serving
+/// forever (#280). This is what lets an orderly stop proceed to the lease
+/// release and final commit behind it — a server that never returns makes
+/// every stop a kill.
+#[test]
+fn the_replica_peer_server_drains_and_returns_on_shutdown() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let leader_cert = cert_for_cn(&LEADER.to_string());
+    let repairer_cert = cert_for_cn(&REPAIRER.to_string());
+    let dir = tempfile::tempdir().unwrap();
+    let range = range_identity();
+    let leader = rolled_leader(&dir, &range);
+    let handler: Arc<dyn ReplicaPeerHandler> =
+        Arc::new(LeaderSegmentTransferHandler::new(Arc::clone(&leader)));
+    runtime.block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server =
+            ReplicaPeerServer::new(material(&leader_cert, &[&repairer_cert]), LEADER, handler)
+                .unwrap();
+        let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(server.serve(listener, shutdown_rx));
+        shutdown.send(()).unwrap();
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the server must drain promptly, not hang")
+            .expect("join");
+        assert!(
+            joined.is_ok(),
+            "shutdown is an orderly return, not an error: {joined:?}"
+        );
+    });
 }
 
 struct Harness {

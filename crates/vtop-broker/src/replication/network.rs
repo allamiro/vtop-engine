@@ -275,23 +275,45 @@ impl ReplicaPeerServer {
         })
     }
 
-    pub async fn serve(self, listener: TcpListener) -> BrokerResult<()> {
-        loop {
-            let (tcp, _peer) =
-                listener
-                    .accept()
-                    .await
-                    .map_err(|source| crate::BrokerError::Io {
-                        path: std::path::PathBuf::from("replica-peer-listener"),
-                        source,
-                    })?;
-            let acceptor = self.acceptor.clone();
-            let handler = Arc::clone(&self.handler);
-            let local_id = self.local_id;
-            tokio::spawn(async move {
-                let _ = serve_follower_connection(acceptor, tcp, handler, local_id).await;
-            });
-        }
+    /// Serve until the listener fails or `shutdown` fires (#280).
+    ///
+    /// Mirrors [`crate::NativeServer::serve`]: on shutdown the accept loop
+    /// stops, in-flight connection tasks are aborted, and every task is
+    /// drained before returning. Aborting mid-append is crash-equivalent by
+    /// design — a replica acks only after fsync, so anything an abort
+    /// interrupts was never acknowledged and the next open recovers it.
+    pub async fn serve(
+        self,
+        listener: TcpListener,
+        mut shutdown: tokio::sync::oneshot::Receiver<()>,
+    ) -> BrokerResult<()> {
+        let mut connections = tokio::task::JoinSet::new();
+        let result = loop {
+            tokio::select! {
+                _ = &mut shutdown => break Ok(()),
+                _ = connections.join_next(), if !connections.is_empty() => {}
+                accepted = listener.accept() => {
+                    let (tcp, _peer) = match accepted {
+                        Ok(accepted) => accepted,
+                        Err(source) => {
+                            break Err(crate::BrokerError::Io {
+                                path: std::path::PathBuf::from("replica-peer-listener"),
+                                source,
+                            });
+                        }
+                    };
+                    let acceptor = self.acceptor.clone();
+                    let handler = Arc::clone(&self.handler);
+                    let local_id = self.local_id;
+                    connections.spawn(async move {
+                        let _ = serve_follower_connection(acceptor, tcp, handler, local_id).await;
+                    });
+                }
+            }
+        };
+        connections.abort_all();
+        while connections.join_next().await.is_some() {}
+        result
     }
 }
 

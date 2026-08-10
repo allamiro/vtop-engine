@@ -769,7 +769,7 @@ Completed:
       against the new leader while fenced, and truncates a diverged tail
       instead of being stranded — bounded so it can never discard
       acknowledged records
-- [x] **13-scenario live-chaos suite in CI** — real processes over real TLS:
+- [x] **14-scenario live-chaos suite in CI** — real processes over real TLS:
       SIGKILL durability, disk-full and fsync failure, metadata partition,
       clock skew, membership change under load, and range-leader failover
 - [x] **signed, attested releases** — multi-arch image and per-target binaries

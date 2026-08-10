@@ -68,7 +68,10 @@ impl ColocatedNodeConfig {
     }
 }
 
-pub async fn run(config: ColocatedNodeConfig) -> Result<(), String> {
+pub async fn run(
+    config: ColocatedNodeConfig,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), String> {
     config.validate()?;
     let ColocatedNodeConfig {
         meta,
@@ -102,12 +105,39 @@ pub async fn run(config: ColocatedNodeConfig) -> Result<(), String> {
     // error. A half-alive node is the one failure mode co-location must not
     // introduce — a metadata voter that has died inside a process still serving
     // data keeps being counted toward quorum while answering nothing.
+    //
+    // With one exception (#280): a role that exits Ok did so because the
+    // process-wide shutdown flag flipped, and the OTHER role is draining on
+    // the same flag — a data role releasing its lease and writing its final
+    // commit boundary. Dropping that future mid-drain would turn an orderly
+    // stop back into a crash stop, so the survivor is awaited with a bound.
+    let mut meta_role = std::pin::pin!(meta_node::serve(
+        meta,
+        &observability,
+        metrics_addr,
+        shutdown.clone()
+    ));
+    let mut data_role = std::pin::pin!(data_node::serve(
+        data,
+        &observability,
+        metrics_addr,
+        shutdown.clone()
+    ));
+    let drain = std::time::Duration::from_secs(10);
     tokio::select! {
-        result = meta_node::serve(meta, &observability, metrics_addr) => {
-            result.map_err(|error| format!("metadata role exited: {error}"))
+        result = &mut meta_role => {
+            result.map_err(|error| format!("metadata role exited: {error}"))?;
+            tokio::time::timeout(drain, data_role)
+                .await
+                .map_err(|_| "data role did not finish draining".to_owned())?
+                .map_err(|error| format!("data role exited: {error}"))
         }
-        result = data_node::serve(data, &observability, metrics_addr) => {
-            result.map_err(|error| format!("data role exited: {error}"))
+        result = &mut data_role => {
+            result.map_err(|error| format!("data role exited: {error}"))?;
+            tokio::time::timeout(drain, meta_role)
+                .await
+                .map_err(|_| "metadata role did not finish draining".to_owned())?
+                .map_err(|error| format!("metadata role exited: {error}"))
         }
     }
 }

@@ -143,7 +143,8 @@ async fn main() {
     // carries the ready markers the chaos harness parses.
     vtop_observe::logging::init("info", false);
     let cli = Cli::parse();
-    let outcome = run(cli).await;
+    let shutdown = shutdown_signal();
+    let outcome = run(cli, shutdown).await;
     match outcome {
         Ok(code) => std::process::exit(code),
         Err(message) => {
@@ -153,18 +154,59 @@ async fn main() {
     }
 }
 
-async fn run(cli: Cli) -> Result<i32, String> {
+/// SIGTERM/SIGINT flip one process-wide flag every serving loop observes
+/// (#280). One flag rather than per-role signal plumbing: the roles differ in
+/// what DRAINING means, not in what "stop" means.
+fn shutdown_signal() -> tokio::sync::watch::Receiver<bool> {
+    let (sender, receiver) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        let terminate = async {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut term) => {
+                    term.recv().await;
+                }
+                Err(error) => {
+                    eprintln!("SIGTERM handler unavailable ({error}); only SIGINT is handled");
+                    std::future::pending::<()>().await;
+                }
+            }
+        };
+        #[cfg(not(unix))]
+        let terminate = std::future::pending::<()>();
+        tokio::select! {
+            () = terminate => {}
+            result = tokio::signal::ctrl_c() => {
+                if result.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            }
+        }
+        // Stdout, like the ready markers: the chaos harness parses this line
+        // to distinguish a drain from a hang.
+        println!("shutdown_signal received, draining");
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+        let _ = sender.send(true);
+        // Hold the sender for the rest of the process lifetime so receivers
+        // never observe a closed channel as an implicit shutdown.
+        std::future::pending::<()>().await;
+    });
+    receiver
+}
+
+async fn run(cli: Cli, shutdown: tokio::sync::watch::Receiver<bool>) -> Result<i32, String> {
     match cli.command {
         Command::Meta { config } => {
-            meta_node::run(config::load(&config)?).await?;
+            meta_node::run(config::load(&config)?, shutdown).await?;
             Ok(0)
         }
         Command::Data { config } => {
-            data_node::run(config::load(&config)?).await?;
+            data_node::run(config::load(&config)?, shutdown).await?;
             Ok(0)
         }
         Command::Node { config } => {
-            colocated::run(config::load(&config)?).await?;
+            colocated::run(config::load(&config)?, shutdown).await?;
             Ok(0)
         }
         Command::SealActive { path } => {
