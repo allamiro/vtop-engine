@@ -55,6 +55,11 @@ pub enum LogError {
     },
     #[error("invalid segment configuration: {0}")]
     InvalidConfig(String),
+    #[error(
+        "offset {requested} is below this range's earliest offset {earliest}; the records \
+         before {earliest} were reclaimed by retention"
+    )]
+    OffsetBelowRange { requested: u64, earliest: u64 },
     #[error("invalid segment descriptor: {0}")]
     InvalidDescriptor(String),
     #[error("corrupt segment at byte {position}: {reason}")]

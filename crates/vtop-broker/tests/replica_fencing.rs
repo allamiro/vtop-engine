@@ -21,7 +21,10 @@ use uuid::Uuid;
 use vtop_broker::fencing_epochs::{EpochStart, FencingEpochJournal};
 use vtop_broker::replication::{ClusterCommittedOffset, InProcessFollower};
 use vtop_broker::{MetaFencingEpoch, ProducerEpochJournal};
-use vtop_log::{ActiveSegment, KeyRange, RangeLineage, SegmentConfig, SegmentDescriptor};
+use vtop_log::{
+    ActiveSegment, Durability, KeyRange, LogRecord, RangeLineage, RetentionPolicy, SegmentConfig,
+    SegmentDescriptor, SegmentSet,
+};
 use vtop_protocol::{ErrorCode, ProduceRecord, RangeIdentity, ReplicaAppendRequest};
 
 const FOLLOWER: Uuid = Uuid::from_u128(0xA2);
@@ -285,6 +288,110 @@ fn a_diverged_replica_discards_the_deposed_leaders_records_while_fenced() {
     // being swallowed as a duplicate.
     assert!(append_at(&h, NEW_EPOCH, Uuid::from_u128(0xA9), 5).is_ok());
     assert_eq!(h.node.next_offset(), 6);
+}
+
+/// A divergence verdict BELOW the retained base is unprovable, not fatal
+/// (#290). The epoch entries that produced it describe records retention
+/// reclaimed, and the truncation it would mandate is below the acknowledged
+/// floor by construction — so failing the fence over it would exclude a
+/// valid replica from every promotion for a dispute about data it no longer
+/// holds. The honest verdict is the journal-less one: touch nothing.
+#[test]
+fn a_divergence_below_the_retained_base_does_not_fail_the_fence() {
+    let range = range_identity();
+    let dir = tempfile::tempdir().unwrap();
+    let descriptor = SegmentDescriptor {
+        segment_id: Uuid::from_u128(0xE7),
+        topic: range.topic.clone(),
+        topic_epoch: range.topic_epoch,
+        lineage: RangeLineage {
+            range_id: range.range_id,
+            generation: range.range_generation,
+            key_range: KeyRange::full(),
+            parents: Vec::new(),
+        },
+        base_offset: 0,
+    };
+    let config = SegmentConfig {
+        max_record_bytes: 256,
+        max_group_bytes: 512,
+        max_segment_bytes: 512,
+        max_segment_records: 100,
+        index_stride: 2,
+    };
+    let mut set =
+        SegmentSet::create_in(&vtop_log::env::Env::real(), dir.path(), descriptor, config).unwrap();
+    for sequence in 0..40_u64 {
+        set.append_group(
+            &[LogRecord {
+                producer_id: PRODUCER,
+                producer_epoch: 0,
+                sequence,
+                timestamp_millis: 1_000,
+                attributes: 0,
+                key: b"k".to_vec(),
+                value: format!("v{sequence:04}").into_bytes(),
+            }],
+            Durability::Fsync,
+            Uuid::from_u128(50_000 + sequence as u128),
+        )
+        .unwrap();
+    }
+    let next = set.next_offset();
+    set.retain(
+        &RetentionPolicy {
+            max_total_bytes: 600,
+        },
+        next,
+    )
+    .unwrap();
+    let base = set.base_offset();
+    assert!(base > 2, "the front must have moved for this test to bite");
+
+    let epochs = ProducerEpochJournal::open(dir.path().join("epochs")).unwrap();
+    let meta = MetaFencingEpoch::new(OLD_EPOCH);
+    let node = Arc::new(
+        InProcessFollower::new(
+            FOLLOWER,
+            set,
+            epochs,
+            range,
+            OLD_EPOCH,
+            meta.clone(),
+            ClusterCommittedOffset::new(next),
+        )
+        .unwrap(),
+    );
+    // Histories that differ ONLY below the retained base: same epochs, with
+    // the two sides recording the later epoch's start two records apart — a
+    // legitimate skew of adoption timing whose records are now reclaimed on
+    // this side.
+    let mut journal = FencingEpochJournal::open(dir.path().join("fencing-epochs")).unwrap();
+    journal.record(OLD_EPOCH, 0).unwrap();
+    journal.record(NEW_EPOCH, base - 2).unwrap();
+    node.set_fencing_epoch_journal(journal);
+
+    meta.set(NEW_EPOCH + 1);
+    let fenced = node
+        .fence(
+            NEW_EPOCH + 1,
+            &[
+                EpochStart {
+                    epoch: OLD_EPOCH,
+                    start_offset: 0,
+                },
+                EpochStart {
+                    epoch: NEW_EPOCH,
+                    start_offset: base - 1,
+                },
+            ],
+        )
+        .expect("a dispute about reclaimed records must not fail the fence");
+    assert_eq!(
+        fenced.truncated_records, 0,
+        "nothing this replica holds is provably in dispute"
+    );
+    assert_eq!(fenced.next_offset, next, "nothing held was discarded");
 }
 
 /// A caller that cannot vouch for its own history truncates nothing.

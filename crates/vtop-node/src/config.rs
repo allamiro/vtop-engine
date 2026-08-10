@@ -316,6 +316,28 @@ pub struct DataNodeConfig {
     /// requirement and is tracked on #255; until it lands, keep
     /// `poll_interval_ms` short on replicated ranges so the window stays small.
     pub lease: Option<LeaseConfig>,
+    /// Sealed-prefix retention (#290). Absent = retention disabled, the
+    /// previous behaviour: nothing is ever deleted and the range grows until
+    /// the disk does not.
+    #[serde(default)]
+    pub retention: Option<RetentionConfig>,
+}
+
+/// What a range keeps on disk before its oldest sealed segments are
+/// reclaimed (#290).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetentionConfig {
+    /// Total bytes of encoded record frames (sealed content plus the active
+    /// tail) the range may hold. Whole sealed segments are deleted
+    /// oldest-first once the bound is exceeded — and only segments wholly
+    /// below the acknowledged (cluster-committed) floor are ever eligible,
+    /// so unacknowledged data is never reclaimed whatever this says.
+    ///
+    /// MUST be greater than zero; startup refuses zero rather than guessing
+    /// between "reclaim everything" and "disabled". Disabling retention is
+    /// spelled by omitting the whole `retention` block.
+    pub max_total_bytes: u64,
 }
 
 /// Where to reach the metadata admin endpoint, and how hard to hold the lease.

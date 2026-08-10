@@ -385,6 +385,20 @@ pub async fn serve(
 
     observability.register(Box::new(SegmentRecoveryCollector::new(recovery.as_ref())?))?;
 
+    if let Some(retention) = &config.retention {
+        // Zero is ambiguous between "reclaim everything eligible" (the
+        // storage API's reading) and "disabled" (the broker's atomic
+        // sentinel). Refusing it at startup keeps an operator who typed 0
+        // from silently getting the unbounded growth this config exists to
+        // prevent (#290).
+        if retention.max_total_bytes == 0 {
+            return Err(
+                "retention.max_total_bytes must be greater than zero; omit the retention block                  to disable retention"
+                    .to_owned(),
+            );
+        }
+    }
+
     match config.role {
         DataRole::Follower => {
             run_follower(
@@ -466,6 +480,13 @@ async fn run_follower(
         )
         .map_err(|error| error.to_string())?,
     );
+    if let Some(retention) = &config.retention {
+        // Followers reclaim by their own policy exactly as they roll at
+        // their own bound: the leader replicates offsets, not files (#290).
+        follower.set_retention(Some(vtop_log::RetentionPolicy {
+            max_total_bytes: retention.max_total_bytes,
+        }));
+    }
     observability.register(Box::new(FollowerCollector::new(Arc::clone(&follower))?))?;
 
     // With a lease configured, this follower learns its epoch from metadata
@@ -628,6 +649,11 @@ async fn run_leader(
         )
         .map_err(|error| error.to_string())?,
     );
+    if let Some(retention) = &config.retention {
+        broker.set_retention(Some(vtop_log::RetentionPolicy {
+            max_total_bytes: retention.max_total_bytes,
+        }));
+    }
     // Verified promotion probes each follower's DISK over the replication
     // plane rather than reading this leader's own replication counters, which
     // on a fresh promotion have never been advanced and would report every
