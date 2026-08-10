@@ -119,10 +119,10 @@ endpoint_url. `run_matrix.py --all` automatically picks it up.
 | File volume | ✅ 1k–1M (configurable) | very large volumes need disk + time |
 | File sizes | ✅ small / medium / large / mixed | |
 | Batch size | ✅ by count, by bytes, by time window | `batch_max_records/bytes/age` |
-| Formats | ✅ jsonl, csv, txt, cef, leef, syslog, mixed; ⚠️ binary | engine is line-oriented; binary archives as raw |
+| Formats | ✅ jsonl, csv, txt, cef, leef, syslog, mixed; ⚠️ binary | engine supports whole-file (`whole_file`) reads for binary/compressed sources; the harness has no scenario driving that mode yet |
 | Compression | ✅ none / gzip / zstd | |
-| Checksum | ✅ sha256; ⚠️ blake3 / disabled | engine currently SHA-256 only (recorded as requested) |
-| Upload backend | ✅ MinIO, in-memory mock; AWS S3 via endpoint+creds | a local-fs backend is a planned follow-up |
+| Checksum | ✅ sha256; ⚠️ blake3 / disabled | engine implements all three (protocol §10); the harness scenarios only sweep SHA-256 so far |
+| Upload backend | ✅ MinIO, in-memory mock; AWS S3 via endpoint+creds; ⚠️ localfs | the engine's `localfs` backend exists (VTOP-LocalFS profile); no benchmark scenario drives it yet |
 | Failure conditions | ✅ verification failure, replay/recovery | `backend: mock_fail`, `fault: replay` |
 | Runtime duration | ✅ any (`duration_seconds`) | 5 min / 30 min / 1 h presets easy to add |
 
@@ -185,13 +185,17 @@ sharding (epic #93). Multi-hour dedicated soaks remain deferred.
 
 ## Known limitations
 
-- **BLAKE3 / checksum-disabled** are matrix dimensions the engine does not yet
-  implement; scenarios record the requested value but the engine uses SHA-256.
-- **Binary / compressed-source files**: the engine is line-oriented, so binary
-  inputs archive as `raw` and yield few records. A whole-object source mode is a
-  follow-up.
-- **A local-filesystem upload backend** is not yet implemented; use `mock`
-  (in-memory) or `minio` for backend comparisons.
+- **BLAKE3 / checksum-disabled** are implemented in the engine
+  ([protocol §10](../docs/VTOP_PROTOCOL_DRAFT.md#10-checksum)) but the
+  benchmark scenarios do not yet sweep them; runs record the requested value
+  while exercising SHA-256.
+- **Binary / compressed-source files**: the engine's file source supports
+  whole-file (`whole_file`) reads, but the harness has no scenario for that
+  mode yet, so binary inputs in the matrix archive line-oriented as `raw`.
+- **The local-filesystem upload backend** (`backend: localfs`, the
+  VTOP-LocalFS profile) is implemented in the engine but not yet driven by a
+  benchmark scenario; use `mock` (in-memory) or `minio` for backend
+  comparisons meanwhile.
 - **System metrics** are best with `psutil`; the `ps` fallback reports CPU%/RSS
   of the process tree only (disk/network show 0).
 - **Mid-flight restart** is approximated via the fault/replay path

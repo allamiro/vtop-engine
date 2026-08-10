@@ -2,7 +2,10 @@
 
 VTOP deliberately separates PostgreSQL schema ownership from engine runtime
 access. Normal startup never executes DDL. It checks that the expected columns
-and verify-before-commit trigger exist, then operates with table DML only.
+and the commit-rule invariant trigger exist (the trigger enforces
+[VTOP_PROTOCOL_DRAFT.md §13](VTOP_PROTOCOL_DRAFT.md#13-commit-rule) at the
+database layer; durable state persistence implements §14), then operates with
+table DML only.
 
 ## Identities
 

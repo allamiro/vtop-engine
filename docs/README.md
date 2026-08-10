@@ -10,7 +10,7 @@ Start with the [project README](../README.md) for setup, the CLI, and the Docker
 
 | Document | What it covers | Read it if you want to… |
 |----------|----------------|--------------------------|
-| [VTOP_PROTOCOL_DRAFT.md](VTOP_PROTOCOL_DRAFT.md) | Normative protocol draft (`MUST`/`SHOULD`/`MAY`), state machine, commit & replay rules, object naming, conformance profiles (`VTOP-Core`, `-Kafka`, `-File`, `-Syslog-Spool`, `-S3`). | Understand the rules a conformant implementation must follow. |
+| [VTOP_PROTOCOL_DRAFT.md](VTOP_PROTOCOL_DRAFT.md) | Normative protocol draft (`MUST`/`SHOULD`/`MAY`), state machine, commit & replay rules, object naming, conformance profiles (`VTOP-Core`, `-Kafka`, `-File`, `-Syslog-Spool`, `-S3`, `-LocalFS`). | Understand the rules a conformant implementation must follow. |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Crate layout, the engine runtime flow, crash recovery / replay, partitioning, and a data-flow diagram. | Understand how the reference implementation is built. |
 | [NATIVE_BROKER_ARCHITECTURE.md](NATIVE_BROKER_ARCHITECTURE.md) | Governing direction for the VTOP-owned broker/control plane, its Kafka boundary, storage kernel, and implementation order. | Understand how VTOP grows into a native log system rather than depending on Kafka for cluster correctness. |
 | [WRITE_AMP_PROOF_OVERHEAD.md](WRITE_AMP_PROOF_OVERHEAD.md) | Methodology and runner for native segment write amplification + proof-carrying overhead (#189). | Measure single-copy body path and v1 vs v2 proof cost without redesigning storage. |
@@ -21,6 +21,12 @@ Start with the [project README](../README.md) for setup, the CLI, and the Docker
 | [SECURITY_MODEL.md](SECURITY_MODEL.md) | Transport security, credential handling, manifest confidentiality, integrity verification, immutability, hardening, supply chain, and a normative-rules summary. | Understand the threat model and operational security rules. |
 | [INVENTION_DISCLOSURE_DRAFT.md](INVENTION_DISCLOSURE_DRAFT.md) | Problem, invention, technical advantages, main claim candidate, and potential claim families. | Review the candidate invention for technical/legal evaluation. |
 | [PRIOR_ART_SEARCH_PLAN.md](PRIOR_ART_SEARCH_PLAN.md) | Comparison of related tools/systems and a prior-art search strategy. | Plan a prior-art investigation. |
+| [COMPARISON.md](COMPARISON.md) | Honest positioning against Kafka and LinkedIn Northguard/Xinfra: where VTOP is ahead, behind, and which roadmap item closes each gap. | Position VTOP against existing systems. |
+| [POSTGRES_DEPLOYMENT.md](POSTGRES_DEPLOYMENT.md) | PostgreSQL state-store rollout: `vtopctl migrate`, identity/privilege split, TLS requirements, scheduled pruning. | Deploy the engine against a Postgres ledger. |
+| [PRODUCTION_HA_PLAN.md](PRODUCTION_HA_PLAN.md) | Engine-fleet HA design & reference: system model, StateStore, Kafka HA, topologies, sizing, runbook. | Design or operate a highly-available engine deployment. |
+| [PRODUCTION_HA_ROADMAP.md](PRODUCTION_HA_ROADMAP.md) | Execution status of the HA plan: phases 0–10, risk register, readiness checklist, open decisions. | See what HA work is done and what remains. |
+| [RELEASE_VERIFICATION.md](RELEASE_VERIFICATION.md) | Verifying release artifacts (checksums, cosign signatures, SBOM). | Validate a downloaded release. |
+| [ROADMAP.md](ROADMAP.md) | Release-by-release narrative for the VTOP *cluster* plane (v0.1.0+), including known limitations per release. | Decide whether to depend on a cluster version. |
 
 ## The one rule everything serves
 
@@ -28,7 +34,7 @@ Start with the [project README](../README.md) for setup, the CLI, and the Docker
 SOURCE_COMMITTED is forbidden until VERIFIED is true.
 ```
 
-A source progress marker (Kafka offset, file byte offset, syslog spool offset) is never committed until the telemetry object and its manifest have been durably written **and verified** in object storage. The normative statement lives in [VTOP_PROTOCOL_DRAFT.md §7](VTOP_PROTOCOL_DRAFT.md#7-commit-rule); its enforcement is described in [ARCHITECTURE.md](ARCHITECTURE.md#engine-runtime-flow) and the [README](../README.md#verification-before-commit).
+A source progress marker (Kafka offset, file byte offset, syslog spool offset) is never committed until the telemetry object and its manifest have been durably written **and verified** in object storage. The normative statement lives in [VTOP_PROTOCOL_DRAFT.md §13](VTOP_PROTOCOL_DRAFT.md#13-commit-rule); its enforcement is described in [ARCHITECTURE.md](ARCHITECTURE.md#engine-runtime-flow) and the [README](../README.md#core-rule).
 
 ## Legal note
 

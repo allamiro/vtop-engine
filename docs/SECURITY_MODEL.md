@@ -1,6 +1,8 @@
 # Security Model
 
 > Security model for the **VTOP Engine reference implementation** (a prototype of the proposed VTOP protocol). Part of an **invention-disclosure support package**.
+>
+> Protocol-level behavior referenced here (state machine, commit rule §13, replay rule §14, verification semantics §17, manifest spec §11) is normatively defined in [VTOP_PROTOCOL_DRAFT.md](VTOP_PROTOCOL_DRAFT.md); this document adds the security rules around it.
 
 The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are used as normative requirements for conformant behavior.
 
@@ -60,7 +62,7 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are used as normat
 
 ---
 
-## 2. Transport Security
+## 2. Transport security
 
 ### TLS for Kafka
 
@@ -103,7 +105,7 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are used as normat
 - Session count, global in-flight work, negotiated record/frame limits, idle
   timeouts, and fetch-response byte credit are explicit resource boundaries.
 
-## 3. Credential Handling
+## 3. Credential handling
 
 Normative rules:
 
@@ -122,7 +124,7 @@ Additional guidance:
 - The PostgreSQL engine identity **SHOULD** have only database `CONNECT`, schema `USAGE`, and `SELECT, INSERT, UPDATE` on the `batches` ledger. It **MUST NOT** own the table or receive `CREATE`, `ALTER`, `DROP`, `DELETE`, or `TRUNCATE` privileges.
 - The privileged migration secret **MUST NOT** be mounted into the engine workload. See [PostgreSQL deployment](POSTGRES_DEPLOYMENT.md) for the rollout and grant sequence.
 
-## 4. Manifest Confidentiality
+## 4. Manifest confidentiality
 
 - Manifests describe object integrity and source progress only.
 - Manifests **MUST NOT** contain credentials, tokens, or other authentication material.
@@ -163,8 +165,8 @@ Per-format buckets (e.g. `telemetry-{format}`) with optional on-demand creation 
 - The engine **MUST** compute a content checksum (SHA-256 or BLAKE3; or size-only when checksums are explicitly disabled) over the compressed telemetry object.
 - The engine **MUST** verify the durably stored object against the manifest before transitioning to `VERIFIED`.
 - The engine **MUST** verify the stored manifest before committing source progress.
-- Strong verification **MUST** be derived from stored content or a checksum the storage service computed over that content. Engine-written sidecars, ETags, and user metadata **MUST NOT** be classified as strong.
-- A source progress marker **MUST NOT** be committed unless both object and manifest verification succeed (see the protocol commit rule).
+- Strong verification **MUST** be derived from stored content or a checksum the storage service computed over that content. Uploader-written sidecars, ETags, and user-metadata digests **MUST NOT** be classified as strong ([VTOP_PROTOCOL_DRAFT.md §17.1](VTOP_PROTOCOL_DRAFT.md#17-verification-semantics)).
+- A source progress marker **MUST NOT** be committed unless both object and manifest verification succeed (the commit rule, [VTOP_PROTOCOL_DRAFT.md §13](VTOP_PROTOCOL_DRAFT.md#13-commit-rule)).
 - The manifest binds the object hash to the covered source progress markers. Its unkeyed **self-hash** is reproducible corruption detection, not authenticity: a writer who can replace the document can recompute it.
 - When `manifest_mac_key_env` is configured, the stored manifest **MUST** carry a valid keyed BLAKE3 `manifest.mac`; missing or invalid MACs fail pipeline, CLI, and recovery verification.
 - Where only size/existence can be confirmed, verification is **backend-limited** and the engine **MUST** report it as such rather than as cryptographic verification. The engine defaults to rejecting this result; accepting it requires the explicit `require_strong_verification: false` compatibility opt-out.
@@ -172,14 +174,14 @@ Per-format buckets (e.g. `telemetry-{format}`) with optional on-demand creation 
 
 ## 7. Data at rest and object immutability
 
-- **Object lock SHOULD be supported later.**
+- Object immutability **SHOULD** be supported where the backend allows it ([VTOP_PROTOCOL_DRAFT.md §18](VTOP_PROTOCOL_DRAFT.md#18-security-considerations)). VTOP validates bucket versioning (§8.1); object-lock *configuration* is deployment policy, not automated by the engine.
 - Where the backend supports it (e.g., S3 Object Lock / WORM), telemetry objects and manifests **SHOULD** be written as immutable for the configured retention period.
 - Immutability complements verification: verification detects tampering, immutability prevents post-write tampering or accidental overwrite.
 - At-rest encryption (server-side or bucket-default) **MAY** be enabled at the storage layer; it is orthogonal to VTOP's integrity guarantees.
 
-## 8. Manifest Authentication
+## 8. Manifest authentication
 
-- VTOP 0.2 supports an optional keyed BLAKE3 authenticator in `manifest.mac`.
+- VTOP 0.2 supports an optional keyed BLAKE3 authenticator in `manifest.mac` ([VTOP_PROTOCOL_DRAFT.md §11.2](VTOP_PROTOCOL_DRAFT.md#11-manifest-object), §17.3).
 - Config stores only the environment-variable name (`manifest_mac_key_env`); the 32-byte hex key **MUST NOT** appear in config serialization, manifests, or logs.
 - Naming an absent or malformed key **MUST** fail startup rather than silently emit unsigned manifests.
 - Enabling a key deliberately rejects unsigned pre-cutover manifests. Operators **MUST** verify or explicitly migrate their backlog before enabling it.
@@ -193,14 +195,23 @@ manifest or replay an older, still-validly-signed one over the current key.
 Version pinning plus storage retention closes that gap; the controls are
 complementary.
 
+> Version pinning is an **implementation extension** of the reference
+> implementation, layered under the extensibility contract of
+> [VTOP_PROTOCOL_DRAFT.md §20](VTOP_PROTOCOL_DRAFT.md#20-extensibility): it
+> strengthens manifest verification (§17.3) without weakening the commit rule
+> (§13) or replay rule (§14). The protocol draft itself does not (yet) define
+> manifest version pinning; the MUSTs below bind this implementation's
+> hardened profile, not every conformant implementation.
+
 - When the backend assigns an immutable object version on manifest upload
   (S3 `x-amz-version-id`), the engine records it in the durable ledger
   (`manifest_version_id`), and every later read — the pre-commit stored-bytes
   authentication and the recovery re-check — **MUST** address that exact
   version, never the mutable current key.
 - A recorded version that can no longer be read **MUST** fail closed: the
-  batch is flagged `replay_required`, and source progress is not committed.
-  Recovery **MUST NOT** fall back from a pinned version to the current key.
+  batch is transitioned to `FAILED` then `REPLAY_REQUIRED` (the only legal
+  path, protocol §12/§14), and source progress is not committed. Recovery
+  **MUST NOT** fall back from a pinned version to the current key.
 - With `upload.require_object_versioning = true` (the hardened profile), the
   backend **MUST** expose immutable object versions, bucket versioning
   **MUST** be preflighted before the first upload to each bucket, and a
@@ -217,7 +228,7 @@ complementary.
   Rows written before this feature (no recorded version) are verified the
   same legacy way.
 
-## 9. Resource Exhaustion Controls
+## 9. Resource exhaustion controls
 
 Resource exhaustion controls are part of the security boundary:
 
@@ -235,20 +246,20 @@ Resource exhaustion controls are part of the security boundary:
   entry type are revalidated immediately before unlinking. Changed entries are
   retained for the next cleanup pass.
 
-## 10. Audit and Failure Logging
+## 10. Audit and failure logging
 
 - The engine **SHOULD** emit structured audit logs for batch lifecycle events (seal, upload, verify, commit) including `batch_id`, object key, and outcome.
 - Failures **SHOULD** be logged with enough context to support replay and forensic review, **without** including secrets or raw sensitive payloads.
 - Audit logs **SHOULD** be append-oriented and suitable for retention alongside the archived objects.
 
-## 11. Secret Redaction
+## 11. Secret redaction
 
 - Any log path, error type, or diagnostic that could surface credentials **MUST** redact them.
 - Connection strings, headers, and configuration dumps **MUST** have secret fields masked before logging.
 - PostgreSQL parse/connect errors **MUST NOT** echo the supplied URL. VTOP connects from parsed options and applies URL redaction at the state-store error boundary as defense in depth.
 - The redaction layer **SHOULD** default to redacting unknown sensitive-looking fields rather than printing them.
 
-## 12. Container and Runtime Hardening
+## 12. Container and runtime hardening
 
 - Container images **SHOULD** run as a non-root user.
 - Images **SHOULD** use minimal/distroless-style bases to reduce attack surface.
@@ -256,7 +267,7 @@ Resource exhaustion controls are part of the security boundary:
 - Linux capabilities **SHOULD** be dropped to the minimum required.
 - Secrets **SHOULD** be provided via mounted secrets or the orchestrator's secret store, never baked into images.
 
-## 13. Supply-Chain Security
+## 13. Supply-chain security
 
 - Dependencies **SHOULD** be pinned and audited (e.g., dependency vulnerability scanning).
 - Builds **SHOULD** be reproducible where practical, and release artifacts **SHOULD** be checksummed and **MAY** be signed.
@@ -295,12 +306,12 @@ the ignore list and the build re-audited.
 | PostgreSQL transport authentication | Yes for remote hosts | Non-loopback connections require `sslmode=verify-full`; loopback/socket plaintext is limited to local operation. |
 | Backend-limited verification disclosure | Yes | Size-only mode is labeled and rejected by default. |
 | Data-at-rest encryption | Not by VTOP | Delegated to storage layer (SSE/bucket default). |
-| Object immutability (WORM) | Not yet | Designed; relies on backend object lock (future). |
+| Object immutability (WORM) | Partial | Bucket versioning is validated and manifest versions pinned under the hardened profile (§8.1); object-lock retention itself is deployment policy, not engine-configured. |
 | Public-key manifest signing / MAC rotation | Not yet | One shared MAC key is supported. |
 | Multipart upload integrity for very large objects | Not yet | Native backend uses single-part `put_object`. |
 | Authorization / multi-tenant isolation | Not by VTOP | Relies on storage-side IAM and least-privilege credentials. |
 
-## 15. Summary of Normative Rules
+## 15. Summary of normative rules
 
 | Rule | Level |
 |------|-------|
@@ -315,7 +326,7 @@ the ignore list and the build re-audited.
 | Verify object + manifest before commit | **MUST** |
 | Report backend-limited verification as such (not cryptographic) | **MUST** |
 | Configured manifest MAC verifies without downgrade | **MUST** |
-| Pinned manifest version unreadable → fail closed (`replay_required`) | **MUST** |
+| Pinned manifest version unreadable → fail closed (`FAILED` → `REPLAY_REQUIRED`) | **MUST** |
 | Hardened profile: versioned bucket preflight + version on every manifest upload | **MUST** (when `require_object_versioning`) |
 | Object Lock retention on versioned manifest buckets | **SHOULD** |
 | Object lock / immutability | **SHOULD** (later) |

@@ -114,6 +114,8 @@ VTOP addresses this with a source-agnostic safety model:
 
 ## Core rule
 
+The protocol's **commit rule** ([docs/VTOP_PROTOCOL_DRAFT.md §13](docs/VTOP_PROTOCOL_DRAFT.md#13-commit-rule)):
+
 ```text
 SOURCE_COMMITTED is forbidden until VERIFIED is true.
 ```
@@ -203,7 +205,7 @@ MANIFEST_UPLOADED → SOURCE_COMMITTED
 Relevant implementation:
 
 - [crates/vtop-core/src/state_machine.rs](crates/vtop-core/src/state_machine.rs)
-- [docs/VTOP_PROTOCOL_DRAFT.md](docs/VTOP_PROTOCOL_DRAFT.md)
+- [docs/VTOP_PROTOCOL_DRAFT.md §12](docs/VTOP_PROTOCOL_DRAFT.md#12-state-machine)
 
 ---
 
@@ -212,7 +214,7 @@ Relevant implementation:
 | Source mode | Progress marker | Behavior |
 |---|---|---|
 | **Kafka** | topic, partition, offset range | Uses a Kafka consumer with auto-commit disabled. Each batch contains records from one topic and one partition. Offsets are committed only after verification. |
-| **File** | path, inode, byte range | Reads append-only files line by line. Partial trailing lines are not committed. Replay resumes from the last safe byte offset. |
+| **File** | path, inode, byte range | Reads append-only files line-oriented, or whole-file for binary/compressed sources (`whole_file`). Partial trailing lines are not committed. Replay resumes from the last safe byte offset. |
 | **Syslog spool** | spool ID, byte range | Treats rsyslog or syslog-ng spool files as append-only inputs. External collectors own syslog delivery; VTOP owns batching, upload, verification, replay, and commit safety. |
 
 ---
@@ -228,10 +230,11 @@ Supported detected formats:
 | Format | Example output extension |
 |---|---|
 | CEF | `.cef.gz` |
+| LEEF | `.leef.gz` |
 | JSON | `.json.gz` |
 | JSON Lines | `.jsonl.gz` |
 | Syslog | `.syslog.gz` |
-| Plain text | `.txt.gz` |
+| Raw | `.raw.gz` |
 
 A single engine can process different formats across different streams.
 
@@ -571,22 +574,31 @@ tests/integration_file_to_minio.rs
     "consumer_group": "vtop-engine"
   },
   "object": {
-    "uri": "s3://telemetry-data/tenant=default/source=app/format=cef/year=2026/month=06/day=18/hour=15/vtop-....cef.gz",
+    "uri": "s3://telemetry-data/tenant=default/source=app_events/format=cef/year=2026/month=06/day=18/hour=15/vtop-....cef.gz",
     "size_bytes": 924822,
-    "sha256": "abc123..."
+    "checksum_algorithm": "sha256",
+    "checksum": "abc123..."
   },
   "manifest": {
     "uri": "s3://telemetry-data/.../vtop-....manifest.json",
     "sha256": "def456...",
     "mac": "0123abcd..."
   },
+  "partitioning": {
+    "path_template": "tenant={tenant}/source={source}/format={format}/year={yyyy}/month={mm}/day={dd}/hour={hh}",
+    "resolved_prefix": "tenant=default/source=app_events/format=cef/year=2026/month=06/day=18/hour=15"
+  },
+  "upload_backend": "s3_native",
   "state": "manifest_uploaded",
-  "verification_status": "not_verified"
+  "verification_status": "not_verified",
+  "created_at": "2026-06-18T15:00:02Z"
 }
 ```
 
 > [!NOTE]
 > The manifest is written at `MANIFEST_UPLOADED`, before storage-side verification.
+>
+> The trailing `batch_id` token is a random suffix: replaying a batch currently writes a **new** object key rather than reproducing the same one — the open gap against the deterministic-naming rule of [docs/VTOP_PROTOCOL_DRAFT.md §15.1](docs/VTOP_PROTOCOL_DRAFT.md#15-object-and-bucket-naming).
 >
 > The authoritative post-verification state lives in the state store and can be queried with `vtopctl status` or `vtopctl list-batches --json`.
 
@@ -702,13 +714,15 @@ VTOP is currently a prototype. The following limits are known and intentional.
 
 | Area | Current behavior | Planned direction |
 |---|---|---|
+| Deterministic object naming | not yet — `batch_id` embeds a timestamp + random suffix, so replay writes a **new** key (duplicate object, no data loss), against the MUST of [protocol §15.1](docs/VTOP_PROTOCOL_DRAFT.md#15-object-and-bucket-naming)/§16 | deterministic / content-addressed keys ([HA roadmap Phase 4](docs/PRODUCTION_HA_ROADMAP.md)) |
+| Verification classes | strong (default) / backend-limited / disabled (size-only), per [protocol §17](docs/VTOP_PROTOCOL_DRAFT.md#17-verification-semantics); non-strong commit requires explicit opt-out | — |
 | Large objects | native S3 + mock support resumable multipart with persisted sessions (`vtopctl tier copy --multipart-state-dir`); compatibility backends still single-shot `put_object` | wire remaining backends / streaming rehydrate |
 | Large records / whole files | `max_bytes` is a hard per-source/per-batch ceiling; an oversized record is rejected without advancing source progress | raise the explicit budget only when the deployment has matching memory headroom |
 | Partial upload recovery | replays from source instead of resuming half-written local objects | add resumable local staging |
 | Command backend verification cost | `aws`, `s3cmd`, and `mc` download each stored object to hash it | prefer native S3 SHA-256 when read-back bandwidth is costly |
 | Syslog timestamps | `received_time_*` is not yet extracted into the spool marker | add timestamp extraction |
 | Manifest integrity | self-hash plus optional keyed-BLAKE3 authentication; key rotation not implemented | add multi-key rotation and public-key signatures if required |
-| Object immutability | S3 Object Lock is designed but not implemented | add Object Lock profile |
+| Object immutability | manifest version pinning + bucket-versioning validation implemented (hardened profile, `upload.require_object_versioning`); Object Lock retention itself is deployment policy | document an Object Lock deployment profile |
 | Metrics export | **Prometheus `/metrics` implemented** (opt-in via `VTOP_METRICS_ADDR`); OpenTelemetry trace export not yet | add OTLP span export |
 | Kafka integration test | requires live broker and is ignored by default | add optional CI service profile |
 | Binary / pre-compressed inputs | **supported** via the file source `whole_file` mode (archived verbatim, byte-exact) | streaming for very large files |

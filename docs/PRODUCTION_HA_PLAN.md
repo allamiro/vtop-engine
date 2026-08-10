@@ -19,6 +19,11 @@
 > VTOP *cluster* (`vtop-meta` Raft metadata, `vtop-node`, `vtop-broker`,
 > `vtop-log` sealed-segment replication) is a separate plane with its own
 > narrative roadmap in [`ROADMAP.md`](ROADMAP.md).
+>
+> Normative behavior (states, commit rule, verification classes, naming) is
+> defined by [`VTOP_PROTOCOL_DRAFT.md`](VTOP_PROTOCOL_DRAFT.md); this document
+> cites it as "protocol §N" and describes how to *deploy* a conformant engine,
+> not what conformance means.
 
 ---
 
@@ -61,7 +66,9 @@ transfer engine, **without weakening the core guarantee**:
 - **Replay safety** — a crash at any stage is recoverable with **no data loss**.
 - **Delivery semantics (accurate):** today the system is **at-least-once with
   possible duplicate objects** (§1.5, §6). *Idempotent at the archive layer*
-  requires **deterministic / content-addressed object keys [PROPOSED]**.
+  requires **deterministic / content-addressed object keys [PROPOSED]** —
+  which protocol §15.1 already mandates (deterministic naming is a **MUST**);
+  this is the one known conformance gap in the reference implementation.
 
 ### 1.3 Non-goals
 - Not a stream-processing/analytics engine (only framing/format detection).
@@ -135,7 +142,10 @@ VTOP has a clean **two-plane** design; understanding it keeps the HA design smal
 
 ## 3. Definition of VERIFIED (precise)
 
-The whole invariant hinges on `VERIFIED`, so it must be unambiguous.
+The whole invariant hinges on `VERIFIED`, so it must be unambiguous. This
+section operationalizes the protocol's commit rule (protocol §13) and
+verification semantics (protocol §17); the state names are those of the
+protocol state machine (protocol §12).
 
 **A batch is VERIFIED only when all of the following hold:**
 1. the **object exists** in object storage;
@@ -354,10 +364,17 @@ Rows in any non-committed state are never touched.
 This section supersedes any earlier "rewrites the same object" wording.
 
 ### 6.1 Current reality
-Object keys are **non-deterministic** (`Utc::now()` + `Uuid::new_v4()`), so a
-replayed batch writes a **new** object. Result: **no data loss, but duplicate
-objects** can accumulate on crash/replay. The **state ledger + manifests** are the
-dedup authority today — not key collision.
+Object keys are **non-deterministic** (`Utc::now()` + `Uuid::new_v4()` inside
+the `batch_id`), so a replayed batch writes a **new** object. Result: **no data
+loss, but duplicate objects** can accumulate on crash/replay. The **state
+ledger + manifests** are the dedup authority today — not key collision.
+
+Protocol §15.1 requires the naming scheme to be **deterministic so that replay
+produces the same object key**, and protocol §14 says re-uploads of identical
+content SHOULD be idempotent. The reference implementation follows the §15.1
+partition layout (`tenant=…/source=…/format=…/year=…/…/{batch_id}…`) but the
+random `batch_id` component breaks the determinism MUST — this is the
+conformance gap that roadmap Phase 4 closes.
 
 ### 6.2 Object Lock / WORM safe-retry rules
 With S3 Object Lock, protected object versions **cannot be overwritten or deleted**.
@@ -744,7 +761,9 @@ Short procedures now; expand into a full ops runbook before go-live.
   different host pointed at the same Postgres; that configuration is
   unsupported and warned about at startup. Do not scale replicas.
 - **Non-deterministic object keys** — replay can create **duplicate objects** (no
-  loss). Fixed by deterministic/content-addressed keys (roadmap Phase 4).
+  loss). This is also the implementation's one known gap against the protocol
+  draft's deterministic-naming MUST (protocol §15.1). Fixed by
+  deterministic/content-addressed keys (roadmap Phase 4).
 - **Engine loop is single-process** — no horizontal scale until Kafka
   consumer-group fleet mode lands (roadmap Phase 5).
 - **File/syslog HA is not solved without leases** — single-owner only.

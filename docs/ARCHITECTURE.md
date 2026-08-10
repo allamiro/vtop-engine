@@ -28,7 +28,7 @@
 
 VTOP Engine is a Rust workspace implementing a replay-safe, manifest-driven telemetry object transfer engine. It ingests telemetry from Kafka topics, files, and syslog spool files; forms adaptive batches; compresses them; computes a content checksum (SHA-256 or BLAKE3, or size-only when disabled); generates a bound manifest; uploads the telemetry object and manifest to a pluggable storage backend; verifies the uploaded object and manifest; and commits source progress only after verification succeeds.
 
-The governing rule is: **`SOURCE_COMMITTED` is forbidden until `VERIFIED` is true.** It is enforced in three places — the state machine, the SQLite state store, and the engine pipeline.
+The governing rule is the protocol's **commit rule** ([VTOP_PROTOCOL_DRAFT.md §13](VTOP_PROTOCOL_DRAFT.md#13-commit-rule)): **`SOURCE_COMMITTED` is forbidden until `VERIFIED` is true.** It is enforced in three places — the state machine, the durable state store, and the engine pipeline. Throughout this document, "protocol §N" cites [VTOP_PROTOCOL_DRAFT.md](VTOP_PROTOCOL_DRAFT.md).
 
 ---
 
@@ -41,7 +41,7 @@ The governing rule is: **`SOURCE_COMMITTED` is forbidden until `VERIFIED` is tru
 | Replay safety | Durable state journal + verification-before-commit; no marker advances for unverified data. |
 | Protocol/transport independence | `vtop-core` has no dependency on Kafka, S3, or the CLI; sources and backends sit behind traits. |
 | Cross-source uniformity | One `SourceAdapter` trait and one progress-marker abstraction over Kafka/file/spool. |
-| Determinism | Deterministic object naming so replay reproduces the same key. |
+| Determinism | Deterministic object naming so replay reproduces the same key (protocol §15.1 goal — **not yet met**: the `batch_id` embeds a timestamp and random suffix, so replay currently writes a new key; see §13). |
 | Auditability | A bound, self-hashed manifest per object. |
 | Backend independence | One `UploadBackend` trait with a verification contract; many implementations. |
 
@@ -62,8 +62,11 @@ The project is a Cargo workspace. `vtop-core` is protocol-independent and depend
 | `vtop-core` | Protocol-independent engine logic (state machine, batching, manifest, checksum, compression, partitioning, detection, config, replay classification, metrics). | none source/backend-specific |
 | `vtop-adapters` | Source adapters behind the `SourceAdapter` trait: Kafka, file, syslog spool. | `rdkafka` |
 | `vtop-upload` | Upload backends behind the `UploadBackend` trait. | `aws-sdk-s3`, external CLIs |
-| `vtop-state` | Durable SQLite state journal (`sqlx`). | `sqlx` (sqlite) |
+| `vtop-state` | Durable state journal behind the `StateStore` trait: SQLite by default, PostgreSQL behind `--features postgres`. | `sqlx` |
+| `vtop-observe` | Opt-in metrics/readiness HTTP endpoint (`VTOP_METRICS_ADDR`). | — |
 | `vtop-cli` | The `vtopctl` binary and the engine runtime that wires everything together. | all of the above |
+
+(The workspace also contains the cluster-plane crates `vtop-meta`, `vtop-node`, `vtop-broker`, `vtop-log`, and `vtop-protocol`, documented in [NATIVE_BROKER_ARCHITECTURE.md](NATIVE_BROKER_ARCHITECTURE.md); they are outside this document's scope.)
 
 ### 3.1 `vtop-core` modules
 
@@ -88,12 +91,12 @@ The project is a Cargo workspace. `vtop-core` is protocol-independent and depend
 
 | Type | Role |
 |------|------|
-| `BatchId` | Unique, deterministic batch identifier embedding source/partition/offset range. |
+| `BatchId` | Unique batch identifier embedding a UTC stamp, source/partition/offset range, and a random suffix (deterministic in shape, not in value — protocol §15.1 gap). |
 | `SourceProgressMarker` | Source-agnostic position: Kafka offset, file byte offset, or syslog spool offset. |
 | `Batch` | Sealed, immutable record set + covered marker range + record count + format + sizes. |
 | `Manifest` | Bound document: source identity, marker range, object location, integrity metadata, self-hash. |
-| `BatchState` | One of the state-machine states (see §12 / protocol §12). |
-| `UploadResult` / `VerifyResult` | Backend outcomes, including verification strength (strong vs backend-limited). |
+| `BatchState` | One of the state-machine states (see §5.1 / protocol §12). |
+| `UploadResult` / `VerifyResult` | Backend outcomes, including verification strength (strong vs backend-limited vs disabled/size-only — protocol §17). |
 | `BatchMetrics` | Per-batch sizes, ratios, per-stage latencies, throughput. |
 
 ---
@@ -245,10 +248,14 @@ upload through a persisted multipart session when the backend advertises
   strong whole-object `verify_object` and immutable version pins (#183/#184).
 - `vtopctl tier cleanup-abandoned` aborts aged in-progress uploads.
 
-Checksums disabled by configuration (or a service unable to return a required
-service checksum) produce **backend-limited** verification. Strong verification
-is the default; accepting a limited result requires an explicit opt-out (see
-protocol §17).
+Protocol §17 grades verification into three classes: **strong**
+(stored-content or service-computed digest matches the manifest),
+**backend-limited** (the service can confirm only existence and size), and
+**disabled** (size-only by explicit configuration). A service unable to return
+a required content checksum yields a backend-limited result; checksums
+disabled by configuration are the separate disabled class. Strong verification
+is the default; accepting a non-strong result requires an explicit opt-out
+(`require_strong_verification: false`).
 
 ---
 
@@ -257,7 +264,8 @@ protocol §17).
 - The `checksum` module computes a content checksum over the **compressed** object bytes — after compression, before upload (pipeline stage 4).
 - Supported modes: **SHA-256**, **BLAKE3**, or **disabled** (size-only verification). The mode is configurable per run.
 - The chosen algorithm and value (or the disabled indicator) are recorded in the manifest.
-- The manifest additionally carries a reproducible **self-hash** (computed with the self-hash field blanked) for tamper-evidence (`verify_self_hash`).
+- The manifest additionally carries a reproducible **self-hash** (computed with both the embedded self-hash and MAC fields blanked) for corruption detection (`verify_self_hash`) — tamper detection requires the optional keyed BLAKE3 `manifest.mac` (protocol §11.2/§17.3).
+- When `manifest_mac_key_env` is configured, stored manifests must carry a valid keyed MAC; a missing MAC never silently downgrades verification (protocol §17.3).
 - Verification compares a digest derived from the stored body (or S3's service-computed SHA-256) against the manifest before `VERIFIED` is reached. Uploader metadata and LocalFS sidecars are never strong evidence.
 
 ---
@@ -272,7 +280,7 @@ protocol §17).
 
 ## 11. Partitioning and per-format buckets
 
-The `partitioning` module derives a deterministic, telemetry-aware partition path from a consistent time policy. It is **general-purpose** (log analytics, observability, audit, compliance, SIEM), not tied to one domain.
+The `partitioning` module derives a telemetry-aware partition path from a consistent time policy (protocol §15.1, §15.2, §16). It is **general-purpose** (log analytics, observability, audit, compliance, SIEM), not tied to one domain.
 
 ```
 s3://{bucket}/{prefix}/tenant={tenant}/source={source}/format={format}/year={yyyy}/month={mm}/day={dd}/hour={hh}/{batch_id}.{format}.{compression_ext}
@@ -287,7 +295,7 @@ The bound manifest is stored at the same prefix as `{batch_id}.manifest.json`.
 
 ## 12. State store schema
 
-`vtop-state` is a durable journal backed by **SQLite via `sqlx`**. It survives restart and is the source of truth for recovery. Conceptually it stores, per batch:
+`vtop-state` is a durable journal behind the `StateStore` trait — **SQLite via `sqlx`** by default, **PostgreSQL** behind `--features postgres` (see [POSTGRES_DEPLOYMENT.md](POSTGRES_DEPLOYMENT.md)). It survives restart and is the source of truth for recovery. Conceptually it stores, per batch:
 
 | Field group | Contents |
 |-------------|----------|
@@ -298,7 +306,7 @@ The bound manifest is stored at the same prefix as `{batch_id}.manifest.json`.
 | Verification | Verification status and strength. |
 | Timestamps | Discovery/seal/commit timestamps for audit and recovery. |
 
-Crucially, `SqliteStateStore::update_batch_state` routes **every** state change through the state machine's `transition()`, so the commit rule holds even at the persistence layer (not only in the pipeline).
+Crucially, every backend's `update_batch_state` routes **every** state change through the state machine's `transition()`, so the commit rule holds even at the persistence layer (not only in the pipeline); the PostgreSQL backend additionally enforces it with database constraints.
 
 ---
 
@@ -308,7 +316,7 @@ On startup, the `replay` module inspects `vtop-state` and maps each incomplete b
 
 1. A batch in **`VERIFIED`** but not yet committed (object and manifest durably stored and verified) has its **source commit retried** (`VERIFIED → SOURCE_COMMITTED`). The verified object is never discarded.
 2. A batch in any state **before `VERIFIED`** is transitioned `... → FAILED → REPLAY_REQUIRED → BATCHING` and re-driven from the last committed source progress marker.
-3. Because object naming is deterministic (`{batch_id}` + partition path), re-uploading identical content yields the same object key — replay is **idempotent**.
+3. Replay currently produces a **new** object key: the `batch_id` and the `year/…/hour` path components are derived from wall-clock time plus a random suffix, so a replayed batch writes a duplicate object (at-least-once, no data loss). Protocol §14/§15.1/§16 specify deterministic naming so that replay is idempotent — this is the open gap tracked as [PRODUCTION_HA_ROADMAP.md](PRODUCTION_HA_ROADMAP.md) Phase 4.
 4. A state/storage mismatch (e.g., an object present but unverified) is resolved by re-verifying or re-uploading **before** any commit.
 
 This guarantees: no source progress marker is committed unless its object and manifest are durably stored and verified, and no committed marker is double-committed. Source progress is **never** advanced for unverified data.

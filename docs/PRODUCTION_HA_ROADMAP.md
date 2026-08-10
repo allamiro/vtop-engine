@@ -6,7 +6,9 @@
 > reference; this one holds **what is done, what is in flight, what remains**,
 > in dependency order, with per-phase test plans, exit criteria, and rollback.
 >
-> Section references of the form "PLAN §N" point into the design document.
+> Section references of the form "PLAN §N" point into the design document;
+> "protocol §N" points into [`VTOP_PROTOCOL_DRAFT.md`](VTOP_PROTOCOL_DRAFT.md),
+> which defines the normative behavior every phase must preserve.
 >
 > Scope note: this roadmap covers the **engine pipeline** (`vtop-core`,
 > `vtop-state`, `vtop-adapters`, `vtop-upload`, `vtopctl engine`). The VTOP
@@ -122,7 +124,11 @@ deployment identity; the live battery proves the runtime role cannot run DDL,
 
 ### Phase 4 — Deterministic keys + idempotent retry ⬜ NOT STARTED — next up
 - **Objective:** replaying a batch must resolve to the same object, so retry is
-  idempotent at the archive layer and Object Lock is safe (PLAN §6).
+  idempotent at the archive layer and Object Lock is safe (PLAN §6). This also
+  closes the implementation's one known conformance gap against the protocol
+  draft, whose naming rule is a MUST
+  ([`VTOP_PROTOCOL_DRAFT.md`](VTOP_PROTOCOL_DRAFT.md) §15.1: replay produces
+  the same object key; §14: identical re-uploads SHOULD be idempotent).
 - **Work:** deterministic / content-addressed object keys behind
   `VTOP_OBJECT_KEY_MODE=legacy|deterministic|content-addressed`; "existing
   verified object = success" on retry; record `version_id` when

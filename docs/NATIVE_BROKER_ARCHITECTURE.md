@@ -404,6 +404,12 @@ VERIFIED or TIER_VERIFIED -> RETIRE_PLANNED -> RETIRED
 any non-retired state -> QUARANTINED
 ```
 
+> These segment states are disjoint from the archive **batch** states of
+> [`VTOP_PROTOCOL_DRAFT.md` §12](VTOP_PROTOCOL_DRAFT.md#12-state-machine):
+> `VERIFIED` here means a chunk-root-verified *segment* gated by a cluster
+> commit statement, not an object+manifest-verified *batch* on the archive
+> path.
+
 `RETIRE_PLANNED` requires a committed `ReplacementProof` naming the source,
 destination, expected length, authenticated root, segment identity/generation,
 verification method, verifier, and verification time/term. Physical deletion
