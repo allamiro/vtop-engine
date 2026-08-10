@@ -385,6 +385,20 @@ pub async fn serve(
 
     observability.register(Box::new(SegmentRecoveryCollector::new(recovery.as_ref())?))?;
 
+    if let Some(retention) = &config.retention {
+        // Zero is ambiguous between "reclaim everything eligible" (the
+        // storage API's reading) and "disabled" (the broker's atomic
+        // sentinel). Refusing it at startup keeps an operator who typed 0
+        // from silently getting the unbounded growth this config exists to
+        // prevent (#290).
+        if retention.max_total_bytes == 0 {
+            return Err(
+                "retention.max_total_bytes must be greater than zero; omit the retention block                  to disable retention"
+                    .to_owned(),
+            );
+        }
+    }
+
     match config.role {
         DataRole::Follower => {
             run_follower(

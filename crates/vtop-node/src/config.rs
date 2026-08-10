@@ -333,6 +333,10 @@ pub struct RetentionConfig {
     /// oldest-first once the bound is exceeded — and only segments wholly
     /// below the acknowledged (cluster-committed) floor are ever eligible,
     /// so unacknowledged data is never reclaimed whatever this says.
+    ///
+    /// MUST be greater than zero; startup refuses zero rather than guessing
+    /// between "reclaim everything" and "disabled". Disabling retention is
+    /// spelled by omitting the whole `retention` block.
     pub max_total_bytes: u64,
 }
 

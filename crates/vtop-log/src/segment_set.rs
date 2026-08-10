@@ -770,6 +770,16 @@ impl SegmentSet {
         policy: &RetentionPolicy,
         floor: u64,
     ) -> VtopLogResult<RetentionOutcome> {
+        // FINISH BEFORE STARTING. A previous pass may have failed between its
+        // marker and its last unlink; the caller keeps serving and calls
+        // retain again on a later append. Writing a fresh marker over the
+        // unfinished one would forget its doomed list — files half-deleted
+        // under the old intent would be orphans no recovery ever revisits,
+        // and discovery would quarantine the range for them. Completing the
+        // old intent first makes the live path self-healing, exactly as the
+        // next open would be; if the finish fails again, the error propagates
+        // and the OLD marker stays authoritative for the next attempt.
+        finish_pending_retention(&self.env, &self.directory)?;
         let sealed_bytes: u64 = self
             .sealed
             .iter()
@@ -2643,6 +2653,62 @@ mod tests {
             }
             other => panic!("a retained offset must be a nameable error, got {other:?}"),
         }
+    }
+
+    /// The exact state a FAILED pass leaves behind: marker durable, the
+    /// in-memory front already drained, deletions incomplete, and the error
+    /// swallowed by a caller that keeps serving. A later pass must finish
+    /// that intent before writing its own — replacing it would forget the
+    /// old doomed list and leave its half-deleted files as orphans no
+    /// recovery ever revisits.
+    #[test]
+    fn a_new_retention_pass_finishes_an_unfinished_marker_first() {
+        let dir = tempdir().unwrap();
+        let producer = Uuid::from_u128(0xB0);
+        build_rolled_range(dir.path(), producer);
+        let mut set = SegmentSet::open_in(&Env::real(), dir.path())
+            .unwrap()
+            .expect("the range exists");
+        let front = crate::retention_intent::RetainedSegment {
+            segment_id: set.sealed()[0].segment_id(),
+            base_offset: set.sealed()[0].base_offset(),
+        };
+        let front_stem = segment_stem(front.base_offset);
+        let new_base = set.sealed()[1].base_offset();
+        let intent = RetentionIntent {
+            new_base,
+            doomed: vec![front],
+        };
+        write_atomic(
+            &Env::real(),
+            &dir.path().join(RETENTION_INTENT_FILE),
+            &intent.encode().unwrap(),
+        )
+        .unwrap();
+        // What drain(..cut) had already done before the failure.
+        set.sealed.remove(0);
+
+        // A later pass whose own policy is satisfied must STILL finish the
+        // unfinished intent rather than ignoring or replacing it.
+        let outcome = set
+            .retain(
+                &RetentionPolicy {
+                    max_total_bytes: u64::MAX,
+                },
+                u64::MAX,
+            )
+            .expect("the pass must complete the pending intent");
+        assert_eq!(outcome.segments_removed, 0, "its own policy dooms nothing");
+        assert!(
+            !dir.path().join(format!("{front_stem}.segment")).exists(),
+            "the OLD intent's deletions must have been finished"
+        );
+        assert!(!dir.path().join(RETENTION_INTENT_FILE).exists());
+        drop(set);
+        let reopened = SegmentSet::open_in(&Env::real(), dir.path())
+            .unwrap()
+            .expect("no orphans, no quarantine");
+        assert_eq!(reopened.base_offset(), new_base);
     }
 
     /// The frontier of a reclaimed segment survives in its successor's

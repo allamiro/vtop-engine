@@ -414,6 +414,12 @@ fn interrupted_atomic_write(name: &str) -> bool {
     if Uuid::parse_str(uuid).is_err() {
         return false;
     }
+    // The two range-level markers are single fixed names, so their scratch
+    // files are matched exactly — a suffix match would sweep an unrelated
+    // `.notes.retention-intent.<uuid>.tmp`, which is nobody's scratch file.
+    if target == TRUNCATE_INTENT_FILE || target == RETENTION_INTENT_FILE {
+        return true;
+    }
     [
         ".commit",
         ".index",
@@ -425,12 +431,6 @@ fn interrupted_atomic_write(name: &str) -> bool {
         // roll is reported as a corrupt range rather than an incomplete
         // write.
         ".producers",
-        // Same shape for a truncation marker whose atomic write was
-        // interrupted: `.range.truncate-intent.<uuid>.tmp` is an
-        // incomplete write, not an intent.
-        ".truncate-intent",
-        // And the retention marker's interrupted write, same shape (#290).
-        ".retention-intent",
     ]
     .iter()
     .any(|suffix| target.ends_with(suffix))
@@ -1110,6 +1110,11 @@ mod tests {
             ".scratch.00000000-0000-0000-0000-000000000001.tmp",
             // Recognized marker but not in target position.
             ".commit.notes.backup.tmp",
+            // Valid UUID and an intent-marker SUFFIX, but not the one fixed
+            // range-level name — the markers are matched exactly, so these
+            // are nobody's scratch files (#290).
+            ".notes.retention-intent.00000000-0000-0000-0000-000000000002.tmp",
+            ".notes.truncate-intent.00000000-0000-0000-0000-000000000003.tmp",
         ] {
             fs::write(directory.path().join(name), b"not ours").unwrap();
         }

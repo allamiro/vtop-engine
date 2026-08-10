@@ -802,29 +802,14 @@ impl LocalBroker {
         self.held_fencing_epoch.fetch_max(epoch, Ordering::SeqCst) < epoch
     }
 
-    /// Install the durable epoch→offset vector for this replica (#240).
-    ///
-    /// Seeds the currently held epoch when the vector is empty AND the log is
-    /// empty. Without that, a replica configured with a static epoch never
-    /// calls `adopt_fencing_epoch`, so it would report "unknown" for its
-    /// entire history and be unreconcilable forever.
-    ///
-    /// The log-empty condition is the part that matters, and it is narrower
-    /// than it looks tempting to make it: for a replica that ALREADY holds
-    /// records, this process cannot know where its held epoch began — the
-    /// records may have been written under an older one. Claiming it started
-    /// at the current tail would be a fabricated boundary, and a later
-    /// truncation computed from it could discard acknowledged records.
-    /// Reporting "unknown" there is the honest answer, and the API already
-    /// handles it.
-    ///
-    /// Also completes an interrupted truncation. See
-    /// [`Self::attach_epoch_journal_to_log`].
     /// Bound this range's disk in bytes; `None` disables retention (#290).
     ///
     /// Takes effect on the next produce that appends. The bound covers
     /// encoded record frames (sealed content plus the active tail), and only
-    /// segments wholly below the acknowledged floor are ever reclaimed.
+    /// segments wholly below the acknowledged floor are ever reclaimed. A
+    /// `Some` policy with a zero bound is treated as disabled at this layer;
+    /// node configuration rejects zero outright, so the only way to disable
+    /// retention is to not configure it.
     pub fn set_retention(&self, policy: Option<vtop_log::RetentionPolicy>) {
         self.retention_max_total_bytes.store(
             policy.map(|policy| policy.max_total_bytes).unwrap_or(0),
@@ -858,6 +843,24 @@ impl LocalBroker {
         }
     }
 
+    /// Install the durable epoch→offset vector for this replica (#240).
+    ///
+    /// Seeds the currently held epoch when the vector is empty AND the log is
+    /// empty. Without that, a replica configured with a static epoch never
+    /// calls `adopt_fencing_epoch`, so it would report "unknown" for its
+    /// entire history and be unreconcilable forever.
+    ///
+    /// The log-empty condition is the part that matters, and it is narrower
+    /// than it looks tempting to make it: for a replica that ALREADY holds
+    /// records, this process cannot know where its held epoch began — the
+    /// records may have been written under an older one. Claiming it started
+    /// at the current tail would be a fabricated boundary, and a later
+    /// truncation computed from it could discard acknowledged records.
+    /// Reporting "unknown" there is the honest answer, and the API already
+    /// handles it.
+    ///
+    /// Also completes an interrupted truncation. See
+    /// [`Self::attach_epoch_journal_to_log`].
     pub fn set_fencing_epoch_journal(
         &self,
         mut journal: crate::fencing_epochs::FencingEpochJournal,

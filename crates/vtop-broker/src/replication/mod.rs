@@ -305,16 +305,11 @@ impl InProcessFollower {
         self.held_fencing_epoch.fetch_max(epoch, Ordering::SeqCst) < epoch
     }
 
-    /// Install the durable epoch→offset vector for this replica (#240).
-    ///
-    /// Seeds the held epoch only when both the vector and the log are empty;
-    /// see [`crate::LocalBroker::set_fencing_epoch_journal`] for why a replica
-    /// that already holds records must report "unknown" instead. Also completes
-    /// a truncation interrupted by a crash, per
-    /// [`crate::LocalBroker::attach_epoch_journal_to_log`].
     /// Bound this replica's disk in bytes; `None` disables retention (#290).
     /// Followers reclaim by their own policy exactly as they roll at their
-    /// own bound: the leader replicates offsets, not files.
+    /// own bound: the leader replicates offsets, not files. A `Some` policy
+    /// with a zero bound is treated as disabled at this layer; node
+    /// configuration rejects zero outright.
     pub fn set_retention(&self, policy: Option<vtop_log::RetentionPolicy>) {
         self.retention_max_total_bytes.store(
             policy.map(|policy| policy.max_total_bytes).unwrap_or(0),
@@ -341,6 +336,13 @@ impl InProcessFollower {
         }
     }
 
+    /// Install the durable epoch→offset vector for this replica (#240).
+    ///
+    /// Seeds the held epoch only when both the vector and the log are empty;
+    /// see [`crate::LocalBroker::set_fencing_epoch_journal`] for why a replica
+    /// that already holds records must report "unknown" instead. Also completes
+    /// a truncation interrupted by a crash, per
+    /// [`crate::LocalBroker::attach_epoch_journal_to_log`].
     pub fn set_fencing_epoch_journal(
         &self,
         mut journal: crate::fencing_epochs::FencingEpochJournal,
@@ -615,12 +617,18 @@ impl InProcessFollower {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.segment.commit().map_err(|problem| {
+        let committed = state.segment.commit().map_err(|problem| {
             (
                 ErrorCode::Storage,
                 format!("follower {} flush_held_fsync: {problem}", self.node_id),
             )
-        })
+        })?;
+        // The flush is the moment held appends become durable, and it may
+        // have rolled the tail — reclaim here too, or a follower flushed
+        // after a hold keeps its now-durable sealed prefix until the next
+        // append happens to arrive (#290).
+        self.run_retention(&mut state.segment);
+        Ok(committed)
     }
 
     /// Replace on-disk state after a simulated crash/reboot recovery.
