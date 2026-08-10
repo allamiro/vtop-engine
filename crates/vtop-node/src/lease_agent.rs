@@ -597,7 +597,7 @@ impl LeaseAgent {
         })
     }
 
-    /// Run until the process stops or `shutdown` fires (#280).
+    /// Run until the process stops or `release` fires (#280).
     ///
     /// Losing a lease is a state transition, not a reason to exit — the node
     /// stays up so it can be inspected and can win the range back. Shutdown
@@ -605,9 +605,18 @@ impl LeaseAgent {
     /// the lease lapse, so failover starts as soon as the holder leaves
     /// rather than after a metadata deadline the departed leader can no
     /// longer make use of.
-    pub async fn run(mut self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    ///
+    /// `release` is NOT the raw process signal — the node fires it only after
+    /// the native server has stopped admitting and drained. Releasing any
+    /// earlier would let metadata authorize a successor at a higher epoch
+    /// while this broker still executes an admitted produce under the old
+    /// one, and a record acked in that window could sit above the boundary
+    /// the successor's promotion proves — acknowledged, then outside the
+    /// range everyone agrees on. The order is: stop admitting, drain, THEN
+    /// hand the range back.
+    pub async fn run(mut self, mut release: tokio::sync::watch::Receiver<bool>) {
         loop {
-            if *shutdown.borrow() {
+            if *release.borrow() {
                 break;
             }
             let delay = match self.step().await {
@@ -641,7 +650,7 @@ impl LeaseAgent {
             };
             tokio::select! {
                 _ = tokio::time::sleep(delay) => {}
-                _ = shutdown.changed() => {}
+                _ = release.changed() => {}
             }
         }
         self.release().await;

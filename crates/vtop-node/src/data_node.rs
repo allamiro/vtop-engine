@@ -705,7 +705,14 @@ async fn run_leader(
     // Range leadership from the metadata plane (#223). Without this the
     // configured `fencing_epoch` is simply asserted and never revisited, which
     // is the pre-#223 behaviour every existing config still gets.
+    // The agent's exit trigger is NOT the process signal: releasing the
+    // lease while the native server still executes an admitted produce would
+    // let metadata authorize a successor at a higher epoch under a broker
+    // still acking at the old one. run_leader fires this only after the
+    // server has drained (#280).
+    let (release_lease, release_lease_rx) = tokio::sync::watch::channel(false);
     let mut agent_task = None;
+    let mut agent_drain = std::time::Duration::from_secs(5);
     if let Some(lease) = config.lease.as_ref() {
         // Followers learn granted epochs on their own now (#239), so a
         // replicated range no longer needs them restarted on every grant —
@@ -740,7 +747,11 @@ async fn run_leader(
             ))),
             promotion_probe,
         )?;
-        agent_task = Some(tokio::spawn(agent.run(shutdown.clone())));
+        agent_task = Some(tokio::spawn(agent.run(release_lease_rx)));
+        // The drain wait must survive an in-flight admin round trip, whose
+        // own budget is the lease duration; past one full lease the release
+        // is moot anyway — the lease has lapsed on its own.
+        agent_drain = agent_drain.max(Duration::from_millis(lease.lease_duration_ms));
     }
     observability.register(Box::new(BrokerCollector::new(
         Arc::clone(&broker),
@@ -901,8 +912,12 @@ async fn run_leader(
         if replicated { "leader" } else { "standalone" },
         config.node_uuid
     );
+    // Stop admitting and drain FIRST (the serve above has returned), only
+    // then hand the range back — see the channel's comment for why the order
+    // is load-bearing.
+    let _ = release_lease.send(true);
     if let Some(task) = agent_task {
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+        let _ = tokio::time::timeout(agent_drain, task).await;
     }
     match broker.quiesce() {
         Ok(committed) => println!(

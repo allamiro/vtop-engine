@@ -143,8 +143,7 @@ async fn main() {
     // carries the ready markers the chaos harness parses.
     vtop_observe::logging::init("info", false);
     let cli = Cli::parse();
-    let shutdown = shutdown_signal();
-    let outcome = run(cli, shutdown).await;
+    let outcome = run(cli).await;
     match outcome {
         Ok(code) => std::process::exit(code),
         Err(message) => {
@@ -195,18 +194,22 @@ fn shutdown_signal() -> tokio::sync::watch::Receiver<bool> {
     receiver
 }
 
-async fn run(cli: Cli, shutdown: tokio::sync::watch::Receiver<bool>) -> Result<i32, String> {
+async fn run(cli: Cli) -> Result<i32, String> {
     match cli.command {
+        // The handler is installed only for the SERVER roles. A client
+        // command (`produce`, `verify`, `replica-status`) keeps the default
+        // signal disposition: swallowing SIGINT into a flag nothing observes
+        // would leave a hung client killable only by SIGKILL.
         Command::Meta { config } => {
-            meta_node::run(config::load(&config)?, shutdown).await?;
+            meta_node::run(config::load(&config)?, shutdown_signal()).await?;
             Ok(0)
         }
         Command::Data { config } => {
-            data_node::run(config::load(&config)?, shutdown).await?;
+            data_node::run(config::load(&config)?, shutdown_signal()).await?;
             Ok(0)
         }
         Command::Node { config } => {
-            colocated::run(config::load(&config)?, shutdown).await?;
+            colocated::run(config::load(&config)?, shutdown_signal()).await?;
             Ok(0)
         }
         Command::SealActive { path } => {

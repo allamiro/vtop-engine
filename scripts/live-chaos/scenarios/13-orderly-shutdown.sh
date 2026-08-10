@@ -112,6 +112,11 @@ NEW=$(start_promoted_follower "$PROMOTE_N" "$LEADER_ID")
 ACQUIRE_STARTED=$SECONDS
 EPOCH_AFTER="$(await_lease_holder "$LEADER_ID" "$PROMOTE_UUID" "$ELECTION_TIMEOUT_SECONDS")"
 ACQUIRE_TOOK=$((SECONDS - ACQUIRE_STARTED))
+# A released lease still mints FORWARD: the successor must hold a strictly
+# higher epoch, or the old leader was never fenced out of the range it left.
+[[ "$EPOCH_AFTER" -gt "$EPOCH_BEFORE" ]] \
+  || fail "handoff epoch $EPOCH_AFTER did not advance past $EPOCH_BEFORE; the release must \
+not let a successor serve under an epoch the departed leader also held"
 # Generous sanity bound, not the primary assertion (the log line above is):
 # against a RELEASED lease the acquisition is immediate, where an unreleased
 # one cannot be granted until the old deadline passes.
