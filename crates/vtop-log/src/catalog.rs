@@ -90,6 +90,26 @@ pub struct StartupCatalog {
     /// entries above describe the directory as it stands, doomed segments
     /// included. `SegmentSet::open_in` is what finishes the truncation.
     pub truncate_intent: Option<PathBuf>,
+    /// Interrupted atomic writes: `.{stem}.<kind>.<uuid>.tmp` files whose
+    /// rename never happened.
+    ///
+    /// REPORTED, NOT QUARANTINED. These used to be quarantined, and a range
+    /// with any quarantined bundle refuses to open — so a `kill -9` landing
+    /// inside a commit write left a node that would not start, and the remedy
+    /// was an operator deleting a file whose name gave them no way to know
+    /// that deleting it was safe (#310).
+    ///
+    /// It is safe by construction. `write_atomic` writes the temp, fsyncs, and
+    /// renames over the real name; if the process died before the rename then
+    /// the committed state is either the previous file or no file, and in
+    /// neither case does the temp carry anything. Quarantine is the right
+    /// answer for an artifact that MIGHT hold records — a half-written
+    /// segment, an undecodable manifest — and the wrong one for the losing
+    /// side of a rename, which the `<uuid>.tmp` naming already identifies.
+    ///
+    /// Discovery still only reports, keeping its promise above.
+    /// `SegmentSet::open_in` removes them, because it owns the directory.
+    pub temporary: Vec<PathBuf>,
 }
 
 impl StartupCatalog {
@@ -115,6 +135,7 @@ impl StartupCatalog {
 
         let mut bundles = BTreeMap::<PathBuf, ArtifactBundle>::new();
         let mut quarantined = Vec::new();
+        let mut temporary = Vec::new();
         let mut truncate_intent = None;
         for entry in discovered {
             let Some(classification) = classify_artifact(&entry.path) else {
@@ -143,10 +164,7 @@ impl StartupCatalog {
                 continue;
             }
             if classification.kind == ArtifactKind::Temporary {
-                quarantined.push(QuarantinedArtifacts {
-                    paths: vec![entry.path],
-                    reasons: vec![QuarantineReason::IncompleteAtomicWrite],
-                });
+                temporary.push(entry.path);
                 continue;
             }
             bundles.entry(classification.base).or_default().insert(
@@ -240,6 +258,7 @@ impl StartupCatalog {
         });
         Ok(Self {
             entries,
+            temporary,
             quarantined,
             truncate_intent,
         })
@@ -336,29 +355,51 @@ struct ArtifactClassification {
     kind: ArtifactKind,
 }
 
+/// Does `name` have the exact shape `write_atomic` gives its scratch file,
+/// `.{target}.{uuid}.tmp`, for a sidecar target this crate owns?
+///
+/// The match is deliberately exact and not `contains`: what is classified
+/// temporary is DELETED by `SegmentSet::open_in`, so a loose match would
+/// silently remove an unrelated dotted `.tmp` that merely mentions a marker
+/// (`.notes.commit.backup.tmp`), breaking discovery's promise to ignore
+/// files it does not recognize. Requiring the trailing UUID and a recognized
+/// target suffix means only names this crate can actually produce qualify.
+fn interrupted_atomic_write(name: &str) -> bool {
+    let Some(stripped) = name
+        .strip_prefix('.')
+        .and_then(|rest| rest.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let Some((target, uuid)) = stripped.rsplit_once('.') else {
+        return false;
+    };
+    if Uuid::parse_str(uuid).is_err() {
+        return false;
+    }
+    [
+        ".commit",
+        ".index",
+        ".manifest.json",
+        ".chunks",
+        // `write_atomic` names an in-progress sidecar
+        // `.{stem}.producers.<uuid>.tmp`. Without this a half-written
+        // frontier is classified as a real artifact, and an interrupted
+        // roll is reported as a corrupt range rather than an incomplete
+        // write.
+        ".producers",
+        // Same shape for a truncation marker whose atomic write was
+        // interrupted: `.range.truncate-intent.<uuid>.tmp` is an
+        // incomplete write, not an intent.
+        ".truncate-intent",
+    ]
+    .iter()
+    .any(|suffix| target.ends_with(suffix))
+}
+
 fn classify_artifact(path: &Path) -> Option<ArtifactClassification> {
     let name = path.file_name()?.to_str()?;
-    if name.starts_with('.')
-        && name.ends_with(".tmp")
-        && [
-            ".commit.",
-            ".index.",
-            ".manifest.json.",
-            ".chunks.",
-            // `write_atomic` names an in-progress sidecar
-            // `.{stem}.producers.<uuid>.tmp`. Without this a half-written
-            // frontier is classified as a real artifact, and an interrupted
-            // roll is reported as a corrupt range rather than an incomplete
-            // write.
-            ".producers.",
-            // Same shape for a truncation marker whose atomic write was
-            // interrupted: `.range.truncate-intent.<uuid>.tmp` is an
-            // incomplete write, not an intent.
-            ".truncate-intent.",
-        ]
-        .iter()
-        .any(|marker| name.contains(marker))
-    {
+    if interrupted_atomic_write(name) {
         return Some(ArtifactClassification {
             base: path.to_path_buf(),
             kind: ArtifactKind::Temporary,
@@ -950,7 +991,7 @@ mod tests {
     }
 
     #[test]
-    fn quarantines_conflicting_primaries_orphans_and_atomic_temporary_files() {
+    fn quarantines_conflicting_primaries_and_orphans_but_reports_interrupted_writes() {
         let directory = tempdir().unwrap();
         let active = directory.path().join("both.active");
         let sealed = directory.path().join("both.segment");
@@ -970,7 +1011,20 @@ mod tests {
         let catalog = StartupCatalog::discover(directory.path()).unwrap();
 
         assert!(catalog.entries.is_empty());
-        assert_eq!(catalog.quarantined.len(), 3);
+        // TWO, not three. An interrupted atomic write is reported separately
+        // and no longer quarantines the range — quarantine is for artifacts
+        // that might hold records, and the losing side of a rename does not
+        // (#310).
+        assert_eq!(catalog.quarantined.len(), 2);
+        assert_eq!(
+            catalog.temporary.len(),
+            1,
+            "the interrupted write must still be REPORTED, so the opener can remove it"
+        );
+        assert!(catalog.temporary[0]
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".tmp")));
         assert!(catalog
             .quarantined
             .iter()
@@ -983,12 +1037,50 @@ mod tests {
             .any(|item| has_reason(item, |reason| {
                 matches!(reason, QuarantineReason::OrphanSidecars)
             })));
-        assert!(catalog
-            .quarantined
-            .iter()
-            .any(|item| has_reason(item, |reason| {
-                matches!(reason, QuarantineReason::IncompleteAtomicWrite)
-            })));
+        assert!(
+            !catalog
+                .quarantined
+                .iter()
+                .any(|item| has_reason(item, |reason| matches!(
+                    reason,
+                    QuarantineReason::IncompleteAtomicWrite
+                ))),
+            "an interrupted atomic write must not quarantine the range: it made a kill -9 during \
+             a commit write leave a node that would not start"
+        );
+    }
+
+    /// A dotted `.tmp` that merely mentions a sidecar marker is NOT this
+    /// crate's file. What is classified temporary gets DELETED by the opener,
+    /// so a `contains` match would silently remove operator or application
+    /// data; only the exact `write_atomic` shape `.{target}.{uuid}.tmp` may
+    /// qualify.
+    #[test]
+    fn an_unrelated_dotted_tmp_is_ignored_not_classified_temporary() {
+        let directory = tempdir().unwrap();
+        for name in [
+            // Mentions `.commit.` but the trailing component is not a UUID.
+            ".notes.commit.backup.tmp",
+            // Valid UUID but no recognized sidecar target before it.
+            ".scratch.00000000-0000-0000-0000-000000000001.tmp",
+            // Recognized marker but not in target position.
+            ".commit.notes.backup.tmp",
+        ] {
+            fs::write(directory.path().join(name), b"not ours").unwrap();
+        }
+
+        let catalog = StartupCatalog::discover(directory.path()).unwrap();
+
+        assert!(
+            catalog.temporary.is_empty(),
+            "unrelated files must never be swept: {:?}",
+            catalog.temporary
+        );
+        assert!(
+            catalog.quarantined.is_empty(),
+            "and ignoring them must not quarantine anything either: {:?}",
+            catalog.quarantined
+        );
     }
 
     fn descriptor_v2(segment_id: u128, base_offset: u64) -> crate::SegmentDescriptorV2 {

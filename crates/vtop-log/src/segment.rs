@@ -4936,19 +4936,24 @@ mod tests {
     fn a_half_written_producer_sidecar_reads_as_an_incomplete_write() {
         let directory = tempdir().unwrap();
         fs::write(
-            directory
-                .path()
-                .join(format!(".{}.producers.abcd.tmp", segment_stem(99))),
+            directory.path().join(format!(
+                ".{}.producers.00000000-0000-0000-0000-00000000abcd.tmp",
+                segment_stem(99)
+            )),
             b"partial",
         )
         .unwrap();
 
         let catalog = crate::StartupCatalog::discover(directory.path()).unwrap();
+        assert_eq!(
+            catalog.temporary.len(),
+            1,
+            "a partial sidecar is an interrupted write, reported so the opener can remove it"
+        );
         assert!(
-            catalog.quarantined.iter().any(|bundle| bundle
-                .reasons
-                .contains(&crate::QuarantineReason::IncompleteAtomicWrite)),
-            "a partial sidecar is an interrupted write, not corruption: {:?}",
+            catalog.quarantined.is_empty(),
+            "and it must NOT quarantine the range — that is what left a node unable to start \
+             after a crash landed inside a write (#310): {:?}",
             catalog.quarantined
         );
     }

@@ -420,9 +420,14 @@ fn incomplete_atomic_sidecar_is_reported_without_hiding_safe_committed_state() {
     assert_eq!(catalog.entries.len(), 1);
     assert_eq!(catalog.entries[0].state, CatalogSegmentState::Active);
     assert_eq!(catalog.entries[0].next_offset, 1);
-    assert_eq!(catalog.quarantined.len(), 1);
-    assert_eq!(
-        catalog.quarantined[0].reasons,
-        vec![QuarantineReason::IncompleteAtomicWrite]
+    // REPORTED, not quarantined. The committed state is intact either way —
+    // that is what the assertions above establish — and quarantining the
+    // interrupted write on top of it is what made a range refuse to open
+    // after a crash landed inside `write_atomic` (#310).
+    assert_eq!(catalog.temporary.len(), 1);
+    assert!(
+        catalog.quarantined.is_empty(),
+        "an interrupted write alongside safe committed state must not condemn the range: {:?}",
+        catalog.quarantined
     );
 }
