@@ -306,6 +306,59 @@ fn an_unknown_caller_history_truncates_nothing() {
     assert_eq!(fenced.next_offset, 10, "the log is untouched");
 }
 
+/// A replica holding records with NO history — the shape `vtopctl node
+/// repair` left behind before the transfer carried the lineage, and the shape
+/// any replica is in after losing its journal file — must not be truncated by
+/// a fence carrying a real history (#315).
+///
+/// REGRESSION. The fence adopts the new epoch before reconciling, which
+/// manufactured such a replica's FIRST journal entry at its current tail; a
+/// lone `(epoch, tail)` entry zipped against the caller's real history
+/// compared as divergence at offset zero, and the whole log — a completed
+/// repair — was discarded. The honest answer for records-without-history is
+/// "unknown", the same verdict `set_fencing_epoch_journal` deliberately
+/// reports for this state, and unknown truncates nothing.
+#[test]
+fn a_replica_with_records_but_no_history_is_not_truncated() {
+    let h = follower();
+    for offset in 0..10 {
+        append_at(&h, OLD_EPOCH, OLD_LEADER, offset).unwrap();
+    }
+    // Restart with an empty journal over a log that has records.
+    let journal_dir = tempfile::tempdir().unwrap();
+    h.node.set_fencing_epoch_journal(
+        FencingEpochJournal::open(journal_dir.path().join("fencing-epochs")).unwrap(),
+    );
+    assert!(
+        h.node.epoch_starts().is_empty(),
+        "precondition: records without history"
+    );
+
+    h.meta.set(NEW_EPOCH);
+    let fenced = h
+        .node
+        .fence(
+            NEW_EPOCH,
+            &[
+                EpochStart {
+                    epoch: OLD_EPOCH,
+                    start_offset: 0,
+                },
+                EpochStart {
+                    epoch: NEW_EPOCH,
+                    start_offset: 10,
+                },
+            ],
+        )
+        .unwrap();
+
+    assert_eq!(
+        fenced.truncated_records, 0,
+        "a claim this replica cannot check must not delete what it holds"
+    );
+    assert_eq!(fenced.next_offset, 10, "the records survive the fence");
+}
+
 /// A replica that agrees with the caller keeps everything.
 ///
 /// REGRESSION. The first version of this wiped the log: the replica adopts the

@@ -117,6 +117,15 @@ reopen quietly.
 - **#310** — a `kill -9` during a commit write leaves a quarantined `.tmp` and
   the node refuses to restart. The losing side of a rename is garbage by
   definition and should be swept, not judged.
+- **#315** — the repair carries the epoch history with the records. Sealed
+  segments moved but their lineage did not, so the first leader transition
+  truncated a repaired replica back to zero. `vtopctl node repair` now
+  installs the source's `fencing-epochs` (truncated to the sealed prefix)
+  alongside the transfer — the same trust replication already extends, since
+  a follower's journal is leader-derived too — and a replica holding records
+  with no history now answers "unknown" at a fence instead of fabricating a
+  lone entry that compared as divergence-at-zero. Scenario 12 asserts the
+  repair outlives the failover instead of pinning the loss.
 - **#240 remainder** — the election-restriction question (Raft dissertation §5.4.1), then the signed
   leadership-transition record.
 

@@ -543,38 +543,42 @@ CLIENT_CFG="$(emit_client_config_at_epoch "$EPOCH_AFTER")"
 await_verified_floor "$CLIENT_CFG" "$(native_addr)" "$ACKED" "" "$VALUE_BYTES"
 log "every one of the $ACKED acknowledged records is still readable after the replacement"
 
-# WHAT THE REPLACEMENT REPLICA HOLDS AFTER A LEADER TRANSITION — and this is
-# where the replacement flow currently stops short.
+# WHAT THE REPLACEMENT REPLICA HOLDS AFTER A LEADER TRANSITION — the assertion
+# #315 was filed to make possible.
 #
-# The check above reads through the leader, so it proves the RANGE survived and
-# says nothing about the newcomer. The newcomer, at this point, has lost
-# everything the repair gave it: sealed-segment transfer carries `.segment`,
-# `.manifest.json` and `.producers` but NOT the epoch history, so a repaired
-# replica holds records it cannot prove the lineage of. The first reconciliation
-# with a promoted leader finds no common point and truncates the range to its
-# base. That is #315.
+# The check above reads through the leader, so it proves the RANGE survived; it
+# says nothing about the newcomer. Before #315, the newcomer lost everything
+# the repair gave it here: the transfer carried no epoch history, so its first
+# reconciliation with a promoted leader found no common point and truncated the
+# range to its base. The repair now installs the source's `fencing-epochs`
+# alongside the segments, so the reconciliation AGREES and the repaired data
+# survives the one operation that asks it to prove its lineage.
 #
-# PINNED, not tolerated. The assertion below states today's broken behaviour
-# exactly, so it FAILS the moment #315 is fixed and whoever fixes it is forced
-# to come here and turn this into the assertion it should be — the replacement
-# reaching the acknowledged floor. A scenario that merely noted the shortfall
-# would still be noting it in a year.
-SPARE_OFFSET="$(follower_committed_offset 3)"
 # A glob that matches nothing makes `ls` exit non-zero, and under `pipefail`
-# that aborts the scenario with no message — which is exactly the state this
-# assertion exists to describe, so counting it must not be able to fail.
+# that aborts the scenario with no message, so counting must not be able to
+# fail.
 SPARE_SEALED=0
 for _candidate in "$SPARE_DIR"/*.segment; do
   [[ -f "$_candidate" ]] && SPARE_SEALED=$((SPARE_SEALED + 1))
 done
-if [[ "$SPARE_SEALED" -gt 0 || "$SPARE_OFFSET" -ge "$ACKED" ]]; then
-  fail "the replacement kept its repaired data across the leader transition (sealed=$SPARE_SEALED, \
-committed=$SPARE_OFFSET). That is the CORRECT behaviour and #315 has evidently been fixed — \
-replace this assertion with: the replacement must reach the acknowledged floor of $ACKED."
-fi
-log "KNOWN GAP (#315): the replacement lost its repaired range to the leader transition — it \
-holds $SPARE_SEALED sealed segments and has committed through $SPARE_OFFSET of $ACKED, because \
-the transfer carries no epoch history and reconciliation cannot place the records it received"
+[[ "$SPARE_SEALED" -gt 0 ]] \
+  || fail "the replacement lost its sealed segments to the leader transition; the repaired \
+range was truncated, which is #315 reopened"
+# The committed offset must REACH THE ACKNOWLEDGED FLOOR, not merely survive:
+# a replica that kept its bytes but cannot rejoin replication is repaired in
+# name only. Deadline-polled, because the new leader's stream has to catch the
+# newcomer up before its boundary moves.
+SPARE_DEADLINE=$((SECONDS + PROGRESS_TIMEOUT_SECONDS))
+SPARE_OFFSET="$(follower_committed_offset 3)"
+while [[ "$SPARE_OFFSET" -lt "$ACKED" ]]; do
+  [[ $SECONDS -lt $SPARE_DEADLINE ]] \
+    || fail "the replacement kept its data (sealed=$SPARE_SEALED) but its committed offset \
+stalled at $SPARE_OFFSET of $ACKED; it survived the transition without rejoining replication"
+  sleep 1
+  SPARE_OFFSET="$(follower_committed_offset 3)"
+done
+log "the replacement survived the leader transition with $SPARE_SEALED sealed segment(s) and \
+committed through $SPARE_OFFSET >= $ACKED — the repair outlives the failover that used to erase it"
 
 # Named directly rather than through `${!name}`: indirect expansion is not a
 # USE as far as shellcheck is concerned, so the variables stayed flagged and
@@ -604,8 +608,8 @@ log "the surviving replica and the newcomer are both still serving"
 # the liveness assertion above is what makes stopping it here meaningful rather
 # than incidental.
 stop_node_now "$SPARE"
-# Not `seal_and_verify_active`: #315 leaves the replacement holding an empty
-# range, and sealing an empty tail proves nothing about the transfer. The
-# artifact that DID land was already checked byte-for-byte against the source,
-# before the transition destroyed it.
+# The transferred artifacts were checked byte-for-byte against the source
+# earlier; the assertion block above proved the same data outlived the leader
+# transition and the newcomer rejoined replication through the acknowledged
+# floor. That is the full claim of the replacement flow.
 log "PASS"

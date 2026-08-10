@@ -23,7 +23,7 @@ use std::time::Duration;
 use uuid::Uuid;
 use vtop_broker::replication::{ReplicaStatusClient, ReplicaTlsMaterial, SegmentTransferClient};
 use vtop_log::env::Env;
-use vtop_log::{SegmentReceiver, SegmentSet};
+use vtop_log::{SegmentReader, SegmentReceiver, SegmentSet};
 use vtop_meta::{resolve_endpoint, TlsMaterial};
 use vtop_protocol::RangeIdentity;
 
@@ -563,6 +563,31 @@ fn remaining_gap(source_tip: u64, adopted_next_offset: u64) -> Result<u64, Strin
     Ok(source_tip - adopted_next_offset)
 }
 
+/// The end of the sealed prefix in `directory`: the highest `next_offset`
+/// across its `.segment` files, or `None` when there are none.
+///
+/// Measured from disk rather than from a transfer's return value because a
+/// re-run repair skips segments a previous run already installed — the
+/// transferred epoch history must be bounded by everything the directory
+/// holds, not by what this invocation happened to move.
+fn sealed_prefix_end(env: &Env, directory: &Path) -> Result<Option<u64>, String> {
+    let mut end = None;
+    let entries = fs::read_dir(directory)
+        .map_err(|error| format!("read {}: {error}", directory.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("read {}: {error}", directory.display()))?;
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("segment") {
+            continue;
+        }
+        let reader = SegmentReader::open_in(env, &path)
+            .map_err(|error| format!("open {}: {error}", path.display()))?;
+        let next = reader.next_offset();
+        end = Some(end.map_or(next, |current: u64| current.max(next)));
+    }
+    Ok(end)
+}
+
 /// Pull a leader's sealed prefix into `into` and adopt it into a servable
 /// range.
 ///
@@ -776,6 +801,74 @@ async fn repair(
         .await
         .map_err(|error| format!("transfer from {from}: {error}"))?;
 
+    // THE LINEAGE TRAVELS WITH THE RECORDS (#315). The transfer carries the
+    // bytes; this carries the history that lets the replica prove which
+    // epochs produced them. Without it the first leader transition asks the
+    // replica to reconcile, it can show nothing, and epoch-qualified
+    // truncation erases the entire repair — the operator was told "repaired"
+    // and the range is back at zero.
+    //
+    // Fetched from the same source as the segments, which extends exactly
+    // the trust the transfer already required: a follower's journal is
+    // leader-derived in normal replication too. The next fence still
+    // compares this history honestly and truncates at any genuine
+    // divergence.
+    //
+    // Installed BEFORE the adopt so a crash between the two is re-runnable:
+    // the receiver refuses a directory with an adopted tail, so anything
+    // that must happen on the repair path has to happen before the tail is
+    // minted.
+    let status_client = ReplicaStatusClient::new(ReplicaTlsMaterial {
+        certificate_chain: status_material.certificate_chain,
+        private_key: status_material.private_key,
+        trust_roots: status_material.trust_roots,
+    })
+    .map_err(|error| error.to_string())?
+    .with_timeout(timeout);
+    let history = status_client
+        .epoch_history(
+            addr,
+            &source.server_name,
+            source.node_uuid,
+            &config.range.identity(),
+        )
+        .await
+        // An error fails the repair rather than installing records without
+        // lineage: the transfer is resumable, so a retry is cheap, and a
+        // "repaired" replica that cannot prove its history is the very state
+        // this command exists to remove.
+        .map_err(|error| format!("epoch history from {from}: {error}"))?;
+    // The history is bounded by the sealed prefix this directory actually
+    // holds — measured from the segments on disk rather than this run's
+    // transfer list, because a re-run may have skipped segments a previous
+    // run already installed.
+    let sealed_end = sealed_prefix_end(&env, into)?;
+    if history.is_empty() {
+        // A legal answer (the client's contract maps a peer that does not
+        // know the request to an empty vector), but it leaves this replica
+        // unable to prove lineage; say so now instead of letting the
+        // operator find out at the next failover.
+        eprintln!(
+            "warning: {from} reported no epoch history; the repaired replica will answer \
+             \"unknown\" at its next reconciliation instead of proving its lineage"
+        );
+    } else if let Some(tail) = sealed_end {
+        let entries: Vec<vtop_broker::fencing_epochs::EpochStart> = history
+            .iter()
+            .map(|entry| vtop_broker::fencing_epochs::EpochStart {
+                epoch: entry.epoch,
+                start_offset: entry.start_offset,
+            })
+            .collect();
+        vtop_broker::fencing_epochs::install_transferred_history(
+            &env,
+            into.join("fencing-epochs"),
+            &entries,
+            tail,
+        )
+        .map_err(|error| format!("install epoch history in {}: {error}", into.display()))?;
+    }
+
     // ADOPT, so the result is a range and not a pile of segments. The successor
     // id is minted here because nothing else in this command owns one, and a
     // fresh id is correct: this tail has never existed anywhere else.
@@ -804,13 +897,8 @@ async fn repair(
     // The gap is measured and reported rather than assumed away. This asks the
     // source where it actually is instead of trusting the listing, because the
     // listing describes the sealed prefix and the question is about the tail.
-    let status_client = ReplicaStatusClient::new(ReplicaTlsMaterial {
-        certificate_chain: status_material.certificate_chain,
-        private_key: status_material.private_key,
-        trust_roots: status_material.trust_roots,
-    })
-    .map_err(|error| error.to_string())?
-    .with_timeout(timeout);
+    // (The client was built before the adopt, where it also fetched the epoch
+    // history.)
     let source_tip = status_client
         .status(
             addr,

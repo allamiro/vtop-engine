@@ -447,6 +447,24 @@ impl InProcessFollower {
                 ),
             ));
         }
+        // A replica holding records with NO history cannot prove lineage for
+        // any of them, and the honest answer to a reconciliation is
+        // "unknown" — the same verdict `set_fencing_epoch_journal`
+        // deliberately reports for exactly this state. The adoption below
+        // manufactures this replica's FIRST journal entry at its current
+        // tail, and a lone `(epoch, tail)` entry zipped against a real
+        // history compares as divergence at offset zero: the fence would
+        // then truncate a repaired or journal-less replica to the base,
+        // destroying everything a `vtopctl node repair` installed (#315).
+        // Snapshot the ignorance BEFORE adoption fabricates the entry.
+        let lineage_unknown_before_adoption = self.epoch_starts().is_empty() && {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.segment.next_offset() > 0
+        };
+
         // Records the start durably before the epoch becomes visible, exactly
         // as the append path does.
         self.adopt_fencing_epoch(epoch);
@@ -463,7 +481,11 @@ impl InProcessFollower {
         // append cannot answer. After this, a diverged replica has already
         // discarded what the caller disagrees with, so the catch-up path is
         // never reached in a diverged state and never has to answer it.
-        let truncated_records = self.reconcile_with(leader_epoch_starts)?;
+        let truncated_records = if lineage_unknown_before_adoption {
+            0
+        } else {
+            self.reconcile_with(leader_epoch_starts)?
+        };
 
         // Offsets and history read together, under the state lock, so the pair
         // describes one instant of one log.

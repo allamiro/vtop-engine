@@ -451,6 +451,50 @@ impl FencingEpochJournal {
     }
 }
 
+/// Install a source-provided epoch history into a repaired range directory
+/// (#315).
+///
+/// Sealed-segment transfer carries the records but not their lineage, so a
+/// repaired replica could not answer the epoch-qualified reconciliation the
+/// next leader transition asks of it — and was truncated to the base by the
+/// first fence it received. This writes the source's history alongside the
+/// transferred prefix so the replica can answer honestly.
+///
+/// **Trust:** this extends exactly the trust the transfer already required.
+/// A follower's journal is leader-derived in normal replication too — each
+/// entry is recorded when the follower adopts an epoch over records the
+/// leader replicated to it. Carrying the source's history with the source's
+/// records grants the repaired replica the same standing, no more: the next
+/// fence still compares this history against the caller's and truncates at
+/// any genuine divergence.
+///
+/// **Normalization:** entries with `start_offset >= tail` are dropped. The
+/// repaired replica holds only the sealed prefix; an entry beyond it would
+/// claim lineage for records the replica does not hold, and — concretely —
+/// would poison the journal at the next epoch adoption, because `record`
+/// refuses a new entry whose start offset is below the last one's.
+///
+/// Idempotent for a re-run repair fetching the same history (`record` accepts
+/// an epoch already present at the same offset). A conflicting prior install
+/// — same epoch, different offset — fails loudly instead of merging.
+pub fn install_transferred_history(
+    env: &Env,
+    path: impl AsRef<Path>,
+    entries: &[EpochStart],
+    tail: u64,
+) -> BrokerResult<usize> {
+    let mut journal = FencingEpochJournal::open_in(env, &path)?;
+    let mut installed = 0;
+    for entry in entries {
+        if entry.start_offset >= tail {
+            break;
+        }
+        journal.record(entry.epoch, entry.start_offset)?;
+        installed += 1;
+    }
+    Ok(installed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,6 +502,76 @@ mod tests {
 
     fn journal(dir: &TempDir) -> FencingEpochJournal {
         FencingEpochJournal::open(dir.path().join("fencing-epochs")).expect("open")
+    }
+
+    fn starts(pairs: &[(u64, u64)]) -> Vec<EpochStart> {
+        pairs
+            .iter()
+            .map(|&(epoch, start_offset)| EpochStart {
+                epoch,
+                start_offset,
+            })
+            .collect()
+    }
+
+    /// The transferred history is truncated to the sealed prefix: an entry at
+    /// or beyond the tail claims lineage for records the repaired replica
+    /// does not hold, and would poison the journal at the next adoption.
+    #[test]
+    fn installing_a_transferred_history_stops_at_the_tail() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("fencing-epochs");
+        let entries = starts(&[(1, 0), (3, 400), (5, 900)]);
+
+        let installed =
+            install_transferred_history(&Env::real(), &path, &entries, 900).expect("install");
+
+        assert_eq!(installed, 2, "the entry at the tail is not ours to claim");
+        let reopened = FencingEpochJournal::open(&path).expect("reopen");
+        assert_eq!(reopened.entries(), &starts(&[(1, 0), (3, 400)])[..]);
+        // The next adoption can now append at the tail without violating the
+        // journal's non-decreasing offset rule — the exact poisoning the
+        // truncation exists to prevent.
+        let mut journal = FencingEpochJournal::open(&path).expect("reopen for adoption");
+        journal
+            .record(6, 900)
+            .expect("adopting at the tail must work");
+    }
+
+    /// A repair that crashes and re-runs fetches the same history again; the
+    /// second install must be a no-op, not a corruption.
+    #[test]
+    fn installing_the_same_history_twice_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("fencing-epochs");
+        let entries = starts(&[(1, 0), (2, 250)]);
+
+        install_transferred_history(&Env::real(), &path, &entries, 500).expect("first install");
+        let second =
+            install_transferred_history(&Env::real(), &path, &entries, 500).expect("re-run");
+
+        assert_eq!(second, 2);
+        let reopened = FencingEpochJournal::open(&path).expect("reopen");
+        assert_eq!(reopened.entries(), &entries[..]);
+    }
+
+    /// A conflicting prior install — same epoch, different start — must fail
+    /// loudly. Merging two sources' claims would corrupt every later
+    /// comparison, which is the journal's own rule for `record`.
+    #[test]
+    fn installing_a_conflicting_history_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("fencing-epochs");
+
+        install_transferred_history(&Env::real(), &path, &starts(&[(1, 0), (2, 250)]), 500)
+            .expect("first install");
+        let conflicting =
+            install_transferred_history(&Env::real(), &path, &starts(&[(1, 0), (2, 300)]), 500);
+
+        assert!(
+            conflicting.is_err(),
+            "same epoch at a different offset is a lineage conflict, not a merge"
+        );
     }
 
     #[test]
