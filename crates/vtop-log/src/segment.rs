@@ -4936,9 +4936,10 @@ mod tests {
     fn a_half_written_producer_sidecar_reads_as_an_incomplete_write() {
         let directory = tempdir().unwrap();
         fs::write(
-            directory
-                .path()
-                .join(format!(".{}.producers.abcd.tmp", segment_stem(99))),
+            directory.path().join(format!(
+                ".{}.producers.00000000-0000-0000-0000-00000000abcd.tmp",
+                segment_stem(99)
+            )),
             b"partial",
         )
         .unwrap();

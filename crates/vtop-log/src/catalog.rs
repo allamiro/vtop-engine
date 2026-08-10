@@ -355,29 +355,51 @@ struct ArtifactClassification {
     kind: ArtifactKind,
 }
 
+/// Does `name` have the exact shape `write_atomic` gives its scratch file,
+/// `.{target}.{uuid}.tmp`, for a sidecar target this crate owns?
+///
+/// The match is deliberately exact and not `contains`: what is classified
+/// temporary is DELETED by `SegmentSet::open_in`, so a loose match would
+/// silently remove an unrelated dotted `.tmp` that merely mentions a marker
+/// (`.notes.commit.backup.tmp`), breaking discovery's promise to ignore
+/// files it does not recognize. Requiring the trailing UUID and a recognized
+/// target suffix means only names this crate can actually produce qualify.
+fn interrupted_atomic_write(name: &str) -> bool {
+    let Some(stripped) = name
+        .strip_prefix('.')
+        .and_then(|rest| rest.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let Some((target, uuid)) = stripped.rsplit_once('.') else {
+        return false;
+    };
+    if Uuid::parse_str(uuid).is_err() {
+        return false;
+    }
+    [
+        ".commit",
+        ".index",
+        ".manifest.json",
+        ".chunks",
+        // `write_atomic` names an in-progress sidecar
+        // `.{stem}.producers.<uuid>.tmp`. Without this a half-written
+        // frontier is classified as a real artifact, and an interrupted
+        // roll is reported as a corrupt range rather than an incomplete
+        // write.
+        ".producers",
+        // Same shape for a truncation marker whose atomic write was
+        // interrupted: `.range.truncate-intent.<uuid>.tmp` is an
+        // incomplete write, not an intent.
+        ".truncate-intent",
+    ]
+    .iter()
+    .any(|suffix| target.ends_with(suffix))
+}
+
 fn classify_artifact(path: &Path) -> Option<ArtifactClassification> {
     let name = path.file_name()?.to_str()?;
-    if name.starts_with('.')
-        && name.ends_with(".tmp")
-        && [
-            ".commit.",
-            ".index.",
-            ".manifest.json.",
-            ".chunks.",
-            // `write_atomic` names an in-progress sidecar
-            // `.{stem}.producers.<uuid>.tmp`. Without this a half-written
-            // frontier is classified as a real artifact, and an interrupted
-            // roll is reported as a corrupt range rather than an incomplete
-            // write.
-            ".producers.",
-            // Same shape for a truncation marker whose atomic write was
-            // interrupted: `.range.truncate-intent.<uuid>.tmp` is an
-            // incomplete write, not an intent.
-            ".truncate-intent.",
-        ]
-        .iter()
-        .any(|marker| name.contains(marker))
-    {
+    if interrupted_atomic_write(name) {
         return Some(ArtifactClassification {
             base: path.to_path_buf(),
             kind: ArtifactKind::Temporary,
@@ -1025,6 +1047,39 @@ mod tests {
                 ))),
             "an interrupted atomic write must not quarantine the range: it made a kill -9 during \
              a commit write leave a node that would not start"
+        );
+    }
+
+    /// A dotted `.tmp` that merely mentions a sidecar marker is NOT this
+    /// crate's file. What is classified temporary gets DELETED by the opener,
+    /// so a `contains` match would silently remove operator or application
+    /// data; only the exact `write_atomic` shape `.{target}.{uuid}.tmp` may
+    /// qualify.
+    #[test]
+    fn an_unrelated_dotted_tmp_is_ignored_not_classified_temporary() {
+        let directory = tempdir().unwrap();
+        for name in [
+            // Mentions `.commit.` but the trailing component is not a UUID.
+            ".notes.commit.backup.tmp",
+            // Valid UUID but no recognized sidecar target before it.
+            ".scratch.00000000-0000-0000-0000-000000000001.tmp",
+            // Recognized marker but not in target position.
+            ".commit.notes.backup.tmp",
+        ] {
+            fs::write(directory.path().join(name), b"not ours").unwrap();
+        }
+
+        let catalog = StartupCatalog::discover(directory.path()).unwrap();
+
+        assert!(
+            catalog.temporary.is_empty(),
+            "unrelated files must never be swept: {:?}",
+            catalog.temporary
+        );
+        assert!(
+            catalog.quarantined.is_empty(),
+            "and ignoring them must not quarantine anything either: {:?}",
+            catalog.quarantined
         );
     }
 

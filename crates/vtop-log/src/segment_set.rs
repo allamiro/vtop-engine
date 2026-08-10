@@ -195,15 +195,29 @@ fn refuse_if_condemned(env: &Env, directory: &Path) -> VtopLogResult<()> {
 /// A failure to remove one is NOT fatal. The range is openable either way, and
 /// refusing to start over an undeletable stray file would reintroduce the
 /// outage this removes.
-fn sweep_interrupted_writes(env: &Env, catalog: &StartupCatalog) {
+fn sweep_interrupted_writes(env: &Env, directory: &Path, catalog: &StartupCatalog) {
+    let mut removed_any = false;
     for path in &catalog.temporary {
         // Printed rather than traced: this crate carries no logging
         // dependency, and a line on stderr is enough for a condition an
         // operator will otherwise never see.
-        if let Err(error) = env.storage.remove_file(path) {
-            eprintln!(
+        match env.storage.remove_file(path) {
+            Ok(()) => removed_any = true,
+            Err(error) => eprintln!(
                 "could not remove interrupted atomic write {}: {error}",
                 path.display()
+            ),
+        }
+    }
+    // Make the unlinks durable, as every other directory-entry removal in
+    // this crate does. Without it a crash right after the sweep can resurrect
+    // the debris — self-healing on the next open, but a cleanup that reported
+    // success should stay done. Failure is as non-fatal as a failed removal.
+    if removed_any {
+        if let Err(error) = env.storage.sync_dir(directory) {
+            eprintln!(
+                "could not sync {} after sweeping interrupted writes: {error}",
+                directory.display()
             );
         }
     }
@@ -232,7 +246,7 @@ impl SegmentSet {
         // open refuses like any other ambiguity.
         finish_pending_truncation(env, &directory)?;
         let catalog = StartupCatalog::discover_in(env, &directory)?;
-        sweep_interrupted_writes(env, &catalog);
+        sweep_interrupted_writes(env, &directory, &catalog);
         if !catalog.quarantined.is_empty() {
             // Name every quarantined bundle and its reasons in the refusal.
             // This error is what an operator sees at startup, and "N
@@ -347,7 +361,7 @@ impl SegmentSet {
         // whatever was appended to it.
         finish_pending_truncation(env, &directory)?;
         let catalog = StartupCatalog::discover_in(env, &directory)?;
-        sweep_interrupted_writes(env, &catalog);
+        sweep_interrupted_writes(env, &directory, &catalog);
         if !catalog.quarantined.is_empty() {
             return Err(LogError::InvalidDescriptor(format!(
                 "range at {} has {} quarantined artifact bundle(s); refusing to adopt an \
@@ -2217,6 +2231,41 @@ mod tests {
             !debris.exists(),
             "the opener owns the directory, so it should have swept the debris rather than \
              leaving an operator to delete a file whose name cannot tell them that is safe"
+        );
+    }
+
+    /// The counterpart boundary: the sweep must take ONLY the exact
+    /// `write_atomic` shape `.{target}.{uuid}.tmp`. A dotted `.tmp` that
+    /// merely mentions `.commit.` is not this crate's file, and deleting it
+    /// would break discovery's promise to ignore what it does not recognize.
+    #[test]
+    fn the_sweep_does_not_delete_an_unrelated_dotted_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::real();
+        let mut set = SegmentSet::create_in(
+            &env,
+            dir.path(),
+            descriptor(),
+            crate::SegmentConfig::default(),
+        )
+        .unwrap();
+        let producer = Uuid::from_u128(1);
+        set.append_group(&[record(producer, 0)], Durability::Fsync, Uuid::new_v4())
+            .unwrap();
+        drop(set);
+
+        // Mentions `.commit.` but its trailing component is not a UUID, so it
+        // cannot be a write_atomic scratch file.
+        let unrelated = dir.path().join(".notes.commit.backup.tmp");
+        std::fs::write(&unrelated, b"operator notes, not ours").unwrap();
+
+        let reopened = SegmentSet::open_in(&env, dir.path())
+            .expect("an unrelated dotted .tmp must not affect opening")
+            .expect("the range exists");
+        assert_eq!(reopened.next_offset(), 1);
+        assert!(
+            unrelated.exists(),
+            "a file that is not an interrupted atomic write must survive the sweep untouched"
         );
     }
 }
