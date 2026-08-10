@@ -1226,6 +1226,26 @@ stop_node_now() { # <pid>
   done
 }
 
+# stop_node_gracefully <label> <pid> — SIGTERM and REQUIRE the drain (#280).
+#
+# The deadline is the assertion, not a courtesy: a node that ignores SIGTERM
+# hangs here until the timeout fails the scenario, which is exactly the
+# regression this helper exists to catch. Callers that want the crash path
+# keep using stop_node_now.
+stop_node_gracefully() { # <label> <pid>
+  local label="$1" pid="$2" deadline=$((SECONDS + STOP_TIMEOUT_SECONDS))
+  kill "$pid" 2>/dev/null || true
+  while kill -0 "$pid" 2>/dev/null; do
+    local state
+    state="$(ps -o stat= -p "$pid" 2>/dev/null || true)"
+    [[ "$state" == Z* ]] && break
+    [[ $SECONDS -lt $deadline ]] \
+      || fail "$label (pid $pid) ignored SIGTERM for ${STOP_TIMEOUT_SECONDS}s; every orderly \
+stop is a crash stop again, which is #280 reopened"
+    sleep 0.05
+  done
+}
+
 # seal_and_verify_active <label> <data-dir>
 #
 # The tail's filename belongs to the storage layer now (#270): a range is a

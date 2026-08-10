@@ -116,6 +116,8 @@ pub enum BrokerError {
     Task(#[from] tokio::task::JoinError),
     #[error("{0} timed out")]
     Timeout(&'static str),
+    #[error("segment storage error: {0}")]
+    Segment(#[from] vtop_log::LogError),
 }
 
 pub type BrokerResult<T> = Result<T, BrokerError>;
@@ -1110,6 +1112,21 @@ impl LocalBroker {
             state.segment.committed_offset(),
             state.segment.next_offset(),
         )
+    }
+
+    /// Durably commit the tail's boundary, for an orderly shutdown (#280).
+    ///
+    /// Every acknowledged append was already fsynced, so this loses nothing
+    /// if skipped — it writes the commit-boundary sidecar one final time so
+    /// the next open's recovery finds a boundary that matches the file
+    /// exactly and has no torn tail to truncate. The tail is NOT sealed: a
+    /// tail sealed without a successor is a directory `open_in` refuses.
+    pub fn quiesce(&self) -> BrokerResult<u64> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.segment.commit().map_err(BrokerError::from)
     }
 
     /// Non-blocking `(local_committed_offset, next_offset)`, for observation

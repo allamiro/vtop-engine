@@ -154,7 +154,7 @@ impl LeaseWatcher {
         })
     }
 
-    pub async fn run(self) {
+    pub async fn run(self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
         // The epoch this watcher has already published, so a steady state does
         // not re-publish the same grant every poll. Purely to keep the logs
         // and the atomics quiet — correctness does not depend on it, because
@@ -216,7 +216,15 @@ impl LeaseWatcher {
                     }
                 }
             }
-            tokio::time::sleep(self.config.poll_interval).await;
+            tokio::select! {
+                _ = tokio::time::sleep(self.config.poll_interval) => {}
+                _ = shutdown.changed() => {}
+            }
+            if *shutdown.borrow() {
+                // Nothing to release: a watcher only observes the lease. It
+                // just stops observing (#280).
+                return;
+            }
         }
     }
 

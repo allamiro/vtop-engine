@@ -407,21 +407,17 @@ priorityClassName: ""
 
 # How long Kubernetes waits after SIGTERM before SIGKILL.
 #
-# STATED PLAINLY: vtop-node installs no signal handler, so SIGTERM is ignored
-# and every pod deletion, rolling update, and node drain ends in SIGKILL after
-# this many seconds. The wait buys a clean shutdown from nothing — it only
-# delays the inevitable.
+# vtop-node handles SIGTERM (#280): the listeners drain, a leader RELEASES
+# its range lease so failover starts immediately instead of waiting out the
+# lease deadline, and the final commit boundary is written so the next open
+# has no torn tail to truncate. This interval is the budget for that drain —
+# in practice it completes in single-digit seconds.
 #
-# That is safe rather than merely tolerable: durability here does not depend on
-# an orderly exit. A record is acknowledged only once it is fsynced, recovery
-# truncates any torn tail, and live-chaos scenario 04 kills the leader with
-# SIGKILL mid-produce and verifies every acknowledged record survives
-# byte-exact. Restart takes the crash-recovery path by design.
-#
-# What it costs is time: 60 seconds of waiting per pod on every rollout. Lower
-# it if you would rather roll faster, since nothing is using the interval.
-# Signal-aware shutdown is tracked separately; when it lands this value starts
-# meaning what it says.
+# SIGKILL after the deadline remains safe rather than merely tolerable:
+# durability does not depend on the orderly exit. A record is acknowledged
+# only once it is fsynced, recovery truncates any torn tail, and live-chaos
+# scenario 04 kills the leader with SIGKILL mid-produce and verifies every
+# acknowledged record survives byte-exact.
 terminationGracePeriodSeconds: 60
 
 extraEnv: []

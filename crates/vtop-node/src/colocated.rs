@@ -68,7 +68,10 @@ impl ColocatedNodeConfig {
     }
 }
 
-pub async fn run(config: ColocatedNodeConfig) -> Result<(), String> {
+pub async fn run(
+    config: ColocatedNodeConfig,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), String> {
     config.validate()?;
     let ColocatedNodeConfig {
         meta,
@@ -102,12 +105,51 @@ pub async fn run(config: ColocatedNodeConfig) -> Result<(), String> {
     // error. A half-alive node is the one failure mode co-location must not
     // introduce — a metadata voter that has died inside a process still serving
     // data keeps being counted toward quorum while answering nothing.
+    //
+    // Shutdown is SEQUENCED, not shared (#280). The data role's drain ends by
+    // proposing ReleaseRangeLease — through the local admin endpoint, in the
+    // supported single-endpoint configuration. Handing the raw signal to both
+    // roles would race that proposal against the admin listener closing, and
+    // the release would commonly lose: the lease would lapse on its deadline,
+    // defeating the orderly handoff. So the metadata role's shutdown fires
+    // only after the data role has fully drained, and the drain waits are
+    // bounded by the lease duration rather than a constant, so a slow release
+    // round trip is not abandoned inside the chart's grace budget.
+    let (meta_shutdown, meta_shutdown_rx) = tokio::sync::watch::channel(false);
+    let lease_bound = data
+        .lease
+        .as_ref()
+        .map(|lease| std::time::Duration::from_millis(lease.lease_duration_ms))
+        .unwrap_or_default();
+    let drain = std::time::Duration::from_secs(10).max(lease_bound);
+    let mut meta_role = std::pin::pin!(meta_node::serve(
+        meta,
+        &observability,
+        metrics_addr,
+        meta_shutdown_rx
+    ));
+    let mut data_role = std::pin::pin!(data_node::serve(
+        data,
+        &observability,
+        metrics_addr,
+        shutdown.clone()
+    ));
     tokio::select! {
-        result = meta_node::serve(meta, &observability, metrics_addr) => {
-            result.map_err(|error| format!("metadata role exited: {error}"))
+        result = &mut meta_role => {
+            // The metadata role can only exit on a fault now — its shutdown
+            // channel has not fired — so this is the shared-fate arm.
+            result.map_err(|error| format!("metadata role exited: {error}"))?;
+            Err("metadata role exited unexpectedly without an error".to_owned())
         }
-        result = data_node::serve(data, &observability, metrics_addr) => {
-            result.map_err(|error| format!("data role exited: {error}"))
+        result = &mut data_role => {
+            result.map_err(|error| format!("data role exited: {error}"))?;
+            // The data role drained (lease released, boundary committed);
+            // only now may the local admin plane go down.
+            let _ = meta_shutdown.send(true);
+            tokio::time::timeout(drain, meta_role)
+                .await
+                .map_err(|_| "metadata role did not finish draining".to_owned())?
+                .map_err(|error| format!("metadata role exited: {error}"))
         }
     }
 }

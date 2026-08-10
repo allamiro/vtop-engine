@@ -136,6 +136,16 @@ reopen quietly.
   `WrongLineage` (#278's re-resolution, now asserted for retention). Age
   bounds need a durable per-segment seal time no manifest records yet — a
   format change deferred to its own slice.
+- **#280** — every orderly stop is no longer a crash stop. vtop-node handles
+  SIGTERM/SIGINT: the listeners drain, a departing leader RELEASES its range
+  lease (the `ReleaseRangeLease` verb existed; nothing in production called
+  it) so failover starts immediately instead of waiting out the lease
+  deadline, and the final commit boundary is written so the next open has no
+  torn tail to truncate. The helm chart's terminationGracePeriodSeconds now
+  means what its name says. Scenario 13 proves the drain on real processes
+  and fails if SIGTERM is ever ignored again. Durability still never depends
+  on the clean path — the k8s smoke test keeps force-deleting pods to prove
+  it.
 - **#240 remainder** — the election-restriction question (Raft dissertation §5.4.1), then the signed
   leadership-transition record.
 

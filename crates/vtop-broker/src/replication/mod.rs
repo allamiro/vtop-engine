@@ -343,6 +343,17 @@ impl InProcessFollower {
     /// that already holds records must report "unknown" instead. Also completes
     /// a truncation interrupted by a crash, per
     /// [`crate::LocalBroker::attach_epoch_journal_to_log`].
+    /// Durably commit the tail's boundary for an orderly shutdown (#280).
+    /// Same contract as [`crate::LocalBroker::quiesce`]: loses nothing if
+    /// skipped, spares the next open a torn-tail truncation.
+    pub fn quiesce(&self) -> BrokerResult<u64> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.segment.commit().map_err(BrokerError::from)
+    }
+
     pub fn set_fencing_epoch_journal(
         &self,
         mut journal: crate::fencing_epochs::FencingEpochJournal,

@@ -335,7 +335,10 @@ impl SessionAuthorizer for PrincipalAuthorizer {
 }
 
 /// Run a data node that owns its own observability endpoint.
-pub async fn run(mut config: DataNodeConfig) -> Result<(), String> {
+pub async fn run(
+    mut config: DataNodeConfig,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), String> {
     let observability = NodeObservability::new(
         match config.role {
             DataRole::Follower => "data-follower",
@@ -346,7 +349,24 @@ pub async fn run(mut config: DataNodeConfig) -> Result<(), String> {
     )?;
     let endpoint = config.observability.take().unwrap_or_default();
     let metrics_addr = observability.serve(&endpoint).await?;
-    serve(config, &observability, metrics_addr).await
+    serve(config, &observability, metrics_addr, shutdown).await
+}
+
+/// Adapt the process-wide shutdown flag to the oneshot a server takes (#280).
+/// A dropped sender never fires: only a real signal drains the listeners.
+fn oneshot_on_shutdown(
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> tokio::sync::oneshot::Receiver<()> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        while !*shutdown.borrow() {
+            if shutdown.changed().await.is_err() {
+                return;
+            }
+        }
+        let _ = sender.send(());
+    });
+    receiver
 }
 
 /// Run a data node against a caller-owned observability surface (#215).
@@ -354,6 +374,7 @@ pub async fn serve(
     config: DataNodeConfig,
     observability: &NodeObservability,
     metrics_addr: Option<std::net::SocketAddr>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), String> {
     std::fs::create_dir_all(&config.data_dir)
         .map_err(|error| format!("create {}: {error}", config.data_dir.display()))?;
@@ -409,6 +430,7 @@ pub async fn serve(
                 meta,
                 observability,
                 metrics_addr,
+                shutdown,
             )
             .await
         }
@@ -422,6 +444,7 @@ pub async fn serve(
                 true,
                 observability,
                 metrics_addr,
+                shutdown,
             )
             .await
         }
@@ -435,12 +458,14 @@ pub async fn serve(
                 false,
                 observability,
                 metrics_addr,
+                shutdown,
             )
             .await
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_follower(
     config: DataNodeConfig,
     range: RangeIdentity,
@@ -449,6 +474,7 @@ async fn run_follower(
     meta: MetaFencingEpoch,
     observability: &NodeObservability,
     metrics_addr: Option<std::net::SocketAddr>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), String> {
     let listen = config
         .replica_listen
@@ -492,6 +518,7 @@ async fn run_follower(
     // With a lease configured, this follower learns its epoch from metadata
     // instead of from its config file (#239). Without one it keeps asserting
     // the configured epoch, which is what every pre-#239 config still gets.
+    let mut watcher_task = None;
     if let Some(lease) = config.lease.as_ref() {
         // Readiness becomes a conjunction: the replica listener is bound AND
         // the watcher has read metadata once. A follower that does not yet
@@ -516,13 +543,13 @@ async fn run_follower(
             )),
             Some(observability.gate.clone()),
         )?;
-        tokio::spawn(watcher.run());
+        watcher_task = Some(tokio::spawn(watcher.run(shutdown.clone())));
     }
 
     let server = ReplicaPeerServer::new(
         tls::replica_material(&config.replica_tls)?,
         config.node_uuid,
-        follower as Arc<dyn ReplicaPeerHandler>,
+        Arc::clone(&follower) as Arc<dyn ReplicaPeerHandler>,
     )
     .map_err(|error| error.to_string())?;
     let listener = TcpListener::bind(listen)
@@ -539,9 +566,24 @@ async fn run_follower(
     use std::io::Write;
     std::io::stdout().flush().ok();
     server
-        .serve(listener)
+        .serve(listener, oneshot_on_shutdown(shutdown.clone()))
         .await
-        .map_err(|error| format!("replica server exited: {error}"))
+        .map_err(|error| format!("replica server exited: {error}"))?;
+    // Orderly stop (#280): the listener is closed and in-flight connections
+    // drained; stop the watcher, then write the final commit boundary so the
+    // next open finds no torn tail to truncate.
+    println!("data_node_stopping role=follower node={}", config.node_uuid);
+    if let Some(task) = watcher_task {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+    }
+    match follower.quiesce() {
+        Ok(committed) => println!(
+            "data_node_stopped role=follower node={} committed={committed}",
+            config.node_uuid
+        ),
+        Err(error) => eprintln!("final commit failed; recovery will handle it: {error}"),
+    }
+    Ok(())
 }
 
 /// Argument list mirrors what `serve` has already unpacked; grouping it into a
@@ -556,6 +598,7 @@ async fn run_leader(
     replicated: bool,
     observability: &NodeObservability,
     metrics_addr: Option<std::net::SocketAddr>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), String> {
     let listen = config
         .native_listen
@@ -688,6 +731,14 @@ async fn run_leader(
     // Range leadership from the metadata plane (#223). Without this the
     // configured `fencing_epoch` is simply asserted and never revisited, which
     // is the pre-#223 behaviour every existing config still gets.
+    // The agent's exit trigger is NOT the process signal: releasing the
+    // lease while the native server still executes an admitted produce would
+    // let metadata authorize a successor at a higher epoch under a broker
+    // still acking at the old one. run_leader fires this only after the
+    // server has drained (#280).
+    let (release_lease, release_lease_rx) = tokio::sync::watch::channel(false);
+    let mut agent_task = None;
+    let mut agent_drain = std::time::Duration::from_secs(5);
     if let Some(lease) = config.lease.as_ref() {
         // Followers learn granted epochs on their own now (#239), so a
         // replicated range no longer needs them restarted on every grant —
@@ -722,7 +773,11 @@ async fn run_leader(
             ))),
             promotion_probe,
         )?;
-        tokio::spawn(agent.run());
+        agent_task = Some(tokio::spawn(agent.run(release_lease_rx)));
+        // The drain wait must survive an in-flight admin round trip, whose
+        // own budget is the lease duration; past one full lease the release
+        // is moot anyway — the lease has lapsed on its own.
+        agent_drain = agent_drain.max(Duration::from_millis(lease.lease_duration_ms));
     }
     observability.register(Box::new(BrokerCollector::new(
         Arc::clone(&broker),
@@ -841,8 +896,9 @@ async fn run_leader(
             let status_listener = TcpListener::bind(status_listen)
                 .await
                 .map_err(|error| format!("bind {status_listen}: {error}"))?;
+            let status_shutdown = oneshot_on_shutdown(shutdown.clone());
             tokio::spawn(async move {
-                if let Err(error) = status_server.serve(status_listener).await {
+                if let Err(error) = status_server.serve(status_listener, status_shutdown).await {
                     tracing::warn!(%error, "leader replica-status server exited");
                 }
             });
@@ -854,7 +910,7 @@ async fn run_leader(
     let listener = TcpListener::bind(listen)
         .await
         .map_err(|error| format!("bind {listen}: {error}"))?;
-    let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+    let shutdown_rx = oneshot_on_shutdown(shutdown.clone());
     observability.gate.mark_ready();
     println!(
         "data_node_ready role={} node={} native={listen}{}{}",
@@ -869,9 +925,35 @@ async fn run_leader(
     );
     use std::io::Write;
     std::io::stdout().flush().ok();
-    let result = server.serve(listener, shutdown_rx).await;
-    drop(shutdown);
-    result.map_err(|error| format!("native server exited: {error}"))
+    server
+        .serve(listener, shutdown_rx)
+        .await
+        .map_err(|error| format!("native server exited: {error}"))?;
+    // Orderly stop (#280). The native listener is closed and sessions are
+    // drained; the lease agent — racing on the same signal — releases the
+    // range so failover need not wait out the lease deadline, and the final
+    // commit boundary spares the next open a torn-tail truncation.
+    println!(
+        "data_node_stopping role={} node={}",
+        if replicated { "leader" } else { "standalone" },
+        config.node_uuid
+    );
+    // Stop admitting and drain FIRST (the serve above has returned), only
+    // then hand the range back — see the channel's comment for why the order
+    // is load-bearing.
+    let _ = release_lease.send(true);
+    if let Some(task) = agent_task {
+        let _ = tokio::time::timeout(agent_drain, task).await;
+    }
+    match broker.quiesce() {
+        Ok(committed) => println!(
+            "data_node_stopped role={} node={} committed={committed}",
+            if replicated { "leader" } else { "standalone" },
+            config.node_uuid
+        ),
+        Err(error) => eprintln!("final commit failed; recovery will handle it: {error}"),
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -178,8 +178,12 @@ fn spawn_follower_server(
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = ReplicaPeerServer::new(material, node_id, handler).unwrap();
+        // Held for the runtime's lifetime: dropping the sender would stop
+        // the server mid-test (#280).
+        let (_shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
         let handle = tokio::spawn(async move {
-            let _ = server.serve(listener).await;
+            let _shutdown = _shutdown;
+            let _ = server.serve(listener, shutdown_rx).await;
         });
         (addr, handle.abort_handle())
     })

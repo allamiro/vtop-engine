@@ -14,11 +14,14 @@ use vtop_meta::{
 };
 
 /// Run a metadata node that owns its own observability endpoint.
-pub async fn run(mut config: MetaNodeConfig) -> Result<(), String> {
+pub async fn run(
+    mut config: MetaNodeConfig,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), String> {
     let observability = NodeObservability::new("meta", &config.node_id.to_string())?;
     let endpoint = config.observability.take().unwrap_or_default();
     let metrics_addr = observability.serve(&endpoint).await?;
-    serve(config, &observability, metrics_addr).await
+    serve(config, &observability, metrics_addr, shutdown).await
 }
 
 /// Run a metadata node against an observability surface someone else owns.
@@ -30,6 +33,7 @@ pub async fn serve(
     config: MetaNodeConfig,
     observability: &NodeObservability,
     metrics_addr: Option<std::net::SocketAddr>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), String> {
     std::fs::create_dir_all(&config.data_dir)
         .map_err(|error| format!("create {}: {error}", config.data_dir.display()))?;
@@ -134,6 +138,23 @@ pub async fn serve(
         }
         result = admin_server.serve(admin_listener) => {
             Err(format!("admin server exited: {result:?}"))
+        }
+        () = wait_for_shutdown(shutdown) => {
+            // An orderly stop (#280). Raft state is durable on every apply,
+            // so there is nothing to flush: dropping the listeners is the
+            // whole drain, and the survivors elect around the departure.
+            println!("meta_node_stopping");
+            Ok(())
+        }
+    }
+}
+
+/// Resolve only when the process-wide shutdown flag flips (#280); a dropped
+/// sender parks forever rather than reading as an implicit shutdown.
+async fn wait_for_shutdown(mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    while !*shutdown.borrow() {
+        if shutdown.changed().await.is_err() {
+            std::future::pending::<()>().await;
         }
     }
 }
