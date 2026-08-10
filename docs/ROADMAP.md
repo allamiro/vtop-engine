@@ -160,17 +160,29 @@ reopen quietly.
   untested assumption. A directory written by release N+1 may hold artifacts
   release N cannot interpret (retention markers, epoch journals with
   adoption semantics N predates), and no test defends the reverse path.
-- **#240 remainder** — the election-restriction question (Raft dissertation §5.4.1), then the signed
-  leadership-transition record.
+
+One observation rode along without becoming a fix: scenario 09 once left a
+promotion unacquired within its deadline (#318). The flake has not recurred —
+twenty clean runs on the fix branch, plus every CI run since — so the release
+ships the diagnosis kit instead of a guess: `await_lease_holder` now reports
+what it observed (reads attempted, epochs answered, holders seen) whenever it
+gives up, so the next occurrence names its cause. The issue stays open in
+v0.4.0 as a watch item.
 
 ## v0.4.0 and beyond
 
-A Helm chart that can deploy a replicated range and separate metadata from
-data (#284, #287), and TLS as a configured capability rather than a hard
-dependency across every deployment method (#294). FIPS (#296) and the Kafka
-wire-compatibility gateway (#225) sit behind those. (Retention #290, orderly
-shutdown #280, and upgrade testing #291 moved up into v0.3.1 and shipped
-there.)
+The **#240 remainder** moves here wholesale: the election-restriction question
+(Raft dissertation §5.4.1) and the signed leadership-transition record are one
+design conversation — restricting who may be promoted and proving who was —
+and splitting them across a patch-release boundary would ship half an
+argument.
+
+Beyond that: a Helm chart that can deploy a replicated range and separate
+metadata from data (#284, #287), and TLS as a configured capability rather
+than a hard dependency across every deployment method (#294). FIPS (#296) and
+the Kafka wire-compatibility gateway (#225) sit behind those. (Retention
+#290, orderly shutdown #280, and upgrade testing #291 moved up into v0.3.1
+and shipped there.)
 
 ---
 
