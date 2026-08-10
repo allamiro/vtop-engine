@@ -64,6 +64,7 @@ fail() { echo "[upgrade-compat/$OLD_LABEL] FAIL: $*" >&2; exit 1; }
 # processes holding the fixture ports into the next invocation. Tracked in a
 # FILE, not a shell array — start_node runs inside command substitution, so
 # an array append there would land in a subshell and vanish.
+# shellcheck disable=SC2329  # invoked indirectly, via the EXIT trap below
 cleanup() {
   if [[ -f "$WORKDIR/pids" ]]; then
     while read -r pid; do
