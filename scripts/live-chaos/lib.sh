@@ -800,10 +800,14 @@ await_lease_holder() {
       reads_failed=$((reads_failed + 1))
     fi
     if [[ "$holder" == "$expected" ]]; then
-      epoch="$(lease_field "$id" "d['lease']['fencing_epoch']")" || epoch=""
-      if [[ -n "$epoch" ]]; then
+      # The epoch follow-up is a metadata read too: a run where the holder
+      # answers but this one keeps failing must count as read failures, or
+      # the evidence points away from the exact fault it is reporting.
+      if epoch="$(lease_field "$id" "d['lease']['fencing_epoch']")" && [[ -n "$epoch" ]]; then
         echo "$epoch"
         return 0
+      else
+        reads_failed=$((reads_failed + 1))
       fi
     fi
     [[ $SECONDS -lt $deadline ]] \
