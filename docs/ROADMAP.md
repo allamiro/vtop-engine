@@ -146,12 +146,15 @@ reopen quietly.
   and fails if SIGTERM is ever ignored again. Durability still never depends
   on the clean path — the k8s smoke test keeps force-deleting pods to prove
   it.
-- **#291** — an upgrade is no longer an untested assumption. CI builds the
-  released tags and proves their data directories open under the current
-  build: v0.2.1's single `range.active` (the exact compatibility claim
-  `open_range` makes) and v0.3.0's rolled sealed segments both open, serve
-  every record byte-exactly, and survive an orderly stop and reopen
-  (`scripts/upgrade-compat.sh`). The old nodes are stopped with SIGKILL —
+- **#291** — an upgrade is no longer an untested assumption. CI derives the
+  newest patch release of every minor series since the native data plane
+  (v0.2+; the v0.1.x CLI predates the surface the script drives) and proves
+  each one's data directory opens under the current build — today that is
+  v0.2.1's single `range.active` (the exact compatibility claim `open_range`
+  makes) and v0.3.0's rolled sealed segments; each opens, serves every
+  record byte-exactly, and still serves after an orderly stop and reopen
+  (`scripts/upgrade-compat.sh`). New tags join the matrix the moment they
+  exist. The old nodes are stopped with SIGKILL —
   deliberately, because that is the stop every pre-#280 release performs.
   Downgrade is NOT supported: stated here as a decision, not left as an
   untested assumption. A directory written by release N+1 may hold artifacts
@@ -162,12 +165,12 @@ reopen quietly.
 
 ## v0.4.0 and beyond
 
-Retention and reclamation (#290), a Helm chart that can deploy a replicated
-range and separate metadata from data (#284, #287), orderly shutdown (#280),
-cross-version data-directory compatibility testing (#291), and TLS as a
-configured capability rather than a hard dependency across every deployment
-method (#294). FIPS (#296) and the Kafka wire-compatibility gateway (#225) sit
-behind those.
+A Helm chart that can deploy a replicated range and separate metadata from
+data (#284, #287), and TLS as a configured capability rather than a hard
+dependency across every deployment method (#294). FIPS (#296) and the Kafka
+wire-compatibility gateway (#225) sit behind those. (Retention #290, orderly
+shutdown #280, and upgrade testing #291 moved up into v0.3.1 and shipped
+there.)
 
 ---
 
@@ -175,8 +178,9 @@ behind those.
 
 0.x. Minor versions may break compatibility, and releases are published as
 GitHub pre-releases to say so. **Upgrades are tested** (#291): CI proves a
-data directory written by each released tag opens under the current build,
-serves byte-exactly, and survives a restart. **Downgrades are not supported**
+data directory written by the newest patch of each released minor series
+(v0.2+) opens under the current build, serves byte-exactly, and still serves
+after a restart; newly published tags join that matrix automatically. **Downgrades are not supported**
 — a newer release's directory may hold artifacts an older release cannot
 interpret, and nothing tests that path; going back means a fresh directory or
 a verified backup taken before the upgrade.

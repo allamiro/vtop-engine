@@ -171,6 +171,8 @@ jobs:
             shell:
               - 'docker/*.sh'
               - 'docker/tests/**'
+              # Executable CI test code (#291), linted like the rest.
+              - 'scripts/upgrade-compat.sh'
               # The live-chaos harness is executable shell that gates every
               # distributed-systems claim this project makes, and it was
               # unlinted: a change to lib.sh — sourced by every scenario —
@@ -228,10 +230,14 @@ jobs:
               - '.github/workflows/ci.yml'
             upgrade:
               # The on-disk format contract (#291): any crate change can move
-              # the format, and the script itself is executable test code.
+              # the format, the toolchain/cargo config changes the HEAD binary
+              # that opens the fixtures, and the script itself is executable
+              # test code.
               - 'crates/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
+              - '.cargo/**'
+              - 'rust-toolchain*'
               - 'scripts/upgrade-compat.sh'
               - 'scripts/live-chaos/gen-certs.sh'
               - '.github/workflows/ci.yml'
@@ -718,7 +724,7 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/mnt" -w /mnt \
             koalaman/shellcheck:v0.11.0 docker/*.sh scripts/release-notes.sh \
-            scripts/k8s-smoke.sh scripts/e2e-smoke.sh
+            scripts/k8s-smoke.sh scripts/e2e-smoke.sh scripts/upgrade-compat.sh
 
       # `-P scripts/live-chaos/scenarios` resolves the scenarios' dynamic
       # `source "$(dirname …)/../lib.sh"`. Without it every scenario reports
@@ -960,12 +966,28 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-upgrade-${{ hashFiles('**/Cargo.lock') }}
+      # The tag list is DERIVED, not hardcoded: the newest patch release of
+      # every minor series since the native data plane shipped (v0.2+ — the
+      # v0.1.x CLI predates the produce/verify surface this script drives).
+      # A new release therefore joins the matrix the moment its tag exists,
+      # so the immediately preceding release — the upgrade path most
+      # operators actually take — cannot silently fall out of coverage.
+      - name: Select the released tags to replay
+        id: tags
+        run: |
+          set -euo pipefail
+          tags="$(git tag --list 'v0.*' --sort=version:refname \
+            | awk -F. '($1 "." $2) != "v0.1" { latest[$1 "." $2] = $0 } END { for (m in latest) print latest[m] }' \
+            | sort -V | tr '\n' ' ')"
+          [[ -n "${tags// /}" ]] || { echo "no release tags found"; exit 1; }
+          echo "list=$tags" >> "$GITHUB_OUTPUT"
+          echo "replaying: $tags"
       # Release tags are immutable, so their builds are cached essentially
       # forever: after the first run this job pays only the HEAD build.
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target-old
-          key: ${{ runner.os }}-upgrade-old-tags-v0.2.1-v0.3.0
+          key: ${{ runner.os }}-upgrade-old-tags-${{ steps.tags.outputs.list }}
 
       - name: Build HEAD vtop-node
         run: cargo build -p vtop-node --bin vtop-node
@@ -973,7 +995,7 @@ jobs:
       - name: Build the released tags
         run: |
           set -euo pipefail
-          for tag in v0.2.1 v0.3.0; do
+          for tag in ${{ steps.tags.outputs.list }}; do
             if [[ -x "target-old/$tag/debug/vtop-node" ]]; then
               echo "$tag build cached"
               continue
@@ -984,28 +1006,32 @@ jobs:
             git worktree remove --force "../wt-$tag"
           done
 
-      - name: v0.2.1 directory opens under HEAD (single range.active)
+      - name: Each released directory opens under HEAD
         run: |
-          UPGRADE_KEEP=1 UPGRADE_WORKDIR="$GITHUB_WORKSPACE/upgrade-v021" \
-          UPGRADE_NATIVE_PORT=9700 \
-            scripts/upgrade-compat.sh v0.2.1 \
-              target-old/v0.2.1/debug/vtop-node target/debug/vtop-node legacy
-
-      - name: v0.3.0 directory opens under HEAD (rolled sealed segments)
-        run: |
-          UPGRADE_KEEP=1 UPGRADE_WORKDIR="$GITHUB_WORKSPACE/upgrade-v030" \
-          UPGRADE_NATIVE_PORT=9720 \
-            scripts/upgrade-compat.sh v0.3.0 \
-              target-old/v0.3.0/debug/vtop-node target/debug/vtop-node rolling
+          set -euo pipefail
+          port=9700
+          for tag in ${{ steps.tags.outputs.list }}; do
+            # The rolling profile's threshold keys exist from v0.3.0 (#313);
+            # older releases refuse unknown config keys, which is itself the
+            # compatibility contract, so they replay the legacy single-file
+            # shape — the exact claim open_range makes.
+            profile=legacy
+            case "$tag" in
+              v0.[3-9].*|v[1-9]*) profile=rolling ;;
+            esac
+            UPGRADE_KEEP=1 UPGRADE_WORKDIR="$GITHUB_WORKSPACE/upgrade-$tag" \
+            UPGRADE_NATIVE_PORT="$port" \
+              scripts/upgrade-compat.sh "$tag" \
+                "target-old/$tag/debug/vtop-node" target/debug/vtop-node "$profile"
+            port=$((port + 20))
+          done
 
       - name: Upload fixture logs
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: upgrade-compat-logs
-          path: |
-            upgrade-v021/logs
-            upgrade-v030/logs
+          path: upgrade-v0*/logs
           if-no-files-found: ignore
           retention-days: 7
 

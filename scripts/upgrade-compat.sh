@@ -187,10 +187,23 @@ start_node() { # <binary> <config> <log-name> -> pid
   echo "$pid"
 }
 
+# A gone process OR a zombie counts as stopped: the nodes are reparented
+# when start_node's command-substitution subshell exits, and a container
+# whose PID 1 does not reap orphans leaves them as zombies `kill -0` still
+# sees — the same reasoning as the live-chaos harness's stop_node_now.
+is_stopped() { # <pid>
+  if ! kill -0 "$1" 2>/dev/null; then
+    return 0
+  fi
+  local state
+  state="$(ps -o stat= -p "$1" 2>/dev/null | tr -d ' ')"
+  [[ "$state" == Z* ]]
+}
+
 kill_hard() { # <pid>
   kill -9 "$1" 2>/dev/null || true
   local deadline=$((SECONDS + STOP_TIMEOUT))
-  while kill -0 "$1" 2>/dev/null; do
+  until is_stopped "$1"; do
     [[ $SECONDS -lt $deadline ]] || fail "pid $1 did not stop"
     sleep 0.05
   done
@@ -236,7 +249,7 @@ log "every record written by $OLD_LABEL reads back byte-exact under the current 
 # deadline and write the final commit boundary.
 kill "$NEW_PID" 2>/dev/null || true
 deadline=$((SECONDS + STOP_TIMEOUT))
-while kill -0 "$NEW_PID" 2>/dev/null; do
+until is_stopped "$NEW_PID"; do
   [[ $SECONDS -lt $deadline ]] \
     || fail "the current build ignored SIGTERM after an upgrade open (#280 reopened)"
   sleep 0.05
@@ -246,8 +259,15 @@ grep -q "data_node_stopped" "$WORKDIR/logs/new-node.log" \
 log "the current build drained on SIGTERM over the upgraded directory"
 
 # And the directory reopens once more — the post-upgrade restart an operator
-# will actually perform after a clean stop.
+# will actually perform after a clean stop — and must still SERVE everything:
+# reaching ready proves the open, not the data. A wrong final commit boundary
+# would pass a readiness check and lose records anyway.
 AGAIN_PID="$(start_node "$NEW_BIN" "$NEW_CFG" "again-node")"
+"$NEW_BIN" verify --client-config "$CLIENT_CFG" --addr "127.0.0.1:$NATIVE_PORT" \
+  --expect-at-least "$RECORDS" > "$WORKDIR/logs/again-verify.log" 2>&1 \
+  || fail "records did not survive the clean-stop restart: \
+$(tail -3 "$WORKDIR/logs/again-verify.log")"
+log "every record still serves after the clean-stop restart"
 kill_hard "$AGAIN_PID"
 log "PASS: a $OLD_LABEL data directory opens, serves, and survives under the current build"
 if [[ -z "${UPGRADE_KEEP:-}" ]]; then
