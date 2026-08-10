@@ -152,5 +152,5 @@ panel.
 - Alloy holds a (read-only) docker socket to discover containers and read logs;
 - no alerting rules yet.
 
-See [`docs/PRODUCTION_HA_PLAN.md`](../docs/PRODUCTION_HA_PLAN.md) for what a
+See [`docs/PRODUCTION_HA.md`](../docs/PRODUCTION_HA.md) for what a
 production topology requires.

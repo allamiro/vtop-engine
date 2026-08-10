@@ -32,8 +32,9 @@ head-on.
 | Area | VTOP | Kafka |
 |---|---|---|
 | Leader election safety | Leadership is a metadata **lease**; acquisition mints `fencing_epoch + 1` through a linearizable Raft proposal, so the old leader is fenced **by construction**. There is no unclean-election knob to misconfigure. | ISR-based election; `unclean.leader.election.enable` exists and, when enabled (or mis-set), silently trades durability for availability. |
-| End-to-end verifiability | Content roots per segment; sealed artifacts verified **offline and byte-exactly** (`vtopctl segment verify`); repair, retirement, and tiering commit only after **evidence** (`CommitReplacementProof`, `CommitTierEvidence`) with verifier identity and epoch recorded. | Checksums protect against corruption in flight/at rest, but there is no end-to-end, third-party-re-verifiable proof chain for replicas, repairs, or tiered copies. |
-| Determinism and test rigor | Pure deterministic metadata state machine (no serde, hand-coded bounded codecs, golden byte vectors); crash sweeps drive the exact production byte paths at every write boundary; mutation testing in CI; deterministic fault harness plus 11 live-chaos scenarios (kill -9, disk-full, fsync-EIO, partitions, clock skew, live failover, co-location). | Strong integration test culture, but replay determinism and byte-exact snapshot equivalence are not design invariants, and crash-point sweeps of the storage engine are not part of CI. |
+| End-to-end verifiability | Content roots per segment; sealed artifacts verified **offline and byte-exactly** (`vtopctl segment verify`); repair, retirement, and tiering commit only after **evidence** (`CommitReplacementProof`, `CommitTierEvidence`) with verifier identity and epoch recorded. These are metadata-log commits — distinct from the archive protocol's *source-progress* commit ([VTOP_PROTOCOL_DRAFT.md §3, §13](VTOP_PROTOCOL_DRAFT.md#13-commit-rule)). On the archive path, verification is graded strong / backend-limited / disabled (§17), with strong the default and non-strong commit requiring explicit opt-out. | Checksums protect against corruption in flight/at rest, but there is no end-to-end, third-party-re-verifiable proof chain for replicas, repairs, or tiered copies. |
+| Source-commit safety (archive path) | The commit rule ([§13](VTOP_PROTOCOL_DRAFT.md#13-commit-rule)): a Kafka offset / file cursor / spool position is never advanced until the object **and** its bound manifest are durably stored and verified; crash recovery is specified (§14) and replay never loses data. | `enable.auto.commit` and consumer-side offset management leave verify-before-commit discipline to each application. |
+| Determinism and test rigor | Pure deterministic metadata state machine (no serde, hand-coded bounded codecs, golden byte vectors); crash sweeps drive the exact production byte paths at every write boundary; mutation testing in CI; deterministic fault harness plus a 13-scenario live-chaos suite (kill -9, disk-full, fsync-EIO, partitions, clock skew, live failover, co-location, admin authorization, replica replacement). | Strong integration test culture, but replay determinism and byte-exact snapshot equivalence are not design invariants, and crash-point sweeps of the storage engine are not part of CI. |
 | Clock independence | Lease expiry is computed from data **in the replicated log** (`issued_at_ms` + duration), so every replica derives the same deadline; skew affects liveness, never safety (proven live in the clock-skew scenario). | Broker-side time is load-bearing in more places (log rolling, retention, transaction timeouts); safety does not depend on it, but the boundary is less explicit. |
 | Failover that leaves evidence | Verified promotion establishes the committed boundary from a **quorum of replica disks** before a new leader serves, refuses when the candidate's own log is behind, and the arc ends (#240) with a signed leadership-transition statement. | High-water-mark handling on failover is correct post-KIP-101 but leaves no independently checkable record of what a transition decided. |
 | Supply chain | Releases ship SBOM, provenance attestations, cosign-signed images and binaries, checksums; `--locked` builds. | Distribution-dependent; upstream Apache releases are signed but SBOM/provenance are not first-class. |
@@ -42,9 +43,7 @@ head-on.
 
 | Gap | Honest state | Closing item |
 |---|---|---|
-| Epoch-qualified truncation (KIP-101/KIP-279) | Kafka **has** leader-epoch fencing of log divergence; VTOP's promotion floor is not epoch-qualified yet — two replicas reporting offset 90 may not hold the same record at 90, and followers are never truncated on election. Documented plainly in `promotion.rs`. | #240 (epoch vector, election-driven truncation, new-epoch marker) |
-| Follower epoch propagation | Kafka propagates leader epochs to replicas as a matter of course. VTOP followers validate appends against a **statically configured** epoch; the harness restarts them on epoch change. | #239 (follower-side lease watcher) — `priority:high` |
-| Authorization | Kafka has ACLs and pluggable authorizers. VTOP's admin transport accepts **any CA-signed client** for any command (mTLS authenticates, nothing authorizes). | #238 (identity-aware admin dispatch, per-command-class policy) |
+| Epoch-qualified truncation (KIP-101/KIP-279) | Largely closed in v0.2.0: per-replica epoch history, bounded divergence truncation, fence-and-read reconciliation. The remaining piece is the §5.4.1-style election restriction and the signed leadership-transition record. | #240 remainder |
 | Transactions / EOS | Kafka has cross-partition transactions and exactly-once streams. VTOP has producer idempotency (epoch + sequence dedup) — enough for exactly-once produce per range, no cross-range transactions. | Not scheduled; deliberate scope cut for now |
 | Consumer-group sophistication | Kafka has incremental cooperative rebalancing, static membership, regex subscriptions. VTOP has groups, cursors-in-metadata, heartbeats, and assignment — the minimum honest core. | Grows with #225's needs |
 | Ecosystem | Clients in every language, Connect, Streams, MirrorMaker, ksqlDB, decades of operational tooling. VTOP has `vtopctl` and dashboards-as-code. | #225 (Kafka wire-compatibility gateway) — inherit the client ecosystem instead of rebuilding it |
@@ -95,8 +94,9 @@ The strategy is not to out-Kafka Kafka or out-scale Northguard this year. It
 is to be the system whose **claims are checkable**:
 
 1. **Close the correctness gaps the incumbents already closed** — #239
-   (epoch propagation), #240 (epoch-qualified truncation) — so parity is real,
-   not asserted.
+   (epoch propagation) and admin authorization (#238) landed in v0.2.0; the
+   #240 remainder (election restriction, signed transition record) is what's
+   left — so parity is real, not asserted.
 2. **Keep the evidence advantage** — every new mechanism (repair, tiering,
    failover) lands with proofs and offline verification, which neither Kafka
    nor Northguard's public material offers.
@@ -107,6 +107,7 @@ is to be the system whose **claims are checkable**:
    docs (`promotion.rs` names its own limitations), not in a footnote. This
    document is part of that: when a row above stops being true, change it.
 
-*Related reading: `ARCHITECTURE.md`, `NATIVE_BROKER_ARCHITECTURE.md`,
-`LIVE_CHAOS_VALIDATION.md`, `PRODUCTION_HA_PLAN.md` (§21 Known limitations),
-and the roadmap issue #243.*
+*Related reading: [`VTOP_PROTOCOL_DRAFT.md`](VTOP_PROTOCOL_DRAFT.md) (the
+normative archive protocol: commit rule §13, verification semantics §17),
+`ARCHITECTURE.md`, `NATIVE_BROKER_ARCHITECTURE.md`, `LIVE_CHAOS_VALIDATION.md`,
+`PRODUCTION_HA.md` (§19 Known limitations), and the roadmap issue #243.*

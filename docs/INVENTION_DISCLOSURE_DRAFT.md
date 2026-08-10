@@ -1,6 +1,8 @@
 # Invention Disclosure Draft
 
 > This document is part of an **invention-disclosure support package** and supports a **candidate invention**. It is an internal draft for technical and legal review.
+>
+> Normative reference: the behavior described here is specified in [VTOP_PROTOCOL_DRAFT.md](VTOP_PROTOCOL_DRAFT.md) (cited below as "protocol §N").
 
 ## Table of contents
 
@@ -90,7 +92,7 @@ These three otherwise-incompatible positions are made **interchangeable** under 
 
 ### Adaptive batching
 
-Records accumulate into a single-source batch sealed by configurable triggers: `max_records`, `max_bytes`, `max_batch_age_seconds`, partition change, or manual/shutdown flush. Each batch carries a unique, deterministic `batch_id`.
+Records accumulate into a single-source batch sealed by configurable triggers: `max_records`, `max_bytes`, `max_batch_age_seconds`, partition change, or manual/shutdown flush. Each batch carries a unique `batch_id` of deterministic shape embedding the source identity and covered range (the current reference implementation additionally embeds a timestamp and random suffix; fully deterministic naming per protocol §15.1 is a specified target, not yet implemented).
 
 ### Format detection
 
@@ -102,7 +104,7 @@ The sealed batch is compressed (gzip, zstd, or none). A content checksum (**SHA-
 
 ### Manifest binding (chain of custody)
 
-A manifest binds the **source progress marker range → object checksum → verification state**, plus object/manifest URIs, sizes, compression, format, and timestamps. The manifest carries a reproducible **self-hash** (computed with the self-hash field blanked) for tamper-evidence.
+A manifest binds the **source progress marker range → object checksum → verification state**, plus object/manifest URIs, sizes, compression, format, and timestamps. The manifest carries a reproducible **self-hash** (computed with both the embedded self-hash and MAC fields blanked) for corruption detection, and optionally a keyed BLAKE3 authenticator (`manifest.mac`) for tamper detection among key holders (protocol §11.2; the unkeyed self-hash alone does not prove authenticity).
 
 ### State machine and verification-before-commit
 
@@ -110,7 +112,7 @@ A strongly-typed state machine (`DISCOVERED → BATCHING → SEALED → COMPRESS
 
 ### Replay and recovery
 
-On restart, incomplete batches are classified: a `VERIFIED`-but-uncommitted batch retries its commit (the durable, verified object is never discarded); any pre-`VERIFIED` batch is marked `REPLAY_REQUIRED` and re-read from the source. Deterministic naming makes re-upload idempotent. Source progress is never advanced for unverified data.
+On restart, incomplete batches are classified: a `VERIFIED`-but-uncommitted batch retries its commit (the durable, verified object is never discarded); any pre-`VERIFIED` batch is transitioned to `FAILED` then `REPLAY_REQUIRED` and re-entered at `BATCHING` (protocol §12/§14), re-reading from the source. The protocol's deterministic naming rule (§15.1) is what makes re-upload idempotent; until the reference implementation adopts it, a replayed batch writes a duplicate object rather than losing data. Source progress is never advanced for unverified data.
 
 ### Per-format buckets and partitioning
 
@@ -125,7 +127,7 @@ A single upload/verification interface abstracts the storage target: native S3 (
 The aspects below are presented as candidate distinguishing features; novelty/non-obviousness is for counsel to determine.
 
 1. A **single source-progress-marker abstraction** unifying Kafka offsets, file byte offsets, and syslog spool offsets under one commit discipline.
-2. A **bound, self-hashed manifest** tying the stored object's hash to the exact covered source positions, used as a **gating precondition** for advancing source progress.
+2. A **bound, self-hashed manifest** — optionally carrying a keyed BLAKE3 authenticator (`manifest.mac`) — tying the stored object's hash to the exact covered source positions, used as a **gating precondition** for advancing source progress.
 3. **Commit strictly after dual verification** of both object and manifest, enforced redundantly at three layers (state machine, state store, pipeline).
 4. A **deterministic, idempotent recovery model** distinguishing `VERIFIED`-retry-commit from pre-`VERIFIED` replay.
 5. **Per-batch format detection** allowing heterogeneous formats through one engine, each labeled and bucketed by format.
@@ -150,7 +152,8 @@ The aspects below are presented as candidate distinguishing features; novelty/no
 | Backend | Native S3, local filesystem (air-gapped), or command-compatible external tools; verification strength declared per backend. |
 | Source mode | Line-oriented vs. whole-file ingestion for files; manual-offset Kafka; spool byte ranges. |
 | Verification strength | Strong cryptographic verification vs. backend-limited size/existence, explicitly reported. |
-| Future strengthening | Optional manifest signing and object-lock/WORM immutability (designed, not yet implemented). |
+| Manifest authentication | Keyed BLAKE3 MAC in `manifest.mac` (implemented, protocol §11.2); public-key signatures and key rotation are future work. |
+| Future strengthening | Object-lock/WORM immutability: manifest version pinning and bucket-versioning validation are implemented in the hardened profile; object-lock retention itself is deployment policy. |
 
 These variations are described so that the candidate invention is not read as limited to a single algorithm, backend, or bucket scheme.
 
@@ -158,7 +161,7 @@ These variations are described so that the candidate invention is not read as li
 
 The proposed method is **reduced to practice** in the VTOP Engine reference implementation:
 
-- A Rust workspace (`vtop-core`, `vtop-adapters`, `vtop-upload`, `vtop-state`, `vtop-cli`) implements the adapters, batching, compression, checksums (SHA-256/BLAKE3/disabled), bound manifests, the state machine, verification-before-commit, replay/recovery, per-format buckets, and pluggable backends described above.
+- The engine crates of a Rust workspace (`vtop-core`, `vtop-adapters`, `vtop-upload`, `vtop-state`, `vtop-observe`, `vtop-cli`; the workspace also contains the separate cluster-plane crates `vtop-meta`, `vtop-node`, `vtop-broker`, `vtop-log`, `vtop-protocol`) implement the adapters, batching, compression, checksums (SHA-256/BLAKE3/disabled), bound manifests, the state machine, verification-before-commit, replay/recovery, per-format buckets, and pluggable backends described above.
 - The commit rule and recovery behavior are exercised by automated tests (state-machine transition tests; replay/recovery integration tests confirming verification failure never commits and that a crash before commit is replayable and recovers).
 - A separate benchmark harness drives the compiled binary to produce **CSV + JSON evidence** of throughput, latency, compression, and replay across input volumes, file sizes, formats, batch settings, compression and checksum algorithms, and backends — corroborating that the method operates across the claimed dimensions.
 
@@ -170,7 +173,8 @@ A method comprising discovering telemetry sources, forming adaptive batches, gen
 
 1. **Manifest-bound telemetry object archival.**
    - 1a. Binding object hash to covered source positions in a stored manifest.
-   - 1b. Reproducible manifest self-hash for tamper-evidence.
+   - 1b. Reproducible manifest self-hash (both embedded hash/MAC values blanked) for corruption detection.
+   - 1c. Optional keyed (BLAKE3) manifest authenticator for tamper detection among key holders.
 2. **Replay-safe source progress commit.**
    - 2a. Commit gated on dual (object + manifest) verification.
    - 2b. Redundant enforcement at state-machine, state-store, and pipeline layers.

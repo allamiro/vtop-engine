@@ -18,7 +18,7 @@
 
 ## 1. Purpose
 
-Catalog existing tools and systems whose behavior overlaps with the **proposed VTOP method** (replay-safe, manifest-driven telemetry object transfer with verification-before-commit). For each item, record what it does, how it is similar to and different from VTOP, the possible prior-art risk area, and notes for patent counsel.
+Catalog existing tools and systems whose behavior overlaps with the **proposed VTOP method** (replay-safe, manifest-driven telemetry object transfer with verification-before-commit — normatively specified in [VTOP_PROTOCOL_DRAFT.md](VTOP_PROTOCOL_DRAFT.md), commit rule [§13](VTOP_PROTOCOL_DRAFT.md#13-commit-rule) and verification semantics [§17](VTOP_PROTOCOL_DRAFT.md#17-verification-semantics)). For each item, record what it does, how it is similar to and different from VTOP, the possible prior-art risk area, and notes for patent counsel.
 
 ## 2. How to read this
 
@@ -56,7 +56,7 @@ The dimension that matters most for VTOP is the **commit discipline**: whether t
 
 The **distinguishing combination** to test against all prior art:
 
-> **uniform cross-source progress marker abstraction + bound cryptographic manifest verified in storage + commit strictly after verification.**
+> **uniform cross-source progress marker abstraction + bound cryptographic manifest (self-hashed, optionally keyed-MAC-authenticated) verified in storage + commit strictly after verification.**
 
 | Dimension | Question to answer for each item |
 |-----------|----------------------------------|
@@ -64,7 +64,7 @@ The **distinguishing combination** to test against all prior art:
 | Bound manifest | Is there a stored manifest binding object hash to covered source positions? |
 | Verified-before-commit | Is durable + verified storage a precondition for advancing source progress? |
 | Dual verification | Are both object and manifest verified? |
-| Integrity strength | Cryptographic hash vs. size/existence vs. none? |
+| Integrity strength | Which protocol §17 class: **strong** (stored-content hash) vs **backend-limited** (existence/size) vs **disabled** (size-only by configuration)? |
 | Recovery model | Deterministic, idempotent replay distinguishing verified-retry from pre-verified replay? |
 | Partitioning/retention | Telemetry-aware partition + retention metadata, per-format buckets? |
 | Immutability | WORM/object-lock gating? |
@@ -126,12 +126,12 @@ Per item, record: identifier/source, date, which dimensions (§4) it matches, th
 - Prioritize **Kafka S3 Sink Connector** for the "offset-commit-after-upload" angle.
 - Treat CLI transfer tools (rclone, s3cmd, AWS CLI, mc) as **background art** for upload + checksum verification primitives.
 - Treat object lock / WORM and broad WORM-compliance systems as **storage-feature** background art relevant to immutability claims.
-- The distinguishing combination to test against all prior art: **uniform cross-source progress marker abstraction + bound cryptographic manifest verified in storage + commit strictly after verification.**
+- The distinguishing combination to test against all prior art: **uniform cross-source progress marker abstraction + bound cryptographic manifest (self-hashed, optionally keyed-MAC-authenticated) verified in storage + commit strictly after verification.**
 
 ## 9. Notes for patent counsel
 
 - The investigation above is for **technical triage only**; it deliberately does **not** assess novelty or non-obviousness.
-- The key element-by-element comparison points are: (1) the source-progress-marker abstraction across Kafka/file/spool; (2) the stored, self-hashed manifest binding object hash to covered positions; (3) commit strictly after dual verification, enforced redundantly.
+- The key element-by-element comparison points are: (1) the source-progress-marker abstraction across Kafka/file/spool; (2) the stored, self-hashed (and optionally keyed-MAC-authenticated) manifest binding object hash to covered positions; (3) commit strictly after dual verification, enforced redundantly.
 - Background-art primitives (checksum-verify-after-upload, multipart ETag, object lock/WORM) should be distinguished from the **method-level** combination.
 - Open questions to resolve with counsel include the exact ack/commit timing in Vector, Data Prepper, OpenTelemetry Collector, and Cribl, and whether any of them verify a stored object hash (not merely confirm delivery) before advancing a source position.
 

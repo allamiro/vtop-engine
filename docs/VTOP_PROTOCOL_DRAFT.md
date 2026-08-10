@@ -3,11 +3,12 @@
 **Verified Telemetry Object Protocol (VTOP)**
 
 Status: Draft / proposed protocol
-Version: 0.1 (reference implementation specification)
+Version: 0.2 (reference implementation specification; 0.2 adds the optional
+keyed BLAKE3 manifest authenticator, §11.2 and §18)
 
 > This document describes a **proposed protocol** and accompanies a **reference implementation** ("VTOP Engine"). It is a draft for technical review and is part of an **invention-disclosure support package**. It does not describe a shipped standard.
 
-The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** in this document are to be interpreted as normative requirements describing conformant behavior of a VTOP implementation.
+The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHOULD**, **SHOULD NOT**, and **MAY** in this document are to be interpreted as normative requirements describing conformant behavior of a VTOP implementation (in the spirit of RFC 2119 / RFC 8174).
 
 ---
 
@@ -25,7 +26,7 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** in
 10. [Checksum](#10-checksum)
 11. [Manifest object](#11-manifest-object)
 12. [State machine](#12-state-machine)
-13. [Commit rule](#7-commit-rule) *(see §13)*
+13. [Commit rule](#13-commit-rule)
 14. [Replay and recovery rule](#14-replay-and-recovery-rule)
 15. [Object and bucket naming](#15-object-and-bucket-naming)
 16. [Partitioning](#16-partitioning)
@@ -202,7 +203,7 @@ A sealed batch carries at minimum: `batch_id`, source identity, covered progress
 
 ### 8.2 Format
 
-The batch **format** **MAY** be declared explicitly per stream or **MAY** be auto-detected per batch from content (§17.3 and §20). Different formats **MAY** flow through one engine simultaneously; an explicit declaration **MUST** override detection.
+The batch **format** **MAY** be declared explicitly per stream or **MAY** be auto-detected per batch from content (see §20, "New format"). Different formats **MAY** flow through one engine simultaneously; an explicit declaration **MUST** override detection.
 
 ---
 
@@ -252,8 +253,8 @@ A conformant manifest:
 - **MUST** include source identity (tenant, source, format).
 - **MUST** include the covered source progress markers (start and end).
 - **MUST** include the telemetry object's storage location (bucket, key/URI).
-- **MUST** include the telemetry object's integrity metadata: checksum algorithm, checksum value (or disabled indicator), compressed byte size, and uncompressed byte size.
-- **MUST** include the compression algorithm and extension.
+- **MUST** include the telemetry object's integrity metadata: checksum algorithm, checksum value (or disabled indicator), and compressed byte size; **SHOULD** include the uncompressed byte size.
+- **MUST** include the compression algorithm (the file extension follows deterministically from it per the §9 table and need not be a separate field).
 - **MUST** include a creation timestamp.
 - **MUST NOT** include credentials, secrets, or authentication material (§18).
 - **SHOULD** include retention/partitioning metadata to support archival policies.
@@ -268,7 +269,7 @@ A conformant manifest:
 | `version` | string | MUST | Protocol version (e.g. `"0.2"`). |
 | `batch_id` | string | MUST | Unique batch identifier. |
 | `tenant` | string | MUST | Tenant/source-owner identity. |
-| `source_type` | enum | MUST | `kafka` \| `file` \| `syslog`. |
+| `source_type` | enum | MUST | `kafka` \| `file` \| `syslog_spool`. |
 | `source_name` | string | MUST | Logical source name. |
 | `format` | string | MUST | Detected/declared format (cef, leef, json, jsonl, syslog, raw, …). |
 | `compression` | enum | MUST | `gzip` \| `zstd` \| `none`. |
@@ -277,8 +278,9 @@ A conformant manifest:
 | `object.uri` | string | MUST | Object storage URI/key. |
 | `object.size_bytes` | integer | MUST | Compressed object size. |
 | `object.uncompressed_bytes` | integer | SHOULD | Uncompressed size. |
-| `object.checksum_algorithm` | enum | MUST | `sha256` \| `blake3` \| `disabled`. |
-| `object.sha256` / checksum value | string | MUST* | Hash value; required unless checksum disabled. |
+| `object.checksum_algorithm` | enum | MUST | `sha256` \| `blake3` \| `none` (checksum disabled). |
+| `object.checksum` | string | MUST* | Hash value; required unless checksum disabled. (Legacy spelling: `object.sha256`.) |
+| `created_at` | string (RFC 3339) | MUST | Manifest creation time. |
 | `manifest.uri` | string | MUST | Manifest storage URI/key. |
 | `manifest.sha256` (self-hash) | string | MUST | Reproducible SHA-256 computed with both embedded hash/MAC values blanked. |
 | `manifest.mac` | string | MAY | 32-byte keyed BLAKE3 authenticator (lowercase hex), computed over the same canonical bytes. |
@@ -309,7 +311,7 @@ DISCOVERED → BATCHING → SEALED → COMPRESSED → CHECKSUMMED →
 OBJECT_UPLOADED → MANIFEST_UPLOADED → VERIFIED → SOURCE_COMMITTED
 ```
 
-plus terminal/recovery states `FAILED` and `REPLAY_REQUIRED`.
+plus the failure/recovery states `FAILED` and `REPLAY_REQUIRED` (`REPLAY_REQUIRED` is not terminal — it re-enters at `BATCHING`).
 
 Legal transitions (and **only** these) are permitted:
 
@@ -341,6 +343,8 @@ A conformant implementation **MUST** persist state transitions durably so that r
 
 ---
 
+<a name="7-commit-rule"></a>
+
 ## 13. Commit rule
 
 This is the **core normative rule** of VTOP:
@@ -361,8 +365,7 @@ Concretely, a source progress marker **MUST NOT** transition to `SOURCE_COMMITTE
 
 A conformant implementation **MUST NOT** commit source progress in any other order. `SOURCE_COMMITTED` **MUST NOT** be reachable unless `VERIFIED` is true.
 
-<a name="7-commit-rule"></a>
-> The historical anchor `#7-commit-rule` resolves here for backward compatibility with external links.
+> The historical anchor `#7-commit-rule` resolves to this section for backward compatibility with external links.
 
 ---
 
@@ -407,7 +410,7 @@ A conformant implementation **MAY** route objects to **per-format buckets** via 
 
 - The `{format}` (and other declared template fields) **MUST** be resolved deterministically.
 - The implementation **MAY** create the target bucket on demand (see §18 for the least-privilege implications of `CreateBucket`).
-- The manifest **MUST** record the fully resolved bucket and key.
+- The manifest **MUST** record the fully resolved bucket and key; a fully-qualified `object.uri` of the form `s3://{bucket}/{key}` (§11.2) satisfies this.
 
 ---
 

@@ -70,7 +70,7 @@ replaced by broker acknowledgements.
 | Source reads materialize record bodies in memory. | `crates/vtop-adapters/src/base.rs:19-35` | Adapters feed bounded append groups into the native broker or legacy archive path. Native storage writes record bodies once. |
 | Archive ownership uses owner strings, host-clock leases, and an optional shared SQL store. | `crates/vtop-state/src/store.rs:109-138` | Do not promote this to cluster leadership. Native authority is a committed metadata term/epoch checked at every mutation boundary. |
 | Object deletion is exposed directly on the backend trait. | `crates/vtop-upload/src/base.rs:351-352` | Broker code receives no raw delete capability. A verified-retirement coordinator alone may invoke a private delete operation after a committed proof. |
-| Existing HA documents treat Kafka groups and PostgreSQL as the coordinator. | `docs/PRODUCTION_HA_PLAN.md`, `docs/PRODUCTION_HA_ROADMAP.md` | These documents describe HA for the legacy archiver only. They are not the native-broker architecture. |
+| Existing HA documents treat Kafka groups and PostgreSQL as the coordinator. | `docs/PRODUCTION_HA.md` | That document describes HA for the legacy archiver only. It is not the native-broker architecture. |
 | Existing protocol draft is object-transfer oriented. | `docs/VTOP_PROTOCOL_DRAFT.md` | Retain it as the archive profile. Define native produce/fetch/replication as a separate versioned protocol. |
 
 ### 2.3 Review of the first `vtop-log` slice
@@ -403,6 +403,12 @@ VERIFIED -> TIER_COPYING -> TIER_VERIFIED
 VERIFIED or TIER_VERIFIED -> RETIRE_PLANNED -> RETIRED
 any non-retired state -> QUARANTINED
 ```
+
+> These segment states are disjoint from the archive **batch** states of
+> [`VTOP_PROTOCOL_DRAFT.md` §12](VTOP_PROTOCOL_DRAFT.md#12-state-machine):
+> `VERIFIED` here means a chunk-root-verified *segment* gated by a cluster
+> commit statement, not an object+manifest-verified *batch* on the archive
+> path.
 
 `RETIRE_PLANNED` requires a committed `ReplacementProof` naming the source,
 destination, expected length, authenticated root, segment identity/generation,

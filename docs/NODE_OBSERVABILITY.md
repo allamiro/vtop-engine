@@ -162,10 +162,13 @@ not keep publishing the follower lag it saw at the instant of the failover.
 | `vtop_broker_memory_rejections_total{reason}` | counter | Admissions refused, by which ledger refused (#187). |
 | `vtop_broker_backpressure_nanoseconds_total` / `_events_total` | counter | Time and count spent waiting on admission. |
 
-### Integrity
+### Recovery integrity
 
-The differentiator neither Kafka nor Northguard exposes: verification health is
-alertable, not just throughput.
+The differentiator neither Kafka nor Northguard exposes: recovery health is
+alertable, not just throughput. (These are segment-recovery counters; metrics
+for archive-path verification status — strong vs backend-limited per
+[VTOP_PROTOCOL_DRAFT.md §17](VTOP_PROTOCOL_DRAFT.md#17-verification-semantics)
+— are follow-up work.)
 
 | Metric | Type | Meaning |
 |---|---|---|

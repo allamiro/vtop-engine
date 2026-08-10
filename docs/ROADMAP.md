@@ -117,7 +117,7 @@ reopen quietly.
 - **#310** — a `kill -9` during a commit write leaves a quarantined `.tmp` and
   the node refuses to restart. The losing side of a rename is garbage by
   definition and should be swept, not judged.
-- **#240 remainder** — the §5.4.1 election-restriction question, then the signed
+- **#240 remainder** — the election-restriction question (Raft dissertation §5.4.1), then the signed
   leadership-transition record.
 
 ## v0.4.0 and beyond

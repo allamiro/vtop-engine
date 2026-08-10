@@ -5,7 +5,12 @@ ceremony: the point of publishing signatures is that somebody checks them, and
 an unverified download from a release page is a download from whoever could
 reach the release page.
 
-Replace `VERSION` with the release you are installing, for example `0.2.0`.
+Replace `VERSION` with the release you are installing, for example `0.3.0`.
+(This is the software release version; the VTOP *protocol* version carried
+inside manifests is separate — see
+[VTOP_PROTOCOL_DRAFT.md §11.2](VTOP_PROTOCOL_DRAFT.md#11-manifest-object).
+Likewise, "verifying" here means release-artifact verification, distinct from
+the protocol's object/manifest verification in §17.)
 
 ## Container image
 
@@ -67,5 +72,5 @@ VTOP is a **prototype / reference implementation**. The 0.x series signals that
 the API may still change — not that a tag is a preview. Each release is signed,
 attested, and intended for use.
 
-Read [Known limitations](PRODUCTION_HA_PLAN.md) (§21) before depending on this
-in production.
+Read [Known limitations](PRODUCTION_HA.md#19-known-limitations-current-code) (§19)
+before depending on this in production.
