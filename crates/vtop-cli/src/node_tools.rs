@@ -776,6 +776,105 @@ async fn repair(
         .await
         .map_err(|error| format!("transfer from {from}: {error}"))?;
 
+    // THE LINEAGE TRAVELS WITH THE RECORDS (#315). The transfer carries the
+    // bytes; this carries the history that lets the replica prove which
+    // epochs produced them. Without it the first leader transition asks the
+    // replica to reconcile, it can show nothing, and epoch-qualified
+    // truncation erases the entire repair — the operator was told "repaired"
+    // and the range is back at zero.
+    //
+    // Fetched from the same source as the segments, which extends exactly
+    // the trust the transfer already required: a follower's journal is
+    // leader-derived in normal replication too. The next fence still
+    // compares this history honestly and truncates at any genuine
+    // divergence.
+    //
+    // Installed BEFORE the adopt so a crash between the two is re-runnable:
+    // the receiver refuses a directory with an adopted tail, so anything
+    // that must happen on the repair path has to happen before the tail is
+    // minted.
+    let status_client = ReplicaStatusClient::new(ReplicaTlsMaterial {
+        certificate_chain: status_material.certificate_chain,
+        private_key: status_material.private_key,
+        trust_roots: status_material.trust_roots,
+    })
+    .map_err(|error| error.to_string())?
+    .with_timeout(timeout);
+    let history = status_client
+        .epoch_history(
+            addr,
+            &source.server_name,
+            source.node_uuid,
+            &config.range.identity(),
+        )
+        .await
+        // An error fails the repair rather than installing records without
+        // lineage: the transfer is resumable, so a retry is cheap, and a
+        // "repaired" replica that cannot prove its history is the very state
+        // this command exists to remove.
+        .map_err(|error| format!("epoch history from {from}: {error}"))?;
+    // THE HISTORY IS BOUNDED AND FENCED by a second, fenced listing. The
+    // epoch-history request itself carries no fencing epoch, so on its own
+    // the repair could pair segment bytes from one source state with lineage
+    // from another — a source deposed between the last chunk and the fetch.
+    // Epochs are strictly monotonic, so a fenced call SUCCEEDING here proves
+    // the source held the credential epoch across the transfer, the history
+    // fetch, and this moment. The listing also supplies the sealed-prefix
+    // end without re-scanning the transferred segments on disk: after a
+    // successful transfer the directory's sealed set equals this listing.
+    let listing = client
+        .list_sealed_segments(
+            addr,
+            &source.server_name,
+            source.node_uuid,
+            &config.range.identity(),
+            fencing_epoch,
+        )
+        .await
+        .map_err(|error| {
+            format!(
+                "the source no longer serves epoch {fencing_epoch} ({error}); the fetched \
+                 history cannot be trusted to describe the transferred bytes — repair again \
+                 once the source is stable"
+            )
+        })?;
+    let sealed_end = listing.iter().map(|entry| entry.next_offset).max();
+    if let Some(newest) = history.last() {
+        if newest.epoch > fencing_epoch {
+            return Err(format!(
+                "the source's history reaches epoch {} but this repair was authorized under \
+                 epoch {fencing_epoch}; the source has moved on — repair again with a current \
+                 fencing epoch",
+                newest.epoch
+            ));
+        }
+    }
+    if history.is_empty() {
+        // A legal answer (the client's contract maps a peer that does not
+        // know the request to an empty vector), but it leaves this replica
+        // unable to prove lineage; say so now instead of letting the
+        // operator find out at the next failover.
+        eprintln!(
+            "warning: {from} reported no epoch history; the repaired replica will answer \
+             \"unknown\" at its next reconciliation instead of proving its lineage"
+        );
+    } else if let Some(tail) = sealed_end {
+        let entries: Vec<vtop_broker::fencing_epochs::EpochStart> = history
+            .iter()
+            .map(|entry| vtop_broker::fencing_epochs::EpochStart {
+                epoch: entry.epoch,
+                start_offset: entry.start_offset,
+            })
+            .collect();
+        vtop_broker::fencing_epochs::install_transferred_history(
+            &env,
+            into.join("fencing-epochs"),
+            &entries,
+            tail,
+        )
+        .map_err(|error| format!("install epoch history in {}: {error}", into.display()))?;
+    }
+
     // ADOPT, so the result is a range and not a pile of segments. The successor
     // id is minted here because nothing else in this command owns one, and a
     // fresh id is correct: this tail has never existed anywhere else.
@@ -804,13 +903,8 @@ async fn repair(
     // The gap is measured and reported rather than assumed away. This asks the
     // source where it actually is instead of trusting the listing, because the
     // listing describes the sealed prefix and the question is about the tail.
-    let status_client = ReplicaStatusClient::new(ReplicaTlsMaterial {
-        certificate_chain: status_material.certificate_chain,
-        private_key: status_material.private_key,
-        trust_roots: status_material.trust_roots,
-    })
-    .map_err(|error| error.to_string())?
-    .with_timeout(timeout);
+    // (The client was built before the adopt, where it also fetched the epoch
+    // history.)
     let source_tip = status_client
         .status(
             addr,

@@ -721,6 +721,75 @@ fn a_transferred_prefix_becomes_a_range_that_serves_and_accepts_appends() {
     assert_eq!(repaired.next_offset(), prefix_end + 1);
 }
 
+/// #315 — the lineage travels with the records. A transferred prefix plus an
+/// installed epoch history can answer the reconciliation a leader transition
+/// asks of it: the comparison against the source's history AGREES — not
+/// "unknown", and not the divergence-at-zero that used to erase the repair —
+/// and the journal accepts the next epoch adoption at the adopted tail.
+#[test]
+fn an_installed_epoch_history_lets_a_repaired_prefix_prove_its_lineage() {
+    use vtop_broker::fencing_epochs::{
+        install_transferred_history, EpochStart, FencingEpochJournal, Lineage,
+    };
+
+    let h = harness();
+    let receiver = SegmentReceiver::open(&Env::real(), h.destination.path()).unwrap();
+    let installed = transfer(&h, &receiver).unwrap();
+    assert!(!installed.is_empty(), "the fixture must transfer something");
+    let prefix_end = h
+        .leader
+        .sealed_segment_handles()
+        .last()
+        .expect("sealed prefix")
+        .next_offset;
+
+    // The source's lineage: one epoch for the older records, another for the
+    // newer, and a third that begins exactly at the sealed end — which the
+    // repaired replica must NOT claim, because it holds nothing produced
+    // under it.
+    let source_history = [
+        EpochStart {
+            epoch: 3,
+            start_offset: 0,
+        },
+        EpochStart {
+            epoch: 5,
+            start_offset: prefix_end / 2,
+        },
+        EpochStart {
+            epoch: 7,
+            start_offset: prefix_end,
+        },
+    ];
+    let journal_path = h.destination.path().join("fencing-epochs");
+    let kept =
+        install_transferred_history(&Env::real(), &journal_path, &source_history, prefix_end)
+            .expect("install the source's history alongside the transferred prefix");
+    assert_eq!(
+        kept, 2,
+        "the entry at the sealed end is not this replica's to claim"
+    );
+
+    let set = SegmentSet::adopt_in(&Env::real(), h.destination.path(), Uuid::from_u128(0xFACE))
+        .expect("the prefix with a journal beside it must still adopt");
+    assert_eq!(set.next_offset(), prefix_end);
+    drop(set);
+
+    // The reconciliation the next fence will run: this replica's history
+    // against the source's.
+    let mut journal = FencingEpochJournal::open(&journal_path).expect("reopen");
+    assert_eq!(
+        journal.compare_lineage(&source_history),
+        Lineage::Agreed,
+        "a repaired replica must be able to prove its lineage"
+    );
+    // And the replica's own first grant records cleanly at the adopted tail —
+    // the append the truncated history exists to keep legal.
+    journal
+        .record(8, prefix_end)
+        .expect("the next epoch adoption at the tail must be accepted");
+}
+
 /// A repair's ownership marker must not make the range unopenable.
 ///
 /// `vtopctl node repair` writes a marker file into the destination so a retry

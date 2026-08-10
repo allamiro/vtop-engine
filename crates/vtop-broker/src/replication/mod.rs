@@ -293,7 +293,7 @@ impl InProcessFollower {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(journal) = guard.as_mut() {
-                if journal.record(epoch, next_offset).is_err() {
+                if journal.record_adoption(epoch, next_offset).is_err() {
                     self.fencing_epoch_history_broken
                         .store(true, Ordering::SeqCst);
                 }
@@ -448,7 +448,12 @@ impl InProcessFollower {
             ));
         }
         // Records the start durably before the epoch becomes visible, exactly
-        // as the append path does.
+        // as the append path does. A replica holding records with NO history
+        // stays that way: `record_adoption` refuses to fabricate a first
+        // entry over a non-empty log (#315), so the reconciliation below
+        // sees an empty vector, compares as Unknown, and truncates nothing —
+        // on this fence and every later one, and in the `epoch_starts` this
+        // fence returns to the caller.
         self.adopt_fencing_epoch(epoch);
 
         // Reconcile WHILE STOPPED. This is the only moment it is sound: the

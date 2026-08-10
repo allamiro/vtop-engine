@@ -362,6 +362,70 @@ impl SegmentTransferClient {
     /// primary renames last, so its presence proves the bundle verified), and
     /// a segment that was mid-receive left only ignorable staging debris the
     /// receiver swept at open.
+    /// The source's sealed-segment listing, served UNDER THE FENCING CHECK.
+    ///
+    /// Exists for two callers' reasons at once (#315): the listing's highest
+    /// `next_offset` is the sealed-prefix end a repair must bound the
+    /// installed epoch history by, and the fencing check makes the call a
+    /// proof — a source that lost its lease or adopted a newer epoch since
+    /// the transfer refuses it, so a repair that fetches the (unfenced)
+    /// epoch history and THEN succeeds here knows the source held the
+    /// credential epoch across the whole exchange. Epochs are strictly
+    /// monotonic, so there is no lose-and-regain path around that proof.
+    pub async fn list_sealed_segments(
+        &self,
+        addr: SocketAddr,
+        server_name: &str,
+        expected_node: Uuid,
+        range: &RangeIdentity,
+        fencing_epoch: u64,
+    ) -> BrokerResult<Vec<vtop_protocol::SealedSegmentEntry>> {
+        let name = rustls::pki_types::ServerName::try_from(server_name.to_owned())
+            .map_err(|error| {
+                crate::BrokerError::InvalidConfig(format!("server name {server_name:?}: {error}"))
+            })?
+            .to_owned();
+        let mut stream = timeout(self.request_timeout, async {
+            let tcp = TcpStream::connect(addr)
+                .await
+                .map_err(|source| crate::BrokerError::Io {
+                    path: PathBuf::from("segment-listing"),
+                    source,
+                })?;
+            self.connector
+                .connect(name, tcp)
+                .await
+                .map_err(|source| crate::BrokerError::Io {
+                    path: PathBuf::from("segment-listing-tls"),
+                    source,
+                })
+        })
+        .await
+        .map_err(|_| crate::BrokerError::Timeout("segment listing connect"))??;
+        assert_peer_uuid(peer_certs_client(&stream), expected_node)?;
+        let mut request_id = 1_u64;
+        match self
+            .round_trip(
+                &mut stream,
+                &mut request_id,
+                Message::ListSealedSegmentsRequest(ListSealedSegmentsRequest {
+                    range: range.clone(),
+                    fencing_epoch,
+                }),
+            )
+            .await?
+        {
+            Message::ListSealedSegmentsResponse(response) => Ok(response.segments),
+            Message::Error(error) => Err(crate::BrokerError::InvalidConfig(format!(
+                "leader refused the sealed-segment listing: {:?} {}",
+                error.code, error.message
+            ))),
+            other => Err(crate::BrokerError::InvalidConfig(format!(
+                "unexpected reply to a sealed-segment listing: {other:?}"
+            ))),
+        }
+    }
+
     pub async fn transfer_sealed_prefix(
         &self,
         addr: SocketAddr,
