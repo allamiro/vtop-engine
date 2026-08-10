@@ -714,7 +714,7 @@ VTOP is currently a prototype. The following limits are known and intentional.
 
 | Area | Current behavior | Planned direction |
 |---|---|---|
-| Deterministic object naming | not yet — `batch_id` embeds a timestamp + random suffix, so replay writes a **new** key (duplicate object, no data loss), against the MUST of [protocol §15.1](docs/VTOP_PROTOCOL_DRAFT.md#15-object-and-bucket-naming)/§16 | deterministic / content-addressed keys ([HA roadmap Phase 4](docs/PRODUCTION_HA_ROADMAP.md)) |
+| Deterministic object naming | not yet — `batch_id` embeds a timestamp + random suffix, so replay writes a **new** key (duplicate object, no data loss), against the MUST of [protocol §15.1](docs/VTOP_PROTOCOL_DRAFT.md#15-object-and-bucket-naming)/§16 | deterministic / content-addressed keys ([PRODUCTION_HA.md Phase 4](docs/PRODUCTION_HA.md)) |
 | Verification classes | strong (default) / backend-limited / disabled (size-only), per [protocol §17](docs/VTOP_PROTOCOL_DRAFT.md#17-verification-semantics); non-strong commit requires explicit opt-out | — |
 | Large objects | native S3 + mock support resumable multipart with persisted sessions (`vtopctl tier copy --multipart-state-dir`); compatibility backends still single-shot `put_object` | wire remaining backends / streaming rehydrate |
 | Large records / whole files | `max_bytes` is a hard per-source/per-batch ceiling; an oversized record is rejected without advancing source progress | raise the explicit budget only when the deployment has matching memory headroom |
@@ -788,9 +788,11 @@ Not implemented yet:
 
 | Document | Purpose |
 |---|---|
-| [docs/README.md](docs/README.md) | documentation index |
+| [docs/README.md](docs/README.md) | documentation index and reading order |
 | [docs/VTOP_PROTOCOL_DRAFT.md](docs/VTOP_PROTOCOL_DRAFT.md) | protocol draft and conformance profiles |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | architecture and runtime flow |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | architecture, runtime flow, implementation status |
+| [docs/PRODUCTION_HA.md](docs/PRODUCTION_HA.md) | engine HA: status, design, and phased roadmap |
+| [docs/ROADMAP.md](docs/ROADMAP.md) | cluster-plane releases and per-release limitations |
 | [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md) | security model and normative rules |
 | [docs/INVENTION_DISCLOSURE_DRAFT.md](docs/INVENTION_DISCLOSURE_DRAFT.md) | candidate-invention disclosure draft |
 | [docs/PRIOR_ART_SEARCH_PLAN.md](docs/PRIOR_ART_SEARCH_PLAN.md) | prior-art search plan |

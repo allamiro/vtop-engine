@@ -110,4 +110,4 @@ is to be the system whose **claims are checkable**:
 *Related reading: [`VTOP_PROTOCOL_DRAFT.md`](VTOP_PROTOCOL_DRAFT.md) (the
 normative archive protocol: commit rule §13, verification semantics §17),
 `ARCHITECTURE.md`, `NATIVE_BROKER_ARCHITECTURE.md`, `LIVE_CHAOS_VALIDATION.md`,
-`PRODUCTION_HA_PLAN.md` (§18 Known limitations), and the roadmap issue #243.*
+`PRODUCTION_HA.md` (§19 Known limitations), and the roadmap issue #243.*

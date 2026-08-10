@@ -1,6 +1,18 @@
 # Architecture
 
-> Architecture of the **VTOP Engine reference implementation** (a prototype of the proposed VTOP protocol). Part of an **invention-disclosure support package**.
+> **Status:** living document, kept aligned with the code. **Audience:**
+> engineers reading or extending the reference implementation.
+>
+> Architecture of the **VTOP Engine reference implementation** (a prototype of
+> the proposed VTOP protocol). Part of an **invention-disclosure support
+> package**. Normative behavior is defined in
+> [VTOP_PROTOCOL_DRAFT.md](VTOP_PROTOCOL_DRAFT.md) (cited as "protocol §N");
+> deployment/HA design and the achieved-vs-planned ledger live in
+> [PRODUCTION_HA.md](PRODUCTION_HA.md).
+>
+> This document covers the **engine plane** (archive path). The distributed
+> cluster plane (`vtop-meta`/`vtop-node`/`vtop-broker`/`vtop-log`) is designed
+> in [NATIVE_BROKER_ARCHITECTURE.md](NATIVE_BROKER_ARCHITECTURE.md).
 
 ## Table of contents
 
@@ -21,6 +33,7 @@
 15. [Concurrency and backpressure design](#15-concurrency-and-backpressure-design)
 16. [Benchmark harness](#16-benchmark-harness)
 17. [Extensibility](#17-extensibility)
+18. [Implementation status and direction](#18-implementation-status-and-direction)
 
 ---
 
@@ -316,7 +329,7 @@ On startup, the `replay` module inspects `vtop-state` and maps each incomplete b
 
 1. A batch in **`VERIFIED`** but not yet committed (object and manifest durably stored and verified) has its **source commit retried** (`VERIFIED → SOURCE_COMMITTED`). The verified object is never discarded.
 2. A batch in any state **before `VERIFIED`** is transitioned `... → FAILED → REPLAY_REQUIRED → BATCHING` and re-driven from the last committed source progress marker.
-3. Replay currently produces a **new** object key: the `batch_id` and the `year/…/hour` path components are derived from wall-clock time plus a random suffix, so a replayed batch writes a duplicate object (at-least-once, no data loss). Protocol §14/§15.1/§16 specify deterministic naming so that replay is idempotent — this is the open gap tracked as [PRODUCTION_HA_ROADMAP.md](PRODUCTION_HA_ROADMAP.md) Phase 4.
+3. Replay currently produces a **new** object key: the `batch_id` and the `year/…/hour` path components are derived from wall-clock time plus a random suffix, so a replayed batch writes a duplicate object (at-least-once, no data loss). Protocol §14/§15.1/§16 specify deterministic naming so that replay is idempotent — this is the open gap tracked as [PRODUCTION_HA.md](PRODUCTION_HA.md) Phase 4.
 4. A state/storage mismatch (e.g., an object present but unverified) is resolved by re-verifying or re-uploading **before** any commit.
 
 This guarantees: no source progress marker is committed unless its object and manifest are durably stored and verified, and no committed marker is double-committed. Source progress is **never** advanced for unverified data.
@@ -365,3 +378,26 @@ The engine depends only on the `SourceAdapter` and `UploadBackend` traits, so ne
 | Partition field | Resolve deterministically from declared policy in `partitioning`. | Protocol §16. |
 
 No extension may weaken the commit rule (protocol §13) or the replay rule (protocol §14).
+
+---
+
+## 18. Implementation status and direction
+
+A one-screen map of how far this architecture is built and where it is going.
+The authoritative, maintained version is
+[PRODUCTION_HA.md](PRODUCTION_HA.md) Part I (status) and Part III (roadmap);
+this table exists so a reader of the architecture does not mistake design for
+reality.
+
+| Architectural element | Status | Notes |
+|---|---|---|
+| Pipeline, state machine, commit rule (§5, §12–13) | ✅ shipped | Enforced in state machine + state store + pipeline; crash/replay tested in CI. |
+| Source adapters: Kafka (`assign`), file (line + `whole_file`), syslog spool (§7) | ✅ shipped | Kafka consumer-group (`subscribe`) fleet mode is future work. |
+| Upload backends incl. `localfs`, hardened command backends (§8) | ✅ shipped | Verification strength declared per backend (protocol §17). |
+| `StateStore`: SQLite + PostgreSQL, shared battery, DB constraints (§12) | ✅ shipped | Retry-on-`40001`; `vtopctl migrate` privilege split; retention (#128). |
+| Manifest self-hash + keyed BLAKE3 MAC, version pinning (§9) | ✅ shipped | Public-key signatures and key rotation are future work. |
+| Metrics endpoint + readiness, dashboards-as-code (§14) | ✅ shipped | OTLP trace export and alerting rules are future work. |
+| Deterministic object naming (§11, §13) | ⬜ planned | Protocol §15.1 MUST; the open conformance gap — [PRODUCTION_HA.md](PRODUCTION_HA.md) Phase 4. |
+| Multi-instance fleet (consumer groups + multi-writer recovery) | ⬜ planned | Phase 5; single-instance lock (#66) until then. |
+| Engine Kubernetes chart | ⬜ planned | Phase 7 — `helm/vtop` deploys the cluster plane, not the engine. |
+| File/syslog HA (leases) | ⬜ optional | Phase 9, gated on an explicit product decision. |

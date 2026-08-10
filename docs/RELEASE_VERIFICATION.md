@@ -72,5 +72,5 @@ VTOP is a **prototype / reference implementation**. The 0.x series signals that
 the API may still change — not that a tag is a preview. Each release is signed,
 attested, and intended for use.
 
-Read [Known limitations](PRODUCTION_HA_PLAN.md#18-known-limitations-current-code) (§18)
+Read [Known limitations](PRODUCTION_HA.md#19-known-limitations-current-code) (§19)
 before depending on this in production.
