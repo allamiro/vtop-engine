@@ -1129,6 +1129,82 @@ impl LocalBroker {
         state.segment.commit().map_err(BrokerError::from)
     }
 
+    /// Seal the active tail so the sealed prefix reaches this leader's
+    /// actual position (#306).
+    ///
+    /// Only sealed segments transfer, so before this a repair stopped at
+    /// wherever the range last happened to roll — up to a whole segment
+    /// bound behind the leader. Sealing on demand is an ordinary roll taken
+    /// deliberately: the tail seals, a successor opens at its end, and the
+    /// freshly sealed segment is transferable the moment this returns.
+    ///
+    /// FENCED IN HERE, under the produce path's own lock discipline —
+    /// metadata lease view first, then broker state, both held through the
+    /// roll — so a grant or release cannot land between the fencing check
+    /// and the seal. A check performed outside these locks would leave
+    /// exactly that window, and sealing is a write a deposed leader must
+    /// not perform (review: the one-snapshot check alone was not enough).
+    ///
+    /// RETENTION DOES NOT RUN HERE, deliberately. A bytes-bound retention
+    /// pass could reclaim the very segment this call just sealed — the
+    /// committed floor covers it by construction — and the RPC would then
+    /// report a `sealed_end` the transfer listing cannot reach from within
+    /// this very call. What this does NOT promise is persistence: retention
+    /// runs after every successful append, so a produce landing between
+    /// this seal and the repair's listing can still reclaim the segment
+    /// under a bound smaller than the sealed tail. That window is the same
+    /// one every listed segment already lives in until its chunks are
+    /// fetched, and both ends of it fail HONESTLY — a shorter listing is a
+    /// measured, reported gap (exit 1), and a segment reclaimed mid-fetch
+    /// is a clean, resumable refusal. A cross-RPC pin was considered and
+    /// rejected: the leader cannot know when a repairer is done, and a pin
+    /// that outlives a crashed repairer is a retention bound that silently
+    /// stopped being one.
+    ///
+    /// Returns `(sealed_end, records_sealed)`. An EMPTY tail over a sealed
+    /// prefix is an idempotent no-op — the prefix already reaches the
+    /// leader's position, records_sealed is zero, and a retrying repair can
+    /// tell that from progress. An empty tail with NO sealed prefix is
+    /// refused: a never-written range has nothing a transfer could carry,
+    /// and minting a degenerate sealed segment to say so would cost a file
+    /// and a lie.
+    pub fn seal_tail(
+        &self,
+        range: &RangeIdentity,
+        fencing_epoch: u64,
+    ) -> Result<(u64, u64), (ErrorCode, String)> {
+        // Lock order: metadata lease view, then broker state — identical to
+        // the produce path, which documents why: held together through the
+        // write, a concurrent grant/release cannot revoke between the
+        // fencing check and the mutation.
+        let meta = self.meta_fencing_epoch.lock();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.check_range(&meta, range, fencing_epoch)
+            .map_err(|(code, message)| (code, message.to_owned()))?;
+        let tail_base = state.segment.active().base_offset();
+        let tail_next = state.segment.next_offset();
+        if tail_next == tail_base {
+            if state.segment.sealed().is_empty() {
+                return Err((
+                    ErrorCode::InvalidRequest,
+                    "this range has never held a record; there is nothing to seal and nothing \
+                     a transfer could carry — produce to the range before repairing from it"
+                        .to_owned(),
+                ));
+            }
+            return Ok((tail_next, 0));
+        }
+        let records_sealed = tail_next - tail_base;
+        state
+            .segment
+            .roll_minting()
+            .map_err(|problem| (ErrorCode::Storage, problem.to_string()))?;
+        Ok((tail_next, records_sealed))
+    }
+
     /// Non-blocking `(local_committed_offset, next_offset)`, for observation
     /// only (#224).
     ///

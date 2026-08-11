@@ -72,6 +72,14 @@ pub enum NodeCommand {
         /// the serving side and must match what metadata granted.
         #[arg(long)]
         fencing_epoch: u64,
+        /// Ask the leader to SEAL its active tail first (#306), so the
+        /// transferred prefix reaches the leader's position at the seal
+        /// rather than wherever the range last happened to roll. Without
+        /// this, up to a whole segment bound of records stays behind in a
+        /// tail that only the append path can deliver. Fenced like the
+        /// transfer itself; sealing early costs one shorter segment.
+        #[arg(long)]
+        seal_tail: bool,
         #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
         timeout_seconds: u64,
     },
@@ -449,6 +457,7 @@ async fn run_inner(command: NodeCommand, json: bool) -> Result<i32, String> {
             from,
             into,
             fencing_epoch,
+            seal_tail,
             timeout_seconds,
         } => {
             let config = load_config(&common.config)?;
@@ -457,6 +466,7 @@ async fn run_inner(command: NodeCommand, json: bool) -> Result<i32, String> {
                 from,
                 &into,
                 fencing_epoch,
+                seal_tail,
                 Duration::from_secs(timeout_seconds),
                 json,
             )
@@ -799,6 +809,7 @@ async fn repair(
     from: Uuid,
     into: &Path,
     fencing_epoch: u64,
+    seal_tail: bool,
     timeout: Duration,
     json: bool,
 ) -> Result<i32, String> {
@@ -923,7 +934,9 @@ async fn repair(
     // This matters because re-running repair is the natural reflex when a gap
     // is reported, and it is the wrong move: a gap lives in the source's ACTIVE
     // segment, which never transfers, so no second repair can shrink it. Only
-    // the replica catching up from the leader can.
+    // the replica catching up from the leader can — or a fresh repair into an
+    // empty directory with --seal-tail, which moves the sealed prefix to the
+    // leader's position first (#306).
     if marker.exists() {
         let adopted = std::fs::read_dir(into)
             .map_err(|error| format!("read {}: {error}", into.display()))?
@@ -938,12 +951,12 @@ async fn repair(
             return Err(format!(
                 "{} was repaired already — it holds an adopted range with an active segment at \
                  {}, so this repair finished and running it again would re-seed a live range. If \
-                 a gap was reported, another repair cannot close it: those records are in the \
-                 source's active segment, which never transfers, and only the replica catching \
-                 up from the leader will bring them over. Start the replica against this \
-                 directory. If it is refused for a base-offset mismatch then the gap was too \
-                 large to catch up, and the remedy is a fresh repair into an EMPTY directory \
-                 rather than a second one over this.",
+                 a gap was reported, another repair over this directory cannot close it: those \
+                 records are in the source's active segment, which never transfers. Start the \
+                 replica against this directory and let it catch up. If it is refused for a \
+                 base-offset mismatch then the gap was too large to catch up, and the remedy is \
+                 a fresh repair into an EMPTY directory with --seal-tail, which seals the \
+                 leader's tail so the transferred prefix reaches its position (#306).",
                 into.display(),
                 entry.path().display()
             ));
@@ -981,6 +994,36 @@ async fn repair(
         )
     })?;
     let addr = resolve_endpoint(&source.addr).map_err(|error| error.to_string())?;
+    // BEFORE the transfer, so the listing that drives it already includes
+    // the freshly sealed tail (#306). Ordering is the point: sealing after
+    // the transfer would close the gap for the NEXT repair, not this one.
+    let mut sealed_tail_end: Option<u64> = None;
+    if seal_tail {
+        let (sealed_end, records_sealed) = client
+            .seal_tail(
+                addr,
+                &source.server_name,
+                source.node_uuid,
+                &config.range.identity(),
+                fencing_epoch,
+            )
+            .await
+            .map_err(|error| format!("seal the tail on {from}: {error}"))?;
+        sealed_tail_end = Some(sealed_end);
+        if !json {
+            if records_sealed > 0 {
+                println!(
+                    "the leader sealed {records_sealed} tail record(s); the sealed prefix now \
+                     reaches offset {sealed_end}"
+                );
+            } else {
+                println!(
+                    "the leader's tail was already empty; the sealed prefix already reaches \
+                     offset {sealed_end}"
+                );
+            }
+        }
+    }
     let installed = client
         .transfer_sealed_prefix(
             addr,
@@ -1056,6 +1099,22 @@ async fn repair(
             )
         })?;
     let sealed_end = listing.iter().map(|entry| entry.next_offset).max();
+    // The seal's promise is checked against what the listing actually held:
+    // retention runs after every append on the leader, so a produce landing
+    // between the seal and this listing can reclaim the freshly sealed
+    // segment under a bytes bound smaller than it. Nothing lies — the gap
+    // is measured and reported below — but the operator deserves the CAUSE
+    // named rather than a mysteriously shorter prefix (#306 review).
+    if let (Some(promised), Some(listed)) = (sealed_tail_end, sealed_end) {
+        if listed < promised && !json {
+            println!(
+                "note: the leader sealed through offset {promised}, but the transfer listing \
+                 reaches only {listed} — the leader's retention reclaimed sealed segments \
+                 between the two (its bound is smaller than what was sealed). The repair \
+                 carries what remained; the reported gap below includes the reclaimed records"
+            );
+        }
+    }
     if let Some(newest) = history.last() {
         if newest.epoch > fencing_epoch {
             return Err(format!(
@@ -1236,7 +1295,17 @@ async fn repair(
                  so its bytes can be superseded by a truncation mid-copy. They must be replayed \
                  from the leader's retransmission buffer when the replica starts, and that buffer \
                  is bounded (8 MiB by default). If the gap exceeds it the replica will be refused \
-                 for a base-offset mismatch and this repair will not have been enough."
+                 for a base-offset mismatch and this repair will not have been enough.{}",
+                if seal_tail {
+                    "\nThe tail WAS sealed for this repair, so these records arrived after the \
+                     seal. Starting the replica lets it replay them from the leader; if the gap \
+                     exceeds the retransmission buffer, run a FRESH repair into an empty \
+                     directory with --seal-tail — this directory is adopted now, and a second \
+                     repair over it is refused."
+                } else {
+                    "\nRe-running with --seal-tail into an empty directory would seal the tail \
+                     first, so the transferred prefix reaches the leader's position (#306)."
+                }
             );
         }
     }

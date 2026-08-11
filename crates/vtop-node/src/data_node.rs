@@ -330,6 +330,20 @@ impl ReplicaPeerHandler for LeaderStatusReplica {
         self.authorize_transfer(peer)?;
         self.transfer.fetch_segment_chunk(peer, request)
     }
+
+    fn seal_tail(
+        &self,
+        peer: Uuid,
+        range: &vtop_protocol::RangeIdentity,
+        fencing_epoch: u64,
+    ) -> Result<vtop_protocol::SealTailResponse, (vtop_protocol::ErrorCode, String)> {
+        // The transfer allowlist gates the seal too: sealing exists FOR the
+        // transfer, and a peer that may not pull the bytes has no business
+        // reshaping the leader's segments to prepare for a pull it will be
+        // refused.
+        self.authorize_transfer(peer)?;
+        self.transfer.seal_tail(peer, range, fencing_epoch)
+    }
 }
 
 impl LeaderStatusReplica {

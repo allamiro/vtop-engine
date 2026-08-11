@@ -165,6 +165,25 @@ pub trait ReplicaPeerHandler: Send + Sync {
             "this peer does not serve sealed-segment transfer".to_owned(),
         ))
     }
+
+    /// Seal the active tail so the sealed prefix reaches the leader's
+    /// position (#306).
+    ///
+    /// Defaults to REFUSING, in the [`Self::fence`] camp: sealing is a
+    /// WRITE, and a peer that silently "succeeded" without sealing would
+    /// report a tail transferable that is still moving — the answer that
+    /// can be mistaken for success is the one this default must not give.
+    fn seal_tail(
+        &self,
+        _peer: Uuid,
+        _range: &vtop_protocol::RangeIdentity,
+        _fencing_epoch: u64,
+    ) -> Result<vtop_protocol::SealTailResponse, (ErrorCode, String)> {
+        Err((
+            ErrorCode::InvalidRequest,
+            "this peer does not serve sealed-segment transfer".to_owned(),
+        ))
+    }
 }
 
 impl ReplicaPeerHandler for InProcessFollower {
@@ -405,6 +424,12 @@ fn dispatch_replica_frame(
             Message::FetchSegmentChunkRequest(request) => {
                 match handler.fetch_segment_chunk(peer, &request) {
                     Ok(response) => Message::FetchSegmentChunkResponse(response),
+                    Err((code, message)) => error_message(code, message),
+                }
+            }
+            Message::SealTailRequest(request) => {
+                match handler.seal_tail(peer, &request.range, request.fencing_epoch) {
+                    Ok(response) => Message::SealTailResponse(response),
                     Err((code, message)) => error_message(code, message),
                 }
             }

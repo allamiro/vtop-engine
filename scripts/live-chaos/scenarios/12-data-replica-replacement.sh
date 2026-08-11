@@ -351,19 +351,25 @@ REPAIR_CONFIG="$(emit_repair_config 0)"
 REPAIR_EXIT=0
 "$VTOPCTL" node repair \
   --config "$REPAIR_CONFIG" --from "$LEADER_UUID" --into "$SPARE_DIR" \
-  --fencing-epoch "$EPOCH" > "$WORKDIR/logs/repair.log" 2>&1 || REPAIR_EXIT=$?
-# 0 current, 1 behind by a measured gap, 2 adopted but unmeasured. A gap is
-# EXPECTED here: the records written after the seal are in the leader's active
-# segment, which never transfers, and the replica closes that by catching up.
-[[ "$REPAIR_EXIT" -le 1 ]] \
-  || fail "repair failed (exit $REPAIR_EXIT): $(tail -5 "$WORKDIR/logs/repair.log")"
+  --fencing-epoch "$EPOCH" --seal-tail > "$WORKDIR/logs/repair.log" 2>&1 || REPAIR_EXIT=$?
+# EXACTLY 0, the inverted pin #306 finally fires positive on: --seal-tail
+# seals the leader's tail before the transfer, so the prefix reaches the
+# leader's position and no gap remains. Nothing produces during the repair in
+# this scenario, so any nonzero exit here means the seal did not do its job —
+# the gap this suite spent two releases stating out loud is supposed to be
+# closed now.
+[[ "$REPAIR_EXIT" -eq 0 ]] \
+  || fail "repair with --seal-tail must close the gap entirely (exit $REPAIR_EXIT): \
+$(tail -5 "$WORKDIR/logs/repair.log")"
 log "repair finished with exit $REPAIR_EXIT: $(grep -c . "$WORKDIR/logs/repair.log") lines of report"
 
-SEALED_COPY=""
-for candidate in "$SPARE_DIR"/*.segment; do
-  [[ -f "$candidate" ]] && SEALED_COPY="$candidate"
-done
-[[ -n "$SEALED_COPY" ]] || fail "repair left no sealed segment in $SPARE_DIR"
+# MATCHED BY NAME, not by position: with --seal-tail the transfer carries the
+# sealed former tail too, so "the last .segment" in the two directories are
+# different segments — the source was captured before the seal existed. The
+# byte-for-byte claim is per segment, so compare the file with the same name.
+SEALED_COPY="$SPARE_DIR/$(basename "$SEALED_SOURCE")"
+[[ -f "$SEALED_COPY" ]] \
+  || fail "repair left no copy of $(basename "$SEALED_SOURCE") in $SPARE_DIR"
 
 # BYTE-EXACT, not merely valid. The transfer's whole claim is that the bytes
 # are the same bytes; a copy that verified on its own but differed would be a
@@ -571,31 +577,32 @@ done
 [[ "$SPARE_SEALED" -gt 0 ]] \
   || fail "the replacement lost its sealed segments to the leader transition; the repaired \
 range was truncated, which is #315 reopened"
-# The committed offset must HOLD THE SEALED-PREFIX END, not merely leave files
-# on disk: a truncation would drag the boundary back toward the base even if a
-# directory listing still showed segments. Deadline-polled, because the
-# restarted leader's HWM stream has to reach the newcomer before its boundary
-# is republished.
+# The committed offset must HOLD THE ACKNOWLEDGED FLOOR, not merely leave
+# files on disk: a truncation would drag the boundary back toward the base
+# even if a directory listing still showed segments. Deadline-polled, because
+# the restarted leader's HWM stream has to reach the newcomer before its
+# boundary is republished.
 #
-# The bound is $SEG_NEXT — the end of the sealed prefix the repair installed —
-# and NOT the acknowledged floor of $ACKED. The records in ($SEG_NEXT, $ACKED]
-# live in the leader's active tail, which only the append path can deliver,
-# and a restarted leader's retransmission buffer is empty: that remaining gap
-# is #306's boundary, stated below rather than silently waited on.
+# The bound is $ACKED — the FULL acknowledged floor — which for two releases
+# this scenario could only state as out of reach: the tail records lived in
+# the leader's active segment, which never transfers. --seal-tail (#306)
+# sealed that tail before the transfer, so the repaired prefix carries every
+# acknowledged record and this is the inverted pin fired positive: a
+# replacement that stops at the old sealed-prefix end now FAILS the scenario
+# instead of being tolerated with a caveat.
 SPARE_DEADLINE=$((SECONDS + PROGRESS_TIMEOUT_SECONDS))
 SPARE_OFFSET="$(follower_committed_offset 3)"
-while [[ "$SPARE_OFFSET" -lt "$SEG_NEXT" ]]; do
+while [[ "$SPARE_OFFSET" -lt "$ACKED" ]]; do
   [[ $SECONDS -lt $SPARE_DEADLINE ]] \
     || fail "the replacement kept $SPARE_SEALED sealed segment(s) but its committed offset \
-reads $SPARE_OFFSET, below the sealed-prefix end of $SEG_NEXT; the repaired range was \
-truncated or never re-served, which is #315 reopened"
+reads $SPARE_OFFSET, below the acknowledged floor of $ACKED; either the repaired range was \
+truncated (#315 reopened) or the sealed tail did not reach the replica (#306 reopened)"
   sleep 1
   SPARE_OFFSET="$(follower_committed_offset 3)"
 done
-log "the replacement survived the leader transition with $SPARE_SEALED sealed segment(s), \
-committed through $SPARE_OFFSET >= $SEG_NEXT — the repair outlives the failover that used to \
-erase it. The $((ACKED - SEG_NEXT)) tail records above the sealed prefix remain out of its \
-reach until #306 gives the gap a road back"
+log "the replacement survived the leader transition committed through $SPARE_OFFSET >= $ACKED \
+with $SPARE_SEALED sealed segment(s) — the repair carries the leader's WHOLE position, tail \
+included, and outlives the failover. The gap #306 tracked is closed"
 
 # Named directly rather than through `${!name}`: indirect expansion is not a
 # USE as far as shellcheck is concerned, so the variables stayed flagged and

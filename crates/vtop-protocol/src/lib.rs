@@ -496,6 +496,34 @@ pub struct ListSealedSegmentsRequest {
     pub fencing_epoch: u64,
 }
 
+/// Ask a leader to SEAL its active tail, so the sealed prefix reaches its
+/// actual position (#306).
+///
+/// Only sealed segments transfer, and a leader may be gigabytes past the
+/// sealed prefix inside a tail catch-up cannot replay — so a repair without
+/// this stops short by exactly that tail. Sealing is a WRITE: it carries the
+/// same fencing discipline as the append plane, or a deposed leader could
+/// seal a tail the cluster has moved past.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SealTailRequest {
+    pub range: RangeIdentity,
+    /// Range-leader fencing epoch, checked exactly as the append plane checks
+    /// it.
+    pub fencing_epoch: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SealTailResponse {
+    /// The end of the sealed prefix AFTER the seal — the offset a transfer
+    /// taken now can reach.
+    pub sealed_end: u64,
+    /// How many records the seal moved out of the tail. Zero means the tail
+    /// was already empty and the call was an idempotent no-op — the sealed
+    /// prefix already reached the leader's position — which a retrying
+    /// repair must be able to distinguish from progress.
+    pub records_sealed: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListSealedSegmentsResponse {
     /// A CONTIGUOUS ascending run: each entry begins exactly where the
@@ -612,6 +640,8 @@ pub enum Message {
     ListSealedSegmentsResponse(ListSealedSegmentsResponse),
     FetchSegmentChunkRequest(FetchSegmentChunkRequest),
     FetchSegmentChunkResponse(FetchSegmentChunkResponse),
+    SealTailRequest(SealTailRequest),
+    SealTailResponse(SealTailResponse),
 }
 
 impl Message {
@@ -655,6 +685,8 @@ impl Message {
             Self::ListSealedSegmentsResponse(_) => 78,
             Self::FetchSegmentChunkRequest(_) => 79,
             Self::FetchSegmentChunkResponse(_) => 80,
+            Self::SealTailRequest(_) => 81,
+            Self::SealTailResponse(_) => 82,
         }
     }
 }
@@ -891,6 +923,8 @@ fn encoded_payload_size(message: &Message, limits: ProtocolLimits) -> Result<usi
                 }
                 8 + bytes_size(&value.bytes)?
             }
+            Message::SealTailRequest(value) => range_size(&value.range)? + 8,
+            Message::SealTailResponse(_) => 8 + 8,
         };
     if total > limits.max_payload_bytes() {
         return Err(ProtocolError::Limit(format!(
@@ -1021,6 +1055,8 @@ fn decode_header(header: &[u8], limits: ProtocolLimits) -> Result<Header, Protoc
             | 78
             | 79
             | 80
+            | 81
+            | 82
     ) {
         return Err(ProtocolError::UnknownKind(kind));
     }
@@ -1278,6 +1314,14 @@ fn encode_message(message: &Message, out: &mut Vec<u8>) -> Result<(), ProtocolEr
             }
             put_u64(out, value.total_bytes);
             put_bytes(out, &value.bytes)?;
+        }
+        Message::SealTailRequest(value) => {
+            put_range(out, &value.range)?;
+            put_u64(out, value.fencing_epoch);
+        }
+        Message::SealTailResponse(value) => {
+            put_u64(out, value.sealed_end);
+            put_u64(out, value.records_sealed);
         }
     }
     Ok(())
@@ -1646,6 +1690,14 @@ fn decode_message(
             let bytes = decoder.bounded_bytes(MAX_SEGMENT_CHUNK_BYTES as usize, "segment chunk")?;
             Message::FetchSegmentChunkResponse(FetchSegmentChunkResponse { total_bytes, bytes })
         }
+        81 => Message::SealTailRequest(SealTailRequest {
+            range: decoder.range()?,
+            fencing_epoch: decoder.u64()?,
+        }),
+        82 => Message::SealTailResponse(SealTailResponse {
+            sealed_end: decoder.u64()?,
+            records_sealed: decoder.u64()?,
+        }),
         other => return Err(ProtocolError::UnknownKind(other)),
     })
 }
@@ -2278,6 +2330,14 @@ mod tests {
             Message::FetchSegmentChunkResponse(FetchSegmentChunkResponse {
                 total_bytes: 96,
                 bytes: vec![7; 32],
+            }),
+            Message::SealTailRequest(SealTailRequest {
+                range: range(),
+                fencing_epoch: 12,
+            }),
+            Message::SealTailResponse(SealTailResponse {
+                sealed_end: 4096,
+                records_sealed: 640,
             }),
         ];
         for (request_id, message) in messages.into_iter().enumerate() {
