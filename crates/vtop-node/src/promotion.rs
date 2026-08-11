@@ -254,6 +254,21 @@ pub fn establish(probes: &[ReplicaProbe], replication_factor: usize, leader_id: 
     // lineage, and counting bytes from a contradicted leadership line as
     // log-completeness is the exact mistake epoch qualification (#258)
     // exists to prevent.
+    //
+    // Can a divergent reconciliation delete an ACKNOWLEDGED record before
+    // the vote is read? Only if some past promotion already violated this
+    // restriction. The argument is inductive: a record acknowledged on a
+    // quorum intersects every later epoch's fence-majority, so with this
+    // gate in force at every promotion, the intersecting voter refuses any
+    // candidate whose log lacks the record — meaning every granted epoch's
+    // leader holds every previously acknowledged record, every subsequent
+    // leadership line contains them, and any suffix a voter loses to
+    // `DivergesAt` was written under a superseded line and never
+    // acknowledged. The truncation-below-HWM guard stays as the last
+    // resort for histories that predate the restriction; making the
+    // property local rather than inductive — a fence that votes before it
+    // reconciles — is a protocol reordering that belongs to #240's
+    // remaining design conversation, not to this gate.
     let votes = answered
         .values()
         .filter(|offset| **offset <= candidate_offset)
