@@ -616,6 +616,13 @@ pub struct LeaseAgent {
     range_uuid: Uuid,
     promoter: Promoter,
     state: LeaseState,
+    /// Marked once the first metadata exchange COMPLETES, whatever it said
+    /// (granted, refused, rival held — each tells this node where it
+    /// stands). Same doctrine as the watcher's gate: a candidate that has
+    /// never reached metadata does not know the current epoch, its follower
+    /// refuses every append, and reporting ready before that first read is
+    /// the same false green the static follower already refuses to show.
+    ready: Option<vtop_observe::ReadinessGate>,
     /// Rounds of the run loop during which this node will NOT campaign for
     /// the lease, set when a promotion was refused on eligibility grounds
     /// (LeaderBehind or the §5.4.1 vote check). A refused candidate that
@@ -676,9 +683,17 @@ impl LeaseAgent {
                 stand_aside: false,
             },
             state: LeaseState::NotHeld,
+            ready: None,
             held_until_ms: None,
             campaign_hold_off_rounds: 0,
         })
+    }
+
+    /// Open `gate` on the first completed metadata exchange (see the
+    /// `ready` field for why a candidate is not ready before that).
+    pub fn with_ready_gate(mut self, gate: vtop_observe::ReadinessGate) -> Self {
+        self.ready = Some(gate);
+        self
     }
 
     /// Run until the process stops or `release` fires (#280).
@@ -712,7 +727,12 @@ impl LeaseAgent {
                 break;
             }
             let delay = match self.step().await {
-                Ok(delay) => delay,
+                Ok(delay) => {
+                    if let Some(gate) = self.ready.take() {
+                        gate.mark_ready();
+                    }
+                    delay
+                }
                 Err(error) => {
                     // A metadata group mid-election refuses reads. Retrying is
                     // right; what would be wrong is treating an unreachable

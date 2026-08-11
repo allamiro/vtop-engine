@@ -1221,6 +1221,12 @@ async fn run_candidate(
         Arc::clone(&publisher) as Arc<dyn crate::lease_agent::LeasePublisher>,
         Some(Arc::new(probe) as Arc<dyn crate::lease_agent::QuorumProbe>),
     )?;
+    // Two marks before /readyz goes green, same shape as the static
+    // follower: the binds below are one, the agent's first completed
+    // metadata exchange is the other (review: a candidate that has never
+    // reached metadata reports a follower that refuses every append).
+    observability.gate.require_marks(2);
+    let agent = agent.with_ready_gate(observability.gate.clone());
     let agent_drain = std::time::Duration::from_secs(5)
         .max(std::time::Duration::from_millis(lease.lease_duration_ms));
     let mut agent_task = tokio::spawn(agent.run(release_lease_rx));
@@ -1308,7 +1314,7 @@ async fn run_candidate(
     let mut phase = Phase::Following(initial);
 
     let mut native_task_done = false;
-    loop {
+    'supervisor: loop {
         tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -1380,8 +1386,65 @@ async fn run_candidate(
                         // worse than a dead node is a live one holding a
                         // range it cannot serve. Exiting lets the lease
                         // lapse and a healthy candidate win.
-                        let built =
-                            build_leader_phase(&config, &range, &peers, roll, &meta).await?;
+                        // The build can wait up to ten seconds on follower
+                        // streams, and the supervisor's select arms are
+                        // unreachable while it does — so the build is RACED
+                        // against the very things those arms watch (review,
+                        // round four). A listener dying mid-build is the
+                        // same fail-stop as ever; shutdown mid-build
+                        // abandons a leader nothing has published yet and
+                        // runs the ordinary drain.
+                        let build = build_leader_phase(&config, &range, &peers, roll, &meta);
+                        tokio::pin!(build);
+                        let built = loop {
+                            tokio::select! {
+                                built = &mut build => break built?,
+                                changed = shutdown.changed() => {
+                                    if changed.is_err() || *shutdown.borrow() {
+                                        break 'supervisor;
+                                    }
+                                }
+                                result = &mut native_task => {
+                                    if *shutdown.borrow() {
+                                        if let Ok(Err(error)) = &result {
+                                            eprintln!(
+                                                "native server error during shutdown: {error}"
+                                            );
+                                        }
+                                        native_task_done = true;
+                                        break 'supervisor;
+                                    }
+                                    return Err(match result {
+                                        Ok(Ok(())) => {
+                                            "candidate native server exited early".to_owned()
+                                        }
+                                        Ok(Err(error)) => error,
+                                        Err(join) => format!(
+                                            "candidate native server task failed: {join}"
+                                        ),
+                                    });
+                                }
+                                result = &mut replica_task => {
+                                    if *shutdown.borrow() {
+                                        if let Ok(Err(error)) = &result {
+                                            eprintln!(
+                                                "replica server error during shutdown: {error}"
+                                            );
+                                        }
+                                        break 'supervisor;
+                                    }
+                                    return Err(match result {
+                                        Ok(Ok(())) => {
+                                            "candidate replica server exited early".to_owned()
+                                        }
+                                        Ok(Err(error)) => error,
+                                        Err(join) => format!(
+                                            "candidate replica server task failed: {join}"
+                                        ),
+                                    });
+                                }
+                            }
+                        };
                         // ATOMIC COMPLETION (review P0, round two): a lease
                         // lost during the build — the follower-stream wait
                         // can take seconds — must win over the build, and a
@@ -2017,8 +2080,20 @@ impl CandidateLeasePublisher {
 
 impl crate::lease_agent::LeasePublisher for CandidateLeasePublisher {
     fn promote(&self, fencing_epoch: u64, committed_offset: Option<u64>) {
-        self.recorded_through
-            .fetch_max(fencing_epoch, std::sync::atomic::Ordering::SeqCst);
+        // Under the SAME lock `complete_promotion` holds (review): recorded
+        // outside it, a newer grant's watermark could land between an older
+        // completion's check and its install, and the stale build would
+        // publish anyway. Inside it, the two linearize — the completion
+        // either sees this record and refuses, or finishes first and the
+        // queued verdict re-promotes the standing leader at this epoch.
+        {
+            let _guard = self
+                .target
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.recorded_through
+                .fetch_max(fencing_epoch, std::sync::atomic::Ordering::SeqCst);
+        }
         let _ = self.verdicts.send(RoleVerdict::Lead {
             fencing_epoch,
             committed_offset,
