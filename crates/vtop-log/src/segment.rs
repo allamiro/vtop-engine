@@ -1,8 +1,10 @@
 use crate::codec::{
     encode_header, encode_record, read_frame, read_header, record_content_hash, AnyHeader,
-    FrameRead, SegmentHeader, INDEX_MAGIC,
+    FrameRead, SegmentHeader, HEADER_MAGIC, INDEX_MAGIC,
 };
-use crate::codec_v2::{encode_header_v2, encode_record_v2, read_frame_v2, SegmentHeaderV2};
+use crate::codec_v2::{
+    encode_header_v2, encode_record_v2, read_frame_v2, SegmentHeaderV2, HEADER_MAGIC_V2,
+};
 use crate::env::{Env, OpenMode, Storage, StorageFile};
 use crate::proof;
 use crate::types::{
@@ -2071,6 +2073,20 @@ pub(crate) fn rebuild_empty_successor_commit(
         // work. The compatibility refusal must survive this repair path
         // exactly as it survives every other open.
         Err(error @ LogError::UnsupportedVersion(_)) => return Err(error),
+        // A COMPLETE file under a magic this binary has never heard of is a
+        // FUTURE format, not a torn write — v2 itself arrived exactly this
+        // way, as a new magic an older binary reads as Corrupt rather than
+        // UnsupportedVersion. Only a file that positively begins as v1 or
+        // v2 (or is too short to have finished any magic at all) can be
+        // classified as torn; anything else stays quarantined for a newer
+        // binary to explain (review round eight).
+        Err(_)
+            if bytes.len() >= HEADER_MAGIC.len()
+                && &bytes[..HEADER_MAGIC.len()] != HEADER_MAGIC.as_slice()
+                && &bytes[..HEADER_MAGIC_V2.len()] != HEADER_MAGIC_V2.as_slice() =>
+        {
+            return Ok(false);
+        }
         Err(_) => {
             // A TORN HEADER, and provably nothing else: the commit sidecar
             // is written only after the primary file is complete and synced,

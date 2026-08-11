@@ -382,6 +382,15 @@ fn sweep_roll_window_sidecar(
     if *path != directory.join(format!("{}.producers", segment_stem(sealed_end))) {
         return Ok(false);
     }
+    // write_atomic never leaves a partial file, so an undecodable snapshot
+    // is not the roll's debris — it is separate evidence, kept quarantined.
+    let bytes = env
+        .storage
+        .read(path)
+        .map_err(|source| io_error(path, source))?;
+    if ProducerSnapshot::decode(&bytes).is_err() {
+        return Ok(false);
+    }
     env.storage
         .remove_file(path)
         .map_err(|source| io_error(path, source))?;
@@ -430,10 +439,25 @@ fn repair_roll_window_successor(env: &Env, catalog: &StartupCatalog) -> VtopLogR
     else {
         return Ok(false);
     };
-    let sidecar_present = bundle
+    // The roll's own sidecar is always a COMPLETE write (write_atomic), so
+    // one that does not decode is a SEPARATE corruption — not this window —
+    // and it must gate BOTH outcomes: a repair must not promote past it,
+    // and the torn-discard must not delete the evidence next to it (review
+    // round eight).
+    let sidecar_path = bundle
         .paths
         .iter()
-        .any(|path| extension_of(path) == "producers");
+        .find(|path| extension_of(path) == "producers");
+    if let Some(path) = sidecar_path {
+        let bytes = env
+            .storage
+            .read(path)
+            .map_err(|source| io_error(path, source))?;
+        if ProducerSnapshot::decode(&bytes).is_err() {
+            return Ok(false);
+        }
+    }
+    let sidecar_present = sidecar_path.is_some();
     if catalog
         .entries
         .iter()
@@ -3709,6 +3733,55 @@ mod tests {
         assert!(
             !commit_path.exists(),
             "no boundary may be written for a tail whose inherited frontier would be wrong"
+        );
+    }
+
+    /// A COMPLETE file under an unknown magic is a future format, not a
+    /// torn write — v2 itself arrived as a new magic older binaries read as
+    /// Corrupt. A downgrade must quarantine it, never delete it.
+    #[test]
+    fn a_future_magic_successor_is_preserved_not_deleted() {
+        let directory = tempdir().unwrap();
+        strand_after_seal(directory.path(), false);
+        let future_path = directory.path().join(format!("{}.active", segment_stem(3)));
+        std::fs::write(&future_path, b"VTOPSEG9 a complete file from a newer build").unwrap();
+
+        let refused = SegmentSet::open_in(&Env::real(), directory.path())
+            .map(|_| ())
+            .expect_err("an unknown-magic successor must refuse this binary");
+        assert!(
+            !matches!(refused, LogError::TailSealedWithoutSuccessor { .. }),
+            "the future file must not have been classified as torn and deleted"
+        );
+        assert!(
+            future_path.exists(),
+            "a downgrade must quarantine a newer build's format, never delete it"
+        );
+    }
+
+    /// A torn successor next to an UNDECODABLE sidecar is two corruptions,
+    /// not one window: the discard must not destroy the evidence beside it.
+    #[test]
+    fn a_torn_successor_beside_a_corrupt_sidecar_stays_quarantined() {
+        let directory = tempdir().unwrap();
+        strand_after_seal(directory.path(), false);
+        let torn_path = directory.path().join(format!("{}.active", segment_stem(3)));
+        std::fs::write(&torn_path, b"VTOPSEG1 but torn mid-wr").unwrap();
+        let sidecar_path = directory
+            .path()
+            .join(format!("{}.producers", segment_stem(3)));
+        std::fs::write(&sidecar_path, b"not a snapshot").unwrap();
+
+        let refused = SegmentSet::open_in(&Env::real(), directory.path())
+            .map(|_| ())
+            .expect_err("two corruptions must keep the range quarantined");
+        assert!(
+            !matches!(refused, LogError::TailSealedWithoutSuccessor { .. }),
+            "the pair must not have been consumed as if it were the roll window"
+        );
+        assert!(
+            torn_path.exists() && sidecar_path.exists(),
+            "neither file may be deleted while the layout is unexplained"
         );
     }
 
