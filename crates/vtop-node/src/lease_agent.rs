@@ -889,6 +889,14 @@ impl LeaseAgent {
                 // monotonic and idempotent, so repeating it every poll is
                 // free.
                 self.promoter.lost(fencing_epoch);
+                // A rival holding the range is the stand-aside's purpose
+                // ACHIEVED: the replica this node's refusal made way for (or
+                // any other eligible one) has the lease. Clearing the
+                // hold-off here means a much later failure of that holder is
+                // answered by an immediate campaign, not by serving out the
+                // residue of a wait that already did its job (review round
+                // four).
+                self.campaign_hold_off_rounds = 0;
                 Ok(self.config.poll_interval)
             }
             LeaseDecision::RangeMissing => {
