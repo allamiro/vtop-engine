@@ -539,15 +539,46 @@ fn reconfigure_range(
     })?;
 
     let env = Env::real();
-    let mut set = SegmentSet::open_in(&env, data_dir)
-        .map_err(|error| format!("open the range in {}: {error}", data_dir.display()))?
-        .ok_or_else(|| {
-            format!(
+    // RERUNNING THIS COMMAND IS THE RECOVERY. An interruption between a
+    // roll's two steps — this command's own roll included — leaves the tail
+    // sealed with no successor, a layout `open_in` refuses because extending
+    // a range is a writer's decision. This command has the standing to be
+    // that writer: adopt a fresh tail at the sealed end (it inherits the
+    // sealed header's OLD limits, exactly as an uninterrupted roll's
+    // successor would have started from them), and the reconfigure below
+    // then rewrites the empty tail in place under the new ones. Without
+    // this, a routine threshold change interrupted at the wrong instant
+    // would strand the range behind a tool the operator has no reason to
+    // know about.
+    let mut resumed = false;
+    let mut set = match SegmentSet::open_in(&env, data_dir) {
+        Ok(Some(set)) => set,
+        Ok(None) => {
+            return Err(format!(
                 "no range found in {}; reconfigure changes an EXISTING range's thresholds — a \
                  range not yet created takes its limits from the node YAML at first start",
                 data_dir.display()
-            )
-        })?;
+            ));
+        }
+        Err(vtop_log::LogError::TailSealedWithoutSuccessor { .. }) => {
+            resumed = true;
+            SegmentSet::adopt_in(&env, data_dir, Uuid::new_v4()).map_err(|error| {
+                format!(
+                    "adopt a fresh tail onto the sealed range in {}: {error}",
+                    data_dir.display()
+                )
+            })?
+        }
+        Err(error) => {
+            return Err(format!("open the range in {}: {error}", data_dir.display()));
+        }
+    };
+    if resumed && !json {
+        println!(
+            "resumed: an interrupted roll left this range's tail sealed without a successor; \
+             a fresh tail was adopted at its end before reconfiguring"
+        );
+    }
 
     let before = limits_of(&set);
     let outcome = set
@@ -573,6 +604,7 @@ fn reconfigure_range(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "outcome": outcome_name,
+                "resumed_from_sealed_tail": resumed,
                 "format_version": before.0,
                 "successor_base": successor_base,
                 "previous": describe(before),
@@ -1547,6 +1579,75 @@ replicas: []
             reopened.active().config().max_segment_bytes,
             4096,
             "the next node start reads the limits this command just wrote"
+        );
+    }
+
+    /// The P1 the review caught: an interruption between a roll's seal and
+    /// its successor-create leaves a tail-less range `open_in` refuses.
+    /// Rerunning the command must BE the recovery, or a routine threshold
+    /// change interrupted at the wrong instant strands the range.
+    #[test]
+    fn reconfigure_range_resumes_a_range_whose_tail_was_sealed_without_a_successor() {
+        let directory = tempfile::tempdir().unwrap();
+        let set = create_range(directory.path());
+        drop(set);
+        // Stage the crash layout through the real seal path: recover the
+        // tail, append, and seal it with no successor — exactly what an
+        // interruption between roll_in's two steps leaves behind.
+        let active_path = directory
+            .path()
+            .join(format!("{}.active", vtop_log::segment_stem(0)));
+        let mut active =
+            vtop_log::ActiveSegment::recover(&active_path).expect("the created tail must recover");
+        active
+            .append_group(
+                &[vtop_log::LogRecord {
+                    producer_id: Uuid::from_u128(83),
+                    producer_epoch: 0,
+                    sequence: 0,
+                    timestamp_millis: 1_700_000_000_000,
+                    attributes: 0,
+                    key: b"key".to_vec(),
+                    value: b"value".to_vec(),
+                }],
+                vtop_log::Durability::Fsync,
+            )
+            .unwrap();
+        drop(
+            active
+                .seal()
+                .expect("sealing the tail stages the crash layout"),
+        );
+
+        let code = reconfigure_range(
+            directory.path(),
+            vtop_log::RollThresholds {
+                max_segment_bytes: Some(4096),
+                max_group_bytes: Some(1024),
+                ..Default::default()
+            },
+            false,
+        )
+        .expect("rerunning reconfigure-range must recover the interrupted layout, not refuse it");
+        assert_eq!(code, 0);
+
+        let reopened = SegmentSet::open_in(&Env::real(), directory.path())
+            .unwrap()
+            .expect("the resumed range must open as a normal range again");
+        assert_eq!(
+            reopened.active().config().max_segment_bytes,
+            4096,
+            "the adopted tail must carry the reconfigured limits"
+        );
+        assert_eq!(
+            reopened.sealed().len(),
+            1,
+            "the sealed segment from before the interruption is still the prefix"
+        );
+        assert_eq!(
+            reopened.next_offset(),
+            1,
+            "the record sealed before the interruption is still the range's content"
         );
     }
 

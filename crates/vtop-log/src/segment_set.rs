@@ -412,11 +412,9 @@ impl SegmentSet {
             // A crash between sealing a segment and creating its successor
             // leaves a range whose tail is closed. That is recoverable — open a
             // new active at its end — but it is a decision for a writer, not
-            // something a reader should do silently.
-            return Err(LogError::InvalidDescriptor(format!(
-                "range at {} has no active segment; its tail was sealed without a successor",
-                directory.display()
-            )));
+            // something a reader should do silently. Typed, so the one caller
+            // with the standing to be that writer can recognise it (#314).
+            return Err(LogError::TailSealedWithoutSuccessor { directory });
         };
 
         let mut sealed = Vec::with_capacity(sealed_paths.len());
