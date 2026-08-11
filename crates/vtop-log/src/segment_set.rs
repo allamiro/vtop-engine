@@ -32,11 +32,14 @@
 use crate::env::Env;
 use crate::producer_snapshot::ProducerSnapshot;
 use crate::retention_intent::{RetainedSegment, RetentionIntent, RETENTION_INTENT_FILE};
-use crate::segment::{io_error, roll_in, segment_stem, write_atomic, ActiveSegment, SegmentReader};
+use crate::segment::{
+    io_error, rewrite_empty_header_in_place, roll_in, roll_in_with, segment_stem, write_atomic,
+    ActiveSegment, SegmentReader, SuccessorConfig,
+};
 use crate::truncate_intent::{DoomedSegment, TruncateIntent, TRUNCATE_INTENT_FILE};
 use crate::{
     CatalogEntry, CatalogSegmentState, Durability, FetchBatch, FetchedRecord, LogError, LogRecord,
-    SegmentDescriptor, StartupCatalog, VtopLogResult,
+    RollThresholds, SegmentDescriptor, StartupCatalog, VtopLogResult,
 };
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -199,6 +202,23 @@ fn validate_single_lineage(entries: &[CatalogEntry], directory: &Path) -> VtopLo
         }
     }
     Ok(())
+}
+
+/// What [`SegmentSet::reconfigure`] did (#314). Three distinct outcomes,
+/// because the operator's next question differs for each: an unchanged
+/// range needs no verification, a rolled one has a new sealed segment to
+/// account for, and a rewritten tail has the same file count it started
+/// with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReconfigureOutcome {
+    /// Every requested threshold already matched the tail's header.
+    Unchanged,
+    /// The tail was sealed and a successor opened under the new limits,
+    /// beginning at `successor_base`.
+    Rolled { successor_base: u64 },
+    /// The tail held no records, so its header was rewritten in place —
+    /// rolling would have sealed an empty segment.
+    RewrittenInPlace,
 }
 
 /// One range's segments, ordered and contiguous.
@@ -737,6 +757,83 @@ impl SegmentSet {
         self.active = Some(successor);
         self.sealed.push(sealed);
         Ok(())
+    }
+
+    /// Change the range's roll thresholds, from the tail forward (#314).
+    ///
+    /// A segment's limits live in its header and nowhere else, and that
+    /// stays true here: the new thresholds take effect by putting a NEW
+    /// header in front of the log — sealing the tail and opening a successor
+    /// under the new limits — never by mutating a header that existing bytes
+    /// were already validated against. Every sealed segment, and the sealed
+    /// former tail, keeps describing exactly the records it holds, which is
+    /// why narrowing and raising are the same operation: no live segment's
+    /// contract changes, a new segment simply starts under a new one. It is
+    /// also why nothing here needs remembering — reopen, adoption, and
+    /// cross-segment truncation all rebuild the tail from a header that now
+    /// carries the reconfigured limits.
+    ///
+    /// Validation happens FIRST, under the rules of the tail's ACTUAL
+    /// format: the v1 and v2 frame overheads differ, so a group bound that
+    /// fits one framed v1 record can be one byte too small for the same
+    /// record framed as v2 — and it must be refused before the seal, not
+    /// discovered after it has left the range tail-less.
+    ///
+    /// An override that changes nothing is a no-op: rolling for it would
+    /// seal a segment purely to re-state its own limits. A tail holding no
+    /// records has its header rewritten in place instead of rolling, because
+    /// sealing it would leave an empty sealed segment.
+    pub fn reconfigure(
+        &mut self,
+        thresholds: RollThresholds,
+        successor_id: Uuid,
+    ) -> VtopLogResult<ReconfigureOutcome> {
+        let candidate = match self.tail().config_v2() {
+            Some(current) => {
+                let applied = thresholds.applied_to_v2(current);
+                if applied == current {
+                    return Ok(ReconfigureOutcome::Unchanged);
+                }
+                SuccessorConfig::V2(applied.validate()?)
+            }
+            None => {
+                let current = self.tail().config();
+                let applied = thresholds.applied_to(current);
+                if applied == current {
+                    return Ok(ReconfigureOutcome::Unchanged);
+                }
+                SuccessorConfig::V1(applied.validate()?)
+            }
+        };
+        if self.tail().next_offset() == self.tail().base_offset() {
+            let active = self
+                .active
+                .take()
+                .expect("the tail is absent only mid-roll, mid-truncation, or after one failed");
+            let replacement = rewrite_empty_header_in_place(&self.env, active, candidate)?;
+            self.active = Some(replacement);
+            return Ok(ReconfigureOutcome::RewrittenInPlace);
+        }
+        let active = self
+            .active
+            .take()
+            .expect("the tail is absent only mid-roll, mid-truncation, or after one failed");
+        let (sealed, successor) = roll_in_with(&self.env, active, successor_id, Some(candidate))?;
+        let successor_base = successor.base_offset();
+        self.active = Some(successor);
+        self.sealed.push(sealed);
+        Ok(ReconfigureOutcome::Rolled { successor_base })
+    }
+
+    /// [`Self::reconfigure`], minting the successor's identity from this
+    /// set's own environment — the same minting `append_group_minting` and
+    /// cross-segment truncation use.
+    pub fn reconfigure_minting(
+        &mut self,
+        thresholds: RollThresholds,
+    ) -> VtopLogResult<ReconfigureOutcome> {
+        let successor_id = Uuid::from_u128(self.env.rng.next_u128());
+        self.reconfigure(thresholds, successor_id)
     }
 
     /// Reclaim sealed segments from the FRONT of the range until the policy
@@ -2746,5 +2843,394 @@ mod tests {
             )
             .expect("the producer's sequence must continue across the retention");
         assert_eq!(reopened.next_offset(), next_offset + 1);
+    }
+
+    // ----- reconfigure (#314) -----------------------------------------------
+    //
+    // Each test below pins one of the six cases review found on #313 before
+    // the feature was pulled out, and every range is built through the real
+    // create/open path — a hand-assembled config hides invalid combinations,
+    // which is how an earlier test came to assert nothing.
+
+    /// Case 1: the change happens NOW, durably — a roll at the reconfigure,
+    /// not a stored setting waiting for an unpredictable moment.
+    #[test]
+    fn reconfigure_rolls_once_and_the_new_tail_carries_the_new_limits() {
+        let directory = tempdir().unwrap();
+        let producer = Uuid::from_u128(31);
+        let mut set =
+            SegmentSet::create_in(&Env::real(), directory.path(), descriptor(), config()).unwrap();
+        for sequence in 0..5 {
+            set.append_group(
+                &[record(producer, sequence)],
+                Durability::Fsync,
+                Uuid::from_u128(3100 + sequence as u128),
+            )
+            .unwrap();
+        }
+        let sealed_before = set.sealed().len();
+
+        let outcome = set
+            .reconfigure(
+                RollThresholds {
+                    max_segment_bytes: Some(4096),
+                    max_group_bytes: Some(1024),
+                    ..RollThresholds::default()
+                },
+                Uuid::from_u128(3999),
+            )
+            .unwrap();
+
+        assert!(
+            matches!(outcome, ReconfigureOutcome::Rolled { .. }),
+            "a tail holding records must roll, so its sealed bytes keep the header they were \
+             written under"
+        );
+        assert_eq!(
+            set.sealed().len(),
+            sealed_before + 1,
+            "reconfigure rolls exactly once"
+        );
+        let tail = set.active().config();
+        assert_eq!(tail.max_segment_bytes, 4096);
+        assert_eq!(tail.max_group_bytes, 1024);
+        assert_eq!(
+            tail.max_record_bytes,
+            config().max_record_bytes,
+            "an absent threshold keeps the tail's current value; the operator restates nothing"
+        );
+        // The sealed former tail still describes its own records.
+        assert_eq!(
+            set.sealed().last().unwrap().config().max_segment_bytes,
+            config().max_segment_bytes,
+            "no existing header changes; the read path decodes sealed bytes against the limits \
+             they were written under"
+        );
+    }
+
+    /// Case 4: a RAISED limit has a roll path — the record the old tail
+    /// refused is admitted by the new one.
+    #[test]
+    fn a_raised_record_limit_admits_the_record_the_old_limits_refused() {
+        let directory = tempdir().unwrap();
+        let producer = Uuid::from_u128(37);
+        let mut set =
+            SegmentSet::create_in(&Env::real(), directory.path(), descriptor(), config()).unwrap();
+        set.append_group(
+            &[record(producer, 0)],
+            Durability::Fsync,
+            Uuid::from_u128(1),
+        )
+        .unwrap();
+        let big = LogRecord {
+            value: vec![0xAB; 600],
+            sequence: 1,
+            ..record(producer, 1)
+        };
+        assert!(
+            set.append_group(
+                std::slice::from_ref(&big),
+                Durability::Fsync,
+                Uuid::from_u128(2)
+            )
+            .is_err(),
+            "a 600-byte value must be refused under a 256-byte record limit, or this test \
+             proves nothing about raising it"
+        );
+
+        set.reconfigure(
+            RollThresholds {
+                max_record_bytes: Some(2048),
+                max_group_bytes: Some(4096),
+                max_segment_bytes: Some(8192),
+                ..RollThresholds::default()
+            },
+            Uuid::from_u128(3),
+        )
+        .unwrap();
+
+        set.append_group(&[big], Durability::Fsync, Uuid::from_u128(4))
+            .expect("after raising the limits, a workload of larger records must not stay wedged");
+        assert_eq!(set.next_offset(), 2);
+    }
+
+    /// Case 3: narrowing never touches an existing header — the sealed prefix
+    /// written under the wider limits stays readable, and only the new tail
+    /// rolls at the narrower bound.
+    #[test]
+    fn a_narrowed_limit_governs_the_new_tail_while_the_sealed_prefix_still_reads() {
+        let directory = tempdir().unwrap();
+        let producer = Uuid::from_u128(41);
+        let wide = SegmentConfig {
+            max_segment_bytes: 8192,
+            max_group_bytes: 1024,
+            ..config()
+        };
+        let mut set =
+            SegmentSet::create_in(&Env::real(), directory.path(), descriptor(), wide).unwrap();
+        for sequence in 0..10 {
+            set.append_group(
+                &[record(producer, sequence)],
+                Durability::Fsync,
+                Uuid::from_u128(4100 + sequence as u128),
+            )
+            .unwrap();
+        }
+        assert!(
+            set.sealed().is_empty(),
+            "10 small records must fit one 8 KiB segment, or the narrow assertion below is \
+             measuring the old limits"
+        );
+
+        set.reconfigure(
+            RollThresholds {
+                max_segment_bytes: Some(512),
+                max_group_bytes: Some(512),
+                ..RollThresholds::default()
+            },
+            Uuid::from_u128(4998),
+        )
+        .unwrap();
+        for sequence in 10..20 {
+            set.append_group(
+                &[record(producer, sequence)],
+                Durability::Fsync,
+                Uuid::from_u128(4200 + sequence as u128),
+            )
+            .unwrap();
+        }
+        assert!(
+            set.sealed().len() >= 2,
+            "the narrowed tail must roll under load the wide config absorbed"
+        );
+        let batch = set.fetch_through(0, 1 << 20, 100, 20).unwrap();
+        assert_eq!(
+            batch.records.len(),
+            20,
+            "every record on both sides of the narrowing must read back"
+        );
+    }
+
+    /// Case 5: validation follows the tail's ACTUAL format. The v1 and v2
+    /// frame overheads differ by ten bytes, so the identical numbers are a
+    /// working v1 configuration and an impossible v2 one.
+    #[test]
+    fn validation_follows_the_tails_actual_format() {
+        let v1_dir = tempdir().unwrap();
+        let mut v1_set =
+            SegmentSet::create_in(&Env::real(), v1_dir.path(), descriptor(), config()).unwrap();
+        let exactly_one_v1_record = RollThresholds {
+            max_record_bytes: Some(256),
+            max_group_bytes: Some(256 + crate::types::RECORD_FRAME_OVERHEAD_BYTES),
+            max_segment_bytes: Some(512),
+            ..RollThresholds::default()
+        };
+        v1_set
+            .reconfigure(exactly_one_v1_record, Uuid::from_u128(51))
+            .expect("a group bound of one framed v1 record is a working v1 configuration");
+
+        let v2_dir = tempdir().unwrap();
+        let env = Env::real();
+        let base = 42;
+        let path = v2_dir.path().join(format!("{}.active", segment_stem(base)));
+        drop(
+            crate::segment::ActiveSegment::create_v2_in(
+                &env,
+                &path,
+                crate::SegmentDescriptorV2 {
+                    segment_id: Uuid::from_u128(52),
+                    topic: "audit.v1".to_owned(),
+                    topic_epoch: 3,
+                    lineage: RangeLineage::root(Uuid::from_u128(53)),
+                    base_offset: base,
+                    segment_generation: 1,
+                    creation_node_id: Uuid::from_u128(54),
+                    creation_fencing_epoch: 1,
+                },
+                crate::SegmentConfigV2 {
+                    max_record_bytes: 256,
+                    max_group_bytes: 1024,
+                    max_segment_bytes: 4096,
+                    max_segment_records: 100,
+                    index_stride: 2,
+                    chunk_size: 64 * 1024,
+                },
+            )
+            .unwrap(),
+        );
+        let mut v2_set = SegmentSet::open_in(&env, v2_dir.path()).unwrap().unwrap();
+        let refused = v2_set.reconfigure(exactly_one_v1_record, Uuid::from_u128(55));
+        assert!(
+            refused.is_err(),
+            "the same numbers must be refused on a v2 range: its frame overhead is ten bytes \
+             larger, so this group bound cannot fit one framed record"
+        );
+        assert!(
+            v2_set.active().config_v2().is_some(),
+            "a refused reconfigure must leave the v2 tail untouched"
+        );
+    }
+
+    /// The empty-tail path: rewritten in place, because sealing a segment
+    /// holding nothing would cost a file to say nothing.
+    #[test]
+    fn an_empty_tail_is_rewritten_in_place_not_sealed_empty() {
+        let directory = tempdir().unwrap();
+        let mut set =
+            SegmentSet::create_in(&Env::real(), directory.path(), descriptor(), config()).unwrap();
+        let identity_before = set.active().descriptor().segment_id;
+
+        let outcome = set
+            .reconfigure(
+                RollThresholds {
+                    max_segment_bytes: Some(2048),
+                    ..RollThresholds::default()
+                },
+                Uuid::from_u128(61),
+            )
+            .unwrap();
+
+        assert_eq!(outcome, ReconfigureOutcome::RewrittenInPlace);
+        assert!(
+            set.sealed().is_empty(),
+            "reconfiguring an empty range must not manufacture an empty sealed segment"
+        );
+        assert_eq!(
+            set.active().descriptor().segment_id,
+            identity_before,
+            "an in-place rewrite changes the limits, not the segment's identity"
+        );
+        assert_eq!(set.active().config().max_segment_bytes, 2048);
+
+        // And the rewrite is durable: the reopened range runs the new limits.
+        drop(set);
+        let reopened = SegmentSet::open_in(&Env::real(), directory.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(reopened.active().config().max_segment_bytes, 2048);
+    }
+
+    /// Case 1's durability half: the reconfigured limits ARE the header, so
+    /// a reopen cannot lose them — there is no second channel to forget.
+    #[test]
+    fn reconfigured_limits_survive_reopen() {
+        let directory = tempdir().unwrap();
+        let producer = Uuid::from_u128(67);
+        let mut set =
+            SegmentSet::create_in(&Env::real(), directory.path(), descriptor(), config()).unwrap();
+        for sequence in 0..5 {
+            set.append_group(
+                &[record(producer, sequence)],
+                Durability::Fsync,
+                Uuid::from_u128(6100 + sequence as u128),
+            )
+            .unwrap();
+        }
+        set.reconfigure(
+            RollThresholds {
+                max_segment_bytes: Some(4096),
+                max_group_bytes: Some(1024),
+                ..RollThresholds::default()
+            },
+            Uuid::from_u128(6999),
+        )
+        .unwrap();
+        drop(set);
+
+        let reopened = SegmentSet::open_in(&Env::real(), directory.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reopened.active().config().max_segment_bytes,
+            4096,
+            "the reconfigured limit must come back from the header on reopen"
+        );
+    }
+
+    /// Case 6: cross-segment truncation replaces the tail — and the
+    /// replacement must carry the reconfigured limits, because the intent
+    /// captures the live tail's header, which is where they now live.
+    #[test]
+    fn reconfigured_limits_survive_cross_segment_truncation() {
+        let directory = tempdir().unwrap();
+        let producer = Uuid::from_u128(71);
+        let mut set =
+            SegmentSet::create_in(&Env::real(), directory.path(), descriptor(), config()).unwrap();
+        for sequence in 0..5 {
+            set.append_group(
+                &[record(producer, sequence)],
+                Durability::Fsync,
+                Uuid::from_u128(7100 + sequence as u128),
+            )
+            .unwrap();
+        }
+        set.reconfigure(
+            RollThresholds {
+                max_segment_bytes: Some(4096),
+                max_group_bytes: Some(1024),
+                ..RollThresholds::default()
+            },
+            Uuid::from_u128(7998),
+        )
+        .unwrap();
+        for sequence in 5..10 {
+            set.append_group(
+                &[record(producer, sequence)],
+                Durability::Fsync,
+                Uuid::from_u128(7200 + sequence as u128),
+            )
+            .unwrap();
+        }
+        // A cross-segment cut must land on a sealed boundary; the last
+        // sealed segment's base is one, and it is strictly below the tail.
+        let below_tail = set.sealed().last().unwrap().base_offset();
+
+        set.truncate_to(below_tail).unwrap();
+
+        assert_eq!(
+            set.active().config().max_segment_bytes,
+            4096,
+            "a fenced follower whose truncation crossed segments must keep the reconfigured \
+             limits, not silently revert to the ones in an older header"
+        );
+    }
+
+    /// An override that changes nothing is a no-op — rolling for it would
+    /// seal a segment purely to restate its own limits — and an EMPTY
+    /// override is the same case, not an error.
+    #[test]
+    fn an_unchanged_reconfigure_is_a_no_op() {
+        let directory = tempdir().unwrap();
+        let producer = Uuid::from_u128(73);
+        let mut set =
+            SegmentSet::create_in(&Env::real(), directory.path(), descriptor(), config()).unwrap();
+        set.append_group(
+            &[record(producer, 0)],
+            Durability::Fsync,
+            Uuid::from_u128(1),
+        )
+        .unwrap();
+        let sealed_before = set.sealed().len();
+
+        let restated = set
+            .reconfigure(
+                RollThresholds {
+                    max_segment_bytes: Some(config().max_segment_bytes),
+                    ..RollThresholds::default()
+                },
+                Uuid::from_u128(2),
+            )
+            .unwrap();
+        let empty = set
+            .reconfigure(RollThresholds::default(), Uuid::from_u128(3))
+            .unwrap();
+
+        assert_eq!(restated, ReconfigureOutcome::Unchanged);
+        assert_eq!(empty, ReconfigureOutcome::Unchanged);
+        assert_eq!(
+            set.sealed().len(),
+            sealed_before,
+            "restating the current limits must not cost a sealed segment"
+        );
     }
 }

@@ -428,6 +428,67 @@ impl SegmentConfig {
     }
 }
 
+/// The operator-tunable roll thresholds, as a PARTIAL override (#314).
+///
+/// `None` means "keep the tail's current value" — an operator raising one
+/// limit must not have to restate the other three, because a restated value
+/// that drifts from what the range actually runs is exactly the config-vs-
+/// header disagreement this type exists to end. What is NOT here is also
+/// deliberate: `index_stride` and the v2 `chunk_size` shape how a segment's
+/// interior is laid out, not when it rolls, and changing them mid-range has
+/// no operator story yet.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RollThresholds {
+    pub max_record_bytes: Option<u32>,
+    pub max_group_bytes: Option<u64>,
+    pub max_segment_bytes: Option<u64>,
+    pub max_segment_records: Option<u64>,
+}
+
+impl RollThresholds {
+    /// True when the override would change nothing — every field absent.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The v1 config this override produces over `current`. NOT validated:
+    /// the caller validates with the rules of the tail's actual format,
+    /// which is the entire reason application and validation are separate.
+    pub(crate) fn applied_to(&self, mut current: SegmentConfig) -> SegmentConfig {
+        if let Some(value) = self.max_record_bytes {
+            current.max_record_bytes = value;
+        }
+        if let Some(value) = self.max_group_bytes {
+            current.max_group_bytes = value;
+        }
+        if let Some(value) = self.max_segment_bytes {
+            current.max_segment_bytes = value;
+        }
+        if let Some(value) = self.max_segment_records {
+            current.max_segment_records = value;
+        }
+        current
+    }
+
+    /// The v2 config this override produces over `current`; `chunk_size`
+    /// and `index_stride` pass through untouched.
+    pub(crate) fn applied_to_v2(&self, mut current: SegmentConfigV2) -> SegmentConfigV2 {
+        if let Some(value) = self.max_record_bytes {
+            current.max_record_bytes = value;
+        }
+        if let Some(value) = self.max_group_bytes {
+            current.max_group_bytes = value;
+        }
+        if let Some(value) = self.max_segment_bytes {
+            current.max_segment_bytes = value;
+        }
+        if let Some(value) = self.max_segment_records {
+            current.max_segment_records = value;
+        }
+        current
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogRecord {
     pub producer_id: Uuid,

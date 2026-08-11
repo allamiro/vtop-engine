@@ -28,15 +28,17 @@ pub use segment::{
     rebuild_chunk_index, rebuild_chunk_index_in, rebuild_index, rebuild_index_in, roll_in,
     segment_stem, ActiveSegment, SegmentReader,
 };
-pub use segment_set::{RetentionOutcome, RetentionPolicy, SegmentSet, CONDEMNED_MARKER};
+pub use segment_set::{
+    ReconfigureOutcome, RetentionOutcome, RetentionPolicy, SegmentSet, CONDEMNED_MARKER,
+};
 pub use transfer::{
     sealed_artifact_path, SegmentPresence, SegmentReceiver, StagedSegment, TransferArtifact,
 };
 pub use types::{
     AppendOutcome, CommitStatementV1, Durability, FetchBatch, FetchedRecord, KeyRange, LogError,
-    LogRecord, ParentRange, ProducerSummaryEntry, RangeLineage, RecoveryReport, SegmentCommitKey,
-    SegmentConfig, SegmentConfigV2, SegmentCursor, SegmentDescriptor, SegmentDescriptorV2,
-    SegmentEvidence, SegmentId, SegmentManifest, SegmentManifestV2, TruncateOutcome, VtopLogResult,
-    CHUNK_SIDECAR_MAGIC, CHUNK_TREE_SCHEME_V1, COMMIT_SCHEME_KEYED, COMMIT_SCHEME_UNKEYED,
-    FORMAT_VERSION_V2, PRODUCER_SEQUENCE_WINDOW, RECORD_SCHEMA_VERSION_V2,
+    LogRecord, ParentRange, ProducerSummaryEntry, RangeLineage, RecoveryReport, RollThresholds,
+    SegmentCommitKey, SegmentConfig, SegmentConfigV2, SegmentCursor, SegmentDescriptor,
+    SegmentDescriptorV2, SegmentEvidence, SegmentId, SegmentManifest, SegmentManifestV2,
+    TruncateOutcome, VtopLogResult, CHUNK_SIDECAR_MAGIC, CHUNK_TREE_SCHEME_V1, COMMIT_SCHEME_KEYED,
+    COMMIT_SCHEME_UNKEYED, FORMAT_VERSION_V2, PRODUCER_SEQUENCE_WINDOW, RECORD_SCHEMA_VERSION_V2,
 };

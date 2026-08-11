@@ -1164,6 +1164,29 @@ impl SegmentReader {
         }
     }
 
+    /// The v1 limits this sealed segment was written under. A sealed header
+    /// is immutable — reconfiguring a range (#314) changes only headers put
+    /// in front of the log — so this is exactly the contract its bytes were
+    /// validated against.
+    ///
+    /// # Panics
+    ///
+    /// Panics on a v2 segment; use [`Self::config_v2`] there.
+    pub fn config(&self) -> SegmentConfig {
+        match &self.header {
+            AnyHeader::V1(header) => header.config,
+            AnyHeader::V2(_) => panic!("config() is a v1 accessor; use config_v2()"),
+        }
+    }
+
+    /// The v2 limits, if this segment uses the v2 format.
+    pub fn config_v2(&self) -> Option<SegmentConfigV2> {
+        match &self.header {
+            AnyHeader::V1(_) => None,
+            AnyHeader::V2(header) => Some(header.config),
+        }
+    }
+
     pub fn format_version(&self) -> u16 {
         self.header.format_version()
     }
@@ -1874,6 +1897,44 @@ pub fn roll_in(
     active: ActiveSegment,
     successor_id: Uuid,
 ) -> VtopLogResult<(SegmentReader, ActiveSegment)> {
+    roll_in_with(env, active, successor_id, None)
+}
+
+/// A successor configuration for a reconfiguring roll (#314), in the format
+/// of the tail it replaces. Pre-validated by the caller UNDER THAT FORMAT'S
+/// RULES — validation cannot live here, because by the time this is applied
+/// the predecessor is already sealed, and a refusal at that point leaves the
+/// range with no tail.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SuccessorConfig {
+    V1(SegmentConfig),
+    V2(SegmentConfigV2),
+}
+
+/// `roll_in`, with the successor's limits optionally replaced (#314).
+///
+/// The override changes ONLY the config the successor's header records; the
+/// descriptor, format, producer frontier and sidecar handling are byte-for-
+/// byte the inheritance path, because the one subtle part of rolling — the
+/// CLONED-not-taken producer maps below — must not exist twice.
+pub(crate) fn roll_in_with(
+    env: &Env,
+    active: ActiveSegment,
+    successor_id: Uuid,
+    config_override: Option<SuccessorConfig>,
+) -> VtopLogResult<(SegmentReader, ActiveSegment)> {
+    // A mismatched override is a programming error in the caller, refused
+    // BEFORE the seal below makes the range tail-less.
+    match (&config_override, active.header.format_version()) {
+        (None, _)
+        | (Some(SuccessorConfig::V1(_)), FORMAT_VERSION)
+        | (Some(SuccessorConfig::V2(_)), FORMAT_VERSION_V2) => {}
+        (Some(_), version) => {
+            return Err(LogError::InvalidConfig(format!(
+                "the successor config's format does not match the tail's format v{version}"
+            )));
+        }
+    }
     let directory = active
         .path
         .parent()
@@ -1903,13 +1964,21 @@ pub fn roll_in(
             .map(|(mut descriptor, config)| {
                 descriptor.segment_id = successor_id;
                 descriptor.base_offset = base_offset;
+                let config = match config_override {
+                    Some(SuccessorConfig::V2(replacement)) => replacement,
+                    _ => config,
+                };
                 (descriptor, config)
             });
     let v1 = if v2.is_none() {
         let mut descriptor = active.descriptor().clone();
         descriptor.segment_id = successor_id;
         descriptor.base_offset = base_offset;
-        Some((descriptor, active.config()))
+        let config = match config_override {
+            Some(SuccessorConfig::V1(replacement)) => replacement,
+            _ => active.config(),
+        };
+        Some((descriptor, config))
     } else {
         None
     };
@@ -1943,6 +2012,48 @@ pub fn roll_in(
     successor.producer_epochs = epochs;
     successor.inherited = inherited;
     Ok((sealed, successor))
+}
+
+/// Replace an EMPTY tail's header atomically, in place (#314).
+///
+/// Rolling is the wrong tool for a tail holding no records: sealing it would
+/// leave an empty sealed segment and a successor at the identical base — the
+/// exact no-op `SegmentSet::roll` refuses. But an empty tail is a real state
+/// an operator reconfigures (a range created before its first traffic, or a
+/// crash landing between a roll's seal and its append), so the header is
+/// rewritten instead: an empty active file IS its encoded header, the
+/// descriptor and format stay untouched, and `write_atomic`'s temp-rename
+/// shape means an interruption is swept at the next open rather than read.
+pub(crate) fn rewrite_empty_header_in_place(
+    env: &Env,
+    active: ActiveSegment,
+    config: SuccessorConfig,
+) -> VtopLogResult<ActiveSegment> {
+    if active.next_offset() != active.header.base_offset() {
+        return Err(LogError::InvalidConfig(
+            "only an empty tail may have its header rewritten; a tail with records rolls"
+                .to_owned(),
+        ));
+    }
+    let path = active.path.clone();
+    let encoded = match (&active.header, config) {
+        (AnyHeader::V1(header), SuccessorConfig::V1(config)) => {
+            encode_header(&SegmentHeader::new(header.descriptor.clone(), config))?
+        }
+        (AnyHeader::V2(header), SuccessorConfig::V2(config)) => {
+            encode_header_v2(&SegmentHeaderV2::new(header.descriptor.clone(), config))?
+        }
+        _ => {
+            return Err(LogError::InvalidConfig(
+                "the replacement config's format does not match the tail's".to_owned(),
+            ));
+        }
+    };
+    // The open handle is released BEFORE the rename lands, so the recovered
+    // tail below is the only writer the file has ever had two of.
+    drop(active);
+    write_atomic(env, &path, &encoded)?;
+    ActiveSegment::recover_in(env, &path)
 }
 
 /// Open a new active tail immediately after a SEALED segment, inheriting the

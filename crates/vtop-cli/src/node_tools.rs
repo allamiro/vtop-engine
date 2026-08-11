@@ -75,6 +75,43 @@ pub enum NodeCommand {
         #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
         timeout_seconds: u64,
     },
+    /// Change a range's roll thresholds by rolling once (#314).
+    ///
+    /// A segment's limits live in its header and are carried forward at every
+    /// roll, so editing the node's YAML changes nothing for a range that
+    /// already exists. This command is the contract for changing them: it
+    /// validates the new thresholds under the range's ACTUAL format, seals
+    /// the tail, opens a successor under the new limits, and exits. No
+    /// existing header is touched — every sealed segment keeps describing
+    /// exactly the records it holds — and because the new limits live in the
+    /// new tail's header, reopen, adoption, and cross-segment truncation all
+    /// carry them without remembering anything.
+    ///
+    /// OPERATES ON A STOPPED NODE'S DIRECTORY, like `repair`: a roll races a
+    /// live appender, and the node reads its thresholds once at open. The
+    /// workflow is: stop the node, reconfigure, start it — and update the
+    /// node YAML to match, so a LATER recreation from empty starts at the
+    /// same limits.
+    ReconfigureRange {
+        /// The data directory of the stopped node whose range to reconfigure.
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// New per-record ceiling in bytes. Absent thresholds keep the
+        /// tail's current value.
+        #[arg(long)]
+        max_record_bytes: Option<u32>,
+        /// New per-group ceiling in bytes. Must fit one framed record; the
+        /// frame overhead differs between the v1 and v2 formats and is
+        /// checked against the range's actual one.
+        #[arg(long)]
+        max_group_bytes: Option<u64>,
+        /// New per-segment byte ceiling — the roll threshold.
+        #[arg(long)]
+        max_segment_bytes: Option<u64>,
+        /// New per-segment record ceiling.
+        #[arg(long)]
+        max_segment_records: Option<u64>,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -425,7 +462,149 @@ async fn run_inner(command: NodeCommand, json: bool) -> Result<i32, String> {
             )
             .await
         }
+        NodeCommand::ReconfigureRange {
+            data_dir,
+            max_record_bytes,
+            max_group_bytes,
+            max_segment_bytes,
+            max_segment_records,
+        } => reconfigure_range(
+            &data_dir,
+            vtop_log::RollThresholds {
+                max_record_bytes,
+                max_group_bytes,
+                max_segment_bytes,
+                max_segment_records,
+            },
+            json,
+        ),
     }
+}
+
+/// The four thresholds of one header, format-independent, for reporting.
+fn limits_of(set: &SegmentSet) -> (u16, u32, u64, u64, u64) {
+    match set.active().config_v2() {
+        Some(config) => (
+            vtop_log::FORMAT_VERSION_V2,
+            config.max_record_bytes,
+            config.max_group_bytes,
+            config.max_segment_bytes,
+            config.max_segment_records,
+        ),
+        None => {
+            let config = set.active().config();
+            (
+                1,
+                config.max_record_bytes,
+                config.max_group_bytes,
+                config.max_segment_bytes,
+                config.max_segment_records,
+            )
+        }
+    }
+}
+
+fn reconfigure_range(
+    data_dir: &Path,
+    thresholds: vtop_log::RollThresholds,
+    json: bool,
+) -> Result<i32, String> {
+    if thresholds == vtop_log::RollThresholds::default() {
+        return Err(
+            "no threshold given; pass at least one of --max-record-bytes, --max-group-bytes, \
+             --max-segment-bytes, --max-segment-records"
+                .to_owned(),
+        );
+    }
+    // THE SAME LOCK REPAIR TAKES, deliberately: both commands mutate the
+    // directory's segment layout, and two of them interleaving would race
+    // each other exactly as two repairs would. Sharing the file serializes
+    // them, and `flock` means a crashed command releases it.
+    let lock_handle = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(data_dir.join(LOCK_FILE))
+        .map_err(|error| format!("open the lock in {}: {error}", data_dir.display()))?;
+    rustix::fs::flock(
+        &lock_handle,
+        rustix::fs::FlockOperation::NonBlockingLockExclusive,
+    )
+    .map_err(|error| {
+        format!(
+            "another repair or reconfigure is already running against {} ({error}); wait for \
+             it to finish",
+            data_dir.display()
+        )
+    })?;
+
+    let env = Env::real();
+    let mut set = SegmentSet::open_in(&env, data_dir)
+        .map_err(|error| format!("open the range in {}: {error}", data_dir.display()))?
+        .ok_or_else(|| {
+            format!(
+                "no range found in {}; reconfigure changes an EXISTING range's thresholds — a \
+                 range not yet created takes its limits from the node YAML at first start",
+                data_dir.display()
+            )
+        })?;
+
+    let before = limits_of(&set);
+    let outcome = set
+        .reconfigure_minting(thresholds)
+        .map_err(|error| error.to_string())?;
+    let after = limits_of(&set);
+
+    let describe = |limits: (u16, u32, u64, u64, u64)| {
+        serde_json::json!({
+            "max_record_bytes": limits.1,
+            "max_group_bytes": limits.2,
+            "max_segment_bytes": limits.3,
+            "max_segment_records": limits.4,
+        })
+    };
+    let (outcome_name, successor_base) = match outcome {
+        vtop_log::ReconfigureOutcome::Unchanged => ("unchanged", None),
+        vtop_log::ReconfigureOutcome::Rolled { successor_base } => ("rolled", Some(successor_base)),
+        vtop_log::ReconfigureOutcome::RewrittenInPlace => ("rewritten_in_place", None),
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "outcome": outcome_name,
+                "format_version": before.0,
+                "successor_base": successor_base,
+                "previous": describe(before),
+                "current": describe(after),
+            }))
+            .map_err(|error| error.to_string())?
+        );
+    } else {
+        match outcome {
+            vtop_log::ReconfigureOutcome::Unchanged => {
+                println!("unchanged: the tail already runs these thresholds; nothing was sealed")
+            }
+            vtop_log::ReconfigureOutcome::Rolled { successor_base } => println!(
+                "rolled: tail sealed, successor opened at offset {successor_base} under the \
+                 new thresholds"
+            ),
+            vtop_log::ReconfigureOutcome::RewrittenInPlace => println!(
+                "rewritten in place: the tail holds no records, so its header now carries the \
+                 new thresholds without sealing an empty segment"
+            ),
+        }
+        println!(
+            "thresholds (format v{}): record {} -> {}, group {} -> {}, segment bytes {} -> {}, \
+             segment records {} -> {}",
+            before.0, before.1, after.1, before.2, after.2, before.3, after.3, before.4, after.4
+        );
+        println!(
+            "remember to update the node YAML to match: a recreation from an empty directory \
+             starts from the YAML, not from this range's headers"
+        );
+    }
+    Ok(0)
 }
 
 /// The three files `node repair` writes into a destination, and the only names
@@ -1315,5 +1494,89 @@ replicas: []
         // together rather than each correct alone.
         check_prior_divergence(dir.path(), &diverged)
             .expect_err("a recorded verdict must refuse the next repair");
+    }
+
+    // ----- reconfigure-range (#314) ----------------------------------------
+
+    fn create_range(directory: &std::path::Path) -> SegmentSet {
+        SegmentSet::create_in(
+            &Env::real(),
+            directory,
+            vtop_log::SegmentDescriptor {
+                segment_id: Uuid::from_u128(81),
+                topic: "telemetry".into(),
+                topic_epoch: 1,
+                lineage: vtop_log::RangeLineage::root(Uuid::from_u128(82)),
+                base_offset: 0,
+            },
+            vtop_log::SegmentConfig {
+                max_record_bytes: 256,
+                max_group_bytes: 512,
+                max_segment_bytes: 512,
+                max_segment_records: 100,
+                index_stride: 2,
+            },
+        )
+        .expect("the test range must build through the real create path")
+    }
+
+    /// The operator path end to end: a directory built through the real
+    /// create path, reconfigured through the command's own function, opened
+    /// again to prove the change is what a restarted node will read.
+    #[test]
+    fn reconfigure_range_applies_and_reports_through_the_operator_path() {
+        let directory = tempfile::tempdir().unwrap();
+        drop(create_range(directory.path()));
+
+        let code = reconfigure_range(
+            directory.path(),
+            vtop_log::RollThresholds {
+                max_segment_bytes: Some(4096),
+                max_group_bytes: Some(1024),
+                ..Default::default()
+            },
+            false,
+        )
+        .expect("reconfiguring a healthy stopped range must succeed");
+        assert_eq!(code, 0);
+
+        let reopened = SegmentSet::open_in(&Env::real(), directory.path())
+            .unwrap()
+            .expect("the reconfigured range must still open");
+        assert_eq!(
+            reopened.active().config().max_segment_bytes,
+            4096,
+            "the next node start reads the limits this command just wrote"
+        );
+    }
+
+    #[test]
+    fn reconfigure_range_refuses_an_empty_override() {
+        let directory = tempfile::tempdir().unwrap();
+        drop(create_range(directory.path()));
+        let error = reconfigure_range(directory.path(), vtop_log::RollThresholds::default(), false)
+            .expect_err("an override that names no threshold has nothing to apply");
+        assert!(
+            error.contains("--max-"),
+            "the refusal must name the flags that fix it, got: {error}"
+        );
+    }
+
+    #[test]
+    fn reconfigure_range_refuses_a_directory_holding_no_range() {
+        let directory = tempfile::tempdir().unwrap();
+        let error = reconfigure_range(
+            directory.path(),
+            vtop_log::RollThresholds {
+                max_segment_bytes: Some(4096),
+                ..Default::default()
+            },
+            false,
+        )
+        .expect_err("an empty directory holds nothing to reconfigure");
+        assert!(
+            error.contains("node YAML"),
+            "the refusal must point a not-yet-created range at the YAML path, got: {error}"
+        );
     }
 }
