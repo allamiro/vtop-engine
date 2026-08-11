@@ -1244,13 +1244,14 @@ async fn run_candidate(
     // mid-fsync holds the lease view for its whole critical section, and a
     // probe landing then must not drain a healthy leader (review).
     let probe_last = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let probe_last_probe = Arc::clone(&probe_last);
     observability.set_readiness_probe(Arc::new(move || {
         match probe_flag.load(std::sync::atomic::Ordering::Relaxed) {
             1 => match probe_slot.current() {
                 Some(broker) => match probe_meta.try_snapshot() {
                     Some((epoch, live)) => {
                         let ready = live && epoch == broker.held_fencing_epoch();
-                        probe_last.store(ready, std::sync::atomic::Ordering::Relaxed);
+                        probe_last_probe.store(ready, std::sync::atomic::Ordering::Relaxed);
                         if ready {
                             vtop_observe::Readiness::Ready
                         } else {
@@ -1261,7 +1262,7 @@ async fn run_candidate(
                         }
                     }
                     None => {
-                        if probe_last.load(std::sync::atomic::Ordering::Relaxed) {
+                        if probe_last_probe.load(std::sync::atomic::Ordering::Relaxed) {
                             vtop_observe::Readiness::Ready
                         } else {
                             vtop_observe::Readiness::not_ready(
@@ -1271,7 +1272,7 @@ async fn run_candidate(
                     }
                 },
                 None => {
-                    probe_last.store(false, std::sync::atomic::Ordering::Relaxed);
+                    probe_last_probe.store(false, std::sync::atomic::Ordering::Relaxed);
                     vtop_observe::Readiness::not_ready(
                         "leading, but the broker is absent".to_owned(),
                     )
@@ -1388,6 +1389,10 @@ async fn run_candidate(
                     (Phase::Following(_), RoleVerdict::Lead { fencing_epoch, committed_offset }) => {
                         role_flag.store(2, std::sync::atomic::Ordering::Relaxed);
                         switching.transitioning();
+                        // The cached probe verdict belongs to the role that
+                        // decided it (review): a fresh promotion must start
+                        // fail-closed, not inherit the prior leader's green.
+                        probe_last.store(false, std::sync::atomic::Ordering::Relaxed);
                         view.clear();
                         publisher.set_target(None);
                         let Phase::Following(follower) =
@@ -1496,7 +1501,10 @@ async fn run_candidate(
                                 Arc::clone(&built.broker),
                             ));
                         if !publisher.complete_promotion(
-                            Arc::clone(&broker_publisher)
+                            Arc::new(LeadingDemoteAdapter {
+                                broker: Arc::clone(&built.broker),
+                                inner: Arc::clone(&broker_publisher),
+                            })
                                 as Arc<dyn crate::lease_agent::LeasePublisher>,
                             fencing_epoch,
                             committed_offset,
@@ -1563,6 +1571,10 @@ async fn run_candidate(
                         // broker, so in-flight requests are refusing.
                         slot.clear();
                         switching.transitioning();
+                        // The cached probe verdict belongs to the role that
+                        // decided it (review): a fresh promotion must start
+                        // fail-closed, not inherit the prior leader's green.
+                        probe_last.store(false, std::sync::atomic::Ordering::Relaxed);
                         view.clear();
                         publisher.set_target(None);
                         let Phase::Leading { broker, .. } =
@@ -2038,6 +2050,43 @@ enum RoleVerdict {
     Follow,
 }
 
+/// The LEADING candidate's demotion dialect (#284): fence what THIS node
+/// held, not the epoch the rival was granted. run_leader's static broker
+/// clears through the rival's epoch, and that is correct THERE — the
+/// process never follows, so poisoning reactivation at the rival's epoch
+/// costs nothing. A candidate becomes the rival's follower NEXT:
+/// `clear_lease` records its epoch in the shared view's `released_through`,
+/// and recording the RIVAL's would leave the successor's own grant
+/// unactivatable — a deposed but otherwise healthy candidate refusing
+/// every append for the successor's entire epoch (review). Clearing the
+/// broker's own held epoch fences it just as surely, and leaves the
+/// successor's epoch free to activate the rebuilt follower.
+struct LeadingDemoteAdapter {
+    broker: Arc<LocalBroker>,
+    inner: Arc<crate::lease_agent::BrokerLeasePublisher>,
+}
+
+impl crate::lease_agent::LeasePublisher for LeadingDemoteAdapter {
+    fn promote(&self, fencing_epoch: u64, committed_offset: Option<u64>) {
+        crate::lease_agent::LeasePublisher::promote(
+            self.inner.as_ref(),
+            fencing_epoch,
+            committed_offset,
+        );
+    }
+
+    fn demote(&self, _rival_epoch: u64) {
+        crate::lease_agent::LeasePublisher::demote(
+            self.inner.as_ref(),
+            self.broker.held_fencing_epoch(),
+        );
+    }
+
+    fn suspend(&self, fencing_epoch: u64) {
+        crate::lease_agent::LeasePublisher::suspend(self.inner.as_ref(), fencing_epoch);
+    }
+}
+
 /// The candidate's lease publisher: a VERDICT RECORDER, not a role toggle
 /// (#284). Promotion cannot take effect here — the leader it promotes does
 /// not exist until the supervisor builds it — so `promote` only records,
@@ -2487,6 +2536,51 @@ mod tests {
                 Some(41)
             ),
             "the latest recorded grant completes"
+        );
+    }
+
+    /// A deposed leading candidate must remain able to FOLLOW its successor.
+    /// The leading demotion dialect fences the epoch this node held, never
+    /// the rival's: `clear_lease` records its argument in the shared view's
+    /// `released_through`, and recording the rival's epoch would leave the
+    /// successor's own grant unactivatable — a healthy replica refusing
+    /// every append for the successor's entire epoch.
+    #[test]
+    fn a_deposed_leader_fences_its_own_epoch_so_the_successors_grant_activates() {
+        use crate::lease_agent::LeasePublisher;
+        let dir = tempfile::tempdir().unwrap();
+        let range = test_range();
+        let (set, _) = open_range(dir.path(), Uuid::from_u128(0xD9), &range, test_roll()).unwrap();
+        let epochs = ProducerEpochJournal::open(dir.path().join("epochs")).unwrap();
+        let meta = MetaFencingEpoch::new_inactive(0);
+        let broker = Arc::new(
+            LocalBroker::with_meta_fencing_epoch(set, epochs, range, 0, meta.clone()).unwrap(),
+        );
+        let adapter = LeadingDemoteAdapter {
+            broker: Arc::clone(&broker),
+            inner: Arc::new(crate::lease_agent::BrokerLeasePublisher::new(Arc::clone(
+                &broker,
+            ))),
+        };
+        adapter.promote(1, None);
+        assert_eq!(
+            meta.try_snapshot(),
+            Some((1, true)),
+            "the grant at epoch 1 activates the shared view"
+        );
+        adapter.demote(2);
+        assert_eq!(
+            meta.try_snapshot(),
+            Some((1, false)),
+            "the deposed broker is fenced — its own epoch is no longer live"
+        );
+        meta.set(2);
+        assert_eq!(
+            meta.try_snapshot(),
+            Some((2, true)),
+            "the successor's grant must still activate the shared view: fencing the \
+             rival's epoch instead of our own would pin this replica out of the range \
+             for the successor's entire reign"
         );
     }
 

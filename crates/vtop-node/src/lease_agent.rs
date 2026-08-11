@@ -623,6 +623,13 @@ pub struct LeaseAgent {
     /// refuses every append, and reporting ready before that first read is
     /// the same false green the static follower already refuses to show.
     ready: Option<vtop_observe::ReadinessGate>,
+    /// A persistent handle on the same gate, kept so a range that goes
+    /// missing AFTER the gate opened can revoke readiness — the consumable
+    /// `ready` above only governs the first open (review).
+    gate: Option<vtop_observe::ReadinessGate>,
+    /// True while readiness is being withheld because of a missing range,
+    /// so recovery re-marks the gate exactly once.
+    gate_degraded: bool,
     /// True when the last completed exchange said the RANGE ITSELF is gone.
     /// That answer must not open the readiness gate: a candidate configured
     /// with a deleted or unknown range is a configuration fault, and the
@@ -696,6 +703,8 @@ impl LeaseAgent {
             },
             state: LeaseState::NotHeld,
             ready: None,
+            gate: None,
+            gate_degraded: false,
             range_missing: false,
             observed_rival: None,
             held_until_ms: None,
@@ -706,7 +715,8 @@ impl LeaseAgent {
     /// Open `gate` on the first completed metadata exchange (see the
     /// `ready` field for why a candidate is not ready before that).
     pub fn with_ready_gate(mut self, gate: vtop_observe::ReadinessGate) -> Self {
-        self.ready = Some(gate);
+        self.ready = Some(gate.clone());
+        self.gate = Some(gate);
         self
     }
 
@@ -742,10 +752,28 @@ impl LeaseAgent {
             }
             let delay = match self.step().await {
                 Ok(delay) => {
-                    if !self.range_missing {
+                    if self.range_missing {
+                        // Definitive, not transient: metadata answered and
+                        // said the range does not exist. Readiness is
+                        // withheld before the first open and REVOKED after
+                        // it — a node serving a deleted range is a
+                        // configuration fault however long it has been up
+                        // (review).
+                        if let Some(gate) = &self.gate {
+                            gate.mark_not_ready(
+                                "the configured range is missing from metadata".to_owned(),
+                            );
+                        }
+                        self.gate_degraded = true;
+                    } else {
                         if let Some(gate) = self.ready.take() {
                             gate.mark_ready();
+                        } else if self.gate_degraded {
+                            if let Some(gate) = &self.gate {
+                                gate.mark_ready();
+                            }
                         }
+                        self.gate_degraded = false;
                     }
                     delay
                 }
@@ -995,6 +1023,19 @@ impl LeaseAgent {
                     // A range deleted out from under its holder is an operator
                     // action; the broker must not keep serving it.
                     self.publish_lost(fencing_epoch);
+                } else if let Some(epoch) = self.observed_rival {
+                    // A FOLLOWING view fails closed on the same answer:
+                    // without this, the last observed rival epoch stays
+                    // active and the node keeps accepting authenticated
+                    // replication for a range metadata has deleted (review).
+                    // Suspend, not demote — through the candidate's
+                    // observation dialect a demotion MEANS "rival grant,
+                    // serve this epoch", while suspension is the fail-closed
+                    // verb in both dialects, and it leaves the view
+                    // reactivatable should the range be recreated and a new
+                    // grant observed. Idempotent, so repeating it every
+                    // round the range stays missing is free.
+                    self.promoter.publisher.suspend(epoch);
                 }
                 Ok(self.config.poll_interval)
             }
