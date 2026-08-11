@@ -4,17 +4,38 @@
 #   docker compose -f benchmarks/docker-compose.benchmark.yml up -d
 #   python3 benchmarks/run_benchmark.py benchmarks/scenarios/07-backend-minio-jsonl.yaml
 #   docker compose -f benchmarks/docker-compose.benchmark.yml down
+#
+# SECURITY (issue #81): same baseline as the lab compose. Ports bind to
+# LOOPBACK by default (the runner talks to 127.0.0.1:9000, so nothing off-box
+# ever needed them); credentials are lab-grade and overridable via the same
+# MINIO_ROOT_USER / MINIO_ROOT_PASSWORD variables the lab uses. Re-expose
+# deliberately, only on a network you trust:
+#   VTOP_BIND_ADDR=0.0.0.0 docker compose -f benchmarks/docker-compose.benchmark.yml up -d
+#
+# Override CHANNELS, precisely: exported shell variables, or a .env file in
+# THIS directory — compose resolves a -f file's project directory here, so
+# the repository root's .env is NOT read for this stack. The benchmark
+# runner (benchmarks/lib/engine.py) reads the same two channels, so the
+# client it launches always authenticates with the credentials this server
+# was started with.
 services:
   minio:
     image: minio/minio:latest
     container_name: vtop-bench-minio
     command: server /data --console-address ":9001"
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "${VTOP_BIND_ADDR:-127.0.0.1}:9000:9000"
+      - "${VTOP_BIND_ADDR:-127.0.0.1}:9001:9001"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    pids_limit: 512
+    mem_limit: 1g
+    read_only: true
+    tmpfs: [/tmp]
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 5s
@@ -25,6 +46,21 @@ services:
 
   minio-init:
     image: minio/mc:latest
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    pids_limit: 256
+    mem_limit: 256m
+    read_only: true
+    tmpfs: [/tmp]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      # The image's /root has no owner write bit; root only ever wrote its
+      # config there through CAP_DAC_OVERRIDE, which cap_drop removes. Point
+      # mc at a directory whose write bit is real instead of restoring the
+      # capability.
+      HOME: /tmp
     depends_on:
       minio:
         condition: service_healthy
@@ -32,7 +68,7 @@ services:
     command:
       - |
         set -e
-        mc alias set local http://minio:9000 minioadmin minioadmin
+        mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"
         for b in telemetry-data telemetry-cef telemetry-leef telemetry-json telemetry-jsonl telemetry-syslog telemetry-raw; do
           mc mb --ignore-existing "local/$$b"
         done

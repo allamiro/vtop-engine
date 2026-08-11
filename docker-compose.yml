@@ -21,6 +21,10 @@
 #     producing/consuming from the HOST via 127.0.0.1:9092 does not work — run
 #     host-side clients inside the compose network, like scripts/e2e-smoke.sh
 #     does. That was true before the loopback bind; the bind changes nothing.
+#   * Every service drops ALL capabilities, runs under a PID and memory bound,
+#     and joins only the network its role needs (see `networks:` at the
+#     bottom). Root filesystems are read-only wherever the image tolerates it;
+#     the exceptions state their reason in place.
 
 services:
   kafka:
@@ -30,7 +34,13 @@ services:
       - "${VTOP_BIND_ADDR:-127.0.0.1}:9092:9092"
     security_opt:
       - no-new-privileges:true
+    cap_drop: [ALL]
     pids_limit: 1024  # JVM thread count; still bounded vs unlimited
+    mem_limit: 2g
+    networks: [kafka-net]
+    # NOT read_only: the broker's data (log.dirs) lives in the container
+    # filesystem — this lab mounts no volume for it — and a read-only root
+    # would move it to tmpfs, silently changing what a `restart` preserves.
     environment:
       # KRaft single-node (no ZooKeeper). The official Apache Kafka image uses
       # KAFKA_* env vars (not the Bitnami KAFKA_CFG_* prefix) and ships the CLI
@@ -64,7 +74,12 @@ services:
       - "${VTOP_BIND_ADDR:-127.0.0.1}:8080:8080"
     security_opt:
       - no-new-privileges:true
+    cap_drop: [ALL]
     pids_limit: 1024  # JVM
+    mem_limit: 1g
+    read_only: true
+    tmpfs: [/tmp]
+    networks: [kafka-net]
     environment:
       KAFKA_CLUSTERS_0_NAME: vtop-lab
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
@@ -80,7 +95,12 @@ services:
     container_name: vtop-kafka-init
     security_opt:
       - no-new-privileges:true
+    cap_drop: [ALL]
     pids_limit: 512
+    mem_limit: 1g
+    read_only: true
+    tmpfs: [/tmp]
+    networks: [kafka-net]
     depends_on:
       kafka:
         condition: service_healthy
@@ -110,7 +130,12 @@ services:
       - "${VTOP_BIND_ADDR:-127.0.0.1}:9001:9001"
     security_opt:
       - no-new-privileges:true
+    cap_drop: [ALL]
     pids_limit: 512
+    mem_limit: 1g
+    read_only: true
+    tmpfs: [/tmp]
+    networks: [storage-net]
     environment:
       # LAB-GRADE credentials, overridable via .env (see .env.example). If you
       # change them, set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY to match —
@@ -139,10 +164,20 @@ services:
     container_name: vtop-minio-init
     security_opt:
       - no-new-privileges:true
+    cap_drop: [ALL]
     pids_limit: 256
+    mem_limit: 256m
+    read_only: true
+    tmpfs: [/tmp]
+    networks: [storage-net]
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      # The image's /root has no owner write bit; root only ever wrote its
+      # config there through CAP_DAC_OVERRIDE, which cap_drop removes. Point
+      # mc at a directory whose write bit is real instead of restoring the
+      # capability.
+      HOME: /tmp
     depends_on:
       minio:
         condition: service_healthy
@@ -172,7 +207,14 @@ services:
     container_name: vtop-engine
     security_opt:
       - no-new-privileges:true
+    cap_drop: [ALL]
     pids_limit: 512
+    mem_limit: 2g
+    read_only: true
+    tmpfs: [/tmp]
+    # Both planes deliberately: the engine is the only service that consumes
+    # from Kafka AND uploads to object storage, so it alone joins both.
+    networks: [kafka-net, storage-net]
     depends_on:
       kafka:
         condition: service_healthy
@@ -220,7 +262,12 @@ services:
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
+    cap_drop: [ALL]
     pids_limit: 512
+    mem_limit: 1g
+    read_only: true
+    tmpfs: [/tmp]
+    networks: [kafka-net]
     depends_on:
       kafka:
         condition: service_healthy
@@ -237,7 +284,13 @@ services:
       - ./docker/load-generator.sh:/load-generator.sh:ro
     # Put the Apache Kafka CLI tools on PATH so the generator's bare
     # kafka-topics.sh / kafka-console-producer.sh calls resolve.
-    entrypoint: ["/bin/bash", "-c", "export PATH=/opt/kafka/bin:$PATH; exec /load-generator.sh"]
+    #
+    # $$PATH, escaped: a single $ is interpolated by compose AT PARSE TIME
+    # with the HOST's PATH, which silently replaces the container's. That
+    # leaked PATH usually lacks /bin, where this image keeps bash — so the
+    # generator's `#!/usr/bin/env bash` found no bash at all, on any machine
+    # whose host PATH diverged from the container's layout.
+    entrypoint: ["/bin/bash", "-c", "export PATH=/opt/kafka/bin:$$PATH; exec /load-generator.sh"]
 
   # Optional collector: an rsyslog instance writing into the spool directory.
   optional-rsyslog:
@@ -247,8 +300,25 @@ services:
     security_opt:
       - no-new-privileges:true
     pids_limit: 256
+    mem_limit: 256m
+    # NOT read_only and NOT cap-dropped: the appliance's init generates its
+    # rsyslog config in place and adjusts ownership as it starts, both of
+    # which a read-only root or an empty capability set refuse. Its network
+    # is internal instead — the container's lab role is writing the shared
+    # spool volume, so nothing routes to or from it.
+    networks: [syslog-net]
     volumes:
       - ./data/spool:/var/log/spool
+
+# Segmented by role (issue #81): the broker plane and the storage plane are
+# separate networks, and only the engine — the one service whose job spans
+# both — joins both. A service that gets compromised in one plane has no
+# route into the other.
+networks:
+  kafka-net:
+  storage-net:
+  syslog-net:
+    internal: true
 
 volumes:
   minio-data:

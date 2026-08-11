@@ -444,15 +444,24 @@ only schema `USAGE` and `SELECT, INSERT, UPDATE` on `batches`. See
 
 The Docker lab provides Kafka, MinIO, seeded telemetry, and the VTOP engine.
 
-**Local-only by default (issue #81):** every published port binds to
-`127.0.0.1`, so the lab is not reachable from the network. The credentials
-below are lab-grade public defaults — the loopback bind, not the password, is
-the security boundary. To deliberately re-expose the lab on a trusted network:
+**Local-only by default (issue #81):** every published port — the lab's, the
+observability stack's, and the benchmark backend's — binds to `127.0.0.1`, so
+none of it is reachable from the network. The credentials below are lab-grade
+public defaults — the loopback bind, not the password, is the security
+boundary. To deliberately re-expose the lab on a trusted network:
 `VTOP_BIND_ADDR=0.0.0.0 docker compose up -d`. All lab credentials are
 overridable via `.env` (`MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD`,
-`GRAFANA_ADMIN_USER` / `GRAFANA_ADMIN_PASSWORD` — see `.env.example`). The
-optional observability stack's Alloy mounts the host Docker socket read-only;
-treat that as a privileged handle — it can read every container's logs.
+`GRAFANA_ADMIN_USER` / `GRAFANA_ADMIN_PASSWORD` — see `.env.example`).
+
+Every container also runs against a hardening baseline: all capabilities
+dropped, `no-new-privileges`, PID and memory limits, a read-only root
+filesystem wherever the image tolerates one (the exceptions state their
+reason in the compose file), and role-segmented networks — the broker plane,
+the storage plane, and the observability plane are separate, and only the
+services whose job spans planes join more than one. The optional
+observability stack's Alloy mounts the host Docker socket read-only; treat
+that as a privileged handle — it can read every container's logs, which is
+why that stack stays lab-only.
 
 | Service | Purpose |
 |---|---|

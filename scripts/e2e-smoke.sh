@@ -64,6 +64,13 @@ chmod -R 0777 data
 bash docker/seed-events.sh json   200 > data/input/smoke.log
 bash docker/seed-events.sh cef    200 > data/input/smoke-cef
 bash docker/seed-events.sh syslog 200 > data/spool/smoke.log
+# A second chmod, AFTER seeding: the seeded files are created with the invoking
+# user's umask, and a restrictive one (077) writes sources the container's
+# unprivileged uid cannot read — the engine then skips every read cycle with
+# "Permission denied" while the chmod above, which ran before the files
+# existed, suggests the permissions were handled. CI never sees this because
+# runners default to umask 022.
+chmod -R a+r data/input data/spool
 pass "seeded file + syslog sources (600 records)"
 
 # ---------------------------------------------------------------------------
@@ -135,13 +142,55 @@ info "4/6  Asserting objects AND manifests landed in MinIO"
 # ---------------------------------------------------------------------------
 # An object without its manifest is unusable: the manifest carries the checksum a
 # consumer verifies against. Assert BOTH, per format.
+# The lab is segmented by role (issue #81), so the engine sits on TWO
+# networks and `Networks` names both. The clients below need the STORAGE
+# plane: the mc listing talks to minio, and the metrics check talks to the
+# engine, which also lives there. Picking whichever name came first would
+# work or fail depending on Docker's ordering — select the storage network
+# by name instead.
 NET="$("${COMPOSE[@]}" ps --format json vtop-engine 2>/dev/null | head -1 | python3 -c 'import json,sys
-try: print(json.loads(sys.stdin.read()).get("Networks",""))
-except Exception: print("")' 2>/dev/null || true)"
-NET="${NET:-vtop-engine_default}"
+try:
+    nets = json.loads(sys.stdin.read()).get("Networks", "")
+    if isinstance(nets, list):
+        nets = ",".join(nets)
+    names = [n.strip() for n in nets.split(",") if n.strip()]
+    storage = [n for n in names if "storage" in n]
+    print((storage or names or [""])[0])
+except Exception:
+    print("")' 2>/dev/null || true)"
+NET="${NET:-vtop-engine_storage-net}"
 
-listing=$(docker run --rm --network "$NET" --entrypoint /bin/sh minio/mc:latest -c \
-  'mc alias set local http://minio:9000 minioadmin minioadmin >/dev/null 2>&1; mc ls --recursive local' 2>/dev/null || true)
+# The same override variables the compose files honor, THROUGH THE SAME
+# CHANNELS and with the same precedence. compose auto-loads ./.env for the
+# services; Bash does not — but .env is COMPOSE DATA, not shell code, so it
+# must be parsed, never sourced: the shipped .env.example carries an unquoted
+# multi-word FORMATS= line that sourcing would execute as a command, killing
+# this script under set -e, and sourcing would also let the filed value
+# clobber an exported one, inverting compose's shell-wins precedence. Only
+# the two keys this client needs are read, one layer of matching quotes
+# stripped as compose strips them, and only when the shell did not set the
+# variable at all — a blank-but-set export masks .env for compose, so it
+# must mask it here too (the ${VAR:-default} at the use site then maps blank
+# to the lab default on both sides).
+env_default() { # <key> — the value filed in ./.env, one quote layer stripped
+  local value
+  value="$(sed -n "s/^$1=//p" .env | tail -1)"
+  case "$value" in
+    \"*\") value="${value#\"}"; value="${value%\"}" ;;
+    \'*\') value="${value#\'}"; value="${value%\'}" ;;
+  esac
+  printf '%s' "$value"
+}
+if [ -f .env ]; then
+  MINIO_ROOT_USER="${MINIO_ROOT_USER-$(env_default MINIO_ROOT_USER)}"
+  MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD-$(env_default MINIO_ROOT_PASSWORD)}"
+fi
+listing=$(docker run --rm --network "$NET" \
+  -e "MINIO_ROOT_USER=${MINIO_ROOT_USER:-minioadmin}" \
+  -e "MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-minioadmin}" \
+  -e HOME=/tmp \
+  --entrypoint /bin/sh minio/mc:latest -c \
+  'mc alias set local http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null 2>&1; mc ls --recursive local' 2>/dev/null || true)
 
 # Count DATA objects only: a manifest ends in `.manifest.json`, so a naive
 # extension match counts it twice and makes objects == 2x manifests.

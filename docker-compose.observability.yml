@@ -18,6 +18,11 @@
 # read every container's logs and metadata on the host. That alone makes this
 # stack lab-only.
 #
+# The stack lives on its own network. Only the two services whose job is to
+# OBSERVE the lab bridge into it: alloy joins the storage plane (it scrapes
+# the engine and MinIO there), and kafka-exporter joins the broker plane. A
+# compromised dashboard container has no route to the lab at all.
+#
 # Ports are deliberately off the defaults (3400 not 3000): 3000/8080 are common
 # and collide with other local stacks.
 #
@@ -46,7 +51,11 @@ services:
     container_name: vtop-kafka-exporter
     security_opt:
       - no-new-privileges:true
+    cap_drop: [ALL]
     pids_limit: 256
+    mem_limit: 256m
+    read_only: true
+    networks: [kafka-net, observability-net]
     command:
       - "--kafka.server=kafka:9092"
       - "--web.listen-address=:9308"
@@ -61,7 +70,17 @@ services:
     container_name: vtop-mimir
     security_opt:
       - no-new-privileges:true
+    cap_drop: [ALL]
     pids_limit: 512
+    mem_limit: 1g
+    read_only: true
+    tmpfs: [/tmp]
+    networks: [observability-net]
+    # The activity tracker writes ./metrics-activity.log RELATIVE to the
+    # working directory, which in this image is / — a read-only root would
+    # crash-loop it. Point the working directory at the data volume instead
+    # of giving the root filesystem back its write bit.
+    working_dir: /data
     command: ["-config.file=/etc/mimir/mimir.yaml"]
     volumes:
       - ./observability/mimir/mimir.yaml:/etc/mimir/mimir.yaml:ro
@@ -74,7 +93,12 @@ services:
     container_name: vtop-loki
     security_opt:
       - no-new-privileges:true
+    cap_drop: [ALL]
     pids_limit: 512
+    mem_limit: 1g
+    read_only: true
+    tmpfs: [/tmp]
+    networks: [observability-net]
     command: ["-config.file=/etc/loki/loki.yaml"]
     volumes:
       - ./observability/loki/loki.yaml:/etc/loki/loki.yaml:ro
@@ -87,7 +111,12 @@ services:
     container_name: vtop-tempo
     security_opt:
       - no-new-privileges:true
+    cap_drop: [ALL]
     pids_limit: 512
+    mem_limit: 1g
+    read_only: true
+    tmpfs: [/tmp]
+    networks: [observability-net]
     command: ["-config.file=/etc/tempo/tempo.yaml"]
     volumes:
       - ./observability/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
@@ -103,11 +132,25 @@ services:
     container_name: vtop-alloy
     security_opt:
       - no-new-privileges:true
+    cap_drop: [ALL]
     pids_limit: 512
+    mem_limit: 1g
+    read_only: true
+    tmpfs: [/tmp]
+    # The storage plane holds both scrape targets outside this stack: the
+    # engine's own /metrics and MinIO's. Kafka has no Prometheus endpoint —
+    # kafka-exporter covers that plane, so alloy itself never joins it.
+    networks: [observability-net, storage-net]
+    # Storage lives at /data, NOT the image's /var/lib/alloy/data: that image
+    # directory is owned alloy:alloy with mode 770 while the process runs as
+    # root (it must — the Docker socket is readable by root's owner bits
+    # alone), and a capability-less root cannot traverse a 770 directory it
+    # does not own. Moving the mount is least-privilege; restoring
+    # DAC_OVERRIDE would not be.
     command:
       - run
       - --server.http.listen-addr=0.0.0.0:12345
-      - --storage.path=/var/lib/alloy/data
+      - --storage.path=/data
       - /etc/alloy/config.alloy
     ports:
       - "${VTOP_BIND_ADDR:-127.0.0.1}:12345:12345"   # Alloy UI: shows which targets are actually UP
@@ -121,7 +164,7 @@ services:
     volumes:
       - ./observability/alloy/config.alloy:/etc/alloy/config.alloy:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - alloy-data:/var/lib/alloy/data
+      - alloy-data:/data
     depends_on:
       - mimir
       - loki
@@ -134,7 +177,12 @@ services:
     container_name: vtop-grafana
     security_opt:
       - no-new-privileges:true
+    cap_drop: [ALL]
     pids_limit: 512
+    mem_limit: 1g
+    read_only: true
+    tmpfs: [/tmp]
+    networks: [observability-net]
     ports:
       # Bound to LOOPBACK deliberately. Anonymous access below grants Editor
       # rights with no sign-in, so a 0.0.0.0 bind would let anyone routable to
@@ -191,7 +239,11 @@ services:
     container_name: vtop-grafana-seed
     security_opt:
       - no-new-privileges:true
+    cap_drop: [ALL]
     pids_limit: 128
+    mem_limit: 128m
+    read_only: true
+    networks: [observability-net]
     depends_on:
       - grafana
     entrypoint: ["/bin/sh", "/seed-dashboards.sh"]
@@ -206,6 +258,12 @@ services:
       - ./observability/grafana/dashboards:/dashboards:ro
     restart: "no"
 
+
+# kafka-net and storage-net come from the base file; this overlay is only ever
+# composed on top of it (its services depend on the lab's kafka), so the merge
+# always finds them.
+networks:
+  observability-net:
 
 volumes:
   mimir-data:
