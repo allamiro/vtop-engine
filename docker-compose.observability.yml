@@ -130,7 +130,7 @@ services:
 
   # --- Dashboards -----------------------------------------------------------
   grafana:
-    image: grafana/grafana:13.1.1
+    image: grafana/grafana:13.1.3
     container_name: vtop-grafana
     security_opt:
       - no-new-privileges:true
