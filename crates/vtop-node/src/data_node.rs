@@ -1573,12 +1573,24 @@ async fn run_candidate(
                             _replicas: built.replicas,
                         };
                     }
-                    (Phase::Leading { publisher: leader_publisher, .. },
+                    (Phase::Leading { broker, publisher: leader_publisher, .. },
                      RoleVerdict::Lead { fencing_epoch, committed_offset }) => {
                         // Re-promotion at a new epoch (a re-grant after a
-                        // suspension) completes against the standing leader.
-                        crate::lease_agent::LeasePublisher::promote(
-                            leader_publisher.as_ref(),
+                        // suspension) completes against the standing leader —
+                        // through the SAME atomic handoff as a fresh build
+                        // (review): a direct promote here bypassed the
+                        // demotion lock and ceilings, so a lease lost after
+                        // this verdict was read could be fenced by its
+                        // demotion and then reactivated by this stale
+                        // promotion until the queued Follow was processed.
+                        // A refusal publishes nothing; the queued verdict
+                        // decides what happens next.
+                        publisher.complete_promotion(
+                            Arc::new(LeadingDemoteAdapter {
+                                broker: Arc::clone(broker),
+                                inner: Arc::clone(leader_publisher),
+                            })
+                                as Arc<dyn crate::lease_agent::LeasePublisher>,
                             fencing_epoch,
                             committed_offset,
                         );
