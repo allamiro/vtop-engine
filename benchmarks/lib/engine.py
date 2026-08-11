@@ -82,8 +82,16 @@ def write_engine_config(scenario, work_dir: str, state_db: str,
 def _backend_env(scenario) -> dict[str, str]:
     env = dict(os.environ)
     if scenario.get("backend") == "minio":
-        env.setdefault("AWS_ACCESS_KEY_ID", "minioadmin")
-        env.setdefault("AWS_SECRET_ACCESS_KEY", "minioadmin")
+        # The benchmark compose lets an operator override the SERVER's
+        # credentials via MINIO_ROOT_USER / MINIO_ROOT_PASSWORD (issue #81).
+        # The client must follow the same variables: a literal default here
+        # made every upload against an overridden stack fail authentication,
+        # while the stack itself came up healthy and pointed suspicion at
+        # the scenario.
+        env.setdefault("AWS_ACCESS_KEY_ID",
+                       env.get("MINIO_ROOT_USER", "minioadmin"))
+        env.setdefault("AWS_SECRET_ACCESS_KEY",
+                       env.get("MINIO_ROOT_PASSWORD", "minioadmin"))
         env.setdefault("AWS_REGION", "us-east-1")
         env.setdefault("VTOP_S3_FORCE_PATH_STYLE", "true")
         env.setdefault("VTOP_S3_VERIFY_TLS", "false")

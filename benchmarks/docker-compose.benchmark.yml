@@ -23,6 +23,9 @@ services:
       - no-new-privileges:true
     cap_drop: [ALL]
     pids_limit: 512
+    mem_limit: 1g
+    read_only: true
+    tmpfs: [/tmp]
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
@@ -40,6 +43,9 @@ services:
       - no-new-privileges:true
     cap_drop: [ALL]
     pids_limit: 256
+    mem_limit: 256m
+    read_only: true
+    tmpfs: [/tmp]
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}

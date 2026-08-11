@@ -160,8 +160,15 @@ except Exception:
     print("")' 2>/dev/null || true)"
 NET="${NET:-vtop-engine_storage-net}"
 
-listing=$(docker run --rm --network "$NET" --entrypoint /bin/sh minio/mc:latest -c \
-  'mc alias set local http://minio:9000 minioadmin minioadmin >/dev/null 2>&1; mc ls --recursive local' 2>/dev/null || true)
+# The same override variables the compose files honor: a run against a stack
+# whose credentials were overridden via .env must list the real buckets, not
+# silently see nothing and fail the assertion below as a fixture mystery.
+listing=$(docker run --rm --network "$NET" \
+  -e "MINIO_ROOT_USER=${MINIO_ROOT_USER:-minioadmin}" \
+  -e "MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-minioadmin}" \
+  -e HOME=/tmp \
+  --entrypoint /bin/sh minio/mc:latest -c \
+  'mc alias set local http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null 2>&1; mc ls --recursive local' 2>/dev/null || true)
 
 # Count DATA objects only: a manifest ends in `.manifest.json`, so a naive
 # extension match counts it twice and makes objects == 2x manifests.
