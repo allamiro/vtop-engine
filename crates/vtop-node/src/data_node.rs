@@ -2031,4 +2031,81 @@ mod tests {
             "the refusal must name the reason and the path: {problem}"
         );
     }
+
+    /// The candidate publisher records a promotion rather than acting on
+    /// it — the leader it would promote does not exist until the supervisor
+    /// builds one — while demotion forwards immediately, because
+    /// fail-closed has no build step to wait for.
+    #[test]
+    fn candidate_publisher_records_promotions_and_forwards_demotions() {
+        use crate::lease_agent::LeasePublisher;
+        #[derive(Default)]
+        struct Target {
+            demoted: std::sync::Mutex<Vec<u64>>,
+            promoted: std::sync::Mutex<Vec<u64>>,
+        }
+        impl LeasePublisher for Target {
+            fn promote(&self, fencing_epoch: u64, _committed_offset: Option<u64>) {
+                self.promoted.lock().unwrap().push(fencing_epoch);
+            }
+            fn demote(&self, fencing_epoch: u64) {
+                self.demoted.lock().unwrap().push(fencing_epoch);
+            }
+            fn suspend(&self, _fencing_epoch: u64) {}
+        }
+        let (verdict_tx, verdict_rx) = tokio::sync::watch::channel(RoleVerdict::Undecided);
+        let publisher = CandidateLeasePublisher {
+            target: std::sync::RwLock::new(None),
+            verdicts: verdict_tx,
+        };
+        let target = std::sync::Arc::new(Target::default());
+        publisher.set_target(Some(
+            std::sync::Arc::clone(&target) as std::sync::Arc<dyn LeasePublisher>
+        ));
+
+        publisher.promote(7, Some(41));
+        assert_eq!(
+            *verdict_rx.borrow(),
+            RoleVerdict::Lead {
+                fencing_epoch: 7,
+                committed_offset: Some(41)
+            },
+            "a promotion is recorded for the supervisor to complete"
+        );
+        assert!(
+            target.promoted.lock().unwrap().is_empty(),
+            "a promotion must NOT reach the role object from the publisher: the broker it \
+             authorizes does not exist yet"
+        );
+
+        publisher.demote(7);
+        assert_eq!(
+            *target.demoted.lock().unwrap(),
+            vec![7],
+            "a demotion forwards immediately — fail-closed cannot wait for the supervisor"
+        );
+        assert_eq!(*verdict_rx.borrow(), RoleVerdict::Follow);
+    }
+
+    /// The switching handler serves whatever is installed and refuses
+    /// mid-transition, so a request racing a role change is refused rather
+    /// than served by a half-built role.
+    #[test]
+    fn switching_handler_refuses_mid_transition() {
+        let node = Uuid::from_u128(9);
+        let handler = SwitchingReplicaHandler::new(node);
+        let range = vtop_protocol::RangeIdentity {
+            topic: "t".into(),
+            topic_epoch: 1,
+            range_id: Uuid::from_u128(1),
+            range_generation: 0,
+        };
+        let (code, message) = handler.status(&range).unwrap_err();
+        assert_eq!(code, vtop_protocol::ErrorCode::InvalidRequest);
+        assert!(
+            message.contains("transition"),
+            "the refusal must say WHY, so a peer retries instead of diagnosing: {message}"
+        );
+        assert_eq!(handler.node_id(), node);
+    }
 }
