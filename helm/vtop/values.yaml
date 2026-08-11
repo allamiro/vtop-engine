@@ -161,45 +161,38 @@ data:
   # harness. The lease credential is the node's own data-plane certificate
   # (CN = its node UUID) — the chart wires exactly that, because admin
   # authorization rejects anything else.
-  # Deployment topology. The binary supports leader/follower/standalone and the
-  # live-chaos harness exercises all three; this value is how the chart reaches
-  # them.
+  # Deployment topology. The binary supports candidate/leader/follower/
+  # standalone and the live-chaos harness exercises all of them; this value is
+  # how the chart reaches them.
   #
   #   standalone  every pod serves an INDEPENDENT range. Three replicas are
   #               three separate logs — quorum durability is refused, and a pod
   #               nobody produced to stays empty. This is the default because
   #               it needs no coordination and cannot half-work.
   #
-  #   replicated  ONE range across the pods: `leaderOrdinal` leads and names
-  #               the rest as followers. The only shape that exercises
-  #               replication, fencing and promotion.
+  #   replicated  ONE range across the pods, every pod a CANDIDATE (#284): the
+  #               role follows the metadata lease inside the binary. Whichever
+  #               pod acquires the range leads and the rest follow it; when the
+  #               holder dies, a surviving candidate takes the range in place —
+  #               no re-render, no helm upgrade, no restart. Requires
+  #               `lease.enabled` (candidates acquire the range through the
+  #               lease) and `fencingEpoch: 0` (grants are minted from 1);
+  #               both are enforced at render time.
   #
-  # FAILOVER IS MANUAL under `replicated`, and this is a real limitation rather
-  # than a caveat. `role` is fixed at render time, so when metadata grants the
-  # range to another node nothing re-renders the ConfigMap: the new holder
-  # still says `follower` and the old one still says `leader`. Recovering means
-  # changing `leaderOrdinal` and upgrading, which restarts the pods. Set
-  # `lease.enabled` as well so followers adopt granted epochs without a
-  # restart (#239) — without it a replicated range stalls the moment the epoch
-  # moves.
+  # `leaderOrdinal` is RETIRED (#284). The chart used to freeze `role: leader`
+  # on one ordinal, which made failover a manual re-render-and-restart; setting
+  # the value now fails the render with the migration message rather than being
+  # silently ignored.
   #
-  # BOOTSTRAP ORDER matters under `replicated`, and observed rather than
-  # assumed. Followers watch the metadata plane for granted epochs, so until
-  # `vtopctl meta init` has run they log "lease watch round failed; follower
-  # fails closed until it can read again" and refuse to serve — correctly, since
-  # a follower that served without knowing its epoch would be guessing. The
-  # range therefore does not work until the metadata group has a leader, which
-  # is a manual post-install step (see NOTES.txt).
-  #
-  # The leader also resolves its followers' DNS at startup and exits if they are
-  # not resolvable yet, so a cold replicated install restarts a few times before
-  # settling — the same startup-ordering behaviour the README describes for the
-  # metadata peers, on the data plane.
-  #
-  # Tracked in #284: the durable fix is for the role to follow the lease inside
-  # the binary, so the chart stops encoding it at all.
+  # BOOTSTRAP ORDER still matters under `replicated`, observed rather than
+  # assumed. Candidates learn everything from the metadata plane, so until
+  # `vtopctl meta init` has run — and the topic, range, and node registrations
+  # exist — every pod stays NOT READY, correctly: a candidate that has never
+  # completed a metadata exchange does not know the current epoch, and a range
+  # metadata says does not exist withholds readiness for as long as that is
+  # true. The range starts working the moment one candidate acquires the lease,
+  # which is a manual post-install step (see NOTES.txt).
   topology: standalone
-  leaderOrdinal: 0
 
   lease:
     enabled: false

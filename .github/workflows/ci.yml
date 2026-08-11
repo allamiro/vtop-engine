@@ -598,35 +598,46 @@ jobs:
             end
             abort "expected three node configs, got #{configs.keys.sort}" unless configs.size == 3
 
+            # SYMMETRIC by design (#284): every pod a candidate, no rendered
+            # leader at all — the role follows the metadata lease at runtime,
+            # which is the entire point of retiring leaderOrdinal.
             roles = configs.transform_values { |c| c.fetch("data").fetch("role") }
-            expected = {"0" => "leader", "1" => "follower", "2" => "follower"}
-            abort "roles are #{roles}, expected #{expected}" unless roles == expected
+            abort "roles are #{roles}, expected candidate on every pod" \
+              unless roles.values.uniq == ["candidate"]
 
-            followers = configs["0"]["data"].fetch("followers")
-            abort "leader must name both followers, got #{followers.inspect}" unless followers.size == 2
+            # Each candidate names the FULL peer set, self included; the
+            # binary skips its own entry. The lists must be identical — a
+            # divergent list is two nodes disagreeing about the replica set.
+            peer_lists = configs.transform_values { |c| c.fetch("data").fetch("peers") }
+            abort "peer lists differ between pods: #{peer_lists}" \
+              unless peer_lists.values.uniq.size == 1
+            peers = peer_lists["0"]
+            abort "expected 3 peers (self included), got #{peers.inspect}" unless peers.size == 3
 
-            # Each follower dialled at its OWN address. A shared SAN once
+            # Each peer dialled at its OWN address. A shared SAN once
             # collapsed every follower to one name here, so the leader
             # replicated to the same pod twice and "quorum" meant one replica.
-            addrs = followers.map { |f| f.fetch("addr") }
-            abort "followers collapsed to one address: #{addrs}" unless addrs.uniq.size == 2
-            %w[1 2].each_with_index do |ordinal, idx|
+            addrs = peers.map { |f| f.fetch("addr") }
+            abort "peers collapsed to shared addresses: #{addrs}" unless addrs.uniq.size == 3
+            %w[0 1 2].each_with_index do |ordinal, idx|
               want = "vtop-#{ordinal}.vtop-headless.default.svc.cluster.local:9300"
-              abort "follower addr #{addrs.sort[idx]} != #{want}" unless addrs.sort[idx] == want
+              abort "peer addr #{addrs.sort[idx]} != #{want}" unless addrs.sort[idx] == want
             end
 
-            # Followers cannot adopt a granted epoch without the lease watcher,
-            # so a replicated range without one serves until the epoch moves
-            # and then stops — the failure mode hardest to attribute to a cause.
-            %w[1 2].each do |ordinal|
-              abort "follower #{ordinal} has no lease block" unless configs[ordinal]["data"]["lease"]
+            # Candidates acquire the range through the lease; a candidate
+            # without one can never lead, and the render-time guard for that
+            # is itself tested below — this asserts the happy path carries it.
+            %w[0 1 2].each do |ordinal|
+              abort "candidate #{ordinal} has no lease block" unless configs[ordinal]["data"]["lease"]
+              epoch = configs[ordinal]["data"].fetch("fencing_epoch")
+              abort "candidate #{ordinal} fencing_epoch is #{epoch}, must be 0" unless epoch == 0
             end
 
             # One range, not a mixture. A stray standalone pod would serve its
             # own log while the others replicate, and renders perfectly.
             abort "a replicated render must contain no standalone pod" if roles.values.include?("standalone")
 
-            puts "replicated topology parses: one leader, two distinct leased followers"
+            puts "replicated topology parses: three identical leased candidates"
           '
 
       # The guards on the replicated shape. Both were added with the topology
@@ -655,9 +666,20 @@ jobs:
             echo "refused because: $expected"
           }
 
-          # A leader outside the replica set leaves EVERY pod a follower.
-          refuses_because "the leader must be one of the pods" \
-            -f helm/vtop/ci/replicated-values.yaml --set data.leaderOrdinal=3
+          # leaderOrdinal is retired (#284): the refusal must EXPLAIN the
+          # migration, not silently ignore a value that used to steer roles.
+          refuses_because "data.leaderOrdinal is retired" \
+            -f helm/vtop/ci/replicated-values.yaml --set data.leaderOrdinal=0
+
+          # Candidates acquire the range through the lease; without it no pod
+          # would ever lead, and the render is a cluster that cannot work.
+          refuses_because "requires data.lease.enabled" \
+            -f helm/vtop/ci/replicated-values.yaml --set data.lease.enabled=false
+
+          # Grants are minted from 1; a floor at or above the first grant
+          # refuses the very grant that makes a candidate lead.
+          refuses_because "must be 0 under" \
+            -f helm/vtop/ci/replicated-values.yaml --set data.fencingEpoch=1
 
           # A single-replica replicated range is standalone wearing the wrong
           # name. nodeUuids is shortened to match, so this reaches the

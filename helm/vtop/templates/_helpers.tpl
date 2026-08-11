@@ -174,59 +174,65 @@ meta:
     operator_common_names: {{ toJson $v.meta.adminAuthorization.operatorCommonNames }}
 {{- end }}
 data:
-  {{- /* TOPOLOGY. The binary has always supported leader/follower/standalone,
-         and the live-chaos harness configures all three; only this chart used
-         to hardcode one. It no longer does — `data.topology` selects the shape.
+  {{- /* TOPOLOGY. The binary supports candidate/leader/follower/standalone,
+         and the live-chaos harness configures all of them; this value is how
+         the chart reaches them.
 
          standalone (default): every pod serves an INDEPENDENT range. Three
          replicas are three separate logs, which is why quorum durability is
          refused and why a pod nobody produced to stays empty.
 
-         replicated: ONE range across the pods. `data.leaderOrdinal` leads and
-         names the others as followers; everyone else follows. This is the only
-         shape that exercises replication, fencing and promotion — see the
-         failover caveat in values.yaml, which is a real limitation and not a
-         detail. */ -}}
+         replicated: ONE range across the pods, every pod a CANDIDATE (#284).
+         The role follows the metadata lease inside the binary: whichever pod
+         acquires the range leads, the rest follow it, and when the holder
+         dies a survivor takes the range in place — no re-render, no restart.
+         The chart used to encode `role: leader`/`follower` from a
+         `leaderOrdinal` value, which made failover a helm upgrade; that value
+         is retired, and setting it now fails the render rather than being
+         silently ignored. */ -}}
   {{- if eq $v.data.topology "replicated" }}
-  {{- /* Both of these render perfectly well and then cannot work, which is the
-         worst kind of configuration error: a leaderOrdinal outside the replica
-         set leaves EVERY pod a follower and the range with no leader at all,
-         and a single-replica replicated install gives a leader with no
-         followers, which is standalone wearing the wrong name. */ -}}
-  {{- if ge (int $v.data.leaderOrdinal) (int $v.replicaCount) }}
-  {{- fail (printf "\n\ndata.leaderOrdinal is %d but replicaCount is %d: the leader must be one of the pods, or the range has no leader at all." (int $v.data.leaderOrdinal) (int $v.replicaCount)) }}
+  {{- if hasKey $v.data "leaderOrdinal" }}
+  {{- fail "\n\ndata.leaderOrdinal is retired (#284): \"replicated\" now renders every pod as a CANDIDATE and the role follows the metadata lease, so failover no longer needs a re-render. Remove the value." }}
   {{- end }}
   {{- if lt (int $v.replicaCount) 2 }}
   {{- fail (printf "\n\ndata.topology is \"replicated\" but replicaCount is %d: a replicated range needs at least one follower. Use topology \"standalone\" for a single node." (int $v.replicaCount)) }}
   {{- end }}
-  {{- if eq (int $i) (int $v.data.leaderOrdinal) }}
-  role: leader
-  followers:
+  {{- /* Candidates take the range FROM the lease; without it no pod would
+         ever lead and every pod would sit as a follower of nobody. This
+         renders-then-cannot-work, the worst kind of configuration error, so
+         it fails at render time instead. */ -}}
+  {{- if not $v.data.lease.enabled }}
+  {{- fail "\n\ndata.topology \"replicated\" requires data.lease.enabled: candidates acquire the range through the metadata lease (#284). Without it no pod would ever lead." }}
+  {{- end }}
+  {{- /* Grants are minted from 1; a static floor at or above the first grant
+         would refuse the very grant that makes a candidate lead. */ -}}
+  {{- if ne (int $v.data.fencingEpoch) 0 }}
+  {{- fail (printf "\n\ndata.fencingEpoch is %d but must be 0 under \"replicated\": candidates learn their epoch from lease grants (minted from 1), and a static floor at or above the first grant refuses it." (int $v.data.fencingEpoch)) }}
+  {{- end }}
+  role: candidate
+  peers:
     {{- range $ordinal := until (int $root.Values.replicaCount) }}
-    {{- if ne $ordinal (int $v.data.leaderOrdinal) }}
-    {{- /* addr is the pod's OWN FQDN, never `vtop.peerServerName`. That helper
-           returns tls.serverName when a shared SAN is configured, and using it
-           here would make the leader dial one shared name for every follower —
-           a load-balanced endpoint, or the same pod repeatedly — instead of
-           each specific replica. The socket destination and the name verified
-           on the certificate are different questions; only the second may be
-           shared. The metadata peer list above already draws this distinction.
+    {{- /* The SAME list on every pod, self included — the binary skips its
+           own entry, and one shared list keeps the rendered configs diffable
+           (the metadata peer list above follows the same convention).
+
+           addr is the pod's OWN FQDN, never `vtop.peerServerName`: that
+           helper returns tls.serverName when a shared SAN is configured, and
+           using it here would make a leading candidate dial one shared name
+           for every peer — a load-balanced endpoint, or the same pod
+           repeatedly — instead of each specific replica. The socket
+           destination and the name verified on the certificate are different
+           questions; only the second may be shared.
 
            This comment must NOT close with a right-chomping delimiter. A
-           right-chomp here swallows the newline and indent that follow, so the
-           first list item lands on the "followers:" line as
-           "followers:- node_uuid: ..." and every later one glues onto its
-           predecessor. That renders without error, survives any grep-shaped
-           check, and produces a config the binary refuses to parse: the leader
-           CrashLoopBackOffs with "unknown field followers:- node_uuid". */}}
+           right-chomp swallows the newline and indent that follow, so the
+           first list item lands on the "peers:" line as "peers:- node_uuid:"
+           and every later one glues onto its predecessor — YAML that renders
+           without error and that the binary refuses to parse. */}}
     - node_uuid: {{ index $v.cluster.nodeUuids $ordinal }}
       addr: "{{ include "vtop.podFqdn" (dict "root" $root "ordinal" $ordinal) }}:{{ $v.ports.replica }}"
       server_name: "{{ include "vtop.peerServerName" (dict "root" $root "ordinal" $ordinal) }}"
     {{- end }}
-    {{- end }}
-  {{- else }}
-  role: follower
-  {{- end }}
   {{- else }}
   role: standalone
   {{- end }}
