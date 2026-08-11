@@ -324,6 +324,73 @@ fn sweep_interrupted_writes(env: &Env, directory: &Path, catalog: &StartupCatalo
     }
 }
 
+/// Consume the ONE unambiguous quarantine: the successor sidecar `roll_in`
+/// writes between sealing a tail and creating the successor's own file.
+///
+/// That ordering is deliberate — a successor must never exist without the
+/// frontier that makes it readable — but it opens a window where a crash
+/// leaves a sealed prefix, no tail, and a lone `.producers` file for a
+/// segment that never came to be. Discovery rightly reports the file as an
+/// orphan sidecar; refusing the whole range over it is what turns a routine
+/// interruption into a stranded directory (#314 review), because both
+/// `open_in` and `adopt_in` refuse quarantined layouts and the recovery
+/// (adoption) can then never run.
+///
+/// The conditions are DELIBERATELY NARROW, and every one of them is what
+/// distinguishes this window from real ambiguity:
+///
+/// * the directory's ONLY quarantine is a single orphan-sidecar bundle of
+///   exactly one `.producers` file — anything more is not this window;
+/// * the catalog holds no active tail — with a tail present, an orphan
+///   sidecar belongs to some other history and is not ours to explain;
+/// * the file sits at exactly the last sealed segment's end offset — the
+///   one place `roll_in` writes it.
+///
+/// Deleting it loses nothing: the snapshot is derived from the sealed
+/// predecessor, and `open_successor_in` re-derives and rewrites it when
+/// adoption mints the successor this one never became.
+fn sweep_roll_window_sidecar(
+    env: &Env,
+    directory: &Path,
+    catalog: &StartupCatalog,
+) -> VtopLogResult<bool> {
+    let [bundle] = catalog.quarantined.as_slice() else {
+        return Ok(false);
+    };
+    if bundle.reasons != [crate::QuarantineReason::OrphanSidecars] {
+        return Ok(false);
+    }
+    let [path] = bundle.paths.as_slice() else {
+        return Ok(false);
+    };
+    let has_active = catalog
+        .entries
+        .iter()
+        .any(|entry| entry.state == CatalogSegmentState::Active);
+    if has_active {
+        return Ok(false);
+    }
+    let Some(sealed_end) = catalog
+        .entries
+        .iter()
+        .filter(|entry| entry.state == CatalogSegmentState::Sealed)
+        .map(|entry| entry.next_offset)
+        .max()
+    else {
+        return Ok(false);
+    };
+    if *path != directory.join(format!("{}.producers", segment_stem(sealed_end))) {
+        return Ok(false);
+    }
+    env.storage
+        .remove_file(path)
+        .map_err(|source| io_error(path, source))?;
+    env.storage
+        .sync_dir(directory)
+        .map_err(|source| io_error(directory, source))?;
+    Ok(true)
+}
+
 impl SegmentSet {
     /// Open every segment of the range in `directory`.
     ///
@@ -353,6 +420,14 @@ impl SegmentSet {
         finish_pending_retention(env, &directory)?;
         let catalog = StartupCatalog::discover_in(env, &directory)?;
         sweep_interrupted_writes(env, &directory, &catalog);
+        let catalog = if sweep_roll_window_sidecar(env, &directory, &catalog)? {
+            // The layout is now exactly "sealed prefix, no tail"; re-read it
+            // so the refusal below is the typed, recoverable one rather than
+            // a quarantine over a file that no longer exists.
+            StartupCatalog::discover_in(env, &directory)?
+        } else {
+            catalog
+        };
         if !catalog.quarantined.is_empty() {
             // Name every quarantined bundle and its reasons in the refusal.
             // This error is what an operator sees at startup, and "N
@@ -471,6 +546,14 @@ impl SegmentSet {
         finish_pending_retention(env, &directory)?;
         let catalog = StartupCatalog::discover_in(env, &directory)?;
         sweep_interrupted_writes(env, &directory, &catalog);
+        // Adoption is exactly the writer the roll-window sidecar is waiting
+        // for, and `open_successor_in` rewrites that sidecar from the sealed
+        // predecessor — so consuming the orphan here loses nothing.
+        let catalog = if sweep_roll_window_sidecar(env, &directory, &catalog)? {
+            StartupCatalog::discover_in(env, &directory)?
+        } else {
+            catalog
+        };
         if !catalog.quarantined.is_empty() {
             return Err(LogError::InvalidDescriptor(format!(
                 "range at {} has {} quarantined artifact bundle(s); refusing to adopt an \
@@ -832,6 +915,61 @@ impl SegmentSet {
     ) -> VtopLogResult<ReconfigureOutcome> {
         let successor_id = Uuid::from_u128(self.env.rng.next_u128());
         self.reconfigure(thresholds, successor_id)
+    }
+
+    /// Adopt a stranded range — tail sealed, successor never created — so a
+    /// reconfigure can proceed, VALIDATING FIRST (#314).
+    ///
+    /// Adoption mutates the directory: it mints a tail. A resume that
+    /// adopted and then discovered the thresholds invalid would leave the
+    /// range changed by a command that reported failure — startable, under
+    /// limits the operator never confirmed. So the thresholds are checked
+    /// against the LAST SEALED segment's header before anything is written:
+    /// that header is exactly what the adopted tail will inherit, so the
+    /// validation answers for the config `reconfigure` will really see. On
+    /// any refusal the directory is byte-for-byte what this call found.
+    ///
+    /// Returns the adopted set with its tail still at the sealed header's
+    /// limits; the caller runs [`Self::reconfigure_minting`] on it, which
+    /// takes the empty-tail rewrite path.
+    pub fn adopt_for_reconfigure(
+        env: &Env,
+        directory: impl AsRef<Path>,
+        thresholds: RollThresholds,
+        successor_id: Uuid,
+    ) -> VtopLogResult<Self> {
+        let directory = directory.as_ref().to_path_buf();
+        // A read-only pass: discovery reports, it never writes.
+        let catalog = StartupCatalog::discover_in(env, &directory)?;
+        let last_sealed = catalog
+            .entries
+            .iter()
+            .filter(|entry| entry.state == CatalogSegmentState::Sealed)
+            .max_by_key(|entry| entry.descriptor.base_offset)
+            .ok_or_else(|| {
+                LogError::InvalidDescriptor(format!(
+                    "range at {} has no sealed segment to adopt a tail onto",
+                    directory.display()
+                ))
+            })?;
+        let reader = SegmentReader::open_in(env, &last_sealed.path)?;
+        match reader.config_v2() {
+            Some(current) => {
+                let applied = thresholds.applied_to_v2(current);
+                if applied != current {
+                    applied.validate()?;
+                }
+            }
+            None => {
+                let current = reader.config();
+                let applied = thresholds.applied_to(current);
+                if applied != current {
+                    applied.validate()?;
+                }
+            }
+        }
+        drop(reader);
+        Self::adopt_in(env, &directory, successor_id)
     }
 
     /// Reclaim sealed segments from the FRONT of the range until the policy
@@ -3191,6 +3329,127 @@ mod tests {
             "a fenced follower whose truncation crossed segments must keep the reconfigured \
              limits, not silently revert to the ones in an older header"
         );
+    }
+
+    /// Stage the layout a crash between roll_in's seal and its
+    /// successor-create leaves: a sealed prefix, no tail — and, when the
+    /// sealed segment carried producer state, a lone `.producers` sidecar
+    /// for the successor that never came to be.
+    fn strand_after_seal(directory: &Path, with_orphan_sidecar: bool) {
+        let producer = Uuid::from_u128(77);
+        let mut set =
+            SegmentSet::create_in(&Env::real(), directory, descriptor(), config()).unwrap();
+        for sequence in 0..3 {
+            set.append_group(
+                &[record(producer, sequence)],
+                Durability::Fsync,
+                Uuid::from_u128(7700 + sequence as u128),
+            )
+            .unwrap();
+        }
+        let end = set.next_offset();
+        drop(set);
+        let active_path = directory.join(format!("{}.active", segment_stem(0)));
+        let tail = ActiveSegment::recover_in(&Env::real(), &active_path).unwrap();
+        drop(tail.seal().expect("sealing stages the crash layout"));
+        if with_orphan_sidecar {
+            // The exact file roll_in writes in its window, at the exact
+            // place: the successor's stem, before the successor exists.
+            std::fs::write(
+                directory.join(format!("{}.producers", segment_stem(end))),
+                b"re-derivable snapshot bytes",
+            )
+            .unwrap();
+        }
+    }
+
+    /// The review's P1: the sidecar roll_in writes before the successor's
+    /// own file quarantined discovery, so neither open nor adoption could
+    /// ever run — the one interruption window the typed refusal missed.
+    #[test]
+    fn an_orphan_successor_sidecar_from_an_interrupted_roll_is_consumed() {
+        let directory = tempdir().unwrap();
+        strand_after_seal(directory.path(), true);
+
+        let refused = SegmentSet::open_in(&Env::real(), directory.path())
+            .map(|_| ())
+            .expect_err("a prefix without a tail must still refuse to open as a range");
+        assert!(
+            matches!(refused, LogError::TailSealedWithoutSuccessor { .. }),
+            "the roll-window sidecar must be consumed so the refusal is the typed,              recoverable one — a quarantine here strands the range: {refused}"
+        );
+
+        let adopted = SegmentSet::adopt_in(&Env::real(), directory.path(), Uuid::from_u128(0xABCD))
+            .expect("adoption must proceed once the re-derivable sidecar is consumed");
+        assert_eq!(adopted.next_offset(), 3);
+        assert_eq!(adopted.sealed().len(), 1);
+    }
+
+    /// The sweep's conditions are narrow: a sidecar anywhere but the sealed
+    /// end is NOT the roll window, and stays quarantined.
+    #[test]
+    fn a_sidecar_away_from_the_sealed_end_stays_quarantined() {
+        let directory = tempdir().unwrap();
+        strand_after_seal(directory.path(), false);
+        std::fs::write(
+            directory
+                .path()
+                .join(format!("{}.producers", segment_stem(999))),
+            b"not the roll window",
+        )
+        .unwrap();
+
+        let refused = SegmentSet::open_in(&Env::real(), directory.path())
+            .map(|_| ())
+            .expect_err("an unexplained sidecar must keep the range quarantined");
+        assert!(
+            !matches!(refused, LogError::TailSealedWithoutSuccessor { .. }),
+            "a sidecar at an offset roll_in never wrote must not be consumed as if it were              the roll window"
+        );
+    }
+
+    /// The review's P2: a resume must validate BEFORE it adopts, so a failed
+    /// command leaves the directory byte-for-byte as it found it.
+    #[test]
+    fn an_invalid_stranded_reconfigure_mutates_nothing() {
+        let directory = tempdir().unwrap();
+        strand_after_seal(directory.path(), false);
+
+        let invalid = RollThresholds {
+            // A group bound one framed record cannot fit — refused by
+            // validation under every format.
+            max_record_bytes: Some(256),
+            max_group_bytes: Some(10),
+            ..RollThresholds::default()
+        };
+        SegmentSet::adopt_for_reconfigure(
+            &Env::real(),
+            directory.path(),
+            invalid,
+            Uuid::from_u128(0xBEEF),
+        )
+        .map(|_| ())
+        .expect_err("invalid thresholds must be refused before anything is written");
+        assert!(
+            !directory
+                .path()
+                .join(format!("{}.active", segment_stem(3)))
+                .exists(),
+            "a refused resume must not have minted a tail; the failed command changed the              directory it reported failing on"
+        );
+
+        let set = SegmentSet::adopt_for_reconfigure(
+            &Env::real(),
+            directory.path(),
+            RollThresholds {
+                max_segment_bytes: Some(4096),
+                max_group_bytes: Some(1024),
+                ..RollThresholds::default()
+            },
+            Uuid::from_u128(0xBEF0),
+        )
+        .expect("valid thresholds adopt the stranded range");
+        assert_eq!(set.next_offset(), 3);
     }
 
     /// An override that changes nothing is a no-op — rolling for it would

@@ -562,12 +562,18 @@ fn reconfigure_range(
         }
         Err(vtop_log::LogError::TailSealedWithoutSuccessor { .. }) => {
             resumed = true;
-            SegmentSet::adopt_in(&env, data_dir, Uuid::new_v4()).map_err(|error| {
-                format!(
-                    "adopt a fresh tail onto the sealed range in {}: {error}",
-                    data_dir.display()
-                )
-            })?
+            // VALIDATE-THEN-ADOPT, in that order: adoption mints a tail,
+            // and a resume that mutated the directory before discovering
+            // the thresholds invalid would leave the range changed by a
+            // command that reported failure.
+            SegmentSet::adopt_for_reconfigure(&env, data_dir, thresholds, Uuid::new_v4()).map_err(
+                |error| {
+                    format!(
+                        "resume the interrupted roll in {}: {error}",
+                        data_dir.display()
+                    )
+                },
+            )?
         }
         Err(error) => {
             return Err(format!("open the range in {}: {error}", data_dir.display()));
