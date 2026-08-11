@@ -150,6 +150,16 @@ pub enum DataRole {
     /// Accepts produce/fetch with no replication — used to re-open a killed
     /// node's directory and verify what survived on its local disk.
     Standalone,
+    /// Starts as neither leader nor follower; the role FOLLOWS THE LEASE
+    /// (#284). Every candidate runs the lease agent, campaigns under the
+    /// election restriction (#342), serves the replica plane while
+    /// following, and serves produce/fetch while holding the range — with
+    /// no config change and no restart on failover, which is what a
+    /// Kubernetes pod (whose address can never move to another pod)
+    /// actually needs. Requires `peers` (the SYMMETRIC replica set,
+    /// including this node) and a `lease` block; `followers` must be empty
+    /// — the follower list is derived as peers minus self.
+    Candidate,
 }
 
 #[derive(Debug, Deserialize)]
@@ -173,7 +183,7 @@ impl RangeConfig {
 }
 
 /// One replication follower as seen from the leader.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FollowerPeerConfig {
     pub node_uuid: Uuid,
@@ -218,6 +228,14 @@ pub struct DataNodeConfig {
     /// Leader only.
     #[serde(default)]
     pub followers: Vec<FollowerPeerConfig>,
+    /// Candidate only: the WHOLE replica set, this node included, identical
+    /// on every member — the same shape as the metadata plane's `peers`,
+    /// and for the same reason: a symmetric config is one ConfigMap, and a
+    /// node's own entry is filtered by `node_uuid` rather than maintained
+    /// by hand. The follower list a promotion needs, and the transfer
+    /// allowlist a repair needs, are both derived as peers minus self.
+    #[serde(default)]
+    pub peers: Vec<FollowerPeerConfig>,
     /// Identity on the replication plane (CN = node_uuid).
     pub replica_tls: TlsPaths,
     /// Leader/standalone: identity + client trust on the produce/fetch plane.

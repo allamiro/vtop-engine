@@ -102,8 +102,39 @@ pub trait QuorumProbe: Send + Sync {
 ///
 /// `ReplicaStatusClient` asks the follower's disk instead, and a peer that does
 /// not answer is genuinely absent.
+/// A candidate's own local view, as the promotion probe reads it (#284):
+/// the committed offset it votes with, and the epoch lineage it sends with
+/// every fence. A leader answers from its broker and a follower from its
+/// replica state; a candidate answers through whichever it currently is —
+/// which is exactly why this is a trait and not `Arc<LocalBroker>`.
+pub trait CandidateLocalView: Send + Sync {
+    fn local_committed_offset(&self) -> u64;
+    fn epoch_starts(&self) -> Vec<vtop_broker::fencing_epochs::EpochStart>;
+}
+
+impl CandidateLocalView for LocalBroker {
+    fn local_committed_offset(&self) -> u64 {
+        // The BLOCKING accessor, deliberately — see the probe body.
+        self.local_offsets().0
+    }
+
+    fn epoch_starts(&self) -> Vec<vtop_broker::fencing_epochs::EpochStart> {
+        self.epoch_starts()
+    }
+}
+
+impl CandidateLocalView for vtop_broker::replication::InProcessFollower {
+    fn local_committed_offset(&self) -> u64 {
+        self.local_committed_offset()
+    }
+
+    fn epoch_starts(&self) -> Vec<vtop_broker::fencing_epochs::EpochStart> {
+        self.epoch_starts()
+    }
+}
+
 pub struct ReplicaPlaneProbe {
-    broker: Arc<LocalBroker>,
+    view: Arc<dyn CandidateLocalView>,
     node_uuid: Uuid,
     client: vtop_broker::replication::ReplicaStatusClient,
     followers: Vec<FollowerEndpoint>,
@@ -120,14 +151,14 @@ pub struct FollowerEndpoint {
 
 impl ReplicaPlaneProbe {
     pub fn new(
-        broker: Arc<LocalBroker>,
+        view: Arc<dyn CandidateLocalView>,
         node_uuid: Uuid,
         client: vtop_broker::replication::ReplicaStatusClient,
         followers: Vec<FollowerEndpoint>,
         range: vtop_protocol::RangeIdentity,
     ) -> Self {
         Self {
-            broker,
+            view,
             node_uuid,
             client,
             followers,
@@ -149,7 +180,7 @@ impl QuorumProbe for ReplicaPlaneProbe {
         // at — that is what made it the candidate — so nothing else can be
         // writing here under an older one. Dialling its own port to be told so
         // would add a failure mode without adding a fact.
-        let (local_committed, _) = self.broker.local_offsets();
+        let local_committed = self.view.local_committed_offset();
         let mut probes = vec![crate::promotion::ReplicaProbe {
             node_id: self.node_uuid,
             local_committed_offset: Some(local_committed),
@@ -160,7 +191,7 @@ impl QuorumProbe for ReplicaPlaneProbe {
         // anything — the honest outcome, since there is nothing to reconcile
         // against.
         let leader_epoch_starts: Vec<vtop_protocol::ReplicaEpochStart> = self
-            .broker
+            .view
             .epoch_starts()
             .into_iter()
             .map(|entry| vtop_protocol::ReplicaEpochStart {
@@ -1484,7 +1515,7 @@ mod tests {
         // Port 1 on loopback: reserved, and nothing this test could race with.
         let unreachable = "127.0.0.1:1".parse().unwrap();
         let probe = ReplicaPlaneProbe::new(
-            Arc::clone(&broker),
+            Arc::clone(&broker) as Arc<dyn CandidateLocalView>,
             leader_uuid,
             client,
             vec![FollowerEndpoint {
