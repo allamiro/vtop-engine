@@ -2032,14 +2032,71 @@ pub(crate) fn rebuild_empty_successor_commit(
     env: &Env,
     active_path: &Path,
     expected_base: u64,
+    expected_identity: &SegmentDescriptor,
 ) -> VtopLogResult<bool> {
+    // THE NAME IS AN ANCHOR, not a convenience: a header-only active under
+    // any other filename is not a successor a roll could have created, and
+    // matching it on offsets alone would promote a foreign artifact out of
+    // quarantine (review round four).
+    if active_path.file_name().and_then(|name| name.to_str())
+        != Some(&format!("{}.active", segment_stem(expected_base)))
+    {
+        return Ok(false);
+    }
     let bytes = env
         .storage
         .read(active_path)
         .map_err(|source| io_error(active_path, source))?;
     let mut cursor = std::io::Cursor::new(bytes.as_slice());
-    let (header, header_len) = read_header(&mut cursor)?;
+    let (header, header_len) = match read_header(&mut cursor) {
+        Ok(decoded) => decoded,
+        Err(LogError::Io { .. }) => {
+            // Reading the bytes we already hold cannot fail for I/O reasons;
+            // surface anything that claims otherwise.
+            return Err(LogError::Corrupt {
+                position: 0,
+                reason: format!(
+                    "re-reading the in-memory header of {} failed",
+                    active_path.display()
+                ),
+            });
+        }
+        Err(_) => {
+            // A TORN HEADER, and provably nothing else: the commit sidecar
+            // is written only after the primary file is complete and synced,
+            // so its absence — a caller precondition — means creation never
+            // finished, and a file whose creation never finished has never
+            // held a record. Discarding it is the counterpart of sweeping
+            // the roll-window sidecar: the layout becomes "sealed prefix,
+            // no tail", whose recovery is adoption.
+            env.storage
+                .remove_file(active_path)
+                .map_err(|source| io_error(active_path, source))?;
+            if let Some(parent) = active_path.parent() {
+                env.storage
+                    .sync_dir(parent)
+                    .map_err(|source| io_error(parent, source))?;
+            }
+            return Ok(true);
+        }
+    };
+    // A valid header with records after it is NOT this window: records mean
+    // creation finished, which means a boundary existed and is now missing
+    // for a reason this repair must not paper over.
     if bytes.len() as u64 != header_len || header.base_offset() != expected_base {
+        return Ok(false);
+    }
+    // The lineage must be the SEALED PREFIX'S lineage. Without this check, a
+    // header-only active from some other range sitting at a coincidentally
+    // matching offset would receive a durable commit marker moments before
+    // the mixed-lineage validation refuses the directory anyway — a mutation
+    // by a command that then reports failure (review round four).
+    let identity = header.v1_descriptor_view();
+    if identity.topic != expected_identity.topic
+        || identity.topic_epoch != expected_identity.topic_epoch
+        || identity.lineage.range_id != expected_identity.lineage.range_id
+        || identity.lineage.generation != expected_identity.lineage.generation
+    {
         return Ok(false);
     }
     let paths = SegmentPaths::from_active(active_path)?;

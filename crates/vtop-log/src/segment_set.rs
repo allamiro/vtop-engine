@@ -454,16 +454,20 @@ fn repair_roll_window_successor(env: &Env, catalog: &StartupCatalog) -> VtopLogR
     {
         return Ok(false);
     }
-    let Some(sealed_end) = catalog
+    let Some(last_sealed) = catalog
         .entries
         .iter()
         .filter(|entry| entry.state == CatalogSegmentState::Sealed)
-        .map(|entry| entry.next_offset)
-        .max()
+        .max_by_key(|entry| entry.next_offset)
     else {
         return Ok(false);
     };
-    crate::segment::rebuild_empty_successor_commit(env, active_path, sealed_end)
+    crate::segment::rebuild_empty_successor_commit(
+        env,
+        active_path,
+        last_sealed.next_offset,
+        &last_sealed.descriptor,
+    )
 }
 
 impl SegmentSet {
@@ -493,21 +497,25 @@ impl SegmentSet {
         // the marker says exactly which prefix is doomed. Finish it before
         // discovery so the catalog sees the completed range (#290).
         finish_pending_retention(env, &directory)?;
-        let catalog = StartupCatalog::discover_in(env, &directory)?;
+        let mut catalog = StartupCatalog::discover_in(env, &directory)?;
         sweep_interrupted_writes(env, &directory, &catalog);
-        let catalog = if sweep_roll_window_sidecar(env, &directory, &catalog)? {
-            // The layout is now exactly "sealed prefix, no tail"; re-read it
-            // so the refusal below is the typed, recoverable one rather than
-            // a quarantine over a file that no longer exists.
-            StartupCatalog::discover_in(env, &directory)?
-        } else if repair_roll_window_successor(env, &catalog)? {
-            // The roll's other window: its successor now has the boundary
-            // its creation never reached, and reads back as a healthy empty
-            // tail — this open proceeds normally.
-            StartupCatalog::discover_in(env, &directory)?
-        } else {
-            catalog
-        };
+        // The roll-window repairs, to a fixed point: discarding a torn
+        // successor can expose the orphan sidecar its roll wrote first, so
+        // one pass is not always enough. Two suffice — the windows are
+        // sequential — and the bound is a backstop, not a loop condition.
+        for _ in 0..3 {
+            if sweep_roll_window_sidecar(env, &directory, &catalog)?
+                || repair_roll_window_successor(env, &catalog)?
+            {
+                // The layout changed — a consumed sidecar, a rebuilt
+                // boundary, or a discarded torn create — so re-read it: the
+                // refusal below must describe what is on disk NOW, and a
+                // healed tail must open normally.
+                catalog = StartupCatalog::discover_in(env, &directory)?;
+            } else {
+                break;
+            }
+        }
         if !catalog.quarantined.is_empty() {
             // Name every quarantined bundle and its reasons in the refusal.
             // This error is what an operator sees at startup, and "N
@@ -3434,10 +3442,13 @@ mod tests {
         drop(tail.seal().expect("sealing stages the crash layout"));
         if with_orphan_sidecar {
             // The exact file roll_in writes in its window, at the exact
-            // place: the successor's stem, before the successor exists.
+            // place: the successor's stem, before the successor exists —
+            // and VALID, because write_atomic never leaves a partial file;
+            // an undecodable snapshot is a different corruption the sweep
+            // rightly refuses to touch.
             std::fs::write(
                 directory.join(format!("{}.producers", segment_stem(end))),
-                b"re-derivable snapshot bytes",
+                ProducerSnapshot::default().encode().unwrap(),
             )
             .unwrap();
         }
@@ -3525,6 +3536,84 @@ mod tests {
             set.next_offset(),
             3,
             "the repaired successor is empty; its boundary is its base by definition"
+        );
+    }
+
+    /// The roll's FIRST window: a crash mid-write of the successor's own
+    /// header. The commit sidecar's absence proves creation never finished,
+    /// so the torn file has never held a record and is discarded — the
+    /// layout becomes sealed-only, whose recovery is adoption.
+    #[test]
+    fn a_torn_successor_header_is_discarded_and_the_range_recovers() {
+        let directory = tempdir().unwrap();
+        strand_after_seal(directory.path(), true);
+        std::fs::write(
+            directory.path().join(format!("{}.active", segment_stem(3))),
+            b"VTOPSEG1 but torn mid-wr",
+        )
+        .unwrap();
+
+        let refused = SegmentSet::open_in(&Env::real(), directory.path())
+            .map(|_| ())
+            .expect_err("a prefix without a usable tail must still refuse to open");
+        assert!(
+            matches!(refused, LogError::TailSealedWithoutSuccessor { .. }),
+            "the torn create and its sidecar must both be consumed, leaving the typed              recoverable refusal: {refused}"
+        );
+        let adopted = SegmentSet::adopt_in(&Env::real(), directory.path(), Uuid::from_u128(0xDEAD))
+            .expect("adoption recovers the discarded roll");
+        assert_eq!(adopted.next_offset(), 3);
+    }
+
+    /// A header-only active from ANOTHER RANGE at a coincidentally matching
+    /// offset must not be promoted — and must not receive a boundary marker
+    /// moments before the directory is refused anyway.
+    #[test]
+    fn a_foreign_empty_active_is_not_given_a_commit_boundary() {
+        let directory = tempdir().unwrap();
+        strand_after_seal(directory.path(), false);
+        let mut foreign = descriptor();
+        foreign.segment_id = Uuid::from_u128(0xF0);
+        foreign.base_offset = 3;
+        foreign.lineage.range_id = Uuid::from_u128(0xF1);
+        let foreign_path = directory.path().join(format!("{}.active", segment_stem(3)));
+        drop(ActiveSegment::create_in(&Env::real(), &foreign_path, foreign, config()).unwrap());
+        let commit_path = directory.path().join(format!("{}.commit", segment_stem(3)));
+        std::fs::remove_file(&commit_path).unwrap();
+
+        SegmentSet::open_in(&Env::real(), directory.path())
+            .map(|_| ())
+            .expect_err("a mixed-lineage directory must refuse to open");
+        assert!(
+            !commit_path.exists(),
+            "the refusal must not have written a durable boundary into the foreign artifact;              a command that fails must not mutate what it failed on"
+        );
+    }
+
+    /// The filename is an anchor: a header-only active under any other name
+    /// is not a successor a roll could have created, whatever its offsets
+    /// say.
+    #[test]
+    fn an_empty_active_under_a_foreign_name_is_not_promoted() {
+        let directory = tempdir().unwrap();
+        strand_after_seal(directory.path(), false);
+        let mut stray = descriptor();
+        stray.segment_id = Uuid::from_u128(0xF2);
+        stray.base_offset = 3;
+        let stray_path = directory.path().join("zzz.active");
+        drop(ActiveSegment::create_in(&Env::real(), &stray_path, stray, config()).unwrap());
+        std::fs::remove_file(directory.path().join("zzz.commit")).unwrap();
+
+        let refused = SegmentSet::open_in(&Env::real(), directory.path())
+            .map(|_| ())
+            .expect_err("a stray active must keep the directory refused");
+        assert!(
+            !matches!(refused, LogError::TailSealedWithoutSuccessor { .. }),
+            "a stray active is not the roll window and must not be consumed as if it were"
+        );
+        assert!(
+            !directory.path().join("zzz.commit").exists(),
+            "no boundary may be invented for a file the roll never wrote"
         );
     }
 
