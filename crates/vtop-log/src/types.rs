@@ -62,6 +62,17 @@ pub enum LogError {
     OffsetBelowRange { requested: u64, earliest: u64 },
     #[error("invalid segment descriptor: {0}")]
     InvalidDescriptor(String),
+    /// A range whose tail was sealed and whose successor was never created —
+    /// the layout a crash between a roll's two steps leaves behind.
+    ///
+    /// Its own variant, not an `InvalidDescriptor` string, because the REMEDY
+    /// differs from every other malformed layout: this one is recoverable by
+    /// a writer adopting a fresh tail at the sealed end (`adopt_in`), and a
+    /// caller with the standing to be that writer — `vtopctl node
+    /// reconfigure-range` resuming after an interruption (#314) — has to
+    /// recognise the state without parsing prose.
+    #[error("range at {directory} has no active segment; its tail was sealed without a successor")]
+    TailSealedWithoutSuccessor { directory: PathBuf },
     #[error("corrupt segment at byte {position}: {reason}")]
     Corrupt { position: u64, reason: String },
     #[error("unsupported segment format version {0}")]
@@ -425,6 +436,65 @@ impl SegmentConfig {
             ));
         }
         Ok(self)
+    }
+}
+
+/// The operator-tunable roll thresholds, as a PARTIAL override (#314).
+///
+/// `None` means "keep the tail's current value" — an operator raising one
+/// limit must not have to restate the other three, because a restated value
+/// that drifts from what the range actually runs is exactly the config-vs-
+/// header disagreement this type exists to end. What is NOT here is also
+/// deliberate: `index_stride` and the v2 `chunk_size` shape how a segment's
+/// interior is laid out, not when it rolls, and changing them mid-range has
+/// no operator story yet.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RollThresholds {
+    pub max_record_bytes: Option<u32>,
+    pub max_group_bytes: Option<u64>,
+    pub max_segment_bytes: Option<u64>,
+    pub max_segment_records: Option<u64>,
+}
+
+/// One override application, shared between the v1 and v2 config types: the
+/// four thresholds are common to both, and two hand-maintained copies of
+/// this block could drift the moment a fifth threshold arrives.
+macro_rules! apply_roll_thresholds {
+    ($thresholds:expr, $current:expr) => {{
+        if let Some(value) = $thresholds.max_record_bytes {
+            $current.max_record_bytes = value;
+        }
+        if let Some(value) = $thresholds.max_group_bytes {
+            $current.max_group_bytes = value;
+        }
+        if let Some(value) = $thresholds.max_segment_bytes {
+            $current.max_segment_bytes = value;
+        }
+        if let Some(value) = $thresholds.max_segment_records {
+            $current.max_segment_records = value;
+        }
+    }};
+}
+
+impl RollThresholds {
+    /// True when the override would change nothing — every field absent.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The v1 config this override produces over `current`. NOT validated:
+    /// the caller validates with the rules of the tail's actual format,
+    /// which is the entire reason application and validation are separate.
+    pub(crate) fn applied_to(&self, mut current: SegmentConfig) -> SegmentConfig {
+        apply_roll_thresholds!(self, current);
+        current
+    }
+
+    /// The v2 config this override produces over `current`; `chunk_size`
+    /// and `index_stride` pass through untouched.
+    pub(crate) fn applied_to_v2(&self, mut current: SegmentConfigV2) -> SegmentConfigV2 {
+        apply_roll_thresholds!(self, current);
+        current
     }
 }
 

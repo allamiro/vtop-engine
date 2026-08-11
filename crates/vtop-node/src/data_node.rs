@@ -137,6 +137,42 @@ fn open_range(
         // about; sealed segments either validate or quarantine.
         let report = set.active().recovery_report().clone();
         println!("segment_recovered report={report:?}");
+        // An existing range runs the limits in its tail's HEADER; the YAML
+        // only ever applies at creation. Said out loud when they disagree,
+        // with the remedy — otherwise an operator who edited the config
+        // watches nothing change and has no line telling them why (#314).
+        let (record, group, bytes, records) = match set.active().config_v2() {
+            Some(config) => (
+                config.max_record_bytes,
+                config.max_group_bytes,
+                config.max_segment_bytes,
+                config.max_segment_records,
+            ),
+            None => {
+                let config = set.active().config();
+                (
+                    config.max_record_bytes,
+                    config.max_group_bytes,
+                    config.max_segment_bytes,
+                    config.max_segment_records,
+                )
+            }
+        };
+        if (record, group, bytes, records)
+            != (
+                roll.max_record_bytes,
+                roll.max_group_bytes,
+                roll.max_bytes,
+                roll.max_records,
+            )
+        {
+            println!(
+                "roll_thresholds_differ configured=({},{},{},{}) header=({record},{group},{bytes},{records}) \
+                 note=\"an existing range runs its header's limits; change them with vtopctl node \
+                 reconfigure-range\"",
+                roll.max_record_bytes, roll.max_group_bytes, roll.max_bytes, roll.max_records,
+            );
+        }
         return Ok((set, Some(report)));
     }
     let descriptor = SegmentDescriptor {

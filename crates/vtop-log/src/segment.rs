@@ -1,8 +1,10 @@
 use crate::codec::{
     encode_header, encode_record, read_frame, read_header, record_content_hash, AnyHeader,
-    FrameRead, SegmentHeader, INDEX_MAGIC,
+    FrameRead, SegmentHeader, HEADER_MAGIC, INDEX_MAGIC,
 };
-use crate::codec_v2::{encode_header_v2, encode_record_v2, read_frame_v2, SegmentHeaderV2};
+use crate::codec_v2::{
+    encode_header_v2, encode_record_v2, read_frame_v2, SegmentHeaderV2, HEADER_MAGIC_V2,
+};
 use crate::env::{Env, OpenMode, Storage, StorageFile};
 use crate::proof;
 use crate::types::{
@@ -1164,6 +1166,29 @@ impl SegmentReader {
         }
     }
 
+    /// The v1 limits this sealed segment was written under. A sealed header
+    /// is immutable — reconfiguring a range (#314) changes only headers put
+    /// in front of the log — so this is exactly the contract its bytes were
+    /// validated against.
+    ///
+    /// # Panics
+    ///
+    /// Panics on a v2 segment; use [`Self::config_v2`] there.
+    pub fn config(&self) -> SegmentConfig {
+        match &self.header {
+            AnyHeader::V1(header) => header.config,
+            AnyHeader::V2(_) => panic!("config() is a v1 accessor; use config_v2()"),
+        }
+    }
+
+    /// The v2 limits, if this segment uses the v2 format.
+    pub fn config_v2(&self) -> Option<SegmentConfigV2> {
+        match &self.header {
+            AnyHeader::V1(_) => None,
+            AnyHeader::V2(header) => Some(header.config),
+        }
+    }
+
     pub fn format_version(&self) -> u16 {
         self.header.format_version()
     }
@@ -1874,6 +1899,44 @@ pub fn roll_in(
     active: ActiveSegment,
     successor_id: Uuid,
 ) -> VtopLogResult<(SegmentReader, ActiveSegment)> {
+    roll_in_with(env, active, successor_id, None)
+}
+
+/// A successor configuration for a reconfiguring roll (#314), in the format
+/// of the tail it replaces. Pre-validated by the caller UNDER THAT FORMAT'S
+/// RULES — validation cannot live here, because by the time this is applied
+/// the predecessor is already sealed, and a refusal at that point leaves the
+/// range with no tail.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SuccessorConfig {
+    V1(SegmentConfig),
+    V2(SegmentConfigV2),
+}
+
+/// `roll_in`, with the successor's limits optionally replaced (#314).
+///
+/// The override changes ONLY the config the successor's header records; the
+/// descriptor, format, producer frontier and sidecar handling are byte-for-
+/// byte the inheritance path, because the one subtle part of rolling — the
+/// CLONED-not-taken producer maps below — must not exist twice.
+pub(crate) fn roll_in_with(
+    env: &Env,
+    active: ActiveSegment,
+    successor_id: Uuid,
+    config_override: Option<SuccessorConfig>,
+) -> VtopLogResult<(SegmentReader, ActiveSegment)> {
+    // A mismatched override is a programming error in the caller, refused
+    // BEFORE the seal below makes the range tail-less.
+    match (&config_override, active.header.format_version()) {
+        (None, _)
+        | (Some(SuccessorConfig::V1(_)), FORMAT_VERSION)
+        | (Some(SuccessorConfig::V2(_)), FORMAT_VERSION_V2) => {}
+        (Some(_), version) => {
+            return Err(LogError::InvalidConfig(format!(
+                "the successor config's format does not match the tail's format v{version}"
+            )));
+        }
+    }
     let directory = active
         .path
         .parent()
@@ -1903,13 +1966,21 @@ pub fn roll_in(
             .map(|(mut descriptor, config)| {
                 descriptor.segment_id = successor_id;
                 descriptor.base_offset = base_offset;
+                let config = match config_override {
+                    Some(SuccessorConfig::V2(replacement)) => replacement,
+                    _ => config,
+                };
                 (descriptor, config)
             });
     let v1 = if v2.is_none() {
         let mut descriptor = active.descriptor().clone();
         descriptor.segment_id = successor_id;
         descriptor.base_offset = base_offset;
-        Some((descriptor, active.config()))
+        let config = match config_override {
+            Some(SuccessorConfig::V1(replacement)) => replacement,
+            _ => active.config(),
+        };
+        Some((descriptor, config))
     } else {
         None
     };
@@ -1943,6 +2014,208 @@ pub fn roll_in(
     successor.producer_epochs = epochs;
     successor.inherited = inherited;
     Ok((sealed, successor))
+}
+
+/// Rebuild the commit boundary of an EMPTY successor whose creation was
+/// interrupted between its primary file and its commit sidecar (#314
+/// review — the roll's LAST window), or discard one whose header write was
+/// itself torn (the FIRST window).
+///
+/// Everything the candidate is judged against is DERIVED FROM THE SEALED
+/// PREDECESSOR, the same way adoption derives it: the successor a roll
+/// creates begins at the predecessor's scanned end, carries its descriptor
+/// with only the id and base changed, keeps its format, and is preceded by
+/// exactly the producer frontier the predecessor's records end with. The
+/// acceptance condition is therefore "byte-equivalent to what `roll_in`
+/// would have produced, minus the boundary" — anything else stays
+/// quarantined, and any refusal leaves the directory untouched. Config is
+/// deliberately NOT compared: a reconfiguring roll's successor differs from
+/// its predecessor in config by design.
+pub(crate) fn rebuild_empty_successor_commit(
+    env: &Env,
+    active_path: &Path,
+    sealed_path: &Path,
+    sidecar_present: bool,
+) -> VtopLogResult<bool> {
+    let sealed_paths = SegmentPaths::from_segment(sealed_path)?;
+    let inherited = read_producer_snapshot(env, &sealed_paths)?;
+    let mut sealed_file = env
+        .storage
+        .open(sealed_path, OpenMode::Read)
+        .map_err(|source| io_error(sealed_path, source))?;
+    let inspection = inspect_sealed_file(
+        env.storage.as_ref(),
+        sealed_file.as_mut(),
+        sealed_path,
+        &inherited,
+    )?;
+    drop(sealed_file);
+    let expected_base = inspection.scan.next_offset;
+    // THE NAME IS AN ANCHOR, not a convenience: a header-only active under
+    // any other filename is not a successor a roll could have created, and
+    // matching it on offsets alone would promote a foreign artifact out of
+    // quarantine (review round four).
+    if active_path.file_name().and_then(|name| name.to_str())
+        != Some(&format!("{}.active", segment_stem(expected_base)))
+    {
+        return Ok(false);
+    }
+    let bytes = env
+        .storage
+        .read(active_path)
+        .map_err(|source| io_error(active_path, source))?;
+    let mut cursor = std::io::Cursor::new(bytes.as_slice());
+    let (header, header_len) = match read_header(&mut cursor) {
+        Ok(decoded) => decoded,
+        // A KNOWN format at a version this binary does not speak is not a
+        // torn write — it is a complete file from a NEWER build, and an
+        // older binary that deleted it would be destroying its successor's
+        // work. The compatibility refusal must survive this repair path
+        // exactly as it survives every other open.
+        Err(error @ LogError::UnsupportedVersion(_)) => return Err(error),
+        // A COMPLETE file under a magic this binary has never heard of is a
+        // FUTURE format, not a torn write — v2 itself arrived exactly this
+        // way, as a new magic an older binary reads as Corrupt rather than
+        // UnsupportedVersion. Only a file that positively begins as v1 or
+        // v2 (or is too short to have finished any magic at all) can be
+        // classified as torn; anything else stays quarantined for a newer
+        // binary to explain (review round eight).
+        Err(_)
+            if bytes.len() >= HEADER_MAGIC.len()
+                && &bytes[..HEADER_MAGIC.len()] != HEADER_MAGIC.as_slice()
+                && &bytes[..HEADER_MAGIC_V2.len()] != HEADER_MAGIC_V2.as_slice() =>
+        {
+            return Ok(false);
+        }
+        Err(_) => {
+            // A TORN HEADER, and provably nothing else: the commit sidecar
+            // is written only after the primary file is complete and synced,
+            // so its absence — a caller precondition — means creation never
+            // finished, and a file whose creation never finished has never
+            // held a record. Discarding it is the counterpart of sweeping
+            // the roll-window sidecar: the layout becomes "sealed prefix,
+            // no tail", whose recovery is adoption.
+            env.storage
+                .remove_file(active_path)
+                .map_err(|source| io_error(active_path, source))?;
+            if let Some(parent) = active_path.parent() {
+                env.storage
+                    .sync_dir(parent)
+                    .map_err(|source| io_error(parent, source))?;
+            }
+            return Ok(true);
+        }
+    };
+    // A valid header with records after it is NOT this window: records mean
+    // creation finished, which means a boundary existed and is now missing
+    // for a reason this repair must not paper over.
+    if bytes.len() as u64 != header_len {
+        return Ok(false);
+    }
+    // THE WHOLE DESCRIPTOR, with only the two fields a roll legitimately
+    // changes substituted: id and base. This covers format (a v1 candidate
+    // against a v2 predecessor falls through), the full lineage with its
+    // parents, and the v2-only fields — segment generation, creating node,
+    // creation fencing epoch — that a v1-shaped projection erases (review
+    // round seven). Field subsets drifted three times in this review;
+    // whole-value equality cannot.
+    let identity_matches = match (&inspection.header, &header) {
+        (AnyHeader::V1(sealed), AnyHeader::V1(candidate)) => {
+            let mut expected = sealed.descriptor.clone();
+            expected.segment_id = candidate.descriptor.segment_id;
+            expected.base_offset = expected_base;
+            candidate.descriptor == expected
+        }
+        (AnyHeader::V2(sealed), AnyHeader::V2(candidate)) => {
+            let mut expected = sealed.descriptor.clone();
+            expected.segment_id = candidate.descriptor.segment_id;
+            expected.base_offset = expected_base;
+            candidate.descriptor == expected
+        }
+        _ => false,
+    };
+    if !identity_matches {
+        return Ok(false);
+    }
+    // THE FRONTIER, verified rather than trusted (review round seven): a
+    // real roll with producer state durably writes the exact frontier the
+    // predecessor's records end with BEFORE creating the successor's file.
+    // So a present sidecar must decode to precisely that frontier, and an
+    // absent one is only possible when that frontier is empty — a repaired
+    // tail with the wrong inherited frontier would reject a continuing
+    // producer, or worse, let a stale epoch evade fencing.
+    let expected_frontier = snapshot_of(
+        &inspection.scan.producer_states,
+        &inspection.scan.producer_epochs,
+    );
+    if sidecar_present {
+        let producers_path = SegmentPaths::from_active(active_path)?.producers;
+        let sidecar_bytes = env
+            .storage
+            .read(&producers_path)
+            .map_err(|source| io_error(&producers_path, source))?;
+        let Ok(found) = crate::producer_snapshot::ProducerSnapshot::decode(&sidecar_bytes) else {
+            return Ok(false);
+        };
+        if found != expected_frontier {
+            return Ok(false);
+        }
+    } else if !expected_frontier.is_empty() {
+        return Ok(false);
+    }
+    let paths = SegmentPaths::from_active(active_path)?;
+    write_commit_boundary_atomic(
+        env,
+        &paths.commit,
+        CommitBoundary {
+            segment_id: header.segment_id(),
+            committed_offset: header.base_offset(),
+            content_bytes: 0,
+        },
+    )?;
+    Ok(true)
+}
+
+/// Replace an EMPTY tail's header atomically, in place (#314).
+///
+/// Rolling is the wrong tool for a tail holding no records: sealing it would
+/// leave an empty sealed segment and a successor at the identical base — the
+/// exact no-op `SegmentSet::roll` refuses. But an empty tail is a real state
+/// an operator reconfigures (a range created before its first traffic, or a
+/// crash landing between a roll's seal and its append), so the header is
+/// rewritten instead: an empty active file IS its encoded header, the
+/// descriptor and format stay untouched, and `write_atomic`'s temp-rename
+/// shape means an interruption is swept at the next open rather than read.
+pub(crate) fn rewrite_empty_header_in_place(
+    env: &Env,
+    active: ActiveSegment,
+    config: SuccessorConfig,
+) -> VtopLogResult<ActiveSegment> {
+    if active.next_offset() != active.header.base_offset() {
+        return Err(LogError::InvalidConfig(
+            "only an empty tail may have its header rewritten; a tail with records rolls"
+                .to_owned(),
+        ));
+    }
+    let path = active.path.clone();
+    let encoded = match (&active.header, config) {
+        (AnyHeader::V1(header), SuccessorConfig::V1(config)) => {
+            encode_header(&SegmentHeader::new(header.descriptor.clone(), config))?
+        }
+        (AnyHeader::V2(header), SuccessorConfig::V2(config)) => {
+            encode_header_v2(&SegmentHeaderV2::new(header.descriptor.clone(), config))?
+        }
+        _ => {
+            return Err(LogError::InvalidConfig(
+                "the replacement config's format does not match the tail's".to_owned(),
+            ));
+        }
+    };
+    // The open handle is released BEFORE the rename lands, so the recovered
+    // tail below is the only writer the file has ever had two of.
+    drop(active);
+    write_atomic(env, &path, &encoded)?;
+    ActiveSegment::recover_in(env, &path)
 }
 
 /// Open a new active tail immediately after a SEALED segment, inheriting the
