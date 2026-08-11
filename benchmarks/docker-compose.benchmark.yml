@@ -11,6 +11,13 @@
 # MINIO_ROOT_USER / MINIO_ROOT_PASSWORD variables the lab uses. Re-expose
 # deliberately, only on a network you trust:
 #   VTOP_BIND_ADDR=0.0.0.0 docker compose -f benchmarks/docker-compose.benchmark.yml up -d
+#
+# Override CHANNELS, precisely: exported shell variables, or a .env file in
+# THIS directory — compose resolves a -f file's project directory here, so
+# the repository root's .env is NOT read for this stack. The benchmark
+# runner (benchmarks/lib/engine.py) reads the same two channels, so the
+# client it launches always authenticates with the credentials this server
+# was started with.
 services:
   minio:
     image: minio/minio:latest

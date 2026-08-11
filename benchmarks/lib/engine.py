@@ -79,19 +79,61 @@ def write_engine_config(scenario, work_dir: str, state_db: str,
     return config_path
 
 
+# The .env the BENCHMARK STACK actually honors. Compose resolves a -f file's
+# project directory to that file's own directory, so it is benchmarks/.env —
+# and deliberately NOT the repository root's — that interpolates the stack's
+# credentials. The runner must read the same file, or a filed override would
+# reach one side of the authentication and not the other, in either
+# direction.
+_ENV_FILE = os.path.join(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))), ".env")
+
+
+def _dotenv_overrides() -> dict[str, str]:
+    """KEY=VALUE pairs from the .env compose reads for the benchmark stack.
+
+    Deliberately minimal (comments and blank lines skipped, one layer of
+    matching quotes stripped, no interpolation): the harness is
+    dependency-light, and the lab's .env holds simple assignments.
+    """
+    values: dict[str, str] = {}
+    try:
+        with open(_ENV_FILE, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] \
+                        and value[0] in "\"'":
+                    value = value[1:-1]
+                values[key.strip()] = value
+    except OSError:
+        pass
+    return values
+
+
 def _backend_env(scenario) -> dict[str, str]:
     env = dict(os.environ)
     if scenario.get("backend") == "minio":
         # The benchmark compose lets an operator override the SERVER's
         # credentials via MINIO_ROOT_USER / MINIO_ROOT_PASSWORD (issue #81).
-        # The client must follow the same variables: a literal default here
-        # made every upload against an overridden stack fail authentication,
-        # while the stack itself came up healthy and pointed suspicion at
-        # the scenario.
-        env.setdefault("AWS_ACCESS_KEY_ID",
-                       env.get("MINIO_ROOT_USER", "minioadmin"))
+        # The client must follow the same variables THROUGH THE SAME
+        # CHANNELS: a literal default here made every upload against an
+        # overridden stack fail authentication, and consulting only the
+        # process environment repeats that failure for an operator who set
+        # the override in .env — which compose auto-loads and a separately
+        # launched Python process does not. A blank value falls back to the
+        # lab default, exactly as compose's own ${VAR:-default} would.
+        dotenv = _dotenv_overrides()
+
+        def _credential(name: str) -> str:
+            return env.get(name) or dotenv.get(name) or "minioadmin"
+
+        env.setdefault("AWS_ACCESS_KEY_ID", _credential("MINIO_ROOT_USER"))
         env.setdefault("AWS_SECRET_ACCESS_KEY",
-                       env.get("MINIO_ROOT_PASSWORD", "minioadmin"))
+                       _credential("MINIO_ROOT_PASSWORD"))
         env.setdefault("AWS_REGION", "us-east-1")
         env.setdefault("VTOP_S3_FORCE_PATH_STYLE", "true")
         env.setdefault("VTOP_S3_VERIFY_TLS", "false")

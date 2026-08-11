@@ -160,9 +160,13 @@ except Exception:
     print("")' 2>/dev/null || true)"
 NET="${NET:-vtop-engine_storage-net}"
 
-# The same override variables the compose files honor: a run against a stack
-# whose credentials were overridden via .env must list the real buckets, not
-# silently see nothing and fail the assertion below as a fixture mystery.
+# The same override variables the compose files honor, THROUGH THE SAME
+# CHANNELS: compose auto-loads ./.env for the services, Bash does not — so
+# without sourcing it here, an operator who set the credentials only in .env
+# (the documented pattern) runs a stack this client cannot authenticate to,
+# and the assertion below fails as a fixture mystery. ${VAR:-default} treats
+# a blank value as unset, matching compose's own interpolation.
+if [ -f .env ]; then set -a; . ./.env; set +a; fi
 listing=$(docker run --rm --network "$NET" \
   -e "MINIO_ROOT_USER=${MINIO_ROOT_USER:-minioadmin}" \
   -e "MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-minioadmin}" \
