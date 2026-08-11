@@ -1225,6 +1225,144 @@ start_colocated_node() {
   echo "$pid"
 }
 
+# --- candidate mode (#284): the role follows the lease ----------------------
+#
+# One config shape, identical on every member apart from the node's own
+# identity — which is the point: failover becomes a role change inside the
+# binary instead of the re-render-and-restart choreography every scenario
+# above performs.
+
+candidate_native_addr() { echo "$DATA_HOST:$((NATIVE_PORT + 10 + $1))"; }
+
+candidate_identity() { # <n: 1|2|3> — echoes "<uuid> <cert-basename>"
+  case "$1" in
+    1) echo "$LEADER_UUID data-1" ;;
+    2) echo "$FOLLOWER1_UUID data-2" ;;
+    3) echo "$FOLLOWER2_UUID data-3" ;;
+    *) fail "unknown candidate $1" ;;
+  esac
+}
+
+# emit_candidate_config <n: 1|2|3> <meta-id>
+emit_candidate_config() {
+  local n="$1" id="$2"
+  local uuid cert
+  read -r uuid cert <<<"$(candidate_identity "$n")"
+  local cfg="$WORKDIR/data-candidate-$n.yaml"
+  {
+    echo "role: candidate"
+    echo "node_uuid: $uuid"
+    echo "cluster_id: $CLUSTER_ID"
+    echo "data_dir: $WORKDIR/data-candidate-$n"
+    # The FLOOR of the epoch view, not an epoch to serve at: metadata mints
+    # from 1, and a floor above a real grant would ignore it forever (see
+    # emit_leader_config_with_lease).
+    echo "fencing_epoch: 0"
+    [[ -n "${CHAOS_MAX_SEGMENT_BYTES:-}" ]] \
+      && echo "max_segment_bytes: $CHAOS_MAX_SEGMENT_BYTES"
+    [[ -n "${CHAOS_MAX_SEGMENT_RECORDS:-}" ]] \
+      && echo "max_segment_records: $CHAOS_MAX_SEGMENT_RECORDS"
+    [[ -n "${CHAOS_MAX_GROUP_BYTES:-}" ]] \
+      && echo "max_group_bytes: $CHAOS_MAX_GROUP_BYTES"
+    [[ -n "${CHAOS_MAX_RECORD_BYTES:-}" ]] \
+      && echo "max_record_bytes: $CHAOS_MAX_RECORD_BYTES"
+    true
+    emit_range_yaml
+    echo "segment_id: $SEGMENT_ID"
+    echo "native_listen: \"$(candidate_native_addr "$n")\""
+    echo "replica_listen: \"$(replica_addr $((n - 1)))\""
+    # THE SAME LIST ON EVERY MEMBER, this node included; the binary filters
+    # its own entry by node_uuid. Symmetry is the feature under test.
+    echo "peers:"
+    local i iu ic
+    for i in 1 2 3; do
+      read -r iu ic <<<"$(candidate_identity "$i")"
+      echo "  - { node_uuid: $iu, addr: \"$(replica_addr $((i - 1)))\", server_name: \"localhost\" }"
+    done
+    echo "replica_tls: { ca: $CERTS/ca.pem, cert: $CERTS/$cert.pem, key: $CERTS/$cert-key.pem }"
+    echo "native_tls: { ca: $CERTS/ca.pem, cert: $CERTS/$cert.pem, key: $CERTS/$cert-key.pem }"
+    echo "principal_id: $PRINCIPAL_ID"
+    echo "observability: { listen: \"$(data_metrics_addr $((n + 10)))\" }"
+    emit_lease_yaml "$id" "$cert"
+  } | install_config "$cfg"
+  echo "$cfg"
+}
+
+start_candidate() { # <n> <meta-id>
+  local n="$1" id="$2" pid
+  pid="$(start_node "data-candidate-$n" "data_node_ready" data \
+    --config "$(emit_candidate_config "$n" "$id")")"
+  await_ready "$(data_metrics_addr $((n + 10)))" "data-candidate-$n"
+  echo "$pid"
+}
+
+# await_log_line <file> <pattern> <what> [timeout] — deadline-poll a log for a
+# line, per the suite's doctrine: the event and the observation are separate
+# moments, and a one-shot grep taken the instant a precondition holds races
+# whatever writes the line (#326's lesson, relearned live by scenario 14: the
+# lease appears in metadata a beat before the winner logs its role change).
+await_log_line() {
+  local file="$1" pattern="$2" what="$3" limit="${4:-$PROGRESS_TIMEOUT_SECONDS}"
+  local deadline=$((SECONDS + limit))
+  until grep -q "$pattern" "$file" 2>/dev/null; do
+    [[ $SECONDS -lt $deadline ]] \
+      || fail "$what: no line matching [$pattern] in $file within ${limit}s"
+    sleep 0.2
+  done
+}
+
+# await_any_lease_holder <meta-id> [timeout] — block until SOMEBODY holds the
+# range; echoes "<holder-uuid> <epoch>". The candidate scenarios cannot name
+# the winner in advance — that the winner is not scripted is the point.
+await_any_lease_holder() {
+  local id="$1" limit="${2:-$ELECTION_TIMEOUT_SECONDS}"
+  local deadline=$((SECONDS + limit)) holder epoch
+  while :; do
+    if holder="$(lease_field "$id" "d['lease']['holder_node_uuid'] if d.get('lease') else ''")" \
+      && [[ -n "$holder" ]]; then
+      if epoch="$(lease_field "$id" "d['lease']['fencing_epoch']")" && [[ -n "$epoch" ]]; then
+        echo "$holder $epoch"
+        return 0
+      fi
+    fi
+    [[ $SECONDS -lt $deadline ]] \
+      || fail "no candidate acquired the range within ${limit}s"
+    sleep 0.2
+  done
+}
+
+# await_lease_holder_changed <meta-id> <old-holder-uuid> [timeout] — block
+# until the range is held by someone OTHER than <old-holder>; echoes
+# "<holder> <epoch>". After a leader dies its unexpired lease is still on
+# record — correctly, that is what a lease means — so waiting for "any
+# holder" right after a kill reads back the corpse.
+await_lease_holder_changed() {
+  local id="$1" old="$2" limit="${3:-$ELECTION_TIMEOUT_SECONDS}"
+  local deadline=$((SECONDS + limit)) holder epoch
+  while :; do
+    if holder="$(lease_field "$id" "d['lease']['holder_node_uuid'] if d.get('lease') else ''")" \
+      && [[ -n "$holder" && "$holder" != "$old" ]]; then
+      if epoch="$(lease_field "$id" "d['lease']['fencing_epoch']")" && [[ -n "$epoch" ]]; then
+        echo "$holder $epoch"
+        return 0
+      fi
+    fi
+    [[ $SECONDS -lt $deadline ]] \
+      || fail "no survivor took the range from $old within ${limit}s (last holder: ${holder:-none})"
+    sleep 0.2
+  done
+}
+
+# candidate_by_uuid <uuid> — echoes the candidate ordinal for a holder uuid.
+candidate_by_uuid() {
+  local n uuid cert
+  for n in 1 2 3; do
+    read -r uuid cert <<<"$(candidate_identity "$n")"
+    [[ "$uuid" == "$1" ]] && { echo "$n"; return 0; }
+  done
+  fail "lease holder $1 is not one of the three candidates"
+}
+
 start_follower() {
   local n="$1" pid
   pid="$(start_node "data-follower-$n" "data_node_ready" data --config "$(emit_follower_config "$@")")"

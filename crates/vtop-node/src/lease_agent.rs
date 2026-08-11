@@ -699,6 +699,14 @@ impl LeaseAgent {
     /// range everyone agrees on. The order is: stop admitting, drain, THEN
     /// hand the range back.
     pub async fn run(mut self, mut release: tokio::sync::watch::Receiver<bool>) {
+        // Said out loud at start of life: an agent that never logs is
+        // indistinguishable from an agent that never ran, and the difference
+        // once cost a debugging session (#284).
+        tracing::info!(
+            range = %self.range_uuid,
+            node = %self.node_uuid,
+            "lease agent running"
+        );
         loop {
             if *release.borrow() {
                 break;

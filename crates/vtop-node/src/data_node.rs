@@ -1276,11 +1276,10 @@ async fn run_candidate(
     let install_follower = |follower: &Arc<InProcessFollower>| {
         switching.install(Arc::clone(follower) as Arc<dyn ReplicaPeerHandler>);
         view.install(Arc::clone(follower) as Arc<dyn crate::lease_agent::CandidateLocalView>);
-        publisher.set_target(Some(
-            Arc::new(crate::lease_watcher::FollowerLeasePublisher::new(
-                Arc::clone(follower),
-            )) as Arc<dyn crate::lease_agent::LeasePublisher>,
-        ));
+        publisher.set_target(Some(Arc::new(FollowerObservationAdapter {
+            inner: crate::lease_watcher::FollowerLeasePublisher::new(Arc::clone(follower)),
+        })
+            as Arc<dyn crate::lease_agent::LeasePublisher>));
         role_flag.store(0, std::sync::atomic::Ordering::Relaxed);
     };
 
@@ -1769,6 +1768,37 @@ impl crate::lease_agent::CandidateLocalView for SwitchingLocalView {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
             .map_or_else(Vec::new, |view| view.epoch_starts())
+    }
+}
+
+/// The watcher's semantics for an agent-driven follower (#284).
+///
+/// A LeaseWatcher translates an OBSERVED grant into `promote(epoch, None)` —
+/// "serve this epoch" — because that is what a granted epoch means to a
+/// follower. The lease agent speaks the holder's dialect: a rival's grant
+/// arrives as `demote(rival_epoch)`. For a FOLLOWING candidate every demote
+/// is exactly that observation (a non-holder has no renewal to lose), so
+/// this adapter translates it back — without it, a following candidate
+/// clears its lease view on every poll and refuses every append from the
+/// leader it is supposed to follow, which is how scenario 14's first quorum
+/// produce found three healthy replicas and zero acks.
+struct FollowerObservationAdapter {
+    inner: crate::lease_watcher::FollowerLeasePublisher,
+}
+
+impl crate::lease_agent::LeasePublisher for FollowerObservationAdapter {
+    fn promote(&self, fencing_epoch: u64, committed_offset: Option<u64>) {
+        self.inner.promote(fencing_epoch, committed_offset);
+    }
+
+    fn demote(&self, fencing_epoch: u64) {
+        // A rival holds the range at this epoch: to a follower, that IS the
+        // grant to serve under.
+        self.inner.promote(fencing_epoch, None);
+    }
+
+    fn suspend(&self, fencing_epoch: u64) {
+        self.inner.suspend(fencing_epoch);
     }
 }
 
