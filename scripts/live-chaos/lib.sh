@@ -1274,9 +1274,11 @@ emit_candidate_config() {
     # THE SAME LIST ON EVERY MEMBER, this node included; the binary filters
     # its own entry by node_uuid. Symmetry is the feature under test.
     echo "peers:"
-    local i iu ic
+    local i iu
     for i in 1 2 3; do
-      read -r iu ic <<<"$(candidate_identity "$i")"
+      # The identity's second field (the cert) is this node's concern only;
+      # a peer entry names the uuid and where to dial it.
+      read -r iu _ <<<"$(candidate_identity "$i")"
       echo "  - { node_uuid: $iu, addr: \"$(replica_addr $((i - 1)))\", server_name: \"localhost\" }"
     done
     echo "replica_tls: { ca: $CERTS/ca.pem, cert: $CERTS/$cert.pem, key: $CERTS/$cert-key.pem }"
