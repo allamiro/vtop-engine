@@ -171,6 +171,16 @@ preflight_settings() {
     labels+=("data-metrics-$id")
     endpoints+=("$(data_metrics_addr "$id")")
   done
+  # Candidates (scenario 14) derive their own listeners at offsets 11..13
+  # above the shared bases; a base override that lands one of those on an
+  # occupied port must fail HERE, not at a mid-scenario bind (review).
+  for id in 1 2 3; do
+    labels+=("candidate-native-$id" "candidate-metrics-$id")
+    endpoints+=(
+      "$(candidate_native_addr "$id")"
+      "$(data_metrics_addr "$((id + 10))")"
+    )
+  done
   for ((id = 0; id < ${#endpoints[@]}; id++)); do
     for ((existing = 0; existing < id; existing++)); do
       if [[ "${endpoints[$id]}" == "${endpoints[$existing]}" ]]; then

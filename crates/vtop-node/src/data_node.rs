@@ -1204,6 +1204,7 @@ async fn run_candidate(
     let publisher = Arc::new(CandidateLeasePublisher {
         target: std::sync::RwLock::new(None),
         verdicts: verdict_tx,
+        finished_through: std::sync::atomic::AtomicU64::new(0),
     });
     let (release_lease, release_lease_rx) = tokio::sync::watch::channel(false);
     let agent = crate::lease_agent::LeaseAgent::new(
@@ -1360,23 +1361,27 @@ async fn run_candidate(
                         // lapse and a healthy candidate win.
                         let built =
                             build_leader_phase(&config, &range, &peers, roll, &meta).await?;
-                        // THE VERDICT RECHECK (review P0): a lease lost
-                        // during the build — the follower-stream wait can
-                        // take seconds — must win over the build. The
-                        // demote that recorded it found no target, so
-                        // nothing has fenced yet; completing the stale
-                        // promotion would serve writes at an epoch metadata
-                        // moved past. Any residual race after this check is
-                        // closed by the queued verdict: the loop's next
-                        // iteration runs the full demotion before anything
-                        // else happens.
-                        let current = *verdict_rx.borrow();
-                        if current
-                            != (RoleVerdict::Lead {
-                                fencing_epoch,
-                                committed_offset,
-                            })
-                        {
+                        // ATOMIC COMPLETION (review P0, round two): a lease
+                        // lost during the build — the follower-stream wait
+                        // can take seconds — must win over the build, and a
+                        // recheck separate from publication only narrowed
+                        // that race. `complete_promotion` closes it: the
+                        // publish and the target install happen under the
+                        // same lock the demote path holds, so a demotion
+                        // either landed first (the ceiling refuses this
+                        // completion — nothing was published) or lands
+                        // after (it reaches the broker publisher installed
+                        // here and fences the live broker).
+                        let broker_publisher =
+                            Arc::new(crate::lease_agent::BrokerLeasePublisher::new(
+                                Arc::clone(&built.broker),
+                            ));
+                        if !publisher.complete_promotion(
+                            Arc::clone(&broker_publisher)
+                                as Arc<dyn crate::lease_agent::LeasePublisher>,
+                            fencing_epoch,
+                            committed_offset,
+                        ) {
                             if let Err(error) = built.broker.quiesce() {
                                 eprintln!(
                                     "post-abandoned-build commit failed; recovery will handle \
@@ -1400,24 +1405,14 @@ async fn run_candidate(
                             std::io::stdout().flush().ok();
                             continue;
                         }
+                        // The promotion is live and every later demotion
+                        // reaches the broker publisher; only now does the
+                        // broker become observable and reachable. A demote
+                        // between the completion and these installs fences
+                        // the broker before any session could reach it.
                         switching.install(Arc::clone(&built.status));
                         view.install(Arc::clone(&built.broker)
                             as Arc<dyn crate::lease_agent::CandidateLocalView>);
-                        let broker_publisher =
-                            Arc::new(crate::lease_agent::BrokerLeasePublisher::new(
-                                Arc::clone(&built.broker),
-                            ));
-                        // Target BEFORE promote: a demotion racing this
-                        // instant forwards to the broker rather than into
-                        // the void, and the queued verdict then unwinds the
-                        // promotion on the next iteration.
-                        publisher.set_target(Some(Arc::clone(&broker_publisher)
-                            as Arc<dyn crate::lease_agent::LeasePublisher>));
-                        crate::lease_agent::LeasePublisher::promote(
-                            broker_publisher.as_ref(),
-                            fencing_epoch,
-                            committed_offset,
-                        );
                         slot.install(Arc::clone(&built.broker));
                         role_flag.store(1, std::sync::atomic::Ordering::Relaxed);
                         println!(
@@ -1493,26 +1488,44 @@ async fn run_candidate(
     }
     // Both server tasks were signalled by the shutdown watch already; await
     // the native drain (the accept loop joins its sessions) within the same
-    // budget the agent gets.
-    let _ = tokio::time::timeout(agent_drain, &mut native_task).await;
+    // budget the agent gets. A drain that runs out the budget is SAID, not
+    // swallowed: aborted session futures cannot cancel a request already
+    // inside `spawn_blocking`, so a timeout here means such a request may
+    // still be running (review) — and the quiesce below is what bounds it.
+    if tokio::time::timeout(agent_drain, &mut native_task)
+        .await
+        .is_err()
+    {
+        eprintln!(
+            "native drain ran out its budget; an admitted request may still \
+             be in flight — quiescing before release to serialize with it"
+        );
+    }
+    // QUIESCE BEFORE RELEASE when leading (review, round two): `quiesce`
+    // takes the same state lock every admitted append holds through its
+    // critical section, so it cannot return until in-flight blocking work
+    // has committed — and its commit is then durable before the release
+    // lets metadata authorize a successor. A straggler that reaches the
+    // lock after this has no client left to ack (its session future is
+    // gone) and cannot reach quorum once the successor fences the
+    // followers: the same exposure as a SIGKILL, which the protocol
+    // already tolerates.
+    let committed = match &phase {
+        Phase::Following(follower) => Some(follower.quiesce()),
+        Phase::Leading { broker, .. } => Some(broker.quiesce()),
+        Phase::Transitioning => None,
+    };
     let _ = release_lease.send(true);
     let _ = tokio::time::timeout(agent_drain, &mut agent_task).await;
-    match phase {
-        Phase::Following(follower) => match follower.quiesce() {
-            Ok(committed) => println!(
-                "data_node_stopped role=candidate node={} committed={committed}",
-                config.node_uuid
-            ),
-            Err(error) => eprintln!("final commit failed; recovery will handle it: {error}"),
-        },
-        Phase::Leading { broker, .. } => match broker.quiesce() {
-            Ok(committed) => println!(
-                "data_node_stopped role=candidate node={} committed={committed}",
-                config.node_uuid
-            ),
-            Err(error) => eprintln!("final commit failed; recovery will handle it: {error}"),
-        },
-        Phase::Transitioning => {}
+    match committed {
+        Some(Ok(committed)) => println!(
+            "data_node_stopped role=candidate node={} committed={committed}",
+            config.node_uuid
+        ),
+        Some(Err(error)) => {
+            eprintln!("final commit failed; recovery will handle it: {error}")
+        }
+        None => {}
     }
     Ok(())
 }
@@ -1916,6 +1929,14 @@ enum RoleVerdict {
 struct CandidateLeasePublisher {
     target: std::sync::RwLock<Option<Arc<dyn crate::lease_agent::LeasePublisher>>>,
     verdicts: tokio::sync::watch::Sender<RoleVerdict>,
+    /// The highest epoch ever demoted through this publisher. A recorded
+    /// promotion is completed only while its epoch is above this ceiling,
+    /// and the check happens under the SAME lock the demotion path holds —
+    /// so a demote racing a completion either lands first and refuses it,
+    /// or lands second and reaches the just-installed broker publisher.
+    /// There is no third interleaving (review: a check separate from the
+    /// publication only narrowed the window; this closes it).
+    finished_through: std::sync::atomic::AtomicU64,
 }
 
 impl CandidateLeasePublisher {
@@ -1926,15 +1947,37 @@ impl CandidateLeasePublisher {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = target;
     }
 
-    fn forward(&self, act: impl Fn(&dyn crate::lease_agent::LeasePublisher)) {
-        if let Some(target) = self
+    /// Complete a recorded promotion: publish the boundary through the
+    /// real broker publisher and make it the demotion target, atomically
+    /// against the demote path. Returns false — publishing NOTHING — if a
+    /// demotion at or above this epoch already happened, which is exactly
+    /// the lease-moved-during-build case; the caller must stand the node
+    /// back up as a follower.
+    ///
+    /// Observed rival epochs (recorded while following) cannot refuse a
+    /// legitimate completion: metadata mints epochs monotonically, so a
+    /// grant issued to this node is strictly above every epoch it ever
+    /// watched a rival hold.
+    fn complete_promotion(
+        &self,
+        target: Arc<dyn crate::lease_agent::LeasePublisher>,
+        fencing_epoch: u64,
+        committed_offset: Option<u64>,
+    ) -> bool {
+        let mut guard = self
             .target
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .as_ref()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self
+            .finished_through
+            .load(std::sync::atomic::Ordering::SeqCst)
+            >= fencing_epoch
         {
-            act(target.as_ref());
+            return false;
         }
+        target.promote(fencing_epoch, committed_offset);
+        *guard = Some(target);
+        true
     }
 }
 
@@ -1947,16 +1990,41 @@ impl crate::lease_agent::LeasePublisher for CandidateLeasePublisher {
     }
 
     fn demote(&self, fencing_epoch: u64) {
-        self.forward(|target| target.demote(fencing_epoch));
+        // The WRITE lock, not a read: demotion must be exclusive with
+        // `complete_promotion`, and the ceiling must rise inside the same
+        // critical section that forwards — otherwise a completion could
+        // slip between the two and serve at an epoch already finished.
+        {
+            let guard = self
+                .target
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.finished_through
+                .fetch_max(fencing_epoch, std::sync::atomic::Ordering::SeqCst);
+            if let Some(target) = guard.as_ref() {
+                target.demote(fencing_epoch);
+            }
+        }
         let _ = self.verdicts.send(RoleVerdict::Follow);
     }
 
     fn suspend(&self, fencing_epoch: u64) {
-        self.forward(|target| target.suspend(fencing_epoch));
-        // Suspension is not a role change: the epoch is still this node's
-        // live grant and the agent will retry. The broker is already
-        // refusing (the forward above); rebuilding as a follower here would
-        // turn every transient quorum miss into a full teardown.
+        if let Some(target) = self
+            .target
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            target.suspend(fencing_epoch);
+        }
+        // Suspension is not a role change and does not raise the finished
+        // ceiling: the epoch is still this node's live grant and the agent
+        // will retry. The broker is already refusing (the forward above);
+        // rebuilding as a follower here would turn every transient quorum
+        // miss into a full teardown. A suspend that races a completion is
+        // benign in either order: landing after suspends the live broker,
+        // landing before is healed by the agent's next successful renewal
+        // re-promoting the standing leader.
     }
 }
 
@@ -2175,6 +2243,7 @@ mod tests {
         let publisher = CandidateLeasePublisher {
             target: std::sync::RwLock::new(None),
             verdicts: verdict_tx,
+            finished_through: std::sync::atomic::AtomicU64::new(0),
         };
         let target = std::sync::Arc::new(Target::default());
         publisher.set_target(Some(
@@ -2203,6 +2272,47 @@ mod tests {
             "a demotion forwards immediately — fail-closed cannot wait for the supervisor"
         );
         assert_eq!(*verdict_rx.borrow(), RoleVerdict::Follow);
+
+        // The lease-moved-during-build race, replayed in miniature: the
+        // demotion at epoch 7 already happened, so completing the recorded
+        // promotion at 7 must publish NOTHING — the broker built for that
+        // grant would serve at an epoch metadata moved past.
+        let stale = std::sync::Arc::new(Target::default());
+        assert!(
+            !publisher.complete_promotion(
+                std::sync::Arc::clone(&stale) as std::sync::Arc<dyn LeasePublisher>,
+                7,
+                Some(41)
+            ),
+            "a completion at or below the demoted ceiling must be refused"
+        );
+        assert!(
+            stale.promoted.lock().unwrap().is_empty(),
+            "a refused completion publishes nothing"
+        );
+
+        // A fresh grant sits strictly above every finished epoch, so its
+        // completion publishes the boundary and becomes the demote target.
+        let fresh = std::sync::Arc::new(Target::default());
+        assert!(
+            publisher.complete_promotion(
+                std::sync::Arc::clone(&fresh) as std::sync::Arc<dyn LeasePublisher>,
+                8,
+                Some(41)
+            ),
+            "a grant above the ceiling completes"
+        );
+        assert_eq!(
+            *fresh.promoted.lock().unwrap(),
+            vec![8],
+            "completion publishes through the real publisher"
+        );
+        publisher.demote(8);
+        assert_eq!(
+            *fresh.demoted.lock().unwrap(),
+            vec![8],
+            "a demotion after completion reaches the broker it authorized"
+        );
     }
 
     /// The switching handler serves whatever is installed and refuses
