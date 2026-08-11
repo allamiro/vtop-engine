@@ -623,6 +623,18 @@ pub struct LeaseAgent {
     /// refuses every append, and reporting ready before that first read is
     /// the same false green the static follower already refuses to show.
     ready: Option<vtop_observe::ReadinessGate>,
+    /// True when the last completed exchange said the RANGE ITSELF is gone.
+    /// That answer must not open the readiness gate: a candidate configured
+    /// with a deleted or unknown range is a configuration fault, and the
+    /// watcher keeps readiness closed for the same case (review).
+    range_missing: bool,
+    /// The rival epoch most recently fenced into the local view by the Wait
+    /// arm. Kept so that LOSING SIGHT of metadata while following suspends
+    /// that epoch — the watcher's exact doctrine: without it, a following
+    /// candidate would keep accepting replication at a stale epoch for as
+    /// long as metadata stays unreachable, on nothing but the memory of a
+    /// read that may already be superseded (review).
+    observed_rival: Option<u64>,
     /// Rounds of the run loop during which this node will NOT campaign for
     /// the lease, set when a promotion was refused on eligibility grounds
     /// (LeaderBehind or the §5.4.1 vote check). A refused candidate that
@@ -684,6 +696,8 @@ impl LeaseAgent {
             },
             state: LeaseState::NotHeld,
             ready: None,
+            range_missing: false,
+            observed_rival: None,
             held_until_ms: None,
             campaign_hold_off_rounds: 0,
         })
@@ -728,8 +742,10 @@ impl LeaseAgent {
             }
             let delay = match self.step().await {
                 Ok(delay) => {
-                    if let Some(gate) = self.ready.take() {
-                        gate.mark_ready();
+                    if !self.range_missing {
+                        if let Some(gate) = self.ready.take() {
+                            gate.mark_ready();
+                        }
                     }
                     delay
                 }
@@ -755,6 +771,19 @@ impl LeaseAgent {
                                 "metadata unreachable past the lease deadline; demoting locally"
                             );
                             self.publish_lost(fencing_epoch);
+                        }
+                    } else if !matches!(self.state, LeaseState::Held { .. }) {
+                        // Following, and blind: the watcher's doctrine applies
+                        // here too. Losing sight of metadata is not the lease
+                        // ending, but it is the end of knowing the observed
+                        // epoch is still current — so the view is suspended,
+                        // reactivatable the moment a read lands, rather than
+                        // left accepting replication on the memory of a read
+                        // a turnover may already have superseded (review).
+                        // Suspension is idempotent; repeating it every
+                        // failing round is free.
+                        if let Some(epoch) = self.observed_rival {
+                            self.promoter.publisher.suspend(epoch);
                         }
                     }
                     self.config.poll_interval
@@ -842,6 +871,7 @@ impl LeaseAgent {
         // later than this, so a local deadline derived from it is always at
         // or before the one metadata records.
         let round_started_ms = now_ms();
+        self.range_missing = false;
         let view = self
             .bounded(
                 "read range lease",
@@ -948,6 +978,7 @@ impl LeaseAgent {
                 // monotonic and idempotent, so repeating it every poll is
                 // free.
                 self.promoter.lost(fencing_epoch);
+                self.observed_rival = Some(fencing_epoch);
                 // A rival holding the range is the stand-aside's purpose
                 // ACHIEVED: the replica this node's refusal made way for (or
                 // any other eligible one) has the lease. Clearing the
@@ -959,6 +990,7 @@ impl LeaseAgent {
                 Ok(self.config.poll_interval)
             }
             LeaseDecision::RangeMissing => {
+                self.range_missing = true;
                 if let LeaseState::Held { fencing_epoch } = self.state {
                     // A range deleted out from under its holder is an operator
                     // action; the broker must not keep serving it.

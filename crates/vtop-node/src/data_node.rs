@@ -1239,21 +1239,43 @@ async fn run_candidate(
     let probe_meta = meta.clone();
     let probe_slot = Arc::clone(&slot);
     let probe_flag = Arc::clone(&role_flag);
+    // Same contract as run_leader's probe: non-blocking, and contention
+    // serves the LAST DECIDED verdict rather than guessing — a produce
+    // mid-fsync holds the lease view for its whole critical section, and a
+    // probe landing then must not drain a healthy leader (review).
+    let probe_last = Arc::new(std::sync::atomic::AtomicBool::new(false));
     observability.set_readiness_probe(Arc::new(move || {
         match probe_flag.load(std::sync::atomic::Ordering::Relaxed) {
-            1 => match (probe_meta.try_snapshot(), probe_slot.current()) {
-                (Some((epoch, live)), Some(broker)) => {
-                    if live && epoch == broker.held_fencing_epoch() {
-                        vtop_observe::Readiness::Ready
-                    } else {
-                        vtop_observe::Readiness::not_ready(
-                            "leading, but the lease view is not live at the held epoch".to_owned(),
-                        )
+            1 => match probe_slot.current() {
+                Some(broker) => match probe_meta.try_snapshot() {
+                    Some((epoch, live)) => {
+                        let ready = live && epoch == broker.held_fencing_epoch();
+                        probe_last.store(ready, std::sync::atomic::Ordering::Relaxed);
+                        if ready {
+                            vtop_observe::Readiness::Ready
+                        } else {
+                            vtop_observe::Readiness::not_ready(
+                                "leading, but the lease view is not live at the held epoch"
+                                    .to_owned(),
+                            )
+                        }
                     }
+                    None => {
+                        if probe_last.load(std::sync::atomic::Ordering::Relaxed) {
+                            vtop_observe::Readiness::Ready
+                        } else {
+                            vtop_observe::Readiness::not_ready(
+                                "lease view contended; last decided state was fenced".to_owned(),
+                            )
+                        }
+                    }
+                },
+                None => {
+                    probe_last.store(false, std::sync::atomic::Ordering::Relaxed);
+                    vtop_observe::Readiness::not_ready(
+                        "leading, but the broker is absent".to_owned(),
+                    )
                 }
-                _ => vtop_observe::Readiness::not_ready(
-                    "leading, but the lease view is contended or the broker is absent".to_owned(),
-                ),
             },
             2 => vtop_observe::Readiness::not_ready("role transition in progress".to_owned()),
             _ => vtop_observe::Readiness::Ready,
@@ -1398,7 +1420,20 @@ async fn run_candidate(
                         tokio::pin!(build);
                         let built = loop {
                             tokio::select! {
-                                built = &mut build => break built?,
+                                built = &mut build => {
+                                    // Both can be ready; select does not
+                                    // order its arms. A build completing
+                                    // during shutdown is still a shutdown
+                                    // (review, round five): abandon the
+                                    // unpublished leader — and abandon a
+                                    // failed build the same way, because an
+                                    // orderly stop must not exit as a
+                                    // build failure.
+                                    if *shutdown.borrow() {
+                                        break 'supervisor;
+                                    }
+                                    break built?;
+                                }
                                 changed = shutdown.changed() => {
                                     if changed.is_err() || *shutdown.borrow() {
                                         break 'supervisor;
