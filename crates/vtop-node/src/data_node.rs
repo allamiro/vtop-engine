@@ -1205,6 +1205,7 @@ async fn run_candidate(
         target: std::sync::RwLock::new(None),
         verdicts: verdict_tx,
         finished_through: std::sync::atomic::AtomicU64::new(0),
+        recorded_through: std::sync::atomic::AtomicU64::new(0),
     });
     let (release_lease, release_lease_rx) = tokio::sync::watch::channel(false);
     let agent = crate::lease_agent::LeaseAgent::new(
@@ -1306,6 +1307,7 @@ async fn run_candidate(
     install_follower(&initial);
     let mut phase = Phase::Following(initial);
 
+    let mut native_task_done = false;
     loop {
         tokio::select! {
             changed = shutdown.changed() => {
@@ -1316,7 +1318,20 @@ async fn run_candidate(
             // A plane dying under a live candidate is fail-stop (review): a
             // ready leader with a dead endpoint pins metadata to a leader
             // nobody can reach, and readiness reads the slot, not the task.
+            // But the SAME watch that breaks this loop also stops both
+            // servers, and select does not order its arms — a listener
+            // finishing its orderly shutdown first must read as the
+            // shutdown it is, not as a dead plane, or the node would exit
+            // without draining and let its lease expire instead of
+            // releasing it (review, round three).
             result = &mut native_task => {
+                if *shutdown.borrow() {
+                    if let Ok(Err(error)) = &result {
+                        eprintln!("native server error during shutdown: {error}");
+                    }
+                    native_task_done = true;
+                    break;
+                }
                 return Err(match result {
                     Ok(Ok(())) => "candidate native server exited early".to_owned(),
                     Ok(Err(error)) => error,
@@ -1324,6 +1339,12 @@ async fn run_candidate(
                 });
             }
             result = &mut replica_task => {
+                if *shutdown.borrow() {
+                    if let Ok(Err(error)) = &result {
+                        eprintln!("replica server error during shutdown: {error}");
+                    }
+                    break;
+                }
                 return Err(match result {
                     Ok(Ok(())) => "candidate replica server exited early".to_owned(),
                     Ok(Err(error)) => error,
@@ -1492,9 +1513,10 @@ async fn run_candidate(
     // swallowed: aborted session futures cannot cancel a request already
     // inside `spawn_blocking`, so a timeout here means such a request may
     // still be running (review) — and the quiesce below is what bounds it.
-    if tokio::time::timeout(agent_drain, &mut native_task)
-        .await
-        .is_err()
+    if !native_task_done
+        && tokio::time::timeout(agent_drain, &mut native_task)
+            .await
+            .is_err()
     {
         eprintln!(
             "native drain ran out its budget; an admitted request may still \
@@ -1937,6 +1959,14 @@ struct CandidateLeasePublisher {
     /// There is no third interleaving (review: a check separate from the
     /// publication only narrowed the window; this closes it).
     finished_through: std::sync::atomic::AtomicU64,
+    /// The highest epoch ever RECORDED as a promotion. A completion below
+    /// this watermark is superseded — the agent has since verified a newer
+    /// grant — and installing it would publish a boundary metadata has
+    /// moved past (review: reachable via suspend-then-regrant, which never
+    /// raises the finished ceiling). The refusal is safe because the newer
+    /// verdict is already queued: the supervisor's next iteration builds
+    /// for the grant that superseded this one.
+    recorded_through: std::sync::atomic::AtomicU64,
 }
 
 impl CandidateLeasePublisher {
@@ -1972,6 +2002,10 @@ impl CandidateLeasePublisher {
             .finished_through
             .load(std::sync::atomic::Ordering::SeqCst)
             >= fencing_epoch
+            || self
+                .recorded_through
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > fencing_epoch
         {
             return false;
         }
@@ -1983,6 +2017,8 @@ impl CandidateLeasePublisher {
 
 impl crate::lease_agent::LeasePublisher for CandidateLeasePublisher {
     fn promote(&self, fencing_epoch: u64, committed_offset: Option<u64>) {
+        self.recorded_through
+            .fetch_max(fencing_epoch, std::sync::atomic::Ordering::SeqCst);
         let _ = self.verdicts.send(RoleVerdict::Lead {
             fencing_epoch,
             committed_offset,
@@ -2244,6 +2280,7 @@ mod tests {
             target: std::sync::RwLock::new(None),
             verdicts: verdict_tx,
             finished_through: std::sync::atomic::AtomicU64::new(0),
+            recorded_through: std::sync::atomic::AtomicU64::new(0),
         };
         let target = std::sync::Arc::new(Target::default());
         publisher.set_target(Some(
@@ -2312,6 +2349,34 @@ mod tests {
             *fresh.demoted.lock().unwrap(),
             vec![8],
             "a demotion after completion reaches the broker it authorized"
+        );
+
+        // Suspend-then-regrant never raises the finished ceiling, so the
+        // recorded watermark must refuse a build for a superseded grant:
+        // epoch 10 was recorded while the build for 9 was still in flight.
+        publisher.promote(9, Some(41));
+        publisher.promote(10, Some(41));
+        let superseded = std::sync::Arc::new(Target::default());
+        assert!(
+            !publisher.complete_promotion(
+                std::sync::Arc::clone(&superseded) as std::sync::Arc<dyn LeasePublisher>,
+                9,
+                Some(41)
+            ),
+            "a completion below the recorded watermark is superseded and must be refused"
+        );
+        assert!(
+            superseded.promoted.lock().unwrap().is_empty(),
+            "a superseded completion publishes nothing"
+        );
+        let latest = std::sync::Arc::new(Target::default());
+        assert!(
+            publisher.complete_promotion(
+                std::sync::Arc::clone(&latest) as std::sync::Arc<dyn LeasePublisher>,
+                10,
+                Some(41)
+            ),
+            "the latest recorded grant completes"
         );
     }
 
