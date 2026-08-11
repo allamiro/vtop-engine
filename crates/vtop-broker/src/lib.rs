@@ -1129,6 +1129,52 @@ impl LocalBroker {
         state.segment.commit().map_err(BrokerError::from)
     }
 
+    /// Seal the active tail so the sealed prefix reaches this leader's
+    /// actual position (#306).
+    ///
+    /// Only sealed segments transfer, so before this a repair stopped at
+    /// wherever the range last happened to roll — up to a whole segment
+    /// bound behind the leader. Sealing on demand is an ordinary roll taken
+    /// deliberately: the tail seals, a successor opens at its end, and the
+    /// freshly sealed segment is transferable the moment this returns.
+    /// Under the SAME lock as the append path, because rolling belongs to
+    /// the append critical section — a produce landing mid-seal would
+    /// otherwise race the successor's creation.
+    ///
+    /// Returns `(sealed_end, records_sealed)`. An EMPTY tail over a sealed
+    /// prefix is an idempotent no-op — the prefix already reaches the
+    /// leader's position, records_sealed is zero, and a retrying repair can
+    /// tell that from progress. An empty tail with NO sealed prefix is
+    /// refused: a never-written range has nothing a transfer could carry,
+    /// and minting a degenerate sealed segment to say so would cost a file
+    /// and a lie.
+    ///
+    /// The caller is responsible for fencing: this is a WRITE, and the
+    /// transfer plane's per-request epoch check runs before it.
+    pub fn seal_tail(&self) -> BrokerResult<(u64, u64)> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tail_base = state.segment.active().base_offset();
+        let tail_next = state.segment.next_offset();
+        if tail_next == tail_base {
+            if state.segment.sealed().is_empty() {
+                return Err(BrokerError::InvalidConfig(
+                    "this range has never held a record; there is nothing to seal and nothing                      a transfer could carry — produce to the range before repairing from it"
+                        .to_owned(),
+                ));
+            }
+            return Ok((tail_next, 0));
+        }
+        let records_sealed = tail_next - tail_base;
+        state.segment.roll_minting().map_err(BrokerError::from)?;
+        // A seal adds a sealed segment, and retention reasons in sealed
+        // units — the same follow-through the produce path's roll performs.
+        self.run_retention(&mut state.segment);
+        Ok((tail_next, records_sealed))
+    }
+
     /// Non-blocking `(local_committed_offset, next_offset)`, for observation
     /// only (#224).
     ///

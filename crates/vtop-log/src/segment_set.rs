@@ -942,6 +942,15 @@ impl SegmentSet {
         Ok(())
     }
 
+    /// [`Self::roll`], minting the successor's identity from this set's own
+    /// environment — for a caller with no meaningful id to choose, like a
+    /// leader sealing its tail on demand (#306). Same minting as
+    /// `append_group_minting` and cross-segment truncation.
+    pub fn roll_minting(&mut self) -> VtopLogResult<()> {
+        let successor_id = Uuid::from_u128(self.env.rng.next_u128());
+        self.roll(successor_id)
+    }
+
     /// Change the range's roll thresholds, from the tail forward (#314).
     ///
     /// A segment's limits live in its header and nowhere else, and that

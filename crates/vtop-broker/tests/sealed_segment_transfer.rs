@@ -380,6 +380,20 @@ fn the_leader_refuses_by_name_what_the_transfer_plane_does_not_serve() {
         .unwrap_err();
     assert_eq!(code, ErrorCode::Fenced);
 
+    // The strongest of the three: a SealTail served under a stale epoch
+    // MUTATES the leader's range (#306), so a deposed leader's client must
+    // be refused before anything rolls.
+    let sealed_before = h.leader.sealed_segment_handles().len();
+    let (code, _) = handler
+        .seal_tail(TEST_PEER, &h.range, FENCING_EPOCH - 1)
+        .unwrap_err();
+    assert_eq!(code, ErrorCode::Fenced);
+    assert_eq!(
+        h.leader.sealed_segment_handles().len(),
+        sealed_before,
+        "a fenced seal request must not have rolled anything"
+    );
+
     // A frontier the listing advertised as absent cannot be fetched: the
     // first sealed segment inherited nothing.
     let first = sealed
@@ -913,5 +927,130 @@ fn a_condemned_range_refuses_to_open_and_to_be_adopted() {
     assert!(
         SegmentSet::adopt_in(&Env::real(), h.destination.path(), Uuid::from_u128(0xBEEF)).is_err(),
         "a condemned range must not be adoptable either"
+    );
+}
+
+/// The #306 arithmetic, closed: sealing on demand moves the sealed prefix to
+/// the leader's actual position, and the very next transfer carries what was
+/// the tail. The leader keeps serving appends afterwards — the seal is an
+/// ordinary roll taken deliberately, not a shutdown.
+#[test]
+fn sealing_the_tail_makes_the_leaders_position_transferable() {
+    let h = harness();
+    let (_, tail_next_before) = h.leader.local_offsets();
+    let sealed_end_before = h
+        .leader
+        .sealed_segment_handles()
+        .iter()
+        .map(|handle| handle.next_offset)
+        .max()
+        .unwrap();
+    assert!(
+        sealed_end_before < tail_next_before,
+        "the fixture must hold tail records, or this test proves nothing about sealing them"
+    );
+
+    let (sealed_end, records_sealed) = h
+        .runtime
+        .block_on(
+            h.client
+                .seal_tail(h.addr, "localhost", LEADER, &h.range, FENCING_EPOCH),
+        )
+        .expect("a fenced seal from an authorized repairer must succeed");
+    assert_eq!(
+        sealed_end, tail_next_before,
+        "the sealed prefix must now reach the leader's position at the seal"
+    );
+    assert_eq!(records_sealed, tail_next_before - sealed_end_before);
+
+    // Idempotent: the tail is now empty, so a retrying repair seals nothing
+    // and learns that from the count rather than from an error.
+    let (again_end, again_records) = h
+        .runtime
+        .block_on(
+            h.client
+                .seal_tail(h.addr, "localhost", LEADER, &h.range, FENCING_EPOCH),
+        )
+        .expect("sealing an already-empty tail is a no-op, not a failure");
+    assert_eq!(again_end, sealed_end);
+    assert_eq!(again_records, 0, "nothing was left to seal");
+
+    // The transfer now carries what was the tail: the received prefix ends
+    // at the leader's sealed position, and adoption serves every record.
+    let receiver = SegmentReceiver::open(&Env::real(), h.destination.path()).unwrap();
+    transfer(&h, &receiver).expect("the transfer after the seal must succeed");
+    let adopted =
+        SegmentSet::adopt_in(&Env::real(), h.destination.path(), Uuid::from_u128(0x5EA1)).unwrap();
+    assert_eq!(
+        adopted.next_offset(),
+        tail_next_before,
+        "the repaired replica must begin exactly at the leader's sealed position — the gap \
+         the tail used to hold is what #306 exists to close"
+    );
+
+    // And the leader is still a leader: the successor tail serves appends.
+    let response = h.leader.handle(
+        Role::Producer,
+        WireFrame {
+            request_id: 999,
+            stream_id: 1,
+            message: Message::ProduceRequest(ProduceRequest {
+                range: h.range.clone(),
+                fencing_epoch: FENCING_EPOCH,
+                producer_id: PRODUCER,
+                producer_epoch: 1,
+                first_sequence: 48,
+                durability: WireDurability::LocalFsync,
+                records: vec![ProduceRecord {
+                    timestamp_millis: 99_000,
+                    key: b"k".to_vec(),
+                    value: vec![b'y'; 64],
+                }],
+            }),
+        },
+    );
+    match response.message {
+        Message::ProduceResponse(_) => {}
+        other => panic!("the leader must keep serving appends after a seal: {other:?}"),
+    }
+}
+
+/// A range that has never held a record refuses the seal with a reason: a
+/// degenerate sealed segment would cost a file to say nothing, and adoption
+/// would still refuse the empty prefix it decorated.
+#[test]
+fn sealing_a_never_written_range_is_refused_with_a_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let range = range_identity();
+    let descriptor = SegmentDescriptor {
+        segment_id: Uuid::from_u128(0xE1),
+        topic: range.topic.clone(),
+        topic_epoch: range.topic_epoch,
+        lineage: RangeLineage {
+            range_id: range.range_id,
+            generation: range.range_generation,
+            key_range: KeyRange::full(),
+            parents: Vec::new(),
+        },
+        base_offset: 0,
+    };
+    let segment = SegmentSet::create_in(
+        &Env::real(),
+        dir.path(),
+        descriptor,
+        SegmentConfig::default(),
+    )
+    .unwrap();
+    let epochs = ProducerEpochJournal::open(dir.path().join("epochs")).unwrap();
+    let broker = Arc::new(LocalBroker::new(segment, epochs, range.clone(), FENCING_EPOCH).unwrap());
+    let handler = LeaderSegmentTransferHandler::new(Arc::clone(&broker));
+
+    let (code, message) = handler
+        .seal_tail(TEST_PEER, &range, FENCING_EPOCH)
+        .unwrap_err();
+    assert_eq!(code, ErrorCode::InvalidRequest);
+    assert!(
+        message.contains("never held a record"),
+        "the refusal must say why a never-written range cannot be repaired from: {message}"
     );
 }

@@ -232,6 +232,30 @@ impl ReplicaPeerHandler for LeaderSegmentTransferHandler {
         })
     }
 
+    fn seal_tail(
+        &self,
+        // Same division of labour as the transfer RPCs: authorization
+        // belongs to the node that installs this handler.
+        _peer: Uuid,
+        range: &RangeIdentity,
+        fencing_epoch: u64,
+    ) -> Result<vtop_protocol::SealTailResponse, (ErrorCode, String)> {
+        self.check_range(range)?;
+        // BEFORE the seal, deliberately: sealing is a write, and the fencing
+        // check is what stops a deposed leader sealing a tail the cluster
+        // has moved past. The same one-snapshot-one-lock discipline as every
+        // other fenced request applies inside check_fencing.
+        self.check_fencing(fencing_epoch)?;
+        let (sealed_end, records_sealed) = self
+            .broker
+            .seal_tail()
+            .map_err(|problem| (ErrorCode::InvalidRequest, problem.to_string()))?;
+        Ok(vtop_protocol::SealTailResponse {
+            sealed_end,
+            records_sealed,
+        })
+    }
+
     fn list_sealed_segments(
         &self,
         // This handler serves whoever reaches it; the authorization decision
@@ -362,6 +386,70 @@ impl SegmentTransferClient {
     /// primary renames last, so its presence proves the bundle verified), and
     /// a segment that was mid-receive left only ignorable staging debris the
     /// receiver swept at open.
+    /// Ask the leader to seal its active tail, so the sealed prefix reaches
+    /// its actual position (#306).
+    ///
+    /// Fenced like every mutating request: a deposed leader refuses rather
+    /// than sealing a tail the cluster has moved past. Returns
+    /// `(sealed_end, records_sealed)`; zero records sealed means the tail
+    /// was already empty and the sealed prefix already reached the leader's
+    /// position — an idempotent no-op, not a failure.
+    pub async fn seal_tail(
+        &self,
+        addr: SocketAddr,
+        server_name: &str,
+        expected_node: Uuid,
+        range: &RangeIdentity,
+        fencing_epoch: u64,
+    ) -> BrokerResult<(u64, u64)> {
+        let name = rustls::pki_types::ServerName::try_from(server_name.to_owned())
+            .map_err(|error| {
+                crate::BrokerError::InvalidConfig(format!("server name {server_name:?}: {error}"))
+            })?
+            .to_owned();
+        let mut stream = timeout(self.request_timeout, async {
+            let tcp = TcpStream::connect(addr)
+                .await
+                .map_err(|source| crate::BrokerError::Io {
+                    path: PathBuf::from("seal-tail"),
+                    source,
+                })?;
+            self.connector
+                .connect(name, tcp)
+                .await
+                .map_err(|source| crate::BrokerError::Io {
+                    path: PathBuf::from("seal-tail-tls"),
+                    source,
+                })
+        })
+        .await
+        .map_err(|_| crate::BrokerError::Timeout("seal tail connect"))??;
+        assert_peer_uuid(peer_certs_client(&stream), expected_node)?;
+        let mut request_id = 1_u64;
+        match self
+            .round_trip(
+                &mut stream,
+                &mut request_id,
+                Message::SealTailRequest(vtop_protocol::SealTailRequest {
+                    range: range.clone(),
+                    fencing_epoch,
+                }),
+            )
+            .await?
+        {
+            Message::SealTailResponse(response) => {
+                Ok((response.sealed_end, response.records_sealed))
+            }
+            Message::Error(error) => Err(crate::BrokerError::InvalidConfig(format!(
+                "leader refused to seal its tail: {:?} {}",
+                error.code, error.message
+            ))),
+            other => Err(crate::BrokerError::InvalidConfig(format!(
+                "unexpected reply to a seal-tail request: {other:?}"
+            ))),
+        }
+    }
+
     /// The source's sealed-segment listing, served UNDER THE FENCING CHECK.
     ///
     /// Exists for two callers' reasons at once (#315): the listing's highest
