@@ -242,6 +242,18 @@ pub fn establish(probes: &[ReplicaProbe], replication_factor: usize, leader_id: 
     // acknowledged record. The floor check above cannot substitute: the
     // k-th largest can sit below an acknowledged record whose surviving
     // holders straddle the candidate.
+    //
+    // These are POST-RECONCILIATION offsets — the fence reconciles before it
+    // answers (#263) — and that is correct, not a leak in the restriction.
+    // A same-epoch prefix relationship is not divergence (`compare_lineage`
+    // answers Agreed and reconciliation touches nothing), so the replica
+    // ahead of the candidate still answers with its full offset and refuses
+    // the candidate here. Truncation before answering happens only on
+    // GENUINE lineage divergence, and there a pre-truncation offset would be
+    // the wrong vote input: offsets are only comparable within an agreed
+    // lineage, and counting bytes from a contradicted leadership line as
+    // log-completeness is the exact mistake epoch qualification (#258)
+    // exists to prevent.
     let votes = answered
         .values()
         .filter(|offset| **offset <= candidate_offset)
