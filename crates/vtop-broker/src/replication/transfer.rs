@@ -240,16 +240,12 @@ impl ReplicaPeerHandler for LeaderSegmentTransferHandler {
         range: &RangeIdentity,
         fencing_epoch: u64,
     ) -> Result<vtop_protocol::SealTailResponse, (ErrorCode, String)> {
-        self.check_range(range)?;
-        // BEFORE the seal, deliberately: sealing is a write, and the fencing
-        // check is what stops a deposed leader sealing a tail the cluster
-        // has moved past. The same one-snapshot-one-lock discipline as every
-        // other fenced request applies inside check_fencing.
-        self.check_fencing(fencing_epoch)?;
-        let (sealed_end, records_sealed) = self
-            .broker
-            .seal_tail()
-            .map_err(|problem| (ErrorCode::InvalidRequest, problem.to_string()))?;
+        // Fencing is checked INSIDE the broker, under the produce path's own
+        // lock discipline, held through the roll. A check out here — this
+        // handler's one-shot check_fencing — leaves a window between the
+        // check and the seal where a grant or release can land, and sealing
+        // is a write a deposed leader must not perform (review P1).
+        let (sealed_end, records_sealed) = self.broker.seal_tail(range, fencing_epoch)?;
         Ok(vtop_protocol::SealTailResponse {
             sealed_end,
             records_sealed,
@@ -379,13 +375,6 @@ impl SegmentTransferClient {
         self
     }
 
-    /// Pull every sealed segment `receiver` does not already hold.
-    ///
-    /// Returns the installed primary paths, oldest first. Idempotent across
-    /// interruptions: a segment whose primary already landed is skipped (the
-    /// primary renames last, so its presence proves the bundle verified), and
-    /// a segment that was mid-receive left only ignorable staging debris the
-    /// receiver swept at open.
     /// Ask the leader to seal its active tail, so the sealed prefix reaches
     /// its actual position (#306).
     ///
@@ -450,6 +439,13 @@ impl SegmentTransferClient {
         }
     }
 
+    /// Pull every sealed segment `receiver` does not already hold.
+    ///
+    /// Returns the installed primary paths, oldest first. Idempotent across
+    /// interruptions: a segment whose primary already landed is skipped (the
+    /// primary renames last, so its presence proves the bundle verified), and
+    /// a segment that was mid-receive left only ignorable staging debris the
+    /// receiver swept at open.
     /// The source's sealed-segment listing, served UNDER THE FENCING CHECK.
     ///
     /// Exists for two callers' reasons at once (#315): the listing's highest

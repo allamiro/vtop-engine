@@ -1278,7 +1278,10 @@ async fn repair(
                  for a base-offset mismatch and this repair will not have been enough.{}",
                 if seal_tail {
                     "\nThe tail WAS sealed for this repair, so these records arrived after the \
-                     seal — a retry narrows the gap to whatever lands during the next transfer."
+                     seal. Starting the replica lets it replay them from the leader; if the gap \
+                     exceeds the retransmission buffer, run a FRESH repair into an empty \
+                     directory with --seal-tail — this directory is adopted now, and a second \
+                     repair over it is refused."
                 } else {
                     "\nRe-running with --seal-tail into an empty directory would seal the tail \
                      first, so the transferred prefix reaches the leader's position (#306)."

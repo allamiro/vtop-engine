@@ -1137,9 +1137,20 @@ impl LocalBroker {
     /// bound behind the leader. Sealing on demand is an ordinary roll taken
     /// deliberately: the tail seals, a successor opens at its end, and the
     /// freshly sealed segment is transferable the moment this returns.
-    /// Under the SAME lock as the append path, because rolling belongs to
-    /// the append critical section — a produce landing mid-seal would
-    /// otherwise race the successor's creation.
+    ///
+    /// FENCED IN HERE, under the produce path's own lock discipline —
+    /// metadata lease view first, then broker state, both held through the
+    /// roll — so a grant or release cannot land between the fencing check
+    /// and the seal. A check performed outside these locks would leave
+    /// exactly that window, and sealing is a write a deposed leader must
+    /// not perform (review: the one-snapshot check alone was not enough).
+    ///
+    /// RETENTION DOES NOT RUN HERE, deliberately. A bytes-bound retention
+    /// pass could reclaim the very segment this call just sealed — the
+    /// committed floor covers it by construction — and the RPC would then
+    /// report a `sealed_end` the transfer listing cannot reach. The seal
+    /// exists to make the tail transferable; housekeeping that could
+    /// unmake it waits for the next ordinary roll.
     ///
     /// Returns `(sealed_end, records_sealed)`. An EMPTY tail over a sealed
     /// prefix is an idempotent no-op — the prefix already reaches the
@@ -1148,30 +1159,40 @@ impl LocalBroker {
     /// refused: a never-written range has nothing a transfer could carry,
     /// and minting a degenerate sealed segment to say so would cost a file
     /// and a lie.
-    ///
-    /// The caller is responsible for fencing: this is a WRITE, and the
-    /// transfer plane's per-request epoch check runs before it.
-    pub fn seal_tail(&self) -> BrokerResult<(u64, u64)> {
+    pub fn seal_tail(
+        &self,
+        range: &RangeIdentity,
+        fencing_epoch: u64,
+    ) -> Result<(u64, u64), (ErrorCode, String)> {
+        // Lock order: metadata lease view, then broker state — identical to
+        // the produce path, which documents why: held together through the
+        // write, a concurrent grant/release cannot revoke between the
+        // fencing check and the mutation.
+        let meta = self.meta_fencing_epoch.lock();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.check_range(&meta, range, fencing_epoch)
+            .map_err(|(code, message)| (code, message.to_owned()))?;
         let tail_base = state.segment.active().base_offset();
         let tail_next = state.segment.next_offset();
         if tail_next == tail_base {
             if state.segment.sealed().is_empty() {
-                return Err(BrokerError::InvalidConfig(
-                    "this range has never held a record; there is nothing to seal and nothing                      a transfer could carry — produce to the range before repairing from it"
+                return Err((
+                    ErrorCode::InvalidRequest,
+                    "this range has never held a record; there is nothing to seal and nothing \
+                     a transfer could carry — produce to the range before repairing from it"
                         .to_owned(),
                 ));
             }
             return Ok((tail_next, 0));
         }
         let records_sealed = tail_next - tail_base;
-        state.segment.roll_minting().map_err(BrokerError::from)?;
-        // A seal adds a sealed segment, and retention reasons in sealed
-        // units — the same follow-through the produce path's roll performs.
-        self.run_retention(&mut state.segment);
+        state
+            .segment
+            .roll_minting()
+            .map_err(|problem| (ErrorCode::Storage, problem.to_string()))?;
         Ok((tail_next, records_sealed))
     }
 
