@@ -108,7 +108,12 @@ await_log_line "$WORKDIR/logs/data-candidate-$NEW_LEADER.log" \
   "the survivor must have BECOME the leader in place; a restart would be scenario 09"
 
 # --- the new leader serves, on its own address, and nothing acked was lost --
-CLIENT_CFG2="$(emit_client_config_at_epoch "$NEW_EPOCH")"
+# A BUMPED PRODUCER EPOCH, not just the new fencing epoch (review): the
+# fresh batch reuses sequence numbers 0.., and under the original producer
+# epoch the broker deduplicates them against the first batch — the produce
+# would "succeed" while proving nothing about fresh quorum writes. Scenario
+# 09's post-promotion ritual, inherited.
+CLIENT_CFG2="$(emit_client_config_at_epoch "$NEW_EPOCH" 2)"
 produce_deadline=$((SECONDS + PROGRESS_TIMEOUT_SECONDS))
 until "$VTOP_NODE" produce --client-config "$CLIENT_CFG2" \
   --addr "$(candidate_native_addr "$NEW_LEADER")" \
@@ -122,7 +127,11 @@ done
 await_acked_floor "$WORKDIR/acked-after" "$BATCH"
 log "quorum produce resumed at epoch $NEW_EPOCH on candidate $NEW_LEADER's own address"
 
-await_verified_floor "$CLIENT_CFG2" "$(candidate_native_addr "$NEW_LEADER")" "$ACKED"
+# Content is verifiable only through $ACKED: the post-failover batch was
+# written under a bumped producer epoch with sequences restarting at 0, so
+# its bytes are not reconstructible from offsets — structure is still
+# checked through the tail (await_verified_floor's own contract).
+await_verified_floor "$CLIENT_CFG2" "$(candidate_native_addr "$NEW_LEADER")" "$ACKED" "$ACKED"
 log "every one of the $ACKED pre-kill acknowledged records is intact after the failover"
 
 log "PASS"

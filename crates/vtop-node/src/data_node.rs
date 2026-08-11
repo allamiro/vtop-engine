@@ -1080,6 +1080,21 @@ async fn run_candidate(
                 .into(),
         );
     }
+    {
+        // Distinct members, verified (review): a duplicated peer would count
+        // toward the quorum twice, letting one reachable node satisfy a
+        // majority that exists to require different disks.
+        let mut seen = std::collections::BTreeSet::new();
+        for peer in &config.peers {
+            if !seen.insert(peer.node_uuid) {
+                return Err(format!(
+                    "candidate `peers` lists {} more than once; a quorum over duplicated \
+                     members is a quorum in name only",
+                    peer.node_uuid
+                ));
+            }
+        }
+    }
     let native_listen = config
         .native_listen
         .as_ref()
@@ -1114,13 +1129,15 @@ async fn run_candidate(
         .await
         .map_err(|error| format!("bind {replica_listen}: {error}"))?;
     let replica_shutdown = oneshot_on_shutdown(shutdown.clone());
-    tokio::spawn(async move {
-        if let Err(error) = replica_server
+    // HELD, not detached (review): a listener that dies while this node
+    // holds the lease leaves a ready leader with a dead endpoint. The
+    // supervisor selects on these handles and treats an early exit as
+    // fatal — fail-stop, so the lease lapses and a healthy candidate wins.
+    let mut replica_task = tokio::spawn(async move {
+        replica_server
             .serve(replica_listener, replica_shutdown)
             .await
-        {
-            tracing::warn!(%error, "candidate replica server exited");
-        }
+            .map_err(|error| format!("candidate replica server exited: {error}"))
     });
 
     let slot = Arc::new(vtop_broker::BrokerSlot::empty());
@@ -1149,10 +1166,11 @@ async fn run_candidate(
         .await
         .map_err(|error| format!("bind {native_listen}: {error}"))?;
     let native_shutdown = oneshot_on_shutdown(shutdown.clone());
-    tokio::spawn(async move {
-        if let Err(error) = native_server.serve(native_listener, native_shutdown).await {
-            tracing::warn!(%error, "candidate native server exited");
-        }
+    let mut native_task = tokio::spawn(async move {
+        native_server
+            .serve(native_listener, native_shutdown)
+            .await
+            .map_err(|error| format!("candidate native server exited: {error}"))
     });
     // NO role collector in this first slice, deliberately: BrokerCollector
     // and FollowerCollector export the same metric names, the registry
@@ -1294,6 +1312,23 @@ async fn run_candidate(
                     break;
                 }
             }
+            // A plane dying under a live candidate is fail-stop (review): a
+            // ready leader with a dead endpoint pins metadata to a leader
+            // nobody can reach, and readiness reads the slot, not the task.
+            result = &mut native_task => {
+                return Err(match result {
+                    Ok(Ok(())) => "candidate native server exited early".to_owned(),
+                    Ok(Err(error)) => error,
+                    Err(join) => format!("candidate native server task failed: {join}"),
+                });
+            }
+            result = &mut replica_task => {
+                return Err(match result {
+                    Ok(Ok(())) => "candidate replica server exited early".to_owned(),
+                    Ok(Err(error)) => error,
+                    Err(join) => format!("candidate replica server task failed: {join}"),
+                });
+            }
             changed = verdict_rx.changed() => {
                 if changed.is_err() {
                     break;
@@ -1303,6 +1338,7 @@ async fn run_candidate(
                     (Phase::Following(_), RoleVerdict::Lead { fencing_epoch, committed_offset }) => {
                         role_flag.store(2, std::sync::atomic::Ordering::Relaxed);
                         switching.transitioning();
+                        view.clear();
                         publisher.set_target(None);
                         let Phase::Following(follower) =
                             std::mem::replace(&mut phase, Phase::Transitioning)
@@ -1316,41 +1352,84 @@ async fn run_candidate(
                         // handler and view already point elsewhere, and this
                         // binding was the last.
                         drop(follower);
-                        match build_leader_phase(
-                            &config, &range, &peers, roll, &meta, &slot, &switching, &view,
-                            &publisher, fencing_epoch, committed_offset,
-                        )
-                        .await
+                        // FAIL-STOP on a failed build (review): the agent
+                        // already verified this epoch and would renew a
+                        // lease over an empty slot forever — the one state
+                        // worse than a dead node is a live one holding a
+                        // range it cannot serve. Exiting lets the lease
+                        // lapse and a healthy candidate win.
+                        let built =
+                            build_leader_phase(&config, &range, &peers, roll, &meta).await?;
+                        // THE VERDICT RECHECK (review P0): a lease lost
+                        // during the build — the follower-stream wait can
+                        // take seconds — must win over the build. The
+                        // demote that recorded it found no target, so
+                        // nothing has fenced yet; completing the stale
+                        // promotion would serve writes at an epoch metadata
+                        // moved past. Any residual race after this check is
+                        // closed by the queued verdict: the loop's next
+                        // iteration runs the full demotion before anything
+                        // else happens.
+                        let current = *verdict_rx.borrow();
+                        if current
+                            != (RoleVerdict::Lead {
+                                fencing_epoch,
+                                committed_offset,
+                            })
                         {
-                            Ok(next) => {
-                                role_flag.store(1, std::sync::atomic::Ordering::Relaxed);
-                                println!(
-                                    "data_node_role_changed role=leader node={} epoch={fencing_epoch}",
-                                    config.node_uuid
+                            if let Err(error) = built.broker.quiesce() {
+                                eprintln!(
+                                    "post-abandoned-build commit failed; recovery will handle \
+                                     it: {error}"
                                 );
-                                std::io::stdout().flush().ok();
-                                phase = next;
                             }
-                            Err(error) => {
-                                // The lease is held but the leader could not be
-                                // built. Fail closed as a follower again: the
-                                // unrenewed lease lapses and another candidate
-                                // wins.
-                                eprintln!("promotion failed to build the leader: {error}");
-                                let (set, _) = open_range(
-                                    &config.data_dir,
-                                    config.segment_id,
-                                    &range,
-                                    roll,
-                                )?;
-                                let epochs =
-                                    ProducerEpochJournal::open(config.data_dir.join("epochs"))
-                                        .map_err(|error| error.to_string())?;
-                                let follower = build_follower(set, epochs)?;
-                                install_follower(&follower);
-                                phase = Phase::Following(follower);
-                            }
+                            drop(built);
+                            let (set, _) =
+                                open_range(&config.data_dir, config.segment_id, &range, roll)?;
+                            let epochs =
+                                ProducerEpochJournal::open(config.data_dir.join("epochs"))
+                                    .map_err(|error| error.to_string())?;
+                            let follower = build_follower(set, epochs)?;
+                            install_follower(&follower);
+                            phase = Phase::Following(follower);
+                            println!(
+                                "data_node_role_changed role=follower node={} \
+                                 note=lease-moved-during-promotion",
+                                config.node_uuid
+                            );
+                            std::io::stdout().flush().ok();
+                            continue;
                         }
+                        switching.install(Arc::clone(&built.status));
+                        view.install(Arc::clone(&built.broker)
+                            as Arc<dyn crate::lease_agent::CandidateLocalView>);
+                        let broker_publisher =
+                            Arc::new(crate::lease_agent::BrokerLeasePublisher::new(
+                                Arc::clone(&built.broker),
+                            ));
+                        // Target BEFORE promote: a demotion racing this
+                        // instant forwards to the broker rather than into
+                        // the void, and the queued verdict then unwinds the
+                        // promotion on the next iteration.
+                        publisher.set_target(Some(Arc::clone(&broker_publisher)
+                            as Arc<dyn crate::lease_agent::LeasePublisher>));
+                        crate::lease_agent::LeasePublisher::promote(
+                            broker_publisher.as_ref(),
+                            fencing_epoch,
+                            committed_offset,
+                        );
+                        slot.install(Arc::clone(&built.broker));
+                        role_flag.store(1, std::sync::atomic::Ordering::Relaxed);
+                        println!(
+                            "data_node_role_changed role=leader node={} epoch={fencing_epoch}",
+                            config.node_uuid
+                        );
+                        std::io::stdout().flush().ok();
+                        phase = Phase::Leading {
+                            broker: built.broker,
+                            publisher: broker_publisher,
+                            _replicas: built.replicas,
+                        };
                     }
                     (Phase::Leading { publisher: leader_publisher, .. },
                      RoleVerdict::Lead { fencing_epoch, committed_offset }) => {
@@ -1370,6 +1449,7 @@ async fn run_candidate(
                         // broker, so in-flight requests are refusing.
                         slot.clear();
                         switching.transitioning();
+                        view.clear();
                         publisher.set_target(None);
                         let Phase::Leading { broker, .. } =
                             std::mem::replace(&mut phase, Phase::Transitioning)
@@ -1400,10 +1480,21 @@ async fn run_candidate(
     }
 
     // --- drain (#280) -------------------------------------------------------
+    // The leader's ordering, in-process: stop admission, drain the native
+    // sessions, and only THEN release — a release racing an admitted
+    // produce would let metadata authorize a successor under a broker
+    // still acking at the old epoch (review; run_leader's own invariant).
     println!(
         "data_node_stopping role=candidate node={}",
         config.node_uuid
     );
+    if matches!(phase, Phase::Leading { .. }) {
+        slot.clear();
+    }
+    // Both server tasks were signalled by the shutdown watch already; await
+    // the native drain (the accept loop joins its sessions) within the same
+    // budget the agent gets.
+    let _ = tokio::time::timeout(agent_drain, &mut native_task).await;
     let _ = release_lease.send(true);
     let _ = tokio::time::timeout(agent_drain, &mut agent_task).await;
     match phase {
@@ -1438,24 +1529,26 @@ enum Phase {
     Transitioning,
 }
 
-/// Build the leader half of a candidate: replica set from peers minus self,
-/// broker over the reopened range, transfer surface, and the COMPLETED
-/// promotion — the boundary the agent proved is published only here, once
-/// the broker it authorizes actually exists.
-#[allow(clippy::too_many_arguments)]
+/// A leader BUILT but not yet serving: nothing in it is installed,
+/// promoted, or reachable until the supervisor rechecks the verdict — a
+/// lease lost during this build must win over the build (review P0).
+struct BuiltLeader {
+    broker: Arc<LocalBroker>,
+    status: Arc<dyn ReplicaPeerHandler>,
+    replicas: Arc<NetworkedReplicaSet>,
+}
+
+/// Build the leader half of a candidate: replica set from peers minus
+/// self, broker over the reopened range, transfer surface. PURE
+/// CONSTRUCTION — the promotion completes in the supervisor, after it has
+/// confirmed the verdict that ordered this build still stands.
 async fn build_leader_phase(
     config: &DataNodeConfig,
     range: &RangeIdentity,
     peers: &[crate::config::FollowerPeerConfig],
     roll: SegmentRoll,
     meta: &MetaFencingEpoch,
-    slot: &Arc<vtop_broker::BrokerSlot>,
-    switching: &Arc<SwitchingReplicaHandler>,
-    view: &Arc<SwitchingLocalView>,
-    publisher: &Arc<CandidateLeasePublisher>,
-    fencing_epoch: u64,
-    committed_offset: Option<u64>,
-) -> Result<Phase, String> {
+) -> Result<BuiltLeader, String> {
     let (set, _recovery) = open_range(&config.data_dir, config.segment_id, range, roll)?;
     let epochs = ProducerEpochJournal::open(config.data_dir.join("epochs"))
         .map_err(|error| error.to_string())?;
@@ -1520,8 +1613,9 @@ async fn build_leader_phase(
     }
     // The transfer surface a leader owes the repair plane, gated on the
     // symmetric allowlist: peers minus self, plus any named repair
-    // destinations.
-    switching.install(Arc::new(LeaderStatusReplica {
+    // destinations. BUILT here, INSTALLED by the supervisor — nothing this
+    // function does may take effect before the verdict recheck.
+    let status = Arc::new(LeaderStatusReplica {
         broker: Arc::clone(&broker),
         node_id: config.node_uuid,
         transfer: LeaderSegmentTransferHandler::new(Arc::clone(&broker)),
@@ -1530,28 +1624,11 @@ async fn build_leader_phase(
             .map(|peer| peer.node_uuid)
             .chain(config.transfer_peers.iter().copied())
             .collect(),
-    }) as Arc<dyn ReplicaPeerHandler>);
-    view.install(Arc::clone(&broker) as Arc<dyn crate::lease_agent::CandidateLocalView>);
-    // COMPLETE the promotion: the verdict recorded the epoch and the proven
-    // boundary; only now does a broker exist for them to authorize. Install
-    // the real publisher first so a demotion racing this instant forwards
-    // to the broker rather than into the void.
-    let broker_publisher = Arc::new(crate::lease_agent::BrokerLeasePublisher::new(Arc::clone(
-        &broker,
-    )));
-    publisher.set_target(Some(
-        Arc::clone(&broker_publisher) as Arc<dyn crate::lease_agent::LeasePublisher>
-    ));
-    crate::lease_agent::LeasePublisher::promote(
-        broker_publisher.as_ref(),
-        fencing_epoch,
-        committed_offset,
-    );
-    slot.install(Arc::clone(&broker));
-    Ok(Phase::Leading {
+    }) as Arc<dyn ReplicaPeerHandler>;
+    Ok(BuiltLeader {
         broker,
-        publisher: broker_publisher,
-        _replicas: replicas,
+        status,
+        replicas,
     })
 }
 
@@ -1750,6 +1827,17 @@ impl SwitchingLocalView {
             .delegate
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(view);
+    }
+
+    /// Release the current delegate. Called BEFORE a transition drops its
+    /// role object (review): this view's Arc would otherwise keep the old
+    /// storage owner alive across the reopen, and the handoff contract is
+    /// that the directory has exactly one owner at a time.
+    fn clear(&self) {
+        *self
+            .delegate
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 }
 

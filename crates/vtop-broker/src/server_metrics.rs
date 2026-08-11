@@ -230,10 +230,12 @@ pub struct ServerMetrics {
     sessions_refused_at_capacity: AtomicU64,
     sessions_refused_unauthorized: AtomicU64,
     sessions_refused_handshake: AtomicU64,
-    /// Sockets refused because no broker currently stands behind the
-    /// listener — a candidate that is not leading (#284). Its own counter,
-    /// not capacity's: "we are full" and "we are not the leader" point an
-    /// operator at opposite remedies.
+    /// Sockets refused because no SERVABLE broker stands behind the
+    /// listener: a candidate that is not leading (#284), or — rarer and
+    /// loud on stderr — an installed broker whose segment format does not
+    /// match the listener's declaration. Its own counter, not capacity's:
+    /// "we are full" and "nothing here can serve you" point an operator at
+    /// opposite remedies, and the stderr line splits the two causes.
     sessions_refused_no_broker: AtomicU64,
     requests: [[AtomicU64; RequestOutcome::ALL.len()]; RequestKind::ALL.len()],
     latency: [LatencyHistogram; RequestKind::ALL.len()],

@@ -1045,6 +1045,13 @@ impl ServerCollector {
                     vec!["handshake"],
                     self.metrics.sessions_refused_handshake_total(),
                 ),
+                // A candidate that is not currently leading (#284): the
+                // remedy is "produce to the leader", which is the opposite
+                // of capacity's "scale or shed".
+                (
+                    vec!["no_broker"],
+                    self.metrics.sessions_refused_no_broker_total(),
+                ),
             ]),
             self.produced_records
                 .family([(Vec::new(), self.metrics.records_produced_total())]),
