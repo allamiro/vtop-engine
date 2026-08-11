@@ -286,6 +286,13 @@ struct Promoter {
     /// the boundary it is about to publish.
     node_uuid: Uuid,
     range_uuid: Uuid,
+    /// Set when a refusal was an ELIGIBILITY verdict — the quorum answered
+    /// and this node's log is the problem — rather than a transient quorum
+    /// miss. The agent turns it into a campaign hold-off: a refused
+    /// candidate that keeps winning the acquisition race starves the very
+    /// replica its own refusal named, because a suspended non-leader
+    /// receives no replication with which to become eligible.
+    stand_aside: bool,
 }
 
 impl Promoter {
@@ -361,6 +368,7 @@ impl Promoter {
                         // Also retryable in principle: probes are a snapshot,
                         // and a stale follower answer can transiently place
                         // the boundary above this node's own disk.
+                        self.stand_aside = true;
                         self.suspended(fencing_epoch);
                         return false;
                     }
@@ -386,6 +394,7 @@ impl Promoter {
                         // Retryable for the same reason as LeaderBehind: the
                         // right fix is a different candidate, and suspending
                         // leaves the epoch grantable to it.
+                        self.stand_aside = true;
                         self.suspended(fencing_epoch);
                         return false;
                     }
@@ -410,6 +419,12 @@ impl Promoter {
     fn suspended(&mut self, fencing_epoch: u64) {
         self.publisher.suspend(fencing_epoch);
         self.verified_epoch = None;
+    }
+
+    /// Whether the last refusal was an eligibility verdict; reading clears
+    /// it, because one verdict funds one hold-off.
+    fn take_stand_aside(&mut self) -> bool {
+        std::mem::take(&mut self.stand_aside)
     }
 }
 
@@ -570,6 +585,17 @@ pub struct LeaseAgent {
     range_uuid: Uuid,
     promoter: Promoter,
     state: LeaseState,
+    /// Rounds of the run loop during which this node will NOT campaign for
+    /// the lease, set when a promotion was refused on eligibility grounds
+    /// (LeaderBehind or the §5.4.1 vote check). A refused candidate that
+    /// keeps winning the acquisition race starves the replica its own
+    /// refusal named — it holds the lease it cannot serve, lets it lapse,
+    /// and wins again — while receiving no replication with which to become
+    /// eligible. Standing aside for a bounded window gives the eligible
+    /// replica uncontested acquisitions; BOUNDED, not until-another-holder,
+    /// because if the eligible replica is down someone must keep probing,
+    /// and the refusal repeating is the honest unavailability signal.
+    campaign_hold_off_rounds: u32,
     /// Local upper bound on how long the current hold may be trusted without
     /// hearing from metadata, in the same wall-clock the envelope carries.
     ///
@@ -616,9 +642,11 @@ impl LeaseAgent {
                 verified_epoch: None,
                 node_uuid,
                 range_uuid,
+                stand_aside: false,
             },
             state: LeaseState::NotHeld,
             held_until_ms: None,
+            campaign_hold_off_rounds: 0,
         })
     }
 
@@ -812,6 +840,18 @@ impl LeaseAgent {
                 if let LeaseState::Held { fencing_epoch } = self.state {
                     self.publish_lost(fencing_epoch);
                 }
+                // Standing aside after an eligibility refusal: campaigning
+                // now would only take the lease away from the replica the
+                // refusal named, hold it unserved, and lapse it again.
+                if self.campaign_hold_off_rounds > 0 {
+                    self.campaign_hold_off_rounds -= 1;
+                    tracing::debug!(
+                        range = %self.range_uuid,
+                        rounds_remaining = self.campaign_hold_off_rounds,
+                        "standing aside from the lease race after an eligibility refusal"
+                    );
+                    return Ok(self.config.poll_interval);
+                }
                 match self.acquire(expected_range_generation).await? {
                     Some(fencing_epoch) => {
                         let granted_until = Some(
@@ -906,6 +946,13 @@ impl LeaseAgent {
 
     async fn publish_held(&mut self, fencing_epoch: u64, held_until_ms: Option<i64>) -> bool {
         if !self.promoter.ensure(fencing_epoch).await {
+            if self.promoter.take_stand_aside() {
+                // Two lease lifetimes of poll rounds: enough for the replica
+                // the refusal named to see the lapse and win at least one
+                // uncontested acquisition, however the two agents' polls
+                // interleave.
+                self.campaign_hold_off_rounds = self.stand_aside_rounds();
+            }
             self.state = LeaseState::NotHeld;
             self.held_until_ms = None;
             return false;
@@ -913,6 +960,14 @@ impl LeaseAgent {
         self.state = LeaseState::Held { fencing_epoch };
         self.held_until_ms = held_until_ms;
         true
+    }
+
+    /// How many poll rounds an eligibility refusal sits out: two lease
+    /// lifetimes, expressed in this agent's own polling cadence.
+    fn stand_aside_rounds(&self) -> u32 {
+        let lease_ms = self.config.lease_duration.as_millis().max(1);
+        let poll_ms = self.config.poll_interval.as_millis().max(1);
+        (lease_ms.saturating_mul(2).div_ceil(poll_ms)).min(u128::from(u32::MAX)) as u32
     }
 
     fn publish_lost(&mut self, fencing_epoch: u64) {
@@ -1178,6 +1233,7 @@ mod tests {
             publisher,
             probe,
             verified_epoch: None,
+            stand_aside: false,
             // Matches `at(1, ..)`: the tests' candidate is node 1.
             node_uuid: Uuid::from_u128(1),
             range_uuid: Uuid::from_u128(21),
@@ -1277,6 +1333,41 @@ mod tests {
             recorder.demoted.lock().unwrap().is_empty(),
             "a transient quorum miss must not release the epoch — release is \
              permanent, and the coming retry must be able to reactivate it"
+        );
+    }
+
+    /// An eligibility refusal — the quorum answered and this node's log is
+    /// the problem — requests a stand-aside, so the agent stops winning
+    /// acquisition races away from the replica the refusal named. A quorum
+    /// MISS does not: standing aside there would delay recovery for a
+    /// verdict nobody reached.
+    #[tokio::test]
+    async fn an_eligibility_refusal_requests_a_stand_aside_and_a_quorum_miss_does_not() {
+        let recorder = Arc::new(Recorder::default());
+        // Node 1 answers 100 and holds the floor, but node 2 is ahead at
+        // 101: one vote of a required two — the §5.4.1 refusal.
+        let mut behind = promoter(
+            Arc::clone(&recorder) as Arc<dyn LeasePublisher>,
+            Some(fixed(vec![at(1, Some(100)), at(2, Some(101))], 3)),
+        );
+        assert!(!behind.ensure(7).await);
+        assert!(
+            behind.take_stand_aside(),
+            "an eligibility verdict must request a stand-aside, or the refused candidate              keeps winning the race away from the replica it named"
+        );
+        assert!(
+            !behind.take_stand_aside(),
+            "one verdict funds one hold-off; reading clears it"
+        );
+
+        let mut miss = promoter(
+            Arc::clone(&recorder) as Arc<dyn LeasePublisher>,
+            Some(fixed(vec![at(1, Some(10)), at(2, None), at(3, None)], 3)),
+        );
+        assert!(!miss.ensure(8).await);
+        assert!(
+            !miss.take_stand_aside(),
+            "a quorum miss is not an eligibility verdict; standing aside would delay              recovery for nothing"
         );
     }
 
