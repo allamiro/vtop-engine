@@ -3567,15 +3567,51 @@ mod tests {
 
     /// A header-only active from ANOTHER RANGE at a coincidentally matching
     /// offset must not be promoted — and must not receive a boundary marker
-    /// moments before the directory is refused anyway.
+    /// moments before the directory is refused anyway. The foreign header
+    /// differs ONLY in its key range: every other identity field matches,
+    /// deliberately, because the key range is part of the lineage
+    /// `validate_single_lineage` compares and so must be part of what the
+    /// repair compares. (Generation 1 with a split parent, because a
+    /// generation-zero lineage must be the full keyspace and could not
+    /// differ in key range at all.)
     #[test]
     fn a_foreign_empty_active_is_not_given_a_commit_boundary() {
         let directory = tempdir().unwrap();
-        strand_after_seal(directory.path(), false);
-        let mut foreign = descriptor();
+        let split = |prefix: u64| RangeLineage {
+            range_id: Uuid::from_u128(2),
+            generation: 1,
+            key_range: KeyRange {
+                prefix,
+                prefix_bits: 1,
+            },
+            parents: vec![crate::ParentRange {
+                range_id: Uuid::from_u128(0xAA),
+                generation: 0,
+                key_range: KeyRange::full(),
+            }],
+        };
+        let mut base = descriptor();
+        base.lineage = split(0);
+        let producer = Uuid::from_u128(0xF7);
+        let mut set =
+            SegmentSet::create_in(&Env::real(), directory.path(), base.clone(), config()).unwrap();
+        for sequence in 0..3 {
+            set.append_group(
+                &[record(producer, sequence)],
+                Durability::Fsync,
+                Uuid::from_u128(0xF700 + sequence as u128),
+            )
+            .unwrap();
+        }
+        drop(set);
+        let active_path = directory.path().join(format!("{}.active", segment_stem(0)));
+        let tail = ActiveSegment::recover_in(&Env::real(), &active_path).unwrap();
+        drop(tail.seal().expect("sealing stages the crash layout"));
+
+        let mut foreign = base;
         foreign.segment_id = Uuid::from_u128(0xF0);
         foreign.base_offset = 3;
-        foreign.lineage.range_id = Uuid::from_u128(0xF1);
+        foreign.lineage = split(1 << 63);
         let foreign_path = directory.path().join(format!("{}.active", segment_stem(3)));
         drop(ActiveSegment::create_in(&Env::real(), &foreign_path, foreign, config()).unwrap());
         let commit_path = directory.path().join(format!("{}.commit", segment_stem(3)));

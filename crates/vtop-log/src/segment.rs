@@ -2096,6 +2096,10 @@ pub(crate) fn rebuild_empty_successor_commit(
         || identity.topic_epoch != expected_identity.topic_epoch
         || identity.lineage.range_id != expected_identity.lineage.range_id
         || identity.lineage.generation != expected_identity.lineage.generation
+        // The key range too — validate_single_lineage compares it, so
+        // omitting it here would write a boundary into a bundle the open
+        // then refuses over exactly that field.
+        || identity.lineage.key_range != expected_identity.lineage.key_range
     {
         return Ok(false);
     }
