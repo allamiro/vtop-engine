@@ -2016,24 +2016,39 @@ pub(crate) fn roll_in_with(
 
 /// Rebuild the commit boundary of an EMPTY successor whose creation was
 /// interrupted between its primary file and its commit sidecar (#314
-/// review — the roll's LAST window).
+/// review — the roll's LAST window), or discard one whose header write was
+/// itself torn (the FIRST window).
 ///
-/// `create_with_header` syncs the successor's file before it writes the
-/// commit boundary, so a crash between the two leaves an active whose
-/// recovery refuses — rightly, in general: a tail with records and no
-/// boundary cannot prove what was durable. But a file that is EXACTLY a
-/// valid header holds no records, so its boundary is provable without the
-/// sidecar: the base offset, zero content bytes. That is the only shape
-/// this touches — one record's worth of extra bytes and it returns `false`,
-/// leaving the refusal to stand. `expected_base` anchors the repair to the
-/// one place a roll creates a successor; a stray empty segment anywhere
-/// else is not ours to explain.
+/// Everything the candidate is judged against is DERIVED FROM THE SEALED
+/// PREDECESSOR, the same way adoption derives it: the successor a roll
+/// creates begins at the predecessor's scanned end, carries its descriptor
+/// with only the id and base changed, keeps its format, and is preceded by
+/// exactly the producer frontier the predecessor's records end with. The
+/// acceptance condition is therefore "byte-equivalent to what `roll_in`
+/// would have produced, minus the boundary" — anything else stays
+/// quarantined, and any refusal leaves the directory untouched. Config is
+/// deliberately NOT compared: a reconfiguring roll's successor differs from
+/// its predecessor in config by design.
 pub(crate) fn rebuild_empty_successor_commit(
     env: &Env,
     active_path: &Path,
-    expected_base: u64,
-    expected_identity: &SegmentDescriptor,
+    sealed_path: &Path,
+    sidecar_present: bool,
 ) -> VtopLogResult<bool> {
+    let sealed_paths = SegmentPaths::from_segment(sealed_path)?;
+    let inherited = read_producer_snapshot(env, &sealed_paths)?;
+    let mut sealed_file = env
+        .storage
+        .open(sealed_path, OpenMode::Read)
+        .map_err(|source| io_error(sealed_path, source))?;
+    let inspection = inspect_sealed_file(
+        env.storage.as_ref(),
+        sealed_file.as_mut(),
+        sealed_path,
+        &inherited,
+    )?;
+    drop(sealed_file);
+    let expected_base = inspection.scan.next_offset;
     // THE NAME IS AN ANCHOR, not a convenience: a header-only active under
     // any other filename is not a successor a roll could have created, and
     // matching it on offsets alone would promote a foreign artifact out of
@@ -2050,17 +2065,6 @@ pub(crate) fn rebuild_empty_successor_commit(
     let mut cursor = std::io::Cursor::new(bytes.as_slice());
     let (header, header_len) = match read_header(&mut cursor) {
         Ok(decoded) => decoded,
-        Err(LogError::Io { .. }) => {
-            // Reading the bytes we already hold cannot fail for I/O reasons;
-            // surface anything that claims otherwise.
-            return Err(LogError::Corrupt {
-                position: 0,
-                reason: format!(
-                    "re-reading the in-memory header of {} failed",
-                    active_path.display()
-                ),
-            });
-        }
         // A KNOWN format at a version this binary does not speak is not a
         // torn write — it is a complete file from a NEWER build, and an
         // older binary that deleted it would be destroying its successor's
@@ -2089,25 +2093,58 @@ pub(crate) fn rebuild_empty_successor_commit(
     // A valid header with records after it is NOT this window: records mean
     // creation finished, which means a boundary existed and is now missing
     // for a reason this repair must not paper over.
-    if bytes.len() as u64 != header_len || header.base_offset() != expected_base {
+    if bytes.len() as u64 != header_len {
         return Ok(false);
     }
-    // The lineage must be the SEALED PREFIX'S lineage. Without this check, a
-    // header-only active from some other range sitting at a coincidentally
-    // matching offset would receive a durable commit marker moments before
-    // the mixed-lineage validation refuses the directory anyway — a mutation
-    // by a command that then reports failure (review round four).
-    // The WHOLE lineage, not a field subset: a roll copies its
-    // predecessor's lineage wholesale — parents included — so any
-    // difference at all means this is not a successor a roll could have
-    // created, whether or not the open's own lineage check would later
-    // notice. Field-by-field comparisons here drifted twice in review
-    // (generation, then key range); whole-value equality cannot.
-    let identity = header.v1_descriptor_view();
-    if identity.topic != expected_identity.topic
-        || identity.topic_epoch != expected_identity.topic_epoch
-        || identity.lineage != expected_identity.lineage
-    {
+    // THE WHOLE DESCRIPTOR, with only the two fields a roll legitimately
+    // changes substituted: id and base. This covers format (a v1 candidate
+    // against a v2 predecessor falls through), the full lineage with its
+    // parents, and the v2-only fields — segment generation, creating node,
+    // creation fencing epoch — that a v1-shaped projection erases (review
+    // round seven). Field subsets drifted three times in this review;
+    // whole-value equality cannot.
+    let identity_matches = match (&inspection.header, &header) {
+        (AnyHeader::V1(sealed), AnyHeader::V1(candidate)) => {
+            let mut expected = sealed.descriptor.clone();
+            expected.segment_id = candidate.descriptor.segment_id;
+            expected.base_offset = expected_base;
+            candidate.descriptor == expected
+        }
+        (AnyHeader::V2(sealed), AnyHeader::V2(candidate)) => {
+            let mut expected = sealed.descriptor.clone();
+            expected.segment_id = candidate.descriptor.segment_id;
+            expected.base_offset = expected_base;
+            candidate.descriptor == expected
+        }
+        _ => false,
+    };
+    if !identity_matches {
+        return Ok(false);
+    }
+    // THE FRONTIER, verified rather than trusted (review round seven): a
+    // real roll with producer state durably writes the exact frontier the
+    // predecessor's records end with BEFORE creating the successor's file.
+    // So a present sidecar must decode to precisely that frontier, and an
+    // absent one is only possible when that frontier is empty — a repaired
+    // tail with the wrong inherited frontier would reject a continuing
+    // producer, or worse, let a stale epoch evade fencing.
+    let expected_frontier = snapshot_of(
+        &inspection.scan.producer_states,
+        &inspection.scan.producer_epochs,
+    );
+    if sidecar_present {
+        let producers_path = SegmentPaths::from_active(active_path)?.producers;
+        let sidecar_bytes = env
+            .storage
+            .read(&producers_path)
+            .map_err(|source| io_error(&producers_path, source))?;
+        let Ok(found) = crate::producer_snapshot::ProducerSnapshot::decode(&sidecar_bytes) else {
+            return Ok(false);
+        };
+        if found != expected_frontier {
+            return Ok(false);
+        }
+    } else if !expected_frontier.is_empty() {
         return Ok(false);
     }
     let paths = SegmentPaths::from_active(active_path)?;

@@ -430,23 +430,10 @@ fn repair_roll_window_successor(env: &Env, catalog: &StartupCatalog) -> VtopLogR
     else {
         return Ok(false);
     };
-    // The roll's own sidecar is always a COMPLETE write (write_atomic). A
-    // producers file that does not decode is a second, separate corruption —
-    // not this window — and a repair that wrote a boundary next to it would
-    // mutate a range it cannot actually heal.
-    for path in bundle
+    let sidecar_present = bundle
         .paths
         .iter()
-        .filter(|path| extension_of(path) == "producers")
-    {
-        let bytes = env
-            .storage
-            .read(path)
-            .map_err(|source| io_error(path, source))?;
-        if ProducerSnapshot::decode(&bytes).is_err() {
-            return Ok(false);
-        }
-    }
+        .any(|path| extension_of(path) == "producers");
     if catalog
         .entries
         .iter()
@@ -462,11 +449,14 @@ fn repair_roll_window_successor(env: &Env, catalog: &StartupCatalog) -> VtopLogR
     else {
         return Ok(false);
     };
+    // Everything else — the name anchor, the identity, the format, the
+    // frontier the sidecar must carry — is judged inside against the sealed
+    // predecessor itself, the same source of truth adoption derives from.
     crate::segment::rebuild_empty_successor_commit(
         env,
         active_path,
-        last_sealed.next_offset,
-        &last_sealed.descriptor,
+        &last_sealed.path,
+        sidecar_present,
     )
 }
 
@@ -3506,25 +3496,23 @@ mod tests {
     #[test]
     fn an_empty_successor_missing_its_commit_boundary_is_repaired_on_open() {
         let directory = tempdir().unwrap();
-        strand_after_seal(directory.path(), false);
-        // Create the successor exactly as roll_in would, then delete the
-        // boundary its creation wrote — the state a crash between the
-        // primary's sync and the commit write leaves. (No producers sidecar:
-        // this window occurs with or without one, and the sidecar variant is
-        // exercised by the sweep tests above.)
-        let successor_path = directory.path().join(format!("{}.active", segment_stem(3)));
-        let mut successor_descriptor = descriptor();
-        successor_descriptor.segment_id = Uuid::from_u128(0xC0FFEE);
-        successor_descriptor.base_offset = 3;
-        drop(
-            ActiveSegment::create_in(
-                &Env::real(),
-                &successor_path,
-                successor_descriptor,
-                config(),
-            )
-            .unwrap(),
-        );
+        // Stage through the REAL roll — sidecar, descriptor, format all
+        // exactly what roll_in writes — then delete only the boundary, the
+        // one file the crash window never reached.
+        let producer = Uuid::from_u128(77);
+        let mut staged =
+            SegmentSet::create_in(&Env::real(), directory.path(), descriptor(), config()).unwrap();
+        for sequence in 0..3 {
+            staged
+                .append_group(
+                    &[record(producer, sequence)],
+                    Durability::Fsync,
+                    Uuid::from_u128(7900 + sequence as u128),
+                )
+                .unwrap();
+        }
+        staged.roll(Uuid::from_u128(0xC0FFEE)).unwrap();
+        drop(staged);
         std::fs::remove_file(directory.path().join(format!("{}.commit", segment_stem(3)))).unwrap();
 
         let set = SegmentSet::open_in(&Env::real(), directory.path())
@@ -3603,19 +3591,24 @@ mod tests {
             )
             .unwrap();
         }
+        // A REAL roll, so the sidecar, the name, and the format are exactly
+        // right and the lineage is the ONLY thing the overwrite changes.
+        set.roll(Uuid::from_u128(0xF0F)).unwrap();
         drop(set);
-        let active_path = directory.path().join(format!("{}.active", segment_stem(0)));
-        let tail = ActiveSegment::recover_in(&Env::real(), &active_path).unwrap();
-        drop(tail.seal().expect("sealing stages the crash layout"));
+        let commit_path = directory.path().join(format!("{}.commit", segment_stem(3)));
+        std::fs::remove_file(&commit_path).unwrap();
 
         let mut foreign = base;
         foreign.segment_id = Uuid::from_u128(0xF0);
         foreign.base_offset = 3;
         foreign.lineage = split(1 << 63);
         let foreign_path = directory.path().join(format!("{}.active", segment_stem(3)));
-        drop(ActiveSegment::create_in(&Env::real(), &foreign_path, foreign, config()).unwrap());
-        let commit_path = directory.path().join(format!("{}.commit", segment_stem(3)));
-        std::fs::remove_file(&commit_path).unwrap();
+        std::fs::write(
+            &foreign_path,
+            crate::codec::encode_header(&crate::codec::SegmentHeader::new(foreign, config()))
+                .unwrap(),
+        )
+        .unwrap();
 
         SegmentSet::open_in(&Env::real(), directory.path())
             .map(|_| ())
@@ -3681,6 +3674,41 @@ mod tests {
         assert!(
             successor_path.exists(),
             "an older binary must not delete a newer build's successor"
+        );
+    }
+
+    /// A real roll over producer state writes the frontier BEFORE the
+    /// successor's file, so a boundary-less successor with no sidecar over
+    /// a predecessor whose records carry producer state cannot be the roll
+    /// window — and repairing it would open the tail with an empty
+    /// inherited frontier, rejecting a continuing producer or letting a
+    /// stale epoch past fencing.
+    #[test]
+    fn a_successor_without_the_frontier_its_predecessor_requires_stays_quarantined() {
+        let directory = tempdir().unwrap();
+        strand_after_seal(directory.path(), false);
+        let successor_path = directory.path().join(format!("{}.active", segment_stem(3)));
+        let mut successor_descriptor = descriptor();
+        successor_descriptor.segment_id = Uuid::from_u128(0xC0FFED);
+        successor_descriptor.base_offset = 3;
+        drop(
+            ActiveSegment::create_in(
+                &Env::real(),
+                &successor_path,
+                successor_descriptor,
+                config(),
+            )
+            .unwrap(),
+        );
+        let commit_path = directory.path().join(format!("{}.commit", segment_stem(3)));
+        std::fs::remove_file(&commit_path).unwrap();
+
+        SegmentSet::open_in(&Env::real(), directory.path())
+            .map(|_| ())
+            .expect_err("a successor missing the frontier its predecessor requires must refuse");
+        assert!(
+            !commit_path.exists(),
+            "no boundary may be written for a tail whose inherited frontier would be wrong"
         );
     }
 
