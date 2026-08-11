@@ -129,7 +129,14 @@ def _backend_env(scenario) -> dict[str, str]:
         dotenv = _dotenv_overrides()
 
         def _credential(name: str) -> str:
-            return env.get(name) or dotenv.get(name) or "minioadmin"
+            # A PRESENT shell variable masks the filed one even when blank,
+            # exactly as compose's interpolation resolves it: the server
+            # sees ${VAR:-minioadmin} with the blank shell value and uses
+            # the default, so falling through to .env here would hand the
+            # client a credential the server never saw.
+            if name in env:
+                return env[name] or "minioadmin"
+            return dotenv.get(name) or "minioadmin"
 
         env.setdefault("AWS_ACCESS_KEY_ID", _credential("MINIO_ROOT_USER"))
         env.setdefault("AWS_SECRET_ACCESS_KEY",

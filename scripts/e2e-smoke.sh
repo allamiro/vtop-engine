@@ -161,12 +161,30 @@ except Exception:
 NET="${NET:-vtop-engine_storage-net}"
 
 # The same override variables the compose files honor, THROUGH THE SAME
-# CHANNELS: compose auto-loads ./.env for the services, Bash does not — so
-# without sourcing it here, an operator who set the credentials only in .env
-# (the documented pattern) runs a stack this client cannot authenticate to,
-# and the assertion below fails as a fixture mystery. ${VAR:-default} treats
-# a blank value as unset, matching compose's own interpolation.
-if [ -f .env ]; then set -a; . ./.env; set +a; fi
+# CHANNELS and with the same precedence. compose auto-loads ./.env for the
+# services; Bash does not — but .env is COMPOSE DATA, not shell code, so it
+# must be parsed, never sourced: the shipped .env.example carries an unquoted
+# multi-word FORMATS= line that sourcing would execute as a command, killing
+# this script under set -e, and sourcing would also let the filed value
+# clobber an exported one, inverting compose's shell-wins precedence. Only
+# the two keys this client needs are read, one layer of matching quotes
+# stripped as compose strips them, and only when the shell did not set the
+# variable at all — a blank-but-set export masks .env for compose, so it
+# must mask it here too (the ${VAR:-default} at the use site then maps blank
+# to the lab default on both sides).
+env_default() { # <key> — the value filed in ./.env, one quote layer stripped
+  local value
+  value="$(sed -n "s/^$1=//p" .env | tail -1)"
+  case "$value" in
+    \"*\") value="${value#\"}"; value="${value%\"}" ;;
+    \'*\') value="${value#\'}"; value="${value%\'}" ;;
+  esac
+  printf '%s' "$value"
+}
+if [ -f .env ]; then
+  MINIO_ROOT_USER="${MINIO_ROOT_USER-$(env_default MINIO_ROOT_USER)}"
+  MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD-$(env_default MINIO_ROOT_PASSWORD)}"
+fi
 listing=$(docker run --rm --network "$NET" \
   -e "MINIO_ROOT_USER=${MINIO_ROOT_USER:-minioadmin}" \
   -e "MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-minioadmin}" \

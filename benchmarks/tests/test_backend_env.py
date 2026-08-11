@@ -91,6 +91,28 @@ def test_a_blank_override_falls_back_to_the_lab_default(
     assert env["AWS_SECRET_ACCESS_KEY"] == "minioadmin"
 
 
+def test_a_blank_shell_variable_masks_the_filed_one(tmp_path, monkeypatch):
+    # The case that actually recreates the mismatch: compose lets a PRESENT
+    # shell variable mask .env even when blank, then resolves the blank to
+    # the default — so the client must do the same, never falling through
+    # to the filed value the server was denied.
+    from lib import engine
+    monkeypatch.setattr(engine, "_ENV_FILE", str(tmp_path / ".env"))
+    (tmp_path / ".env").write_text("MINIO_ROOT_USER=filed-user\n"
+                                   "MINIO_ROOT_PASSWORD=filed-secret\n",
+                                   encoding="utf-8")
+    monkeypatch.setenv("MINIO_ROOT_USER", "")
+    monkeypatch.setenv("MINIO_ROOT_PASSWORD", "")
+    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+    env = _backend_env(minio_scenario())
+    assert env["AWS_ACCESS_KEY_ID"] == "minioadmin", (
+        "a blank export masks .env for compose, so the server runs on the "
+        "default; the client following the filed value would diverge"
+    )
+    assert env["AWS_SECRET_ACCESS_KEY"] == "minioadmin"
+
+
 def test_explicit_aws_credentials_still_win(tmp_path, monkeypatch):
     # setdefault semantics are load-bearing: an operator who points the
     # runner at real S3 with real AWS credentials must not have them
