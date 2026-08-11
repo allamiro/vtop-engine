@@ -394,6 +394,9 @@ pub async fn run(
             DataRole::Follower => "data-follower",
             DataRole::Leader => "data-leader",
             DataRole::Standalone => "data-standalone",
+            // Set ONCE, like every identity label; the live role verdict is
+            // carried by the lease gauges, not by a mutating label.
+            DataRole::Candidate => "data-candidate",
         },
         &config.node_uuid.to_string(),
     )?;
@@ -498,6 +501,19 @@ pub async fn serve(
             )
             .await
         }
+        DataRole::Candidate => {
+            run_candidate(
+                config,
+                range,
+                set,
+                epochs,
+                meta,
+                observability,
+                metrics_addr,
+                shutdown,
+            )
+            .await
+        }
         DataRole::Standalone => {
             run_leader(
                 config,
@@ -575,8 +591,11 @@ async fn run_follower(
         // know its epoch refuses every append, so reporting ready before that
         // first read advertises a replica that cannot participate — which is
         // how a freshly started follower sat at offset 0 while its leader
-        // moved on without it.
-        observability.gate.require_marks(2);
+        // moved on without it. ADDED to the marks already owed, not declared
+        // as a total: under colocated::run the gate is shared with the meta
+        // role's own mark, and a stated total of two would let any two of
+        // the three components open /readyz (review).
+        observability.gate.add_required_marks(1);
         let watcher = crate::lease_watcher::LeaseWatcher::new(
             lease_admin_client(lease)?,
             lease.topic_uuid,
@@ -766,7 +785,7 @@ async fn run_leader(
             })
             .collect::<Result<Vec<_>, String>>()?;
         Some(Arc::new(crate::lease_agent::ReplicaPlaneProbe::new(
-            Arc::clone(&broker),
+            Arc::clone(&broker) as Arc<dyn crate::lease_agent::CandidateLocalView>,
             config.node_uuid,
             vtop_broker::replication::ReplicaStatusClient::new(tls::replica_material(
                 &config.replica_tls,
@@ -1006,6 +1025,1236 @@ async fn run_leader(
     Ok(())
 }
 
+/// The candidate supervisor (#284): both planes bind ONCE, and the role
+/// behind them follows the lease.
+///
+/// The agent runs for the life of the process; its verdicts arrive on a
+/// watch channel and this loop restructures the node around them — build a
+/// leader on `Lead`, rebuild a follower on `Follow` — in #280 order, with
+/// the transition window served by refusing placeholders. The two state
+/// machines that own storage (`InProcessFollower`, `LocalBroker`) take the
+/// `SegmentSet` by value, so every transition quiesces, drops, and re-opens
+/// the range from disk: the directory is the handoff, exactly as it is
+/// between processes, minus the processes.
+#[allow(clippy::too_many_arguments)]
+async fn run_candidate(
+    config: DataNodeConfig,
+    range: RangeIdentity,
+    set: SegmentSet,
+    epochs: ProducerEpochJournal,
+    meta: MetaFencingEpoch,
+    observability: &NodeObservability,
+    metrics_addr: Option<std::net::SocketAddr>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), String> {
+    let lease = config.lease.as_ref().ok_or(
+        "candidate requires a lease block: the role follows the lease, and a node that \
+                cannot observe the lease has no role to follow",
+    )?;
+    if !config.followers.is_empty() {
+        return Err(
+            "candidate takes `peers` (the whole symmetric replica set); `followers` is \
+                    derived as peers minus self and must not be set"
+                .into(),
+        );
+    }
+    if !config
+        .peers
+        .iter()
+        .any(|peer| peer.node_uuid == config.node_uuid)
+    {
+        return Err(
+            "candidate `peers` must include this node: the list is the SYMMETRIC replica \
+                    set, identical on every member, and a file that omits its own node is a file \
+                    that was edited per node — the exact practice candidate mode retires"
+                .into(),
+        );
+    }
+    let peers: Vec<crate::config::FollowerPeerConfig> = config
+        .peers
+        .iter()
+        .filter(|peer| peer.node_uuid != config.node_uuid)
+        .cloned()
+        .collect();
+    if peers.is_empty() {
+        return Err(
+            "candidate requires at least one peer besides this node; a single-node range \
+                    is `standalone`"
+                .into(),
+        );
+    }
+    {
+        // Distinct members, verified (review): a duplicated peer would count
+        // toward the quorum twice, letting one reachable node satisfy a
+        // majority that exists to require different disks.
+        let mut seen = std::collections::BTreeSet::new();
+        for peer in &config.peers {
+            if !seen.insert(peer.node_uuid) {
+                return Err(format!(
+                    "candidate `peers` lists {} more than once; a quorum over duplicated \
+                     members is a quorum in name only",
+                    peer.node_uuid
+                ));
+            }
+        }
+    }
+    let native_listen = config
+        .native_listen
+        .as_ref()
+        .ok_or("candidate requires native_listen: any member may become the leader")?;
+    let native_tls = config
+        .native_tls
+        .as_ref()
+        .ok_or("candidate requires native_tls")?;
+    let principal = config
+        .principal_id
+        .ok_or("candidate requires principal_id")?;
+    let replica_listen = config
+        .replica_listen
+        .as_ref()
+        .ok_or("candidate requires replica_listen: any member may become a follower")?;
+    let roll = SegmentRoll {
+        max_bytes: config.max_segment_bytes,
+        max_records: config.max_segment_records,
+        max_group_bytes: config.max_group_bytes,
+        max_record_bytes: config.max_record_bytes,
+    };
+
+    // --- both planes, bound once --------------------------------------------
+    let switching = Arc::new(SwitchingReplicaHandler::new(config.node_uuid));
+    let replica_server = ReplicaPeerServer::new(
+        tls::replica_material(&config.replica_tls)?,
+        config.node_uuid,
+        Arc::clone(&switching) as Arc<dyn ReplicaPeerHandler>,
+    )
+    .map_err(|error| error.to_string())?;
+    let replica_listener = TcpListener::bind(replica_listen)
+        .await
+        .map_err(|error| format!("bind {replica_listen}: {error}"))?;
+    let replica_shutdown = oneshot_on_shutdown(shutdown.clone());
+    // HELD, not detached (review): a listener that dies while this node
+    // holds the lease leaves a ready leader with a dead endpoint. The
+    // supervisor selects on these handles and treats an early exit as
+    // fatal — fail-stop, so the lease lapses and a healthy candidate wins.
+    let mut replica_task = tokio::spawn(async move {
+        replica_server
+            .serve(replica_listener, replica_shutdown)
+            .await
+            .map_err(|error| format!("candidate replica server exited: {error}"))
+    });
+
+    let slot = Arc::new(vtop_broker::BrokerSlot::empty());
+    let native_server = vtop_broker::NativeServer::over_slot(
+        Arc::clone(&slot),
+        tls::server_material(native_tls)?,
+        Arc::new(PrincipalAuthorizer { principal }),
+        ServerConfig {
+            cluster_id: config.cluster_id,
+            node_id: config.node_uuid,
+            segment_format: vtop_broker::SegmentFormat::V1,
+            max_frame_bytes: MAX_FRAME_BYTES,
+            max_records_per_frame: MAX_RECORDS,
+            window_bytes: WINDOW_BYTES,
+            max_sessions: 8,
+            max_inflight_requests: 8,
+            handshake_timeout: Duration::from_secs(5),
+            idle_timeout: Duration::from_secs(300),
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    observability.register(Box::new(ServerCollector::new(Arc::clone(
+        native_server.metrics(),
+    ))?))?;
+    let native_listener = TcpListener::bind(native_listen)
+        .await
+        .map_err(|error| format!("bind {native_listen}: {error}"))?;
+    let native_shutdown = oneshot_on_shutdown(shutdown.clone());
+    let mut native_task = tokio::spawn(async move {
+        native_server
+            .serve(native_listener, native_shutdown)
+            .await
+            .map_err(|error| format!("candidate native server exited: {error}"))
+    });
+    // NO role collector in this first slice, deliberately: BrokerCollector
+    // and FollowerCollector export the same metric names, the registry
+    // refuses duplicate descriptors, and there is no unregister path — a
+    // role-agnostic replica collector is the follow-up. The server and
+    // lease gauges above are live regardless.
+
+    // --- the agent, for the life of the process -----------------------------
+    let endpoints = peers
+        .iter()
+        .map(|peer| {
+            Ok(crate::lease_agent::FollowerEndpoint {
+                node_uuid: peer.node_uuid,
+                addr: vtop_meta::resolve_endpoint(&peer.addr).map_err(|error| error.to_string())?,
+                server_name: peer.server_name.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let view = Arc::new(SwitchingLocalView::empty());
+    let probe = crate::lease_agent::ReplicaPlaneProbe::new(
+        Arc::clone(&view) as Arc<dyn crate::lease_agent::CandidateLocalView>,
+        config.node_uuid,
+        vtop_broker::replication::ReplicaStatusClient::new(tls::replica_material(
+            &config.replica_tls,
+        )?)
+        .map_err(|error| error.to_string())?,
+        endpoints,
+        range.clone(),
+    );
+    let (verdict_tx, mut verdict_rx) = tokio::sync::watch::channel(RoleVerdict::Undecided);
+    let publisher = Arc::new(CandidateLeasePublisher {
+        target: std::sync::RwLock::new(None),
+        verdicts: verdict_tx,
+        finished_through: std::sync::atomic::AtomicU64::new(0),
+        recorded_through: std::sync::atomic::AtomicU64::new(0),
+    });
+    let (release_lease, release_lease_rx) = tokio::sync::watch::channel(false);
+    let agent = crate::lease_agent::LeaseAgent::new(
+        lease_admin_client(lease)?,
+        crate::lease_agent::LeaseAgentConfig {
+            lease_duration: Duration::from_millis(lease.lease_duration_ms),
+            renew_interval: Duration::from_millis(lease.renew_interval_ms),
+            poll_interval: Duration::from_millis(lease.poll_interval_ms),
+        },
+        config.node_uuid,
+        lease.topic_uuid,
+        config.range.range_id,
+        Arc::clone(&publisher) as Arc<dyn crate::lease_agent::LeasePublisher>,
+        Some(Arc::new(probe) as Arc<dyn crate::lease_agent::QuorumProbe>),
+    )?;
+    // One MORE mark before /readyz goes green, same shape as the static
+    // follower: the binds' own mark plus the agent's first completed
+    // metadata exchange (review: a candidate that has never reached
+    // metadata reports a follower that refuses every append). Added, not
+    // declared as a total, so a colocated meta role's mark stays counted.
+    observability.gate.add_required_marks(1);
+    let agent = agent.with_ready_gate(observability.gate.clone());
+    let agent_drain = std::time::Duration::from_secs(5)
+        .max(std::time::Duration::from_millis(lease.lease_duration_ms));
+    let mut agent_task = tokio::spawn(agent.run(release_lease_rx));
+
+    // --- readiness ----------------------------------------------------------
+    // 0 = following, 1 = leading, 2 = transitioning. A follower is ready the
+    // moment its planes are bound — appends are epoch-gated regardless — and
+    // a leader is ready only with a live lease view, same as run_leader.
+    let role_flag = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let probe_meta = meta.clone();
+    let probe_slot = Arc::clone(&slot);
+    let probe_flag = Arc::clone(&role_flag);
+    // Same contract as run_leader's probe: non-blocking, and contention
+    // serves the LAST DECIDED verdict rather than guessing — a produce
+    // mid-fsync holds the lease view for its whole critical section, and a
+    // probe landing then must not drain a healthy leader (review).
+    let probe_last = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let probe_last_probe = Arc::clone(&probe_last);
+    observability.set_readiness_probe(Arc::new(move || {
+        match probe_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => match probe_slot.current() {
+                Some(broker) => match probe_meta.try_snapshot() {
+                    Some((epoch, live)) => {
+                        let ready = live && epoch == broker.held_fencing_epoch();
+                        probe_last_probe.store(ready, std::sync::atomic::Ordering::Relaxed);
+                        if ready {
+                            vtop_observe::Readiness::Ready
+                        } else {
+                            vtop_observe::Readiness::not_ready(
+                                "leading, but the lease view is not live at the held epoch"
+                                    .to_owned(),
+                            )
+                        }
+                    }
+                    None => {
+                        if probe_last_probe.load(std::sync::atomic::Ordering::Relaxed) {
+                            vtop_observe::Readiness::Ready
+                        } else {
+                            vtop_observe::Readiness::not_ready(
+                                "lease view contended; last decided state was fenced".to_owned(),
+                            )
+                        }
+                    }
+                },
+                None => {
+                    probe_last_probe.store(false, std::sync::atomic::Ordering::Relaxed);
+                    vtop_observe::Readiness::not_ready(
+                        "leading, but the broker is absent".to_owned(),
+                    )
+                }
+            },
+            2 => vtop_observe::Readiness::not_ready("role transition in progress".to_owned()),
+            _ => vtop_observe::Readiness::Ready,
+        }
+    }));
+    observability.gate.mark_ready();
+    println!(
+        "data_node_ready role=candidate node={} native={native_listen} replica={replica_listen}{}",
+        config.node_uuid,
+        metrics_addr
+            .map(|addr| format!(" metrics={addr}"))
+            .unwrap_or_default()
+    );
+    use std::io::Write;
+    std::io::stdout().flush().ok();
+
+    // --- phases -------------------------------------------------------------
+    let build_follower =
+        |set: SegmentSet, epochs: ProducerEpochJournal| -> Result<Arc<InProcessFollower>, String> {
+            let follower = Arc::new(
+                InProcessFollower::new(
+                    config.node_uuid,
+                    set,
+                    epochs,
+                    range.clone(),
+                    config.fencing_epoch,
+                    meta.clone(),
+                    ClusterCommittedOffset::new(0),
+                )
+                .map_err(|error| error.to_string())?,
+            );
+            follower.set_fencing_epoch_journal(
+                vtop_broker::fencing_epochs::FencingEpochJournal::open(
+                    config.data_dir.join("fencing-epochs"),
+                )
+                .map_err(|error| error.to_string())?,
+            );
+            if let Some(retention) = &config.retention {
+                follower.set_retention(Some(vtop_log::RetentionPolicy {
+                    max_total_bytes: retention.max_total_bytes,
+                }));
+            }
+            Ok(follower)
+        };
+
+    let install_follower = |follower: &Arc<InProcessFollower>| {
+        switching.install(Arc::clone(follower) as Arc<dyn ReplicaPeerHandler>);
+        view.install(Arc::clone(follower) as Arc<dyn crate::lease_agent::CandidateLocalView>);
+        publisher.set_target(Some(Arc::new(FollowerObservationAdapter {
+            inner: crate::lease_watcher::FollowerLeasePublisher::new(Arc::clone(follower)),
+        })
+            as Arc<dyn crate::lease_agent::LeasePublisher>));
+        role_flag.store(0, std::sync::atomic::Ordering::Relaxed);
+    };
+
+    let initial = build_follower(set, epochs)?;
+    install_follower(&initial);
+    let mut phase = Phase::Following(initial);
+
+    let mut native_task_done = false;
+    'supervisor: loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            // A plane dying under a live candidate is fail-stop (review): a
+            // ready leader with a dead endpoint pins metadata to a leader
+            // nobody can reach, and readiness reads the slot, not the task.
+            // But the SAME watch that breaks this loop also stops both
+            // servers, and select does not order its arms — a listener
+            // finishing its orderly shutdown first must read as the
+            // shutdown it is, not as a dead plane, or the node would exit
+            // without draining and let its lease expire instead of
+            // releasing it (review, round three).
+            result = &mut native_task => {
+                if *shutdown.borrow() {
+                    if let Ok(Err(error)) = &result {
+                        eprintln!("native server error during shutdown: {error}");
+                    }
+                    native_task_done = true;
+                    break;
+                }
+                return Err(match result {
+                    Ok(Ok(())) => "candidate native server exited early".to_owned(),
+                    Ok(Err(error)) => error,
+                    Err(join) => format!("candidate native server task failed: {join}"),
+                });
+            }
+            result = &mut replica_task => {
+                if *shutdown.borrow() {
+                    if let Ok(Err(error)) = &result {
+                        eprintln!("replica server error during shutdown: {error}");
+                    }
+                    break;
+                }
+                return Err(match result {
+                    Ok(Ok(())) => "candidate replica server exited early".to_owned(),
+                    Ok(Err(error)) => error,
+                    Err(join) => format!("candidate replica server task failed: {join}"),
+                });
+            }
+            changed = verdict_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let verdict = *verdict_rx.borrow();
+                match (&phase, verdict) {
+                    (Phase::Following(_), RoleVerdict::Lead { fencing_epoch, committed_offset }) => {
+                        role_flag.store(2, std::sync::atomic::Ordering::Relaxed);
+                        switching.transitioning();
+                        // The cached probe verdict belongs to the role that
+                        // decided it (review): a fresh promotion must start
+                        // fail-closed, not inherit the prior leader's green.
+                        probe_last.store(false, std::sync::atomic::Ordering::Relaxed);
+                        view.clear();
+                        publisher.set_target(None);
+                        let Phase::Following(follower) =
+                            std::mem::replace(&mut phase, Phase::Transitioning)
+                        else {
+                            unreachable!("matched Following above");
+                        };
+                        // THE DRAIN, disguised as a suspension (review): a
+                        // replication call that took the old delegate before
+                        // the handler switched still holds its own Arc, and
+                        // dropping our binding does not end it. But every
+                        // such call holds the shared meta view's lock from
+                        // fence check through write, so this suspend —
+                        // which must take that same lock — cannot return
+                        // until the last in-flight call has finished, and
+                        // every call after it refuses under the guard. Only
+                        // then is reopening the directory safe; the retained
+                        // object outlives the swap as a refusal machine, not
+                        // a writer. The promotion's own set() reactivates
+                        // the view at the granted epoch.
+                        follower
+                            .meta_fencing_epoch()
+                            .suspend(follower.meta_fencing_epoch().get());
+                        if let Err(error) = follower.quiesce() {
+                            eprintln!("pre-promotion commit failed; recovery will handle it: {error}");
+                        }
+                        // EVERY Arc dropped before the directory reopens: the
+                        // handler and view already point elsewhere, and this
+                        // binding was the last.
+                        drop(follower);
+                        // FAIL-STOP on a failed build (review): the agent
+                        // already verified this epoch and would renew a
+                        // lease over an empty slot forever — the one state
+                        // worse than a dead node is a live one holding a
+                        // range it cannot serve. Exiting lets the lease
+                        // lapse and a healthy candidate win.
+                        // The build can wait up to ten seconds on follower
+                        // streams, and the supervisor's select arms are
+                        // unreachable while it does — so the build is RACED
+                        // against the very things those arms watch (review,
+                        // round four). A listener dying mid-build is the
+                        // same fail-stop as ever; shutdown mid-build
+                        // abandons a leader nothing has published yet and
+                        // runs the ordinary drain.
+                        let build = build_leader_phase(&config, &range, &peers, roll, &meta);
+                        tokio::pin!(build);
+                        let built = loop {
+                            tokio::select! {
+                                built = &mut build => {
+                                    // Both can be ready; select does not
+                                    // order its arms. A build completing
+                                    // during shutdown is still a shutdown
+                                    // (review, round five): abandon the
+                                    // unpublished leader — and abandon a
+                                    // failed build the same way, because an
+                                    // orderly stop must not exit as a
+                                    // build failure.
+                                    if *shutdown.borrow() {
+                                        break 'supervisor;
+                                    }
+                                    break built?;
+                                }
+                                changed = shutdown.changed() => {
+                                    if changed.is_err() || *shutdown.borrow() {
+                                        break 'supervisor;
+                                    }
+                                }
+                                result = &mut native_task => {
+                                    if *shutdown.borrow() {
+                                        if let Ok(Err(error)) = &result {
+                                            eprintln!(
+                                                "native server error during shutdown: {error}"
+                                            );
+                                        }
+                                        native_task_done = true;
+                                        break 'supervisor;
+                                    }
+                                    return Err(match result {
+                                        Ok(Ok(())) => {
+                                            "candidate native server exited early".to_owned()
+                                        }
+                                        Ok(Err(error)) => error,
+                                        Err(join) => format!(
+                                            "candidate native server task failed: {join}"
+                                        ),
+                                    });
+                                }
+                                result = &mut replica_task => {
+                                    if *shutdown.borrow() {
+                                        if let Ok(Err(error)) = &result {
+                                            eprintln!(
+                                                "replica server error during shutdown: {error}"
+                                            );
+                                        }
+                                        break 'supervisor;
+                                    }
+                                    return Err(match result {
+                                        Ok(Ok(())) => {
+                                            "candidate replica server exited early".to_owned()
+                                        }
+                                        Ok(Err(error)) => error,
+                                        Err(join) => format!(
+                                            "candidate replica server task failed: {join}"
+                                        ),
+                                    });
+                                }
+                            }
+                        };
+                        // ATOMIC COMPLETION (review P0, round two): a lease
+                        // lost during the build — the follower-stream wait
+                        // can take seconds — must win over the build, and a
+                        // recheck separate from publication only narrowed
+                        // that race. `complete_promotion` closes it: the
+                        // publish and the target install happen under the
+                        // same lock the demote path holds, so a demotion
+                        // either landed first (the ceiling refuses this
+                        // completion — nothing was published) or lands
+                        // after (it reaches the broker publisher installed
+                        // here and fences the live broker).
+                        let broker_publisher =
+                            Arc::new(crate::lease_agent::BrokerLeasePublisher::new(
+                                Arc::clone(&built.broker),
+                            ));
+                        if !publisher.complete_promotion(
+                            Arc::new(LeadingDemoteAdapter {
+                                broker: Arc::clone(&built.broker),
+                                inner: Arc::clone(&broker_publisher),
+                            })
+                                as Arc<dyn crate::lease_agent::LeasePublisher>,
+                            fencing_epoch,
+                            committed_offset,
+                        ) {
+                            if let Err(error) = built.broker.quiesce() {
+                                eprintln!(
+                                    "post-abandoned-build commit failed; recovery will handle \
+                                     it: {error}"
+                                );
+                            }
+                            drop(built);
+                            let (set, _) =
+                                open_range(&config.data_dir, config.segment_id, &range, roll)?;
+                            let epochs =
+                                ProducerEpochJournal::open(config.data_dir.join("epochs"))
+                                    .map_err(|error| error.to_string())?;
+                            let follower = build_follower(set, epochs)?;
+                            install_follower(&follower);
+                            phase = Phase::Following(follower);
+                            println!(
+                                "data_node_role_changed role=follower node={} \
+                                 note=lease-moved-during-promotion",
+                                config.node_uuid
+                            );
+                            std::io::stdout().flush().ok();
+                            continue;
+                        }
+                        // The promotion is live and every later demotion
+                        // reaches the broker publisher; only now does the
+                        // broker become observable and reachable. A demote
+                        // between the completion and these installs fences
+                        // the broker before any session could reach it.
+                        switching.install(Arc::clone(&built.status));
+                        view.install(Arc::clone(&built.broker)
+                            as Arc<dyn crate::lease_agent::CandidateLocalView>);
+                        slot.install(Arc::clone(&built.broker));
+                        role_flag.store(1, std::sync::atomic::Ordering::Relaxed);
+                        println!(
+                            "data_node_role_changed role=leader node={} epoch={fencing_epoch}",
+                            config.node_uuid
+                        );
+                        std::io::stdout().flush().ok();
+                        phase = Phase::Leading {
+                            broker: built.broker,
+                            publisher: broker_publisher,
+                            _replicas: built.replicas,
+                        };
+                    }
+                    (Phase::Leading { broker, publisher: leader_publisher, .. },
+                     RoleVerdict::Lead { fencing_epoch, committed_offset }) => {
+                        // Re-promotion at a new epoch (a re-grant after a
+                        // suspension) completes against the standing leader —
+                        // through the SAME atomic handoff as a fresh build
+                        // (review): a direct promote here bypassed the
+                        // demotion lock and ceilings, so a lease lost after
+                        // this verdict was read could be fenced by its
+                        // demotion and then reactivated by this stale
+                        // promotion until the queued Follow was processed.
+                        // A refusal publishes nothing; the queued verdict
+                        // decides what happens next.
+                        publisher.complete_promotion(
+                            Arc::new(LeadingDemoteAdapter {
+                                broker: Arc::clone(broker),
+                                inner: Arc::clone(leader_publisher),
+                            })
+                                as Arc<dyn crate::lease_agent::LeasePublisher>,
+                            fencing_epoch,
+                            committed_offset,
+                        );
+                    }
+                    (Phase::Leading { .. }, RoleVerdict::Follow) => {
+                        role_flag.store(2, std::sync::atomic::Ordering::Relaxed);
+                        // #280 order: no new sessions, no new appends, then
+                        // the durable boundary, then the rebuild. The demote
+                        // that produced this verdict already forwarded to the
+                        // broker, so in-flight requests are refusing.
+                        slot.clear();
+                        switching.transitioning();
+                        // The cached probe verdict belongs to the role that
+                        // decided it (review): a fresh promotion must start
+                        // fail-closed, not inherit the prior leader's green.
+                        probe_last.store(false, std::sync::atomic::Ordering::Relaxed);
+                        view.clear();
+                        publisher.set_target(None);
+                        let Phase::Leading { broker, .. } =
+                            std::mem::replace(&mut phase, Phase::Transitioning)
+                        else {
+                            unreachable!("matched Leading above");
+                        };
+                        if let Err(error) = broker.quiesce() {
+                            eprintln!("post-demotion commit failed; recovery will handle it: {error}");
+                        }
+                        drop(broker);
+                        let (set, _) =
+                            open_range(&config.data_dir, config.segment_id, &range, roll)?;
+                        let epochs = ProducerEpochJournal::open(config.data_dir.join("epochs"))
+                            .map_err(|error| error.to_string())?;
+                        let follower = build_follower(set, epochs)?;
+                        install_follower(&follower);
+                        println!(
+                            "data_node_role_changed role=follower node={}",
+                            config.node_uuid
+                        );
+                        std::io::stdout().flush().ok();
+                        phase = Phase::Following(follower);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // --- drain (#280) -------------------------------------------------------
+    // The leader's ordering, in-process: stop admission, drain the native
+    // sessions, and only THEN release — a release racing an admitted
+    // produce would let metadata authorize a successor under a broker
+    // still acking at the old epoch (review; run_leader's own invariant).
+    println!(
+        "data_node_stopping role=candidate node={}",
+        config.node_uuid
+    );
+    if matches!(phase, Phase::Leading { .. }) {
+        slot.clear();
+    }
+    // Both server tasks were signalled by the shutdown watch already; await
+    // the native drain (the accept loop joins its sessions) within the same
+    // budget the agent gets. A drain that runs out the budget is SAID, not
+    // swallowed: aborted session futures cannot cancel a request already
+    // inside `spawn_blocking`, so a timeout here means such a request may
+    // still be running (review) — and the quiesce below is what bounds it.
+    if !native_task_done
+        && tokio::time::timeout(agent_drain, &mut native_task)
+            .await
+            .is_err()
+    {
+        eprintln!(
+            "native drain ran out its budget; an admitted request may still \
+             be in flight — quiescing before release to serialize with it"
+        );
+    }
+    // QUIESCE BEFORE RELEASE when leading (review, round two): `quiesce`
+    // takes the same state lock every admitted append holds through its
+    // critical section, so it cannot return until in-flight blocking work
+    // has committed — and its commit is then durable before the release
+    // lets metadata authorize a successor. A straggler that reaches the
+    // lock after this has no client left to ack (its session future is
+    // gone) and cannot reach quorum once the successor fences the
+    // followers: the same exposure as a SIGKILL, which the protocol
+    // already tolerates.
+    let committed = match &phase {
+        Phase::Following(follower) => Some(follower.quiesce()),
+        Phase::Leading { broker, .. } => Some(broker.quiesce()),
+        Phase::Transitioning => None,
+    };
+    let _ = release_lease.send(true);
+    let _ = tokio::time::timeout(agent_drain, &mut agent_task).await;
+    match committed {
+        Some(Ok(committed)) => println!(
+            "data_node_stopped role=candidate node={} committed={committed}",
+            config.node_uuid
+        ),
+        Some(Err(error)) => {
+            eprintln!("final commit failed; recovery will handle it: {error}")
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+/// A candidate's current shape (#284).
+enum Phase {
+    Following(Arc<InProcessFollower>),
+    Leading {
+        broker: Arc<LocalBroker>,
+        publisher: Arc<crate::lease_agent::BrokerLeasePublisher>,
+        /// Held so the follower drivers live exactly as long as the role.
+        _replicas: Arc<NetworkedReplicaSet>,
+    },
+    Transitioning,
+}
+
+/// A leader BUILT but not yet serving: nothing in it is installed,
+/// promoted, or reachable until the supervisor rechecks the verdict — a
+/// lease lost during this build must win over the build (review P0).
+struct BuiltLeader {
+    broker: Arc<LocalBroker>,
+    status: Arc<dyn ReplicaPeerHandler>,
+    replicas: Arc<NetworkedReplicaSet>,
+}
+
+/// Build the leader half of a candidate: replica set from peers minus
+/// self, broker over the reopened range, transfer surface. PURE
+/// CONSTRUCTION — the promotion completes in the supervisor, after it has
+/// confirmed the verdict that ordered this build still stands.
+async fn build_leader_phase(
+    config: &DataNodeConfig,
+    range: &RangeIdentity,
+    peers: &[crate::config::FollowerPeerConfig],
+    roll: SegmentRoll,
+    meta: &MetaFencingEpoch,
+) -> Result<BuiltLeader, String> {
+    let (set, _recovery) = open_range(&config.data_dir, config.segment_id, range, roll)?;
+    let epochs = ProducerEpochJournal::open(config.data_dir.join("epochs"))
+        .map_err(|error| error.to_string())?;
+    let follower_configs = peers
+        .iter()
+        .map(|peer| {
+            Ok(NetworkFollowerConfig {
+                node_id: peer.node_uuid,
+                addr: vtop_meta::resolve_endpoint(&peer.addr).map_err(|error| error.to_string())?,
+                server_name: peer.server_name.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let follower_ids: Vec<Uuid> = follower_configs.iter().map(|f| f.node_id).collect();
+    let replicas = Arc::new(
+        NetworkedReplicaSet::start_on_handle_with_memory(
+            tokio::runtime::Handle::current(),
+            follower_configs,
+            tls::replica_material(&config.replica_tls)?,
+            FlowControlConfig::default(),
+            None,
+        )
+        .map_err(|error| error.to_string())?,
+    );
+    // Wait for follower streams so the first quorum produce does not race
+    // the dials — the same courtesy run_leader extends, and equally bounded.
+    // This runs in the SUPERVISOR, not the agent loop, so renewals continue
+    // underneath it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if follower_ids
+            .iter()
+            .all(|node| replicas.follower_connected(*node) == Some(true))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let broker = Arc::new(
+        LocalBroker::with_replication(
+            set,
+            epochs,
+            range.clone(),
+            config.fencing_epoch,
+            meta.clone(),
+            config.node_uuid,
+            Some(ClusterCommittedOffset::new(0)),
+            Some(Arc::clone(&replicas) as Arc<dyn ReplicaSet>),
+        )
+        .map_err(|error| error.to_string())?,
+    );
+    broker.set_fencing_epoch_journal(
+        vtop_broker::fencing_epochs::FencingEpochJournal::open(
+            config.data_dir.join("fencing-epochs"),
+        )
+        .map_err(|error| error.to_string())?,
+    );
+    if let Some(retention) = &config.retention {
+        broker.set_retention(Some(vtop_log::RetentionPolicy {
+            max_total_bytes: retention.max_total_bytes,
+        }));
+    }
+    // The transfer surface a leader owes the repair plane, gated on the
+    // symmetric allowlist: peers minus self, plus any named repair
+    // destinations. BUILT here, INSTALLED by the supervisor — nothing this
+    // function does may take effect before the verdict recheck.
+    let status = Arc::new(LeaderStatusReplica {
+        broker: Arc::clone(&broker),
+        node_id: config.node_uuid,
+        transfer: LeaderSegmentTransferHandler::new(Arc::clone(&broker)),
+        transfer_allowed: peers
+            .iter()
+            .map(|peer| peer.node_uuid)
+            .chain(config.transfer_peers.iter().copied())
+            .collect(),
+    }) as Arc<dyn ReplicaPeerHandler>;
+    Ok(BuiltLeader {
+        broker,
+        status,
+        replicas,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Candidate mode (#284): the role follows the lease.
+// ---------------------------------------------------------------------------
+
+/// The replica-plane handler behind a candidate's listener, which outlives
+/// any one role (#284). The socket binds once; the delegate swaps at role
+/// transitions — `InProcessFollower` while following, `LeaderStatusReplica`
+/// while leading, and the trait's refusing defaults mid-transition — so no
+/// address ever moves, which is the property a Kubernetes pod needs and the
+/// live-chaos harness's port-takeover choreography exists to work around.
+struct SwitchingReplicaHandler {
+    node_uuid: Uuid,
+    delegate: std::sync::RwLock<Arc<dyn ReplicaPeerHandler>>,
+}
+
+/// The delegate installed mid-transition: every method inherits the trait's
+/// refusing defaults, so a request that races a role change is refused
+/// rather than served by a half-built role.
+struct TransitioningHandler {
+    node_uuid: Uuid,
+}
+
+impl ReplicaPeerHandler for TransitioningHandler {
+    fn node_id(&self) -> Uuid {
+        self.node_uuid
+    }
+
+    fn apply_append(
+        &self,
+        _request: &vtop_protocol::ReplicaAppendRequest,
+    ) -> Result<vtop_protocol::ReplicaAppendResponse, (vtop_protocol::ErrorCode, String)> {
+        Err((
+            vtop_protocol::ErrorCode::InvalidRequest,
+            "this candidate is mid role-transition; retry".to_owned(),
+        ))
+    }
+
+    fn apply_append_batch(
+        &self,
+        _requests: &[vtop_protocol::ReplicaAppendRequest],
+    ) -> Result<vtop_protocol::ReplicaAppendResponse, (vtop_protocol::ErrorCode, String)> {
+        Err((
+            vtop_protocol::ErrorCode::InvalidRequest,
+            "this candidate is mid role-transition; retry".to_owned(),
+        ))
+    }
+
+    fn observe_hwm(
+        &self,
+        _update: &vtop_protocol::CommittedHwmUpdate,
+    ) -> Result<(), (vtop_protocol::ErrorCode, String)> {
+        Err((
+            vtop_protocol::ErrorCode::InvalidRequest,
+            "this candidate is mid role-transition; retry".to_owned(),
+        ))
+    }
+
+    fn status(
+        &self,
+        _range: &vtop_protocol::RangeIdentity,
+    ) -> Result<vtop_protocol::ReplicaStatusResponse, (vtop_protocol::ErrorCode, String)> {
+        Err((
+            vtop_protocol::ErrorCode::InvalidRequest,
+            "this candidate is mid role-transition; retry".to_owned(),
+        ))
+    }
+}
+
+impl SwitchingReplicaHandler {
+    fn new(node_uuid: Uuid) -> Self {
+        Self {
+            node_uuid,
+            delegate: std::sync::RwLock::new(Arc::new(TransitioningHandler { node_uuid })),
+        }
+    }
+
+    fn install(&self, delegate: Arc<dyn ReplicaPeerHandler>) {
+        *self
+            .delegate
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = delegate;
+    }
+
+    fn transitioning(&self) {
+        self.install(Arc::new(TransitioningHandler {
+            node_uuid: self.node_uuid,
+        }));
+    }
+
+    fn current(&self) -> Arc<dyn ReplicaPeerHandler> {
+        Arc::clone(
+            &self
+                .delegate
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+}
+
+impl ReplicaPeerHandler for SwitchingReplicaHandler {
+    fn node_id(&self) -> Uuid {
+        self.node_uuid
+    }
+
+    fn apply_append(
+        &self,
+        request: &vtop_protocol::ReplicaAppendRequest,
+    ) -> Result<vtop_protocol::ReplicaAppendResponse, (vtop_protocol::ErrorCode, String)> {
+        self.current().apply_append(request)
+    }
+
+    fn apply_append_batch(
+        &self,
+        requests: &[vtop_protocol::ReplicaAppendRequest],
+    ) -> Result<vtop_protocol::ReplicaAppendResponse, (vtop_protocol::ErrorCode, String)> {
+        self.current().apply_append_batch(requests)
+    }
+
+    fn observe_hwm(
+        &self,
+        update: &vtop_protocol::CommittedHwmUpdate,
+    ) -> Result<(), (vtop_protocol::ErrorCode, String)> {
+        self.current().observe_hwm(update)
+    }
+
+    fn status(
+        &self,
+        range: &vtop_protocol::RangeIdentity,
+    ) -> Result<vtop_protocol::ReplicaStatusResponse, (vtop_protocol::ErrorCode, String)> {
+        self.current().status(range)
+    }
+
+    fn epoch_history(
+        &self,
+        range: &vtop_protocol::RangeIdentity,
+    ) -> Result<Vec<vtop_protocol::ReplicaEpochStart>, (vtop_protocol::ErrorCode, String)> {
+        self.current().epoch_history(range)
+    }
+
+    fn fence(
+        &self,
+        range: &vtop_protocol::RangeIdentity,
+        fencing_epoch: u64,
+        leader_epoch_starts: &[vtop_broker::fencing_epochs::EpochStart],
+    ) -> Result<vtop_protocol::ReplicaFenceResponse, (vtop_protocol::ErrorCode, String)> {
+        self.current()
+            .fence(range, fencing_epoch, leader_epoch_starts)
+    }
+
+    fn list_sealed_segments(
+        &self,
+        peer: Uuid,
+        range: &vtop_protocol::RangeIdentity,
+        fencing_epoch: u64,
+    ) -> Result<Vec<vtop_protocol::SealedSegmentEntry>, (vtop_protocol::ErrorCode, String)> {
+        self.current()
+            .list_sealed_segments(peer, range, fencing_epoch)
+    }
+
+    fn fetch_segment_chunk(
+        &self,
+        peer: Uuid,
+        request: &vtop_protocol::FetchSegmentChunkRequest,
+    ) -> Result<vtop_protocol::FetchSegmentChunkResponse, (vtop_protocol::ErrorCode, String)> {
+        self.current().fetch_segment_chunk(peer, request)
+    }
+
+    fn seal_tail(
+        &self,
+        peer: Uuid,
+        range: &vtop_protocol::RangeIdentity,
+        fencing_epoch: u64,
+    ) -> Result<vtop_protocol::SealTailResponse, (vtop_protocol::ErrorCode, String)> {
+        self.current().seal_tail(peer, range, fencing_epoch)
+    }
+}
+
+/// The candidate's own view for the promotion probe, switching with the
+/// role (#284).
+struct SwitchingLocalView {
+    delegate: std::sync::RwLock<Option<Arc<dyn crate::lease_agent::CandidateLocalView>>>,
+}
+
+impl SwitchingLocalView {
+    fn empty() -> Self {
+        Self {
+            delegate: std::sync::RwLock::new(None),
+        }
+    }
+
+    fn install(&self, view: Arc<dyn crate::lease_agent::CandidateLocalView>) {
+        *self
+            .delegate
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(view);
+    }
+
+    /// Release the current delegate. Called BEFORE a transition drops its
+    /// role object (review): this view's Arc would otherwise keep the old
+    /// storage owner alive across the reopen, and the handoff contract is
+    /// that the directory has exactly one owner at a time.
+    fn clear(&self) {
+        *self
+            .delegate
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
+impl crate::lease_agent::CandidateLocalView for SwitchingLocalView {
+    fn local_committed_offset(&self) -> u64 {
+        self.delegate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map_or(0, |view| view.local_committed_offset())
+    }
+
+    fn epoch_starts(&self) -> Vec<vtop_broker::fencing_epochs::EpochStart> {
+        self.delegate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map_or_else(Vec::new, |view| view.epoch_starts())
+    }
+}
+
+/// The watcher's semantics for an agent-driven follower (#284).
+///
+/// A LeaseWatcher translates an OBSERVED grant into `promote(epoch, None)` —
+/// "serve this epoch" — because that is what a granted epoch means to a
+/// follower. The lease agent speaks the holder's dialect: a rival's grant
+/// arrives as `demote(rival_epoch)`. For a FOLLOWING candidate every demote
+/// is exactly that observation (a non-holder has no renewal to lose), so
+/// this adapter translates it back — without it, a following candidate
+/// clears its lease view on every poll and refuses every append from the
+/// leader it is supposed to follow, which is how scenario 14's first quorum
+/// produce found three healthy replicas and zero acks.
+struct FollowerObservationAdapter {
+    inner: crate::lease_watcher::FollowerLeasePublisher,
+}
+
+impl crate::lease_agent::LeasePublisher for FollowerObservationAdapter {
+    fn promote(&self, fencing_epoch: u64, committed_offset: Option<u64>) {
+        self.inner.promote(fencing_epoch, committed_offset);
+    }
+
+    fn demote(&self, fencing_epoch: u64) {
+        // A rival holds the range at this epoch: to a follower, that IS the
+        // grant to serve under.
+        self.inner.promote(fencing_epoch, None);
+    }
+
+    fn suspend(&self, fencing_epoch: u64) {
+        self.inner.suspend(fencing_epoch);
+    }
+}
+
+/// What the lease agent decided, as the supervisor consumes it (#284).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RoleVerdict {
+    /// Startup: no verdict yet; the candidate begins as a follower.
+    Undecided,
+    /// The agent holds the range; the supervisor must build (or keep) the
+    /// leader and then complete the promotion by publishing this boundary.
+    Lead {
+        fencing_epoch: u64,
+        committed_offset: Option<u64>,
+    },
+    /// The agent does not hold the range.
+    Follow,
+}
+
+/// The LEADING candidate's demotion dialect (#284): fence what THIS node
+/// held, not the epoch the rival was granted. run_leader's static broker
+/// clears through the rival's epoch, and that is correct THERE — the
+/// process never follows, so poisoning reactivation at the rival's epoch
+/// costs nothing. A candidate becomes the rival's follower NEXT:
+/// `clear_lease` records its epoch in the shared view's `released_through`,
+/// and recording the RIVAL's would leave the successor's own grant
+/// unactivatable — a deposed but otherwise healthy candidate refusing
+/// every append for the successor's entire epoch (review). Clearing the
+/// broker's own held epoch fences it just as surely, and leaves the
+/// successor's epoch free to activate the rebuilt follower.
+struct LeadingDemoteAdapter {
+    broker: Arc<LocalBroker>,
+    inner: Arc<crate::lease_agent::BrokerLeasePublisher>,
+}
+
+impl crate::lease_agent::LeasePublisher for LeadingDemoteAdapter {
+    fn promote(&self, fencing_epoch: u64, committed_offset: Option<u64>) {
+        crate::lease_agent::LeasePublisher::promote(
+            self.inner.as_ref(),
+            fencing_epoch,
+            committed_offset,
+        );
+    }
+
+    fn demote(&self, _rival_epoch: u64) {
+        crate::lease_agent::LeasePublisher::demote(
+            self.inner.as_ref(),
+            self.broker.held_fencing_epoch(),
+        );
+    }
+
+    fn suspend(&self, fencing_epoch: u64) {
+        crate::lease_agent::LeasePublisher::suspend(self.inner.as_ref(), fencing_epoch);
+    }
+}
+
+/// The candidate's lease publisher: a VERDICT RECORDER, not a role toggle
+/// (#284). Promotion cannot take effect here — the leader it promotes does
+/// not exist until the supervisor builds it — so `promote` only records,
+/// and the supervisor completes it by calling the real
+/// [`crate::lease_agent::BrokerLeasePublisher`] once the broker stands.
+/// Demotion and suspension CANNOT wait for the supervisor: fail-closed has
+/// no build step, so they forward to the current role object immediately
+/// and record second.
+struct CandidateLeasePublisher {
+    target: std::sync::RwLock<Option<Arc<dyn crate::lease_agent::LeasePublisher>>>,
+    verdicts: tokio::sync::watch::Sender<RoleVerdict>,
+    /// The highest epoch ever demoted through this publisher. A recorded
+    /// promotion is completed only while its epoch is above this ceiling,
+    /// and the check happens under the SAME lock the demotion path holds —
+    /// so a demote racing a completion either lands first and refuses it,
+    /// or lands second and reaches the just-installed broker publisher.
+    /// There is no third interleaving (review: a check separate from the
+    /// publication only narrowed the window; this closes it).
+    finished_through: std::sync::atomic::AtomicU64,
+    /// The highest epoch ever RECORDED as a promotion. A completion below
+    /// this watermark is superseded — the agent has since verified a newer
+    /// grant — and installing it would publish a boundary metadata has
+    /// moved past (review: reachable via suspend-then-regrant, which never
+    /// raises the finished ceiling). The refusal is safe because the newer
+    /// verdict is already queued: the supervisor's next iteration builds
+    /// for the grant that superseded this one.
+    recorded_through: std::sync::atomic::AtomicU64,
+}
+
+impl CandidateLeasePublisher {
+    fn set_target(&self, target: Option<Arc<dyn crate::lease_agent::LeasePublisher>>) {
+        *self
+            .target
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = target;
+    }
+
+    /// Complete a recorded promotion: publish the boundary through the
+    /// real broker publisher and make it the demotion target, atomically
+    /// against the demote path. Returns false — publishing NOTHING — if a
+    /// demotion at or above this epoch already happened, which is exactly
+    /// the lease-moved-during-build case; the caller must stand the node
+    /// back up as a follower.
+    ///
+    /// Observed rival epochs (recorded while following) cannot refuse a
+    /// legitimate completion: metadata mints epochs monotonically, so a
+    /// grant issued to this node is strictly above every epoch it ever
+    /// watched a rival hold.
+    fn complete_promotion(
+        &self,
+        target: Arc<dyn crate::lease_agent::LeasePublisher>,
+        fencing_epoch: u64,
+        committed_offset: Option<u64>,
+    ) -> bool {
+        let mut guard = self
+            .target
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self
+            .finished_through
+            .load(std::sync::atomic::Ordering::SeqCst)
+            >= fencing_epoch
+            || self
+                .recorded_through
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > fencing_epoch
+        {
+            return false;
+        }
+        target.promote(fencing_epoch, committed_offset);
+        *guard = Some(target);
+        true
+    }
+}
+
+impl crate::lease_agent::LeasePublisher for CandidateLeasePublisher {
+    fn promote(&self, fencing_epoch: u64, committed_offset: Option<u64>) {
+        // Under the SAME lock `complete_promotion` holds (review): recorded
+        // outside it, a newer grant's watermark could land between an older
+        // completion's check and its install, and the stale build would
+        // publish anyway. Inside it, the two linearize — the completion
+        // either sees this record and refuses, or finishes first and the
+        // queued verdict re-promotes the standing leader at this epoch.
+        {
+            let _guard = self
+                .target
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.recorded_through
+                .fetch_max(fencing_epoch, std::sync::atomic::Ordering::SeqCst);
+        }
+        let _ = self.verdicts.send(RoleVerdict::Lead {
+            fencing_epoch,
+            committed_offset,
+        });
+    }
+
+    fn demote(&self, fencing_epoch: u64) {
+        // The WRITE lock, not a read: demotion must be exclusive with
+        // `complete_promotion`, and the ceiling must rise inside the same
+        // critical section that forwards — otherwise a completion could
+        // slip between the two and serve at an epoch already finished.
+        {
+            let guard = self
+                .target
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.finished_through
+                .fetch_max(fencing_epoch, std::sync::atomic::Ordering::SeqCst);
+            if let Some(target) = guard.as_ref() {
+                target.demote(fencing_epoch);
+            }
+        }
+        let _ = self.verdicts.send(RoleVerdict::Follow);
+    }
+
+    fn suspend(&self, fencing_epoch: u64) {
+        if let Some(target) = self
+            .target
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            target.suspend(fencing_epoch);
+        }
+        // Suspension is not a role change and does not raise the finished
+        // ceiling: the epoch is still this node's live grant and the agent
+        // will retry. The broker is already refusing (the forward above);
+        // rebuilding as a follower here would turn every transient quorum
+        // miss into a full teardown. A suspend that races a completion is
+        // benign in either order: landing after suspends the live broker,
+        // landing before is healed by the agent's next successful renewal
+        // re-promoting the standing leader.
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// The production roll thresholds, so these tests exercise the same
@@ -1194,5 +2443,198 @@ mod tests {
             problem.contains("InvalidArtifact") && problem.contains("stray.active"),
             "the refusal must name the reason and the path: {problem}"
         );
+    }
+
+    /// The candidate publisher records a promotion rather than acting on
+    /// it — the leader it would promote does not exist until the supervisor
+    /// builds one — while demotion forwards immediately, because
+    /// fail-closed has no build step to wait for.
+    #[test]
+    fn candidate_publisher_records_promotions_and_forwards_demotions() {
+        use crate::lease_agent::LeasePublisher;
+        #[derive(Default)]
+        struct Target {
+            demoted: std::sync::Mutex<Vec<u64>>,
+            promoted: std::sync::Mutex<Vec<u64>>,
+        }
+        impl LeasePublisher for Target {
+            fn promote(&self, fencing_epoch: u64, _committed_offset: Option<u64>) {
+                self.promoted.lock().unwrap().push(fencing_epoch);
+            }
+            fn demote(&self, fencing_epoch: u64) {
+                self.demoted.lock().unwrap().push(fencing_epoch);
+            }
+            fn suspend(&self, _fencing_epoch: u64) {}
+        }
+        let (verdict_tx, verdict_rx) = tokio::sync::watch::channel(RoleVerdict::Undecided);
+        let publisher = CandidateLeasePublisher {
+            target: std::sync::RwLock::new(None),
+            verdicts: verdict_tx,
+            finished_through: std::sync::atomic::AtomicU64::new(0),
+            recorded_through: std::sync::atomic::AtomicU64::new(0),
+        };
+        let target = std::sync::Arc::new(Target::default());
+        publisher.set_target(Some(
+            std::sync::Arc::clone(&target) as std::sync::Arc<dyn LeasePublisher>
+        ));
+
+        publisher.promote(7, Some(41));
+        assert_eq!(
+            *verdict_rx.borrow(),
+            RoleVerdict::Lead {
+                fencing_epoch: 7,
+                committed_offset: Some(41)
+            },
+            "a promotion is recorded for the supervisor to complete"
+        );
+        assert!(
+            target.promoted.lock().unwrap().is_empty(),
+            "a promotion must NOT reach the role object from the publisher: the broker it \
+             authorizes does not exist yet"
+        );
+
+        publisher.demote(7);
+        assert_eq!(
+            *target.demoted.lock().unwrap(),
+            vec![7],
+            "a demotion forwards immediately — fail-closed cannot wait for the supervisor"
+        );
+        assert_eq!(*verdict_rx.borrow(), RoleVerdict::Follow);
+
+        // The lease-moved-during-build race, replayed in miniature: the
+        // demotion at epoch 7 already happened, so completing the recorded
+        // promotion at 7 must publish NOTHING — the broker built for that
+        // grant would serve at an epoch metadata moved past.
+        let stale = std::sync::Arc::new(Target::default());
+        assert!(
+            !publisher.complete_promotion(
+                std::sync::Arc::clone(&stale) as std::sync::Arc<dyn LeasePublisher>,
+                7,
+                Some(41)
+            ),
+            "a completion at or below the demoted ceiling must be refused"
+        );
+        assert!(
+            stale.promoted.lock().unwrap().is_empty(),
+            "a refused completion publishes nothing"
+        );
+
+        // A fresh grant sits strictly above every finished epoch, so its
+        // completion publishes the boundary and becomes the demote target.
+        let fresh = std::sync::Arc::new(Target::default());
+        assert!(
+            publisher.complete_promotion(
+                std::sync::Arc::clone(&fresh) as std::sync::Arc<dyn LeasePublisher>,
+                8,
+                Some(41)
+            ),
+            "a grant above the ceiling completes"
+        );
+        assert_eq!(
+            *fresh.promoted.lock().unwrap(),
+            vec![8],
+            "completion publishes through the real publisher"
+        );
+        publisher.demote(8);
+        assert_eq!(
+            *fresh.demoted.lock().unwrap(),
+            vec![8],
+            "a demotion after completion reaches the broker it authorized"
+        );
+
+        // Suspend-then-regrant never raises the finished ceiling, so the
+        // recorded watermark must refuse a build for a superseded grant:
+        // epoch 10 was recorded while the build for 9 was still in flight.
+        publisher.promote(9, Some(41));
+        publisher.promote(10, Some(41));
+        let superseded = std::sync::Arc::new(Target::default());
+        assert!(
+            !publisher.complete_promotion(
+                std::sync::Arc::clone(&superseded) as std::sync::Arc<dyn LeasePublisher>,
+                9,
+                Some(41)
+            ),
+            "a completion below the recorded watermark is superseded and must be refused"
+        );
+        assert!(
+            superseded.promoted.lock().unwrap().is_empty(),
+            "a superseded completion publishes nothing"
+        );
+        let latest = std::sync::Arc::new(Target::default());
+        assert!(
+            publisher.complete_promotion(
+                std::sync::Arc::clone(&latest) as std::sync::Arc<dyn LeasePublisher>,
+                10,
+                Some(41)
+            ),
+            "the latest recorded grant completes"
+        );
+    }
+
+    /// A deposed leading candidate must remain able to FOLLOW its successor.
+    /// The leading demotion dialect fences the epoch this node held, never
+    /// the rival's: `clear_lease` records its argument in the shared view's
+    /// `released_through`, and recording the rival's epoch would leave the
+    /// successor's own grant unactivatable — a healthy replica refusing
+    /// every append for the successor's entire epoch.
+    #[test]
+    fn a_deposed_leader_fences_its_own_epoch_so_the_successors_grant_activates() {
+        use crate::lease_agent::LeasePublisher;
+        let dir = tempfile::tempdir().unwrap();
+        let range = test_range();
+        let (set, _) = open_range(dir.path(), Uuid::from_u128(0xD9), &range, test_roll()).unwrap();
+        let epochs = ProducerEpochJournal::open(dir.path().join("epochs")).unwrap();
+        let meta = MetaFencingEpoch::new_inactive(0);
+        let broker = Arc::new(
+            LocalBroker::with_meta_fencing_epoch(set, epochs, range, 0, meta.clone()).unwrap(),
+        );
+        let adapter = LeadingDemoteAdapter {
+            broker: Arc::clone(&broker),
+            inner: Arc::new(crate::lease_agent::BrokerLeasePublisher::new(Arc::clone(
+                &broker,
+            ))),
+        };
+        adapter.promote(1, None);
+        assert_eq!(
+            meta.try_snapshot(),
+            Some((1, true)),
+            "the grant at epoch 1 activates the shared view"
+        );
+        adapter.demote(2);
+        assert_eq!(
+            meta.try_snapshot(),
+            Some((1, false)),
+            "the deposed broker is fenced — its own epoch is no longer live"
+        );
+        meta.set(2);
+        assert_eq!(
+            meta.try_snapshot(),
+            Some((2, true)),
+            "the successor's grant must still activate the shared view: fencing the \
+             rival's epoch instead of our own would pin this replica out of the range \
+             for the successor's entire reign"
+        );
+    }
+
+    /// The switching handler serves whatever is installed and refuses
+    /// mid-transition, so a request racing a role change is refused rather
+    /// than served by a half-built role.
+    #[test]
+    fn switching_handler_refuses_mid_transition() {
+        let node = Uuid::from_u128(9);
+        let handler = SwitchingReplicaHandler::new(node);
+        let range = vtop_protocol::RangeIdentity {
+            topic: "t".into(),
+            topic_epoch: 1,
+            range_id: Uuid::from_u128(1),
+            range_generation: 0,
+        };
+        let (code, message) = handler.status(&range).unwrap_err();
+        assert_eq!(code, vtop_protocol::ErrorCode::InvalidRequest);
+        assert!(
+            message.contains("transition"),
+            "the refusal must say WHY, so a peer retries instead of diagnosing: {message}"
+        );
+        assert_eq!(handler.node_id(), node);
     }
 }

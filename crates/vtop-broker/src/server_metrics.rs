@@ -230,6 +230,13 @@ pub struct ServerMetrics {
     sessions_refused_at_capacity: AtomicU64,
     sessions_refused_unauthorized: AtomicU64,
     sessions_refused_handshake: AtomicU64,
+    /// Sockets refused because no SERVABLE broker stands behind the
+    /// listener: a candidate that is not leading (#284), or — rarer and
+    /// loud on stderr — an installed broker whose segment format does not
+    /// match the listener's declaration. Its own counter, not capacity's:
+    /// "we are full" and "nothing here can serve you" point an operator at
+    /// opposite remedies, and the stderr line splits the two causes.
+    sessions_refused_no_broker: AtomicU64,
     requests: [[AtomicU64; RequestOutcome::ALL.len()]; RequestKind::ALL.len()],
     latency: [LatencyHistogram; RequestKind::ALL.len()],
     records_produced: AtomicU64,
@@ -264,6 +271,11 @@ impl ServerMetrics {
 
     pub fn session_refused_at_capacity(&self) {
         self.sessions_refused_at_capacity
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn session_refused_no_broker(&self) {
+        self.sessions_refused_no_broker
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -312,6 +324,10 @@ impl ServerMetrics {
 
     pub fn sessions_refused_at_capacity_total(&self) -> u64 {
         self.sessions_refused_at_capacity.load(Ordering::Relaxed)
+    }
+
+    pub fn sessions_refused_no_broker_total(&self) -> u64 {
+        self.sessions_refused_no_broker.load(Ordering::Relaxed)
     }
 
     pub fn sessions_refused_unauthorized_total(&self) -> u64 {

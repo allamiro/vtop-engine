@@ -102,8 +102,39 @@ pub trait QuorumProbe: Send + Sync {
 ///
 /// `ReplicaStatusClient` asks the follower's disk instead, and a peer that does
 /// not answer is genuinely absent.
+/// A candidate's own local view, as the promotion probe reads it (#284):
+/// the committed offset it votes with, and the epoch lineage it sends with
+/// every fence. A leader answers from its broker and a follower from its
+/// replica state; a candidate answers through whichever it currently is —
+/// which is exactly why this is a trait and not `Arc<LocalBroker>`.
+pub trait CandidateLocalView: Send + Sync {
+    fn local_committed_offset(&self) -> u64;
+    fn epoch_starts(&self) -> Vec<vtop_broker::fencing_epochs::EpochStart>;
+}
+
+impl CandidateLocalView for LocalBroker {
+    fn local_committed_offset(&self) -> u64 {
+        // The BLOCKING accessor, deliberately — see the probe body.
+        self.local_offsets().0
+    }
+
+    fn epoch_starts(&self) -> Vec<vtop_broker::fencing_epochs::EpochStart> {
+        self.epoch_starts()
+    }
+}
+
+impl CandidateLocalView for vtop_broker::replication::InProcessFollower {
+    fn local_committed_offset(&self) -> u64 {
+        self.local_committed_offset()
+    }
+
+    fn epoch_starts(&self) -> Vec<vtop_broker::fencing_epochs::EpochStart> {
+        self.epoch_starts()
+    }
+}
+
 pub struct ReplicaPlaneProbe {
-    broker: Arc<LocalBroker>,
+    view: Arc<dyn CandidateLocalView>,
     node_uuid: Uuid,
     client: vtop_broker::replication::ReplicaStatusClient,
     followers: Vec<FollowerEndpoint>,
@@ -120,14 +151,14 @@ pub struct FollowerEndpoint {
 
 impl ReplicaPlaneProbe {
     pub fn new(
-        broker: Arc<LocalBroker>,
+        view: Arc<dyn CandidateLocalView>,
         node_uuid: Uuid,
         client: vtop_broker::replication::ReplicaStatusClient,
         followers: Vec<FollowerEndpoint>,
         range: vtop_protocol::RangeIdentity,
     ) -> Self {
         Self {
-            broker,
+            view,
             node_uuid,
             client,
             followers,
@@ -149,7 +180,7 @@ impl QuorumProbe for ReplicaPlaneProbe {
         // at — that is what made it the candidate — so nothing else can be
         // writing here under an older one. Dialling its own port to be told so
         // would add a failure mode without adding a fact.
-        let (local_committed, _) = self.broker.local_offsets();
+        let local_committed = self.view.local_committed_offset();
         let mut probes = vec![crate::promotion::ReplicaProbe {
             node_id: self.node_uuid,
             local_committed_offset: Some(local_committed),
@@ -160,7 +191,7 @@ impl QuorumProbe for ReplicaPlaneProbe {
         // anything — the honest outcome, since there is nothing to reconcile
         // against.
         let leader_epoch_starts: Vec<vtop_protocol::ReplicaEpochStart> = self
-            .broker
+            .view
             .epoch_starts()
             .into_iter()
             .map(|entry| vtop_protocol::ReplicaEpochStart {
@@ -585,6 +616,32 @@ pub struct LeaseAgent {
     range_uuid: Uuid,
     promoter: Promoter,
     state: LeaseState,
+    /// Marked once the first metadata exchange COMPLETES, whatever it said
+    /// (granted, refused, rival held — each tells this node where it
+    /// stands). Same doctrine as the watcher's gate: a candidate that has
+    /// never reached metadata does not know the current epoch, its follower
+    /// refuses every append, and reporting ready before that first read is
+    /// the same false green the static follower already refuses to show.
+    ready: Option<vtop_observe::ReadinessGate>,
+    /// A persistent handle on the same gate, kept so a range that goes
+    /// missing AFTER the gate opened can revoke readiness — the consumable
+    /// `ready` above only governs the first open (review).
+    gate: Option<vtop_observe::ReadinessGate>,
+    /// True while readiness is being withheld because of a missing range,
+    /// so recovery re-marks the gate exactly once.
+    gate_degraded: bool,
+    /// True when the last completed exchange said the RANGE ITSELF is gone.
+    /// That answer must not open the readiness gate: a candidate configured
+    /// with a deleted or unknown range is a configuration fault, and the
+    /// watcher keeps readiness closed for the same case (review).
+    range_missing: bool,
+    /// The rival epoch most recently fenced into the local view by the Wait
+    /// arm. Kept so that LOSING SIGHT of metadata while following suspends
+    /// that epoch — the watcher's exact doctrine: without it, a following
+    /// candidate would keep accepting replication at a stale epoch for as
+    /// long as metadata stays unreachable, on nothing but the memory of a
+    /// read that may already be superseded (review).
+    observed_rival: Option<u64>,
     /// Rounds of the run loop during which this node will NOT campaign for
     /// the lease, set when a promotion was refused on eligibility grounds
     /// (LeaderBehind or the §5.4.1 vote check). A refused candidate that
@@ -645,9 +702,22 @@ impl LeaseAgent {
                 stand_aside: false,
             },
             state: LeaseState::NotHeld,
+            ready: None,
+            gate: None,
+            gate_degraded: false,
+            range_missing: false,
+            observed_rival: None,
             held_until_ms: None,
             campaign_hold_off_rounds: 0,
         })
+    }
+
+    /// Open `gate` on the first completed metadata exchange (see the
+    /// `ready` field for why a candidate is not ready before that).
+    pub fn with_ready_gate(mut self, gate: vtop_observe::ReadinessGate) -> Self {
+        self.ready = Some(gate.clone());
+        self.gate = Some(gate);
+        self
     }
 
     /// Run until the process stops or `release` fires (#280).
@@ -668,12 +738,45 @@ impl LeaseAgent {
     /// range everyone agrees on. The order is: stop admitting, drain, THEN
     /// hand the range back.
     pub async fn run(mut self, mut release: tokio::sync::watch::Receiver<bool>) {
+        // Said out loud at start of life: an agent that never logs is
+        // indistinguishable from an agent that never ran, and the difference
+        // once cost a debugging session (#284).
+        tracing::info!(
+            range = %self.range_uuid,
+            node = %self.node_uuid,
+            "lease agent running"
+        );
         loop {
             if *release.borrow() {
                 break;
             }
             let delay = match self.step().await {
-                Ok(delay) => delay,
+                Ok(delay) => {
+                    if self.range_missing {
+                        // Definitive, not transient: metadata answered and
+                        // said the range does not exist. Readiness is
+                        // withheld before the first open and REVOKED after
+                        // it — a node serving a deleted range is a
+                        // configuration fault however long it has been up
+                        // (review).
+                        if let Some(gate) = &self.gate {
+                            gate.mark_not_ready(
+                                "the configured range is missing from metadata".to_owned(),
+                            );
+                        }
+                        self.gate_degraded = true;
+                    } else {
+                        if let Some(gate) = self.ready.take() {
+                            gate.mark_ready();
+                        } else if self.gate_degraded {
+                            if let Some(gate) = &self.gate {
+                                gate.mark_ready();
+                            }
+                        }
+                        self.gate_degraded = false;
+                    }
+                    delay
+                }
                 Err(error) => {
                     // A metadata group mid-election refuses reads. Retrying is
                     // right; what would be wrong is treating an unreachable
@@ -696,6 +799,19 @@ impl LeaseAgent {
                                 "metadata unreachable past the lease deadline; demoting locally"
                             );
                             self.publish_lost(fencing_epoch);
+                        }
+                    } else if !matches!(self.state, LeaseState::Held { .. }) {
+                        // Following, and blind: the watcher's doctrine applies
+                        // here too. Losing sight of metadata is not the lease
+                        // ending, but it is the end of knowing the observed
+                        // epoch is still current — so the view is suspended,
+                        // reactivatable the moment a read lands, rather than
+                        // left accepting replication on the memory of a read
+                        // a turnover may already have superseded (review).
+                        // Suspension is idempotent; repeating it every
+                        // failing round is free.
+                        if let Some(epoch) = self.observed_rival {
+                            self.promoter.publisher.suspend(epoch);
                         }
                     }
                     self.config.poll_interval
@@ -783,6 +899,7 @@ impl LeaseAgent {
         // later than this, so a local deadline derived from it is always at
         // or before the one metadata records.
         let round_started_ms = now_ms();
+        self.range_missing = false;
         let view = self
             .bounded(
                 "read range lease",
@@ -889,6 +1006,7 @@ impl LeaseAgent {
                 // monotonic and idempotent, so repeating it every poll is
                 // free.
                 self.promoter.lost(fencing_epoch);
+                self.observed_rival = Some(fencing_epoch);
                 // A rival holding the range is the stand-aside's purpose
                 // ACHIEVED: the replica this node's refusal made way for (or
                 // any other eligible one) has the lease. Clearing the
@@ -900,10 +1018,24 @@ impl LeaseAgent {
                 Ok(self.config.poll_interval)
             }
             LeaseDecision::RangeMissing => {
+                self.range_missing = true;
                 if let LeaseState::Held { fencing_epoch } = self.state {
                     // A range deleted out from under its holder is an operator
                     // action; the broker must not keep serving it.
                     self.publish_lost(fencing_epoch);
+                } else if let Some(epoch) = self.observed_rival {
+                    // A FOLLOWING view fails closed on the same answer:
+                    // without this, the last observed rival epoch stays
+                    // active and the node keeps accepting authenticated
+                    // replication for a range metadata has deleted (review).
+                    // Suspend, not demote — through the candidate's
+                    // observation dialect a demotion MEANS "rival grant,
+                    // serve this epoch", while suspension is the fail-closed
+                    // verb in both dialects, and it leaves the view
+                    // reactivatable should the range be recreated and a new
+                    // grant observed. Idempotent, so repeating it every
+                    // round the range stays missing is free.
+                    self.promoter.publisher.suspend(epoch);
                 }
                 Ok(self.config.poll_interval)
             }
@@ -1484,7 +1616,7 @@ mod tests {
         // Port 1 on loopback: reserved, and nothing this test could race with.
         let unreachable = "127.0.0.1:1".parse().unwrap();
         let probe = ReplicaPlaneProbe::new(
-            Arc::clone(&broker),
+            Arc::clone(&broker) as Arc<dyn CandidateLocalView>,
             leader_uuid,
             client,
             vec![FollowerEndpoint {

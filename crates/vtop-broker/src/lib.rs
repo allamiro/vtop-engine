@@ -2032,8 +2032,59 @@ pub trait SessionAuthorizer: Send + Sync + 'static {
     fn authorize(&self, peer_chain_der: &[Vec<u8>], principal_id: Uuid, role: Role) -> bool;
 }
 
+/// The broker behind a listener that OUTLIVES any one broker (#284).
+///
+/// A candidate's native listener binds once and never moves, but the
+/// [`LocalBroker`] behind it is rebuilt at each role transition. The slot
+/// is read at session ACCEPT: sessions in flight keep the broker they
+/// started with — which fails closed the moment it is fenced — and new
+/// sessions see the current one. An EMPTY slot refuses the socket
+/// outright: a candidate that is not leading has no broker, and spending
+/// a TLS handshake to say so would be politeness at the price of load.
+#[derive(Default)]
+pub struct BrokerSlot {
+    inner: std::sync::RwLock<Option<Arc<LocalBroker>>>,
+}
+
+impl BrokerSlot {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    pub fn holding(broker: Arc<LocalBroker>) -> Self {
+        Self {
+            inner: std::sync::RwLock::new(Some(broker)),
+        }
+    }
+
+    /// Install the broker a promotion built. The caller is responsible for
+    /// the #280 ordering — the previous broker must have been drained and
+    /// quiesced before its successor is installed.
+    pub fn install(&self, broker: Arc<LocalBroker>) {
+        *self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(broker);
+    }
+
+    /// Empty the slot; new sessions are refused until the next install.
+    pub fn clear(&self) {
+        *self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    pub fn current(&self) -> Option<Arc<LocalBroker>> {
+        self.inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
 pub struct NativeServer {
-    broker: Arc<LocalBroker>,
+    broker: Arc<BrokerSlot>,
     authorizer: Arc<dyn SessionAuthorizer>,
     acceptor: TlsAcceptor,
     config: ServerConfig,
@@ -2050,7 +2101,6 @@ impl NativeServer {
         authorizer: Arc<dyn SessionAuthorizer>,
         config: ServerConfig,
     ) -> BrokerResult<Self> {
-        config.validate()?;
         // The configured format is a declaration of intent; refusing a
         // mismatch here keeps a v1 deployment from silently serving a v2
         // segment (or the reverse) after a bad rollout.
@@ -2061,6 +2111,26 @@ impl NativeServer {
                 broker.segment_format()
             )));
         }
+        Self::over_slot(
+            Arc::new(BrokerSlot::holding(broker)),
+            tls,
+            authorizer,
+            config,
+        )
+    }
+
+    /// Build the server over a [`BrokerSlot`], for a candidate whose broker
+    /// comes and goes with the lease (#284). The format declaration is
+    /// checked per ACCEPT rather than at construction — the slot may be
+    /// empty now and hold a broker later — and a mismatched install refuses
+    /// sessions loudly instead of serving the wrong format.
+    pub fn over_slot(
+        broker: Arc<BrokerSlot>,
+        tls: ServerTlsMaterial,
+        authorizer: Arc<dyn SessionAuthorizer>,
+        config: ServerConfig,
+    ) -> BrokerResult<Self> {
+        config.validate()?;
         // Pin the provider: workspace feature unification can enable more
         // than one rustls backend, and process-level auto-detection then
         // aborts instead of choosing.
@@ -2122,9 +2192,31 @@ impl NativeServer {
                         drop(socket);
                         continue;
                     };
+                    // Read AT ACCEPT: sessions keep the broker they started
+                    // with (it fails closed once fenced); new sessions see
+                    // the slot's current holder. Empty — a candidate not
+                    // currently leading — refuses the socket (#284).
+                    let Some(broker) = self.broker.current() else {
+                        self.metrics.session_refused_no_broker();
+                        drop(socket);
+                        continue;
+                    };
+                    if self.config.segment_format != broker.segment_format() {
+                        // A mismatched install: refuse loudly rather than
+                        // serve a format the deployment did not declare.
+                        self.metrics.session_refused_no_broker();
+                        eprintln!(
+                            "refusing session: installed broker serves {:?} but this listener \
+                             declared {:?}",
+                            broker.segment_format(),
+                            self.config.segment_format
+                        );
+                        drop(socket);
+                        continue;
+                    }
                     let context = SessionContext {
                         acceptor: self.acceptor.clone(),
-                        broker: Arc::clone(&self.broker),
+                        broker,
                         authorizer: Arc::clone(&self.authorizer),
                         requests: Arc::clone(&self.requests),
                         config: self.config.clone(),
