@@ -997,6 +997,7 @@ async fn repair(
     // BEFORE the transfer, so the listing that drives it already includes
     // the freshly sealed tail (#306). Ordering is the point: sealing after
     // the transfer would close the gap for the NEXT repair, not this one.
+    let mut sealed_tail_end: Option<u64> = None;
     if seal_tail {
         let (sealed_end, records_sealed) = client
             .seal_tail(
@@ -1008,14 +1009,17 @@ async fn repair(
             )
             .await
             .map_err(|error| format!("seal the tail on {from}: {error}"))?;
+        sealed_tail_end = Some(sealed_end);
         if !json {
             if records_sealed > 0 {
                 println!(
-                    "the leader sealed {records_sealed} tail record(s); the sealed prefix now                      reaches offset {sealed_end}"
+                    "the leader sealed {records_sealed} tail record(s); the sealed prefix now \
+                     reaches offset {sealed_end}"
                 );
             } else {
                 println!(
-                    "the leader's tail was already empty; the sealed prefix already reaches                      offset {sealed_end}"
+                    "the leader's tail was already empty; the sealed prefix already reaches \
+                     offset {sealed_end}"
                 );
             }
         }
@@ -1095,6 +1099,22 @@ async fn repair(
             )
         })?;
     let sealed_end = listing.iter().map(|entry| entry.next_offset).max();
+    // The seal's promise is checked against what the listing actually held:
+    // retention runs after every append on the leader, so a produce landing
+    // between the seal and this listing can reclaim the freshly sealed
+    // segment under a bytes bound smaller than it. Nothing lies — the gap
+    // is measured and reported below — but the operator deserves the CAUSE
+    // named rather than a mysteriously shorter prefix (#306 review).
+    if let (Some(promised), Some(listed)) = (sealed_tail_end, sealed_end) {
+        if listed < promised && !json {
+            println!(
+                "note: the leader sealed through offset {promised}, but the transfer listing \
+                 reaches only {listed} — the leader's retention reclaimed sealed segments \
+                 between the two (its bound is smaller than what was sealed). The repair \
+                 carries what remained; the reported gap below includes the reclaimed records"
+            );
+        }
+    }
     if let Some(newest) = history.last() {
         if newest.epoch > fencing_epoch {
             return Err(format!(

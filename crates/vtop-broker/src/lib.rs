@@ -1148,9 +1148,18 @@ impl LocalBroker {
     /// RETENTION DOES NOT RUN HERE, deliberately. A bytes-bound retention
     /// pass could reclaim the very segment this call just sealed — the
     /// committed floor covers it by construction — and the RPC would then
-    /// report a `sealed_end` the transfer listing cannot reach. The seal
-    /// exists to make the tail transferable; housekeeping that could
-    /// unmake it waits for the next ordinary roll.
+    /// report a `sealed_end` the transfer listing cannot reach from within
+    /// this very call. What this does NOT promise is persistence: retention
+    /// runs after every successful append, so a produce landing between
+    /// this seal and the repair's listing can still reclaim the segment
+    /// under a bound smaller than the sealed tail. That window is the same
+    /// one every listed segment already lives in until its chunks are
+    /// fetched, and both ends of it fail HONESTLY — a shorter listing is a
+    /// measured, reported gap (exit 1), and a segment reclaimed mid-fetch
+    /// is a clean, resumable refusal. A cross-RPC pin was considered and
+    /// rejected: the leader cannot know when a repairer is done, and a pin
+    /// that outlives a crashed repairer is a retention bound that silently
+    /// stopped being one.
     ///
     /// Returns `(sealed_end, records_sealed)`. An EMPTY tail over a sealed
     /// prefix is an idempotent no-op — the prefix already reaches the
