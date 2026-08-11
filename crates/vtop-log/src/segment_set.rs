@@ -3653,6 +3653,37 @@ mod tests {
         );
     }
 
+    /// A complete header at a version this binary does not speak is a file
+    /// from a NEWER build, not a torn write — deleting it would destroy the
+    /// successor's work during a downgrade. The compatibility refusal must
+    /// survive the repair path.
+    #[test]
+    fn a_newer_format_successor_is_refused_not_deleted() {
+        let directory = tempdir().unwrap();
+        strand_after_seal(directory.path(), false);
+        let successor_path = directory.path().join(format!("{}.active", segment_stem(3)));
+        let mut future = crate::codec::SegmentHeader::new(descriptor(), config());
+        future.version += 1;
+        future.descriptor.base_offset = 3;
+        std::fs::write(
+            &successor_path,
+            crate::codec::encode_header(&future).unwrap(),
+        )
+        .unwrap();
+
+        let refused = SegmentSet::open_in(&Env::real(), directory.path())
+            .map(|_| ())
+            .expect_err("a newer-format successor must refuse this binary");
+        assert!(
+            matches!(refused, LogError::UnsupportedVersion(_)),
+            "the refusal must be the compatibility error, not a quarantine and never a              deletion: {refused}"
+        );
+        assert!(
+            successor_path.exists(),
+            "an older binary must not delete a newer build's successor"
+        );
+    }
+
     /// The repair's guard: a successor holding RECORDS with no boundary
     /// cannot prove what was durable, and must stay refused.
     #[test]

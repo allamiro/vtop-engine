@@ -2061,6 +2061,12 @@ pub(crate) fn rebuild_empty_successor_commit(
                 ),
             });
         }
+        // A KNOWN format at a version this binary does not speak is not a
+        // torn write — it is a complete file from a NEWER build, and an
+        // older binary that deleted it would be destroying its successor's
+        // work. The compatibility refusal must survive this repair path
+        // exactly as it survives every other open.
+        Err(error @ LogError::UnsupportedVersion(_)) => return Err(error),
         Err(_) => {
             // A TORN HEADER, and provably nothing else: the commit sidecar
             // is written only after the primary file is complete and synced,
@@ -2091,15 +2097,16 @@ pub(crate) fn rebuild_empty_successor_commit(
     // matching offset would receive a durable commit marker moments before
     // the mixed-lineage validation refuses the directory anyway — a mutation
     // by a command that then reports failure (review round four).
+    // The WHOLE lineage, not a field subset: a roll copies its
+    // predecessor's lineage wholesale — parents included — so any
+    // difference at all means this is not a successor a roll could have
+    // created, whether or not the open's own lineage check would later
+    // notice. Field-by-field comparisons here drifted twice in review
+    // (generation, then key range); whole-value equality cannot.
     let identity = header.v1_descriptor_view();
     if identity.topic != expected_identity.topic
         || identity.topic_epoch != expected_identity.topic_epoch
-        || identity.lineage.range_id != expected_identity.lineage.range_id
-        || identity.lineage.generation != expected_identity.lineage.generation
-        // The key range too — validate_single_lineage compares it, so
-        // omitting it here would write a boundary into a bundle the open
-        // then refuses over exactly that field.
-        || identity.lineage.key_range != expected_identity.lineage.key_range
+        || identity.lineage != expected_identity.lineage
     {
         return Ok(false);
     }
