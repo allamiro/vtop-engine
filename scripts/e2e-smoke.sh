@@ -64,6 +64,13 @@ chmod -R 0777 data
 bash docker/seed-events.sh json   200 > data/input/smoke.log
 bash docker/seed-events.sh cef    200 > data/input/smoke-cef
 bash docker/seed-events.sh syslog 200 > data/spool/smoke.log
+# A second chmod, AFTER seeding: the seeded files are created with the invoking
+# user's umask, and a restrictive one (077) writes sources the container's
+# unprivileged uid cannot read — the engine then skips every read cycle with
+# "Permission denied" while the chmod above, which ran before the files
+# existed, suggests the permissions were handled. CI never sees this because
+# runners default to umask 022.
+chmod -R a+r data/input data/spool
 pass "seeded file + syslog sources (600 records)"
 
 # ---------------------------------------------------------------------------
@@ -135,10 +142,23 @@ info "4/6  Asserting objects AND manifests landed in MinIO"
 # ---------------------------------------------------------------------------
 # An object without its manifest is unusable: the manifest carries the checksum a
 # consumer verifies against. Assert BOTH, per format.
+# The lab is segmented by role (issue #81), so the engine sits on TWO
+# networks and `Networks` names both. The clients below need the STORAGE
+# plane: the mc listing talks to minio, and the metrics check talks to the
+# engine, which also lives there. Picking whichever name came first would
+# work or fail depending on Docker's ordering — select the storage network
+# by name instead.
 NET="$("${COMPOSE[@]}" ps --format json vtop-engine 2>/dev/null | head -1 | python3 -c 'import json,sys
-try: print(json.loads(sys.stdin.read()).get("Networks",""))
-except Exception: print("")' 2>/dev/null || true)"
-NET="${NET:-vtop-engine_default}"
+try:
+    nets = json.loads(sys.stdin.read()).get("Networks", "")
+    if isinstance(nets, list):
+        nets = ",".join(nets)
+    names = [n.strip() for n in nets.split(",") if n.strip()]
+    storage = [n for n in names if "storage" in n]
+    print((storage or names or [""])[0])
+except Exception:
+    print("")' 2>/dev/null || true)"
+NET="${NET:-vtop-engine_storage-net}"
 
 listing=$(docker run --rm --network "$NET" --entrypoint /bin/sh minio/mc:latest -c \
   'mc alias set local http://minio:9000 minioadmin minioadmin >/dev/null 2>&1; mc ls --recursive local' 2>/dev/null || true)

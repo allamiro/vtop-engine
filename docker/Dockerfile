@@ -121,8 +121,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /build/target/release/vtopctl /usr/local/bin/vtopctl
 COPY --from=builder /build/target/release/vtop-node /usr/local/bin/vtop-node
-COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
+# --chmod, so the image does not inherit the CHECKOUT's permission bits: git
+# records only the executable bit, and a maintainer whose umask strips group
+# and other bits builds an entrypoint no non-owner may read — which surfaces
+# as exit 126 from a container whose capability set can no longer override
+# file modes (issue #81's hardening made this visible).
+COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 
 # Data volumes are created by the entrypoint; run as an unprivileged user.
 USER vtop
