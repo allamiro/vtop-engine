@@ -65,11 +65,17 @@
 //!
 //! This is the same arithmetic the replication path already uses to advance the
 //! watermark during steady-state produce; promotion applies it once, from a
-//! standing start, to state written by someone else. One further gate applies:
+//! standing start, to state written by someone else. Two further gates apply:
 //! the candidate must itself hold the boundary the quorum proved
 //! ([`Promotion::LeaderBehind`]) — a leader behind the boundary would publish
 //! a high-water mark covering offsets its own log does not contain, and the
-//! produce fast path would then acknowledge fresh writes into them.
+//! produce fast path would then acknowledge fresh writes into them — and a
+//! majority of the fenced replicas must be at or below the candidate's own
+//! offset ([`Promotion::CandidateBehindVoters`]), which is Raft's election
+//! restriction (§5.4.1): the floor alone can sit below a record acknowledged
+//! on a quorum whose survivors straddle the candidate, and a candidate that
+//! majority would refuse the vote used to promote anyway and let
+//! reconciliation truncate the acknowledged record away (#240).
 //!
 //! # Why an inherited watermark is never lowered
 //!
@@ -128,6 +134,33 @@ pub enum Promotion {
         /// The leader's own reported boundary; `None` if its probe was absent,
         /// which is refused for the same reason.
         leader_committed_offset: Option<u64>,
+    },
+    /// The candidate holds the proven floor, but fewer than a majority of the
+    /// fenced replicas are at or below its own offset — Raft's election
+    /// restriction (§5.4.1), in its per-voter form.
+    ///
+    /// The floor alone is not enough: the k-th largest can sit BELOW a record
+    /// that was acknowledged on a quorum whose survivors now straddle the
+    /// candidate — a candidate at 100 counting a fenced replica at 101 passes
+    /// the floor check (the floor computes to 100) and would then publish a
+    /// boundary under which reconciliation truncates the acknowledged record
+    /// away. In Raft terms, a replica whose log is ahead of the candidate
+    /// would refuse it the vote; counting it toward the quorum anyway is how
+    /// promotion used to conclude an entry was uncommitted merely because
+    /// the candidate had not seen it. Deliberately per-voter rather than
+    /// candidate-must-hold-the-maximum: a majority at or below the candidate
+    /// is exactly §5.4.1's guarantee (any acknowledged record's quorum
+    /// intersects every vote quorum), and the stricter form would refuse a
+    /// legitimate leader over a record that was never acknowledged.
+    CandidateBehindVoters {
+        /// The candidate's own offset.
+        candidate_offset: u64,
+        /// How many fenced replicas are at or below the candidate.
+        votes: usize,
+        required: usize,
+        /// The most complete replica observed — the one an operator or the
+        /// lease agent should let win the range instead.
+        most_complete: (Uuid, u64),
     },
 }
 
@@ -199,6 +232,33 @@ pub fn establish(probes: &[ReplicaProbe], replication_factor: usize, leader_id: 
             leader_committed_offset,
         };
     }
+    let candidate_offset =
+        leader_committed_offset.expect("a candidate below the floor returned above");
+    // Raft's election restriction (§5.4.1), per voter: only replicas at or
+    // below the candidate's own offset would have granted it the vote, and a
+    // majority of grants is what makes the promotion safe — any record
+    // acknowledged on a quorum lives on at least one member of every
+    // majority, so a candidate a majority can vouch for holds every
+    // acknowledged record. The floor check above cannot substitute: the
+    // k-th largest can sit below an acknowledged record whose surviving
+    // holders straddle the candidate.
+    let votes = answered
+        .values()
+        .filter(|offset| **offset <= candidate_offset)
+        .count();
+    if votes < required {
+        let most_complete = answered
+            .iter()
+            .max_by_key(|(_, offset)| **offset)
+            .map(|(node, offset)| (*node, *offset))
+            .expect("a quorum answered");
+        return Promotion::CandidateBehindVoters {
+            candidate_offset,
+            votes,
+            required,
+            most_complete,
+        };
+    }
     Promotion::Established {
         committed_offset,
         answered,
@@ -213,6 +273,76 @@ mod tests {
         ReplicaProbe {
             node_id: Uuid::from_u128(node),
             local_committed_offset: offset,
+        }
+    }
+
+    /// REGRESSION shape, from #240's #265 postmortem: A acknowledges a
+    /// record on {A, B} and dies; B answers 101, candidate C answers 100.
+    /// The floor computes to 100 and C holds it, so every pre-§5.4.1 check
+    /// passed — and B's acknowledged record was then reconciled away under
+    /// C's boundary. The election restriction refuses C: only one fenced
+    /// replica is at or below C's offset, and one is not a majority.
+    #[test]
+    fn a_candidate_a_fenced_replica_would_refuse_the_vote_is_not_promoted() {
+        let outcome = establish(
+            &[probe(2, Some(101)), probe(3, Some(100))],
+            3,
+            Uuid::from_u128(3),
+        );
+        assert_eq!(
+            outcome,
+            Promotion::CandidateBehindVoters {
+                candidate_offset: 100,
+                votes: 1,
+                required: 2,
+                most_complete: (Uuid::from_u128(2), 101),
+            },
+            "a candidate counting a fenced replica ahead of its own log used to promote at a              floor below an acknowledged record; the replica ahead is the one that must win"
+        );
+    }
+
+    /// The remedy the refusal names: the more complete replica promotes over
+    /// the identical probe set.
+    #[test]
+    fn the_replica_the_refusal_names_promotes_over_the_same_probes() {
+        let outcome = establish(
+            &[probe(2, Some(101)), probe(3, Some(100))],
+            3,
+            Uuid::from_u128(2),
+        );
+        match outcome {
+            Promotion::Established {
+                committed_offset, ..
+            } => assert_eq!(
+                committed_offset, 100,
+                "the floor is still what the quorum can vouch for; the record above it is                  protected by the candidate holding it, not by the floor"
+            ),
+            other => panic!("the most complete replica must promote: {other:?}"),
+        }
+    }
+
+    /// Deliberately Raft's PER-VOTER form, not candidate-holds-the-maximum:
+    /// at RF 5 a candidate with a majority at or below it may lead even
+    /// though one fenced replica is ahead — the record making that replica
+    /// ahead was never acknowledged (its quorum would have needed three),
+    /// and refusing here would trade availability for nothing.
+    #[test]
+    fn a_majority_at_or_below_the_candidate_promotes_despite_a_more_complete_minority() {
+        let outcome = establish(
+            &[
+                probe(2, Some(101)),
+                probe(3, Some(100)),
+                probe(4, Some(100)),
+                probe(5, Some(100)),
+            ],
+            5,
+            Uuid::from_u128(3),
+        );
+        match outcome {
+            Promotion::Established {
+                committed_offset, ..
+            } => assert_eq!(committed_offset, 100),
+            other => panic!("a candidate with majority votes must promote: {other:?}"),
         }
     }
 

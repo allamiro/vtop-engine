@@ -364,6 +364,28 @@ impl Promoter {
                         self.suspended(fencing_epoch);
                         return false;
                     }
+                    crate::promotion::Promotion::CandidateBehindVoters {
+                        candidate_offset,
+                        votes,
+                        required,
+                        most_complete,
+                    } => {
+                        tracing::warn!(
+                            range = %self.range_uuid,
+                            fencing_epoch,
+                            candidate_offset,
+                            votes,
+                            required,
+                            most_complete_node = %most_complete.0,
+                            most_complete_offset = most_complete.1,
+                            "refusing promotion: fewer than a majority of the fenced                              replicas are at or below this node's offset (Raft §5.4.1);                              letting the lease lapse so the more complete replica can                              win the range"
+                        );
+                        // Retryable for the same reason as LeaderBehind: the
+                        // right fix is a different candidate, and suspending
+                        // leaves the epoch grantable to it.
+                        self.suspended(fencing_epoch);
+                        return false;
+                    }
                 }
             }
         };
