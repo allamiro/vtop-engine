@@ -82,6 +82,18 @@ impl ReadinessGate {
             .store(n.max(1), std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Declare `n` MORE required marks on top of whatever is already owed —
+    /// for a component wiring itself into a gate other components share.
+    /// [`Self::require_marks`] states a total and so cannot compose: two
+    /// callers each declaring their own count would overwrite each other,
+    /// and the gate would open before the overwritten component finished
+    /// starting (review). Startup wiring only, like `require_marks`: call
+    /// before the components begin marking.
+    pub fn add_required_marks(&self, n: usize) {
+        self.pending_marks
+            .fetch_add(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// One component finished starting. The gate opens once every required
     /// mark (default: one) has arrived.
     pub fn mark_ready(&self) {

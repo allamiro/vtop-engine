@@ -591,8 +591,11 @@ async fn run_follower(
         // know its epoch refuses every append, so reporting ready before that
         // first read advertises a replica that cannot participate — which is
         // how a freshly started follower sat at offset 0 while its leader
-        // moved on without it.
-        observability.gate.require_marks(2);
+        // moved on without it. ADDED to the marks already owed, not declared
+        // as a total: under colocated::run the gate is shared with the meta
+        // role's own mark, and a stated total of two would let any two of
+        // the three components open /readyz (review).
+        observability.gate.add_required_marks(1);
         let watcher = crate::lease_watcher::LeaseWatcher::new(
             lease_admin_client(lease)?,
             lease.topic_uuid,
@@ -1221,11 +1224,12 @@ async fn run_candidate(
         Arc::clone(&publisher) as Arc<dyn crate::lease_agent::LeasePublisher>,
         Some(Arc::new(probe) as Arc<dyn crate::lease_agent::QuorumProbe>),
     )?;
-    // Two marks before /readyz goes green, same shape as the static
-    // follower: the binds below are one, the agent's first completed
-    // metadata exchange is the other (review: a candidate that has never
-    // reached metadata reports a follower that refuses every append).
-    observability.gate.require_marks(2);
+    // One MORE mark before /readyz goes green, same shape as the static
+    // follower: the binds' own mark plus the agent's first completed
+    // metadata exchange (review: a candidate that has never reached
+    // metadata reports a follower that refuses every append). Added, not
+    // declared as a total, so a colocated meta role's mark stays counted.
+    observability.gate.add_required_marks(1);
     let agent = agent.with_ready_gate(observability.gate.clone());
     let agent_drain = std::time::Duration::from_secs(5)
         .max(std::time::Duration::from_millis(lease.lease_duration_ms));
@@ -1400,6 +1404,22 @@ async fn run_candidate(
                         else {
                             unreachable!("matched Following above");
                         };
+                        // THE DRAIN, disguised as a suspension (review): a
+                        // replication call that took the old delegate before
+                        // the handler switched still holds its own Arc, and
+                        // dropping our binding does not end it. But every
+                        // such call holds the shared meta view's lock from
+                        // fence check through write, so this suspend —
+                        // which must take that same lock — cannot return
+                        // until the last in-flight call has finished, and
+                        // every call after it refuses under the guard. Only
+                        // then is reopening the directory safe; the retained
+                        // object outlives the swap as a refusal machine, not
+                        // a writer. The promotion's own set() reactivates
+                        // the view at the granted epoch.
+                        follower
+                            .meta_fencing_epoch()
+                            .suspend(follower.meta_fencing_epoch().get());
                         if let Err(error) = follower.quiesce() {
                             eprintln!("pre-promotion commit failed; recovery will handle it: {error}");
                         }
