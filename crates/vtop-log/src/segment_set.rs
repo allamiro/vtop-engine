@@ -391,6 +391,81 @@ fn sweep_roll_window_sidecar(
     Ok(true)
 }
 
+/// Repair the roll's LAST window: a successor whose primary file was fully
+/// written but whose commit boundary never was (#314 review).
+///
+/// Discovery quarantines the bundle because recovery refuses an active with
+/// no boundary — rightly, in general, since a tail with records cannot prove
+/// what was durable. This window's tail provably has NO records: the repair
+/// only fires when the quarantined primary is exactly a valid header sitting
+/// at the last sealed segment's end, accompanied by nothing but the roll's
+/// own producers sidecar, with no commit file present and no other tail in
+/// the directory. Its boundary is then its base by definition, and after
+/// rebuilding it the bundle is a healthy empty tail — the same state an
+/// uninterrupted roll would have reached.
+fn repair_roll_window_successor(env: &Env, catalog: &StartupCatalog) -> VtopLogResult<bool> {
+    let [bundle] = catalog.quarantined.as_slice() else {
+        return Ok(false);
+    };
+    let extension_of = |path: &PathBuf| {
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_owned)
+            .unwrap_or_default()
+    };
+    // Only the files the interrupted roll itself writes; a commit file in
+    // the bundle means the boundary EXISTS and failed for another reason —
+    // rebuilding over it would mask corruption, not repair an interruption.
+    if !bundle
+        .paths
+        .iter()
+        .all(|path| matches!(extension_of(path).as_str(), "active" | "producers"))
+    {
+        return Ok(false);
+    }
+    let Some(active_path) = bundle
+        .paths
+        .iter()
+        .find(|path| extension_of(path) == "active")
+    else {
+        return Ok(false);
+    };
+    // The roll's own sidecar is always a COMPLETE write (write_atomic). A
+    // producers file that does not decode is a second, separate corruption —
+    // not this window — and a repair that wrote a boundary next to it would
+    // mutate a range it cannot actually heal.
+    for path in bundle
+        .paths
+        .iter()
+        .filter(|path| extension_of(path) == "producers")
+    {
+        let bytes = env
+            .storage
+            .read(path)
+            .map_err(|source| io_error(path, source))?;
+        if ProducerSnapshot::decode(&bytes).is_err() {
+            return Ok(false);
+        }
+    }
+    if catalog
+        .entries
+        .iter()
+        .any(|entry| entry.state == CatalogSegmentState::Active)
+    {
+        return Ok(false);
+    }
+    let Some(sealed_end) = catalog
+        .entries
+        .iter()
+        .filter(|entry| entry.state == CatalogSegmentState::Sealed)
+        .map(|entry| entry.next_offset)
+        .max()
+    else {
+        return Ok(false);
+    };
+    crate::segment::rebuild_empty_successor_commit(env, active_path, sealed_end)
+}
+
 impl SegmentSet {
     /// Open every segment of the range in `directory`.
     ///
@@ -424,6 +499,11 @@ impl SegmentSet {
             // The layout is now exactly "sealed prefix, no tail"; re-read it
             // so the refusal below is the typed, recoverable one rather than
             // a quarantine over a file that no longer exists.
+            StartupCatalog::discover_in(env, &directory)?
+        } else if repair_roll_window_successor(env, &catalog)? {
+            // The roll's other window: its successor now has the boundary
+            // its creation never reached, and reads back as a healthy empty
+            // tail — this open proceeds normally.
             StartupCatalog::discover_in(env, &directory)?
         } else {
             catalog
@@ -3406,6 +3486,82 @@ mod tests {
             !matches!(refused, LogError::TailSealedWithoutSuccessor { .. }),
             "a sidecar at an offset roll_in never wrote must not be consumed as if it were              the roll window"
         );
+    }
+
+    /// The roll's LAST window: the successor's file exists — synced, valid,
+    /// empty — but its commit boundary was never written. Recovery refuses
+    /// it, rightly in general; for THIS provable shape the boundary is
+    /// rebuilt at the base and the open proceeds as if the roll finished.
+    #[test]
+    fn an_empty_successor_missing_its_commit_boundary_is_repaired_on_open() {
+        let directory = tempdir().unwrap();
+        strand_after_seal(directory.path(), false);
+        // Create the successor exactly as roll_in would, then delete the
+        // boundary its creation wrote — the state a crash between the
+        // primary's sync and the commit write leaves. (No producers sidecar:
+        // this window occurs with or without one, and the sidecar variant is
+        // exercised by the sweep tests above.)
+        let successor_path = directory.path().join(format!("{}.active", segment_stem(3)));
+        let mut successor_descriptor = descriptor();
+        successor_descriptor.segment_id = Uuid::from_u128(0xC0FFEE);
+        successor_descriptor.base_offset = 3;
+        drop(
+            ActiveSegment::create_in(
+                &Env::real(),
+                &successor_path,
+                successor_descriptor,
+                config(),
+            )
+            .unwrap(),
+        );
+        std::fs::remove_file(directory.path().join(format!("{}.commit", segment_stem(3)))).unwrap();
+
+        let set = SegmentSet::open_in(&Env::real(), directory.path())
+            .expect("the provably-empty successor must be repaired, not quarantined")
+            .expect("the range must open");
+        assert_eq!(set.sealed().len(), 1);
+        assert_eq!(set.active().base_offset(), 3);
+        assert_eq!(
+            set.next_offset(),
+            3,
+            "the repaired successor is empty; its boundary is its base by definition"
+        );
+    }
+
+    /// The repair's guard: a successor holding RECORDS with no boundary
+    /// cannot prove what was durable, and must stay refused.
+    #[test]
+    fn a_successor_with_records_and_no_commit_boundary_stays_quarantined() {
+        let directory = tempdir().unwrap();
+        strand_after_seal(directory.path(), false);
+        let successor_path = directory.path().join(format!("{}.active", segment_stem(3)));
+        let mut successor_descriptor = descriptor();
+        successor_descriptor.segment_id = Uuid::from_u128(0xC0FFEF);
+        successor_descriptor.base_offset = 3;
+        let mut successor = ActiveSegment::create_in(
+            &Env::real(),
+            &successor_path,
+            successor_descriptor,
+            config(),
+        )
+        .unwrap();
+        successor
+            .append_group(
+                &[LogRecord {
+                    sequence: 0,
+                    ..record(Uuid::from_u128(78), 0)
+                }],
+                Durability::Fsync,
+            )
+            .unwrap();
+        drop(successor);
+        std::fs::remove_file(directory.path().join(format!("{}.commit", segment_stem(3)))).unwrap();
+
+        SegmentSet::open_in(&Env::real(), directory.path())
+            .map(|_| ())
+            .expect_err(
+                "a tail with records and no commit boundary cannot prove what was durable;                  repairing it would invent a boundary",
+            );
     }
 
     /// The review's P2: a resume must validate BEFORE it adopts, so a failed

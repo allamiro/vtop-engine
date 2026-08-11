@@ -2014,6 +2014,47 @@ pub(crate) fn roll_in_with(
     Ok((sealed, successor))
 }
 
+/// Rebuild the commit boundary of an EMPTY successor whose creation was
+/// interrupted between its primary file and its commit sidecar (#314
+/// review — the roll's LAST window).
+///
+/// `create_with_header` syncs the successor's file before it writes the
+/// commit boundary, so a crash between the two leaves an active whose
+/// recovery refuses — rightly, in general: a tail with records and no
+/// boundary cannot prove what was durable. But a file that is EXACTLY a
+/// valid header holds no records, so its boundary is provable without the
+/// sidecar: the base offset, zero content bytes. That is the only shape
+/// this touches — one record's worth of extra bytes and it returns `false`,
+/// leaving the refusal to stand. `expected_base` anchors the repair to the
+/// one place a roll creates a successor; a stray empty segment anywhere
+/// else is not ours to explain.
+pub(crate) fn rebuild_empty_successor_commit(
+    env: &Env,
+    active_path: &Path,
+    expected_base: u64,
+) -> VtopLogResult<bool> {
+    let bytes = env
+        .storage
+        .read(active_path)
+        .map_err(|source| io_error(active_path, source))?;
+    let mut cursor = std::io::Cursor::new(bytes.as_slice());
+    let (header, header_len) = read_header(&mut cursor)?;
+    if bytes.len() as u64 != header_len || header.base_offset() != expected_base {
+        return Ok(false);
+    }
+    let paths = SegmentPaths::from_active(active_path)?;
+    write_commit_boundary_atomic(
+        env,
+        &paths.commit,
+        CommitBoundary {
+            segment_id: header.segment_id(),
+            committed_offset: header.base_offset(),
+            content_bytes: 0,
+        },
+    )?;
+    Ok(true)
+}
+
 /// Replace an EMPTY tail's header atomically, in place (#314).
 ///
 /// Rolling is the wrong tool for a tail holding no records: sealing it would
