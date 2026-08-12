@@ -941,6 +941,15 @@ pub trait ReplicaObservation: Send + Sync {
     /// Whether this replica currently SERVES the range. The installed role
     /// object is the answer: a broker leads, a follower does not.
     fn is_leading(&self) -> bool;
+
+    /// Whether any role owns the range right now. A concrete role always
+    /// does — it IS the role — so only a switching view mid-transition
+    /// answers false, and the distinction matters: "nobody owns this yet"
+    /// is knowledge, while a contended lock is ignorance, and the two call
+    /// for opposite treatment of an authorization gauge (review).
+    fn has_role(&self) -> bool {
+        true
+    }
 }
 
 impl ReplicaObservation for LocalBroker {
@@ -1094,12 +1103,28 @@ impl CandidateCollector {
         // collector for the reason recorded there: both writes are monotonic
         // and promotion orders them, so this order can never report ownership
         // for a replica still mid-promotion.
+        let has_role = self.view.has_role();
         let snapshot = self.view.try_meta_fencing_epoch();
         let held = self.view.held_fencing_epoch();
         let leading = self.view.is_leading();
-        self.held_fencing_epoch
-            .with_label_values(&range)
-            .set(held as i64);
+        // Only while a role owns the range: mid-transition the switching view
+        // answers 0, and writing that would rewind a monotonic gauge to a
+        // number this replica left long ago. The last known epoch standing
+        // is the honest reading, exactly as for the offsets.
+        if has_role {
+            self.held_fencing_epoch
+                .with_label_values(&range)
+                .set(held as i64);
+        }
+        if !has_role {
+            // NOT the same as a contended read (review). Between roles this
+            // replica is certainly not the authorized holder, and leaving the
+            // previous 1 standing would advertise a leaseholder through a
+            // transition whose quiesce and reopen can stall on disk — a false
+            // claim that outlives the moment it was true. Ignorance keeps the
+            // last value; knowledge writes it down.
+            self.lease_active.with_label_values(&range).set(0);
+        }
         if let Some((epoch, active)) = snapshot {
             self.meta_fencing_epoch
                 .with_label_values(&range)
@@ -1113,9 +1138,11 @@ impl CandidateCollector {
             // gauge would report three leaseholders for one range and tell
             // an operator the opposite of what two of them will do with a
             // produce (review).
-            self.lease_active
-                .with_label_values(&range)
-                .set(i64::from(active && epoch == held && leading));
+            if has_role {
+                self.lease_active
+                    .with_label_values(&range)
+                    .set(i64::from(active && epoch == held && leading));
+            }
         }
         self.leading
             .with_label_values(&range)
@@ -1556,6 +1583,54 @@ mod tests {
                 .any(|line| line.starts_with("vtop_broker_lease_active{") && line.ends_with(" 0")),
             "a following candidate must NOT report itself the authorized \
              leaseholder, however live the lease it observes: {text}"
+        );
+
+        // BETWEEN roles, the authorization gauges fail closed. A transition
+        // quiesces and reopens the range and can stall on a slow disk, so a
+        // 1 left standing from the role that just ended would advertise a
+        // leaseholder for as long as the stall lasts. The progress gauges
+        // behave the opposite way on purpose: they keep their last reading
+        // rather than rewinding to a number the replica left long ago.
+        struct Nothing;
+        impl ReplicaObservation for Nothing {
+            fn try_local_offsets(&self) -> Option<(u64, u64)> {
+                None
+            }
+            fn cluster_committed_offset(&self) -> Option<u64> {
+                None
+            }
+            fn try_meta_fencing_epoch(&self) -> Option<(u64, bool)> {
+                None
+            }
+            fn held_fencing_epoch(&self) -> u64 {
+                0
+            }
+            fn is_leading(&self) -> bool {
+                false
+            }
+            fn has_role(&self) -> bool {
+                false
+            }
+        }
+        let between = Registry::new_custom(Some("vtop".into()), None).unwrap();
+        between
+            .register(Box::new(
+                CandidateCollector::new(Arc::new(Nothing) as Arc<dyn ReplicaObservation>, &range)
+                    .unwrap(),
+            ))
+            .unwrap();
+        let text = scrape(&between);
+        assert!(
+            text.lines()
+                .any(|line| line.starts_with("vtop_broker_lease_active{") && line.ends_with(" 0")),
+            "a replica between roles must say it holds nothing, not leave the \
+             previous leader's claim standing: {text}"
+        );
+        assert!(
+            !text.contains("vtop_broker_held_fencing_epoch"),
+            "the held epoch must not be rewound to zero mid-transition — a \
+             monotonic gauge that goes backwards reads as a replica that lost \
+             its history: {text}"
         );
     }
 

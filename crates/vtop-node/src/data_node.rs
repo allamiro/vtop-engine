@@ -2099,6 +2099,13 @@ impl crate::observe::ReplicaObservation for SwitchingLocalView {
             .as_ref()
             .is_some_and(|view| view.is_leading())
     }
+
+    fn has_role(&self) -> bool {
+        self.delegate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+    }
 }
 
 /// The watcher's semantics for an agent-driven follower (#284).

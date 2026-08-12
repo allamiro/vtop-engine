@@ -760,13 +760,27 @@ log "candidate $holder_ordinal ($HOLDER) holds the range at epoch $EPOCH — an 
 r_produce() { # <ordinal> <fencing-epoch> <producer-epoch> <records>
   local ordinal="$1" fencing="$2" producer="$3" records="$4"
   alloc_port; local pport="$r_port"
+  # A FORWARD PER ATTEMPT, torn down when the attempt ends (review). Fresh
+  # because a pod that restarted takes its forward with it and a reused one
+  # only repeats `connection refused` — the same reasoning the init retry
+  # loop above records. Torn down because this call sits in a retry loop:
+  # sixty abandoned port-forwards would be sixty kubectl processes and sixty
+  # API streams held open for the length of the wait.
   forward_ns "$REPLICATED_NS" "${REL}-${ordinal}" "$pport" 9400
+  local fwd="${FORWARDS##* }"
   local fqdn="${REL}-${ordinal}.${HEADLESS}.${REPLICATED_NS}.svc.${DOMAIN}"
   sed "s|^server_name: .*|server_name: \"${fqdn}\"|; s|cert: $CERTS/client.pem|cert: $CERTS/r-client.pem|; s|key: $CERTS/client-key.pem|key: $CERTS/r-client-key.pem|; s/^producer_epoch: .*/producer_epoch: ${producer}/; s/^fencing_epoch: .*/fencing_epoch: ${fencing}/" \
     "$WORK/client.yaml" > "$WORK/r-client.yaml"
-  vtop-node produce --client-config "$WORK/r-client.yaml" \
+  # BOUNDED, so the retry deadline outside means what it says: the client
+  # waits on a socket, and a forward that accepts and then stops answering
+  # would hang this attempt forever while the loop below never got another
+  # chance to check the clock (review).
+  local rc=0
+  timeout 60 vtop-node produce --client-config "$WORK/r-client.yaml" \
     --addr "127.0.0.1:${pport}" --records "$records" --batch 10 \
-    --durability quorum > "$WORK/r-produce.log" 2>&1
+    --durability quorum > "$WORK/r-produce.log" 2>&1 || rc=$?
+  kill "$fwd" 2>/dev/null || true
+  return "$rc"
 }
 
 # THE ASSERTION THIS VARIANT EXISTS FOR. Quorum durability is refused
@@ -843,6 +857,16 @@ R_TOTAL=$((R_EXPECTED + 30))
 # live-chaos scenario 09 and 14 use after every promotion, and the reason is
 # recorded there too. A single attempt tests the timing, not the failover
 # (which is exactly how this step first failed in CI).
+# What the write actually ran against, recorded rather than asserted. The
+# claim worth making is "the range served during the outage", and whether the
+# replacement was still absent when the write landed is a race this test does
+# not control — a fast StatefulSet restart is not a failure. So the member
+# count is captured and NARRATED: a run that says "2 of 3" proves the
+# degraded path, and one that says "3 of 3" says plainly that it did not,
+# instead of printing a claim nobody checked (review).
+members_at_write="$(kubectl -n "$REPLICATED_NS" get pods -l "app.kubernetes.io/instance=${REL}" \
+  -o jsonpath='{range .items[*]}{.metadata.deletionTimestamp}{"|"}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' \
+  2>/dev/null | grep -c '^|True$' || true)"
 log "producing 30 more records against the post-failover holder, retrying until it lands"
 produce_deadline=$((SECONDS + 180))
 until r_produce "$new_ordinal" "$NEW_EPOCH" 2 30; do
@@ -853,7 +877,23 @@ failover: $(tail -3 "$WORK/r-produce.log" 2>/dev/null)"
   }
   sleep 3
 done
-log "produce resumed at epoch $NEW_EPOCH while the deleted pod was still returning"
+case "${members_at_write:-0}" in
+  1 | 2)
+    log "produce resumed at epoch $NEW_EPOCH with only ${members_at_write} of 3 members Ready — \
+the range served through the outage on a bare quorum"
+    ;;
+  3)
+    log "produce resumed at epoch $NEW_EPOCH; the replacement was already back, so this run \
+did not exercise the degraded-quorum path (a fast restart, not a failure)"
+    ;;
+  *)
+    # Zero Ready members cannot be true of a cluster that just accepted a
+    # quorum write, so this is the readiness QUERY having failed. Say that,
+    # rather than reporting a member count nobody measured.
+    log "produce resumed at epoch $NEW_EPOCH; how many members were Ready at the time is \
+unknown (the readiness query did not answer)"
+    ;;
+esac
 
 # NOW the returning pod must rejoin, because the convergence assertion below
 # is about it: with only two pods up, "a majority acked" and "everyone acked"
@@ -863,18 +903,32 @@ log "produce resumed at epoch $NEW_EPOCH while the deleted pod was still returni
 # TERMINATING under the same name and return instantly — the recreated pod is
 # a different object, and waiting on the name alone is how this wait sailed
 # through in 4 seconds while the replacement had not started.
+# A FAILED QUERY IS NOT AN UNREADY POD — the rule `await_pods_exist` states
+# above, and which this loop broke on its first draft (review). Retrying is
+# right either way; the difference is ATTRIBUTION. Blaming the recreated pod
+# after four minutes in which the API server never answered accuses a
+# component nobody observed doing anything.
 returned=""
+answered=0
 for _ in $(seq 1 80); do
-  ready="$(kubectl -n "$REPLICATED_NS" get pods -l "app.kubernetes.io/instance=${REL}" \
+  if pods="$(kubectl -n "$REPLICATED_NS" get pods -l "app.kubernetes.io/instance=${REL}" \
     -o jsonpath='{range .items[*]}{.metadata.deletionTimestamp}{"|"}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' \
-    2>/dev/null | grep -c '^|True$' || true)"
-  [ "${ready:-0}" -eq 3 ] && { returned="yes"; break; }
+    2>/dev/null)"; then
+    answered=1
+    ready="$(printf '%s' "$pods" | grep -c '^|True$' || true)"
+    [ "${ready:-0}" -eq 3 ] && { returned="yes"; break; }
+  fi
   sleep 3
 done
 [ -n "$returned" ] || {
   kubectl -n "$REPLICATED_NS" get pods || true
-  fail "the deleted pod never came back Ready: fewer than 3 pods are Running and \
+  if [ "$answered" -eq 1 ]; then
+    fail "the deleted pod never came back: only ${ready:-0} of 3 pods are Ready and \
 un-terminating after 240s"
+  else
+    fail "could not read pod readiness for 240s: the API server never answered, so \
+nothing is known about the recreated pod"
+  fi
 }
 log "the deleted pod rejoined; all three replicas are Ready again"
 
