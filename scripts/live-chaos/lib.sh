@@ -1166,6 +1166,26 @@ await_metric_at_least() {
   done
 }
 
+# await_metric_equals <addr> <metric> <expected> <what> — block until a scraped
+# gauge reads EXACTLY <expected>.
+#
+# Distinct from await_metric_at_least because some gauges are states rather
+# than progress: "this replica leads the range" is 1 or 0, and a floor of 0
+# would accept the 1 that means the opposite. Absence keeps polling and is
+# reported as `absent`, so "the metric does not exist" and "the metric says
+# something else" fail with different messages.
+await_metric_equals() {
+  local addr="$1" metric="$2" expected="$3" what="$4"
+  local deadline=$((SECONDS + PROGRESS_TIMEOUT_SECONDS)) value
+  while :; do
+    value="$(metric_value "$addr" "$metric")" || value=""
+    [[ "${value%.*}" == "$expected" ]] && return 0
+    [[ $SECONDS -lt $deadline ]] \
+      || fail "$what: $metric read '${value:-absent}', expected $expected, for ${PROGRESS_TIMEOUT_SECONDS}s"
+    sleep 0.2
+  done
+}
+
 # The restarted old leader's native address: one past the range's real port.
 old_leader_native_addr() { echo "$DATA_HOST:$((NATIVE_PORT + 1))"; }
 

@@ -766,7 +766,7 @@ r_produce() { # <ordinal> <fencing-epoch> <producer-epoch> <records>
     "$WORK/client.yaml" > "$WORK/r-client.yaml"
   vtop-node produce --client-config "$WORK/r-client.yaml" \
     --addr "127.0.0.1:${pport}" --records "$records" --batch 10 \
-    --durability quorum >/dev/null
+    --durability quorum > "$WORK/r-produce.log" 2>&1
 }
 
 # THE ASSERTION THIS VARIANT EXISTS FOR. Quorum durability is refused
@@ -829,17 +829,54 @@ else
   log "candidate $new_ordinal ($NEW_HOLDER) took the range at epoch $NEW_EPOCH — in place, no re-render, no upgrade"
 fi
 
-# The recreated pod must rejoin before quorum arithmetic means what it says:
-# with only two pods up, "a majority acked" and "everyone acked" are the
-# same claim and the catch-up assertion below would prove nothing extra.
-kubectl -n "$REPLICATED_NS" wait --for=condition=ready pod "${REL}-${holder_ordinal}" \
-  --timeout=240s >/dev/null \
-  || { kubectl -n "$REPLICATED_NS" get pods; fail "the deleted pod never came back Ready"; }
-
 R_TOTAL=$((R_EXPECTED + 30))
-log "producing 30 more records against the post-failover holder"
-r_produce "$new_ordinal" "$NEW_EPOCH" 2 30 \
-  || fail "produce did not resume after the failover"
+
+# PRODUCE FIRST, while the deleted pod is still coming back: with three
+# members a quorum is the holder plus one, so the range must keep serving
+# through the outage rather than waiting for the full set. Proving that is a
+# stronger claim than producing into a healed cluster, and it is the claim
+# operators actually care about.
+#
+# DEADLINE-POLLED, never one-shot. A freshly granted holder has to establish
+# its replication streams before any quorum write can land, so the first
+# attempts legitimately fail — this is the same retry-until-deadline shape
+# live-chaos scenario 09 and 14 use after every promotion, and the reason is
+# recorded there too. A single attempt tests the timing, not the failover
+# (which is exactly how this step first failed in CI).
+log "producing 30 more records against the post-failover holder, retrying until it lands"
+produce_deadline=$((SECONDS + 180))
+until r_produce "$new_ordinal" "$NEW_EPOCH" 2 30; do
+  [ "$SECONDS" -lt "$produce_deadline" ] || {
+    kubectl -n "$REPLICATED_NS" get pods || true
+    fail "produce never resumed against candidate $new_ordinal within 180s of the \
+failover: $(tail -3 "$WORK/r-produce.log" 2>/dev/null)"
+  }
+  sleep 3
+done
+log "produce resumed at epoch $NEW_EPOCH while the deleted pod was still returning"
+
+# NOW the returning pod must rejoin, because the convergence assertion below
+# is about it: with only two pods up, "a majority acked" and "everyone acked"
+# are the same claim and checking all three would prove nothing extra.
+#
+# Polled rather than `kubectl wait`, which can match the pod that is still
+# TERMINATING under the same name and return instantly — the recreated pod is
+# a different object, and waiting on the name alone is how this wait sailed
+# through in 4 seconds while the replacement had not started.
+returned=""
+for _ in $(seq 1 80); do
+  ready="$(kubectl -n "$REPLICATED_NS" get pods -l "app.kubernetes.io/instance=${REL}" \
+    -o jsonpath='{range .items[*]}{.metadata.deletionTimestamp}{"|"}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' \
+    2>/dev/null | grep -c '^|True$' || true)"
+  [ "${ready:-0}" -eq 3 ] && { returned="yes"; break; }
+  sleep 3
+done
+[ -n "$returned" ] || {
+  kubectl -n "$REPLICATED_NS" get pods || true
+  fail "the deleted pod never came back Ready: fewer than 3 pods are Running and \
+un-terminating after 240s"
+}
+log "the deleted pod rejoined; all three replicas are Ready again"
 
 # Every replica — INCLUDING the recreated pod — converges on the full total:
 # the 60 pre-delete records survived the failover, the 30 post-failover

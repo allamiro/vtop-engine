@@ -636,9 +636,16 @@ jobs:
             abort "peer identities #{uuids.sort} are not the configured cluster.nodeUuids #{want_uuids}" \
               unless uuids.sort == want_uuids
 
-            # Each pod's own node_uuid is in that set exactly once, and the
-            # peer list is the same everywhere: together those say the three
+            # Every pod carries its OWN identity from that same set, and the
+            # peer list is identical everywhere: together those say the three
             # pods are three members of ONE range, not overlapping claims.
+            #
+            # NO APOSTROPHES anywhere in this ruby block, for the same reason
+            # the comment above cannot name a dollar-sigil: the whole program
+            # is one single-quoted shell argument, so an apostrophe in a
+            # COMMENT terminates the string and the step dies with a bash
+            # syntax error pointing at ruby code that is perfectly valid.
+            # Write "the pod own identity" shaped prose instead.
             own = configs.values.map { |c| c.fetch("data").fetch("node_uuid") }
             abort "pod identities #{own.sort} are not the configured set" unless own.sort == want_uuids
             %w[0 1 2].each_with_index do |ordinal, idx|

@@ -1049,7 +1049,8 @@ impl CandidateCollector {
             )?,
             lease_active: gauge_vec(
                 "broker_lease_active",
-                "1 while metadata still records a live lease at the observed epoch",
+                "1 while THIS replica is the authorized leaseholder; 0 while it \
+                 follows another holder or is fenced",
                 &["topic", "range"],
             )?,
             leading: gauge_vec(
@@ -1089,20 +1090,36 @@ impl CandidateCollector {
                 .with_label_values(&range)
                 .set(cluster as i64);
         }
-        if let Some((epoch, active)) = self.view.try_meta_fencing_epoch() {
+        // The metadata snapshot BEFORE the held epoch, matching the leader's
+        // collector for the reason recorded there: both writes are monotonic
+        // and promotion orders them, so this order can never report ownership
+        // for a replica still mid-promotion.
+        let snapshot = self.view.try_meta_fencing_epoch();
+        let held = self.view.held_fencing_epoch();
+        let leading = self.view.is_leading();
+        self.held_fencing_epoch
+            .with_label_values(&range)
+            .set(held as i64);
+        if let Some((epoch, active)) = snapshot {
             self.meta_fencing_epoch
                 .with_label_values(&range)
                 .set(epoch as i64);
+            // AUTHORIZATION, exactly as the leader's collector defines it —
+            // and with one more term, because a candidate can be neither
+            // fenced nor the holder. A FOLLOWING candidate adopts the
+            // holder's granted epoch and activates its view at it (that is
+            // how it accepts replication), so `active && epoch == held` is
+            // true on all three replicas at once: without the role term this
+            // gauge would report three leaseholders for one range and tell
+            // an operator the opposite of what two of them will do with a
+            // produce (review).
             self.lease_active
                 .with_label_values(&range)
-                .set(i64::from(active));
+                .set(i64::from(active && epoch == held && leading));
         }
-        self.held_fencing_epoch
-            .with_label_values(&range)
-            .set(self.view.held_fencing_epoch() as i64);
         self.leading
             .with_label_values(&range)
-            .set(i64::from(self.view.is_leading()));
+            .set(i64::from(leading));
     }
 }
 
@@ -1528,6 +1545,17 @@ mod tests {
             "an offset that could not be read must be ABSENT, never zero: a \
              zero here reads as an empty replica and would send an operator \
              hunting a replication failure that did not happen: {text}"
+        );
+        // A following candidate adopts the HOLDER's epoch and activates its
+        // view at it — that is how it accepts replication — so every term of
+        // the leader's own authorization test is satisfied on all three
+        // replicas at once. Only the role separates them, and without it this
+        // gauge would report three leaseholders for one range.
+        assert!(
+            text.lines()
+                .any(|line| line.starts_with("vtop_broker_lease_active{") && line.ends_with(" 0")),
+            "a following candidate must NOT report itself the authorized \
+             leaseholder, however live the lease it observes: {text}"
         );
     }
 
