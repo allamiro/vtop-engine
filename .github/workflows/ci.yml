@@ -619,6 +619,28 @@ jobs:
             # replicated to the same pod twice and "quorum" meant one replica.
             addrs = peers.map { |f| f.fetch("addr") }
             abort "peers collapsed to shared addresses: #{addrs}" unless addrs.uniq.size == 3
+
+            # And each peer carries its OWN identity, checked against the
+            # configured set (review). Addresses are what the replica plane
+            # DIALS; node UUIDs are what quorum arithmetic COUNTS. Three
+            # distinct addresses under two distinct identities would render,
+            # deploy, and then count a two-node quorum as three — the failure
+            # the address check alone cannot see.
+            uuids = peers.map { |f| f.fetch("node_uuid") }
+            abort "peers carry duplicate identities: #{uuids}" unless uuids.uniq.size == 3
+            want_uuids = %w[
+              aaaaaaaa-0000-0000-0000-0000000000a1
+              aaaaaaaa-0000-0000-0000-0000000000a2
+              aaaaaaaa-0000-0000-0000-0000000000a3
+            ]
+            abort "peer identities #{uuids.sort} are not the configured cluster.nodeUuids #{want_uuids}" \
+              unless uuids.sort == want_uuids
+
+            # Each pod's own node_uuid is in that set exactly once, and the
+            # peer list is the same everywhere: together those say the three
+            # pods are three members of ONE range, not overlapping claims.
+            own = configs.values.map { |c| c.fetch("data").fetch("node_uuid") }
+            abort "pod identities #{own.sort} are not the configured set" unless own.sort == want_uuids
             %w[0 1 2].each_with_index do |ordinal, idx|
               want = "vtop-#{ordinal}.vtop-headless.default.svc.cluster.local:9300"
               abort "peer addr #{addrs.sort[idx]} != #{want}" unless addrs.sort[idx] == want

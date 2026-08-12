@@ -721,15 +721,24 @@ ordinal_of() { # <node-uuid> -> pod ordinal
   esac
 }
 
-await_holder() { # [uuid-to-exclude] — echoes "<holder> <epoch>"
-  # Deadline-polled, and the exclusion matters: after a holder dies its
-  # unexpired lease is still on record — correctly, that is what a lease
-  # means — so waiting for "any holder" right after a kill reads back the
-  # corpse (the live-chaos suite learned this the hard way).
-  local exclude="${1:-}" holder="" epoch=""
+await_holder() { # [min-epoch] — echoes "<holder> <epoch>"
+  # Deadline-polled, and the epoch floor is the whole point: after a holder
+  # goes away its unexpired lease is still on record — correctly, that is
+  # what a lease means — so waiting for "any holder" right after a delete
+  # reads back the corpse and proves nothing (the live-chaos suite learned
+  # this the hard way).
+  #
+  # A FLOOR ON THE EPOCH, not an exclusion on the UUID, because the thing
+  # being waited for is a NEW GRANT and the epoch is what a grant mints.
+  # Metadata mints them monotonically, so "epoch above the one we saw" is
+  # exactly "somebody has been granted the range since" — and it stays true
+  # whether a survivor took over or the recreated pod won its own range back
+  # (a legitimate outcome an exclusion would wrongly reject, and one this
+  # test must not turn into a flake).
+  local floor="${1:-0}" holder="" epoch=""
   for _ in $(seq 1 90); do
     read -r holder epoch <<< "$(lease_state)" || true
-    if [ -n "$holder" ] && [ "$holder" != "$exclude" ]; then
+    if [ -n "$holder" ] && [ -n "$epoch" ] && [ "$epoch" -gt "$floor" ]; then
       printf '%s %s\n' "$holder" "$epoch"
       return 0
     fi
@@ -810,11 +819,12 @@ kubectl -n "$REPLICATED_NS" delete pod "${REL}-${holder_ordinal}" >/dev/null
 # that the range is HELD and SERVING again, not who holds it; scenario 14 in
 # the live-chaos suite already proves the takeover-by-a-survivor path with a
 # kill no orchestrator softens.
-read -r NEW_HOLDER NEW_EPOCH <<< "$(await_holder)" \
-  || fail "the range had no holder 180s after the pod delete"
+read -r NEW_HOLDER NEW_EPOCH <<< "$(await_holder "$EPOCH")" \
+  || fail "no grant above epoch $EPOCH within 180s of deleting the holder: the range \
+did not move, so either the lease never came free or no candidate could take it"
 new_ordinal="$(ordinal_of "$NEW_HOLDER")"
 if [ "$NEW_HOLDER" = "$HOLDER" ]; then
-  log "the recreated pod resumed its own range at epoch $NEW_EPOCH (a legitimate outcome of the race)"
+  log "the recreated pod won its own range back at epoch $NEW_EPOCH, above the pre-delete $EPOCH (a legitimate outcome of the race — the grant is new either way)"
 else
   log "candidate $new_ordinal ($NEW_HOLDER) took the range at epoch $NEW_EPOCH — in place, no re-render, no upgrade"
 fi

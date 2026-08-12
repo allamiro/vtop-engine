@@ -190,10 +190,15 @@ data:
          `leaderOrdinal` value, which made failover a helm upgrade; that value
          is retired, and setting it now fails the render rather than being
          silently ignored. */ -}}
-  {{- if eq $v.data.topology "replicated" }}
+  {{- /* Checked BEFORE the topology branch (review): a retired key is retired
+         in every shape. A standalone values file still carrying
+         `leaderOrdinal` would otherwise render happily and only fail the day
+         somebody switched it to `replicated` — which is the moment they can
+         least afford a surprise. */ -}}
   {{- if hasKey $v.data "leaderOrdinal" }}
-  {{- fail "\n\ndata.leaderOrdinal is retired (#284): \"replicated\" now renders every pod as a CANDIDATE and the role follows the metadata lease, so failover no longer needs a re-render. Remove the value." }}
+  {{- fail "\n\ndata.leaderOrdinal is retired (#284): \"replicated\" renders every pod as a CANDIDATE and the role follows the metadata lease, so failover no longer needs a re-render. Remove the value." }}
   {{- end }}
+  {{- if eq $v.data.topology "replicated" }}
   {{- if lt (int $v.replicaCount) 2 }}
   {{- fail (printf "\n\ndata.topology is \"replicated\" but replicaCount is %d: a replicated range needs at least one follower. Use topology \"standalone\" for a single node." (int $v.replicaCount)) }}
   {{- end }}

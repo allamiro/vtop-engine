@@ -134,4 +134,38 @@ log "quorum produce resumed at epoch $NEW_EPOCH on candidate $NEW_LEADER's own a
 await_verified_floor "$CLIENT_CFG2" "$(candidate_native_addr "$NEW_LEADER")" "$ACKED" "$ACKED"
 log "every one of the $ACKED pre-kill acknowledged records is intact after the failover"
 
+# --- a candidate that cannot be measured cannot be operated ----------------
+# Pinned here because this suite is the composition proof and this gap walked
+# straight through it: candidate mode registered no role collector, so
+# vtop_broker_local_committed_offset — the metric this very harness reads to
+# pick a promotion target, and the one every dashboard and the k8s smoke
+# read — did not exist on a candidate at all. Nothing in the suite asked, so
+# nothing noticed until a live cluster did.
+#
+# Asked of BOTH roles: the leader that just took the range, and a survivor
+# that is following it. One collector answers for whichever role holds the
+# range, and the names must not change when the role does — that is what
+# lets a panel built for a statically-rendered range keep working here.
+FOLLOWING=$(( NEW_LEADER == 2 ? 3 : 2 ))
+for n in "$NEW_LEADER" "$FOLLOWING"; do
+  offset="$(metric_value "$(data_metrics_addr $((n + 10)))" vtop_broker_local_committed_offset)"
+  [[ -n "$offset" ]] \
+    || fail "candidate $n exports no vtop_broker_local_committed_offset: a replica \
+nobody can measure is one nobody can operate, and this suite reads that very metric \
+to choose a promotion target"
+  [[ "$offset" -ge "$ACKED" ]] \
+    || fail "candidate $n reports committed offset $offset, below the $ACKED records \
+acknowledged under quorum before the kill"
+done
+leading="$(metric_value "$(data_metrics_addr $((NEW_LEADER + 10)))" vtop_broker_candidate_leading)"
+[[ "$leading" == "1" ]] \
+  || fail "the candidate that holds the range reports vtop_broker_candidate_leading=\
+${leading:-<absent>}; who serves the range must be answerable from metrics alone"
+following="$(metric_value "$(data_metrics_addr $((FOLLOWING + 10)))" vtop_broker_candidate_leading)"
+[[ "$following" == "0" ]] \
+  || fail "a following candidate reports vtop_broker_candidate_leading=${following:-<absent>}, \
+so metrics cannot distinguish the holder from its followers"
+log "both roles are observable through one collector: offsets exported, and the holder \
+is identifiable from metrics alone"
+
 log "PASS"

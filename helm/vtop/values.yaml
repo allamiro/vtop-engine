@@ -127,19 +127,24 @@ meta:
 # `topology` below selects the shape. It defaults to STANDALONE — every pod an
 # independent range, the same shape the upstream co-located harness runs
 # (scripts/live-chaos/lib.sh) — and `replicated` gives one range across the
-# pods with a leader and followers.
+# pods, every pod a candidate for it.
 #
 # This block used to say the chart "does not offer a leader/follower topology
 # it cannot back", because replicated ranges were waiting on follower-side
-# epoch propagation upstream. That landed (#239), along with the rest of the
-# recovery arc (#240). What is still not backed is automatic FAILOVER, which
-# is a narrower claim and is documented on `topology` itself.
+# epoch propagation upstream. That landed (#239), then the recovery arc
+# (#240), and finally candidate mode (#284) — so automatic FAILOVER, the last
+# thing this block called unbacked, is now backed too: the role follows the
+# metadata lease inside the binary and a dead holder is replaced in place.
+# What the chart still does not do is separate the metadata and data planes
+# into their own workloads (#287); every pod runs both.
 # ---------------------------------------------------------------------------
 data:
   # Static fencing epoch each node starts at. With `lease.enabled` this is
   # only the monotonic FLOOR of the node's epoch view; metadata mints epochs
   # from 1, so leave this at 0/1 when the lease drives leadership — a floor
-  # above real grants makes the node ignore them all.
+  # above real grants makes the node ignore them all. Under `replicated` it
+  # must be 0 (enforced at render time): candidates start knowing nothing and
+  # learn every epoch from grants, so a floor at the first grant refuses it.
   fencingEpoch: 1
   # Identity of the range each node serves. REQUIRED (no defaults — these are
   # protocol-visible identities, verified end to end).
@@ -156,11 +161,6 @@ data:
   # the CN of your client certificate. REQUIRED — defaulting it would be a
   # baked-in credential.
   principalId: ""
-  # Drive range leadership from the metadata plane (#223) instead of the
-  # static fencing epoch. Off by default to match the upstream co-located
-  # harness. The lease credential is the node's own data-plane certificate
-  # (CN = its node UUID) — the chart wires exactly that, because admin
-  # authorization rejects anything else.
   # Deployment topology. The binary supports candidate/leader/follower/
   # standalone and the live-chaos harness exercises all of them; this value is
   # how the chart reaches them.
@@ -194,6 +194,12 @@ data:
   # which is a manual post-install step (see NOTES.txt).
   topology: standalone
 
+  # Drive range leadership from the metadata plane (#223) instead of the
+  # static fencing epoch. Off by default to match the upstream co-located
+  # harness, and REQUIRED under `topology: replicated`, where it is what
+  # makes a candidate able to lead at all. The lease credential is the node's
+  # own data-plane certificate (CN = its node UUID) — the chart wires exactly
+  # that, because admin authorization rejects anything else.
   lease:
     enabled: false
     # Any metadata admin endpoint. The default is this same process's local

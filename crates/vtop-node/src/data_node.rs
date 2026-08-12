@@ -1175,11 +1175,6 @@ async fn run_candidate(
             .await
             .map_err(|error| format!("candidate native server exited: {error}"))
     });
-    // NO role collector in this first slice, deliberately: BrokerCollector
-    // and FollowerCollector export the same metric names, the registry
-    // refuses duplicate descriptors, and there is no unregister path — a
-    // role-agnostic replica collector is the follow-up. The server and
-    // lease gauges above are live regardless.
 
     // --- the agent, for the life of the process -----------------------------
     let endpoints = peers
@@ -1193,6 +1188,18 @@ async fn run_candidate(
         })
         .collect::<Result<Vec<_>, String>>()?;
     let view = Arc::new(SwitchingLocalView::empty());
+    // The candidate's ONE role collector, registered here for the life of the
+    // process and reading through the switching view. Registering a
+    // role-specific collector per transition cannot work — the leader's and
+    // follower's collectors export the same descriptors, the registry refuses
+    // duplicates, and there is no unregister — so without this a candidate
+    // exported no range progress at all: `vtop_broker_local_committed_offset`
+    // simply did not exist on a candidate pod, which is how the k8s smoke
+    // caught it (a replica nobody can measure is one nobody can operate).
+    observability.register(Box::new(crate::observe::CandidateCollector::new(
+        Arc::clone(&view) as Arc<dyn crate::observe::ReplicaObservation>,
+        &range,
+    )?))?;
     let probe = crate::lease_agent::ReplicaPlaneProbe::new(
         Arc::clone(&view) as Arc<dyn crate::lease_agent::CandidateLocalView>,
         config.node_uuid,
@@ -1328,7 +1335,7 @@ async fn run_candidate(
 
     let install_follower = |follower: &Arc<InProcessFollower>| {
         switching.install(Arc::clone(follower) as Arc<dyn ReplicaPeerHandler>);
-        view.install(Arc::clone(follower) as Arc<dyn crate::lease_agent::CandidateLocalView>);
+        view.install(Arc::clone(follower) as Arc<dyn CandidateSurface>);
         publisher.set_target(Some(Arc::new(FollowerObservationAdapter {
             inner: crate::lease_watcher::FollowerLeasePublisher::new(Arc::clone(follower)),
         })
@@ -1558,8 +1565,7 @@ async fn run_candidate(
                         // between the completion and these installs fences
                         // the broker before any session could reach it.
                         switching.install(Arc::clone(&built.status));
-                        view.install(Arc::clone(&built.broker)
-                            as Arc<dyn crate::lease_agent::CandidateLocalView>);
+                        view.install(Arc::clone(&built.broker) as Arc<dyn CandidateSurface>);
                         slot.install(Arc::clone(&built.broker));
                         role_flag.store(1, std::sync::atomic::Ordering::Relaxed);
                         println!(
@@ -1988,8 +1994,25 @@ impl ReplicaPeerHandler for SwitchingReplicaHandler {
 
 /// The candidate's own view for the promotion probe, switching with the
 /// role (#284).
+/// The two surfaces a candidate's range is read through, in one object.
+///
+/// The probe needs the TRUE offset and blocks for it; the metrics scrape
+/// must never block and takes a stale gauge instead. One installed role
+/// answers both, so the switching view carries both traits rather than
+/// keeping two containers that could disagree about which role is current
+/// mid-transition.
+trait CandidateSurface:
+    crate::lease_agent::CandidateLocalView + crate::observe::ReplicaObservation
+{
+}
+
+impl<T> CandidateSurface for T where
+    T: crate::lease_agent::CandidateLocalView + crate::observe::ReplicaObservation
+{
+}
+
 struct SwitchingLocalView {
-    delegate: std::sync::RwLock<Option<Arc<dyn crate::lease_agent::CandidateLocalView>>>,
+    delegate: std::sync::RwLock<Option<Arc<dyn CandidateSurface>>>,
 }
 
 impl SwitchingLocalView {
@@ -1999,7 +2022,7 @@ impl SwitchingLocalView {
         }
     }
 
-    fn install(&self, view: Arc<dyn crate::lease_agent::CandidateLocalView>) {
+    fn install(&self, view: Arc<dyn CandidateSurface>) {
         *self
             .delegate
             .write()
@@ -2033,6 +2056,48 @@ impl crate::lease_agent::CandidateLocalView for SwitchingLocalView {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
             .map_or_else(Vec::new, |view| view.epoch_starts())
+    }
+}
+
+impl crate::observe::ReplicaObservation for SwitchingLocalView {
+    fn try_local_offsets(&self) -> Option<(u64, u64)> {
+        self.delegate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(|view| view.try_local_offsets())
+    }
+
+    fn cluster_committed_offset(&self) -> Option<u64> {
+        self.delegate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(|view| view.cluster_committed_offset())
+    }
+
+    fn try_meta_fencing_epoch(&self) -> Option<(u64, bool)> {
+        self.delegate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(|view| view.try_meta_fencing_epoch())
+    }
+
+    fn held_fencing_epoch(&self) -> u64 {
+        self.delegate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map_or(0, |view| view.held_fencing_epoch())
+    }
+
+    fn is_leading(&self) -> bool {
+        self.delegate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|view| view.is_leading())
     }
 }
 
