@@ -44,7 +44,9 @@ for id in 1 2 3; do
 done
 log "metadata metrics published on all three nodes"
 
-VOTERS_METRIC="$(metric_value "$(meta_metrics_addr "$LEADER_ID")" 'vtop_meta_raft_voters')"
+VOTERS_METRIC="$(metric_value "$(meta_metrics_addr "$LEADER_ID")" 'vtop_meta_raft_voters')" \
+  || fail "the metadata leader served no vtop_meta_raft_voters sample; a scrape that does not \
+answer must say so rather than ending the scenario with a bare exit code"
 [[ "$VOTERS_METRIC" == "3" ]] \
   || fail "leader reports $VOTERS_METRIC voters over /metrics, expected 3"
 
@@ -80,7 +82,10 @@ log "produced $RECORDS records at quorum durability"
 
 # The committed offset an operator reads on a dashboard must be the offset the
 # replica will actually serve. Cross-check the two independent paths.
-COMMITTED_METRIC="$(metric_value "$(data_metrics_addr 0)" 'vtop_broker_local_committed_offset')"
+COMMITTED_METRIC="$(metric_value "$(data_metrics_addr 0)" 'vtop_broker_local_committed_offset')" \
+  || fail "the leader served no vtop_broker_local_committed_offset sample after a quorum \
+produce; this read is the one that died of a SIGPIPEd curl in CI, so name it rather than \
+exiting on a status nobody printed"
 [[ "$COMMITTED_METRIC" == "$RECORDS" ]] \
   || fail "leader /metrics reports committed offset $COMMITTED_METRIC, expected $RECORDS"
 

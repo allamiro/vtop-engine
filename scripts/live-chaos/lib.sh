@@ -726,12 +726,31 @@ await_not_ready() {
 
 # metric_value <addr> <metric-name> — the value of a single unlabelled sample,
 # or of the first sample when the metric carries labels. Prometheus text is
-# `name{labels} value`, so the value is always the last field.
+# `name{labels} value`, so the value is always the last field. Non-zero when
+# the endpoint did not answer or the metric is absent.
+#
+# SCRAPED WHOLE, THEN PARSED — never `curl | grep -m1`, which is how this was
+# written and how it failed. `grep -m1` closes the pipe on its first match; a
+# curl still writing the rest of a large /metrics body then dies of SIGPIPE
+# with exit 23, and under `pipefail` the pipeline reports failure while having
+# printed a PERFECTLY GOOD value on stdout. Guarded callers (`|| value=""`)
+# threw that value away; the unguarded ones took `set -e` and killed the
+# scenario outright.
+#
+# That is not theoretical: scenario 08 died exactly this way in CI
+# (`FAILED (exit 23)`) on the read immediately after a 500-record quorum
+# produce — the produce is what made the body big enough for curl to still be
+# writing. The size of a metrics page is not something a caller can reason
+# about, so the pipeline had to go rather than be made conditional.
+#
+# The herestring has no pipeline at all, so awk's `exit` after the first match
+# costs nothing and can starve no writer.
 metric_value() {
-  local addr="$1" metric="$2"
-  curl -s --max-time 5 "http://$addr/metrics" 2>/dev/null \
-    | grep -m1 "^$metric" \
-    | awk '{print $NF}'
+  local addr="$1" metric="$2" body value
+  body="$(curl -s --max-time 5 "http://$addr/metrics" 2>/dev/null)" || return 1
+  value="$(awk -v pattern="^$metric" '$0 ~ pattern { print $NF; exit }' <<< "$body")"
+  [[ -n "$value" ]] || return 1
+  printf '%s\n' "$value"
 }
 
 # count_raft_leaders <meta-ids...> — how many nodes report themselves leader.
@@ -876,11 +895,44 @@ await_acked_floor() {
 # its own metrics endpoint. Used after a leader kill to promote the replica
 # that actually holds the acknowledged floor: quorum produce only guarantees
 # the floor reached SOME majority, not any one particular follower.
+#
+# FAILS when the read does not answer; it does NOT report 0. It used to, and
+# that is a dangerous answer from this particular helper: 0 is also what a
+# replica that legitimately holds nothing reports, so an unreachable endpoint
+# and an empty replica were the same number. Callers use this value to choose
+# which replica to PROMOTE — so a scrape that failed could hand the range to
+# the replica WITHOUT the acknowledged floor, in scenarios whose whole purpose
+# is proving no acknowledged record is lost. A helper cannot know whether its
+# caller is polling (where a missed read is nothing) or deciding (where it is
+# everything), so it reports what happened and lets the caller say.
 follower_committed_offset() {
   local n="$1" value
   value="$(metric_value "$(data_metrics_addr "$n")" vtop_broker_local_committed_offset)" \
-    || value=""
-  echo "${value:-0}"
+    || return 1
+  printf '%s\n' "$value"
+}
+
+# await_follower_committed_offset <n> — the same reading, WAITED FOR rather
+# than sampled once.
+#
+# The gauge is legitimately absent for a moment: `FollowerCollector` omits it
+# when its non-blocking read finds the append path holding the lock, and right
+# after a leader kill there may be no earlier sample left standing to report.
+# So a single read fails runs that are perfectly healthy (review) — while
+# promoting on an invented zero fails the safety claim the scenario exists to
+# make. Polling is the only answer that serves both: wait for the replica to
+# say something, and let a deadline, not one unlucky scrape, decide that it
+# never will.
+await_follower_committed_offset() {
+  local n="$1" deadline=$((SECONDS + PROGRESS_TIMEOUT_SECONDS)) value
+  while :; do
+    if value="$(follower_committed_offset "$n")"; then
+      printf '%s\n' "$value"
+      return 0
+    fi
+    [[ $SECONDS -lt $deadline ]] || return 1
+    sleep 0.2
+  done
 }
 
 # await_verified_floor <client-cfg> <addr> <floor> — retry verify until the
