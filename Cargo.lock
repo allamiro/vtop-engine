@@ -4060,6 +4060,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "vtop-kafka"
+version = "0.3.1"
+dependencies = [
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "vtop-log"
 version = "0.3.1"
 dependencies = [
