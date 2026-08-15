@@ -209,7 +209,23 @@ jobs:
           mkdir -p "dist/$name"
           cp "target/${{ matrix.target }}/release/vtop-node" "dist/$name/"
           cp "target/${{ matrix.target }}/release/vtopctl" "dist/$name/"
-          cp README.md LICENSE "dist/$name/" 2>/dev/null || true
+          # THE DOCUMENT SET CLOSES OVER ITS OWN LINKS. The README links
+          # LICENSE-EE and COMMERCIAL.md; COMMERCIAL.md and LICENSE-EE both
+          # send a reader to CONTRIBUTING.md for the contribution terms. Ship
+          # any subset and the archive carries dead references — and the moment
+          # an EE-backed binary ships, a recipient would not receive the terms
+          # governing it (review). The rule is simply that whatever the bundled
+          # docs link to, the bundle carries.
+          #
+          # `2>/dev/null || true` is kept for the reason it was here before, but
+          # it now hides five possible absences rather than two, so the two that
+          # must never be missing are asserted explicitly.
+          cp README.md LICENSE LICENSE-EE COMMERCIAL.md CONTRIBUTING.md \
+            "dist/$name/" 2>/dev/null || true
+          for required in LICENSE LICENSE-EE; do
+            [ -f "dist/$name/$required" ] \
+              || { echo "::error::$required is missing from the release bundle"; exit 1; }
+          done
           tar -czf "dist/$name.tar.gz" -C dist "$name"
           echo "artifact=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
 

@@ -1,0 +1,110 @@
+VTOP ENGINE ENTERPRISE EDITION LICENSE
+Version 1.0
+
+Copyright (c) 2026 Tamir Suliman. All rights reserved.
+
+IMPORTANT — READ BEFORE USING THIS SOFTWARE.
+
+This license governs ONLY the software in directories named `ee/` and in any
+file that carries the header "VTOP Engine Enterprise Edition" (together, the
+"EE Software"). Everything else in this repository is licensed under the MIT
+License in the file LICENSE, and nothing in this document alters, limits, or
+adds conditions to those MIT-licensed files. If a file is not EE Software, the
+MIT License is your entire license for it.
+
+1. DEFINITIONS
+
+   "Licensor" means Tamir Suliman.
+
+   "You" means the individual or legal entity exercising rights under this
+   license, together with any entity that controls, is controlled by, or is
+   under common control with that entity.
+
+   "Affiliate" means any entity that controls, is controlled by, or is under
+   common control with You, where "control" means ownership of more than fifty
+   percent (50%) of the voting interests. An Affiliate exercising rights under
+   this license is itself part of "You" and holds no separate grant; Section
+   4(c) exists to permit internal distribution, not to widen the grant.
+
+   "Subscription" means a current, paid commercial agreement between You and
+   the Licensor that expressly grants rights to the EE Software.
+
+   "Production Use" means any use other than the evaluation, development, and
+   testing use permitted by Section 3.
+
+2. GRANT, IF YOU HOLD A SUBSCRIPTION
+
+   Subject to Your compliance with this license and with the terms of Your
+   Subscription, the Licensor grants You a non-exclusive, non-transferable,
+   non-sublicensable, worldwide right to use, reproduce, and modify the EE
+   Software, and to run it in Production Use, for the term of and to the extent
+   set out in that Subscription. Where this license and Your Subscription
+   differ, Your Subscription governs.
+
+3. GRANT, IF YOU DO NOT HOLD A SUBSCRIPTION
+
+   Without a Subscription You may use, copy, and modify the EE Software solely
+   to evaluate it, to develop against it, and to test it, including running
+   automated tests and continuous integration. You may not put the EE Software
+   to Production Use, and You may not offer it to third parties as a hosted or
+   managed service.
+
+4. CONDITIONS ON ANY USE
+
+   You may not:
+
+   (a) remove or obscure any licensing, copyright, or other notice in the EE
+       Software;
+
+   (b) circumvent, disable, or interfere with any license-key, entitlement, or
+       usage-reporting mechanism in the EE Software;
+
+   (c) distribute the EE Software to third parties, except that You may
+       distribute unmodified copies to Your Affiliates who are themselves bound
+       by this license, and You may submit modifications back to the Licensor;
+
+   (d) use the Licensor's trademarks except as permitted by applicable law.
+
+   You may publish benchmarks and evaluations of the EE Software. The Licensor
+   asks only that You state the version measured and the configuration used, so
+   that the result can be reproduced or disputed.
+
+5. CONTRIBUTIONS
+
+   Contributions to the EE Software are accepted only under a separate written
+   agreement with the Licensor. Contributions to the MIT-licensed portion of
+   this repository are governed by that MIT License and are not affected by
+   this document. See CONTRIBUTING.md.
+
+6. TERM AND TERMINATION
+
+   This license applies for as long as You use the EE Software. It terminates
+   automatically if You breach it and do not cure the breach within thirty (30)
+   days of becoming aware of it. On termination You must stop all use of the EE
+   Software and destroy Your copies. Sections 7, 8, and 9 survive termination.
+
+7. NO WARRANTY
+
+   THE EE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+   OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+
+8. LIMITATION OF LIABILITY
+
+   TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT SHALL THE
+   LICENSOR BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN
+   ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN
+   CONNECTION WITH THE EE SOFTWARE OR THE USE OR OTHER DEALINGS IN IT.
+
+9. GENERAL
+
+   If any provision of this license is held unenforceable, the remaining
+   provisions remain in force. This license is the entire agreement between You
+   and the Licensor concerning the EE Software, except where a Subscription
+   states otherwise.
+
+CONTACT
+
+   Commercial terms: open an issue at
+   https://github.com/allamiro/vtop-engine/issues titled "commercial licensing",
+   or contact the Licensor directly.
