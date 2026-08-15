@@ -1,4 +1,5 @@
-# The REPLICATED shape: one range across the pods, ordinal 0 leading.
+# The REPLICATED shape: one range across the pods, every pod a candidate —
+# the role follows the metadata lease (#284), and failover happens in place.
 #
 # Separate from `default-values.yaml` rather than a `--set` on top of it,
 # because a replicated range is not the default plus a flag — it also needs
@@ -24,11 +25,23 @@ data:
   segmentId: aaaaaaaa-0000-0000-0000-0000000000d1
   principalId: aaaaaaaa-0000-0000-0000-0000000000ce
   topology: replicated
-  leaderOrdinal: 0
+  # Candidates learn their epoch from lease grants (minted from 1); the static
+  # floor must sit below the first grant. Enforced at render time.
+  fencingEpoch: 0
   lease:
-    # Required under `replicated`: followers adopt granted epochs by watching
-    # the metadata plane (#239). Without it the range serves until the epoch
-    # moves and then stops, which is the failure mode hardest to attribute.
+    # Required under `replicated` and enforced at render time: candidates
+    # acquire the range through the metadata lease (#284) — without it no pod
+    # would ever lead.
     enabled: true
     # Metadata's UUID for the topic, NOT the wire name in data.range.topic.
     topicUuid: aaaaaaaa-0000-0000-0000-0000000000f1
+
+# CI-only scheduling size, for the reason recorded in `default-values.yaml`:
+# these three pods share a runner with the four the earlier phases left
+# standing, and the chart's production requests do not fit seven of them on a
+# two-vCPU node. Limits are untouched, so the replicated phase still bursts
+# exactly as a real one would.
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi

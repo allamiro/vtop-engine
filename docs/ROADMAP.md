@@ -177,9 +177,16 @@ design conversation — restricting who may be promoted and proving who was —
 and splitting them across a patch-release boundary would ship half an
 argument.
 
-Beyond that: a Helm chart that can deploy a replicated range and separate
-metadata from data (#284, #287), and TLS as a configured capability rather
-than a hard dependency across every deployment method (#294). FIPS (#296) and
+**Candidate mode shipped here (#284)**: the data node's role now follows the
+metadata lease inside the binary — every pod a candidate, an election deciding
+who leads, failover in place with no restart and no re-render. Scenario 14
+proves the composition on real processes, and the chart's `replicated`
+topology renders three identical leased candidates (`data.leaderOrdinal` is
+retired; setting it now explains the migration instead of steering roles).
+
+Beyond that: a chart that separates metadata from data (#287), and TLS as a
+configured capability rather than a hard dependency across every deployment
+method (#294). FIPS (#296) and
 the Kafka wire-compatibility gateway (#225) sit behind those. (Retention
 #290, orderly shutdown #280, and upgrade testing #291 moved up into v0.3.1
 and shipped there.)

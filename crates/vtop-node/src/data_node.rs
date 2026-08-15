@@ -1175,11 +1175,6 @@ async fn run_candidate(
             .await
             .map_err(|error| format!("candidate native server exited: {error}"))
     });
-    // NO role collector in this first slice, deliberately: BrokerCollector
-    // and FollowerCollector export the same metric names, the registry
-    // refuses duplicate descriptors, and there is no unregister path — a
-    // role-agnostic replica collector is the follow-up. The server and
-    // lease gauges above are live regardless.
 
     // --- the agent, for the life of the process -----------------------------
     let endpoints = peers
@@ -1193,6 +1188,18 @@ async fn run_candidate(
         })
         .collect::<Result<Vec<_>, String>>()?;
     let view = Arc::new(SwitchingLocalView::empty());
+    // The candidate's ONE role collector, registered here for the life of the
+    // process and reading through the switching view. Registering a
+    // role-specific collector per transition cannot work — the leader's and
+    // follower's collectors export the same descriptors, the registry refuses
+    // duplicates, and there is no unregister — so without this a candidate
+    // exported no range progress at all: `vtop_broker_local_committed_offset`
+    // simply did not exist on a candidate pod, which is how the k8s smoke
+    // caught it (a replica nobody can measure is one nobody can operate).
+    observability.register(Box::new(crate::observe::CandidateCollector::new(
+        Arc::clone(&view) as Arc<dyn crate::observe::ReplicaObservation>,
+        &range,
+    )?))?;
     let probe = crate::lease_agent::ReplicaPlaneProbe::new(
         Arc::clone(&view) as Arc<dyn crate::lease_agent::CandidateLocalView>,
         config.node_uuid,
@@ -1328,7 +1335,7 @@ async fn run_candidate(
 
     let install_follower = |follower: &Arc<InProcessFollower>| {
         switching.install(Arc::clone(follower) as Arc<dyn ReplicaPeerHandler>);
-        view.install(Arc::clone(follower) as Arc<dyn crate::lease_agent::CandidateLocalView>);
+        view.install(Arc::clone(follower) as Arc<dyn CandidateSurface>);
         publisher.set_target(Some(Arc::new(FollowerObservationAdapter {
             inner: crate::lease_watcher::FollowerLeasePublisher::new(Arc::clone(follower)),
         })
@@ -1558,8 +1565,7 @@ async fn run_candidate(
                         // between the completion and these installs fences
                         // the broker before any session could reach it.
                         switching.install(Arc::clone(&built.status));
-                        view.install(Arc::clone(&built.broker)
-                            as Arc<dyn crate::lease_agent::CandidateLocalView>);
+                        view.install(Arc::clone(&built.broker) as Arc<dyn CandidateSurface>);
                         slot.install(Arc::clone(&built.broker));
                         role_flag.store(1, std::sync::atomic::Ordering::Relaxed);
                         println!(
@@ -1988,8 +1994,25 @@ impl ReplicaPeerHandler for SwitchingReplicaHandler {
 
 /// The candidate's own view for the promotion probe, switching with the
 /// role (#284).
+/// The two surfaces a candidate's range is read through, in one object.
+///
+/// The probe needs the TRUE offset and blocks for it; the metrics scrape
+/// must never block and takes a stale gauge instead. One installed role
+/// answers both, so the switching view carries both traits rather than
+/// keeping two containers that could disagree about which role is current
+/// mid-transition.
+trait CandidateSurface:
+    crate::lease_agent::CandidateLocalView + crate::observe::ReplicaObservation
+{
+}
+
+impl<T> CandidateSurface for T where
+    T: crate::lease_agent::CandidateLocalView + crate::observe::ReplicaObservation
+{
+}
+
 struct SwitchingLocalView {
-    delegate: std::sync::RwLock<Option<Arc<dyn crate::lease_agent::CandidateLocalView>>>,
+    delegate: std::sync::RwLock<Option<Arc<dyn CandidateSurface>>>,
 }
 
 impl SwitchingLocalView {
@@ -1999,7 +2022,7 @@ impl SwitchingLocalView {
         }
     }
 
-    fn install(&self, view: Arc<dyn crate::lease_agent::CandidateLocalView>) {
+    fn install(&self, view: Arc<dyn CandidateSurface>) {
         *self
             .delegate
             .write()
@@ -2033,6 +2056,72 @@ impl crate::lease_agent::CandidateLocalView for SwitchingLocalView {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
             .map_or_else(Vec::new, |view| view.epoch_starts())
+    }
+}
+
+impl crate::observe::ReplicaObservation for SwitchingLocalView {
+    fn try_local_offsets(&self) -> Option<(u64, u64)> {
+        self.delegate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(|view| view.try_local_offsets())
+    }
+
+    fn cluster_committed_offset(&self) -> Option<u64> {
+        self.delegate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(|view| view.cluster_committed_offset())
+    }
+
+    fn try_meta_fencing_epoch(&self) -> Option<(u64, bool)> {
+        self.delegate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(|view| view.try_meta_fencing_epoch())
+    }
+
+    fn held_fencing_epoch(&self) -> u64 {
+        self.delegate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map_or(0, |view| view.held_fencing_epoch())
+    }
+
+    fn is_leading(&self) -> bool {
+        self.delegate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|view| view.is_leading())
+    }
+
+    /// ONE acquisition for the whole reading, which is the point of it
+    /// (review). Asked question by question, `clear()` could land between "is
+    /// a role installed?" and the answers, and the scrape would publish this
+    /// view's empty answers — held epoch 0, leading false — as though a role
+    /// had given them, rewinding a monotonic gauge and leaving the departed
+    /// leader's `lease_active` of 1 standing beside it. Holding the read lock
+    /// across all three makes that interleaving unrepresentable.
+    ///
+    /// Safe to hold it across them because every call under this guard is an
+    /// atomic load or a `try_` read: the guard cannot park a transition behind
+    /// a scrape, which is the direction that would actually hurt.
+    fn role_reading(&self) -> Option<crate::observe::RoleReading> {
+        let delegate = self
+            .delegate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let view = delegate.as_ref()?;
+        Some(crate::observe::RoleReading {
+            meta: view.try_meta_fencing_epoch(),
+            held: view.held_fencing_epoch(),
+            leading: view.is_leading(),
+        })
     }
 }
 
@@ -2291,6 +2380,79 @@ mod tests {
             key: b"key".to_vec(),
             value: format!("value-{sequence}").into_bytes(),
         }
+    }
+
+    /// A scrape racing a role transition never sees half a role.
+    ///
+    /// The switching view answers every authorization question under one lock
+    /// acquisition, so a reading either comes wholly from an installed role or
+    /// is `None`. Asked question by question it could straddle a `clear()`, and
+    /// the collector would publish this view's empty answers — held epoch 0,
+    /// leading false — as though a role had given them (review).
+    ///
+    /// The race is real but rare, so this hammers it: 5000 transitions against
+    /// 5000 readings. A regression that split the reading back into separate
+    /// lock acquisitions fails here intermittently rather than never.
+    #[test]
+    fn a_scrape_racing_a_transition_never_sees_half_a_role() {
+        use crate::observe::ReplicaObservation as _;
+
+        struct Leading;
+        impl crate::lease_agent::CandidateLocalView for Leading {
+            fn local_committed_offset(&self) -> u64 {
+                12
+            }
+            fn epoch_starts(&self) -> Vec<vtop_broker::fencing_epochs::EpochStart> {
+                Vec::new()
+            }
+        }
+        impl crate::observe::ReplicaObservation for Leading {
+            fn try_local_offsets(&self) -> Option<(u64, u64)> {
+                Some((12, 13))
+            }
+            fn cluster_committed_offset(&self) -> Option<u64> {
+                Some(12)
+            }
+            fn try_meta_fencing_epoch(&self) -> Option<(u64, bool)> {
+                Some((5, true))
+            }
+            fn held_fencing_epoch(&self) -> u64 {
+                5
+            }
+            fn is_leading(&self) -> bool {
+                true
+            }
+        }
+
+        let view = Arc::new(SwitchingLocalView::empty());
+        view.install(Arc::new(Leading));
+        let churn = {
+            let view = Arc::clone(&view);
+            std::thread::spawn(move || {
+                for _ in 0..5_000 {
+                    view.clear();
+                    view.install(Arc::new(Leading));
+                }
+            })
+        };
+        for _ in 0..5_000 {
+            // `None` is the honest mid-transition answer and is allowed. What
+            // must never happen is a reading that MIXES the two: an installed
+            // role's presence with the empty view's values.
+            if let Some(reading) = view.role_reading() {
+                assert_eq!(
+                    reading.held, 5,
+                    "a reading taken from an installed role must carry that \
+                     role's epoch, never the empty view's zero"
+                );
+                assert!(
+                    reading.leading,
+                    "the installed role leads; only the empty view answers false"
+                );
+                assert_eq!(reading.meta, Some((5, true)));
+            }
+        }
+        churn.join().unwrap();
     }
 
     /// A fresh directory creates the range's first segment under the

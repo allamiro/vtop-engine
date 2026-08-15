@@ -134,4 +134,55 @@ log "quorum produce resumed at epoch $NEW_EPOCH on candidate $NEW_LEADER's own a
 await_verified_floor "$CLIENT_CFG2" "$(candidate_native_addr "$NEW_LEADER")" "$ACKED" "$ACKED"
 log "every one of the $ACKED pre-kill acknowledged records is intact after the failover"
 
+# --- a candidate that cannot be measured cannot be operated ----------------
+# Pinned here because this suite is the composition proof and this gap walked
+# straight through it: candidate mode registered no role collector, so
+# vtop_broker_local_committed_offset — the metric this very harness reads to
+# pick a promotion target, and the one every dashboard and the k8s smoke
+# read — did not exist on a candidate at all. Nothing in the suite asked, so
+# nothing noticed until a live cluster did.
+#
+# Asked of BOTH roles: the leader that just took the range, and a survivor
+# that is following it. One collector answers for whichever role holds the
+# range, and the names must not change when the role does — that is what
+# lets a panel built for a statically-rendered range keep working here.
+# THE SURVIVOR, derived — never guessed (review). The candidates are 1, 2, 3,
+# so the one that is neither the SIGKILLed WINNER nor the NEW_LEADER is
+# 6 minus the two. Naming a fixed ordinal here would have curled a dead
+# endpoint whenever the election came out differently, failing the scenario
+# for the crime of electing another pod — the exact class of bug this suite
+# exists to catch, in this suite.
+FOLLOWING=$(( 6 - WINNER - NEW_LEADER ))
+for n in "$NEW_LEADER" "$FOLLOWING"; do
+  # DEADLINE-POLLED, because a follower can still be applying the tail when
+  # the leader's own verification returns: quorum means a MAJORITY acked, so
+  # one replica legitimately trails. A one-shot read here would test the
+  # timing rather than the replication. `absent` and "too low" fail with
+  # different messages, which is the distinction that matters: the first
+  # means candidate mode exports no role collector at all (the #284
+  # regression this pins), the second means replication is behind.
+  await_metric_at_least "$(data_metrics_addr "$((n + 10))")" \
+    vtop_broker_local_committed_offset "$ACKED" \
+    "candidate $n (a replica nobody can measure is one nobody can operate; \
+this very suite reads this metric to choose a promotion target)"
+done
+await_metric_equals "$(data_metrics_addr "$((NEW_LEADER + 10))")" \
+  vtop_broker_candidate_leading 1 \
+  "the candidate holding the range must say so — who serves the range has to be \
+answerable from metrics alone"
+await_metric_equals "$(data_metrics_addr "$((FOLLOWING + 10))")" \
+  vtop_broker_candidate_leading 0 \
+  "a following candidate must not claim the range, or metrics cannot tell the \
+holder from its followers"
+# And the authorization gauge separates them too: adopting the holder's epoch
+# is not holding the lease.
+await_metric_equals "$(data_metrics_addr "$((NEW_LEADER + 10))")" \
+  vtop_broker_lease_active 1 "the holder is the authorized leaseholder"
+await_metric_equals "$(data_metrics_addr "$((FOLLOWING + 10))")" \
+  vtop_broker_lease_active 0 \
+  "a following candidate adopts the holder's epoch and activates its view at it, \
+so only the role keeps this from reporting three leaseholders for one range"
+log "both roles are observable through one collector: offsets exported, and the holder \
+is identifiable from metrics alone"
+
 log "PASS"

@@ -915,6 +915,290 @@ impl Collector for FollowerCollector {
 }
 
 // ---------------------------------------------------------------------------
+// Data plane, candidate (role follows the lease)
+// ---------------------------------------------------------------------------
+
+/// What a candidate's collector reads, whichever role currently owns the
+/// range (#284).
+///
+/// NON-BLOCKING throughout, for the reason the module docs give: both role
+/// objects hold their state lock across fsync, and a scrape that parks a
+/// runtime worker behind a stalled disk takes the observability endpoint
+/// down exactly when it is needed most. This is deliberately NOT
+/// [`crate::lease_agent::CandidateLocalView`], whose accessors block on
+/// purpose — a promotion probe must have the true offset and can afford to
+/// wait for it; a scrape must never wait and can afford a stale gauge.
+pub trait ReplicaObservation: Send + Sync {
+    /// `(committed, next)`, or `None` while the append path holds the lock.
+    fn try_local_offsets(&self) -> Option<(u64, u64)>;
+    /// The quorum high-water mark, where the role tracks one.
+    fn cluster_committed_offset(&self) -> Option<u64>;
+    /// `(epoch, lease_active)`, or `None` under contention — one snapshot for
+    /// both, so the pair cannot straddle a grant.
+    fn try_meta_fencing_epoch(&self) -> Option<(u64, bool)>;
+    /// The epoch this role object was granted or adopted.
+    fn held_fencing_epoch(&self) -> u64;
+    /// Whether this replica currently SERVES the range. The installed role
+    /// object is the answer: a broker leads, a follower does not.
+    fn is_leading(&self) -> bool;
+
+    /// Everything the authorization gauges are derived from, AS ONE
+    /// OBSERVATION. `None` means no role owns the range right now.
+    ///
+    /// A concrete role always owns it — it IS the role — so the default
+    /// composes its own accessors and can never answer `None`. Only a
+    /// switching view mid-transition has an identity to lose, and the
+    /// distinction matters twice over: "nobody owns this yet" is knowledge
+    /// while a contended lock is ignorance, and the two call for opposite
+    /// treatment of an authorization gauge (review).
+    ///
+    /// It is ONE call rather than an ownership question followed by three
+    /// answers because asking separately let a transition land in the middle
+    /// (review): a scrape could read "a role owns this", then have `clear()`
+    /// land, and go on to publish the empty view's held epoch of 0 beside the
+    /// departed leader's `lease_active` of 1 — a rewound monotonic gauge and a
+    /// false leaseholder, the exact pair the conditional writes below exist to
+    /// prevent. A switching view overrides this to answer under ONE lock
+    /// acquisition, which makes that interleaving unrepresentable rather than
+    /// merely unlikely.
+    fn role_reading(&self) -> Option<RoleReading> {
+        Some(RoleReading {
+            meta: self.try_meta_fencing_epoch(),
+            held: self.held_fencing_epoch(),
+            leading: self.is_leading(),
+        })
+    }
+}
+
+/// One role's answer to every authorization question a scrape asks, taken at
+/// one instant (#284).
+pub struct RoleReading {
+    /// `(epoch, lease_active)` from metadata, `None` under contention — the
+    /// same ignorance a `try_` accessor reports, and treated the same way.
+    pub meta: Option<(u64, bool)>,
+    /// The epoch this role was granted or adopted.
+    pub held: u64,
+    /// Whether this replica SERVES the range.
+    pub leading: bool,
+}
+
+impl ReplicaObservation for LocalBroker {
+    fn try_local_offsets(&self) -> Option<(u64, u64)> {
+        LocalBroker::try_local_offsets(self)
+    }
+
+    fn cluster_committed_offset(&self) -> Option<u64> {
+        self.cluster_committed().map(|cluster| cluster.get())
+    }
+
+    fn try_meta_fencing_epoch(&self) -> Option<(u64, bool)> {
+        self.meta_fencing_epoch().try_snapshot()
+    }
+
+    fn held_fencing_epoch(&self) -> u64 {
+        LocalBroker::held_fencing_epoch(self)
+    }
+
+    fn is_leading(&self) -> bool {
+        true
+    }
+}
+
+impl ReplicaObservation for InProcessFollower {
+    fn try_local_offsets(&self) -> Option<(u64, u64)> {
+        InProcessFollower::try_local_offsets(self)
+    }
+
+    fn cluster_committed_offset(&self) -> Option<u64> {
+        Some(self.cluster_committed().get())
+    }
+
+    fn try_meta_fencing_epoch(&self) -> Option<(u64, bool)> {
+        self.meta_fencing_epoch().try_snapshot()
+    }
+
+    fn held_fencing_epoch(&self) -> u64 {
+        InProcessFollower::held_fencing_epoch(self)
+    }
+
+    fn is_leading(&self) -> bool {
+        false
+    }
+}
+
+/// A candidate's range progress, read through whichever role holds it now.
+///
+/// ONE collector for the life of the process, which is what makes candidate
+/// mode observable at all. Registering `BrokerCollector` on promotion and
+/// `FollowerCollector` on demotion cannot work: the two export the same
+/// descriptors, the registry refuses duplicates, and there is no unregister
+/// — so the first transition would either fail or leave the process
+/// exporting a role it no longer has. This collector is registered once and
+/// reads through the switching view, so the metric names stay stable across
+/// every transition and a dashboard does not have to know which pod
+/// currently leads.
+///
+/// The names match the leader's and the follower's deliberately: a panel
+/// built for a statically-rendered range keeps working against a candidate
+/// deployment, which is the whole point of retiring the rendered role.
+pub struct CandidateCollector {
+    view: Arc<dyn ReplicaObservation>,
+    range_labels: [String; 2],
+    local_committed: IntGaugeVec,
+    next_offset: IntGaugeVec,
+    cluster_committed: IntGaugeVec,
+    held_fencing_epoch: IntGaugeVec,
+    meta_fencing_epoch: IntGaugeVec,
+    lease_active: IntGaugeVec,
+    leading: IntGaugeVec,
+}
+
+impl CandidateCollector {
+    pub fn new(
+        view: Arc<dyn ReplicaObservation>,
+        range: &vtop_protocol::RangeIdentity,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            view,
+            range_labels: [range.topic.clone(), range.range_id.to_string()],
+            local_committed: gauge_vec(
+                "broker_local_committed_offset",
+                "Durable commit boundary of this replica's active segment",
+                &["topic", "range"],
+            )?,
+            next_offset: gauge_vec(
+                "broker_next_offset",
+                "Next offset the segment will assign, including records not yet durable",
+                &["topic", "range"],
+            )?,
+            cluster_committed: gauge_vec(
+                "broker_cluster_committed_offset",
+                "Quorum-committed high-water mark this replica has observed",
+                &["topic", "range"],
+            )?,
+            held_fencing_epoch: gauge_vec(
+                "broker_held_fencing_epoch",
+                "Fencing epoch this replica was granted or has adopted",
+                &["topic", "range"],
+            )?,
+            meta_fencing_epoch: gauge_vec(
+                "broker_meta_fencing_epoch",
+                "Latest metadata-committed fencing epoch observed for the range",
+                &["topic", "range"],
+            )?,
+            lease_active: gauge_vec(
+                "broker_lease_active",
+                "1 while THIS replica is the authorized leaseholder; 0 while it \
+                 follows another holder or is fenced",
+                &["topic", "range"],
+            )?,
+            leading: gauge_vec(
+                "broker_candidate_leading",
+                "1 while this candidate serves the range; 0 while it follows another holder",
+                &["topic", "range"],
+            )?,
+        })
+    }
+
+    fn members(&self) -> Vec<&dyn Collector> {
+        vec![
+            &self.local_committed,
+            &self.next_offset,
+            &self.cluster_committed,
+            &self.held_fencing_epoch,
+            &self.meta_fencing_epoch,
+            &self.lease_active,
+            &self.leading,
+        ]
+    }
+
+    fn refresh(&self) {
+        let range = [self.range_labels[0].as_str(), self.range_labels[1].as_str()];
+        // A contended read leaves the previous value standing (module docs).
+        // Mid-transition the switching view holds no role at all and answers
+        // the same way — the gauges pause for the length of a transition
+        // rather than reporting a zero the replica never went back to.
+        if let Some((committed, next)) = self.view.try_local_offsets() {
+            self.local_committed
+                .with_label_values(&range)
+                .set(committed as i64);
+            self.next_offset.with_label_values(&range).set(next as i64);
+        }
+        if let Some(cluster) = self.view.cluster_committed_offset() {
+            self.cluster_committed
+                .with_label_values(&range)
+                .set(cluster as i64);
+        }
+        // ONE observation of the role rather than an ownership question
+        // followed by three answers, so a transition cannot land in the middle
+        // of a scrape and have it publish half of each role (review; the
+        // reasoning is on `ReplicaObservation::role_reading`). Inside it, the
+        // metadata snapshot is still taken BEFORE the held epoch, matching the
+        // leader's collector for the reason recorded there: both writes are
+        // monotonic and promotion orders them, so this order can never report
+        // ownership for a replica still mid-promotion.
+        match self.view.role_reading() {
+            Some(RoleReading {
+                meta,
+                held,
+                leading,
+            }) => {
+                self.held_fencing_epoch
+                    .with_label_values(&range)
+                    .set(held as i64);
+                if let Some((epoch, active)) = meta {
+                    self.meta_fencing_epoch
+                        .with_label_values(&range)
+                        .set(epoch as i64);
+                    // AUTHORIZATION, exactly as the leader's collector defines
+                    // it — and with one more term, because a candidate can be
+                    // neither fenced nor the holder. A FOLLOWING candidate
+                    // adopts the holder's granted epoch and activates its view
+                    // at it (that is how it accepts replication), so `active &&
+                    // epoch == held` is true on all three replicas at once:
+                    // without the role term this gauge would report three
+                    // leaseholders for one range and tell an operator the
+                    // opposite of what two of them will do with a produce
+                    // (review).
+                    self.lease_active
+                        .with_label_values(&range)
+                        .set(i64::from(active && epoch == held && leading));
+                }
+                self.leading
+                    .with_label_values(&range)
+                    .set(i64::from(leading));
+            }
+            None => {
+                // BETWEEN ROLES, and that is NOT the same as a contended read
+                // (review). This replica is certainly not the authorized
+                // holder, and leaving the previous 1 standing would advertise a
+                // leaseholder through a transition whose quiesce and reopen can
+                // stall on disk — a false claim that outlives the moment it was
+                // true. Ignorance keeps the last value; knowledge writes it
+                // down.
+                self.lease_active.with_label_values(&range).set(0);
+                self.leading.with_label_values(&range).set(0);
+                // The epoch gauges keep their last reading on purpose: the
+                // switching view would answer 0, and writing that rewinds a
+                // monotonic gauge to a number this replica left long ago,
+                // which reads as a replica that lost its history.
+            }
+        }
+    }
+}
+
+impl Collector for CandidateCollector {
+    fn desc(&self) -> Vec<&Desc> {
+        descs_of(&self.members())
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        self.refresh();
+        collect_all(&self.members())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Native server request path
 // ---------------------------------------------------------------------------
 
@@ -1224,6 +1508,245 @@ mod tests {
         assert!(
             text.contains(r#"vtop_node_info{node_id="7",role="meta"} 1"#),
             "{text}"
+        );
+    }
+
+    /// A candidate exports range progress under the SAME metric names a
+    /// statically-rendered leader or follower does, through whichever role
+    /// currently holds the range.
+    ///
+    /// This pins a real regression: candidate mode registered no role
+    /// collector at all, so `vtop_broker_local_committed_offset` — the metric
+    /// the k8s smoke, the chaos harness and every dashboard read — simply did
+    /// not exist on a candidate pod. A replica nobody can measure is one
+    /// nobody can operate, and the gap was invisible until a live cluster
+    /// asked the question.
+    #[test]
+    fn a_candidate_exports_range_progress_through_whichever_role_holds_it() {
+        struct Role {
+            offsets: Option<(u64, u64)>,
+            leading: bool,
+        }
+        impl ReplicaObservation for Role {
+            fn try_local_offsets(&self) -> Option<(u64, u64)> {
+                self.offsets
+            }
+            fn cluster_committed_offset(&self) -> Option<u64> {
+                Some(40)
+            }
+            fn try_meta_fencing_epoch(&self) -> Option<(u64, bool)> {
+                Some((3, true))
+            }
+            fn held_fencing_epoch(&self) -> u64 {
+                3
+            }
+            fn is_leading(&self) -> bool {
+                self.leading
+            }
+        }
+
+        let range = test_range();
+        // The node's OWN registry, not a bare one: the `vtop_` prefix is
+        // applied by the registry, and a test that scrapes an unprefixed
+        // registry would assert a name no operator ever sees.
+        let registry = Registry::new_custom(Some("vtop".into()), None).unwrap();
+        let leading = Arc::new(Role {
+            offsets: Some((41, 42)),
+            leading: true,
+        });
+        let collector =
+            CandidateCollector::new(Arc::clone(&leading) as Arc<dyn ReplicaObservation>, &range)
+                .unwrap();
+        registry.register(Box::new(collector)).unwrap();
+        let text = scrape(&registry);
+        assert!(
+            text.contains(&format!(
+                r#"vtop_broker_local_committed_offset{{range="{}",topic="{}"}} 41"#,
+                range.range_id, range.topic
+            )),
+            "a leading candidate must export the durable boundary under the \
+             shared name, so a dashboard built for a rendered leader keeps \
+             working: {text}"
+        );
+        assert!(
+            text.contains("vtop_broker_candidate_leading"),
+            "the one question candidate mode adds — who serves the range — \
+             must be answerable from metrics: {text}"
+        );
+        assert!(
+            text.lines()
+                .any(|line| line.starts_with("vtop_broker_candidate_leading")
+                    && line.ends_with(" 1")),
+            "the installed role is the answer, and this one leads: {text}"
+        );
+
+        // A FOLLOWING candidate reports the same names with leading=0, and a
+        // contended (or mid-transition) read leaves the last value standing
+        // rather than reporting a zero the replica never returned to.
+        let following = Registry::new_custom(Some("vtop".into()), None).unwrap();
+        let follower = Arc::new(Role {
+            offsets: None,
+            leading: false,
+        });
+        following
+            .register(Box::new(
+                CandidateCollector::new(
+                    Arc::clone(&follower) as Arc<dyn ReplicaObservation>,
+                    &range,
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        let text = scrape(&following);
+        assert!(
+            text.lines()
+                .any(|line| line.starts_with("vtop_broker_candidate_leading")
+                    && line.ends_with(" 0")),
+            "a following candidate must say so: {text}"
+        );
+        assert!(
+            !text.contains("vtop_broker_local_committed_offset"),
+            "an offset that could not be read must be ABSENT, never zero: a \
+             zero here reads as an empty replica and would send an operator \
+             hunting a replication failure that did not happen: {text}"
+        );
+        // A following candidate adopts the HOLDER's epoch and activates its
+        // view at it — that is how it accepts replication — so every term of
+        // the leader's own authorization test is satisfied on all three
+        // replicas at once. Only the role separates them, and without it this
+        // gauge would report three leaseholders for one range.
+        assert!(
+            text.lines()
+                .any(|line| line.starts_with("vtop_broker_lease_active{") && line.ends_with(" 0")),
+            "a following candidate must NOT report itself the authorized \
+             leaseholder, however live the lease it observes: {text}"
+        );
+
+        // BETWEEN roles, the authorization gauges fail closed. A transition
+        // quiesces and reopens the range and can stall on a slow disk, so a
+        // 1 left standing from the role that just ended would advertise a
+        // leaseholder for as long as the stall lasts. The progress gauges
+        // behave the opposite way on purpose: they keep their last reading
+        // rather than rewinding to a number the replica left long ago.
+        struct Nothing;
+        impl ReplicaObservation for Nothing {
+            fn try_local_offsets(&self) -> Option<(u64, u64)> {
+                None
+            }
+            fn cluster_committed_offset(&self) -> Option<u64> {
+                None
+            }
+            fn try_meta_fencing_epoch(&self) -> Option<(u64, bool)> {
+                None
+            }
+            fn held_fencing_epoch(&self) -> u64 {
+                0
+            }
+            fn is_leading(&self) -> bool {
+                false
+            }
+            fn role_reading(&self) -> Option<RoleReading> {
+                None
+            }
+        }
+        let between = Registry::new_custom(Some("vtop".into()), None).unwrap();
+        between
+            .register(Box::new(
+                CandidateCollector::new(Arc::new(Nothing) as Arc<dyn ReplicaObservation>, &range)
+                    .unwrap(),
+            ))
+            .unwrap();
+        let text = scrape(&between);
+        assert!(
+            text.lines()
+                .any(|line| line.starts_with("vtop_broker_lease_active{") && line.ends_with(" 0")),
+            "a replica between roles must say it holds nothing, not leave the \
+             previous leader's claim standing: {text}"
+        );
+        assert!(
+            !text.contains("vtop_broker_held_fencing_epoch"),
+            "the held epoch must not be rewound to zero mid-transition — a \
+             monotonic gauge that goes backwards reads as a replica that lost \
+             its history: {text}"
+        );
+    }
+
+    /// A scrape asks the role ONCE. Asking whether a role owns the range and
+    /// then asking that role three questions is four reads, and a transition
+    /// landing between them makes the collector publish half of each role: the
+    /// empty view's held epoch of 0 written as though a role gave it (a
+    /// monotonic gauge rewound), beside the departed leader's `lease_active`
+    /// of 1 that the no-role reset was skipped for.
+    ///
+    /// The interleaving cannot be reproduced deterministically, so the pin is
+    /// STRUCTURAL: the collector must not reach past `role_reading()` for any
+    /// value that decides authorization. A fake that counts both is the only
+    /// way to assert that from outside.
+    #[test]
+    fn a_scrape_reads_the_role_through_one_observation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct Counting {
+            readings: AtomicUsize,
+            piecemeal: AtomicUsize,
+        }
+        impl ReplicaObservation for Counting {
+            fn try_local_offsets(&self) -> Option<(u64, u64)> {
+                Some((7, 8))
+            }
+            fn cluster_committed_offset(&self) -> Option<u64> {
+                Some(7)
+            }
+            fn try_meta_fencing_epoch(&self) -> Option<(u64, bool)> {
+                self.piecemeal.fetch_add(1, Ordering::SeqCst);
+                Some((4, true))
+            }
+            fn held_fencing_epoch(&self) -> u64 {
+                self.piecemeal.fetch_add(1, Ordering::SeqCst);
+                4
+            }
+            fn is_leading(&self) -> bool {
+                self.piecemeal.fetch_add(1, Ordering::SeqCst);
+                true
+            }
+            fn role_reading(&self) -> Option<RoleReading> {
+                self.readings.fetch_add(1, Ordering::SeqCst);
+                Some(RoleReading {
+                    meta: Some((4, true)),
+                    held: 4,
+                    leading: true,
+                })
+            }
+        }
+
+        let range = test_range();
+        let view = Arc::new(Counting::default());
+        let registry = Registry::new_custom(Some("vtop".into()), None).unwrap();
+        registry
+            .register(Box::new(
+                CandidateCollector::new(Arc::clone(&view) as Arc<dyn ReplicaObservation>, &range)
+                    .unwrap(),
+            ))
+            .unwrap();
+        let text = scrape(&registry);
+
+        assert_eq!(
+            view.readings.load(Ordering::SeqCst),
+            1,
+            "one scrape must take exactly one observation of the role"
+        );
+        assert_eq!(
+            view.piecemeal.load(Ordering::SeqCst),
+            0,
+            "the collector must not reach past role_reading() for the values \
+             that decide authorization — reading them separately is what let a \
+             role change land mid-scrape"
+        );
+        assert!(
+            text.lines()
+                .any(|line| line.starts_with("vtop_broker_lease_active{") && line.ends_with(" 1")),
+            "the one observation must still drive the gauges: {text}"
         );
     }
 

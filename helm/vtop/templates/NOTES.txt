@@ -52,10 +52,29 @@ vtop {{ .Chart.AppVersion }} — {{ int .Values.replicaCount }} co-located node(
    The endpoint is UNAUTHENTICATED (#78)
    {{- if .Values.networkPolicy.enabled }} — NetworkPolicy is enabled and restricts it.{{ else }} — consider networkPolicy.enabled=true to restrict it in-cluster.{{ end }}
 
+{{- if eq .Values.data.topology "replicated" }}
+5. ONE range, every pod a CANDIDATE (#284): the role follows the metadata
+   lease. After `meta init`, create the topic and register each node once —
+   the range cannot be leased before metadata knows it exists, and /readyz
+   stays closed on every pod until a completed metadata exchange FINDS it:
+
+     vtopctl meta create-topic --name {{ .Values.data.range.topic }} --topic-uuid {{ .Values.data.lease.topicUuid | default "<topicUuid>" }} --root-range-uuid {{ .Values.data.range.rangeId | default "<rangeId>" }} --config admin.yaml
+     # once per pod, each at its OWN headless FQDN:
+     vtopctl meta register-node --node-uuid <that pod's cluster.nodeUuids entry> --addr <pod-fqdn>:{{ .Values.ports.replica }} --config admin.yaml
+
+   Whichever pod acquires the range leads; when the holder dies, a surviving
+   candidate takes the range in place — no re-render, no upgrade. WHICH pod
+   leads is an election's outcome, so ask metadata rather than assuming:
+
+     vtopctl --json meta range-lease --topic-uuid {{ .Values.data.lease.topicUuid | default "<topicUuid>" }} --range-uuid {{ .Values.data.range.rangeId | default "<rangeId>" }} --config admin.yaml
+
+   and aim produce/fetch at the holder's own headless FQDN on port {{ .Values.ports.native }}.
+{{- else }}
 5. Per-pod planes (each pod is an independent standalone range): address a
    specific pod through the headless Service, e.g.
 
      {{ $fullname }}-0.{{ include "vtop.headlessServiceName" . }}.{{ $ns }}.svc.{{ .Values.clusterDomain }}:{{ .Values.ports.native }}
+{{- end }}
 
 Full docs, including the TLS Secret contract: helm/vtop/README.md in the
 chart sources.

@@ -457,26 +457,26 @@ helm upgrade --install "$REL" helm/vtop -n "$REPLICATED_NS" \
   --set image.pullPolicy=IfNotPresent \
   --timeout 5m >/dev/null
 
-# A cold replicated install restarts a few times on purpose: followers fail
-# closed until `meta init` has run, and the leader exits if its followers'
-# DNS has not caught up. Both are documented in values.yaml as deliberate. So
-# the metadata group is bootstrapped FIRST and readiness is waited on after,
-# rather than waiting on a state the design says will not hold yet.
+# Bootstrap FIRST, wait for readiness AFTER — the order is the design (#284).
+# Candidates learn everything from the metadata plane: /readyz stays closed
+# until a pod has completed a metadata exchange that FINDS the range, and the
+# range cannot exist until `meta init` and `create-topic` have run. Waiting
+# for Ready here would deadlock against the very steps that open the gate. A
+# winning candidate can also exit fail-stop if its peers' DNS has not caught
+# up when it builds its replica set, so a cold install may still restart a
+# few times while the headless Service settles — deliberate, not a symptom.
 #
-# RUNNING, not Ready, and the distinction is the whole point. A replicated
-# leader cannot become Ready until it holds the range lease, and it cannot hold
-# the lease until the metadata group has been initialised — so waiting for
-# Ready here deadlocks against the very step that would break the deadlock.
-# The standalone install above can wait for Ready because a standalone range
-# needs no lease at all.
-log "waiting for the leader's process to be up, then bootstrapping metadata"
+# RUNNING, not Ready, and the distinction is the whole point. The standalone
+# install above can wait for Ready because a standalone range needs no lease
+# and no metadata at all.
+log "waiting for pod 0's metadata process to be up, then bootstrapping the group"
 for _ in $(seq 1 60); do
   phase="$(kubectl -n "$REPLICATED_NS" get "pod/${REL}-0" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
   [ "$phase" = "Running" ] && break
   sleep 3
 done
 [ "${phase:-}" = "Running" ] \
-  || { kubectl -n "$REPLICATED_NS" get pods; fail "the replicated leader's pod never reached Running (phase='${phase:-none}')"; }
+  || { kubectl -n "$REPLICATED_NS" get pods; fail "replicated pod 0 never reached Running (phase='${phase:-none}')"; }
 
 # The forward is re-established on EVERY attempt, which the standalone path
 # does not need to do. Two things are moving here that are settled there: the
@@ -509,9 +509,10 @@ alloc_port() {
 # this is roughly six minutes of patience against roughly two before.
 #
 # The budget is not arbitrary and the earlier one was tuned to the wrong
-# cluster. A cold replicated install restarts while follower DNS settles — the
-# leader exits with "failed to lookup address information" until the headless
-# Service publishes every peer, which the chart documents as expected. On
+# cluster. A cold replicated install can restart while peer DNS settles — a
+# winning candidate exits fail-stop with "failed to lookup address
+# information" until the headless Service publishes every peer, which the
+# chart documents as expected. On
 # Docker Desktop that resolves in well under a minute, so 30 attempts looked
 # generous; on kind it does not, and CI failed here with `Connection refused`
 # while the pod was still in that loop. Waiting for `phase=Running` cannot help:
@@ -660,9 +661,14 @@ meta_admin "created the topic and its root range in metadata" \
   meta create-topic --name telemetry \
   --topic-uuid "$TOPIC_UUID" --root-range-uuid "$RANGE_ID"
 
+# Each node registered at its OWN address: with candidates (#284) any of the
+# three may end up holding the range, and the registration should say where
+# that node actually lives rather than pointing every identity at pod 0.
+ordinal=0
 for uuid in "$UUID_0" "$UUID_1" "$UUID_2"; do
   meta_admin "registered data node $uuid" \
-    meta register-node --node-uuid "$uuid" --addr "${REL}-0.${HEADLESS}.${REPLICATED_NS}.svc.${DOMAIN}:9300"
+    meta register-node --node-uuid "$uuid" --addr "${REL}-${ordinal}.${HEADLESS}.${REPLICATED_NS}.svc.${DOMAIN}:9300"
+  ordinal=$((ordinal + 1))
 done
 
 # THE ASSERTION. Without it this suite would pass against a `vtopctl` that
@@ -683,65 +689,266 @@ kubectl -n "$REPLICATED_NS" wait --for=condition=ready pod -l "app.kubernetes.io
     fail "the replicated range never became Ready"
   }
 
-# THE ASSERTION THIS WHOLE VARIANT EXISTS FOR. Quorum durability is refused
-# outright on a standalone range — "Quorum durability requires a configured
-# replica set" — so a produce that SUCCEEDS with it is proof the leader really
-# has followers and really reached a majority of them. Nothing else in CI
-# establishes that.
-log "producing with QUORUM durability, which a standalone range refuses"
-alloc_port; produce_port="$r_port"
-forward_ns "$REPLICATED_NS" "${REL}-0" "$produce_port" 9400
-r_fqdn="${REL}-0.${HEADLESS}.${REPLICATED_NS}.svc.${DOMAIN}"
-sed "s|^server_name: .*|server_name: \"${r_fqdn}\"|; s|cert: $CERTS/client.pem|cert: $CERTS/r-client.pem|; s|key: $CERTS/client-key.pem|key: $CERTS/r-client-key.pem|; s/^producer_epoch: .*/producer_epoch: 1/" \
-  "$WORK/client.yaml" > "$WORK/r-client.yaml"
+# WHICH POD HOLDS THE RANGE IS AN ELECTION'S OUTCOME, NOT A RENDERED FACT.
+# The chart used to freeze the leader at ordinal 0, so this test could aim
+# everything at pod 0 and be right by construction. Candidates (#284) take
+# the range through the metadata lease, so the holder must be ASKED for —
+# aiming at pod 0 now would fail two runs in three, looking like a produce
+# bug and actually being an assumption the topology no longer honours.
+lease_state() { # echoes "<holder-uuid> <fencing-epoch>", empty when no lease
+  vtopctl --json meta range-lease --config "$WORK/r-admin-multi.yaml" \
+    --topic-uuid "$TOPIC_UUID" --range-uuid "$RANGE_ID" 2>/dev/null \
+    | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+lease = d.get("lease") or {}
+holder = lease.get("holder_node_uuid") or ""
+epoch = lease.get("fencing_epoch")
+if holder and epoch is not None:
+    print(holder, epoch)
+' 2>/dev/null || true
+}
 
-R_EXPECTED=60
-vtop-node produce --client-config "$WORK/r-client.yaml" \
-  --addr "127.0.0.1:${produce_port}" --records "$R_EXPECTED" --batch 10 \
-  --durability quorum >/dev/null \
-  || fail "quorum produce failed; the range is not actually replicated"
-log "quorum produce accepted $R_EXPECTED records"
+ordinal_of() { # <node-uuid> -> pod ordinal
+  case "$1" in
+    "$UUID_0") echo 0 ;;
+    "$UUID_1") echo 1 ;;
+    "$UUID_2") echo 2 ;;
+    *) fail "lease holder $1 is not one of the rendered candidates" ;;
+  esac
+}
 
-alloc_port; leader_metrics_port="$r_port"
-forward_ns "$REPLICATED_NS" "${REL}-0" "$leader_metrics_port" 9500
-r_got="$(committed_offset "$leader_metrics_port")"
-[ "$r_got" = "$R_EXPECTED" ] || fail "leader should hold $R_EXPECTED records, reports '${r_got:-none}'"
-
-# The inverse of the standalone check above, and the reason both are worth
-# having: there, a pod nobody produced to MUST be empty; here it must hold
-# every record. Quorum only proves a majority acked — with three replicas that
-# is the leader plus one, so checking BOTH followers is a strictly stronger
-# claim than the produce call already made.
-#
-# Read as local_committed_offset rather than next_offset: the first is what
-# the follower has FSYNCED, the second only what it has been assigned. Quorum
-# durability is a claim about disks, so the assertion should be too.
-#
-# POLLED, not asserted once, and the reason is the same arithmetic that makes
-# checking both followers worthwhile. Quorum means a MAJORITY acked — with three
-# replicas, the leader plus one. So a perfectly healthy write can return while
-# the third replica is still catching up, and an immediate assertion on both
-# followers tests the timing rather than the replication. That is a flake, and
-# it would have failed intermittently in CI while looking like a real
-# replication bug.
-#
-# A deadline rather than a fixed sleep: it reports the state that matters and
-# fails with the offset it actually observed, so a genuine stall is still
-# diagnosable instead of hidden behind a wait that was long enough.
-for ordinal in 1 2; do
-  alloc_port; metrics_port="$r_port"
-  forward_ns "$REPLICATED_NS" "${REL}-${ordinal}" "$metrics_port" 9500
-  f_offset=""
-  for _ in $(seq 1 30); do
-    f_offset="$(committed_offset "$metrics_port")"
-    [ "${f_offset:-0}" = "$R_EXPECTED" ] && break
+await_holder() { # [min-epoch] — echoes "<holder> <epoch>"
+  # Deadline-polled, and the epoch floor is the whole point: after a holder
+  # goes away its unexpired lease is still on record — correctly, that is
+  # what a lease means — so waiting for "any holder" right after a delete
+  # reads back the corpse and proves nothing (the live-chaos suite learned
+  # this the hard way).
+  #
+  # A FLOOR ON THE EPOCH, not an exclusion on the UUID, because the thing
+  # being waited for is a NEW GRANT and the epoch is what a grant mints.
+  # Metadata mints them monotonically, so "epoch above the one we saw" is
+  # exactly "somebody has been granted the range since" — and it stays true
+  # whether a survivor took over or the recreated pod won its own range back
+  # (a legitimate outcome an exclusion would wrongly reject, and one this
+  # test must not turn into a flake).
+  local floor="${1:-0}" holder="" epoch=""
+  for _ in $(seq 1 90); do
+    read -r holder epoch <<< "$(lease_state)" || true
+    if [ -n "$holder" ] && [ -n "$epoch" ] && [ "$epoch" -gt "$floor" ]; then
+      printf '%s %s\n' "$holder" "$epoch"
+      return 0
+    fi
     sleep 2
   done
-  [ "${f_offset:-0}" = "$R_EXPECTED" ] \
-    || fail "follower $ordinal has durably applied '${f_offset:-0}' of $R_EXPECTED records after 60s; replication is not reaching it"
-  log "follower $ordinal has durably applied all $R_EXPECTED records"
-done
+  return 1
+}
 
-log "replication verified in Kubernetes: quorum durability works and both followers hold the data"
+read -r HOLDER EPOCH <<< "$(await_holder)" \
+  || fail "no candidate acquired the range within 180s"
+holder_ordinal="$(ordinal_of "$HOLDER")"
+log "candidate $holder_ordinal ($HOLDER) holds the range at epoch $EPOCH — an election decided that, not the chart"
+
+# Point the produce client at the pod that actually leads, at the epoch the
+# lease actually granted. producer_epoch is bumped per produce round for the
+# same reason the standalone phase bumps it: sequence state is keyed on
+# (producer_id, producer_epoch), and replaying an epoch is correctly
+# deduplicated — a stall that is actually idempotency working.
+r_produce() { # <ordinal> <fencing-epoch> <producer-epoch> <records>
+  local ordinal="$1" fencing="$2" producer="$3" records="$4"
+  alloc_port; local pport="$r_port"
+  # A FORWARD PER ATTEMPT, torn down when the attempt ends (review). Fresh
+  # because a pod that restarted takes its forward with it and a reused one
+  # only repeats `connection refused` — the same reasoning the init retry
+  # loop above records. Torn down because this call sits in a retry loop:
+  # sixty abandoned port-forwards would be sixty kubectl processes and sixty
+  # API streams held open for the length of the wait.
+  forward_ns "$REPLICATED_NS" "${REL}-${ordinal}" "$pport" 9400
+  local fwd="${FORWARDS##* }"
+  local fqdn="${REL}-${ordinal}.${HEADLESS}.${REPLICATED_NS}.svc.${DOMAIN}"
+  sed "s|^server_name: .*|server_name: \"${fqdn}\"|; s|cert: $CERTS/client.pem|cert: $CERTS/r-client.pem|; s|key: $CERTS/client-key.pem|key: $CERTS/r-client-key.pem|; s/^producer_epoch: .*/producer_epoch: ${producer}/; s/^fencing_epoch: .*/fencing_epoch: ${fencing}/" \
+    "$WORK/client.yaml" > "$WORK/r-client.yaml"
+  # BOUNDED, so the retry deadline outside means what it says: the client
+  # waits on a socket, and a forward that accepts and then stops answering
+  # would hang this attempt forever while the loop below never got another
+  # chance to check the clock (review).
+  local rc=0
+  timeout 60 vtop-node produce --client-config "$WORK/r-client.yaml" \
+    --addr "127.0.0.1:${pport}" --records "$records" --batch 10 \
+    --durability quorum > "$WORK/r-produce.log" 2>&1 || rc=$?
+  kill "$fwd" 2>/dev/null || true
+  return "$rc"
+}
+
+# THE ASSERTION THIS VARIANT EXISTS FOR. Quorum durability is refused
+# outright on a standalone range — "Quorum durability requires a configured
+# replica set" — so a produce that SUCCEEDS with it is proof the holder
+# really has followers and really reached a majority of them. Nothing else
+# in CI establishes that.
+R_EXPECTED=60
+log "producing with QUORUM durability, which a standalone range refuses"
+r_produce "$holder_ordinal" "$EPOCH" 1 "$R_EXPECTED" \
+  || fail "quorum produce failed; the range is not actually replicated"
+log "quorum produce accepted $R_EXPECTED records on candidate $holder_ordinal"
+
+# Every pod converges on the same offset — the holder because it acked, the
+# other two because quorum only proves a majority: a perfectly healthy write
+# returns while the third replica is still catching up, so this is POLLED
+# with a deadline rather than asserted once (an immediate assertion tests
+# the timing, not the replication, and flakes).
+await_all_committed() { # <expected>
+  local expected="$1" ordinal offset mport
+  for ordinal in 0 1 2; do
+    alloc_port; mport="$r_port"
+    forward_ns "$REPLICATED_NS" "${REL}-${ordinal}" "$mport" 9500
+    offset=""
+    for _ in $(seq 1 45); do
+      offset="$(committed_offset "$mport")"
+      [ "${offset:-0}" = "$expected" ] && break
+      sleep 2
+    done
+    [ "${offset:-0}" = "$expected" ] \
+      || fail "pod $ordinal has durably applied '${offset:-0}' of $expected records after 90s; replication is not reaching it"
+    log "pod $ordinal has durably applied all $expected records"
+  done
+}
+await_all_committed "$R_EXPECTED"
+log "replication verified in Kubernetes: quorum durability works and every replica holds the data"
+
+# THE FAILOVER THE TOPOLOGY EXISTS FOR (#284). Delete the holder's pod —
+# gracefully, so the #280 drain runs and the lease is RELEASED rather than
+# left to lapse — and the range must move (or provably come back) without
+# anyone re-rendering anything. Which surviving candidate wins is an
+# election's outcome; whichever it is, produce must resume against it and
+# every previously acknowledged record must still be there.
+log "deleting the holder's pod (candidate $holder_ordinal) to force a failover"
+kubectl -n "$REPLICATED_NS" delete pod "${REL}-${holder_ordinal}" >/dev/null
+
+# The recreated pod races the survivors for the vacated lease, and it CAN
+# legitimately win — StatefulSets restart fast, and a recovered holder
+# resuming its range is #284 working, not a test failure. The assertion is
+# that the range is HELD and SERVING again, not who holds it; scenario 14 in
+# the live-chaos suite already proves the takeover-by-a-survivor path with a
+# kill no orchestrator softens.
+read -r NEW_HOLDER NEW_EPOCH <<< "$(await_holder "$EPOCH")" \
+  || fail "no grant above epoch $EPOCH within 180s of deleting the holder: the range \
+did not move, so either the lease never came free or no candidate could take it"
+new_ordinal="$(ordinal_of "$NEW_HOLDER")"
+if [ "$NEW_HOLDER" = "$HOLDER" ]; then
+  log "the recreated pod won its own range back at epoch $NEW_EPOCH, above the pre-delete $EPOCH (a legitimate outcome of the race — the grant is new either way)"
+else
+  log "candidate $new_ordinal ($NEW_HOLDER) took the range at epoch $NEW_EPOCH — in place, no re-render, no upgrade"
+fi
+
+R_TOTAL=$((R_EXPECTED + 30))
+
+# PRODUCE FIRST, while the deleted pod is still coming back: with three
+# members a quorum is the holder plus one, so the range must keep serving
+# through the outage rather than waiting for the full set. Proving that is a
+# stronger claim than producing into a healed cluster, and it is the claim
+# operators actually care about.
+#
+# DEADLINE-POLLED, never one-shot. A freshly granted holder has to establish
+# its replication streams before any quorum write can land, so the first
+# attempts legitimately fail — this is the same retry-until-deadline shape
+# live-chaos scenario 09 and 14 use after every promotion, and the reason is
+# recorded there too. A single attempt tests the timing, not the failover
+# (which is exactly how this step first failed in CI).
+
+# Ready, un-terminating members. Echoes the count; FAILS when the API server
+# did not answer, so a caller can tell "nobody is Ready" from "nobody was
+# asked" — the same attribution rule `await_pods_exist` states above.
+ready_members() {
+  local pods
+  pods="$(kubectl -n "$REPLICATED_NS" get pods -l "app.kubernetes.io/instance=${REL}" \
+    -o jsonpath='{range .items[*]}{.metadata.deletionTimestamp}{"|"}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' \
+    2>/dev/null)" || return 1
+  printf '%s' "$pods" | grep -c '^|True$' || true
+}
+
+log "producing 30 more records against the post-failover holder, retrying until it lands"
+produce_deadline=$((SECONDS + 180))
+while :; do
+  # SAMPLED PER ATTEMPT, immediately before the produce it describes (review).
+  # The claim worth making is "the range served during the outage", and whether
+  # the replacement was still absent when the write landed is a race this test
+  # does not control — a fast StatefulSet restart is not a failure. So the
+  # member count is captured and NARRATED rather than asserted. Sampling it
+  # ONCE before the loop measured the wrong attempt: the retry deadline is
+  # 180s, long enough for the replacement to become Ready between the reading
+  # and the write, which would have reported a bare quorum that no write ever
+  # ran on. What survives the loop is the reading taken at the start of the
+  # attempt that actually landed.
+  members_at_write="$(ready_members || true)"
+  r_produce "$new_ordinal" "$NEW_EPOCH" 2 30 && break
+  [ "$SECONDS" -lt "$produce_deadline" ] || {
+    kubectl -n "$REPLICATED_NS" get pods || true
+    fail "produce never resumed against candidate $new_ordinal within 180s of the \
+failover: $(tail -3 "$WORK/r-produce.log" 2>/dev/null)"
+  }
+  sleep 3
+done
+case "${members_at_write:-0}" in
+  1 | 2)
+    log "produce resumed at epoch $NEW_EPOCH; the attempt that landed began with only \
+${members_at_write} of 3 members Ready — the range served through the outage on a bare quorum"
+    ;;
+  3)
+    log "produce resumed at epoch $NEW_EPOCH; the replacement was already back when the \
+winning attempt began, so this run did not exercise the degraded-quorum path (a fast restart, \
+not a failure)"
+    ;;
+  *)
+    # Zero Ready members cannot be true of a cluster that just accepted a
+    # quorum write, so this is the readiness QUERY having failed. Say that,
+    # rather than reporting a member count nobody measured.
+    log "produce resumed at epoch $NEW_EPOCH; how many members were Ready at the time is \
+unknown (the readiness query did not answer)"
+    ;;
+esac
+
+# NOW the returning pod must rejoin, because the convergence assertion below
+# is about it: with only two pods up, "a majority acked" and "everyone acked"
+# are the same claim and checking all three would prove nothing extra.
+#
+# Polled rather than `kubectl wait`, which can match the pod that is still
+# TERMINATING under the same name and return instantly — the recreated pod is
+# a different object, and waiting on the name alone is how this wait sailed
+# through in 4 seconds while the replacement had not started.
+# A FAILED QUERY IS NOT AN UNREADY POD — the rule `await_pods_exist` states
+# above, and which this loop broke on its first draft (review). Retrying is
+# right either way; the difference is ATTRIBUTION. Blaming the recreated pod
+# after four minutes in which the API server never answered accuses a
+# component nobody observed doing anything.
+returned=""
+answered=0
+ready=""
+for _ in $(seq 1 80); do
+  if ready="$(ready_members)"; then
+    answered=1
+    [ "${ready:-0}" -eq 3 ] && { returned="yes"; break; }
+  fi
+  sleep 3
+done
+[ -n "$returned" ] || {
+  kubectl -n "$REPLICATED_NS" get pods || true
+  if [ "$answered" -eq 1 ]; then
+    fail "the deleted pod never came back: only ${ready:-0} of 3 pods are Ready and \
+un-terminating after 240s"
+  else
+    fail "could not read pod readiness for 240s: the API server never answered, so \
+nothing is known about the recreated pod"
+  fi
+}
+log "the deleted pod rejoined; all three replicas are Ready again"
+
+# Every replica — INCLUDING the recreated pod — converges on the full total:
+# the 60 pre-delete records survived the failover, the 30 post-failover
+# records replicated, and the returned pod caught up from whatever it missed.
+await_all_committed "$R_TOTAL"
+log "failover verified in Kubernetes: the range moved (or recovered) without a re-render, produce resumed, and all $R_TOTAL records are on every replica"
 
 log "PASS"

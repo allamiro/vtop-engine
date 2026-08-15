@@ -19,3 +19,20 @@ data:
     rangeId: aaaaaaaa-0000-0000-0000-0000000000c1
   segmentId: aaaaaaaa-0000-0000-0000-0000000000d1
   principalId: aaaaaaaa-0000-0000-0000-0000000000ce
+
+# CI-ONLY SCHEDULING SIZE, never a recommendation. The chart's own defaults
+# (500m/512Mi requested) are what a real deployment should ask for, but this
+# test stands up SEVEN pods at once — three standalone, one neighbour, three
+# replicated — and 3.5 CPU of requests does not fit a two-vCPU runner. The
+# scheduler simply leaves one pod Pending, and its peers then fail DNS
+# resolution and crash-loop, which is the same failure reported three layers
+# from its cause (the note on the kind job in ci.yml records the diagnosis).
+#
+# Requests are a SCHEDULING claim, not a throttle, so lowering them here costs
+# the test nothing: the limits stay at the chart's defaults, and a pod may burst
+# to them exactly as in production. What it buys is a run that does not depend
+# on which runner size the job happens to land on.
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
