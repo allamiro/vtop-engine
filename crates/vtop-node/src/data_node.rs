@@ -2435,24 +2435,24 @@ mod tests {
                 }
             })
         };
-        let mut torn = 0usize;
-        let start = std::time::Instant::now();
         for _ in 0..5_000 {
             // `None` is the honest mid-transition answer and is allowed. What
             // must never happen is a reading that MIXES the two: an installed
             // role's presence with the empty view's values.
             if let Some(reading) = view.role_reading() {
-                if reading.held != 5 || !reading.leading || reading.meta != Some((5, true)) {
-                    torn += 1;
-                }
+                assert_eq!(
+                    reading.held, 5,
+                    "a reading taken from an installed role must carry that \
+                     role's epoch, never the empty view's zero"
+                );
+                assert!(
+                    reading.leading,
+                    "the installed role leads; only the empty view answers false"
+                );
+                assert_eq!(reading.meta, Some((5, true)));
             }
         }
-        let reader_elapsed = start.elapsed();
         churn.join().unwrap();
-        println!(
-            "INSTRUMENT torn={torn} reader_elapsed={reader_elapsed:?} churn_total={:?}",
-            start.elapsed()
-        );
     }
 
     /// A fresh directory creates the range's first segment under the
