@@ -96,8 +96,23 @@ grep -q "data_node_stopped role=leader" "$LEADER_LOG" \
 log "the departing leader released the lease and wrote its final commit boundary"
 
 # --- the replacement takes the RELEASED range -------------------------------
-F1_OFFSET="$(follower_committed_offset 1)"
-F2_OFFSET="$(follower_committed_offset 2)"
+# A READ THAT DID NOT ANSWER IS NOT AN OFFSET OF ZERO. This value chooses
+# which replica takes the range, so a failed scrape must stop the scenario
+# rather than nominate the replica whose endpoint merely went quiet — that
+# would hand the range to the follower WITHOUT the acknowledged floor, in a
+# scenario whose whole claim is that no acknowledged record is lost.
+# WAITED FOR, not sampled once: the gauge is legitimately absent for a moment
+# when a non-blocking read meets the append path, and right after this there
+# may be no earlier sample standing (review). A single read would abort a
+# healthy run; a deadline decides that a replica truly never answered.
+F1_OFFSET="$(await_follower_committed_offset 1)" \
+  || fail "follower 1 served no committed-offset sample after the orderly stop within \
+${PROGRESS_TIMEOUT_SECONDS}s, so which replica holds the acknowledged floor is unknown; \
+promoting on that would be a guess"
+F2_OFFSET="$(await_follower_committed_offset 2)" \
+  || fail "follower 2 served no committed-offset sample after the orderly stop within \
+${PROGRESS_TIMEOUT_SECONDS}s, so which replica holds the acknowledged floor is unknown; \
+promoting on that would be a guess"
 if [[ "$F1_OFFSET" -ge "$F2_OFFSET" ]]; then
   PROMOTE_N=1 PROMOTE_UUID="$FOLLOWER1_UUID" PROMOTE_PID="$F1"
   OTHER_N=2 OTHER_PID="$F2"

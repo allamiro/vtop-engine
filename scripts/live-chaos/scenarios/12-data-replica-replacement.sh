@@ -591,14 +591,20 @@ range was truncated, which is #315 reopened"
 # replacement that stops at the old sealed-prefix end now FAILS the scenario
 # instead of being tolerated with a caveat.
 SPARE_DEADLINE=$((SECONDS + PROGRESS_TIMEOUT_SECONDS))
-SPARE_OFFSET="$(follower_committed_offset 3)"
-while [[ "$SPARE_OFFSET" -lt "$ACKED" ]]; do
+# A POLL, so a scrape that did not answer simply is not progress — it keeps
+# the loop waiting rather than ending the scenario, which is the opposite of
+# what the same read means at a promotion decision. The empty string is kept
+# distinct from a number so the deadline message cannot report an offset
+# nobody read.
+SPARE_OFFSET="$(follower_committed_offset 3)" || SPARE_OFFSET=""
+while [[ -z "$SPARE_OFFSET" || "$SPARE_OFFSET" -lt "$ACKED" ]]; do
   [[ $SECONDS -lt $SPARE_DEADLINE ]] \
     || fail "the replacement kept $SPARE_SEALED sealed segment(s) but its committed offset \
-reads $SPARE_OFFSET, below the acknowledged floor of $ACKED; either the repaired range was \
-truncated (#315 reopened) or the sealed tail did not reach the replica (#306 reopened)"
+reads ${SPARE_OFFSET:-<no sample answered>}, below the acknowledged floor of $ACKED; either \
+the repaired range was truncated (#315 reopened) or the sealed tail did not reach the replica \
+(#306 reopened)"
   sleep 1
-  SPARE_OFFSET="$(follower_committed_offset 3)"
+  SPARE_OFFSET="$(follower_committed_offset 3)" || SPARE_OFFSET=""
 done
 log "the replacement survived the leader transition committed through $SPARE_OFFSET >= $ACKED \
 with $SPARE_SEALED sealed segment(s) — the repair carries the leader's WHOLE position, tail \
