@@ -1,0 +1,142 @@
+name: traffic
+
+# Capture repository traffic before GitHub drops it.
+#
+# GitHub keeps traffic for fourteen days. Every question worth asking about
+# where attention comes from spans longer than that, so the answer has to be
+# accumulated while it still exists — daily, and outside the fourteen-day
+# window's reach.
+#
+# IT DOES NOT WRITE TO `main`. Every change to main in this repository goes
+# through a pull request, and a bot appending a data file every day would break
+# that for no benefit: the data is not source, nothing builds against it, and a
+# daily commit in main's history makes `git log` worse at the one job it has.
+# It lives on an orphan branch instead, which carries data and nothing else.
+on:
+  schedule:
+    # 05:10 UTC. Off the hour on purpose: GitHub's scheduled runs queue heavily
+    # at :00, and a traffic collector has no reason to compete for that slot.
+    - cron: "10 5 * * *"
+  workflow_dispatch:
+
+concurrency:
+  # A manual run during the nightly one would race for the same branch tip.
+  group: traffic-collector
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    name: collect and accumulate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+
+      # THE TOKEN CANNOT BE THE DEFAULT ONE, and the failure if it is would be
+      # an opaque 403. Traffic endpoints require the repository's
+      # `Administration: read` permission, and a workflow GITHUB_TOKEN cannot be
+      # granted it — the `permissions:` block has no such scope.
+      #
+      # IT NEEDS TWO PERMISSIONS, not one. The same PAT is the credential for
+      # the push to `analytics-data`, which needs `Contents: write`; this job's
+      # GITHUB_TOKEN is deliberately `contents: read` and cannot stand in
+      # (review). A token with only Administration:read would read the traffic
+      # happily and then fail at publication every single night, which is the
+      # worst place for a permission to be missing — after the work, before the
+      # keeping.
+      - name: Check the traffic token is configured
+        env:
+          TRAFFIC_TOKEN: ${{ secrets.TRAFFIC_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TRAFFIC_TOKEN}" ]; then
+            echo "::error title=TRAFFIC_TOKEN is not set::Traffic collection needs a \
+          fine-grained PAT scoped to this repository with BOTH 'Administration: read' (to read \
+          the traffic endpoints, which the workflow GITHUB_TOKEN cannot be granted) and \
+          'Contents: write' (to publish to the analytics-data branch). Add it as the \
+          repository secret TRAFFIC_TOKEN and re-run."
+            exit 1
+          fi
+
+      - name: Collect
+        env:
+          GH_TOKEN: ${{ secrets.TRAFFIC_TOKEN }}
+          TRAFFIC_REPO: ${{ github.repository }}
+        run: scripts/traffic-snapshot.sh "$RUNNER_TEMP/traffic"
+
+      # Fetched, not checked out over the working tree: the orphan branch shares
+      # no history with main, and the accumulated files must be merged with what
+      # this run produced rather than either side replacing the other.
+      # Uses TRAFFIC_TOKEN, not GITHUB_TOKEN: this job holds `contents: read`
+      # on purpose, so the PAT is the only credential that can write here — and
+      # it needs `Contents: write` for exactly this step.
+      - name: Publish to the analytics-data branch
+        env:
+          GH_TOKEN: ${{ secrets.TRAFFIC_TOKEN }}
+        run: |
+          set -euo pipefail
+          BRANCH=analytics-data
+          WORK="$RUNNER_TEMP/data"
+          git config --global user.name "vtop-traffic-collector"
+          git config --global user.email "noreply@github.com"
+
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            git clone --branch "$BRANCH" --single-branch --depth 1 \
+              "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$WORK"
+            # Merge INTO the accumulated history: this run only ever saw the last
+            # fourteen days, so replacing the file would silently drop every day
+            # older than that — the exact loss this collector exists to prevent.
+            if [ -f "$WORK/analytics/traffic/daily.json" ]; then
+              cp "$WORK/analytics/traffic/daily.json" "$RUNNER_TEMP/prior-daily.json"
+              cp "$WORK/analytics/traffic/snapshots.json" "$RUNNER_TEMP/prior-snapshots.json" 2>/dev/null || true
+            fi
+          else
+            git init "$WORK"
+            git -C "$WORK" checkout --orphan "$BRANCH"
+            git -C "$WORK" remote add origin \
+              "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          fi
+
+          mkdir -p "$WORK/analytics/traffic"
+          # Re-run the collector against the accumulated files so the merge
+          # happens in the one place that knows how: the script.
+          if [ -f "$RUNNER_TEMP/prior-daily.json" ]; then
+            cp "$RUNNER_TEMP/prior-daily.json" "$WORK/analytics/traffic/daily.json"
+          fi
+          if [ -f "$RUNNER_TEMP/prior-snapshots.json" ]; then
+            cp "$RUNNER_TEMP/prior-snapshots.json" "$WORK/analytics/traffic/snapshots.json"
+          fi
+          TRAFFIC_REPO="$GITHUB_REPOSITORY" scripts/traffic-snapshot.sh "$WORK/analytics/traffic"
+
+          cd "$WORK"
+          git add analytics/traffic
+          # Nothing to say is not a failure: traffic can be identical to
+          # yesterday's reading, and an empty commit every night would be noise
+          # in the one place this data is supposed to be readable.
+          if git diff --cached --quiet; then
+            echo "no change in the accumulated traffic history"
+            exit 0
+          fi
+          git commit -m "traffic: $(date -u +%Y-%m-%d)"
+          git push origin "$BRANCH"
+
+      # THE MERGED REPORT, not the collection one. The first run writes only
+      # what this API window returned; the run against the accumulated branch
+      # writes the report whose daily table actually spans everything the
+      # collector has ever seen. Summarising the former would show a table
+      # claiming full history while silently dropping every day older than
+      # fourteen (review). Falls back only if the publish step never ran.
+      - name: Summary
+        if: always()
+        run: |
+          set -euo pipefail
+          for candidate in "$RUNNER_TEMP/data/analytics/traffic/README.md" \
+                           "$RUNNER_TEMP/traffic/README.md"; do
+            if [ -f "$candidate" ]; then
+              cat "$candidate" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          done

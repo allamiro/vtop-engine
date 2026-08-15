@@ -189,6 +189,11 @@ jobs:
               # unlinted-shell hole the live-chaos entry below exists to close.
               - 'scripts/k8s-smoke.sh'
               - 'scripts/e2e-smoke.sh'
+              # The traffic collector, for the same reason and by the same
+              # mistake: it was added to the shellcheck step without being
+              # added here, so a PR touching only the collector would have
+              # skipped the lint it was added for (review).
+              - 'scripts/traffic-snapshot.sh'
               # The release-notes generator only ever runs during a tag build,
               # where a failure means a published release with a broken body and
               # no second chance to get it right before people see it. Lint it
@@ -775,7 +780,8 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/mnt" -w /mnt \
             koalaman/shellcheck:v0.11.0 docker/*.sh scripts/release-notes.sh \
-            scripts/k8s-smoke.sh scripts/e2e-smoke.sh scripts/upgrade-compat.sh
+            scripts/k8s-smoke.sh scripts/e2e-smoke.sh scripts/upgrade-compat.sh \
+            scripts/traffic-snapshot.sh
 
       # `-P scripts/live-chaos/scenarios` resolves the scenarios' dynamic
       # `source "$(dirname …)/../lib.sh"`. Without it every scenario reports
