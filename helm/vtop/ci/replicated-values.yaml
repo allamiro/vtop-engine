@@ -35,3 +35,13 @@ data:
     enabled: true
     # Metadata's UUID for the topic, NOT the wire name in data.range.topic.
     topicUuid: aaaaaaaa-0000-0000-0000-0000000000f1
+
+# CI-only scheduling size, for the reason recorded in `default-values.yaml`:
+# these three pods share a runner with the four the earlier phases left
+# standing, and the chart's production requests do not fit seven of them on a
+# two-vCPU node. Limits are untouched, so the replicated phase still bursts
+# exactly as a real one would.
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
