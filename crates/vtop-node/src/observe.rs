@@ -942,14 +942,44 @@ pub trait ReplicaObservation: Send + Sync {
     /// object is the answer: a broker leads, a follower does not.
     fn is_leading(&self) -> bool;
 
-    /// Whether any role owns the range right now. A concrete role always
-    /// does — it IS the role — so only a switching view mid-transition
-    /// answers false, and the distinction matters: "nobody owns this yet"
-    /// is knowledge, while a contended lock is ignorance, and the two call
-    /// for opposite treatment of an authorization gauge (review).
-    fn has_role(&self) -> bool {
-        true
+    /// Everything the authorization gauges are derived from, AS ONE
+    /// OBSERVATION. `None` means no role owns the range right now.
+    ///
+    /// A concrete role always owns it — it IS the role — so the default
+    /// composes its own accessors and can never answer `None`. Only a
+    /// switching view mid-transition has an identity to lose, and the
+    /// distinction matters twice over: "nobody owns this yet" is knowledge
+    /// while a contended lock is ignorance, and the two call for opposite
+    /// treatment of an authorization gauge (review).
+    ///
+    /// It is ONE call rather than an ownership question followed by three
+    /// answers because asking separately let a transition land in the middle
+    /// (review): a scrape could read "a role owns this", then have `clear()`
+    /// land, and go on to publish the empty view's held epoch of 0 beside the
+    /// departed leader's `lease_active` of 1 — a rewound monotonic gauge and a
+    /// false leaseholder, the exact pair the conditional writes below exist to
+    /// prevent. A switching view overrides this to answer under ONE lock
+    /// acquisition, which makes that interleaving unrepresentable rather than
+    /// merely unlikely.
+    fn role_reading(&self) -> Option<RoleReading> {
+        Some(RoleReading {
+            meta: self.try_meta_fencing_epoch(),
+            held: self.held_fencing_epoch(),
+            leading: self.is_leading(),
+        })
     }
+}
+
+/// One role's answer to every authorization question a scrape asks, taken at
+/// one instant (#284).
+pub struct RoleReading {
+    /// `(epoch, lease_active)` from metadata, `None` under contention — the
+    /// same ignorance a `try_` accessor reports, and treated the same way.
+    pub meta: Option<(u64, bool)>,
+    /// The epoch this role was granted or adopted.
+    pub held: u64,
+    /// Whether this replica SERVES the range.
+    pub leading: bool,
 }
 
 impl ReplicaObservation for LocalBroker {
@@ -1099,54 +1129,61 @@ impl CandidateCollector {
                 .with_label_values(&range)
                 .set(cluster as i64);
         }
-        // The metadata snapshot BEFORE the held epoch, matching the leader's
-        // collector for the reason recorded there: both writes are monotonic
-        // and promotion orders them, so this order can never report ownership
-        // for a replica still mid-promotion.
-        let has_role = self.view.has_role();
-        let snapshot = self.view.try_meta_fencing_epoch();
-        let held = self.view.held_fencing_epoch();
-        let leading = self.view.is_leading();
-        // Only while a role owns the range: mid-transition the switching view
-        // answers 0, and writing that would rewind a monotonic gauge to a
-        // number this replica left long ago. The last known epoch standing
-        // is the honest reading, exactly as for the offsets.
-        if has_role {
-            self.held_fencing_epoch
-                .with_label_values(&range)
-                .set(held as i64);
-        }
-        if !has_role {
-            // NOT the same as a contended read (review). Between roles this
-            // replica is certainly not the authorized holder, and leaving the
-            // previous 1 standing would advertise a leaseholder through a
-            // transition whose quiesce and reopen can stall on disk — a false
-            // claim that outlives the moment it was true. Ignorance keeps the
-            // last value; knowledge writes it down.
-            self.lease_active.with_label_values(&range).set(0);
-        }
-        if let Some((epoch, active)) = snapshot {
-            self.meta_fencing_epoch
-                .with_label_values(&range)
-                .set(epoch as i64);
-            // AUTHORIZATION, exactly as the leader's collector defines it —
-            // and with one more term, because a candidate can be neither
-            // fenced nor the holder. A FOLLOWING candidate adopts the
-            // holder's granted epoch and activates its view at it (that is
-            // how it accepts replication), so `active && epoch == held` is
-            // true on all three replicas at once: without the role term this
-            // gauge would report three leaseholders for one range and tell
-            // an operator the opposite of what two of them will do with a
-            // produce (review).
-            if has_role {
-                self.lease_active
+        // ONE observation of the role rather than an ownership question
+        // followed by three answers, so a transition cannot land in the middle
+        // of a scrape and have it publish half of each role (review; the
+        // reasoning is on `ReplicaObservation::role_reading`). Inside it, the
+        // metadata snapshot is still taken BEFORE the held epoch, matching the
+        // leader's collector for the reason recorded there: both writes are
+        // monotonic and promotion orders them, so this order can never report
+        // ownership for a replica still mid-promotion.
+        match self.view.role_reading() {
+            Some(RoleReading {
+                meta,
+                held,
+                leading,
+            }) => {
+                self.held_fencing_epoch
                     .with_label_values(&range)
-                    .set(i64::from(active && epoch == held && leading));
+                    .set(held as i64);
+                if let Some((epoch, active)) = meta {
+                    self.meta_fencing_epoch
+                        .with_label_values(&range)
+                        .set(epoch as i64);
+                    // AUTHORIZATION, exactly as the leader's collector defines
+                    // it — and with one more term, because a candidate can be
+                    // neither fenced nor the holder. A FOLLOWING candidate
+                    // adopts the holder's granted epoch and activates its view
+                    // at it (that is how it accepts replication), so `active &&
+                    // epoch == held` is true on all three replicas at once:
+                    // without the role term this gauge would report three
+                    // leaseholders for one range and tell an operator the
+                    // opposite of what two of them will do with a produce
+                    // (review).
+                    self.lease_active
+                        .with_label_values(&range)
+                        .set(i64::from(active && epoch == held && leading));
+                }
+                self.leading
+                    .with_label_values(&range)
+                    .set(i64::from(leading));
+            }
+            None => {
+                // BETWEEN ROLES, and that is NOT the same as a contended read
+                // (review). This replica is certainly not the authorized
+                // holder, and leaving the previous 1 standing would advertise a
+                // leaseholder through a transition whose quiesce and reopen can
+                // stall on disk — a false claim that outlives the moment it was
+                // true. Ignorance keeps the last value; knowledge writes it
+                // down.
+                self.lease_active.with_label_values(&range).set(0);
+                self.leading.with_label_values(&range).set(0);
+                // The epoch gauges keep their last reading on purpose: the
+                // switching view would answer 0, and writing that rewinds a
+                // monotonic gauge to a number this replica left long ago,
+                // which reads as a replica that lost its history.
             }
         }
-        self.leading
-            .with_label_values(&range)
-            .set(i64::from(leading));
     }
 }
 
@@ -1608,8 +1645,8 @@ mod tests {
             fn is_leading(&self) -> bool {
                 false
             }
-            fn has_role(&self) -> bool {
-                false
+            fn role_reading(&self) -> Option<RoleReading> {
+                None
             }
         }
         let between = Registry::new_custom(Some("vtop".into()), None).unwrap();
@@ -1631,6 +1668,85 @@ mod tests {
             "the held epoch must not be rewound to zero mid-transition — a \
              monotonic gauge that goes backwards reads as a replica that lost \
              its history: {text}"
+        );
+    }
+
+    /// A scrape asks the role ONCE. Asking whether a role owns the range and
+    /// then asking that role three questions is four reads, and a transition
+    /// landing between them makes the collector publish half of each role: the
+    /// empty view's held epoch of 0 written as though a role gave it (a
+    /// monotonic gauge rewound), beside the departed leader's `lease_active`
+    /// of 1 that the no-role reset was skipped for.
+    ///
+    /// The interleaving cannot be reproduced deterministically, so the pin is
+    /// STRUCTURAL: the collector must not reach past `role_reading()` for any
+    /// value that decides authorization. A fake that counts both is the only
+    /// way to assert that from outside.
+    #[test]
+    fn a_scrape_reads_the_role_through_one_observation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct Counting {
+            readings: AtomicUsize,
+            piecemeal: AtomicUsize,
+        }
+        impl ReplicaObservation for Counting {
+            fn try_local_offsets(&self) -> Option<(u64, u64)> {
+                Some((7, 8))
+            }
+            fn cluster_committed_offset(&self) -> Option<u64> {
+                Some(7)
+            }
+            fn try_meta_fencing_epoch(&self) -> Option<(u64, bool)> {
+                self.piecemeal.fetch_add(1, Ordering::SeqCst);
+                Some((4, true))
+            }
+            fn held_fencing_epoch(&self) -> u64 {
+                self.piecemeal.fetch_add(1, Ordering::SeqCst);
+                4
+            }
+            fn is_leading(&self) -> bool {
+                self.piecemeal.fetch_add(1, Ordering::SeqCst);
+                true
+            }
+            fn role_reading(&self) -> Option<RoleReading> {
+                self.readings.fetch_add(1, Ordering::SeqCst);
+                Some(RoleReading {
+                    meta: Some((4, true)),
+                    held: 4,
+                    leading: true,
+                })
+            }
+        }
+
+        let range = test_range();
+        let view = Arc::new(Counting::default());
+        let registry = Registry::new_custom(Some("vtop".into()), None).unwrap();
+        registry
+            .register(Box::new(
+                CandidateCollector::new(Arc::clone(&view) as Arc<dyn ReplicaObservation>, &range)
+                    .unwrap(),
+            ))
+            .unwrap();
+        let text = scrape(&registry);
+
+        assert_eq!(
+            view.readings.load(Ordering::SeqCst),
+            1,
+            "one scrape must take exactly one observation of the role"
+        );
+        assert_eq!(
+            view.piecemeal.load(Ordering::SeqCst),
+            0,
+            "the collector must not reach past role_reading() for the values \
+             that decide authorization — reading them separately is what let a \
+             role change land mid-scrape"
+        );
+        assert!(
+            text.lines()
+                .any(|line| line.starts_with("vtop_broker_lease_active{") && line.ends_with(" 1")),
+            "the one observation must still drive the gauges: {text}"
         );
     }
 

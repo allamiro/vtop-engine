@@ -2100,11 +2100,28 @@ impl crate::observe::ReplicaObservation for SwitchingLocalView {
             .is_some_and(|view| view.is_leading())
     }
 
-    fn has_role(&self) -> bool {
-        self.delegate
+    /// ONE acquisition for the whole reading, which is the point of it
+    /// (review). Asked question by question, `clear()` could land between "is
+    /// a role installed?" and the answers, and the scrape would publish this
+    /// view's empty answers — held epoch 0, leading false — as though a role
+    /// had given them, rewinding a monotonic gauge and leaving the departed
+    /// leader's `lease_active` of 1 standing beside it. Holding the read lock
+    /// across all three makes that interleaving unrepresentable.
+    ///
+    /// Safe to hold it across them because every call under this guard is an
+    /// atomic load or a `try_` read: the guard cannot park a transition behind
+    /// a scrape, which is the direction that would actually hurt.
+    fn role_reading(&self) -> Option<crate::observe::RoleReading> {
+        let delegate = self
+            .delegate
             .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_some()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let view = delegate.as_ref()?;
+        Some(crate::observe::RoleReading {
+            meta: view.try_meta_fencing_epoch(),
+            held: view.held_fencing_epoch(),
+            leading: view.is_leading(),
+        })
     }
 }
 
@@ -2363,6 +2380,79 @@ mod tests {
             key: b"key".to_vec(),
             value: format!("value-{sequence}").into_bytes(),
         }
+    }
+
+    /// A scrape racing a role transition never sees half a role.
+    ///
+    /// The switching view answers every authorization question under one lock
+    /// acquisition, so a reading either comes wholly from an installed role or
+    /// is `None`. Asked question by question it could straddle a `clear()`, and
+    /// the collector would publish this view's empty answers — held epoch 0,
+    /// leading false — as though a role had given them (review).
+    ///
+    /// The race is real but rare, so this hammers it: 5000 transitions against
+    /// 5000 readings. A regression that split the reading back into separate
+    /// lock acquisitions fails here intermittently rather than never.
+    #[test]
+    fn a_scrape_racing_a_transition_never_sees_half_a_role() {
+        use crate::observe::ReplicaObservation as _;
+
+        struct Leading;
+        impl crate::lease_agent::CandidateLocalView for Leading {
+            fn local_committed_offset(&self) -> u64 {
+                12
+            }
+            fn epoch_starts(&self) -> Vec<vtop_broker::fencing_epochs::EpochStart> {
+                Vec::new()
+            }
+        }
+        impl crate::observe::ReplicaObservation for Leading {
+            fn try_local_offsets(&self) -> Option<(u64, u64)> {
+                Some((12, 13))
+            }
+            fn cluster_committed_offset(&self) -> Option<u64> {
+                Some(12)
+            }
+            fn try_meta_fencing_epoch(&self) -> Option<(u64, bool)> {
+                Some((5, true))
+            }
+            fn held_fencing_epoch(&self) -> u64 {
+                5
+            }
+            fn is_leading(&self) -> bool {
+                true
+            }
+        }
+
+        let view = Arc::new(SwitchingLocalView::empty());
+        view.install(Arc::new(Leading));
+        let churn = {
+            let view = Arc::clone(&view);
+            std::thread::spawn(move || {
+                for _ in 0..5_000 {
+                    view.clear();
+                    view.install(Arc::new(Leading));
+                }
+            })
+        };
+        let mut torn = 0usize;
+        let start = std::time::Instant::now();
+        for _ in 0..5_000 {
+            // `None` is the honest mid-transition answer and is allowed. What
+            // must never happen is a reading that MIXES the two: an installed
+            // role's presence with the empty view's values.
+            if let Some(reading) = view.role_reading() {
+                if reading.held != 5 || !reading.leading || reading.meta != Some((5, true)) {
+                    torn += 1;
+                }
+            }
+        }
+        let reader_elapsed = start.elapsed();
+        churn.join().unwrap();
+        println!(
+            "INSTRUMENT torn={torn} reader_elapsed={reader_elapsed:?} churn_total={:?}",
+            start.elapsed()
+        );
     }
 
     /// A fresh directory creates the range's first segment under the
