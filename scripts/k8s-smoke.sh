@@ -857,19 +857,33 @@ R_TOTAL=$((R_EXPECTED + 30))
 # live-chaos scenario 09 and 14 use after every promotion, and the reason is
 # recorded there too. A single attempt tests the timing, not the failover
 # (which is exactly how this step first failed in CI).
-# What the write actually ran against, recorded rather than asserted. The
-# claim worth making is "the range served during the outage", and whether the
-# replacement was still absent when the write landed is a race this test does
-# not control — a fast StatefulSet restart is not a failure. So the member
-# count is captured and NARRATED: a run that says "2 of 3" proves the
-# degraded path, and one that says "3 of 3" says plainly that it did not,
-# instead of printing a claim nobody checked (review).
-members_at_write="$(kubectl -n "$REPLICATED_NS" get pods -l "app.kubernetes.io/instance=${REL}" \
-  -o jsonpath='{range .items[*]}{.metadata.deletionTimestamp}{"|"}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' \
-  2>/dev/null | grep -c '^|True$' || true)"
+
+# Ready, un-terminating members. Echoes the count; FAILS when the API server
+# did not answer, so a caller can tell "nobody is Ready" from "nobody was
+# asked" — the same attribution rule `await_pods_exist` states above.
+ready_members() {
+  local pods
+  pods="$(kubectl -n "$REPLICATED_NS" get pods -l "app.kubernetes.io/instance=${REL}" \
+    -o jsonpath='{range .items[*]}{.metadata.deletionTimestamp}{"|"}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' \
+    2>/dev/null)" || return 1
+  printf '%s' "$pods" | grep -c '^|True$' || true
+}
+
 log "producing 30 more records against the post-failover holder, retrying until it lands"
 produce_deadline=$((SECONDS + 180))
-until r_produce "$new_ordinal" "$NEW_EPOCH" 2 30; do
+while :; do
+  # SAMPLED PER ATTEMPT, immediately before the produce it describes (review).
+  # The claim worth making is "the range served during the outage", and whether
+  # the replacement was still absent when the write landed is a race this test
+  # does not control — a fast StatefulSet restart is not a failure. So the
+  # member count is captured and NARRATED rather than asserted. Sampling it
+  # ONCE before the loop measured the wrong attempt: the retry deadline is
+  # 180s, long enough for the replacement to become Ready between the reading
+  # and the write, which would have reported a bare quorum that no write ever
+  # ran on. What survives the loop is the reading taken at the start of the
+  # attempt that actually landed.
+  members_at_write="$(ready_members || true)"
+  r_produce "$new_ordinal" "$NEW_EPOCH" 2 30 && break
   [ "$SECONDS" -lt "$produce_deadline" ] || {
     kubectl -n "$REPLICATED_NS" get pods || true
     fail "produce never resumed against candidate $new_ordinal within 180s of the \
@@ -879,12 +893,13 @@ failover: $(tail -3 "$WORK/r-produce.log" 2>/dev/null)"
 done
 case "${members_at_write:-0}" in
   1 | 2)
-    log "produce resumed at epoch $NEW_EPOCH with only ${members_at_write} of 3 members Ready — \
-the range served through the outage on a bare quorum"
+    log "produce resumed at epoch $NEW_EPOCH; the attempt that landed began with only \
+${members_at_write} of 3 members Ready — the range served through the outage on a bare quorum"
     ;;
   3)
-    log "produce resumed at epoch $NEW_EPOCH; the replacement was already back, so this run \
-did not exercise the degraded-quorum path (a fast restart, not a failure)"
+    log "produce resumed at epoch $NEW_EPOCH; the replacement was already back when the \
+winning attempt began, so this run did not exercise the degraded-quorum path (a fast restart, \
+not a failure)"
     ;;
   *)
     # Zero Ready members cannot be true of a cluster that just accepted a
@@ -910,12 +925,10 @@ esac
 # component nobody observed doing anything.
 returned=""
 answered=0
+ready=""
 for _ in $(seq 1 80); do
-  if pods="$(kubectl -n "$REPLICATED_NS" get pods -l "app.kubernetes.io/instance=${REL}" \
-    -o jsonpath='{range .items[*]}{.metadata.deletionTimestamp}{"|"}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' \
-    2>/dev/null)"; then
+  if ready="$(ready_members)"; then
     answered=1
-    ready="$(printf '%s' "$pods" | grep -c '^|True$' || true)"
     [ "${ready:-0}" -eq 3 ] && { returned="yes"; break; }
   fi
   sleep 3

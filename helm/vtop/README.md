@@ -43,10 +43,53 @@ The rendered config is exactly the co-located schema the binary accepts
 `observability:`** block. Per-role observability blocks are rejected by the
 binary, and this chart never emits them.
 
-Each pod's data role runs an independent **standalone** range — the same
-shape the upstream co-located harness runs, because replicated ranges under
-co-location wait on follower-side epoch propagation upstream. The chart does
-not offer a topology it cannot back.
+## Topology: one range, or one range per pod
+
+`data.topology` selects what the pods' data roles are. Both shapes are
+exercised by `scripts/k8s-smoke.sh` against a live cluster.
+
+| Value | What it renders | What you get |
+|---|---|---|
+| `standalone` (default) | `role: standalone` on every pod, no replica peers | Each pod serves an **independent** range: three replicas are three separate logs. Quorum durability is refused, and a pod nobody produced to stays empty. The default because it needs no coordination and cannot half-work. |
+| `replicated` | `role: candidate` on every pod, one shared peer list (self included — the binary skips its own entry, and identical lists keep the rendered configs diffable) | **One** range across the pods (#284). The role follows the metadata lease inside the binary: whichever pod acquires the range leads and the rest follow it. When the holder dies a surviving candidate takes the range **in place** — no re-render, no `helm upgrade`, no restart. |
+
+`replicated` requires two other values, and both are enforced at render time
+rather than left to fail in the cluster:
+
+- **`data.lease.enabled: true`** (with `data.lease.topicUuid`) — candidates
+  take the range *through* the lease, so without it no pod would ever lead.
+- **`data.fencingEpoch: 0`** — grants are minted from 1, so a static floor at
+  or above the first grant refuses the very grant that makes a candidate lead.
+
+`data.leaderOrdinal` is **retired** and now fails the render in *every*
+topology. The chart used to freeze `role: leader` on one ordinal, which made
+failover a re-render and a restart; the role now lives in the binary, and a
+value that used to steer it must not be silently ignored.
+
+`ci/replicated-values.yaml` in this chart is a complete, copyable example —
+it is what CI renders and what the smoke test installs.
+
+### Bootstrap order under `replicated`
+
+Candidates learn everything from the metadata plane, so **every pod stays NOT
+READY until `vtopctl meta init` has run and the topic, range, and node
+registrations exist.** That is correct, not a broken install: a candidate that
+has never completed a metadata exchange does not know the current epoch, and a
+range metadata says does not exist withholds readiness for as long as that is
+true. Bootstrap first and wait for Ready after — waiting first deadlocks
+against the very steps that open the gate. The post-install NOTES print the
+exact commands, including registering each node at its **own** headless FQDN.
+
+Which pod holds the range is an election's outcome, never a rendered fact, so
+ask metadata for the holder rather than assuming an ordinal:
+
+```bash
+vtopctl --json meta range-lease \
+  --topic-uuid <data.lease.topicUuid> --range-uuid <data.range.rangeId> \
+  --config admin.yaml
+```
+
+then aim produce/fetch at that holder's own headless FQDN on the native port.
 
 ## TLS: required, never defaulted
 
@@ -114,9 +157,15 @@ alongside #280.
 ## Verifying a real deployment
 
 `scripts/k8s-smoke.sh` installs the chart against a live cluster and asserts
-what rendering cannot: pods reach Ready, the Raft group bootstraps and elects a
-leader, records stream and the committed offset matches what was produced, each
-pod is an independent range, and every record survives a force-deleted pod.
+what rendering cannot. **Standalone:** pods reach Ready, the Raft group
+bootstraps and elects a leader, records stream and the committed offset matches
+what was produced, each pod is an independent range, and every record survives
+a force-deleted pod. **Replicated:** quorum durability — refused outright on a
+standalone range — succeeds, every replica converges on the produced offset,
+and deleting the pod that holds the lease moves the range: the test asks
+metadata who holds it now, resumes producing against that holder while the
+deleted pod is still coming back, and requires all three replicas (the
+recreated one included) to converge on the full total.
 
 ```
 docker build -f docker/Dockerfile -t vtop-engine:local .
@@ -214,14 +263,16 @@ certificates also carry that Service's DNS name as a shared SAN.
 | `meta.timers.heartbeatIntervalMs` | `60` | |
 | `meta.adminAuthorization.enabled` | `false` | `false` = block absent: authenticate-only, node warns at startup. `true` + empty list = **nobody** may run cluster-scoped commands (enforced as written). |
 | `meta.adminAuthorization.operatorCommonNames` | `[]` | Certificate CNs allowed cluster-scoped admin commands. |
-| `data.fencingEpoch` | `1` | Static epoch; only a floor when the lease drives leadership. |
+| `data.topology` | `standalone` | `standalone` = one independent range per pod; `replicated` = one range, every pod a candidate, role from the lease (section above). |
+| `data.leaderOrdinal` | — **retired** | Setting it fails the render in every topology; the role lives in the binary now. |
+| `data.fencingEpoch` | `1` | Static epoch; only a floor when the lease drives leadership. **Must be `0` under `replicated`** (grants are minted from 1). |
 | `data.range.topic` | — **required** | Wire-level topic name. |
 | `data.range.topicEpoch` | `1` | |
 | `data.range.rangeId` | — **required** | Range UUID. |
 | `data.range.rangeGeneration` | `0` | |
 | `data.segmentId` | — **required** | Segment UUID. |
 | `data.principalId` | — **required** | The one client principal accepted (= client cert CN). Never defaulted. |
-| `data.lease.enabled` | `false` | Metadata-driven leadership (#223); credential is the node's own data cert. |
+| `data.lease.enabled` | `false` | Metadata-driven leadership (#223); credential is the node's own data cert. **Required under `replicated`.** |
 | `data.lease.adminEndpoint` | `127.0.0.1:9200` | Local admin listener — legitimate under co-location. |
 | `data.lease.serverName` | `""` | Falls back to `tls.serverName`, then the pod's own FQDN. |
 | `data.lease.topicUuid` | — **required when enabled** | Metadata's topic UUID (not the wire name). |
