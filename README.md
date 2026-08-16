@@ -811,4 +811,19 @@ Not implemented yet:
 
 ## License
 
-[MIT](LICENSE) © 2026 Tamir Suliman.
+**[MIT](LICENSE) © 2026 Tamir Suliman** — and today that covers the entire
+engine.
+
+The repository is set up as **dual-licensed** so the boundary is written down
+before there is anything on the other side of it: directories named `ee/`, and
+files carrying the header `VTOP Engine Enterprise Edition`, fall under
+[LICENSE-EE](LICENSE-EE) instead, which permits evaluation, development and
+testing but requires a commercial subscription for production use. **No `ee/`
+directory exists yet**, so nothing in this repository is currently under those
+terms.
+
+Three rules bound it, stated in [COMMERCIAL.md](COMMERCIAL.md): code that is
+MIT stays MIT, the core must build and pass CI with `ee/` deleted, and anything
+whose absence could lose or corrupt acknowledged data — durability, fencing,
+replication, failover, verification — stays in the core. Paying is for
+operating at scale, not for not losing data.
