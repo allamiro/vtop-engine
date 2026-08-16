@@ -126,6 +126,32 @@ else
 fi
 log "follower offsets: f1=$F1_OFFSET f2=$F2_OFFSET; promoting follower $PROMOTE_N"
 
+# THE GAP THE PROMOTION OPENS, recorded because it decides whether the rest of
+# this run can converge at all (#340). Promoting the replica that holds the
+# acknowledged floor is correct and not negotiable — it is what keeps the
+# floor readable — but when the two followers sit at different offsets it
+# leaves the SURVIVOR below the new leader's tip by the difference. A follower
+# only applies a batch whose expected_base_offset equals its own next_offset,
+# and a leader can only close such a gap out of its in-memory retransmission
+# buffer, which a process that has just been promoted never filled for offsets
+# it never sent. Promotion advances the committed watermark; it does not
+# truncate the new leader's log back to the proven floor. So a non-zero gap
+# here is the configuration the node config already documents as unrepairable
+# in place — "behind a leader promoted after the gap opened ... needs its data
+# directory restored from a peer" — and is tracked on #255.
+# BOTH OFFSETS ARE KNOWN-GOOD BY CONSTRUCTION, and this arithmetic depends on
+# it: an unread offset that had been substituted with 0 would fabricate a gap
+# out of two replicas standing level, and the verdict below would then declare
+# — definitively, ahead of every other piece of evidence — that quorum was
+# impossible at any deadline (review). It cannot happen here because the reads
+# above fail the scenario by name rather than returning a number nobody read.
+# If those reads ever stop doing that, this line stops being sound.
+REJOIN_GAP=$((F1_OFFSET > F2_OFFSET ? F1_OFFSET - F2_OFFSET : F2_OFFSET - F1_OFFSET))
+if [[ "$REJOIN_GAP" -gt 0 ]]; then
+  log "NOTE: follower $OTHER_N is $REJOIN_GAP record(s) behind the promoted replica, so it \
+starts below the new leader's tip (the #255 window)"
+fi
+
 # The original follower process must be gone before another process opens the
 # same active segment; a promotion is a handoff, not a second writer.
 stop_node_now "$PROMOTE_PID"
@@ -177,13 +203,194 @@ VERIFY_CFG="$(emit_client_config_at_epoch "$EPOCH_AFTER" "$VERIFY_PRODUCER_EPOCH
 # asynchronously, so the first attempt can legitimately find zero followers
 # durable — that is the stream still connecting, not a durability failure. A
 # single attempt here made the scenario depend on winning that race.
+#
+# EVERY ATTEMPT ALSO SAMPLES THE LEADER'S VIEW OF THE REJOINING FOLLOWER —
+# the evidence #340 needed and did not have. That failure reads
+#
+#   produce rejected: Overloaded quorum not reached: 0 follower ack(s)
+#
+# and despite the error code this is NOT admission control refusing work: by
+# the time it is emitted the leader has already appended AND fsynced those
+# records into its own log, and what expired is its bounded wait for follower
+# acknowledgements (2s per follower, not configurable on a deployed node). The
+# count is of ack tasks that returned true, and it reaches zero through five
+# paths a produce error cannot tell apart — no stream, a stream that timed
+# out, a follower that acked but still trails the leader's tip, a refusal
+# (fencing looks exactly like silence here), and back-pressure inside the
+# leader. "The follower is slow on a disk somebody else is saturating" and
+# "the follower never rejoined" are two of those, they point at different
+# bugs, and the soak that followed #340 could not choose between them because
+# it never reproduced: 40/40 passed. So the next occurrence chooses for
+# itself, the way #318's lease wait was taught to report what it observed
+# rather than only its last read.
+#
+# The discriminator is published by the leader, per follower: `connected` is
+# whether it holds a replication stream at all, `durable_offset` is what that
+# follower has acknowledged. The promoted leader serves them on the range's
+# own metrics address and is configured with exactly ONE follower, so an
+# unlabelled read cannot pick up the wrong one.
+LEADER_METRICS="$(data_metrics_addr 0)"
+stream_seen=0
+stream_last=""
+durable_first=""
+durable_prev=""
+durable_last=""
+durable_seen=0
+last_read_answered=0
+reads_ok=0
+reads_failed=0
+
+# ONE SCRAPE PER SAMPLE, not one per gauge (review). Two reasons, and both
+# matter more than the line count:
+#
+#   COHERENCE — `connected` and `durable_offset` describe the same follower at
+#   the same instant only if they come out of the same response. Read
+#   separately they can straddle a reconnect, and the verdict below is built
+#   out of exactly that pair.
+#
+#   THE BOUND — this runs inside a loop whose deadline the failure message
+#   quotes. Two scrapes at curl's 5s ceiling could push a run 10s past the
+#   bound it advertises, per attempt, and the low CHAOS_PROGRESS_TIMEOUT_SECONDS
+#   values the harness supports are where that reads worst. One scrape, and its
+#   timeout clamped to what is actually left, means diagnosing the failure
+#   cannot outlast the failure's own deadline.
+#
+# It also sidesteps a hazard in the shared helper: `metric_value` pipes curl
+# into `grep -m1`, and grep exiting on the first match can SIGPIPE a curl still
+# writing a large /metrics body — which under `pipefail` marks a GOOD sample as
+# a failed read. Parsing a captured body has no pipeline to fail.
+sample_rejoining_follower() { # <seconds-left>
+  local budget="$1" body connected durable
+  # NO TIME LEFT MEANS NO OBSERVATION, and the freshness flag has to say so.
+  # The final produce attempt can itself cross the deadline, and returning here
+  # while `last_read_answered` still holds the PREVIOUS attempt's 1 would let
+  # the verdict describe the follower "at the deadline" from a sample taken
+  # before a multi-second produce (review).
+  if [[ "$budget" -le 0 ]]; then
+    last_read_answered=0
+    return 0
+  fi
+  [[ "$budget" -gt 5 ]] && budget=5
+  # A SCRAPE THAT FAILED IS IGNORANCE, not a follower that is disconnected —
+  # counted apart so a run whose leader stopped answering can never be
+  # reported as a stream that never came up (the distinction #318 exists to
+  # preserve, and the reason follower_committed_offset is not used here: it
+  # collapses an unreachable node into a legitimate offset of 0).
+  if ! body="$(curl -s --max-time "$budget" "http://$LEADER_METRICS/metrics" 2>/dev/null)" \
+    || [[ -z "$body" ]]; then
+    reads_failed=$((reads_failed + 1))
+    last_read_answered=0
+    return 0
+  fi
+  reads_ok=$((reads_ok + 1))
+  last_read_answered=1
+  # TWO FACTS, not one. `stream_seen` is sticky — it answers "was there ever a
+  # stream", which is what separates a rejoin that never happened from one that
+  # did. `stream_last` is the state at the most recent answering scrape, which
+  # is what any claim ABOUT THE DEADLINE has to rest on: a follower that
+  # connected, advanced, and then dropped would otherwise be reported as still
+  # catching up on the strength of history, while the newest coherent sample
+  # said its stream was down (review).
+  connected="$(awk '/^vtop_broker_follower_connected/ {v=$NF} END {print v}' <<< "$body")"
+  if [[ -n "$connected" ]]; then
+    stream_last="${connected%.*}"
+    if [[ "$stream_last" -ge 1 ]]; then
+      stream_seen=1
+    fi
+  fi
+  # The durable offset is tracked SEPARATELY from the scrape that carried it:
+  # a leader that answers without publishing this gauge yet is not a follower
+  # whose offset stood still, and only `durable_seen` can tell those apart
+  # (review).
+  durable="$(awk '/^vtop_broker_follower_durable_offset/ {v=$NF} END {print v}' <<< "$body")"
+  if [[ -n "$durable" ]]; then
+    durable_seen=1
+    if [[ -z "$durable_first" ]]; then
+      durable_first="$durable"
+    fi
+    durable_prev="$durable_last"
+    durable_last="$durable"
+  fi
+}
+
 produce_deadline=$((SECONDS + PROGRESS_TIMEOUT_SECONDS))
+attempts=0
 until "$VTOP_NODE" produce --client-config "$VERIFY_CFG" --addr "$(native_addr)" \
   --records "$BATCH" --batch "$BATCH" \
   --durability quorum > "$WORKDIR/logs/produce-after-failover.log" 2>&1; do
-  [[ $SECONDS -lt $produce_deadline ]] \
-    || fail "post-failover produce never reached quorum within ${PROGRESS_TIMEOUT_SECONDS}s: \
-$(tail -1 "$WORKDIR/logs/produce-after-failover.log")"
+  attempts=$((attempts + 1))
+  sample_rejoining_follower "$((produce_deadline - SECONDS))"
+  if [[ $SECONDS -ge $produce_deadline ]]; then
+    if [[ "$REJOIN_GAP" -gt 0 ]]; then
+      # NAMED FIRST, because it explains the observation rather than competing
+      # with it: with the survivor below the new leader's tip, every replica
+      # append is refused for a base offset that cannot match, and no deadline
+      # can change that. This is the answer to the fork #340 was filed with —
+      # it is "never", and for a documented reason rather than a slow disk.
+      verdict="follower $OTHER_N was $REJOIN_GAP record(s) behind the promoted replica when \
+the range moved, so it starts below the new leader's tip and no batch it is offered can match \
+its next_offset. A promoted leader cannot backfill that gap — it can only retransmit what its \
+own buffer holds, and it never sent those offsets — so this run could not have reached quorum \
+at ANY deadline (the in-place limitation the node config documents, tracked on #255). Read the \
+promotion line above: this is not a timing flake"
+    elif [[ "$reads_ok" -eq 0 ]]; then
+      verdict="the leader's metrics endpoint never answered, so NOTHING is known about the \
+rejoining follower — do not read this as a stall"
+    elif [[ "$durable_seen" -eq 0 ]]; then
+      # The leader answered but never published this follower's durable offset,
+      # so there is no progress reading to reason from. Saying "it never moved"
+      # here would invent an observation nobody made (review).
+      verdict="the leader answered $reads_ok scrape(s) but never published a durable offset \
+for follower $OTHER_N, so how far it got is UNKNOWN — the stream was $(
+        [[ "$stream_seen" -eq 1 ]] && echo "up at least once" || echo "never seen up"
+      ), and that is all this run observed"
+    elif [[ "$stream_seen" -eq 0 ]]; then
+      verdict="the leader never held a replication stream to follower $OTHER_N, so it could \
+not have acked: this is #340's REJOIN-STALL fork, not a bound that is too tight"
+    elif [[ "$last_read_answered" -eq 0 ]]; then
+      # The samples on record may be minutes old: two advancing readings
+      # followed by a run of failed scrapes would otherwise be reported as
+      # "still advancing when the clock ran out", which is a claim about a
+      # moment nobody observed (review). What is known is what was seen, and
+      # when it stopped being seen.
+      verdict="the last scrape(s) did not answer, so the follower's state AT the deadline is \
+unknown; the last readings that did answer were durable offset ${durable_first:-unknown} -> \
+${durable_last:-unknown} with the stream $(
+        [[ "$stream_seen" -eq 1 ]] && echo "seen up" || echo "never seen up"
+      ) ($reads_ok answered, $reads_failed failed)"
+    elif [[ "$stream_last" == "0" ]]; then
+      # The newest coherent reading says the stream is DOWN, whatever the
+      # offsets did earlier. A drop is not the same failure as never having
+      # connected, and it is not a bound that is too tight either — so it is
+      # named as itself rather than folded into a movement verdict.
+      verdict="the leader had a stream to follower $OTHER_N earlier — its durable offset \
+reached ${durable_last:-unknown} — but the last scrape that answered says the stream is DOWN. \
+A stream that came up and then dropped is neither fork of #340: look for what disconnected it \
+(the follower restarting, or a refusal tearing the session down) before suspecting the disk"
+    elif [[ -n "$durable_prev" && "$durable_last" != "$durable_prev" ]]; then
+      # RECENT movement, not any movement (review). A follower that advanced
+      # once and then stopped satisfies "last != first" for the rest of the
+      # wait, and reporting that as catching-up would send the next reader
+      # after a slow disk while the replica sat still.
+      verdict="the stream was up and follower $OTHER_N's durable offset was STILL advancing \
+when the clock ran out ($durable_first -> $durable_last, moving between the last two \
+samples): this is #340's TOO-TIGHT-BOUND fork — durable and catching up, just not inside \
+${PROGRESS_TIMEOUT_SECONDS}s — not a stall"
+    elif [[ -n "$durable_first" && "$durable_last" != "$durable_first" ]]; then
+      verdict="follower $OTHER_N's durable offset advanced $durable_first -> $durable_last \
+and then STOPPED before the clock ran out: AMBIGUOUS between a follower that stalled after \
+partial progress and one merely between acks. Compare the last value against the leader's \
+own tip before choosing a suspect"
+    else
+      verdict="the leader held a stream to follower $OTHER_N and its durable offset never \
+moved off ${durable_first:-unknown}: connected and acknowledging nothing, which is NEITHER \
+fork #340 was filed with. A refusal looks exactly like this — a follower on the wrong epoch \
+misses silently — so suspect the restart-at-the-granted-epoch step above before the disk"
+    fi
+    fail "post-failover produce never reached quorum within ${PROGRESS_TIMEOUT_SECONDS}s over \
+$attempts failed attempt(s): $verdict ($reads_ok metric read(s) answered, $reads_failed failed). \
+Last refusal: $(tail -1 "$WORKDIR/logs/produce-after-failover.log")"
+  fi
   sleep 0.2
 done
 log "the new leader acknowledged fresh quorum writes"
