@@ -498,7 +498,15 @@ fn delta_timestamp(timestamp_millis: i64, base_timestamp: i64) -> i64 {
 /// one handed in (review). Callers build batches from a contiguous run of
 /// offsets, so the distance is bounded by the batch size.
 fn delta_i32(offset: i64, base_offset: i64) -> i32 {
-    let delta = offset - base_offset;
+    // CHECKED, like the timestamp delta beside it. The `i32::try_from` below
+    // guards the narrowing but not the subtraction that feeds it, so a span
+    // wider than an i64 — `i64::MIN` against `i64::MAX` — overflowed before
+    // the conversion ever saw it: a panic in a debug build with a message
+    // about the wrong thing, and in release a WRAPPED value that could land
+    // inside i32 range and encode a plausible, wrong offset (review).
+    let delta = offset.checked_sub(base_offset).unwrap_or_else(|| {
+        panic!("record offset {offset} is beyond an i64 delta from base {base_offset}")
+    });
     i32::try_from(delta).unwrap_or_else(|_| {
         panic!("record offset {offset} is {delta} from base {base_offset}, beyond an i32 delta")
     })
@@ -934,6 +942,25 @@ mod tests {
             }
             other => panic!("a batch over the aggregate header ceiling must be refused: {other:?}"),
         }
+    }
+
+    /// The encode path checks its OFFSET subtraction too (review).
+    ///
+    /// `i32::try_from` guarded the narrowing but not the subtraction feeding
+    /// it, so an i64-wide span overflowed first — and in release it wrapped,
+    /// which is the dangerous half: a wrapped delta can land inside i32 range
+    /// and encode a plausible, wrong offset instead of failing.
+    #[test]
+    #[should_panic(expected = "beyond an i64 delta")]
+    fn an_offset_span_wider_than_an_i64_panics_rather_than_wrapping() {
+        let records = vec![Record {
+            offset: i64::MIN,
+            timestamp_millis: 1,
+            key: None,
+            value: None,
+            headers: Vec::new(),
+        }];
+        let _ = RecordBatch::encode(i64::MAX, 1, 0, 0, &records);
     }
 
     /// The encode path checks its timestamp subtraction (review).
