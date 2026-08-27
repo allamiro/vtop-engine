@@ -433,12 +433,28 @@ pub struct AdminClient {
     /// leadership can invalidate between the snapshot and the request. A test
     /// asserting redirect support needs the same thing, for the same reason.
     redirects: std::sync::atomic::AtomicUsize,
-    /// Candidates whose last attempt failed to establish a connection.
+    /// Where each candidate is now, and whether that is still believed.
     ///
-    /// Membership is what makes a name worth looking up again (#367): the
-    /// address that just answered does not need checking, and re-resolving on
-    /// the success path would put a name query on every metadata request.
-    unreachable: Mutex<std::collections::BTreeSet<usize>>,
+    /// Index-aligned with `candidates`, and it is where a refreshed address
+    /// LIVES (#367). Resolving into a local copy would find the peer once and
+    /// forget it — the next request would dial the configured address again
+    /// and pay the connect timeout to rediscover the same thing (review).
+    resolutions: Mutex<Vec<Resolution>>,
+}
+
+/// One candidate's live address, and what is known about it.
+struct Resolution {
+    /// The address in use: configured at first, whatever the name last
+    /// resolved to afterwards.
+    endpoint: SocketAddr,
+    /// Set when the last attempt to this candidate failed, for any reason —
+    /// including a stale address that accepts TCP and then is not the service
+    /// we wanted (review). Cleared by a success, which is the only thing that
+    /// proves an address.
+    stale: bool,
+    /// When the name was last looked up, so a candidate that is simply down
+    /// is not a name query per request.
+    resolved_at: Option<std::time::Instant>,
 }
 
 /// How long one candidate may take to become a usable connection before the
@@ -466,6 +482,18 @@ pub struct AdminClient {
 /// Once a connection exists, the operation is bounded by the caller's own
 /// budget, which is the thing that knows how long it is willing to wait.
 const CANDIDATE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How often one candidate's name may be looked up again.
+///
+/// A candidate that is down fails every request, and each failure asks for a
+/// lookup; without a floor that is a name query per metadata call (review).
+const RERESOLVE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// How long one name lookup may take before it is abandoned.
+///
+/// This runs inside the caller's own budget — five seconds for a lease round —
+/// so a resolver that stalls must not be able to consume it (review).
+const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 impl AdminClient {
     pub fn new(
@@ -542,18 +570,23 @@ impl AdminClient {
         // the peer would have to fail once before it could ever be found, and
         // for a peer that later becomes the leader that is one failed request
         // per lease round, forever, since a redirect always lands back on it.
-        let unreachable = candidates
+        let resolutions = candidates
             .iter()
-            .enumerate()
-            .filter(|(_, candidate)| candidate.host.is_some() && candidate.endpoint.port() == 0)
-            .map(|(index, _)| index)
+            .map(|candidate| Resolution {
+                endpoint: candidate.endpoint,
+                // A candidate whose name had not resolved carries a
+                // placeholder, not an address, so the first attempt must look
+                // it up rather than dial nothing.
+                stale: candidate.host.is_some() && candidate.endpoint.port() == 0,
+                resolved_at: None,
+            })
             .collect();
         Ok(Self {
             connector,
             candidates,
             preferred: std::sync::atomic::AtomicUsize::new(0),
             redirects: std::sync::atomic::AtomicUsize::new(0),
-            unreachable: Mutex::new(unreachable),
+            resolutions: Mutex::new(resolutions),
         })
     }
 
@@ -764,10 +797,11 @@ impl AdminClient {
                     self.preferred.store(index, Ordering::Relaxed);
                     // It answered, so its address is right and does not need
                     // looking up again on the next request.
-                    self.unreachable
-                        .lock()
-                        .expect("unreachable set")
-                        .remove(&index);
+                    if let Some(resolution) =
+                        self.resolutions.lock().expect("resolutions").get_mut(index)
+                    {
+                        resolution.stale = false;
+                    }
                     return Ok(frame);
                 }
                 // An unreachable candidate is worth moving past for the same
@@ -832,7 +866,7 @@ impl AdminClient {
         let mut stream = match stream {
             Ok(stream) => stream,
             Err(error) => {
-                self.mark_unreachable(index);
+                self.mark_stale(index);
                 return Err(error);
             }
         };
@@ -840,41 +874,81 @@ impl AdminClient {
         // is the thing that knows how long this operation is worth waiting
         // for. A server-side deadline imposed here would report a completed
         // mutation as a failure.
-        write_frame(&mut stream, request).await?;
-        read_frame(&mut stream).await
+        //
+        // A FAILURE HERE IS ALSO A REASON TO DOUBT THE ADDRESS (review). An
+        // address something else has taken over accepts the connection and
+        // then is not the service we wanted, so keying the refresh on connect
+        // failures alone would leave that candidate believed and wrong.
+        match async {
+            write_frame(&mut stream, request).await?;
+            read_frame(&mut stream).await
+        }
+        .await
+        {
+            Ok(frame) => Ok(frame),
+            Err(error) => {
+                self.mark_stale(index);
+                Err(error)
+            }
+        }
     }
 
-    /// This candidate, with its address refreshed if the last attempt failed.
+    /// This candidate, with its address re-resolved if the last attempt failed
+    /// and the throttle has passed — and the answer KEPT.
     async fn resolved_candidate(&self, index: usize) -> AdminCandidate {
         let mut candidate = self.candidates[index].clone();
         let Some(host) = candidate.host.clone() else {
             return candidate;
         };
-        if !self
-            .unreachable
-            .lock()
-            .expect("unreachable set")
-            .contains(&index)
         {
-            return candidate;
+            // The stamp is claimed before the await, so concurrent requests to
+            // a candidate whose resolver has stopped answering do not each
+            // start their own query (review).
+            let mut resolutions = self.resolutions.lock().expect("resolutions");
+            let Some(resolution) = resolutions.get_mut(index) else {
+                return candidate;
+            };
+            candidate.endpoint = resolution.endpoint;
+            let due = resolution.stale
+                && !resolution
+                    .resolved_at
+                    .is_some_and(|at| at.elapsed() < RERESOLVE_INTERVAL);
+            if !due {
+                return candidate;
+            }
+            resolution.resolved_at = Some(std::time::Instant::now());
         }
-        if let Some(addr) = tokio::net::lookup_host(&host)
-            .await
-            .ok()
-            .and_then(|mut addrs| addrs.next())
-        {
-            // A lookup that fails leaves the last known address standing: a
-            // resolver hiccup is not evidence that a member moved.
+        let resolved =
+            match tokio::time::timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host(&host)).await {
+                Ok(Ok(mut addrs)) => addrs.next(),
+                Ok(Err(error)) => {
+                    eprintln!("could not resolve metadata endpoint {host:?}: {error}");
+                    None
+                }
+                Err(_) => {
+                    eprintln!("resolving metadata endpoint {host:?} exceeded {RESOLVE_TIMEOUT:?}");
+                    None
+                }
+            };
+        // A lookup that fails leaves the last known address standing: a
+        // resolver hiccup is not evidence that a member moved.
+        if let Some(addr) = resolved {
+            // PERSISTED, not used and forgotten. An address that lived only in
+            // this clone would be rediscovered — at the cost of a connect
+            // timeout — on every request after the next success cleared the
+            // staleness flag (review).
+            if let Some(resolution) = self.resolutions.lock().expect("resolutions").get_mut(index) {
+                resolution.endpoint = addr;
+            }
             candidate.endpoint = addr;
         }
         candidate
     }
 
-    fn mark_unreachable(&self, index: usize) {
-        self.unreachable
-            .lock()
-            .expect("unreachable set")
-            .insert(index);
+    fn mark_stale(&self, index: usize) {
+        if let Some(resolution) = self.resolutions.lock().expect("resolutions").get_mut(index) {
+            resolution.stale = true;
+        }
     }
 
     async fn establish(&self, candidate: &AdminCandidate) -> TransportResult<MaybeTls<TcpStream>> {
