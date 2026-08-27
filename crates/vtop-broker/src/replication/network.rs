@@ -23,9 +23,9 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
 use tokio_rustls::client::TlsStream as ClientTlsStream;
-use tokio_rustls::server::TlsStream as ServerTlsStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use uuid::Uuid;
+use vtop_meta::transport::MaybeTls;
 use vtop_protocol::{
     read_frame, write_frame, CommittedHwmUpdate, ErrorCode, ErrorResponse, Message, ProtocolLimits,
     RangeIdentity, ReplicaAppendBatchRequest, ReplicaAppendRequest, ReplicaAppendResponse,
@@ -274,11 +274,30 @@ impl ReplicaPeerHandler for InProcessFollower {
     }
 }
 
-/// Accepts persistent mTLS replication streams and dispatches wire messages.
+/// How far a PLAINTEXT replica endpoint may be reachable.
+///
+/// The same two-value shape the metadata planes use (#294 slices 1 and 2).
+/// Three planes making the same decision three different ways would be worse
+/// than any one of the ways.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlaintextExposure {
+    /// The default, and a refusal rather than a warning: loopback or nothing.
+    LoopbackOnly,
+    /// Explicitly acknowledged at the call site.
+    AnyInterface,
+}
+
+/// Accepts persistent replication streams and dispatches wire messages.
+///
+/// mTLS by default; plaintext is possible (#294 slice 3) and costs a specific
+/// authorization, described on [`ReplicaPeerServer::plaintext`].
 pub struct ReplicaPeerServer {
-    acceptor: TlsAcceptor,
+    /// `None` means plaintext, built deliberately — never a TLS setup that
+    /// failed.
+    acceptor: Option<TlsAcceptor>,
     local_id: Uuid,
     handler: Arc<dyn ReplicaPeerHandler>,
+    exposure: PlaintextExposure,
 }
 
 impl ReplicaPeerServer {
@@ -288,10 +307,87 @@ impl ReplicaPeerServer {
         handler: Arc<dyn ReplicaPeerHandler>,
     ) -> BrokerResult<Self> {
         Ok(Self {
-            acceptor: build_server_acceptor(material)?,
+            acceptor: Some(build_server_acceptor(material)?),
             local_id,
             handler,
+            exposure: PlaintextExposure::LoopbackOnly,
         })
+    }
+
+    /// A replica endpoint with NO TLS, on loopback only (#294 slice 3).
+    ///
+    /// # What this gives up, and what it therefore refuses
+    ///
+    /// On this plane the certificate CN is the peer's node UUID, and it is an
+    /// AUTHORIZATION input: `authorize_transfer` matches it against the
+    /// leader's followers plus the UUIDs named in `transfer_peers`, because a
+    /// sealed-segment transfer hands over a whole range's bytes and "any
+    /// certificate this cluster trusts" is the wrong granularity for that.
+    ///
+    /// With no TLS there is no CN, so there is no UUID, so that allowlist has
+    /// nothing to match. Slice 1 set the rule for exactly this situation: a
+    /// policy that cannot be enforced must not be accepted quietly. So rather
+    /// than starting and silently permitting every transfer, a plaintext
+    /// replica plane REFUSES the three transfer RPCs — list, fetch, seal —
+    /// naming the reason. Replication appends still work, because they are
+    /// gated by the fencing epoch rather than by peer identity.
+    ///
+    /// Fencing is refused for the same reason and it costs more, so it is
+    /// worth stating plainly: a fence truncates this replica's log against the
+    /// caller's epoch history, so it must come from an identified leader.
+    /// Promotion fences its followers, which means **a plaintext replica plane
+    /// replicates but does not fail over**. That is the boundary of the mode,
+    /// and TLS is what moves it.
+    ///
+    /// What remains is still worth having: a plaintext dev cluster replicates,
+    /// serves reads, and is observable through `vtopctl node status`. Only the
+    /// two privileged verbs — transfer and fence — wait for an identity.
+    ///
+    /// # The whole envelope, verb by verb
+    ///
+    /// Stated completely rather than partially, because "appends are exposed"
+    /// was true and left three other verbs unaccounted for:
+    ///
+    /// | verb | on a plaintext plane |
+    /// |---|---|
+    /// | `ReplicaAppend`, `ReplicaAppendBatch` | ACCEPTED at the granted epoch. Anything reaching this port can feed this replica records the leader never wrote. This is the mode's headline cost. |
+    /// | `CommittedHwmUpdate` | ACCEPTED, and bounded twice over: it is checked against the granted epoch, clamped to this replica's own durable offset, and advances monotonically. So it can make already-durable records visible early, but cannot expose records this replica does not hold and cannot move the bound backwards — which matters, because that bound is what stops a truncation from discarding acknowledged records. |
+    /// | `ReplicaStatus`, `ReplicaEpochHistory` | ACCEPTED, read-only. They disclose offsets and epoch history. `status` must stay reachable or the mode is unobservable. |
+    /// | `ListSealedSegments`, `FetchSegmentChunk`, `SealTail` | REFUSED. A transfer hands over a whole range's bytes. |
+    /// | `ReplicaFence` | REFUSED. It truncates against the caller's history. |
+    ///
+    /// The line between the two halves is not "reads versus writes" — it is
+    /// whether an unidentified caller can cause something UNRECOVERABLE. An
+    /// append can be reconciled away by a legitimate leader; a high-water mark
+    /// cannot exceed what is already on disk; a transfer or a truncation
+    /// cannot be undone.
+    pub fn plaintext(local_id: Uuid, handler: Arc<dyn ReplicaPeerHandler>) -> Self {
+        Self {
+            acceptor: None,
+            local_id,
+            handler,
+            exposure: PlaintextExposure::LoopbackOnly,
+        }
+    }
+
+    /// Plaintext replication on a NON-LOOPBACK address, acknowledged
+    /// explicitly.
+    ///
+    /// Separate constructor rather than a boolean, because the risk deserves a
+    /// name at the call site. Replication appends carry the range's data and
+    /// are gated only by the fencing epoch, which is a number an attacker on
+    /// this port can read from any reply — so anything that can reach it can
+    /// feed a follower records the leader never wrote.
+    ///
+    /// Legitimate on a trusted segment or inside a sidecar mesh supplying the
+    /// authentication this plane is giving up.
+    pub fn plaintext_on_any_interface(
+        local_id: Uuid,
+        handler: Arc<dyn ReplicaPeerHandler>,
+    ) -> Self {
+        let mut server = Self::plaintext(local_id, handler);
+        server.exposure = PlaintextExposure::AnyInterface;
+        server
     }
 
     /// Serve until the listener fails or `shutdown` fires (#280).
@@ -306,6 +402,35 @@ impl ReplicaPeerServer {
         listener: TcpListener,
         mut shutdown: tokio::sync::oneshot::Receiver<()>,
     ) -> BrokerResult<()> {
+        // CHECKED AT BIND TIME, not per connection (#294 slices 1 and 2 set
+        // this): the question is about the address this endpoint is reachable
+        // on, so answering it once means a misconfigured deployment fails to
+        // start rather than replicating until the first unwanted peer arrives.
+        if self.acceptor.is_none() {
+            let bound = listener
+                .local_addr()
+                .map_err(|source| crate::BrokerError::Io {
+                    path: std::path::PathBuf::from("replica-peer-listener"),
+                    source,
+                })?;
+            if self.exposure == PlaintextExposure::LoopbackOnly && !bound.ip().is_loopback() {
+                return Err(crate::BrokerError::InvalidConfig(format!(
+                    "refusing to serve a plaintext replica endpoint on {bound}: it is not a \
+                     loopback address, and a plaintext replica endpoint has no certificate and \
+                     therefore no peer UUID — anything that can reach this port can feed a \
+                     follower records the leader never wrote, since appends are gated by the \
+                     fencing epoch alone and that number is readable from any reply. Bind to \
+                     127.0.0.1 for local use, enable TLS to expose it, or construct the server \
+                     with `plaintext_on_any_interface` if that is genuinely intended."
+                )));
+            }
+            eprintln!(
+                "warning: replica endpoint {bound} is PLAINTEXT: peers carry no certificate, so \
+                 no peer UUID exists. Sealed-segment transfers are REFUSED on this endpoint \
+                 because the transfer allowlist has nothing to match; replication appends are \
+                 served and are authenticated only by the fencing epoch."
+            );
+        }
         let mut connections = tokio::task::JoinSet::new();
         let result = loop {
             tokio::select! {
@@ -337,18 +462,27 @@ impl ReplicaPeerServer {
 }
 
 async fn serve_follower_connection(
-    acceptor: TlsAcceptor,
+    acceptor: Option<TlsAcceptor>,
     tcp: TcpStream,
     handler: Arc<dyn ReplicaPeerHandler>,
     local_id: Uuid,
 ) -> BrokerResult<()> {
-    let mut stream = acceptor
-        .accept(tcp)
-        .await
-        .map_err(|source| crate::BrokerError::Io {
-            path: std::path::PathBuf::from("replica-peer-accept"),
-            source,
-        })?;
+    let mut stream = match acceptor {
+        Some(acceptor) => {
+            let tls = acceptor
+                .accept(tcp)
+                .await
+                .map_err(|source| crate::BrokerError::Io {
+                    path: std::path::PathBuf::from("replica-peer-accept"),
+                    source,
+                })?;
+            MaybeTls::Tls(Box::new(tls.into()))
+        }
+        None => MaybeTls::Plain(tcp),
+    };
+    // `None` here means the plane is plaintext and NO identity exists — not
+    // that a certificate was unreadable, which stays an error. The two want
+    // opposite treatment, and `dispatch_replica_frame` is where that is spent.
     let peer_id = peer_uuid_from_server_stream(&stream)?;
     // `local_id` is this node's own identity, unused on the serving side.
     let _ = local_id;
@@ -375,9 +509,53 @@ async fn serve_follower_connection(
 /// not once one serves it: a sealed-segment fetch hands over a whole range's
 /// bytes, so "any certificate this cluster trusts" is the wrong granularity
 /// for it even though it is the right one for an append.
+/// Refusal for a transfer RPC on a plane that cannot authorize one.
+///
+/// The alternative was to start refusing at construction time, which would
+/// have made plaintext useless for the replication it CAN do safely, or to
+/// permit transfers to an unnamed peer, which hands a whole range's bytes to
+/// anything that connects. Refusing the specific operations whose allowlist
+/// has nothing to match is the narrow answer, and it follows slice 1's rule
+/// that a policy which cannot be enforced must not be silently dropped.
+/// Refusal for a FENCE on a plane that cannot authorize one.
+///
+/// This was the privileged verb the plane left ungated (review). `fence`
+/// refuses an epoch above the one metadata granted — a replica will not fence
+/// itself on a caller's word alone — but it then reconciles against the
+/// caller's OWN epoch-start vector and TRUNCATES whatever disagrees. So at any
+/// epoch metadata has legitimately granted, an unauthenticated caller can hand
+/// over a bogus history and make a follower discard records it already holds.
+///
+/// That is strictly worse than the append exposure this mode documents and
+/// accepts: an append adds records a leader never wrote, and reconciliation
+/// can still undo it; this destroys records that were already durable.
+fn fence_needs_identity() -> Message {
+    error_message(
+        vtop_protocol::ErrorCode::InvalidRequest,
+        "fencing a replica is refused on a PLAINTEXT replica endpoint: a fence raises this \
+         replica's epoch and truncates its log against the caller's epoch history, so it must \
+         come from an identified leader. A plaintext peer presents no certificate and therefore \
+         no identity to authorize. Enable TLS on the replica plane to fence, and so to promote."
+            .to_owned(),
+    )
+}
+
+fn transfer_needs_identity(what: &str) -> Message {
+    error_message(
+        vtop_protocol::ErrorCode::InvalidRequest,
+        format!(
+            "{what} is refused on a PLAINTEXT replica endpoint: a transfer hands over a whole \
+             range's bytes and is limited to this leader's followers and the UUIDs named in \
+             `transfer_peers`, but a plaintext peer presents no certificate and therefore no \
+             UUID for that allowlist to match. Enable TLS on the replica plane to repair by \
+             transfer."
+        ),
+    )
+}
+
 fn dispatch_replica_frame(
     handler: &dyn ReplicaPeerHandler,
-    peer: Uuid,
+    peer: Option<Uuid>,
     frame: WireFrame,
 ) -> Option<WireFrame> {
     let WireFrame {
@@ -414,6 +592,13 @@ fn dispatch_replica_frame(
                 Err((code, message)) => error_message(code, message),
             },
             Message::ListSealedSegmentsRequest(request) => {
+                let Some(peer) = peer else {
+                    return Some(WireFrame {
+                        request_id,
+                        stream_id,
+                        message: transfer_needs_identity("listing sealed segments"),
+                    });
+                };
                 match handler.list_sealed_segments(peer, &request.range, request.fencing_epoch) {
                     Ok(segments) => Message::ListSealedSegmentsResponse(
                         vtop_protocol::ListSealedSegmentsResponse { segments },
@@ -422,18 +607,39 @@ fn dispatch_replica_frame(
                 }
             }
             Message::FetchSegmentChunkRequest(request) => {
+                let Some(peer) = peer else {
+                    return Some(WireFrame {
+                        request_id,
+                        stream_id,
+                        message: transfer_needs_identity("fetching a segment chunk"),
+                    });
+                };
                 match handler.fetch_segment_chunk(peer, &request) {
                     Ok(response) => Message::FetchSegmentChunkResponse(response),
                     Err((code, message)) => error_message(code, message),
                 }
             }
             Message::SealTailRequest(request) => {
+                let Some(peer) = peer else {
+                    return Some(WireFrame {
+                        request_id,
+                        stream_id,
+                        message: transfer_needs_identity("sealing the tail for a transfer"),
+                    });
+                };
                 match handler.seal_tail(peer, &request.range, request.fencing_epoch) {
                     Ok(response) => Message::SealTailResponse(response),
                     Err((code, message)) => error_message(code, message),
                 }
             }
             Message::ReplicaFenceRequest(request) => {
+                if peer.is_none() {
+                    return Some(WireFrame {
+                        request_id,
+                        stream_id,
+                        message: fence_needs_identity(),
+                    });
+                }
                 let leader_epoch_starts: Vec<crate::fencing_epochs::EpochStart> = request
                     .leader_epoch_starts
                     .iter()
@@ -525,7 +731,7 @@ impl NetworkedReplicaSet {
         Self::start_on(
             RuntimeBinding::Owned(runtime),
             followers,
-            leader_tls,
+            Some(leader_tls),
             flow,
             memory,
         )
@@ -541,6 +747,32 @@ impl NetworkedReplicaSet {
         Self::start_on_handle_with_memory(handle, followers, leader_tls, flow, None)
     }
 
+    /// A leader that replicates to its followers in PLAINTEXT (#294 slice 3).
+    ///
+    /// The outbound counterpart to [`ReplicaPeerServer::plaintext`], and it
+    /// exists because a plane that can only be SERVED without TLS is the
+    /// "looks configurable, isn't" failure #294 is meant to remove — a
+    /// replicated range needs both ends.
+    ///
+    /// What it gives up is named at the dial site: with no certificate there
+    /// is nothing to check `assert_peer_uuid` against, so this leader will
+    /// replicate into whichever replica answers the configured address. Under
+    /// mTLS a reused address or a drifted config is caught; here it is not.
+    pub fn start_plaintext_on_handle(
+        handle: Handle,
+        followers: Vec<NetworkFollowerConfig>,
+        flow: FlowControlConfig,
+        memory: Option<Arc<MemoryBudgetPool>>,
+    ) -> BrokerResult<Self> {
+        Self::start_on(
+            RuntimeBinding::External(handle),
+            followers,
+            None,
+            flow,
+            memory,
+        )
+    }
+
     /// Like [`Self::start_on_handle`], sharing a broker-wide [`MemoryBudgetPool`].
     pub fn start_on_handle_with_memory(
         handle: Handle,
@@ -552,7 +784,7 @@ impl NetworkedReplicaSet {
         Self::start_on(
             RuntimeBinding::External(handle),
             followers,
-            leader_tls,
+            Some(leader_tls),
             flow,
             memory,
         )
@@ -561,7 +793,7 @@ impl NetworkedReplicaSet {
     fn start_on(
         runtime: RuntimeBinding,
         followers: Vec<NetworkFollowerConfig>,
-        leader_tls: ReplicaTlsMaterial,
+        leader_tls: Option<ReplicaTlsMaterial>,
         flow: FlowControlConfig,
         memory: Option<Arc<MemoryBudgetPool>>,
     ) -> BrokerResult<Self> {
@@ -582,7 +814,12 @@ impl NetworkedReplicaSet {
             })
             .map_err(crate::BrokerError::InvalidConfig)?,
         };
-        let connector = build_client_connector(leader_tls)?;
+        // `None` is plaintext, chosen by the caller — never a TLS setup that
+        // failed, which stays an error.
+        let connector = match leader_tls {
+            Some(material) => Some(build_client_connector(material)?),
+            None => None,
+        };
         let handle = runtime.handle();
         let mut channels = Vec::with_capacity(followers.len());
         let mut shutdown = Vec::with_capacity(followers.len());
@@ -827,7 +1064,8 @@ struct BufferedBatch {
 
 struct FollowerDriver {
     config: NetworkFollowerConfig,
-    connector: TlsConnector,
+    /// `None` means this leader dials its followers in plaintext (#294 slice 3).
+    connector: Option<TlsConnector>,
     flow: FlowControlConfig,
     channel: Arc<FollowerChannel>,
     budget: Arc<FollowerBudget>,
@@ -881,22 +1119,33 @@ impl FollowerDriver {
             Ok(Ok(tcp)) => tcp,
             _ => return SessionOutcome::Disconnected,
         };
-        let server_name = match ServerName::try_from(self.config.server_name.clone()) {
-            Ok(name) => name,
-            Err(_) => return SessionOutcome::Disconnected,
+        let mut stream = match self.connector.as_ref() {
+            Some(connector) => {
+                let server_name = match ServerName::try_from(self.config.server_name.clone()) {
+                    Ok(name) => name,
+                    Err(_) => return SessionOutcome::Disconnected,
+                };
+                let tls = match timeout(
+                    self.flow.connect_timeout,
+                    connector.connect(server_name, tcp),
+                )
+                .await
+                {
+                    Ok(Ok(stream)) => stream,
+                    _ => return SessionOutcome::Disconnected,
+                };
+                // Skipped EXPLICITLY under plaintext below, not folded into a
+                // helper that tolerates a missing certificate: this check is
+                // what stops a leader replicating into whichever replica now
+                // answers a reused address, and its absence is a fact worth
+                // seeing at the call site.
+                if assert_peer_uuid(peer_certs_client(&tls), self.config.node_id).is_err() {
+                    return SessionOutcome::Disconnected;
+                }
+                MaybeTls::Tls(Box::new(tls.into()))
+            }
+            None => MaybeTls::Plain(tcp),
         };
-        let mut stream = match timeout(
-            self.flow.connect_timeout,
-            self.connector.connect(server_name, tcp),
-        )
-        .await
-        {
-            Ok(Ok(stream)) => stream,
-            _ => return SessionOutcome::Disconnected,
-        };
-        if assert_peer_uuid(peer_certs_client(&stream), self.config.node_id).is_err() {
-            return SessionOutcome::Disconnected;
-        }
         // Catch-up probe + bounded retransmission. Mark connected only after the
         // optional status exchange succeeds so tests do not observe a false ready.
         let range = retransmission
@@ -1148,7 +1397,7 @@ impl FollowerDriver {
 
     async fn send_replicate(
         &self,
-        stream: &mut ClientTlsStream<TcpStream>,
+        stream: &mut MaybeTls<TcpStream>,
         state: &mut SessionSendState<'_>,
         batch: OutboundBatch,
     ) -> Result<(), SessionOutcome> {
@@ -1483,16 +1732,34 @@ fn approx_batch_bytes(requests: &[ReplicaAppendRequest]) -> usize {
 /// expected, so `vtopctl node status` cannot silently report a different
 /// replica's offsets after an address is reused or a config drifts.
 pub struct ReplicaStatusClient {
-    connector: TlsConnector,
+    /// `None` is a plaintext plane, chosen deliberately.
+    connector: Option<TlsConnector>,
     timeout: Duration,
 }
 
 impl ReplicaStatusClient {
     pub fn new(material: ReplicaTlsMaterial) -> BrokerResult<Self> {
         Ok(Self {
-            connector: build_client_connector(material)?,
+            connector: Some(build_client_connector(material)?),
             timeout: Duration::from_secs(5),
         })
+    }
+
+    /// A status client for a PLAINTEXT replica plane (#294 slice 3).
+    ///
+    /// Without this, `vtopctl node status` cannot reach a plaintext range at
+    /// all — the mode would replicate but be unobservable, which is the
+    /// "looks configurable, isn't" failure one level down (review).
+    ///
+    /// It carries the same loss the dialer does and it is worth naming: the
+    /// expected node UUID cannot be checked against a certificate, so this
+    /// reports the offsets of whatever replica answers the address. On a
+    /// plaintext plane that is the most any client can know.
+    pub fn plaintext() -> Self {
+        Self {
+            connector: None,
+            timeout: Duration::from_secs(5),
+        }
     }
 
     /// Deadline covering connect, handshake, and the round trip.
@@ -1523,13 +1790,22 @@ impl ReplicaStatusClient {
                     path: PathBuf::from("replica-status"),
                     source,
                 })?;
-            let mut stream = self.connector.connect(name, tcp).await.map_err(|source| {
-                crate::BrokerError::Io {
-                    path: PathBuf::from("replica-status-tls"),
-                    source,
+            // Skipped EXPLICITLY on a plaintext plane: there is no
+            // certificate, so the expected node UUID cannot be confirmed and
+            // this reports whatever replica answered the address.
+            let mut stream = match self.connector.as_ref() {
+                Some(connector) => {
+                    let tls = connector.connect(name, tcp).await.map_err(|source| {
+                        crate::BrokerError::Io {
+                            path: PathBuf::from("replica-status-tls"),
+                            source,
+                        }
+                    })?;
+                    assert_peer_uuid(peer_certs_client(&tls), expected_node)?;
+                    MaybeTls::Tls(Box::new(tls.into()))
                 }
-            })?;
-            assert_peer_uuid(peer_certs_client(&stream), expected_node)?;
+                None => MaybeTls::Plain(tcp),
+            };
             let frame = WireFrame {
                 request_id: 1,
                 stream_id: 0,
@@ -1596,13 +1872,21 @@ impl ReplicaStatusClient {
                     path: PathBuf::from("replica-fence"),
                     source,
                 })?;
-            let mut stream = self.connector.connect(name, tcp).await.map_err(|source| {
-                crate::BrokerError::Io {
-                    path: PathBuf::from("replica-fence-tls"),
-                    source,
+            // Same explicit skip as `status`: no certificate on a plaintext
+            // plane means the expected node UUID cannot be confirmed.
+            let mut stream = match self.connector.as_ref() {
+                Some(connector) => {
+                    let tls = connector.connect(name, tcp).await.map_err(|source| {
+                        crate::BrokerError::Io {
+                            path: PathBuf::from("replica-fence-tls"),
+                            source,
+                        }
+                    })?;
+                    assert_peer_uuid(peer_certs_client(&tls), expected_node)?;
+                    MaybeTls::Tls(Box::new(tls.into()))
                 }
-            })?;
-            assert_peer_uuid(peer_certs_client(&stream), expected_node)?;
+                None => MaybeTls::Plain(tcp),
+            };
             let frame = WireFrame {
                 request_id: 1,
                 stream_id: 0,
@@ -1685,13 +1969,21 @@ impl ReplicaStatusClient {
                     path: PathBuf::from("replica-epoch-history"),
                     source,
                 })?;
-            let mut stream = self.connector.connect(name, tcp).await.map_err(|source| {
-                crate::BrokerError::Io {
-                    path: PathBuf::from("replica-epoch-history-tls"),
-                    source,
+            // Same explicit skip as `status`: no certificate on a plaintext
+            // plane means the expected node UUID cannot be confirmed.
+            let mut stream = match self.connector.as_ref() {
+                Some(connector) => {
+                    let tls = connector.connect(name, tcp).await.map_err(|source| {
+                        crate::BrokerError::Io {
+                            path: PathBuf::from("replica-epoch-history-tls"),
+                            source,
+                        }
+                    })?;
+                    assert_peer_uuid(peer_certs_client(&tls), expected_node)?;
+                    MaybeTls::Tls(Box::new(tls.into()))
                 }
-            })?;
-            assert_peer_uuid(peer_certs_client(&stream), expected_node)?;
+                None => MaybeTls::Plain(tcp),
+            };
             let frame = WireFrame {
                 request_id: 1,
                 stream_id: 0,
@@ -1765,13 +2057,27 @@ pub(crate) fn peer_certs_client(
     conn.peer_certificates().map(|certs| certs.to_vec())
 }
 
-fn peer_uuid_from_server_stream(stream: &ServerTlsStream<TcpStream>) -> BrokerResult<Uuid> {
-    let (_, conn) = stream.get_ref();
-    let certs = conn.peer_certificates();
-    let leaf = certs.and_then(|c| c.first()).ok_or_else(|| {
-        crate::BrokerError::InvalidConfig("replica peer presented no certificate".to_owned())
-    })?;
-    uuid_from_cert(leaf)
+/// The authenticated peer UUID, or `None` when the plane carries no TLS.
+///
+/// `None` is not "the certificate was unreadable" — that stays an error below.
+/// It is "this plane is plaintext, so no identity exists", which callers must
+/// treat as an unauthorizable peer rather than as an authorized one whose name
+/// they failed to read.
+fn peer_uuid_from_server_stream(stream: &MaybeTls<TcpStream>) -> BrokerResult<Option<Uuid>> {
+    match stream {
+        MaybeTls::Plain(_) => Ok(None),
+        MaybeTls::Tls(_) => {
+            let leaf = stream
+                .peer_certificates()
+                .and_then(|c| c.first())
+                .ok_or_else(|| {
+                    crate::BrokerError::InvalidConfig(
+                        "replica peer presented no certificate".to_owned(),
+                    )
+                })?;
+            uuid_from_cert(leaf).map(Some)
+        }
+    }
 }
 
 pub(crate) fn assert_peer_uuid(
@@ -1813,6 +2119,75 @@ mod tests {
     use super::*;
     use crate::memory_budget::MemoryBudgetConfig;
     use vtop_protocol::{ProduceRecord, RangeIdentity};
+
+    /// A transfer RPC is REFUSED on a plaintext replica plane, and says why
+    /// (#294 slice 3).
+    ///
+    /// The alternative designs were both worse: refusing the whole mode makes
+    /// plaintext useless for the replication it can do safely, and permitting
+    /// the transfer hands a whole range's bytes to anything that connects.
+    /// Refusing exactly the operations whose allowlist has nothing to match is
+    /// the narrow answer, and it follows slice 1's rule that a policy which
+    /// cannot be enforced must not be silently dropped.
+    #[test]
+    fn a_plaintext_peer_is_refused_a_sealed_segment_transfer() {
+        let message = transfer_needs_identity("listing sealed segments");
+        let Message::Error(error) = message else {
+            panic!("a refusal must be an error message");
+        };
+        assert_eq!(error.code, vtop_protocol::ErrorCode::InvalidRequest);
+        assert!(
+            error.message.contains("PLAINTEXT"),
+            "the refusal must name the mode that caused it, or an operator sees \
+             an authorization failure and goes looking for a missing UUID: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains("transfer_peers"),
+            "and it must name the allowlist that could not be matched: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains("Enable TLS"),
+            "and the way out, since the operation is not broken — it is \
+             unauthorizable on this plane: {}",
+            error.message
+        );
+    }
+
+    /// Fencing is refused on a plaintext plane (#294 slice 3, review).
+    ///
+    /// This was the privileged verb the first version left ungated, and it is
+    /// the destructive one: `fence` will not accept an epoch above the one
+    /// metadata granted, but it then truncates the replica's log against the
+    /// CALLER's epoch history. At any legitimately granted epoch an
+    /// unauthenticated caller could therefore make a follower discard records
+    /// it already held — worse than the append exposure this mode documents
+    /// and accepts, because an append can be reconciled away and destroyed
+    /// records cannot.
+    #[test]
+    fn a_plaintext_peer_is_refused_a_fence() {
+        let Message::Error(error) = fence_needs_identity() else {
+            panic!("a refusal must be an error message");
+        };
+        assert_eq!(error.code, vtop_protocol::ErrorCode::InvalidRequest);
+        assert!(
+            error.message.contains("truncates"),
+            "the refusal must name the destructive part, not just say no: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains("PLAINTEXT"),
+            "and the mode that caused it: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains("promote"),
+            "and the consequence an operator will meet next — no fence means no \
+             promotion on this plane: {}",
+            error.message
+        );
+    }
 
     fn test_budget() -> (Arc<MemoryBudgetPool>, Arc<FollowerBudget>) {
         let pool = MemoryBudgetPool::new(MemoryBudgetConfig::default()).unwrap();
