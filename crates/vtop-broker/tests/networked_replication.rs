@@ -189,11 +189,26 @@ fn spawn_follower_server(
     })
 }
 
+/// How the leader is told where its followers are.
+///
+/// The difference is the whole of #367. `Resolved` hands it the address the
+/// harness just bound — the shape every test used before, and the shape a
+/// static deployment has. `ByName` hands it a NAME plus a deliberately wrong
+/// cached address, which is what a leader holds after a follower's pod has
+/// been replaced: the name still points somewhere real, the address it was
+/// resolved to once does not.
+#[derive(Clone, Copy, PartialEq)]
+enum FollowerAddressing {
+    Resolved,
+    ByName,
+}
+
 fn harness_with(
     flow: FlowControlConfig,
     group_commit: Option<GroupCommitConfig>,
     slow_follower2: Option<(Duration, Arc<AtomicBool>)>,
     memory: Option<Arc<MemoryBudgetPool>>,
+    followers_by_name: FollowerAddressing,
 ) -> NetworkHarness {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -252,10 +267,27 @@ fn harness_with(
         };
         let server_material = material(cert, &[&leader_cert]);
         let (addr, abort) = spawn_follower_server(&runtime, server_material, node_id, handler);
-        follower_configs.push(NetworkFollowerConfig {
-            node_id,
-            addr,
-            server_name: "localhost".to_owned(),
+        follower_configs.push(match followers_by_name {
+            // The harness knows the address it just bound; there is no name to
+            // look up again, and pinning it here keeps these tests measuring
+            // replication rather than the host's resolver.
+            FollowerAddressing::Resolved => NetworkFollowerConfig {
+                node_id,
+                addr,
+                host: None,
+                server_name: "localhost".to_owned(),
+            },
+            // A name that is right and a cached address that is wrong. The
+            // address is the unroutable placeholder a node carries for a peer
+            // whose name had not resolved at startup, so nothing here can
+            // succeed by accident: connecting to it fails immediately, and the
+            // only way to the follower is through the name.
+            FollowerAddressing::ByName => NetworkFollowerConfig {
+                node_id,
+                addr: SocketAddr::from(([0, 0, 0, 0], 0)),
+                host: Some(format!("127.0.0.1:{}", addr.port())),
+                server_name: "localhost".to_owned(),
+            },
         });
         server_abort.push(abort);
         followers.push(follower);
@@ -315,7 +347,13 @@ fn harness_with(
 }
 
 fn harness() -> NetworkHarness {
-    harness_with(FlowControlConfig::default(), None, None, None)
+    harness_with(
+        FlowControlConfig::default(),
+        None,
+        None,
+        None,
+        FollowerAddressing::Resolved,
+    )
 }
 
 fn produce_frame(
@@ -392,6 +430,7 @@ fn networked_quorum_acks_and_propagates_hwm() {
         None,
         None,
         None,
+        FollowerAddressing::Resolved,
     );
     let first = produce_ok(&h.leader, h.range.clone(), 0);
     assert_eq!(first.outcomes[0].offset, 0);
@@ -430,6 +469,7 @@ fn slow_non_quorum_follower_does_not_block_producer() {
         None,
         Some((Duration::from_secs(5), Arc::clone(&hold))),
         None,
+        FollowerAddressing::Resolved,
     );
 
     let started = std::time::Instant::now();
@@ -474,7 +514,7 @@ fn reconnect_catch_up_from_retransmission_buffer() {
         ack_timeout: Duration::from_millis(500),
         ..FlowControlConfig::default()
     };
-    let h = harness_with(flow, None, None, None);
+    let h = harness_with(flow, None, None, None, FollowerAddressing::Resolved);
     let _ = produce_ok(&h.leader, h.range.clone(), 0);
     assert_eq!(h.cluster_committed.get(), 1);
 
@@ -521,6 +561,7 @@ fn fencing_still_works_with_networked_group_commit() {
         }),
         None,
         None,
+        FollowerAddressing::Resolved,
     );
 
     let _ = produce_ok(&h.leader, h.range.clone(), 0);
@@ -564,6 +605,7 @@ fn catch_up_charges_return_to_zero_after_replica_set_shutdown() {
         None,
         None,
         Some(Arc::clone(&pool)),
+        FollowerAddressing::Resolved,
     );
     let _ = produce_ok(&h.leader, h.range.clone(), 0);
 
@@ -605,6 +647,7 @@ fn reconnect_catch_up_charges_each_byte_once() {
         None,
         Some((Duration::from_secs(5), Arc::clone(&hold))),
         Some(Arc::clone(&pool)),
+        FollowerAddressing::Resolved,
     );
     let _ = produce_ok(&h.leader, h.range.clone(), 0);
 
@@ -635,4 +678,53 @@ fn reconnect_catch_up_charges_each_byte_once() {
         "reconnect catch-up must not charge the same bytes twice"
     );
     hold.store(false, Ordering::SeqCst);
+}
+
+/// A leader finds a follower through its NAME, not through the address that
+/// name resolved to once (#367).
+///
+/// The address a peer was at when somebody last looked is not where it is. An
+/// orchestrator that replaces a follower's pod gives it a new one, and a
+/// leader holding the old address reconnects to it for the rest of its life —
+/// with a bounded connect timeout and a reconnect backoff, so it presents as
+/// a follower that is merely down, indefinitely, and the range's quorum
+/// silently shrinks by one with nothing in the logs that says why.
+///
+/// The harness makes the cached address unusable on purpose: it is the
+/// unroutable placeholder a node carries for a peer whose name had not
+/// resolved yet, so no part of this can succeed by accident. Every ack below
+/// travelled to an address that was found, not remembered.
+#[test]
+fn a_follower_configured_by_name_is_reached_at_the_address_the_name_holds_now() {
+    let h = harness_with(
+        FlowControlConfig::default(),
+        None,
+        None,
+        None,
+        FollowerAddressing::ByName,
+    );
+
+    let response = produce_ok(&h.leader, h.range.clone(), 0);
+    assert_eq!(
+        response.committed_next_offset, 1,
+        "a produce that reached quorum through a re-resolved follower must be \
+         acknowledged exactly like any other"
+    );
+    assert_eq!(
+        h.cluster_committed.get(),
+        1,
+        "the committed offset must advance, which it can only do if a MAJORITY \
+         acknowledged — and with one leader and two followers behind stale \
+         addresses, a majority is not reachable without the lookup"
+    );
+
+    // And it keeps working across a reconnect, which is the moment the stale
+    // address would reassert itself if the name were only consulted once.
+    assert!(h.replica_set.force_reconnect(FOLLOWER_1));
+    let _ = produce_ok(&h.leader, h.range.clone(), 1);
+    assert!(
+        await_within(Duration::from_secs(5), || h.cluster_committed.get() == 2),
+        "a reconnect must look the name up again; a leader that re-dialled its \
+         cached address here would be exactly the failure this test exists for"
+    );
 }

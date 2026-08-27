@@ -145,7 +145,19 @@ pub struct ReplicaPlaneProbe {
 #[derive(Clone, Debug)]
 pub struct FollowerEndpoint {
     pub node_uuid: Uuid,
+    /// Where the follower was, last time its name was looked up.
     pub addr: std::net::SocketAddr,
+    /// The `host:port` it was configured under, when it was a name (#367).
+    ///
+    /// A probe is what decides whether a candidate may promote, so a stale
+    /// address here does not merely lose a connection — it withholds a vote,
+    /// and a range with one absent replica out of three cannot establish its
+    /// boundary at all. Resolved per probe rather than cached: a probe runs
+    /// once per grant, not per heartbeat, so the lookup is free at this rate
+    /// and the answer is never older than the question.
+    ///
+    /// `None` for a follower given as a literal address.
+    pub host: Option<String>,
     pub server_name: String,
 }
 
@@ -203,10 +215,19 @@ impl QuorumProbe for ReplicaPlaneProbe {
         // Concurrent: a follower that has stopped answering must not add its
         // full deadline to every other follower's wait.
         let answers = futures::future::join_all(self.followers.iter().map(|follower| async move {
+            // The name, if we have one, outranks the address we last resolved
+            // it to (#367). Inside the concurrent block so one follower whose
+            // name is slow to answer does not delay the others.
+            let addr = match &follower.host {
+                Some(host) => vtop_broker::replication::address_now(host)
+                    .await
+                    .unwrap_or(follower.addr),
+                None => follower.addr,
+            };
             let fenced = self
                 .client
                 .fence(
-                    follower.addr,
+                    addr,
                     &follower.server_name,
                     follower.node_uuid,
                     &self.range,
@@ -1717,6 +1738,9 @@ mod tests {
             vec![FollowerEndpoint {
                 node_uuid: follower_uuid,
                 addr: unreachable,
+                // A literal address, so the probe uses it verbatim: this test
+                // is about an unreachable follower, not about resolution.
+                host: None,
                 server_name: "replica".to_owned(),
             }],
             broker.range().clone(),

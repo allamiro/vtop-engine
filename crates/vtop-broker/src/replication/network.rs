@@ -74,9 +74,43 @@ impl Default for FlowControlConfig {
 #[derive(Clone, Debug)]
 pub struct NetworkFollowerConfig {
     pub node_id: Uuid,
+    /// Where the follower was, last time its name was looked up.
     pub addr: SocketAddr,
+    /// The `host:port` this follower was configured under, when it was a name.
+    ///
+    /// Kept because `addr` goes stale (#367). A follower whose pod is replaced
+    /// returns at a different address, and a leader that resolved the name
+    /// once at startup reconnects to the old one for the rest of its life —
+    /// with a bounded connect timeout and a reconnect backoff, so it looks
+    /// exactly like a follower that is merely down, forever, and quorum
+    /// silently shrinks by one.
+    ///
+    /// `None` for a follower given as a literal address, which is what the
+    /// deterministic harnesses do: there is nothing to look up again.
+    pub host: Option<String>,
     /// Expected server certificate name (SNI / rustls ServerName).
     pub server_name: String,
+}
+
+/// How often one follower's name may be looked up again.
+///
+/// The reconnect loop retries on a 50 ms backoff, and re-resolving on each
+/// would be twenty name queries a second for a follower that is simply down.
+/// A quarter second still finds a follower that moved within one connect
+/// timeout of it happening.
+const FOLLOWER_RERESOLVE_INTERVAL: Duration = Duration::from_millis(250);
+
+/// The address `host` names now, or `None` if the lookup gave nothing.
+///
+/// A lookup that fails is deliberately not an answer: the caller keeps the
+/// address it had, because a resolver hiccup is not evidence that a peer
+/// moved and replacing a working address with nothing would make a reachable
+/// replica unreachable.
+pub async fn address_now(host: &str) -> Option<SocketAddr> {
+    tokio::net::lookup_host(host)
+        .await
+        .ok()
+        .and_then(|mut addrs| addrs.next())
 }
 
 /// Apply surface hosted by a follower peer server.
@@ -846,6 +880,7 @@ impl NetworkedReplicaSet {
                 budget: Arc::clone(&budget),
             });
             let driver = FollowerDriver {
+                resolved_at: None,
                 config,
                 connector: connector.clone(),
                 flow: flow.clone(),
@@ -1064,6 +1099,9 @@ struct BufferedBatch {
 
 struct FollowerDriver {
     config: NetworkFollowerConfig,
+    /// When this follower's name was last looked up, so a follower that is
+    /// down is not a name query on the reconnect backoff (#367).
+    resolved_at: Option<std::time::Instant>,
     /// `None` means this leader dials its followers in plaintext (#294 slice 3).
     connector: Option<TlsConnector>,
     flow: FlowControlConfig,
@@ -1103,6 +1141,22 @@ impl FollowerDriver {
         }
     }
 
+    async fn re_resolve_if_due(&mut self) {
+        let Some(host) = self.config.host.clone() else {
+            return;
+        };
+        if self
+            .resolved_at
+            .is_some_and(|at| at.elapsed() < FOLLOWER_RERESOLVE_INTERVAL)
+        {
+            return;
+        }
+        self.resolved_at = Some(std::time::Instant::now());
+        if let Some(addr) = address_now(&host).await {
+            self.config.addr = addr;
+        }
+    }
+
     async fn connect_and_session(
         &mut self,
         next_request_id: &mut u64,
@@ -1110,6 +1164,12 @@ impl FollowerDriver {
         retransmission_bytes: &mut usize,
         pending: &mut VecDeque<FollowerCmd>,
     ) -> SessionOutcome {
+        // ASK WHERE THE FOLLOWER IS BEFORE DIALLING WHERE IT WAS (#367).
+        // Every arrival here is either the first connection or a reconnect
+        // after one failed, and "the follower moved" is one of the few things
+        // that failure can mean which retrying the same address will never
+        // fix.
+        self.re_resolve_if_due().await;
         let tcp = match timeout(
             self.flow.connect_timeout,
             TcpStream::connect(self.config.addr),

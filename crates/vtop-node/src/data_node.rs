@@ -80,11 +80,21 @@ fn lease_admin_client(
         // choose it belongs with the config surface, not here.
         plaintext: false,
     }];
+    // THE PEERS MAY NOT EXIST YET; THIS NODE'S OWN ENDPOINT MUST (#367). The
+    // configured endpoint above stays strict — a node that cannot resolve the
+    // metadata address it was given has been misconfigured, and saying so at
+    // startup is the kindest moment. A redirect target is different: in a
+    // group created all at once, some of these names have not been published,
+    // and refusing to start over a neighbour that is still being scheduled
+    // makes a startup race look like a broken node.
+    //
+    // A candidate that never resolves is simply one the walk cannot reach,
+    // which the walk already handles — and now handles quickly, since each
+    // candidate has its own deadline.
     for peer in &lease.admin_peers {
         candidates.push(vtop_meta::AdminCandidate {
             node_id: Some(vtop_meta::MetaNodeId(peer.node_id)),
-            endpoint: vtop_meta::resolve_endpoint(&peer.endpoint)
-                .map_err(|error| error.to_string())?,
+            endpoint: first_address_of(&peer.endpoint),
             server_name: if peer.server_name.is_empty() {
                 lease.server_name.clone()
             } else {
@@ -694,8 +704,8 @@ async fn run_leader(
             .map(|follower| {
                 Ok(NetworkFollowerConfig {
                     node_id: follower.node_uuid,
-                    addr: vtop_meta::resolve_endpoint(&follower.addr)
-                        .map_err(|error| error.to_string())?,
+                    addr: first_address_of(&follower.addr),
+                    host: Some(follower.addr.clone()),
                     server_name: follower.server_name.clone(),
                 })
             })
@@ -778,8 +788,8 @@ async fn run_leader(
             .map(|follower| {
                 Ok(crate::lease_agent::FollowerEndpoint {
                     node_uuid: follower.node_uuid,
-                    addr: vtop_meta::resolve_endpoint(&follower.addr)
-                        .map_err(|error| error.to_string())?,
+                    addr: first_address_of(&follower.addr),
+                    host: Some(follower.addr.clone()),
                     server_name: follower.server_name.clone(),
                 })
             })
@@ -1182,7 +1192,8 @@ async fn run_candidate(
         .map(|peer| {
             Ok(crate::lease_agent::FollowerEndpoint {
                 node_uuid: peer.node_uuid,
-                addr: vtop_meta::resolve_endpoint(&peer.addr).map_err(|error| error.to_string())?,
+                addr: first_address_of(&peer.addr),
+                host: Some(peer.addr.clone()),
                 server_name: peer.server_name.clone(),
             })
         })
@@ -1805,6 +1816,38 @@ async fn run_candidate(
     Ok(())
 }
 
+/// The address a peer's name holds right now, or a placeholder when it holds
+/// none yet (#367).
+///
+/// A name that does not resolve at startup is not a configuration error. In a
+/// replica set whose members are created together every member is in that
+/// position for some of its neighbours, and refusing to start over it turns an
+/// ordinary startup race into a crash loop — which is what the pod events
+/// showed, read as a broken node rather than a name that had not been
+/// published yet.
+///
+/// Both users of this address look the name up again before they use it: the
+/// replication driver on every connect, the promotion probe on every probe.
+/// So the placeholder's only job is to be a `SocketAddr`-shaped nothing in the
+/// meantime, and `0.0.0.0:0` is the one that fails a connect immediately
+/// instead of waiting out a timeout against something real.
+///
+/// It is announced rather than swallowed. A misspelt peer would otherwise
+/// start quietly and fail later as an absent replica, which is a much harder
+/// thing to read than a line at startup saying which name did not answer.
+fn first_address_of(host: &str) -> std::net::SocketAddr {
+    match vtop_meta::resolve_endpoint(host) {
+        Ok(addr) => addr,
+        Err(error) => {
+            eprintln!(
+                "peer {host} does not resolve yet ({error}); it will be looked up again \
+                 before each use, and stays unreachable until it answers"
+            );
+            std::net::SocketAddr::from(([0, 0, 0, 0], 0))
+        }
+    }
+}
+
 /// A candidate's current shape (#284).
 enum Phase {
     Following(Arc<InProcessFollower>),
@@ -1845,7 +1888,8 @@ async fn build_leader_phase(
         .map(|peer| {
             Ok(NetworkFollowerConfig {
                 node_id: peer.node_uuid,
-                addr: vtop_meta::resolve_endpoint(&peer.addr).map_err(|error| error.to_string())?,
+                addr: first_address_of(&peer.addr),
+                host: Some(peer.addr.clone()),
                 server_name: peer.server_name.clone(),
             })
         })
