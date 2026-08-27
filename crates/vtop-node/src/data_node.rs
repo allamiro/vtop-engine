@@ -1353,6 +1353,17 @@ async fn run_candidate(
     let mut phase = Phase::Following(initial);
 
     let mut native_task_done = false;
+    // A fatal plane failure, carried out of the loop instead of returned from
+    // inside it.
+    //
+    // Returning early skipped the drain below — which is where the lease is
+    // RELEASED — so a node that fail-stopped kept the range until its deadline
+    // and the survivors could not take it for a full lease duration. Worse, a
+    // restart inside that window sees itself as the holder and tries to serve
+    // again, which is #367's loop reached by a different door. Every exit now
+    // leaves through the same drain, so handing the range back is not
+    // something a new failure path can forget to do.
+    let mut fatal: Option<String> = None;
     'supervisor: loop {
         tokio::select! {
             changed = shutdown.changed() => {
@@ -1377,11 +1388,15 @@ async fn run_candidate(
                     native_task_done = true;
                     break;
                 }
-                return Err(match result {
+                // Marked done: the drain must not poll a JoinHandle this arm
+                // has already driven to completion.
+                native_task_done = true;
+                fatal = Some(match result {
                     Ok(Ok(())) => "candidate native server exited early".to_owned(),
                     Ok(Err(error)) => error,
                     Err(join) => format!("candidate native server task failed: {join}"),
                 });
+                break 'supervisor;
             }
             result = &mut replica_task => {
                 if *shutdown.borrow() {
@@ -1390,11 +1405,12 @@ async fn run_candidate(
                     }
                     break;
                 }
-                return Err(match result {
+                fatal = Some(match result {
                     Ok(Ok(())) => "candidate replica server exited early".to_owned(),
                     Ok(Err(error)) => error,
                     Err(join) => format!("candidate replica server task failed: {join}"),
                 });
+                break 'supervisor;
             }
             changed = verdict_rx.changed() => {
                 if changed.is_err() {
@@ -1536,7 +1552,8 @@ async fn run_candidate(
                                         native_task_done = true;
                                         break 'supervisor;
                                     }
-                                    return Err(match result {
+                                    native_task_done = true;
+                                    fatal = Some(match result {
                                         Ok(Ok(())) => {
                                             "candidate native server exited early".to_owned()
                                         }
@@ -1545,6 +1562,7 @@ async fn run_candidate(
                                             "candidate native server task failed: {join}"
                                         ),
                                     });
+                                    break 'supervisor;
                                 }
                                 result = &mut replica_task => {
                                     if *shutdown.borrow() {
@@ -1555,7 +1573,7 @@ async fn run_candidate(
                                         }
                                         break 'supervisor;
                                     }
-                                    return Err(match result {
+                                    fatal = Some(match result {
                                         Ok(Ok(())) => {
                                             "candidate replica server exited early".to_owned()
                                         }
@@ -1564,6 +1582,7 @@ async fn run_candidate(
                                             "candidate replica server task failed: {join}"
                                         ),
                                     });
+                                    break 'supervisor;
                                 }
                             }
                         };
@@ -1751,6 +1770,14 @@ async fn run_candidate(
             eprintln!("final commit failed; recovery will handle it: {error}")
         }
         None => {}
+    }
+    // THE FAILURE IS REPORTED LAST, after the range has been handed back. The
+    // node still exits — a dead plane is not something it can serve through —
+    // but it exits having released the lease rather than holding it to its
+    // deadline, so a survivor can take the range now instead of in fifteen
+    // seconds, and a fast restart cannot find itself still the holder.
+    if let Some(error) = fatal {
+        return Err(error);
     }
     Ok(())
 }
