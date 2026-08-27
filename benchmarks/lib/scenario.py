@@ -60,7 +60,11 @@ def reseed_count(volume: int, multiplier: float) -> int:
     scenario into a single-cycle drain, which looks like a passing run of
     something it never did (#98).
     """
-    return max(1, int(volume * multiplier))
+    # ROUNDED, not truncated. `int()` floors, and a multiplier whose binary
+    # representation lands a hair under the integer (1.15, 0.29) then seeds one
+    # file fewer every round — permanently understating both bytes_seeded and
+    # the very deficit this knob exists to create (review).
+    return max(1, round(volume * multiplier))
 
 
 @dataclass

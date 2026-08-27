@@ -1,6 +1,6 @@
 """Metrics collection + summary generation.
 
-Writes the six required CSV files plus summary.json / summary.md into
+Writes the seven required CSV files plus summary.json / summary.md into
 `results/<run_id>/`. Never overwrites a prior run (unique run_id; refuses an
 existing directory).
 """

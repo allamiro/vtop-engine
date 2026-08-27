@@ -15,6 +15,7 @@ Never overwrites a prior run.
 from __future__ import annotations
 
 import argparse
+import glob
 import os
 import shutil
 import sqlite3
@@ -125,6 +126,17 @@ def main() -> int:
 
     with SystemMonitor(emit_sys, interval=float(sc.get("sys_sample_interval", 1.0))):
         # initial seed
+        # A --seed-dir the caller supplied may already hold input. Those bytes
+        # reach `bytes_archived`, so they must reach `bytes_seeded` too or the
+        # deficit is computed between two different populations and clamps to
+        # zero (review).
+        for existing in glob.glob(os.path.join(seed_dir, "*")):
+            if os.path.isfile(existing):
+                seeded_bytes += os.path.getsize(existing)
+                files_seen += 1
+        if files_seen:
+            print(f"[bench] seed dir already held {files_seen} file(s); counted "
+                  "into the seeded baseline")
         totals = seed.generate_dataset(seed_dir, sc.format, int(sc.volume), sc.file_size)
         files_seen += totals["files"]
         seeded_bytes += totals["bytes"]
@@ -145,21 +157,48 @@ def main() -> int:
         # restores the property at whatever scale the disk can afford.
         stop_seeding = threading.Event()
         seeder = None
+        seeder_error: list[BaseException] = []
         if duration > 0 and sc.get("seed_concurrently", False):
             per_round = reseed_count(int(sc.volume),
                                      float(sc.get("backlog_multiplier", 0.25)))
             interval = float(sc.get("seed_interval_seconds", 1.0))
+            # REFUSED, not clamped: a non-positive interval turns the seeder
+            # into a tight loop that fills the disk instead of pacing anything,
+            # and a scenario asking for it has a mistake in it that a silent
+            # correction would hide (review).
+            if interval <= 0:
+                print("[bench] seed_interval_seconds must be > 0 when seeding "
+                      f"concurrently; got {interval}", file=sys.stderr)
+                return 2
+            # Whole-file formats are refused for the same reason a partially
+            # written file is not a record: the seeder writes to the final path,
+            # so the engine can discover and commit a half-written object and
+            # then archive the rest as a second one. Line formats tolerate this
+            # because the reader stops at the last newline (review).
+            if sc.get("whole_file", False) or sc.format == "binary":
+                print("[bench] seed_concurrently cannot be used with whole-file "
+                      "input: the engine may commit a partially written file",
+                      file=sys.stderr)
+                return 2
 
             def _seed_loop():
                 nonlocal files_seen, seeded_bytes
                 round_no = 0
-                while not stop_seeding.wait(interval):
-                    round_no += 1
-                    more = seed.generate_dataset(seed_dir, sc.format, per_round,
-                                                 sc.file_size, seed=10_000 + round_no)
-                    with seed_lock:
-                        files_seen += more["files"]
-                        seeded_bytes += more["bytes"]
+                try:
+                    while not stop_seeding.wait(interval):
+                        round_no += 1
+                        # ITS OWN NAMESPACE. Sharing one across rounds makes
+                        # filename collisions likely over a long soak, and a
+                        # collision truncates a file the engine already holds a
+                        # cursor for — silent loss inside the measurement.
+                        more = seed.generate_dataset(seed_dir, sc.format, per_round,
+                                                     sc.file_size, seed=10_000 + round_no,
+                                                     prefix=f"evt{round_no}")
+                        with seed_lock:
+                            files_seen += more["files"]
+                            seeded_bytes += more["bytes"]
+                except BaseException as exc:  # noqa: BLE001 - reported, not swallowed
+                    seeder_error.append(exc)
 
             seeder = threading.Thread(target=_seed_loop, name="seeder", daemon=True)
             seeder.start()
@@ -271,7 +310,13 @@ def main() -> int:
                     break
                 if seeder is not None:
                     # The seeder is already supplying work; adding more here
-                    # would double-count the rate the scenario asked for.
+                    # would double-count the rate the scenario asked for. But
+                    # a cycle that saw nothing must WAIT for the next round
+                    # rather than immediately launching another `process-once`
+                    # — a 300-second soak would otherwise spin subprocesses and
+                    # bill their startup to the engine's CPU (review).
+                    if produced == 0:
+                        time.sleep(float(sc.get("seed_interval_seconds", 1.0)))
                     continue
                 # SUSTAIN, and optionally OUTRUN. The re-seed happens after the
                 # cycle drained, so at the default multiplier the engine is
@@ -296,6 +341,23 @@ def main() -> int:
                 if cycle > 100000:  # safety backstop
                     break
 
+        # THE SEEDER STOPS BEFORE ANYTHING ELSE IS MEASURED. It used to be
+        # signalled after replay, so a run that replayed kept accumulating
+        # post-window files and inflated both total_seeded_bytes and the
+        # backlog (review). Joined without a timeout, too: a bounded join left
+        # a daemon thread writing into a seed directory the cleanup was about
+        # to remove.
+        stop_seeding.set()
+        if seeder is not None:
+            seeder.join()
+        if seeder_error:
+            # Reported, not swallowed. A run whose load generation died
+            # half-way is not a shorter run, it is a different experiment, and
+            # returning success would file it as the one that was asked for.
+            print(f"[bench] concurrent seeding failed: {seeder_error[0]}",
+                  file=sys.stderr)
+            return 3
+
         # failure / replay measurement
         if failed > 0 or sc.get("fault") in ("verify_fail", "replay"):
             rstart = iso_now()
@@ -310,9 +372,6 @@ def main() -> int:
                 "replay_success": rc == 0, "error_message": "" if rc == 0 else out[:200],
             })
 
-        stop_seeding.set()
-        if seeder is not None:
-            seeder.join(timeout=10)
 
     # --- the ledger, and what it costs to open (#98 hypotheses 2 and 3) -----
     # Both are about BATCH count rather than record count, which is why they
@@ -336,15 +395,29 @@ def main() -> int:
         # aborting a run whose real measurements already succeeded.
         pass
 
-    # RECOVERY, timed against the ledger the soak just built. The input is
-    # drained by now, so what this measures is startup plus recover() with no
-    # work to do — the cost of the ledger itself, which is the thing #77 says
-    # grows.
+    # RECOVERY, timed against the ledger the soak just built — and against an
+    # EMPTY INPUT DIRECTORY, which is the whole point.
+    #
+    # The first version pointed `process-once` at the real input glob. That
+    # command runs recover() and then a full source cycle, so in any run that
+    # ended with a backlog — the intended state of this scenario — it ingested
+    # and uploaded the leftovers and billed all of it to `recovery_ms`, while
+    # mutating the ledger it had just measured and discarding the outcomes
+    # (review). It measured the opposite of what it claimed: the more backlog
+    # the soak built, the less the number had to do with recovery.
+    #
+    # A second config over the SAME state store and an empty input directory
+    # isolates it: same ledger to open, nothing to process.
     recovery_ms = 0
     if ledger_rows:
+        empty_dir = tempfile.mkdtemp(prefix="vtop-recovery-empty-")
+        recovery_config = os.path.join(os.path.dirname(state_db), "_recovery.yaml")
+        engine.write_engine_config(
+            sc, work_dir, state_db, os.path.join(empty_dir, "*"), recovery_config)
         t0 = time.time()
-        engine.process_once(binary, config_path, sc)
+        engine.process_once(binary, recovery_config, sc)
         recovery_ms = int((time.time() - t0) * 1000)
+        shutil.rmtree(empty_dir, ignore_errors=True)
 
     end = time.time()
     duration_s = round(end - start, 3)
