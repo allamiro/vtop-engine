@@ -81,6 +81,24 @@ docker compose version >/dev/null 2>&1 || fail "docker compose plugin is require
 # would then have reported as a row of zeros (review). Creating them here as
 # the invoking user is what makes the run possible rather than merely honest.
 mkdir -p "$OUT_DIR" ./data/state ./data/work ./data/input ./data/spool
+
+# CREATING THEM IS NOT THE SAME AS THE ENGINE BEING ABLE TO WRITE THEM. A
+# previous lab run that started without this script leaves ./data owned by
+# root, and `mkdir -p` over an existing directory succeeds while changing
+# nothing — so the entrypoint's own check (docker/entrypoint.sh: work and
+# state must be writable) still exits the container, every cell still profiles
+# nothing, and the sweep still prints a grid of zeros and PASS (review).
+#
+# uid 10001 is neither the owner nor in the group of anything this user
+# creates, so the only permission bit that helps it is other-write. Try to
+# grant it; refuse to run if we could not, and say what to remove.
+for d in ./data/state ./data/work; do
+  chmod a+rwx "$d" 2>/dev/null || true
+  mode=$(stat -c '%a' "$d")
+  if [ "$(stat -c '%u' "$d")" != "10001" ] && [ "$(( 0$mode & 0002 ))" -eq 0 ]; then
+    fail "$d is mode $mode owned by $(stat -c '%U' "$d"), so the engine (uid 10001) cannot write it and every cell would profile nothing. Remove ./data (it is lab scratch: sudo rm -rf ./data) and rerun."
+  fi
+done
 CSV="$OUT_DIR/topic_sweep.csv"
 echo "topics,records_produced,observe_seconds,kafka_cycles,records_read,avg_read_phase_ms,avg_empty_wait_pct,objects_archived" > "$CSV"
 
@@ -162,11 +180,24 @@ TOTAL_RECORDS or lower the count."
   # (review). They are pointed at an empty directory rather than disabled: the
   # adapters still run, so their share of the read cycle stays visible in the
   # profile, which is part of what is being measured.
+  #
+  # The rule rewrites every host path bullet, not the file source's two. The
+  # first version of this narrowed `- /data/input/...` and then set a
+  # `spool_dir:` key that examples/config.yaml does not have — so the syslog
+  # plane kept reading `- /data/spool/*.log`, and whatever a previous lab run
+  # left in ./data/spool was archived inside every cell (review). The comment
+  # above said "all three planes" while the code narrowed one and a half.
   mkdir -p ./data/sweep-empty
   sed -e "s|^    topic_include_regex: .*|    topic_include_regex: \"^${prefix}-\"|" \
-      -e "s|^\( *\)- /data/input/.*|\1- /data/sweep-empty/*|" \
-      -e "s|^\( *\)spool_dir: .*|\1spool_dir: \"/data/sweep-empty\"|" \
+      -e "s|^\( *\)- /data/.*|\1- /data/sweep-empty/*|" \
     examples/config.yaml > "$SWEEP_CONFIG"
+
+  # ASSERTED, NOT ASSUMED — that is the whole lesson of the bug above. A
+  # config that grows a host path this rule does not cover fails the sweep
+  # instead of quietly folding someone else's backlog into the measurement.
+  if grep -nE '^[[:space:]]*- /data/' "$SWEEP_CONFIG" | grep -qv 'sweep-empty'; then
+    fail "the sweep config still reads a host path outside /data/sweep-empty: $(grep -nE '^[[:space:]]*- /data/' "$SWEEP_CONFIG" | grep -v 'sweep-empty' | tr '\n' ' ')"
+  fi
 
   log "observing the engine for ${OBSERVE_SECONDS}s"
   VTOP_CONFIG="$SWEEP_CONFIG_IN_CONTAINER" docker compose up -d vtop-engine >/dev/null
