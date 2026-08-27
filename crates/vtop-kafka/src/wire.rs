@@ -355,6 +355,19 @@ impl<'a> Decoder<'a> {
     }
 }
 
+/// A compact length: `len + 1` in a `u32`, or a panic.
+///
+/// Both halves can go wrong and only one of them is obvious. The cast wraps
+/// for a value above `u32::MAX`, and the `+ 1` wraps to zero for a value at
+/// exactly `u32::MAX` — which encodes as the compact NULL, turning the longest
+/// possible field into an absent one.
+fn compact_len(len: usize, what: &str) -> u32 {
+    u32::try_from(len)
+        .ok()
+        .and_then(|n| n.checked_add(1))
+        .unwrap_or_else(|| panic!("{what} cannot carry {len} bytes: the compact length is a u32"))
+}
+
 /// A growable response buffer.
 ///
 /// Encoding cannot fail: everything written is already a well-typed Rust value,
@@ -481,8 +494,16 @@ impl Encoder {
         }
     }
 
+    /// # Panics
+    ///
+    /// If `v` is too long for a compact length, which is a `u32` carrying
+    /// `len + 1`. Guarded for the same reason [`Encoder::string`] is, and it
+    /// was missed when that one was fixed: the earlier pass guarded the two
+    /// sites review had named and left the compact family and the array
+    /// lengths behind. Unused today — phase 1 serves no flexible version — so
+    /// this is a trap set for whoever enables one.
     pub fn compact_string(&mut self, v: &str) {
-        self.uvarint(v.len() as u32 + 1);
+        self.uvarint(compact_len(v.len(), "a COMPACT_STRING field"));
         self.raw(v.as_bytes());
     }
 
@@ -512,22 +533,36 @@ impl Encoder {
         }
     }
 
+    /// # Panics
+    ///
+    /// If `v` is too long for a compact length. See [`Encoder::compact_string`].
     pub fn compact_nullable_bytes(&mut self, v: Option<&[u8]>) {
         match v {
             Some(b) => {
-                self.uvarint(b.len() as u32 + 1);
+                self.uvarint(compact_len(b.len(), "a COMPACT_BYTES field"));
                 self.raw(b);
             }
             None => self.uvarint(0),
         }
     }
 
+    /// # Panics
+    ///
+    /// If `count` exceeds an `i32`. An ARRAY length that wraps describes a
+    /// different array than the one being written — negative, or short — and
+    /// the far side parses the remainder as something else entirely.
     pub fn array_len(&mut self, count: usize) {
-        self.i32(count as i32);
+        self.i32(i32::try_from(count).unwrap_or_else(|_| {
+            panic!("an ARRAY cannot carry {count} elements: the wire length is an i32")
+        }));
     }
 
+    /// # Panics
+    ///
+    /// If `count` is too large for a compact length. See
+    /// [`Encoder::compact_string`].
     pub fn compact_array_len(&mut self, count: usize) {
-        self.uvarint(count as u32 + 1);
+        self.uvarint(compact_len(count, "a COMPACT_ARRAY"));
     }
 
     /// The empty tagged-field section every flexible struct ends with.
@@ -538,6 +573,18 @@ impl Encoder {
 
 #[cfg(test)]
 mod tests {
+    // Length guards, checked as a family rather than one at a time — the
+    // earlier pass fixed the two sites review had named and left four behind.
+    #[test]
+    fn a_compact_length_at_the_u32_ceiling_is_refused_not_wrapped() {
+        // The `+ 1` is the half that hides: at exactly u32::MAX it wraps to
+        // zero, which is the compact encoding for NULL — so the longest
+        // possible field would have been written as an absent one.
+        assert_eq!(super::compact_len(0, "x"), 1);
+        assert_eq!(super::compact_len(41, "x"), 42);
+        assert!(std::panic::catch_unwind(|| super::compact_len(u32::MAX as usize, "x")).is_err());
+    }
+
     use super::*;
 
     /// Round-tripping is the cheap half. The half that matters is that the

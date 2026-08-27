@@ -316,7 +316,7 @@ impl RecordBatch {
         body.i64(producer_id);
         body.i16(producer_epoch);
         body.i32(base_sequence);
-        body.i32(records.len() as i32);
+        body.i32(wire_len(records.len(), "batch record count"));
         for record in records {
             encode_record(&mut body, record, base_offset, base_timestamp);
         }
@@ -324,7 +324,7 @@ impl RecordBatch {
 
         // batchLength counts everything after itself: the 9 bytes from
         // partitionLeaderEpoch through crc, plus the CRC-covered body.
-        let batch_length = (9 + body.len()) as i32;
+        let batch_length = wire_len(9 + body.len(), "batch length");
         let crc = crc32c(&body);
 
         let mut out = Encoder::with_capacity(HEADER_BYTES + body.len());
@@ -453,14 +453,14 @@ fn encode_record(out: &mut Encoder, record: &Record, base_offset: i64, base_time
     body.varint(delta_i32(record.offset, base_offset));
     write_varint_bytes(&mut body, record.key.as_deref());
     write_varint_bytes(&mut body, record.value.as_deref());
-    body.varint(record.headers.len() as i32);
+    body.varint(wire_len(record.headers.len(), "record header count"));
     for (name, value) in &record.headers {
-        body.varint(name.len() as i32);
+        body.varint(wire_len(name.len(), "header name"));
         body.raw(name.as_bytes());
         write_varint_bytes(&mut body, value.as_deref());
     }
     let body = body.into_vec();
-    out.varint(body.len() as i32);
+    out.varint(wire_len(body.len(), "record body"));
     out.raw(&body);
 }
 
@@ -497,6 +497,24 @@ fn delta_timestamp(timestamp_millis: i64, base_timestamp: i64) -> i64 {
 /// the batch would encode, decode, and describe a different record than the
 /// one handed in (review). Callers build batches from a contiguous run of
 /// offsets, so the distance is bounded by the batch size.
+/// A length on its way into an i32 wire field.
+///
+/// The deltas were checked one at a time as review found them; this is the
+/// same narrowing everywhere else in the encoder, done once. `usize` to `i32`
+/// is a silent wrap in release, and the value it wraps to is a LENGTH — a
+/// negative or truncated one describes a batch the far side will parse into
+/// something other than what was sent, which is worse than not sending it.
+///
+/// Panics rather than returning a Result, matching `Encoder::string` and
+/// `delta_i32`: everything encoded here is a well-typed Rust value the caller
+/// already holds, so a length beyond i32 is a programming error rather than
+/// input, and a `Result` nobody can trigger trains callers to unwrap the ones
+/// that matter.
+fn wire_len(len: usize, what: &str) -> i32 {
+    i32::try_from(len)
+        .unwrap_or_else(|_| panic!("{what} is {len} bytes, beyond an i32 wire length"))
+}
+
 fn delta_i32(offset: i64, base_offset: i64) -> i32 {
     // CHECKED, like the timestamp delta beside it. The `i32::try_from` below
     // guards the narrowing but not the subtraction that feeds it, so a span
@@ -555,7 +573,7 @@ fn read_exact(d: &mut Decoder<'_>, len: usize, field: &'static str) -> Result<Ve
 fn write_varint_bytes(out: &mut Encoder, value: Option<&[u8]>) {
     match value {
         Some(bytes) => {
-            out.varint(bytes.len() as i32);
+            out.varint(wire_len(bytes.len(), "varint-prefixed bytes"));
             out.raw(bytes);
         }
         None => out.varint(-1),
