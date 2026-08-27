@@ -311,11 +311,24 @@ impl TlsRaftNetwork {
     /// so the lookup happens before the error is returned, because openraft
     /// retries on its own schedule and the next attempt should already have
     /// the new address.
-    async fn unreachable_and_re_resolve(
+    fn unreachable_and_re_resolve(
         &self,
         error: impl std::fmt::Display,
     ) -> RPCError<NodeId, EmptyNode, RaftError<NodeId>> {
-        self.directory.re_resolve(self.target).await;
+        // DETACHED, because this RPC has a hard deadline and the lookup does
+        // not belong inside it (review). Awaiting here added the resolver's
+        // latency AFTER the deadline had already expired, delaying the
+        // failure's return — and with a 60 ms heartbeat against a 300 ms
+        // minimum election timeout, delaying a heartbeat is how a live peer
+        // is pushed into campaigning. The refresh is maintenance; the RPC's
+        // job is to return.
+        //
+        // Safe to detach: `re_resolve` throttles itself, so a burst of
+        // failures cannot become a burst of queries, and the next attempt
+        // uses whatever it has by then.
+        let directory = self.directory.clone();
+        let target = self.target;
+        tokio::spawn(async move { directory.re_resolve(target).await });
         self.unreachable(error)
     }
 
@@ -347,7 +360,7 @@ impl RaftNetwork<MetaRaftTypeConfig> for TlsRaftNetwork {
         let response =
             match with_rpc_deadline(option.hard_ttl(), client.append(addr, &request)).await {
                 Ok(response) => response,
-                Err(error) => return Err(self.unreachable_and_re_resolve(error).await),
+                Err(error) => return Err(self.unreachable_and_re_resolve(error)),
             };
         append_from_wire(response).map_err(|e| self.unreachable(e))
     }
@@ -362,7 +375,7 @@ impl RaftNetwork<MetaRaftTypeConfig> for TlsRaftNetwork {
         let response = match with_rpc_deadline(option.hard_ttl(), client.vote(addr, &request)).await
         {
             Ok(response) => response,
-            Err(error) => return Err(self.unreachable_and_re_resolve(error).await),
+            Err(error) => return Err(self.unreachable_and_re_resolve(error)),
         };
         vote_resp_from_wire(response).map_err(|e| self.unreachable(e))
     }

@@ -790,6 +790,12 @@ impl AdminClient {
                             ),
                             leader: hint.leader,
                         });
+                        // NOT A CLEARANCE. A redirect proves something is
+                        // answering, not that it is the node this candidate
+                        // was configured as (review) — a reused address may
+                        // reach a different member, which then redirects, and
+                        // treating that as proof would freeze the address. Only
+                        // a real answer clears the flag.
                         self.redirects.fetch_add(1, Ordering::Relaxed);
                         index = named.unwrap_or(index);
                         continue;
@@ -853,21 +859,32 @@ impl AdminClient {
     /// visits an address that answers nothing, with two healthy members in the
     /// list who both know exactly where the leader is.
     async fn attempt(&self, index: usize, request: &VtpmFrame) -> TransportResult<VtpmFrame> {
-        let candidate = self.resolved_candidate(index).await;
-        let stream =
-            match tokio::time::timeout(CANDIDATE_CONNECT_TIMEOUT, self.establish(&candidate)).await
-            {
-                Ok(result) => result,
-                Err(_) => Err(TransportError::Protocol(format!(
-                    "{} did not accept a connection within {CANDIDATE_CONNECT_TIMEOUT:?}",
-                    candidate.endpoint
-                ))),
-            };
-        let mut stream = match stream {
-            Ok(stream) => stream,
-            Err(error) => {
+        // ONE BUDGET PER CANDIDATE, COVERING THE LOOKUP TOO (review). Bounding
+        // only the connection let a stalled resolver add its own half second
+        // on top, so a candidate could cost 2.5 s of the caller's 5 s and two
+        // of them could spend the lot before the third — healthy — member was
+        // ever asked. Finding out where a candidate is, is part of reaching
+        // it, and the documented arithmetic below depends on that being true.
+        let reached = tokio::time::timeout(CANDIDATE_CONNECT_TIMEOUT, async {
+            let candidate = self.resolved_candidate(index).await;
+            let endpoint = candidate.endpoint;
+            self.establish(&candidate)
+                .await
+                .map(|stream| (stream, endpoint))
+        })
+        .await;
+        let mut stream = match reached {
+            Ok(Ok((stream, _))) => stream,
+            Ok(Err(error)) => {
                 self.mark_stale(index);
                 return Err(error);
+            }
+            Err(_) => {
+                self.mark_stale(index);
+                return Err(TransportError::Protocol(format!(
+                    "{} could not be reached within {CANDIDATE_CONNECT_TIMEOUT:?}",
+                    self.candidates[index].endpoint
+                )));
             }
         };
         // Beyond the connection the caller's budget is the bound, because it
