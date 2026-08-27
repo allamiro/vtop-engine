@@ -886,6 +886,24 @@ while :; do
   r_produce "$new_ordinal" "$NEW_EPOCH" 2 30 && break
   [ "$SECONDS" -lt "$produce_deadline" ] || {
     kubectl -n "$REPLICATED_NS" get pods || true
+    # THE ENGINE'S OWN ACCOUNT, not just the client's error. This failure has
+    # now been diagnosed twice from the outside and misattributed twice, both
+    # times because the only evidence was `tls handshake eof` — which says the
+    # holder is not serving and nothing about why. The decisions that matter
+    # are the engine's: whether it refused promotion, whether its quorum probe
+    # answered, whether it stood aside, whether it restarted. Dumping them here
+    # costs nothing on a passing run and is the difference between a diagnosis
+    # and a guess on a failing one.
+    for o in 0 1 2; do
+      echo "--- ${REL}-$o (last 120 lines) ---"
+      kubectl -n "$REPLICATED_NS" logs "${REL}-$o" --tail=120 2>&1 \
+        | grep -iE 'promot|quorum|lease|epoch|fenc|stand|slot|listener|panic|error' \
+        || kubectl -n "$REPLICATED_NS" logs "${REL}-$o" --tail=40 2>&1 || true
+      echo "--- ${REL}-$o previous container, if it restarted ---"
+      kubectl -n "$REPLICATED_NS" logs "${REL}-$o" --previous --tail=60 2>&1 | tail -20 || true
+    done
+    echo "--- lease as metadata sees it ---"
+    lease_state || true
     fail "produce never resumed against candidate $new_ordinal within 180s of the \
 failover, last aimed at epoch $NEW_EPOCH: $(tail -3 "$WORK/r-produce.log" 2>/dev/null)"
   }
