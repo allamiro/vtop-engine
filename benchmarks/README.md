@@ -75,6 +75,7 @@ Each `results/<run_id>/` contains:
 | `state_transition_metrics.csv` | one row per state transition | `from_state→to_state`, duration |
 | `upload_metrics.csv` | one row per object | object size, upload duration + speed, retries |
 | `replay_metrics.csv` | one row per replay | failed state, replay duration, success |
+| `backlog_metrics.csv` | one row per sustained-load cycle | bytes seeded vs archived, and the deficit between them |
 | `system_metrics.csv` | one row per sample | cpu%, memory, disk, network |
 | `summary.json` / `summary.md` | run rollup | everything above, aggregated + bottleneck notes |
 
@@ -97,6 +98,29 @@ Set `duration_seconds` in a scenario (e.g. `06-longrun-5min.yaml` = 300 s,
 also 1800 / 3600 for 30 min / 1 h). The runner re-seeds fresh files each cycle
 to sustain load and samples system metrics throughout. Each run gets its own
 `run_id` directory — long runs never clobber earlier ones.
+
+### Sustained backpressure (#98)
+
+Sustained load is not the same as a **backlog**. `process-once` drains
+everything it can see before returning, so work added between cycles is work
+the engine was never behind on: serially the deficit is zero at the end of
+every cycle, at any volume. That is the property the original "1M records/sec
+for 5 minutes" framing was really after — Kafka's producers do not wait — and
+it comes from the *source*, not from the record rate.
+
+`seed_concurrently: true` runs the seeder beside the engine, adding
+`volume x backlog_multiplier` files every `seed_interval_seconds`. Above what
+a cycle can drain, a real deficit accumulates — at whatever scale the disk can
+afford, which is why `11-backpressure-soak.yaml` reaches the condition on an
+ordinary machine instead of needing 45 GB and a producer rig.
+
+Three outputs answer the questions the issue asks:
+
+| output | reads on |
+|--------|----------|
+| `backlog_metrics.csv` | the deficit per cycle, in bytes seeded vs bytes archived. Whether it **plateaus or climbs** is the whole hypothesis; a shape needs samples, not an end-of-run total |
+| `ledger_bytes` / `ledger_rows` / `ledger_bytes_per_batch` | ledger growth. Rows scale with BATCH count, so a low `batch_max_records` grows the ledger far faster per byte archived than a flood does — this is tested *better* small than large |
+| `recovery_ms` | what it costs to open that ledger afterwards, with no work left to do (#77 loads the whole thing into memory at startup) |
 
 ## 8. Clean benchmark data
 
@@ -125,6 +149,7 @@ endpoint_url. `run_matrix.py --all` automatically picks it up.
 | Upload backend | ✅ MinIO, in-memory mock, localfs; AWS S3 via endpoint+creds | `localfs` (VTOP-LocalFS profile) driven by scenario `10-binary-localfs` |
 | Failure conditions | ✅ verification failure, replay/recovery | `backend: mock_fail`, `fault: replay` |
 | Runtime duration | ✅ any (`duration_seconds`) | 5 min / 30 min / 1 h presets easy to add |
+| Sustained backpressure | ✅ `seed_concurrently` + `backlog_multiplier` | a real deficit, not just sustained load — scenario `11-backpressure-soak` (#98) |
 
 ## Native segment write amp / proof overhead (#189)
 

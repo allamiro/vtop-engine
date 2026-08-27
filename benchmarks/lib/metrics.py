@@ -18,6 +18,8 @@ CSV_HEADERS: dict[str, list[str]] = {
         "run_id", "scenario_name", "start_time", "end_time", "duration_seconds",
         "total_input_files", "total_input_bytes", "total_output_objects",
         "total_output_bytes", "successful_files", "failed_files", "replayed_files",
+        "ledger_bytes", "ledger_rows", "ledger_bytes_per_batch", "recovery_ms",
+        "final_backlog_bytes", "total_seeded_bytes",
         "throughput_files_per_sec", "throughput_mb_per_sec", "avg_latency_ms",
         "p50_latency_ms", "p95_latency_ms", "p99_latency_ms", "cpu_avg_percent",
         "cpu_max_percent", "memory_avg_mb", "memory_max_mb", "disk_read_mb",
@@ -40,6 +42,13 @@ CSV_HEADERS: dict[str, list[str]] = {
         "object_size_bytes", "upload_start_time", "upload_end_time",
         "upload_duration_ms", "upload_speed_mb_per_sec", "retry_count", "status",
         "error_message",
+    ],
+    # One row per sustained-load cycle: how far behind the engine is, sampled
+    # as it runs. Whether this plateaus or climbs is the whole of #98's first
+    # hypothesis, and a shape needs samples rather than an end-of-run total.
+    "backlog_metrics.csv": [
+        "run_id", "cycle", "elapsed_seconds", "files_seeded", "bytes_seeded",
+        "bytes_archived", "backlog_bytes", "cycle_batches",
     ],
     "replay_metrics.csv": [
         "run_id", "batch_id", "failed_state", "replay_start_time",

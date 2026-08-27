@@ -17,15 +17,17 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
+import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lib import engine, seed  # noqa: E402
 from lib.metrics import ResultsWriter, iso_now, new_run_id, percentile  # noqa: E402
-from lib.scenario import load_scenario  # noqa: E402
+from lib.scenario import load_scenario, reseed_count  # noqa: E402
 from lib.sysmon import SystemMonitor  # noqa: E402
 
 STAGES = [
@@ -107,6 +109,14 @@ def main() -> int:
     success = failed = replayed = errors = 0
     comp_ratios = []
     files_seen = 0
+    # Seeded bytes, tracked alongside the archived ones so the backlog is a
+    # like-for-like subtraction. The first version compared seeded FILES with
+    # `success`, which counts committed BATCHES — with small batches a run
+    # archives more batches than it was ever given files, so the deficit came
+    # out negative and clamped to a permanent zero. A metric that reads zero
+    # whatever happens is worse than no metric.
+    seeded_bytes = 0
+    seed_lock = threading.Lock()
 
     def emit_sys(sample):
         row = {"run_id": run_id}
@@ -117,11 +127,43 @@ def main() -> int:
         # initial seed
         totals = seed.generate_dataset(seed_dir, sc.format, int(sc.volume), sc.file_size)
         files_seen += totals["files"]
+        seeded_bytes += totals["bytes"]
         print(f"[bench] seeded {totals['files']} files ({totals['bytes']} bytes) "
               f"format={sc.format} size={sc.file_size}")
 
         duration = float(sc.get("duration_seconds", 0) or 0)
         cycle = 0
+
+        # THE SEEDER RUNS BESIDE THE ENGINE, not between its cycles.
+        #
+        # `process-once` drains everything it can see before returning, so
+        # work added after it returns is work the engine was never behind on:
+        # serially, the deficit is zero at the end of every cycle by
+        # construction, at any volume and any multiplier. Kafka's producers do
+        # not wait, and that — not the record rate — is what put the engine
+        # hopelessly behind in #98. A thread seeding on a wall-clock interval
+        # restores the property at whatever scale the disk can afford.
+        stop_seeding = threading.Event()
+        seeder = None
+        if duration > 0 and sc.get("seed_concurrently", False):
+            per_round = reseed_count(int(sc.volume),
+                                     float(sc.get("backlog_multiplier", 0.25)))
+            interval = float(sc.get("seed_interval_seconds", 1.0))
+
+            def _seed_loop():
+                nonlocal files_seen, seeded_bytes
+                round_no = 0
+                while not stop_seeding.wait(interval):
+                    round_no += 1
+                    more = seed.generate_dataset(seed_dir, sc.format, per_round,
+                                                 sc.file_size, seed=10_000 + round_no)
+                    with seed_lock:
+                        files_seen += more["files"]
+                        seeded_bytes += more["bytes"]
+
+            seeder = threading.Thread(target=_seed_loop, name="seeder", daemon=True)
+            seeder.start()
+            print(f"[bench] seeding concurrently: {per_round} files every {interval}s")
         while True:
             rc, outcomes, stderr = engine.process_once(binary, config_path, sc)
             if rc != 0 and not outcomes:
@@ -208,13 +250,42 @@ def main() -> int:
             cycle += 1
             elapsed = time.time() - start
             if duration > 0:
+                # THE DEFICIT, recorded per cycle. Lag is the observable the
+                # sustained-backpressure hypotheses (#98) are read off: whether
+                # it plateaus or climbs is the difference between an engine
+                # that holds a steady deficit and one that degrades as it falls
+                # behind. Sampling it per cycle is what makes that a shape
+                # rather than a single end-of-run number.
+                with seed_lock:
+                    seeded_now, files_now = seeded_bytes, files_seen
+                writer.row("backlog_metrics.csv", {
+                    "run_id": run_id, "cycle": cycle,
+                    "elapsed_seconds": round(elapsed, 3),
+                    "files_seeded": files_now,
+                    "bytes_seeded": seeded_now,
+                    "bytes_archived": in_bytes,
+                    "backlog_bytes": max(0, seeded_now - in_bytes),
+                    "cycle_batches": produced,
+                })
                 if elapsed >= duration:
                     break
-                # sustain load: add more files
+                if seeder is not None:
+                    # The seeder is already supplying work; adding more here
+                    # would double-count the rate the scenario asked for.
+                    continue
+                # SUSTAIN, and optionally OUTRUN. The re-seed happens after the
+                # cycle drained, so at the default multiplier the engine is
+                # never actually behind — it is caught up by construction, and
+                # no amount of volume changes that. A multiplier above what a
+                # cycle can drain is what creates a real backlog, which is the
+                # condition the hypotheses need and the reason this knob exists.
+                per_cycle = reseed_count(int(sc.volume),
+                                         float(sc.get("backlog_multiplier", 0.25)))
                 more = seed.generate_dataset(seed_dir, sc.format,
-                                             max(1, int(sc.volume) // 4), sc.file_size,
+                                             per_cycle, sc.file_size,
                                              seed=cycle + 1)
                 files_seen += more["files"]
+                seeded_bytes += more["bytes"]
             else:
                 # Drained, or no forward progress (e.g. mock_fail keeps failing
                 # the same files since nothing commits) — stop and let replay run.
@@ -239,6 +310,42 @@ def main() -> int:
                 "replay_success": rc == 0, "error_message": "" if rc == 0 else out[:200],
             })
 
+        stop_seeding.set()
+        if seeder is not None:
+            seeder.join(timeout=10)
+
+    # --- the ledger, and what it costs to open (#98 hypotheses 2 and 3) -----
+    # Both are about BATCH count rather than record count, which is why they
+    # are testable at small scale: every batch writes its transitions, so a
+    # scenario with a low batch_max_records produces more ledger rows per byte
+    # than a flood does. #77 notes startup loads the whole ledger into memory,
+    # so its size is an operational limit rather than a curiosity.
+    ledger_bytes = 0
+    ledger_rows = 0
+    try:
+        ledger_bytes = os.path.getsize(state_db)
+        con = sqlite3.connect(state_db)
+        try:
+            for (table,) in con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'").fetchall():
+                ledger_rows += con.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+        finally:
+            con.close()
+    except (OSError, sqlite3.Error):
+        # A missing or unreadable ledger is reported as zero rather than
+        # aborting a run whose real measurements already succeeded.
+        pass
+
+    # RECOVERY, timed against the ledger the soak just built. The input is
+    # drained by now, so what this measures is startup plus recover() with no
+    # work to do — the cost of the ledger itself, which is the thing #77 says
+    # grows.
+    recovery_ms = 0
+    if ledger_rows:
+        t0 = time.time()
+        engine.process_once(binary, config_path, sc)
+        recovery_ms = int((time.time() - t0) * 1000)
+
     end = time.time()
     duration_s = round(end - start, 3)
     in_mb = in_bytes / 1e6
@@ -250,6 +357,12 @@ def main() -> int:
         "total_output_objects": out_objects, "total_output_bytes": out_bytes,
         "successful_files": success, "failed_files": failed,
         "replayed_files": replayed,
+        "ledger_bytes": ledger_bytes,
+        "ledger_rows": ledger_rows,
+        "ledger_bytes_per_batch": round(ledger_bytes / out_objects, 1) if out_objects else 0,
+        "recovery_ms": recovery_ms,
+        "final_backlog_bytes": max(0, seeded_bytes - in_bytes),
+        "total_seeded_bytes": seeded_bytes,
         "throughput_files_per_sec": round(success / duration_s, 3) if duration_s else 0,
         "throughput_mb_per_sec": round(in_mb / duration_s, 3) if duration_s else 0,
         "avg_latency_ms": round(sum(batch_total_ms) / len(batch_total_ms), 3) if batch_total_ms else 0,
