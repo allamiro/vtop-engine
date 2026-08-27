@@ -100,17 +100,33 @@ pub struct NetworkFollowerConfig {
 /// timeout of it happening.
 const FOLLOWER_RERESOLVE_INTERVAL: Duration = Duration::from_millis(250);
 
-/// The address `host` names now, or `None` if the lookup gave nothing.
+/// The address `host` names now, or `None` if the lookup gave nothing in time.
 ///
 /// A lookup that fails is deliberately not an answer: the caller keeps the
 /// address it had, because a resolver hiccup is not evidence that a peer
 /// moved and replacing a working address with nothing would make a reachable
 /// replica unreachable.
-pub async fn address_now(host: &str) -> Option<SocketAddr> {
-    tokio::net::lookup_host(host)
-        .await
-        .ok()
-        .and_then(|mut addrs| addrs.next())
+///
+/// BOUNDED, and the bound is the caller's (review). Every caller of this sits
+/// on a path that already has a deadline — a connect timeout, a probe budget
+/// — and an unbounded name lookup would quietly become the longest thing on
+/// it. A resolver that stalls costs `within` and no more; the next attempt
+/// asks again.
+pub async fn address_now(host: &str, within: Duration) -> Option<SocketAddr> {
+    match tokio::time::timeout(within, tokio::net::lookup_host(host)).await {
+        Ok(Ok(mut addrs)) => addrs.next(),
+        Ok(Err(error)) => {
+            // Said rather than swallowed: a misspelt peer and a transient DNS
+            // race look identical from the outside, and only one of them is
+            // worth an operator's attention (review).
+            eprintln!("could not resolve replica peer {host:?}: {error}");
+            None
+        }
+        Err(_) => {
+            eprintln!("resolving replica peer {host:?} exceeded {within:?}");
+            None
+        }
+    }
 }
 
 /// Apply surface hosted by a follower peer server.
@@ -1151,8 +1167,14 @@ impl FollowerDriver {
         {
             return;
         }
+        // Claimed before the await, so a resolver that has stopped answering
+        // cannot be asked again on the next backoff while the first query is
+        // still outstanding (review).
         self.resolved_at = Some(std::time::Instant::now());
-        if let Some(addr) = address_now(&host).await {
+        // Bounded by the connect timeout this is standing in front of: a name
+        // lookup must not cost more than the connection it is preparing, or a
+        // stalled resolver stalls reconnect and shutdown with it (review).
+        if let Some(addr) = address_now(&host, self.flow.connect_timeout).await {
             self.config.addr = addr;
         }
     }

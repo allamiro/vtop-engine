@@ -59,6 +59,14 @@ type MemRaft = Raft<MetaRaftTypeConfig>;
 /// simply down is asked about five times a second rather than seventeen.
 const RERESOLVE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// How long one name lookup may take before it is abandoned.
+///
+/// A resolver that stalls must not become a stall in the RPC that asked
+/// (review): replication's hard deadline is the heartbeat interval, 60 ms, and
+/// this runs on its failure path. Generous next to that and still finite —
+/// the point is that it ends, not that it is fast.
+const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Peer address directory keyed by Raft node id.
 #[derive(Clone, Debug, Default)]
 pub struct PeerDirectory {
@@ -147,9 +155,16 @@ impl PeerDirectory {
         // The lock is taken twice on purpose and is never held across the
         // lookup: a name that does not answer takes as long as the resolver
         // takes, and every other peer's RPCs would queue behind it.
+        //
+        // THE STAMP IS CLAIMED BEFORE THE AWAIT, not written after it
+        // (review). Replication drives one of these per failing RPC and they
+        // run concurrently, so a throttle that only takes effect once a lookup
+        // RETURNS is no throttle at all against exactly the case it is for: a
+        // resolver that has stopped answering, where every caller would start
+        // its own query and none would finish.
         let host = {
-            let peers = self.peers.lock().expect("peer directory");
-            let Some(peer) = peers.get(&id) else {
+            let mut peers = self.peers.lock().expect("peer directory");
+            let Some(peer) = peers.get_mut(&id) else {
                 return;
             };
             // Nothing to re-resolve from: this peer was given as a literal
@@ -163,17 +178,33 @@ impl PeerDirectory {
             {
                 return;
             }
+            peer.resolved_at = Some(std::time::Instant::now());
             host
         };
-        let resolved = tokio::net::lookup_host(&host)
+        // BOUNDED, because a resolver can stall and this is on the path of an
+        // RPC that has its own hard deadline — 60 ms for replication (review).
+        // A lookup that outlives the bound is abandoned, not waited for; the
+        // next failure will ask again.
+        let resolved = match tokio::time::timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host(&host))
             .await
-            .ok()
-            .and_then(|mut addrs| addrs.next());
+        {
+            Ok(Ok(mut addrs)) => addrs.next(),
+            Ok(Err(error)) => {
+                // SAID, because a misspelt peer and a transient DNS race look
+                // identical from the outside and only one of them is worth
+                // paging someone about (review).
+                eprintln!("could not resolve metadata peer {id} at {host:?}: {error}");
+                None
+            }
+            Err(_) => {
+                eprintln!("resolving metadata peer {id} at {host:?} exceeded {RESOLVE_TIMEOUT:?}");
+                None
+            }
+        };
         let mut peers = self.peers.lock().expect("peer directory");
         let Some(peer) = peers.get_mut(&id) else {
             return;
         };
-        peer.resolved_at = Some(std::time::Instant::now());
         // A lookup that failed leaves the last known address standing. It may
         // still be right — a resolver hiccup is not evidence a peer moved —
         // and replacing it with nothing would turn a transient DNS failure

@@ -718,13 +718,18 @@ fn a_follower_configured_by_name_is_reached_at_the_address_the_name_holds_now() 
          addresses, a majority is not reachable without the lookup"
     );
 
-    // And it keeps working across a reconnect, which is the moment the stale
-    // address would reassert itself if the name were only consulted once.
+    // A reconnect too — but this half proves LESS than it looks like it does,
+    // and saying so is cheaper than someone later trusting it (review). By
+    // now the name has resolved to the follower's real port and been cached,
+    // and the harness cannot move a bound listener, so the reconnect re-dials
+    // an address that is already correct. What it pins is that name-sourced
+    // followers survive a reconnect at all — not that the reconnect re-asks.
+    // The claim about re-resolution rests entirely on the first produce
+    // above, where the cached address could not have worked.
     assert!(h.replica_set.force_reconnect(FOLLOWER_1));
     let _ = produce_ok(&h.leader, h.range.clone(), 1);
     assert!(
         await_within(Duration::from_secs(5), || h.cluster_committed.get() == 2),
-        "a reconnect must look the name up again; a leader that re-dialled its \
-         cached address here would be exactly the failure this test exists for"
+        "a follower configured by name must keep acknowledging across a reconnect"
     );
 }

@@ -74,7 +74,7 @@ fn lease_admin_client(
         node_id: None,
         endpoint: vtop_meta::resolve_endpoint(&lease.admin_endpoint)
             .map_err(|error| error.to_string())?,
-        host: Some(lease.admin_endpoint.clone()),
+        host: name_source(&lease.admin_endpoint),
         server_name: lease.server_name.clone(),
         // TLS remains the only mode this path builds. Slice 1 of #294 makes the
         // admin transport CAPABLE of plaintext; wiring a node's lease client to
@@ -96,7 +96,7 @@ fn lease_admin_client(
         candidates.push(vtop_meta::AdminCandidate {
             node_id: Some(vtop_meta::MetaNodeId(peer.node_id)),
             endpoint: first_address_of(&peer.endpoint),
-            host: Some(peer.endpoint.clone()),
+            host: name_source(&peer.endpoint),
             server_name: if peer.server_name.is_empty() {
                 lease.server_name.clone()
             } else {
@@ -707,7 +707,7 @@ async fn run_leader(
                 Ok(NetworkFollowerConfig {
                     node_id: follower.node_uuid,
                     addr: first_address_of(&follower.addr),
-                    host: Some(follower.addr.clone()),
+                    host: name_source(&follower.addr),
                     server_name: follower.server_name.clone(),
                 })
             })
@@ -791,7 +791,7 @@ async fn run_leader(
                 Ok(crate::lease_agent::FollowerEndpoint {
                     node_uuid: follower.node_uuid,
                     addr: first_address_of(&follower.addr),
-                    host: Some(follower.addr.clone()),
+                    host: name_source(&follower.addr),
                     server_name: follower.server_name.clone(),
                 })
             })
@@ -1195,7 +1195,7 @@ async fn run_candidate(
             Ok(crate::lease_agent::FollowerEndpoint {
                 node_uuid: peer.node_uuid,
                 addr: first_address_of(&peer.addr),
-                host: Some(peer.addr.clone()),
+                host: name_source(&peer.addr),
                 server_name: peer.server_name.clone(),
             })
         })
@@ -1818,6 +1818,19 @@ async fn run_candidate(
     Ok(())
 }
 
+/// The configured value, when it is a NAME worth looking up again.
+///
+/// A literal `host:port` is already as current as it will ever be, so keeping
+/// it as a name-source buys nothing and costs a resolver query on every
+/// reconnect for a peer that is simply down (review). `None` for those, which
+/// every re-resolving path already treats as "nothing to look up".
+fn name_source(configured: &str) -> Option<String> {
+    if configured.parse::<std::net::SocketAddr>().is_ok() {
+        return None;
+    }
+    Some(configured.to_owned())
+}
+
 /// The address a peer's name holds right now, or a placeholder when it holds
 /// none yet (#367).
 ///
@@ -1891,7 +1904,7 @@ async fn build_leader_phase(
             Ok(NetworkFollowerConfig {
                 node_id: peer.node_uuid,
                 addr: first_address_of(&peer.addr),
-                host: Some(peer.addr.clone()),
+                host: name_source(&peer.addr),
                 server_name: peer.server_name.clone(),
             })
         })

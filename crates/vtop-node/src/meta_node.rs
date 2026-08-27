@@ -65,6 +65,17 @@ pub async fn serve(
         directory
             .insert_by_name(peer.id, peer.addr.clone(), peer.server_name.clone())
             .await;
+        // ANNOUNCED, so a typo and a startup race are distinguishable. Both
+        // present as an unreachable member; only one of them will ever fix
+        // itself, and an operator reading a node that came up "fine" has
+        // nothing to go on otherwise (review).
+        if directory.get(peer.id).is_none() {
+            eprintln!(
+                "metadata peer {} at {:?} does not resolve yet; it will be looked up \
+                 again on every failed exchange and stays unreachable until it answers",
+                peer.id, peer.addr
+            );
+        }
     }
 
     let env = Env::real();

@@ -139,7 +139,21 @@ pub struct ReplicaPlaneProbe {
     client: vtop_broker::replication::ReplicaStatusClient,
     followers: Vec<FollowerEndpoint>,
     range: vtop_protocol::RangeIdentity,
+    /// The most recent address each named follower actually resolved to.
+    ///
+    /// The fallback when a lookup fails, and it must not be the address this
+    /// process started with (#367): a follower that moved and was found stays
+    /// found, so the next resolver hiccup does not send the probe back to
+    /// where the follower used to be and report a healthy replica absent.
+    last_known: std::sync::Mutex<std::collections::HashMap<Uuid, std::net::SocketAddr>>,
 }
+
+/// How long a probe will wait for one follower's name.
+///
+/// Well inside the fence deadline it precedes, because a probe that waited out
+/// a stalled resolver would spend its round budget before asking a single
+/// replica anything.
+const PROBE_RESOLVE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// One follower, as the leader dials it.
 #[derive(Clone, Debug)]
@@ -175,6 +189,7 @@ impl ReplicaPlaneProbe {
             client,
             followers,
             range,
+            last_known: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 }
@@ -218,10 +233,35 @@ impl QuorumProbe for ReplicaPlaneProbe {
             // The name, if we have one, outranks the address we last resolved
             // it to (#367). Inside the concurrent block so one follower whose
             // name is slow to answer does not delay the others.
+            // THE FALLBACK IS THE LAST ADDRESS THAT WORKED, not the one this
+            // process started with (review). A follower that moved and was
+            // found is found again on the next probe; falling back to the
+            // startup address would send the next transient resolver failure
+            // straight back to where the follower used to be, report a healthy
+            // replica absent, and lose the promotion quorum on it.
+            //
+            // Bounded by the same deadline the fence itself gets: a probe that
+            // waited out a stalled resolver would spend the round budget
+            // before asking a single replica anything.
             let addr = match &follower.host {
-                Some(host) => vtop_broker::replication::address_now(host)
-                    .await
-                    .unwrap_or(follower.addr),
+                Some(host) => {
+                    match vtop_broker::replication::address_now(host, PROBE_RESOLVE_TIMEOUT).await {
+                        Some(addr) => {
+                            self.last_known
+                                .lock()
+                                .expect("resolved peers")
+                                .insert(follower.node_uuid, addr);
+                            addr
+                        }
+                        None => self
+                            .last_known
+                            .lock()
+                            .expect("resolved peers")
+                            .get(&follower.node_uuid)
+                            .copied()
+                            .unwrap_or(follower.addr),
+                    }
+                }
                 None => follower.addr,
             };
             let fenced = self
