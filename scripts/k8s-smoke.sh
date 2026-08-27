@@ -887,8 +887,25 @@ while :; do
   [ "$SECONDS" -lt "$produce_deadline" ] || {
     kubectl -n "$REPLICATED_NS" get pods || true
     fail "produce never resumed against candidate $new_ordinal within 180s of the \
-failover: $(tail -3 "$WORK/r-produce.log" 2>/dev/null)"
+failover, last aimed at epoch $NEW_EPOCH: $(tail -3 "$WORK/r-produce.log" 2>/dev/null)"
   }
+  # RE-READ THE HOLDER AFTER A FAILURE (review). The first grant above the
+  # pre-delete epoch is not necessarily the last: a candidate can win the
+  # race and then fail to stand its leader up — resolving or connecting to
+  # the peer that was just deleted — and lapse the lease to somebody else at
+  # a higher epoch. Pinning the target for all 180 seconds would then spend
+  # the whole budget producing at an epoch metadata has moved past, and fail
+  # a failover that actually succeeded. Retarget only when the epoch
+  # ADVANCES: monotonic minting makes that the one unambiguous signal that
+  # this is a different grant and not a stale read.
+  if read -r seen_holder seen_epoch <<< "$(lease_state)" \
+    && [ -n "${seen_epoch:-}" ] && [ "$seen_epoch" -gt "$NEW_EPOCH" ]; then
+    NEW_HOLDER="$seen_holder"
+    NEW_EPOCH="$seen_epoch"
+    new_ordinal="$(ordinal_of "$NEW_HOLDER")"
+    log "the range moved again while retrying: candidate $new_ordinal now holds it at \
+epoch $NEW_EPOCH — retargeting"
+  fi
   sleep 3
 done
 case "${members_at_write:-0}" in

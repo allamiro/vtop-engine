@@ -1041,6 +1041,21 @@ impl ReplicaObservation for InProcessFollower {
 /// The names match the leader's and the follower's deliberately: a panel
 /// built for a statically-rendered range keeps working against a candidate
 /// deployment, which is the whole point of retiring the rendered role.
+///
+/// # Two gauges, because a candidate has two states worth telling apart
+///
+/// `broker_candidate_leading` reports which ROLE is installed;
+/// `broker_lease_active` reports whether that role is AUTHORIZED right now.
+/// They differ in a case that matters and that neither one can express
+/// alone: a leading candidate whose agent lost sight of metadata is
+/// suspended — fenced, refusing writes, not ready — but still the leader
+/// role, and its supervisor deliberately does not rebuild it as a follower
+/// because a transient quorum miss is not a role change. Such a node reads
+/// `leading=1, lease_active=0`, and that pair is the whole diagnosis:
+/// which pod is the leader, and whether it can currently act as one
+/// (review). Collapsing `leading` into authorization would make the two
+/// gauges identical and lose the ability to say "the leader is fenced"
+/// rather than "there is no leader".
 pub struct CandidateCollector {
     view: Arc<dyn ReplicaObservation>,
     range_labels: [String; 2],
@@ -1094,7 +1109,10 @@ impl CandidateCollector {
             )?,
             leading: gauge_vec(
                 "broker_candidate_leading",
-                "1 while this candidate serves the range; 0 while it follows another holder",
+                "1 while the LEADER role is installed on this candidate; 0 while it \
+                 follows another holder. Read with broker_lease_active: leading=1 \
+                 with lease_active=0 is a leader that is currently fenced, and \
+                 refusing writes",
                 &["topic", "range"],
             )?,
         })
@@ -1668,6 +1686,65 @@ mod tests {
             "the held epoch must not be rewound to zero mid-transition — a \
              monotonic gauge that goes backwards reads as a replica that lost \
              its history: {text}"
+        );
+
+        // A SUSPENDED LEADER: still the leader role, currently unauthorized.
+        // The agent suspends the broker when it loses sight of metadata and
+        // deliberately leaves the supervisor leading, because a transient
+        // quorum miss is not a role change. The two gauges must say exactly
+        // that — leading=1, lease_active=0 — because neither one alone can:
+        // collapsing `leading` into authorization would make the pair
+        // identical and lose the difference between "the leader is fenced"
+        // and "there is no leader" (review).
+        struct Fenced;
+        impl ReplicaObservation for Fenced {
+            fn try_local_offsets(&self) -> Option<(u64, u64)> {
+                Some((41, 42))
+            }
+            fn cluster_committed_offset(&self) -> Option<u64> {
+                Some(41)
+            }
+            fn try_meta_fencing_epoch(&self) -> Option<(u64, bool)> {
+                Some((3, false))
+            }
+            fn held_fencing_epoch(&self) -> u64 {
+                3
+            }
+            fn is_leading(&self) -> bool {
+                true
+            }
+            fn role_reading(&self) -> Option<RoleReading> {
+                Some(RoleReading {
+                    // Suspension deactivates the view WITHOUT advancing the
+                    // epoch: the grant is still this node's, which is why it
+                    // can be reactivated by the next successful read.
+                    meta: Some((3, false)),
+                    held: 3,
+                    leading: true,
+                })
+            }
+        }
+        let fenced = Registry::new_custom(Some("vtop".into()), None).unwrap();
+        fenced
+            .register(Box::new(
+                CandidateCollector::new(Arc::new(Fenced) as Arc<dyn ReplicaObservation>, &range)
+                    .unwrap(),
+            ))
+            .unwrap();
+        let text = scrape(&fenced);
+        assert!(
+            text.lines()
+                .any(|line| line.starts_with("vtop_broker_candidate_leading{")
+                    && line.ends_with(" 1")),
+            "a fenced leader is still the leader ROLE, and an operator hunting \
+             the leader must still find it: {text}"
+        );
+        assert!(
+            text.lines()
+                .any(|line| line.starts_with("vtop_broker_lease_active{") && line.ends_with(" 0")),
+            "a fenced leader is NOT authorized and will refuse the next write, \
+             so the authorization gauge must say so even while the role stands: \
+             {text}"
         );
     }
 
