@@ -220,7 +220,13 @@ TOTAL_RECORDS or lower the count."
   seal_age=$(( OBSERVE_SECONDS / 4 ))
   [ "$seal_age" -ge 1 ] || fail "OBSERVE_SECONDS=$OBSERVE_SECONDS is too short to \
 seal a batch inside a cell; objects_archived would measure scheduling. Use 4s or more."
+  # EMPTIED, not merely created. `mkdir -p` over a directory that already
+  # holds a file leaves it there, and both the file and syslog adapters are
+  # pointed here — so that one file is re-archived after every cell's state
+  # reset and counted in objects_archived, which is the confound this
+  # redirection exists to remove (review).
   mkdir -p ./data/sweep-empty
+  rm -rf ./data/sweep-empty/* ./data/sweep-empty/.[!.]* 2>/dev/null || true
   sed -e "s|^    topic_include_regex: .*|    topic_include_regex: \"^${prefix}-\"|" \
       -e "s|^\( *\)- /data/.*|\1- /data/sweep-empty/*|" \
       -e "s|^\( *\)max_batch_age_seconds: .*|\1max_batch_age_seconds: ${seal_age}|" \
@@ -250,6 +256,12 @@ seal at or after the observation window and objects_archived would be meaningles
   VTOP_CONFIG="$SWEEP_CONFIG_IN_CONTAINER" docker compose up -d vtop-engine >/dev/null
   sleep "$OBSERVE_SECONDS"
 
+  # STILL RUNNING? A cell that emitted a profile and then died leaves a
+  # non-empty log and a plausible row, and the sweep would report it (review).
+  # Asked before the container is stopped, so "not running" means it stopped
+  # itself.
+  engine_state="$(docker compose ps --format '{{.State}}' vtop-engine 2>/dev/null | head -1)"
+
   logs="$OUT_DIR/engine-${count}.log"
   docker compose logs --no-color vtop-engine > "$logs" 2>&1 || true
   docker compose stop vtop-engine >/dev/null 2>&1 || true
@@ -259,6 +271,11 @@ seal at or after the observation window and objects_archived would be meaningles
   # in it is more useful than no grid — as long as the hole is reported,
   # which is what the refusal at the end is for.
   cell_ok=0
+  if [ "$engine_state" != "running" ]; then
+    log "WARNING: the engine was '${engine_state:-absent}' at collection, not running — \
+this cell did not survive its own observation window"
+    cell_ok=4
+  fi
   python3 - "$logs" "$count" "$produced" "$OBSERVE_SECONDS" "$CSV" <<'PY_PARSE' || cell_ok=$?
 import re, sys
 log, count, produced, observe, csv_path = (
@@ -310,6 +327,18 @@ else:
         fh.write(",".join(str(v) for v in row) + "\n")
     print(f"[topic-sweep] {count} topic(s): {n} cycle(s), {int(sum(reads))} record(s) read, "
           f"avg read phase {row[5]} ms, avg empty wait {row[6]}%, {archived} object(s) archived")
+    # READS WITHOUT ARCHIVES MEANS THE PIPELINE BROKE BEHIND THE READER
+    # (review). Before the seal age was narrowed this was ambiguous — a batch
+    # simply might not have aged out inside the window — but the config now
+    # seals several times per cell, so records read and nothing archived is an
+    # upload, verification or commit that failed, and the row it produced
+    # describes half a pipeline.
+    if sum(reads) > 0 and archived == 0:
+        print(f"[topic-sweep] WARNING: {count} topic(s) read {int(sum(reads))} record(s) and "
+              f"archived NOTHING, with a seal age well inside the window — the upload, "
+              f"verification or commit stage failed. The row above is not a measurement of "
+              f"a working pipeline.")
+        sys.exit(5)
 PY_PARSE
   if [ "$cell_ok" -ne 0 ]; then
     FAILED_CELLS="${FAILED_CELLS}${FAILED_CELLS:+ }${count}"
