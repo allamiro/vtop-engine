@@ -2136,21 +2136,25 @@ mod tests {
         );
     }
 
-    /// A sub-threshold read must be buffered (not flushed) on a non-forced
-    /// cycle, then sealed and committed when the cycle forces a flush — proving
-    /// `AdaptiveBatcher`/`BatchLimits` is actually driving runtime batching.
-    #[tokio::test]
-    /// Batches are processed CONCURRENTLY across sources (#87), and every one
-    /// of them still commits only after its own verification.
+    /// Every batch commits off the back of ITS OWN verification, with several
+    /// of them admitted to the pipeline at once (#87).
     ///
-    /// The pipelining itself landed in #94 and was never pinned. What matters
-    /// is not that it is fast — a timing assertion would measure the machine —
-    /// but that concurrency did not cost the invariant: with several batches
-    /// in flight at once, each must reach SOURCE_COMMITTED off the back of ITS
-    /// OWN verify, and none may be left verified-but-uncommitted. A batch in
-    /// that state is the wedge the flush loop documents at length: the next
-    /// cycle rebuilds the same batch_id, the ledger refuses the duplicate, and
+    /// WHAT THIS DOES NOT PIN, stated because the test's name could be read
+    /// as claiming it: this does not prove any work OVERLAPS. Every assertion
+    /// below is about final outcomes, so a runtime that processed the five
+    /// batches strictly serially would pass it unchanged (review). Proving
+    /// overlap needs an instrumented backend that records peak in-flight work
+    /// — a barrier or an atomic counter the pipeline increments — which the
+    /// mock backend does not offer today.
+    ///
+    /// What it does pin is the property concurrency was allowed to cost, and
+    /// that is worth its own test: with several batches in flight, each must
+    /// reach SOURCE_COMMITTED off the back of its own verify, and none may be
+    /// left verified-but-uncommitted. A batch in that state is the wedge the
+    /// flush loop documents at length: the next cycle rebuilds the same
+    /// batch_id, the ledger refuses the duplicate, and
     /// the source stops until a restart runs recovery.
+    #[tokio::test]
     async fn concurrent_batches_each_commit_after_their_own_verify() {
         let dir = tempfile::tempdir().unwrap();
         let work = dir.path().join("work");
@@ -2207,6 +2211,9 @@ mod tests {
         );
     }
 
+    /// A sub-threshold read must be buffered (not flushed) on a non-forced
+    /// cycle, then sealed and committed when the cycle forces a flush — proving
+    /// `AdaptiveBatcher`/`BatchLimits` is actually driving runtime batching.
     #[tokio::test]
     async fn run_source_holds_subthreshold_data_until_forced() {
         let dir = tempfile::tempdir().unwrap();

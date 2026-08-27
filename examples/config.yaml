@@ -51,9 +51,16 @@ batching:
   # many verifications are in flight.
   #
   # Raise it when uploads dominate (high latency to the object store, small
-  # batches). Lower it when memory matters: each in-flight batch holds its
-  # payload, so the ceiling on resident bytes is roughly this times
-  # `max_bytes`. Zero is refused at startup — it would flush nothing.
+  # batches). Zero is refused at startup — it would flush nothing.
+  #
+  # NOT A MEMORY CEILING, and worth being exact about because lowering it to
+  # prevent an OOM would not work (review). A cycle drains EVERY flushable
+  # buffer into a work queue first, and this setting bounds how many of those
+  # are compressed, uploaded and verified AT ONCE — not how many are resident.
+  # Fifty sources flushing in one cycle hold fifty payloads whatever this is
+  # set to. What bounds resident bytes is `max_bytes` times the number of
+  # buffers a cycle can flush, which is a property of how many sources are
+  # configured and how often they seal.
   max_concurrent_batches: 8
 
 compression:
