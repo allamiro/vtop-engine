@@ -687,7 +687,7 @@ pub struct LeaseAgent {
 /// short and the node that just stood aside wins the next race anyway, which
 /// is the re-acquisition loop of #367 with extra steps; the hold-off has to
 /// outlast the lease so somebody else gets an uncontested acquisition.
-fn stand_aside_rounds_for(lease: Duration, poll: Duration) -> u32 {
+pub(crate) fn stand_aside_rounds_for(lease: Duration, poll: Duration) -> u32 {
     let lease_ms = lease.as_millis().max(1);
     let poll_ms = poll.as_millis().max(1);
     (lease_ms.saturating_mul(2).div_ceil(poll_ms)).min(u128::from(u32::MAX)) as u32
@@ -739,6 +739,20 @@ impl LeaseAgent {
     /// granted (#367). See [`LeaseAgent::stand_down`].
     pub fn with_stand_down(mut self, flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
         self.stand_down = Some(flag);
+        self
+    }
+
+    /// Begin already standing aside, because a previous incarnation of this
+    /// process was granted an epoch it could not serve (#367).
+    ///
+    /// The in-process hold-off cannot survive the process. If the node exits —
+    /// a fail-stop, a panic, an orchestrator restarting the pod — the fresh
+    /// agent starts with a clean slate and campaigns immediately, wins again
+    /// because nothing marks it as the replica that just failed, and fails the
+    /// same way. That is the loop #368 did not close, and it is why the marker
+    /// this reads is written to disk rather than remembered.
+    pub fn standing_aside(mut self, rounds: u32) -> Self {
+        self.campaign_hold_off_rounds = rounds;
         self
     }
 

@@ -1221,6 +1221,7 @@ async fn run_candidate(
     // Set when a granted epoch turns out to be unservable (#367); the agent
     // releases it and sits out the next rounds rather than renewing it.
     let stand_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stand_aside_marker = StandAsideMarker::new(&config.data_dir);
     let agent = crate::lease_agent::LeaseAgent::new(
         lease_admin_client(lease)?,
         crate::lease_agent::LeaseAgentConfig {
@@ -1240,9 +1241,24 @@ async fn run_candidate(
     // metadata reports a follower that refuses every append). Added, not
     // declared as a total, so a colocated meta role's mark stays counted.
     observability.gate.add_required_marks(1);
-    let agent = agent
+    let mut agent = agent
         .with_ready_gate(observability.gate.clone())
         .with_stand_down(Arc::clone(&stand_down));
+    // A previous incarnation of this process may have been granted an epoch it
+    // could not serve (#367). The marker outlives the process precisely because
+    // the hold-off cannot.
+    if let Some(failed_epoch) = stand_aside_marker.take() {
+        let rounds = crate::lease_agent::stand_aside_rounds_for(
+            Duration::from_millis(lease.lease_duration_ms),
+            Duration::from_millis(lease.poll_interval_ms),
+        );
+        eprintln!(
+            "a previous run of this node was granted epoch {failed_epoch} and could not \
+             serve it; standing aside for {rounds} poll round(s) so another candidate \
+             gets an uncontested turn"
+        );
+        agent = agent.standing_aside(rounds);
+    }
     let agent_drain = std::time::Duration::from_secs(5)
         .max(std::time::Duration::from_millis(lease.lease_duration_ms));
     let mut agent_task = tokio::spawn(agent.run(release_lease_rx));
@@ -1513,6 +1529,11 @@ async fn run_candidate(
                                                 true,
                                                 std::sync::atomic::Ordering::SeqCst,
                                             );
+                                            // AND on disk, because this
+                                            // process may not live long enough
+                                            // to serve the hold-off it just
+                                            // armed (#367).
+                                            stand_aside_marker.record(fencing_epoch);
                                             publisher.set_target(None);
                                             let (set, _) = open_range(
                                                 &config.data_dir,
@@ -1734,6 +1755,15 @@ async fn run_candidate(
     // anything an abort interrupts was never acknowledged — while a range
     // nobody can serve is a range nobody else can take.
     if fatal.is_some() {
+        // A FATAL EXIT IS ALSO A FAILURE TO SERVE (#367). This process was
+        // granted an epoch and its plane died under it; the restart that
+        // follows must not walk straight back into the same grant. The
+        // in-process hold-off cannot help — there is no next round of this
+        // process — so the marker is the only thing that carries the fact
+        // across.
+        if let Phase::Leading { broker, .. } = &phase {
+            stand_aside_marker.record(broker.held_fencing_epoch());
+        }
         native_task.abort();
         replica_task.abort();
         // Aborted handles must not be awaited again below.
@@ -1803,6 +1833,62 @@ async fn run_candidate(
         return Err(error);
     }
     Ok(())
+}
+
+/// The marker a candidate leaves behind when it was granted an epoch it could
+/// not serve (#367).
+///
+/// The hold-off that stops a failed candidate from immediately re-winning the
+/// range lives in the lease agent, which lives in the process. When the
+/// process ends — a fail-stop, a panic, an orchestrator restart — that memory
+/// goes with it, the fresh agent campaigns at once, wins because nothing marks
+/// it as the replica that just failed, and fails identically. Five grants in
+/// ninety seconds, none of them served.
+///
+/// So the fact outlives the process, in the one place that also does: the
+/// range's own data directory. It is a fact about THIS replica and THIS range,
+/// which is exactly what a per-range directory is.
+///
+/// ONE-SHOT BY CONSTRUCTION. Reading it removes it, so a node stands aside for
+/// one hold-off and then competes normally. A marker that persisted would be
+/// worse than the loop it prevents: a single-candidate range would never come
+/// back, and the failure this guards against is usually transient (a peer's
+/// DNS that had not resolved yet, a port still held by the dying process).
+struct StandAsideMarker {
+    path: std::path::PathBuf,
+}
+
+impl StandAsideMarker {
+    fn new(data_dir: &std::path::Path) -> Self {
+        Self {
+            path: data_dir.join(".stand-aside"),
+        }
+    }
+
+    /// Record that this node could not serve `fencing_epoch`.
+    ///
+    /// Best effort, deliberately: a node that cannot write here is a node
+    /// whose data directory is already unusable, which is the same condition
+    /// that stopped it serving. Failing the shutdown over the marker would
+    /// trade a recoverable loop for an unrecoverable stop.
+    fn record(&self, fencing_epoch: u64) {
+        if let Err(error) = std::fs::write(&self.path, fencing_epoch.to_string()) {
+            eprintln!(
+                "could not record the stand-aside marker at {}; a restart may \
+                 re-acquire the range it just failed to serve: {error}",
+                self.path.display()
+            );
+        }
+    }
+
+    /// Consume the marker, if one is there. Returns the epoch it named.
+    fn take(&self) -> Option<u64> {
+        let contents = std::fs::read_to_string(&self.path).ok()?;
+        // Removed BEFORE the value is used: a marker that survives its own
+        // reading would stand this node aside on every restart forever.
+        let _ = std::fs::remove_file(&self.path);
+        contents.trim().parse().ok()
+    }
 }
 
 /// A candidate's current shape (#284).
@@ -2835,6 +2921,47 @@ mod tests {
                 Some(41)
             ),
             "the latest recorded grant completes"
+        );
+    }
+
+    /// The stand-aside marker outlives the process, and is consumed by the
+    /// first restart that reads it (#367).
+    ///
+    /// Both halves matter and they pull against each other. It must SURVIVE,
+    /// because the in-process hold-off dies with the process and a restarted
+    /// candidate would otherwise campaign immediately, win because nothing
+    /// marks it as the replica that just failed, and fail the same way. It
+    /// must be CONSUMED, because a marker that persisted would leave a
+    /// single-candidate range permanently unled — and the failures it guards
+    /// against are usually transient.
+    #[test]
+    fn a_stand_aside_marker_survives_the_process_and_only_the_first_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = StandAsideMarker::new(dir.path());
+
+        assert_eq!(
+            marker.take(),
+            None,
+            "a node that never failed must not stand aside"
+        );
+
+        marker.record(7);
+        // A DIFFERENT handle over the same directory: this is the restarted
+        // process, which shares nothing with the one that wrote it except the
+        // data dir.
+        let after_restart = StandAsideMarker::new(dir.path());
+        assert_eq!(
+            after_restart.take(),
+            Some(7),
+            "the epoch this node could not serve must survive the process that \
+             could not serve it"
+        );
+        assert_eq!(
+            StandAsideMarker::new(dir.path()).take(),
+            None,
+            "and exactly one restart may claim it: a marker that outlived its own \
+             reading would stand this node aside on every restart forever, which \
+             leaves a single-candidate range with no leader at all"
         );
     }
 
