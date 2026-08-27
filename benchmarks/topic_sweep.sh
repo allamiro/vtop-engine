@@ -106,6 +106,7 @@ for d in ./data/state ./data/work; do
     fail "$d is mode $mode owned by $(stat -c '%U' "$d"); the engine (uid 10001) and this script both write it, so it needs other-write and the chmod could not grant it. Remove ./data (it is lab scratch: sudo rm -rf ./data) and rerun."
   fi
 done
+FAILED_CELLS=""
 CSV="$OUT_DIR/topic_sweep.csv"
 echo "topics,records_produced,observe_seconds,kafka_cycles,records_read,avg_read_phase_ms,avg_empty_wait_pct,objects_archived" > "$CSV"
 
@@ -249,7 +250,12 @@ seal at or after the observation window and objects_archived would be meaningles
   docker compose logs --no-color vtop-engine > "$logs" 2>&1 || true
   docker compose stop vtop-engine >/dev/null 2>&1 || true
 
-  python3 - "$logs" "$count" "$produced" "$OBSERVE_SECONDS" "$CSV" <<'PY_PARSE'
+  # A FAILED CELL IS RECORDED AND THE SWEEP CONTINUES. Aborting here would
+  # throw away the cells that did measure something, and a grid with a hole
+  # in it is more useful than no grid — as long as the hole is reported,
+  # which is what the refusal at the end is for.
+  cell_ok=0
+  python3 - "$logs" "$count" "$produced" "$OBSERVE_SECONDS" "$CSV" <<'PY_PARSE' || cell_ok=$?
 import re, sys
 log, count, produced, observe, csv_path = (
     sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5])
@@ -283,9 +289,14 @@ if n == 0:
     # NOT WRITTEN AT ALL. A row of zeros is indistinguishable from a measured
     # zero once anyone loads the CSV, and an engine that failed to start is
     # exactly how a cell reaches here (review).
+    # AND A NON-ZERO EXIT. Not writing a fabricated row stopped the CSV
+    # lying, but the sweep still printed PASS over a grid with cells missing
+    # from it (review) — an incomplete benchmark reported as a successful one,
+    # which is the same failure one level up.
     print(f"[topic-sweep] WARNING: {count} topic(s) produced NO kafka read_cycle_profile "
           f"lines — the engine may not have started, or discovery matched nothing. "
           f"NO ROW WRITTEN; this cell is not a measurement.")
+    sys.exit(3)
 else:
     row = [count, produced, observe, n, int(sum(reads)),
            round(sum(phase) / len(phase), 1) if phase else 0,
@@ -296,8 +307,17 @@ else:
     print(f"[topic-sweep] {count} topic(s): {n} cycle(s), {int(sum(reads))} record(s) read, "
           f"avg read phase {row[5]} ms, avg empty wait {row[6]}%, {archived} object(s) archived")
 PY_PARSE
+  if [ "$cell_ok" -ne 0 ]; then
+    FAILED_CELLS="${FAILED_CELLS}${FAILED_CELLS:+ }${count}"
+  fi
 done
 
 log "results -> $CSV"
 column -s, -t "$CSV" || cat "$CSV"
+if [ -n "$FAILED_CELLS" ]; then
+  fail "topic count(s) [$FAILED_CELLS] produced no measurement, so this grid is \
+incomplete. Their engine logs are in $OUT_DIR/engine-<count>.log. A sweep that \
+reported PASS over a missing cell is how a comparison gets drawn between a \
+number and an absence."
+fi
 log "PASS"
