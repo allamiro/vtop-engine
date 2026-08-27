@@ -3003,9 +3003,15 @@ pub(crate) fn read_chunk_sidecar(
             reason: "chunk-sidecar checksum mismatch".to_owned(),
         });
     }
+    // `as_chunks`, not `chunks_exact`: the chunk is then a [u8; 32] by TYPE,
+    // so the conversion below is a copy rather than a fallible `try_into`
+    // whose failure branch could never be taken. The length was already
+    // checked above, so the remainder is empty by construction.
     let leaves = bytes[22..checksum_start]
-        .chunks_exact(32)
-        .map(|chunk| blake3::Hash::from_bytes(chunk.try_into().expect("fixed slice")))
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .map(|chunk| blake3::Hash::from_bytes(*chunk))
         .collect();
     Ok((chunk_size, leaves))
 }
@@ -3051,10 +3057,24 @@ fn read_index(storage: &dyn Storage, path: &Path) -> VtopLogResult<Vec<IndexEntr
         });
     }
     Ok(bytes[16..]
-        .chunks_exact(16)
-        .map(|chunk| IndexEntry {
-            offset: u64::from_be_bytes(chunk[..8].try_into().expect("fixed slice")),
-            position: u64::from_be_bytes(chunk[8..].try_into().expect("fixed slice")),
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .map(|chunk| {
+            // Split by TYPE into two [u8; 8] halves. `split_at` would hand
+            // back slices and leave both `try_into().expect(...)` calls in
+            // place — the very conversions this was meant to remove (review).
+            // A slice pattern over `as_chunks` binds the halves as arrays, so
+            // `from_be_bytes` takes exactly what it needs and nothing can
+            // fail. The `else` arm is unreachable by arithmetic: sixteen
+            // bytes is exactly two eight-byte halves with no remainder.
+            let ([offset, position], []) = chunk.as_chunks::<8>() else {
+                unreachable!("a 16-byte entry is exactly two 8-byte halves")
+            };
+            IndexEntry {
+                offset: u64::from_be_bytes(*offset),
+                position: u64::from_be_bytes(*position),
+            }
         })
         .collect())
 }

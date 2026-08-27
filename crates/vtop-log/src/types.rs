@@ -881,7 +881,7 @@ fn decode_hex_32(value: &str) -> Option<[u8; 32]> {
         return None;
     }
     let mut bytes = [0_u8; 32];
-    for (byte, pair) in bytes.iter_mut().zip(raw.chunks_exact(2)) {
+    for (byte, pair) in bytes.iter_mut().zip(raw.as_chunks::<2>().0) {
         *byte = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
     }
     Some(bytes)
