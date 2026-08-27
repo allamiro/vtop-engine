@@ -876,6 +876,17 @@ impl AdminClient {
                 .map(|stream| (stream, endpoint))
         })
         .await;
+        // THE ADDRESS ACTUALLY TRIED, not the one this client was built with
+        // (review). A timeout that names the configured endpoint — or worse,
+        // the `0.0.0.0:0` placeholder — sends an operator looking at the wrong
+        // machine.
+        let attempted = self
+            .resolutions
+            .lock()
+            .expect("resolutions")
+            .get(index)
+            .map(|resolution| resolution.endpoint)
+            .unwrap_or(self.candidates[index].endpoint);
         let mut stream = match reached {
             Ok(Ok((stream, _))) => stream,
             Ok(Err(error)) => {
@@ -885,8 +896,7 @@ impl AdminClient {
             Err(_) => {
                 self.mark_stale(index);
                 return Err(TransportError::Protocol(format!(
-                    "{} could not be reached within {CANDIDATE_CONNECT_TIMEOUT:?}",
-                    self.candidates[index].endpoint
+                    "{attempted} could not be reached within {CANDIDATE_CONNECT_TIMEOUT:?}"
                 )));
             }
         };

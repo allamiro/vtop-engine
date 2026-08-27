@@ -297,20 +297,33 @@ impl TlsRaftNetwork {
     async fn client_or_re_resolve(
         &self,
     ) -> Result<(PeerClient, SocketAddr), RPCError<NodeId, EmptyNode, RaftError<NodeId>>> {
+        // SCHEDULED, NOT AWAITED (review). A peer with no cached address is
+        // one whose name had not resolved yet, and waiting for the resolver
+        // here puts the whole lookup in front of an RPC whose hard deadline is
+        // 60 ms — so a stalled resolver would occupy the heartbeat path for
+        // longer than the deadline it is supposed to honour, which is how a
+        // live peer gets pushed into campaigning.
+        //
+        // This attempt therefore fails fast as unreachable, which is true: we
+        // do not know where the peer is. The next one, some milliseconds
+        // later, has the answer if there is one.
         if self.directory.get(self.target).is_none() {
-            self.directory.re_resolve(self.target).await;
+            let directory = self.directory.clone();
+            let target = self.target;
+            tokio::spawn(async move { directory.re_resolve(target).await });
         }
         self.client()
     }
 
-    /// Report a failed RPC AND look the peer's name up again.
+    /// Report a failed RPC and SCHEDULE a fresh lookup of the peer's name.
     ///
     /// The two belong together. Every transport failure is a candidate for
     /// "this peer is no longer where we think it is", and the address is only
-    /// ever wrong on this path — the success path proves it right. Ordered
-    /// so the lookup happens before the error is returned, because openraft
-    /// retries on its own schedule and the next attempt should already have
-    /// the new address.
+    /// ever wrong on this path — the success path proves it right.
+    ///
+    /// The lookup does NOT complete before this returns, and callers must not
+    /// assume it has (review). It is spawned; the error comes back at once,
+    /// and openraft's next attempt uses whatever the directory holds by then.
     fn unreachable_and_re_resolve(
         &self,
         error: impl std::fmt::Display,
@@ -397,7 +410,13 @@ impl RaftNetwork<MetaRaftTypeConfig> for TlsRaftNetwork {
             match with_rpc_deadline(option.hard_ttl(), client.install(addr, &request)).await {
                 Ok(response) => response,
                 Err(error) => {
-                    self.directory.re_resolve(self.target).await;
+                    // Detached for the same reason as append and vote: this
+                    // exchange has a hard deadline and a stalled resolver must
+                    // not extend it, postponing the snapshot retry that is how
+                    // a lagging peer catches up at all (review).
+                    let directory = self.directory.clone();
+                    let target = self.target;
+                    tokio::spawn(async move { directory.re_resolve(target).await });
                     return Err(install_unreachable(error));
                 }
             };

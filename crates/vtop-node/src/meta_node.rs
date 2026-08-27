@@ -62,6 +62,16 @@ pub async fn serve(
         if peer.id == config.node_id {
             continue;
         }
+        // Malformed refuses; merely absent does not (review). `resolve_endpoint`
+        // used to reject both and the tolerance added here covered both, so a
+        // peer written without a port started the node and was retried for the
+        // life of it.
+        if let Some(why) = crate::data_node::malformed_endpoint(&peer.addr) {
+            return Err(format!(
+                "metadata peer {} at {:?} cannot be an address: {why}",
+                peer.id, peer.addr
+            ));
+        }
         directory
             .insert_by_name(peer.id, peer.addr.clone(), peer.server_name.clone())
             .await;

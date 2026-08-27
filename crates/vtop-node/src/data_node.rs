@@ -1850,24 +1850,58 @@ fn name_source(configured: &str) -> Option<String> {
 /// It is announced rather than swallowed. A misspelt peer would otherwise
 /// start quietly and fail later as an absent replica, which is a much harder
 /// thing to read than a line at startup saying which name did not answer.
-fn first_address_of(host: &str) -> Result<std::net::SocketAddr, String> {
-    // MALFORMED IS NOT ABSENT (review). A name with no port is not a peer that
-    // has yet to appear; it is a peer that never will, and no amount of
-    // re-resolution fixes it. Tolerating it would start the node and spend the
-    // rest of its life looking up something that cannot be looked up, which is
-    // exactly the class of quiet misconfiguration the placeholder is meant to
-    // keep DISTINGUISHABLE from a startup race.
-    let Some((_, port)) = host.rsplit_once(':') else {
-        return Err(format!(
-            "peer {host:?} has no port; a peer address is host:port and this one \
-             cannot become valid by waiting"
-        ));
+/// The reason `configured` can never be a peer address, if there is one.
+///
+/// MALFORMED IS NOT ABSENT (review). A name with no port — or an unbracketed
+/// IPv6 literal, whose last colon belongs to the address rather than to a port
+/// — is not a peer that has yet to appear; it is a peer that never will, and
+/// no amount of re-resolution fixes it. Tolerating it would start the node and
+/// spend the rest of its life looking up something unlookuppable, which is
+/// exactly the quiet misconfiguration the placeholder is meant to keep
+/// DISTINGUISHABLE from a startup race.
+pub(crate) fn malformed_endpoint(configured: &str) -> Option<String> {
+    let Some((host, port)) = configured.rsplit_once(':') else {
+        return Some("it has no port; a peer address is host:port".to_owned());
     };
     if port.parse::<u16>().is_err() {
-        return Err(format!(
-            "peer {host:?} has no usable port; a peer address is host:port and this \
-             one cannot become valid by waiting"
+        return Some(format!(
+            "{port:?} is not a port; a peer address is host:port"
         ));
+    }
+    if host.is_empty() {
+        return Some("it has no host; a peer address is host:port".to_owned());
+    }
+    if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
+        return Some(format!(
+            "{host:?} looks like an unbracketed IPv6 address, so the last colon is part \
+             of the address and not a port separator; write it as [{host}]:{port}"
+        ));
+    }
+    None
+}
+
+/// The address a peer's name holds right now, or a placeholder when it holds
+/// none yet (#367).
+///
+/// A name that does not resolve at startup is not a configuration error. In a
+/// replica set whose members are created together every member is in that
+/// position for some of its neighbours, and refusing to start over it turns an
+/// ordinary startup race into a crash loop — which is what the pod events
+/// showed, read as a broken node rather than a name that had not been
+/// published yet.
+///
+/// Both users of this address look the name up again before they use it: the
+/// replication driver on every connect, the promotion probe on every probe.
+/// So the placeholder's only job is to be a `SocketAddr`-shaped nothing in the
+/// meantime, and `0.0.0.0:0` is the one that fails a connect immediately
+/// instead of waiting out a timeout against something real.
+///
+/// It is announced rather than swallowed. A misspelt peer would otherwise
+/// start quietly and fail later as an absent replica, which is a much harder
+/// thing to read than a line at startup saying which name did not answer.
+fn first_address_of(host: &str) -> Result<std::net::SocketAddr, String> {
+    if let Some(why) = malformed_endpoint(host) {
+        return Err(format!("peer {host:?} cannot be an address: {why}"));
     }
     match vtop_meta::resolve_endpoint(host) {
         Ok(addr) => Ok(addr),
@@ -2575,6 +2609,46 @@ mod tests {
     /// The race is real but rare, so this hammers it: 5000 transitions against
     /// 5000 readings. A regression that split the reading back into separate
     /// lock acquisitions fails here intermittently rather than never.
+    /// A peer address that cannot become valid by waiting is refused now
+    /// (#367).
+    ///
+    /// The placeholder exists so a name that has not been published yet does
+    /// not crash-loop a node that boots alongside its neighbours. Letting a
+    /// MALFORMED address take the same path spends that tolerance on a
+    /// misconfiguration, and the node then spends its life looking up
+    /// something unlookuppable while presenting as a startup race.
+    #[test]
+    fn an_address_that_waiting_cannot_fix_is_refused_and_one_that_it_can_is_not() {
+        for good in [
+            "vtop-1.vtop-headless.ns.svc.cluster.local:9300",
+            "127.0.0.1:9300",
+            "[::1]:9300",
+        ] {
+            assert!(
+                malformed_endpoint(good).is_none(),
+                "{good} is a well-formed peer address and must be allowed to be absent"
+            );
+        }
+
+        for (bad, expected) in [
+            ("vtop-1.vtop-headless", "no port"),
+            ("vtop-1.vtop-headless:", "not a port"),
+            ("vtop-1:not-a-number", "not a port"),
+            (":9300", "no host"),
+            // The last colon here belongs to the address, so the "port" it
+            // seems to carry is a fiction the split invented.
+            ("::1:9300", "unbracketed IPv6"),
+            ("fe80::1:9300", "unbracketed IPv6"),
+        ] {
+            let why = malformed_endpoint(bad)
+                .unwrap_or_else(|| panic!("{bad} must be refused; waiting cannot fix it"));
+            assert!(
+                why.contains(expected),
+                "the refusal for {bad} must name the cause ({expected}), not just refuse: {why}"
+            );
+        }
+    }
+
     #[test]
     fn a_scrape_racing_a_transition_never_sees_half_a_role() {
         use crate::observe::ReplicaObservation as _;
