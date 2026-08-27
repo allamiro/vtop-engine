@@ -36,6 +36,22 @@ pub const MAGIC_V2: i8 = 2;
 /// cannot be forwarded, so refusing it here refuses it while the reason is
 /// still legible instead of deep in a translation.
 pub const MAX_RECORDS: usize = 65_536;
+/// The hard ceiling on headers in one record.
+///
+/// Unlike [`MAX_RECORDS`], this one is the gateway's own policy rather than a
+/// mirror of the native protocol — the native `LogRecord` has no headers at
+/// all, so nothing here is forwardable and no upstream number constrains it.
+/// It exists because headers AMPLIFY: the smallest one on the wire is two
+/// bytes (an empty name and a null value), and each becomes a `String` plus
+/// an `Option<Vec<u8>>` — some fifty bytes resident. A record near the
+/// 16 MiB field cap could therefore declare millions of them and turn a small
+/// Produce into hundreds of megabytes, which the per-field size cap does
+/// nothing to prevent because no single field is large (review).
+///
+/// A thousand is three orders of magnitude above what real records carry — a
+/// trace id, a schema id, a routing hint — so it bounds the amplification
+/// without being a limit anyone meets by accident.
+pub const MAX_HEADERS: usize = 1024;
 /// Compression codec lives in the low three bits of `attributes`.
 const COMPRESSION_MASK: i16 = 0x07;
 const TRANSACTIONAL_FLAG: i16 = 0x10;
@@ -69,6 +85,16 @@ pub enum BatchError {
     },
     #[error("record batch declares {declared} records, above the {MAX_RECORDS}-record ceiling")]
     TooManyRecords { declared: i64 },
+    #[error("record batch is a control batch, whose markers only a transaction coordinator can interpret")]
+    Control,
+    #[error(
+        "record batch declares {declared} record(s) but {remaining} byte(s) remain after them"
+    )]
+    TrailingBytes { declared: i32, remaining: usize },
+    #[error(
+        "record {index} declares {declared} header(s), above the {MAX_HEADERS}-header ceiling"
+    )]
+    TooManyHeaders { index: usize, declared: i64 },
     #[error("record {index} would sit at an offset or timestamp that overflows i64")]
     CoordinateOverflow { index: usize },
 }
@@ -156,6 +182,18 @@ impl RecordBatch {
         if attributes & TRANSACTIONAL_FLAG != 0 {
             return Err(BatchError::Transactional);
         }
+        // REFUSED BY NAME, beside the other two, rather than read as an empty
+        // batch. A control batch's "records" are transaction markers only a
+        // coordinator understands — but the flag is independent of the
+        // transactional one, so an untrusted batch can set CONTROL alone and
+        // sail past the check above. Reporting that as a successful empty
+        // batch makes the caller's records DISAPPEAR: a Produce that returns
+        // success having stored nothing, which is the one failure mode a
+        // gateway must never have. The promise for a format this gateway
+        // cannot honour is a refusal that names it (review).
+        if attributes & CONTROL_FLAG != 0 {
+            return Err(BatchError::Control);
+        }
         let _last_offset_delta = d.i32("batch.lastOffsetDelta")?;
         let base_timestamp = d.i64("batch.baseTimestamp")?;
         let _max_timestamp = d.i64("batch.maxTimestamp")?;
@@ -176,25 +214,34 @@ impl RecordBatch {
             });
         }
 
-        // A control batch carries no user records; its "records" are markers
-        // whose payload only a transaction coordinator understands. Reporting
-        // it as an empty batch is the honest read, and the caller refuses it
-        // where the transactional flag is checked.
-        let is_control = attributes & CONTROL_FLAG != 0;
+        // No `with_capacity(declared)`: the count is an attacker's number
+        // until the records are actually there, and the ceiling above is
+        // 65,536 entries of reserve on a lie.
         let mut records = Vec::new();
-        if !is_control {
-            // No `with_capacity(declared)`: the count is an attacker's number
-            // until the records are actually there, and the ceiling above is
-            // 65,536 entries of reserve on a lie.
-            for index in 0..declared as usize {
-                if d.is_empty() {
-                    return Err(BatchError::RecordCount {
-                        declared,
-                        found: records.len(),
-                    });
-                }
-                records.push(decode_record(&mut d, base_offset, base_timestamp, index)?);
+        for index in 0..declared as usize {
+            if d.is_empty() {
+                return Err(BatchError::RecordCount {
+                    declared,
+                    found: records.len(),
+                });
             }
+            records.push(decode_record(&mut d, base_offset, base_timestamp, index)?);
+        }
+        // THE COUNT IS BINDING IN BOTH DIRECTIONS. Declaring too many was
+        // already refused above; declaring too FEW was not, and the batch
+        // simply returned with the surplus unread — so a batch whose count
+        // is rewritten to zero (with the CRC recomputed, which costs an
+        // attacker nothing) decoded as a valid empty batch and every record
+        // in it was silently dropped. Data that a Produce acknowledged and
+        // nobody stored is worse than a refusal (review). The batch was
+        // sliced to its own declared length before the CRC check, so
+        // anything left here is surplus inside this batch rather than the
+        // next one.
+        if !d.is_empty() {
+            return Err(BatchError::TrailingBytes {
+                declared,
+                remaining: d.remaining(),
+            });
         }
         Ok(Self {
             base_offset,
@@ -294,6 +341,25 @@ fn decode_record(
         return Err(BatchError::Wire(WireError::NegativeLength {
             field: "record.headerCount",
             len: header_count,
+        }));
+    }
+    // BOUNDED BEFORE ANYTHING IS PUSHED. Two guards, and they refuse
+    // different lies: the ceiling refuses a count that is merely enormous,
+    // and the structural bound refuses one this record could not possibly
+    // hold — every header costs at least two bytes (an empty name, a null
+    // value), so a count above half the remaining bytes is arithmetically
+    // impossible and can be rejected without reading a single one.
+    if header_count as usize > MAX_HEADERS {
+        return Err(BatchError::TooManyHeaders {
+            index,
+            declared: i64::from(header_count),
+        });
+    }
+    if header_count as usize > d.remaining() / 2 {
+        return Err(BatchError::Wire(WireError::Truncated {
+            field: "record.headerCount",
+            needed: header_count as usize * 2,
+            available: d.remaining(),
         }));
     }
     let mut headers = Vec::new();
@@ -674,6 +740,124 @@ mod tests {
             RecordBatch::decode(&encoded),
             Err(BatchError::TooManyRecords { .. })
         ));
+    }
+
+    /// The count binds in BOTH directions. Declaring more records than a batch
+    /// carries was always refused; declaring fewer was not, and the surplus
+    /// went unread — so a batch whose count is rewritten to zero decoded as a
+    /// valid empty batch and every record in it vanished. Recomputing the CRC
+    /// costs an attacker nothing, which is what makes this reachable.
+    #[test]
+    fn a_batch_declaring_fewer_records_than_it_carries_is_refused() {
+        let records = vec![record(0, "k0", "v0"), record(1, "k1", "v1")];
+        let mut encoded = RecordBatch::encode(0, 1, 0, 0, &records);
+        assert_eq!(
+            RecordBatch::decode(&encoded).unwrap().records.len(),
+            2,
+            "the batch is honest before it is tampered with"
+        );
+
+        encoded[57..61].copy_from_slice(&0_i32.to_be_bytes());
+        refresh_crc(&mut encoded);
+        match RecordBatch::decode(&encoded) {
+            Err(BatchError::TrailingBytes {
+                declared,
+                remaining,
+            }) => {
+                assert_eq!(declared, 0);
+                assert!(remaining > 0, "the unread records are the surplus");
+            }
+            other => panic!(
+                "a batch under-declaring its count must be refused, not decoded as empty — \
+                 acknowledging a Produce and storing nothing is the one failure a gateway \
+                 must not have: {other:?}"
+            ),
+        }
+    }
+
+    /// The control flag is INDEPENDENT of the transactional one, so a batch
+    /// can set it alone and miss the transactional refusal entirely. Reading
+    /// it as an empty batch then discards whatever it carried.
+    #[test]
+    fn a_control_batch_is_refused_rather_than_read_as_empty() {
+        let records = vec![record(0, "k0", "v0")];
+        let mut encoded = RecordBatch::encode(0, 1, 0, 0, &records);
+        set_attributes(&mut encoded, CONTROL_FLAG);
+        assert!(
+            matches!(RecordBatch::decode(&encoded), Err(BatchError::Control)),
+            "a control batch must be refused by name; reporting it as an empty \
+             success makes the caller's records disappear"
+        );
+
+        // And with BOTH flags the transactional refusal still wins, because it
+        // is the more specific thing to say about the batch.
+        let mut both = RecordBatch::encode(0, 1, 0, 0, &records);
+        set_attributes(&mut both, CONTROL_FLAG | TRANSACTIONAL_FLAG);
+        assert!(matches!(
+            RecordBatch::decode(&both),
+            Err(BatchError::Transactional)
+        ));
+    }
+
+    /// Headers amplify: two bytes on the wire become some fifty resident, so
+    /// an unbounded count turns a small Produce into hundreds of megabytes.
+    /// The per-field size cap cannot see this, because no single field is big.
+    #[test]
+    fn a_record_above_the_header_ceiling_is_refused() {
+        let hostile = Record {
+            offset: 0,
+            timestamp_millis: 1,
+            key: None,
+            value: None,
+            // The cheapest header there is: an empty name and a null value,
+            // two bytes each on the wire.
+            headers: vec![(String::new(), None); MAX_HEADERS + 1],
+        };
+        let encoded = RecordBatch::encode(0, 1, 0, 0, &[hostile]);
+        match RecordBatch::decode(&encoded) {
+            Err(BatchError::TooManyHeaders { index, declared }) => {
+                assert_eq!(index, 0);
+                assert_eq!(declared, MAX_HEADERS as i64 + 1);
+            }
+            other => panic!("a record over the header ceiling must be refused: {other:?}"),
+        }
+
+        // The ceiling is not a round-trip barrier for anything real: a record
+        // AT the ceiling still decodes, so the bound refuses only the abuse.
+        let at_ceiling = Record {
+            offset: 0,
+            timestamp_millis: 1,
+            key: None,
+            value: None,
+            headers: vec![(String::new(), None); MAX_HEADERS],
+        };
+        let encoded = RecordBatch::encode(0, 1, 0, 0, std::slice::from_ref(&at_ceiling));
+        assert_eq!(
+            RecordBatch::decode(&encoded).unwrap().records[0],
+            at_ceiling
+        );
+    }
+
+    /// A count no record could hold is refused without reading a header at
+    /// all: every one costs at least two bytes, so a count above half the
+    /// remainder is arithmetically impossible.
+    #[test]
+    fn a_header_count_larger_than_the_record_could_hold_is_refused() {
+        let mut encoded = RecordBatch::encode(0, 1, 0, 0, &[record(0, "k", "v")]);
+        // The header count is the last byte of the record body, which is the
+        // last byte of the batch: a lone zero varint with no headers after it.
+        let last = encoded.len() - 1;
+        assert_eq!(encoded[last], 0, "the sample record carries no headers");
+        encoded[last] = 100; // varint 50, in a record with nothing left to read
+        refresh_crc(&mut encoded);
+        assert!(
+            matches!(
+                RecordBatch::decode(&encoded),
+                Err(BatchError::Wire(WireError::Truncated { .. }))
+            ),
+            "a header count the record cannot hold must be refused before any \
+             of them is materialized"
+        );
     }
 
     /// Set the attributes field and repair the CRC, so the test exercises the
