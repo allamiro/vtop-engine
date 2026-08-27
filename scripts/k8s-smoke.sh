@@ -713,25 +713,48 @@ kubectl -n "$REPLICATED_NS" wait --for=condition=ready pod -l "app.kubernetes.io
 dump_failover_evidence() {
   log "--- failover evidence: what the engine decided ---"
   kubectl -n "$REPLICATED_NS" get pods -o wide || true
-  log "the lease as metadata sees it: $(lease_state 2>/dev/null || echo '(no answer)')"
+
+  # SAID, NOT INFERRED FROM EMPTINESS. `lease_state` swallows its own failure
+  # and echoes nothing, so `|| echo '(no answer)'` could never fire and an
+  # unreachable metadata plane read exactly like a range with no lease
+  # (review) — which, in the failure this dump exists for, is the difference
+  # between two very different diagnoses.
+  local lease
+  lease="$(lease_state 2>/dev/null)" || true
+  log "the lease as metadata sees it: ${lease:-(no answer — no lease, or metadata did not respond)}"
+
   for pod in $(kubectl -n "$REPLICATED_NS" get pods -o name 2>/dev/null || true); do
+    # FETCHED ONCE, AND BOUNDED. The first version streamed each pod's whole
+    # log three times with no limit, and the failure it runs on is a term
+    # storm — hundreds of thousands of vote lines — so the diagnostics could
+    # outlast the test they were diagnosing (review). One bounded fetch,
+    # three views of it.
+    local current previous
+    current="$WORK/evidence-${pod##*/}.log"
+    previous="$WORK/evidence-${pod##*/}.previous.log"
+    kubectl -n "$REPLICATED_NS" --request-timeout=30s logs "$pod" \
+      --tail=4000 --limit-bytes=4000000 >"$current" 2>/dev/null || true
+    kubectl -n "$REPLICATED_NS" --request-timeout=30s logs "$pod" --previous \
+      --tail=1000 --limit-bytes=1000000 >"$previous" 2>/dev/null || true
+
     log "=== $pod — role, promotion, lease and fencing decisions ==="
-    kubectl -n "$REPLICATED_NS" logs "$pod" --tail=-1 2>/dev/null \
-      | grep -Ei 'promot|quorum|lease|epoch|fenc|stand|slot|listener|role_changed|refus|not writable|panic|ERROR' \
+    grep -Ei 'promot|quorum|lease|epoch|fenc|stand|slot|listener|role_changed|refus|not writable|panic|ERROR' "$current" 2>/dev/null \
       | grep -vE 'openraft|handle_vote_req|Raft::vote|RequestVote' \
       | tail -60 || true
-    # SUMMARISED, NOT DUMPED. "116 distinct terms, 1 to 116" is a diagnosis;
-    # a hundred vote lines are the thing that hid it last time.
-    terms="$(kubectl -n "$REPLICATED_NS" logs "$pod" --tail=-1 2>/dev/null \
-      | grep -oE 'vote:T[0-9]+' | sed 's/vote:T//' | sort -n | uniq || true)"
+
+    # SUMMARISED, NOT DUMPED. "116 distinct terms, 1 through 116" is a
+    # diagnosis; a hundred vote lines are the thing that hid it last time.
+    local terms
+    terms="$(grep -oE 'vote:T[0-9]+' "$current" 2>/dev/null | sed 's/vote:T//' | sort -n | uniq || true)"
     if [ -n "$terms" ]; then
       log "  raft terms seen: $(printf '%s\n' "$terms" | wc -l | tr -d ' ') distinct, \
 $(printf '%s\n' "$terms" | head -1) through $(printf '%s\n' "$terms" | tail -1)"
     fi
+
     # A POD THAT RESTARTED TOOK ITS EVIDENCE WITH IT, and the container that
     # died is usually the one that explains the cluster the survivors are in.
-    prev="$(kubectl -n "$REPLICATED_NS" logs "$pod" --previous --tail=-1 2>/dev/null \
-      | grep -Ei 'promot|lease|epoch|not writable|panic|ERROR' | tail -20 || true)"
+    local prev
+    prev="$(grep -Ei 'promot|lease|epoch|not writable|panic|ERROR' "$previous" 2>/dev/null | tail -20 || true)"
     if [ -n "$prev" ]; then
       log "  --- $pod, the container before this one ---"
       printf '%s\n' "$prev"

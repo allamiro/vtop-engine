@@ -1930,7 +1930,21 @@ impl StandAsideMarker {
             Err(error) => {
                 // Removed on this path too: an unreadable marker that
                 // survived its own reading would sit this node out forever.
-                let _ = std::fs::remove_file(&self.path);
+                //
+                // A removal that FAILS is said rather than dropped (review).
+                // It bounds itself — the hold-off is finite, so the node sits
+                // out once per restart rather than never leading — but a
+                // marker that cannot be consumed is a data directory in
+                // trouble, and `refuse_an_unwritable_data_dir` has already
+                // declined to campaign for most of the ways that happens.
+                // This covers the rest by naming it.
+                if let Err(removal) = std::fs::remove_file(&self.path) {
+                    eprintln!(
+                        "the stand-aside marker at {} could not be removed ({removal}); \
+                         this node will sit out a hold-off on every restart until it can",
+                        self.path.display()
+                    );
+                }
                 return StandAside::Unreadable(error.to_string());
             }
         };
@@ -1979,13 +1993,26 @@ enum StandAside {
 /// recognise.
 fn refuse_an_unwritable_data_dir(data_dir: &std::path::Path) -> Result<(), String> {
     let probe = data_dir.join(".writable-probe");
-    std::fs::write(&probe, b"").map_err(|error| {
+    // THE PROBE MUST CREATE A DIRECTORY ENTRY, not overwrite one. Writing to a
+    // file that already exists needs no permission on the directory, so a
+    // leftover probe made this pass in exactly the case it exists to catch: a
+    // directory that refuses new entries, which is the permission the marker
+    // needs (review). Removed first, so the write has to prove the thing being
+    // asked.
+    let _ = std::fs::remove_file(&probe);
+    let refuse = |what: &str, error: std::io::Error| {
         format!(
-            "{} is not writable ({error}); refusing to campaign for a range this node              could not serve and could not even record that it could not serve",
+            "{} is not writable ({what}: {error}); refusing to campaign for a range this \
+             node could not serve and could not even record that it could not serve",
             data_dir.display()
         )
-    })?;
-    let _ = std::fs::remove_file(&probe);
+    };
+    std::fs::write(&probe, b"").map_err(|error| refuse("creating a file", error))?;
+    // And the unlink is checked too, for the same reason it is checked in the
+    // marker: a directory that will not let an entry be removed will not let
+    // the stand-aside marker be consumed either, and this is the one moment
+    // where noticing that costs nothing.
+    std::fs::remove_file(&probe).map_err(|error| refuse("removing a file", error))?;
     Ok(())
 }
 
@@ -3124,6 +3151,39 @@ mod tests {
             error.contains("refusing to campaign"),
             "the refusal must say what it is refusing and why, not just fail: {error}"
         );
+    }
+
+    /// A leftover probe must not vouch for a directory that refuses new
+    /// entries (#367).
+    ///
+    /// Writing to a file that already exists needs no permission on the
+    /// DIRECTORY, and the directory is the permission the stand-aside marker
+    /// needs — so a probe left behind by an earlier run made this check pass
+    /// in precisely the case it exists to catch, which is the shape of every
+    /// guard that tests something adjacent to the thing it means (review).
+    #[test]
+    fn a_leftover_probe_does_not_vouch_for_a_directory_that_refuses_new_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let probe = dir.path().join(".writable-probe");
+        std::fs::write(&probe, b"left behind by an earlier run").unwrap();
+
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Root ignores directory modes, so ASK rather than assume: if a new
+        // entry can still be created here, this process is privileged and the
+        // condition under test cannot be produced at all.
+        let privileged = std::fs::write(dir.path().join(".privilege-probe"), b"").is_ok();
+        if !privileged {
+            let error = refuse_an_unwritable_data_dir(dir.path())
+                .expect_err("a directory that will not take a new entry must be refused");
+            assert!(
+                error.contains("refusing to campaign"),
+                "and it must say so plainly: {error}"
+            );
+        }
+        // Restored, or the temp dir cannot be cleaned up.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     /// A deposed leading candidate must remain able to FOLLOW its successor.
