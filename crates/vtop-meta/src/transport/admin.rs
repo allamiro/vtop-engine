@@ -766,6 +766,22 @@ impl AdminClient {
             let candidate = &self.candidates[index];
             match self.attempt(index, &request).await {
                 Ok(frame) => {
+                    // ANY FRAME CLEARS THE STALENESS, redirect included
+                    // (review). An earlier revision of this held redirects
+                    // back on the grounds that answering does not prove
+                    // WHICH node answered — true, and the weaker argument:
+                    // a candidate that completes a TLS handshake and frames a
+                    // reply is at a live admin endpoint, and leaving it marked
+                    // means re-resolving a recovered candidate on every
+                    // request, which for a name with several A records means
+                    // drifting between them. Wrong-node detection needs the
+                    // responder's identity in the frame, which is a wire
+                    // change and not this.
+                    if let Some(resolution) =
+                        self.resolutions.lock().expect("resolutions").get_mut(index)
+                    {
+                        resolution.stale = false;
+                    }
                     // A frame is not automatically success: a non-leader
                     // answers with KIND_ADMIN_ERROR, and the redirect inside it
                     // is the whole point of this loop.
@@ -790,24 +806,11 @@ impl AdminClient {
                             ),
                             leader: hint.leader,
                         });
-                        // NOT A CLEARANCE. A redirect proves something is
-                        // answering, not that it is the node this candidate
-                        // was configured as (review) — a reused address may
-                        // reach a different member, which then redirects, and
-                        // treating that as proof would freeze the address. Only
-                        // a real answer clears the flag.
                         self.redirects.fetch_add(1, Ordering::Relaxed);
                         index = named.unwrap_or(index);
                         continue;
                     }
                     self.preferred.store(index, Ordering::Relaxed);
-                    // It answered, so its address is right and does not need
-                    // looking up again on the next request.
-                    if let Some(resolution) =
-                        self.resolutions.lock().expect("resolutions").get_mut(index)
-                    {
-                        resolution.stale = false;
-                    }
                     return Ok(frame);
                 }
                 // An unreachable candidate is worth moving past for the same

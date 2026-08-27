@@ -95,7 +95,7 @@ fn lease_admin_client(
     for peer in &lease.admin_peers {
         candidates.push(vtop_meta::AdminCandidate {
             node_id: Some(vtop_meta::MetaNodeId(peer.node_id)),
-            endpoint: first_address_of(&peer.endpoint),
+            endpoint: first_address_of(&peer.endpoint)?,
             host: name_source(&peer.endpoint),
             server_name: if peer.server_name.is_empty() {
                 lease.server_name.clone()
@@ -706,7 +706,7 @@ async fn run_leader(
             .map(|follower| {
                 Ok(NetworkFollowerConfig {
                     node_id: follower.node_uuid,
-                    addr: first_address_of(&follower.addr),
+                    addr: first_address_of(&follower.addr)?,
                     host: name_source(&follower.addr),
                     server_name: follower.server_name.clone(),
                 })
@@ -790,7 +790,7 @@ async fn run_leader(
             .map(|follower| {
                 Ok(crate::lease_agent::FollowerEndpoint {
                     node_uuid: follower.node_uuid,
-                    addr: first_address_of(&follower.addr),
+                    addr: first_address_of(&follower.addr)?,
                     host: name_source(&follower.addr),
                     server_name: follower.server_name.clone(),
                 })
@@ -1194,7 +1194,7 @@ async fn run_candidate(
         .map(|peer| {
             Ok(crate::lease_agent::FollowerEndpoint {
                 node_uuid: peer.node_uuid,
-                addr: first_address_of(&peer.addr),
+                addr: first_address_of(&peer.addr)?,
                 host: name_source(&peer.addr),
                 server_name: peer.server_name.clone(),
             })
@@ -1850,15 +1850,33 @@ fn name_source(configured: &str) -> Option<String> {
 /// It is announced rather than swallowed. A misspelt peer would otherwise
 /// start quietly and fail later as an absent replica, which is a much harder
 /// thing to read than a line at startup saying which name did not answer.
-fn first_address_of(host: &str) -> std::net::SocketAddr {
+fn first_address_of(host: &str) -> Result<std::net::SocketAddr, String> {
+    // MALFORMED IS NOT ABSENT (review). A name with no port is not a peer that
+    // has yet to appear; it is a peer that never will, and no amount of
+    // re-resolution fixes it. Tolerating it would start the node and spend the
+    // rest of its life looking up something that cannot be looked up, which is
+    // exactly the class of quiet misconfiguration the placeholder is meant to
+    // keep DISTINGUISHABLE from a startup race.
+    let Some((_, port)) = host.rsplit_once(':') else {
+        return Err(format!(
+            "peer {host:?} has no port; a peer address is host:port and this one \
+             cannot become valid by waiting"
+        ));
+    };
+    if port.parse::<u16>().is_err() {
+        return Err(format!(
+            "peer {host:?} has no usable port; a peer address is host:port and this \
+             one cannot become valid by waiting"
+        ));
+    }
     match vtop_meta::resolve_endpoint(host) {
-        Ok(addr) => addr,
+        Ok(addr) => Ok(addr),
         Err(error) => {
             eprintln!(
                 "peer {host} does not resolve yet ({error}); it will be looked up again \
                  before each use, and stays unreachable until it answers"
             );
-            std::net::SocketAddr::from(([0, 0, 0, 0], 0))
+            Ok(std::net::SocketAddr::from(([0, 0, 0, 0], 0)))
         }
     }
 }
@@ -1903,7 +1921,7 @@ async fn build_leader_phase(
         .map(|peer| {
             Ok(NetworkFollowerConfig {
                 node_id: peer.node_uuid,
-                addr: first_address_of(&peer.addr),
+                addr: first_address_of(&peer.addr)?,
                 host: name_source(&peer.addr),
                 server_name: peer.server_name.clone(),
             })
