@@ -26,12 +26,24 @@ batching:
   max_batch_age_seconds: 60
   # Polling. Both are optional; these are the defaults.
   #
-  # source_poll_wait_ms is paid PER SOURCE, serially: an EMPTY source burns the
-  # whole window before returning nothing, so a cycle over N idle Kafka topics
-  # costs up to N * this. A backlogged topic returns immediately (Kafka
-  # prefetches), so lowering this speeds up idle scanning without hurting
-  # throughput. Raise it if a broker is slow enough that reads come back empty
-  # when data is in fact available.
+  # source_poll_wait_ms is the longest a read pass waits for data.
+  #
+  # It is paid ONCE PER PASS on the Kafka plane, not once per topic. That
+  # changed in #96: the adapter assigns every topic-partition to one consumer
+  # and polls them together, so a hundred idle topics cost one window rather
+  # than a hundred. This comment used to say the opposite — "paid PER SOURCE,
+  # serially […] a cycle over N idle Kafka topics costs up to N * this" — which
+  # described the pre-#96 loop and survived the fix that removed it. An
+  # operator reading it would have tuned this value down to buy back a cost
+  # that no longer exists, and concluded the engine was ignoring them.
+  #
+  # File and syslog-spool sources do not wait on this at all: a read there
+  # either finds bytes or does not.
+  #
+  # Raise it if a broker is slow enough that a pass comes back empty while data
+  # is in fact available. Lowering it shortens the idle pass, which matters
+  # only when the engine is otherwise idle — a backlogged assignment returns
+  # immediately because Kafka prefetches.
   source_poll_wait_ms: 250
   # Pause between cycles ONLY when the previous cycle read nothing. A cycle
   # that read data loops straight into the next one, so a backlog drains at

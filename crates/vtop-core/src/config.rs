@@ -263,12 +263,21 @@ pub struct BatchingConfig {
     pub max_batch_age_seconds: u64,
     /// How long a single source read may block waiting for data.
     ///
-    /// This is paid PER SOURCE, serially: with N Kafka topics, a cycle costs up
-    /// to `N * source_poll_wait_ms` even when every topic is empty, because an
-    /// empty topic burns the whole window before returning nothing. It used to
-    /// be a hard-coded 2s, which put ~28 topics at ~56s per cycle. Kafka
-    /// prefetches into a local queue, so a backlogged topic returns
-    /// immediately regardless of this value — it only bounds the idle case.
+    /// Paid ONCE PER PASS on the Kafka plane, not once per topic.
+    ///
+    /// This doc used to say the opposite — paid per source, serially, so N
+    /// idle topics cost `N * source_poll_wait_ms` — and it was true of the
+    /// loop that existed when it was written. #96 replaced that loop: every
+    /// topic-partition is assigned to one consumer and polled together, so a
+    /// hundred idle topics now cost one window. The claim outlived the code it
+    /// described, which is the worst kind of stale comment, because an
+    /// operator would tune this value down to buy back a cost that is already
+    /// gone (review).
+    ///
+    /// File and syslog-spool reads do not wait on it at all.
+    ///
+    /// Kafka prefetches into a local queue, so a backlogged assignment returns
+    /// immediately regardless of this value — it bounds the idle pass.
     #[serde(default = "default_source_poll_wait_ms")]
     pub source_poll_wait_ms: u64,
     /// Pause between cycles when the previous cycle read nothing at all.
