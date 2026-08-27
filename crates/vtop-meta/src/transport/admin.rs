@@ -421,6 +421,22 @@ pub struct AdminClient {
     redirects: std::sync::atomic::AtomicUsize,
 }
 
+/// How long one candidate may take before the walk moves on.
+///
+/// UNBOUNDED BEFORE, AND THAT WAS THE WHOLE FAILURE (#367). `attempt` awaits
+/// `TcpStream::connect`, the TLS handshake and both frames with no deadline of
+/// its own, so a candidate whose address no longer belongs to anything hangs
+/// in the kernel's SYN retry — roughly two minutes on Linux — while the
+/// caller's entire budget (the lease agent's is 5 s) drains against it. Two
+/// healthy members sat in the same list, unasked, and every metadata call from
+/// that node failed with "no answer within 5s".
+///
+/// Two seconds against a five-second budget: a three-member cluster can lose
+/// its first two candidates to this and still reach the third inside the
+/// caller's deadline, and it matches the replication plane's own connect
+/// timeout so the two planes fail over on comparable timescales.
+const CANDIDATE_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 impl AdminClient {
     pub fn new(
         material: TlsMaterial,
@@ -671,7 +687,7 @@ impl AdminClient {
             index = current;
             visited[index] = true;
             let candidate = &self.candidates[index];
-            match self.attempt(candidate, &request).await {
+            match self.bounded_attempt(candidate, &request).await {
                 Ok(frame) => {
                     // A frame is not automatically success: a non-leader
                     // answers with KIND_ADMIN_ERROR, and the redirect inside it
@@ -736,6 +752,28 @@ impl AdminClient {
         self.candidates
             .iter()
             .position(|candidate| candidate.node_id == Some(leader))
+    }
+
+    /// `attempt`, but it gives up on one candidate instead of on the request.
+    ///
+    /// The timeout is per candidate rather than over the whole walk on
+    /// purpose: the walk's job is to find a member that answers, and spending
+    /// the whole budget proving that the first one does not is the opposite of
+    /// that job.
+    async fn bounded_attempt(
+        &self,
+        candidate: &AdminCandidate,
+        request: &VtpmFrame,
+    ) -> TransportResult<VtpmFrame> {
+        match tokio::time::timeout(CANDIDATE_ATTEMPT_TIMEOUT, self.attempt(candidate, request))
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(TransportError::Protocol(format!(
+                "{} did not answer within {CANDIDATE_ATTEMPT_TIMEOUT:?}",
+                candidate.endpoint
+            ))),
+        }
     }
 
     async fn attempt(
