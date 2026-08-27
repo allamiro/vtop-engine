@@ -262,9 +262,41 @@ seal at or after the observation window and objects_archived would be meaningles
   # itself.
   engine_state="$(docker compose ps --format '{{.State}}' vtop-engine 2>/dev/null | head -1)"
 
+  # A GRACE PERIOD BEFORE JUDGING THE UPLOADS. Records read in the last
+  # seconds of the window are in a batch that has not aged out yet, so
+  # collecting immediately classifies a healthy pipeline as a broken one
+  # (review). One seal age plus a margin is what it takes for the last batch
+  # to seal and its object to land.
+  log "draining for $(( seal_age + 5 ))s so the last batch can seal and upload"
+  sleep "$(( seal_age + 5 ))"
+
   logs="$OUT_DIR/engine-${count}.log"
   docker compose logs --no-color vtop-engine > "$logs" 2>&1 || true
   docker compose stop vtop-engine >/dev/null 2>&1 || true
+
+  # THE TOPICS GO WITH THE CELL, or the sweep stops measuring what it says.
+  # Unique names per cell keep the RECORDS apart, which is what they were for,
+  # and do nothing about the metadata: `KafkaSource::discover_sources` fetches
+  # metadata for the whole broker BEFORE applying topic_include_regex, so the
+  # cells accumulate — the 100-topic cell asks about 1 + 4 + 16 + 64 + 100
+  # topics, and the topic-count dimension is confounded with sweep position,
+  # which is the one thing this design exists to separate (review).
+  #
+  # Deletion is asynchronous, so it is WAITED FOR rather than fired and
+  # forgotten; a create in the next cell that landed on a half-deleted topic
+  # is the failure the unique names were guarding against in the first place.
+  kafka kafka-topics.sh --bootstrap-server localhost:9092 --delete \
+    --topic "${prefix}-.*" >/dev/null 2>&1 || true
+  for _ in $(seq 1 60); do
+    remaining="$(kafka kafka-topics.sh --bootstrap-server localhost:9092 --list 2>/dev/null \
+      | grep -c "^${prefix}-" || true)"
+    [ "${remaining:-0}" -eq 0 ] && break
+    sleep 1
+  done
+  if [ "${remaining:-0}" -ne 0 ]; then
+    fail "$remaining topic(s) from the ${count}-topic cell survived deletion; the next \
+cell would measure them too, and the topic-count dimension would be a fiction."
+  fi
 
   # A FAILED CELL IS RECORDED AND THE SWEEP CONTINUES. Aborting here would
   # throw away the cells that did measure something, and a grid with a hole
@@ -333,6 +365,16 @@ else:
     # seals several times per cell, so records read and nothing archived is an
     # upload, verification or commit that failed, and the row it produced
     # describes half a pipeline.
+    # A CYCLE THAT ERRORED IS A FAILED CELL EVEN IF OTHERS SUCCEEDED
+    # (review). `Engine::run` logs a cycle error and keeps going, so one batch
+    # can upload while another fails verification or its commit — and the row
+    # above would describe the half that worked.
+    errors = len(re.findall(r'"level"\s*:\s*"ERROR"|cycle_error|upload_failed|verification_failed', text))
+    if errors:
+        print(f"[topic-sweep] WARNING: {count} topic(s) logged {errors} engine error(s) "
+              f"during the window; some batch did not complete its pipeline and this row "
+              f"describes only the part that did.")
+        sys.exit(6)
     if sum(reads) > 0 and archived == 0:
         print(f"[topic-sweep] WARNING: {count} topic(s) read {int(sum(reads))} record(s) and "
               f"archived NOTHING, with a seal age well inside the window — the upload, "
