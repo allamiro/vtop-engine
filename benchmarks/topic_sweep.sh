@@ -92,11 +92,18 @@ mkdir -p "$OUT_DIR" ./data/state ./data/work ./data/input ./data/spool
 # uid 10001 is neither the owner nor in the group of anything this user
 # creates, so the only permission bit that helps it is other-write. Try to
 # grant it; refuse to run if we could not, and say what to remove.
+#
+# OTHER-WRITE, and nothing weaker. An earlier version accepted "owned by
+# 10001" as sufficient, which passes for a directory owned by the engine at
+# mode 0500 that the engine still cannot write — and passes for one at 0700
+# that the CALLER cannot write, while this script empties ./data/state between
+# every cell (review). Two different users have to write here, so the only
+# mode that satisfies both is the one that says so.
 for d in ./data/state ./data/work; do
   chmod a+rwx "$d" 2>/dev/null || true
   mode=$(stat -c '%a' "$d")
-  if [ "$(stat -c '%u' "$d")" != "10001" ] && [ "$(( 0$mode & 0002 ))" -eq 0 ]; then
-    fail "$d is mode $mode owned by $(stat -c '%U' "$d"), so the engine (uid 10001) cannot write it and every cell would profile nothing. Remove ./data (it is lab scratch: sudo rm -rf ./data) and rerun."
+  if [ "$(( 0$mode & 0002 ))" -eq 0 ]; then
+    fail "$d is mode $mode owned by $(stat -c '%U' "$d"); the engine (uid 10001) and this script both write it, so it needs other-write and the chmod could not grant it. Remove ./data (it is lab scratch: sudo rm -rf ./data) and rerun."
   fi
 done
 CSV="$OUT_DIR/topic_sweep.csv"
@@ -141,6 +148,21 @@ for count in "${COUNTS[@]}"; do
   docker compose rm -sf vtop-engine >/dev/null 2>&1 || true
   rm -rf ./data/state/* ./data/work/* 2>/dev/null || true
 
+  # A count above the record total cannot hold the total CONSTANT — every
+  # topic would be forced to one record and the cell would carry more than the
+  # others, which is the confound this design exists to avoid. Refused rather
+  # than fudged (review).
+  #
+  # BEFORE the topics are created, not after. The refusal was originally
+  # placed with the arithmetic it protects, which meant `TOTAL_RECORDS=10
+  # topic_sweep.sh 100000` created a hundred thousand Kafka topics and then
+  # announced that the cell was invalid (review).
+  if [ "$count" -gt "$TOTAL_RECORDS" ]; then
+    fail "topic count $count exceeds TOTAL_RECORDS=$TOTAL_RECORDS: the constant \
+record total cannot be spread one-per-topic without changing it. Raise \
+TOTAL_RECORDS or lower the count."
+  fi
+
   for i in $(seq 1 "$count"); do
     kafka kafka-topics.sh --bootstrap-server localhost:9092 --create --if-not-exists \
       --topic "${prefix}-$i" --partitions 1 --replication-factor 1 >/dev/null
@@ -150,15 +172,6 @@ for count in "${COUNTS[@]}"; do
   # Integer division silently changed the load between cells — 4000 over 28
   # topics is 142 each, so 3976, not 4000 — which confounds topic count with
   # record count, the one thing this sweep exists to separate (review).
-  # A count above the record total cannot hold the total CONSTANT — every
-  # topic would be forced to one record and the cell would carry more than the
-  # others, which is the confound this design exists to avoid. Refused rather
-  # than fudged (review).
-  if [ "$count" -gt "$TOTAL_RECORDS" ]; then
-    fail "topic count $count exceeds TOTAL_RECORDS=$TOTAL_RECORDS: the constant \
-record total cannot be spread one-per-topic without changing it. Raise \
-TOTAL_RECORDS or lower the count."
-  fi
   base=$(( TOTAL_RECORDS / count ))
   extra=$(( TOTAL_RECORDS % count ))
   produced=0
@@ -187,16 +200,45 @@ TOTAL_RECORDS or lower the count."
   # plane kept reading `- /data/spool/*.log`, and whatever a previous lab run
   # left in ./data/spool was archived inside every cell (review). The comment
   # above said "all three planes" while the code narrowed one and a half.
+  # AND THE BATCHES MUST SEAL INSIDE THE WINDOW, or objects_archived measures
+  # the clock rather than the work. The lab's batch thresholds are 10,000
+  # records and 100 MiB; a cell spreads a few thousand records across every
+  # topic, so no threshold is ever reached and the only thing that seals a
+  # batch is `max_batch_age_seconds`, which the shipped config sets to 60 —
+  # exactly the default observation window. The first seal therefore raced the
+  # log collection, and objects_archived came out zero or not, depending on
+  # scheduling, while every record had in fact been read (review).
+  #
+  # A quarter of the window instead, asserted below rather than assumed, so
+  # several seals land inside every cell and the column is comparable between
+  # them.
+  seal_age=$(( OBSERVE_SECONDS / 4 ))
+  [ "$seal_age" -ge 1 ] || fail "OBSERVE_SECONDS=$OBSERVE_SECONDS is too short to \
+seal a batch inside a cell; objects_archived would measure scheduling. Use 4s or more."
   mkdir -p ./data/sweep-empty
   sed -e "s|^    topic_include_regex: .*|    topic_include_regex: \"^${prefix}-\"|" \
       -e "s|^\( *\)- /data/.*|\1- /data/sweep-empty/*|" \
+      -e "s|^\( *\)max_batch_age_seconds: .*|\1max_batch_age_seconds: ${seal_age}|" \
     examples/config.yaml > "$SWEEP_CONFIG"
+
+  # The seal age is the one substitution whose ABSENCE is silent: the sweep
+  # would still run, still read every record, and still report a column of
+  # zeros that looked like a finding.
+  grep -q "max_batch_age_seconds: ${seal_age}\b" "$SWEEP_CONFIG" \
+    || fail "the sweep config kept the shipped max_batch_age_seconds; batches would \
+seal at or after the observation window and objects_archived would be meaningless"
 
   # ASSERTED, NOT ASSUMED — that is the whole lesson of the bug above. A
   # config that grows a host path this rule does not cover fails the sweep
   # instead of quietly folding someone else's backlog into the measurement.
-  if grep -nE '^[[:space:]]*- /data/' "$SWEEP_CONFIG" | grep -qv 'sweep-empty'; then
-    fail "the sweep config still reads a host path outside /data/sweep-empty: $(grep -nE '^[[:space:]]*- /data/' "$SWEEP_CONFIG" | grep -v 'sweep-empty' | tr '\n' ' ')"
+  #
+  # Not a pipeline. `grep ... | grep -qv ...` looks equivalent and is not:
+  # `-q` exits at the first match, the upstream grep takes SIGPIPE, and under
+  # `pipefail` the whole condition reports failure — so the `if` is false and
+  # the sweep sails past the very thing it just detected (review).
+  stray="$(grep -nE '^[[:space:]]*- /data/' "$SWEEP_CONFIG" | grep -v 'sweep-empty' || true)"
+  if [ -n "$stray" ]; then
+    fail "the sweep config still reads a host path outside /data/sweep-empty: $(printf '%s' "$stray" | tr '\n' ' ')"
   fi
 
   log "observing the engine for ${OBSERVE_SECONDS}s"
