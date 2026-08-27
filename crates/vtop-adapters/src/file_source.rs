@@ -23,6 +23,12 @@ struct FileCursor {
     read_byte: u64,
     /// Highest byte durably committed to object storage.
     committed_byte: u64,
+    /// What the file looked like when this cursor last caught up with it.
+    ///
+    /// Kept so a cycle can decide NOT to open the file at all (#100). `None`
+    /// until a read has actually observed the file, so an unseen file is
+    /// always read rather than skipped on an assumption.
+    seen: Option<FileIdentity>,
 }
 
 pub struct FileSource {
@@ -61,6 +67,50 @@ impl FileSource {
         let c = self.cursors.entry(path.to_string()).or_default();
         c.committed_byte = committed_byte;
         c.read_byte = committed_byte;
+    }
+
+    /// Whether this cycle can skip opening `path` entirely (#100).
+    ///
+    /// A stat is orders of magnitude cheaper than an open-seek-read, and a
+    /// log directory is mostly cold: a few files are being appended to and
+    /// the rest are rotated history that will never change again. Skipping
+    /// those is where the work goes.
+    ///
+    /// THE CONDITION IS DELIBERATELY NARROW. All four must hold: the file must
+    /// be the same INODE this cursor last saw, at the same SIZE, at the same
+    /// MTIME, and the cursor must already have read through to that size.
+    /// Anything else — an append, a truncation, a rotation that reused the
+    /// name, a file this cursor has never observed — falls through to a real
+    /// read, where the rotation handling in `read_slice` (#65) decides what
+    /// the identity change means.
+    ///
+    /// WHY THIS CANNOT TRAP, which the Kafka backoff in #99 could. That one
+    /// shortened the poll window of a source that had returned nothing, so a
+    /// quiet source became LESS able to observe data, which lengthened the
+    /// streak that shortened the window — starvation with no way out, measured
+    /// at 48x. Nothing here narrows what a later cycle can see: the stat is a
+    /// reliable emptiness check rather than a probabilistic one, it happens
+    /// every cycle at full strength, and any byte appended to the file changes
+    /// both the size and the mtime it is compared against. A file that starts
+    /// changing again is read on the very next cycle.
+    fn can_skip(cursor: &FileCursor, current: &FileIdentity) -> bool {
+        let Some(seen) = cursor.seen.as_ref() else {
+            return false;
+        };
+        seen.inode == current.inode
+            && seen.file_size == current.file_size
+            && seen.mtime == current.mtime
+            && cursor.read_byte >= current.file_size
+    }
+
+    /// Stat a path without opening it, for the skip decision. A path that
+    /// cannot be stat'd is NOT skipped: it is handed to the read, which
+    /// reports the error properly instead of having it swallowed here as a
+    /// silent skip.
+    fn stat_identity(path: &str) -> Option<FileIdentity> {
+        std::fs::metadata(path)
+            .ok()
+            .map(|md| Self::identity_of(&md))
     }
 
     fn identity_of(md: &std::fs::Metadata) -> FileIdentity {
@@ -266,10 +316,29 @@ impl SourceAdapter for FileSource {
         _max_wait: Duration,
     ) -> Result<Vec<ReadResult>, VtopError> {
         let path = source.source_name.clone();
-        let start = self.cursors.entry(path.clone()).or_default().read_byte;
+        let cursor = self.cursors.entry(path.clone()).or_default();
+        let start = cursor.read_byte;
+        // Cheapest signal first (#100): an unchanged, fully-read file is
+        // skipped without an open. The marker still reports the cursor where
+        // it stands, so a skipped file is indistinguishable from one that was
+        // read and had nothing to give — which is what it is.
+        if let Some(current) = Self::stat_identity(&path) {
+            if Self::can_skip(cursor, &current) {
+                return Ok(vec![ReadResult {
+                    progress_start: Self::marker_from(&path, &current, start, start),
+                    progress_end: Self::marker_from(&path, &current, start, start),
+                    records: Vec::new(),
+                    first_timestamp: None,
+                    last_timestamp: None,
+                    verbatim: false,
+                }]);
+            }
+        }
         let (records, end, verbatim, id) =
             Self::read_slice(path.clone(), start, max_records, max_bytes, self.whole_file).await?;
-        self.cursors.get_mut(&path).unwrap().read_byte = end;
+        let cursor = self.cursors.get_mut(&path).unwrap();
+        cursor.read_byte = end;
+        cursor.seen = Some(id.clone());
         Ok(vec![ReadResult {
             progress_start: Self::marker_from(&path, &id, start, start),
             progress_end: Self::marker_from(&path, &id, start, end),
@@ -295,18 +364,36 @@ impl SourceAdapter for FileSource {
         let started = std::time::Instant::now();
 
         let whole_file = self.whole_file;
-        let jobs: Vec<(usize, String, u64)> = sources
-            .iter()
-            .enumerate()
-            .map(|(i, s)| {
-                let start = self
-                    .cursors
-                    .entry(s.source_name.clone())
-                    .or_default()
-                    .read_byte;
-                (i, s.source_name.clone(), start)
-            })
-            .collect();
+        // STAT BEFORE READ (#100). A directory of rotated logs is mostly cold,
+        // and a stat costs a fraction of an open-seek-read. Files that have
+        // not moved since this cursor caught up with them are separated out
+        // here and never opened; what is left is the work the cycle actually
+        // has to do.
+        let mut jobs: Vec<(usize, String, u64)> = Vec::new();
+        let mut skipped: Vec<(usize, String, u64, FileIdentity)> = Vec::new();
+        for (i, s) in sources.iter().enumerate() {
+            let path = s.source_name.clone();
+            let cursor = self.cursors.entry(path.clone()).or_default();
+            let start = cursor.read_byte;
+            match Self::stat_identity(&path) {
+                Some(current) if Self::can_skip(cursor, &current) => {
+                    skipped.push((i, path, start, current));
+                }
+                _ => jobs.push((i, path, start)),
+            }
+        }
+        // COUNTED, not silent. The issue asks for deferred work to be visible,
+        // and a cycle that skipped nine files out of ten is a very different
+        // cycle from one that read all ten and found them empty — they look
+        // identical in every other metric.
+        let skipped_count = skipped.len();
+        if skipped_count > 0 {
+            tracing::debug!(
+                skipped = skipped_count,
+                read = jobs.len(),
+                "file_cycle_skipped_unchanged"
+            );
+        }
 
         let mut results: Vec<(
             usize,
@@ -332,10 +419,32 @@ impl SourceAdapter for FileSource {
         };
         let mut any_records = false;
         let mut any_failed = false;
+        // Skipped files report an empty read at the cursor they already hold,
+        // so the caller sees one outcome per source however the cycle got
+        // there. Pushed first and sorted back into source order at the end.
+        for (source_index, path, start, id) in skipped {
+            report.outcomes.push(SourceReadOutcome {
+                source_index,
+                result: Ok(vec![ReadResult {
+                    progress_start: Self::marker_from(&path, &id, start, start),
+                    progress_end: Self::marker_from(&path, &id, start, start),
+                    records: Vec::new(),
+                    first_timestamp: None,
+                    last_timestamp: None,
+                    verbatim: false,
+                }]),
+            });
+        }
         for (source_index, path, start, res) in results {
             let result = match res {
                 Ok((records, end, verbatim, id)) => {
-                    self.cursors.get_mut(&path).unwrap().read_byte = end;
+                    let cursor = self.cursors.get_mut(&path).unwrap();
+                    cursor.read_byte = end;
+                    // What the read ACTUALLY observed, not what the stat saw
+                    // before it: the file can grow between the two, and
+                    // recording the earlier identity would let the next cycle
+                    // skip bytes this one never read.
+                    cursor.seen = Some(id.clone());
                     any_records |= !records.is_empty();
                     Ok(vec![ReadResult {
                         progress_start: Self::marker_from(&path, &id, start, start),
@@ -356,6 +465,11 @@ impl SourceAdapter for FileSource {
                 result,
             });
         }
+        // ONE ORDER OUT, whatever order the work happened in. Skipped files
+        // were appended before the read results, so without this the caller
+        // sees the cold files first and the hot ones after — source order is
+        // part of this report's contract and a skip must not change it.
+        report.outcomes.sort_by_key(|o| o.source_index);
         // The reads overlapped, so the pass's wall-clock is one shared bucket
         // (splitting per source would double-count it): productive if ANY file
         // yielded, else failed if ANY file errored, else empty. File reads
@@ -473,6 +587,91 @@ mod tests {
             source_name: path.to_string(),
             format: TelemetryFormat::Raw,
         }
+    }
+
+    /// An unchanged, fully-read file is not opened again (#100), and a file
+    /// that starts changing again is picked up on the very NEXT cycle.
+    ///
+    /// The second half is the important one. A naive "back off sources that
+    /// returned nothing" heuristic was tried for Kafka and reverted in #99: it
+    /// shrank the poll window of a quiet source, which made the source less
+    /// able to return data, which lengthened the quiet streak — a starvation
+    /// trap measured at 48x. This skip cannot do that, because the stat is a
+    /// reliable emptiness check rather than a probabilistic one and it runs at
+    /// full strength every cycle. This test is that claim, executed.
+    #[tokio::test]
+    async fn an_unchanged_file_is_skipped_and_a_changed_one_is_read_at_once() {
+        let f = write_log(&["a", "b"]);
+        let path = f.path().to_string_lossy().into_owned();
+        let mut fs = FileSource::new(vec![path.clone()], TelemetryFormat::Raw, false);
+
+        let first = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(first[0].records.len(), 2, "the first cycle reads the file");
+
+        // Nothing has changed, and the cursor is at EOF: the second cycle must
+        // decide that without opening the file.
+        assert!(
+            FileSource::can_skip(
+                fs.cursors.get(&path).unwrap(),
+                &FileSource::stat_identity(&path).unwrap()
+            ),
+            "an unchanged, fully-read file is exactly the case worth skipping"
+        );
+        let second = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(
+            second[0].records.is_empty(),
+            "a skipped cycle yields nothing, like the read it stands in for"
+        );
+
+        // Append, and the skip must stop applying immediately — no streak to
+        // work off, no window to widen back.
+        {
+            use std::io::Write as _;
+            let mut fh = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            writeln!(fh, "c").unwrap();
+            fh.sync_all().unwrap();
+        }
+        assert!(
+            !FileSource::can_skip(
+                fs.cursors.get(&path).unwrap(),
+                &FileSource::stat_identity(&path).unwrap()
+            ),
+            "an appended file must never be skippable: this is the anti-starvation \
+             property the Kafka backoff in #99 could not offer"
+        );
+        let third = fs
+            .read_batch_candidates(&src(&path), 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            third[0].records,
+            vec![b"c".to_vec()],
+            "the appended record is read on the very next cycle, not after a backoff"
+        );
+    }
+
+    /// A file this cursor has never observed is read, never skipped. Skipping
+    /// on an assumption would lose a file's entire contents the first time it
+    /// appeared already-quiet — which is exactly what rotated history looks
+    /// like when the engine starts.
+    #[tokio::test]
+    async fn a_file_never_seen_before_is_never_skipped() {
+        let f = write_log(&["x"]);
+        let path = f.path().to_string_lossy().into_owned();
+        let cursor = FileCursor::default();
+        assert!(
+            !FileSource::can_skip(&cursor, &FileSource::stat_identity(&path).unwrap()),
+            "no prior observation means no basis to skip"
+        );
     }
 
     #[tokio::test]
