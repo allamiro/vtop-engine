@@ -214,12 +214,16 @@ impl RequestHeader {
             });
         };
 
-        let client_id = if key.is_flexible(api_version) {
-            d.compact_nullable_string("header.clientId")?
-                .map(str::to_owned)
-        } else {
-            d.nullable_string("header.clientId")?.map(str::to_owned)
-        };
+        // CLASSIC NULLABLE STRING, even in header v2 (review).
+        //
+        // Request header v2 adds a tagged-field section but deliberately keeps
+        // `client_id` in the pre-flexible encoding — the header predates
+        // flexible versions and Kafka never migrated this field. API-body
+        // flexibility says nothing about it. Reading it as a compact string
+        // misreads the length by one and then treats the remainder as payload:
+        // a short client id whose first byte is 0x00 decodes as null, and a
+        // longer one bleeds into the body.
+        let client_id = d.nullable_string("header.clientId")?.map(str::to_owned);
         let header = RequestHeader {
             api_key,
             api_version,
@@ -357,7 +361,14 @@ mod tests {
             e.i16(key);
             e.i16(version);
             e.i32(7);
-            e.compact_nullable_string(Some("modern-client"));
+            // CLASSIC nullable string, not compact — request header v2 keeps
+            // `client_id` in the pre-flexible encoding
+            // (`"flexibleVersions": "none"` in Kafka's own
+            // RequestHeaderData.json), and only the tagged-field section that
+            // follows is flexible. This test used to encode it compactly,
+            // which meant it asserted the decoder's matching mistake rather
+            // than the wire (review).
+            e.nullable_string(Some("modern-client"));
             e.empty_tagged_fields();
             let bytes = e.into_vec();
 
@@ -369,7 +380,7 @@ mod tests {
                     assert_eq!(
                         header.client_id.as_deref(),
                         Some("modern-client"),
-                        "api {key} v{version}: the compact client id must decode"
+                        "api {key} v{version}: the client id must decode"
                     );
                 }
                 other => panic!("api {key} v{version}: expected Refuse, got {other:?}"),

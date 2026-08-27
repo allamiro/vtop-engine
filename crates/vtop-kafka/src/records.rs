@@ -52,6 +52,20 @@ pub const MAX_RECORDS: usize = 65_536;
 /// trace id, a schema id, a routing hint — so it bounds the amplification
 /// without being a limit anyone meets by accident.
 pub const MAX_HEADERS: usize = 1024;
+/// The ceiling on headers across a WHOLE batch.
+///
+/// The per-record ceiling above is necessary and not sufficient, which is the
+/// second half of the same finding: a batch under the 16 MiB field limit can
+/// carry ~30,000 records, and 256 headers each — comfortably under
+/// [`MAX_HEADERS`] — is still 7.7 million headers at two bytes apiece on the
+/// wire and some fifty bytes apiece resident. Bounding each record while
+/// leaving their sum unbounded just moves the amplification up a level
+/// (review).
+///
+/// 65,536 is the same order as [`MAX_RECORDS`] and three orders above what a
+/// real batch carries, so it bounds the total without being a limit anyone
+/// meets by accident.
+pub const MAX_BATCH_HEADERS: usize = 65_536;
 /// Compression codec lives in the low three bits of `attributes`.
 const COMPRESSION_MASK: i16 = 0x07;
 const TRANSACTIONAL_FLAG: i16 = 0x10;
@@ -95,6 +109,11 @@ pub enum BatchError {
         "record {index} declares {declared} header(s), above the {MAX_HEADERS}-header ceiling"
     )]
     TooManyHeaders { index: usize, declared: i64 },
+    #[error(
+        "record batch declares {declared} header(s) across its records, above the \
+         {MAX_BATCH_HEADERS}-header ceiling for one batch"
+    )]
+    TooManyBatchHeaders { declared: usize },
     #[error("record {index} would sit at an offset or timestamp that overflows i64")]
     CoordinateOverflow { index: usize },
 }
@@ -218,6 +237,9 @@ impl RecordBatch {
         // until the records are actually there, and the ceiling above is
         // 65,536 entries of reserve on a lie.
         let mut records = Vec::new();
+        // Spent down across every record in this batch, so their SUM is
+        // bounded and not merely each one of them.
+        let mut header_budget = MAX_BATCH_HEADERS;
         for index in 0..declared as usize {
             if d.is_empty() {
                 return Err(BatchError::RecordCount {
@@ -225,7 +247,13 @@ impl RecordBatch {
                     found: records.len(),
                 });
             }
-            records.push(decode_record(&mut d, base_offset, base_timestamp, index)?);
+            records.push(decode_record(
+                &mut d,
+                base_offset,
+                base_timestamp,
+                index,
+                &mut header_budget,
+            )?);
         }
         // THE COUNT IS BINDING IN BOTH DIRECTIONS. Declaring too many was
         // already refused above; declaring too FEW was not, and the batch
@@ -315,6 +343,7 @@ fn decode_record(
     base_offset: i64,
     base_timestamp: i64,
     index: usize,
+    header_budget: &mut usize,
 ) -> Result<Record, BatchError> {
     let len = outer.varint("record.length")?;
     if len < 0 {
@@ -355,6 +384,15 @@ fn decode_record(
             declared: i64::from(header_count),
         });
     }
+    // And against the batch's remaining budget, before anything is pushed. A
+    // batch of many modest records adds up to the same memory as one
+    // outrageous record, and only this check sees that.
+    let Some(remaining) = header_budget.checked_sub(header_count as usize) else {
+        return Err(BatchError::TooManyBatchHeaders {
+            declared: MAX_BATCH_HEADERS - *header_budget + header_count as usize,
+        });
+    };
+    *header_budget = remaining;
     if header_count as usize > d.remaining() / 2 {
         return Err(BatchError::Wire(WireError::Truncated {
             field: "record.headerCount",
@@ -411,7 +449,7 @@ fn encode_record(out: &mut Encoder, record: &Record, base_offset: i64, base_time
     // built first and measured rather than predicted.
     let mut body = Encoder::new();
     body.i8(0); // record attributes are unused in v2
-    body.varlong(record.timestamp_millis - base_timestamp);
+    body.varlong(delta_timestamp(record.timestamp_millis, base_timestamp));
     body.varint(delta_i32(record.offset, base_offset));
     write_varint_bytes(&mut body, record.key.as_deref());
     write_varint_bytes(&mut body, record.value.as_deref());
@@ -424,6 +462,30 @@ fn encode_record(out: &mut Encoder, record: &Record, base_offset: i64, base_time
     let body = body.into_vec();
     out.varint(body.len() as i32);
     out.raw(&body);
+}
+
+/// The timestamp delta a record carries.
+///
+/// # Panics
+///
+/// If the record sits further from the batch's base timestamp than an i64 can
+/// express — a base of -1 with a record at `i64::MAX`, say. The decode path
+/// checks its additions; this subtraction was left unchecked, so it panicked
+/// in a debug build and WRAPPED in a release one, emitting a batch whose
+/// timestamp says the opposite of the truth and which this crate's own decoder
+/// then rejects as a coordinate overflow (review). Panicking in both builds is
+/// the lesser evil: callers build batches from records they just read, so the
+/// span is bounded by the data, and a wrapped timestamp is a silent corruption
+/// that outlives the process.
+fn delta_timestamp(timestamp_millis: i64, base_timestamp: i64) -> i64 {
+    timestamp_millis
+        .checked_sub(base_timestamp)
+        .unwrap_or_else(|| {
+            panic!(
+                "record timestamp {timestamp_millis} is further from the batch base \
+                 {base_timestamp} than an i64 delta can express"
+            )
+        })
 }
 
 /// The offset delta a record carries, which the wire stores as an i32.
@@ -836,6 +898,71 @@ mod tests {
             RecordBatch::decode(&encoded).unwrap().records[0],
             at_ceiling
         );
+    }
+
+    /// Headers are bounded across the WHOLE batch, not merely per record
+    /// (review).
+    ///
+    /// The per-record ceiling alone leaves the amplification one level up: a
+    /// batch under the field limit can carry tens of thousands of records,
+    /// each with a header count comfortably beneath [`MAX_HEADERS`], and their
+    /// sum is what turns two bytes apiece on the wire into hundreds of
+    /// megabytes resident.
+    #[test]
+    fn headers_are_bounded_across_the_batch_not_only_per_record() {
+        // Each record sits far below the per-record ceiling; together they
+        // exceed the batch budget.
+        let per_record = 512;
+        let records: Vec<Record> = (0..(MAX_BATCH_HEADERS / per_record) + 1)
+            .map(|i| Record {
+                offset: i as i64,
+                timestamp_millis: 1,
+                key: None,
+                value: None,
+                headers: vec![(String::new(), None); per_record],
+            })
+            .collect();
+        assert!(
+            records.iter().all(|r| r.headers.len() < MAX_HEADERS),
+            "every record must be individually legal, or this tests the wrong ceiling"
+        );
+
+        let encoded = RecordBatch::encode(0, 1, 0, 0, &records);
+        match RecordBatch::decode(&encoded) {
+            Err(BatchError::TooManyBatchHeaders { declared }) => {
+                assert!(declared > MAX_BATCH_HEADERS);
+            }
+            other => panic!("a batch over the aggregate header ceiling must be refused: {other:?}"),
+        }
+    }
+
+    /// The encode path checks its timestamp subtraction (review).
+    ///
+    /// The decode path was given checked arithmetic; this one was not, so a
+    /// span wider than an i64 panicked in debug and WRAPPED in release —
+    /// emitting a batch whose timestamp said the opposite of the truth and
+    /// which this crate's own decoder then rejected. A panic in both builds is
+    /// the lesser evil.
+    #[test]
+    #[should_panic(expected = "than an i64 delta can express")]
+    fn a_timestamp_span_wider_than_an_i64_panics_rather_than_wrapping() {
+        let records = vec![
+            Record {
+                offset: 0,
+                timestamp_millis: -1,
+                key: None,
+                value: None,
+                headers: Vec::new(),
+            },
+            Record {
+                offset: 1,
+                timestamp_millis: i64::MAX,
+                key: None,
+                value: None,
+                headers: Vec::new(),
+            },
+        ];
+        let _ = RecordBatch::encode(0, 1, 0, 0, &records);
     }
 
     /// A count no record could hold is refused without reading a header at
