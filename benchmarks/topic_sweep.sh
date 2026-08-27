@@ -102,8 +102,12 @@ mkdir -p "$OUT_DIR" ./data/state ./data/work ./data/input ./data/spool
 for d in ./data/state ./data/work; do
   chmod a+rwx "$d" 2>/dev/null || true
   mode=$(stat -c '%a' "$d")
-  if [ "$(( 0$mode & 0002 ))" -eq 0 ]; then
-    fail "$d is mode $mode owned by $(stat -c '%U' "$d"); the engine (uid 10001) and this script both write it, so it needs other-write and the chmod could not grant it. Remove ./data (it is lab scratch: sudo rm -rf ./data) and rerun."
+  # WRITE AND EXECUTE. On a directory, write permits creating entries and
+  # EXECUTE permits reaching them; 0622 grants the first without the second,
+  # so every path inside is unreachable and the cell still profiles nothing
+  # (review). Both bits, or the guard passes a directory nobody can use.
+  if [ "$(( 0$mode & 0003 ))" -ne 3 ]; then
+    fail "$d is mode $mode owned by $(stat -c '%U' "$d"); the engine (uid 10001) and this script both write it, so it needs other-write AND other-execute and the chmod could not grant them. Remove ./data (it is lab scratch: sudo rm -rf ./data) and rerun."
   fi
 done
 FAILED_CELLS=""
