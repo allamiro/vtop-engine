@@ -25,11 +25,46 @@ DEFAULTS: dict[str, Any] = {
     "checksum": "sha256",           # sha256 | blake3 | disabled (engine: sha256)
     "backend": "mock",              # mock | mock_fail | mock_limited | minio
     "duration_seconds": 0,          # 0 = drain once; >0 = sustained load for N s
+    # How much work to add per cycle, as a multiple of the ORIGINAL volume.
+    # The default re-seeds a quarter of it, which the engine drains within the
+    # cycle — load, but never a deficit. Above ~1.0 the seeder outruns the
+    # engine and a real backlog accumulates, which is the only condition the
+    # sustained-backpressure hypotheses (#98) are about. See
+    # scenarios/11-backpressure-soak.yaml.
+    "backlog_multiplier": 0.25,
+    # Seed WHILE the engine works, instead of between cycles.
+    #
+    # The serial loop cannot produce a backlog at any volume or multiplier:
+    # `process-once` drains everything it can see before returning, and only
+    # then is more work added, so the engine is caught up by construction at
+    # the end of every cycle. That is why the original 1M rec/s framing of #98
+    # would not have measured what it wanted either — the deficit came from
+    # Kafka producing continuously, which is a property of the SOURCE, not of
+    # the volume. A background seeder restores that property at any scale.
+    "seed_concurrently": False,
+    # Seconds between background seeding rounds, when seeding concurrently.
+    "seed_interval_seconds": 1.0,
     "fault": "none",                # none | verify_fail | replay
     "sys_sample_interval": 1.0,     # seconds between system-metric samples
     "bucket": "telemetry-data",
     "endpoint_url": "",             # for backend=minio
 }
+
+
+def reseed_count(volume: int, multiplier: float) -> int:
+    """How many files to add per sustained-load cycle.
+
+    Extracted from the runner so the arithmetic that decides whether a soak
+    builds a backlog can be tested without running one. Always at least one
+    file: a multiplier rounding to zero would silently turn a sustained-load
+    scenario into a single-cycle drain, which looks like a passing run of
+    something it never did (#98).
+    """
+    # ROUNDED, not truncated. `int()` floors, and a multiplier whose binary
+    # representation lands a hair under the integer (1.15, 0.29) then seeds one
+    # file fewer every round — permanently understating both bytes_seeded and
+    # the very deficit this knob exists to create (review).
+    return max(1, round(volume * multiplier))
 
 
 @dataclass

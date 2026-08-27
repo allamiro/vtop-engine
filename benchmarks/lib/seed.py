@@ -128,11 +128,20 @@ def _pick_size(size_class: str) -> int:
 
 
 def generate_dataset(out_dir: str, fmt: str, volume: int, size_class: str,
-                     seed: int = 0) -> dict[str, int]:
+                     seed: int = 0, prefix: str = "evt") -> dict[str, int]:
     """Generate `volume` files into `out_dir`. Returns totals.
 
     `seed`: pass a NON-ZERO value for reproducible data (same bytes every run);
     the default `0` means "seed from OS entropy" (fresh, non-reproducible data).
+
+    `prefix`: the filename namespace. Rounds of a sustained run MUST pass
+    distinct prefixes. Names are `{prefix}-{index}-{4 random chars}`, so two
+    rounds sharing a prefix draw from only 456,976 suffixes per index and
+    collide readily over a long soak — and a collision opens the existing path
+    with "w", truncating a file the engine has already recorded a cursor for.
+    The engine keeps that path's committed byte offset, so the shorter
+    replacement is skipped and its records never arrive: silent loss inside the
+    very measurement meant to observe a backlog (review).
     """
     random.seed(seed if seed else None)
     os.makedirs(out_dir, exist_ok=True)
@@ -140,7 +149,7 @@ def generate_dataset(out_dir: str, fmt: str, volume: int, size_class: str,
     total_bytes = 0
     pad = len(str(volume))
     for i in range(volume):
-        name = f"evt-{str(i).zfill(pad)}-{''.join(random.choices(string.ascii_lowercase, k=4))}.{ext}"
+        name = f"{prefix}-{str(i).zfill(pad)}-{''.join(random.choices(string.ascii_lowercase, k=4))}.{ext}"
         path = os.path.join(out_dir, name)
         target = _pick_size(size_class)
         if fmt == "binary":

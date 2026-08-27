@@ -11,7 +11,7 @@ import textwrap
 
 import pytest
 
-from lib.scenario import _coerce, _fallback_parse, load_scenario
+from lib.scenario import _coerce, _fallback_parse, load_scenario, reseed_count
 
 
 def write(tmp_path, text, name="s.yaml"):
@@ -97,3 +97,35 @@ def test_fallback_parse_ignores_comments_and_blanks():
 )
 def test_coerce_types(raw, expected):
     assert _coerce(raw) == expected
+
+
+# --------------------------------------------------------------------------
+# Sustained-load backlog (#98)
+# --------------------------------------------------------------------------
+
+
+def test_backlog_multiplier_defaults_to_a_quarter_of_the_volume(tmp_path):
+    # The historical behaviour, kept as the default so existing scenarios run
+    # exactly as before: a quarter of the volume per cycle, which the engine
+    # drains within the cycle.
+    path = write(tmp_path, "name: s\nvolume: 400\n")
+    sc = load_scenario(path)
+    assert sc.values["backlog_multiplier"] == 0.25
+    assert reseed_count(sc.values["volume"], sc.values["backlog_multiplier"]) == 100
+
+
+def test_a_multiplier_above_one_seeds_more_than_a_cycle_drains(tmp_path):
+    # The condition every sustained-backpressure hypothesis in #98 needs. At or
+    # below the drain rate the engine is caught up by construction and the
+    # deficit never appears, however long or large the run is — which is why
+    # the 1M rec/s target was never the thing that mattered.
+    path = write(tmp_path, "name: s\nvolume: 400\nbacklog_multiplier: 1.5\n")
+    sc = load_scenario(path)
+    assert reseed_count(sc.values["volume"], sc.values["backlog_multiplier"]) == 600
+
+
+def test_a_multiplier_that_rounds_to_zero_still_seeds_one_file():
+    # Otherwise a sustained-load scenario silently becomes a single-cycle
+    # drain, and reports a duration it never actually spent working.
+    assert reseed_count(10, 0.01) == 1
+    assert reseed_count(1, 0.0) == 1
