@@ -1999,7 +1999,6 @@ fn refuse_an_unwritable_data_dir(data_dir: &std::path::Path) -> Result<(), Strin
     // directory that refuses new entries, which is the permission the marker
     // needs (review). Removed first, so the write has to prove the thing being
     // asked.
-    let _ = std::fs::remove_file(&probe);
     let refuse = |what: &str, error: std::io::Error| {
         format!(
             "{} is not writable ({what}: {error}); refusing to campaign for a range this \
@@ -2007,7 +2006,19 @@ fn refuse_an_unwritable_data_dir(data_dir: &std::path::Path) -> Result<(), Strin
             data_dir.display()
         )
     };
-    std::fs::write(&probe, b"").map_err(|error| refuse("creating a file", error))?;
+    // A REMOVAL THAT FAILS FOR ANY REASON BUT ABSENCE IS ITSELF THE ANSWER
+    // (review). Ignoring it let the write below truncate whatever is at that
+    // path — following a symlink there, if someone put one — and only the
+    // unlink afterwards would have refused, by which time the damage is done.
+    match std::fs::remove_file(&probe) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(refuse("removing a stale probe", error)),
+    }
+    // create_new, so this can only ever make a NEW entry: it is the directory
+    // permission being tested, and a path that already exists — including a
+    // symlink to somewhere that matters — must be refused rather than opened.
+    std::fs::File::create_new(&probe).map_err(|error| refuse("creating a file", error))?;
     // And the unlink is checked too, for the same reason it is checked in the
     // marker: a directory that will not let an entry be removed will not let
     // the stand-aside marker be consumed either, and this is the one moment
