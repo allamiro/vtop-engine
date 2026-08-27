@@ -123,6 +123,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# FROM NOTHING, EVERY TIME. `up` over a lab that is already running reuses
+# whatever topics are in the broker — a previous sweep interrupted before its
+# cleanup, or someone's compose lab — and `discover_sources` fetches metadata
+# for the WHOLE broker before the include regex is applied, so those topics
+# are in every cell's measurement (review). The teardown at the end cannot
+# help a run that starts dirty.
+log "tearing down any existing lab so the broker starts empty"
+docker compose down -v --remove-orphans >/dev/null 2>&1 || true
+
 log "bringing up kafka + minio + engine"
 docker compose up -d kafka minio minio-init >/dev/null
 for _ in $(seq 1 60); do
@@ -253,7 +262,11 @@ seal at or after the observation window and objects_archived would be meaningles
   fi
 
   log "observing the engine for ${OBSERVE_SECONDS}s"
-  VTOP_CONFIG="$SWEEP_CONFIG_IN_CONTAINER" docker compose up -d vtop-engine >/dev/null
+  # JSON, so the failure guards have one shape to match rather than two
+  # (review). The parser reads levels out of the log, and a text-formatted run
+  # would hide the very lines it is looking for.
+  VTOP_CONFIG="$SWEEP_CONFIG_IN_CONTAINER" VTOP_LOG_FORMAT=json \
+    docker compose up -d vtop-engine >/dev/null
   sleep "$OBSERVE_SECONDS"
 
   # STILL RUNNING? A cell that emitted a profile and then died leaves a
@@ -262,16 +275,22 @@ seal at or after the observation window and objects_archived would be meaningles
   # itself.
   engine_state="$(docker compose ps --format '{{.State}}' vtop-engine 2>/dev/null | head -1)"
 
+  # TWO SNAPSHOTS, because the drain is not part of the measurement. The
+  # window's log is taken at the declared deadline and is what the read-cycle
+  # numbers come from; the drain that follows exists only so the last batch can
+  # seal, and folding its extra cycles and records into the profile would make
+  # the sweep report more work than it declared it observed (review).
+  logs="$OUT_DIR/engine-${count}.log"
+  docker compose logs --no-color vtop-engine > "$logs" 2>&1 || true
+
   # A GRACE PERIOD BEFORE JUDGING THE UPLOADS. Records read in the last
   # seconds of the window are in a batch that has not aged out yet, so
-  # collecting immediately classifies a healthy pipeline as a broken one
-  # (review). One seal age plus a margin is what it takes for the last batch
-  # to seal and its object to land.
+  # judging immediately classifies a healthy pipeline as a broken one.
   log "draining for $(( seal_age + 5 ))s so the last batch can seal and upload"
   sleep "$(( seal_age + 5 ))"
 
-  logs="$OUT_DIR/engine-${count}.log"
-  docker compose logs --no-color vtop-engine > "$logs" 2>&1 || true
+  drained="$OUT_DIR/engine-${count}.drained.log"
+  docker compose logs --no-color vtop-engine > "$drained" 2>&1 || true
   docker compose stop vtop-engine >/dev/null 2>&1 || true
 
   # THE TOPICS GO WITH THE CELL, or the sweep stops measuring what it says.
@@ -285,15 +304,33 @@ seal at or after the observation window and objects_archived would be meaningles
   # Deletion is asynchronous, so it is WAITED FOR rather than fired and
   # forgotten; a create in the next cell that landed on a half-deleted topic
   # is the failure the unique names were guarding against in the first place.
-  kafka kafka-topics.sh --bootstrap-server localhost:9092 --delete \
-    --topic "${prefix}-.*" >/dev/null 2>&1 || true
+  # EXACT NAMES. `--topic "${prefix}-.*"` is a literal topic name to Kafka
+  # here, not a pattern, so it deleted nothing and the wait below would have
+  # aborted the sweep after its first cell (review).
+  for i in $(seq 1 "$count"); do
+    kafka kafka-topics.sh --bootstrap-server localhost:9092 --delete \
+      --topic "${prefix}-$i" >/dev/null 2>&1 || true
+  done
+  # A FAILED LIST IS UNKNOWN, NOT ZERO. `grep -c` over an empty stream counts
+  # nothing whether the topics are gone or the query never answered, and
+  # treating the second as success is how the next cell silently inherits them
+  # (review).
+  remaining=""
   for _ in $(seq 1 60); do
-    remaining="$(kafka kafka-topics.sh --bootstrap-server localhost:9092 --list 2>/dev/null \
-      | grep -c "^${prefix}-" || true)"
-    [ "${remaining:-0}" -eq 0 ] && break
+    if listing="$(kafka kafka-topics.sh --bootstrap-server localhost:9092 --list 2>/dev/null)"; then
+      remaining="$(printf '%s\n' "$listing" | grep -c "^${prefix}-" || true)"
+      [ "$remaining" -eq 0 ] && break
+    else
+      remaining=""
+    fi
     sleep 1
   done
-  if [ "${remaining:-0}" -ne 0 ]; then
+  if [ -z "$remaining" ]; then
+    fail "the broker never answered a topic listing after the ${count}-topic cell, so \
+whether its topics are gone is unknown — and an unknown here means the next cell may be \
+measuring them."
+  fi
+  if [ "$remaining" -ne 0 ]; then
     fail "$remaining topic(s) from the ${count}-topic cell survived deletion; the next \
 cell would measure them too, and the topic-count dimension would be a fiction."
   fi
@@ -308,11 +345,16 @@ cell would measure them too, and the topic-count dimension would be a fiction."
 this cell did not survive its own observation window"
     cell_ok=4
   fi
-  python3 - "$logs" "$count" "$produced" "$OBSERVE_SECONDS" "$CSV" <<'PY_PARSE' || cell_ok=$?
+  python3 - "$logs" "$count" "$produced" "$OBSERVE_SECONDS" "$CSV" "$drained" <<'PY_PARSE' || cell_ok=$?
 import re, sys
 log, count, produced, observe, csv_path = (
     sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5])
+# TWO SNAPSHOTS (review). `text` is the declared observation window and is
+# where every read-cycle number comes from; `drained` also covers the grace
+# period afterwards, and is used ONLY to judge whether the pipeline completed —
+# uploads, commits and errors — since the last batch of the window seals in it.
 text = open(log, errors="replace").read()
+drained = open(sys.argv[6], errors="replace").read() if len(sys.argv) > 6 else text
 
 # KAFKA LINES ONLY. read_cycle_profile is emitted once per cycle PER SOURCE
 # TYPE, so aggregating every line mixes the file and syslog planes into a
@@ -335,7 +377,7 @@ phase = nums("read_phase_ms")
 # "verified", which a successful batch never logs — it logs
 # `verification_passed` and then `source_committed` — so the column read zero
 # on every healthy run (review). One `object_uploaded` per archived object.
-archived = len(re.findall(r"object_uploaded", text))
+archived = len(re.findall(r"object_uploaded", drained))
 
 n = len(kafka_lines)
 if n == 0:
@@ -369,12 +411,35 @@ else:
     # (review). `Engine::run` logs a cycle error and keeps going, so one batch
     # can upload while another fails verification or its commit — and the row
     # above would describe the half that worked.
-    errors = len(re.findall(r'"level"\s*:\s*"ERROR"|cycle_error|upload_failed|verification_failed', text))
-    if errors:
-        print(f"[topic-sweep] WARNING: {count} topic(s) logged {errors} engine error(s) "
-              f"during the window; some batch did not complete its pipeline and this row "
-              f"describes only the part that did.")
+    # BOTH LOG SHAPES, and the adapter's own WARNINGS. The engine logs JSON
+    # when VTOP_LOG_FORMAT=json and plain text otherwise, and a partial Kafka
+    # read is a WARN — `adapter read pass failed`, `source read failed` — not
+    # an ERROR, so matching only ERROR let a cell that read some of its topics
+    # pass as if it had read all of them (review).
+    trouble = re.findall(
+        r'"level"\s*:\s*"(?:ERROR|WARN)"|\bERROR\b|\bWARN\b'
+        r'|adapter read pass failed|source read failed|process cycle error|batch failed'
+        r'|upload_failed|verification_failed|cycle_error',
+        drained)
+    # And the profile's own count of sources it could not read. A cell that
+    # read four of its five topics is not a measurement of five.
+    failed_sources = [int(m) for m in re.findall(r'failed_sources[=":\s]+"?(\d+)', drained)]
+    if trouble or any(failed_sources):
+        print(f"[topic-sweep] WARNING: {count} topic(s) logged {len(trouble)} engine "
+              f"error/warning line(s) and {sum(failed_sources)} failed source(s); some "
+              f"batch or topic did not complete its pipeline and this row describes only "
+              f"the part that did.")
         sys.exit(6)
+
+    # EVERY BATCH MUST HAVE COMMITTED. `object_uploaded` says an object landed;
+    # `source_committed` is the engine saying the batch is done end to end, and
+    # a cell with more uploads than commits is a pipeline that stopped halfway
+    # through at least one of them (review).
+    committed = len(re.findall(r"source_committed", drained))
+    if committed < archived:
+        print(f"[topic-sweep] WARNING: {count} topic(s) uploaded {archived} object(s) but "
+              f"only committed {committed}; at least one batch did not finish.")
+        sys.exit(7)
     if sum(reads) > 0 and archived == 0:
         print(f"[topic-sweep] WARNING: {count} topic(s) read {int(sum(reads))} record(s) and "
               f"archived NOTHING, with a seal age well inside the window — the upload, "
