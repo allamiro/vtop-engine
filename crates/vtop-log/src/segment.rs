@@ -3003,9 +3003,15 @@ pub(crate) fn read_chunk_sidecar(
             reason: "chunk-sidecar checksum mismatch".to_owned(),
         });
     }
+    // `as_chunks`, not `chunks_exact`: the chunk is then a [u8; 32] by TYPE,
+    // so the conversion below is a copy rather than a fallible `try_into`
+    // whose failure branch could never be taken. The length was already
+    // checked above, so the remainder is empty by construction.
     let leaves = bytes[22..checksum_start]
-        .chunks_exact(32)
-        .map(|chunk| blake3::Hash::from_bytes(chunk.try_into().expect("fixed slice")))
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .map(|chunk| blake3::Hash::from_bytes(*chunk))
         .collect();
     Ok((chunk_size, leaves))
 }
@@ -3051,10 +3057,17 @@ fn read_index(storage: &dyn Storage, path: &Path) -> VtopLogResult<Vec<IndexEntr
         });
     }
     Ok(bytes[16..]
-        .chunks_exact(16)
-        .map(|chunk| IndexEntry {
-            offset: u64::from_be_bytes(chunk[..8].try_into().expect("fixed slice")),
-            position: u64::from_be_bytes(chunk[8..].try_into().expect("fixed slice")),
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .map(|chunk| {
+            // Split by TYPE into two [u8; 8] halves, so neither
+            // `from_be_bytes` needs a `try_into` that cannot fail.
+            let (offset, position) = chunk.split_at(8);
+            IndexEntry {
+                offset: u64::from_be_bytes(offset.try_into().expect("fixed half")),
+                position: u64::from_be_bytes(position.try_into().expect("fixed half")),
+            }
         })
         .collect())
 }
