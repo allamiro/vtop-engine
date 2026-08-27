@@ -422,6 +422,10 @@ mod tests {
             .read_batch_candidates(&src, 100, 1 << 20, Duration::ZERO)
             .await
             .unwrap();
+        // Asserted rather than indexed blind, matching the sibling test above:
+        // a regression returning nothing should fail here with a readable
+        // message instead of panicking on the index (review).
+        assert_eq!(reads2.len(), 1);
         assert_eq!(
             reads2[0].records,
             vec![b"<13>still being written now".to_vec()],
