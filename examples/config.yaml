@@ -37,6 +37,31 @@ batching:
   # that read data loops straight into the next one, so a backlog drains at
   # read speed rather than being throttled by this timer.
   idle_poll_interval_ms: 2000
+  # How many batches may be compressed, uploaded and verified AT ONCE (#87).
+  #
+  # A batch is roughly 163 ms of work and almost none of it is the same KIND of
+  # work: compression is CPU, the two uploads are network round-trips, and one
+  # batch running alone leaves whichever resource it is not using idle. Running
+  # several overlaps them — the measured engine sat at 5.67% CPU while doing
+  # this strictly one batch at a time.
+  #
+  # Concurrency is ACROSS batches only. Each one still reaches
+  # SOURCE_COMMITTED off the back of its own verification, never another's, so
+  # raising this cannot let an unverified batch commit; it only decides how
+  # many verifications are in flight.
+  #
+  # Raise it when uploads dominate (high latency to the object store, small
+  # batches). Zero is refused at startup — it would flush nothing.
+  #
+  # NOT A MEMORY CEILING, and worth being exact about because lowering it to
+  # prevent an OOM would not work (review). A cycle drains EVERY flushable
+  # buffer into a work queue first, and this setting bounds how many of those
+  # are compressed, uploaded and verified AT ONCE — not how many are resident.
+  # Fifty sources flushing in one cycle hold fifty payloads whatever this is
+  # set to. What bounds resident bytes is `max_bytes` times the number of
+  # buffers a cycle can flush, which is a property of how many sources are
+  # configured and how often they seal.
+  max_concurrent_batches: 8
 
 compression:
   # zstd, not gzip. Measured on 13 MB of this lab's own CEF traffic:
