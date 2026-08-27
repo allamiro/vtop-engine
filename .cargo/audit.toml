@@ -31,4 +31,16 @@ ignore = [
     "RUSTSEC-2026-0098", # name constraints accepted for URI names
     "RUSTSEC-2026-0099", # name constraints accepted for wildcard certs
     "RUSTSEC-2026-0104", # reachable panic parsing a CRL
+
+    # lru 0.16.4 — potential use-after-free from a lack of panic safety in
+    # `LruCache::pop()`. UNSOUNDNESS, not a vulnerability, and it is reachable
+    # only if a cached value's `Drop` panics during eviction.
+    #
+    # No fixed release exists: 0.16.4 IS the newest published version, so there
+    # is nothing to upgrade to (`cargo update -p lru` moves nothing, and
+    # `--precise 0.16.5` reports no such package). It reaches this build solely
+    # through aws-sdk-s3 1.137.0, whose cached values are SDK-internal types
+    # this project neither supplies nor controls. Re-evaluate when upstream
+    # publishes a fix, and on the next AWS SDK bump.
+    "RUSTSEC-2026-0253",
 ]
