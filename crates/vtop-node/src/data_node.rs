@@ -1221,6 +1221,12 @@ async fn run_candidate(
     // Set when a granted epoch turns out to be unservable (#367); the agent
     // releases it and sits out the next rounds rather than renewing it.
     let stand_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Before anything here may want the range (#367). A candidate that cannot
+    // write its directory cannot serve what it would win and cannot record
+    // that it could not — the loop, with the one mechanism that breaks it
+    // removed. Scoped to the candidate path deliberately: a statically
+    // configured leader has no election to re-enter.
+    refuse_an_unwritable_data_dir(&config.data_dir)?;
     let stand_aside_marker = StandAsideMarker::new(&config.data_dir);
     let agent = crate::lease_agent::LeaseAgent::new(
         lease_admin_client(lease)?,
@@ -1247,16 +1253,25 @@ async fn run_candidate(
     // A previous incarnation of this process may have been granted an epoch it
     // could not serve (#367). The marker outlives the process precisely because
     // the hold-off cannot.
-    if let Some(failed_epoch) = stand_aside_marker.take() {
+    let stand_aside = stand_aside_marker.take();
+    if !matches!(stand_aside, StandAside::NeverFailed) {
         let rounds = crate::lease_agent::stand_aside_rounds_for(
             Duration::from_millis(lease.lease_duration_ms),
             Duration::from_millis(lease.poll_interval_ms),
         );
-        eprintln!(
-            "a previous run of this node was granted epoch {failed_epoch} and could not \
-             serve it; standing aside for {rounds} poll round(s) so another candidate \
-             gets an uncontested turn"
-        );
+        match &stand_aside {
+            StandAside::Failed(failed_epoch) => eprintln!(
+                "a previous run of this node was granted epoch {failed_epoch} and could \
+                 not serve it; standing aside for {rounds} poll round(s) so another \
+                 candidate gets an uncontested turn"
+            ),
+            StandAside::Unreadable(why) => eprintln!(
+                "a previous run of this node left a stand-aside marker that could not be \
+                 read ({why}); standing aside for {rounds} poll round(s) anyway, because \
+                 an unreadable marker is a marker"
+            ),
+            StandAside::NeverFailed => unreachable!("excluded above"),
+        }
         agent = agent.standing_aside(rounds);
     }
     let agent_drain = std::time::Duration::from_secs(5)
@@ -1761,8 +1776,24 @@ async fn run_candidate(
         // in-process hold-off cannot help — there is no next round of this
         // process — so the marker is the only thing that carries the fact
         // across.
-        if let Phase::Leading { broker, .. } = &phase {
-            stand_aside_marker.record(broker.held_fencing_epoch());
+        //
+        // THE EPOCH COMES FROM THE VERDICT WHEN THERE IS NO LEADER TO ASK
+        // (review). Keying this on `Phase::Leading` alone missed the window
+        // the marker most needs to cover: a listener that dies while the
+        // promotion is still being built leaves `phase` at `Transitioning`,
+        // and the agent has ALREADY accepted the grant — so the exit that
+        // follows is precisely an unservable epoch, and it was the one case
+        // that recorded nothing. The last verdict is the agent's own answer
+        // to "what was I granted", which is the question being asked.
+        let failed_epoch = match &phase {
+            Phase::Leading { broker, .. } => Some(broker.held_fencing_epoch()),
+            _ => match *verdict_rx.borrow() {
+                RoleVerdict::Lead { fencing_epoch, .. } => Some(fencing_epoch),
+                _ => None,
+            },
+        };
+        if let Some(fencing_epoch) = failed_epoch {
+            stand_aside_marker.record(fencing_epoch);
         }
         native_task.abort();
         replica_task.abort();
@@ -1881,14 +1912,81 @@ impl StandAsideMarker {
         }
     }
 
-    /// Consume the marker, if one is there. Returns the epoch it named.
-    fn take(&self) -> Option<u64> {
-        let contents = std::fs::read_to_string(&self.path).ok()?;
+    /// Consume the marker, if one is there.
+    ///
+    /// ABSENT AND UNREADABLE ARE DIFFERENT ANSWERS (review). The first
+    /// version of this collapsed them with `.ok()?`, so an I/O error or a
+    /// truncated write read as "this node never failed" — the marker's whole
+    /// purpose discarded by the one class of fault most likely to have
+    /// written it badly. Only `NotFound` now means no marker; anything else
+    /// stands the node aside, because the safe reading of a marker we cannot
+    /// read is that it said something.
+    fn take(&self) -> StandAside {
+        let contents = match std::fs::read_to_string(&self.path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return StandAside::NeverFailed
+            }
+            Err(error) => {
+                // Removed on this path too: an unreadable marker that
+                // survived its own reading would sit this node out forever.
+                let _ = std::fs::remove_file(&self.path);
+                return StandAside::Unreadable(error.to_string());
+            }
+        };
         // Removed BEFORE the value is used: a marker that survives its own
         // reading would stand this node aside on every restart forever.
         let _ = std::fs::remove_file(&self.path);
-        contents.trim().parse().ok()
+        match contents.trim().parse() {
+            Ok(fencing_epoch) => StandAside::Failed(fencing_epoch),
+            Err(_) => StandAside::Unreadable(format!(
+                "the marker held {contents:?}, which is not an epoch"
+            )),
+        }
     }
+}
+
+/// What the stand-aside marker had to say (#367).
+enum StandAside {
+    /// No marker. This node has no reason to sit out.
+    NeverFailed,
+    /// A marker naming the epoch a previous incarnation could not serve.
+    Failed(u64),
+    /// A marker was there and could not be read, or did not parse. Treated as
+    /// a failure rather than an absence — see `take`.
+    Unreadable(String),
+}
+
+/// Prove the data directory is writable before this node may campaign (#367).
+///
+/// This is the fail-closed half the marker cannot provide for itself
+/// (review). `record` is best effort on purpose: it runs on the way out of a
+/// process that has already decided it cannot serve, and failing a shutdown
+/// over a note trades a recoverable loop for an unrecoverable stop. But the
+/// hazard behind that trade is real — a node whose directory filled up or
+/// remounted read-only cannot write the marker, restarts with nothing to read,
+/// campaigns at once, and fails again. So the condition is refused where it
+/// can be refused: at startup, before the agent is allowed to want the range
+/// at all.
+///
+/// Opening the range does not catch it. A directory that became unwritable
+/// after the last clean stop still OPENS — reads succeed, and the first write
+/// is a produce that has already been acknowledged as this node's job.
+///
+/// The probe is a fixed name rather than a unique one so a process killed
+/// between the write and the unlink leaves one empty dotfile that the next
+/// start overwrites, instead of accumulating litter the range sweep does not
+/// recognise.
+fn refuse_an_unwritable_data_dir(data_dir: &std::path::Path) -> Result<(), String> {
+    let probe = data_dir.join(".writable-probe");
+    std::fs::write(&probe, b"").map_err(|error| {
+        format!(
+            "{} is not writable ({error}); refusing to campaign for a range this node              could not serve and could not even record that it could not serve",
+            data_dir.display()
+        )
+    })?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
 }
 
 /// A candidate's current shape (#284).
@@ -2939,9 +3037,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let marker = StandAsideMarker::new(dir.path());
 
-        assert_eq!(
-            marker.take(),
-            None,
+        assert!(
+            matches!(marker.take(), StandAside::NeverFailed),
             "a node that never failed must not stand aside"
         );
 
@@ -2950,18 +3047,82 @@ mod tests {
         // process, which shares nothing with the one that wrote it except the
         // data dir.
         let after_restart = StandAsideMarker::new(dir.path());
-        assert_eq!(
-            after_restart.take(),
-            Some(7),
+        assert!(
+            matches!(after_restart.take(), StandAside::Failed(7)),
             "the epoch this node could not serve must survive the process that \
              could not serve it"
         );
-        assert_eq!(
-            StandAsideMarker::new(dir.path()).take(),
-            None,
+        assert!(
+            matches!(
+                StandAsideMarker::new(dir.path()).take(),
+                StandAside::NeverFailed
+            ),
             "and exactly one restart may claim it: a marker that outlived its own \
              reading would stand this node aside on every restart forever, which \
              leaves a single-candidate range with no leader at all"
+        );
+    }
+
+    /// A marker that cannot be read is a marker, not an absence (#367).
+    ///
+    /// The first version collapsed both into `None` with `.ok()?`, which
+    /// meant the one class of fault most likely to have written a marker
+    /// badly — a directory that ran out of room mid-write — was also the
+    /// class that made the marker disappear. The node would then campaign
+    /// immediately for the epoch it had just failed to serve, which is the
+    /// loop this file exists to break.
+    #[test]
+    fn an_unreadable_stand_aside_marker_still_stands_the_node_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = StandAsideMarker::new(dir.path());
+
+        // A half-written marker: the bytes are there, the epoch is not.
+        std::fs::write(dir.path().join(".stand-aside"), b"").unwrap();
+        assert!(
+            matches!(marker.take(), StandAside::Unreadable(_)),
+            "a marker holding no epoch must sit the node out, not read as a node \
+             that never failed"
+        );
+        assert!(
+            matches!(marker.take(), StandAside::NeverFailed),
+            "and it must still be consumed, or an unparseable marker sits the node \
+             out forever"
+        );
+
+        // Unreadable rather than unparseable: a directory where the file
+        // should be is the cheapest deterministic read error there is.
+        std::fs::create_dir(dir.path().join(".stand-aside")).unwrap();
+        assert!(
+            matches!(marker.take(), StandAside::Unreadable(_)),
+            "an I/O error reading the marker must not be reported as no marker"
+        );
+    }
+
+    /// A candidate that cannot write its data directory must not campaign
+    /// (#367).
+    ///
+    /// This is the fail-closed half `record` cannot provide: it runs on the
+    /// way out and must stay best effort, so the condition that would have
+    /// stopped it writing is refused at the only point where refusing costs
+    /// nothing — before the node is allowed to want the range.
+    #[test]
+    fn a_candidate_refuses_to_campaign_from_a_directory_it_cannot_write() {
+        let dir = tempfile::tempdir().unwrap();
+        refuse_an_unwritable_data_dir(dir.path())
+            .expect("a writable directory is the ordinary case and must pass");
+        assert!(
+            !dir.path().join(".writable-probe").exists(),
+            "the probe must not survive itself; a data directory is not a place to \
+             leave litter"
+        );
+
+        // Unwritable expressed as a missing parent rather than a mode change:
+        // the same refusal, and it holds when the suite runs as root.
+        let error = refuse_an_unwritable_data_dir(&dir.path().join("no-such-dir"))
+            .expect_err("a directory that cannot be written must be refused");
+        assert!(
+            error.contains("refusing to campaign"),
+            "the refusal must say what it is refusing and why, not just fail: {error}"
         );
     }
 

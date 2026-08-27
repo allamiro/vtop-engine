@@ -695,6 +695,51 @@ kubectl -n "$REPLICATED_NS" wait --for=condition=ready pod -l "app.kubernetes.io
 # the range through the metadata lease, so the holder must be ASKED for —
 # aiming at pod 0 now would fail two runs in three, looking like a produce
 # bug and actually being an assumption the topology no longer honours.
+# WHAT THE ENGINE DECIDED, not only what the client saw (#367).
+#
+# This failover failure was diagnosed twice from `tls handshake eof` alone,
+# and both diagnoses were wrong, because that string says the holder is not
+# serving and cannot say why. The workflow-level dump that exists is
+# `--tail=60`, which openraft's per-vote logging fills entirely — so the one
+# thing that mattered, a member campaigning to term 115 while the cluster sat
+# at term 2, arrived as noise and the engine's own verdicts arrived not at
+# all.
+#
+# So the failure path prints three things the client's view cannot supply:
+# the verdicts each pod reached, the RESTART counts (a holder that never
+# restarted refutes every restart-shaped theory at a glance), and the range
+# of Raft terms each pod has seen — summarised rather than dumped, because a
+# term storm is a cause and a hundred vote lines are not evidence of it.
+dump_failover_evidence() {
+  log "--- failover evidence: what the engine decided ---"
+  kubectl -n "$REPLICATED_NS" get pods -o wide || true
+  log "the lease as metadata sees it: $(lease_state 2>/dev/null || echo '(no answer)')"
+  for pod in $(kubectl -n "$REPLICATED_NS" get pods -o name 2>/dev/null || true); do
+    log "=== $pod — role, promotion, lease and fencing decisions ==="
+    kubectl -n "$REPLICATED_NS" logs "$pod" --tail=-1 2>/dev/null \
+      | grep -Ei 'promot|quorum|lease|epoch|fenc|stand|slot|listener|role_changed|refus|not writable|panic|ERROR' \
+      | grep -vE 'openraft|handle_vote_req|Raft::vote|RequestVote' \
+      | tail -60 || true
+    # SUMMARISED, NOT DUMPED. "116 distinct terms, 1 to 116" is a diagnosis;
+    # a hundred vote lines are the thing that hid it last time.
+    terms="$(kubectl -n "$REPLICATED_NS" logs "$pod" --tail=-1 2>/dev/null \
+      | grep -oE 'vote:T[0-9]+' | sed 's/vote:T//' | sort -n | uniq || true)"
+    if [ -n "$terms" ]; then
+      log "  raft terms seen: $(printf '%s\n' "$terms" | wc -l | tr -d ' ') distinct, \
+$(printf '%s\n' "$terms" | head -1) through $(printf '%s\n' "$terms" | tail -1)"
+    fi
+    # A POD THAT RESTARTED TOOK ITS EVIDENCE WITH IT, and the container that
+    # died is usually the one that explains the cluster the survivors are in.
+    prev="$(kubectl -n "$REPLICATED_NS" logs "$pod" --previous --tail=-1 2>/dev/null \
+      | grep -Ei 'promot|lease|epoch|not writable|panic|ERROR' | tail -20 || true)"
+    if [ -n "$prev" ]; then
+      log "  --- $pod, the container before this one ---"
+      printf '%s\n' "$prev"
+    fi
+  done
+  log "--- end failover evidence ---"
+}
+
 lease_state() { # echoes "<holder-uuid> <fencing-epoch>", empty when no lease
   vtopctl --json meta range-lease --config "$WORK/r-admin-multi.yaml" \
     --topic-uuid "$TOPIC_UUID" --range-uuid "$RANGE_ID" 2>/dev/null \
@@ -885,7 +930,7 @@ while :; do
   members_at_write="$(ready_members || true)"
   r_produce "$new_ordinal" "$NEW_EPOCH" 2 30 && break
   [ "$SECONDS" -lt "$produce_deadline" ] || {
-    kubectl -n "$REPLICATED_NS" get pods || true
+    dump_failover_evidence
     fail "produce never resumed against candidate $new_ordinal within 180s of the \
 failover, last aimed at epoch $NEW_EPOCH: $(tail -3 "$WORK/r-produce.log" 2>/dev/null)"
   }
