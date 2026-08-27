@@ -370,6 +370,70 @@ mod tests {
         assert_eq!(reads2[0].records[0], b"<13>msg two");
     }
 
+    /// A partial trailing line is left alone, and arrives once it is finished
+    /// (#101).
+    ///
+    /// This is not a hypothetical for a spool: rsyslog appends to the file the
+    /// engine is reading, so a read landing mid-write sees a line with no
+    /// newline on the end of it. Consuming that would emit half a syslog
+    /// record as a whole one AND advance the cursor past it, so the other half
+    /// would arrive as a second, equally wrong record — a corruption that no
+    /// later pass can undo, and one nothing in the suite pinned. `FileSource`
+    /// has carried this test since it had the same problem; the spool source
+    /// documented the behaviour without ever asserting it.
+    #[tokio::test]
+    async fn a_partial_trailing_line_waits_until_it_is_finished() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(f, "<13>complete one\n<13>still being writ").unwrap();
+        f.flush().unwrap();
+        let path = f.path().to_string_lossy().into_owned();
+
+        let mut s = SyslogSpoolSource::new(vec![path.clone()]);
+        let src = DiscoveredSource {
+            source_type: SourceType::SyslogSpool,
+            source_name: path.clone(),
+            format: TelemetryFormat::Syslog,
+        };
+
+        let reads = s
+            .read_batch_candidates(&src, 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(reads.len(), 1);
+        assert_eq!(
+            reads[0].records,
+            vec![b"<13>complete one".to_vec()],
+            "only the newline-terminated line is a record; the fragment is not \
+             a short record, it is half of one"
+        );
+        s.commit_progress(&reads[0].progress_end).await.unwrap();
+
+        // rsyslog finishes the line.
+        {
+            let mut fh = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            writeln!(fh, "ten now").unwrap();
+            fh.flush().unwrap();
+        }
+
+        let reads2 = s
+            .read_batch_candidates(&src, 100, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        // Asserted rather than indexed blind, matching the sibling test above:
+        // a regression returning nothing should fail here with a readable
+        // message instead of panicking on the index (review).
+        assert_eq!(reads2.len(), 1);
+        assert_eq!(
+            reads2[0].records,
+            vec![b"<13>still being written now".to_vec()],
+            "the cursor never advanced past the fragment, so the finished line \
+             arrives whole exactly once — not as two halves, and not twice"
+        );
+    }
+
     #[tokio::test]
     async fn rejects_an_oversized_spool_record_without_advancing() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
