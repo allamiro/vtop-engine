@@ -100,7 +100,14 @@ impl FileSource {
         seen.inode == current.inode
             && seen.file_size == current.file_size
             && seen.mtime == current.mtime
-            && cursor.read_byte >= current.file_size
+            // EQUALITY, not `>=` (review). A cursor beyond the file's end is
+            // not a caught-up cursor, it is an inconsistency — the file shrank
+            // under a read head that had already passed the new end — and the
+            // right response to an inconsistency is to look, not to skip. `>=`
+            // would answer "caught up" to the one state where the cursor
+            // provably does not point at valid unread continuity; `==` says
+            // what the check actually means.
+            && cursor.read_byte == current.file_size
     }
 
     /// Stat a path without opening it, for the skip decision. A path that
