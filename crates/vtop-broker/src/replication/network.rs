@@ -342,6 +342,25 @@ impl ReplicaPeerServer {
     /// What remains is still worth having: a plaintext dev cluster replicates,
     /// serves reads, and is observable through `vtopctl node status`. Only the
     /// two privileged verbs — transfer and fence — wait for an identity.
+    ///
+    /// # The whole envelope, verb by verb
+    ///
+    /// Stated completely rather than partially, because "appends are exposed"
+    /// was true and left three other verbs unaccounted for:
+    ///
+    /// | verb | on a plaintext plane |
+    /// |---|---|
+    /// | `ReplicaAppend`, `ReplicaAppendBatch` | ACCEPTED at the granted epoch. Anything reaching this port can feed this replica records the leader never wrote. This is the mode's headline cost. |
+    /// | `CommittedHwmUpdate` | ACCEPTED, and bounded twice over: it is checked against the granted epoch, clamped to this replica's own durable offset, and advances monotonically. So it can make already-durable records visible early, but cannot expose records this replica does not hold and cannot move the bound backwards — which matters, because that bound is what stops a truncation from discarding acknowledged records. |
+    /// | `ReplicaStatus`, `ReplicaEpochHistory` | ACCEPTED, read-only. They disclose offsets and epoch history. `status` must stay reachable or the mode is unobservable. |
+    /// | `ListSealedSegments`, `FetchSegmentChunk`, `SealTail` | REFUSED. A transfer hands over a whole range's bytes. |
+    /// | `ReplicaFence` | REFUSED. It truncates against the caller's history. |
+    ///
+    /// The line between the two halves is not "reads versus writes" — it is
+    /// whether an unidentified caller can cause something UNRECOVERABLE. An
+    /// append can be reconciled away by a legitimate leader; a high-water mark
+    /// cannot exceed what is already on disk; a transfer or a truncation
+    /// cannot be undone.
     pub fn plaintext(local_id: Uuid, handler: Arc<dyn ReplicaPeerHandler>) -> Self {
         Self {
             acceptor: None,
