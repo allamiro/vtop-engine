@@ -2140,6 +2140,74 @@ mod tests {
     /// cycle, then sealed and committed when the cycle forces a flush — proving
     /// `AdaptiveBatcher`/`BatchLimits` is actually driving runtime batching.
     #[tokio::test]
+    /// Batches are processed CONCURRENTLY across sources (#87), and every one
+    /// of them still commits only after its own verification.
+    ///
+    /// The pipelining itself landed in #94 and was never pinned. What matters
+    /// is not that it is fast — a timing assertion would measure the machine —
+    /// but that concurrency did not cost the invariant: with several batches
+    /// in flight at once, each must reach SOURCE_COMMITTED off the back of ITS
+    /// OWN verify, and none may be left verified-but-uncommitted. A batch in
+    /// that state is the wedge the flush loop documents at length: the next
+    /// cycle rebuilds the same batch_id, the ledger refuses the duplicate, and
+    /// the source stops until a restart runs recovery.
+    async fn concurrent_batches_each_commit_after_their_own_verify() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+
+        // One file per source, so the flush loop sees several keys and the
+        // concurrent path is the one under test rather than a single batch
+        // taking the same code path trivially.
+        let mut paths = Vec::new();
+        for i in 0..5 {
+            let input = dir.path().join(format!("in-{i}.log"));
+            let mut f = std::fs::File::create(&input).unwrap();
+            for line in 0..3 {
+                writeln!(f, "source {i} line {line}").unwrap();
+            }
+            paths.push(input.to_string_lossy().into_owned());
+        }
+
+        let mut cfg = file_config(work.to_str().unwrap(), "sqlite::memory:", paths, "mock");
+        // Above one, or the test would prove nothing about concurrency; below
+        // the batch count, so the limit is actually exercised as a limit
+        // rather than admitting everything at once.
+        cfg.batching.max_concurrent_batches = 3;
+        cfg.batching.max_batch_age_seconds = 3_600;
+
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        let flushed = engine.run_source(SourceType::File, true).await.unwrap();
+
+        assert_eq!(
+            flushed.len(),
+            5,
+            "every source must produce its batch: a concurrency limit bounds \
+             how many run at once, never how many run"
+        );
+        for outcome in &flushed {
+            assert!(
+                outcome.committed,
+                "batch {} verified but did not commit — a verified-but-uncommitted \
+                 batch wedges its source until recovery runs",
+                outcome.batch_id
+            );
+            assert_eq!(outcome.final_state, BatchState::SourceCommitted);
+            assert_eq!(outcome.record_count, 3);
+        }
+
+        let ids: std::collections::BTreeSet<_> =
+            flushed.iter().map(|o| o.batch_id.clone()).collect();
+        assert_eq!(
+            ids.len(),
+            5,
+            "each batch keeps its own identity; a shared batch_id would collide \
+             in the ledger the moment two of them committed"
+        );
+    }
+
+    #[tokio::test]
     async fn run_source_holds_subthreshold_data_until_forced() {
         let dir = tempfile::tempdir().unwrap();
         let work = dir.path().join("work");
