@@ -1218,6 +1218,9 @@ async fn run_candidate(
         recorded_through: std::sync::atomic::AtomicU64::new(0),
     });
     let (release_lease, release_lease_rx) = tokio::sync::watch::channel(false);
+    // Set when a granted epoch turns out to be unservable (#367); the agent
+    // releases it and sits out the next rounds rather than renewing it.
+    let stand_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let agent = crate::lease_agent::LeaseAgent::new(
         lease_admin_client(lease)?,
         crate::lease_agent::LeaseAgentConfig {
@@ -1237,7 +1240,9 @@ async fn run_candidate(
     // metadata reports a follower that refuses every append). Added, not
     // declared as a total, so a colocated meta role's mark stays counted.
     observability.gate.add_required_marks(1);
-    let agent = agent.with_ready_gate(observability.gate.clone());
+    let agent = agent
+        .with_ready_gate(observability.gate.clone())
+        .with_stand_down(Arc::clone(&stand_down));
     let agent_drain = std::time::Duration::from_secs(5)
         .max(std::time::Duration::from_millis(lease.lease_duration_ms));
     let mut agent_task = tokio::spawn(agent.run(release_lease_rx));
@@ -1434,12 +1439,24 @@ async fn run_candidate(
                         // handler and view already point elsewhere, and this
                         // binding was the last.
                         drop(follower);
-                        // FAIL-STOP on a failed build (review): the agent
-                        // already verified this epoch and would renew a
-                        // lease over an empty slot forever — the one state
-                        // worse than a dead node is a live one holding a
-                        // range it cannot serve. Exiting lets the lease
-                        // lapse and a healthy candidate win.
+                        // STAND DOWN on a failed build (#367), where this
+                        // used to fail-stop. The property worth keeping is
+                        // that a node never renews a lease over a slot it
+                        // cannot serve. Exiting achieved that and then made
+                        // things worse: its stated reasoning — "exiting lets
+                        // the lease lapse and a healthy candidate win" — is
+                        // false under an orchestrator, which restarts the pod
+                        // well inside the lease duration. The fresh process
+                        // campaigns at once, wins again because nothing marks
+                        // it as the node that just failed, and fails
+                        // identically. Five grants in ninety seconds, all to
+                        // the same replica, none ever served, while the two
+                        // healthy ones starve.
+                        //
+                        // So the node hands the epoch back and sits out the
+                        // next rounds instead, and stays up as a follower —
+                        // which also leaves something diagnosable behind
+                        // rather than a restart count.
                         // The build can wait up to ten seconds on follower
                         // streams, and the supervisor's select arms are
                         // unreachable while it does — so the build is RACED
@@ -1464,7 +1481,45 @@ async fn run_candidate(
                                     if *shutdown.borrow() {
                                         break 'supervisor;
                                     }
-                                    break built?;
+                                    match built {
+                                        Ok(built) => break built,
+                                        Err(error) => {
+                                            // Hand the epoch back and sit out
+                                            // (#367), then rebuild as a
+                                            // follower below.
+                                            eprintln!(
+                                                "leader build failed at epoch \
+                                                 {fencing_epoch}; standing down and \
+                                                 letting another candidate take the \
+                                                 range: {error}"
+                                            );
+                                            stand_down.store(
+                                                true,
+                                                std::sync::atomic::Ordering::SeqCst,
+                                            );
+                                            publisher.set_target(None);
+                                            let (set, _) = open_range(
+                                                &config.data_dir,
+                                                config.segment_id,
+                                                &range,
+                                                roll,
+                                            )?;
+                                            let epochs = ProducerEpochJournal::open(
+                                                config.data_dir.join("epochs"),
+                                            )
+                                            .map_err(|error| error.to_string())?;
+                                            let follower = build_follower(set, epochs)?;
+                                            install_follower(&follower);
+                                            phase = Phase::Following(follower);
+                                            println!(
+                                                "data_node_role_changed role=follower \
+                                                 node={} note=leader-build-failed",
+                                                config.node_uuid
+                                            );
+                                            std::io::stdout().flush().ok();
+                                            continue 'supervisor;
+                                        }
+                                    }
                                 }
                                 changed = shutdown.changed() => {
                                     if changed.is_err() || *shutdown.borrow() {

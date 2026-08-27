@@ -623,6 +623,14 @@ pub struct LeaseAgent {
     /// refuses every append, and reporting ready before that first read is
     /// the same false green the static follower already refuses to show.
     ready: Option<vtop_observe::ReadinessGate>,
+    /// Set by the SUPERVISOR when it holds a granted epoch it cannot serve
+    /// (#367): the leader build failed after the grant, so the lease must go
+    /// back and this node must not immediately campaign for it again.
+    ///
+    /// The eligibility stand-aside in `publish_held` cannot cover this. That
+    /// one fires BEFORE a grant, on a refusal the promoter made; this fires
+    /// AFTER one, on a failure only the supervisor can see.
+    stand_down: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// A persistent handle on the same gate, kept so a range that goes
     /// missing AFTER the gate opened can revoke readiness — the consumable
     /// `ready` above only governs the first open (review).
@@ -671,6 +679,20 @@ pub struct LeaseAgent {
 /// legitimately acquires the range after the recorded deadline. The epoch
 /// still guarantees no torn history — this is about not accepting writes we
 /// already know a rival may be authorized to supersede.
+/// How many poll rounds a stand-aside sits out, given the two durations that
+/// decide it.
+///
+/// A free function so the arithmetic is testable without an admin client —
+/// and it is worth testing, because the LENGTH is the whole mechanism. Too
+/// short and the node that just stood aside wins the next race anyway, which
+/// is the re-acquisition loop of #367 with extra steps; the hold-off has to
+/// outlast the lease so somebody else gets an uncontested acquisition.
+fn stand_aside_rounds_for(lease: Duration, poll: Duration) -> u32 {
+    let lease_ms = lease.as_millis().max(1);
+    let poll_ms = poll.as_millis().max(1);
+    (lease_ms.saturating_mul(2).div_ceil(poll_ms)).min(u128::from(u32::MAX)) as u32
+}
+
 fn must_demote_locally(state: LeaseState, held_until_ms: Option<i64>, now_ms: i64) -> bool {
     matches!(state, LeaseState::Held { .. })
         && held_until_ms.is_some_and(|deadline| now_ms >= deadline)
@@ -703,6 +725,7 @@ impl LeaseAgent {
             },
             state: LeaseState::NotHeld,
             ready: None,
+            stand_down: None,
             gate: None,
             gate_degraded: false,
             range_missing: false,
@@ -710,6 +733,13 @@ impl LeaseAgent {
             held_until_ms: None,
             campaign_hold_off_rounds: 0,
         })
+    }
+
+    /// Share the flag a supervisor sets when it cannot serve an epoch it was
+    /// granted (#367). See [`LeaseAgent::stand_down`].
+    pub fn with_stand_down(mut self, flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.stand_down = Some(flag);
+        self
     }
 
     /// Open `gate` on the first completed metadata exchange (see the
@@ -749,6 +779,39 @@ impl LeaseAgent {
         loop {
             if *release.borrow() {
                 break;
+            }
+            // GIVE THE EPOCH BACK BEFORE ANYTHING ELSE (#367). The supervisor
+            // sets this when a leader build failed after the grant: the node
+            // holds an epoch it demonstrably cannot serve, so renewing it
+            // strands the range on a replica that will never answer.
+            //
+            // Releasing alone is not enough, and that is the whole bug. The
+            // previous behaviour — exit the process — assumed the lease would
+            // lapse and a healthy candidate would win, but an orchestrator
+            // restarts the pod well inside the lease duration and the fresh
+            // process campaigns at once, wins again because nothing marks it
+            // as the node that just failed, and fails the same way. The epoch
+            // climbs, the survivors starve. So the release is paired with the
+            // same hold-off an eligibility refusal takes: hand it back AND sit
+            // out, long enough for somebody else to win uncontested.
+            if self
+                .stand_down
+                .as_ref()
+                .is_some_and(|flag| flag.swap(false, std::sync::atomic::Ordering::SeqCst))
+            {
+                if let LeaseState::Held { fencing_epoch } = self.state {
+                    tracing::warn!(
+                        range = %self.range_uuid,
+                        fencing_epoch,
+                        "standing down: this node was granted an epoch it could not serve, \
+                         so the lease goes back and this node sits out the next rounds"
+                    );
+                    self.release().await;
+                    self.publish_lost(fencing_epoch);
+                }
+                self.state = LeaseState::NotHeld;
+                self.held_until_ms = None;
+                self.campaign_hold_off_rounds = self.stand_aside_rounds();
             }
             let delay = match self.step().await {
                 Ok(delay) => {
@@ -1105,9 +1168,7 @@ impl LeaseAgent {
     /// How many poll rounds an eligibility refusal sits out: two lease
     /// lifetimes, expressed in this agent's own polling cadence.
     fn stand_aside_rounds(&self) -> u32 {
-        let lease_ms = self.config.lease_duration.as_millis().max(1);
-        let poll_ms = self.config.poll_interval.as_millis().max(1);
-        (lease_ms.saturating_mul(2).div_ceil(poll_ms)).min(u128::from(u32::MAX)) as u32
+        stand_aside_rounds_for(self.config.lease_duration, self.config.poll_interval)
     }
 
     fn publish_lost(&mut self, fencing_epoch: u64) {
@@ -1474,6 +1535,40 @@ mod tests {
             "a transient quorum miss must not release the epoch — release is \
              permanent, and the coming retry must be able to reactivate it"
         );
+    }
+
+    /// A stand-aside must outlast the lease it just gave back (#367).
+    ///
+    /// This is the length that makes standing aside mean anything. A node
+    /// hands the epoch back because it could not serve it; if the hold-off
+    /// expired inside the lease duration it would campaign again before any
+    /// survivor had an uncontested shot, win — nothing marks it as the node
+    /// that just failed — and fail identically. That is the loop this fix
+    /// exists to break, and a hold-off measured in rounds rather than time is
+    /// only correct if the arithmetic converts between them properly.
+    #[test]
+    fn a_stand_aside_outlasts_two_lease_lifetimes() {
+        let lease = Duration::from_millis(15_000);
+        let poll = Duration::from_millis(2_000);
+        let rounds = stand_aside_rounds_for(lease, poll);
+        assert_eq!(rounds, 15, "30s of hold-off at a 2s cadence");
+        assert!(
+            u128::from(rounds) * poll.as_millis() >= lease.as_millis() * 2,
+            "the hold-off must cover two lease lifetimes in WALL CLOCK, not just \
+             in round count: {rounds} rounds x {poll:?} against {lease:?}"
+        );
+
+        // A cadence that does not divide the window rounds UP, never down: a
+        // hold-off one round short is a hold-off that ends inside the lease.
+        assert_eq!(
+            stand_aside_rounds_for(lease, Duration::from_millis(4_000)),
+            8
+        );
+
+        // Degenerate durations must not produce a zero-round hold-off, which
+        // would be no hold-off at all.
+        assert!(stand_aside_rounds_for(Duration::ZERO, Duration::ZERO) >= 1);
+        assert!(stand_aside_rounds_for(lease, Duration::from_secs(3_600)) >= 1);
     }
 
     /// An eligibility refusal — the quorum answered and this node's log is
