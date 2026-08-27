@@ -23,7 +23,7 @@ use crate::command::MetadataCommand;
 use crate::keys::MetaNodeId;
 use async_trait::async_trait;
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
@@ -383,7 +383,21 @@ pub struct AdminCandidate {
     /// what lets a redirect be followed to a SPECIFIC node rather than by
     /// rotating hopefully through all of them.
     pub node_id: Option<MetaNodeId>,
+    /// Where this candidate was, last time its name was looked up.
     pub endpoint: SocketAddr,
+    /// The `host:port` it was configured under, when it was a name (#367).
+    ///
+    /// A candidate that was absent from DNS at startup, or that has since
+    /// moved, is otherwise dialled at a dead address for the life of the
+    /// client — and this list is where redirects LAND. If the unreachable one
+    /// becomes the metadata leader, every other candidate names it, the walk
+    /// visits an address that answers nothing, and the request fails with two
+    /// healthy members in the list who both know exactly where the leader is
+    /// (review). Re-resolved before each attempt, and only when the previous
+    /// one to this candidate failed.
+    ///
+    /// `None` for a candidate given as a literal address.
+    pub host: Option<String>,
     pub server_name: String,
     /// Speak to this endpoint WITHOUT TLS (#294).
     ///
@@ -419,23 +433,39 @@ pub struct AdminClient {
     /// leadership can invalidate between the snapshot and the request. A test
     /// asserting redirect support needs the same thing, for the same reason.
     redirects: std::sync::atomic::AtomicUsize,
+    /// Candidates whose last attempt failed to establish a connection.
+    ///
+    /// Membership is what makes a name worth looking up again (#367): the
+    /// address that just answered does not need checking, and re-resolving on
+    /// the success path would put a name query on every metadata request.
+    unreachable: Mutex<std::collections::BTreeSet<usize>>,
 }
 
-/// How long one candidate may take before the walk moves on.
+/// How long one candidate may take to become a usable connection before the
+/// walk moves on.
 ///
-/// UNBOUNDED BEFORE, AND THAT WAS THE WHOLE FAILURE (#367). `attempt` awaits
-/// `TcpStream::connect`, the TLS handshake and both frames with no deadline of
-/// its own, so a candidate whose address no longer belongs to anything hangs
-/// in the kernel's SYN retry — roughly two minutes on Linux — while the
-/// caller's entire budget (the lease agent's is 5 s) drains against it. Two
-/// healthy members sat in the same list, unasked, and every metadata call from
-/// that node failed with "no answer within 5s".
+/// UNBOUNDED BEFORE, AND THAT WAS THE WHOLE FAILURE (#367). `attempt` awaited
+/// `TcpStream::connect` and the TLS handshake with no deadline of its own, so
+/// a candidate whose address no longer belongs to anything hung in the
+/// kernel's SYN retry — roughly two minutes on Linux — while the caller's
+/// entire budget (the lease agent's is 5 s) drained against it. Two healthy
+/// members sat in the same list, unasked, and every metadata call from that
+/// node failed with "no answer within 5s".
 ///
 /// Two seconds against a five-second budget: a three-member cluster can lose
 /// its first two candidates to this and still reach the third inside the
 /// caller's deadline, and it matches the replication plane's own connect
 /// timeout so the two planes fail over on comparable timescales.
-const CANDIDATE_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+///
+/// ESTABLISHMENT ONLY, and the boundary is load-bearing (review). A first
+/// draft bounded the whole exchange, which would have made this deadline a
+/// limit on how long a legitimate operation may take on the SERVER — and
+/// `init` alone can spend `MEMBERSHIP_PUBLISH_MS` waiting for membership to
+/// publish, which is also two seconds. The client would have reported failure
+/// for a mutation that succeeded, which is a worse answer than a slow one.
+/// Once a connection exists, the operation is bounded by the caller's own
+/// budget, which is the thing that knows how long it is willing to wait.
+const CANDIDATE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl AdminClient {
     pub fn new(
@@ -448,6 +478,7 @@ impl AdminClient {
             vec![AdminCandidate {
                 node_id: None,
                 endpoint,
+                host: None,
                 server_name: server_name.into(),
                 plaintext: false,
             }],
@@ -505,11 +536,24 @@ impl AdminClient {
                 "a TLS endpoint was configured without any TLS material".to_owned(),
             ));
         }
+        // A CANDIDATE WHOSE NAME HAD NOT RESOLVED CARRIES A PLACEHOLDER, NOT AN
+        // ADDRESS (#367). Seeding it as already-unreachable makes the very
+        // first attempt look the name up rather than dial nothing — otherwise
+        // the peer would have to fail once before it could ever be found, and
+        // for a peer that later becomes the leader that is one failed request
+        // per lease round, forever, since a redirect always lands back on it.
+        let unreachable = candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| candidate.host.is_some() && candidate.endpoint.port() == 0)
+            .map(|(index, _)| index)
+            .collect();
         Ok(Self {
             connector,
             candidates,
             preferred: std::sync::atomic::AtomicUsize::new(0),
             redirects: std::sync::atomic::AtomicUsize::new(0),
+            unreachable: Mutex::new(unreachable),
         })
     }
 
@@ -687,7 +731,7 @@ impl AdminClient {
             index = current;
             visited[index] = true;
             let candidate = &self.candidates[index];
-            match self.bounded_attempt(candidate, &request).await {
+            match self.attempt(index, &request).await {
                 Ok(frame) => {
                     // A frame is not automatically success: a non-leader
                     // answers with KIND_ADMIN_ERROR, and the redirect inside it
@@ -718,6 +762,12 @@ impl AdminClient {
                         continue;
                     }
                     self.preferred.store(index, Ordering::Relaxed);
+                    // It answered, so its address is right and does not need
+                    // looking up again on the next request.
+                    self.unreachable
+                        .lock()
+                        .expect("unreachable set")
+                        .remove(&index);
                     return Ok(frame);
                 }
                 // An unreachable candidate is worth moving past for the same
@@ -760,48 +810,92 @@ impl AdminClient {
     /// purpose: the walk's job is to find a member that answers, and spending
     /// the whole budget proving that the first one does not is the opposite of
     /// that job.
-    async fn bounded_attempt(
-        &self,
-        candidate: &AdminCandidate,
-        request: &VtpmFrame,
-    ) -> TransportResult<VtpmFrame> {
-        match tokio::time::timeout(CANDIDATE_ATTEMPT_TIMEOUT, self.attempt(candidate, request))
-            .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(TransportError::Protocol(format!(
-                "{} did not answer within {CANDIDATE_ATTEMPT_TIMEOUT:?}",
-                candidate.endpoint
-            ))),
-        }
-    }
-
-    async fn attempt(
-        &self,
-        candidate: &AdminCandidate,
-        request: &VtpmFrame,
-    ) -> TransportResult<VtpmFrame> {
-        let tcp = TcpStream::connect(candidate.endpoint).await?;
-        let mut stream = if candidate.plaintext {
-            MaybeTls::Plain(tcp)
-        } else {
-            let connector = self.connector.as_ref().ok_or_else(|| {
-                // Unreachable: `build` refuses this combination. Written as a
-                // refusal anyway, because the alternative is an unwrap that
-                // turns a configuration mistake into a panic in a server.
-                TransportError::Tls("no TLS material for a TLS endpoint".to_owned())
-            })?;
-            let name = server_name(&candidate.server_name)?;
-            MaybeTls::Tls(Box::new(
-                connector
-                    .connect(name, tcp)
-                    .await
-                    .map_err(|error| TransportError::Tls(format!("admin connect: {error}")))?
-                    .into(),
-            ))
+    /// Attempt this candidate, giving ESTABLISHMENT its own deadline.
+    ///
+    /// The address is looked up again first when the candidate carries a name
+    /// and its last attempt failed (#367): this list is where redirects land,
+    /// so a candidate stuck at a dead address is not merely one member fewer —
+    /// if it becomes the leader, every other candidate names it and the walk
+    /// visits an address that answers nothing, with two healthy members in the
+    /// list who both know exactly where the leader is.
+    async fn attempt(&self, index: usize, request: &VtpmFrame) -> TransportResult<VtpmFrame> {
+        let candidate = self.resolved_candidate(index).await;
+        let stream =
+            match tokio::time::timeout(CANDIDATE_CONNECT_TIMEOUT, self.establish(&candidate)).await
+            {
+                Ok(result) => result,
+                Err(_) => Err(TransportError::Protocol(format!(
+                    "{} did not accept a connection within {CANDIDATE_CONNECT_TIMEOUT:?}",
+                    candidate.endpoint
+                ))),
+            };
+        let mut stream = match stream {
+            Ok(stream) => stream,
+            Err(error) => {
+                self.mark_unreachable(index);
+                return Err(error);
+            }
         };
+        // Beyond the connection the caller's budget is the bound, because it
+        // is the thing that knows how long this operation is worth waiting
+        // for. A server-side deadline imposed here would report a completed
+        // mutation as a failure.
         write_frame(&mut stream, request).await?;
         read_frame(&mut stream).await
+    }
+
+    /// This candidate, with its address refreshed if the last attempt failed.
+    async fn resolved_candidate(&self, index: usize) -> AdminCandidate {
+        let mut candidate = self.candidates[index].clone();
+        let Some(host) = candidate.host.clone() else {
+            return candidate;
+        };
+        if !self
+            .unreachable
+            .lock()
+            .expect("unreachable set")
+            .contains(&index)
+        {
+            return candidate;
+        }
+        if let Some(addr) = tokio::net::lookup_host(&host)
+            .await
+            .ok()
+            .and_then(|mut addrs| addrs.next())
+        {
+            // A lookup that fails leaves the last known address standing: a
+            // resolver hiccup is not evidence that a member moved.
+            candidate.endpoint = addr;
+        }
+        candidate
+    }
+
+    fn mark_unreachable(&self, index: usize) {
+        self.unreachable
+            .lock()
+            .expect("unreachable set")
+            .insert(index);
+    }
+
+    async fn establish(&self, candidate: &AdminCandidate) -> TransportResult<MaybeTls<TcpStream>> {
+        let tcp = TcpStream::connect(candidate.endpoint).await?;
+        if candidate.plaintext {
+            return Ok(MaybeTls::Plain(tcp));
+        }
+        let connector = self.connector.as_ref().ok_or_else(|| {
+            // Unreachable: `build` refuses this combination. Written as a
+            // refusal anyway, because the alternative is an unwrap that
+            // turns a configuration mistake into a panic in a server.
+            TransportError::Tls("no TLS material for a TLS endpoint".to_owned())
+        })?;
+        let name = server_name(&candidate.server_name)?;
+        Ok(MaybeTls::Tls(Box::new(
+            connector
+                .connect(name, tcp)
+                .await
+                .map_err(|error| TransportError::Tls(format!("admin connect: {error}")))?
+                .into(),
+        )))
     }
 }
 
@@ -988,6 +1082,7 @@ mod tests {
         let client = AdminClient::plaintext(vec![AdminCandidate {
             node_id: Some(MetaNodeId(1)),
             endpoint: addr,
+            host: None,
             server_name: String::new(),
             plaintext: true,
         }])
@@ -1003,6 +1098,54 @@ mod tests {
         // one — they take different routes through dispatch.
         client.propose(acquire(NODE_A)).await.unwrap_err();
         assert_eq!(handler.proposals.load(Ordering::SeqCst), 1);
+
+        task.abort();
+    }
+
+    /// A candidate that was not in DNS at startup is found once it appears
+    /// (#367).
+    ///
+    /// The address in the list is where a member was, and a candidate whose
+    /// name had not resolved yet has no address at all — only a placeholder.
+    /// This list is also where every redirect LANDS, so a candidate frozen at
+    /// an address that answers nothing is not merely one member fewer: if it
+    /// becomes the leader, the other members all name it, the walk visits
+    /// nothing, and the request fails with two healthy nodes in the list who
+    /// both know exactly where the leader is.
+    ///
+    /// The client here has ONE candidate and no fallback, so the request can
+    /// only succeed through the name.
+    #[tokio::test]
+    async fn a_candidate_that_was_not_resolvable_at_startup_is_found_once_it_answers() {
+        let handler = Arc::new(CountingHandler::default());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = AdminServer::plaintext(
+            Arc::clone(&handler) as Arc<dyn AdminHandler>,
+            AdminAuthorizer::permissive(),
+        )
+        .expect("a permissive plaintext endpoint is allowed");
+        let task = tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let client = AdminClient::plaintext(vec![AdminCandidate {
+            node_id: Some(MetaNodeId(1)),
+            // The placeholder a node carries for a peer whose name did not
+            // resolve when the client was built. Nothing listens here.
+            endpoint: "0.0.0.0:0".parse().unwrap(),
+            host: Some(format!("127.0.0.1:{}", addr.port())),
+            server_name: String::new(),
+            plaintext: true,
+        }])
+        .unwrap();
+
+        let status = client.status().await.expect(
+            "the only candidate is reachable through its NAME, so a client that dials \
+             the placeholder it was built with can never answer this",
+        );
+        assert_eq!(status.node_id, MetaNodeId(1));
 
         task.abort();
     }
@@ -1123,6 +1266,7 @@ mod tests {
         let client = AdminClient::plaintext(vec![AdminCandidate {
             node_id: Some(MetaNodeId(1)),
             endpoint: addr,
+            host: None,
             server_name: String::new(),
             plaintext: true,
         }])
@@ -1152,6 +1296,7 @@ mod tests {
         let client = AdminClient::plaintext(vec![AdminCandidate {
             node_id: Some(MetaNodeId(1)),
             endpoint: format!("127.0.0.1:{port}").parse().unwrap(),
+            host: None,
             server_name: String::new(),
             plaintext: true,
         }])
@@ -1195,12 +1340,14 @@ mod tests {
                 AdminCandidate {
                     node_id: Some(MetaNodeId(1)),
                     endpoint: follower_addr,
+                    host: None,
                     server_name: "localhost".to_owned(),
                     plaintext: false,
                 },
                 AdminCandidate {
                     node_id: Some(leader_id),
                     endpoint: leader_addr,
+                    host: None,
                     server_name: "localhost".to_owned(),
                     plaintext: false,
                 },
@@ -1267,18 +1414,21 @@ mod tests {
                 AdminCandidate {
                     node_id: Some(MetaNodeId(1)),
                     endpoint: a_addr,
+                    host: None,
                     server_name: "localhost".to_owned(),
                     plaintext: false,
                 },
                 AdminCandidate {
                     node_id: Some(MetaNodeId(2)),
                     endpoint: b_addr,
+                    host: None,
                     server_name: "localhost".to_owned(),
                     plaintext: false,
                 },
                 AdminCandidate {
                     node_id: Some(MetaNodeId(3)),
                     endpoint: c_addr,
+                    host: None,
                     server_name: "localhost".to_owned(),
                     plaintext: false,
                 },
@@ -1332,12 +1482,14 @@ mod tests {
                 AdminCandidate {
                     node_id: Some(MetaNodeId(1)),
                     endpoint: follower_addr,
+                    host: None,
                     server_name: "localhost".to_owned(),
                     plaintext: false,
                 },
                 AdminCandidate {
                     node_id: Some(leader_id),
                     endpoint: leader_addr,
+                    host: None,
                     server_name: "localhost".to_owned(),
                     plaintext: false,
                 },
@@ -1391,12 +1543,14 @@ mod tests {
                 AdminCandidate {
                     node_id: Some(MetaNodeId(1)),
                     endpoint: blind_addr,
+                    host: None,
                     server_name: "localhost".to_owned(),
                     plaintext: false,
                 },
                 AdminCandidate {
                     node_id: Some(MetaNodeId(2)),
                     endpoint: leader_addr,
+                    host: None,
                     server_name: "localhost".to_owned(),
                     plaintext: false,
                 },
@@ -1436,12 +1590,14 @@ mod tests {
                 AdminCandidate {
                     node_id: Some(MetaNodeId(1)),
                     endpoint: first_addr,
+                    host: None,
                     server_name: "localhost".to_owned(),
                     plaintext: false,
                 },
                 AdminCandidate {
                     node_id: Some(MetaNodeId(2)),
                     endpoint: second_addr,
+                    host: None,
                     server_name: "localhost".to_owned(),
                     plaintext: false,
                 },

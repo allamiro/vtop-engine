@@ -74,6 +74,7 @@ fn lease_admin_client(
         node_id: None,
         endpoint: vtop_meta::resolve_endpoint(&lease.admin_endpoint)
             .map_err(|error| error.to_string())?,
+        host: Some(lease.admin_endpoint.clone()),
         server_name: lease.server_name.clone(),
         // TLS remains the only mode this path builds. Slice 1 of #294 makes the
         // admin transport CAPABLE of plaintext; wiring a node's lease client to
@@ -95,6 +96,7 @@ fn lease_admin_client(
         candidates.push(vtop_meta::AdminCandidate {
             node_id: Some(vtop_meta::MetaNodeId(peer.node_id)),
             endpoint: first_address_of(&peer.endpoint),
+            host: Some(peer.endpoint.clone()),
             server_name: if peer.server_name.is_empty() {
                 lease.server_name.clone()
             } else {
