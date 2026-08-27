@@ -1717,6 +1717,29 @@ async fn run_candidate(
         }
     }
 
+    // A FATAL EXIT STOPS THE SURVIVING PLANE FIRST (review).
+    //
+    // Only one listener fails; the other is still serving, and nobody has told
+    // it to stop — the shutdown watch belongs to the caller and this is not a
+    // shutdown. The drain below awaits the native listener within
+    // `agent_drain`, which is at least a full lease duration, so a replica
+    // failure would have waited that entire window before releasing: exactly
+    // the delay this commit exists to remove, reintroduced on the other path.
+    //
+    // Aborted rather than asked politely, and the trade is deliberate. A
+    // fail-stop has already decided this process cannot serve the range, so
+    // the choice is between dropping in-flight sessions now and holding the
+    // range for fifteen seconds while they finish. In-flight work is
+    // crash-equivalent either way — a produce acks only after fsync, so
+    // anything an abort interrupts was never acknowledged — while a range
+    // nobody can serve is a range nobody else can take.
+    if fatal.is_some() {
+        native_task.abort();
+        replica_task.abort();
+        // Aborted handles must not be awaited again below.
+        native_task_done = true;
+    }
+
     // --- drain (#280) -------------------------------------------------------
     // The leader's ordering, in-process: stop admission, drain the native
     // sessions, and only THEN release — a release racing an admitted
