@@ -1218,7 +1218,13 @@ impl Engine {
         force_flush: bool,
     ) -> Result<Vec<BatchOutcome>, VtopError> {
         let sources = adapter.discover_sources().await?;
-        // Paid per source, serially — see `BatchingConfig::source_poll_wait_ms`.
+        // How long ONE PASS may wait for data. Whether that is paid once or
+        // once per source is the adapter's business, not this loop's: the
+        // Kafka adapter multiplexes every topic-partition into a single poll
+        // (#96), while file and syslog-spool reads do not wait on it at all.
+        // This comment used to say "paid per source, serially", which was the
+        // pre-#96 truth and is the third copy of that claim to outlive the fix
+        // — see `BatchingConfig::source_poll_wait_ms`.
         let max_wait = Duration::from_millis(self.config.batching.source_poll_wait_ms);
 
         // Bound the Kafka partition-metadata cache: drop entries for topics that
