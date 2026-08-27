@@ -4,17 +4,34 @@
 # WHY THIS IS NOT A SWEEP CELL. Every other dimension — format, compression,
 # size, batch — is a property of the DATA, so `run_matrix.py --sweep` can vary
 # it by writing a scenario and pointing the file harness at it. Topic count is
-# a property of the SOURCE SET, and the cost it is suspected of carrying is
-# paid in the read loop rather than in any batch: `source_poll_wait_ms` is
-# spent PER SOURCE, serially, and an empty source burns the whole window
-# before returning nothing. A cycle over N idle topics therefore costs up to
-# N * that window — 100 topics at the default 250 ms is 25 seconds of a cycle
-# spent waiting on nothing.
+# a property of the SOURCE SET, and what it costs is paid in the read loop
+# rather than in any batch.
 #
-# That is a hypothesis with an arithmetic prediction, which is worth measuring
-# rather than reasoning about. This drives the compose lab, produces into a
-# controlled number of topics, and reads the engine's own `read_cycle_profile`
-# back out.
+# THE HYPOTHESIS THIS SCRIPT WAS FIRST WRITTEN FOR WAS ALREADY FALSE, and
+# recording that is more useful than quietly replacing it. It assumed
+# `source_poll_wait_ms` is spent PER SOURCE, serially — so N idle topics cost
+# N times the window, and 100 topics at 250 ms would be 25 seconds of a cycle
+# spent waiting on nothing. That was true of the loop #96 deleted. The adapter
+# now assigns every topic-partition to ONE consumer and polls them together,
+# so a hundred idle topics cost one window. The claim survived in three
+# comments (fixed in #372) and this benchmark was built on top of it.
+#
+# WHAT TOPIC COUNT STILL COSTS, read off the adapter rather than assumed:
+#
+#   1. Per-topic metadata. `partitions_for` is called once per source per pass
+#      and, on a cache miss, does a `fetch_metadata(Some(topic))` round trip
+#      to the broker. N topics with a cold cache is N round trips; the cache
+#      is pruned as topics come and go, so churn re-pays it.
+#   2. Assignment construction. The (topic, partition) list is built and
+#      reconciled every pass, and the seek path examines every partition to
+#      find the diverged ones even though it seeks only those.
+#   3. Demultiplexing. Every polled message is routed back to its source by
+#      (topic, partition).
+#
+# None of those is N * poll_wait, and all of them are linear in the topic or
+# partition count — so the shape to look for is a gentle slope, not a cliff,
+# and the interesting question is whether the first pass (cold cache) differs
+# from the steady state.
 #
 # Usage:  benchmarks/topic_sweep.sh [counts...]      (default: 1 8 28 100)
 #
@@ -31,6 +48,11 @@ COUNTS=("$@")
 # topics they are spread across. Varying both would measure their product and
 # attribute it to whichever one the reader had in mind.
 TOTAL_RECORDS="${TOTAL_RECORDS:-4000}"
+# A run id, so two runs of the same count cannot share topics. The count alone
+# was not enough: a broker surviving a previous run keeps its topics, and
+# `--if-not-exists` then reuses one still holding the earlier cell's records
+# (review).
+RUN_ID="${RUN_ID:-$(date -u +%H%M%S)$$}"
 # How long the engine is observed at each count, after the load has landed.
 OBSERVE_SECONDS="${OBSERVE_SECONDS:-60}"
 OUT_DIR="${OUT_DIR:-benchmarks/results/topic-sweep-$(date -u +%Y%m%dT%H%M%SZ)}"
@@ -53,7 +75,12 @@ fail() { printf '[topic-sweep] FAIL: %s\n' "$*" >&2; exit 1; }
 command -v docker >/dev/null || fail "docker is required"
 docker compose version >/dev/null 2>&1 || fail "docker compose plugin is required"
 
-mkdir -p "$OUT_DIR"
+# CREATED BEFORE COMPOSE SEES THEM. These are bind-mount SOURCES; if they do
+# not exist Docker creates them as root, the engine (uid 10001) cannot write
+# them, it exits, and the cell produces no profile at all — which the script
+# would then have reported as a row of zeros (review). Creating them here as
+# the invoking user is what makes the run possible rather than merely honest.
+mkdir -p "$OUT_DIR" ./data/state ./data/work ./data/input ./data/spool
 CSV="$OUT_DIR/topic_sweep.csv"
 echo "topics,records_produced,observe_seconds,kafka_cycles,records_read,avg_read_phase_ms,avg_empty_wait_pct,objects_archived" > "$CSV"
 
@@ -84,7 +111,7 @@ for count in "${COUNTS[@]}"; do
   # Deleting and recreating under one name is not enough: deletion is
   # asynchronous, and a create that succeeds with `--if-not-exists` can land
   # on a topic still holding the previous cell's records (review).
-  prefix="sweep${count}"
+  prefix="sweep${RUN_ID}c${count}"
 
   # A FRESH ENGINE MEANS FRESH STATE, not a fresh container. Removing the
   # container leaves the ledger and the committed Kafka offsets behind, so a
@@ -105,13 +132,21 @@ for count in "${COUNTS[@]}"; do
   # Integer division silently changed the load between cells — 4000 over 28
   # topics is 142 each, so 3976, not 4000 — which confounds topic count with
   # record count, the one thing this sweep exists to separate (review).
+  # A count above the record total cannot hold the total CONSTANT — every
+  # topic would be forced to one record and the cell would carry more than the
+  # others, which is the confound this design exists to avoid. Refused rather
+  # than fudged (review).
+  if [ "$count" -gt "$TOTAL_RECORDS" ]; then
+    fail "topic count $count exceeds TOTAL_RECORDS=$TOTAL_RECORDS: the constant \
+record total cannot be spread one-per-topic without changing it. Raise \
+TOTAL_RECORDS or lower the count."
+  fi
   base=$(( TOTAL_RECORDS / count ))
   extra=$(( TOTAL_RECORDS % count ))
   produced=0
   for i in $(seq 1 "$count"); do
     n=$base
     [ "$i" -le "$extra" ] && n=$(( n + 1 ))
-    [ "$n" -lt 1 ] && n=1
     seq 1 "$n" \
       | sed 's/.*/{"ts":"2026-01-01T00:00:00Z","msg":"topic-sweep record &"}/' \
       | docker compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh \
@@ -120,8 +155,17 @@ for count in "${COUNTS[@]}"; do
   done
   log "produced $produced record(s) across $count topic(s)"
 
-  # The engine reads THIS cell's topics only.
-  sed "s|^    topic_include_regex: .*|    topic_include_regex: \"^${prefix}-\"|" \
+  # DISCOVERY NARROWED ON ALL THREE PLANES, not just Kafka. The lab's config
+  # also enables the file and syslog-spool sources over host-mounted
+  # directories, and anything sitting in them is archived during a Kafka cell
+  # — inflating objects_archived with work this sweep did not ask for
+  # (review). They are pointed at an empty directory rather than disabled: the
+  # adapters still run, so their share of the read cycle stays visible in the
+  # profile, which is part of what is being measured.
+  mkdir -p ./data/sweep-empty
+  sed -e "s|^    topic_include_regex: .*|    topic_include_regex: \"^${prefix}-\"|" \
+      -e "s|^\( *\)- /data/input/.*|\1- /data/sweep-empty/*|" \
+      -e "s|^\( *\)spool_dir: .*|\1spool_dir: \"/data/sweep-empty\"|" \
     examples/config.yaml > "$SWEEP_CONFIG"
 
   log "observing the engine for ${OBSERVE_SECONDS}s"
@@ -162,18 +206,20 @@ phase = nums("read_phase_ms")
 archived = len(re.findall(r"object_uploaded", text))
 
 n = len(kafka_lines)
-row = [count, produced, observe, n, int(sum(reads)),
-       round(sum(phase) / len(phase), 1) if phase else 0,
-       round(sum(waits) / len(waits), 1) if waits else 0,
-       archived]
-with open(csv_path, "a") as fh:
-    fh.write(",".join(str(v) for v in row) + "\n")
-
 if n == 0:
+    # NOT WRITTEN AT ALL. A row of zeros is indistinguishable from a measured
+    # zero once anyone loads the CSV, and an engine that failed to start is
+    # exactly how a cell reaches here (review).
     print(f"[topic-sweep] WARNING: {count} topic(s) produced NO kafka read_cycle_profile "
           f"lines — the engine may not have started, or discovery matched nothing. "
-          f"This row is not a measurement.")
+          f"NO ROW WRITTEN; this cell is not a measurement.")
 else:
+    row = [count, produced, observe, n, int(sum(reads)),
+           round(sum(phase) / len(phase), 1) if phase else 0,
+           round(sum(waits) / len(waits), 1) if waits else 0,
+           archived]
+    with open(csv_path, "a") as fh:
+        fh.write(",".join(str(v) for v in row) + "\n")
     print(f"[topic-sweep] {count} topic(s): {n} cycle(s), {int(sum(reads))} record(s) read, "
           f"avg read phase {row[5]} ms, avg empty wait {row[6]}%, {archived} object(s) archived")
 PY_PARSE
