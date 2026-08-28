@@ -71,6 +71,7 @@ different subjects** — each doc says which it means.
 | [LIVE_CHAOS_VALIDATION.md](LIVE_CHAOS_VALIDATION.md) | Repeatable real-process metadata membership and native data-plane chaos scenarios (#215), including exact scope boundaries. | Run or audit the live-cluster validation harness and understand what it does not yet prove. |
 | [WRITE_AMP_PROOF_OVERHEAD.md](WRITE_AMP_PROOF_OVERHEAD.md) | Methodology and runner for native segment write amplification + proof-carrying overhead (#189). | Measure single-copy body path and v1 vs v2 proof cost. |
 | [FETCH_IO_RESEARCH.md](FETCH_IO_RESEARCH.md) | Methodology, runner, and recommendation gate for native fetch I/O (#190): buffered vs sendfile/splice vs experimental O_DIRECT. | Decide whether buffered fetch is enough before pursuing Direct I/O / io_uring. |
+| [THROUGHPUT_RESEARCH.md](THROUGHPUT_RESEARCH.md) | What reaching 1M records/sec would actually take (#92): per-stage timing, the single-box arithmetic, the measured compression matrix, and — stated plainly — that no end-to-end demonstration exists. | Plan capacity, or check what the throughput numbers do and do not claim. |
 | [METADATA_SATURATION_RESEARCH.md](METADATA_SATURATION_RESEARCH.md) | Methodology, runner, and sharding-trigger gate for the single three-node metadata Raft group (#192). | Measure when one metadata group saturates before implementing multi-group sharding. |
 
 ### Legal / disclosure support
