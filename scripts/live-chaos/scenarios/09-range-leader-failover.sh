@@ -136,9 +136,11 @@ log "follower offsets: f1=$F1_OFFSET f2=$F2_OFFSET; promoting follower $PROMOTE_
 # buffer, which a process that has just been promoted never filled for offsets
 # it never sent. Promotion advances the committed watermark; it does not
 # truncate the new leader's log back to the proven floor. So a non-zero gap
-# here is the configuration the node config already documents as unrepairable
-# in place — "behind a leader promoted after the gap opened ... needs its data
-# directory restored from a peer" — and is tracked on #255.
+# here is the configuration the node config documents as unable to catch up in
+# place — "behind a leader promoted after the gap opened". That is repairable
+# rather than terminal: `vtopctl node repair --seal-tail` into an empty
+# directory seals the leader's tail so the transferred prefix reaches its
+# position, and the replica catches up from there (#306, shipped).
 # BOTH OFFSETS ARE KNOWN-GOOD BY CONSTRUCTION, and this arithmetic depends on
 # it: an unread offset that had been substituted with 0 would fabricate a gap
 # out of two replicas standing level, and the verdict below would then declare
@@ -149,7 +151,7 @@ log "follower offsets: f1=$F1_OFFSET f2=$F2_OFFSET; promoting follower $PROMOTE_
 REJOIN_GAP=$((F1_OFFSET > F2_OFFSET ? F1_OFFSET - F2_OFFSET : F2_OFFSET - F1_OFFSET))
 if [[ "$REJOIN_GAP" -gt 0 ]]; then
   log "NOTE: follower $OTHER_N is $REJOIN_GAP record(s) behind the promoted replica, so it \
-starts below the new leader's tip (the #255 window)"
+starts below the new leader's tip (the adopt-window gap)"
 fi
 
 # The original follower process must be gone before another process opens the
@@ -331,7 +333,8 @@ until "$VTOP_NODE" produce --client-config "$VERIFY_CFG" --addr "$(native_addr)"
 the range moved, so it starts below the new leader's tip and no batch it is offered can match \
 its next_offset. A promoted leader cannot backfill that gap — it can only retransmit what its \
 own buffer holds, and it never sent those offsets — so this run could not have reached quorum \
-at ANY deadline (the in-place limitation the node config documents, tracked on #255). Read the \
+at ANY deadline (the catch-up limitation the node config documents; the remedy is a fresh \
+repair with --seal-tail, #306). Read the \
 promotion line above: this is not a timing flake"
     elif [[ "$reads_ok" -eq 0 ]]; then
       verdict="the leader's metrics endpoint never answered, so NOTHING is known about the \
