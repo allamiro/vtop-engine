@@ -88,7 +88,12 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are used as normat
 ### Native broker transport
 
 - The native broker transport is restricted to TLS 1.3 and requires a client
-  certificate chained to the configured client roots.
+  certificate chained to the configured client roots. The transport gained a
+  plaintext mode in #294 slice 3, but no node config key, `vtopctl` flag or
+  Helm value reaches it, so the restriction holds for every deployable
+  configuration; #294 is where selecting it would be decided, and a plaintext
+  replica plane refuses the verbs whose authorization depends on a client
+  certificate.
 - Certificate validity alone does not grant a role. The embedding deployment
   **MUST** supply a `SessionAuthorizer` that binds the peer certificate chain,
   declared principal ID, and requested producer/consumer role. Produce requests
@@ -331,7 +336,7 @@ the ignore list and the build re-audited.
 | Object Lock retention on versioned manifest buckets | **SHOULD** |
 | Object lock / immutability | **SHOULD** (later) |
 | Secret redaction in logs | **MUST** |
-| Native broker transport restricted to TLS 1.3 with client certificates | **MUST** |
+| Native broker transport restricted to TLS 1.3 with client certificates | **MUST** (no deployment method can select the plaintext transport; see §2) |
 | Native broker sessions authorized by an explicit `SessionAuthorizer` | **MUST** |
 | Native clients validate the broker certificate and expected server identity | **MUST** |
 | Native produce bound to the authenticated principal (`producer_id == principal_id`) | **MUST** |

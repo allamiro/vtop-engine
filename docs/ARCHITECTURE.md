@@ -243,9 +243,11 @@ end the same way:
   partition is assigned at `Offset::Stored` and librdkafka resolves it from the
   committed offset, or from `auto.offset.reset` when that offset no longer
   exists.
-- **While still running** — the pass seeks the partition to the cursor it
-  wants, and a seek below the low watermark is out of range, so the same reset
-  applies.
+- **While still running** — the assignment is sticky and ordinary lag does not
+  seek at all; the pass seeks only where the desired offset diverges from what
+  librdkafka would deliver next. A consumer that simply falls behind therefore
+  keeps fetching forward until the broker answers out-of-range, and the reset
+  applies there.
 
 Either way the consumer resumes at the **new** earliest offset. Nothing queries the
 watermarks, nothing compares the resumed offset against the committed one, and
