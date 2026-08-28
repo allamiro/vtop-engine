@@ -116,6 +116,19 @@ echo "topics,records_produced,observe_seconds,kafka_cycles,records_read,avg_read
 
 kafka() { docker compose exec -T kafka /opt/kafka/bin/"$@"; }
 
+# Run kafka-init to completion before any cell, so its seed topics exist when
+# the first purge happens rather than arriving after it.
+seed_kafka_init() {
+  docker compose up -d --wait kafka-init >/dev/null 2>&1 \
+    || docker compose up -d kafka-init >/dev/null 2>&1 || true
+  for _ in $(seq 1 60); do
+    case "$(docker compose ps -a --format '{{.State}}' kafka-init 2>/dev/null | head -1)" in
+      exited|"") break ;;
+      *) sleep 1 ;;
+    esac
+  done
+}
+
 # EVERY TOPIC THAT IS NOT THIS CELL'S IS A CONFOUND. `discover_sources` fetches
 # metadata for the whole broker BEFORE topic_include_regex is applied, so the
 # four topics `kafka-init` seeds — which compose starts through the engine's
@@ -164,6 +177,12 @@ docker compose down -v --remove-orphans >/dev/null 2>&1 \
 run 'docker compose down -v --remove-orphans' by hand and rerun"
 
 log "bringing up kafka + minio + engine"
+# kafka-init IS BROUGHT UP HERE, ahead of the cells. It is a dependency of the
+# engine, so leaving it implicit meant compose started it on the first `up -d
+# vtop-engine` — after the per-cell purge had already run — and its four seed
+# topics were back in the broker for the whole of that cell (review). Started
+# and awaited once, up front, it can be purged like any other foreign topic and
+# never returns.
 docker compose up -d kafka minio minio-init >/dev/null
 for _ in $(seq 1 60); do
   if kafka kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1; then
@@ -173,6 +192,10 @@ for _ in $(seq 1 60); do
 done
 kafka kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1 \
   || fail "kafka never became ready"
+
+# Now, while nothing is measuring: let kafka-init finish seeding so its topics
+# are present for the first purge rather than arriving after it.
+seed_kafka_init
 
 for count in "${COUNTS[@]}"; do
   log "=== $count topic(s), $TOTAL_RECORDS records spread across them ==="
@@ -334,11 +357,22 @@ seal at or after the observation window and objects_archived would be meaningles
   log "closing the window: SIGINT flushes and seals without reading further"
   docker compose kill -s SIGINT vtop-engine >/dev/null 2>&1 \
     || fail "could not signal the engine to flush; the cell's uploads would be incomplete"
+  drained_ok=""
   for _ in $(seq 1 60); do
-    [ "$(docker compose ps --format '{{.State}}' vtop-engine 2>/dev/null | head -1)" = "running" ] \
-      || break
+    if [ "$(docker compose ps --format '{{.State}}' vtop-engine 2>/dev/null | head -1)" != "running" ]; then
+      drained_ok=yes
+      break
+    fi
     sleep 1
   done
+  # A WAIT THAT EXPIRES IS NOT A DRAIN THAT FINISHED (review). Falling through
+  # here would snapshot a flush still in progress and record its partial
+  # archive count as a completed cell — the row would be a measurement of when
+  # we happened to look.
+  [ -n "$drained_ok" ] || fail "the engine was still running 60s after SIGINT in the \
+${count}-topic cell; its flush did not finish, so anything read from its log now is a \
+snapshot of a drain in progress rather than a measurement"
+
 
   drained="$OUT_DIR/engine-${count}.drained.log"
   docker compose logs --no-color vtop-engine > "$drained" 2>&1 || true
@@ -428,7 +462,13 @@ phase = nums("read_phase_ms")
 # "verified", which a successful batch never logs — it logs
 # `verification_passed` and then `source_committed` — so the column read zero
 # on every healthy run (review). One `object_uploaded` per archived object.
-archived = len(re.findall(r"object_uploaded", drained))
+# FROM THE WINDOW, not the drain. The engine's shutdown runs a full cycle —
+# it READS before it force-flushes — so counting uploads from the drained log
+# put post-deadline work in the same row as a records_read that covers only
+# the window, and the two columns stopped describing the same thing (review).
+# Every CSV column now comes from the declared window; the drained log is used
+# below only to judge whether the pipeline COMPLETED.
+archived = len(re.findall(r"object_uploaded", text))
 
 n = len(kafka_lines)
 if n == 0:
@@ -486,22 +526,27 @@ else:
     # `source_committed` is the engine saying the batch is done end to end, and
     # a cell with more uploads than commits is a pipeline that stopped halfway
     # through at least one of them (review).
+    # Like compared with like: BOTH counted over the drained log, because a
+    # batch that sealed at the deadline commits during the grace period and
+    # comparing a window count against a drained one would always pass.
+    uploaded_total = len(re.findall(r"object_uploaded", drained))
     committed = len(re.findall(r"source_committed", drained))
-    if committed < archived:
-        print(f"[topic-sweep] WARNING: {count} topic(s) uploaded {archived} object(s) but "
-              f"only committed {committed}; at least one batch did not finish.")
+    if committed < uploaded_total:
+        print(f"[topic-sweep] WARNING: {count} topic(s) uploaded {uploaded_total} object(s) "
+              f"but only committed {committed}; at least one batch did not finish.")
         sys.exit(7)
 
-    with open(csv_path, "a") as fh:
-        fh.write(",".join(str(v) for v in row) + "\n")
-    print(f"[topic-sweep] {count} topic(s): {n} cycle(s), {int(sum(reads))} record(s) read, "
-          f"avg read phase {row[5]} ms, avg empty wait {row[6]}%, {archived} object(s) archived")
     if sum(reads) > 0 and archived == 0:
         print(f"[topic-sweep] WARNING: {count} topic(s) read {int(sum(reads))} record(s) and "
               f"archived NOTHING, with a seal age well inside the window — the upload, "
               f"verification or commit stage failed. The row above is not a measurement of "
               f"a working pipeline.")
         sys.exit(5)
+
+    with open(csv_path, "a") as fh:
+        fh.write(",".join(str(v) for v in row) + "\n")
+    print(f"[topic-sweep] {count} topic(s): {n} cycle(s), {int(sum(reads))} record(s) read, "
+          f"avg read phase {row[5]} ms, avg empty wait {row[6]}%, {archived} object(s) archived")
 PY_PARSE
   if [ "$cell_ok" -ne 0 ]; then
     FAILED_CELLS="${FAILED_CELLS}${FAILED_CELLS:+ }${count}"
