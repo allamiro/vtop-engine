@@ -1,0 +1,31 @@
+name: backpressure-soak-minio
+description: >-
+  Scenario 11's sustained backpressure, upload path made real (#102): the
+  same seeder-outruns-engine deficit, but batches travel the shipped
+  s3_native backend to a live MinIO instead of the mock. The signal is
+  object_upload p95 as max_concurrent_batches varies — flat p95 across the
+  grid means the store absorbs the configured width and an adaptive
+  concurrency controller has nothing to react to; a climbing p95 is the
+  control signal such a controller would need. Requires
+  benchmarks/docker-compose.benchmark.yml up.
+volume: 400
+file_size: small
+format: jsonl
+compression: gzip
+checksum: sha256
+backend: s3_native
+bucket: "vtop-bench-soak"
+endpoint_url: http://localhost:9000
+batch_max_records: 50
+batch_max_bytes: 1048576
+batch_max_age_seconds: 5
+# Unset here = the engine default (#87's pipeline width). The grid that
+# answers #102 runs this scenario at several values — e.g. 1, 4, 8 — via
+# copies overriding max_concurrent_batches; the committed scenario stays at
+# the default so a plain run measures what ships.
+backlog_multiplier: 1.5
+seed_concurrently: true
+seed_interval_seconds: 1.0
+duration_seconds: 300
+fault: none
+sys_sample_interval: 2.0
