@@ -292,6 +292,39 @@ struct FileIdentity {
 
 /// How many files are read concurrently in one pass. Bounded so a glob that
 /// matches thousands of files does not open them all at once.
+/// The path with `.` components removed, for comparing two spellings of it.
+///
+/// `PathBuf` equality already ignores an INTERIOR `.` — `a/./b` and `a/b`
+/// compare equal, because `Components` skips it — so this exists for the
+/// LEADING one, which it keeps: `./a/b` and `a/b` do not compare equal, and a
+/// config carrying one relative pattern written each way would otherwise
+/// discover the file twice. Probed rather than assumed; the direct test below
+/// is what proves the difference, since the discovery test runs on absolute
+/// paths where `PathBuf` alone would have been enough.
+///
+/// Lexical and total: no filesystem access, so it cannot fail, cannot block,
+/// and cannot change its answer between two calls in one discovery pass.
+///
+/// `..` is preserved rather than resolved. Resolving it lexically is wrong
+/// whenever a symlink precedes it — `a/link/../b` is not `a/b` — and the
+/// consequence of being wrong in that direction is merging two real sources
+/// into one, which loses data. Leaving it costs at most a duplicate, which is
+/// the defect this exists to reduce rather than one it creates.
+fn without_dot_components(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    if !path
+        .components()
+        .any(|component| matches!(component, Component::CurDir))
+    {
+        // The overwhelmingly common case: nothing to strip, nothing to
+        // allocate beyond the copy the set needs anyway.
+        return path.to_path_buf();
+    }
+    path.components()
+        .filter(|component| !matches!(component, Component::CurDir))
+        .collect()
+}
+
 const FILE_READ_CONCURRENCY: usize = 8;
 
 #[async_trait]
@@ -310,27 +343,27 @@ impl SourceAdapter for FileSource {
         //
         // Keyed on the resolved path rather than the pattern, because the
         // pattern is what differs and the file is what matters.
-        // KEYED ON THE CANONICAL PATH, NAMED BY THE FIRST SPELLING SEEN.
+        // KEYED ON THE SPELLING WITH `.` REMOVED, NAMED BY WHAT WAS MATCHED.
         //
-        // Two patterns can name one file differently and `glob` returns each
-        // spelling verbatim — `logs/./app.log`, `logs/../logs/app.log` and
-        // `./logs/app.log` are three distinct strings for one inode — so a set
-        // over the rendered names does not deduplicate them (review).
-        // Canonicalising resolves the spellings AND symlinks, which is the
-        // same question asked twice: one inode read twice is one set of
-        // records archived twice.
+        // Two patterns can name one file and `glob` returns each match
+        // verbatim, so `logs/app.log` and `logs/./app.log` are two strings for
+        // one path — probed, not assumed. Stripping `.` components makes them
+        // the same key, with no filesystem access and no ambiguity.
         //
-        // The NAME is deliberately left as it was found. It is the cursor key
-        // (`self.cursors`) and what an operator reads in the logs, so
-        // canonicalising it would reset every cursor on upgrade and re-archive
-        // everything the engine had already committed — a far worse bug than
-        // the one being fixed here.
+        // `..` IS DELIBERATELY LEFT ALONE. Collapsing it lexically is wrong in
+        // the one case that matters: if `link` is a symlink, `a/link/../b` and
+        // `a/b` are different files, and merging them would DROP a real source.
+        // Failing to merge two spellings costs a duplicate; merging two
+        // sources costs data. The asymmetry decides it.
         //
-        // A path that cannot be canonicalised — deleted between the glob and
-        // this line, or unreadable — falls back to its own spelling. That is
-        // no worse than the behaviour before this change, and it keeps a
-        // transient race from dropping a real source, which deduplication must
-        // never do.
+        // Aliases — a symlink beside its target, or two hard links — are not a
+        // spelling question and are not handled here (#378). They ask whether
+        // two directory entries for one inode are one source or two, which has
+        // a defensible answer either way, and the answer has to be paired with
+        // a cursor identity that survives `delete_after_commit` removing one
+        // of the aliases. `canonicalize` looks like it settles this and does
+        // not: it merges symlinks, cannot see hard links at all, and leaves
+        // the deletion of an alias silently re-reading the survivor from zero.
         let mut seen = std::collections::HashSet::<std::path::PathBuf>::new();
         for pattern in &self.paths {
             for entry in glob::glob(pattern)
@@ -338,8 +371,7 @@ impl SourceAdapter for FileSource {
             {
                 match entry {
                     Ok(p) if p.is_file() => {
-                        let key = std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
-                        if !seen.insert(key) {
+                        if !seen.insert(without_dot_components(&p)) {
                             continue;
                         }
                         out.push(DiscoveredSource {
@@ -656,10 +688,10 @@ mod tests {
     ///
     /// The spellings here are not decoration. `glob` returns each pattern's
     /// match verbatim, so `logs/./app.log` and `logs/app.log` are two strings
-    /// for one inode, and a set over the rendered names would let the second
+    /// for one path, and a set over the rendered names lets the second
     /// through. Probed before this test was written rather than assumed.
     #[tokio::test]
-    async fn one_file_named_several_ways_is_discovered_once() {
+    async fn one_file_spelled_two_ways_is_discovered_once() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("logs")).unwrap();
         std::fs::write(dir.path().join("logs/app.log"), "one\ntwo\n").unwrap();
@@ -669,11 +701,7 @@ mod tests {
         let base = dir.path().display().to_string();
 
         let source = FileSource::new(
-            vec![
-                format!("{base}/logs/*.log"),
-                format!("{base}/logs/./app*"),
-                format!("{base}/logs/../logs/app*"),
-            ],
+            vec![format!("{base}/logs/*.log"), format!("{base}/logs/./app*")],
             TelemetryFormat::Raw,
             false,
         );
@@ -689,7 +717,7 @@ mod tests {
         assert_eq!(
             found.len(),
             2,
-            "one file spelled three ways is still ONE file — more than that means it is \
+            "one file spelled two ways is still ONE file — more than that means it is \
              read, acknowledged and archived once per spelling: {found:?}"
         );
         assert_eq!(
@@ -747,23 +775,71 @@ mod tests {
         );
     }
 
-    /// A symlink and its target are one file, so they are discovered once
-    /// (#376).
+    /// A leading `./` is the spelling `PathBuf` does not normalise away, and
+    /// is therefore the whole reason `without_dot_components` exists (#376).
     ///
-    /// The same invariant as the spellings, arrived at from the other
-    /// direction: deduplication is about the inode, not the string. An
-    /// operator who globs a directory of symlinks beside the directory they
-    /// point at would otherwise archive every record twice.
+    /// Tested directly rather than through discovery, because discovery runs
+    /// on absolute paths from a temporary directory, where every `.` is
+    /// interior and `PathBuf` equality alone would have passed. A helper whose
+    /// only test is satisfied by not having the helper is not tested.
+    #[test]
+    fn a_leading_dot_is_the_spelling_path_equality_keeps() {
+        use std::path::PathBuf;
+
+        assert_eq!(
+            PathBuf::from("a/./b.log"),
+            PathBuf::from("a/b.log"),
+            "an interior `.` is already ignored by PathBuf; this is the baseline the \
+             helper is measured against"
+        );
+        assert_ne!(
+            PathBuf::from("./a/b.log"),
+            PathBuf::from("a/b.log"),
+            "a LEADING `.` is not, which is the gap"
+        );
+        assert_eq!(
+            without_dot_components(std::path::Path::new("./a/b.log")),
+            without_dot_components(std::path::Path::new("a/b.log")),
+            "and closing it is this function's entire job"
+        );
+        assert_eq!(
+            without_dot_components(std::path::Path::new("a/../a/b.log")),
+            PathBuf::from("a/../a/b.log"),
+            "`..` is left exactly as it was: resolving it lexically is wrong through a \
+             symlink, and merging two real sources loses data"
+        );
+    }
+
+    /// A symlink and its target are still TWO sources, and `..` still does not
+    /// merge — both on purpose (#376, followed up by #378).
+    ///
+    /// This pins a deliberate non-behaviour, which is worth a test precisely
+    /// because it looks like an oversight. Deduplicating by inode would merge
+    /// them, and `canonicalize` makes it a one-liner — but it is not a
+    /// spelling question, it is "are two directory entries for one inode one
+    /// source or two", and the answer has to be paired with a cursor identity
+    /// that survives `delete_after_commit` removing one of the aliases. With
+    /// the symlink deduplicated and deleted, the next discovery surfaces the
+    /// target under a different `source_name`, finds no cursor, and re-reads
+    /// the file from zero — #376 re-entered through its own fix.
+    ///
+    /// `..` is left for the same reason from the other side: `a/link/../b` is
+    /// not `a/b` when `link` is a symlink, so collapsing it lexically could
+    /// merge two REAL sources. A duplicate costs storage; a merge costs data.
     #[tokio::test]
-    async fn a_symlink_and_its_target_are_discovered_once() {
+    async fn aliases_are_not_merged_and_that_is_deliberate() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("real.log"), "one\n").unwrap();
-        std::os::unix::fs::symlink(dir.path().join("real.log"), dir.path().join("link.log"))
-            .unwrap();
+        std::fs::create_dir(dir.path().join("logs")).unwrap();
+        std::fs::write(dir.path().join("logs/real.log"), "one\n").unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join("logs/real.log"),
+            dir.path().join("logs/link.log"),
+        )
+        .unwrap();
         let base = dir.path().display().to_string();
 
-        let found: Vec<String> = FileSource::new(
-            vec![format!("{base}/real*"), format!("{base}/link*")],
+        let symlinked: Vec<String> = FileSource::new(
+            vec![format!("{base}/logs/real*"), format!("{base}/logs/link*")],
             TelemetryFormat::Raw,
             false,
         )
@@ -773,11 +849,33 @@ mod tests {
         .into_iter()
         .map(|s| s.source_name)
         .collect();
-
         assert_eq!(
-            found.len(),
-            1,
-            "a symlink and its target are one inode, so they are one source: {found:?}"
+            symlinked.len(),
+            2,
+            "a symlink and its target are two directory entries and stay two sources \
+             until #378 decides otherwise WITH a cursor identity to match: {symlinked:?}"
+        );
+
+        let traversed: Vec<String> = FileSource::new(
+            vec![
+                format!("{base}/logs/real*"),
+                format!("{base}/logs/../logs/real*"),
+            ],
+            TelemetryFormat::Raw,
+            false,
+        )
+        .discover_sources()
+        .await
+        .expect("a readable directory discovers")
+        .into_iter()
+        .map(|s| s.source_name)
+        .collect();
+        assert_eq!(
+            traversed.len(),
+            2,
+            "`..` is not collapsed: resolving it lexically is wrong through a symlink, \
+             and merging two real sources loses data where a duplicate only costs \
+             storage: {traversed:?}"
         );
     }
 
