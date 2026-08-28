@@ -48,6 +48,37 @@ fn require_password_env(
     }
 }
 
+/// Records that retention removed between where this cursor wanted to resume
+/// and the oldest offset the broker still holds (#361).
+///
+/// The comparison is against the partition's LOW WATERMARK, read from the
+/// broker, and not against anything inferred from delivered offsets. A jump in
+/// what arrives is not evidence: compaction produces one, a recreated topic
+/// produces one, and a first assignment produces one — none of them is data
+/// lost, and a heuristic that cannot tell them apart would cry wolf until it
+/// was ignored.
+///
+/// `None` for a partition with no committed cursor. Nothing has been read, so
+/// nothing can have been missed, and reporting a "gap" the size of the whole
+/// topic on first assignment is the fastest way to make this signal useless.
+fn retention_gap(desired_offset: Option<i64>, low_watermark: i64) -> Option<u64> {
+    let desired = desired_offset?;
+    // A NEGATIVE OFFSET IS A SENTINEL, NOT A POSITION. librdkafka spells
+    // Beginning, End, Stored and Invalid as negative numbers, and subtracting
+    // one from a watermark produces a gap out of nothing — the first draft of
+    // this claimed to handle that in a comment and did not, which a standalone
+    // check of the arithmetic caught before CI did.
+    if desired < 0 {
+        return None;
+    }
+    if desired >= low_watermark {
+        return None;
+    }
+    // Saturating for the same reason: the subtraction must not be able to
+    // wrap, however absurd its inputs.
+    Some(low_watermark.saturating_sub(desired).max(0) as u64)
+}
+
 /// Build the rdkafka [`ClientConfig`]. Auto-commit is forced to `false`
 /// regardless of the input config. Secrets are read from the environment, not
 /// logged.
@@ -862,6 +893,7 @@ impl SourceAdapter for KafkaSource {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     fn cfg() -> KafkaSourceConfig {
@@ -878,6 +910,57 @@ mod tests {
             sasl_username: None,
             sasl_password_env: None,
             ssl_ca_location: None,
+        }
+    }
+
+    /// Retention overtaking a cursor is measured against the broker's low
+    /// watermark, and only when there is a cursor to overtake (#361).
+    ///
+    /// The commit rule protects records the engine READ. This is the one
+    /// failure it cannot see, so the detection has to be exact: a heuristic
+    /// that fires on compaction, on a recreated topic, or on first assignment
+    /// would be ignored within a week, and then the real event would be too.
+    #[test]
+    fn a_cursor_below_the_low_watermark_reports_exactly_what_retention_took() {
+        assert_eq!(
+            retention_gap(Some(100), 350),
+            Some(250),
+            "the gap is (low watermark - desired), which is the count of records that \
+             existed, were never read, and are now unreadable"
+        );
+        assert_eq!(
+            retention_gap(Some(349), 350),
+            Some(1),
+            "one record lost is still a loss and must be reported as one"
+        );
+
+        assert_eq!(
+            retention_gap(Some(350), 350),
+            None,
+            "a cursor exactly at the oldest surviving offset has lost nothing"
+        );
+        assert_eq!(
+            retention_gap(Some(1_000), 350),
+            None,
+            "and a cursor ahead of it is simply healthy"
+        );
+
+        assert_eq!(
+            retention_gap(None, 10_000),
+            None,
+            "a partition with no committed cursor has read nothing, so it can have missed \
+             nothing — reporting the whole topic as a gap on first assignment is the \
+             fastest way to make this signal ignored"
+        );
+
+        // librdkafka spells Beginning, End, Stored and Invalid as negative
+        // numbers. Subtracting one from a watermark invents a gap.
+        for sentinel in [-1_i64, -2, -1_000, -1_001] {
+            assert_eq!(
+                retention_gap(Some(sentinel), 10_000),
+                None,
+                "{sentinel} is a position marker, not an offset, and must not become a gap"
+            );
         }
     }
 
