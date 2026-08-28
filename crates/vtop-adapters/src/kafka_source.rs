@@ -48,6 +48,48 @@ fn require_password_env(
     }
 }
 
+/// How long a watermark query may take before the check is skipped.
+///
+/// Bounded because it runs on a read path, and an unbounded network call there
+/// is the mistake #374 was made of. Skipping is the right failure: a broker
+/// that will not answer has not lost records, it has declined to say.
+const WATERMARK_TIMEOUT_SECONDS: u64 = 5;
+
+/// How often the retention check runs. Retention moves on the scale of hours;
+/// a minute is free and keeps a broker round trip off the per-pass path.
+const RETENTION_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Records that retention removed between where this cursor wanted to resume
+/// and the oldest offset the broker still holds (#361).
+///
+/// The comparison is against the partition's LOW WATERMARK, read from the
+/// broker, and not against anything inferred from delivered offsets. A jump in
+/// what arrives is not evidence: compaction produces one, a recreated topic
+/// produces one, and a first assignment produces one — none of them is data
+/// lost, and a heuristic that cannot tell them apart would cry wolf until it
+/// was ignored.
+///
+/// `None` for a partition with no committed cursor. Nothing has been read, so
+/// nothing can have been missed, and reporting a "gap" the size of the whole
+/// topic on first assignment is the fastest way to make this signal useless.
+fn retention_gap(desired_offset: Option<i64>, low_watermark: i64) -> Option<u64> {
+    let desired = desired_offset?;
+    // A NEGATIVE OFFSET IS A SENTINEL, NOT A POSITION. librdkafka spells
+    // Beginning, End, Stored and Invalid as negative numbers, and subtracting
+    // one from a watermark produces a gap out of nothing — the first draft of
+    // this claimed to handle that in a comment and did not, which a standalone
+    // check of the arithmetic caught before CI did.
+    if desired < 0 {
+        return None;
+    }
+    if desired >= low_watermark {
+        return None;
+    }
+    // Saturating for the same reason: the subtraction must not be able to
+    // wrap, however absurd its inputs.
+    Some(low_watermark.saturating_sub(desired).max(0) as u64)
+}
+
 /// Build the rdkafka [`ClientConfig`]. Auto-commit is forced to `false`
 /// regardless of the input config. Secrets are read from the environment, not
 /// logged.
@@ -250,6 +292,9 @@ pub struct KafkaSource {
     /// including messages the accumulator REJECTED. Where this diverges from
     /// the cursor's desired offset, the pass seeks that partition back.
     delivered: HashMap<(String, i32), i64>,
+    /// When retention was last checked (#361). Bounds a broker round trip on
+    /// a read path to something retention's own timescale makes free.
+    last_retention_check: Option<std::time::Instant>,
     /// Partitions paused mid-pass (topic hit its budget); resumed at the
     /// start of the next pass.
     paused: Vec<(String, i32)>,
@@ -298,10 +343,97 @@ impl KafkaSource {
             cursors: HashMap::new(),
             assigned: Vec::new(),
             delivered: HashMap::new(),
+            last_retention_check: None,
             paused: Vec::new(),
             stored_pending: std::collections::HashSet::new(),
             partitions: HashMap::new(),
         })
+    }
+
+    /// Say what retention took, for every assigned partition (#361).
+    ///
+    /// PERIODIC, NOT ASSIGNMENT-TRIGGERED, and that is the second design this
+    /// had. Hooking it to a changed assignment missed both cases it exists
+    /// for (review):
+    ///
+    /// - **After a restart** the desired offset is `Offset::Stored` — the
+    ///   group commit is librdkafka's to resolve — so a guard that only
+    ///   accepted a concrete offset skipped the primary case entirely.
+    /// - **While lagging** the assignment never changes. Retention cannot
+    ///   overtake a cursor between two consecutive passes, which is true and
+    ///   beside the point: it does so over hundreds of them.
+    ///
+    /// One mechanism covers both. The offset compared is the one this source
+    /// would read NEXT — the in-memory cursor where there is one, the group's
+    /// committed offset otherwise — which is exactly the position retention
+    /// can have moved past.
+    ///
+    /// Reports; does not decide. Whether the adapter should REFUSE to resume
+    /// past a gap is a deployment question — refusing turns a partial archive
+    /// into no archive — and it stays on #361.
+    ///
+    /// Never fails the pass. A broker that will not answer has not lost
+    /// anything; it has only declined to say, and turning that into a read
+    /// failure would trade a real archive for a diagnostic.
+    fn report_retention_gaps(&mut self) {
+        // Retention moves on the scale of hours. Once a minute is free, and
+        // an unbounded network call on a read path is the mistake #374 was
+        // made of — so both the interval and each query are bounded.
+        if self
+            .last_retention_check
+            .is_some_and(|at| at.elapsed() < RETENTION_CHECK_INTERVAL)
+        {
+            return;
+        }
+        self.last_retention_check = Some(std::time::Instant::now());
+
+        let Some(consumer) = self.consumer.as_ref() else {
+            return;
+        };
+        // ONE call for every partition, rather than one per partition: the
+        // group's committed offsets are what a restart would resume from.
+        let committed = consumer
+            .committed(std::time::Duration::from_secs(WATERMARK_TIMEOUT_SECONDS))
+            .ok();
+
+        for (topic, partition) in &self.assigned {
+            // The in-memory cursor is what this process would read next; the
+            // group commit is what a fresh one would. Whichever exists is the
+            // position retention can have moved past.
+            let next_offset = self
+                .delivered
+                .get(&(topic.clone(), *partition))
+                .copied()
+                .or_else(|| {
+                    committed
+                        .as_ref()
+                        .and_then(|tpl| tpl.find_partition(topic, *partition))
+                        .and_then(|elem| match elem.offset() {
+                            Offset::Offset(at) => Some(at),
+                            _ => None,
+                        })
+                });
+            let Ok((low_watermark, _high)) = consumer.fetch_watermarks(
+                topic,
+                *partition,
+                std::time::Duration::from_secs(WATERMARK_TIMEOUT_SECONDS),
+            ) else {
+                continue;
+            };
+            if let Some(lost) = retention_gap(next_offset, low_watermark) {
+                tracing::warn!(
+                    topic = %topic,
+                    partition = *partition,
+                    resuming_from = next_offset.unwrap_or_default(),
+                    oldest_available = low_watermark,
+                    records_lost = lost,
+                    "retention removed records this source had not read: the commit rule \
+                     covers records the engine read, and these were never read, never \
+                     manifested and never verified. Size retention above worst-case lag \
+                     and monitor consumer lag independently (#361)"
+                );
+            }
+        }
     }
 
     fn consumer(&mut self) -> Result<&BaseConsumer, VtopError> {
@@ -601,6 +733,20 @@ impl SourceAdapter for KafkaSource {
             }
         }
 
+        // AFTER THE ASSIGNMENT IS SETTLED AND BEFORE ANY POLL (#361). Placed
+        // at the top of the pass it ran against an empty `self.assigned` on a
+        // restart — examining no partitions at all — and then the first poll
+        // advanced `delivered` past the gap, masking the group commit for the
+        // life of the process. That is the third time this hook has been in
+        // the wrong place, and each time for the same reason: the restart is
+        // the case the check exists for, and the restart is the case where the
+        // state it reads has not been built yet.
+        self.report_retention_gaps();
+        // The check takes `&mut self` (it advances its own clock), which ends
+        // the borrow the assignment block held — so the poll loop takes its
+        // own.
+        let consumer = self.consumer.as_ref().expect("consumer built above");
+
         // Budgets are PER TOPIC (the trait contract's per-source budgets),
         // enforced inside the accumulator. An aggregate budget would let one
         // busy topic monopolise the whole topic-count multiple in a single
@@ -862,6 +1008,7 @@ impl SourceAdapter for KafkaSource {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     fn cfg() -> KafkaSourceConfig {
@@ -878,6 +1025,57 @@ mod tests {
             sasl_username: None,
             sasl_password_env: None,
             ssl_ca_location: None,
+        }
+    }
+
+    /// Retention overtaking a cursor is measured against the broker's low
+    /// watermark, and only when there is a cursor to overtake (#361).
+    ///
+    /// The commit rule protects records the engine READ. This is the one
+    /// failure it cannot see, so the detection has to be exact: a heuristic
+    /// that fires on compaction, on a recreated topic, or on first assignment
+    /// would be ignored within a week, and then the real event would be too.
+    #[test]
+    fn a_cursor_below_the_low_watermark_reports_exactly_what_retention_took() {
+        assert_eq!(
+            retention_gap(Some(100), 350),
+            Some(250),
+            "the gap is (low watermark - desired), which is the count of records that \
+             existed, were never read, and are now unreadable"
+        );
+        assert_eq!(
+            retention_gap(Some(349), 350),
+            Some(1),
+            "one record lost is still a loss and must be reported as one"
+        );
+
+        assert_eq!(
+            retention_gap(Some(350), 350),
+            None,
+            "a cursor exactly at the oldest surviving offset has lost nothing"
+        );
+        assert_eq!(
+            retention_gap(Some(1_000), 350),
+            None,
+            "and a cursor ahead of it is simply healthy"
+        );
+
+        assert_eq!(
+            retention_gap(None, 10_000),
+            None,
+            "a partition with no committed cursor has read nothing, so it can have missed \
+             nothing — reporting the whole topic as a gap on first assignment is the \
+             fastest way to make this signal ignored"
+        );
+
+        // librdkafka spells Beginning, End, Stored and Invalid as negative
+        // numbers. Subtracting one from a watermark invents a gap.
+        for sentinel in [-1_i64, -2, -1_000, -1_001] {
+            assert_eq!(
+                retention_gap(Some(sentinel), 10_000),
+                None,
+                "{sentinel} is a position marker, not an offset, and must not become a gap"
+            );
         }
     }
 
