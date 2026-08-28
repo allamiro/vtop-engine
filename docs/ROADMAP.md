@@ -169,36 +169,117 @@ what it observed (reads attempted, epochs answered, holders seen) whenever it
 gives up, so the next occurrence names its cause. The issue stays open in
 v0.4.0 as a watch item.
 
-## v0.4.0 and beyond
+## v0.4.0 — the failures a healthy lab never shows
 
-The **#240 remainder** is now one item, not two. The election restriction is
-implemented and ships in **this** release — no tag contains it yet, so v0.3.1
-does not have it. `promotion.rs` requires a majority of answering replicas to sit at or
-below the candidate's own committed offset before it may be promoted, which is
-Raft dissertation §5.4.1 in its per-voter form — any record acknowledged on a
-quorum lives on at least one member of every majority, so a candidate a
-majority can vouch for holds every acknowledged record. Three tests pin it,
-including the case the floor check alone would wave through.
+The theme is **failover you do not have to babysit**. Every headline item in
+this release was found by running the thing — a pod that came back on a new
+address, a quorum that blinked at the wrong moment, a winner that could not
+serve what it won — rather than by reading the design.
 
-What remains of #240 is the **signed leadership-transition record**: proving
-who led, rather than restricting who may. That is a new evidence format
-touching the verification tooling, and it is a design conversation on its own —
-#265 was built and withdrawn for not closing the hazard it was written for,
-which is the reason this half is not being hurried.
+- **#367 / #374** — a candidate that won the lease but could not build its
+  leader re-won it forever, starving healthy survivors. Root cause: a peer's
+  address was resolved once at boot and believed forever, so a recreated pod
+  at a new address was unreachable one-way. Addresses are now re-resolved, a
+  name not yet published is a retry rather than a fatal startup error, and
+  two pieces of hardening ride alongside: a candidate that cannot build its
+  leader stands down (#368), and a fail-stop hands the range back before
+  exit (#371).
+- **#375 / #380** — a quorum miss raised the fencing epoch, which is what
+  stopped the followers catching up: each retry was refused at an epoch one
+  higher than the one it had nearly reached. A refusal for **eligibility**
+  still lapses the lease on purpose; a refusal because the **quorum did not
+  answer** now renews it and holds the epoch still — bounded to one lease
+  lifetime per epoch, latched once spent so a backwards clock step cannot
+  reopen the window.
+- **#240, first half (#342)** — the election restriction. Promotion now
+  requires a majority of the answering fenced replicas to sit at or below
+  the candidate's own committed offset — Raft dissertation §5.4.1 in its
+  per-voter form, with the majority size derived from the replication
+  factor, never from how many happened to answer. Three tests pin it,
+  including the case the floor check alone would wave through. The second
+  half — the signed leadership-transition record, proving who led rather
+  than restricting who may — remains open by design: #265 was built and
+  withdrawn for not closing its hazard, and that lesson is why this half is
+  not being hurried.
+- **#284 (#343 / #344)** — candidate mode. The data node's role follows the
+  metadata lease inside the binary — every pod a candidate, an election
+  deciding who leads, failover in place with no restart and no re-render.
+  Scenario 14 proves the composition on real processes, and the chart's
+  `replicated` topology renders three identical leased candidates
+  (`data.leaderOrdinal` is retired; setting it now explains the migration
+  instead of steering roles).
+- **#306 (#341)** — a leader seals its tail on demand (`vtopctl node repair
+  --seal-tail`), so repair reaches the leader's whole position instead of
+  stopping at the last segment roll. This was v0.3.0's sharpest known
+  limitation; with #315 (v0.3.1) it closes the road back for a lost
+  replica end to end.
+- **#314 (#339)** — roll thresholds change on a range that already exists,
+  by rolling once (`vtopctl node reconfigure-range`). The thread catalogued
+  six interacting cases proving the feature wanted a design, not a patch.
+- **#318** — closed on a 60-run soak: the promotion-never-acquired flake
+  was fixed incidentally by #315/#280, zero recurrences of the signature in
+  59 clean runs (the one failure under load was a different failure, filed
+  as #340). #324's `await_lease_holder` diagnostics stand by to
+  self-diagnose any recurrence.
+- **#326 (#327)** — the suite's deadline-poll doctrine applied to the one
+  read that violated it: scenario 12's one-shot `get-placement` now polls
+  to a deadline and absorbs a momentary ReadIndex quorum lapse.
+- **#81 (#338)** — the lab compose runs under a hardening baseline:
+  loopback-bound published ports, dropped capabilities, read-only roots,
+  segmented networks per plane.
+- **#87 (#362)** — the batch pipeline's read/flush overlap, which had
+  quietly shipped inside earlier work, is now pinned by tests and
+  documented — so it cannot un-ship silently.
+- **#289 (#309) / #295 (#297)** — CI builds the engine image once instead
+  of three times, and the image carries `curl`, because nothing else in it
+  could read `/readyz`.
+- **#376 (#377)** — two globs matching one file archived it twice; the file
+  source deduplicates across overlapping patterns. Whether two directory
+  entries for one **inode** are one source or two is deliberately not
+  answered here — #378 records the question.
+- **#361, detection half (#382)** — a Kafka cursor overtaken by the
+  partition's low watermark resumed at the new earliest offset and the gap
+  was never mentioned. The source now names the records retention took —
+  count, partition, resume point — measured against the broker's low
+  watermark and nothing else, because offset jumps are not evidence.
+  Whether the adapter should *refuse* rather than resume is a deployment
+  decision the issue keeps open.
+- **#92 (#383)** — `docs/THROUGHPUT_RESEARCH.md`: what 1M records/sec would
+  take, what the compression measurements actually show, and what nobody
+  has shown — no end-to-end rate demonstration exists, and the document
+  says so instead of implying otherwise. The sweep grid (#130) and
+  sustained-backpressure soak (#98) that would produce those numbers moved
+  to v0.5.0: they inform tuning, not shipped behavior.
 
-**Candidate mode shipped here (#284)**: the data node's role now follows the
-metadata lease inside the binary — every pod a candidate, an election deciding
-who leads, failover in place with no restart and no re-render. Scenario 14
-proves the composition on real processes, and the chart's `replicated`
-topology renders three identical leased candidates (`data.leaderOrdinal` is
-retired; setting it now explains the migration instead of steering roles).
+A documentation truth pass (#379) rode with the release: three status
+markers the code disproved are fixed, and the docs now state which
+conformance gap the engine has never claimed to close.
 
-Beyond that: a chart that separates metadata from data (#287), and TLS as a
-configured capability rather than a hard dependency across every deployment
-method (#294). FIPS (#296) and
-the Kafka wire-compatibility gateway (#225) sit behind those. (Retention
-#290, orderly shutdown #280, and upgrade testing #291 moved up into v0.3.1
-and shipped there.)
+### Known limitations in v0.4.0
+
+- **Scenario 09's post-failover produce can miss quorum under heavy I/O
+  load (#340).** Open as a watch item — it needs the 30-run adversarial
+  soak that produced it, and the late-vs-never fork is answered *never*
+  from code: uneven follower offsets at the kill make in-place repair
+  impossible. (It was briefly closed by GitHub's keyword parser matching
+  "fix #340" inside a sentence that said the opposite; reopened.)
+- Retention loss on the Kafka plane is **detected, not refused** (#361) —
+  and the count is a log line, not yet a field in the read report.
+- The Kafka wire-compatibility gateway is **not in this release**: its
+  protocol foundation (PR #350) lands at the start of v0.5.0 (#225).
+- The chart still deploys co-located nodes only (#287), and TLS remains a
+  hard dependency of some planes rather than a configured capability
+  (#294).
+
+## v0.5.0 and beyond
+
+The theme is **compatibility**: the Kafka wire-protocol gateway over the
+native broker (#225), whose phase 1 — wire codec, RecordBatch v2, the
+version gate — is reviewed and ready. Around it: TLS as a configured
+capability across every deployment method (#294), a chart that separates
+metadata from data (#287), the FIPS story (#296), the adaptive source and
+target I/O arc (#100 #101 #102) with the measurements that gate it
+(#98 #130), the #240 remainder, and the inode-alias question (#378).
 
 ---
 

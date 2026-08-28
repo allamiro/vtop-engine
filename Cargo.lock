@@ -3952,7 +3952,7 @@ checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
 
 [[package]]
 name = "vtop-adapters"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3971,7 +3971,7 @@ dependencies = [
 
 [[package]]
 name = "vtop-broker"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "blake3",
  "rcgen",
@@ -3989,7 +3989,7 @@ dependencies = [
 
 [[package]]
 name = "vtop-cli"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4020,7 +4020,7 @@ dependencies = [
 
 [[package]]
 name = "vtop-core"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "blake3",
  "chrono",
@@ -4044,7 +4044,7 @@ dependencies = [
 
 [[package]]
 name = "vtop-log"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "blake3",
  "libc",
@@ -4057,7 +4057,7 @@ dependencies = [
 
 [[package]]
 name = "vtop-meta"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -4078,7 +4078,7 @@ dependencies = [
 
 [[package]]
 name = "vtop-node"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "clap",
@@ -4102,7 +4102,7 @@ dependencies = [
 
 [[package]]
 name = "vtop-observe"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "http-body-util",
  "hyper",
@@ -4115,7 +4115,7 @@ dependencies = [
 
 [[package]]
 name = "vtop-protocol"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "blake3",
  "thiserror 2.0.20",
@@ -4125,7 +4125,7 @@ dependencies = [
 
 [[package]]
 name = "vtop-state"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4141,7 +4141,7 @@ dependencies = [
 
 [[package]]
 name = "vtop-upload"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "aws-config",
