@@ -733,11 +733,6 @@ impl SourceAdapter for KafkaSource {
             }
         }
 
-        // Budgets are PER TOPIC (the trait contract's per-source budgets),
-        // enforced inside the accumulator. An aggregate budget would let one
-        // busy topic monopolise the whole topic-count multiple in a single
-        // in-memory unit. Messages for a full topic are skipped and re-read
-        // next pass; the loop stops early once every assigned topic is full.
         // AFTER THE ASSIGNMENT IS SETTLED AND BEFORE ANY POLL (#361). Placed
         // at the top of the pass it ran against an empty `self.assigned` on a
         // restart — examining no partitions at all — and then the first poll
@@ -747,7 +742,16 @@ impl SourceAdapter for KafkaSource {
         // the case the check exists for, and the restart is the case where the
         // state it reads has not been built yet.
         self.report_retention_gaps();
+        // The check takes `&mut self` (it advances its own clock), which ends
+        // the borrow the assignment block held — so the poll loop takes its
+        // own.
+        let consumer = self.consumer.as_ref().expect("consumer built above");
 
+        // Budgets are PER TOPIC (the trait contract's per-source budgets),
+        // enforced inside the accumulator. An aggregate budget would let one
+        // busy topic monopolise the whole topic-count multiple in a single
+        // in-memory unit. Messages for a full topic are skipped and re-read
+        // next pass; the loop stops early once every assigned topic is full.
         let mut acc = MultiTopicAcc::new(sources.len(), max_records, max_bytes);
         let mut paused = vec![false; sources.len()];
         // Delivery positions touched THIS pass, keyed by index (no per-message
