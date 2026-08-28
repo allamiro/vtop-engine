@@ -802,22 +802,6 @@ impl AdminClient {
             let candidate = &self.candidates[index];
             match self.attempt(index, &request).await {
                 Ok(frame) => {
-                    // ANY FRAME CLEARS THE STALENESS, redirect included
-                    // (review). An earlier revision of this held redirects
-                    // back on the grounds that answering does not prove
-                    // WHICH node answered — true, and the weaker argument:
-                    // a candidate that completes a TLS handshake and frames a
-                    // reply is at a live admin endpoint, and leaving it marked
-                    // means re-resolving a recovered candidate on every
-                    // request, which for a name with several A records means
-                    // drifting between them. Wrong-node detection needs the
-                    // responder's identity in the frame, which is a wire
-                    // change and not this.
-                    if let Some(resolution) =
-                        self.resolutions.lock().expect("resolutions").get_mut(index)
-                    {
-                        resolution.stale = false;
-                    }
                     // A frame is not automatically success: a non-leader
                     // answers with KIND_ADMIN_ERROR, and the redirect inside it
                     // is the whole point of this loop.
@@ -847,6 +831,30 @@ impl AdminClient {
                         continue;
                     }
                     self.preferred.store(index, Ordering::Relaxed);
+                    // A NON-REDIRECT ANSWER CLEARS THE STALENESS; A REDIRECT
+                    // DOES NOT. Review has moved this line three times, so
+                    // here is the invariant rather than another preference.
+                    //
+                    // A redirect is structurally the one response that carries
+                    // no information about WHO answered: it names the leader,
+                    // not the responder. So an address that has been reassigned
+                    // to a different member — plaintext, or a shared SAN —
+                    // answers a redirect perfectly well, and treating that as
+                    // proof freezes the wrong address in place forever. Every
+                    // other answer came back from the endpoint we selected, for
+                    // the operation we asked it.
+                    //
+                    // The cost is real and bounded: a candidate that keeps
+                    // redirecting is looked up again once per throttle
+                    // interval. In steady state `preferred` is the leader and
+                    // answers directly, so this is paid during a leadership
+                    // change, which is when being right about addresses
+                    // matters most.
+                    if let Some(resolution) =
+                        self.resolutions.lock().expect("resolutions").get_mut(index)
+                    {
+                        resolution.stale = false;
+                    }
                     return Ok(frame);
                 }
                 // An unreachable candidate is worth moving past for the same
