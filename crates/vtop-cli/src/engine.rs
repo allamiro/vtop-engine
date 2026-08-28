@@ -1260,6 +1260,7 @@ impl Engine {
         let mut empty_sources: usize = 0;
         let mut failed_sources: usize = 0;
         let mut records_read: usize = 0;
+        let mut retention_lost: u64 = 0;
 
         // ONE call reads every source: the default trait impl walks them
         // serially (file, syslog — independent handles), while Kafka overrides
@@ -1295,6 +1296,20 @@ impl Engine {
                 productive_read_ms = report.productive_ms;
                 empty_read_ms = report.empty_ms;
                 failed_read_ms = report.failed_ms;
+                retention_lost = report.retention_lost_records;
+                if retention_lost > 0 {
+                    if let Some(mx) = telemetry::metrics() {
+                        // Engine-default tenant, like the whole-pass error
+                        // path above: the loss is an adapter-level
+                        // observation, not attributable to one configured
+                        // stream. The topic and partition are in the
+                        // adapter's warn line.
+                        let t = self.config.engine.tenant.clone();
+                        mx.retention_lost_records_total
+                            .with_label_values(&[t.as_str(), source_type.as_str()])
+                            .inc_by(retention_lost);
+                    }
+                }
                 for outcome in report.outcomes {
                     let Some(source) = sources.get(outcome.source_index) else {
                         debug_assert!(false, "adapter returned out-of-range source index");
@@ -1382,6 +1397,10 @@ impl Engine {
                 empty_sources,
                 failed_sources,
                 records_read,
+                // Almost always zero; non-zero is records lost upstream of
+                // the archive (#361), carried here so the one line operators
+                // already watch is the one that says so.
+                retention_lost,
                 empty_wait_pct = format!(
                     "{:.1}",
                     (empty_read_ms as f64 / read_phase_ms as f64) * 100.0
