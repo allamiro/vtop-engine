@@ -116,6 +116,31 @@ echo "topics,records_produced,observe_seconds,kafka_cycles,records_read,avg_read
 
 kafka() { docker compose exec -T kafka /opt/kafka/bin/"$@"; }
 
+# EVERY TOPIC THAT IS NOT THIS CELL'S IS A CONFOUND. `discover_sources` fetches
+# metadata for the whole broker BEFORE topic_include_regex is applied, so the
+# four topics `kafka-init` seeds — which compose starts through the engine's
+# own depends_on, after the reset above — are in every cell's metadata cost
+# (review). Deleted once, and then asserted per cell, because an invariant that
+# is only established at startup is one that drifts.
+purge_foreign_topics() { # $1 = the prefix this cell owns, empty for "none"
+  local own="${1:-}"
+  local listing
+  listing="$(kafka kafka-topics.sh --bootstrap-server localhost:9092 --list 2>/dev/null)" \
+    || fail "the broker did not answer a topic listing; the empty-broker invariant is unknown"
+  local topic
+  while IFS= read -r topic; do
+    [ -n "$topic" ] || continue
+    case "$topic" in
+      __*) continue ;;                       # Kafka's own internal topics
+    esac
+    if [ -n "$own" ] && case "$topic" in "${own}-"*) true ;; *) false ;; esac; then
+      continue
+    fi
+    kafka kafka-topics.sh --bootstrap-server localhost:9092 --delete \
+      --topic "$topic" >/dev/null 2>&1 || true
+  done <<< "$listing"
+}
+
 cleanup() {
   log "tearing the lab down"
   rm -f "$SWEEP_CONFIG" 2>/dev/null || true
@@ -130,7 +155,13 @@ trap cleanup EXIT
 # are in every cell's measurement (review). The teardown at the end cannot
 # help a run that starts dirty.
 log "tearing down any existing lab so the broker starts empty"
-docker compose down -v --remove-orphans >/dev/null 2>&1 || true
+# NOT `|| true`. The empty broker is an INVARIANT this sweep depends on, not a
+# convenience: a teardown that half-failed leaves a surviving broker whose
+# topics land in every cell's metadata fetch (review). Failing here costs a
+# rerun; proceeding costs the whole grid, silently.
+docker compose down -v --remove-orphans >/dev/null 2>&1 \
+  || fail "could not tear down the existing lab, so the broker cannot be trusted to be empty; \
+run 'docker compose down -v --remove-orphans' by hand and rerun"
 
 log "bringing up kafka + minio + engine"
 docker compose up -d kafka minio minio-init >/dev/null
@@ -181,6 +212,14 @@ TOTAL_RECORDS or lower the count."
     kafka kafka-topics.sh --bootstrap-server localhost:9092 --create --if-not-exists \
       --topic "${prefix}-$i" --partitions 1 --replication-factor 1 >/dev/null
   done
+
+  # kafka-init's seed topics come back with every `up`, so they are removed
+  # here rather than once at startup, and what is left is asserted.
+  purge_foreign_topics "$prefix"
+  stray="$(kafka kafka-topics.sh --bootstrap-server localhost:9092 --list 2>/dev/null \
+    | grep -v '^__' | grep -cv "^${prefix}-" || true)"
+  [ "${stray:-0}" -eq 0 ] || fail "$stray topic(s) outside this cell survive in the broker; \
+every one of them is in this cell's metadata fetch and the topic-count dimension would be a fiction"
 
   # THE REMAINDER IS DISTRIBUTED, and the ACTUAL total is what gets recorded.
   # Integer division silently changed the load between cells — 4000 over 28
@@ -283,11 +322,23 @@ seal at or after the observation window and objects_archived would be meaningles
   logs="$OUT_DIR/engine-${count}.log"
   docker compose logs --no-color vtop-engine > "$logs" 2>&1 || true
 
-  # A GRACE PERIOD BEFORE JUDGING THE UPLOADS. Records read in the last
-  # seconds of the window are in a batch that has not aged out yet, so
-  # judging immediately classifies a healthy pipeline as a broken one.
-  log "draining for $(( seal_age + 5 ))s so the last batch can seal and upload"
-  sleep "$(( seal_age + 5 ))"
+  # THE DRAIN IS A SHUTDOWN, NOT A SLEEP. A grace period with the engine still
+  # running keeps READING — so the uploads it produces during it are counted
+  # against read-cycle metrics captured at the deadline, and the two columns
+  # describe different intervals (review). SIGINT is the engine's own
+  # shutdown: it forces a final cycle that SEALS every open buffer
+  # (vtop-cli/src/engine.rs, "shutdown signal received; flushing and exiting"),
+  # which is exactly the drain wanted, and it stops the reader at the same
+  # instant the window closes. `docker compose stop` would send SIGTERM, which
+  # this binary does not handle.
+  log "closing the window: SIGINT flushes and seals without reading further"
+  docker compose kill -s SIGINT vtop-engine >/dev/null 2>&1 \
+    || fail "could not signal the engine to flush; the cell's uploads would be incomplete"
+  for _ in $(seq 1 60); do
+    [ "$(docker compose ps --format '{{.State}}' vtop-engine 2>/dev/null | head -1)" = "running" ] \
+      || break
+    sleep 1
+  done
 
   drained="$OUT_DIR/engine-${count}.drained.log"
   docker compose logs --no-color vtop-engine > "$drained" 2>&1 || true
@@ -397,10 +448,10 @@ else:
            round(sum(phase) / len(phase), 1) if phase else 0,
            round(sum(waits) / len(waits), 1) if waits else 0,
            archived]
-    with open(csv_path, "a") as fh:
-        fh.write(",".join(str(v) for v in row) + "\n")
-    print(f"[topic-sweep] {count} topic(s): {n} cycle(s), {int(sum(reads))} record(s) read, "
-          f"avg read phase {row[5]} ms, avg empty wait {row[6]}%, {archived} object(s) archived")
+    # THE ROW IS WRITTEN LAST, after every guard below has passed (review).
+    # Appending first and then exiting non-zero left the CSV holding a
+    # measurement the sweep had already decided not to trust, and a CSV is
+    # exactly the artefact nobody re-reads the log beside.
     # READS WITHOUT ARCHIVES MEANS THE PIPELINE BROKE BEHIND THE READER
     # (review). Before the seal age was narrowed this was ambiguous — a batch
     # simply might not have aged out inside the window — but the config now
@@ -440,6 +491,11 @@ else:
         print(f"[topic-sweep] WARNING: {count} topic(s) uploaded {archived} object(s) but "
               f"only committed {committed}; at least one batch did not finish.")
         sys.exit(7)
+
+    with open(csv_path, "a") as fh:
+        fh.write(",".join(str(v) for v in row) + "\n")
+    print(f"[topic-sweep] {count} topic(s): {n} cycle(s), {int(sum(reads))} record(s) read, "
+          f"avg read phase {row[5]} ms, avg empty wait {row[6]}%, {archived} object(s) archived")
     if sum(reads) > 0 and archived == 0:
         print(f"[topic-sweep] WARNING: {count} topic(s) read {int(sum(reads))} record(s) and "
               f"archived NOTHING, with a seal age well inside the window — the upload, "
