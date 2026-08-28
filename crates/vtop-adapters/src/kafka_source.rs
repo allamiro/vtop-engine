@@ -48,6 +48,13 @@ fn require_password_env(
     }
 }
 
+/// How long a watermark query may take before the check is skipped.
+///
+/// Bounded because it runs on a read path, and an unbounded network call there
+/// is the mistake #374 was made of. Skipping is the right failure: a broker
+/// that will not answer has not lost records, it has declined to say.
+const WATERMARK_TIMEOUT_SECONDS: u64 = 5;
+
 /// Records that retention removed between where this cursor wanted to resume
 /// and the oldest offset the broker still holds (#361).
 ///
@@ -335,6 +342,51 @@ impl KafkaSource {
         })
     }
 
+    /// Say what retention took, for every partition being assigned to a
+    /// concrete offset (#361).
+    ///
+    /// Reports; does not decide. Whether the adapter should REFUSE to resume
+    /// past a gap rather than continue is a deployment question — refusing
+    /// turns a partial archive into no archive, which may be worse — and it is
+    /// tracked on #361 rather than defaulted to here.
+    ///
+    /// Never fails the pass. A broker that will not answer a watermark query
+    /// has not lost anything; it has only declined to say, and turning that
+    /// into a read failure would trade a real archive for a diagnostic.
+    fn report_retention_gaps(&self, desired: &[(String, i32, Offset)]) {
+        let Some(consumer) = self.consumer.as_ref() else {
+            return;
+        };
+        for (topic, partition, offset) in desired {
+            // Only a concrete offset can have been overtaken. `Stored` and the
+            // other sentinels are librdkafka being asked to decide, which is
+            // the case that has nothing to compare against.
+            let Offset::Offset(desired_offset) = offset else {
+                continue;
+            };
+            let Ok((low_watermark, _high)) = consumer.fetch_watermarks(
+                topic,
+                *partition,
+                std::time::Duration::from_secs(WATERMARK_TIMEOUT_SECONDS),
+            ) else {
+                continue;
+            };
+            if let Some(lost) = retention_gap(Some(*desired_offset), low_watermark) {
+                tracing::warn!(
+                    topic = %topic,
+                    partition = *partition,
+                    resuming_from = *desired_offset,
+                    oldest_available = low_watermark,
+                    records_lost = lost,
+                    "retention removed records this source had not read: the commit rule \
+                     covers records the engine read, and these were never read, never \
+                     manifested and never verified. Size retention above worst-case lag \
+                     and monitor consumer lag independently (#361)"
+                );
+            }
+        }
+    }
+
     fn consumer(&mut self) -> Result<&BaseConsumer, VtopError> {
         if self.consumer.is_none() {
             let c: BaseConsumer = build_client_config(&self.cfg)?
@@ -585,6 +637,16 @@ impl SourceAdapter for KafkaSource {
             consumer.assign(&tpl).map_err(|e| {
                 VtopError::Source(format!("assign ({} topics): {e}", sources.len()))
             })?;
+            // RETENTION IS CHECKED HERE AND NOWHERE ELSE (#361). This branch
+            // runs only when the (topic, partition) set changes — a restart,
+            // a rebalance, a topic appearing — which is precisely when a
+            // cursor can have been overtaken while nobody was reading. Per
+            // pass it would be a broker round trip on the hot path for a
+            // condition that cannot arise between two consecutive passes; per
+            // record it would be absurd. Bounded, because `fetch_watermarks`
+            // is a network call and an unbounded one on a read path is the
+            // mistake #374 was made of.
+            self.report_retention_gaps(&desired);
             // Defensively clear any pause state a retained toppar might carry
             // across the re-assign; a silently-paused partition reads as an
             // empty topic forever.
