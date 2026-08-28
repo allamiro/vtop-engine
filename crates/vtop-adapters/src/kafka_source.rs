@@ -572,9 +572,6 @@ impl SourceAdapter for KafkaSource {
         // instead of fetching. assign() is rebalance-free and lets us control
         // the exact start offset per partition.
         self.consumer()?;
-        // Both cases #361 covers are here rather than at assignment time: see
-        // `report_retention_gaps`.
-        self.report_retention_gaps();
         // A metadata failure for ONE topic must not abort the pass for the
         // others — the serial loop isolated it per source, and so does this:
         // the failing topic is skipped and its outcome carries the error.
@@ -741,6 +738,16 @@ impl SourceAdapter for KafkaSource {
         // busy topic monopolise the whole topic-count multiple in a single
         // in-memory unit. Messages for a full topic are skipped and re-read
         // next pass; the loop stops early once every assigned topic is full.
+        // AFTER THE ASSIGNMENT IS SETTLED AND BEFORE ANY POLL (#361). Placed
+        // at the top of the pass it ran against an empty `self.assigned` on a
+        // restart — examining no partitions at all — and then the first poll
+        // advanced `delivered` past the gap, masking the group commit for the
+        // life of the process. That is the third time this hook has been in
+        // the wrong place, and each time for the same reason: the restart is
+        // the case the check exists for, and the restart is the case where the
+        // state it reads has not been built yet.
+        self.report_retention_gaps();
+
         let mut acc = MultiTopicAcc::new(sources.len(), max_records, max_bytes);
         let mut paused = vec![false; sources.len()];
         // Delivery positions touched THIS pass, keyed by index (no per-message
