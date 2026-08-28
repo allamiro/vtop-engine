@@ -246,14 +246,32 @@ impl QuorumProbe for ReplicaPlaneProbe {
             let addr = match &follower.host {
                 Some(host) => {
                     match vtop_broker::replication::address_now(host, PROBE_RESOLVE_TIMEOUT).await {
-                        // NOT REMEMBERED YET (review). A lookup can hand back
-                        // an address that is not serving — a replacement whose
-                        // listener is not up, a record that moved early — and
-                        // recording it here would overwrite a fallback that
-                        // was known to WORK with one that is merely known to
-                        // exist. It is remembered below, after a fence proves
-                        // it.
-                        Some(addr) => addr,
+                        // REMEMBERED ON RESOLUTION, and this reverses an
+                        // earlier revision that waited for a fence to prove it
+                        // (review, twice, in both directions — so here is the
+                        // argument that settles it).
+                        //
+                        // The two candidates for the fallback are "the last
+                        // address that answered a fence" and "the last address
+                        // the NAME gave us". They differ exactly when a
+                        // follower has moved and is not serving yet, and there
+                        // the second is right: the name is authoritative about
+                        // WHERE a peer is, while a fence only reports whether
+                        // it is READY. Preferring the proven address means
+                        // preferring one that is definitively dead — a
+                        // replaced pod's old address never comes back — over
+                        // one that is merely early, and a peer that is early
+                        // becomes correct on its own.
+                        //
+                        // The startup address survives only as the last
+                        // resort, for a peer no lookup has ever answered for.
+                        Some(addr) => {
+                            self.last_known
+                                .lock()
+                                .expect("resolved peers")
+                                .insert(follower.node_uuid, addr);
+                            addr
+                        }
                         None => self
                             .last_known
                             .lock()
@@ -280,16 +298,6 @@ impl QuorumProbe for ReplicaPlaneProbe {
                 node_id: follower.node_uuid,
                 local_committed_offset: match fenced {
                     Ok(response) => {
-                        // PROVED. This address answered a fence for this
-                        // range, which is the only evidence worth keeping as
-                        // the fallback for a future lookup failure.
-                        if let Some(host) = &follower.host {
-                            let _ = host;
-                            self.last_known
-                                .lock()
-                                .expect("resolved peers")
-                                .insert(follower.node_uuid, addr);
-                        }
                         if response.truncated_records > 0 {
                             tracing::warn!(
                                 follower = %follower.node_uuid,

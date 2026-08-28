@@ -1860,13 +1860,30 @@ pub(crate) fn malformed_endpoint(configured: &str) -> Option<String> {
         let Some(inner) = inner.strip_suffix(']') else {
             return Some(format!("{host:?} opens a bracket it never closes"));
         };
-        // A zone id (`%eth0`) is part of the syntax and not part of the
-        // address, so it is set aside before parsing.
-        let addr = inner.split('%').next().unwrap_or(inner);
+        // A zone id is part of the syntax and not part of the address, so it
+        // is set aside before parsing — and then checked, because
+        // `ToSocketAddrs` accepts only NUMERIC scopes. `%eth0` never resolves
+        // on any platform this runs on, so accepting it — as an earlier
+        // revision of this did, in its own test — waves through an address
+        // that is permanently unusable, which is the exact class this
+        // function exists to separate from a peer that is merely absent
+        // (review).
+        let (addr, scope) = match inner.split_once('%') {
+            Some((addr, scope)) => (addr, Some(scope)),
+            None => (inner, None),
+        };
         if addr.parse::<std::net::Ipv6Addr>().is_err() {
             return Some(format!(
                 "{host:?} is bracketed, which means an IPv6 literal, and {addr:?} is not one"
             ));
+        }
+        if let Some(scope) = scope {
+            if scope.is_empty() || scope.parse::<u32>().is_err() {
+                return Some(format!(
+                    "{host:?} carries the scope {scope:?}, and only a numeric scope resolves \
+                     — use the interface index, as in [{addr}%3]"
+                ));
+            }
         }
         return None;
     }
@@ -1890,9 +1907,16 @@ pub(crate) fn malformed_endpoint(configured: &str) -> Option<String> {
             "{host:?} contains {bad:?}, which no hostname or address may hold"
         ));
     }
-    if host.split('.').any(|label| label.is_empty()) {
+    // A SINGLE TRAILING DOT IS THE DNS ROOT LABEL, not an empty one (review).
+    // An absolute name is what an operator writes to stop the resolver
+    // appending search domains — exactly the right thing to write in a
+    // cluster — and rejecting it would refuse startup over correct config.
+    // Everything else empty is still a mistake: a leading dot, or two in a row.
+    let labels = host.strip_suffix('.').unwrap_or(host);
+    if labels.is_empty() || labels.split('.').any(|label| label.is_empty()) {
         return Some(format!(
-            "{host:?} has an empty label; a name is dot-separated"
+            "{host:?} has an empty label; a name is dot-separated, and only a single \
+             trailing dot is meaningful (it is the root)"
         ));
     }
     None
@@ -2641,8 +2665,12 @@ mod tests {
             "vtop-1.vtop-headless.ns.svc.cluster.local:9300",
             "127.0.0.1:9300",
             "[::1]:9300",
-            "[fe80::1%eth0]:9300",
+            // Numeric scope: the only kind the resolver can use.
+            "[fe80::1%3]:9300",
             "vtop_1.svc:9300",
+            // Absolute name — the trailing dot is the root label, and writing
+            // it is how an operator stops search-domain expansion.
+            "vtop-1.vtop-headless.ns.svc.cluster.local.:9300",
         ] {
             assert!(
                 malformed_endpoint(good).is_none(),
@@ -2671,6 +2699,11 @@ mod tests {
             ("peer name:9300", "which no hostname"),
             ("peer@host:9300", "which no hostname"),
             ("peer..host:9300", "empty label"),
+            (".peer.host:9300", "empty label"),
+            ("peer.host..:9300", "empty label"),
+            // Symbolic scopes never resolve, so they are permanent mistakes.
+            ("[fe80::1%eth0]:9300", "numeric scope"),
+            ("[fe80::1%]:9300", "numeric scope"),
         ] {
             let why = malformed_endpoint(bad)
                 .unwrap_or_else(|| panic!("{bad} must be refused; waiting cannot fix it"));
