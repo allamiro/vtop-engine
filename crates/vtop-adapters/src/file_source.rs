@@ -310,20 +310,41 @@ impl SourceAdapter for FileSource {
         //
         // Keyed on the resolved path rather than the pattern, because the
         // pattern is what differs and the file is what matters.
-        let mut seen = std::collections::HashSet::new();
+        // KEYED ON THE CANONICAL PATH, NAMED BY THE FIRST SPELLING SEEN.
+        //
+        // Two patterns can name one file differently and `glob` returns each
+        // spelling verbatim — `logs/./app.log`, `logs/../logs/app.log` and
+        // `./logs/app.log` are three distinct strings for one inode — so a set
+        // over the rendered names does not deduplicate them (review).
+        // Canonicalising resolves the spellings AND symlinks, which is the
+        // same question asked twice: one inode read twice is one set of
+        // records archived twice.
+        //
+        // The NAME is deliberately left as it was found. It is the cursor key
+        // (`self.cursors`) and what an operator reads in the logs, so
+        // canonicalising it would reset every cursor on upgrade and re-archive
+        // everything the engine had already committed — a far worse bug than
+        // the one being fixed here.
+        //
+        // A path that cannot be canonicalised — deleted between the glob and
+        // this line, or unreadable — falls back to its own spelling. That is
+        // no worse than the behaviour before this change, and it keeps a
+        // transient race from dropping a real source, which deduplication must
+        // never do.
+        let mut seen = std::collections::HashSet::<std::path::PathBuf>::new();
         for pattern in &self.paths {
             for entry in glob::glob(pattern)
                 .map_err(|e| VtopError::Source(format!("bad glob {pattern}: {e}")))?
             {
                 match entry {
                     Ok(p) if p.is_file() => {
-                        let source_name = p.to_string_lossy().into_owned();
-                        if !seen.insert(source_name.clone()) {
+                        let key = std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
+                        if !seen.insert(key) {
                             continue;
                         }
                         out.push(DiscoveredSource {
                             source_type: SourceType::File,
-                            source_name,
+                            source_name: p.to_string_lossy().into_owned(),
                             format: self.format.clone(),
                         });
                     }
@@ -629,46 +650,134 @@ mod tests {
     ///
     /// Both discoveries carried the same `source_name`, so both jobs
     /// snapshotted the same starting offset and both outcomes routed into the
-    /// same pending buffer — the records were archived twice, from a
-    /// configuration nothing warns about and that the shipped example already
-    /// resembles: `examples/config.yaml` lists two `file.paths` entries, and
-    /// `*.log` beside a service prefix is the obvious way an operator writes
-    /// the same intent twice.
+    /// same pending buffer — the records were read twice, acknowledged twice
+    /// and archived twice, from a configuration nothing warns about and that
+    /// the shipped example already resembles.
+    ///
+    /// The spellings here are not decoration. `glob` returns each pattern's
+    /// match verbatim, so `logs/./app.log` and `logs/app.log` are two strings
+    /// for one inode, and a set over the rendered names would let the second
+    /// through. Probed before this test was written rather than assumed.
     #[tokio::test]
-    async fn two_globs_matching_one_file_discover_it_once() {
+    async fn one_file_named_several_ways_is_discovered_once() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("app.log"), "one\ntwo\n").unwrap();
-        // A second file that only ONE of the patterns matches, so the test
-        // also pins that deduplication does not swallow distinct sources.
-        std::fs::write(dir.path().join("other.log"), "three\n").unwrap();
+        std::fs::create_dir(dir.path().join("logs")).unwrap();
+        std::fs::write(dir.path().join("logs/app.log"), "one\ntwo\n").unwrap();
+        // Matched by only one pattern, so this test also pins that
+        // deduplication does not swallow distinct sources.
+        std::fs::write(dir.path().join("logs/other.log"), "three\n").unwrap();
+        let base = dir.path().display().to_string();
 
         let source = FileSource::new(
             vec![
-                format!("{}/*.log", dir.path().display()),
-                format!("{}/app*", dir.path().display()),
+                format!("{base}/logs/*.log"),
+                format!("{base}/logs/./app*"),
+                format!("{base}/logs/../logs/app*"),
             ],
             TelemetryFormat::Raw,
             false,
         );
 
-        let mut found: Vec<String> = source
+        let found: Vec<String> = source
             .discover_sources()
             .await
             .expect("a readable directory discovers")
             .into_iter()
             .map(|s| s.source_name)
             .collect();
-        found.sort();
 
         assert_eq!(
             found.len(),
             2,
-            "a file matched by two patterns must be discovered ONCE — twice means it \
-             is read twice, acknowledged twice and archived twice: {found:?}"
+            "one file spelled three ways is still ONE file — more than that means it is \
+             read, acknowledged and archived once per spelling: {found:?}"
+        );
+        assert_eq!(
+            found[0],
+            format!("{base}/logs/app.log"),
+            "and the surviving name must be the FIRST spelling matched, because it is the \
+             cursor key: rewriting it would reset the cursor and re-archive the file"
         );
         assert!(
-            found[0].ends_with("app.log") && found[1].ends_with("other.log"),
-            "and the file only one pattern matched must still be there: {found:?}"
+            found[1].ends_with("other.log"),
+            "the file only one pattern matched must still be there: {found:?}"
+        );
+    }
+
+    /// The name that survives is the one first matched, even when it is not
+    /// the canonical spelling of the file (#376).
+    ///
+    /// This is the half that is easy to get wrong in the tempting direction:
+    /// having canonicalised for the KEY, canonicalising the NAME as well looks
+    /// tidier and is destructive. `source_name` is the cursor key in
+    /// `self.cursors` and the identity in every log line, so rewriting it on
+    /// an existing deployment resets that cursor, and the file is read from
+    /// the beginning and archived again — which is the very defect this issue
+    /// is about, reintroduced by its own fix.
+    ///
+    /// The non-canonical spelling is listed FIRST on purpose. With the
+    /// canonical one first the assertion holds either way and the test proves
+    /// nothing, which is how it was written the first time.
+    #[tokio::test]
+    async fn the_first_spelling_matched_is_the_name_that_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("logs")).unwrap();
+        std::fs::write(dir.path().join("logs/app.log"), "one\n").unwrap();
+        let base = dir.path().display().to_string();
+
+        let found: Vec<String> = FileSource::new(
+            vec![format!("{base}/logs/./app*"), format!("{base}/logs/*.log")],
+            TelemetryFormat::Raw,
+            false,
+        )
+        .discover_sources()
+        .await
+        .expect("a readable directory discovers")
+        .into_iter()
+        .map(|s| s.source_name)
+        .collect();
+
+        assert_eq!(found.len(), 1, "still one file: {found:?}");
+        assert_eq!(
+            found[0],
+            format!("{base}/logs/./app.log"),
+            "the name must be the spelling that was matched first, not the canonical \
+             form: it is the cursor key, and changing it re-reads and re-archives a file \
+             the engine had already committed"
+        );
+    }
+
+    /// A symlink and its target are one file, so they are discovered once
+    /// (#376).
+    ///
+    /// The same invariant as the spellings, arrived at from the other
+    /// direction: deduplication is about the inode, not the string. An
+    /// operator who globs a directory of symlinks beside the directory they
+    /// point at would otherwise archive every record twice.
+    #[tokio::test]
+    async fn a_symlink_and_its_target_are_discovered_once() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("real.log"), "one\n").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real.log"), dir.path().join("link.log"))
+            .unwrap();
+        let base = dir.path().display().to_string();
+
+        let found: Vec<String> = FileSource::new(
+            vec![format!("{base}/real*"), format!("{base}/link*")],
+            TelemetryFormat::Raw,
+            false,
+        )
+        .discover_sources()
+        .await
+        .expect("a readable directory discovers")
+        .into_iter()
+        .map(|s| s.source_name)
+        .collect();
+
+        assert_eq!(
+            found.len(),
+            1,
+            "a symlink and its target are one inode, so they are one source: {found:?}"
         );
     }
 
