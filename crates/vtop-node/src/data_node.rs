@@ -1913,6 +1913,17 @@ pub(crate) fn malformed_endpoint(configured: &str) -> Option<String> {
     // cluster — and rejecting it would refuse startup over correct config.
     // Everything else empty is still a mistake: a leading dot, or two in a row.
     let labels = host.strip_suffix('.').unwrap_or(host);
+    // DNS bounds the whole name as well as each label, and a name can breach
+    // the total while every label is legal — four labels of 63, 63, 63 and 62
+    // clear the per-label rule and cannot be encoded (review). 253 is the
+    // textual limit; the root dot, already stripped above, does not count
+    // toward it.
+    if labels.len() > 253 {
+        return Some(format!(
+            "the name is {} bytes, and DNS cannot encode one over 253",
+            labels.len()
+        ));
+    }
     // DNS cannot encode a label over 63 bytes, so one that is longer is a name
     // that can never resolve rather than one that has not yet (review).
     if let Some(long) = labels.split('.').find(|label| label.len() > 63) {
@@ -2688,8 +2699,17 @@ mod tests {
         }
 
         let too_long = format!("{}:9300", "a".repeat(64));
+        // Every label legal, the whole name not: 63 + 1 + 63 + 1 + 63 + 1 + 62.
+        let too_long_total = format!(
+            "{}.{}.{}.{}:9300",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(62)
+        );
         for (bad, expected) in [
             (too_long.as_str(), "cannot encode one over 63"),
+            (too_long_total.as_str(), "cannot encode one over 253"),
             ("vtop-1.vtop-headless", "no port"),
             ("vtop-1.vtop-headless:", "not a port"),
             ("vtop-1:not-a-number", "not a port"),
