@@ -7,11 +7,12 @@ description: >-
   plane. TLS material is never defaulted — you must supply your own Secrets.
 type: application
 # Chart version (the packaging), independent of the application version below.
+# 0.2.1: no template or values change — the bump carries appVersion 0.4.0.
 # 0.2.0: `replicated` renders symmetric candidates and data.leaderOrdinal is
 # retired (#284) — a values-contract change, hence the minor bump.
-version: 0.2.0
+version: 0.2.1
 # Must track the workspace version in Cargo.toml; the GHCR image tags follow it.
-appVersion: "0.3.1"
+appVersion: "0.4.0"
 kubeVersion: ">=1.25.0-0"
 home: https://github.com/allamiro/vtop-engine
 sources:
