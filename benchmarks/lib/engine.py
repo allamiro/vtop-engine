@@ -31,8 +31,12 @@ def write_engine_config(scenario, work_dir: str, state_db: str,
                         input_glob: str, config_path: str) -> str:
     backend = scenario.get("backend", "mock")
     bucket = scenario.get("bucket", "telemetry-data")
-    create_bucket = "true" if backend == "minio" else "false"
     endpoint = scenario.get("endpoint_url", "") or os.environ.get("VTOP_S3_ENDPOINT_URL", "")
+    # An explicit endpoint means the lab stack, whichever backend speaks to
+    # it — s3_native against MinIO needs its bucket created exactly as the
+    # mc-based backend does. Real S3 (s3_native, no endpoint) keeps bucket
+    # creation out of the runtime identity (SECURITY_MODEL §5).
+    create_bucket = "true" if (backend == "minio" or (backend == "s3_native" and endpoint)) else "false"
     whole_file = "true" if scenario.get("whole_file") or scenario.get("format") == "binary" else "false"
     checksum = scenario.get("checksum", "sha256")
     # The engine implements sha256 / blake3 / none; record the request as-is.
@@ -49,6 +53,15 @@ def write_engine_config(scenario, work_dir: str, state_db: str,
         f"  max_records: {scenario.get('batch_max_records', 10000)}",
         f"  max_bytes: {scenario.get('batch_max_bytes', 104857600)}",
         f"  max_batch_age_seconds: {scenario.get('batch_max_age_seconds', 60)}",
+    ]
+    # The #87 pipeline-width knob, surfaced so a scenario grid can vary it
+    # (#102: object_upload p95 vs concurrency is the signal that decides
+    # whether an adaptive controller has anything to react to). Absent =
+    # the engine default, exactly as before.
+    if scenario.get("max_concurrent_batches"):
+        lines.append(
+            f"  max_concurrent_batches: {scenario.get('max_concurrent_batches')}")
+    lines += [
         "compression:",
         f"  type: {scenario.get('compression', 'gzip')}",
         f"  level: {scenario.get('compression_level', 6)}",
@@ -116,7 +129,11 @@ def _dotenv_overrides() -> dict[str, str]:
 
 def _backend_env(scenario) -> dict[str, str]:
     env = dict(os.environ)
-    if scenario.get("backend") == "minio":
+    # s3_native pointed at the lab endpoint needs the same credentials the
+    # mc-based backend does; setdefault keeps real AWS credentials (already
+    # in the environment) winning over the lab fallbacks.
+    if scenario.get("backend") == "minio" or (
+            scenario.get("backend") == "s3_native" and scenario.get("endpoint_url")):
         # The benchmark compose lets an operator override the SERVER's
         # credentials via MINIO_ROOT_USER / MINIO_ROOT_PASSWORD (issue #81).
         # The client must follow the same variables THROUGH THE SAME
