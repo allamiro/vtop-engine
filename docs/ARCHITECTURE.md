@@ -23,6 +23,7 @@
 5. [The pipeline](#5-the-pipeline) *(see [Engine runtime flow](#engine-runtime-flow))*
 6. [Data-flow diagram](#6-data-flow-diagram)
 7. [Source adapters](#7-source-adapters)
+   - [7.1 What the commit rule does not cover](#71-what-the-commit-rule-does-not-cover)
 8. [Upload backends](#8-upload-backends)
 9. [Checksum subsystem](#9-checksum-subsystem)
 10. [Compression subsystem](#10-compression-subsystem)
@@ -222,11 +223,47 @@ All adapters implement `SourceAdapter`: expose records with progress markers, su
 
 | Adapter | Marker | Behavior |
 |---------|--------|----------|
-| `kafka_source` | Kafka offset per topic+partition | `rdkafka` consumer with **auto-commit always disabled**. One batch = one topic + one partition + one offset range (partitions never mixed). Supports topic include/exclude regex and TLS/SASL config. Offsets committed only after `VERIFIED`. |
+| `kafka_source` | Kafka offset per topic+partition | `rdkafka` consumer with **auto-commit always disabled**. Retention can overtake a committed cursor silently — see §7.1. One batch = one topic + one partition + one offset range (partitions never mixed). Supports topic include/exclude regex and TLS/SASL config. Offsets committed only after `VERIFIED`. |
 | `file_source` | File byte offset | Reads append-only files, tracking `path`, `inode`, byte offsets, size, and mtime. Line-oriented mode (a partial trailing line is never committed) **and** a whole-file mode for binary/compressed-source inputs. Resumes from the last committed byte; replay rewinds to the start of the uncommitted range. |
 | `syslog_spool_source` | Spool byte offset | Treats rsyslog/syslog-ng spool files as append-only with a `spool_id` + byte range. External collectors own delivery; VTOP owns batching, checksum, manifest, upload, verification, replay state, and the commit rule. |
 
 The marker carried by each adapter is a `SourceProgressMarker` — the unit bound into the manifest and gated by the commit rule.
+
+### 7.1 What the commit rule does not cover
+
+The commit rule protects records the engine **read**. It says nothing about
+records that stopped existing before the engine got to them, and for Kafka that
+is a real and silent condition.
+
+`auto.offset.reset` is passed through to `rdkafka` and defaults to `earliest`
+(`kafka_source.rs`). It reaches that default by two different routes, and both
+end the same way:
+
+- **After a restart** — a fresh process has no in-memory cursor, so the
+  partition is assigned at `Offset::Stored` and librdkafka resolves it from the
+  committed offset, or from `auto.offset.reset` when that offset no longer
+  exists.
+- **While still running** — the assignment is sticky and ordinary lag does not
+  seek at all; the pass seeks only where the desired offset diverges from what
+  librdkafka would deliver next. A consumer that simply falls behind therefore
+  keeps fetching forward until the broker answers out-of-range, and the reset
+  applies there.
+
+Either way the consumer resumes at the **new** earliest offset. Nothing queries the
+watermarks, nothing compares the resumed offset against the committed one, and
+no metric fires. The gap between them is data that was never batched, never
+manifested, never verified and never missed.
+
+This is not a defect in the commit rule; it is the boundary of what a
+commit-after-verification design can assert. Every guarantee in this document
+about replay safety, manifests and verification applies to a record once the
+engine has seen it. **Size retention above worst-case lag, and monitor consumer
+lag independently of VTOP**, because VTOP will not tell you.
+
+Tracked as #361, which also carries the question of whether the adapter should
+refuse rather than resume when it detects the jump — a refusal is only useful
+if an operator can act on it, and a source that stops archiving because it fell
+behind may be worse than one that archives what remains.
 
 ---
 
