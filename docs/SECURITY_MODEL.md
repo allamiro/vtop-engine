@@ -23,6 +23,7 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are used as normat
 13. [Supply-chain security](#13-supply-chain-security)
 14. [Security properties provided vs. not provided](#14-security-properties-provided-vs-not-provided)
 15. [Summary of normative rules](#15-summary-of-normative-rules)
+16. [Cryptographic primitive inventory](#16-cryptographic-primitive-inventory)
 
 ---
 
@@ -340,3 +341,79 @@ the ignore list and the build re-audited.
 | Native broker sessions authorized by an explicit `SessionAuthorizer` | **MUST** |
 | Native clients validate the broker certificate and expected server identity | **MUST** |
 | Native produce bound to the authenticated principal (`producer_id == principal_id`) | **MUST** |
+
+---
+
+## 16. Cryptographic primitive inventory
+
+The prerequisite for any FIPS conversation (#296): every cryptographic
+primitive the workspace runs, where it runs, and whether it performs a
+**security function** (defends against an adversary; would need an approved
+algorithm under FIPS) or a **non-security integrity check** (detects
+corruption by a trusted writer; FIPS does not constrain it). The
+classification column is a **proposal** — merging this table ratifies the
+uncontested rows, and the questions the code cannot answer by itself are
+flagged and collected below the tables.
+
+### 16.1 First-party primitives
+
+| Primitive | Where it runs | What it protects | Proposed class |
+|---|---|---|---|
+| BLAKE3 keyed MAC (`manifest_mac_key_env`) | manifest build/verify (`vtop-core/manifest.rs`) | manifest authenticity against an adversary with object-store write access; constant-time compare, fail-closed when keyed | **security function** |
+| BLAKE3 keyed MAC (segment commit key) | v2 commit statement (`vtop-log/types.rs`, seal/verify/tier) | signed assertion of a sealed segment's identity, boundaries, root and manifest digest | **security function** |
+| BLAKE3 unkeyed content commitments: v2 chunk-tree root + Merkle proofs, v1 `blake3_root`, `manifest_core_digest`, tier-copy whole-file digest gate | seal, offline verify, `vtopctl tier copy/rehydrate`, Raft-pinned `CommitTierEvidence` | tamper-evidence of sealed content **when the root is pinned somewhere the adversary cannot rewrite** (Raft metadata, operator `--expect-root`, cursors); locally, corruption detection | **flagged — Q1 below** |
+| SHA-256 / BLAKE3 object checksum (`checksum.algorithm`, default sha256) | archive-plane object write + read-back verify before commit | stored-object corruption; unkeyed, so substitution is the MAC's job | integrity check |
+| SHA-256 manifest self-hash (fixed, not configurable) | every manifest | manifest corruption/truncation; the doc-stated "reproducible corruption-detection record" | integrity check |
+| Ledger cross-check (`object_sha256` / `manifest_sha256` columns vs storage) | recovery re-check, `vtopctl` deep verify | rejects a coherently-replaced object+manifest pair that is internally self-consistent — a two-root-of-trust binding | **flagged — Q1 below** |
+| BLAKE3 unkeyed 32-byte trailers | segment headers/frames, `.producers`, `.chunks`, commit-boundary, truncate/retention intent markers, Raft hard state/log/snapshots, VTPM + native wire frames, epoch journal | torn writes, bit rot, frame desync — written and re-read by the same trusted process; wire planes run under TLS, which owns authenticity | integrity check |
+| CRC-32C (hand-rolled, vector-pinned) | `vtop-kafka` RecordBatch v2 | Kafka wire-format corruption; the code itself documents it as forgeable | integrity check |
+| BLAKE3 as a stable PRF (derive-key): rendezvous placement, multipart session name, tier-copy request id, `storage_producer_id`; SHA-256 lock-file name | placement, upload resume, idempotency keys, single-instance lock | nothing adversarial — deterministic derivation and naming; any stable hash would do | **neither** (not a check, not a control) |
+| Idempotent-producer content hash | duplicate-vs-conflict decision on retry | content-equality fingerprint; producer controls both sides | integrity check (accidental-collision resistance only) |
+| UUID v4 (OS CSPRNG via `getrandom`) | request ids, batch ids, temp names, lineage ids, session nonce | uniqueness, never secrecy: fencing is monotonic epochs, principals are configured; the native `session_nonce` is generated and **not yet consumed** (reserved binding point) | **neither** |
+
+### 16.2 Delegated primitives (an external library chooses and implements)
+
+| Family | Stack | Function | Class |
+|---|---|---|---|
+| Cluster-plane TLS (admin, Raft peer, replica, native client) | rustls 0.23, **ring pinned at every construction site**, TLS 1.3 only, mutual, CN identity via `x509-parser` after chain validation | peer authentication, confidentiality, authorization input (CN is a Raft **safety** input on the peer plane) | security function |
+| Kafka source transport | librdkafka (vendored C, cmake) + **system OpenSSL** (`ssl`) + **system Cyrus SASL** (`sasl`) | broker TLS + SASL auth; plaintext unless configured (SHOULD-level, §2); missing password env is a hard startup error, never a silent downgrade | security function |
+| S3 upload transport + signing | AWS SDK: hyper 1 + hyper-rustls + rustls 0.23 with the SDK's **aws-lc-rs** provider, system roots; SigV4 HMAC-SHA-256 (SigV4a/P-256 available, never explicitly invoked) | endpoint TLS (scheme floor via `verify_tls`; cert verification not disableable) and per-request authentication | security function |
+| Postgres state store (`--features postgres`) | sqlx with `tls-rustls-ring-webpki` (the one place the workspace picks the stack); SCRAM-SHA-256 auth with ChaCha CSPRNG nonces | verify-full floor for remote hosts (§2, MUST); database authentication | security function |
+| Release supply chain | cosign keyless (Sigstore), SPDX SBOM, provenance, SHA256SUMS | image + artifact authenticity; SHA256SUMS alone is integrity only, and the release notes say so | security function |
+| Test-only material | `rcgen` (dev-deps), ECDSA P-256 + SHA-256 cert minting in `gen-certs.sh` / `k8s-smoke.sh`, PEM key loading (`TlsMaterial::from_pem_files`) as the production ingestion boundary | throwaway harness PKI; production operators bring their own PEM | security function (test scope) |
+
+Two rustls crypto providers coexist in the tree by design: **ring** (pinned
+explicitly at every cluster-plane construction site, precisely because
+feature unification pulls aws-lc-rs into the lockfile) and the AWS SDK's
+own default for S3. First-party code contains **no HMAC, no SHA-1, no MD5**;
+those appear only inside the delegated stacks above. At-rest encryption is
+delegated to the storage layer (§7).
+
+### 16.3 The questions this inventory exists to ask
+
+**Q1 — the substantive one (#296 calls it that):** are the *unkeyed* BLAKE3
+content commitments a security function? Locally each is a corruption
+check, but the offline verifier's stated threat model is adversarial, and
+the tier flow pins `content_root` / `manifest_core_digest` into Raft
+metadata precisely so an untrusted object store cannot substitute content —
+there, collision/second-preimage resistance is load-bearing. The same
+question covers the ledger cross-check (an unkeyed two-root-of-trust
+binding that defeats coherent substitution). If ratified as a security
+function, BLAKE3 itself is inside the FIPS boundary and the v2 format
+grows a pluggable-digest question; if ratified as defense-in-depth
+integrity, the FIPS story needs only the keyed MACs addressed.
+
+**Q2 — the FIPS consequence, either way:** a FIPS-shaped deployment can
+already select `checksum.algorithm: sha256` (the default) and leave the
+MAC keys unset — but then manifest **authentication does not exist**, and
+the only authenticated-content mechanisms in the workspace (both MACs, the
+chunk tree) are BLAKE3-only. There is no FIPS-approved authenticated path
+today; that is the gap the later #296 checkboxes exist to close, not a
+property this inventory can document around.
+
+**Q3 — housekeeping the sweep surfaced:** the produce/fetch
+`PrincipalAuthorizer` ignores the verified certificate chain (the declared
+principal is matched against config, not bound to the cert — unlike the
+meta and replica planes, where the leaf CN *is* the identity); and only one
+CI container is digest-pinned (`actionlint`) while the shellcheck images
+are tag-pinned. Both are posture notes, not inventory rows.
