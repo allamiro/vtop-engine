@@ -455,6 +455,16 @@ struct Resolution {
     /// When the name was last looked up, so a candidate that is simply down
     /// is not a name query per request.
     resolved_at: Option<std::time::Instant>,
+    /// A lookup for this candidate is running right now.
+    ///
+    /// The throttle alone does not bound concurrency: it is 200 ms and a
+    /// lookup may take up to `RESOLVE_TIMEOUT`, so a second request can start
+    /// one while the first is still out — and if the name changed between
+    /// them, the SLOWER lookup lands last and reverts the candidate to the
+    /// older address (review). One at a time removes the race rather than
+    /// ordering it. The same guard is on the Raft peer directory, and having
+    /// fixed one and not the other is how this was found.
+    resolving: bool,
 }
 
 /// How long one candidate may take to become a usable connection before the
@@ -579,6 +589,7 @@ impl AdminClient {
                 // it up rather than dial nothing.
                 stale: candidate.host.is_some() && candidate.endpoint.port() == 0,
                 resolved_at: None,
+                resolving: false,
             })
             .collect();
         Ok(Self {
@@ -940,6 +951,7 @@ impl AdminClient {
             };
             candidate.endpoint = resolution.endpoint;
             let due = resolution.stale
+                && !resolution.resolving
                 && !resolution
                     .resolved_at
                     .is_some_and(|at| at.elapsed() < RERESOLVE_INTERVAL);
@@ -947,6 +959,7 @@ impl AdminClient {
                 return candidate;
             }
             resolution.resolved_at = Some(std::time::Instant::now());
+            resolution.resolving = true;
         }
         let resolved =
             match tokio::time::timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host(&host)).await {
@@ -962,6 +975,11 @@ impl AdminClient {
             };
         // A lookup that fails leaves the last known address standing: a
         // resolver hiccup is not evidence that a member moved.
+        // Cleared whatever the outcome, including a timeout, so a lookup that
+        // never answered does not wedge the candidate.
+        if let Some(resolution) = self.resolutions.lock().expect("resolutions").get_mut(index) {
+            resolution.resolving = false;
+        }
         if let Some(addr) = resolved {
             // PERSISTED, not used and forgotten. An address that lived only in
             // this clone would be rediscovered — at the cost of a connect
