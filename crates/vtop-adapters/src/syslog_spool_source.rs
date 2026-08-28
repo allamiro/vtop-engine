@@ -20,6 +20,21 @@ use vtop_core::types::{ProgressMarker, SourceType, TelemetryFormat};
 struct SpoolCursor {
     read_byte: u64,
     committed_byte: u64,
+    /// What the spool looked like when this cursor last caught up with it.
+    ///
+    /// Kept so a cycle can decide NOT to open the file at all (#101). `None`
+    /// until a read has actually observed the file, so an unseen spool is
+    /// always read rather than skipped on an assumption.
+    seen: Option<SpoolSeen>,
+}
+
+/// Identity of a spool file as a read last observed it: enough to prove,
+/// with one stat, that nothing has happened to it since.
+#[derive(Debug, Clone, PartialEq)]
+struct SpoolSeen {
+    inode: Option<u64>,
+    file_size: u64,
+    mtime: String,
 }
 
 pub struct SyslogSpoolSource {
@@ -39,6 +54,63 @@ impl SyslogSpoolSource {
         let c = self.cursors.entry(path.to_string()).or_default();
         c.committed_byte = committed_byte;
         c.read_byte = committed_byte;
+    }
+
+    /// Whether this cycle can skip opening `path` entirely (#101 — the
+    /// stat-before-read mechanism #363 built for the file source, ported on
+    /// the measured 2.5x: an open-seek-read-fstat per cold spool versus the
+    /// one stat this replaces).
+    ///
+    /// A spool directory is mostly cold — a few files the collector is
+    /// appending to, and history it will never touch again.
+    ///
+    /// THE CONDITION IS DELIBERATELY NARROW. All four must hold: the file
+    /// must be the same INODE this cursor last saw, at the same SIZE, at the
+    /// same MTIME, and the cursor must already have read through to that
+    /// size. Anything else — an append, a truncation, a rotation that reused
+    /// the name, a partial trailing line still being written (its cursor
+    /// sits before the end), a file this cursor has never observed — falls
+    /// through to a real read. And EQUALITY on the cursor, not `>=`: a
+    /// cursor beyond the file's end is not a caught-up cursor, it is an
+    /// inconsistency, and the right response to an inconsistency is to look,
+    /// not to skip.
+    ///
+    /// This cannot trap the way the #99 backoff did: the stat is a reliable
+    /// emptiness check at full strength every cycle, and any byte the
+    /// collector appends changes both the size and the mtime compared
+    /// against. A spool that starts moving again is read on the very next
+    /// pass.
+    fn can_skip(cursor: &SpoolCursor, current: &SpoolSeen) -> bool {
+        let Some(seen) = cursor.seen.as_ref() else {
+            return false;
+        };
+        seen.inode == current.inode
+            && seen.file_size == current.file_size
+            && seen.mtime == current.mtime
+            && cursor.read_byte == current.file_size
+    }
+
+    /// Stat a path without opening it, for the skip decision. A path that
+    /// cannot be stat'd is NOT skipped: it is handed to the read, which
+    /// reports the error properly instead of having it swallowed here as a
+    /// silent skip.
+    fn stat_identity(path: &str) -> Option<SpoolSeen> {
+        std::fs::metadata(path).ok().map(|md| Self::seen_of(&md))
+    }
+
+    fn seen_of(md: &std::fs::Metadata) -> SpoolSeen {
+        SpoolSeen {
+            inode: inode_of(md),
+            file_size: md.len(),
+            mtime: md
+                .modified()
+                .ok()
+                .map(|t| {
+                    let dt: chrono::DateTime<chrono::Utc> = t.into();
+                    dt.to_rfc3339()
+                })
+                .unwrap_or_default(),
+        }
     }
 
     fn spool_id(path: &str) -> String {
@@ -69,7 +141,7 @@ impl SyslogSpoolSource {
         start: u64,
         max_records: usize,
         max_bytes: usize,
-    ) -> Result<(Vec<Vec<u8>>, u64, Option<u64>), VtopError> {
+    ) -> Result<(Vec<Vec<u8>>, u64, SpoolSeen), VtopError> {
         let mut file = tokio::fs::File::open(&path).await?;
         file.seek(std::io::SeekFrom::Start(start)).await?;
         // Put the whole-call byte limiter BELOW BufReader. If Take wrapped the
@@ -116,9 +188,11 @@ impl SyslogSpoolSource {
         }
         // Fingerprint the descriptor whose bytes were actually consumed. A
         // path lookup here could instead describe a replacement installed by
-        // a concurrent spool rotation (#127).
-        let inode = inode_of(&reader.get_ref().get_ref().metadata().await?);
-        Ok((records, pos, inode))
+        // a concurrent spool rotation (#127). The whole identity comes back,
+        // not only the inode: what the read OBSERVED is what the next
+        // cycle's skip decision must compare against (#101).
+        let seen = Self::seen_of(&reader.get_ref().get_ref().metadata().await?);
+        Ok((records, pos, seen))
     }
 }
 
@@ -155,9 +229,27 @@ impl SourceAdapter for SyslogSpoolSource {
     ) -> Result<Vec<ReadResult>, VtopError> {
         let path = source.source_name.clone();
         let start = self.cursors.entry(path.clone()).or_default().read_byte;
-        let (records, pos, inode) =
+        // Same skip as the shared pass (#101): one stat instead of an open
+        // the cycle would learn nothing from.
+        if let Some(current) = Self::stat_identity(&path) {
+            let cursor = self.cursors.get(&path).expect("entry created above");
+            if Self::can_skip(cursor, &current) {
+                return Ok(vec![ReadResult {
+                    progress_start: Self::marker(&path, current.inode, start, start),
+                    progress_end: Self::marker(&path, current.inode, start, start),
+                    records: Vec::new(),
+                    first_timestamp: None,
+                    last_timestamp: None,
+                    verbatim: false,
+                }]);
+            }
+        }
+        let (records, pos, seen) =
             Self::read_slice(path.clone(), start, max_records, max_bytes).await?;
-        self.cursors.get_mut(&path).unwrap().read_byte = pos;
+        let inode = seen.inode;
+        let cursor = self.cursors.get_mut(&path).unwrap();
+        cursor.read_byte = pos;
+        cursor.seen = Some(seen);
 
         Ok(vec![ReadResult {
             progress_start: Self::marker(&path, inode, start, start),
@@ -183,24 +275,40 @@ impl SourceAdapter for SyslogSpoolSource {
         use futures::StreamExt;
         let started = std::time::Instant::now();
 
-        let jobs: Vec<(usize, String, u64)> = sources
-            .iter()
-            .enumerate()
-            .map(|(i, s)| {
-                let start = self
-                    .cursors
-                    .entry(s.source_name.clone())
-                    .or_default()
-                    .read_byte;
-                (i, s.source_name.clone(), start)
-            })
-            .collect();
+        // STAT BEFORE READ (#101). Cold spool files — cursor caught up,
+        // identity unchanged since the read that caught it up — are
+        // separated out here and never opened; what is left is the work the
+        // pass actually has to do.
+        let mut jobs: Vec<(usize, String, u64)> = Vec::new();
+        let mut skipped: Vec<(usize, String, u64, SpoolSeen)> = Vec::new();
+        for (i, s) in sources.iter().enumerate() {
+            let path = s.source_name.clone();
+            let cursor = self.cursors.entry(path.clone()).or_default();
+            let start = cursor.read_byte;
+            match Self::stat_identity(&path) {
+                Some(current) if Self::can_skip(cursor, &current) => {
+                    skipped.push((i, path, start, current));
+                }
+                _ => jobs.push((i, path, start)),
+            }
+        }
+        // COUNTED, not silent — the #100 visibility rule holds here too: a
+        // cycle that skipped nine spools out of ten is a very different
+        // cycle from one that read all ten and found them empty, and they
+        // look identical in every other metric.
+        if !skipped.is_empty() {
+            tracing::debug!(
+                skipped = skipped.len(),
+                read = jobs.len(),
+                "spool_cycle_skipped_unchanged"
+            );
+        }
 
         let mut results: Vec<(
             usize,
             String,
             u64,
-            Result<(Vec<Vec<u8>>, u64, Option<u64>), VtopError>,
+            Result<(Vec<Vec<u8>>, u64, SpoolSeen), VtopError>,
         )> = futures::stream::iter(jobs.into_iter().map(|(i, path, start)| async move {
             let res = Self::read_slice(path.clone(), start, max_records, max_bytes).await;
             (i, path, start, res)
@@ -218,10 +326,33 @@ impl SourceAdapter for SyslogSpoolSource {
         };
         let mut any_records = false;
         let mut any_failed = false;
+        // Skipped spools report an empty read at the cursor they already
+        // hold, so the caller sees one outcome per source however the cycle
+        // got there; sorted back into source order below.
+        for (source_index, path, start, current) in skipped {
+            report.outcomes.push(SourceReadOutcome {
+                source_index,
+                result: Ok(vec![ReadResult {
+                    progress_start: Self::marker(&path, current.inode, start, start),
+                    progress_end: Self::marker(&path, current.inode, start, start),
+                    records: Vec::new(),
+                    first_timestamp: None,
+                    last_timestamp: None,
+                    verbatim: false,
+                }]),
+            });
+        }
         for (source_index, path, start, res) in results {
             let result = match res {
-                Ok((records, pos, inode)) => {
-                    self.cursors.get_mut(&path).unwrap().read_byte = pos;
+                Ok((records, pos, seen)) => {
+                    let inode = seen.inode;
+                    let cursor = self.cursors.get_mut(&path).unwrap();
+                    cursor.read_byte = pos;
+                    // What the read ACTUALLY observed, not what the stat saw
+                    // before it: the spool can grow between the two, and
+                    // recording the earlier identity would let the next
+                    // cycle skip bytes this one never read.
+                    cursor.seen = Some(seen);
                     any_records |= !records.is_empty();
                     Ok(vec![ReadResult {
                         progress_start: Self::marker(&path, inode, start, start),
@@ -242,6 +373,9 @@ impl SourceAdapter for SyslogSpoolSource {
                 result,
             });
         }
+        // ONE ORDER OUT, whatever order the work happened in: source order
+        // is part of this report's contract and a skip must not change it.
+        report.outcomes.sort_by_key(|o| o.source_index);
         // Shared attribution, same convention as the other overrides: the
         // overlapped reads are one wall-clock bucket.
         let elapsed = started.elapsed().as_millis() as u64;
@@ -562,5 +696,203 @@ mod tests {
             panic!("expected syslog-spool marker");
         };
         assert_eq!(inode, None);
+    }
+
+    fn seen(inode: Option<u64>, file_size: u64, mtime: &str) -> SpoolSeen {
+        SpoolSeen {
+            inode,
+            file_size,
+            mtime: mtime.to_string(),
+        }
+    }
+
+    fn caught_up_cursor(at: u64, identity: SpoolSeen) -> SpoolCursor {
+        SpoolCursor {
+            read_byte: at,
+            committed_byte: at,
+            seen: Some(identity),
+        }
+    }
+
+    #[test]
+    fn a_caught_up_unchanged_spool_is_skippable() {
+        let id = seen(Some(7), 100, "2026-08-28T12:00:00+00:00");
+        assert!(
+            SyslogSpoolSource::can_skip(&caught_up_cursor(100, id.clone()), &id),
+            "identical identity with the cursor at its end is the ONE state \
+             the skip exists for; refusing it makes the port a no-op"
+        );
+    }
+
+    #[test]
+    fn an_appended_spool_is_not_skippable() {
+        let id = seen(Some(7), 100, "2026-08-28T12:00:00+00:00");
+        let grown = seen(Some(7), 150, "2026-08-28T12:00:05+00:00");
+        assert!(
+            !SyslogSpoolSource::can_skip(&caught_up_cursor(100, id), &grown),
+            "an appended spool has unread bytes; skipping it is starvation, \
+             the exact trap the #99 backoff fell into"
+        );
+    }
+
+    #[test]
+    fn a_rotated_spool_with_the_same_size_is_not_skippable() {
+        let id = seen(Some(7), 100, "2026-08-28T12:00:00+00:00");
+        let replaced = seen(Some(9), 100, "2026-08-28T12:00:00+00:00");
+        assert!(
+            !SyslogSpoolSource::can_skip(&caught_up_cursor(100, id), &replaced),
+            "a rotation that reused the name at the same size is a different \
+             file with 100 unread bytes; a size-keyed skip would never read it"
+        );
+    }
+
+    #[test]
+    fn a_cursor_short_of_the_end_is_not_skippable() {
+        let id = seen(Some(7), 100, "2026-08-28T12:00:00+00:00");
+        assert!(
+            !SyslogSpoolSource::can_skip(&caught_up_cursor(80, id.clone()), &id),
+            "a cursor before the end means a partial trailing line is still \
+             pending; skipping would leave its completion unread forever"
+        );
+    }
+
+    #[test]
+    fn a_cursor_beyond_the_end_is_not_skippable() {
+        let id = seen(Some(7), 100, "2026-08-28T12:00:00+00:00");
+        assert!(
+            !SyslogSpoolSource::can_skip(&caught_up_cursor(120, id.clone()), &id),
+            "a cursor past the file's end is an inconsistency (the file \
+             shrank under a read head that had passed the new end), and the \
+             right response to an inconsistency is to look, not to skip — \
+             this is the `==` vs `>=` review case from #363"
+        );
+    }
+
+    #[test]
+    fn a_spool_never_seen_before_is_never_skipped() {
+        let id = seen(Some(7), 0, "2026-08-28T12:00:00+00:00");
+        let unseen = SpoolCursor::default();
+        assert!(
+            !SyslogSpoolSource::can_skip(&unseen, &id),
+            "no read has observed this file; skipping on an assumption \
+             would make an empty-so-far spool invisible forever"
+        );
+    }
+
+    /// The no-starvation proof for the skip (#101): a spool that goes cold
+    /// and then starts moving again is read on the very next pass, because
+    /// the appended byte changes the size and mtime the stat compares
+    /// against. A skip that latched — recording an identity it never
+    /// refreshes, or never re-statting a file it once skipped — fails here.
+    #[tokio::test]
+    async fn a_skipped_spool_that_grows_again_is_read_on_the_very_next_pass() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "<13>cold one").unwrap();
+        f.flush().unwrap();
+        let path = f.path().to_string_lossy().into_owned();
+        let src = DiscoveredSource {
+            source_type: SourceType::SyslogSpool,
+            source_name: path.clone(),
+            format: TelemetryFormat::Syslog,
+        };
+
+        let mut spool = SyslogSpoolSource::new(vec![path.clone()]);
+        let first = spool
+            .read_batch_candidates(&src, 10, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            first[0].records.len(),
+            1,
+            "the warm-up read must consume the line"
+        );
+
+        let second = spool
+            .read_batch_candidates(&src, 10, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(
+            second[0].records.is_empty(),
+            "a caught-up unchanged spool yields nothing, skipped or read"
+        );
+
+        writeln!(f, "<13>warm again").unwrap();
+        f.flush().unwrap();
+        let third = spool
+            .read_batch_candidates(&src, 10, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            third[0].records.len(),
+            1,
+            "the appended line must arrive on the pass after the append; \
+             anything later means the skip starved a live spool"
+        );
+        assert_eq!(third[0].records[0], b"<13>warm again");
+    }
+
+    /// The shared pass reports one outcome per source in source order,
+    /// however each source got its outcome (#101): a skip must be
+    /// indistinguishable from an empty read in the report's shape, and it
+    /// must not reorder the sources around it.
+    #[tokio::test]
+    async fn a_cold_spool_in_a_shared_pass_keeps_its_place_in_the_report() {
+        let mut cold = tempfile::NamedTempFile::new().unwrap();
+        writeln!(cold, "<13>cold").unwrap();
+        cold.flush().unwrap();
+        let mut hot = tempfile::NamedTempFile::new().unwrap();
+        writeln!(hot, "<13>hot one").unwrap();
+        hot.flush().unwrap();
+        let cold_path = cold.path().to_string_lossy().into_owned();
+        let hot_path = hot.path().to_string_lossy().into_owned();
+        let srcs: Vec<DiscoveredSource> = [&cold_path, &hot_path]
+            .iter()
+            .map(|p| DiscoveredSource {
+                source_type: SourceType::SyslogSpool,
+                source_name: (*p).clone(),
+                format: TelemetryFormat::Syslog,
+            })
+            .collect();
+
+        let mut spool = SyslogSpoolSource::new(vec![cold_path.clone(), hot_path.clone()]);
+        spool
+            .read_all_batch_candidates(&srcs, 10, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+
+        writeln!(hot, "<13>hot two").unwrap();
+        hot.flush().unwrap();
+        let report = spool
+            .read_all_batch_candidates(&srcs, 10, 1 << 20, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            report.outcomes.len(),
+            2,
+            "one outcome per source is the report's contract, and a skipped \
+             source must not vanish from it"
+        );
+        assert_eq!(
+            (
+                report.outcomes[0].source_index,
+                report.outcomes[1].source_index
+            ),
+            (0, 1),
+            "source order is part of the contract; a skip must not push the \
+             cold file behind the hot one"
+        );
+        let cold_reads = report.outcomes[0].result.as_ref().unwrap();
+        assert!(
+            cold_reads[0].records.is_empty(),
+            "the cold spool has nothing new, skipped or read"
+        );
+        let hot_reads = report.outcomes[1].result.as_ref().unwrap();
+        assert_eq!(
+            hot_reads[0].records.len(),
+            1,
+            "the hot spool's append must arrive in the same pass that \
+             skipped its cold neighbour"
+        );
+        assert_eq!(hot_reads[0].records[0], b"<13>hot two");
     }
 }
