@@ -43,7 +43,7 @@ head-on.
 
 | Gap | Honest state | Closing item |
 |---|---|---|
-| Epoch-qualified truncation (KIP-101/KIP-279) | Largely closed in v0.2.0: per-replica epoch history, bounded divergence truncation, fence-and-read reconciliation. The remaining piece is the §5.4.1-style election restriction and the signed leadership-transition record. | #240 remainder |
+| Epoch-qualified truncation (KIP-101/KIP-279) | Largely closed in v0.2.0: per-replica epoch history, bounded divergence truncation, fence-and-read reconciliation. The §5.4.1-style election restriction shipped in v0.3.1 (`promotion.rs`, per-voter form, three tests). The remaining piece is the signed leadership-transition record. | #240 remainder |
 | Transactions / EOS | Kafka has cross-partition transactions and exactly-once streams. VTOP has producer idempotency (epoch + sequence dedup) — enough for exactly-once produce per range, no cross-range transactions. | Not scheduled; deliberate scope cut for now |
 | Consumer-group sophistication | Kafka has incremental cooperative rebalancing, static membership, regex subscriptions. VTOP has groups, cursors-in-metadata, heartbeats, and assignment — the minimum honest core. | Grows with #225's needs |
 | Ecosystem | Clients in every language, Connect, Streams, MirrorMaker, ksqlDB, decades of operational tooling. VTOP has `vtopctl` and dashboards-as-code. | #225 (Kafka wire-compatibility gateway) — inherit the client ecosystem instead of rebuilding it |
@@ -95,8 +95,8 @@ is to be the system whose **claims are checkable**:
 
 1. **Close the correctness gaps the incumbents already closed** — #239
    (epoch propagation) and admin authorization (#238) landed in v0.2.0; the
-   #240 remainder (election restriction, signed transition record) is what's
-   left — so parity is real, not asserted.
+   #240 remainder is down to the signed transition record — the election
+   restriction itself shipped in v0.3.1 — so parity is real, not asserted.
 2. **Keep the evidence advantage** — every new mechanism (repair, tiering,
    failover) lands with proofs and offline verification, which neither Kafka
    nor Northguard's public material offers.

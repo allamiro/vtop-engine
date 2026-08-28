@@ -171,11 +171,19 @@ v0.4.0 as a watch item.
 
 ## v0.4.0 and beyond
 
-The **#240 remainder** moves here wholesale: the election-restriction question
-(Raft dissertation §5.4.1) and the signed leadership-transition record are one
-design conversation — restricting who may be promoted and proving who was —
-and splitting them across a patch-release boundary would ship half an
-argument.
+The **#240 remainder** is now one item, not two. The election restriction
+shipped: `promotion.rs` requires a majority of answering replicas to sit at or
+below the candidate's own committed offset before it may be promoted, which is
+Raft dissertation §5.4.1 in its per-voter form — any record acknowledged on a
+quorum lives on at least one member of every majority, so a candidate a
+majority can vouch for holds every acknowledged record. Three tests pin it,
+including the case the floor check alone would wave through.
+
+What remains of #240 is the **signed leadership-transition record**: proving
+who led, rather than restricting who may. That is a new evidence format
+touching the verification tooling, and it is a design conversation on its own —
+#265 was built and withdrawn for not closing the hazard it was written for,
+which is the reason this half is not being hurried.
 
 **Candidate mode shipped here (#284)**: the data node's role now follows the
 metadata lease inside the binary — every pod a candidate, an election deciding
