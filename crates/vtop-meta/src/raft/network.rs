@@ -90,6 +90,14 @@ struct Peer {
     /// together (#367).
     addr: Option<SocketAddr>,
     resolved_at: Option<std::time::Instant>,
+    /// A lookup for this peer is running right now.
+    ///
+    /// The throttle alone does not bound concurrency: it is 200 ms and a
+    /// lookup may take up to `RESOLVE_TIMEOUT`, so a second call can start
+    /// while the first is still out — and if the name changed between them,
+    /// the SLOWER one lands last and overwrites the newer answer (review).
+    /// One at a time removes the race rather than ordering it.
+    resolving: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -113,6 +121,7 @@ impl PeerDirectory {
                 server_name: endpoint.server_name,
                 addr: Some(endpoint.addr),
                 resolved_at: None,
+                resolving: false,
             },
         );
     }
@@ -132,6 +141,7 @@ impl PeerDirectory {
                 server_name,
                 addr: None,
                 resolved_at: None,
+                resolving: false,
             },
         );
         self.re_resolve(id).await;
@@ -172,13 +182,15 @@ impl PeerDirectory {
             let Some(host) = peer.host.clone() else {
                 return;
             };
-            if peer
-                .resolved_at
-                .is_some_and(|at| at.elapsed() < RERESOLVE_INTERVAL)
+            if peer.resolving
+                || peer
+                    .resolved_at
+                    .is_some_and(|at| at.elapsed() < RERESOLVE_INTERVAL)
             {
                 return;
             }
             peer.resolved_at = Some(std::time::Instant::now());
+            peer.resolving = true;
             host
         };
         // BOUNDED, because a resolver can stall and this is on the path of an
@@ -205,6 +217,7 @@ impl PeerDirectory {
         let Some(peer) = peers.get_mut(&id) else {
             return;
         };
+        peer.resolving = false;
         // A lookup that failed leaves the last known address standing. It may
         // still be right — a resolver hiccup is not evidence a peer moved —
         // and replacing it with nothing would turn a transient DNS failure

@@ -1203,7 +1203,14 @@ impl FollowerDriver {
         // stream took twice as long to come back as the number that was tuned
         // for it (review). Finding out where a peer is, is part of reaching
         // it.
+        // The budget covers the whole of ESTABLISHMENT — lookup, dial and
+        // handshake — because they are one thing from the caller's side and
+        // splitting them lets each pay the full price in turn (review). The
+        // deadline is computed once and the remainder carried forward, so a
+        // slow name lookup shortens the handshake's share rather than granting
+        // it a fresh one.
         let budget = self.flow.connect_timeout;
+        let deadline = tokio::time::Instant::now() + budget;
         let tcp = match timeout(budget, self.resolve_and_connect()).await {
             Ok(Ok(tcp)) => tcp,
             _ => return SessionOutcome::Disconnected,
@@ -1214,15 +1221,13 @@ impl FollowerDriver {
                     Ok(name) => name,
                     Err(_) => return SessionOutcome::Disconnected,
                 };
-                let tls = match timeout(
-                    self.flow.connect_timeout,
-                    connector.connect(server_name, tcp),
-                )
-                .await
-                {
-                    Ok(Ok(stream)) => stream,
-                    _ => return SessionOutcome::Disconnected,
-                };
+                let tls =
+                    match tokio::time::timeout_at(deadline, connector.connect(server_name, tcp))
+                        .await
+                    {
+                        Ok(Ok(stream)) => stream,
+                        _ => return SessionOutcome::Disconnected,
+                    };
                 // Skipped EXPLICITLY under plaintext below, not folded into a
                 // helper that tolerates a missing certificate: this check is
                 // what stops a leader replicating into whichever replica now
