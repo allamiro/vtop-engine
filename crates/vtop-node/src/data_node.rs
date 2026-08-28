@@ -1831,34 +1831,16 @@ fn name_source(configured: &str) -> Option<String> {
     Some(configured.to_owned())
 }
 
-/// The address a peer's name holds right now, or a placeholder when it holds
-/// none yet (#367).
-///
-/// A name that does not resolve at startup is not a configuration error. In a
-/// replica set whose members are created together every member is in that
-/// position for some of its neighbours, and refusing to start over it turns an
-/// ordinary startup race into a crash loop — which is what the pod events
-/// showed, read as a broken node rather than a name that had not been
-/// published yet.
-///
-/// Both users of this address look the name up again before they use it: the
-/// replication driver on every connect, the promotion probe on every probe.
-/// So the placeholder's only job is to be a `SocketAddr`-shaped nothing in the
-/// meantime, and `0.0.0.0:0` is the one that fails a connect immediately
-/// instead of waiting out a timeout against something real.
-///
-/// It is announced rather than swallowed. A misspelt peer would otherwise
-/// start quietly and fail later as an absent replica, which is a much harder
-/// thing to read than a line at startup saying which name did not answer.
 /// The reason `configured` can never be a peer address, if there is one.
 ///
-/// MALFORMED IS NOT ABSENT (review). A name with no port — or an unbracketed
-/// IPv6 literal, whose last colon belongs to the address rather than to a port
-/// — is not a peer that has yet to appear; it is a peer that never will, and
-/// no amount of re-resolution fixes it. Tolerating it would start the node and
-/// spend the rest of its life looking up something unlookuppable, which is
-/// exactly the quiet misconfiguration the placeholder is meant to keep
-/// DISTINGUISHABLE from a startup race.
+/// MALFORMED IS NOT ABSENT (review). A name with no port, an unbracketed IPv6
+/// literal — whose last colon belongs to the address rather than to a port —
+/// or a host with characters no resolver will ever accept, is not a peer that
+/// has yet to appear; it is a peer that never will, and no amount of
+/// re-resolution fixes it. Tolerating those would start the node and spend the
+/// rest of its life looking up something unlookuppable, which is exactly the
+/// quiet misconfiguration the placeholder is meant to keep DISTINGUISHABLE
+/// from a startup race.
 pub(crate) fn malformed_endpoint(configured: &str) -> Option<String> {
     let Some((host, port)) = configured.rsplit_once(':') else {
         return Some("it has no port; a peer address is host:port".to_owned());
@@ -1871,10 +1853,46 @@ pub(crate) fn malformed_endpoint(configured: &str) -> Option<String> {
     if host.is_empty() {
         return Some("it has no host; a peer address is host:port".to_owned());
     }
-    if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
+    // A bracketed host is an IPv6 literal and nothing else, so it is checked as
+    // one. `[]` and `[peer]` both reached the resolver before, because the
+    // bracket rule only ran when the host already contained a colon (review).
+    if let Some(inner) = host.strip_prefix('[') {
+        let Some(inner) = inner.strip_suffix(']') else {
+            return Some(format!("{host:?} opens a bracket it never closes"));
+        };
+        // A zone id (`%eth0`) is part of the syntax and not part of the
+        // address, so it is set aside before parsing.
+        let addr = inner.split('%').next().unwrap_or(inner);
+        if addr.parse::<std::net::Ipv6Addr>().is_err() {
+            return Some(format!(
+                "{host:?} is bracketed, which means an IPv6 literal, and {addr:?} is not one"
+            ));
+        }
+        return None;
+    }
+    if host.ends_with(']') {
+        return Some(format!("{host:?} closes a bracket it never opened"));
+    }
+    if host.contains(':') {
         return Some(format!(
             "{host:?} looks like an unbracketed IPv6 address, so the last colon is part \
              of the address and not a port separator; write it as [{host}]:{port}"
+        ));
+    }
+    // Everything a resolver could accept is a hostname or an IPv4 literal, and
+    // both are drawn from this set. A character outside it — a slash, a space,
+    // an @ — is a configuration mistake dressed as a transient one (review).
+    if let Some(bad) = host
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || *c == '.' || *c == '-' || *c == '_'))
+    {
+        return Some(format!(
+            "{host:?} contains {bad:?}, which no hostname or address may hold"
+        ));
+    }
+    if host.split('.').any(|label| label.is_empty()) {
+        return Some(format!(
+            "{host:?} has an empty label; a name is dot-separated"
         ));
     }
     None
@@ -2623,6 +2641,8 @@ mod tests {
             "vtop-1.vtop-headless.ns.svc.cluster.local:9300",
             "127.0.0.1:9300",
             "[::1]:9300",
+            "[fe80::1%eth0]:9300",
+            "vtop_1.svc:9300",
         ] {
             assert!(
                 malformed_endpoint(good).is_none(),
@@ -2639,6 +2659,18 @@ mod tests {
             // seems to carry is a fiction the split invented.
             ("::1:9300", "unbracketed IPv6"),
             ("fe80::1:9300", "unbracketed IPv6"),
+            // Bracketed, and therefore claiming to be an IPv6 literal, which
+            // is a claim that can be checked — and these do not survive it.
+            ("[]:9300", "not one"),
+            ("[peer]:9300", "not one"),
+            ("[::1:9300", "never closes"),
+            ("::1]:9300", "never opened"),
+            // Characters no resolver will ever accept: the mistake is
+            // permanent, so it must not be waited on.
+            ("peer/name:9300", "which no hostname"),
+            ("peer name:9300", "which no hostname"),
+            ("peer@host:9300", "which no hostname"),
+            ("peer..host:9300", "empty label"),
         ] {
             let why = malformed_endpoint(bad)
                 .unwrap_or_else(|| panic!("{bad} must be refused; waiting cannot fix it"));

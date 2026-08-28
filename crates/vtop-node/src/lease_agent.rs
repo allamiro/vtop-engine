@@ -246,13 +246,14 @@ impl QuorumProbe for ReplicaPlaneProbe {
             let addr = match &follower.host {
                 Some(host) => {
                     match vtop_broker::replication::address_now(host, PROBE_RESOLVE_TIMEOUT).await {
-                        Some(addr) => {
-                            self.last_known
-                                .lock()
-                                .expect("resolved peers")
-                                .insert(follower.node_uuid, addr);
-                            addr
-                        }
+                        // NOT REMEMBERED YET (review). A lookup can hand back
+                        // an address that is not serving — a replacement whose
+                        // listener is not up, a record that moved early — and
+                        // recording it here would overwrite a fallback that
+                        // was known to WORK with one that is merely known to
+                        // exist. It is remembered below, after a fence proves
+                        // it.
+                        Some(addr) => addr,
                         None => self
                             .last_known
                             .lock()
@@ -279,6 +280,16 @@ impl QuorumProbe for ReplicaPlaneProbe {
                 node_id: follower.node_uuid,
                 local_committed_offset: match fenced {
                     Ok(response) => {
+                        // PROVED. This address answered a fence for this
+                        // range, which is the only evidence worth keeping as
+                        // the fallback for a future lookup failure.
+                        if let Some(host) = &follower.host {
+                            let _ = host;
+                            self.last_known
+                                .lock()
+                                .expect("resolved peers")
+                                .insert(follower.node_uuid, addr);
+                        }
                         if response.truncated_records > 0 {
                             tracing::warn!(
                                 follower = %follower.node_uuid,
