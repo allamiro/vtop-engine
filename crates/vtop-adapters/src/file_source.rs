@@ -39,6 +39,11 @@ pub struct FileSource {
     /// source files that have no line structure) instead of line by line.
     whole_file: bool,
     cursors: HashMap<String, FileCursor>,
+    /// Alias groups already warned about (#378), keyed by (device, inode),
+    /// so a persistent hard link warns once per process instead of once per
+    /// discovery cycle. A sync Mutex because `discover_sources` takes
+    /// `&self`; it is locked briefly and never across an await.
+    warned_aliases: std::sync::Mutex<std::collections::HashSet<(u64, u64)>>,
 }
 
 impl FileSource {
@@ -59,6 +64,7 @@ impl FileSource {
             delete_after_commit,
             whole_file,
             cursors: HashMap::new(),
+            warned_aliases: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -290,8 +296,6 @@ struct FileIdentity {
     mtime: String,
 }
 
-/// How many files are read concurrently in one pass. Bounded so a glob that
-/// matches thousands of files does not open them all at once.
 /// The path with `.` components removed, for comparing two spellings of it.
 ///
 /// `PathBuf` equality already ignores an INTERIOR `.` — `a/./b` and `a/b`
@@ -323,6 +327,46 @@ fn without_dot_components(path: &std::path::Path) -> std::path::PathBuf {
     path.components()
         .filter(|component| !matches!(component, Component::CurDir))
         .collect()
+}
+
+/// Surviving directory entries that name the SAME file, grouped (#378): each
+/// group is every spelling sharing one (device, inode), with its id, in
+/// first-seen order. Entries with no identity never group — on a platform
+/// without inode identity (or after a raced deletion) "unknown" must not
+/// alias with "unknown", because a false alias warning teaches operators to
+/// ignore the true ones.
+fn alias_groups(entries: &[(String, Option<(u64, u64)>)]) -> Vec<((u64, u64), Vec<String>)> {
+    let mut by_id: HashMap<(u64, u64), Vec<String>> = HashMap::new();
+    let mut order: Vec<(u64, u64)> = Vec::new();
+    for (path, id) in entries {
+        let Some(id) = id else { continue };
+        let group = by_id.entry(*id).or_insert_with(|| {
+            order.push(*id);
+            Vec::new()
+        });
+        group.push(path.clone());
+    }
+    order
+        .into_iter()
+        .filter_map(|id| {
+            let group = by_id.remove(&id)?;
+            (group.len() > 1).then_some((id, group))
+        })
+        .collect()
+}
+
+/// The (device, inode) pair that makes two directory entries provably one
+/// file. `metadata` follows symlinks, so a link and its target answer the
+/// same pair — which is exactly the aliasing #378 asks about.
+#[cfg(unix)]
+fn dev_ino(md: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((md.dev(), md.ino()))
+}
+
+#[cfg(not(unix))]
+fn dev_ino(_md: &std::fs::Metadata) -> Option<(u64, u64)> {
+    None
 }
 
 /// How many files are read concurrently in one pass. Bounded so a glob that
@@ -367,23 +411,55 @@ impl SourceAdapter for FileSource {
         // not: it merges symlinks, cannot see hard links at all, and leaves
         // the deletion of an alias silently re-reading the survivor from zero.
         let mut seen = std::collections::HashSet::<std::path::PathBuf>::new();
+        // Surviving spellings with their (device, inode), for the alias
+        // warning below (#378).
+        let mut identities: Vec<(String, Option<(u64, u64)>)> = Vec::new();
         for pattern in &self.paths {
             for entry in glob::glob(pattern)
                 .map_err(|e| VtopError::Source(format!("bad glob {pattern}: {e}")))?
             {
-                match entry {
-                    Ok(p) if p.is_file() => {
-                        if !seen.insert(without_dot_components(&p)) {
-                            continue;
-                        }
-                        out.push(DiscoveredSource {
-                            source_type: SourceType::File,
-                            source_name: p.to_string_lossy().into_owned(),
-                            format: self.format.clone(),
-                        });
-                    }
-                    _ => {}
+                let Ok(p) = entry else { continue };
+                // ONE metadata call answers both questions: the is-a-file
+                // test this arm always made (`is_file()` is a stat in
+                // disguise) and the identity the alias check needs. A second
+                // stat per file per cycle would tax back part of what #363
+                // reclaimed.
+                let Ok(md) = std::fs::metadata(&p) else {
+                    continue;
+                };
+                if !md.is_file() {
+                    continue;
                 }
+                if !seen.insert(without_dot_components(&p)) {
+                    continue;
+                }
+                let name = p.to_string_lossy().into_owned();
+                identities.push((name.clone(), dev_ino(&md)));
+                out.push(DiscoveredSource {
+                    source_type: SourceType::File,
+                    source_name: name,
+                    format: self.format.clone(),
+                });
+            }
+        }
+        // Two surviving entries for ONE inode are archived as two sources.
+        // Whether they SHOULD be one is #378's open question, deliberately
+        // unanswered here — but doing it silently is the wrong way to do it,
+        // whichever answer wins. Warned once per alias group per process:
+        // the duplication is either intended or a config surprise, and both
+        // deserve exactly one line, not one per cycle.
+        for (id, group) in alias_groups(&identities) {
+            if self
+                .warned_aliases
+                .lock()
+                .expect("alias set lock poisoned")
+                .insert(id)
+            {
+                tracing::warn!(
+                    paths = ?group,
+                    "two directory entries name one file; each is archived as \
+                     its own source, so its records are archived twice (#378)"
+                );
             }
         }
         Ok(out)
@@ -878,6 +954,64 @@ mod tests {
             "`..` is not collapsed: resolving it lexically is wrong through a symlink, \
              and merging two real sources loses data where a duplicate only costs \
              storage: {traversed:?}"
+        );
+    }
+
+    /// The alias DETECTION for #378: while the merge question stays open,
+    /// two directory entries for one inode must at least be named, because
+    /// silent double-archiving is wrong under either eventual answer.
+    #[test]
+    fn two_entries_for_one_inode_are_grouped_and_distinct_files_are_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.log");
+        std::fs::write(&real, "one\n").unwrap();
+        let link = dir.path().join("link.log");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let hard = dir.path().join("hard.log");
+        std::fs::hard_link(&real, &hard).unwrap();
+        let other = dir.path().join("other.log");
+        std::fs::write(&other, "two\n").unwrap();
+
+        let entries: Vec<(String, Option<(u64, u64)>)> = [&real, &link, &hard, &other]
+            .iter()
+            .map(|p| {
+                let md = std::fs::metadata(p).unwrap();
+                (p.display().to_string(), dev_ino(&md))
+            })
+            .collect();
+
+        let groups = alias_groups(&entries);
+        assert_eq!(
+            groups.len(),
+            1,
+            "the symlink, the hard link and the target are ONE file three \
+             ways; the distinct file must not join them: {groups:?}"
+        );
+        assert_eq!(
+            groups[0].1,
+            vec![
+                real.display().to_string(),
+                link.display().to_string(),
+                hard.display().to_string()
+            ],
+            "the group carries every spelling, in first-seen order, because \
+             the warning is only useful if it names what to go look at"
+        );
+    }
+
+    /// An entry whose identity is unknown must never alias with another
+    /// unknown: a false alias warning teaches operators to ignore true ones.
+    #[test]
+    fn unknown_identities_never_group() {
+        let entries: Vec<(String, Option<(u64, u64)>)> = vec![
+            ("a.log".into(), None),
+            ("b.log".into(), None),
+            ("c.log".into(), Some((1, 42))),
+        ];
+        assert!(
+            alias_groups(&entries).is_empty(),
+            "two unknowns are not evidence of one file, and one known entry \
+             alone has nothing to alias with"
         );
     }
 
