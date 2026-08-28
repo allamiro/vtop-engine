@@ -714,6 +714,18 @@ if holder and epoch is not None:
 
 ordinal_of() { # <node-uuid> -> pod ordinal
   case "$1" in
+    # AN EMPTY HOLDER IS NOT A WRONG HOLDER. `lease_state` prints nothing
+    # both when metadata reports no lease and when the read itself did not
+    # answer, so an empty argument reaching here means the caller's wait ran
+    # out — and blaming an unrecognised candidate for it sends the reader
+    # looking for a UUID that was never there. Say which of the two it is,
+    # as far as this can tell.
+    "")
+      fail "no lease holder: metadata either reports no lease on the range or did not \
+answer the read. This is the #318 signature — a promotion that never acquires — and NOT an \
+unrecognised candidate. Check whether any pod logged a promotion verdict before suspecting \
+the chart."
+      ;;
     "$UUID_0") echo 0 ;;
     "$UUID_1") echo 1 ;;
     "$UUID_2") echo 2 ;;
