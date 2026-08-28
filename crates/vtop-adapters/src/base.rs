@@ -57,6 +57,16 @@ pub struct AdapterReadReport {
     pub productive_ms: u64,
     pub empty_ms: u64,
     pub failed_ms: u64,
+    /// Records the SOURCE removed before this adapter ever read them, newly
+    /// observed by this pass (#361): for Kafka, the distance retention moved
+    /// the low watermark past the next-read offset since the last pass that
+    /// counted it. The adapter deduplicates, so a gap that persists across
+    /// passes is counted once, not once per observation. Zero for adapters
+    /// whose sources cannot expire data out from under a cursor (file,
+    /// syslog spool), and zero on passes where the periodic check did not
+    /// run. A log line nobody greps is not a report — this field is how the
+    /// loss reaches `read_cycle_profile` and the metrics.
+    pub retention_lost_records: u64,
 }
 
 /// A telemetry source adapter.
@@ -115,6 +125,7 @@ pub trait SourceAdapter: Send + Sync {
             productive_ms: 0,
             empty_ms: 0,
             failed_ms: 0,
+            retention_lost_records: 0,
         };
         for (source_index, source) in sources.iter().enumerate() {
             let started = std::time::Instant::now();

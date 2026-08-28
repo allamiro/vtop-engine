@@ -94,6 +94,18 @@ pub struct Metrics {
     /// series per file and grow without bound. The failing path is in the log
     /// line beside this counter, where unbounded detail belongs.
     pub source_read_errors_total: IntCounterVec,
+
+    /// Records a SOURCE expired before the engine read them (#361) — for
+    /// Kafka, the low watermark overtaking the next-read offset. Any increase
+    /// is data lost upstream of the archive: never batched, never manifested,
+    /// never verified, and invisible to the commit rule, which protects only
+    /// records the engine read. The adapter deduplicates observations, so
+    /// the counter grows by each lost record exactly once.
+    ///
+    /// Labelled by source_type only, like `source_read_errors_total` and for
+    /// the same reason: the topic and partition are in the warn line beside
+    /// this counter, where unbounded detail belongs.
+    pub retention_lost_records_total: IntCounterVec,
 }
 
 fn labels3() -> Vec<&'static str> {
@@ -170,6 +182,11 @@ impl Metrics {
             "Source reads that failed and were skipped for this cycle (see logs for the path)",
             vec!["tenant", "source_type"],
         )?;
+        let retention_lost_records_total = cv(
+            "retention_lost_records_total",
+            "Records source-side retention removed before the engine read them; any increase is data loss upstream of the archive (see logs for topic/partition)",
+            vec!["tenant", "source_type"],
+        )?;
 
         // Buckets span 1ms..~30s: compression is sub-millisecond on small
         // batches while an upload to a slow backend can take seconds. Default
@@ -235,6 +252,7 @@ impl Metrics {
             compression_ratio,
             inflight_batches,
             source_read_errors_total,
+            retention_lost_records_total,
         })
     }
 

@@ -90,6 +90,33 @@ fn retention_gap(desired_offset: Option<i64>, low_watermark: i64) -> Option<u64>
     Some(low_watermark.saturating_sub(desired).max(0) as u64)
 }
 
+/// The portion of a retention gap that has NOT been counted before (#361).
+///
+/// The periodic check re-observes a gap for as long as the cursor stays
+/// behind the low watermark, and a counter fed the full gap on every
+/// observation would double-count the same lost records once a minute —
+/// `reported_through` is the watermark loss has already been counted to, so
+/// only the watermark's advance beyond it (and beyond the cursor) is new.
+///
+/// The warn line deliberately still reports the FULL current gap: an
+/// operator deciding where to resume needs the whole distance, while a
+/// monotonic counter needs each record counted exactly once. Two questions,
+/// two numbers.
+fn newly_lost(
+    desired_offset: Option<i64>,
+    low_watermark: i64,
+    reported_through: Option<i64>,
+) -> u64 {
+    // No gap at all (caught up, sentinel offset, or no cursor) counts
+    // nothing, whatever was reported before.
+    if retention_gap(desired_offset, low_watermark).is_none() {
+        return 0;
+    }
+    let desired = desired_offset.expect("retention_gap returned Some only with a desired offset");
+    let counted_from = reported_through.unwrap_or(desired).max(desired);
+    low_watermark.saturating_sub(counted_from).max(0) as u64
+}
+
 /// Build the rdkafka [`ClientConfig`]. Auto-commit is forced to `false`
 /// regardless of the input config. Secrets are read from the environment, not
 /// logged.
@@ -295,6 +322,11 @@ pub struct KafkaSource {
     /// When retention was last checked (#361). Bounds a broker round trip on
     /// a read path to something retention's own timescale makes free.
     last_retention_check: Option<std::time::Instant>,
+    /// Low watermark per (topic, partition) up to which retention loss has
+    /// already been COUNTED (#361). Never cleared on re-assignment: it
+    /// tracks a broker-side fact, not assignment state, and clearing it
+    /// would re-count the same lost records after every rebalance.
+    reported_lost_through: HashMap<(String, i32), i64>,
     /// Partitions paused mid-pass (topic hit its budget); resumed at the
     /// start of the next pass.
     paused: Vec<(String, i32)>,
@@ -344,6 +376,7 @@ impl KafkaSource {
             assigned: Vec::new(),
             delivered: HashMap::new(),
             last_retention_check: None,
+            reported_lost_through: HashMap::new(),
             paused: Vec::new(),
             stored_pending: std::collections::HashSet::new(),
             partitions: HashMap::new(),
@@ -375,7 +408,13 @@ impl KafkaSource {
     /// Never fails the pass. A broker that will not answer has not lost
     /// anything; it has only declined to say, and turning that into a read
     /// failure would trade a real archive for a diagnostic.
-    fn report_retention_gaps(&mut self) {
+    ///
+    /// Returns the count of records NEWLY observed lost — deduplicated
+    /// against what previous checks already counted, so the caller can feed
+    /// a monotonic counter without double-counting a gap that persists
+    /// across checks. Passes where the interval gate skips the check return
+    /// zero, which is "nothing new observed", not "nothing lost".
+    fn report_retention_gaps(&mut self) -> u64 {
         // Retention moves on the scale of hours. Once a minute is free, and
         // an unbounded network call on a read path is the mistake #374 was
         // made of — so both the interval and each query are bounded.
@@ -383,12 +422,12 @@ impl KafkaSource {
             .last_retention_check
             .is_some_and(|at| at.elapsed() < RETENTION_CHECK_INTERVAL)
         {
-            return;
+            return 0;
         }
         self.last_retention_check = Some(std::time::Instant::now());
 
         let Some(consumer) = self.consumer.as_ref() else {
-            return;
+            return 0;
         };
         // ONE call for every partition, rather than one per partition: the
         // group's committed offsets are what a restart would resume from.
@@ -396,6 +435,8 @@ impl KafkaSource {
             .committed(std::time::Duration::from_secs(WATERMARK_TIMEOUT_SECONDS))
             .ok();
 
+        let mut newly_observed: u64 = 0;
+        let mut newly_reported: Vec<((String, i32), i64)> = Vec::new();
         for (topic, partition) in &self.assigned {
             // The in-memory cursor is what this process would read next; the
             // group commit is what a fresh one would. Whichever exists is the
@@ -421,6 +462,13 @@ impl KafkaSource {
                 continue;
             };
             if let Some(lost) = retention_gap(next_offset, low_watermark) {
+                let key = (topic.clone(), *partition);
+                newly_observed += newly_lost(
+                    next_offset,
+                    low_watermark,
+                    self.reported_lost_through.get(&key).copied(),
+                );
+                newly_reported.push((key, low_watermark));
                 tracing::warn!(
                     topic = %topic,
                     partition = *partition,
@@ -434,6 +482,17 @@ impl KafkaSource {
                 );
             }
         }
+        // Recorded with max(), never overwritten downward: a broker answer
+        // whose watermark went backwards (leader change, absurd input) must
+        // not re-open loss that was already counted once.
+        for (key, low_watermark) in newly_reported {
+            let entry = self
+                .reported_lost_through
+                .entry(key)
+                .or_insert(low_watermark);
+            *entry = (*entry).max(low_watermark);
+        }
+        newly_observed
     }
 
     fn consumer(&mut self) -> Result<&BaseConsumer, VtopError> {
@@ -664,6 +723,10 @@ impl SourceAdapter for KafkaSource {
                 productive_ms: 0,
                 empty_ms: elapsed.saturating_sub(meta_failed_ms),
                 failed_ms: meta_failed_ms,
+                // The retention check has not run on this path — nothing is
+                // assigned, so there is no cursor a watermark could have
+                // passed.
+                retention_lost_records: 0,
             });
         }
         let consumer = self.consumer.as_ref().expect("consumer built above");
@@ -741,7 +804,7 @@ impl SourceAdapter for KafkaSource {
         // the wrong place, and each time for the same reason: the restart is
         // the case the check exists for, and the restart is the case where the
         // state it reads has not been built yet.
-        self.report_retention_gaps();
+        let retention_lost_records = self.report_retention_gaps();
         // The check takes `&mut self` (it advances its own clock), which ends
         // the borrow the assignment block held — so the poll loop takes its
         // own.
@@ -938,6 +1001,7 @@ impl SourceAdapter for KafkaSource {
             productive_ms,
             empty_ms,
             failed_ms: meta_failed_ms.saturating_add(poll_failed_ms),
+            retention_lost_records,
         })
     }
 
@@ -1077,6 +1141,51 @@ mod tests {
                 "{sentinel} is a position marker, not an offset, and must not become a gap"
             );
         }
+    }
+
+    /// The counter is fed only what previous checks have not already counted
+    /// (#361): the check re-observes a persisting gap once a minute, and a
+    /// counter fed the full gap every time would multiply the same lost
+    /// records by however long the operator took to notice.
+    #[test]
+    fn a_gap_is_counted_once_however_often_it_is_observed() {
+        assert_eq!(
+            newly_lost(Some(100), 350, None),
+            250,
+            "the first observation counts the whole gap"
+        );
+        assert_eq!(
+            newly_lost(Some(100), 350, Some(350)),
+            0,
+            "the second observation of the SAME gap counts nothing — this is \
+             the double-count a naive counter would add once a minute"
+        );
+        assert_eq!(
+            newly_lost(Some(100), 500, Some(350)),
+            150,
+            "when the watermark advances further, only the advance is new loss"
+        );
+        assert_eq!(
+            newly_lost(Some(400), 500, Some(350)),
+            100,
+            "a cursor that advanced past the counted watermark and fell behind \
+             again lost only what is behind the CURSOR, not the stale bookmark"
+        );
+        assert_eq!(
+            newly_lost(Some(350), 350, Some(300)),
+            0,
+            "no current gap means nothing new, whatever was counted before"
+        );
+        assert_eq!(
+            newly_lost(None, 10_000, Some(5_000)),
+            0,
+            "no cursor still means nothing missed, bookmark or not"
+        );
+        assert_eq!(
+            newly_lost(Some(-2), 10_000, None),
+            0,
+            "sentinels stay sentinels here too"
+        );
     }
 
     #[test]
