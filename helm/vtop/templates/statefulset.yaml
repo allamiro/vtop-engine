@@ -1,3 +1,4 @@
+{{- include "vtop.deploymentGuards" . -}}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -104,7 +105,7 @@ spec:
           # the last "-" and selects the per-ordinal config rendered into the
           # ConfigMap. From that ordinal the config fixes the meta Raft
           # node_id (ordinal+1), the data-plane node UUID
-          # (cluster.nodeUuids[ordinal]), and the TLS leaf filenames.
+          # (data.nodeUuids[ordinal]), and the TLS leaf filenames.
           command:
             - /bin/sh
             - -ec

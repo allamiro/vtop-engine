@@ -107,7 +107,44 @@ default credentials is exactly how issue #81 happened.
 {{- end }}
 
 {{- define "vtop.dataSecretName" -}}
-{{- required "\n\nTLS is required and never defaulted: set tls.dataSecretName to an existing Secret holding the data/replica-plane mTLS material (keys: ca.pem, node-<ordinal>.pem, node-<ordinal>-key.pem; leaf CN = cluster.nodeUuids[ordinal]). This chart ships no default credentials (issue #81). See helm/vtop/README.md for the full Secret contract." .Values.tls.dataSecretName -}}
+{{- required "\n\nTLS is required and never defaulted: set tls.dataSecretName to an existing Secret holding the data/replica-plane mTLS material (keys: ca.pem, node-<ordinal>.pem, node-<ordinal>-key.pem; leaf CN = data.nodeUuids[ordinal]). This chart ships no default credentials (issue #81). See helm/vtop/README.md for the full Secret contract." .Values.tls.dataSecretName -}}
+{{- end }}
+
+{{/*
+Deployment-wide guards (#287), included once from the StatefulSet so every
+render passes through them. Three refusals live here rather than scattered:
+
+  - deployment.mode is the colocated/separated switch. `colocated` is the
+    default and renders exactly what this chart always rendered; `separated`
+    is slice 2 and REFUSES until the two-tier rendering exists, because a
+    mode that silently rendered the colocated shape would deploy the wrong
+    processes and look like success.
+  - cluster.nodeUuids is RETIRED in favour of data.nodeUuids. Metadata
+    identities are Raft ids derived from the pod ordinal; data identities
+    are broker UUIDs. They shared one list only because the co-located
+    tiers are the same size, and separated mode sizes them independently —
+    a shared index cannot name both.
+  - the metadata voter count refuses even numbers. An even quorum buys no
+    additional fault tolerance over the odd count below it (four voters
+    tolerate one failure, exactly as three do, while raising the quorum
+    majority) — accepting it would render a cluster that pays for a voter
+    it gets nothing from.
+*/}}
+{{- define "vtop.deploymentGuards" -}}
+{{- $v := .Values -}}
+{{- $mode := "colocated" -}}
+{{- with $v.deployment -}}{{- $mode = default "colocated" .mode -}}{{- end -}}
+{{- if eq $mode "separated" -}}
+{{- fail "\n\ndeployment.mode=separated is #287 slice 2 and this chart version does not render it yet. It refuses rather than silently rendering the co-located shape: a separated deployment expects two tiers of processes, and getting one tier of combined ones would look like success while being the wrong cluster. Use mode colocated (the default) until the separated rendering ships." -}}
+{{- else if ne $mode "colocated" -}}
+{{- fail (printf "\n\ndeployment.mode must be colocated or separated; got %q." $mode) -}}
+{{- end -}}
+{{- if $v.cluster.nodeUuids -}}
+{{- fail "\n\ncluster.nodeUuids moved to data.nodeUuids (#287). Metadata identities are Raft node ids derived from the pod ordinal (ordinal+1, the meta certificate CN) while these are broker UUIDs (the data certificate CN) — two different identities that shared one list only while the tiers were the same size. Move the list unchanged: data.nodeUuids." -}}
+{{- end -}}
+{{- if eq (mod (int $v.replicaCount) 2) 0 -}}
+{{- fail (printf "\n\nreplicaCount %d is even, and the metadata plane is a Raft quorum: an even voter count tolerates no more failures than the odd count below it while raising the majority it must gather. Use %d or %d." (int $v.replicaCount) (sub (int $v.replicaCount) 1) (add1 (int $v.replicaCount))) -}}
+{{- end -}}
 {{- end }}
 
 {{/*
@@ -127,19 +164,19 @@ so this template never emits them. Expects (dict "root" $ "ordinal" <int>).
 {{- $v := $root.Values -}}
 {{- $clusterId := required "\n\ncluster.id is required: the cluster UUID shared by every node. The chart does not default identities — they must match the certificates you minted." $v.cluster.id -}}
 {{- $nodeUuid := "" -}}
-{{- if gt (len $v.cluster.nodeUuids) $i -}}
+{{- if gt (len $v.data.nodeUuids) $i -}}
 {{- /* Distinct per ordinal. Two pods sharing a broker UUID share an IDENTITY:
        with data.lease.enabled they present the same one to the metadata plane
        and race each other for the same range lease, so the StatefulSet is not
        a cluster of replicas but two claimants wearing one name. The
        certificate CN convention makes it worse — one certificate would be
        valid for both. */ -}}
-{{- if ne (len (uniq $v.cluster.nodeUuids)) (len $v.cluster.nodeUuids) -}}
-{{- fail (printf "\n\ncluster.nodeUuids contains duplicates: %v. Each pod ordinal needs its OWN broker UUID — two pods sharing one identity would present the same identity to the metadata plane and race the same range lease." $v.cluster.nodeUuids) -}}
+{{- if ne (len (uniq $v.data.nodeUuids)) (len $v.data.nodeUuids) -}}
+{{- fail (printf "\n\ndata.nodeUuids contains duplicates: %v. Each pod ordinal needs its OWN broker UUID — two pods sharing one identity would present the same identity to the metadata plane and race the same range lease." $v.data.nodeUuids) -}}
 {{- end -}}
-{{- $nodeUuid = index $v.cluster.nodeUuids $i -}}
+{{- $nodeUuid = index $v.data.nodeUuids $i -}}
 {{- else -}}
-{{- fail (printf "\n\ncluster.nodeUuids has %d entries but replicaCount is %d: provide one broker UUID per replica, indexed by pod ordinal. Each must equal the CN of that pod's data-plane certificate." (len $v.cluster.nodeUuids) (int $v.replicaCount)) -}}
+{{- fail (printf "\n\ndata.nodeUuids has %d entries but replicaCount is %d: provide one broker UUID per replica, indexed by pod ordinal. Each must equal the CN of that pod's data-plane certificate." (len $v.data.nodeUuids) (int $v.replicaCount)) -}}
 {{- end -}}
 # Co-located node config for pod {{ include "vtop.fullname" $root }}-{{ $i }}.
 # Rendered by Helm; the container selects this file by its hostname ordinal.
@@ -234,7 +271,7 @@ data:
            first list item lands on the "peers:" line as "peers:- node_uuid:"
            and every later one glues onto its predecessor — YAML that renders
            without error and that the binary refuses to parse. */}}
-    - node_uuid: {{ index $v.cluster.nodeUuids $ordinal }}
+    - node_uuid: {{ index $v.data.nodeUuids $ordinal }}
       addr: "{{ include "vtop.podFqdn" (dict "root" $root "ordinal" $ordinal) }}:{{ $v.ports.replica }}"
       server_name: "{{ include "vtop.peerServerName" (dict "root" $root "ordinal" $ordinal) }}"
     {{- end }}

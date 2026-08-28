@@ -53,13 +53,26 @@ clusterDomain: cluster.local
 # would silently mismatch your certificates and fail at the TLS layer with a
 # far worse error than the one the chart gives you up front.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Which processes run where (#287).
+# ---------------------------------------------------------------------------
+deployment:
+  # colocated: every pod hosts a metadata voter AND a data replica in one
+  #   process — the only shape this chart has ever rendered, and the default.
+  # separated: a metadata tier and a data tier as two StatefulSets, sized
+  #   independently. NOT RENDERED YET (#287 slice 2); the chart refuses it
+  #   rather than silently rendering the co-located shape.
+  mode: colocated
+
 cluster:
   # UUID shared by every node in the cluster. REQUIRED.
   id: ""
-  # One broker UUID per replica, indexed by pod ordinal: nodeUuids[0] is pod
-  # <fullname>-0's data-plane identity. REQUIRED, length >= replicaCount.
-  # Each UUID must equal the CN of that pod's data-plane certificate.
-  nodeUuids: []
+  # nodeUuids: RETIRED (#287) — moved to data.nodeUuids. Metadata identities
+  # are Raft node ids derived from the pod ordinal (ordinal+1, the meta
+  # certificate CN); data identities are broker UUIDs. They shared one list
+  # only while the co-located tiers were the same size, and separated mode
+  # sizes the tiers independently. Setting it here fails the render with the
+  # migration explanation.
 
 # ---------------------------------------------------------------------------
 # TLS — REQUIRED, never defaulted.
@@ -139,6 +152,12 @@ meta:
 # into their own workloads (#287); every pod runs both.
 # ---------------------------------------------------------------------------
 data:
+  # One broker UUID per data replica, indexed by pod ordinal: nodeUuids[0] is
+  # pod <fullname>-0's data-plane identity. REQUIRED, length >= replicaCount.
+  # Each UUID must equal the CN of that pod's data-plane certificate. (Moved
+  # from cluster.nodeUuids at #287: these are DATA identities, and the
+  # separated deployment mode sizes the data tier independently.)
+  nodeUuids: []
   # Static fencing epoch each node starts at. With `lease.enabled` this is
   # only the monotonic FLOOR of the node's epoch view; metadata mints epochs
   # from 1, so leave this at 0/1 when the lease drives leadership — a floor

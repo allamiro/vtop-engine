@@ -28,6 +28,16 @@
   },
   "properties": {
     "global": { "type": "object" },
+    "deployment": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "enum": ["colocated", "separated"],
+          "description": "colocated (default) renders the single co-located StatefulSet; separated is #287 slice 2 and refuses at render time until the two-tier rendering exists."
+        }
+      }
+    },
     "replicaCount": { "$ref": "#/$defs/posInt" },
     "image": {
       "type": "object",
@@ -51,6 +61,7 @@
         "id": { "$ref": "#/$defs/uuidOrEmpty" },
         "nodeUuids": {
           "type": "array",
+          "description": "RETIRED (#287) — moved to data.nodeUuids. Kept in the schema only so the template's fail() can explain the migration instead of a bare additionalProperties rejection.",
           "items": {
             "type": "string",
             "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
@@ -98,6 +109,14 @@
       "additionalProperties": false,
       "properties": {
         "topology": { "enum": ["standalone", "replicated"] },
+        "nodeUuids": {
+          "type": "array",
+          "description": "One broker UUID per data replica, indexed by pod ordinal; each must equal the CN of that pod's data-plane certificate (moved from cluster.nodeUuids, #287).",
+          "items": {
+            "type": "string",
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+          }
+        },
         "leaderOrdinal": {
           "type": "integer",
           "description": "RETIRED (#284). Kept in the schema only so the template's fail() can explain the migration instead of a bare additionalProperties rejection."

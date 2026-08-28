@@ -33,7 +33,7 @@ template` shows every node's exact config and the pod template's
 ordinal the chart fixes:
 
 - **meta `node_id` = ordinal + 1** (Raft ids are 1-based, matching upstream);
-- **data `node_uuid` = `cluster.nodeUuids[ordinal]`**;
+- **data `node_uuid` = `data.nodeUuids[ordinal]`**;
 - the TLS leaf filenames `node-<ordinal>.pem` / `node-<ordinal>-key.pem`;
 - the peer list: every pod's headless FQDN, identical on all pods (the binary
   ignores its own entry).
@@ -116,7 +116,7 @@ CN rules the binary enforces:
 
 - **`tls.metaSecretName` leaves:** CN = the **decimal meta node id**, i.e.
   `ordinal + 1` (`node-0.pem` carries `CN=1`, `node-1.pem` carries `CN=2`, …).
-- **`tls.dataSecretName` leaves:** CN = `cluster.nodeUuids[ordinal]`.
+- **`tls.dataSecretName` leaves:** CN = `data.nodeUuids[ordinal]`.
 - Every leaf needs `serverAuth` + `clientAuth` EKUs and a SAN matching the
   name peers dial: by default each pod's headless FQDN
   (`<fullname>-<ordinal>.<fullname>-headless.<ns>.svc.<clusterDomain>`), or
@@ -209,7 +209,7 @@ helm install vtop helm/vtop \
   --set tls.metaSecretName=vtop-meta-tls \
   --set tls.dataSecretName=vtop-data-tls \
   --set cluster.id=11111111-2222-3333-4444-555555555555 \
-  --set 'cluster.nodeUuids={aaaaaaaa-0000-0000-0000-0000000000a1,aaaaaaaa-0000-0000-0000-0000000000a2,aaaaaaaa-0000-0000-0000-0000000000a3}' \
+  --set 'data.nodeUuids={aaaaaaaa-0000-0000-0000-0000000000a1,aaaaaaaa-0000-0000-0000-0000000000a2,aaaaaaaa-0000-0000-0000-0000000000a3}' \
   --set data.range.topic=telemetry \
   --set data.range.rangeId=aaaaaaaa-0000-0000-0000-0000000000c1 \
   --set data.segmentId=aaaaaaaa-0000-0000-0000-0000000000d1 \
@@ -254,7 +254,7 @@ certificates also carry that Service's DNS name as a shared SAN.
 | `nameOverride` / `fullnameOverride` | `""` | |
 | `clusterDomain` | `cluster.local` | For building peer FQDNs. |
 | `cluster.id` | — **required** | Cluster UUID shared by every node. |
-| `cluster.nodeUuids` | — **required** | One broker UUID per replica, indexed by ordinal; each must equal the CN of that pod's data-plane leaf. |
+| `data.nodeUuids` | — **required** | One broker UUID per replica, indexed by ordinal; each must equal the CN of that pod's data-plane leaf. (Moved from `cluster.nodeUuids`, #287.) |
 | `tls.metaSecretName` | — **required** | Existing Secret, metadata plane (contract above). |
 | `tls.dataSecretName` | — **required** | Existing Secret, data/replica plane (contract above). |
 | `tls.serverName` | `""` | Shared dial name; empty uses each peer's own FQDN. |

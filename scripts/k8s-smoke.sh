@@ -330,7 +330,7 @@ done
 helm upgrade --install "$REL" helm/vtop -n "$NEIGHBOUR_NS" \
   -f helm/vtop/ci/default-values.yaml \
   --set replicaCount=1 \
-  --set "cluster.nodeUuids={$UUID_0}" \
+  --set "data.nodeUuids={$UUID_0}" \
   --set "tls.metaSecretName=${REL}-meta-tls" \
   --set "tls.dataSecretName=${REL}-data-tls" \
   --set "image.repository=${IMAGE_REPO}" \
