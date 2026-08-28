@@ -171,8 +171,9 @@ v0.4.0 as a watch item.
 
 ## v0.4.0 and beyond
 
-The **#240 remainder** is now one item, not two. The election restriction
-shipped: `promotion.rs` requires a majority of answering replicas to sit at or
+The **#240 remainder** is now one item, not two. The election restriction is
+implemented and ships in **this** release — no tag contains it yet, so v0.3.1
+does not have it. `promotion.rs` requires a majority of answering replicas to sit at or
 below the candidate's own committed offset before it may be promoted, which is
 Raft dissertation §5.4.1 in its per-voter form — any record acknowledged on a
 quorum lives on at least one member of every majority, so a candidate a

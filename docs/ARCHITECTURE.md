@@ -236,9 +236,18 @@ records that stopped existing before the engine got to them, and for Kafka that
 is a real and silent condition.
 
 `auto.offset.reset` is passed through to `rdkafka` and defaults to `earliest`
-(`kafka_source.rs`). If a partition's low watermark overtakes a committed
-cursor — the engine was down, or lagging, longer than the topic's retention —
-the next poll resumes at the **new** earliest offset. Nothing queries the
+(`kafka_source.rs`). It reaches that default by two different routes, and both
+end the same way:
+
+- **After a restart** — a fresh process has no in-memory cursor, so the
+  partition is assigned at `Offset::Stored` and librdkafka resolves it from the
+  committed offset, or from `auto.offset.reset` when that offset no longer
+  exists.
+- **While still running** — the pass seeks the partition to the cursor it
+  wants, and a seek below the low watermark is out of range, so the same reset
+  applies.
+
+Either way the consumer resumes at the **new** earliest offset. Nothing queries the
 watermarks, nothing compares the resumed offset against the committed one, and
 no metric fires. The gap between them is data that was never batched, never
 manifested, never verified and never missed.
