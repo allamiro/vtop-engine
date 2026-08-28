@@ -378,6 +378,118 @@ impl LeasePublisher for BrokerLeasePublisher {
     }
 }
 
+/// The decision to keep holding an epoch through a quorum miss, and the
+/// budget state that follows it (#375).
+///
+/// A pure function on purpose. The policy is the part worth testing — that the
+/// hold is bounded, that the bound belongs to an epoch rather than to the
+/// process, and that it is measured in the unit it is described in — and the
+/// surrounding method needs a live admin client, which is the same reason
+/// [`Promoter`] is split out from [`LeaseAgent`].
+struct QuorumMissBudget {
+    /// Whether to renew, holding this epoch still for another round.
+    hold: bool,
+    /// The state to carry into the next round.
+    state: Option<QuorumMissHold>,
+}
+
+/// How much of an epoch's hold is left.
+///
+/// LATCHED, not recomputed from a timestamp every round (review). Comparing
+/// wall clock against a stored deadline means a clock that steps backwards —
+/// NTP correction, a VM restored from a snapshot — reopens a window that had
+/// already closed, and the hold restarts. Once an epoch's window is spent it
+/// stays spent, because "we already decided this" is a fact and not a
+/// measurement.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum QuorumMissHold {
+    /// Holding `epoch` until `until_ms`.
+    Until { epoch: u64, until_ms: i64 },
+    /// `epoch`'s window is closed and does not reopen.
+    Spent { epoch: u64 },
+}
+
+impl QuorumMissHold {
+    fn epoch(self) -> u64 {
+        match self {
+            Self::Until { epoch, .. } | Self::Spent { epoch } => epoch,
+        }
+    }
+}
+
+/// WALL CLOCK, NOT ROUND COUNT (review). The bound is described as two lease
+/// lifetimes and was counted in poll rounds, which are not the same thing: a
+/// probe against blackholed replicas spends the fence deadline before the poll
+/// interval is applied, so N rounds can be several times N poll intervals.
+///
+/// `hold_for` is ONE lease lifetime, not two, and the difference is the
+/// promise (review). The last renewal inside the window extends the metadata
+/// lease by a further full lifetime, so a window of two would hold the epoch
+/// for nearly three. One in, one trailing, two total — which is what a
+/// survivor is waiting on.
+///
+/// A range that recovered and later missed again gets a FRESH window rather
+/// than inheriting a spent one, which is why the epoch travels with the state:
+/// the two situations are indistinguishable from the deadline alone.
+fn quorum_miss_budget(
+    fencing_epoch: u64,
+    now_ms: i64,
+    carried: Option<QuorumMissHold>,
+    hold_for: Duration,
+) -> QuorumMissBudget {
+    let carried = carried.filter(|held| held.epoch() == fencing_epoch);
+    match carried {
+        // Already decided, and not revisited: see `QuorumMissHold`.
+        Some(QuorumMissHold::Spent { epoch }) => QuorumMissBudget {
+            hold: false,
+            state: Some(QuorumMissHold::Spent { epoch }),
+        },
+        Some(QuorumMissHold::Until { epoch, until_ms }) if now_ms < until_ms => QuorumMissBudget {
+            hold: true,
+            state: Some(QuorumMissHold::Until { epoch, until_ms }),
+        },
+        // The window just closed. Latch it.
+        Some(QuorumMissHold::Until { epoch, .. }) => QuorumMissBudget {
+            hold: false,
+            state: Some(QuorumMissHold::Spent { epoch }),
+        },
+        // First miss on this epoch, or a different epoch entirely.
+        None => QuorumMissBudget {
+            hold: true,
+            state: Some(QuorumMissHold::Until {
+                epoch: fencing_epoch,
+                until_ms: now_ms
+                    .saturating_add_unsigned(hold_for.as_millis().min(i64::MAX as u128) as u64),
+            }),
+        },
+    }
+}
+
+/// What a promotion attempt decided, as distinct from whether it succeeded.
+///
+/// `publish_held` returned a bare bool and every `false` was treated alike:
+/// stop renewing, let the lease lapse. For an eligibility refusal that is the
+/// point — the lapse is how the range reaches the replica the refusal named.
+/// For a quorum MISS it is backwards, and #375 is what it costs.
+///
+/// A replica refuses a fence precisely when the epoch is above the grant it
+/// has observed, and lapsing is how the epoch goes UP: acquisition mints
+/// `fencing_epoch + 1` where renewal mints nothing. So the answer to "my
+/// followers are behind me" was to get further ahead of them, every lease
+/// lifetime, without bound.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Promoted {
+    /// Servable at this epoch.
+    Yes,
+    /// Refused on an eligibility verdict: a peer is the better holder, and
+    /// letting the lease lapse is the mechanism that hands it over.
+    Refused,
+    /// Refused because too few replicas answered. No rival can serve this
+    /// range either — the missing answers are the ones a rival would need —
+    /// so the epoch is worth holding still while they catch up.
+    QuorumMissed,
+}
+
 /// Owns everything about believing this node leads: verifying the boundary,
 /// publishing the epoch, and giving it up.
 ///
@@ -385,6 +497,8 @@ impl LeasePublisher for BrokerLeasePublisher {
 /// admin client — the interesting behaviour here is not "can we reach
 /// metadata", it is what happens when a quorum will not answer.
 struct Promoter {
+    /// Set by the quorum-miss arm; read and cleared by the caller (#375).
+    quorum_miss: bool,
     publisher: Arc<dyn LeasePublisher>,
     probe: Option<Arc<dyn QuorumProbe>>,
     /// The epoch whose boundary has already been verified.
@@ -460,6 +574,7 @@ impl Promoter {
                         // making the successful re-probe a promotion the view
                         // permanently refuses, wedging the range under its own
                         // live lease.
+                        self.quorum_miss = true;
                         self.suspended(fencing_epoch);
                         return false;
                     }
@@ -530,6 +645,19 @@ impl Promoter {
     fn suspended(&mut self, fencing_epoch: u64) {
         self.publisher.suspend(fencing_epoch);
         self.verified_epoch = None;
+    }
+
+    /// Whether the last refusal was a quorum miss, as opposed to an
+    /// eligibility verdict or no refusal at all.
+    ///
+    /// The two need opposite responses and the caller could not tell them
+    /// apart (#375). An eligibility refusal names a better holder, so lapsing
+    /// is the mechanism that hands the range over. A quorum miss names
+    /// nobody — the answers a rival would need are the same ones that did not
+    /// arrive — and lapsing is what mints the next epoch, putting it out of
+    /// reach of the very follower that was catching up to this one.
+    fn take_quorum_miss(&mut self) -> bool {
+        std::mem::take(&mut self.quorum_miss)
     }
 
     /// Whether the last refusal was an eligibility verdict; reading clears
@@ -741,6 +869,11 @@ pub struct LeaseAgent {
     /// because if the eligible replica is down someone must keep probing,
     /// and the refusal repeating is the honest unavailability signal.
     campaign_hold_off_rounds: u32,
+    /// How much of the current epoch's quorum-miss hold is left (#375).
+    ///
+    /// Per epoch, not per process: cleared on a successful promotion, and a
+    /// different epoch opens a fresh window rather than inheriting a spent one.
+    quorum_miss_hold: Option<QuorumMissHold>,
     /// Local upper bound on how long the current hold may be trusted without
     /// hearing from metadata, in the same wall-clock the envelope carries.
     ///
@@ -796,6 +929,7 @@ impl LeaseAgent {
             topic_uuid,
             range_uuid,
             promoter: Promoter {
+                quorum_miss: false,
                 publisher,
                 probe,
                 verified_epoch: None,
@@ -812,6 +946,7 @@ impl LeaseAgent {
             observed_rival: None,
             held_until_ms: None,
             campaign_hold_off_rounds: 0,
+            quorum_miss_hold: None,
         })
     }
 
@@ -1057,10 +1192,16 @@ impl LeaseAgent {
                 // lands; a renewal that errors out must not slide the local
                 // deadline forward on the strength of a read alone.
                 let confirmed_until = view.lease.as_ref().and_then(|lease| lease.expires_at_ms);
-                if !self.publish_held(fencing_epoch, confirmed_until).await {
-                    // Could not verify the boundary; do not renew a lease this
-                    // process cannot safely serve under.
-                    return Ok(self.config.poll_interval);
+                match self.publish_held(fencing_epoch, confirmed_until).await {
+                    Promoted::Yes => self.clear_quorum_miss_hold(),
+                    // AN ELIGIBILITY REFUSAL LAPSES ON PURPOSE. It named a
+                    // better holder, and the lapse is how the range reaches it.
+                    Promoted::Refused => return Ok(self.config.poll_interval),
+                    Promoted::QuorumMissed => {
+                        self.hold_through_quorum_miss(fencing_epoch, round_started_ms)
+                            .await?;
+                        return Ok(self.config.poll_interval);
+                    }
                 }
                 match self.renew(fencing_epoch).await? {
                     true => {
@@ -1085,7 +1226,7 @@ impl LeaseAgent {
             LeaseDecision::HeldAdministratively { fencing_epoch } => {
                 // No deadline to track: an administrative lease cannot lapse,
                 // so a metadata partition never forces a local demotion.
-                if !self.publish_held(fencing_epoch, None).await {
+                if self.publish_held(fencing_epoch, None).await != Promoted::Yes {
                     return Ok(self.config.poll_interval);
                 }
                 Ok(self.config.renew_interval)
@@ -1118,13 +1259,24 @@ impl LeaseAgent {
                             round_started_ms
                                 .saturating_add_unsigned(duration_ms(self.config.lease_duration)?),
                         );
-                        if self.publish_held(fencing_epoch, granted_until).await {
-                            Ok(self.config.renew_interval)
-                        } else {
-                            // We hold the lease but cannot verify the boundary.
-                            // Metadata's deadline will hand it on if this does
-                            // not resolve; serving now would be the guess.
-                            Ok(self.config.poll_interval)
+                        match self.publish_held(fencing_epoch, granted_until).await {
+                            Promoted::Yes => {
+                                self.clear_quorum_miss_hold();
+                                Ok(self.config.renew_interval)
+                            }
+                            // A FRESH EPOCH CAN MISS ON ITS FIRST PROBE, and
+                            // falling through here let the next poll arrive
+                            // after the grant expired — minting another epoch
+                            // and bypassing the bound (review).
+                            Promoted::QuorumMissed => {
+                                self.hold_through_quorum_miss(fencing_epoch, round_started_ms)
+                                    .await?;
+                                Ok(self.config.poll_interval)
+                            }
+                            // An eligibility verdict named a better holder, so
+                            // metadata's deadline hands it on; serving now
+                            // would be the guess.
+                            Promoted::Refused => Ok(self.config.poll_interval),
                         }
                     }
                     // Lost the race, or our CAS token was stale. Either way the
@@ -1227,8 +1379,9 @@ impl LeaseAgent {
         ))
     }
 
-    async fn publish_held(&mut self, fencing_epoch: u64, held_until_ms: Option<i64>) -> bool {
+    async fn publish_held(&mut self, fencing_epoch: u64, held_until_ms: Option<i64>) -> Promoted {
         if !self.promoter.ensure(fencing_epoch).await {
+            let quorum_miss = self.promoter.take_quorum_miss();
             if self.promoter.take_stand_aside() {
                 // Two lease lifetimes of poll rounds: enough for the replica
                 // the refusal named to see the lapse and win at least one
@@ -1238,11 +1391,50 @@ impl LeaseAgent {
             }
             self.state = LeaseState::NotHeld;
             self.held_until_ms = None;
-            return false;
+            return if quorum_miss {
+                Promoted::QuorumMissed
+            } else {
+                Promoted::Refused
+            };
         }
         self.state = LeaseState::Held { fencing_epoch };
         self.held_until_ms = held_until_ms;
-        true
+        Promoted::Yes
+    }
+
+    /// Hold a quorum-missed epoch still for as long as the budget allows.
+    ///
+    /// SHARED BY BOTH ARMS THAT CAN SEE A QUORUM MISS (review). The renew arm
+    /// is the common one, but a freshly acquired epoch can miss on its very
+    /// first probe, and leaving that arm to fall through meant the next poll
+    /// could arrive after the grant expired — minting another epoch and
+    /// bypassing the bound this exists to impose. One path, so there is one
+    /// behaviour.
+    async fn hold_through_quorum_miss(
+        &mut self,
+        fencing_epoch: u64,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        // ONE lease lifetime, because the last renewal inside it adds another.
+        let budget = quorum_miss_budget(
+            fencing_epoch,
+            now_ms,
+            self.quorum_miss_hold,
+            self.config.lease_duration,
+        );
+        self.quorum_miss_hold = budget.state;
+        if budget.hold {
+            // Renewing is not serving: `suspended` cleared `lease_active` on
+            // the broker's view and only a successful re-probe restores it.
+            // All this does is stop the epoch moving, which is the one thing a
+            // replica that is behind needs in order to stop being behind.
+            let _ = self.renew(fencing_epoch).await?;
+        }
+        Ok(())
+    }
+
+    fn clear_quorum_miss_hold(&mut self) {
+        self.quorum_miss_hold = None;
     }
 
     /// How many poll rounds an eligibility refusal sits out: two lease
@@ -1511,6 +1703,7 @@ mod tests {
         probe: Option<Arc<dyn QuorumProbe>>,
     ) -> Promoter {
         Promoter {
+            quorum_miss: false,
             publisher,
             probe,
             verified_epoch: None,
@@ -1683,6 +1876,125 @@ mod tests {
         assert!(
             !miss.take_stand_aside(),
             "a quorum miss is not an eligibility verdict; standing aside would delay              recovery for nothing"
+        );
+    }
+
+    /// A quorum miss and an eligibility refusal are told apart, because they
+    /// need opposite answers (#375).
+    ///
+    /// The asymmetry in `stand_aside` was already pinned by the test above;
+    /// this pins the other half of it. `publish_held` returned a bare bool, so
+    /// the caller treated every refusal alike — stop renewing, let the lease
+    /// lapse — and for a quorum miss that lapse is what mints the next epoch
+    /// and puts it out of reach of the follower catching up to this one.
+    #[tokio::test]
+    async fn a_quorum_miss_is_reported_as_one_and_an_eligibility_refusal_is_not() {
+        let recorder = Arc::new(Recorder::default());
+
+        let mut miss = promoter(
+            Arc::clone(&recorder) as Arc<dyn LeasePublisher>,
+            Some(fixed(vec![at(1, Some(10)), at(2, None), at(3, None)], 3)),
+        );
+        assert!(!miss.ensure(8).await);
+        assert!(
+            miss.take_quorum_miss(),
+            "too few answers must be reported as a quorum miss, or the caller cannot \
+             tell it from a verdict that named a better holder"
+        );
+        assert!(
+            !miss.take_quorum_miss(),
+            "and reading clears it: one refusal funds one decision"
+        );
+
+        // Node 2 is ahead, so this is the §5.4.1 refusal, not a miss.
+        let mut behind = promoter(
+            Arc::clone(&recorder) as Arc<dyn LeasePublisher>,
+            Some(fixed(vec![at(1, Some(100)), at(2, Some(101))], 3)),
+        );
+        assert!(!behind.ensure(9).await);
+        assert!(
+            !behind.take_quorum_miss(),
+            "an eligibility verdict is not a quorum miss; holding the epoch for it would \
+             keep the range away from the replica the refusal named"
+        );
+    }
+
+    /// Holding an epoch through a quorum miss is bounded, latched, and per
+    /// epoch (#375).
+    ///
+    /// Four properties, and they pull against each other. It must HOLD,
+    /// because lapsing mints `fencing_epoch + 1` and a replica refuses a fence
+    /// for an epoch it has not observed — so the loop sustains itself. It must
+    /// be BOUNDED, because a range that is genuinely unservable has to reach a
+    /// survivor eventually. The bound must be measured in the unit it is
+    /// stated in — counted in poll rounds it was several times longer than
+    /// promised, because a probe against blackholed replicas spends the fence
+    /// deadline before the poll interval is applied. And it must LATCH, or a
+    /// clock that steps backwards reopens a window that had closed.
+    #[test]
+    fn a_quorum_miss_hold_is_bounded_latched_and_per_epoch() {
+        let hold_for = Duration::from_secs(15);
+
+        let opened = quorum_miss_budget(7, 1_000, None, hold_for);
+        assert!(opened.hold, "the first miss on an epoch must hold it");
+        assert_eq!(
+            opened.state,
+            Some(QuorumMissHold::Until {
+                epoch: 7,
+                until_ms: 16_000
+            }),
+            "the deadline is the hold measured from now, not a round count"
+        );
+
+        let inside = quorum_miss_budget(7, 15_999, opened.state, hold_for);
+        assert!(inside.hold, "a millisecond before the deadline still holds");
+        assert_eq!(
+            inside.state, opened.state,
+            "and the deadline does not slide forward on each round, or the hold would \
+             never end while rounds kept happening"
+        );
+
+        let spent = quorum_miss_budget(7, 16_000, opened.state, hold_for);
+        assert!(
+            !spent.hold,
+            "the budget must run out, or an unservable range never reaches a survivor"
+        );
+        assert_eq!(
+            spent.state,
+            Some(QuorumMissHold::Spent { epoch: 7 }),
+            "and closing it must be LATCHED rather than recomputed"
+        );
+
+        // The clock steps backwards — NTP, or a restored snapshot. A spent
+        // window must not reopen, which a bare timestamp comparison would do.
+        assert!(
+            !quorum_miss_budget(7, 1_000, spent.state, hold_for).hold,
+            "a clock that moves backwards must not reopen a window that closed; the \
+             decision is a fact, not a measurement to repeat"
+        );
+
+        // A single round that itself outlasts the hold exhausts it, which is
+        // the whole reason this is wall clock and not a count of rounds.
+        let one = quorum_miss_budget(9, 0, None, hold_for);
+        assert!(
+            !quorum_miss_budget(9, 15_001, one.state, hold_for).hold,
+            "one slow round can spend the entire window"
+        );
+
+        // A NEW epoch is a new window, even carrying a spent one.
+        let fresh = quorum_miss_budget(8, 16_000, spent.state, hold_for);
+        assert!(
+            fresh.hold,
+            "a range that recovered and missed again must get a fresh window; inheriting \
+             a spent one would make the second outage unrecoverable for no reason"
+        );
+        assert_eq!(
+            fresh.state,
+            Some(QuorumMissHold::Until {
+                epoch: 8,
+                until_ms: 31_000
+            }),
+            "measured from the new miss, and following the new epoch"
         );
     }
 
