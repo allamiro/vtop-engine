@@ -298,16 +298,35 @@ const FILE_READ_CONCURRENCY: usize = 8;
 impl SourceAdapter for FileSource {
     async fn discover_sources(&self) -> Result<Vec<DiscoveredSource>, VtopError> {
         let mut out = Vec::new();
+        // ONE ENTRY PER FILE, not one per pattern that matched it (#376).
+        //
+        // Two globs can name the same path — `*.log` and a service prefix is
+        // the obvious way it happens, and the shipped example config already
+        // carries two `file.paths` entries — and without this the file was
+        // discovered twice. Both discoveries carry the same `source_name`, so
+        // both jobs snapshot the same starting offset and both outcomes route
+        // into the same pending buffer: the records were archived twice, from
+        // a configuration nothing warns about.
+        //
+        // Keyed on the resolved path rather than the pattern, because the
+        // pattern is what differs and the file is what matters.
+        let mut seen = std::collections::HashSet::new();
         for pattern in &self.paths {
             for entry in glob::glob(pattern)
                 .map_err(|e| VtopError::Source(format!("bad glob {pattern}: {e}")))?
             {
                 match entry {
-                    Ok(p) if p.is_file() => out.push(DiscoveredSource {
-                        source_type: SourceType::File,
-                        source_name: p.to_string_lossy().into_owned(),
-                        format: self.format.clone(),
-                    }),
+                    Ok(p) if p.is_file() => {
+                        let source_name = p.to_string_lossy().into_owned();
+                        if !seen.insert(source_name.clone()) {
+                            continue;
+                        }
+                        out.push(DiscoveredSource {
+                            source_type: SourceType::File,
+                            source_name,
+                            format: self.format.clone(),
+                        });
+                    }
                     _ => {}
                 }
             }
@@ -606,6 +625,53 @@ mod tests {
     /// trap measured at 48x. This skip cannot do that, because the stat is a
     /// reliable emptiness check rather than a probabilistic one and it runs at
     /// full strength every cycle. This test is that claim, executed.
+    /// Two globs matching the same file discover it once (#376).
+    ///
+    /// Both discoveries carried the same `source_name`, so both jobs
+    /// snapshotted the same starting offset and both outcomes routed into the
+    /// same pending buffer — the records were archived twice, from a
+    /// configuration nothing warns about and that the shipped example already
+    /// resembles: `examples/config.yaml` lists two `file.paths` entries, and
+    /// `*.log` beside a service prefix is the obvious way an operator writes
+    /// the same intent twice.
+    #[tokio::test]
+    async fn two_globs_matching_one_file_discover_it_once() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("app.log"), "one\ntwo\n").unwrap();
+        // A second file that only ONE of the patterns matches, so the test
+        // also pins that deduplication does not swallow distinct sources.
+        std::fs::write(dir.path().join("other.log"), "three\n").unwrap();
+
+        let source = FileSource::new(
+            vec![
+                format!("{}/*.log", dir.path().display()),
+                format!("{}/app*", dir.path().display()),
+            ],
+            TelemetryFormat::Raw,
+            false,
+        );
+
+        let mut found: Vec<String> = source
+            .discover_sources()
+            .await
+            .expect("a readable directory discovers")
+            .into_iter()
+            .map(|s| s.source_name)
+            .collect();
+        found.sort();
+
+        assert_eq!(
+            found.len(),
+            2,
+            "a file matched by two patterns must be discovered ONCE — twice means it \
+             is read twice, acknowledged twice and archived twice: {found:?}"
+        );
+        assert!(
+            found[0].ends_with("app.log") && found[1].ends_with("other.log"),
+            "and the file only one pattern matched must still be there: {found:?}"
+        );
+    }
+
     #[tokio::test]
     async fn an_unchanged_file_is_skipped_and_a_changed_one_is_read_at_once() {
         let f = write_log(&["a", "b"]);
