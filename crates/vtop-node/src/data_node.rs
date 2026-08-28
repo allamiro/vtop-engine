@@ -1913,6 +1913,15 @@ pub(crate) fn malformed_endpoint(configured: &str) -> Option<String> {
     // cluster — and rejecting it would refuse startup over correct config.
     // Everything else empty is still a mistake: a leading dot, or two in a row.
     let labels = host.strip_suffix('.').unwrap_or(host);
+    // DNS cannot encode a label over 63 bytes, so one that is longer is a name
+    // that can never resolve rather than one that has not yet (review).
+    if let Some(long) = labels.split('.').find(|label| label.len() > 63) {
+        return Some(format!(
+            "the label {:?} is {} bytes, and DNS cannot encode one over 63",
+            &long[..63.min(long.len())],
+            long.len()
+        ));
+    }
     if labels.is_empty() || labels.split('.').any(|label| label.is_empty()) {
         return Some(format!(
             "{host:?} has an empty label; a name is dot-separated, and only a single \
@@ -2678,7 +2687,9 @@ mod tests {
             );
         }
 
+        let too_long = format!("{}:9300", "a".repeat(64));
         for (bad, expected) in [
+            (too_long.as_str(), "cannot encode one over 63"),
             ("vtop-1.vtop-headless", "no port"),
             ("vtop-1.vtop-headless:", "not a port"),
             ("vtop-1:not-a-number", "not a port"),

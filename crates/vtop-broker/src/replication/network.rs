@@ -1157,6 +1157,14 @@ impl FollowerDriver {
         }
     }
 
+    /// Look the name up if it is due, then dial whatever address we hold.
+    ///
+    /// One future so the caller can put one deadline over both.
+    async fn resolve_and_connect(&mut self) -> std::io::Result<TcpStream> {
+        self.re_resolve_if_due().await;
+        TcpStream::connect(self.config.addr).await
+    }
+
     async fn re_resolve_if_due(&mut self) {
         let Some(host) = self.config.host.clone() else {
             return;
@@ -1171,10 +1179,12 @@ impl FollowerDriver {
         // cannot be asked again on the next backoff while the first query is
         // still outstanding (review).
         self.resolved_at = Some(std::time::Instant::now());
-        // Bounded by the connect timeout this is standing in front of: a name
-        // lookup must not cost more than the connection it is preparing, or a
-        // stalled resolver stalls reconnect and shutdown with it (review).
-        if let Some(addr) = address_now(&host, self.flow.connect_timeout).await {
+        // HALF the shared budget, not all of it. The caller now puts one
+        // deadline over the lookup and the dial together, so a lookup allowed
+        // to consume the whole thing would leave nothing for the connection it
+        // exists to prepare — and the cached address is often still reachable
+        // (review).
+        if let Some(addr) = address_now(&host, self.flow.connect_timeout / 2).await {
             self.config.addr = addr;
         }
     }
@@ -1186,18 +1196,15 @@ impl FollowerDriver {
         retransmission_bytes: &mut usize,
         pending: &mut VecDeque<FollowerCmd>,
     ) -> SessionOutcome {
-        // ASK WHERE THE FOLLOWER IS BEFORE DIALLING WHERE IT WAS (#367).
-        // Every arrival here is either the first connection or a reconnect
-        // after one failed, and "the follower moved" is one of the few things
-        // that failure can mean which retrying the same address will never
-        // fix.
-        self.re_resolve_if_due().await;
-        let tcp = match timeout(
-            self.flow.connect_timeout,
-            TcpStream::connect(self.config.addr),
-        )
-        .await
-        {
+        // ASK WHERE THE FOLLOWER IS BEFORE DIALLING WHERE IT WAS (#367), under
+        // ONE budget with the dial. Bounding them separately let a stalled
+        // resolver spend a full connect timeout before the cached address —
+        // which may be perfectly reachable — was tried at all, so a follower
+        // stream took twice as long to come back as the number that was tuned
+        // for it (review). Finding out where a peer is, is part of reaching
+        // it.
+        let budget = self.flow.connect_timeout;
+        let tcp = match timeout(budget, self.resolve_and_connect()).await {
             Ok(Ok(tcp)) => tcp,
             _ => return SessionOutcome::Disconnected,
         };
