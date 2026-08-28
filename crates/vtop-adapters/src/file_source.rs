@@ -325,6 +325,8 @@ fn without_dot_components(path: &std::path::Path) -> std::path::PathBuf {
         .collect()
 }
 
+/// How many files are read concurrently in one pass. Bounded so a glob that
+/// matches thousands of files does not open them all at once.
 const FILE_READ_CONCURRENCY: usize = 8;
 
 #[async_trait]
