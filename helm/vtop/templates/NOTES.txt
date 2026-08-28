@@ -60,7 +60,7 @@ vtop {{ .Chart.AppVersion }} — {{ int .Values.replicaCount }} co-located node(
 
      vtopctl meta create-topic --name {{ .Values.data.range.topic }} --topic-uuid {{ .Values.data.lease.topicUuid | default "<topicUuid>" }} --root-range-uuid {{ .Values.data.range.rangeId | default "<rangeId>" }} --config admin.yaml
      # once per pod, each at its OWN headless FQDN:
-     vtopctl meta register-node --node-uuid <that pod's cluster.nodeUuids entry> --addr <pod-fqdn>:{{ .Values.ports.replica }} --config admin.yaml
+     vtopctl meta register-node --node-uuid <that pod's data.nodeUuids entry> --addr <pod-fqdn>:{{ .Values.ports.replica }} --config admin.yaml
 
    Whichever pod acquires the range leads; when the holder dies, a surviving
    candidate takes the range in place — no re-render, no upgrade. WHICH pod

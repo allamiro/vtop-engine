@@ -551,7 +551,7 @@ jobs:
           # TLS would have sailed through it.
           refuses "TLS secret names" \
             --set cluster.id=11111111-2222-3333-4444-555555555555 \
-            --set 'cluster.nodeUuids={aaaaaaaa-0000-0000-0000-0000000000a1,aaaaaaaa-0000-0000-0000-0000000000a2,aaaaaaaa-0000-0000-0000-0000000000a3}' \
+            --set 'data.nodeUuids={aaaaaaaa-0000-0000-0000-0000000000a1,aaaaaaaa-0000-0000-0000-0000000000a2,aaaaaaaa-0000-0000-0000-0000000000a3}' \
             --set data.range.topic=telemetry \
             --set data.range.rangeId=aaaaaaaa-0000-0000-0000-0000000000c1 \
             --set data.segmentId=aaaaaaaa-0000-0000-0000-0000000000d1 \
@@ -559,7 +559,17 @@ jobs:
           refuses "a matching nodeUuids count" -f helm/vtop/ci/default-values.yaml --set replicaCount=5
           refuses "distinct broker UUIDs" \
             -f helm/vtop/ci/default-values.yaml \
-            --set 'cluster.nodeUuids={aaaaaaaa-0000-0000-0000-0000000000a1,aaaaaaaa-0000-0000-0000-0000000000a1,aaaaaaaa-0000-0000-0000-0000000000a3}'
+            --set 'data.nodeUuids={aaaaaaaa-0000-0000-0000-0000000000a1,aaaaaaaa-0000-0000-0000-0000000000a1,aaaaaaaa-0000-0000-0000-0000000000a3}'
+          # The #287 slice-1 guards. Each refusal is a values file somebody
+          # could plausibly write: the retired key with a real list in it, an
+          # even voter count, and the mode that exists in the schema before
+          # its rendering exists in the chart.
+          refuses "the nodeUuids migration (cluster.nodeUuids is retired)" \
+            -f helm/vtop/ci/default-values.yaml \
+            --set 'cluster.nodeUuids={aaaaaaaa-0000-0000-0000-0000000000a1,aaaaaaaa-0000-0000-0000-0000000000a2,aaaaaaaa-0000-0000-0000-0000000000a3}'
+          refuses "an odd metadata voter count" -f helm/vtop/ci/default-values.yaml --set replicaCount=4
+          refuses "deployment.mode=colocated (separated is slice 2)" \
+            -f helm/vtop/ci/default-values.yaml --set deployment.mode=separated
 
       # The REPLICATED shape, which until now nothing rendered at all — not
       # here, and not in the live smoke test either. It is the only topology
@@ -638,7 +648,7 @@ jobs:
               aaaaaaaa-0000-0000-0000-0000000000a2
               aaaaaaaa-0000-0000-0000-0000000000a3
             ]
-            abort "peer identities #{uuids.sort} are not the configured cluster.nodeUuids #{want_uuids}" \
+            abort "peer identities #{uuids.sort} are not the configured data.nodeUuids #{want_uuids}" \
               unless uuids.sort == want_uuids
 
             # Every pod carries its OWN identity from that same set, and the
@@ -721,7 +731,7 @@ jobs:
           refuses_because "a replicated range needs at least one follower" \
             -f helm/vtop/ci/replicated-values.yaml \
             --set replicaCount=1 \
-            --set 'cluster.nodeUuids={aaaaaaaa-0000-0000-0000-0000000000a1}'
+            --set 'data.nodeUuids={aaaaaaaa-0000-0000-0000-0000000000a1}'
 
       # Long names are where DNS limits and collisions appear, and both were
       # real: the headless Service used to truncate to the same string as the

@@ -6,14 +6,14 @@
 # to objects that do not exist anywhere.
 cluster:
   id: 11111111-2222-3333-4444-555555555555
-  nodeUuids:
-    - aaaaaaaa-0000-0000-0000-0000000000a1
-    - aaaaaaaa-0000-0000-0000-0000000000a2
-    - aaaaaaaa-0000-0000-0000-0000000000a3
 tls:
   metaSecretName: vtop-meta-tls
   dataSecretName: vtop-data-tls
 data:
+  nodeUuids:
+    - aaaaaaaa-0000-0000-0000-0000000000a1
+    - aaaaaaaa-0000-0000-0000-0000000000a2
+    - aaaaaaaa-0000-0000-0000-0000000000a3
   range:
     topic: telemetry
     rangeId: aaaaaaaa-0000-0000-0000-0000000000c1
