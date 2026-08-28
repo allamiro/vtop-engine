@@ -12,6 +12,7 @@ members = [
   "crates/vtop-upload",
   "crates/vtop-state",
   "crates/vtop-cli",
+  "crates/vtop-kafka",
 ]
 
 [workspace.package]
