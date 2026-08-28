@@ -698,6 +698,11 @@ fn connect(config: &MetaAdminConfig) -> Result<AdminClient, String> {
         // naming it matches whichever peer entry covers the same node.
         node_id: None,
         endpoint: resolve_endpoint(&config.endpoint).map_err(|error| error.to_string())?,
+        host: config
+            .endpoint
+            .parse::<std::net::SocketAddr>()
+            .err()
+            .map(|_| config.endpoint.clone()),
         server_name: config.server_name.clone(),
         plaintext: false,
     }];
@@ -705,6 +710,11 @@ fn connect(config: &MetaAdminConfig) -> Result<AdminClient, String> {
         candidates.push(AdminCandidate {
             node_id: Some(MetaNodeId(peer.node_id)),
             endpoint: resolve_endpoint(&peer.endpoint).map_err(|error| error.to_string())?,
+            host: peer
+                .endpoint
+                .parse::<std::net::SocketAddr>()
+                .err()
+                .map(|_| peer.endpoint.clone()),
             server_name: if peer.server_name.is_empty() {
                 config.server_name.clone()
             } else {

@@ -9,8 +9,8 @@ use tokio::net::TcpListener;
 use vtop_log::env::Env;
 use vtop_meta::transport::AdminAuthorizer;
 use vtop_meta::{
-    resolve_endpoint, start_meta_node, AdminHandler, AdminServer, MetaNodeId, MetaNodeTimers,
-    PeerDirectory, PeerEndpoint, PeerRpcHandler, PeerServer,
+    start_meta_node, AdminHandler, AdminServer, MetaNodeId, MetaNodeTimers, PeerDirectory,
+    PeerRpcHandler, PeerServer,
 };
 
 /// Run a metadata node that owns its own observability endpoint.
@@ -38,18 +38,54 @@ pub async fn serve(
     std::fs::create_dir_all(&config.data_dir)
         .map_err(|error| format!("create {}: {error}", config.data_dir.display()))?;
 
+    // PEERS GO IN BY NAME, NOT BY THE ADDRESS THE NAME HAPPENS TO HOLD NOW
+    // (#367). This used to resolve each peer once, here, and store the
+    // resulting `SocketAddr` for the life of the process. Two things follow
+    // from that, and both were observed in CI.
+    //
+    // A member whose pod is replaced comes back at a new address, and every
+    // surviving member keeps dialling the old one — forever. The break is
+    // ONE-WAY, which is what made it so hard to see: the returning member
+    // resolved its neighbours at its own start, so it can reach them, and
+    // they cannot reach it. It is never replicated to, never learns the
+    // current term, and campaigns for the rest of its life — burning a term
+    // per election timeout, which the consensus layer's own notes explain is
+    // not free.
+    //
+    // And a member whose neighbours do not exist yet could not start at all:
+    // resolution failure was fatal, so in a group that boots together
+    // (podManagementPolicy: Parallel) whichever member won the race crash-
+    // looped until the others had addresses. A peer that is not there yet is
+    // not a configuration error.
     let directory = PeerDirectory::new();
     for peer in &config.peers {
         if peer.id == config.node_id {
             continue;
         }
-        directory.insert(
-            peer.id,
-            PeerEndpoint {
-                addr: resolve_endpoint(&peer.addr).map_err(|error| error.to_string())?,
-                server_name: peer.server_name.clone(),
-            },
-        );
+        // Malformed refuses; merely absent does not (review). `resolve_endpoint`
+        // used to reject both and the tolerance added here covered both, so a
+        // peer written without a port started the node and was retried for the
+        // life of it.
+        if let Some(why) = crate::data_node::malformed_endpoint(&peer.addr) {
+            return Err(format!(
+                "metadata peer {} at {:?} cannot be an address: {why}",
+                peer.id, peer.addr
+            ));
+        }
+        directory
+            .insert_by_name(peer.id, peer.addr.clone(), peer.server_name.clone())
+            .await;
+        // ANNOUNCED, so a typo and a startup race are distinguishable. Both
+        // present as an unreachable member; only one of them will ever fix
+        // itself, and an operator reading a node that came up "fine" has
+        // nothing to go on otherwise (review).
+        if directory.get(peer.id).is_none() {
+            eprintln!(
+                "metadata peer {} at {:?} does not resolve yet; it will be looked up \
+                 again on every failed exchange and stays unreachable until it answers",
+                peer.id, peer.addr
+            );
+        }
     }
 
     let env = Env::real();

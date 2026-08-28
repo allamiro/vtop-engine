@@ -139,13 +139,39 @@ pub struct ReplicaPlaneProbe {
     client: vtop_broker::replication::ReplicaStatusClient,
     followers: Vec<FollowerEndpoint>,
     range: vtop_protocol::RangeIdentity,
+    /// The most recent address each named follower actually resolved to.
+    ///
+    /// The fallback when a lookup fails, and it must not be the address this
+    /// process started with (#367): a follower that moved and was found stays
+    /// found, so the next resolver hiccup does not send the probe back to
+    /// where the follower used to be and report a healthy replica absent.
+    last_known: std::sync::Mutex<std::collections::HashMap<Uuid, std::net::SocketAddr>>,
 }
+
+/// How long a probe will wait for one follower's name.
+///
+/// Well inside the fence deadline it precedes, because a probe that waited out
+/// a stalled resolver would spend its round budget before asking a single
+/// replica anything.
+const PROBE_RESOLVE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// One follower, as the leader dials it.
 #[derive(Clone, Debug)]
 pub struct FollowerEndpoint {
     pub node_uuid: Uuid,
+    /// Where the follower was, last time its name was looked up.
     pub addr: std::net::SocketAddr,
+    /// The `host:port` it was configured under, when it was a name (#367).
+    ///
+    /// A probe is what decides whether a candidate may promote, so a stale
+    /// address here does not merely lose a connection — it withholds a vote,
+    /// and a range with one absent replica out of three cannot establish its
+    /// boundary at all. Resolved per probe rather than cached: a probe runs
+    /// once per grant, not per heartbeat, so the lookup is free at this rate
+    /// and the answer is never older than the question.
+    ///
+    /// `None` for a follower given as a literal address.
+    pub host: Option<String>,
     pub server_name: String,
 }
 
@@ -163,6 +189,7 @@ impl ReplicaPlaneProbe {
             client,
             followers,
             range,
+            last_known: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 }
@@ -203,10 +230,63 @@ impl QuorumProbe for ReplicaPlaneProbe {
         // Concurrent: a follower that has stopped answering must not add its
         // full deadline to every other follower's wait.
         let answers = futures::future::join_all(self.followers.iter().map(|follower| async move {
+            // The name, if we have one, outranks the address we last resolved
+            // it to (#367). Inside the concurrent block so one follower whose
+            // name is slow to answer does not delay the others.
+            // THE FALLBACK IS THE LAST ADDRESS THAT WORKED, not the one this
+            // process started with (review). A follower that moved and was
+            // found is found again on the next probe; falling back to the
+            // startup address would send the next transient resolver failure
+            // straight back to where the follower used to be, report a healthy
+            // replica absent, and lose the promotion quorum on it.
+            //
+            // Bounded by the same deadline the fence itself gets: a probe that
+            // waited out a stalled resolver would spend the round budget
+            // before asking a single replica anything.
+            let addr = match &follower.host {
+                Some(host) => {
+                    match vtop_broker::replication::address_now(host, PROBE_RESOLVE_TIMEOUT).await {
+                        // REMEMBERED ON RESOLUTION, and this reverses an
+                        // earlier revision that waited for a fence to prove it
+                        // (review, twice, in both directions — so here is the
+                        // argument that settles it).
+                        //
+                        // The two candidates for the fallback are "the last
+                        // address that answered a fence" and "the last address
+                        // the NAME gave us". They differ exactly when a
+                        // follower has moved and is not serving yet, and there
+                        // the second is right: the name is authoritative about
+                        // WHERE a peer is, while a fence only reports whether
+                        // it is READY. Preferring the proven address means
+                        // preferring one that is definitively dead — a
+                        // replaced pod's old address never comes back — over
+                        // one that is merely early, and a peer that is early
+                        // becomes correct on its own.
+                        //
+                        // The startup address survives only as the last
+                        // resort, for a peer no lookup has ever answered for.
+                        Some(addr) => {
+                            self.last_known
+                                .lock()
+                                .expect("resolved peers")
+                                .insert(follower.node_uuid, addr);
+                            addr
+                        }
+                        None => self
+                            .last_known
+                            .lock()
+                            .expect("resolved peers")
+                            .get(&follower.node_uuid)
+                            .copied()
+                            .unwrap_or(follower.addr),
+                    }
+                }
+                None => follower.addr,
+            };
             let fenced = self
                 .client
                 .fence(
-                    follower.addr,
+                    addr,
                     &follower.server_name,
                     follower.node_uuid,
                     &self.range,
@@ -1717,6 +1797,9 @@ mod tests {
             vec![FollowerEndpoint {
                 node_uuid: follower_uuid,
                 addr: unreachable,
+                // A literal address, so the probe uses it verbatim: this test
+                // is about an unreachable follower, not about resolution.
+                host: None,
                 server_name: "replica".to_owned(),
             }],
             broker.range().clone(),

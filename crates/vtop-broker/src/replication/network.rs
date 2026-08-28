@@ -74,9 +74,59 @@ impl Default for FlowControlConfig {
 #[derive(Clone, Debug)]
 pub struct NetworkFollowerConfig {
     pub node_id: Uuid,
+    /// Where the follower was, last time its name was looked up.
     pub addr: SocketAddr,
+    /// The `host:port` this follower was configured under, when it was a name.
+    ///
+    /// Kept because `addr` goes stale (#367). A follower whose pod is replaced
+    /// returns at a different address, and a leader that resolved the name
+    /// once at startup reconnects to the old one for the rest of its life —
+    /// with a bounded connect timeout and a reconnect backoff, so it looks
+    /// exactly like a follower that is merely down, forever, and quorum
+    /// silently shrinks by one.
+    ///
+    /// `None` for a follower given as a literal address, which is what the
+    /// deterministic harnesses do: there is nothing to look up again.
+    pub host: Option<String>,
     /// Expected server certificate name (SNI / rustls ServerName).
     pub server_name: String,
+}
+
+/// How often one follower's name may be looked up again.
+///
+/// The reconnect loop retries on a 50 ms backoff, and re-resolving on each
+/// would be twenty name queries a second for a follower that is simply down.
+/// A quarter second still finds a follower that moved within one connect
+/// timeout of it happening.
+const FOLLOWER_RERESOLVE_INTERVAL: Duration = Duration::from_millis(250);
+
+/// The address `host` names now, or `None` if the lookup gave nothing in time.
+///
+/// A lookup that fails is deliberately not an answer: the caller keeps the
+/// address it had, because a resolver hiccup is not evidence that a peer
+/// moved and replacing a working address with nothing would make a reachable
+/// replica unreachable.
+///
+/// BOUNDED, and the bound is the caller's (review). Every caller of this sits
+/// on a path that already has a deadline — a connect timeout, a probe budget
+/// — and an unbounded name lookup would quietly become the longest thing on
+/// it. A resolver that stalls costs `within` and no more; the next attempt
+/// asks again.
+pub async fn address_now(host: &str, within: Duration) -> Option<SocketAddr> {
+    match tokio::time::timeout(within, tokio::net::lookup_host(host)).await {
+        Ok(Ok(mut addrs)) => addrs.next(),
+        Ok(Err(error)) => {
+            // Said rather than swallowed: a misspelt peer and a transient DNS
+            // race look identical from the outside, and only one of them is
+            // worth an operator's attention (review).
+            eprintln!("could not resolve replica peer {host:?}: {error}");
+            None
+        }
+        Err(_) => {
+            eprintln!("resolving replica peer {host:?} exceeded {within:?}");
+            None
+        }
+    }
 }
 
 /// Apply surface hosted by a follower peer server.
@@ -846,6 +896,7 @@ impl NetworkedReplicaSet {
                 budget: Arc::clone(&budget),
             });
             let driver = FollowerDriver {
+                resolved_at: None,
                 config,
                 connector: connector.clone(),
                 flow: flow.clone(),
@@ -1064,6 +1115,9 @@ struct BufferedBatch {
 
 struct FollowerDriver {
     config: NetworkFollowerConfig,
+    /// When this follower's name was last looked up, so a follower that is
+    /// down is not a name query on the reconnect backoff (#367).
+    resolved_at: Option<std::time::Instant>,
     /// `None` means this leader dials its followers in plaintext (#294 slice 3).
     connector: Option<TlsConnector>,
     flow: FlowControlConfig,
@@ -1103,6 +1157,38 @@ impl FollowerDriver {
         }
     }
 
+    /// Look the name up if it is due, then dial whatever address we hold.
+    ///
+    /// One future so the caller can put one deadline over both.
+    async fn resolve_and_connect(&mut self) -> std::io::Result<TcpStream> {
+        self.re_resolve_if_due().await;
+        TcpStream::connect(self.config.addr).await
+    }
+
+    async fn re_resolve_if_due(&mut self) {
+        let Some(host) = self.config.host.clone() else {
+            return;
+        };
+        if self
+            .resolved_at
+            .is_some_and(|at| at.elapsed() < FOLLOWER_RERESOLVE_INTERVAL)
+        {
+            return;
+        }
+        // Claimed before the await, so a resolver that has stopped answering
+        // cannot be asked again on the next backoff while the first query is
+        // still outstanding (review).
+        self.resolved_at = Some(std::time::Instant::now());
+        // HALF the shared budget, not all of it. The caller now puts one
+        // deadline over the lookup and the dial together, so a lookup allowed
+        // to consume the whole thing would leave nothing for the connection it
+        // exists to prepare — and the cached address is often still reachable
+        // (review).
+        if let Some(addr) = address_now(&host, self.flow.connect_timeout / 2).await {
+            self.config.addr = addr;
+        }
+    }
+
     async fn connect_and_session(
         &mut self,
         next_request_id: &mut u64,
@@ -1110,12 +1196,22 @@ impl FollowerDriver {
         retransmission_bytes: &mut usize,
         pending: &mut VecDeque<FollowerCmd>,
     ) -> SessionOutcome {
-        let tcp = match timeout(
-            self.flow.connect_timeout,
-            TcpStream::connect(self.config.addr),
-        )
-        .await
-        {
+        // ASK WHERE THE FOLLOWER IS BEFORE DIALLING WHERE IT WAS (#367), under
+        // ONE budget with the dial. Bounding them separately let a stalled
+        // resolver spend a full connect timeout before the cached address —
+        // which may be perfectly reachable — was tried at all, so a follower
+        // stream took twice as long to come back as the number that was tuned
+        // for it (review). Finding out where a peer is, is part of reaching
+        // it.
+        // The budget covers the whole of ESTABLISHMENT — lookup, dial and
+        // handshake — because they are one thing from the caller's side and
+        // splitting them lets each pay the full price in turn (review). The
+        // deadline is computed once and the remainder carried forward, so a
+        // slow name lookup shortens the handshake's share rather than granting
+        // it a fresh one.
+        let budget = self.flow.connect_timeout;
+        let deadline = tokio::time::Instant::now() + budget;
+        let tcp = match timeout(budget, self.resolve_and_connect()).await {
             Ok(Ok(tcp)) => tcp,
             _ => return SessionOutcome::Disconnected,
         };
@@ -1125,15 +1221,13 @@ impl FollowerDriver {
                     Ok(name) => name,
                     Err(_) => return SessionOutcome::Disconnected,
                 };
-                let tls = match timeout(
-                    self.flow.connect_timeout,
-                    connector.connect(server_name, tcp),
-                )
-                .await
-                {
-                    Ok(Ok(stream)) => stream,
-                    _ => return SessionOutcome::Disconnected,
-                };
+                let tls =
+                    match tokio::time::timeout_at(deadline, connector.connect(server_name, tcp))
+                        .await
+                    {
+                        Ok(Ok(stream)) => stream,
+                        _ => return SessionOutcome::Disconnected,
+                    };
                 // Skipped EXPLICITLY under plaintext below, not folded into a
                 // helper that tolerates a missing certificate: this check is
                 // what stops a leader replicating into whichever replica now

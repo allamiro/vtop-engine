@@ -74,17 +74,29 @@ fn lease_admin_client(
         node_id: None,
         endpoint: vtop_meta::resolve_endpoint(&lease.admin_endpoint)
             .map_err(|error| error.to_string())?,
+        host: name_source(&lease.admin_endpoint),
         server_name: lease.server_name.clone(),
         // TLS remains the only mode this path builds. Slice 1 of #294 makes the
         // admin transport CAPABLE of plaintext; wiring a node's lease client to
         // choose it belongs with the config surface, not here.
         plaintext: false,
     }];
+    // THE PEERS MAY NOT EXIST YET; THIS NODE'S OWN ENDPOINT MUST (#367). The
+    // configured endpoint above stays strict — a node that cannot resolve the
+    // metadata address it was given has been misconfigured, and saying so at
+    // startup is the kindest moment. A redirect target is different: in a
+    // group created all at once, some of these names have not been published,
+    // and refusing to start over a neighbour that is still being scheduled
+    // makes a startup race look like a broken node.
+    //
+    // A candidate that never resolves is simply one the walk cannot reach,
+    // which the walk already handles — and now handles quickly, since each
+    // candidate has its own deadline.
     for peer in &lease.admin_peers {
         candidates.push(vtop_meta::AdminCandidate {
             node_id: Some(vtop_meta::MetaNodeId(peer.node_id)),
-            endpoint: vtop_meta::resolve_endpoint(&peer.endpoint)
-                .map_err(|error| error.to_string())?,
+            endpoint: first_address_of(&peer.endpoint)?,
+            host: name_source(&peer.endpoint),
             server_name: if peer.server_name.is_empty() {
                 lease.server_name.clone()
             } else {
@@ -694,8 +706,8 @@ async fn run_leader(
             .map(|follower| {
                 Ok(NetworkFollowerConfig {
                     node_id: follower.node_uuid,
-                    addr: vtop_meta::resolve_endpoint(&follower.addr)
-                        .map_err(|error| error.to_string())?,
+                    addr: first_address_of(&follower.addr)?,
+                    host: name_source(&follower.addr),
                     server_name: follower.server_name.clone(),
                 })
             })
@@ -778,8 +790,8 @@ async fn run_leader(
             .map(|follower| {
                 Ok(crate::lease_agent::FollowerEndpoint {
                     node_uuid: follower.node_uuid,
-                    addr: vtop_meta::resolve_endpoint(&follower.addr)
-                        .map_err(|error| error.to_string())?,
+                    addr: first_address_of(&follower.addr)?,
+                    host: name_source(&follower.addr),
                     server_name: follower.server_name.clone(),
                 })
             })
@@ -1182,7 +1194,8 @@ async fn run_candidate(
         .map(|peer| {
             Ok(crate::lease_agent::FollowerEndpoint {
                 node_uuid: peer.node_uuid,
-                addr: vtop_meta::resolve_endpoint(&peer.addr).map_err(|error| error.to_string())?,
+                addr: first_address_of(&peer.addr)?,
+                host: name_source(&peer.addr),
                 server_name: peer.server_name.clone(),
             })
         })
@@ -1805,6 +1818,165 @@ async fn run_candidate(
     Ok(())
 }
 
+/// The configured value, when it is a NAME worth looking up again.
+///
+/// A literal `host:port` is already as current as it will ever be, so keeping
+/// it as a name-source buys nothing and costs a resolver query on every
+/// reconnect for a peer that is simply down (review). `None` for those, which
+/// every re-resolving path already treats as "nothing to look up".
+fn name_source(configured: &str) -> Option<String> {
+    if configured.parse::<std::net::SocketAddr>().is_ok() {
+        return None;
+    }
+    Some(configured.to_owned())
+}
+
+/// The reason `configured` can never be a peer address, if there is one.
+///
+/// MALFORMED IS NOT ABSENT (review). A name with no port, an unbracketed IPv6
+/// literal — whose last colon belongs to the address rather than to a port —
+/// or a host with characters no resolver will ever accept, is not a peer that
+/// has yet to appear; it is a peer that never will, and no amount of
+/// re-resolution fixes it. Tolerating those would start the node and spend the
+/// rest of its life looking up something unlookuppable, which is exactly the
+/// quiet misconfiguration the placeholder is meant to keep DISTINGUISHABLE
+/// from a startup race.
+pub(crate) fn malformed_endpoint(configured: &str) -> Option<String> {
+    let Some((host, port)) = configured.rsplit_once(':') else {
+        return Some("it has no port; a peer address is host:port".to_owned());
+    };
+    if port.parse::<u16>().is_err() {
+        return Some(format!(
+            "{port:?} is not a port; a peer address is host:port"
+        ));
+    }
+    if host.is_empty() {
+        return Some("it has no host; a peer address is host:port".to_owned());
+    }
+    // A bracketed host is an IPv6 literal and nothing else, so it is checked as
+    // one. `[]` and `[peer]` both reached the resolver before, because the
+    // bracket rule only ran when the host already contained a colon (review).
+    if let Some(inner) = host.strip_prefix('[') {
+        let Some(inner) = inner.strip_suffix(']') else {
+            return Some(format!("{host:?} opens a bracket it never closes"));
+        };
+        // A zone id is part of the syntax and not part of the address, so it
+        // is set aside before parsing — and then checked, because
+        // `ToSocketAddrs` accepts only NUMERIC scopes. `%eth0` never resolves
+        // on any platform this runs on, so accepting it — as an earlier
+        // revision of this did, in its own test — waves through an address
+        // that is permanently unusable, which is the exact class this
+        // function exists to separate from a peer that is merely absent
+        // (review).
+        let (addr, scope) = match inner.split_once('%') {
+            Some((addr, scope)) => (addr, Some(scope)),
+            None => (inner, None),
+        };
+        if addr.parse::<std::net::Ipv6Addr>().is_err() {
+            return Some(format!(
+                "{host:?} is bracketed, which means an IPv6 literal, and {addr:?} is not one"
+            ));
+        }
+        if let Some(scope) = scope {
+            if scope.is_empty() || scope.parse::<u32>().is_err() {
+                return Some(format!(
+                    "{host:?} carries the scope {scope:?}, and only a numeric scope resolves \
+                     — use the interface index, as in [{addr}%3]"
+                ));
+            }
+        }
+        return None;
+    }
+    if host.ends_with(']') {
+        return Some(format!("{host:?} closes a bracket it never opened"));
+    }
+    if host.contains(':') {
+        return Some(format!(
+            "{host:?} looks like an unbracketed IPv6 address, so the last colon is part \
+             of the address and not a port separator; write it as [{host}]:{port}"
+        ));
+    }
+    // Everything a resolver could accept is a hostname or an IPv4 literal, and
+    // both are drawn from this set. A character outside it — a slash, a space,
+    // an @ — is a configuration mistake dressed as a transient one (review).
+    if let Some(bad) = host
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || *c == '.' || *c == '-' || *c == '_'))
+    {
+        return Some(format!(
+            "{host:?} contains {bad:?}, which no hostname or address may hold"
+        ));
+    }
+    // A SINGLE TRAILING DOT IS THE DNS ROOT LABEL, not an empty one (review).
+    // An absolute name is what an operator writes to stop the resolver
+    // appending search domains — exactly the right thing to write in a
+    // cluster — and rejecting it would refuse startup over correct config.
+    // Everything else empty is still a mistake: a leading dot, or two in a row.
+    let labels = host.strip_suffix('.').unwrap_or(host);
+    // DNS bounds the whole name as well as each label, and a name can breach
+    // the total while every label is legal — four labels of 63, 63, 63 and 62
+    // clear the per-label rule and cannot be encoded (review). 253 is the
+    // textual limit; the root dot, already stripped above, does not count
+    // toward it.
+    if labels.len() > 253 {
+        return Some(format!(
+            "the name is {} bytes, and DNS cannot encode one over 253",
+            labels.len()
+        ));
+    }
+    // DNS cannot encode a label over 63 bytes, so one that is longer is a name
+    // that can never resolve rather than one that has not yet (review).
+    if let Some(long) = labels.split('.').find(|label| label.len() > 63) {
+        return Some(format!(
+            "the label {:?} is {} bytes, and DNS cannot encode one over 63",
+            &long[..63.min(long.len())],
+            long.len()
+        ));
+    }
+    if labels.is_empty() || labels.split('.').any(|label| label.is_empty()) {
+        return Some(format!(
+            "{host:?} has an empty label; a name is dot-separated, and only a single \
+             trailing dot is meaningful (it is the root)"
+        ));
+    }
+    None
+}
+
+/// The address a peer's name holds right now, or a placeholder when it holds
+/// none yet (#367).
+///
+/// A name that does not resolve at startup is not a configuration error. In a
+/// replica set whose members are created together every member is in that
+/// position for some of its neighbours, and refusing to start over it turns an
+/// ordinary startup race into a crash loop — which is what the pod events
+/// showed, read as a broken node rather than a name that had not been
+/// published yet.
+///
+/// Both users of this address look the name up again before they use it: the
+/// replication driver on every connect, the promotion probe on every probe.
+/// So the placeholder's only job is to be a `SocketAddr`-shaped nothing in the
+/// meantime, and `0.0.0.0:0` is the one that fails a connect immediately
+/// instead of waiting out a timeout against something real.
+///
+/// It is announced rather than swallowed. A misspelt peer would otherwise
+/// start quietly and fail later as an absent replica, which is a much harder
+/// thing to read than a line at startup saying which name did not answer.
+fn first_address_of(host: &str) -> Result<std::net::SocketAddr, String> {
+    if let Some(why) = malformed_endpoint(host) {
+        return Err(format!("peer {host:?} cannot be an address: {why}"));
+    }
+    match vtop_meta::resolve_endpoint(host) {
+        Ok(addr) => Ok(addr),
+        Err(error) => {
+            eprintln!(
+                "peer {host} does not resolve yet ({error}); it will be looked up again \
+                 before each use, and stays unreachable until it answers"
+            );
+            Ok(std::net::SocketAddr::from(([0, 0, 0, 0], 0)))
+        }
+    }
+}
+
 /// A candidate's current shape (#284).
 enum Phase {
     Following(Arc<InProcessFollower>),
@@ -1845,7 +2017,8 @@ async fn build_leader_phase(
         .map(|peer| {
             Ok(NetworkFollowerConfig {
                 node_id: peer.node_uuid,
-                addr: vtop_meta::resolve_endpoint(&peer.addr).map_err(|error| error.to_string())?,
+                addr: first_address_of(&peer.addr)?,
+                host: name_source(&peer.addr),
                 server_name: peer.server_name.clone(),
             })
         })
@@ -2498,6 +2671,80 @@ mod tests {
     /// The race is real but rare, so this hammers it: 5000 transitions against
     /// 5000 readings. A regression that split the reading back into separate
     /// lock acquisitions fails here intermittently rather than never.
+    /// A peer address that cannot become valid by waiting is refused now
+    /// (#367).
+    ///
+    /// The placeholder exists so a name that has not been published yet does
+    /// not crash-loop a node that boots alongside its neighbours. Letting a
+    /// MALFORMED address take the same path spends that tolerance on a
+    /// misconfiguration, and the node then spends its life looking up
+    /// something unlookuppable while presenting as a startup race.
+    #[test]
+    fn an_address_that_waiting_cannot_fix_is_refused_and_one_that_it_can_is_not() {
+        for good in [
+            "vtop-1.vtop-headless.ns.svc.cluster.local:9300",
+            "127.0.0.1:9300",
+            "[::1]:9300",
+            // Numeric scope: the only kind the resolver can use.
+            "[fe80::1%3]:9300",
+            "vtop_1.svc:9300",
+            // Absolute name — the trailing dot is the root label, and writing
+            // it is how an operator stops search-domain expansion.
+            "vtop-1.vtop-headless.ns.svc.cluster.local.:9300",
+        ] {
+            assert!(
+                malformed_endpoint(good).is_none(),
+                "{good} is a well-formed peer address and must be allowed to be absent"
+            );
+        }
+
+        let too_long = format!("{}:9300", "a".repeat(64));
+        // Every label legal, the whole name not: 63 + 1 + 63 + 1 + 63 + 1 + 62.
+        let too_long_total = format!(
+            "{}.{}.{}.{}:9300",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(62)
+        );
+        for (bad, expected) in [
+            (too_long.as_str(), "cannot encode one over 63"),
+            (too_long_total.as_str(), "cannot encode one over 253"),
+            ("vtop-1.vtop-headless", "no port"),
+            ("vtop-1.vtop-headless:", "not a port"),
+            ("vtop-1:not-a-number", "not a port"),
+            (":9300", "no host"),
+            // The last colon here belongs to the address, so the "port" it
+            // seems to carry is a fiction the split invented.
+            ("::1:9300", "unbracketed IPv6"),
+            ("fe80::1:9300", "unbracketed IPv6"),
+            // Bracketed, and therefore claiming to be an IPv6 literal, which
+            // is a claim that can be checked — and these do not survive it.
+            ("[]:9300", "not one"),
+            ("[peer]:9300", "not one"),
+            ("[::1:9300", "never closes"),
+            ("::1]:9300", "never opened"),
+            // Characters no resolver will ever accept: the mistake is
+            // permanent, so it must not be waited on.
+            ("peer/name:9300", "which no hostname"),
+            ("peer name:9300", "which no hostname"),
+            ("peer@host:9300", "which no hostname"),
+            ("peer..host:9300", "empty label"),
+            (".peer.host:9300", "empty label"),
+            ("peer.host..:9300", "empty label"),
+            // Symbolic scopes never resolve, so they are permanent mistakes.
+            ("[fe80::1%eth0]:9300", "numeric scope"),
+            ("[fe80::1%]:9300", "numeric scope"),
+        ] {
+            let why = malformed_endpoint(bad)
+                .unwrap_or_else(|| panic!("{bad} must be refused; waiting cannot fix it"));
+            assert!(
+                why.contains(expected),
+                "the refusal for {bad} must name the cause ({expected}), not just refuse: {why}"
+            );
+        }
+    }
+
     #[test]
     fn a_scrape_racing_a_transition_never_sees_half_a_role() {
         use crate::observe::ReplicaObservation as _;

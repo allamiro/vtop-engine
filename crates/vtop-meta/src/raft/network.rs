@@ -3,6 +3,21 @@
 //! Converts openraft RPC types ↔ VTOP peer wire messages field-by-field, then
 //! exchanges them over short-lived mTLS connections. Peer addresses come from
 //! an explicit directory because [`openraft::EmptyNode`] carries no address.
+//!
+//! The directory holds the NAME a peer was configured under, not only the
+//! address that name resolved to. A `SocketAddr` is where a peer was the one
+//! time anybody looked; under an orchestrator that rebuilds a member with a
+//! new address — which is every orchestrator — that snapshot is wrong from the
+//! first replacement onward, and a directory written once at startup never
+//! finds out. So a failed RPC re-resolves the name (#367).
+//!
+//! The cost of NOT doing that is not a slow peer, it is a permanently
+//! disrupted group. The break is one-way — the returning member resolved its
+//! neighbours after they existed, so it can reach them and they cannot reach
+//! it — and openraft 0.9 implements no pre-vote, so the isolated member burns
+//! a real term on every election timeout while the leader-lease check keeps
+//! the healthy majority from ever adopting those terms. The group stays up
+//! and the member stays out, indefinitely, until something restarts it.
 
 #![allow(clippy::result_large_err)]
 
@@ -34,10 +49,79 @@ use std::sync::{Arc, Mutex};
 
 type MemRaft = Raft<MetaRaftTypeConfig>;
 
+/// How often one peer's name may be re-resolved.
+///
+/// Replication heartbeats fire every `heartbeat_interval` (60 ms by default),
+/// and a peer that is genuinely down fails every one of them. Re-resolving on
+/// each would put a name lookup on that same cadence for no benefit, so the
+/// floor is a fraction of the shortest election timeout (300 ms): a peer that
+/// really did move is found well inside one election, and a peer that is
+/// simply down is asked about five times a second rather than seventeen.
+const RERESOLVE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// How long one name lookup may take before it is abandoned.
+///
+/// A resolver that stalls must not become a stall in the RPC that asked
+/// (review): replication's hard deadline is the heartbeat interval, 60 ms, and
+/// this runs on its failure path. Generous next to that and still finite —
+/// the point is that it ends, not that it is fast.
+const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Peer address directory keyed by Raft node id.
 #[derive(Clone, Debug, Default)]
 pub struct PeerDirectory {
-    peers: Arc<Mutex<BTreeMap<NodeId, PeerEndpoint>>>,
+    peers: Arc<Mutex<BTreeMap<NodeId, Peer>>>,
+}
+
+/// Clears a peer's in-flight lookup flag however the lookup ends.
+///
+/// Same reasoning as the admin client's: the flag is set before an await, and
+/// a dropped future would otherwise leave it set forever, excluding the peer
+/// from re-resolution for the life of the process. These lookups are spawned
+/// rather than awaited in-line today, so cancellation is unlikely — but
+/// "unlikely" is not the property to rely on for a flag whose stuck state is
+/// permanent, and having this on one plane and not the other is the shape of
+/// mistake that produced the race itself (review).
+struct ResolvingGuard {
+    peers: Arc<Mutex<BTreeMap<NodeId, Peer>>>,
+    id: NodeId,
+}
+
+impl Drop for ResolvingGuard {
+    fn drop(&mut self) {
+        if let Ok(mut peers) = self.peers.lock() {
+            if let Some(peer) = peers.get_mut(&self.id) {
+                peer.resolving = false;
+            }
+        }
+    }
+}
+
+/// One directory entry: where a peer is, and how to find out again.
+#[derive(Clone, Debug)]
+struct Peer {
+    /// The `host:port` this peer was configured under, when it was a name
+    /// rather than a literal address. `None` for peers inserted as an
+    /// already-resolved address — a test harness, or a static deployment —
+    /// which are therefore never re-resolved, because there is nothing to
+    /// re-resolve them from.
+    host: Option<String>,
+    server_name: String,
+    /// Where the peer was, last time anybody looked. `None` when the name has
+    /// never resolved: a member configured before its pod exists is not a
+    /// configuration error, it is a peer that is not there YET, and a node
+    /// that refuses to start over one cannot be part of a group that starts
+    /// together (#367).
+    addr: Option<SocketAddr>,
+    resolved_at: Option<std::time::Instant>,
+    /// A lookup for this peer is running right now.
+    ///
+    /// The throttle alone does not bound concurrency: it is 200 ms and a
+    /// lookup may take up to `RESOLVE_TIMEOUT`, so a second call can start
+    /// while the first is still out — and if the name changed between them,
+    /// the SLOWER one lands last and overwrites the newer answer (review).
+    /// One at a time removes the race rather than ordering it.
+    resolving: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -52,15 +136,123 @@ impl PeerDirectory {
         Self::default()
     }
 
+    /// Insert a peer at a known address, with no name to re-resolve from.
     pub fn insert(&self, id: NodeId, endpoint: PeerEndpoint) {
-        self.peers
-            .lock()
-            .expect("peer directory")
-            .insert(id, endpoint);
+        self.peers.lock().expect("peer directory").insert(
+            id,
+            Peer {
+                host: None,
+                server_name: endpoint.server_name,
+                addr: Some(endpoint.addr),
+                resolved_at: None,
+                resolving: false,
+            },
+        );
+    }
+
+    /// Insert a peer by NAME, to be resolved now and again whenever an RPC to
+    /// it fails.
+    ///
+    /// Resolution failure here is not an error. The name of a member that has
+    /// not been created yet does not resolve, and every member of a group that
+    /// boots together is in that position for some of its neighbours; the peer
+    /// simply reads as unreachable until the name answers.
+    pub async fn insert_by_name(&self, id: NodeId, host: String, server_name: String) {
+        self.peers.lock().expect("peer directory").insert(
+            id,
+            Peer {
+                host: Some(host),
+                server_name,
+                addr: None,
+                resolved_at: None,
+                resolving: false,
+            },
+        );
+        self.re_resolve(id).await;
     }
 
     pub fn get(&self, id: NodeId) -> Option<PeerEndpoint> {
-        self.peers.lock().expect("peer directory").get(&id).cloned()
+        let peers = self.peers.lock().expect("peer directory");
+        let peer = peers.get(&id)?;
+        Some(PeerEndpoint {
+            addr: peer.addr?,
+            server_name: peer.server_name.clone(),
+        })
+    }
+
+    /// Look this peer's name up again, throttled by [`RERESOLVE_INTERVAL`].
+    ///
+    /// Called after a failed RPC, never on the success path: the address that
+    /// just worked does not need checking, and this must not sit on the
+    /// heartbeat path.
+    pub async fn re_resolve(&self, id: NodeId) {
+        // The lock is taken twice on purpose and is never held across the
+        // lookup: a name that does not answer takes as long as the resolver
+        // takes, and every other peer's RPCs would queue behind it.
+        //
+        // THE STAMP IS CLAIMED BEFORE THE AWAIT, not written after it
+        // (review). Replication drives one of these per failing RPC and they
+        // run concurrently, so a throttle that only takes effect once a lookup
+        // RETURNS is no throttle at all against exactly the case it is for: a
+        // resolver that has stopped answering, where every caller would start
+        // its own query and none would finish.
+        let host = {
+            let mut peers = self.peers.lock().expect("peer directory");
+            let Some(peer) = peers.get_mut(&id) else {
+                return;
+            };
+            // Nothing to re-resolve from: this peer was given as a literal
+            // address, which is exactly as current as it ever was.
+            let Some(host) = peer.host.clone() else {
+                return;
+            };
+            if peer.resolving
+                || peer
+                    .resolved_at
+                    .is_some_and(|at| at.elapsed() < RERESOLVE_INTERVAL)
+            {
+                return;
+            }
+            peer.resolved_at = Some(std::time::Instant::now());
+            peer.resolving = true;
+            host
+        };
+        // Armed BEFORE the await that can be cancelled.
+        let _resolving = ResolvingGuard {
+            peers: Arc::clone(&self.peers),
+            id,
+        };
+        // BOUNDED, because a resolver can stall and this is on the path of an
+        // RPC that has its own hard deadline — 60 ms for replication (review).
+        // A lookup that outlives the bound is abandoned, not waited for; the
+        // next failure will ask again.
+        let resolved = match tokio::time::timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host(&host))
+            .await
+        {
+            Ok(Ok(mut addrs)) => addrs.next(),
+            Ok(Err(error)) => {
+                // SAID, because a misspelt peer and a transient DNS race look
+                // identical from the outside and only one of them is worth
+                // paging someone about (review).
+                eprintln!("could not resolve metadata peer {id} at {host:?}: {error}");
+                None
+            }
+            Err(_) => {
+                eprintln!("resolving metadata peer {id} at {host:?} exceeded {RESOLVE_TIMEOUT:?}");
+                None
+            }
+        };
+        let mut peers = self.peers.lock().expect("peer directory");
+        let Some(peer) = peers.get_mut(&id) else {
+            return;
+        };
+        // A lookup that failed leaves the last known address standing. It may
+        // still be right — a resolver hiccup is not evidence a peer moved —
+        // and replacing it with nothing would turn a transient DNS failure
+        // into an unreachable member.
+        if let Some(addr) = resolved {
+            peer.addr = Some(addr);
+        }
     }
 }
 
@@ -138,6 +330,62 @@ impl TlsRaftNetwork {
         ))))
     }
 
+    /// A client for this target, re-resolving first if we have no address.
+    ///
+    /// The no-address case is a peer whose name had not resolved when the
+    /// directory was built — a member configured before its pod existed. It
+    /// is not a permanent condition and must not read as one (#367).
+    async fn client_or_re_resolve(
+        &self,
+    ) -> Result<(PeerClient, SocketAddr), RPCError<NodeId, EmptyNode, RaftError<NodeId>>> {
+        // SCHEDULED, NOT AWAITED (review). A peer with no cached address is
+        // one whose name had not resolved yet, and waiting for the resolver
+        // here puts the whole lookup in front of an RPC whose hard deadline is
+        // 60 ms — so a stalled resolver would occupy the heartbeat path for
+        // longer than the deadline it is supposed to honour, which is how a
+        // live peer gets pushed into campaigning.
+        //
+        // This attempt therefore fails fast as unreachable, which is true: we
+        // do not know where the peer is. The next one, some milliseconds
+        // later, has the answer if there is one.
+        if self.directory.get(self.target).is_none() {
+            let directory = self.directory.clone();
+            let target = self.target;
+            tokio::spawn(async move { directory.re_resolve(target).await });
+        }
+        self.client()
+    }
+
+    /// Report a failed RPC and SCHEDULE a fresh lookup of the peer's name.
+    ///
+    /// The two belong together. Every transport failure is a candidate for
+    /// "this peer is no longer where we think it is", and the address is only
+    /// ever wrong on this path — the success path proves it right.
+    ///
+    /// The lookup does NOT complete before this returns, and callers must not
+    /// assume it has (review). It is spawned; the error comes back at once,
+    /// and openraft's next attempt uses whatever the directory holds by then.
+    fn unreachable_and_re_resolve(
+        &self,
+        error: impl std::fmt::Display,
+    ) -> RPCError<NodeId, EmptyNode, RaftError<NodeId>> {
+        // DETACHED, because this RPC has a hard deadline and the lookup does
+        // not belong inside it (review). Awaiting here added the resolver's
+        // latency AFTER the deadline had already expired, delaying the
+        // failure's return — and with a 60 ms heartbeat against a 300 ms
+        // minimum election timeout, delaying a heartbeat is how a live peer
+        // is pushed into campaigning. The refresh is maintenance; the RPC's
+        // job is to return.
+        //
+        // Safe to detach: `re_resolve` throttles itself, so a burst of
+        // failures cannot become a burst of queries, and the next attempt
+        // uses whatever it has by then.
+        let directory = self.directory.clone();
+        let target = self.target;
+        tokio::spawn(async move { directory.re_resolve(target).await });
+        self.unreachable(error)
+    }
+
     fn client(
         &self,
     ) -> Result<(PeerClient, SocketAddr), RPCError<NodeId, EmptyNode, RaftError<NodeId>>> {
@@ -161,11 +409,13 @@ impl RaftNetwork<MetaRaftTypeConfig> for TlsRaftNetwork {
         rpc: AppendEntriesRequest<MetaRaftTypeConfig>,
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, EmptyNode, RaftError<NodeId>>> {
-        let (client, addr) = self.client()?;
+        let (client, addr) = self.client_or_re_resolve().await?;
         let request = append_to_wire(&rpc).map_err(|e| self.unreachable(e))?;
-        let response = with_rpc_deadline(option.hard_ttl(), client.append(addr, &request))
-            .await
-            .map_err(|e| self.unreachable(e))?;
+        let response =
+            match with_rpc_deadline(option.hard_ttl(), client.append(addr, &request)).await {
+                Ok(response) => response,
+                Err(error) => return Err(self.unreachable_and_re_resolve(error)),
+            };
         append_from_wire(response).map_err(|e| self.unreachable(e))
     }
 
@@ -174,11 +424,13 @@ impl RaftNetwork<MetaRaftTypeConfig> for TlsRaftNetwork {
         rpc: VoteRequest<NodeId>,
         option: RPCOption,
     ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, EmptyNode, RaftError<NodeId>>> {
-        let (client, addr) = self.client()?;
+        let (client, addr) = self.client_or_re_resolve().await?;
         let request = vote_req_to_wire(&rpc).map_err(|e| self.unreachable(e))?;
-        let response = with_rpc_deadline(option.hard_ttl(), client.vote(addr, &request))
-            .await
-            .map_err(|e| self.unreachable(e))?;
+        let response = match with_rpc_deadline(option.hard_ttl(), client.vote(addr, &request)).await
+        {
+            Ok(response) => response,
+            Err(error) => return Err(self.unreachable_and_re_resolve(error)),
+        };
         vote_resp_from_wire(response).map_err(|e| self.unreachable(e))
     }
 
@@ -190,14 +442,25 @@ impl RaftNetwork<MetaRaftTypeConfig> for TlsRaftNetwork {
         InstallSnapshotResponse<NodeId>,
         RPCError<NodeId, EmptyNode, RaftError<NodeId, openraft::error::InstallSnapshotError>>,
     > {
-        let (client, addr) = self.client().map_err(|e| match e {
+        let (client, addr) = self.client_or_re_resolve().await.map_err(|e| match e {
             RPCError::Unreachable(u) => RPCError::Unreachable(u),
             other => install_unreachable(other),
         })?;
         let request = install_to_wire(&rpc).map_err(install_unreachable)?;
-        let response = with_rpc_deadline(option.hard_ttl(), client.install(addr, &request))
-            .await
-            .map_err(install_unreachable)?;
+        let response =
+            match with_rpc_deadline(option.hard_ttl(), client.install(addr, &request)).await {
+                Ok(response) => response,
+                Err(error) => {
+                    // Detached for the same reason as append and vote: this
+                    // exchange has a hard deadline and a stalled resolver must
+                    // not extend it, postponing the snapshot retry that is how
+                    // a lagging peer catches up at all (review).
+                    let directory = self.directory.clone();
+                    let target = self.target;
+                    tokio::spawn(async move { directory.re_resolve(target).await });
+                    return Err(install_unreachable(error));
+                }
+            };
         install_from_wire(response).map_err(install_unreachable)
     }
 }
@@ -447,4 +710,174 @@ fn install_from_wire(
     Ok(InstallSnapshotResponse {
         vote: vote_from_wire(response.vote)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn endpoint(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    /// A member configured before it exists is a member that is not there
+    /// YET, and must not stop this node from starting (#367).
+    ///
+    /// Resolution used to happen once, at boot, and a failure was fatal. In a
+    /// group whose members are created in parallel that is a startup race:
+    /// whoever wins it resolves nobody and exits, and the orchestrator
+    /// restarts it until its neighbours happen to have addresses. The pod
+    /// events read as a crash-looping node; the cause was a name that had not
+    /// been published yet.
+    #[tokio::test]
+    async fn a_peer_whose_name_does_not_resolve_yet_is_absent_rather_than_fatal() {
+        let directory = PeerDirectory::new();
+        // A lookup that yields no address, expressed so it yields none
+        // ANYWHERE: the name is missing its port, which fails before a
+        // resolver is consulted. A name chosen to be absent from DNS is not
+        // portable — plenty of resolvers answer for everything, including one
+        // this was first written on — and a test that depends on the host's
+        // search domains is a test that reports the host.
+        directory
+            .insert_by_name(
+                2,
+                "vtop-1.vtop-headless.absent.svc".to_owned(),
+                "vtop-1".to_owned(),
+            )
+            .await;
+        assert!(
+            directory.get(2).is_none(),
+            "a name that does not answer must read as a peer we cannot reach, which \
+             the RPC path already knows how to say"
+        );
+        // And the entry is still THERE, so the next failed RPC re-resolves it
+        // rather than finding nothing to look up.
+        assert!(
+            directory.peers.lock().expect("peers").contains_key(&2),
+            "the peer must stay in the directory, or it can never be found later"
+        );
+    }
+
+    /// A stale address is replaced by whatever the name says now.
+    ///
+    /// This is the failure itself: a member's pod is replaced, it returns at a
+    /// new address, and every surviving member keeps dialling the old one for
+    /// the life of its process.
+    ///
+    /// The "name" here is a literal so the test asserts the re-resolution
+    /// machinery rather than the host's resolver — using a real DNS name would
+    /// pin this test to the machine it runs on.
+    #[tokio::test]
+    async fn a_failed_rpc_re_resolves_a_peer_that_moved() {
+        let directory = PeerDirectory::new();
+        directory
+            .insert_by_name(2, "127.0.0.1:9300".to_owned(), "vtop-1".to_owned())
+            .await;
+        assert_eq!(directory.get(2).expect("resolved").addr, endpoint(9300));
+
+        // The address the peer used to be at, and the throttle wound back so
+        // this stands for a lookup a moment later rather than the same one.
+        {
+            let mut peers = directory.peers.lock().expect("peers");
+            let peer = peers.get_mut(&2).expect("peer");
+            peer.addr = Some(endpoint(1));
+            peer.resolved_at = None;
+        }
+        directory.re_resolve(2).await;
+        assert_eq!(
+            directory.get(2).expect("resolved").addr,
+            endpoint(9300),
+            "the address must come back from the NAME; a directory that trusts what \
+             it resolved once can never find a peer that moved"
+        );
+    }
+
+    /// Re-resolution is throttled, because the thing that triggers it fires
+    /// every heartbeat.
+    ///
+    /// A peer that is genuinely down fails every replication RPC, and each
+    /// failure asks for a lookup. Without a floor that is a name query on the
+    /// heartbeat interval, forever, for a peer that has not moved.
+    #[tokio::test]
+    async fn re_resolution_is_throttled_so_a_down_peer_is_not_a_name_query_storm() {
+        let directory = PeerDirectory::new();
+        directory
+            .insert_by_name(2, "127.0.0.1:9300".to_owned(), "vtop-1".to_owned())
+            .await;
+        {
+            let mut peers = directory.peers.lock().expect("peers");
+            let peer = peers.get_mut(&2).expect("peer");
+            peer.addr = Some(endpoint(1));
+            // Resolved just now: inside the floor.
+            peer.resolved_at = Some(std::time::Instant::now());
+        }
+        directory.re_resolve(2).await;
+        assert_eq!(
+            directory.get(2).expect("resolved").addr,
+            endpoint(1),
+            "a lookup inside the floor must not have happened at all"
+        );
+
+        {
+            let mut peers = directory.peers.lock().expect("peers");
+            peers.get_mut(&2).expect("peer").resolved_at =
+                Some(std::time::Instant::now() - RERESOLVE_INTERVAL * 2);
+        }
+        directory.re_resolve(2).await;
+        assert_eq!(
+            directory.get(2).expect("resolved").addr,
+            endpoint(9300),
+            "and once the floor has passed the peer must be looked up again"
+        );
+    }
+
+    /// A peer given as an address has no name to be looked up from, and asking
+    /// must be a no-op rather than an erasure.
+    ///
+    /// The deterministic harnesses insert peers this way. Treating a missing
+    /// name as "resolve to nothing" would empty their directory on the first
+    /// RPC that failed for any other reason.
+    #[tokio::test]
+    async fn a_peer_given_as_a_literal_address_is_left_exactly_as_it_was() {
+        let directory = PeerDirectory::new();
+        directory.insert(
+            2,
+            PeerEndpoint {
+                addr: endpoint(9300),
+                server_name: "vtop-1".to_owned(),
+            },
+        );
+        directory.re_resolve(2).await;
+        assert_eq!(
+            directory.get(2).expect("still there").addr,
+            endpoint(9300),
+            "there is nothing to re-resolve from, so there is nothing to change"
+        );
+    }
+
+    /// A resolver that fails leaves the last known address standing.
+    ///
+    /// A hiccup in name resolution is not evidence that a peer moved, and
+    /// replacing a working address with nothing would turn it into an
+    /// unreachable member for as long as the hiccup lasted.
+    #[tokio::test]
+    async fn a_failed_lookup_does_not_erase_the_address_that_was_working() {
+        let directory = PeerDirectory::new();
+        directory
+            .insert_by_name(2, "127.0.0.1:9300".to_owned(), "vtop-1".to_owned())
+            .await;
+        {
+            let mut peers = directory.peers.lock().expect("peers");
+            let peer = peers.get_mut(&2).expect("peer");
+            // Port-less again, for the same portability reason as above.
+            peer.host = Some("vtop-1.absent.svc".to_owned());
+            peer.resolved_at = None;
+        }
+        directory.re_resolve(2).await;
+        assert_eq!(
+            directory.get(2).expect("still there").addr,
+            endpoint(9300),
+            "a name that stopped answering must not cost us the address that did"
+        );
+    }
 }
