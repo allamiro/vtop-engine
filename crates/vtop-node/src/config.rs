@@ -326,13 +326,17 @@ pub struct DataNodeConfig {
     /// fenced and adopts its epoch on the next poll, so it refuses the
     /// leader's appends for up to one `poll_interval_ms` after a grant. Those
     /// refusals put it behind the leader's contiguous sequence, and it rejoins
-    /// by way of the leader's resynchronisation (#255) — which can only
-    /// retransmit what the leader's buffer still holds. A follower whose gap
-    /// exceeds `max_retransmission_bytes`, or that is behind a leader promoted
-    /// after the gap opened, cannot be repaired in place and needs its data
-    /// directory restored from a peer. Segment transfer removes that
-    /// requirement and is tracked on #255; until it lands, keep
-    /// `poll_interval_ms` short on replicated ranges so the window stays small.
+    /// by way of the leader's resynchronisation — which can only retransmit
+    /// what the leader's buffer still holds. A follower whose gap exceeds
+    /// `max_retransmission_bytes`, or that is behind a leader promoted after
+    /// the gap opened, cannot catch up in place.
+    ///
+    /// It is repairable, though, and no longer needs a data directory copied
+    /// by hand: `vtopctl node repair --seal-tail` into an EMPTY directory
+    /// seals the leader's tail so the transferred prefix reaches the leader's
+    /// position, and the replica then catches up from there (#306). Keeping
+    /// `poll_interval_ms` short on replicated ranges still narrows the window
+    /// in which the gap can open, which is cheaper than repairing it.
     pub lease: Option<LeaseConfig>,
     /// Sealed-prefix retention (#290). Absent = retention disabled, the
     /// previous behaviour: nothing is ever deleted and the range grows until

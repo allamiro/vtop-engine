@@ -747,8 +747,16 @@ await_holder() { # [min-epoch] — echoes "<holder> <epoch>"
   return 1
 }
 
-read -r HOLDER EPOCH <<< "$(await_holder)" \
-  || fail "no candidate acquired the range within 180s"
+# CAPTURED, THEN TESTED. `read ... <<< "$(cmd)"` does NOT propagate cmd's
+# exit status, and a here-string appends a newline — so on a failed
+# `await_holder` the read sees an empty LINE, returns 0, and `|| fail` never
+# fires. The variables are then empty and the failure surfaces later as
+# "lease holder  is not one of the rendered candidates", blaming an
+# unrecognised candidate for a UUID that was never there. Observed on a real
+# CI run before this was written.
+held="$(await_holder)" || held=""
+[ -n "$held" ] || fail "no candidate acquired the range within 180s"
+read -r HOLDER EPOCH <<< "$held"
 holder_ordinal="$(ordinal_of "$HOLDER")"
 log "candidate $holder_ordinal ($HOLDER) holds the range at epoch $EPOCH — an election decided that, not the chart"
 
@@ -833,9 +841,12 @@ kubectl -n "$REPLICATED_NS" delete pod "${REL}-${holder_ordinal}" >/dev/null
 # that the range is HELD and SERVING again, not who holds it; scenario 14 in
 # the live-chaos suite already proves the takeover-by-a-survivor path with a
 # kill no orchestrator softens.
-read -r NEW_HOLDER NEW_EPOCH <<< "$(await_holder "$EPOCH")" \
-  || fail "no grant above epoch $EPOCH within 180s of deleting the holder: the range \
+# Same capture-then-test as above: the `||` on a read fed by a here-string
+# guards nothing.
+moved="$(await_holder "$EPOCH")" || moved=""
+[ -n "$moved" ] || fail "no grant above epoch $EPOCH within 180s of deleting the holder: the range \
 did not move, so either the lease never came free or no candidate could take it"
+read -r NEW_HOLDER NEW_EPOCH <<< "$moved"
 new_ordinal="$(ordinal_of "$NEW_HOLDER")"
 if [ "$NEW_HOLDER" = "$HOLDER" ]; then
   log "the recreated pod won its own range back at epoch $NEW_EPOCH, above the pre-delete $EPOCH (a legitimate outcome of the race — the grant is new either way)"
