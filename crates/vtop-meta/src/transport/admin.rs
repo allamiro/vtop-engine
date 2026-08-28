@@ -909,12 +909,24 @@ impl AdminClient {
         // cancels this future at its round deadline, so an endpoint that
         // accepted a connection and then hung was left marked GOOD and every
         // later request reconnected to it — never re-resolving the name that
-        // would have found the peer. Setting it up front is cancellation-safe
-        // by construction, and `round_trip` clears it on the only evidence
-        // that counts, which is an answer.
-        self.mark_stale(index);
+        // would have found the peer. Presuming failure is cancellation-safe by
+        // construction, and `round_trip` clears it on the only evidence that
+        // counts, which is an answer. See the mark's placement below, which is
+        // as load-bearing as the inversion itself.
         let reached = tokio::time::timeout(CANDIDATE_CONNECT_TIMEOUT, async {
             let candidate = self.resolved_candidate(index).await;
+            // MARKED HERE: after the lookup decision has read the old value,
+            // and before the exchange that can be cancelled. Marking earlier
+            // was cancellation-safe but made every request past the 200 ms
+            // throttle re-resolve a candidate that had just answered — a name
+            // query on the lease agent's hot path, and up to half a second of
+            // stalled resolver in front of a cached endpoint that was
+            // perfectly reachable (review).
+            //
+            // Nothing is lost by moving it: cancellation DURING the lookup can
+            // only happen when the candidate was already stale, which is why
+            // the lookup was running.
+            self.mark_stale(index);
             let endpoint = candidate.endpoint;
             self.establish(&candidate)
                 .await
