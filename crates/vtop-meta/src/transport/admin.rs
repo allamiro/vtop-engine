@@ -442,6 +442,31 @@ pub struct AdminClient {
     resolutions: Mutex<Vec<Resolution>>,
 }
 
+/// Clears a candidate's in-flight lookup flag however the lookup ends.
+///
+/// The flag is set before an await, and the callers put deadlines over whole
+/// rounds — `LeaseAgent::bounded` does exactly this — so the future CAN be
+/// dropped mid-lookup (review). A flag cleared only on the paths that RETURN
+/// would then stay set forever, excluding the candidate from re-resolution for
+/// the life of the client: the fix for a race turning into a worse bug than
+/// the race. Drop runs on cancellation, which is the only thing that does.
+struct ResolvingGuard<'a> {
+    resolutions: &'a Mutex<Vec<Resolution>>,
+    index: usize,
+}
+
+impl Drop for ResolvingGuard<'_> {
+    fn drop(&mut self) {
+        // A poisoned lock is not worth a panic inside a Drop; the flag simply
+        // stays set on a client that has already failed harder than this.
+        if let Ok(mut resolutions) = self.resolutions.lock() {
+            if let Some(resolution) = resolutions.get_mut(self.index) {
+                resolution.resolving = false;
+            }
+        }
+    }
+}
+
 /// One candidate's live address, and what is known about it.
 struct Resolution {
     /// The address in use: configured at first, whatever the name last
@@ -961,6 +986,11 @@ impl AdminClient {
             resolution.resolved_at = Some(std::time::Instant::now());
             resolution.resolving = true;
         }
+        // Armed BEFORE the await that can be cancelled.
+        let _resolving = ResolvingGuard {
+            resolutions: &self.resolutions,
+            index,
+        };
         let resolved =
             match tokio::time::timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host(&host)).await {
                 Ok(Ok(mut addrs)) => addrs.next(),
@@ -975,11 +1005,6 @@ impl AdminClient {
             };
         // A lookup that fails leaves the last known address standing: a
         // resolver hiccup is not evidence that a member moved.
-        // Cleared whatever the outcome, including a timeout, so a lookup that
-        // never answered does not wedge the candidate.
-        if let Some(resolution) = self.resolutions.lock().expect("resolutions").get_mut(index) {
-            resolution.resolving = false;
-        }
         if let Some(addr) = resolved {
             // PERSISTED, not used and forgotten. An address that lived only in
             // this clone would be rediscovered — at the cost of a connect

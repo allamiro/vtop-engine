@@ -73,6 +73,30 @@ pub struct PeerDirectory {
     peers: Arc<Mutex<BTreeMap<NodeId, Peer>>>,
 }
 
+/// Clears a peer's in-flight lookup flag however the lookup ends.
+///
+/// Same reasoning as the admin client's: the flag is set before an await, and
+/// a dropped future would otherwise leave it set forever, excluding the peer
+/// from re-resolution for the life of the process. These lookups are spawned
+/// rather than awaited in-line today, so cancellation is unlikely — but
+/// "unlikely" is not the property to rely on for a flag whose stuck state is
+/// permanent, and having this on one plane and not the other is the shape of
+/// mistake that produced the race itself (review).
+struct ResolvingGuard {
+    peers: Arc<Mutex<BTreeMap<NodeId, Peer>>>,
+    id: NodeId,
+}
+
+impl Drop for ResolvingGuard {
+    fn drop(&mut self) {
+        if let Ok(mut peers) = self.peers.lock() {
+            if let Some(peer) = peers.get_mut(&self.id) {
+                peer.resolving = false;
+            }
+        }
+    }
+}
+
 /// One directory entry: where a peer is, and how to find out again.
 #[derive(Clone, Debug)]
 struct Peer {
@@ -193,6 +217,11 @@ impl PeerDirectory {
             peer.resolving = true;
             host
         };
+        // Armed BEFORE the await that can be cancelled.
+        let _resolving = ResolvingGuard {
+            peers: Arc::clone(&self.peers),
+            id,
+        };
         // BOUNDED, because a resolver can stall and this is on the path of an
         // RPC that has its own hard deadline — 60 ms for replication (review).
         // A lookup that outlives the bound is abandoned, not waited for; the
@@ -217,7 +246,6 @@ impl PeerDirectory {
         let Some(peer) = peers.get_mut(&id) else {
             return;
         };
-        peer.resolving = false;
         // A lookup that failed leaves the last known address standing. It may
         // still be right — a resolver hiccup is not evidence a peer moved —
         // and replacing it with nothing would turn a transient DNS failure
