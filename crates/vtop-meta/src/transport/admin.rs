@@ -904,6 +904,15 @@ impl AdminClient {
         // of them could spend the lot before the third — healthy — member was
         // ever asked. Finding out where a candidate is, is part of reaching
         // it, and the documented arithmetic below depends on that being true.
+        // PRESUMED FAILED UNTIL A FRAME COMES BACK (review). Marking staleness
+        // in the error arms could not survive cancellation: `LeaseAgent::bounded`
+        // cancels this future at its round deadline, so an endpoint that
+        // accepted a connection and then hung was left marked GOOD and every
+        // later request reconnected to it — never re-resolving the name that
+        // would have found the peer. Setting it up front is cancellation-safe
+        // by construction, and `round_trip` clears it on the only evidence
+        // that counts, which is an answer.
+        self.mark_stale(index);
         let reached = tokio::time::timeout(CANDIDATE_CONNECT_TIMEOUT, async {
             let candidate = self.resolved_candidate(index).await;
             let endpoint = candidate.endpoint;
@@ -925,12 +934,8 @@ impl AdminClient {
             .unwrap_or(self.candidates[index].endpoint);
         let mut stream = match reached {
             Ok(Ok((stream, _))) => stream,
-            Ok(Err(error)) => {
-                self.mark_stale(index);
-                return Err(error);
-            }
+            Ok(Err(error)) => return Err(error),
             Err(_) => {
-                self.mark_stale(index);
                 return Err(TransportError::Protocol(format!(
                     "{attempted} could not be reached within {CANDIDATE_CONNECT_TIMEOUT:?}"
                 )));
@@ -952,10 +957,7 @@ impl AdminClient {
         .await
         {
             Ok(frame) => Ok(frame),
-            Err(error) => {
-                self.mark_stale(index);
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     }
 
