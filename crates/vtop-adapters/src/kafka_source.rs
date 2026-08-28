@@ -55,6 +55,10 @@ fn require_password_env(
 /// that will not answer has not lost records, it has declined to say.
 const WATERMARK_TIMEOUT_SECONDS: u64 = 5;
 
+/// How often the retention check runs. Retention moves on the scale of hours;
+/// a minute is free and keeps a broker round trip off the per-pass path.
+const RETENTION_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Records that retention removed between where this cursor wanted to resume
 /// and the oldest offset the broker still holds (#361).
 ///
@@ -288,6 +292,9 @@ pub struct KafkaSource {
     /// including messages the accumulator REJECTED. Where this diverges from
     /// the cursor's desired offset, the pass seeks that partition back.
     delivered: HashMap<(String, i32), i64>,
+    /// When retention was last checked (#361). Bounds a broker round trip on
+    /// a read path to something retention's own timescale makes free.
+    last_retention_check: Option<std::time::Instant>,
     /// Partitions paused mid-pass (topic hit its budget); resumed at the
     /// start of the next pass.
     paused: Vec<(String, i32)>,
@@ -336,34 +343,76 @@ impl KafkaSource {
             cursors: HashMap::new(),
             assigned: Vec::new(),
             delivered: HashMap::new(),
+            last_retention_check: None,
             paused: Vec::new(),
             stored_pending: std::collections::HashSet::new(),
             partitions: HashMap::new(),
         })
     }
 
-    /// Say what retention took, for every partition being assigned to a
-    /// concrete offset (#361).
+    /// Say what retention took, for every assigned partition (#361).
+    ///
+    /// PERIODIC, NOT ASSIGNMENT-TRIGGERED, and that is the second design this
+    /// had. Hooking it to a changed assignment missed both cases it exists
+    /// for (review):
+    ///
+    /// - **After a restart** the desired offset is `Offset::Stored` — the
+    ///   group commit is librdkafka's to resolve — so a guard that only
+    ///   accepted a concrete offset skipped the primary case entirely.
+    /// - **While lagging** the assignment never changes. Retention cannot
+    ///   overtake a cursor between two consecutive passes, which is true and
+    ///   beside the point: it does so over hundreds of them.
+    ///
+    /// One mechanism covers both. The offset compared is the one this source
+    /// would read NEXT — the in-memory cursor where there is one, the group's
+    /// committed offset otherwise — which is exactly the position retention
+    /// can have moved past.
     ///
     /// Reports; does not decide. Whether the adapter should REFUSE to resume
-    /// past a gap rather than continue is a deployment question — refusing
-    /// turns a partial archive into no archive, which may be worse — and it is
-    /// tracked on #361 rather than defaulted to here.
+    /// past a gap is a deployment question — refusing turns a partial archive
+    /// into no archive — and it stays on #361.
     ///
-    /// Never fails the pass. A broker that will not answer a watermark query
-    /// has not lost anything; it has only declined to say, and turning that
-    /// into a read failure would trade a real archive for a diagnostic.
-    fn report_retention_gaps(&self, desired: &[(String, i32, Offset)]) {
+    /// Never fails the pass. A broker that will not answer has not lost
+    /// anything; it has only declined to say, and turning that into a read
+    /// failure would trade a real archive for a diagnostic.
+    fn report_retention_gaps(&mut self) {
+        // Retention moves on the scale of hours. Once a minute is free, and
+        // an unbounded network call on a read path is the mistake #374 was
+        // made of — so both the interval and each query are bounded.
+        if self
+            .last_retention_check
+            .is_some_and(|at| at.elapsed() < RETENTION_CHECK_INTERVAL)
+        {
+            return;
+        }
+        self.last_retention_check = Some(std::time::Instant::now());
+
         let Some(consumer) = self.consumer.as_ref() else {
             return;
         };
-        for (topic, partition, offset) in desired {
-            // Only a concrete offset can have been overtaken. `Stored` and the
-            // other sentinels are librdkafka being asked to decide, which is
-            // the case that has nothing to compare against.
-            let Offset::Offset(desired_offset) = offset else {
-                continue;
-            };
+        // ONE call for every partition, rather than one per partition: the
+        // group's committed offsets are what a restart would resume from.
+        let committed = consumer
+            .committed(std::time::Duration::from_secs(WATERMARK_TIMEOUT_SECONDS))
+            .ok();
+
+        for (topic, partition) in &self.assigned {
+            // The in-memory cursor is what this process would read next; the
+            // group commit is what a fresh one would. Whichever exists is the
+            // position retention can have moved past.
+            let next_offset = self
+                .delivered
+                .get(&(topic.clone(), *partition))
+                .copied()
+                .or_else(|| {
+                    committed
+                        .as_ref()
+                        .and_then(|tpl| tpl.find_partition(topic, *partition))
+                        .and_then(|elem| match elem.offset() {
+                            Offset::Offset(at) => Some(at),
+                            _ => None,
+                        })
+                });
             let Ok((low_watermark, _high)) = consumer.fetch_watermarks(
                 topic,
                 *partition,
@@ -371,11 +420,11 @@ impl KafkaSource {
             ) else {
                 continue;
             };
-            if let Some(lost) = retention_gap(Some(*desired_offset), low_watermark) {
+            if let Some(lost) = retention_gap(next_offset, low_watermark) {
                 tracing::warn!(
                     topic = %topic,
                     partition = *partition,
-                    resuming_from = *desired_offset,
+                    resuming_from = next_offset.unwrap_or_default(),
                     oldest_available = low_watermark,
                     records_lost = lost,
                     "retention removed records this source had not read: the commit rule \
@@ -523,6 +572,9 @@ impl SourceAdapter for KafkaSource {
         // instead of fetching. assign() is rebalance-free and lets us control
         // the exact start offset per partition.
         self.consumer()?;
+        // Both cases #361 covers are here rather than at assignment time: see
+        // `report_retention_gaps`.
+        self.report_retention_gaps();
         // A metadata failure for ONE topic must not abort the pass for the
         // others — the serial loop isolated it per source, and so does this:
         // the failing topic is skipped and its outcome carries the error.
@@ -637,16 +689,6 @@ impl SourceAdapter for KafkaSource {
             consumer.assign(&tpl).map_err(|e| {
                 VtopError::Source(format!("assign ({} topics): {e}", sources.len()))
             })?;
-            // RETENTION IS CHECKED HERE AND NOWHERE ELSE (#361). This branch
-            // runs only when the (topic, partition) set changes — a restart,
-            // a rebalance, a topic appearing — which is precisely when a
-            // cursor can have been overtaken while nobody was reading. Per
-            // pass it would be a broker round trip on the hot path for a
-            // condition that cannot arise between two consecutive passes; per
-            // record it would be absurd. Bounded, because `fetch_watermarks`
-            // is a network call and an unbounded one on a read path is the
-            // mistake #374 was made of.
-            self.report_retention_gaps(&desired);
             // Defensively clear any pause state a retained toppar might carry
             // across the re-assign; a silently-paused partition reads as an
             // empty topic forever.
