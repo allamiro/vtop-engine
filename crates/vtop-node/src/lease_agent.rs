@@ -389,43 +389,79 @@ impl LeasePublisher for BrokerLeasePublisher {
 struct QuorumMissBudget {
     /// Whether to renew, holding this epoch still for another round.
     hold: bool,
-    epoch: Option<u64>,
-    /// When the hold expires, in the same clock as the round start.
-    until_ms: Option<i64>,
+    /// The state to carry into the next round.
+    state: Option<QuorumMissHold>,
+}
+
+/// How much of an epoch's hold is left.
+///
+/// LATCHED, not recomputed from a timestamp every round (review). Comparing
+/// wall clock against a stored deadline means a clock that steps backwards —
+/// NTP correction, a VM restored from a snapshot — reopens a window that had
+/// already closed, and the hold restarts. Once an epoch's window is spent it
+/// stays spent, because "we already decided this" is a fact and not a
+/// measurement.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum QuorumMissHold {
+    /// Holding `epoch` until `until_ms`.
+    Until { epoch: u64, until_ms: i64 },
+    /// `epoch`'s window is closed and does not reopen.
+    Spent { epoch: u64 },
+}
+
+impl QuorumMissHold {
+    fn epoch(self) -> u64 {
+        match self {
+            Self::Until { epoch, .. } | Self::Spent { epoch } => epoch,
+        }
+    }
 }
 
 /// WALL CLOCK, NOT ROUND COUNT (review). The bound is described as two lease
 /// lifetimes and was counted in poll rounds, which are not the same thing: a
 /// probe against blackholed replicas spends the fence deadline before the poll
-/// interval is applied, so N rounds can be several times N poll intervals. A
-/// bound stated in seconds has to be measured in seconds, or the range is held
-/// far longer than the promise a survivor is waiting on.
+/// interval is applied, so N rounds can be several times N poll intervals.
+///
+/// `hold_for` is ONE lease lifetime, not two, and the difference is the
+/// promise (review). The last renewal inside the window extends the metadata
+/// lease by a further full lifetime, so a window of two would hold the epoch
+/// for nearly three. One in, one trailing, two total — which is what a
+/// survivor is waiting on.
 ///
 /// A range that recovered and later missed again gets a FRESH window rather
-/// than inheriting a spent one, which is why the epoch travels with the
-/// deadline: the two situations are indistinguishable from the deadline alone.
+/// than inheriting a spent one, which is why the epoch travels with the state:
+/// the two situations are indistinguishable from the deadline alone.
 fn quorum_miss_budget(
     fencing_epoch: u64,
     now_ms: i64,
-    counting_for: Option<u64>,
-    until_ms: Option<i64>,
+    carried: Option<QuorumMissHold>,
     hold_for: Duration,
 ) -> QuorumMissBudget {
-    let until_ms = match (counting_for, until_ms) {
-        // Same epoch, already counting: keep the deadline that was set when
-        // this epoch first missed.
-        (Some(epoch), Some(until)) if epoch == fencing_epoch => until,
-        // First miss on this epoch — or a different epoch entirely.
-        _ => now_ms.saturating_add_unsigned(hold_for.as_millis().min(i64::MAX as u128) as u64),
-    };
-    QuorumMissBudget {
-        // Spent. A range this node has failed to serve for two lease lifetimes
-        // is one a survivor deserves an uncontested attempt at, so it lapses
-        // exactly as it did before #375 — the fix bounds the loop, it does not
-        // remove the exit.
-        hold: now_ms < until_ms,
-        epoch: Some(fencing_epoch),
-        until_ms: Some(until_ms),
+    let carried = carried.filter(|held| held.epoch() == fencing_epoch);
+    match carried {
+        // Already decided, and not revisited: see `QuorumMissHold`.
+        Some(QuorumMissHold::Spent { epoch }) => QuorumMissBudget {
+            hold: false,
+            state: Some(QuorumMissHold::Spent { epoch }),
+        },
+        Some(QuorumMissHold::Until { epoch, until_ms }) if now_ms < until_ms => QuorumMissBudget {
+            hold: true,
+            state: Some(QuorumMissHold::Until { epoch, until_ms }),
+        },
+        // The window just closed. Latch it.
+        Some(QuorumMissHold::Until { epoch, .. }) => QuorumMissBudget {
+            hold: false,
+            state: Some(QuorumMissHold::Spent { epoch }),
+        },
+        // First miss on this epoch, or a different epoch entirely.
+        None => QuorumMissBudget {
+            hold: true,
+            state: Some(QuorumMissHold::Until {
+                epoch: fencing_epoch,
+                until_ms: now_ms
+                    .saturating_add_unsigned(hold_for.as_millis().min(i64::MAX as u128) as u64),
+            }),
+        },
     }
 }
 
@@ -833,14 +869,11 @@ pub struct LeaseAgent {
     /// because if the eligible replica is down someone must keep probing,
     /// and the refusal repeating is the honest unavailability signal.
     campaign_hold_off_rounds: u32,
-    /// When the hold on a quorum-missed epoch expires (#375).
+    /// How much of the current epoch's quorum-miss hold is left (#375).
     ///
-    /// Per epoch, not per process: it clears on a successful promotion and is
-    /// re-set whenever the epoch changes, so a range that recovers and later
-    /// misses again gets a fresh window rather than inheriting a spent one.
-    quorum_miss_until_ms: Option<i64>,
-    /// The epoch `quorum_miss_until_ms` belongs to.
-    quorum_miss_epoch: Option<u64>,
+    /// Per epoch, not per process: cleared on a successful promotion, and a
+    /// different epoch opens a fresh window rather than inheriting a spent one.
+    quorum_miss_hold: Option<QuorumMissHold>,
     /// Local upper bound on how long the current hold may be trusted without
     /// hearing from metadata, in the same wall-clock the envelope carries.
     ///
@@ -913,8 +946,7 @@ impl LeaseAgent {
             observed_rival: None,
             held_until_ms: None,
             campaign_hold_off_rounds: 0,
-            quorum_miss_until_ms: None,
-            quorum_miss_epoch: None,
+            quorum_miss_hold: None,
         })
     }
 
@@ -1383,15 +1415,14 @@ impl LeaseAgent {
         fencing_epoch: u64,
         now_ms: i64,
     ) -> Result<(), String> {
+        // ONE lease lifetime, because the last renewal inside it adds another.
         let budget = quorum_miss_budget(
             fencing_epoch,
             now_ms,
-            self.quorum_miss_epoch,
-            self.quorum_miss_until_ms,
-            self.config.lease_duration.saturating_mul(2),
+            self.quorum_miss_hold,
+            self.config.lease_duration,
         );
-        self.quorum_miss_epoch = budget.epoch;
-        self.quorum_miss_until_ms = budget.until_ms;
+        self.quorum_miss_hold = budget.state;
         if budget.hold {
             // Renewing is not serving: `suspended` cleared `lease_active` on
             // the broker's view and only a successful re-probe restores it.
@@ -1403,8 +1434,7 @@ impl LeaseAgent {
     }
 
     fn clear_quorum_miss_hold(&mut self) {
-        self.quorum_miss_epoch = None;
-        self.quorum_miss_until_ms = None;
+        self.quorum_miss_hold = None;
     }
 
     /// How many poll rounds an eligibility refusal sits out: two lease
@@ -1889,65 +1919,83 @@ mod tests {
         );
     }
 
-    /// Holding an epoch through a quorum miss is bounded in WALL CLOCK, and
-    /// the bound belongs to the epoch rather than to the process (#375).
+    /// Holding an epoch through a quorum miss is bounded, latched, and per
+    /// epoch (#375).
     ///
-    /// Three properties, and they pull against each other. It must HOLD,
+    /// Four properties, and they pull against each other. It must HOLD,
     /// because lapsing mints `fencing_epoch + 1` and a replica refuses a fence
     /// for an epoch it has not observed — so the loop sustains itself. It must
     /// be BOUNDED, because a range that is genuinely unservable has to reach a
-    /// survivor eventually, and an unbounded hold is a different wedge rather
-    /// than a fix. And the bound must be measured in the unit it is stated in:
-    /// counted in poll rounds it was several times longer than "two lease
-    /// lifetimes", because a probe against blackholed replicas spends the
-    /// fence deadline before the poll interval is ever applied.
+    /// survivor eventually. The bound must be measured in the unit it is
+    /// stated in — counted in poll rounds it was several times longer than
+    /// promised, because a probe against blackholed replicas spends the fence
+    /// deadline before the poll interval is applied. And it must LATCH, or a
+    /// clock that steps backwards reopens a window that had closed.
     #[test]
-    fn holding_an_epoch_through_a_quorum_miss_is_bounded_in_time_and_per_epoch() {
-        let hold_for = Duration::from_secs(30);
+    fn a_quorum_miss_hold_is_bounded_latched_and_per_epoch() {
+        let hold_for = Duration::from_secs(15);
 
-        // The window opens on first sight of an epoch.
-        let opened = quorum_miss_budget(7, 1_000, None, None, hold_for);
+        let opened = quorum_miss_budget(7, 1_000, None, hold_for);
         assert!(opened.hold, "the first miss on an epoch must hold it");
         assert_eq!(
-            opened.until_ms,
-            Some(31_000),
-            "and the deadline is the hold measured from now, not a round count"
+            opened.state,
+            Some(QuorumMissHold::Until {
+                epoch: 7,
+                until_ms: 16_000
+            }),
+            "the deadline is the hold measured from now, not a round count"
         );
 
-        // Still inside it, however many rounds have happened.
-        let inside = quorum_miss_budget(7, 30_999, opened.epoch, opened.until_ms, hold_for);
+        let inside = quorum_miss_budget(7, 15_999, opened.state, hold_for);
         assert!(inside.hold, "a millisecond before the deadline still holds");
         assert_eq!(
-            inside.until_ms, opened.until_ms,
+            inside.state, opened.state,
             "and the deadline does not slide forward on each round, or the hold would \
              never end while rounds kept happening"
         );
 
-        // Past it.
-        let spent = quorum_miss_budget(7, 31_000, opened.epoch, opened.until_ms, hold_for);
+        let spent = quorum_miss_budget(7, 16_000, opened.state, hold_for);
         assert!(
             !spent.hold,
             "the budget must run out, or an unservable range never reaches a survivor"
         );
+        assert_eq!(
+            spent.state,
+            Some(QuorumMissHold::Spent { epoch: 7 }),
+            "and closing it must be LATCHED rather than recomputed"
+        );
 
-        // A slow round cannot smuggle extra time: what matters is the clock,
-        // not how many times we looked at it.
-        let one_round = quorum_miss_budget(9, 0, None, None, hold_for);
+        // The clock steps backwards — NTP, or a restored snapshot. A spent
+        // window must not reopen, which a bare timestamp comparison would do.
         assert!(
-            !quorum_miss_budget(9, 30_001, one_round.epoch, one_round.until_ms, hold_for).hold,
-            "a single round that itself took longer than the hold must exhaust it — the \
-             reason this is wall clock and not a count"
+            !quorum_miss_budget(7, 1_000, spent.state, hold_for).hold,
+            "a clock that moves backwards must not reopen a window that closed; the \
+             decision is a fact, not a measurement to repeat"
+        );
+
+        // A single round that itself outlasts the hold exhausts it, which is
+        // the whole reason this is wall clock and not a count of rounds.
+        let one = quorum_miss_budget(9, 0, None, hold_for);
+        assert!(
+            !quorum_miss_budget(9, 15_001, one.state, hold_for).hold,
+            "one slow round can spend the entire window"
         );
 
         // A NEW epoch is a new window, even carrying a spent one.
-        let fresh = quorum_miss_budget(8, 31_000, spent.epoch, spent.until_ms, hold_for);
+        let fresh = quorum_miss_budget(8, 16_000, spent.state, hold_for);
         assert!(
             fresh.hold,
             "a range that recovered and missed again must get a fresh window; inheriting \
              a spent one would make the second outage unrecoverable for no reason"
         );
-        assert_eq!(fresh.epoch, Some(8), "and the budget follows the epoch");
-        assert_eq!(fresh.until_ms, Some(61_000), "measured from the new miss");
+        assert_eq!(
+            fresh.state,
+            Some(QuorumMissHold::Until {
+                epoch: 8,
+                until_ms: 31_000
+            }),
+            "measured from the new miss, and following the new epoch"
+        );
     }
 
     /// The recovery half of the transient-refusal story, end to end against a
