@@ -468,6 +468,10 @@ def main() -> int:
     elif not seed_dir_is_ours:
         print(f"[bench] leaving caller-supplied seed dir untouched: {seed_dir}")
     shutil.rmtree(work_dir, ignore_errors=True)
+    # The state dir is mkdtemp'd exactly like work_dir and was the one of the
+    # three the cleanup forgot — every run leaked a vtop-state-* directory
+    # into the temp dir (found as three strays after a three-run grid).
+    shutil.rmtree(os.path.dirname(state_db), ignore_errors=True)
 
     print(f"[bench] done: {success} ok, {failed} failed, {replayed} replayed in {duration_s}s")
     print(f"[bench] summary: {os.path.join(writer.dir, 'summary.md')}")
