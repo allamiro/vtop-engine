@@ -119,14 +119,20 @@ kafka() { docker compose exec -T kafka /opt/kafka/bin/"$@"; }
 # Run kafka-init to completion before any cell, so its seed topics exist when
 # the first purge happens rather than arriving after it.
 seed_kafka_init() {
-  docker compose up -d --wait kafka-init >/dev/null 2>&1 \
-    || docker compose up -d kafka-init >/dev/null 2>&1 || true
+  docker compose up -d kafka-init >/dev/null 2>&1 \
+    || fail "could not start kafka-init; its seed topics would appear after the first \
+purge and sit in every cell's metadata fetch"
+  # AN EMPTY STATUS IS NOT A FINISHED ONE. Treating a failed or unanswered
+  # query as completion is how the seeds arrive after the purge instead of
+  # before it — the exact failure this function exists to prevent (review).
+  local state=""
   for _ in $(seq 1 60); do
-    case "$(docker compose ps -a --format '{{.State}}' kafka-init 2>/dev/null | head -1)" in
-      exited|"") break ;;
-      *) sleep 1 ;;
-    esac
+    state="$(docker compose ps -a --format '{{.State}}' kafka-init 2>/dev/null | head -1)"
+    [ "$state" = "exited" ] && break
+    sleep 1
   done
+  [ "$state" = "exited" ] || fail "kafka-init did not finish (last state: ${state:-unknown}); \
+its seed topics would arrive after the purge and contaminate every cell"
 }
 
 # EVERY TOPIC THAT IS NOT THIS CELL'S IS A CONFOUND. `discover_sources` fetches
@@ -507,10 +513,20 @@ else:
     # read is a WARN — `adapter read pass failed`, `source read failed` — not
     # an ERROR, so matching only ERROR let a cell that read some of its topics
     # pass as if it had read all of them (review).
+    # NAMED FAILURES, NOT A LOG LEVEL. Matching WARN caught every healthy run:
+    # the lab points the engine at a plaintext MinIO with verify_tls=false, and
+    # `S3NativeBackend::new` warns about BOTH on every startup (review). A guard
+    # that fails every cell is not a strict guard, it is a broken one — and it
+    # would have failed them for the one reason the lab is guaranteed to have.
+    #
+    # ERROR is still matched wholesale, because nothing in a healthy lab run
+    # logs at ERROR. Below that, only the phrases that name a failure of the
+    # pipeline this sweep measures — the partial-read cases are WARN, which is
+    # why the level alone was reached for in the first place.
     trouble = re.findall(
-        r'"level"\s*:\s*"(?:ERROR|WARN)"|\bERROR\b|\bWARN\b'
-        r'|adapter read pass failed|source read failed|process cycle error|batch failed'
-        r'|upload_failed|verification_failed|cycle_error',
+        r'"level"\s*:\s*"ERROR"'
+        r'|adapter read pass failed|source read failed|process cycle error'
+        r'|batch failed|upload_failed|verification_failed|cycle_error',
         drained)
     # And the profile's own count of sources it could not read. A cell that
     # read four of its five topics is not a measurement of five.
