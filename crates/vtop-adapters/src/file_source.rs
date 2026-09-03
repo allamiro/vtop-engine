@@ -9,7 +9,7 @@ use crate::base::{
     AdapterReadReport, DiscoveredSource, ReadResult, SourceAdapter, SourceReadOutcome,
 };
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader};
@@ -39,11 +39,18 @@ pub struct FileSource {
     /// source files that have no line structure) instead of line by line.
     whole_file: bool,
     cursors: HashMap<String, FileCursor>,
-    /// Alias groups already warned about (#378), keyed by (device, inode),
-    /// so a persistent hard link warns once per process instead of once per
-    /// discovery cycle. A sync Mutex because `discover_sources` takes
-    /// `&self`; it is locked briefly and never across an await.
-    warned_aliases: std::sync::Mutex<std::collections::HashSet<(u64, u64)>>,
+    /// Alias-group spellings already warned about (#378), keyed by
+    /// (device, inode): the key is the file, the value every spelling a
+    /// warning has named for it while it lived. An unchanged persistent
+    /// hard link stays one line per process instead of one per discovery
+    /// cycle — but a group carrying a spelling no line has named yet warns
+    /// again, because a warning that stops naming what to go look at has
+    /// stopped being useful. A group that only SHRANK stays silent: fewer
+    /// copies is not new information.
+    /// A `BTreeSet` so ordering differences between passes can never
+    /// masquerade as a change. A sync Mutex because `discover_sources`
+    /// takes `&self`; it is locked briefly and never across an await.
+    warned_aliases: std::sync::Mutex<HashMap<(u64, u64), BTreeSet<String>>>,
 }
 
 impl FileSource {
@@ -64,7 +71,7 @@ impl FileSource {
             delete_after_commit,
             whole_file,
             cursors: HashMap::new(),
-            warned_aliases: std::sync::Mutex::new(std::collections::HashSet::new()),
+            warned_aliases: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -355,6 +362,57 @@ fn alias_groups(entries: &[(String, Option<(u64, u64)>)]) -> Vec<((u64, u64), Ve
         .collect()
 }
 
+/// Which of this pass's alias groups deserve a warning line, given what
+/// earlier passes already named — the bookkeeping behind "one line per
+/// process" (#388), kept beside `alias_groups` so the decision tests as a
+/// pure function, the way `alias_groups` does.
+///
+/// A group warns when it carries a spelling no earlier line has named for
+/// its identity. Keying on bare identity looked equivalent and was not: a
+/// group that gained a hard link in a later cycle was silently suppressed,
+/// so the one path an operator most needed to go look at was exactly the
+/// one never named. Growth is the only trigger — a group that merely
+/// shrank stays silent, because fewer copies is not new information, and
+/// a stored-set equality check would turn one stat blip on a
+/// three-spelling group into two lines of noise (once when a spelling
+/// blinked out, again when it returned). The stored value therefore
+/// accumulates every spelling named while the identity lives, as a
+/// `BTreeSet` so ordering differences between passes can never masquerade
+/// as a change; the returned group keeps `alias_groups`' first-seen order,
+/// because that order is part of what the warning names.
+///
+/// Afterwards the map is cut back to identities present anywhere in THIS
+/// pass — the FULL identities list, not just the grouped entries. The full
+/// list is what makes a transient single-spelling stat failure evict
+/// nothing and re-warn nothing (the surviving spelling still carries the
+/// identity), while an inode freed by `delete_after_commit` and reused by
+/// an unrelated file cannot inherit its dead predecessor's suppression, and
+/// the map stays bounded by live files.
+fn alias_groups_to_warn(
+    warned: &mut HashMap<(u64, u64), BTreeSet<String>>,
+    groups: Vec<((u64, u64), Vec<String>)>,
+    identities: &[(String, Option<(u64, u64)>)],
+) -> Vec<Vec<String>> {
+    let mut to_warn = Vec::new();
+    for (id, group) in groups {
+        let composition: BTreeSet<String> = group.iter().cloned().collect();
+        let named = warned.entry(id).or_default();
+        if !composition.is_subset(named) {
+            named.extend(composition);
+            to_warn.push(group);
+        }
+    }
+    if !warned.is_empty() {
+        // Skipped entirely while the map is empty — the common alias-free
+        // process never pays for it, and indexing every file seen this pass
+        // would tax back part of what #363 reclaimed.
+        let live: std::collections::HashSet<(u64, u64)> =
+            identities.iter().filter_map(|(_, id)| *id).collect();
+        warned.retain(|id, _| live.contains(id));
+    }
+    to_warn
+}
+
 /// The (device, inode) pair that makes two directory entries provably one
 /// file. `metadata` follows symlinks, so a link and its target answer the
 /// same pair — which is exactly the aliasing #378 asks about.
@@ -445,22 +503,21 @@ impl SourceAdapter for FileSource {
         // Two surviving entries for ONE inode are archived as two sources.
         // Whether they SHOULD be one is #378's open question, deliberately
         // unanswered here — but doing it silently is the wrong way to do it,
-        // whichever answer wins. Warned once per alias group per process:
-        // the duplication is either intended or a config surprise, and both
-        // deserve exactly one line, not one per cycle.
-        for (id, group) in alias_groups(&identities) {
-            if self
-                .warned_aliases
-                .lock()
-                .expect("alias set lock poisoned")
-                .insert(id)
-            {
-                tracing::warn!(
-                    paths = ?group,
-                    "two directory entries name one file; each is archived as \
-                     its own source, so its records are archived twice (#378)"
-                );
-            }
+        // whichever answer wins. Warned once per alias-group COMPOSITION per
+        // process (#388): the duplication is either intended or a config
+        // surprise, and both deserve exactly one line, not one per cycle —
+        // until the group changes, when the line that named it no longer
+        // says what to go look at.
+        let to_warn = {
+            let mut warned = self.warned_aliases.lock().expect("alias map lock poisoned");
+            alias_groups_to_warn(&mut warned, alias_groups(&identities), &identities)
+        };
+        for group in to_warn {
+            tracing::warn!(
+                paths = ?group,
+                "two directory entries name one file; each is archived as \
+                 its own source, so its records are archived twice (#378)"
+            );
         }
         Ok(out)
     }
@@ -1013,6 +1070,183 @@ mod tests {
             alias_groups(&entries).is_empty(),
             "two unknowns are not evidence of one file, and one known entry \
              alone has nothing to alias with"
+        );
+    }
+
+    /// REGRESSION (#388's own warning): the suppression was keyed on bare
+    /// (device, inode), so a group that gained a hard link in a later cycle
+    /// stayed suppressed — the one path an operator most needed to go look
+    /// at was exactly the one never named.
+    #[test]
+    fn a_link_added_to_an_already_warned_group_warns_again_naming_the_new_path() {
+        let mut warned = HashMap::new();
+        let two = vec![
+            ("real.log".to_string(), Some((1, 42))),
+            ("link.log".to_string(), Some((1, 42))),
+        ];
+        assert_eq!(
+            alias_groups_to_warn(&mut warned, alias_groups(&two), &two),
+            vec![vec!["real.log".to_string(), "link.log".to_string()]],
+            "the first sighting of a group warns, naming every spelling"
+        );
+
+        let three = vec![
+            ("real.log".to_string(), Some((1, 42))),
+            ("link.log".to_string(), Some((1, 42))),
+            ("hard.log".to_string(), Some((1, 42))),
+        ];
+        assert_eq!(
+            alias_groups_to_warn(&mut warned, alias_groups(&three), &three),
+            vec![vec![
+                "real.log".to_string(),
+                "link.log".to_string(),
+                "hard.log".to_string()
+            ]],
+            "a group that gained a spelling must warn again and name ALL of it: the old \
+             line never said hard.log, and a warning that does not name what to go look \
+             at has stopped being useful"
+        );
+    }
+
+    /// The half #388 already promised, re-pinned across the rekeying: the
+    /// duplication is either intended or a config surprise, and both deserve
+    /// exactly one line per process, not one per discovery cycle.
+    #[test]
+    fn an_unchanged_persistent_alias_group_still_warns_exactly_once() {
+        let mut warned = HashMap::new();
+        let identities = vec![
+            ("real.log".to_string(), Some((1, 42))),
+            ("link.log".to_string(), Some((1, 42))),
+        ];
+        assert_eq!(
+            alias_groups_to_warn(&mut warned, alias_groups(&identities), &identities).len(),
+            1,
+            "the first sighting warns"
+        );
+        for _ in 0..3 {
+            assert!(
+                alias_groups_to_warn(&mut warned, alias_groups(&identities), &identities)
+                    .is_empty(),
+                "an unchanged persistent link is one line per process: a warning that \
+                 repeats every cycle trains operators to stop reading it"
+            );
+        }
+
+        // Same spellings, different first-seen order — a comparison over the
+        // ordered group would call this a change, which is why the stored
+        // composition is a set.
+        let reordered = vec![
+            ("link.log".to_string(), Some((1, 42))),
+            ("real.log".to_string(), Some((1, 42))),
+        ];
+        assert!(
+            alias_groups_to_warn(&mut warned, alias_groups(&reordered), &reordered).is_empty(),
+            "an ordering difference between passes is not a new spelling and must not \
+             masquerade as one"
+        );
+    }
+
+    /// REGRESSION (#388's own warning): once `delete_after_commit` freed an
+    /// inode, an unrelated new file reusing the number inherited the dead
+    /// group's suppression forever — and inode reuse after unlink is
+    /// immediate on Linux (#132 CI).
+    #[test]
+    fn an_inode_reused_by_a_new_group_is_not_suppressed_by_its_dead_predecessor() {
+        let mut warned = HashMap::new();
+        let old = vec![
+            ("old.log".to_string(), Some((1, 42))),
+            ("old-link.log".to_string(), Some((1, 42))),
+        ];
+        assert_eq!(
+            alias_groups_to_warn(&mut warned, alias_groups(&old), &old).len(),
+            1,
+            "the doomed group warns while it lives"
+        );
+
+        // delete_after_commit removed every spelling: a pass that sees the
+        // identity nowhere must evict its entry.
+        let gone: Vec<(String, Option<(u64, u64)>)> = Vec::new();
+        assert!(
+            alias_groups_to_warn(&mut warned, alias_groups(&gone), &gone).is_empty(),
+            "a pass with no aliases warns about nothing"
+        );
+        assert!(
+            warned.is_empty(),
+            "a dead group must not squat in the map: whatever reuses its inode is a \
+             different file, and the map would otherwise grow with every \
+             delete-and-recreate cycle"
+        );
+
+        let new = vec![
+            ("new.log".to_string(), Some((1, 42))),
+            ("new-link.log".to_string(), Some((1, 42))),
+        ];
+        assert_eq!(
+            alias_groups_to_warn(&mut warned, alias_groups(&new), &new),
+            vec![vec!["new.log".to_string(), "new-link.log".to_string()]],
+            "an inode number is not an identity across a delete: this group has never \
+             been named, and inheriting the predecessor's suppression would silence it \
+             forever"
+        );
+    }
+
+    /// One spelling failing a stat for one pass (raced rotation, transient
+    /// EACCES) must not turn into warning noise when it returns. The retain
+    /// runs over the FULL identities list, not just the grouped entries, so
+    /// the surviving spelling keeps the entry alive.
+    #[test]
+    fn a_transiently_missing_spelling_does_not_reset_the_warning() {
+        let mut warned = HashMap::new();
+        let full = vec![
+            ("real.log".to_string(), Some((1, 42))),
+            ("link.log".to_string(), Some((1, 42))),
+        ];
+        assert_eq!(
+            alias_groups_to_warn(&mut warned, alias_groups(&full), &full).len(),
+            1,
+            "the first sighting warns"
+        );
+
+        let one_missing = vec![("real.log".to_string(), Some((1, 42)))];
+        assert!(
+            alias_groups_to_warn(&mut warned, alias_groups(&one_missing), &one_missing).is_empty(),
+            "a single surviving spelling is not an alias group"
+        );
+
+        assert!(
+            alias_groups_to_warn(&mut warned, alias_groups(&full), &full).is_empty(),
+            "the returned spelling re-forms the exact composition the one line already \
+             named: re-warning here would make every transient stat failure a source of \
+             noise, which is how warnings get ignored"
+        );
+
+        // The same blip on a THREE-spelling group: the survivors still form
+        // a group, so a stored-set equality check would warn twice — once
+        // when the spelling blinked out, again when it returned. Growth is
+        // the only trigger, so the blip costs zero lines.
+        let trio = vec![
+            ("a.log".to_string(), Some((1, 7))),
+            ("b.log".to_string(), Some((1, 7))),
+            ("c.log".to_string(), Some((1, 7))),
+        ];
+        assert_eq!(
+            alias_groups_to_warn(&mut warned, alias_groups(&trio), &trio).len(),
+            1,
+            "the first sighting of the trio warns"
+        );
+        let blip = vec![
+            ("a.log".to_string(), Some((1, 7))),
+            ("c.log".to_string(), Some((1, 7))),
+        ];
+        assert!(
+            alias_groups_to_warn(&mut warned, alias_groups(&blip), &blip).is_empty(),
+            "two survivors of a three-spelling group are still a group, but every \
+             spelling was already named: a shrink is not new information"
+        );
+        assert!(
+            alias_groups_to_warn(&mut warned, alias_groups(&trio), &trio).is_empty(),
+            "the restored spelling was named by the original line: one stat blip must \
+             cost zero warning lines, not two"
         );
     }
 
