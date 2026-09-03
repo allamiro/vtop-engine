@@ -113,6 +113,28 @@ def test_a_blank_shell_variable_masks_the_filed_one(tmp_path, monkeypatch):
     assert env["AWS_SECRET_ACCESS_KEY"] == "minioadmin"
 
 
+def test_an_endpoint_supplied_only_by_env_still_gets_the_lab_credentials(
+        tmp_path, monkeypatch):
+    # The engine honors VTOP_S3_ENDPOINT_URL over its config, so a run can be
+    # aimed at the lab stack by environment alone — and must then resolve
+    # credentials exactly as if the scenario had named the endpoint. Gating on
+    # the scenario key only left such a run without the minioadmin fallbacks,
+    # failing every upload on credential resolution.
+    from lib import engine
+    monkeypatch.setattr(engine, "_ENV_FILE", str(tmp_path / ".env"))  # absent
+    monkeypatch.setenv("VTOP_S3_ENDPOINT_URL", "http://localhost:9000")
+    for var in ("MINIO_ROOT_USER", "MINIO_ROOT_PASSWORD",
+                "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    env = _backend_env({"backend": "s3_native"})
+    assert env["AWS_ACCESS_KEY_ID"] == "minioadmin", (
+        "the lab credential fallbacks must follow the same effective endpoint "
+        "the engine resolves, whichever channel supplied it"
+    )
+    assert env["AWS_SECRET_ACCESS_KEY"] == "minioadmin"
+    assert env["VTOP_S3_ENDPOINT_URL"] == "http://localhost:9000"
+
+
 def test_explicit_aws_credentials_still_win(tmp_path, monkeypatch):
     # setdefault semantics are load-bearing: an operator who points the
     # runner at real S3 with real AWS credentials must not have them

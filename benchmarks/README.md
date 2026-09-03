@@ -128,6 +128,25 @@ Three outputs answer the questions the issue asks:
 rm -rf benchmarks/results/*        # results/ is git-ignored
 ```
 
+MinIO objects live in the named volume `bench-minio-data`, which survives
+`docker compose ... down`. Drop them wholesale by removing the volume:
+
+```bash
+docker compose -f benchmarks/docker-compose.benchmark.yml down -v
+```
+
+or delete a single run — every run namespaces its objects under its `run_id`.
+The compose stack's `mc` alias lives only inside the ephemeral init
+container, so point one at the published port first:
+
+```bash
+mc alias set local http://localhost:9000 minioadmin minioadmin   # once per host
+mc rm -r --force local/vtop-bench-soak/<run_id>/
+```
+
+The prefix makes runs separable; only the volume or prefix deletion above
+bounds growth — nothing expires benchmark objects automatically.
+
 ## 9. Add a new scenario
 
 Copy any file in `scenarios/`, change the knobs, drop it in `scenarios/`.

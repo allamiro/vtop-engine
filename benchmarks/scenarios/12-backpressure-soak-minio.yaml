@@ -16,6 +16,9 @@ checksum: sha256
 backend: s3_native
 bucket: "vtop-bench-soak"
 endpoint_url: http://localhost:9000
+# Explicit opt-in: docker-compose.benchmark.yml provisions telemetry-* but not
+# this bucket, so the run creates it against the lab MinIO itself.
+create_bucket: true
 batch_max_records: 50
 batch_max_bytes: 1048576
 batch_max_age_seconds: 5

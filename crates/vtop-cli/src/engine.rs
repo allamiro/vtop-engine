@@ -119,6 +119,12 @@ pub struct Pipeline<'a> {
     /// (#135). Owned by [`Engine`] and shared into every pipeline so the
     /// check runs once per bucket per process, not per batch.
     pub versioned_buckets: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Buckets already provisioned via `ensure_bucket` when
+    /// `upload.create_bucket` is set. Owned by [`Engine`] and shared into
+    /// every pipeline, like `versioned_buckets`, so provisioning runs once
+    /// per bucket per process, not per batch (#102). Per bucket rather than
+    /// at startup because the bucket name is templated per batch.
+    pub provisioned_buckets: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl<'a> Pipeline<'a> {
@@ -414,10 +420,23 @@ impl<'a> Pipeline<'a> {
             &batch_id,
         );
 
-        // Optionally provision the (per-format) bucket on demand.
+        // Optionally provision the (per-format) bucket on demand. Cached like
+        // the versioning preflight below: uncached, every batch of a soak paid
+        // a live CreateBucket round trip against the very store whose
+        // absorption capacity was being measured, visible only inside
+        // `total_ms` (#102). A bucket is marked provisioned only after
+        // `ensure_bucket` succeeds, so a transient provisioning failure is
+        // retried on the next batch instead of latched as done.
         if self.config.upload.create_bucket {
-            if let Err(e) = self.backend.ensure_bucket(&bucket).await {
-                fail!(format!("ensure_bucket {bucket} failed: {e}"));
+            let provisioned = self.provisioned_buckets.lock().unwrap().contains(&bucket);
+            if !provisioned {
+                if let Err(e) = self.backend.ensure_bucket(&bucket).await {
+                    fail!(format!("ensure_bucket {bucket} failed: {e}"));
+                }
+                self.provisioned_buckets
+                    .lock()
+                    .unwrap()
+                    .insert(bucket.clone());
             }
         }
 
@@ -901,6 +920,9 @@ pub struct Engine {
     /// Process-wide hardened-profile preflight cache (#135); see
     /// [`Pipeline::versioned_buckets`].
     versioned_buckets: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Process-wide bucket-provisioning cache (#102); see
+    /// [`Pipeline::provisioned_buckets`].
+    provisioned_buckets: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Per-source accumulation buffers, keyed by `(source_type, source_name)`.
     pending: HashMap<(SourceType, String), PendingBuffer>,
     /// Set by a read cycle that returned any records; drives the adaptive
@@ -1134,6 +1156,7 @@ impl Engine {
             adapters,
             manifest_mac_key,
             versioned_buckets: Arc::default(),
+            provisioned_buckets: Arc::default(),
             pending: HashMap::new(),
             cycle_had_data: false,
             last_ledger_prune: None,
@@ -1157,6 +1180,7 @@ impl Engine {
             config: &self.config,
             manifest_mac_key: self.manifest_mac_key.clone(),
             versioned_buckets: Arc::clone(&self.versioned_buckets),
+            provisioned_buckets: Arc::clone(&self.provisioned_buckets),
         }
     }
 
@@ -2279,6 +2303,89 @@ mod tests {
         assert!(
             flushed[0].committed,
             "flushed batch must commit after verify"
+        );
+    }
+
+    /// #102 (review on #391): with `create_bucket` set, provisioning ran
+    /// inside `process_until_verified`, so every batch of a soak paid a live
+    /// CreateBucket round trip against the very store whose absorption
+    /// capacity the soak measures. Provisioning is cached the way the
+    /// versioning preflight is: once per bucket per process — per bucket,
+    /// not at startup, because the bucket name is templated per batch.
+    #[tokio::test]
+    async fn bucket_provisioning_runs_once_per_bucket_not_once_per_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        let input_a = dir.path().join("in-a.log");
+        let input_b = dir.path().join("in-b.log");
+        std::fs::write(&input_a, "a line 1\n").unwrap();
+        std::fs::write(&input_b, "b line 1\n").unwrap();
+
+        let mut cfg = file_config(
+            work.to_str().unwrap(),
+            "sqlite::memory:",
+            vec![
+                input_a.to_string_lossy().into_owned(),
+                input_b.to_string_lossy().into_owned(),
+            ],
+            "mock",
+        );
+        cfg.upload.create_bucket = true;
+        // One bucket per source, so a single engine covers both cache
+        // verdicts: two sources must provision two buckets, while a later
+        // batch from a source whose bucket already exists must provision
+        // nothing.
+        cfg.upload.bucket = "telemetry-{source}".into();
+        cfg.batching.max_batch_age_seconds = 3_600;
+
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        // `Engine::new` builds its backend from the config string; counting
+        // calls needs a handle the test keeps, so swap in one of its own.
+        let mock = Arc::new(vtop_upload::MockBackend::new());
+        engine.backend = mock.clone();
+
+        let first = engine.run_source(SourceType::File, true).await.unwrap();
+        assert_eq!(first.len(), 2, "both sources must flush a batch");
+        assert!(
+            first.iter().all(|o| o.committed),
+            "provisioning through the cache must leave batches able to verify \
+             and commit"
+        );
+        assert_eq!(
+            mock.ensure_bucket_calls(),
+            2,
+            "distinct buckets are distinct provisioning targets: caching one \
+             must not suppress creating the other"
+        );
+
+        // A second batch from source A resolves to the bucket provisioned
+        // above.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&input_a)
+                .unwrap();
+            writeln!(f, "a line 2").unwrap();
+        }
+        let second = engine.run_source(SourceType::File, true).await.unwrap();
+        assert_eq!(
+            second.len(),
+            1,
+            "only the appended source has new data to flush"
+        );
+        assert!(
+            second[0].committed,
+            "the cached skip must be invisible to the batch: a bucket marked \
+             provisioned still has to verify and commit exactly as the first one did"
+        );
+        assert_eq!(
+            mock.ensure_bucket_calls(),
+            2,
+            "a bucket provisioned earlier in this process must not be \
+             re-provisioned per batch — that per-batch round trip is exactly \
+             the unmeasured store load #102's soak was absorbing"
         );
     }
 }
