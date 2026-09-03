@@ -518,8 +518,10 @@ impl KafkaSource {
     }
 
     /// Convert everything observed-but-undelivered into report entries,
-    /// leaving the accumulator empty. Called ONLY on the path that returns
-    /// the report: a drain on a failing path is exactly the dropped count
+    /// leaving the accumulator empty. Called ONLY on paths that return a
+    /// successful report — the empty-assignment early return included,
+    /// since a debt whose topic was deleted has no polling pass left to
+    /// wait for. A drain on a failing path is exactly the dropped count
     /// `pending_lost` exists to prevent.
     fn take_pending_losses(&mut self) -> Vec<SourceRetentionLoss> {
         std::mem::take(&mut self.pending_lost)
@@ -776,10 +778,12 @@ impl SourceAdapter for KafkaSource {
                 failed_ms: meta_failed_ms,
                 // The retention check has not run on this path — nothing is
                 // assigned, so there is no cursor a watermark could have
-                // passed. Loss a PREVIOUS pass observed and failed to
-                // deliver stays in `pending_lost`: reporting empty here is
-                // fine, the next pass that really polls pays the debt.
-                retention_lost: Vec::new(),
+                // passed. But this IS a successful report, and loss a
+                // PREVIOUS pass observed and failed to deliver must not wait
+                // for a pass that polls: if the indebted topic was deleted,
+                // no such pass ever comes, and the debt would outlive its
+                // subject unpaid. Any pass that completes pays it.
+                retention_lost: self.take_pending_losses(),
             });
         }
         let consumer = self.consumer.as_ref().expect("consumer built above");
