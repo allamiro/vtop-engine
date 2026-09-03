@@ -45,14 +45,17 @@ def _effective_endpoint(scenario) -> str:
 
 
 def _is_lab_endpoint(endpoint: str) -> bool:
-    # The compose stack publishes MinIO on the loopback interface, and that
-    # is the only endpoint whose credentials this harness can know. A remote
-    # endpoint — RGW, a production MinIO, AWS behind a custom URL — means
-    # the operator brought an identity, and injecting the lab fallbacks
-    # would OUTRANK it: environment keys beat profiles and instance
-    # metadata in the SDK's credential chain.
-    host = urlsplit(endpoint).hostname or ""
-    return host in ("localhost", "127.0.0.1", "::1")
+    # The compose stack publishes MinIO on the loopback interface at the
+    # FIXED host port 9000 (docker-compose.benchmark.yml pins it; only the
+    # bind address is overridable), and that one endpoint is the only one
+    # whose credentials this harness can know. Anything else — a remote
+    # store, or another loopback service such as localstack on :4566 —
+    # means the operator brought an identity, and injecting the lab
+    # fallbacks would OUTRANK it: environment keys beat profiles and
+    # instance metadata in the SDK's credential chain.
+    parts = urlsplit(endpoint)
+    return (parts.hostname in ("localhost", "127.0.0.1", "::1")
+            and parts.port == 9000)
 
 
 def write_engine_config(scenario, work_dir: str, state_db: str,

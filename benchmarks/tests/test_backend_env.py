@@ -187,3 +187,21 @@ def test_the_environment_endpoint_outranks_the_scenario_field(monkeypatch):
         "whichever endpoint the engine will actually use is the one every "
         "harness decision must key off"
     )
+
+
+def test_another_loopback_service_is_not_the_lab(tmp_path, monkeypatch):
+    # Loopback alone is not the signal — the compose stack pins host port
+    # 9000, and a different local S3 stand-in (localstack, a second MinIO)
+    # has its own credentials that the minioadmin fallbacks would shadow.
+    from lib import engine
+    monkeypatch.setattr(engine, "_ENV_FILE", str(tmp_path / ".env"))  # absent
+    for var in ("VTOP_S3_ENDPOINT_URL", "MINIO_ROOT_USER",
+                "MINIO_ROOT_PASSWORD", "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    env = _backend_env({"backend": "s3_native",
+                        "endpoint_url": "http://localhost:4566"})
+    assert "AWS_ACCESS_KEY_ID" not in env, (
+        "the lab predicate is host AND port: a loopback service on another "
+        "port is somebody else's store with somebody else's credentials"
+    )
