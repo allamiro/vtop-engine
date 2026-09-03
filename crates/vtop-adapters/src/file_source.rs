@@ -387,7 +387,8 @@ fn alias_groups(entries: &[(String, Option<(u64, u64)>)]) -> Vec<((u64, u64), Ve
 /// nothing and re-warn nothing (the surviving spelling still carries the
 /// identity), while an inode freed by `delete_after_commit` and reused by
 /// an unrelated file cannot inherit its dead predecessor's suppression, and
-/// the map stays bounded by live files.
+/// the map stays bounded by live files. A pass that discovered no
+/// identities at all is exempt: it proves nothing about any one of them.
 fn alias_groups_to_warn(
     warned: &mut HashMap<(u64, u64), BTreeSet<String>>,
     groups: Vec<((u64, u64), Vec<String>)>,
@@ -408,7 +409,14 @@ fn alias_groups_to_warn(
         // would tax back part of what #363 reclaimed.
         let live: std::collections::HashSet<(u64, u64)> =
             identities.iter().filter_map(|(_, id)| *id).collect();
-        warned.retain(|id, _| live.contains(id));
+        // A pass that discovered nothing proves nothing about any single
+        // identity: an unmounted directory or a burst of stat failures looks
+        // exactly like a mass delete, and forgetting on the former turns
+        // recovery into a re-warn of every group the process already named.
+        // Eviction waits for a pass that saw SOMETHING and not this identity.
+        if !live.is_empty() {
+            warned.retain(|id, _| live.contains(id));
+        }
     }
     to_warn
 }
@@ -1163,12 +1171,14 @@ mod tests {
             "the doomed group warns while it lives"
         );
 
-        // delete_after_commit removed every spelling: a pass that sees the
-        // identity nowhere must evict its entry.
-        let gone: Vec<(String, Option<(u64, u64)>)> = Vec::new();
+        // delete_after_commit removed every spelling of the group, while an
+        // unrelated file keeps the pass non-empty: a pass that saw something
+        // and not this identity must evict its entry. (A pass that saw
+        // NOTHING proves nothing — that case is pinned separately below.)
+        let gone = vec![("other.log".to_string(), Some((1, 99)))];
         assert!(
             alias_groups_to_warn(&mut warned, alias_groups(&gone), &gone).is_empty(),
-            "a pass with no aliases warns about nothing"
+            "a pass with no alias groups warns about nothing"
         );
         assert!(
             warned.is_empty(),
@@ -1247,6 +1257,41 @@ mod tests {
             alias_groups_to_warn(&mut warned, alias_groups(&trio), &trio).is_empty(),
             "the restored spelling was named by the original line: one stat blip must \
              cost zero warning lines, not two"
+        );
+    }
+
+    /// An unmounted directory or a burst of stat failures makes one pass
+    /// discover nothing, and that pass looks exactly like a mass delete.
+    /// Forgetting on it would turn recovery into a re-warn of every group
+    /// the process already named.
+    #[test]
+    fn an_empty_discovery_pass_does_not_forget_what_was_warned() {
+        let mut warned = HashMap::new();
+        let group = vec![
+            ("real.log".to_string(), Some((1, 42))),
+            ("link.log".to_string(), Some((1, 42))),
+        ];
+        assert_eq!(
+            alias_groups_to_warn(&mut warned, alias_groups(&group), &group).len(),
+            1,
+            "the first sighting warns"
+        );
+
+        let outage: Vec<(String, Option<(u64, u64)>)> = Vec::new();
+        assert!(
+            alias_groups_to_warn(&mut warned, alias_groups(&outage), &outage).is_empty(),
+            "a pass that saw nothing warns about nothing"
+        );
+        assert!(
+            !warned.is_empty(),
+            "a pass that discovered nothing proves nothing: eviction on it would make \
+             every outage end in a burst of re-warns for groups already named"
+        );
+
+        assert!(
+            alias_groups_to_warn(&mut warned, alias_groups(&group), &group).is_empty(),
+            "the group that rode out the outage was already named: recovery must not \
+             repeat it"
         );
     }
 
