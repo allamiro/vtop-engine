@@ -47,6 +47,17 @@ pub struct SourceReadOutcome {
     pub result: Result<Vec<ReadResult>, VtopError>,
 }
 
+/// Retention loss charged to one source (#361). The loss is reported per
+/// source (topic) because the topic names the stream, and the stream names
+/// the tenant the loss belongs to — a single adapter-wide sum could only ever
+/// land on the engine-default tenant, however clearly the adapter saw whose
+/// records were taken.
+#[derive(Debug, Clone)]
+pub struct SourceRetentionLoss {
+    pub source_name: String,
+    pub records: u64,
+}
+
 /// Everything an adapter read across all its sources in one pass, plus how the
 /// pass's wall-clock divided between reads that produced data, reads that
 /// waited on nothing, and reads that failed. The buckets MUST sum to the time
@@ -58,15 +69,19 @@ pub struct AdapterReadReport {
     pub empty_ms: u64,
     pub failed_ms: u64,
     /// Records the SOURCE removed before this adapter ever read them, newly
-    /// observed by this pass (#361): for Kafka, the distance retention moved
-    /// the low watermark past the next-read offset since the last pass that
-    /// counted it. The adapter deduplicates, so a gap that persists across
-    /// passes is counted once, not once per observation. Zero for adapters
-    /// whose sources cannot expire data out from under a cursor (file,
-    /// syslog spool), and zero on passes where the periodic check did not
-    /// run. A log line nobody greps is not a report — this field is how the
-    /// loss reaches `read_cycle_profile` and the metrics.
-    pub retention_lost_records: u64,
+    /// delivered by this pass (#361), one [`SourceRetentionLoss`] per source
+    /// that lost any: for Kafka, the distance retention moved the low
+    /// watermark past the next-read offset since the last pass that counted
+    /// it. The adapter deduplicates, so a gap that persists across passes is
+    /// counted once, not once per observation — and it holds counts a failed
+    /// pass could not deliver until a pass succeeds, so "counted once" never
+    /// decays into "at most once". Empty for adapters whose sources cannot
+    /// expire data out from under a cursor (file, syslog spool), and on
+    /// passes with nothing owed — the periodic check skipped its interval
+    /// and no debt was pending from a failed pass. A log line nobody greps
+    /// is not a report — these entries are how the loss reaches
+    /// `read_cycle_profile` and the metrics.
+    pub retention_lost: Vec<SourceRetentionLoss>,
 }
 
 /// A telemetry source adapter.
@@ -125,7 +140,7 @@ pub trait SourceAdapter: Send + Sync {
             productive_ms: 0,
             empty_ms: 0,
             failed_ms: 0,
-            retention_lost_records: 0,
+            retention_lost: Vec::new(),
         };
         for (source_index, source) in sources.iter().enumerate() {
             let started = std::time::Instant::now();
