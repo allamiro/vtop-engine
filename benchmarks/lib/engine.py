@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from urllib.parse import urlsplit
 
 
 def repo_root() -> str:
@@ -28,17 +29,30 @@ def vtopctl_path(build_if_missing: bool = True) -> str:
 
 
 def _effective_endpoint(scenario) -> str:
-    """The one answer to "is this run pointed at the lab stack?".
+    """The one answer to "which store is this run actually pointed at?".
 
-    The engine honors VTOP_S3_ENDPOINT_URL over its config (vtop-upload
-    s3_native.rs), so a run can be aimed at the lab by environment alone.
-    Everything that keys off the endpoint must resolve it the same way: the
-    written config's endpoint line does, and the lab credential fallbacks in
-    _backend_env must too — an env-supplied endpoint otherwise produced a
-    config aimed at the lab stack with credentials the server never saw, and
-    every upload failed on credential resolution.
+    The engine resolves VTOP_S3_ENDPOINT_URL over its config file
+    (vtop-upload s3_native.rs), so the environment must win here in the
+    same order: resolving the scenario field first let a run with both set
+    write its config for one store while the engine talked to another.
+    Everything that keys off the endpoint resolves it through this helper —
+    the written config's endpoint line and the lab credential fallbacks in
+    _backend_env alike — because an endpoint recognized by one and not the
+    other produced a bucket-creating config with credentials the server
+    never saw, and every upload failed on credential resolution.
     """
-    return scenario.get("endpoint_url", "") or os.environ.get("VTOP_S3_ENDPOINT_URL", "")
+    return os.environ.get("VTOP_S3_ENDPOINT_URL", "") or scenario.get("endpoint_url", "")
+
+
+def _is_lab_endpoint(endpoint: str) -> bool:
+    # The compose stack publishes MinIO on the loopback interface, and that
+    # is the only endpoint whose credentials this harness can know. A remote
+    # endpoint — RGW, a production MinIO, AWS behind a custom URL — means
+    # the operator brought an identity, and injecting the lab fallbacks
+    # would OUTRANK it: environment keys beat profiles and instance
+    # metadata in the SDK's credential chain.
+    host = urlsplit(endpoint).hostname or ""
+    return host in ("localhost", "127.0.0.1", "::1")
 
 
 def write_engine_config(scenario, work_dir: str, state_db: str,
@@ -53,8 +67,9 @@ def write_engine_config(scenario, work_dir: str, state_db: str,
     # either failed least-privilege credentials with AccessDenied or issued a
     # real CreateBucket against production storage. Unset derives true only
     # for backend=minio — inert, since the mc-based backend's ensure_bucket
-    # is the base no-op. The lab soak (scenario 12) opts in because
-    # docker-compose.benchmark.yml provisions telemetry-* but not its bucket.
+    # is the base no-op. No bundled scenario opts in: the compose init
+    # service provisions every lab bucket, soak included, so per-cycle
+    # subprocesses never carry CreateBucket into a measurement.
     requested = scenario.get("create_bucket", "")
     if requested == "":
         create_bucket = "true" if backend == "minio" else "false"
@@ -164,13 +179,18 @@ def _dotenv_overrides() -> dict[str, str]:
 
 def _backend_env(scenario) -> dict[str, str]:
     env = dict(os.environ)
-    # s3_native pointed at the lab endpoint — named by the scenario or by the
-    # same VTOP_S3_ENDPOINT_URL the engine honors — needs the same credentials
-    # the mc-based backend does; setdefault keeps real AWS credentials
-    # (already in the environment) winning over the lab fallbacks.
     endpoint = _effective_endpoint(scenario)
+    if scenario.get("backend") == "s3_native" and endpoint:
+        # A no-op when the endpoint came from the environment: it is
+        # already set there, and setdefault leaves it alone.
+        env.setdefault("VTOP_S3_ENDPOINT_URL", endpoint)
+    # The lab fallbacks apply to the mc-based backend and to s3_native aimed
+    # at the LAB stack only — the loopback endpoint is the one whose
+    # credentials this harness can know, and setdefault keeps real AWS
+    # credentials (already in the environment) winning over the fallbacks.
     if scenario.get("backend") == "minio" or (
-            scenario.get("backend") == "s3_native" and endpoint):
+            scenario.get("backend") == "s3_native" and endpoint
+            and _is_lab_endpoint(endpoint)):
         # The benchmark compose lets an operator override the SERVER's
         # credentials via MINIO_ROOT_USER / MINIO_ROOT_PASSWORD (issue #81).
         # The client must follow the same variables THROUGH THE SAME
@@ -198,10 +218,6 @@ def _backend_env(scenario) -> dict[str, str]:
         env.setdefault("AWS_REGION", "us-east-1")
         env.setdefault("VTOP_S3_FORCE_PATH_STYLE", "true")
         env.setdefault("VTOP_S3_VERIFY_TLS", "false")
-        if endpoint:
-            # A no-op when the endpoint came from the environment: it is
-            # already set there, and setdefault leaves it alone.
-            env.setdefault("VTOP_S3_ENDPOINT_URL", endpoint)
     return env
 
 

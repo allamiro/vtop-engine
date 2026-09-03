@@ -159,3 +159,23 @@ def test_a_multiplier_that_rounds_to_zero_still_seeds_one_file():
     # drain, and reports a duration it never actually spent working.
     assert reseed_count(10, 0.01) == 1
     assert reseed_count(1, 0.0) == 1
+
+
+def test_every_bundled_scenario_survives_the_fallback_parser():
+    # The PyYAML-side parity test cannot run in the no-PyYAML lane, so this
+    # is that lane's own tripwire: no bundled scenario may parse into a
+    # block-scalar indicator literal — the exact corruption the folded
+    # descriptions used to produce.
+    import glob
+    import os
+    scen_dir = os.path.join(os.path.dirname(__file__), "..", "scenarios")
+    files = sorted(glob.glob(os.path.join(scen_dir, "*.yaml")))
+    assert files, "the bundled scenarios must be visible to this test"
+    for path in files:
+        with open(path, encoding="utf-8") as fh:
+            parsed = _fallback_parse(fh.read())
+        for key, value in parsed.items():
+            assert value not in (">", ">-", ">+", "|", "|-", "|+"), (
+                f"{os.path.basename(path)}: {key} parsed as a bare block "
+                "indicator — the fallback parser dropped its content"
+            )

@@ -148,3 +148,42 @@ def test_explicit_aws_credentials_still_win(tmp_path, monkeypatch):
     env = _backend_env(minio_scenario())
     assert env["AWS_ACCESS_KEY_ID"] == "real-key"
     assert env["AWS_SECRET_ACCESS_KEY"] == "real-secret"
+
+
+def test_a_remote_endpoint_never_receives_the_lab_credentials(
+        tmp_path, monkeypatch):
+    # Environment keys outrank profiles and instance metadata in the SDK's
+    # credential chain, so injecting minioadmin for a NON-lab endpoint would
+    # replace the identity the operator brought — every upload would
+    # authenticate as a user the remote store has never heard of.
+    from lib import engine
+    monkeypatch.setattr(engine, "_ENV_FILE", str(tmp_path / ".env"))  # absent
+    for var in ("VTOP_S3_ENDPOINT_URL", "MINIO_ROOT_USER",
+                "MINIO_ROOT_PASSWORD", "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    env = _backend_env({"backend": "s3_native",
+                        "endpoint_url": "https://rgw.example.net:8443"})
+    assert "AWS_ACCESS_KEY_ID" not in env, (
+        "a remote endpoint means the operator brought an identity: the lab "
+        "fallbacks are for the loopback stack only"
+    )
+    assert env["VTOP_S3_ENDPOINT_URL"] == "https://rgw.example.net:8443", (
+        "the endpoint itself must still reach the engine; only the "
+        "credential fallbacks are lab-scoped"
+    )
+
+
+def test_the_environment_endpoint_outranks_the_scenario_field(monkeypatch):
+    # The engine resolves VTOP_S3_ENDPOINT_URL over its config file, so the
+    # harness must resolve in the same order: preferring the scenario field
+    # let a run write its config for one store while the engine talked to
+    # another.
+    from lib.engine import _effective_endpoint
+    monkeypatch.setenv("VTOP_S3_ENDPOINT_URL", "http://localhost:9000")
+    assert _effective_endpoint(
+        {"endpoint_url": "https://rgw.example.net:8443"}
+    ) == "http://localhost:9000", (
+        "whichever endpoint the engine will actually use is the one every "
+        "harness decision must key off"
+    )

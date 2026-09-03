@@ -137,11 +137,14 @@ docker compose -f benchmarks/docker-compose.benchmark.yml down -v
 
 or delete a single run — every run namespaces its objects under its `run_id`.
 The compose stack's `mc` alias lives only inside the ephemeral init
-container, so point one at the published port first:
+container, so point one at the published port first, with the same
+`MINIO_ROOT_*` overrides the stack itself honors (#81); the bucket is
+whatever the scenario filed (`vtop-bench-soak` for the soak):
 
 ```bash
-mc alias set local http://localhost:9000 minioadmin minioadmin   # once per host
-mc rm -r --force local/vtop-bench-soak/<run_id>/
+mc alias set local http://localhost:9000 \
+  "${MINIO_ROOT_USER:-minioadmin}" "${MINIO_ROOT_PASSWORD:-minioadmin}"   # once per host
+mc rm -r --force "local/<bucket>/<run_id>/"
 ```
 
 The prefix makes runs separable; only the volume or prefix deletion above

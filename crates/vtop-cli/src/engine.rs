@@ -123,8 +123,12 @@ pub struct Pipeline<'a> {
     /// `upload.create_bucket` is set. Owned by [`Engine`] and shared into
     /// every pipeline, like `versioned_buckets`, so provisioning runs once
     /// per bucket per process, not per batch (#102). Per bucket rather than
-    /// at startup because the bucket name is templated per batch.
-    pub provisioned_buckets: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// at startup because the bucket name is templated per batch. An ASYNC
+    /// mutex, unlike its neighbour, because the guard is deliberately held
+    /// across the `ensure_bucket` await: concurrent first batches through
+    /// `buffer_unordered` would otherwise all observe the bucket absent and
+    /// issue width-many CreateBucket calls at once.
+    pub provisioned_buckets: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl<'a> Pipeline<'a> {
@@ -424,19 +428,19 @@ impl<'a> Pipeline<'a> {
         // the versioning preflight below: uncached, every batch of a soak paid
         // a live CreateBucket round trip against the very store whose
         // absorption capacity was being measured, visible only inside
-        // `total_ms` (#102). A bucket is marked provisioned only after
-        // `ensure_bucket` succeeds, so a transient provisioning failure is
-        // retried on the next batch instead of latched as done.
+        // `total_ms` (#102). The guard is held across the await on purpose —
+        // a check-then-insert released around it let every concurrent first
+        // batch observe the bucket absent and provision it again — and a
+        // bucket is inserted only after `ensure_bucket` succeeds, so a
+        // transient provisioning failure is retried on the next batch (the
+        // guard drops with the early return) instead of latched as done.
         if self.config.upload.create_bucket {
-            let provisioned = self.provisioned_buckets.lock().unwrap().contains(&bucket);
-            if !provisioned {
+            let mut provisioned = self.provisioned_buckets.lock().await;
+            if !provisioned.contains(&bucket) {
                 if let Err(e) = self.backend.ensure_bucket(&bucket).await {
                     fail!(format!("ensure_bucket {bucket} failed: {e}"));
                 }
-                self.provisioned_buckets
-                    .lock()
-                    .unwrap()
-                    .insert(bucket.clone());
+                provisioned.insert(bucket.clone());
             }
         }
 
@@ -922,7 +926,7 @@ pub struct Engine {
     versioned_buckets: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Process-wide bucket-provisioning cache (#102); see
     /// [`Pipeline::provisioned_buckets`].
-    provisioned_buckets: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    provisioned_buckets: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
     /// Per-source accumulation buffers, keyed by `(source_type, source_name)`.
     pending: HashMap<(SourceType, String), PendingBuffer>,
     /// Set by a read cycle that returned any records; drives the adaptive
@@ -2386,6 +2390,58 @@ mod tests {
             "a bucket provisioned earlier in this process must not be \
              re-provisioned per batch — that per-batch round trip is exactly \
              the unmeasured store load #102's soak was absorbing"
+        );
+    }
+
+    /// The cache is only a cache once a provisioning completes; before that,
+    /// width-many first batches race through `buffer_unordered`, and a
+    /// check-then-insert released around the `ensure_bucket` await let every
+    /// one of them observe the bucket absent. The guard held across the
+    /// await is what makes "once per bucket" true at any width.
+    #[tokio::test]
+    async fn two_concurrent_first_batches_provision_their_shared_bucket_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        let input_a = dir.path().join("in-a.log");
+        let input_b = dir.path().join("in-b.log");
+        std::fs::write(&input_a, "a line 1\n").unwrap();
+        std::fs::write(&input_b, "b line 1\n").unwrap();
+
+        let mut cfg = file_config(
+            work.to_str().unwrap(),
+            "sqlite::memory:",
+            vec![
+                input_a.to_string_lossy().into_owned(),
+                input_b.to_string_lossy().into_owned(),
+            ],
+            "mock",
+        );
+        cfg.upload.create_bucket = true;
+        // ONE bucket, TWO sources, width two: both first batches are in
+        // flight together and both resolve the same provisioning target.
+        cfg.upload.bucket = "telemetry-shared".into();
+        cfg.batching.max_concurrent_batches = 2;
+        cfg.batching.max_batch_age_seconds = 3_600;
+
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        let mock = Arc::new(vtop_upload::MockBackend::new());
+        engine.backend = mock.clone();
+
+        let outcomes = engine.run_source(SourceType::File, true).await.unwrap();
+        assert_eq!(outcomes.len(), 2, "both sources must flush a batch");
+        assert!(
+            outcomes.iter().all(|o| o.committed),
+            "serialized provisioning must be invisible to the batches: both \
+             still verify and commit"
+        );
+        assert_eq!(
+            mock.ensure_bucket_calls(),
+            1,
+            "two concurrent first batches must provision their shared bucket \
+             exactly once: width-many CreateBucket calls against the measured \
+             store is the race the awaited guard exists to close"
         );
     }
 }

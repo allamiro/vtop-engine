@@ -69,7 +69,7 @@ services:
       - |
         set -e
         mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"
-        for b in telemetry-data telemetry-cef telemetry-leef telemetry-json telemetry-jsonl telemetry-syslog telemetry-raw; do
+        for b in telemetry-data telemetry-cef telemetry-leef telemetry-json telemetry-jsonl telemetry-syslog telemetry-raw vtop-bench-soak; do
           mc mb --ignore-existing "local/$$b"
         done
         echo "benchmark buckets ready"
