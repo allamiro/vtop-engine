@@ -388,10 +388,15 @@ feature unification pulls aws-lc-rs into the lockfile) and the AWS SDK's
 own default for S3. First-party code contains **no HMAC, no SHA-1, no MD5**;
 those appear only inside the delegated stacks above. Of the delegated
 stacks, only the Postgres client will actually execute MD5 as an
-authentication primitive, and only when a legacy server
-(`password_encryption = md5`) requests it — a FIPS-shaped deployment
-therefore pins the server to `scram-sha-256` so the legacy path can never
-be offered. At-rest encryption is delegated to the storage layer (§7).
+authentication primitive, and only when the server requests it. Closing
+that path is a server-side, two-part job: restrict the relevant
+`pg_hba.conf` rules to `scram-sha-256` (the HBA method chooses the
+exchange) and rotate any password set before the switch to
+`password_encryption = scram-sha-256` — that setting governs only how
+NEW passwords are stored, so a legacy MD5 verifier keeps the legacy
+exchange alive until its password is reset. A FIPS-shaped deployment
+does both, and only then can the MD5 path never be offered. At-rest
+encryption is delegated to the storage layer (§7).
 
 ### 16.3 The questions this inventory exists to ask
 
