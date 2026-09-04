@@ -873,9 +873,10 @@ async fn run_leader(
             config.node_uuid,
             lease.topic_uuid,
             config.range.range_id,
-            Arc::new(crate::lease_agent::BrokerLeasePublisher::new(Arc::clone(
-                &broker,
-            ))),
+            Arc::new(
+                crate::lease_agent::BrokerLeasePublisher::new(Arc::clone(&broker))
+                    .with_probe(promotion_probe.clone()),
+            ),
             promotion_probe,
         )?;
         agent_task = Some(tokio::spawn(agent.run(release_lease_rx)));
@@ -1256,6 +1257,11 @@ async fn run_candidate(
         endpoints,
         range.clone(),
     );
+    // Shared with the supervisor's broker publisher below (#240 slice 3
+    // review): retracting a refused boundary marker needs fence-read
+    // evidence, and this probe is the instrument that gathers it.
+    let probe: Arc<dyn crate::lease_agent::QuorumProbe> = Arc::new(probe);
+    let marker_probe = Arc::clone(&probe);
     let (verdict_tx, mut verdict_rx) = tokio::sync::watch::channel(RoleVerdict::Undecided);
     let publisher = Arc::new(CandidateLeasePublisher {
         target: std::sync::RwLock::new(None),
@@ -1278,7 +1284,7 @@ async fn run_candidate(
         lease.topic_uuid,
         config.range.range_id,
         Arc::clone(&publisher) as Arc<dyn crate::lease_agent::LeasePublisher>,
-        Some(Arc::new(probe) as Arc<dyn crate::lease_agent::QuorumProbe>),
+        Some(probe),
     )?;
     // One MORE mark before /readyz goes green, same shape as the static
     // follower: the binds' own mark plus the agent's first completed
@@ -1680,7 +1686,8 @@ async fn run_candidate(
                         let broker_publisher =
                             Arc::new(crate::lease_agent::BrokerLeasePublisher::new(
                                 Arc::clone(&built.broker),
-                            ));
+                            )
+                            .with_probe(Some(Arc::clone(&marker_probe))));
                         if !publisher.complete_promotion(
                             Arc::new(LeadingDemoteAdapter {
                                 broker: Arc::clone(&built.broker),

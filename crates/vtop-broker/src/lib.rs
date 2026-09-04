@@ -877,31 +877,61 @@ impl LocalBroker {
     /// holds the marker except this leader, so truncating it restores the
     /// exact pre-marker state and produce is whole again.
     ///
-    /// Refused — `Ok(false)`, nothing touched — unless the marker is still
-    /// the TAIL and still UNPUBLISHED: anything appended above it means the
-    /// chain was accepted somewhere after all, and a published watermark at
-    /// or past it means it quorum-acked. Zero-ack is the caller's evidence;
-    /// a follower that acks between the last retry and this call ends up
-    /// holding a record its leader retracted, which the next fence's
-    /// reconciliation truncates as any unacked suffix — crash-equivalent,
-    /// and bounded by the same machinery.
+    /// THE MECHANISM ONLY — the caller owns the evidence (review, round
+    /// three): ack counts cannot prove absence (a response can time out
+    /// after the follower applied), so the wiring gathers fence-read
+    /// evidence — every answering replica at or below the marker, a
+    /// majority answering — before calling this, and an unanswering
+    /// replica that DOES hold the marker rejoins as a divergent unacked
+    /// suffix for the fence's reconciliation, the same residue any crash
+    /// leaves.
+    ///
+    /// Refused — `Ok(false)`, nothing touched — while the marker (or
+    /// anything below it) is published. The floor check, the tail check
+    /// and the truncation share ONE state-lock acquisition (review): a
+    /// produce landing between a separate check and the cut could
+    /// otherwise be truncated with it. The truncation deliberately removes
+    /// any UNACKED suffix failed produces stacked above the marker: no
+    /// suffix record can have quorum-acked, because every ack chain routes
+    /// through the marker the caller's evidence says no follower holds.
+    /// The epoch journal is then re-anchored (review): the marker sat
+    /// exactly at the held epoch's recorded start, and truncating it took
+    /// that entry with it — without re-recording, the next produce would
+    /// be attributed to the PRECEDING epoch.
     pub fn retract_unacked_boundary_marker(&self, marker_offset: u64) -> BrokerResult<bool> {
         let Some(cluster) = self.cluster_committed.as_ref() else {
             return Ok(false);
         };
-        if cluster.get() > marker_offset {
-            return Ok(false);
-        }
         {
-            let state = self
+            let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if state.segment.next_offset() != marker_offset + 1 {
+            if cluster.get() > marker_offset {
                 return Ok(false);
             }
+            if state.segment.next_offset() <= marker_offset {
+                return Ok(false);
+            }
+            state
+                .segment
+                .truncate_to(marker_offset)
+                .map_err(|source| BrokerError::InvalidConfig(source.to_string()))?;
         }
-        self.truncate_to(marker_offset)?;
+        {
+            let mut guard = self
+                .fencing_epoch_journal
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(journal) = guard.as_mut() {
+                if journal.truncate_to(marker_offset).is_err() {
+                    self.fencing_epoch_history_broken
+                        .store(true, Ordering::SeqCst);
+                }
+            }
+        }
+        let held = self.held_fencing_epoch.load(Ordering::SeqCst);
+        self.record_epoch_start(held, marker_offset);
         Ok(true)
     }
 
