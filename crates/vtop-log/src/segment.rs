@@ -2070,7 +2070,54 @@ fn torn_prefix_matches_template(candidate: &[u8], template: &[u8]) -> bool {
         }
     }
     let comparable = candidate.len().saturating_sub(12).min(config_at);
-    (0..comparable).all(|at| id_span.contains(&at) || candidate[12 + at] == template_json[at])
+    if !(0..comparable).all(|at| id_span.contains(&at) || candidate[12 + at] == template_json[at]) {
+        return false;
+    }
+    // The config region is unknown in VALUE but not in SHAPE (review, round
+    // five): its key names and punctuation are fixed by the codec — only
+    // the digit runs vary — so a candidate that reaches past the config
+    // boundary must interleave the template's literal chunks with nonempty
+    // digit runs. Corruption that flips a key byte or a brace diverges; a
+    // genuine torn cut, ending anywhere inside the walk — or in the
+    // checksum bytes after a complete shape — cannot.
+    if candidate.len().saturating_sub(12) > config_at {
+        return config_shape_matches(&candidate[12 + config_at..], &template_json[config_at..]);
+    }
+    true
+}
+
+/// Whether `candidate` walks the `template` config region's SHAPE: literal
+/// bytes must match, and each of the template's digit runs must be met by a
+/// nonempty digit run in the candidate (of any width — real configs encode
+/// wider than the narrowest template). A candidate that ends mid-walk is a
+/// consistent prefix; bytes remaining after the shape completes are the
+/// checksum's and are not judged.
+fn config_shape_matches(candidate: &[u8], template: &[u8]) -> bool {
+    let mut have = 0usize;
+    let mut want = 0usize;
+    while have < candidate.len() && want < template.len() {
+        if template[want].is_ascii_digit() {
+            let run_start = have;
+            while have < candidate.len() && candidate[have].is_ascii_digit() {
+                have += 1;
+            }
+            if have == run_start {
+                // Bytes exist where a digit run must begin, and none of
+                // them is a digit: not a prefix of any real config.
+                return false;
+            }
+            while want < template.len() && template[want].is_ascii_digit() {
+                want += 1;
+            }
+        } else {
+            if candidate[have] != template[want] {
+                return false;
+            }
+            have += 1;
+            want += 1;
+        }
+    }
+    true
 }
 
 /// Rebuild the commit boundary of an EMPTY successor whose creation was
