@@ -753,13 +753,19 @@ await_holder() { # [min-epoch] — echoes "<holder> <epoch>"
   local floor="${1:-0}" holder="" epoch="" left holder_deadline=$((SECONDS + 180))
   while [ "$SECONDS" -lt "$holder_deadline" ]; do
     left=$((holder_deadline - SECONDS))
+    # `timeout 0` means UNBOUNDED (review): a tick landing between the
+    # loop condition and this arithmetic makes `left` zero and would turn
+    # the tightest probe into the only unlimited one.
+    [ "$left" -ge 1 ] || break
     [ "$left" -gt 10 ] && left=10
     read -r holder epoch <<< "$(lease_state "$left")" || true
     if [ -n "$holder" ] && [ -n "$epoch" ] && [ "$epoch" -gt "$floor" ]; then
       printf '%s %s\n' "$holder" "$epoch"
       return 0
     fi
-    [ "$SECONDS" -lt "$holder_deadline" ] || break
+    # The sleep only runs when a whole interval fits (review): a probe
+    # returning with a second to spare must not buy two more.
+    [ $((holder_deadline - SECONDS)) -ge 2 ] || break
     sleep 2
   done
   return 1
