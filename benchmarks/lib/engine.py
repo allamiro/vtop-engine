@@ -169,6 +169,13 @@ def _dotenv_overrides() -> dict[str, str]:
     Deliberately minimal (comments and blank lines skipped, one layer of
     matching quotes stripped, no interpolation): the harness is
     dependency-light, and the lab's .env holds simple assignments.
+
+    Inline comments follow Compose's own dotenv rule: an UNQUOTED value
+    stops at the first whitespace-preceded ``#``; a quoted value keeps its
+    content untouched. The rule matters because these values are
+    credentials the server was interpolated with — a parser that keeps
+    ``benchmarksecret # local MinIO`` hands the client a password the
+    server never saw, and the failure reads as an auth bug.
     """
     values: dict[str, str] = {}
     try:
@@ -182,6 +189,12 @@ def _dotenv_overrides() -> dict[str, str]:
                 if len(value) >= 2 and value[0] == value[-1] \
                         and value[0] in "\"'":
                     value = value[1:-1]
+                else:
+                    for at in range(1, len(value)):
+                        if value[at] == "#" and value[at - 1].isspace():
+                            value = value[:at]
+                            break
+                    value = value.rstrip()
                 values[key.strip()] = value
     except OSError:
         pass

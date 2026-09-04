@@ -477,8 +477,11 @@ impl ReplicaPeerServer {
             eprintln!(
                 "warning: replica endpoint {bound} is PLAINTEXT: peers carry no certificate, so \
                  no peer UUID exists. Sealed-segment transfers are REFUSED on this endpoint \
-                 because the transfer allowlist has nothing to match; replication appends are \
-                 served and are authenticated only by the fencing epoch."
+                 because the transfer allowlist has nothing to match; fencing is refused for \
+                 the same reason, and promotion fences its followers — so this plane \
+                 REPLICATES but does NOT FAIL OVER. TLS is what moves that boundary. \
+                 Replication appends are served and are authenticated only by the fencing \
+                 epoch."
             );
         }
         let mut connections = tokio::task::JoinSet::new();
@@ -1869,11 +1872,6 @@ impl ReplicaStatusClient {
         expected_node: Uuid,
         range: &RangeIdentity,
     ) -> BrokerResult<ReplicaStatusResponse> {
-        let name = rustls::pki_types::ServerName::try_from(server_name.to_owned())
-            .map_err(|error| {
-                crate::BrokerError::InvalidConfig(format!("server name {server_name:?}: {error}"))
-            })?
-            .to_owned();
         // One deadline for the whole exchange: a replica whose disk has stopped
         // answering will also stop answering here, and an operator running a
         // status command during an incident needs it to return.
@@ -1889,6 +1887,18 @@ impl ReplicaStatusClient {
             // this reports whatever replica answered the address.
             let mut stream = match self.connector.as_ref() {
                 Some(connector) => {
+                    // Parsed only where it is used (#410): a plaintext
+                    // client has no TLS name to validate, and refusing an
+                    // empty or invalid server_name before dialing made the
+                    // plaintext path fail on a field it never reads —
+                    // mirroring connect_and_session.
+                    let name = rustls::pki_types::ServerName::try_from(server_name.to_owned())
+                        .map_err(|error| {
+                            crate::BrokerError::InvalidConfig(format!(
+                                "server name {server_name:?}: {error}"
+                            ))
+                        })?
+                        .to_owned();
                     let tls = connector.connect(name, tcp).await.map_err(|source| {
                         crate::BrokerError::Io {
                             path: PathBuf::from("replica-status-tls"),
@@ -1954,11 +1964,6 @@ impl ReplicaStatusClient {
         fencing_epoch: u64,
         leader_epoch_starts: &[vtop_protocol::ReplicaEpochStart],
     ) -> BrokerResult<vtop_protocol::ReplicaFenceResponse> {
-        let name = rustls::pki_types::ServerName::try_from(server_name.to_owned())
-            .map_err(|error| {
-                crate::BrokerError::InvalidConfig(format!("server name {server_name:?}: {error}"))
-            })?
-            .to_owned();
         timeout(self.timeout, async {
             let tcp = TcpStream::connect(addr)
                 .await
@@ -1970,6 +1975,18 @@ impl ReplicaStatusClient {
             // plane means the expected node UUID cannot be confirmed.
             let mut stream = match self.connector.as_ref() {
                 Some(connector) => {
+                    // Parsed only where it is used (#410): a plaintext
+                    // client has no TLS name to validate, and refusing an
+                    // empty or invalid server_name before dialing made the
+                    // plaintext path fail on a field it never reads —
+                    // mirroring connect_and_session.
+                    let name = rustls::pki_types::ServerName::try_from(server_name.to_owned())
+                        .map_err(|error| {
+                            crate::BrokerError::InvalidConfig(format!(
+                                "server name {server_name:?}: {error}"
+                            ))
+                        })?
+                        .to_owned();
                     let tls = connector.connect(name, tcp).await.map_err(|source| {
                         crate::BrokerError::Io {
                             path: PathBuf::from("replica-fence-tls"),
@@ -2051,11 +2068,6 @@ impl ReplicaStatusClient {
         expected_node: Uuid,
         range: &RangeIdentity,
     ) -> BrokerResult<Vec<vtop_protocol::ReplicaEpochStart>> {
-        let name = rustls::pki_types::ServerName::try_from(server_name.to_owned())
-            .map_err(|error| {
-                crate::BrokerError::InvalidConfig(format!("server name {server_name:?}: {error}"))
-            })?
-            .to_owned();
         timeout(self.timeout, async {
             let tcp = TcpStream::connect(addr)
                 .await
@@ -2067,6 +2079,18 @@ impl ReplicaStatusClient {
             // plane means the expected node UUID cannot be confirmed.
             let mut stream = match self.connector.as_ref() {
                 Some(connector) => {
+                    // Parsed only where it is used (#410): a plaintext
+                    // client has no TLS name to validate, and refusing an
+                    // empty or invalid server_name before dialing made the
+                    // plaintext path fail on a field it never reads —
+                    // mirroring connect_and_session.
+                    let name = rustls::pki_types::ServerName::try_from(server_name.to_owned())
+                        .map_err(|error| {
+                            crate::BrokerError::InvalidConfig(format!(
+                                "server name {server_name:?}: {error}"
+                            ))
+                        })?
+                        .to_owned();
                     let tls = connector.connect(name, tcp).await.map_err(|source| {
                         crate::BrokerError::Io {
                             path: PathBuf::from("replica-epoch-history-tls"),
@@ -2213,6 +2237,36 @@ mod tests {
     use super::*;
     use crate::memory_budget::MemoryBudgetConfig;
     use vtop_protocol::{ProduceRecord, RangeIdentity};
+
+    /// The plaintext status plane never evaluates TLS naming (#410): an
+    /// empty `server_name` used to fail with `InvalidConfig` BEFORE
+    /// dialing, which read as a configuration bug on a plane that has no
+    /// TLS name to configure. The name is parsed only inside the TLS arm
+    /// now, so the plaintext failure here must be the dial itself.
+    #[test]
+    fn a_plaintext_status_client_never_parses_the_tls_name() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let refused = runtime
+            .block_on(ReplicaStatusClient::plaintext().status(
+                "127.0.0.1:1".parse().unwrap(),
+                "",
+                Uuid::from_u128(0xA1),
+                &RangeIdentity {
+                    topic: "events.v1".to_owned(),
+                    topic_epoch: 1,
+                    range_id: Uuid::from_u128(0xC1),
+                    range_generation: 0,
+                },
+            ))
+            .expect_err("nothing listens at port 1");
+        assert!(
+            !refused.to_string().contains("server name"),
+            "the failure must be the dial, never TLS naming on a plaintext plane: {refused}"
+        );
+    }
 
     /// A transfer RPC is REFUSED on a plaintext replica plane, and says why
     /// (#294 slice 3).

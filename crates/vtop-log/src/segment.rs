@@ -2088,13 +2088,37 @@ pub(crate) fn rebuild_empty_successor_commit(
             return Ok(false);
         }
         Err(_) => {
-            // A TORN HEADER, and provably nothing else: the commit sidecar
-            // is written only after the primary file is complete and synced,
-            // so its absence — a caller precondition — means creation never
-            // finished, and a file whose creation never finished has never
-            // held a record. Discarding it is the counterpart of sweeping
-            // the roll-window sidecar: the layout becomes "sealed prefix,
-            // no tail", whose recovery is adoption.
+            // TORN means PROVABLY SHORT, not merely undecodable (#410): the
+            // decoder returns the same `Corrupt` for a file cut off
+            // mid-header and for a FULL-LENGTH header whose checksum or
+            // JSON fails — and only the first is evidence that creation
+            // never finished. A complete file that stopped decoding is
+            // damage to something that once existed, and deleting damage
+            // destroys the evidence quarantine exists to preserve. So the
+            // torn classification re-derives what the file's own length
+            // prefix implies: both formats lay out 12 prefix bytes, then
+            // `json_len` of JSON, then the checksum. Shorter than its own
+            // claim (with a plausible claim) is torn; anything else stays
+            // quarantined like the unknown-magic arm.
+            let provably_torn = if bytes.len() < 12 {
+                true
+            } else {
+                let json_len = u32::from_be_bytes(bytes[8..12].try_into().expect("fixed slice"));
+                json_len > 0
+                    && json_len <= crate::codec::MAX_HEADER_BYTES
+                    && (bytes.len() as u64)
+                        < 12 + u64::from(json_len) + crate::codec::CHECKSUM_LEN as u64
+            };
+            if !provably_torn {
+                return Ok(false);
+            }
+            // The commit sidecar is written only after the primary file is
+            // complete and synced, so its absence — a caller precondition —
+            // plus the short read above means creation never finished, and
+            // a file whose creation never finished has never held a record.
+            // Discarding it is the counterpart of sweeping the roll-window
+            // sidecar: the layout becomes "sealed prefix, no tail", whose
+            // recovery is adoption.
             env.storage
                 .remove_file(active_path)
                 .map_err(|source| io_error(active_path, source))?;

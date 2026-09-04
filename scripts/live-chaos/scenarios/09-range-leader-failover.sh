@@ -321,7 +321,18 @@ until "$VTOP_NODE" produce --client-config "$VERIFY_CFG" --addr "$(native_addr)"
   --records "$BATCH" --batch "$BATCH" \
   --durability quorum > "$WORKDIR/logs/produce-after-failover.log" 2>&1; do
   attempts=$((attempts + 1))
+  # Diagnostics are charged to their own budget (#410): the scrape used to
+  # ride inside the produce window, so a slow /metrics endpoint spent up to
+  # five seconds of produce attempts per failure — the diagnosis competing
+  # with the thing it diagnoses. Extending the deadline by exactly what the
+  # sample spent keeps the ADVERTISED produce bound honest while making the
+  # number of attempts inside it independent of how the metrics endpoint
+  # answers. Each sample is still clamped to five seconds, so the loop's
+  # total wall time stays bounded by produce time plus one clamp per failed
+  # attempt.
+  sample_started=$SECONDS
   sample_rejoining_follower "$((produce_deadline - SECONDS))"
+  produce_deadline=$((produce_deadline + SECONDS - sample_started))
   if [[ $SECONDS -ge $produce_deadline ]]; then
     if [[ "$REJOIN_GAP" -gt 0 ]]; then
       # NAMED FIRST, because it explains the observation rather than competing

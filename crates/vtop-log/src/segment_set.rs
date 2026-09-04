@@ -3572,17 +3572,77 @@ mod tests {
         );
     }
 
+    /// TORN means provably short, not merely undecodable (#410): a
+    /// FULL-LENGTH successor header whose checksum fails is damage to a
+    /// file that once existed complete, and the decoder hands back the
+    /// same `Corrupt` it uses for a mid-write cut. Deleting damage
+    /// destroys the evidence quarantine exists to preserve, so the flip
+    /// must refuse the open and leave the file where it lies.
+    #[test]
+    fn a_damaged_full_length_successor_header_is_quarantined_not_deleted() {
+        let directory = tempdir().unwrap();
+        // Stage through the REAL roll so the successor is byte-exact, then
+        // delete only the boundary and flip ONE byte inside the header
+        // JSON — the file keeps its full length, only its checksum lies.
+        let producer = Uuid::from_u128(77);
+        let mut staged =
+            SegmentSet::create_in(&Env::real(), directory.path(), descriptor(), config()).unwrap();
+        for sequence in 0..3 {
+            staged
+                .append_group(
+                    &[record(producer, sequence)],
+                    Durability::Fsync,
+                    Uuid::from_u128(8000 + sequence as u128),
+                )
+                .unwrap();
+        }
+        staged.roll(Uuid::from_u128(0xBADF00D)).unwrap();
+        drop(staged);
+        std::fs::remove_file(directory.path().join(format!("{}.commit", segment_stem(3)))).unwrap();
+        let flipped_path = directory.path().join(format!("{}.active", segment_stem(3)));
+        let mut bytes = std::fs::read(&flipped_path).unwrap();
+        bytes[20] ^= 0xFF;
+        std::fs::write(&flipped_path, &bytes).unwrap();
+
+        let refused = SegmentSet::open_in(&Env::real(), directory.path())
+            .map(|_| ())
+            .expect_err("a damaged successor header must keep the directory refused");
+        assert!(
+            !matches!(refused, LogError::TailSealedWithoutSuccessor { .. }),
+            "a full-length file must not have been classified as torn and deleted: {refused}"
+        );
+        assert!(
+            flipped_path.exists(),
+            "the damaged header is evidence; quarantine preserves it, deletion would not"
+        );
+    }
+
     /// The roll's FIRST window: a crash mid-write of the successor's own
     /// header. The commit sidecar's absence proves creation never finished,
     /// so the torn file has never held a record and is discarded — the
     /// layout becomes sealed-only, whose recovery is adoption.
+    ///
+    /// The fixture is a genuine PREFIX of the real header bytes (#410): a
+    /// torn write can only ever leave a prefix, so the file carries its
+    /// true length claim and provably falls short of it. Garbage after the
+    /// magic — the fixture this replaced — is not something a torn write
+    /// of this binary's header can produce, and the classification now
+    /// quarantines it instead.
     #[test]
     fn a_torn_successor_header_is_discarded_and_the_range_recovers() {
         let directory = tempdir().unwrap();
         strand_after_seal(directory.path(), true);
+        let torn = {
+            let mut successor = descriptor();
+            successor.segment_id = Uuid::from_u128(0xF3);
+            successor.base_offset = 3;
+            crate::codec::encode_header(&crate::codec::SegmentHeader::new(successor, config()))
+                .unwrap()[..40]
+                .to_vec()
+        };
         std::fs::write(
             directory.path().join(format!("{}.active", segment_stem(3))),
-            b"VTOPSEG1 but torn mid-wr",
+            torn,
         )
         .unwrap();
 
@@ -3787,7 +3847,18 @@ mod tests {
         let directory = tempdir().unwrap();
         strand_after_seal(directory.path(), false);
         let torn_path = directory.path().join(format!("{}.active", segment_stem(3)));
-        std::fs::write(&torn_path, b"VTOPSEG1 but torn mid-wr").unwrap();
+        // The same genuine-prefix fixture as the discard test (#410): what
+        // keeps this pair quarantined must be the sidecar beside it, not an
+        // artifact of the torn file failing classification on its own.
+        let torn = {
+            let mut successor = descriptor();
+            successor.segment_id = Uuid::from_u128(0xF4);
+            successor.base_offset = 3;
+            crate::codec::encode_header(&crate::codec::SegmentHeader::new(successor, config()))
+                .unwrap()[..40]
+                .to_vec()
+        };
+        std::fs::write(&torn_path, torn).unwrap();
         let sidecar_path = directory
             .path()
             .join(format!("{}.producers", segment_stem(3)));
