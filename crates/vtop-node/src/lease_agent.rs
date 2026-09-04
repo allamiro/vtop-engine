@@ -387,8 +387,39 @@ fn publish_boundary_marker_until_settled(broker: Arc<LocalBroker>, fencing_epoch
                 Err(vtop_broker::BrokerError::BoundaryMarkerUnacked {
                     follower_acks,
                     replication_factor,
+                    marker_offset,
                 }) => {
                     if attempt == MARKER_RETRY_ATTEMPTS {
+                        // ZERO acks after the whole budget means no follower
+                        // holds the marker at all — a majority-v1 set, say,
+                        // whose members refuse it by name — and leaving it
+                        // in the log would poison every later produce's
+                        // base-offset chain (review). Retract it and the
+                        // pre-marker state is restored exactly; the produce
+                        // path's own-epoch quorum still proves §5.4.2 when
+                        // traffic arrives. Any acks at all mean v2
+                        // followers hold it and catch-up completes the
+                        // quorum eventually; the marker stays.
+                        if follower_acks == 0 {
+                            match broker.retract_unacked_boundary_marker(marker_offset) {
+                                Ok(retracted) => tracing::warn!(
+                                    fencing_epoch,
+                                    replication_factor,
+                                    retracted,
+                                    "boundary marker never reached any follower within its \
+                                     retry budget; retracted so the produce chain stays \
+                                     whole, and the first own-epoch produce quorum proves \
+                                     the prefix instead"
+                                ),
+                                Err(refused) => tracing::warn!(
+                                    fencing_epoch,
+                                    %refused,
+                                    "boundary marker reached no follower and could not be \
+                                     retracted; produce may need the followers repaired"
+                                ),
+                            }
+                            return;
+                        }
                         tracing::warn!(
                             fencing_epoch,
                             follower_acks,
@@ -460,7 +491,11 @@ impl LeasePublisher for BrokerLeasePublisher {
         // cannot store the reserved identity and an unreplicated broker
         // has no quorum to convince, and dropping the offset there would
         // leave promotion with no publication at all — a repaired v1
-        // replica would serve nothing until the next produce.
+        // replica would serve nothing until the next produce. Yes, this
+        // branch is the §5.4.2 exposure the marker exists to close
+        // (review): that is the v1 STATUS QUO, unchanged by this wiring —
+        // §5.4.2 closes for the v2 format, the only one that can carry
+        // the marker, and the v1 residue retires with the format itself.
         if !self.broker.boundary_marker_supported() {
             if let (Some(offset), Some(cluster)) =
                 (committed_offset, self.broker.cluster_committed())

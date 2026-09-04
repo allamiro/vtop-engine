@@ -152,6 +152,11 @@ pub enum BrokerError {
     BoundaryMarkerUnacked {
         follower_acks: usize,
         replication_factor: usize,
+        /// Where the unacked marker sits, so the give-up path can retract
+        /// it (#240 slice 3 review): a marker no follower will ever accept
+        /// — a majority-v1 replica set — would otherwise sit in the
+        /// leader's log poisoning every later produce's base-offset chain.
+        marker_offset: u64,
     },
     #[error("producer {producer_id} epoch {actual} is fenced by durable epoch {current}")]
     ProducerFenced {
@@ -863,6 +868,43 @@ impl LocalBroker {
         self.held_fencing_epoch.fetch_max(epoch, Ordering::SeqCst) < epoch
     }
 
+    /// Retract a boundary marker NO follower ever acknowledged (#240 slice
+    /// 3 review): a marker the quorum can never accept — every follower on
+    /// a v1 frame, say — is not merely unpublished, it poisons the log:
+    /// every later produce's base-offset chain includes it, and followers
+    /// that refused it once refuse everything after it forever. When the
+    /// publish retries exhaust with ZERO follower acks, nothing anywhere
+    /// holds the marker except this leader, so truncating it restores the
+    /// exact pre-marker state and produce is whole again.
+    ///
+    /// Refused — `Ok(false)`, nothing touched — unless the marker is still
+    /// the TAIL and still UNPUBLISHED: anything appended above it means the
+    /// chain was accepted somewhere after all, and a published watermark at
+    /// or past it means it quorum-acked. Zero-ack is the caller's evidence;
+    /// a follower that acks between the last retry and this call ends up
+    /// holding a record its leader retracted, which the next fence's
+    /// reconciliation truncates as any unacked suffix — crash-equivalent,
+    /// and bounded by the same machinery.
+    pub fn retract_unacked_boundary_marker(&self, marker_offset: u64) -> BrokerResult<bool> {
+        let Some(cluster) = self.cluster_committed.as_ref() else {
+            return Ok(false);
+        };
+        if cluster.get() > marker_offset {
+            return Ok(false);
+        }
+        {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.segment.next_offset() != marker_offset + 1 {
+                return Ok(false);
+            }
+        }
+        self.truncate_to(marker_offset)?;
+        Ok(true)
+    }
+
     /// Whether this broker can publish the §5.4.2 boundary marker (#240):
     /// replicated and v2-format. A v1 frame cannot store the reserved
     /// identity (the marker refuses it by name) and an unreplicated broker
@@ -1015,6 +1057,7 @@ impl LocalBroker {
             return Err(BrokerError::BoundaryMarkerUnacked {
                 follower_acks: quorum.follower_acks,
                 replication_factor: quorum.replication_factor,
+                marker_offset: replicate_from,
             });
         }
         // Re-validate the lease before publishing, exactly as the produce

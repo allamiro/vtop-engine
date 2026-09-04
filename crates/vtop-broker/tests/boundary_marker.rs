@@ -500,6 +500,70 @@ fn a_v1_follower_refuses_the_marker_so_the_quorum_fails_honestly() {
     assert_eq!(h.cluster_committed.get(), 0, "nothing published");
 }
 
+/// A marker no follower will EVER accept must not stay in the log (#240
+/// slice 3 review): with every follower on a v1 frame the quorum can never
+/// form, and every later produce's base-offset chain would include the
+/// refused marker — followers one offset behind forever, quorum dead.
+/// Zero acks after the budget is the retraction's licence: nothing anywhere
+/// holds the marker, so removing it restores the pre-marker state exactly,
+/// and the produce that follows proves the chain is whole again.
+#[test]
+fn a_fully_refused_marker_is_retracted_and_produce_stays_whole() {
+    let h = harness_config(true, [false, false]);
+    let refused = h
+        .leader
+        .publish_boundary_marker(FENCING_EPOCH)
+        .expect_err("no v1 follower may ack the marker");
+    let BrokerError::BoundaryMarkerUnacked {
+        follower_acks,
+        marker_offset,
+        ..
+    } = refused
+    else {
+        panic!("the refusal must be the typed quorum shortfall: {refused}");
+    };
+    assert_eq!(follower_acks, 0, "v1 followers refuse; nobody acks");
+    assert!(
+        h.leader
+            .retract_unacked_boundary_marker(marker_offset)
+            .expect("a zero-ack marker at the tail retracts"),
+        "the retraction must report that it acted"
+    );
+    let (_, next_offset) = h.leader.local_offsets();
+    assert_eq!(next_offset, 0, "the log is back to its pre-marker state");
+
+    // The whole point: produce works, and the v1 followers ack it — the
+    // chain no longer routes through a record they refuse by name.
+    let produced = produce_ok(&h.leader, h.range.clone(), 0);
+    assert_eq!(
+        produced.outcomes[0].offset, 0,
+        "the retracted marker's offset is minted to the real record"
+    );
+    assert_eq!(
+        h.cluster_committed.get(),
+        1,
+        "the produce quorum published — the v1 set is not wedged"
+    );
+}
+
+/// The retraction refuses everything except its exact licence: a published
+/// marker is committed history, and a tail that moved past the marker means
+/// the chain was accepted somewhere after all.
+#[test]
+fn a_published_marker_is_never_retracted() {
+    let h = harness();
+    let published = h.leader.publish_boundary_marker(FENCING_EPOCH).unwrap();
+    assert_eq!(published, 1);
+    assert!(
+        !h.leader
+            .retract_unacked_boundary_marker(0)
+            .expect("the refusal is Ok(false), not an error"),
+        "a quorum-acked, published marker is committed history"
+    );
+    let (_, next_offset) = h.leader.local_offsets();
+    assert_eq!(next_offset, 1, "nothing was touched");
+}
+
 #[test]
 fn one_v2_follower_still_carries_the_quorum_past_a_v1_peer() {
     // Mixed set, majority still possible: leader + the v2 follower are two
