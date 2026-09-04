@@ -131,10 +131,7 @@ impl CommandPolicy {
         if output.status.success() {
             Ok(())
         } else {
-            Err(VtopError::Upload(format!(
-                "{} {operation} exited with {}",
-                self.backend, output.status
-            )))
+            Err(exit_failure(&self.backend, operation, &output))
         }
     }
 
@@ -145,10 +142,7 @@ impl CommandPolicy {
     ) -> Result<String, VtopError> {
         let output = self.capture(command, operation).await?;
         if !output.status.success() {
-            return Err(VtopError::Upload(format!(
-                "{} {operation} exited with {}",
-                self.backend, output.status
-            )));
+            return Err(exit_failure(&self.backend, operation, &output));
         }
         let mut combined = output.stdout;
         combined.extend_from_slice(&output.stderr);
@@ -236,6 +230,38 @@ struct CapturedOutput {
     status: std::process::ExitStatus,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+}
+
+/// The error for a tool that exited non-zero: its exit status, the last
+/// line it wrote (stderr first, stdout if stderr was silent — bounded, since
+/// a tool can print a whole listing on failure), and the classification the
+/// evidence supports (#102). Before this the message carried only the
+/// status, so a `SlowDown` and a `NoSuchBucket` read identically.
+fn exit_failure(backend: &str, operation: &str, output: &CapturedOutput) -> VtopError {
+    const MAX_EVIDENCE_CHARS: usize = 240;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let evidence = if stderr.trim().is_empty() {
+        stdout
+    } else {
+        stderr
+    };
+    let last_line = evidence
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    let shown: String = last_line.chars().take(MAX_EVIDENCE_CHARS).collect();
+    let detail = if shown.is_empty() {
+        format!("{backend} {operation} exited with {}", output.status)
+    } else {
+        format!(
+            "{backend} {operation} exited with {}: {shown}",
+            output.status
+        )
+    };
+    crate::base::upload_failure(detail, &evidence)
 }
 
 /// Continue draining after the storage cap is reached so a finite child does

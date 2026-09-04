@@ -106,6 +106,15 @@ pub struct Metrics {
     /// the same reason: the topic and partition are in the warn line beside
     /// this counter, where unbounded detail belongs.
     pub retention_lost_records_total: IntCounterVec,
+
+    /// Uploads the object store answered with a THROTTLE — HTTP 429 or 503,
+    /// or an S3 `SlowDown`/`Throttling` code — after the backend's own
+    /// retries were spent (#102). The batch fails and replays like any
+    /// failed upload; what this counter adds is the distinction: a sustained
+    /// rate here means the store wants fewer concurrent uploads, and
+    /// retrying at the same width is the overload it is complaining about.
+    /// `stage` says which upload (`object_upload`, `manifest_upload`).
+    pub upload_throttled_total: IntCounterVec,
 }
 
 fn labels3() -> Vec<&'static str> {
@@ -182,6 +191,11 @@ impl Metrics {
             "Source reads that failed and were skipped for this cycle (see logs for the path)",
             vec!["tenant", "source_type"],
         )?;
+        let upload_throttled_total = cv(
+            "upload_throttled_total",
+            "Uploads the object store answered with a throttle (HTTP 429/503 or an S3 SlowDown/Throttling code) after the backend's own retries; a sustained rate means the store wants less concurrency, not more retries",
+            vec!["tenant", "source_type", "format", "stage"],
+        )?;
         let retention_lost_records_total = cv(
             "retention_lost_records_total",
             "Records source-side retention removed before the engine read them; any increase is data loss upstream of the archive (see logs for topic/partition)",
@@ -253,6 +267,7 @@ impl Metrics {
             inflight_batches,
             source_read_errors_total,
             retention_lost_records_total,
+            upload_throttled_total,
         })
     }
 

@@ -320,6 +320,60 @@ pub(crate) async fn read_command_bounded(
     }
 }
 
+/// S3's throttling error codes, as the AWS SDK's own retry classifier lists
+/// them (#102). A code on this list means the store wants fewer requests,
+/// whichever tool relayed it.
+pub const THROTTLE_ERROR_CODES: &[&str] = &[
+    "Throttling",
+    "ThrottlingException",
+    "ThrottledException",
+    "RequestThrottledException",
+    "TooManyRequestsException",
+    "TooManyRequests",
+    "ProvisionedThroughputExceededException",
+    "RequestLimitExceeded",
+    "BandwidthLimitExceeded",
+    "LimitExceededException",
+    "RequestThrottled",
+    "SlowDown",
+    "PriorRequestNotComplete",
+];
+
+/// Whether an S3 error code is a throttle (#102).
+pub fn is_throttle_code(code: &str) -> bool {
+    THROTTLE_ERROR_CODES.contains(&code)
+}
+
+/// Whether an HTTP status carries a throttle on its own: 429 by definition,
+/// and 503, which is how S3 says `SlowDown` (#102).
+pub fn is_throttle_status(status: u16) -> bool {
+    matches!(status, 429 | 503)
+}
+
+/// Whether a tool's output relays a throttle (#102): the codes above as the
+/// CLIs print them (`An error occurred (SlowDown) …`, `S3 error: 503
+/// (SlowDown)`), the sentence S3 attaches to every one of them, and the two
+/// statuses by their reason phrases. Text is all a spawned tool gives back,
+/// so this is necessarily a vocabulary rather than a status; the vocabulary
+/// is S3's own and every tool passes it through verbatim.
+pub fn looks_throttled(text: &str) -> bool {
+    THROTTLE_ERROR_CODES.iter().any(|code| text.contains(code))
+        || text.contains("reduce your request rate")
+        || text.contains("Too Many Requests")
+        || text.contains("Service Unavailable")
+        || text.contains("ServiceUnavailable")
+}
+
+/// The engine's error for a failed backend call, told apart by what the
+/// evidence says (#102).
+pub(crate) fn upload_failure(detail: String, evidence: &str) -> VtopError {
+    if looks_throttled(evidence) {
+        VtopError::UploadThrottled(detail)
+    } else {
+        VtopError::Upload(detail)
+    }
+}
+
 /// Pluggable object-storage backend.
 #[async_trait]
 pub trait UploadBackend: Send + Sync {
@@ -517,6 +571,46 @@ pub fn parse_s3_uri(uri: &str) -> Result<(String, String), VtopError> {
         return Err(VtopError::Upload(format!("malformed s3 uri: {uri}")));
     }
     Ok((bucket.to_string(), key.to_string()))
+}
+
+#[cfg(test)]
+mod throttle_tests {
+    use super::*;
+
+    /// The vocabulary matches what the three CLIs actually print for a
+    /// throttled put, and nothing about an ordinary failure (#102).
+    #[test]
+    fn a_throttle_is_recognised_in_every_tools_words_and_in_no_others() {
+        for relayed in [
+            "An error occurred (SlowDown) when calling the PutObject operation (reached max retries: 4): Please reduce your request rate.",
+            "ERROR: S3 error: 503 (SlowDown): Please reduce your request rate.",
+            "mc: <ERROR> Failed to copy `x`. Please reduce your request rate.",
+            "An error occurred (Throttling) when calling the PutObject operation",
+            "HTTP 429 Too Many Requests",
+            "503 Service Unavailable",
+        ] {
+            assert!(looks_throttled(relayed), "{relayed}");
+            assert!(matches!(
+                upload_failure("put".into(), relayed),
+                VtopError::UploadThrottled(_)
+            ));
+        }
+        for ordinary in [
+            "An error occurred (NoSuchBucket) when calling the PutObject operation",
+            "ERROR: S3 error: 403 (AccessDenied)",
+            "mc: <ERROR> Unable to validate source `x`: file does not exist",
+            "connection reset by peer",
+        ] {
+            assert!(!looks_throttled(ordinary), "{ordinary}");
+            assert!(matches!(
+                upload_failure("put".into(), ordinary),
+                VtopError::Upload(_)
+            ));
+        }
+        assert!(is_throttle_status(429) && is_throttle_status(503));
+        assert!(!is_throttle_status(500) && !is_throttle_status(404));
+        assert!(is_throttle_code("SlowDown") && !is_throttle_code("NoSuchKey"));
+    }
 }
 
 #[cfg(test)]

@@ -38,6 +38,15 @@ pub enum VtopError {
 
     #[error("upload backend error: {0}")]
     Upload(String),
+    /// The object store asked for LESS, not for a retry (#102): an HTTP 429
+    /// or 503, or one of S3's throttling codes (`SlowDown`, `Throttling`,
+    /// `RequestLimitExceeded`, ...), surfaced after the backend's own retries
+    /// were spent. Kept apart from `Upload` because the two call for opposite
+    /// responses — a throttle answered by retrying at the same rate is the
+    /// overload it complains about — and so the engine can count them apart,
+    /// for an operator now and for a concurrency controller later.
+    #[error("upload backend throttled: {0}")]
+    UploadThrottled(String),
 
     #[error("state store error: {0}")]
     State(String),
@@ -65,6 +74,13 @@ pub enum VtopError {
 
     #[error("{0}")]
     Other(String),
+}
+
+impl VtopError {
+    /// Whether this is the store saying "slow down" (#102).
+    pub fn is_upload_throttle(&self) -> bool {
+        matches!(self, VtopError::UploadThrottled(_))
+    }
 }
 
 /// Convenience result alias.

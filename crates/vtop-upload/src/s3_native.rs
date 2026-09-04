@@ -25,6 +25,10 @@ use aws_sdk_s3::types::{
     BucketVersioningStatus, ChecksumMode, CompletedMultipartUpload, CompletedPart,
 };
 use aws_sdk_s3::Client;
+use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
+use aws_smithy_runtime_api::client::result::SdkError;
+use aws_smithy_types::error::display::DisplayErrorContext;
+use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use bytes::Bytes;
 use std::path::Path;
@@ -183,9 +187,10 @@ impl S3NativeBackend {
             }
         }
 
-        let out = req.send().await.map_err(|e| {
-            VtopError::Upload(format!("put_object {uri}: {}", e.into_service_error()))
-        })?;
+        let out = req
+            .send()
+            .await
+            .map_err(|e| sdk_failure("put_object", &uri, e))?;
         tracing::info!(uri, "object uploaded via s3_native");
         // A suspended-versioning bucket reports the literal version "null",
         // which later writes overwrite — it is not an immutable pin. Surface
@@ -211,15 +216,47 @@ impl S3NativeBackend {
             .key(&key)
             .send()
             .await
-            .map_err(|e| {
-                VtopError::Upload(format!(
-                    "get_object {object_uri}: {}",
-                    e.into_service_error()
-                ))
-            })?;
+            .map_err(|e| sdk_failure("get_object", &object_uri, e))?;
         digest_reader(algo, out.body.into_async_read())
             .await?
             .ok_or_else(|| VtopError::Upload("cannot hash with disabled checksum mode".into()))
+    }
+}
+
+/// The engine's error for a failed SDK call, telling a throttle apart (#102).
+///
+/// The SDK has already retried a throttle with its own backoff by the time
+/// one reaches here, so what arrives is "still overloaded after retries" —
+/// exactly the signal a concurrency controller wants and a same-rate retry
+/// would only worsen. Classified on the wire facts the SDK keeps: the HTTP
+/// status (429, or 503 as S3 spells `SlowDown`) and the error code.
+fn sdk_failure<E>(operation: &str, target: &str, error: SdkError<E, HttpResponse>) -> VtopError
+where
+    E: std::error::Error + ProvideErrorMetadata + Send + Sync + 'static,
+{
+    match error {
+        SdkError::ServiceError(context) => {
+            let status = context.raw().status().as_u16();
+            let code = context.err().code().map(str::to_owned);
+            let detail = format!(
+                "{operation} {target}: {} (http {status}{})",
+                context.err(),
+                code.as_deref()
+                    .map(|code| format!(", {code}"))
+                    .unwrap_or_default()
+            );
+            if crate::base::is_throttle_status(status)
+                || code.as_deref().is_some_and(crate::base::is_throttle_code)
+            {
+                VtopError::UploadThrottled(detail)
+            } else {
+                VtopError::Upload(detail)
+            }
+        }
+        other => VtopError::Upload(format!(
+            "{operation} {target}: {}",
+            DisplayErrorContext(&other)
+        )),
     }
 }
 
@@ -302,12 +339,7 @@ impl UploadBackend for S3NativeBackend {
             .bucket(bucket)
             .send()
             .await
-            .map_err(|e| {
-                VtopError::Upload(format!(
-                    "get_bucket_versioning {bucket}: {}",
-                    e.into_service_error()
-                ))
-            })?;
+            .map_err(|e| sdk_failure("get_bucket_versioning", &bucket, e))?;
         match out.status() {
             Some(BucketVersioningStatus::Enabled) => Ok(()),
             other => Err(VtopError::Upload(format!(
@@ -326,12 +358,7 @@ impl UploadBackend for S3NativeBackend {
             .key(&key)
             .send()
             .await
-            .map_err(|e| {
-                VtopError::Upload(format!(
-                    "get_object {object_uri}: {}",
-                    e.into_service_error()
-                ))
-            })?;
+            .map_err(|e| sdk_failure("get_object", &object_uri, e))?;
         let bytes = out
             .body
             .collect()
@@ -353,12 +380,7 @@ impl UploadBackend for S3NativeBackend {
             .key(&key)
             .send()
             .await
-            .map_err(|e| {
-                VtopError::Upload(format!(
-                    "get_object {object_uri}: {}",
-                    e.into_service_error()
-                ))
-            })?;
+            .map_err(|e| sdk_failure("get_object", &object_uri, e))?;
         if out
             .content_length()
             .is_some_and(|size| size < 0 || size as u64 > max_bytes as u64)
@@ -380,12 +402,7 @@ impl UploadBackend for S3NativeBackend {
             .checksum_mode(ChecksumMode::Enabled)
             .send()
             .await
-            .map_err(|e| {
-                VtopError::Upload(format!(
-                    "head_object {object_uri}: {}",
-                    e.into_service_error()
-                ))
-            })?;
+            .map_err(|e| sdk_failure("head_object", &object_uri, e))?;
 
         // Only expose the checksum S3 itself computed over the stored body.
         // x-amz-meta-vtop-checksum is written by the uploader and therefore
@@ -472,12 +489,7 @@ impl UploadBackend for S3NativeBackend {
             .key(&key)
             .send()
             .await
-            .map_err(|e| {
-                VtopError::Upload(format!(
-                    "delete_object {object_uri}: {}",
-                    e.into_service_error()
-                ))
-            })?;
+            .map_err(|e| sdk_failure("delete_object", &object_uri, e))?;
         Ok(())
     }
 
@@ -533,12 +545,10 @@ impl UploadBackend for S3NativeBackend {
             // be sent as x-amz-checksum-sha256.
             req = req.metadata(CHECKSUM_META_KEY, c.hex);
         }
-        let out = req.send().await.map_err(|e| {
-            VtopError::Upload(format!(
-                "create_multipart_upload {object_uri}: {}",
-                e.into_service_error()
-            ))
-        })?;
+        let out = req
+            .send()
+            .await
+            .map_err(|e| sdk_failure("create_multipart_upload", &object_uri, e))?;
         out.upload_id().map(str::to_owned).ok_or_else(|| {
             VtopError::Upload(format!(
                 "create_multipart_upload {object_uri}: service returned no upload id"
@@ -608,12 +618,7 @@ impl UploadBackend for S3NativeBackend {
             .multipart_upload(multipart)
             .send()
             .await
-            .map_err(|e| {
-                VtopError::Upload(format!(
-                    "complete_multipart_upload {object_uri}: {}",
-                    e.into_service_error()
-                ))
-            })?;
+            .map_err(|e| sdk_failure("complete_multipart_upload", &object_uri, e))?;
         let version_id = out
             .version_id()
             .filter(|id| *id != "null")
@@ -635,12 +640,7 @@ impl UploadBackend for S3NativeBackend {
             .upload_id(upload_id)
             .send()
             .await
-            .map_err(|e| {
-                VtopError::Upload(format!(
-                    "abort_multipart_upload {object_uri}: {}",
-                    e.into_service_error()
-                ))
-            })?;
+            .map_err(|e| sdk_failure("abort_multipart_upload", &object_uri, e))?;
         Ok(())
     }
 }
@@ -726,5 +726,56 @@ mod tests {
         assert!(validate_endpoint_scheme(Some("https://s3.example.com"), false).is_ok());
         // No custom endpoint = default AWS https endpoints.
         assert!(validate_endpoint_scheme(None, true).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod throttle_classification {
+    use super::*;
+    use aws_sdk_s3::error::ErrorMetadata;
+    use aws_sdk_s3::operation::put_object::PutObjectError;
+    use aws_smithy_runtime_api::http::StatusCode;
+    use aws_smithy_types::body::SdkBody;
+
+    fn service_error(status: u16, code: Option<&str>) -> SdkError<PutObjectError, HttpResponse> {
+        let mut metadata = ErrorMetadata::builder().message("as the store said it");
+        if let Some(code) = code {
+            metadata = metadata.code(code);
+        }
+        SdkError::service_error(
+            PutObjectError::generic(metadata.build()),
+            HttpResponse::new(StatusCode::try_from(status).unwrap(), SdkBody::empty()),
+        )
+    }
+
+    /// A `SlowDown`, a bare 503, and a bare 429 are throttles; a missing
+    /// key and a refused credential are not (#102).
+    #[test]
+    fn a_throttle_is_told_apart_by_status_or_code_and_nothing_else() {
+        for (status, code) in [
+            (503, Some("SlowDown")),
+            (503, None),
+            (429, None),
+            (400, Some("Throttling")),
+        ] {
+            let error = sdk_failure("put_object", "s3://b/k", service_error(status, code));
+            assert!(
+                error.is_upload_throttle(),
+                "{status} {code:?} must classify as a throttle: {error}"
+            );
+            assert!(
+                error.to_string().contains(&format!("http {status}")),
+                "{error}"
+            );
+        }
+        for (status, code) in [
+            (404, Some("NoSuchKey")),
+            (403, Some("AccessDenied")),
+            (500, Some("InternalError")),
+        ] {
+            let error = sdk_failure("put_object", "s3://b/k", service_error(status, code));
+            assert!(!error.is_upload_throttle(), "{status} {code:?}: {error}");
+            assert!(matches!(error, VtopError::Upload(_)));
+        }
     }
 }

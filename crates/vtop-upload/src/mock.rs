@@ -67,6 +67,9 @@ pub struct MockBackend {
     /// pays the provisioning round trip — once per bucket per process, not
     /// per batch (#102).
     bucket_ensures: AtomicUsize,
+    /// How many upcoming puts (object or manifest) answer with a throttle
+    /// (#102), counted down as they are refused.
+    throttled_puts: AtomicUsize,
 }
 
 impl Default for MockBackend {
@@ -88,6 +91,30 @@ impl MockBackend {
             multipart_fail_after_parts: Arc::new(AtomicUsize::new(usize::MAX)),
             multipart_parts_uploaded: Arc::new(AtomicUsize::new(0)),
             bucket_ensures: AtomicUsize::new(0),
+            throttled_puts: AtomicUsize::new(0),
+        }
+    }
+
+    /// The next `count` puts answer as an overloaded store does (#102):
+    /// `UploadThrottled`, nothing stored.
+    pub fn with_throttled_puts(self, count: usize) -> Self {
+        self.throttled_puts.store(count, Ordering::SeqCst);
+        self
+    }
+
+    fn take_throttle(&self, uri: &str) -> Result<(), VtopError> {
+        let refused = self
+            .throttled_puts
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok();
+        if refused {
+            Err(VtopError::UploadThrottled(format!(
+                "mock put {uri}: SlowDown (http 503): please reduce your request rate"
+            )))
+        } else {
+            Ok(())
         }
     }
 
@@ -200,6 +227,7 @@ impl UploadBackend for MockBackend {
         object_uri: &str,
         checksum: Option<ObjectChecksum<'_>>,
     ) -> Result<StoredObject, VtopError> {
+        self.take_throttle(object_uri)?;
         let version_id = self
             .store(local_path, object_uri, checksum.map(|c| c.hex))
             .await?;
@@ -214,6 +242,7 @@ impl UploadBackend for MockBackend {
         manifest_uri: &str,
         checksum: Option<ObjectChecksum<'_>>,
     ) -> Result<StoredManifest, VtopError> {
+        self.take_throttle(manifest_uri)?;
         let version_id = self
             .store(local_path, manifest_uri, checksum.map(|c| c.hex))
             .await?;
