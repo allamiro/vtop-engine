@@ -879,10 +879,11 @@ impl LocalBroker {
     /// marker that behaved differently from a produce would prove the wrong
     /// thing: a follower BELOW the marker's base refuses the append and
     /// simply never counts toward the quorum — catching that replica up is
-    /// #306's suffix repair, and the marker rides it when it lands; and a
-    /// follower AHEAD of the base acknowledges on durable coverage without
-    /// proving it holds the same bytes — #261, noted where that branch
-    /// lives.
+    /// the repair path's job (retransmission for small lags, sealed
+    /// transfer plus `--seal-tail` for the rest, #341), after which the
+    /// republish rides the duplicate path; and a follower AHEAD of the
+    /// base acknowledges on durable coverage without proving it holds the
+    /// same bytes — #261, noted where that branch lives.
     ///
     /// NOTHING CALLS THIS IN PRODUCTION YET: promotion wiring is its own
     /// slice, and this primitive ships first so the deterministic harnesses
