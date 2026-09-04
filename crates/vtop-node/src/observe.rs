@@ -1110,9 +1110,10 @@ impl CandidateCollector {
             leading: gauge_vec(
                 "broker_candidate_leading",
                 "1 while the LEADER role is installed on this candidate; 0 while it \
-                 follows another holder. Read with broker_lease_active: leading=1 \
-                 with lease_active=0 is a leader that is currently fenced, and \
-                 refusing writes",
+                 follows another holder. Read with broker_lease_active — the two are \
+                 written together from one snapshot, so within a scrape the pair is \
+                 coherent: leading=1 with lease_active=0 is a leader that is \
+                 currently fenced, and refusing writes",
                 &["topic", "range"],
             )?,
         })
@@ -1164,6 +1165,16 @@ impl CandidateCollector {
                 self.held_fencing_epoch
                     .with_label_values(&range)
                     .set(held as i64);
+                // ONE COHERENT PAIR OR NONE (#411): `leading` and
+                // `lease_active` are documented to be read together, and
+                // writing a fresh role beside a stale lease sample would
+                // manufacture exactly the fenced-leader signature the help
+                // text tells an operator to act on — from a scrape that
+                // merely landed during a contended metadata read. When the
+                // snapshot is contended BOTH gauges keep their last values
+                // (ignorance keeps the last value, the module's doctrine);
+                // the held epoch still writes, because it is monotonic and
+                // read without contention.
                 if let Some((epoch, active)) = meta {
                     self.meta_fencing_epoch
                         .with_label_values(&range)
@@ -1181,10 +1192,10 @@ impl CandidateCollector {
                     self.lease_active
                         .with_label_values(&range)
                         .set(i64::from(active && epoch == held && leading));
+                    self.leading
+                        .with_label_values(&range)
+                        .set(i64::from(leading));
                 }
-                self.leading
-                    .with_label_values(&range)
-                    .set(i64::from(leading));
             }
             None => {
                 // BETWEEN ROLES, and that is NOT the same as a contended read

@@ -70,9 +70,14 @@ batching:
   # buffer into a work queue first, and this setting bounds how many of those
   # are compressed, uploaded and verified AT ONCE — not how many are resident.
   # Fifty sources flushing in one cycle hold fifty payloads whatever this is
-  # set to. What bounds resident bytes is `max_bytes` times the number of
-  # buffers a cycle can flush, which is a property of how many sources are
-  # configured and how often they seal.
+  # set to. Resident bytes are a SET OF FACTORS, not a formula (#411): each
+  # buffer can exceed `max_bytes` by up to one read, because a whole read is
+  # appended before the seal threshold is consulted; the buffer count is per
+  # KAFKA TOPIC-PARTITION, not per configured source, so one busy topic
+  # multiplies it; and a flush holds transient compressed and upload copies
+  # alongside the raw payload while it runs. Sizing memory means bounding
+  # those factors — source count, partition count, `max_bytes`, seal cadence
+  # — not this knob.
   max_concurrent_batches: 8
 
 compression:

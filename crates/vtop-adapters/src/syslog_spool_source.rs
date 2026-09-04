@@ -86,6 +86,11 @@ impl SyslogSpoolSource {
         };
         seen.inode == current.inode
             && seen.file_size == current.file_size
+            // An UNKNOWN mtime never matches (#411) — the same rule as
+            // `FileSource::can_skip`, for the same reason: "" == "" would
+            // skip an in-place rewrite that preserved inode and size, on
+            // exactly the filesystems that cannot report modification time.
+            && !seen.mtime.is_empty()
             && seen.mtime == current.mtime
             && cursor.read_byte == current.file_size
     }
@@ -766,6 +771,20 @@ mod tests {
              shrank under a read head that had passed the new end), and the \
              right response to an inconsistency is to look, not to skip — \
              this is the `==` vs `>=` review case from #363"
+        );
+    }
+
+    #[test]
+    fn a_spool_whose_mtime_cannot_be_read_is_never_skipped() {
+        // The identity records "" when the filesystem cannot report a
+        // modified time (#411), and "" matching "" would skip an in-place
+        // rewrite that preserved inode and size — indefinitely. Unknown
+        // must fall through to a real read, same rule as FileSource.
+        let id = seen(Some(7), 100, "");
+        assert!(
+            !SyslogSpoolSource::can_skip(&caught_up_cursor(100, id.clone()), &id),
+            "inode and size agree and the cursor is caught up, but an unknown \
+             mtime is not evidence the content is unchanged"
         );
     }
 

@@ -696,7 +696,13 @@ kubectl -n "$REPLICATED_NS" wait --for=condition=ready pod -l "app.kubernetes.io
 # aiming at pod 0 now would fail two runs in three, looking like a produce
 # bug and actually being an assumption the topology no longer honours.
 lease_state() { # echoes "<holder-uuid> <fencing-epoch>", empty when no lease
-  vtopctl --json meta range-lease --config "$WORK/r-admin-multi.yaml" \
+  # Bounded per attempt (#411, the meta_admin_read precedent in
+  # live-chaos lib.sh): this runs inside deadline-checked retry loops whose
+  # only clock is between iterations, so one vtopctl read hanging on a
+  # wedged forward would spend the whole produce window in a single call
+  # and the loop's deadline could never fire.
+  timeout --kill-after=1 10 \
+    vtopctl --json meta range-lease --config "$WORK/r-admin-multi.yaml" \
     --topic-uuid "$TOPIC_UUID" --range-uuid "$RANGE_ID" 2>/dev/null \
     | python3 -c '
 import json, sys
