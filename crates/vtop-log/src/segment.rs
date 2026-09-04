@@ -2059,13 +2059,25 @@ fn torn_prefix_matches_template(candidate: &[u8], template: &[u8]) -> Option<Vec
     // The length field is config-dependent, so its exact value is unknowable
     // — but it is BOUNDABLE (review): any real successor's JSON is at least
     // the narrowest template's and at most the codec's ceiling. A candidate
-    // that has all four length bytes and claims something outside that range
-    // is not a prefix of any real header; a cut inside the field leaves a
-    // prefix of the true value, which cannot be validated and is not held
-    // against it.
-    if candidate.len() >= 12 {
-        let claimed = u32::from_be_bytes(candidate[8..12].try_into().expect("fixed slice"));
-        if (claimed as usize) < template_json.len() || claimed > crate::codec::MAX_HEADER_BYTES {
+    // claiming something outside that range is not a prefix of any real
+    // header. That holds for a cut INSIDE the field too (review, round
+    // eight): the bytes present are the high-order bytes of a big-endian
+    // value, so with `k` of four in hand the true length lies in
+    // `[prefix << 8(4-k), prefix << 8(4-k) | (2^(8(4-k)) - 1)]` — and a
+    // first byte of `0xff` already names a length above the ceiling
+    // whatever the missing bytes were. Only the interval is judged; the
+    // unknown low-order bytes are never guessed.
+    let length_bytes = candidate.len().saturating_sub(8).min(4);
+    if length_bytes > 0 {
+        let prefix = candidate[8..8 + length_bytes]
+            .iter()
+            .fold(0_u64, |acc, byte| (acc << 8) | u64::from(*byte));
+        let unknown_bits = 8 * (4 - length_bytes as u32);
+        let lowest = prefix << unknown_bits;
+        let highest = lowest | ((1_u64 << unknown_bits) - 1);
+        if highest < template_json.len() as u64
+            || lowest > u64::from(crate::codec::MAX_HEADER_BYTES)
+        {
             return None;
         }
     }
@@ -2143,82 +2155,113 @@ fn config_shape_runs(candidate: &[u8], template: &[u8]) -> Option<Vec<(u128, boo
     Some(runs)
 }
 
-/// Whether the candidate's COMPLETED config values can extend into any
-/// config the codec would actually write (#410, review round seven): a
-/// value whose closing comma is present is final, and a final combination
+/// Whether the candidate's config values can extend into any config the
+/// codec would actually write (#410, review rounds seven and eight): a
+/// value whose closing byte is present is final, and a final combination
 /// the real `validate()` refuses — a group limit too small for its own
 /// record limit, a chunk size that is not a power of two — is a config no
 /// successor ever encoded, truncated or not. Judged by the REAL validator
-/// over the completed prefix with forward-feasible fills for everything
-/// still open (1 or the field ceiling, whichever direction its chained
-/// constraint needs), so the rules live in one place. An open final run is
-/// a prefix of an unknown wider value and is filled, never judged.
+/// so the rules live in one place, with every field not fully known filled
+/// by the most forgiving value it could still take:
+///
+/// - a field the cut never reached takes 1 or its ceiling, whichever
+///   direction its chained constraint needs;
+/// - an OPEN run — the cut fell inside its digits — is not unknown: the
+///   true value is a CONTINUATION of the digits seen, so it is at least the
+///   run's own value and its decimal spelling begins with those digits.
+///   `70000000` cut mid-run can never become anything below seventy
+///   million, so a record limit that already exceeds its ceiling is refused
+///   rather than filled with `1`. The fill is the smallest continuation
+///   where the chain wants small, the largest continuation under the
+///   ceiling where it wants large, and the only power of two among the
+///   continuations for the chunk size.
+///
+/// The fields arrive in encoding order and an open run can only be the
+/// last, so every fill sits AFTER every closed value in the chain — which
+/// is what makes "most forgiving" well-defined: the chained constraints
+/// only ever look back at closed values.
 fn config_prefix_extendable(sealed: &AnyHeader, runs: &[(u128, bool)]) -> bool {
-    fn completed(runs: &[(u128, bool)], at: usize) -> Option<u128> {
-        runs.get(at)
-            .and_then(|(value, done)| done.then_some(*value))
+    /// How a field not fully known is filled: the smallest value it could
+    /// still be, or the largest at or under `ceiling`.
+    #[derive(Clone, Copy)]
+    enum Fill {
+        Smallest,
+        LargestUnder(u128),
     }
-    fn narrow<T: TryFrom<u128>>(value: u128) -> Option<T> {
+    fn field<T: TryFrom<u128>>(
+        runs: &[(u128, bool)],
+        at: usize,
+        absent: T,
+        fill: Fill,
+    ) -> Option<T> {
+        let value = match runs.get(at) {
+            None => return Some(absent),
+            Some((value, true)) => *value,
+            Some((value, false)) => match fill {
+                Fill::Smallest => *value,
+                Fill::LargestUnder(ceiling) => continuation_range(*value, ceiling)?.1,
+            },
+        };
         T::try_from(value).ok()
     }
-    match sealed {
-        AnyHeader::V1(_) => {
-            let Some(max_record_bytes) = completed(runs, 0).map_or(Some(1_u32), narrow::<u32>)
-            else {
-                return false;
-            };
-            let Some(max_group_bytes) =
-                completed(runs, 1).map_or(Some(crate::types::MAX_GROUP_BYTES), narrow::<u64>)
-            else {
-                return false;
-            };
-            let Some(max_segment_bytes) =
-                completed(runs, 2).map_or(Some(crate::types::MAX_SEGMENT_BYTES), narrow::<u64>)
-            else {
-                return false;
-            };
-            let Some(max_segment_records) = completed(runs, 3).map_or(Some(1_u64), narrow::<u64>)
-            else {
-                return false;
-            };
-            let Some(index_stride) = completed(runs, 4).map_or(Some(1_u32), narrow::<u32>) else {
-                return false;
-            };
-            SegmentConfig {
-                max_record_bytes,
-                max_group_bytes,
-                max_segment_bytes,
-                max_segment_records,
-                index_stride,
-            }
-            .validate()
-            .is_ok()
+    /// The chunk size must be a power of two in its band, so an open run is
+    /// extendable exactly when one of those nine values spells the digits
+    /// seen as its prefix.
+    fn chunk_size(runs: &[(u128, bool)]) -> Option<u32> {
+        let (value, closed) = match runs.get(5) {
+            None => return Some(crate::types::MIN_CHUNK_SIZE_BYTES),
+            Some(run) => *run,
+        };
+        if closed {
+            return u32::try_from(value).ok();
         }
+        let digits = value.to_string();
+        let mut power = crate::types::MIN_CHUNK_SIZE_BYTES;
+        while power <= crate::types::MAX_CHUNK_SIZE_BYTES {
+            if power.to_string().starts_with(&digits) {
+                return Some(power);
+            }
+            power = power.checked_mul(2)?;
+        }
+        None
+    }
+    let Some(max_record_bytes) = field(runs, 0, 1_u32, Fill::Smallest) else {
+        return false;
+    };
+    let Some(max_group_bytes) = field(
+        runs,
+        1,
+        crate::types::MAX_GROUP_BYTES,
+        Fill::LargestUnder(u128::from(crate::types::MAX_GROUP_BYTES)),
+    ) else {
+        return false;
+    };
+    let Some(max_segment_bytes) = field(
+        runs,
+        2,
+        crate::types::MAX_SEGMENT_BYTES,
+        Fill::LargestUnder(u128::from(crate::types::MAX_SEGMENT_BYTES)),
+    ) else {
+        return false;
+    };
+    let Some(max_segment_records) = field(runs, 3, 1_u64, Fill::Smallest) else {
+        return false;
+    };
+    let Some(index_stride) = field(runs, 4, 1_u32, Fill::Smallest) else {
+        return false;
+    };
+    match sealed {
+        AnyHeader::V1(_) => SegmentConfig {
+            max_record_bytes,
+            max_group_bytes,
+            max_segment_bytes,
+            max_segment_records,
+            index_stride,
+        }
+        .validate()
+        .is_ok(),
         AnyHeader::V2(_) => {
-            let Some(max_record_bytes) = completed(runs, 0).map_or(Some(1_u32), narrow::<u32>)
-            else {
-                return false;
-            };
-            let Some(max_group_bytes) =
-                completed(runs, 1).map_or(Some(crate::types::MAX_GROUP_BYTES), narrow::<u64>)
-            else {
-                return false;
-            };
-            let Some(max_segment_bytes) =
-                completed(runs, 2).map_or(Some(crate::types::MAX_SEGMENT_BYTES), narrow::<u64>)
-            else {
-                return false;
-            };
-            let Some(max_segment_records) = completed(runs, 3).map_or(Some(1_u64), narrow::<u64>)
-            else {
-                return false;
-            };
-            let Some(index_stride) = completed(runs, 4).map_or(Some(1_u32), narrow::<u32>) else {
-                return false;
-            };
-            let Some(chunk_size) =
-                completed(runs, 5).map_or(Some(crate::types::MIN_CHUNK_SIZE_BYTES), narrow::<u32>)
-            else {
+            let Some(chunk_size) = chunk_size(runs) else {
                 return false;
             };
             SegmentConfigV2 {
@@ -2233,6 +2276,31 @@ fn config_prefix_extendable(sealed: &AnyHeader, runs: &[(u128, bool)]) -> bool {
             .is_ok()
         }
     }
+}
+
+/// The values an open digit run can still become: every number whose
+/// decimal spelling BEGINS with the digits seen — the run itself, or the
+/// run followed by more digits — never an arbitrary number at or above it.
+/// Returns the smallest such value and the largest at or under `ceiling`,
+/// or `None` when none fits: the run alone already exceeds the ceiling. A
+/// lone `0` admits no further digit (canonical JSON writes no leading
+/// zero), so it continues only as itself.
+fn continuation_range(prefix: u128, ceiling: u128) -> Option<(u128, u128)> {
+    if prefix > ceiling {
+        return None;
+    }
+    if prefix == 0 {
+        return Some((0, 0));
+    }
+    let mut scale: u128 = 1;
+    while let Some(wider) = scale.checked_mul(10) {
+        match prefix.checked_mul(wider) {
+            Some(lowest) if lowest <= ceiling => scale = wider,
+            _ => break,
+        }
+    }
+    let lowest = prefix * scale;
+    Some((prefix, (lowest + (scale - 1)).min(ceiling)))
 }
 
 /// Rebuild the commit boundary of an EMPTY successor whose creation was
@@ -5554,5 +5622,129 @@ mod tests {
              after a crash landed inside a write (#310): {:?}",
             catalog.quarantined
         );
+    }
+
+    /// An open digit run's continuations are the numbers that SPELL its
+    /// digits as a prefix — not every number at or above it (#410, review
+    /// round eight). `7` can become 70 or 799 but never 8 or 64.
+    #[test]
+    fn a_continuation_spells_the_digits_seen_not_any_number_above_them() {
+        assert_eq!(continuation_range(7, 99), Some((7, 79)));
+        assert_eq!(continuation_range(7, 75), Some((7, 75)));
+        assert_eq!(continuation_range(99, 100), Some((99, 99)));
+        assert_eq!(continuation_range(1, 1), Some((1, 1)));
+        // Already past the ceiling: nothing appended to the digits can
+        // bring the value back under it.
+        assert_eq!(continuation_range(100, 99), None);
+        // A lone zero admits no further digit under canonical encoding.
+        assert_eq!(continuation_range(0, 99), Some((0, 0)));
+    }
+
+    /// A cut inside the 4-byte length field leaves a PREFIX of a big-endian
+    /// value, and that prefix bounds the value from both sides: one byte
+    /// of `0xff` names a length above the codec ceiling whatever the three
+    /// missing bytes were, while one byte of `0x00` admits every real
+    /// length. Only the interval is judged (review, round eight).
+    #[test]
+    fn a_partial_length_prefix_is_bounded_not_ignored() {
+        let mut template_descriptor = descriptor();
+        template_descriptor.segment_id = TORN_TEMPLATE_ID;
+        let template = encode_header(&SegmentHeader::new(
+            template_descriptor,
+            SegmentConfig {
+                max_record_bytes: 1,
+                max_group_bytes: 1,
+                max_segment_bytes: 1,
+                max_segment_records: 1,
+                index_stride: 1,
+            },
+        ))
+        .unwrap();
+        let magic = &template[..8];
+        let mut impossible = magic.to_vec();
+        impossible.push(0xff);
+        assert!(
+            torn_prefix_matches_template(&impossible, &template).is_none(),
+            "a first length byte of 0xff cannot prefix any length under the ceiling"
+        );
+        let mut too_short = magic.to_vec();
+        too_short.extend_from_slice(&[0x00, 0x00, 0x00]);
+        assert!(
+            torn_prefix_matches_template(&too_short, &template).is_none(),
+            "three zero bytes cap the length at 255, below any real header of this range"
+        );
+        let mut plausible = magic.to_vec();
+        plausible.push(0x00);
+        assert!(
+            torn_prefix_matches_template(&plausible, &template).is_some(),
+            "a first byte of 0x00 admits every length a real header could carry"
+        );
+        // The genuine prefix still classifies: cut at every length up to
+        // the config boundary, the template is its own torn write.
+        for cut in 0..template.len() - crate::codec::CHECKSUM_LEN {
+            assert!(
+                torn_prefix_matches_template(&template[..cut], &template).is_some(),
+                "a prefix of the real header must always match at cut {cut}"
+            );
+        }
+    }
+
+    /// An open run is filled with a real continuation of its digits, so a
+    /// record limit already past its ceiling is refused instead of being
+    /// filled with `1`, and a chunk-size run no power of two spells is
+    /// refused instead of being filled with the minimum (#410, review round
+    /// eight). Everything the round-seven fill accepted honestly still is.
+    #[test]
+    fn an_open_run_is_judged_by_what_it_can_still_become() {
+        let v1 = AnyHeader::V1(SegmentHeader::new(descriptor(), config()));
+        // Seventy million cut mid-run: every continuation exceeds the
+        // 64 MiB record ceiling.
+        assert!(!config_prefix_extendable(&v1, &[(70_000_000, false)]));
+        // Seven million: a valid record limit as it stands.
+        assert!(config_prefix_extendable(&v1, &[(7_000_000, false)]));
+        // A record limit closed at 1024 and a group limit open at `1`: the
+        // largest continuation under the group ceiling (199_999_999) holds
+        // the record plus its frame, so the pair is extendable — and a
+        // group limit open at `3` when the record limit is closed at 60 MiB
+        // is not, because 39_999_999 is the widest `3…` that fits under the
+        // ceiling and no `3…` between that and 300 million exists.
+        assert!(config_prefix_extendable(&v1, &[(1024, true), (1, false)]));
+        assert!(!config_prefix_extendable(
+            &v1,
+            &[(60 * 1024 * 1024, true), (3, false)]
+        ));
+        // An open lone zero is exactly zero, which no field accepts.
+        assert!(!config_prefix_extendable(&v1, &[(0, false)]));
+
+        let v2 = AnyHeader::V2(SegmentHeaderV2::new(
+            descriptor_v2(),
+            SegmentConfigV2 {
+                max_record_bytes: 1024,
+                max_group_bytes: 4096,
+                max_segment_bytes: 16 * 1024,
+                max_segment_records: 100,
+                index_stride: 2,
+                chunk_size: crate::types::MIN_CHUNK_SIZE_BYTES,
+            },
+        ));
+        let closed = [
+            (1024, true),
+            (4096, true),
+            (16 * 1024, true),
+            (100, true),
+            (2, true),
+        ];
+        let with_chunk = |run: (u128, bool)| {
+            let mut runs = closed.to_vec();
+            runs.push(run);
+            runs
+        };
+        // 131072 = 2^17 spells `1`; nothing in the band spells `9` or `3`.
+        assert!(config_prefix_extendable(&v2, &with_chunk((1, false))));
+        assert!(config_prefix_extendable(&v2, &with_chunk((13, false))));
+        assert!(!config_prefix_extendable(&v2, &with_chunk((9, false))));
+        assert!(!config_prefix_extendable(&v2, &with_chunk((3, false))));
+        assert!(config_prefix_extendable(&v2, &with_chunk((65536, true))));
+        assert!(!config_prefix_extendable(&v2, &with_chunk((65537, true))));
     }
 }

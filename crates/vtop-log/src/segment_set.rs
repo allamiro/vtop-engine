@@ -3670,6 +3670,94 @@ mod tests {
         );
     }
 
+    /// A cut inside the length field is still boundable (#410, review
+    /// round eight): the byte present is the high-order byte of a
+    /// big-endian length, and `0xff` names a length above the codec
+    /// ceiling whatever the three missing bytes were. A file of magic
+    /// plus that byte is not a prefix of any real header, so it quarantines
+    /// as a foreign artifact — where the earlier classification, skipping
+    /// the length check until all four bytes were present, deleted it.
+    #[test]
+    fn a_length_prefix_no_header_could_carry_is_quarantined_not_deleted() {
+        let directory = tempdir().unwrap();
+        strand_after_seal(directory.path(), false);
+        let artifact_path = directory.path().join(format!("{}.active", segment_stem(3)));
+        std::fs::write(&artifact_path, b"VTOPSEG1\xff").unwrap();
+
+        let refused = SegmentSet::open_in(&Env::real(), directory.path())
+            .map(|_| ())
+            .expect_err("an impossible length prefix must keep the directory refused");
+        assert!(
+            !matches!(refused, LogError::TailSealedWithoutSuccessor { .. }),
+            "a length no header could carry is not torn, and must not be swept: {refused}"
+        );
+        assert!(
+            artifact_path.exists(),
+            "the artifact is evidence; quarantine preserves it, deletion would not"
+        );
+    }
+
+    /// An open digit run bounds the value it was cut from (#410, review
+    /// round eight): a record limit whose observed digits already exceed
+    /// the 64 MiB ceiling cannot be completed into any config the codec
+    /// writes, so the cut is quarantined — while the identical cut at a
+    /// value that IS a valid limit is still recognised as torn and swept.
+    /// The pair is what makes the pin discriminating rather than merely
+    /// stricter.
+    #[test]
+    fn an_open_config_run_past_its_ceiling_is_quarantined_not_deleted() {
+        let cut_after_record_limit = |max_record_bytes: u32| {
+            let mut successor = descriptor();
+            successor.segment_id = Uuid::from_u128(0xF6);
+            successor.base_offset = 3;
+            let bytes = crate::codec::encode_header(&crate::codec::SegmentHeader::new(
+                successor,
+                SegmentConfig {
+                    max_record_bytes,
+                    ..config()
+                },
+            ))
+            .unwrap();
+            let needle = format!("\"max_record_bytes\":{max_record_bytes}");
+            let at = bytes
+                .windows(needle.len())
+                .position(|window| window == needle.as_bytes())
+                .expect("the record limit is encoded in the header JSON");
+            bytes[..at + needle.len()].to_vec()
+        };
+
+        let quarantined = tempdir().unwrap();
+        strand_after_seal(quarantined.path(), false);
+        let artifact_path = quarantined
+            .path()
+            .join(format!("{}.active", segment_stem(3)));
+        std::fs::write(&artifact_path, cut_after_record_limit(70_000_000)).unwrap();
+        let refused = SegmentSet::open_in(&Env::real(), quarantined.path())
+            .map(|_| ())
+            .expect_err("a limit past its ceiling must keep the directory refused");
+        assert!(
+            !matches!(refused, LogError::TailSealedWithoutSuccessor { .. }),
+            "no continuation of 70000000 is a valid record limit; the cut is not torn: {refused}"
+        );
+        assert!(artifact_path.exists(), "the artifact is evidence and stays");
+
+        let swept = tempdir().unwrap();
+        strand_after_seal(swept.path(), false);
+        let torn_path = swept.path().join(format!("{}.active", segment_stem(3)));
+        std::fs::write(&torn_path, cut_after_record_limit(7_000_000)).unwrap();
+        let refused = SegmentSet::open_in(&Env::real(), swept.path())
+            .map(|_| ())
+            .expect_err("a prefix without a usable tail must still refuse to open");
+        assert!(
+            matches!(refused, LogError::TailSealedWithoutSuccessor { .. }),
+            "the same cut at a valid limit is a torn write and must be swept: {refused}"
+        );
+        assert!(
+            !torn_path.exists(),
+            "a torn write of this range's own header is discarded"
+        );
+    }
+
     /// The roll's FIRST window: a crash mid-write of the successor's own
     /// header. The commit sidecar's absence proves creation never finished,
     /// so the torn file has never held a record and is discarded — the
