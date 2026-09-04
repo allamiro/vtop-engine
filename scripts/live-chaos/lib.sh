@@ -1581,6 +1581,42 @@ meta_admin_as() {
   "$VTOPCTL" --json meta "$@" --config "$(emit_admin_config_as "$id" "$cert")"
 }
 
+# meta_admin_membership <node-id> <subcommand + args...> — a membership
+# CHANGE, retried across the one refusal that is transient by construction.
+#
+# `wait_meta_leader` proves an election finished, not that the INITIAL
+# membership entry has committed — and openraft refuses overlapping
+# membership changes with "already undergoing a configuration change". A
+# membership change proposed as the first command after init can lose that
+# race on a loaded runner (#404, observed live: scenario 11, index 0, last
+# committed membership None). Retrying EXACTLY that refusal to a deadline is
+# the deadline-poll doctrine (#326) applied to a write; every other failure
+# stays immediate and loud — an authorization refusal must never be retried
+# into silence, because proving those refusals is what scenario 11 exists
+# to do.
+meta_admin_membership() { # <node-id> <subcommand + args...>
+  local id="$1"; shift
+  local deadline=$((SECONDS + ELECTION_TIMEOUT_SECONDS)) out
+  while true; do
+    if out="$(meta_admin "$id" "$@" 2>&1)"; then
+      [[ -n "$out" ]] && printf '%s\n' "$out"
+      return 0
+    fi
+    if [[ "$out" != *"already undergoing a configuration change"* ]]; then
+      printf '%s\n' "$out" >&2
+      return 1
+    fi
+    sleep 0.3
+    # Gate AFTER the sleep, so no attempt runs past the advertised deadline:
+    # checked before, the sleep could carry the loop across it and buy one
+    # retry more than the timeout promises.
+    if [[ $SECONDS -ge $deadline ]]; then
+      printf '%s\n' "$out" >&2
+      fail "membership change still refused as in-progress after ${ELECTION_TIMEOUT_SECONDS}s: the initial membership never committed"
+    fi
+  done
+}
+
 # meta_admin_read <output-file> <node-id> <subcommand + args...> — a metadata
 # admin READ, deadline-polled into <output-file>.
 #
