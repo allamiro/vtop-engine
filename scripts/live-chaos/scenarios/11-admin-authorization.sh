@@ -43,7 +43,11 @@ log "3-node group up under admin authorization, leader=$LEADER_ID"
 # and node registration — so this is the assertion that the policy does not
 # simply refuse everything.
 # ---------------------------------------------------------------------------
-meta_admin "$LEADER_ID" add-learner --node-id 4 > /dev/null \
+# The FIRST command after init and election, so it alone can race the
+# initial membership commit — no committed load precedes it here the way
+# scenario 01's produce loop and scenario 03's sixteen registrations do.
+# The wrapper retries exactly that refusal and nothing else (#404).
+meta_admin_membership "$LEADER_ID" add-learner --node-id 4 > /dev/null \
   || fail "the operator certificate must retain membership changes"
 meta_admin "$LEADER_ID" create-topic \
   --name "$TOPIC" --topic-uuid "$TOPIC_UUID" --root-range-uuid "$RANGE_ID" > /dev/null \
