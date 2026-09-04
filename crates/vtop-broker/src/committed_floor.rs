@@ -31,18 +31,27 @@
 //! records this replica durably holds below an acknowledged mark — exactly
 //! the refusal the guard exists to make.
 //!
-//! # Why overwrite-in-place, not temp-and-rename
+//! # Why two alternating slots, not temp-and-rename
 //!
-//! Deliberate, for three reasons. `write_atomic` is `pub(crate)` in both
-//! crates that have one (vtop-log and vtop-meta) and unreachable from here.
-//! A private `.tmp` scratch of our own would be invisible to the #310
+//! Rename is out for two reasons: `write_atomic` is `pub(crate)` in both
+//! crates that have one (vtop-log and vtop-meta) and unreachable from here,
+//! and a private `.tmp` scratch of our own would be invisible to the #310
 //! startup sweep, whose classifier deletes only the exact
 //! `.{target}.{uuid}.tmp` shapes the log crate itself produces
 //! (`catalog.rs::interrupted_atomic_write`) — an interrupted rename would
-//! leave droppings nothing ever cleans. And, decisive: this value does not
-//! need rename atomicity. A torn overwrite is DETECTED by the trailing
-//! checksum and reads as absent, which degrades to the pre-floor behaviour —
-//! the safe direction, per the asymmetry above.
+//! leave droppings nothing ever cleans.
+//!
+//! A single overwritten frame is out too, and the first review of this file
+//! said why: the crash that tears a frame IS a restart, and a restart is
+//! exactly what the floor exists to arm the guard for. Detect-and-degrade
+//! would surrender the previous floor at the one moment it was needed. So
+//! the file holds TWO independently checksummed frames, and a save writes
+//! the slot NOT holding the newest durable floor: any single torn write can
+//! only damage a frame whose content was already invalid or the lower
+//! value. The reader takes the highest valid frame; a frame that fails its
+//! checksum is ignored, never misread. An acked floor therefore rides
+//! through every crash, and only damage to BOTH slots — or a floor that was
+//! never saved — reads as absent, degrading to the pre-floor behaviour.
 //!
 //! # Placement, cadence, and scope
 //!
@@ -63,16 +72,19 @@
 //! §5.4.2 leadership-transition record design — #240's remaining
 //! conversation — and must not be prejudged by follower persistence.
 //!
-//! # Layout (52 bytes exactly)
+//! # Layout (104 bytes exactly: two 52-byte frames)
 //!
 //! ```text
-//! magic "VTOPFLR1"        8
-//! version u32             4
-//! floor u64               8
-//! BLAKE3-32 over prior   32
+//! frame, twice:
+//!   magic "VTOPFLR1"        8
+//!   version u32             4
+//!   floor u64               8
+//!   BLAKE3-32 over prior   32
 //! ```
 //!
-//! Big-endian, like the journals beside it.
+//! Big-endian, like the journals beside it. The frames carry no sequence
+//! number — the higher floor IS the newer frame, because the value is
+//! monotonic.
 
 use crate::{BrokerError, BrokerResult};
 use std::io::{Seek, SeekFrom, Write};
@@ -83,7 +95,8 @@ const MAGIC: &[u8; 8] = b"VTOPFLR1";
 const VERSION: u32 = 1;
 const CHECKSUM_BYTES: usize = 32;
 const PAYLOAD_BYTES: usize = 8 + 4 + 8;
-const FILE_BYTES: usize = PAYLOAD_BYTES + CHECKSUM_BYTES;
+const FRAME_BYTES: usize = PAYLOAD_BYTES + CHECKSUM_BYTES;
+const FILE_BYTES: usize = 2 * FRAME_BYTES;
 
 /// Owner of the on-disk committed floor for one range replica.
 pub struct CommittedFloorFile {
@@ -98,6 +111,11 @@ pub struct CommittedFloorFile {
     /// does; giving them different representations would invite code to
     /// treat them differently, and nothing should.
     last_persisted: u64,
+    /// The slot the NEXT save writes — always the one NOT holding the newest
+    /// durable floor, so a torn write can only damage a frame whose loss
+    /// costs nothing. This is what makes an acked floor ride through the
+    /// very crash it exists to arm the guard for.
+    write_slot: usize,
     /// The first save also syncs the parent directory — once per handle —
     /// because fsync of the file is not enough on creation: a power loss can
     /// lose the directory entry and take the floor with it. When the entry
@@ -122,9 +140,9 @@ impl CommittedFloorFile {
     /// the safe direction; refusing to open the range is not.
     pub fn open_in(env: &Env, path: impl AsRef<Path>) -> Self {
         let path = path.as_ref().to_path_buf();
-        let floor = match read_floor(env, &path) {
-            Ok(None) => 0,
-            Ok(Some(floor)) => floor,
+        let (floor, write_slot) = match read_floor(env, &path) {
+            Ok(None) => (0, 0),
+            Ok(Some((floor, holding_slot))) => (floor, 1 - holding_slot),
             Err(reason) => {
                 eprintln!(
                     "committed-floor file {} {reason}; treating the floor as absent — the \
@@ -132,7 +150,7 @@ impl CommittedFloorFile {
                      observed cluster HWM (#240)",
                     path.display()
                 );
-                0
+                (0, 0)
             }
         };
         Self {
@@ -140,6 +158,7 @@ impl CommittedFloorFile {
             path,
             file: None,
             last_persisted: floor,
+            write_slot,
             parent_synced: false,
             poisoned: false,
         }
@@ -172,15 +191,18 @@ impl CommittedFloorFile {
         if floor == self.last_persisted {
             return Ok(());
         }
-        if let Err(problem) = self.write_frame(&encode(floor)) {
+        if let Err(problem) = self.write_frame(&encode(floor), self.write_slot) {
             self.poisoned = true;
             return Err(problem);
         }
         self.last_persisted = floor;
+        // The slot just written now holds the newest durable floor; the next
+        // save must spare it and take the other.
+        self.write_slot = 1 - self.write_slot;
         Ok(())
     }
 
-    fn write_frame(&mut self, bytes: &[u8]) -> BrokerResult<()> {
+    fn write_frame(&mut self, bytes: &[u8], slot: usize) -> BrokerResult<()> {
         if self.file.is_none() {
             let file = self
                 .env
@@ -190,13 +212,13 @@ impl CommittedFloorFile {
             self.file = Some(file);
         }
         let file = self.file.as_mut().expect("opened above");
-        file.seek(SeekFrom::Start(0))
+        file.seek(SeekFrom::Start((slot * FRAME_BYTES) as u64))
             .and_then(|_| file.write_all(bytes))
-            // A previous life may have left the file longer than one frame.
-            // The overwrite fixed the first FILE_BYTES; without the set_len
-            // the stale tail would survive and the next open would refuse
-            // the length — reading this repair as damage.
-            .and_then(|()| file.set_len(bytes.len() as u64))
+            // Pin the length to exactly two frames: a fresh file extends
+            // with zeros (an invalid frame the reader ignores), and a tail
+            // some previous life left beyond the format is trimmed rather
+            // than surviving to confuse a later reader.
+            .and_then(|()| file.set_len(FILE_BYTES as u64))
             .and_then(|()| file.sync_data())
             .map_err(|source| Self::io(&self.path, source))?;
         if !self.parent_synced {
@@ -228,8 +250,8 @@ impl CommittedFloorFile {
     }
 }
 
-fn encode(floor: u64) -> [u8; FILE_BYTES] {
-    let mut bytes = [0_u8; FILE_BYTES];
+fn encode(floor: u64) -> [u8; FRAME_BYTES] {
+    let mut bytes = [0_u8; FRAME_BYTES];
     bytes[0..8].copy_from_slice(MAGIC);
     bytes[8..12].copy_from_slice(&VERSION.to_be_bytes());
     bytes[12..20].copy_from_slice(&floor.to_be_bytes());
@@ -238,11 +260,13 @@ fn encode(floor: u64) -> [u8; FILE_BYTES] {
     bytes
 }
 
-/// `Ok(None)` is the one clean absence; every other failure carries the
-/// reason so the open can report it. Length before checksum before
-/// structure: a file that is not exactly one frame is torn or foreign, and
-/// nothing inside it can be trusted enough to name a finer diagnosis.
-fn read_floor(env: &Env, path: &Path) -> Result<Option<u64>, String> {
+/// `Ok(None)` is the one clean absence; `Ok(Some((floor, slot)))` is the
+/// HIGHEST floor any valid slot holds, and which slot holds it. The slots
+/// validate independently, so a frame torn by the crash that interrupted a
+/// save costs exactly that frame — the other slot still answers. Only a
+/// file in which NEITHER slot validates carries a reason back for the open
+/// to report.
+fn read_floor(env: &Env, path: &Path) -> Result<Option<(u64, usize)>, String> {
     let exists = env
         .storage
         .exists(path)
@@ -254,28 +278,37 @@ fn read_floor(env: &Env, path: &Path) -> Result<Option<u64>, String> {
         .storage
         .read(path)
         .map_err(|error| format!("could not be read: {error}"))?;
-    if bytes.len() != FILE_BYTES {
-        return Err(format!(
-            "is {} bytes where the format is exactly {FILE_BYTES}",
+    let best = (0..2)
+        .filter_map(|slot| Some((read_frame(&bytes, slot)?, slot)))
+        .max();
+    match best {
+        Some((floor, slot)) => Ok(Some((floor, slot))),
+        None => Err(format!(
+            "holds no readable floor frame in its {} bytes",
             bytes.len()
-        ));
+        )),
     }
-    let (payload, checksum) = bytes.split_at(PAYLOAD_BYTES);
+}
+
+/// One slot's floor, or `None` for any shape that cannot be trusted: short,
+/// checksum-mismatched, foreign magic, future version. A frame's meaning
+/// under a version this build does not know is unknowable, and guessing
+/// could invent a floor — the one direction the design must never fail in.
+fn read_frame(bytes: &[u8], slot: usize) -> Option<u64> {
+    let frame = bytes.get(slot * FRAME_BYTES..slot * FRAME_BYTES + FRAME_BYTES)?;
+    let (payload, checksum) = frame.split_at(PAYLOAD_BYTES);
     if blake3::hash(payload).as_bytes() != checksum {
-        return Err("fails its checksum".to_owned());
+        return None;
     }
     if &payload[0..8] != MAGIC {
-        return Err("carries foreign magic".to_owned());
+        return None;
     }
-    let version = u32::from_be_bytes(payload[8..12].try_into().expect("fixed width"));
-    if version != VERSION {
-        return Err(format!(
-            "is version {version}, and this build only understands {VERSION}"
-        ));
+    if u32::from_be_bytes(payload[8..12].try_into().expect("fixed width")) != VERSION {
+        return None;
     }
-    Ok(Some(u64::from_be_bytes(
+    Some(u64::from_be_bytes(
         payload[12..20].try_into().expect("fixed width"),
-    )))
+    ))
 }
 
 #[cfg(test)]
@@ -334,50 +367,98 @@ mod tests {
         );
     }
 
-    /// Every damaged shape must read as ABSENT, not as a value. This file
-    /// arms a guard that refuses truncations, and a floor invented from
-    /// damage — the too-high direction — is the one failure the design must
-    /// not allow; absent merely weakens the guard to yesterday's behaviour.
+    /// The point of the two slots, byte by byte: after two saves both hold
+    /// valid frames (5 in slot 0, 9 in slot 1), and damaging EITHER — every
+    /// byte, one at a time — must surface the other's floor. A save writes
+    /// only the slot NOT holding the newest durable value, so this is the
+    /// on-disk shape a torn save leaves behind.
     #[test]
-    fn every_corruption_of_the_floor_file_reads_as_absent_not_as_a_value() {
+    fn damage_to_one_slot_surrenders_only_that_slots_floor() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("committed-floor");
+        {
+            let mut file = CommittedFloorFile::open(&path);
+            file.save(5).unwrap();
+            file.save(9).unwrap();
+        }
+        let pristine = std::fs::read(&path).unwrap();
+        assert_eq!(pristine.len(), FILE_BYTES);
+
+        for index in 0..FRAME_BYTES {
+            let mut damaged = pristine.clone();
+            damaged[index] ^= 0xff;
+            std::fs::write(&path, &damaged).unwrap();
+            assert_eq!(
+                CommittedFloorFile::open(&path).floor(),
+                9,
+                "a flip at byte {index} damaged only slot 0; slot 1's floor must answer"
+            );
+        }
+        for index in FRAME_BYTES..FILE_BYTES {
+            let mut damaged = pristine.clone();
+            damaged[index] ^= 0xff;
+            std::fs::write(&path, &damaged).unwrap();
+            assert_eq!(
+                CommittedFloorFile::open(&path).floor(),
+                5,
+                "a flip at byte {index} tore the newer frame; the crash that tears a frame \
+                 is exactly the restart the floor must survive, so the previous floor \
+                 must answer"
+            );
+        }
+    }
+
+    /// Only a file with NO valid frame reads as absent — and never as a
+    /// value: this file arms a guard that refuses truncations, and a floor
+    /// invented from damage (the too-high direction) is the one failure the
+    /// design must not allow; absent merely weakens the guard to
+    /// yesterday's behaviour.
+    #[test]
+    fn only_a_file_with_no_valid_frame_reads_as_absent_never_as_garbage() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("committed-floor");
         CommittedFloorFile::open(&path).save(7).unwrap();
         let pristine = std::fs::read(&path).unwrap();
-        assert_eq!(pristine.len(), FILE_BYTES);
+        assert_eq!(
+            pristine.len(),
+            FILE_BYTES,
+            "one save still pins the length: the unwritten slot is zeros, an invalid frame"
+        );
 
-        for index in 0..pristine.len() {
+        for index in 0..FRAME_BYTES {
             let mut damaged = pristine.clone();
             damaged[index] ^= 0xff;
             std::fs::write(&path, &damaged).unwrap();
             assert_eq!(
                 CommittedFloorFile::open(&path).floor(),
                 0,
-                "a flip at byte {index} must read as absent, not as a floor"
+                "a flip at byte {index} killed the only valid frame; absent, never garbage"
             );
         }
-        for length in 0..pristine.len() {
+        for length in 0..FRAME_BYTES {
             std::fs::write(&path, &pristine[..length]).unwrap();
             assert_eq!(
                 CommittedFloorFile::open(&path).floor(),
                 0,
-                "a {length}-byte prefix is a torn write, not a shorter floor"
+                "a {length}-byte prefix holds no whole frame; torn, not a shorter floor"
             );
         }
-        let mut longer = pristine.clone();
-        longer.push(0);
-        std::fs::write(&path, &longer).unwrap();
-        assert_eq!(
-            CommittedFloorFile::open(&path).floor(),
-            0,
-            "trailing bytes mean the writer and reader disagree about the format"
-        );
-        // Foreign magic and a future version, each RESEALED with a valid
-        // checksum, so the refusal is proven structural rather than an
-        // accident of the checksum failing first.
+        for length in FRAME_BYTES..FILE_BYTES {
+            std::fs::write(&path, &pristine[..length]).unwrap();
+            assert_eq!(
+                CommittedFloorFile::open(&path).floor(),
+                7,
+                "a cut at {length} bytes tore only the second slot; the first frame is \
+                 whole and must still answer"
+            );
+        }
+        // Foreign magic and a future version, RESEALED with valid checksums
+        // so the refusal is proven structural rather than an accident of the
+        // checksum failing first — in the valid slot, leaving no readable
+        // frame at all.
         let mut foreign = pristine.clone();
         foreign[0..8].copy_from_slice(b"VTOPELSE");
-        reseal(&mut foreign);
+        reseal(&mut foreign[..FRAME_BYTES]);
         std::fs::write(&path, &foreign).unwrap();
         assert_eq!(
             CommittedFloorFile::open(&path).floor(),
@@ -386,7 +467,7 @@ mod tests {
         );
         let mut future = pristine.clone();
         future[8..12].copy_from_slice(&2_u32.to_be_bytes());
-        reseal(&mut future);
+        reseal(&mut future[..FRAME_BYTES]);
         std::fs::write(&path, &future).unwrap();
         assert_eq!(
             CommittedFloorFile::open(&path).floor(),
@@ -395,11 +476,12 @@ mod tests {
         );
     }
 
-    /// The in-place overwrite must leave exactly one clean frame even over a
-    /// file a previous life left longer — without the trailing truncation,
-    /// the next open would refuse the length and read the repair as damage.
+    /// A tail some previous life left beyond the format must not cost the
+    /// floor — the frames validate independently of the file's length — and
+    /// the next save trims it so the shape converges back to exactly two
+    /// frames.
     #[test]
-    fn a_save_over_a_damaged_longer_file_leaves_a_clean_readable_floor() {
+    fn a_tail_beyond_the_format_is_ignored_and_trimmed_by_the_next_save() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("committed-floor");
         CommittedFloorFile::open(&path).save(7).unwrap();
@@ -408,12 +490,16 @@ mod tests {
         std::fs::write(&path, &longer).unwrap();
 
         let mut file = CommittedFloorFile::open(&path);
-        assert_eq!(file.floor(), 0, "precondition: the damage reads as absent");
-        file.save(11).expect("saving over damage repairs it");
+        assert_eq!(
+            file.floor(),
+            7,
+            "trailing junk is not frame damage; the floor must survive it"
+        );
+        file.save(11).expect("saving trims the tail");
         assert_eq!(
             std::fs::read(&path).unwrap().len(),
             FILE_BYTES,
-            "the stale tail must be gone, or the next open reads this repair as damage"
+            "the stale tail must be gone after a save"
         );
         assert_eq!(CommittedFloorFile::open(&path).floor(), 11);
     }

@@ -2,16 +2,16 @@
 //! before every storage operation and during every write at every byte cut,
 //! then reopen and read the floor back.
 //!
-//! The guarantee is deliberately weaker than the journals' sweeps, and the
-//! sweep pins exactly that shape: the floor is overwritten in place, so a
-//! crash DURING a later save may tear the frame and lose a floor an earlier
-//! save had already made durable. That is the documented trade — a torn
-//! frame is detected by its checksum and reads as absent, which weakens the
-//! truncation guard to the pre-floor behaviour instead of inventing a
-//! protection boundary. What must never happen is a floor nobody saved: a
-//! floor invented from damage in the too-high direction could refuse
-//! legitimate reconciliation and exclude a valid replica from every
-//! promotion.
+//! Two properties, and the second is why the file holds two slots. A floor
+//! nobody saved must never be recovered: a floor invented from damage in
+//! the too-high direction could refuse legitimate reconciliation and
+//! exclude a valid replica from every promotion. And an ACKED floor must
+//! survive every crash, torn writes included: a save writes only the slot
+//! NOT holding the newest durable floor, so the frame a crash tears was
+//! never the one protecting anything — the crash that tears a frame is
+//! exactly the restart the floor exists to arm the guard for, which is why
+//! detect-and-degrade-to-absent (the first cut of this file) was not
+//! enough.
 
 use std::path::Path;
 use vtop_broker::committed_floor::CommittedFloorFile;
@@ -93,9 +93,10 @@ fn a_floor_write_interrupted_at_every_boundary_reads_as_old_value_or_absent_neve
     }
 
     // Crash DURING every write, at every byte cut: the torn-frame case the
-    // checksum exists for. Here an acked floor CAN degrade to absent — the
-    // in-place trade — but the recovered value must still be a floor some
-    // save attempted, never a fabrication.
+    // slots exist for. The torn bytes can only have landed in the slot
+    // being written — never the one holding the newest acked floor — so the
+    // recovery must be AT LEAST that acked floor, and still never a
+    // fabrication.
     for entry in trace
         .iter()
         .filter(|entry| entry.kind == TraceKind::HandleWrite)
@@ -112,12 +113,20 @@ fn a_floor_write_interrupted_at_every_boundary_reads_as_old_value_or_absent_neve
                 op: entry.index,
                 byte_cut: cut,
             });
-            let _ = run_workload(&env);
+            let acked = run_workload(&env);
             assert!(sim.has_crashed(), "{context}");
             sim.reboot();
 
             let floor = CommittedFloorFile::open_in(&env, FLOOR_PATH).floor();
             assert_floor_was_actually_saved(floor, &context);
+            assert!(
+                floor >= acked.last().copied().unwrap_or(0),
+                "the torn write landed in the slot being written, never the one holding \
+                 the acked floor {} — recovering {floor} means the crash took protection \
+                 with it, which is the single-frame failure the two slots exist to close \
+                 ({context})",
+                acked.last().copied().unwrap_or(0)
+            );
         }
     }
 }
