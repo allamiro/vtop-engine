@@ -166,6 +166,12 @@ await_peer_dns() { # namespace
     unprobed=""
     unaddressed=""
     for name in 0 1 2; do
+      # Re-checked inside the round too (review): with every remote call
+      # hanging, one full round costs ~105s of bounded timeouts, and a
+      # deadline probed only between rounds would overrun its own claim by
+      # most of a round. Past the deadline the round stops where it stands
+      # — at most one bounded probe late.
+      [ "$SECONDS" -lt "$gate_deadline" ] || break
       want="$(timeout 15 kubectl -n "$peer_ns" get pod "${REL}-${name}" \
         -o jsonpath='{.status.podIP}' 2>/dev/null || true)"
       if [ -z "$want" ]; then
@@ -175,6 +181,7 @@ await_peer_dns() { # namespace
       peer_fqdn="${REL}-${name}.${HEADLESS}.${peer_ns}.svc.${DOMAIN}"
       for probe in 0 1 2; do
         [ "$probe" = "$name" ] && continue
+        [ "$SECONDS" -lt "$gate_deadline" ] || break
         answer="$(timeout 15 kubectl -n "$peer_ns" exec "${REL}-${probe}" -- \
           sh -c "timeout 10 getent hosts ${peer_fqdn} || echo miss:\$?" 2>/dev/null || true)"
         case "$answer" in
@@ -199,9 +206,20 @@ await_peer_dns() { # namespace
   done
   # Self-diagnosing on failure, per #324's rule: each list under its own
   # name, plus the two components that could be responsible, so a CI
-  # recurrence carries its own evidence instead of a bare timeout.
-  kubectl -n "$peer_ns" get endpointslices 2>/dev/null || true
-  kubectl -n kube-system get pods -l k8s-app=kube-dns 2>/dev/null || true
+  # recurrence carries its own evidence instead of a bare timeout. The dumps
+  # ride the same bound as the probes — kubectl's own --request-timeout
+  # defaults to never, and a diagnostic that hangs eats the attribution it
+  # exists to print (review).
+  timeout 15 kubectl -n "$peer_ns" get endpointslices 2>/dev/null || true
+  timeout 15 kubectl -n kube-system get pods -l k8s-app=kube-dns 2>/dev/null || true
+  # No failed lookup means NO DNS VERDICT (review): if everything that ran
+  # resolved correctly, blaming DNS would accuse the one component that was
+  # observed working. The bare-DNS message speaks only when a lookup failed.
+  [ -n "$unresolved" ] || fail "peer DNS in ${peer_ns} could not be OBSERVED before the gate's \
+deadline: every lookup that completed resolved correctly, so this is an API or scheduling \
+verdict, not a DNS one (#416):\
+${unaddressed:+ targets with no podIP:${unaddressed};}\
+${unprobed:+ probes that never completed:${unprobed};}"
   fail "headless DNS never settled in ${peer_ns} within its deadline (#416):\
 ${unresolved:+ unresolved lookups:${unresolved};}\
 ${unaddressed:+ targets with no podIP — not scheduled/started, or the query failed:${unaddressed};}\
