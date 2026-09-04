@@ -165,13 +165,19 @@ await_peer_dns() { # namespace
     unresolved=""
     unprobed=""
     unaddressed=""
+    # Success needs a COMPLETE round (review): the mid-round deadline breaks
+    # below leave the lists exactly as far as the round got, and empty lists
+    # from a round that skipped its remaining probes are absence of
+    # evidence, not evidence — a gate that returned 0 there would wave
+    # through the very failure it was still measuring.
+    round_complete=1
     for name in 0 1 2; do
       # Re-checked inside the round too (review): with every remote call
       # hanging, one full round costs ~105s of bounded timeouts, and a
       # deadline probed only between rounds would overrun its own claim by
       # most of a round. Past the deadline the round stops where it stands
       # — at most one bounded probe late.
-      [ "$SECONDS" -lt "$gate_deadline" ] || break
+      [ "$SECONDS" -lt "$gate_deadline" ] || { round_complete=0; break; }
       want="$(timeout 15 kubectl -n "$peer_ns" get pod "${REL}-${name}" \
         -o jsonpath='{.status.podIP}' 2>/dev/null || true)"
       if [ -z "$want" ]; then
@@ -181,7 +187,7 @@ await_peer_dns() { # namespace
       peer_fqdn="${REL}-${name}.${HEADLESS}.${peer_ns}.svc.${DOMAIN}"
       for probe in 0 1 2; do
         [ "$probe" = "$name" ] && continue
-        [ "$SECONDS" -lt "$gate_deadline" ] || break
+        [ "$SECONDS" -lt "$gate_deadline" ] || { round_complete=0; break; }
         answer="$(timeout 15 kubectl -n "$peer_ns" exec "${REL}-${probe}" -- \
           sh -c "timeout 10 getent hosts ${peer_fqdn} || echo miss:\$?" 2>/dev/null || true)"
         case "$answer" in
@@ -201,7 +207,7 @@ await_peer_dns() { # namespace
         esac
       done
     done
-    [ -z "${unresolved}${unprobed}${unaddressed}" ] && return 0
+    [ "$round_complete" = 1 ] && [ -z "${unresolved}${unprobed}${unaddressed}" ] && return 0
     sleep 2
   done
   # Self-diagnosing on failure, per #324's rule: each list under its own
