@@ -144,11 +144,14 @@ docker compose -f benchmarks/docker-compose.benchmark.yml down -v
 or delete a single run — every run namespaces its objects under its `run_id`.
 The compose stack's `mc` alias lives only inside the ephemeral init
 container, so point one at the published port first, with the same
-`MINIO_ROOT_*` overrides the stack itself honors (#81) — if yours live in
-`benchmarks/.env` rather than the shell, export them from there first
-(`set -a; . benchmarks/.env; set +a`), because `${VAR:-default}` below
-reads only the shell. The bucket is whatever the scenario filed
-(`vtop-bench-soak` for the soak):
+`MINIO_ROOT_*` overrides the stack itself honors (#81). `${VAR:-default}`
+below reads only the shell — if your overrides live in `benchmarks/.env`,
+read the two values out and plug them in (`grep -E
+'^MINIO_ROOT_(USER|PASSWORD)=' benchmarks/.env`); `.env` is compose DATA,
+not shell code, so it is parsed, never sourced — the same rule the smoke
+scripts follow, and sourcing would also let a filed value clobber an
+exported one, inverting compose's shell-wins precedence. The bucket is
+whatever the scenario filed (`vtop-bench-soak` for the soak):
 
 ```bash
 mc alias set local http://localhost:9000 \

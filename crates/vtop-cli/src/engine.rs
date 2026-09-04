@@ -108,6 +108,12 @@ pub enum VerifyStep {
     Finished(BatchOutcome),
 }
 
+/// Per-bucket provisioning cells; see [`Pipeline::provisioned_buckets`].
+/// The outer sync mutex is held only to fetch a bucket's cell, never across
+/// the network call the cell serializes.
+pub type ProvisionedBuckets =
+    Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::OnceCell<()>>>>>;
+
 /// Borrowed context shared by every pipeline step.
 pub struct Pipeline<'a> {
     pub store: &'a dyn StateStore,
@@ -119,16 +125,16 @@ pub struct Pipeline<'a> {
     /// (#135). Owned by [`Engine`] and shared into every pipeline so the
     /// check runs once per bucket per process, not per batch.
     pub versioned_buckets: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
-    /// Buckets already provisioned via `ensure_bucket` when
+    /// Per-bucket provisioning cells for `ensure_bucket` when
     /// `upload.create_bucket` is set. Owned by [`Engine`] and shared into
     /// every pipeline, like `versioned_buckets`, so provisioning runs once
     /// per bucket per process, not per batch (#102). Per bucket rather than
-    /// at startup because the bucket name is templated per batch. An ASYNC
-    /// mutex, unlike its neighbour, because the guard is deliberately held
-    /// across the `ensure_bucket` await: concurrent first batches through
-    /// `buffer_unordered` would otherwise all observe the bucket absent and
-    /// issue width-many CreateBucket calls at once.
-    pub provisioned_buckets: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    /// at startup because the bucket name is templated per batch. Keyed
+    /// cells rather than one guard because both failure modes are real:
+    /// concurrent first batches for ONE bucket must not issue width-many
+    /// CreateBucket calls, and first batches for DIFFERENT buckets must not
+    /// wait on each other's network round trip.
+    pub provisioned_buckets: ProvisionedBuckets,
 }
 
 impl<'a> Pipeline<'a> {
@@ -428,19 +434,24 @@ impl<'a> Pipeline<'a> {
         // the versioning preflight below: uncached, every batch of a soak paid
         // a live CreateBucket round trip against the very store whose
         // absorption capacity was being measured, visible only inside
-        // `total_ms` (#102). The guard is held across the await on purpose —
-        // a check-then-insert released around it let every concurrent first
-        // batch observe the bucket absent and provision it again — and a
-        // bucket is inserted only after `ensure_bucket` succeeds, so a
-        // transient provisioning failure is retried on the next batch (the
-        // guard drops with the early return) instead of latched as done.
+        // `total_ms` (#102). The in-flight state is keyed per bucket: batches
+        // racing for the SAME bucket serialize on its cell (a check released
+        // around the await let every concurrent first batch observe the
+        // bucket absent and provision it again), while distinct buckets
+        // provision concurrently — the registry lock is held only to fetch
+        // the cell, never across the network call. A failed init leaves the
+        // cell empty, so a transient provisioning failure is retried on the
+        // next batch instead of latched as done.
         if self.config.upload.create_bucket {
-            let mut provisioned = self.provisioned_buckets.lock().await;
-            if !provisioned.contains(&bucket) {
-                if let Err(e) = self.backend.ensure_bucket(&bucket).await {
-                    fail!(format!("ensure_bucket {bucket} failed: {e}"));
-                }
-                provisioned.insert(bucket.clone());
+            let cell = {
+                let mut registry = self.provisioned_buckets.lock().unwrap();
+                std::sync::Arc::clone(registry.entry(bucket.clone()).or_default())
+            };
+            if let Err(e) = cell
+                .get_or_try_init(|| async { self.backend.ensure_bucket(&bucket).await })
+                .await
+            {
+                fail!(format!("ensure_bucket {bucket} failed: {e}"));
             }
         }
 
@@ -924,9 +935,9 @@ pub struct Engine {
     /// Process-wide hardened-profile preflight cache (#135); see
     /// [`Pipeline::versioned_buckets`].
     versioned_buckets: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
-    /// Process-wide bucket-provisioning cache (#102); see
+    /// Process-wide bucket-provisioning cells (#102); see
     /// [`Pipeline::provisioned_buckets`].
-    provisioned_buckets: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    provisioned_buckets: ProvisionedBuckets,
     /// Per-source accumulation buffers, keyed by `(source_type, source_name)`.
     pending: HashMap<(SourceType, String), PendingBuffer>,
     /// Set by a read cycle that returned any records; drives the adaptive

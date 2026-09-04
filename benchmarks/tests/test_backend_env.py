@@ -224,3 +224,7 @@ def test_a_malformed_endpoint_is_not_the_lab_and_does_not_crash(
         "an endpoint the parser cannot even read is nobody's lab: injecting "
         "credentials for it would only mask the real configuration error"
     )
+    assert env["VTOP_S3_ENDPOINT_URL"] == "http://localhost:not-a-port", (
+        "the broken endpoint must still reach the engine: the configuration "
+        "error is the engine's to report, and dropping it here would hide it"
+    )
