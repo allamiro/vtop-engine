@@ -562,6 +562,16 @@ async fn run_follower(
     // same range id the follower was constructed for, not a second reading of
     // the config.
     let watched_range_id = range.range_id;
+    // The truncation guard's durable floor (#240): the highest cluster HWM
+    // this replica observed, clamped to its own durability when it was
+    // observed. Read BEFORE the follower is built so the guard is armed from
+    // the first fence after a restart — the in-memory cell alone re-arms
+    // only after the lease watcher adopts the current epoch and the next HWM
+    // frame lands, which is precisely the window a new leader's
+    // fence-and-reconcile arrives in.
+    let committed_floor = vtop_broker::committed_floor::CommittedFloorFile::open(
+        config.data_dir.join("committed-floor"),
+    );
     let follower = Arc::new(
         InProcessFollower::new(
             config.node_uuid,
@@ -570,7 +580,7 @@ async fn run_follower(
             range,
             config.fencing_epoch,
             meta,
-            ClusterCommittedOffset::new(0),
+            ClusterCommittedOffset::new(committed_floor.floor()),
         )
         .map_err(|error| error.to_string())?,
     );
@@ -584,6 +594,7 @@ async fn run_follower(
         )
         .map_err(|error| error.to_string())?,
     );
+    follower.set_committed_floor(committed_floor);
     if let Some(retention) = &config.retention {
         // Followers reclaim by their own policy exactly as they roll at
         // their own bound: the leader replicates offsets, not files (#290).
@@ -1325,6 +1336,14 @@ async fn run_candidate(
     // --- phases -------------------------------------------------------------
     let build_follower =
         |set: SegmentSet, epochs: ProducerEpochJournal| -> Result<Arc<InProcessFollower>, String> {
+            // Reopened on every role flip, deliberately: the leading phase's
+            // broker holds its own committed cell — untouched by #240's
+            // floor, see `vtop_broker::committed_floor` — so this file is
+            // the only continuity the truncation guard has across a
+            // demotion. Reopening is one read of a 52-byte file.
+            let committed_floor = vtop_broker::committed_floor::CommittedFloorFile::open(
+                config.data_dir.join("committed-floor"),
+            );
             let follower = Arc::new(
                 InProcessFollower::new(
                     config.node_uuid,
@@ -1333,7 +1352,7 @@ async fn run_candidate(
                     range.clone(),
                     config.fencing_epoch,
                     meta.clone(),
-                    ClusterCommittedOffset::new(0),
+                    ClusterCommittedOffset::new(committed_floor.floor()),
                 )
                 .map_err(|error| error.to_string())?,
             );
@@ -1343,6 +1362,7 @@ async fn run_candidate(
                 )
                 .map_err(|error| error.to_string())?,
             );
+            follower.set_committed_floor(committed_floor);
             if let Some(retention) = &config.retention {
                 follower.set_retention(Some(vtop_log::RetentionPolicy {
                     max_total_bytes: retention.max_total_bytes,

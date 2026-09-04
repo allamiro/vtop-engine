@@ -176,6 +176,11 @@ pub struct InProcessFollower {
     meta_fencing_epoch: MetaFencingEpoch,
     segment_format: SegmentFormat,
     cluster_committed: ClusterCommittedOffset,
+    /// Durable shadow of `cluster_committed` (#240): read at open to seed the
+    /// cell, advanced at the commit barrier. `None` for harnesses that never
+    /// attach one — absent means the guard starts at zero, the pre-floor
+    /// behaviour every older test pins.
+    committed_floor: Mutex<Option<crate::committed_floor::CommittedFloorFile>>,
     /// Sealed-prefix retention bound in bytes; 0 = disabled (#290).
     retention_max_total_bytes: std::sync::atomic::AtomicU64,
     state: Mutex<FollowerState>,
@@ -248,6 +253,7 @@ impl InProcessFollower {
             meta_fencing_epoch,
             segment_format,
             cluster_committed,
+            committed_floor: Mutex::new(None),
             retention_max_total_bytes: std::sync::atomic::AtomicU64::new(0),
             state: Mutex::new(FollowerState {
                 segment,
@@ -336,6 +342,24 @@ impl InProcessFollower {
         }
     }
 
+    /// Durably commit the tail's boundary for an orderly shutdown (#280).
+    /// Same contract as [`crate::LocalBroker::quiesce`]: loses nothing if
+    /// skipped, spares the next open a torn-tail truncation. Also the
+    /// floor's final persist (#240): `observe_hwm` does no I/O, so the HWM
+    /// frames that arrive after the last committed append would otherwise be
+    /// exactly the lag the next restart starts with.
+    pub fn quiesce(&self) -> BrokerResult<u64> {
+        let committed = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.segment.commit().map_err(BrokerError::from)?
+        };
+        self.persist_committed_floor();
+        Ok(committed)
+    }
+
     /// Install the durable epoch→offset vector for this replica (#240).
     ///
     /// Seeds the held epoch only when both the vector and the log are empty;
@@ -343,17 +367,6 @@ impl InProcessFollower {
     /// that already holds records must report "unknown" instead. Also completes
     /// a truncation interrupted by a crash, per
     /// [`crate::LocalBroker::attach_epoch_journal_to_log`].
-    /// Durably commit the tail's boundary for an orderly shutdown (#280).
-    /// Same contract as [`crate::LocalBroker::quiesce`]: loses nothing if
-    /// skipped, spares the next open a torn-tail truncation.
-    pub fn quiesce(&self) -> BrokerResult<u64> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.segment.commit().map_err(BrokerError::from)
-    }
-
     pub fn set_fencing_epoch_journal(
         &self,
         mut journal: crate::fencing_epochs::FencingEpochJournal,
@@ -377,6 +390,57 @@ impl InProcessFollower {
             .fencing_epoch_journal
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(journal);
+    }
+
+    /// Attach the durable floor beneath `cluster_committed` (#240).
+    ///
+    /// Injected after construction like the fencing-epoch journal: the
+    /// deterministic harness builds followers with no disk at all, and the
+    /// wiring that has a data directory is the wiring that can supply the
+    /// file. Seeding the CELL from the file is deliberately the constructor's
+    /// job — `ClusterCommittedOffset::new(file.floor())` — not this setter's:
+    /// the cell is shared state a caller may already have cloned, and a
+    /// setter that silently advanced it would move a value other components
+    /// were told was theirs to observe.
+    pub fn set_committed_floor(&self, file: crate::committed_floor::CommittedFloorFile) {
+        *self
+            .committed_floor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(file);
+    }
+
+    /// Make the guard's floor durable when it advanced (#240); a no-op when
+    /// no file was attached.
+    ///
+    /// Called only where a durability barrier already exists — after a
+    /// committed append, single or batch, and from [`Self::quiesce`] — and
+    /// deliberately NOT from [`Self::observe_hwm`], which runs in the
+    /// per-connection dispatch loop that also carries append frames and must
+    /// stay I/O-free. The durable floor therefore lags the cell by at most
+    /// one append batch plus the quiet tail before quiesce. That lag is safe
+    /// by the asymmetry [`crate::committed_floor`] states: a floor too low
+    /// only weakens the guard toward the pre-floor behaviour; it never
+    /// blocks legitimate work.
+    ///
+    /// A failed write is reported ONCE and persistence stops: the floor is
+    /// protection, not a liveness dependency, and failing the append path
+    /// over it would convert a damaged sidecar into an outage.
+    fn persist_committed_floor(&self) {
+        let floor = self.cluster_committed.get();
+        let mut guard = self
+            .committed_floor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(file) = guard.as_mut() else {
+            return;
+        };
+        if let Err(problem) = file.save(floor) {
+            eprintln!(
+                "committed-floor persist failed; the in-memory guard keeps serving and the \
+                 durable floor stops advancing until the next open: {problem}"
+            );
+            *guard = None;
+        }
     }
 
     /// Discard every record at or above `offset` and drop the epoch entries
@@ -883,9 +947,12 @@ impl InProcessFollower {
             Ok(_) => {
                 // Not under an fsync hold: the branch above already refused
                 // to roll there, and retention deletes files, which is even
-                // less compatible with "held bytes die with a crash".
+                // less compatible with "held bytes die with a crash". The
+                // floor persist rides the same condition — this append was a
+                // durability barrier, held bytes were not.
                 if !self.hold_fsync() {
                     self.run_retention(&mut state.segment);
+                    self.persist_committed_floor();
                 }
                 Ok(ReplicaAppendResponse {
                     local_committed_offset: state.segment.committed_offset(),
@@ -1037,8 +1104,11 @@ impl InProcessFollower {
         match state.segment.commit() {
             Ok(local_committed_offset) => {
                 // One pass per batch, after the commit, and never under an
-                // fsync hold — the hold path returned above (#290).
+                // fsync hold — the hold path returned above (#290). The floor
+                // persist piggybacks here too (#240): one write per batch at
+                // a barrier that already fsynced, and only when it advanced.
                 self.run_retention(&mut state.segment);
+                self.persist_committed_floor();
                 Ok(ReplicaAppendResponse {
                     local_committed_offset,
                 })

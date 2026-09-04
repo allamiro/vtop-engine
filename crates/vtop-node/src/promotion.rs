@@ -265,7 +265,9 @@ pub fn establish(probes: &[ReplicaProbe], replication_factor: usize, leader_id: 
     // leadership line contains them, and any suffix a voter loses to
     // `DivergesAt` was written under a superseded line and never
     // acknowledged. The truncation-below-HWM guard stays as the last
-    // resort for histories that predate the restriction; making the
+    // resort for histories that predate the restriction — and it now
+    // survives restarts, seeded from the follower's persisted
+    // `committed-floor` instead of rebuilt at zero; making the
     // property local rather than inductive — a fence that votes before it
     // reconciles — is a protocol reordering that belongs to #240's
     // remaining design conversation, not to this gate.
