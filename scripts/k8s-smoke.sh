@@ -125,6 +125,42 @@ whether the StatefulSet created anything is unknown"
   fail "namespace $1 never produced $2 pod(s) in 120s; the StatefulSet did not create them"
 }
 
+# The kube-DNS readiness gate (#416). Pod readiness proves a pod can serve;
+# it proves nothing about whether that pod's PEERS can spell its name. Three
+# CI failures in one day showed both shapes the gap takes on kind: headless
+# names that never resolve before readiness (a rejoin that times out), and a
+# Ready pod whose record its peers still cannot look up — replication to it
+# silently stalls at whatever it last applied, and the verify downstream
+# blames the replica. So every readiness wait for this release is followed by
+# this gate, which asks the only authority that matters — glibc inside each
+# pod, through the same resolv.conf the node process resolves with — and asks
+# EVERY pod about EVERY peer, because the record one pod's query finds says
+# nothing about the cache another pod's query lands on.
+await_peer_dns() { # namespace
+  peer_ns="$1"
+  unresolved=""
+  for _ in $(seq 1 60); do
+    unresolved=""
+    for probe in 0 1 2; do
+      for name in 0 1 2; do
+        [ "$probe" = "$name" ] && continue
+        kubectl -n "$peer_ns" exec "${REL}-${probe}" -- \
+          getent hosts "${REL}-${name}.${HEADLESS}.${peer_ns}.svc.${DOMAIN}" \
+          >/dev/null 2>&1 \
+          || unresolved="$unresolved ${REL}-${probe}->${REL}-${name}"
+      done
+    done
+    [ -z "$unresolved" ] && return 0
+    sleep 2
+  done
+  # Self-diagnosing on failure, per #324's rule: name the lookups that never
+  # answered and show the two components that could be responsible, so a CI
+  # recurrence carries its own evidence instead of a bare timeout.
+  kubectl -n "$peer_ns" get endpointslices 2>/dev/null || true
+  kubectl -n kube-system get pods -l k8s-app=kube-dns 2>/dev/null || true
+  fail "headless DNS never settled in ${peer_ns}: still unresolved after 60 attempts:${unresolved} (#416)"
+}
+
 # ---------------------------------------------------------------------------
 # Identities. The chart refuses to render without them by design (#81), so a
 # smoke test has to mint a real CA and per-ordinal leaves with the CNs and SANs
@@ -196,6 +232,9 @@ kubectl -n "$NS" wait --for=condition=ready pod -l "app.kubernetes.io/instance=$
     fail "pods never became Ready"
   }
 log "all pods Ready"
+log "gating on headless DNS: every pod must resolve every peer (#416)"
+await_peer_dns "$NS"
+log "peer DNS settled"
 
 # ---------------------------------------------------------------------------
 log "bootstrapping the metadata Raft group"
@@ -688,6 +727,9 @@ kubectl -n "$REPLICATED_NS" wait --for=condition=ready pod -l "app.kubernetes.io
     for o in 0 1 2; do echo "--- ${REL}-$o ---"; kubectl -n "$REPLICATED_NS" logs "${REL}-$o" --tail=30 || true; done
     fail "the replicated range never became Ready"
   }
+log "gating on the replicated range's headless DNS (#416)"
+await_peer_dns "$REPLICATED_NS"
+log "replicated peer DNS settled"
 
 # WHICH POD HOLDS THE RANGE IS AN ELECTION'S OUTCOME, NOT A RENDERED FACT.
 # The chart used to freeze the leader at ordinal 0, so this test could aim
@@ -990,6 +1032,14 @@ nothing is known about the recreated pod"
   fi
 }
 log "the deleted pod rejoined; all three replicas are Ready again"
+
+# The second gate is the one occurrence three taught: the recreated pod was
+# Ready, but its peers could not resolve its NEW record, so replication to it
+# stalled and the convergence check below blamed the replica. Readiness and
+# resolvability move independently across a pod recreation — gate on both.
+log "gating on post-failover headless DNS: peers must resolve the recreated pod (#416)"
+await_peer_dns "$REPLICATED_NS"
+log "post-failover peer DNS settled"
 
 # Every replica — INCLUDING the recreated pod — converges on the full total:
 # the 60 pre-delete records survived the failover, the 30 post-failover
