@@ -952,6 +952,13 @@ pub trait ReplicaObservation: Send + Sync {
     /// Whether this replica currently SERVES the range. The installed role
     /// object is the answer: a broker leads, a follower does not.
     fn is_leading(&self) -> bool;
+    /// Whether a leading role is still waiting for its boundary marker to
+    /// be quorum-acknowledged (#240): fetch is refused meanwhile, and the
+    /// cluster high-water mark may read the older durable floor. A role
+    /// that does not lead has nothing pending.
+    fn boundary_pending(&self) -> bool {
+        false
+    }
 
     /// Everything the authorization gauges are derived from, AS ONE
     /// OBSERVATION. `None` means no role owns the range right now.
@@ -1012,6 +1019,10 @@ impl ReplicaObservation for LocalBroker {
 
     fn is_leading(&self) -> bool {
         true
+    }
+
+    fn boundary_pending(&self) -> bool {
+        LocalBroker::boundary_pending(self)
     }
 }
 
@@ -1077,6 +1088,7 @@ pub struct CandidateCollector {
     meta_fencing_epoch: IntGaugeVec,
     lease_active: IntGaugeVec,
     leading: IntGaugeVec,
+    boundary_pending: IntGaugeVec,
     /// Serializes refresh-plus-collect (#411 review): the coherent-pair
     /// guarantee on `leading`/`lease_active` holds within one refresh, but
     /// two concurrent scrapes could interleave their gauge writes between
@@ -1134,6 +1146,14 @@ impl CandidateCollector {
                  currently fenced, and refusing writes",
                 &["topic", "range"],
             )?,
+            boundary_pending: gauge_vec(
+                "broker_boundary_pending",
+                "1 while a leading candidate's boundary marker for the current epoch is not \
+                 yet quorum-acknowledged (#240): fetch is refused meanwhile, and the \
+                 cluster high-water mark may still read the older durable floor. Read it \
+                 beside broker_candidate_leading — 0 on a replica that does not lead.",
+                &["topic", "range"],
+            )?,
             scrape: std::sync::Mutex::new(()),
         })
     }
@@ -1147,6 +1167,7 @@ impl CandidateCollector {
             &self.meta_fencing_epoch,
             &self.lease_active,
             &self.leading,
+            &self.boundary_pending,
         ]
     }
 
@@ -1232,6 +1253,14 @@ impl CandidateCollector {
                 // which reads as a replica that lost its history.
             }
         }
+        // Knowledge, always: a role that leads answers from its gate, and a
+        // role that does not — or no role at all — has nothing pending. So
+        // an operator reading a cluster HWM below the durable floor can tell
+        // a pending proof from a regression on the candidate topology, where
+        // the marker gating actually happens (review).
+        self.boundary_pending
+            .with_label_values(&range)
+            .set(i64::from(self.view.boundary_pending()));
     }
 }
 
@@ -1863,6 +1892,69 @@ mod tests {
             text.lines()
                 .any(|line| line.starts_with("vtop_broker_lease_active{") && line.ends_with(" 1")),
             "the one observation must still drive the gauges: {text}"
+        );
+    }
+
+    /// The boundary gate is exported on the candidate topology, where the
+    /// marker gating actually happens (#240, review): 1 while a leading
+    /// role's marker is pending, 0 the moment it is acknowledged — written
+    /// on every scrape, so an operator reading a cluster high-water mark
+    /// below the durable floor can tell a pending proof from a regression.
+    #[test]
+    fn a_candidate_exports_its_pending_boundary_marker() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Gated {
+            pending: AtomicBool,
+        }
+        impl ReplicaObservation for Gated {
+            fn try_local_offsets(&self) -> Option<(u64, u64)> {
+                Some((9, 9))
+            }
+            fn cluster_committed_offset(&self) -> Option<u64> {
+                Some(5)
+            }
+            fn try_meta_fencing_epoch(&self) -> Option<(u64, bool)> {
+                Some((2, true))
+            }
+            fn held_fencing_epoch(&self) -> u64 {
+                2
+            }
+            fn is_leading(&self) -> bool {
+                true
+            }
+            fn boundary_pending(&self) -> bool {
+                self.pending.load(Ordering::SeqCst)
+            }
+        }
+
+        let range = test_range();
+        let view = Arc::new(Gated {
+            pending: AtomicBool::new(true),
+        });
+        let registry = Registry::new_custom(Some("vtop".into()), None).unwrap();
+        registry
+            .register(Box::new(
+                CandidateCollector::new(Arc::clone(&view) as Arc<dyn ReplicaObservation>, &range)
+                    .unwrap(),
+            ))
+            .unwrap();
+        let pending_line = |text: &str| {
+            text.lines()
+                .find(|line| line.starts_with("vtop_broker_boundary_pending{"))
+                .map(str::to_owned)
+        };
+        let text = scrape(&registry);
+        assert!(
+            pending_line(&text).is_some_and(|line| line.ends_with(" 1")),
+            "a leading candidate whose marker is pending must say so under the same name \
+             the leader's collector uses: {text}"
+        );
+        view.pending.store(false, Ordering::SeqCst);
+        let text = scrape(&registry);
+        assert!(
+            pending_line(&text).is_some_and(|line| line.ends_with(" 0")),
+            "acknowledged on the very next scrape: {text}"
         );
     }
 

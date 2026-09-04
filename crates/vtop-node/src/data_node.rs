@@ -1034,10 +1034,18 @@ async fn run_leader(
                 // leader as fenced forever — draining the one process that is
                 // actually authorized to serve.
                 let held = probe_broker.held_fencing_epoch();
-                let ready = live && epoch == held;
+                // And not while the boundary marker is pending (#240): a
+                // leader that refuses every fetch is not ready to serve.
+                let pending = probe_broker.boundary_pending();
+                let ready = live && epoch == held && !pending;
                 last_ready.store(ready, std::sync::atomic::Ordering::Relaxed);
                 if ready {
                     vtop_observe::Readiness::Ready
+                } else if live && epoch == held {
+                    vtop_observe::Readiness::not_ready(format!(
+                        "leading at epoch {held}, but the boundary marker is not yet \
+                         quorum-acknowledged; fetch is refused until it is"
+                    ))
                 } else if live {
                     vtop_observe::Readiness::not_ready(format!(
                         "metadata lease moved to epoch {epoch}; this leaseholder is fenced at {held}"
@@ -1414,10 +1422,22 @@ async fn run_candidate(
             1 => match probe_slot.current() {
                 Some(broker) => match probe_meta.try_snapshot() {
                     Some((epoch, live)) => {
-                        let ready = live && epoch == broker.held_fencing_epoch();
+                        let held = broker.held_fencing_epoch();
+                        // A leader whose boundary marker is still pending
+                        // refuses every fetch (#240): advertising it as
+                        // ready would route consumers to the one process
+                        // guaranteed to turn them away. The gate is an
+                        // atomic, read without contention.
+                        let pending = broker.boundary_pending();
+                        let ready = live && epoch == held && !pending;
                         probe_last_probe.store(ready, std::sync::atomic::Ordering::Relaxed);
                         if ready {
                             vtop_observe::Readiness::Ready
+                        } else if live && epoch == held {
+                            vtop_observe::Readiness::not_ready(format!(
+                                "leading at epoch {held}, but the boundary marker is not yet \
+                                 quorum-acknowledged; fetch is refused until it is"
+                            ))
                         } else {
                             vtop_observe::Readiness::not_ready(
                                 "leading, but the lease view is not live at the held epoch"
@@ -2588,6 +2608,14 @@ impl crate::observe::ReplicaObservation for SwitchingLocalView {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
             .is_some_and(|view| view.is_leading())
+    }
+
+    fn boundary_pending(&self) -> bool {
+        self.delegate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|view| view.boundary_pending())
     }
 
     /// ONE acquisition for the whole reading, which is the point of it
