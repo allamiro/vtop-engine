@@ -1683,8 +1683,10 @@ impl LeaseAgent {
         let admin = Arc::clone(&self.admin);
         let (topic_uuid, range_uuid, node_uuid) =
             (self.topic_uuid, self.range_uuid, self.node_uuid);
-        // Well inside one renew interval, so even the last attempt of the
-        // last retry cannot outlive the next renewal decision.
+        // Each ATTEMPT is bounded well inside one renew interval; the task as
+        // a whole may outlive several renewals (five attempts plus backoff
+        // is up to ~13s at the default cadence), and that is fine precisely
+        // because it is detached — no renewal ever waits on it (review).
         let attempt_deadline = (self.config.renew_interval / 4)
             .clamp(Duration::from_millis(200), Duration::from_secs(2));
         tokio::spawn(async move {
