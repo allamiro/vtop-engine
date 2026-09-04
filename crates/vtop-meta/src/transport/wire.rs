@@ -805,11 +805,12 @@ pub struct AdminTransitionView {
     pub granted_at_ms: i64,
     pub granted_apply_index: u64,
     pub outcome: crate::state::TransitionOutcome,
-    /// The transition statement's MAC over the record's canonical bytes,
-    /// computed by the serving node with its configured key (#240 item 5);
-    /// `None` when the serving node has no key. Verify with
-    /// [`Self::verify_mac`] — the view rebuilds the record and re-derives
-    /// the bytes, so nothing but the key is trusted.
+    /// The transition statement's MAC over the record's key and canonical
+    /// bytes, computed by the serving node with its configured key (#240
+    /// item 5); `None` when the serving node has no key. Verify with
+    /// [`Self::verify_mac`] against the range identity the read was FOR —
+    /// the view rebuilds the record and re-derives the bytes, so nothing
+    /// but the key and the identity the reader already holds is trusted.
     pub mac: Option<[u8; 32]>,
 }
 
@@ -845,15 +846,22 @@ impl AdminTransitionView {
         }
     }
 
-    /// Whether the carried MAC is the one `key` produces over this record's
-    /// canonical bytes. `Ok(false)` for a view served without a MAC: an
-    /// unsigned statement is not a forged one, but it is not evidence a
-    /// key-holder can stand behind either.
-    pub fn verify_mac(&self, key: &[u8; 32]) -> Result<bool, CodecError> {
+    /// Whether the carried MAC is the one `key` produces over this record
+    /// as a transition OF `range_uuid` in `topic_uuid` — the identity the
+    /// reader asked for, never one carried in the reply, so a record lifted
+    /// from another range's chain fails here. `Ok(false)` for a view served
+    /// without a MAC: an unsigned statement is not a forged one, but it is
+    /// not evidence a key-holder can stand behind either.
+    pub fn verify_mac(
+        &self,
+        key: &[u8; 32],
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+    ) -> Result<bool, CodecError> {
         let Some(mac) = self.mac else {
             return Ok(false);
         };
-        Ok(self.record().mac(key)? == mac)
+        Ok(self.record().mac(key, topic_uuid, range_uuid)? == mac)
     }
 
     fn encode_into(&self, out: &mut Vec<u8>) -> Result<(), CodecError> {
@@ -1882,11 +1890,15 @@ mod tests {
     }
 
     /// The served MAC verifies against the key over the record the view
-    /// rebuilds, a different key does not, a changed field does not, and
-    /// an unsigned view verifies as nothing (#240 item 5).
+    /// rebuilds AND the range identity it was read for; a different key
+    /// does not, a changed field does not, the same record presented as
+    /// another range's does not, and an unsigned view verifies as nothing
+    /// (#240 item 5).
     #[test]
-    fn a_transition_views_mac_verifies_only_the_record_it_was_computed_over() {
+    fn a_transition_views_mac_verifies_only_the_record_and_range_it_was_computed_over() {
         let key = [0x11; 32];
+        let topic = Uuid::from_u128(0x70);
+        let range = Uuid::from_u128(0x71);
         let record = crate::state::RangeTransitionRecord {
             epoch_from: 3,
             epoch_to: 4,
@@ -1898,13 +1910,27 @@ mod tests {
             outcome: crate::state::TransitionOutcome::Pending,
         };
         let mut view = AdminTransitionView::from(record.clone());
-        assert_eq!(view.verify_mac(&key), Ok(false), "unsigned is not verified");
-        view.mac = Some(record.mac(&key).unwrap());
-        assert_eq!(view.verify_mac(&key), Ok(true));
         assert_eq!(
-            view.verify_mac(&[0x22; 32]),
+            view.verify_mac(&key, topic, range),
+            Ok(false),
+            "unsigned is not verified"
+        );
+        view.mac = Some(record.mac(&key, topic, range).unwrap());
+        assert_eq!(view.verify_mac(&key, topic, range), Ok(true));
+        assert_eq!(
+            view.verify_mac(&[0x22; 32], topic, range),
             Ok(false),
             "another key does not vouch"
+        );
+        assert_eq!(
+            view.verify_mac(&key, topic, Uuid::from_u128(0x72)),
+            Ok(false),
+            "the same signed record relabelled as another range's transition is not vouched for"
+        );
+        assert_eq!(
+            view.verify_mac(&key, Uuid::from_u128(0x73), range),
+            Ok(false),
+            "nor as another topic's"
         );
         let decoded = AdminReadRangeTransitionsResponse::decode(
             &AdminReadRangeTransitionsResponse {
@@ -1917,16 +1943,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            decoded.transitions[0].verify_mac(&key),
+            decoded.transitions[0].verify_mac(&key, topic, range),
             Ok(true),
             "survives the wire"
         );
-        let mut tampered = view;
+        let mut tampered = view.clone();
         tampered.holder_to = Uuid::from_u128(12);
         assert_eq!(
-            tampered.verify_mac(&key),
+            tampered.verify_mac(&key, topic, range),
             Ok(false),
             "a changed field is a changed record; the MAC no longer vouches"
+        );
+        let mut moved = view;
+        moved.epoch_to = 5;
+        assert_eq!(
+            moved.verify_mac(&key, topic, range),
+            Ok(false),
+            "the epoch is in the key as well as the value; moving the record along the chain \
+             changes both"
         );
     }
 

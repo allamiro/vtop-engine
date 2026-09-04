@@ -400,14 +400,39 @@ impl RangeTransitionRecord {
         MetaValue::RangeTransition(self.clone()).encode()
     }
 
+    /// The bytes the transition statement's MAC is computed over: the
+    /// record's KEY — topic, range, and the epoch it establishes — followed
+    /// by its canonical value bytes. The key is part of the statement
+    /// because a MAC over the value alone would vouch for "this transition
+    /// happened" without saying WHERE: a signed record lifted from one
+    /// range's chain would verify when presented as another range's, and
+    /// a reader checking an archived chain offline has nothing but the
+    /// MAC to tell it the record belongs to the chain it is checking.
+    pub fn signing_input(&self, topic_uuid: Uuid, range_uuid: Uuid) -> Result<Vec<u8>, CodecError> {
+        let mut input = MetaKey::RangeTransition {
+            topic_uuid,
+            range_uuid,
+            fencing_epoch: self.epoch_to,
+        }
+        .encode();
+        input.extend_from_slice(&self.canonical_bytes()?);
+        Ok(input)
+    }
+
     /// The transition statement's MAC (#240 item 5): a keyed BLAKE3 hash
-    /// over the canonical bytes, computed where the record is SERVED — never
-    /// inside `apply`, which must stay deterministic across voters whose
-    /// keys may differ. A reader holding the key and the record verifies
-    /// it without the cluster; a reader holding neither has only the
-    /// cluster's word, which is what the MAC exists to improve on.
-    pub fn mac(&self, key: &[u8; 32]) -> Result<[u8; 32], CodecError> {
-        Ok(*blake3::keyed_hash(key, &self.canonical_bytes()?).as_bytes())
+    /// over [`Self::signing_input`], computed where the record is SERVED —
+    /// never inside `apply`, which must stay deterministic across voters
+    /// whose keys may differ. A reader holding the key, the record, and
+    /// the range identity it was read for verifies it without the cluster;
+    /// a reader holding none of these has only the cluster's word, which
+    /// is what the MAC exists to improve on.
+    pub fn mac(
+        &self,
+        key: &[u8; 32],
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+    ) -> Result<[u8; 32], CodecError> {
+        Ok(*blake3::keyed_hash(key, &self.signing_input(topic_uuid, range_uuid)?).as_bytes())
     }
 }
 

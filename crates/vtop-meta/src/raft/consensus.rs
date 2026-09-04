@@ -331,13 +331,15 @@ impl AdminReadRangeTransitions for OpenraftConsensus {
             );
             let mut transitions = Vec::new();
             for record in state.range_transitions(topic_uuid, range_uuid, from_epoch, limit) {
-                // Signed HERE, at the serving path, over the canonical
-                // bytes the snapshot carries — see RangeTransitionRecord::mac
-                // for why not in apply.
+                // Signed HERE, at the serving path, over the key the read
+                // was for plus the canonical bytes the snapshot carries —
+                // see RangeTransitionRecord::mac for why not in apply.
                 let mac = match key {
-                    Some(key) => Some(record.mac(&key).map_err(|error| {
-                        ConsensusError::Message(format!("sign transition: {error}"))
-                    })?),
+                    Some(key) => {
+                        Some(record.mac(&key, topic_uuid, range_uuid).map_err(|error| {
+                            ConsensusError::Message(format!("sign transition: {error}"))
+                        })?)
+                    }
                     None => None,
                 };
                 let mut view = AdminTransitionView::from(record);
