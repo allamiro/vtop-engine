@@ -77,21 +77,35 @@
 //! majority would refuse the vote used to promote anyway and let
 //! reconciliation truncate the acknowledged record away (#240).
 //!
+//! # The boundary gates; the marker publishes
+//!
+//! The established boundary used to be published directly through the
+//! watermark's monotonic `advance_to`. It no longer is (#240 — Raft §5.4.2
+//! in its actual form): an offset agreed by counting replies about records
+//! written under EARLIER epochs is a candidate value, not a commitment, and
+//! publishing it re-created exactly the trusted-count hazard the epoch
+//! vector exists to remove. The boundary's job is to GATE the promotion —
+//! [`Promotion::LeaderBehind`] and [`Promotion::CandidateBehindVoters`]
+//! above both judge against it — while the watermark itself advances only
+//! once an entry of the NEW epoch is quorum-acked: the boundary marker the
+//! promotion publishes as soon as the view activates
+//! (`LocalBroker::publish_boundary_marker`), or the first produce,
+//! whichever lands first. Either implicitly commits the prefix, which is
+//! §5.4.2's actual rule; until then the watermark stands at the durable
+//! committed floor, which under-publishes and is safe.
+//!
 //! # Why an inherited watermark is never lowered
 //!
-//! Publishing an established boundary uses the watermark's monotonic
-//! `advance_to`, so a re-promoted broker whose in-memory watermark is already
-//! ABOVE the newly proven boundary keeps the higher value. That is deliberate.
-//! Within one process lifetime the watermark only ever advanced by quorum
-//! acknowledgement (steady state) or quorum proof (promotion), so everything
-//! below it was committed — and commitment is permanent. Rewinding it would
-//! hide records acknowledged to producers, the exact failure this module
-//! exists to prevent; a promotion probe that reaches a *different* majority
-//! (say, the slow follower after the fast one dropped out) proves a lower
-//! floor, it does not disprove the higher one. The case where the same offset
-//! names different records on different replicas is the epoch-qualification
-//! gap above, and no watermark arithmetic can paper over it — it needs
-//! KIP-101-style truncation, tracked with the rest of the recovery arc.
+//! Within one process lifetime the watermark only ever advances by quorum
+//! acknowledgement (steady state) or a quorum-acked entry of the current
+//! epoch (the marker), so everything below it was committed — and
+//! commitment is permanent. Rewinding it would hide records acknowledged
+//! to producers, the exact failure this module exists to prevent; a
+//! promotion probe that reaches a *different* majority (say, the slow
+//! follower after the fast one dropped out) proves a lower floor, it does
+//! not disprove the higher one. The case where the same offset names
+//! different records on different replicas is the epoch-qualification gap
+//! above, answered by the KIP-101 vector and its reconciliation.
 
 use std::collections::BTreeMap;
 use uuid::Uuid;

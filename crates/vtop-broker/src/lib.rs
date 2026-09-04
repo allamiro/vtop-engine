@@ -139,6 +139,18 @@ pub enum BrokerError {
     /// any storage or configuration failure.
     #[error("boundary marker: {0}")]
     BoundaryMarker(String),
+    /// The one RETRYABLE marker refusal (#240 slice 3): the quorum did not
+    /// ack yet. Its own variant so the promotion wiring can retry exactly
+    /// this — a lagging follower catches up and the republish rides the
+    /// duplicate path — without string-matching, while every other marker
+    /// refusal (fenced, v1, unreplicated) stays terminal.
+    #[error(
+        "boundary marker not quorum-acked: {follower_acks} follower ack(s), need majority of          {replication_factor} — the boundary stays unpublished until a majority holds this          epoch's tail"
+    )]
+    BoundaryMarkerUnacked {
+        follower_acks: usize,
+        replication_factor: usize,
+    },
     #[error("producer {producer_id} epoch {actual} is fenced by durable epoch {current}")]
     ProducerFenced {
         producer_id: Uuid,
@@ -986,11 +998,10 @@ impl LocalBroker {
         };
         let quorum = replicas.replicate_append_batch(&[request], leader_committed);
         if !quorum.has_quorum() {
-            return Err(BrokerError::BoundaryMarker(format!(
-                "not quorum-acked: {} follower ack(s), need majority of {} — the boundary \
-                 stays unpublished until a majority holds this epoch's tail",
-                quorum.follower_acks, quorum.replication_factor
-            )));
+            return Err(BrokerError::BoundaryMarkerUnacked {
+                follower_acks: quorum.follower_acks,
+                replication_factor: quorum.replication_factor,
+            });
         }
         // Re-validate the lease before publishing, exactly as the produce
         // path does — the quorum proved durability, not that this node still

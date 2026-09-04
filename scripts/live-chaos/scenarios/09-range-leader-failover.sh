@@ -398,6 +398,21 @@ Last refusal: $(tail -1 "$WORKDIR/logs/produce-after-failover.log")"
 done
 log "the new leader acknowledged fresh quorum writes"
 
+# THE WATERMARK NEVER REGRESSES ACROSS A TRANSITION (#240 slice 3): the
+# promoted leader publishes only on a quorum-acked entry of its OWN epoch —
+# the boundary marker its promotion fires, or the produce that just
+# succeeded, whichever landed first — never on the probe's arithmetic
+# alone. By this point one of those own-epoch entries has provably
+# quorum-acked, so the published watermark must stand at or above every
+# offset acknowledged before the kill. Deadline-polled like every read
+# here; a regression is the §5.4.2 failure this arc exists to close.
+await_metric_at_least "$(data_metrics_addr 0)" \
+  vtop_broker_cluster_committed_offset "$ACKED" \
+  || fail "the promoted leader's published watermark never reached the pre-kill \
+acknowledged floor ($ACKED): the §5.4.2 non-regression is broken — records producers \
+were told were durable sit above what the new leadership publishes"
+log "the published watermark covers the pre-kill acknowledged floor: §5.4.2 non-regression holds"
+
 # Retried while the boundary settles; the produce above guarantees it arrives.
 #
 # Content is byte-verified through $ACKED — exactly the records the pre-kill

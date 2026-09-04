@@ -339,27 +339,141 @@ impl QuorumProbe for ReplicaPlaneProbe {
     }
 }
 
+/// How long the promotion boundary marker keeps retrying a quorum
+/// shortfall before conceding the round to the produce path (#240 slice 3).
+/// The shortfall is transient by construction — the promotion probe just
+/// heard from a quorum — so a modest budget covers a follower finishing its
+/// catch-up; past it, the first own-epoch produce quorum proves the prefix
+/// instead, and an idle range simply keeps serving at the durable floor,
+/// which under-publishes and is safe.
+const MARKER_RETRY_ATTEMPTS: u32 = 40;
+const MARKER_RETRY_PAUSE: Duration = Duration::from_millis(250);
+
+/// Publish this epoch's boundary marker until it lands or the refusal turns
+/// terminal (#240, Raft §5.4.2 in its actual form): a new leader must not
+/// trust a count over records written under earlier epochs, so the
+/// watermark advances only once an entry of ITS OWN epoch — this marker —
+/// is quorum-acked, and the prefix commits implicitly with it.
+///
+/// Runs detached on the runtime when one exists (the fan-out is bounded
+/// blocking I/O, so it rides `spawn_blocking`) and inline otherwise, which
+/// is the deterministic-test path. Only the TYPED quorum shortfall retries:
+/// republication is idempotent by construction — the marker's identity is
+/// (reserved producer, epoch, sequence zero), so a retry rides the
+/// duplicate path from the original offset. Every other refusal is
+/// terminal here: a fence means the lease moved and the next holder
+/// publishes its own marker, a v1 range keeps the pre-marker path by
+/// design, and either way the first own-epoch produce quorum still proves
+/// the prefix — §5.4.2 is satisfied by whichever own-epoch entry lands
+/// first.
+fn publish_boundary_marker_until_settled(broker: Arc<LocalBroker>, fencing_epoch: u64) {
+    if broker.cluster_committed().is_none() {
+        // The standalone boundary is the node's own log; the §5.4.2 hazard
+        // is vacuous there and the marker would only be refused by name.
+        return;
+    }
+    let attempts = move || {
+        for attempt in 0..=MARKER_RETRY_ATTEMPTS {
+            match broker.publish_boundary_marker(fencing_epoch) {
+                Ok(published) => {
+                    tracing::info!(
+                        fencing_epoch,
+                        published,
+                        "promotion boundary marker quorum-acked; the watermark now stands on \
+                         an entry of this epoch"
+                    );
+                    return;
+                }
+                Err(vtop_broker::BrokerError::BoundaryMarkerUnacked {
+                    follower_acks,
+                    replication_factor,
+                }) => {
+                    if attempt == MARKER_RETRY_ATTEMPTS {
+                        tracing::warn!(
+                            fencing_epoch,
+                            follower_acks,
+                            replication_factor,
+                            "boundary marker never reached a quorum within its retry budget; \
+                             the watermark stays at the durable floor until the first \
+                             own-epoch produce quorum proves the prefix"
+                        );
+                        return;
+                    }
+                    std::thread::sleep(MARKER_RETRY_PAUSE);
+                }
+                Err(refused) => {
+                    tracing::info!(
+                        %refused,
+                        fencing_epoch,
+                        "boundary marker publication ended without publishing; the next \
+                         own-epoch produce quorum proves the prefix instead"
+                    );
+                    return;
+                }
+            }
+        }
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn_blocking(attempts);
+        }
+        Err(_) => attempts(),
+    }
+}
+
 /// Publishes into a live broker.
 pub struct BrokerLeasePublisher {
     broker: Arc<LocalBroker>,
+    /// The newest epoch this publisher has fired the boundary marker for
+    /// (#240 slice 3). Keyed HERE, not on the broker's held epoch: a
+    /// static-epoch leader is constructed already holding its granted
+    /// epoch, so adoption never reads as new there — while every promote
+    /// call after the first, renewals included, must not re-fan a
+    /// duplicate marker append at the followers.
+    marker_published_for: std::sync::atomic::AtomicU64,
 }
 
 impl BrokerLeasePublisher {
     pub fn new(broker: Arc<LocalBroker>) -> Self {
-        Self { broker }
+        Self {
+            broker,
+            marker_published_for: std::sync::atomic::AtomicU64::new(0),
+        }
     }
 }
 
 impl LeasePublisher for BrokerLeasePublisher {
     fn promote(&self, fencing_epoch: u64, committed_offset: Option<u64>) {
-        if let (Some(offset), Some(cluster)) = (committed_offset, self.broker.cluster_committed()) {
-            cluster.advance_to(offset);
-        }
+        // THE PROBED BOUNDARY IS A CANDIDATE, NOT A PUBLICATION (#240,
+        // Raft §5.4.2): advancing the cluster watermark from the promotion
+        // probe's arithmetic was the exact forbidden move — trusting a
+        // count over records written under earlier epochs. The offset is
+        // deliberately dropped here; the watermark stays at the durable
+        // floor the cell was seeded from, which under-publishes (safe)
+        // until an entry of THIS epoch is quorum-acked. That entry is the
+        // boundary marker published right after the view activates below —
+        // or the first produce, whichever lands first; both prove the
+        // prefix implicitly, which is §5.4.2's actual rule.
+        let _ = committed_offset;
         // Both values must end up equal or the broker refuses every request.
         // The order is not a safety question — produce checks equality, so any
         // window between the two writes fails closed — but both must happen.
         self.broker.adopt_fencing_epoch(fencing_epoch);
         self.broker.meta_fencing_epoch().set(fencing_epoch);
+        // ONCE PER EPOCH — promote() also runs on every renewal, and
+        // re-firing there would fan a duplicate append to the followers
+        // every renew interval for a boundary already standing. A
+        // same-epoch reactivation after a suspension skips it too: the
+        // marker either landed on the first promote or exhausted its
+        // budget, and the produce path's own-epoch quorum covers the
+        // remainder either way.
+        if self
+            .marker_published_for
+            .fetch_max(fencing_epoch, std::sync::atomic::Ordering::SeqCst)
+            < fencing_epoch
+        {
+            publish_boundary_marker_until_settled(Arc::clone(&self.broker), fencing_epoch);
+        }
     }
 
     fn demote(&self, fencing_epoch: u64) {
@@ -1637,7 +1751,141 @@ fn duration_ms(duration: Duration) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vtop_broker::replication::{
+        ClusterCommittedOffset, InProcessFollower, InProcessReplicaSet,
+    };
+    use vtop_broker::{MetaFencingEpoch, ProducerEpochJournal};
+    use vtop_log::{ActiveSegment, KeyRange, RangeLineage, SegmentConfigV2, SegmentDescriptorV2};
     use vtop_meta::{AdminLeaseView, AdminReadRangeLeaseResponse};
+    use vtop_protocol::RangeIdentity;
+
+    /// The publisher-side pins for #240 slice 3 need the same replicated
+    /// in-process harness the marker's own tests use: a v2 leader over two
+    /// v2 followers, so a quorum exists for the marker to convince.
+    fn marker_range() -> RangeIdentity {
+        RangeIdentity {
+            topic: "events.v1".to_owned(),
+            topic_epoch: 1,
+            range_id: Uuid::from_u128(0xC1),
+            range_generation: 0,
+        }
+    }
+
+    fn marker_segment(
+        dir: &tempfile::TempDir,
+        segment_id: u128,
+        range: &RangeIdentity,
+        epoch: u64,
+    ) -> ActiveSegment {
+        ActiveSegment::create_v2(
+            dir.path().join("range.active"),
+            SegmentDescriptorV2 {
+                segment_id: Uuid::from_u128(segment_id),
+                topic: range.topic.clone(),
+                topic_epoch: range.topic_epoch,
+                lineage: RangeLineage {
+                    range_id: range.range_id,
+                    generation: range.range_generation,
+                    key_range: KeyRange::full(),
+                    parents: Vec::new(),
+                },
+                base_offset: 0,
+                segment_generation: 0,
+                creation_node_id: US,
+                creation_fencing_epoch: epoch,
+            },
+            SegmentConfigV2::default(),
+        )
+        .unwrap()
+    }
+
+    fn replicated_publisher(
+        epoch: u64,
+    ) -> (
+        Vec<tempfile::TempDir>,
+        BrokerLeasePublisher,
+        Arc<LocalBroker>,
+        ClusterCommittedOffset,
+    ) {
+        let range = marker_range();
+        let meta = MetaFencingEpoch::new(epoch);
+        let cluster = ClusterCommittedOffset::new(0);
+        let leader_dir = tempfile::tempdir().unwrap();
+        let leader_segment = marker_segment(&leader_dir, 0xD1, &range, epoch);
+        let leader_epochs = ProducerEpochJournal::open(leader_dir.path().join("epochs")).unwrap();
+        let mut dirs = vec![leader_dir];
+        let mut followers = Vec::new();
+        for (index, node) in [Uuid::from_u128(0xA2), Uuid::from_u128(0xA3)]
+            .into_iter()
+            .enumerate()
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let segment = marker_segment(&dir, 0xE1 + index as u128, &range, epoch);
+            let epochs = ProducerEpochJournal::open(dir.path().join("epochs")).unwrap();
+            followers.push(Arc::new(
+                InProcessFollower::new(
+                    node,
+                    segment,
+                    epochs,
+                    range.clone(),
+                    epoch,
+                    meta.clone(),
+                    ClusterCommittedOffset::new(0),
+                )
+                .unwrap(),
+            ));
+            dirs.push(dir);
+        }
+        let replica_set = Arc::new(InProcessReplicaSet::new(followers));
+        let broker = Arc::new(
+            LocalBroker::with_replication(
+                leader_segment,
+                leader_epochs,
+                range,
+                epoch,
+                meta,
+                US,
+                Some(cluster.clone()),
+                Some(replica_set as Arc<dyn vtop_broker::replication::ReplicaSet>),
+            )
+            .unwrap(),
+        );
+        let publisher = BrokerLeasePublisher::new(Arc::clone(&broker));
+        (dirs, publisher, broker, cluster)
+    }
+
+    /// Promotion no longer publishes the probe's arithmetic (#240, §5.4.2):
+    /// the offset handed to `promote` is a candidate the marker supersedes,
+    /// so the watermark must land on the marker's own quorum-acked end —
+    /// never on the number the probe computed.
+    #[test]
+    fn promote_publishes_through_the_marker_not_the_probe() {
+        let (_dirs, publisher, broker, cluster) = replicated_publisher(18);
+        publisher.promote(18, Some(999));
+        assert_eq!(
+            cluster.get(),
+            1,
+            "the watermark stands on the marker's end (its record at offset 0), not on \
+             the probe's 999 — publishing the probed count is the §5.4.2 hazard"
+        );
+        let (_, next_offset) = broker.local_offsets();
+        assert_eq!(next_offset, 1, "exactly one marker record was appended");
+    }
+
+    /// promote() runs on every renewal; the marker must not.
+    #[test]
+    fn a_renewal_does_not_republish_the_marker() {
+        let (_dirs, publisher, broker, cluster) = replicated_publisher(18);
+        publisher.promote(18, None);
+        publisher.promote(18, None);
+        publisher.promote(18, None);
+        let (_, next_offset) = broker.local_offsets();
+        assert_eq!(
+            next_offset, 1,
+            "adoption fires the marker once; renewals must not fan duplicate appends"
+        );
+        assert_eq!(cluster.get(), 1);
+    }
 
     const US: Uuid = Uuid::from_u128(1);
     const THEM: Uuid = Uuid::from_u128(2);

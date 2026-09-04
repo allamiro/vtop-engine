@@ -286,8 +286,9 @@ fn an_unacked_marker_leaves_the_watermark_unpublished() {
         .publish_boundary_marker(FENCING_EPOCH)
         .expect_err("no majority holds the marker, so nothing may publish");
     assert!(
-        matches!(&refused, BrokerError::BoundaryMarker(message) if message.contains("not quorum-acked")),
-        "the refusal must say the quorum failed, not something incidental: {refused}"
+        matches!(&refused, BrokerError::BoundaryMarkerUnacked { .. }),
+        "the refusal must be the TYPED quorum shortfall — it is the one refusal the \
+         promotion wiring retries: {refused}"
     );
     assert_eq!(
         h.cluster_committed.get(),
@@ -485,9 +486,9 @@ fn a_v1_follower_refuses_the_marker_so_the_quorum_fails_honestly() {
         .publish_boundary_marker(FENCING_EPOCH)
         .expect_err("no v1 follower may ack a marker it cannot hide");
     assert!(
-        matches!(&refused, BrokerError::BoundaryMarker(message) if message.contains("not quorum-acked")),
-        "the failure surfaces as a quorum shortfall, because the refusal happened at the \
-         followers: {refused}"
+        matches!(&refused, BrokerError::BoundaryMarkerUnacked { .. }),
+        "the failure surfaces as the typed quorum shortfall, because the refusal happened \
+         at the followers: {refused}"
     );
     for follower in &h.followers {
         assert_eq!(

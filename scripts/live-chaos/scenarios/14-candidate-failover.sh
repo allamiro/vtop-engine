@@ -127,6 +127,18 @@ done
 await_acked_floor "$WORKDIR/acked-after" "$BATCH"
 log "quorum produce resumed at epoch $NEW_EPOCH on candidate $NEW_LEADER's own address"
 
+# THE WATERMARK NEVER REGRESSES ACROSS A TRANSITION (#240 slice 3): a
+# promoted candidate publishes only on a quorum-acked entry of its OWN
+# epoch — the boundary marker its promotion fires, or the produce that just
+# succeeded — so by now the published watermark must stand at or above
+# every offset acknowledged before the kill. Deadline-polled; a regression
+# is the §5.4.2 failure the marker exists to close.
+await_metric_at_least "$(data_metrics_addr "$((NEW_LEADER + 10))")" \
+  vtop_broker_cluster_committed_offset "$ACKED" \
+  || fail "the promoted candidate's published watermark never reached the pre-kill \
+acknowledged floor ($ACKED): the §5.4.2 non-regression is broken"
+log "the published watermark covers the pre-kill acknowledged floor: §5.4.2 non-regression holds"
+
 # Content is verifiable only through $ACKED: the post-failover batch was
 # written under a bumped producer epoch with sequences restarting at 0, so
 # its bytes are not reconstructible from offsets — structure is still
