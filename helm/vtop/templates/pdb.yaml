@@ -1,4 +1,26 @@
 {{- if .Values.podDisruptionBudget.enabled }}
+{{- if eq (include "vtop.deploymentMode" .) "separated" }}
+{{- /* One budget PER TIER (#287): the metadata quorum and the data
+       replica set are disrupted independently, and one budget over both
+       would let a drain take a voter and a replica together while
+       reporting one unavailable. */}}
+{{- range $tier := list "meta" "data" }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "vtop.tierName" (dict "root" $ "tier" $tier) }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "vtop.labels" $ | nindent 4 }}
+    vtop.allamiro.io/tier: {{ $tier }}
+spec:
+  maxUnavailable: {{ int $.Values.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "vtop.tierSelectorLabels" (dict "root" $ "tier" $tier) | nindent 6 }}
+---
+{{- end }}
+{{- else }}
 # Quorum protection against VOLUNTARY disruption (drains, upgrades): with
 # maxUnavailable 1, a 3-voter metadata group always keeps its majority. This
 # budget cannot protect against involuntary failures — that is what the
@@ -15,4 +37,5 @@ spec:
   selector:
     matchLabels:
       {{- include "vtop.selectorLabels" . | nindent 6 }}
+{{- end }}
 {{- end }}

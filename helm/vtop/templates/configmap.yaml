@@ -3,6 +3,10 @@
 # an initContainer) keeps every byte of every node's config visible in
 # `helm template` output and covered by the pod template's checksum/config
 # annotation — a config change rolls the StatefulSet.
+{{- /* The guards run here as well as in the StatefulSet (review): this
+       file renders first, and a mis-sized tier must fail on the guard that
+       names it, not on an index error further down. */}}
+{{- include "vtop.deploymentGuards" . }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -11,7 +15,21 @@ metadata:
   labels:
     {{- include "vtop.labels" . | nindent 4 }}
 data:
+{{- if eq (include "vtop.deploymentMode" .) "separated" }}
+{{- /* Two tiers, two file families (#287): meta-<i>.yaml for the metadata
+       tier's pods and data-<i>.yaml for the data tier's, each the ROLE
+       config its `vtop-node meta`/`data` command deserializes. */}}
+{{- range $i := until (int (include "vtop.metaReplicaCount" .)) }}
+  meta-{{ $i }}.yaml: |
+{{ include "vtop.metaTierConfig" (dict "root" $ "ordinal" $i) | indent 4 }}
+{{- end }}
+{{- range $i := until (int (include "vtop.dataReplicaCount" .)) }}
+  data-{{ $i }}.yaml: |
+{{ include "vtop.dataTierConfig" (dict "root" $ "ordinal" $i) | indent 4 }}
+{{- end }}
+{{- else }}
 {{- range $i := until (int .Values.replicaCount) }}
   node-{{ $i }}.yaml: |
 {{ include "vtop.nodeConfig" (dict "root" $ "ordinal" $i) | indent 4 }}
+{{- end }}
 {{- end }}

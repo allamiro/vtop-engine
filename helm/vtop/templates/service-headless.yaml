@@ -2,6 +2,7 @@
 # built from (<pod>.<this-service>.<ns>.svc.<domain>) and lets clients address
 # a SPECIFIC pod's native produce/fetch plane — each pod is an independent
 # standalone range, so per-pod addressing is the correct client model here.
+{{- if eq (include "vtop.deploymentMode" .) "colocated" }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -34,3 +35,4 @@ spec:
     - name: obs
       port: {{ .Values.ports.observability }}
       targetPort: obs
+{{- end }}

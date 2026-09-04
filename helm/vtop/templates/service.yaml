@@ -19,6 +19,7 @@
 # The native produce/fetch plane is never here: it is per-pod (each pod is an
 # independent standalone range), and a round-robin Service would hand clients
 # a random range.
+{{- if eq (include "vtop.deploymentMode" .) "colocated" }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -46,3 +47,4 @@ spec:
     - name: obs
       port: {{ .Values.ports.observability }}
       targetPort: obs
+{{- end }}

@@ -1,5 +1,67 @@
 {{- $fullname := include "vtop.fullname" . -}}
 {{- $ns := .Release.Namespace -}}
+{{- if eq (include "vtop.deploymentMode" .) "separated" -}}
+{{- $metaCount := int (include "vtop.metaReplicaCount" .) -}}
+{{- $dataCount := int (include "vtop.dataReplicaCount" .) -}}
+{{- $metaSet := include "vtop.tierName" (dict "root" . "tier" "meta") -}}
+{{- $dataSet := include "vtop.tierName" (dict "root" . "tier" "data") -}}
+{{- $ids := list -}}
+{{- range $j := until $metaCount }}{{ $ids = append $ids (add1 $j) }}{{ end -}}
+vtop {{ .Chart.AppVersion }} — SEPARATED tiers (#287): {{ $metaCount }} metadata voter(s) as StatefulSet {{ $metaSet }}, {{ $dataCount }} data replica(s) as StatefulSet {{ $dataSet }}.
+
+1. Watch both tiers come up:
+
+     kubectl -n {{ $ns }} get pods -l app.kubernetes.io/instance={{ .Release.Name }},app.kubernetes.io/name={{ include "vtop.name" . }} -w
+
+2. Readiness is a LEVEL with reasons on every pod (/readyz on port {{ .Values.ports.observability }}).
+   Metadata pods report Ready before a Raft leader exists — by design.
+
+3. Bootstrap the metadata Raft group ONCE, against a SPECIFIC metadata pod
+   (each presents a certificate whose SAN is its own headless FQDN):
+
+     kubectl -n {{ $ns }} port-forward pod/{{ $metaSet }}-0 {{ .Values.ports.metaAdmin }}:{{ .Values.ports.metaAdmin }} &
+     vtopctl meta init --members {{ join "," $ids }} --config admin.yaml
+     vtopctl meta status --config admin.yaml
+
+   admin.yaml must carry BOTH of these — the name is the one that pod's
+   certificate carries, which is tls.serverName when you set one:
+
+     endpoint: localhost:{{ .Values.ports.metaAdmin }}
+     server_name: {{ include "vtop.tierServerName" (dict "root" . "tier" "meta" "ordinal" 0) }}
+
+   plus ca_cert/client_cert/client_key for your operator credentials.
+   `server_name` defaults to "localhost", which will NOT match — set it.
+
+   Metadata node ids are meta-tier ordinal+1: {{ $metaSet }}-0 is node 1.
+{{- if .Values.meta.adminAuthorization.enabled }}
+
+   NOTE: admin authorization is ENABLED — only these certificate CNs may run
+   cluster-scoped commands: {{ .Values.meta.adminAuthorization.operatorCommonNames | toJson }}
+{{- end }}
+
+4. The data tier reaches metadata through {{ $metaSet }}-0 by default, and
+   every metadata pod is in its admin_peers so a redirect to the Raft leader
+   is followed. Data pod identities are data.nodeUuids[ordinal]; their TLS
+   leaves are node-<ordinal>.pem in {{ include "vtop.dataSecretName" . }}.
+{{- if eq .Values.data.topology "replicated" }}
+
+5. ONE range across the data tier, every data pod a CANDIDATE (#284). Data
+   pods stay NOT READY until the metadata exchange below finds their range.
+   After `meta init`, create the topic and register each DATA pod once:
+
+     vtopctl meta create-topic --name {{ .Values.data.range.topic }} --topic-uuid {{ .Values.data.lease.topicUuid }} --root-range-uuid {{ .Values.data.range.rangeId }} --config admin.yaml
+{{- range $i := until $dataCount }}
+     vtopctl meta register-node --node-uuid {{ index $.Values.data.nodeUuids $i }} --addr {{ include "vtop.tierPodFqdn" (dict "root" $ "tier" "data" "ordinal" $i) }}:{{ $.Values.ports.replica }} --config admin.yaml
+{{- end }}
+
+   Whichever data pod acquires the range leads; produce to it through its
+   headless FQDN on port {{ .Values.ports.native }}.
+{{- end }}
+
+6. Metrics: Prometheus text on http://<pod>:{{ .Values.ports.observability }}/metrics on every pod of
+   both tiers. The endpoint is UNAUTHENTICATED (#78)
+   {{- if .Values.networkPolicy.enabled }} — NetworkPolicy is enabled and restricts it.{{ else }} — consider networkPolicy.enabled=true to restrict it in-cluster.{{ end }}
+{{- else -}}
 {{- $ids := list -}}
 {{- range $j := until (int .Values.replicaCount) }}{{ $ids = append $ids (add1 $j) }}{{ end -}}
 vtop {{ .Chart.AppVersion }} — {{ int .Values.replicaCount }} co-located node(s) as StatefulSet {{ $fullname }}.
@@ -78,3 +140,4 @@ vtop {{ .Chart.AppVersion }} — {{ int .Values.replicaCount }} co-located node(
 
 Full docs, including the TLS Secret contract: helm/vtop/README.md in the
 chart sources.
+{{- end }}

@@ -1,0 +1,41 @@
+# The SEPARATED shape (#287): a three-voter metadata tier and a three-replica
+# data tier as two StatefulSets, the data tier a replicated range of leased
+# candidates. Sized independently on purpose — the values below happen to
+# match, so that a render check cannot mistake one count for the other by
+# accident; the guards refuse an even voter count and a data count that does
+# not index data.nodeUuids.
+#
+# Nothing here is a credential; the Secret names refer to objects that exist
+# only in a smoke test's namespace.
+deployment:
+  mode: separated
+  meta:
+    replicaCount: 3
+  data:
+    replicaCount: 3
+cluster:
+  id: 11111111-2222-3333-4444-555555555555
+tls:
+  metaSecretName: vtop-meta-tls
+  dataSecretName: vtop-data-tls
+data:
+  nodeUuids:
+    - aaaaaaaa-0000-0000-0000-0000000000a1
+    - aaaaaaaa-0000-0000-0000-0000000000a2
+    - aaaaaaaa-0000-0000-0000-0000000000a3
+  range:
+    topic: telemetry
+    rangeId: aaaaaaaa-0000-0000-0000-0000000000c1
+  segmentId: aaaaaaaa-0000-0000-0000-0000000000d1
+  principalId: aaaaaaaa-0000-0000-0000-0000000000ce
+  topology: replicated
+  fencingEpoch: 0
+  lease:
+    enabled: true
+    topicUuid: aaaaaaaa-0000-0000-0000-0000000000f1
+
+# CI-only scheduling size, for the reason recorded in default-values.yaml.
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
