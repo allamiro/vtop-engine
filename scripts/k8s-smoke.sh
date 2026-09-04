@@ -140,57 +140,72 @@ whether the StatefulSet created anything is unknown"
 # (review): across a pod recreation a cached positive answer can hand a peer
 # the DEAD pod's IP with a success exit code, which is precisely the
 # occurrence-three stall this gate exists to catch — so each answer is
-# compared against the target's live status.podIP. And a failed PROBE is not
-# a failed LOOKUP — the same attribution rule `await_pods_exist` states: an
-# exec the API server never answered says nothing about DNS, so the two are
-# tracked and reported apart, and each probe is bounded so one hung exec
-# cannot stretch the gate past its retry budget.
+# compared against the target's live status.podIP.
+#
+# Attribution, the `await_pods_exist` rule applied three ways (review): a
+# hung LOOKUP is a DNS verdict — the resolver stalling is a way DNS fails —
+# so the lookup is bounded REMOTELY and reports its own exit code through
+# the sentinel; an exec that dies without delivering the remote shell's
+# output at all is the API path's failure, not DNS's; and a target with no
+# podIP yet is a pod that is not scheduled or started, which is neither.
+# Three lists, three names in the report, no component blamed unobserved.
+#
+# Wall-clock bounded, not round-counted (review): with every probe hanging,
+# sixty rounds of six 15-second timeouts would run ~90 minutes — past the CI
+# job's own ceiling, so the diagnostics below would never print. The
+# deadline keeps the worst case inside the budget the surrounding readiness
+# waits already set.
 await_peer_dns() { # namespace
   peer_ns="$1"
   unresolved=""
   unprobed=""
-  for _ in $(seq 1 60); do
+  unaddressed=""
+  gate_deadline=$((SECONDS + 240))
+  while [ "$SECONDS" -lt "$gate_deadline" ]; do
     unresolved=""
     unprobed=""
+    unaddressed=""
     for name in 0 1 2; do
-      want="$(kubectl -n "$peer_ns" get pod "${REL}-${name}" \
+      want="$(timeout 15 kubectl -n "$peer_ns" get pod "${REL}-${name}" \
         -o jsonpath='{.status.podIP}' 2>/dev/null || true)"
       if [ -z "$want" ]; then
-        unprobed="$unprobed podIP(${REL}-${name})"
+        unaddressed="$unaddressed ${REL}-${name}"
         continue
       fi
       peer_fqdn="${REL}-${name}.${HEADLESS}.${peer_ns}.svc.${DOMAIN}"
       for probe in 0 1 2; do
         [ "$probe" = "$name" ] && continue
-        # `miss` is emitted by the REMOTE shell, so an empty answer can mean
-        # only one thing: the probe itself never ran to completion.
         answer="$(timeout 15 kubectl -n "$peer_ns" exec "${REL}-${probe}" -- \
-          sh -c "getent hosts ${peer_fqdn} || echo miss" 2>/dev/null || true)"
-        if [ -z "$answer" ]; then
-          unprobed="$unprobed ${REL}-${probe}->${REL}-${name}"
-        elif [ "$answer" = "miss" ]; then
-          unresolved="$unresolved ${REL}-${probe}->${REL}-${name}"
-        else
-          got="${answer%%[[:space:]]*}"
-          [ "$got" = "$want" ] \
-            || unresolved="$unresolved ${REL}-${probe}->${REL}-${name}(stale:${got}!=${want})"
-        fi
+          sh -c "timeout 10 getent hosts ${peer_fqdn} || echo miss:\$?" 2>/dev/null || true)"
+        case "$answer" in
+          "")
+            unprobed="$unprobed ${REL}-${probe}->${REL}-${name}"
+            ;;
+          miss:*)
+            # miss:2 is name-not-found; miss:124 is the remote lookup's own
+            # timeout — a hung resolver, still a DNS verdict.
+            unresolved="$unresolved ${REL}-${probe}->${REL}-${name}(${answer})"
+            ;;
+          *)
+            got="${answer%%[[:space:]]*}"
+            [ "$got" = "$want" ] \
+              || unresolved="$unresolved ${REL}-${probe}->${REL}-${name}(stale:${got}!=${want})"
+            ;;
+        esac
       done
     done
-    [ -z "${unresolved}${unprobed}" ] && return 0
+    [ -z "${unresolved}${unprobed}${unaddressed}" ] && return 0
     sleep 2
   done
-  # Self-diagnosing on failure, per #324's rule: name the lookups that never
-  # answered — kept apart from the probes that never ran — and show the two
-  # components that could be responsible, so a CI recurrence carries its own
-  # evidence instead of a bare timeout.
+  # Self-diagnosing on failure, per #324's rule: each list under its own
+  # name, plus the two components that could be responsible, so a CI
+  # recurrence carries its own evidence instead of a bare timeout.
   kubectl -n "$peer_ns" get endpointslices 2>/dev/null || true
   kubectl -n kube-system get pods -l k8s-app=kube-dns 2>/dev/null || true
-  [ -n "$unresolved" ] || fail "peer DNS in ${peer_ns} could not be OBSERVED: every lookup that \
-ran resolved correctly, but these probes never completed for 60 rounds:${unprobed} — an exec/API \
-problem, not a DNS verdict (#416)"
-  fail "headless DNS never settled in ${peer_ns}: still unresolved after 60 attempts:${unresolved}\
-${unprobed:+ (and these probes never completed:${unprobed})} (#416)"
+  fail "headless DNS never settled in ${peer_ns} within its deadline (#416):\
+${unresolved:+ unresolved lookups:${unresolved};}\
+${unaddressed:+ targets with no podIP — not scheduled/started, or the query failed:${unaddressed};}\
+${unprobed:+ probes that never completed — the exec/API path, not a DNS verdict:${unprobed};}"
 }
 
 # ---------------------------------------------------------------------------
