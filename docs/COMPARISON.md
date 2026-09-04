@@ -86,7 +86,7 @@ Kafka pain points: fixed partitioning, coupled metadata, opaque rebalancing.
 | Live range splitting / self-balancing | VTOP models lineage and placement but does not yet split ranges under load or self-balance placements live. | Post-v0.2.0; placement plane (#180/#181) is the foundation |
 | Virtualization / migration layer | Xinfra gives LinkedIn topic virtualization and transparent migration between backends. VTOP has nothing equivalent; #225's gateway is the nearest analog (protocol-level rather than address-level). | #225, then revisit |
 | Production mileage | Northguard runs LinkedIn-scale traffic (trillions of records/day, per their materials). VTOP's scale story is a benchmark plan, not a track record. | #92 / #98 / #130 sweep grid and soaks |
-| Multi-tenancy | Published Northguard material emphasizes tenant isolation. VTOP is single-tenant today (one principal per range in the authorizer). | After #238 lands the identity layer |
+| Multi-tenancy | Published Northguard material emphasizes tenant isolation. VTOP is single-tenant today (one principal per range in the authorizer). | Identity layer landed with #238 (v0.2.0); per-tenant principals on top of it are the remaining work |
 
 ## What "better" means here, concretely
 

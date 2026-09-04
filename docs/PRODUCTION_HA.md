@@ -218,7 +218,10 @@ protocol state machine (protocol §12).
 2. the **manifest exists** in object storage;
 3. the **object size matches** the manifest's recorded size;
 4. the object **checksum** (SHA-256 or BLAKE3), derived from stored bytes or
-   computed by the storage service, **matches the manifest checksum**;
+   computed by the storage service, **matches the manifest checksum** — this
+   is the **strong** class, and it is what item 4 means under the default
+   configuration; see the verification-strength note below for the explicit
+   opt-outs that weaken it;
 5. the **state store has persisted** `object_key`, `manifest_key`, checksum,
    checksum algorithm, compression type, source range, and `batch_id` **before**
    the VERIFIED transition;
@@ -227,11 +230,18 @@ protocol state machine (protocol §12).
 7. **verification failure prevents source commit** — the batch never advances to
    SOURCE_COMMITTED.
 
-**Verification strength (current code):** the engine supports **strong**
-(stored-content/service-computed checksum) and **backend-limited** (size /
-existence only) verification. Strong verification defaults on.
-`upload.require_strong_verification: false` is an explicit compatibility/lab
-opt-out that allows a backend-limited result to commit.
+**Verification strength (current code):** protocol §17 names three classes —
+**strong** (stored-content/service-computed checksum), **backend-limited**
+(size/existence only), and **disabled checksum** (size-only by configuration,
+the weakest, an explicit opt-in). The engine's verification result carries a
+single strength flag, so the code REPORTS the third class through the same
+flag as the second: `checksum.algorithm: none` verifies size and existence
+only and surfaces as a backend-limited result. Strong verification defaults
+on, and `upload.require_strong_verification: false` is the explicit
+compatibility/lab opt-out that allows a non-strong result to commit — so
+under the default, batches produced with checksums disabled **refuse to
+commit**, and running that way requires both opt-outs deliberately: the
+algorithm choice and the strength opt-out, each visible in configuration.
 
 **ETag caveat:** S3 multipart ETags are **not** reliable MD5 checksums. The
 authoritative integrity value is VTOP's own **SHA-256/BLAKE3 manifest checksum**,

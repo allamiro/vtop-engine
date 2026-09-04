@@ -128,10 +128,13 @@ production cluster daemon.
 - Metadata and native data-plane processes are assembled separately. The
   native broker does not yet consume metadata membership or lease changes
   from the live Raft group.
-- Scenario 03 validates metadata voter replacement. It does not claim that a
-  sealed data replica was repaired and retired through the #180/#181
-  replacement-proof lifecycle; a live repair worker is still required for
-  that end-to-end path.
+- Scenario 03 validates metadata voter replacement, and only that. The
+  #180/#181 replacement-proof lifecycle for a sealed DATA replica is
+  exercised end to end by scenario 12 — operator-driven, through
+  `vtopctl node repair --seal-tail`, which seals the leader's active tail
+  into the transferable prefix and asserts the repaired replica holds the
+  full acknowledged floor (the closure #306 tracked) — so the one thing
+  still unproven here is automated repair with no operator in the loop.
 - The native data plane has quorum replication but no live leader election.
   Scenario 04 therefore proves acknowledged durability and same-directory
   recovery, not automatic data-plane failover.

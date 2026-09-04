@@ -225,7 +225,7 @@ The batch **format** **MAY** be declared explicitly per stream or **MAY** be aut
 ## 10. Checksum
 
 - A conformant implementation **MUST** compute a content checksum over the **compressed** telemetry object bytes, using one of: **SHA-256**, **BLAKE3**, or a **disabled** mode in which size-only verification is used.
-- The selected checksum algorithm and value (or the explicit "disabled" indication) **MUST** be recorded in the manifest.
+- The selected checksum algorithm and value (or the explicit disabled indication, recorded as `object.checksum_algorithm: none`, §11.2) **MUST** be recorded in the manifest.
 - Verification **MUST** compare the checksum (or size, in disabled mode) of the durably stored object against the manifest.
 - An implementation **MUST NOT** transition to `VERIFIED` if the stored object fails the configured check.
 - An implementation **MAY** additionally record an uncompressed-content checksum.
@@ -234,7 +234,7 @@ The batch **format** **MAY** be declared explicitly per stream or **MAY** be aut
 |------|----------|--------------------|
 | `SHA-256` | Cryptographic | Stored object hash vs. manifest hash. |
 | `BLAKE3` | Cryptographic | Stored object hash vs. manifest hash. |
-| disabled | Size-only | Stored object size vs. declared size (weaker; see §17). |
+| disabled (`none`) | Size-only | Stored object size vs. declared size (weaker; see §17). |
 
 The manifest additionally carries a reproducible **self-hash** for corruption
 detection and MAY carry a keyed authenticator for tamper detection (§11.2).
