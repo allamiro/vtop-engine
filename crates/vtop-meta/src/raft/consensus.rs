@@ -18,7 +18,7 @@ use crate::transport::admin::AdminHandler;
 use crate::transport::wire::{
     AdminLeaseView, AdminReadRangeLeaseResponse, AdminReadRangeTransitionsResponse,
     AdminReadSegmentPlacementResponse, AdminRebalanceIntentView, AdminSegmentView,
-    MAX_TRANSITIONS_PER_READ,
+    AdminTransitionView, MAX_TRANSITIONS_PER_READ,
 };
 use crate::transport::wire::{
     AdminMembershipResponse, AdminProposeResponse, AdminStatusResponse, TransportError,
@@ -144,11 +144,28 @@ pub struct OpenraftConsensus {
     /// keep working; a read against one of those reports the store as
     /// unavailable rather than inventing an answer.
     store: Option<MetaRaftStore>,
+    /// The key transition statements are signed with when served (#240 item
+    /// 5). `None` serves them unsigned — stated on the wire as an absent
+    /// MAC, never as a MAC of nothing. Installed after construction because
+    /// the node resolves it from its environment once the store is open.
+    transition_mac_key: std::sync::RwLock<Option<[u8; 32]>>,
 }
 
 impl OpenraftConsensus {
     pub fn new(raft: MemRaft) -> Self {
-        Self { raft, store: None }
+        Self {
+            raft,
+            store: None,
+            transition_mac_key: std::sync::RwLock::new(None),
+        }
+    }
+
+    /// Sign served transition statements with `key` from now on.
+    pub fn set_transition_mac_key(&self, key: [u8; 32]) {
+        *self
+            .transition_mac_key
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(key);
     }
 
     /// Attach the applied state so this node can serve linearizable reads.
@@ -298,7 +315,11 @@ impl AdminReadRangeTransitions for OpenraftConsensus {
         // The caller's maximum, capped at the page bound; zero is zero
         // (review) — a maximum is not a hint.
         let limit = usize::from(limit).min(MAX_TRANSITIONS_PER_READ);
-        Ok(store.with_storage(|storage| {
+        let key = *self
+            .transition_mac_key
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        store.with_storage(|storage| {
             let read_at_applied_index = storage.last_applied();
             let state = storage.state();
             let found = matches!(
@@ -308,16 +329,27 @@ impl AdminReadRangeTransitions for OpenraftConsensus {
                 }),
                 Some(MetaValue::Range(_))
             );
-            AdminReadRangeTransitionsResponse {
-                found,
-                transitions: state
-                    .range_transitions(topic_uuid, range_uuid, from_epoch, limit)
-                    .into_iter()
-                    .map(Into::into)
-                    .collect(),
-                read_at_applied_index,
+            let mut transitions = Vec::new();
+            for record in state.range_transitions(topic_uuid, range_uuid, from_epoch, limit) {
+                // Signed HERE, at the serving path, over the canonical
+                // bytes the snapshot carries — see RangeTransitionRecord::mac
+                // for why not in apply.
+                let mac = match key {
+                    Some(key) => Some(record.mac(&key).map_err(|error| {
+                        ConsensusError::Message(format!("sign transition: {error}"))
+                    })?),
+                    None => None,
+                };
+                let mut view = AdminTransitionView::from(record);
+                view.mac = mac;
+                transitions.push(view);
             }
-        }))
+            Ok(AdminReadRangeTransitionsResponse {
+                found,
+                transitions,
+                read_at_applied_index,
+            })
+        })
     }
 }
 

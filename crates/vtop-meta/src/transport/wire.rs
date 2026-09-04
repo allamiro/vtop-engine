@@ -805,6 +805,12 @@ pub struct AdminTransitionView {
     pub granted_at_ms: i64,
     pub granted_apply_index: u64,
     pub outcome: crate::state::TransitionOutcome,
+    /// The transition statement's MAC over the record's canonical bytes,
+    /// computed by the serving node with its configured key (#240 item 5);
+    /// `None` when the serving node has no key. Verify with
+    /// [`Self::verify_mac`] — the view rebuilds the record and re-derives
+    /// the bytes, so nothing but the key is trusted.
+    pub mac: Option<[u8; 32]>,
 }
 
 impl From<crate::state::RangeTransitionRecord> for AdminTransitionView {
@@ -818,11 +824,38 @@ impl From<crate::state::RangeTransitionRecord> for AdminTransitionView {
             granted_at_ms: record.granted_at_ms,
             granted_apply_index: record.granted_apply_index,
             outcome: record.outcome,
+            mac: None,
         }
     }
 }
 
 impl AdminTransitionView {
+    /// The record this view carries, rebuilt field for field — the input
+    /// to the canonical bytes a verifier re-derives.
+    pub fn record(&self) -> crate::state::RangeTransitionRecord {
+        crate::state::RangeTransitionRecord {
+            epoch_from: self.epoch_from,
+            epoch_to: self.epoch_to,
+            holder_from: self.holder_from,
+            holder_to: self.holder_to,
+            grant: self.grant,
+            granted_at_ms: self.granted_at_ms,
+            granted_apply_index: self.granted_apply_index,
+            outcome: self.outcome.clone(),
+        }
+    }
+
+    /// Whether the carried MAC is the one `key` produces over this record's
+    /// canonical bytes. `Ok(false)` for a view served without a MAC: an
+    /// unsigned statement is not a forged one, but it is not evidence a
+    /// key-holder can stand behind either.
+    pub fn verify_mac(&self, key: &[u8; 32]) -> Result<bool, CodecError> {
+        let Some(mac) = self.mac else {
+            return Ok(false);
+        };
+        Ok(self.record().mac(key)? == mac)
+    }
+
     fn encode_into(&self, out: &mut Vec<u8>) -> Result<(), CodecError> {
         put_u64(out, self.epoch_from);
         put_u64(out, self.epoch_to);
@@ -854,6 +887,13 @@ impl AdminTransitionView {
                 crate::command::encode_promotion_outcome(out, outcome)?;
                 put_i64(out, *reported_at_ms);
                 put_u64(out, *reported_apply_index);
+            }
+        }
+        match &self.mac {
+            None => put_u8(out, 0),
+            Some(mac) => {
+                put_u8(out, 1);
+                put_bytes32(out, mac);
             }
         }
         Ok(())
@@ -889,6 +929,11 @@ impl AdminTransitionView {
                 }
             } else {
                 crate::state::TransitionOutcome::Pending
+            },
+            mac: if reader.flag("transition mac presence")? {
+                Some(reader.bytes32("transition mac")?)
+            } else {
+                None
             },
         })
     }
@@ -1836,6 +1881,55 @@ mod tests {
         );
     }
 
+    /// The served MAC verifies against the key over the record the view
+    /// rebuilds, a different key does not, a changed field does not, and
+    /// an unsigned view verifies as nothing (#240 item 5).
+    #[test]
+    fn a_transition_views_mac_verifies_only_the_record_it_was_computed_over() {
+        let key = [0x11; 32];
+        let record = crate::state::RangeTransitionRecord {
+            epoch_from: 3,
+            epoch_to: 4,
+            holder_from: Some(Uuid::from_u128(10)),
+            holder_to: Uuid::from_u128(11),
+            grant: crate::state::GrantKind::Election,
+            granted_at_ms: 9_000,
+            granted_apply_index: 40,
+            outcome: crate::state::TransitionOutcome::Pending,
+        };
+        let mut view = AdminTransitionView::from(record.clone());
+        assert_eq!(view.verify_mac(&key), Ok(false), "unsigned is not verified");
+        view.mac = Some(record.mac(&key).unwrap());
+        assert_eq!(view.verify_mac(&key), Ok(true));
+        assert_eq!(
+            view.verify_mac(&[0x22; 32]),
+            Ok(false),
+            "another key does not vouch"
+        );
+        let decoded = AdminReadRangeTransitionsResponse::decode(
+            &AdminReadRangeTransitionsResponse {
+                found: true,
+                transitions: vec![view.clone()],
+                read_at_applied_index: 41,
+            }
+            .encode()
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            decoded.transitions[0].verify_mac(&key),
+            Ok(true),
+            "survives the wire"
+        );
+        let mut tampered = view;
+        tampered.holder_to = Uuid::from_u128(12);
+        assert_eq!(
+            tampered.verify_mac(&key),
+            Ok(false),
+            "a changed field is a changed record; the MAC no longer vouches"
+        );
+    }
+
     /// The transition read round-trips in both outcome shapes and refuses a
     /// page longer than the bound (#240 item 5).
     #[test]
@@ -1859,6 +1953,7 @@ mod tests {
             granted_at_ms: 1_000,
             granted_apply_index: 4,
             outcome: crate::state::TransitionOutcome::Pending,
+            mac: None,
         };
         let served = AdminTransitionView {
             epoch_from: 1,
@@ -1882,6 +1977,7 @@ mod tests {
                 reported_at_ms: 2_500,
                 reported_apply_index: 12,
             },
+            mac: Some([0xAB; 32]),
         };
         let response = AdminReadRangeTransitionsResponse {
             found: true,

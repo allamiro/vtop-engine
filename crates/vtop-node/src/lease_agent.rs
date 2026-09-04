@@ -526,6 +526,10 @@ enum Promoted {
 struct Promoter {
     /// Set by the quorum-miss arm; read and cleared by the caller (#375).
     quorum_miss: bool,
+    /// This node's own view, for the evidence a STANDALONE promotion can
+    /// still report (review): a range with no replica set has no probe to
+    /// carry its view, but its sealed prefix is as knowable as anyone's.
+    local_view: Option<Arc<dyn CandidateLocalView>>,
     /// What the last verification established or why it refused, kept for
     /// the agent to report to metadata (#240 item 5) — the evidence the
     /// promotion computes and used to discard. Taken by the caller; a
@@ -701,7 +705,10 @@ impl Promoter {
             // had promoted.
             self.evidence = Some(vtop_meta::PromotionOutcome::Established {
                 boundary_offset: None,
-                sealed_prefix_end: None,
+                sealed_prefix_end: self
+                    .local_view
+                    .as_ref()
+                    .and_then(|view| view.sealed_prefix_end()),
                 quorum: Vec::new(),
                 votes: 0,
                 required: 0,
@@ -1016,6 +1023,7 @@ impl LeaseAgent {
             range_uuid,
             promoter: Promoter {
                 quorum_miss: false,
+                local_view: None,
                 evidence: None,
                 publisher,
                 probe,
@@ -1035,6 +1043,14 @@ impl LeaseAgent {
             campaign_hold_off_rounds: 0,
             quorum_miss_hold: None,
         })
+    }
+
+    /// This node's own view, so a STANDALONE promotion's transition record
+    /// still carries the sealed prefix the node knows (#240 item 5). A
+    /// replicated range's probe carries its view already.
+    pub fn with_local_view(mut self, view: Arc<dyn CandidateLocalView>) -> Self {
+        self.promoter.local_view = Some(view);
+        self
     }
 
     /// Share the flag a supervisor sets when it cannot serve an epoch it was
@@ -2069,6 +2085,29 @@ mod tests {
             }),
             "a standalone promotion is established with nothing to recompute, not left Pending"
         );
+        // Given its own view, a standalone promotion still reports the
+        // sealed prefix it holds (review).
+        struct SealedAt(u64);
+        impl CandidateLocalView for SealedAt {
+            fn local_committed_offset(&self) -> u64 {
+                self.0
+            }
+            fn epoch_starts(&self) -> Vec<vtop_broker::fencing_epochs::EpochStart> {
+                Vec::new()
+            }
+            fn sealed_prefix_end(&self) -> Option<u64> {
+                Some(self.0)
+            }
+        }
+        standalone.local_view = Some(Arc::new(SealedAt(300)));
+        assert!(standalone.ensure(8).await);
+        assert!(matches!(
+            standalone.take_evidence(),
+            Some(vtop_meta::PromotionOutcome::Established {
+                sealed_prefix_end: Some(300),
+                ..
+            })
+        ));
     }
 
     fn test_broker(dir: &std::path::Path, epoch: u64) -> LocalBroker {
@@ -2106,6 +2145,7 @@ mod tests {
     ) -> Promoter {
         Promoter {
             quorum_miss: false,
+            local_view: None,
             evidence: None,
             publisher,
             probe,

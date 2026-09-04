@@ -103,6 +103,24 @@ pub async fn serve(
         },
     )
     .await?;
+    // The transition-statement key (#240 item 5), resolved once the store is
+    // open and refused loudly if configured and absent — a node that quietly
+    // served unsigned statements would look exactly like one that was never
+    // asked to sign.
+    if let Some(name) = config.transition_mac_key_env.as_deref() {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("transition_mac_key_env must name a non-empty environment variable".into());
+        }
+        let value = std::env::var(name).map_err(|_| {
+            format!(
+                "transition MAC key environment variable {name} is missing or not valid Unicode"
+            )
+        })?;
+        node.consensus
+            .set_transition_mac_key(parse_mac_key(value.trim())?);
+        tracing::info!("leadership-transition statements are signed (key from {name})");
+    }
 
     let peer_listener = TcpListener::bind(&config.peer_listen)
         .await
@@ -192,5 +210,35 @@ async fn wait_for_shutdown(mut shutdown: tokio::sync::watch::Receiver<bool>) {
         if shutdown.changed().await.is_err() {
             std::future::pending::<()>().await;
         }
+    }
+}
+
+/// Decode a 32-byte key from its 64-character hex form, refusing anything
+/// else by length or content — the same contract the manifest MAC key has.
+fn parse_mac_key(value: &str) -> Result<[u8; 32], String> {
+    if value.len() != 64 {
+        return Err("transition MAC key must be exactly 32 bytes (64 hex characters)".into());
+    }
+    let mut key = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks(2).enumerate() {
+        let text = std::str::from_utf8(pair).map_err(|_| "transition MAC key is not hex")?;
+        key[index] = u8::from_str_radix(text, 16)
+            .map_err(|_| "transition MAC key must be exactly 32 bytes (64 hex characters)")?;
+    }
+    Ok(key)
+}
+
+#[cfg(test)]
+mod mac_key_tests {
+    use super::parse_mac_key;
+
+    #[test]
+    fn the_key_is_exactly_sixty_four_hex_characters() {
+        let hex = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let key = parse_mac_key(hex).unwrap();
+        assert_eq!(&key[..4], &[0x00, 0x11, 0x22, 0x33]);
+        assert!(parse_mac_key(&hex[..62]).is_err(), "too short");
+        assert!(parse_mac_key(&format!("{hex}00")).is_err(), "too long");
+        assert!(parse_mac_key(&hex.replace('a', "z")).is_err(), "not hex");
     }
 }

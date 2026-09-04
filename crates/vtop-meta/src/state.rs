@@ -393,6 +393,24 @@ pub struct RangeTransitionRecord {
     pub outcome: TransitionOutcome,
 }
 
+impl RangeTransitionRecord {
+    /// The record's canonical encoding — the same bytes the snapshot
+    /// carries — which is the signing input for the transition statement.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, CodecError> {
+        MetaValue::RangeTransition(self.clone()).encode()
+    }
+
+    /// The transition statement's MAC (#240 item 5): a keyed BLAKE3 hash
+    /// over the canonical bytes, computed where the record is SERVED — never
+    /// inside `apply`, which must stay deterministic across voters whose
+    /// keys may differ. A reader holding the key and the record verifies
+    /// it without the cluster; a reader holding neither has only the
+    /// cluster's word, which is what the MAC exists to improve on.
+    pub fn mac(&self, key: &[u8; 32]) -> Result<[u8; 32], CodecError> {
+        Ok(*blake3::keyed_hash(key, &self.canonical_bytes()?).as_bytes())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MetaValue {
     Node(NodeRecord),

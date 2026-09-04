@@ -133,6 +133,14 @@ pub struct MetaNodeConfig {
     /// deliberate choice instead of an unnoticed default.
     #[serde(default)]
     pub admin_authorization: Option<AdminAuthorizationConfig>,
+    /// Name of the environment variable holding the 32-byte hex key that
+    /// signs leadership-transition statements when they are served (#240
+    /// item 5). The secret itself is never in this file. Absent means the
+    /// statements are served unsigned — stated on the wire as an absent
+    /// MAC. Configured but missing at startup is a hard error, never a
+    /// silent downgrade to unsigned, matching `manifest_mac_key_env`.
+    #[serde(default)]
+    pub transition_mac_key_env: Option<String>,
     /// `Option` so a CO-LOCATED wrapper can tell "absent" from "present but
     /// empty": any per-role block, even `{}`, is a config error there, and
     /// detecting it needs field presence to survive deserialization.
