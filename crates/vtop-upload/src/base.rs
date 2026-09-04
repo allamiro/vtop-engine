@@ -350,18 +350,52 @@ pub fn is_throttle_status(status: u16) -> bool {
     matches!(status, 429 | 503)
 }
 
-/// Whether a tool's output relays a throttle (#102): the codes above as the
-/// CLIs print them (`An error occurred (SlowDown) …`, `S3 error: 503
-/// (SlowDown)`), the sentence S3 attaches to every one of them, and the two
-/// statuses by their reason phrases. Text is all a spawned tool gives back,
-/// so this is necessarily a vocabulary rather than a status; the vocabulary
-/// is S3's own and every tool passes it through verbatim.
+/// Whether a tool's output relays a throttle (#102), read from the places
+/// the tools put an error CODE or STATUS — never from the output at large,
+/// where an object key named `SlowDown/` would be mistaken for one (review):
+///
+/// - awscli: `An error occurred (SlowDown) when calling the PutObject …`
+/// - s3cmd:  `ERROR: S3 error: 503 (SlowDown): Please reduce your request rate.`
+/// - mc:     `mc: <ERROR> … Please reduce your request rate.` — mc prints no
+///   code, only S3's message, so that sentence (S3's own wording for every
+///   throttle) is the one message-text match; and a bare `429 Too Many
+///   Requests` / `503 Service Unavailable` status line as any of them may
+///   relay it from a proxy.
 pub fn looks_throttled(text: &str) -> bool {
-    THROTTLE_ERROR_CODES.iter().any(|code| text.contains(code))
-        || text.contains("reduce your request rate")
-        || text.contains("Too Many Requests")
-        || text.contains("Service Unavailable")
-        || text.contains("ServiceUnavailable")
+    text.lines().any(line_relays_throttle)
+}
+
+fn line_relays_throttle(line: &str) -> bool {
+    // awscli: the code in parentheses right after "error occurred".
+    if let Some(rest) = line.split("error occurred (").nth(1) {
+        if let Some(code) = rest.split(')').next() {
+            if is_throttle_code(code) {
+                return true;
+            }
+        }
+    }
+    // s3cmd: "S3 error: <status> (<code>)".
+    if let Some(rest) = line.split("S3 error: ").nth(1) {
+        let mut parts = rest.splitn(2, ' ');
+        let status = parts.next().unwrap_or_default().trim_end_matches(':');
+        if status.parse::<u16>().is_ok_and(is_throttle_status) {
+            return true;
+        }
+        if let Some(code) = parts.next().and_then(|tail| {
+            tail.strip_prefix('(')
+                .and_then(|inner| inner.split(')').next())
+        }) {
+            if is_throttle_code(code) {
+                return true;
+            }
+        }
+    }
+    // A status line with its reason phrase, as a proxy or mc relays it.
+    if line.contains("429 Too Many Requests") || line.contains("503 Service Unavailable") {
+        return true;
+    }
+    // S3's message for every throttle, which mc relays without the code.
+    line.contains("Please reduce your request rate")
 }
 
 /// The engine's error for a failed backend call, told apart by what the
@@ -584,8 +618,10 @@ mod throttle_tests {
         for relayed in [
             "An error occurred (SlowDown) when calling the PutObject operation (reached max retries: 4): Please reduce your request rate.",
             "ERROR: S3 error: 503 (SlowDown): Please reduce your request rate.",
+            "ERROR: S3 error: 429 (TooManyRequests)",
             "mc: <ERROR> Failed to copy `x`. Please reduce your request rate.",
             "An error occurred (Throttling) when calling the PutObject operation",
+            "upload failed: s3://bucket/key\nAn error occurred (RequestLimitExceeded) when calling the PutObject operation",
             "HTTP 429 Too Many Requests",
             "503 Service Unavailable",
         ] {
@@ -600,6 +636,10 @@ mod throttle_tests {
             "ERROR: S3 error: 403 (AccessDenied)",
             "mc: <ERROR> Unable to validate source `x`: file does not exist",
             "connection reset by peer",
+            // A key that happens to be named after a code is not a code (review).
+            "An error occurred (AccessDenied) when calling the PutObject operation: s3://bucket/SlowDown/Throttling.log",
+            "upload failed: s3://bucket/TooManyRequests/file to s3://bucket/503 Service/Unavailable",
+            "ERROR: S3 error: 403 (AccessDenied): s3://bucket/SlowDown",
         ] {
             assert!(!looks_throttled(ordinary), "{ordinary}");
             assert!(matches!(

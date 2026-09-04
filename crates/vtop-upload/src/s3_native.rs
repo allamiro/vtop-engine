@@ -253,6 +253,21 @@ where
                 VtopError::Upload(detail)
             }
         }
+        // A 429/503 whose body the SDK could not parse as an S3 error — a
+        // proxy's HTML, an empty body — arrives as a response error with the
+        // raw status still attached (review). It is the same throttle.
+        SdkError::ResponseError(context) => {
+            let status = context.raw().status().as_u16();
+            let detail = format!(
+                "{operation} {target}: unparseable response (http {status}): {}",
+                DisplayErrorContext(context.err())
+            );
+            if crate::base::is_throttle_status(status) {
+                VtopError::UploadThrottled(detail)
+            } else {
+                VtopError::Upload(detail)
+            }
+        }
         other => VtopError::Upload(format!(
             "{operation} {target}: {}",
             DisplayErrorContext(&other)
@@ -574,12 +589,7 @@ impl UploadBackend for S3NativeBackend {
             .body(ByteStream::from(data))
             .send()
             .await
-            .map_err(|e| {
-                VtopError::Upload(format!(
-                    "upload_part {object_uri}#{part_number}: {}",
-                    e.into_service_error()
-                ))
-            })?;
+            .map_err(|e| sdk_failure("upload_part", &format!("{object_uri}#{part_number}"), e))?;
         let etag = out.e_tag().map(str::to_owned).ok_or_else(|| {
             VtopError::Upload(format!(
                 "upload_part {object_uri}#{part_number}: service returned no etag"
@@ -777,5 +787,31 @@ mod throttle_classification {
             assert!(!error.is_upload_throttle(), "{status} {code:?}: {error}");
             assert!(matches!(error, VtopError::Upload(_)));
         }
+    }
+
+    /// A 503 whose body is not an S3 error document — a proxy's page, an
+    /// empty body — reaches the backend as a response error with the raw
+    /// status still attached, and is the same throttle (review).
+    #[test]
+    fn an_unparseable_throttle_response_is_still_a_throttle() {
+        fn response_error(status: u16) -> SdkError<PutObjectError, HttpResponse> {
+            SdkError::response_error(
+                std::io::Error::other("body was HTML, not an S3 error document"),
+                HttpResponse::new(
+                    StatusCode::try_from(status).unwrap(),
+                    SdkBody::from("<html>"),
+                ),
+            )
+        }
+        for status in [429, 503] {
+            let error = sdk_failure("upload_part", "s3://b/k", response_error(status));
+            assert!(error.is_upload_throttle(), "{status}: {error}");
+            assert!(
+                error.to_string().contains(&format!("http {status}")),
+                "{error}"
+            );
+        }
+        let error = sdk_failure("upload_part", "s3://b/k", response_error(502));
+        assert!(!error.is_upload_throttle(), "{error}");
     }
 }
