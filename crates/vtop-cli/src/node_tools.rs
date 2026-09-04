@@ -1024,7 +1024,7 @@ async fn repair(
             }
         }
     }
-    let installed = client
+    let transferred = client
         .transfer_sealed_prefix(
             addr,
             &source.server_name,
@@ -1035,6 +1035,14 @@ async fn repair(
         )
         .await
         .map_err(|error| format!("transfer from {from}: {error}"))?;
+    let installed = transferred.installed;
+    // The install bound for the epoch history is what THIS transfer verified
+    // (#407): the source can seal new segments between the transfer's own
+    // listing and the fenced proof listing below, and a bound taken from the
+    // later listing would install lineage for records that were never
+    // copied — exactly the claims-what-it-does-not-hold poisoning the
+    // installer's truncation exists to prevent.
+    let transferred_end = transferred.prefix_end;
 
     // THE LINEAGE TRAVELS WITH THE RECORDS (#315). The transfer carries the
     // bytes; this carries the history that lets the replica prove which
@@ -1079,9 +1087,10 @@ async fn repair(
     // from another — a source deposed between the last chunk and the fetch.
     // Epochs are strictly monotonic, so a fenced call SUCCEEDING here proves
     // the source held the credential epoch across the transfer, the history
-    // fetch, and this moment. The listing also supplies the sealed-prefix
-    // end without re-scanning the transferred segments on disk: after a
-    // successful transfer the directory's sealed set equals this listing.
+    // fetch, and this moment. The listing is that PROOF and nothing more —
+    // the epoch-history install is bounded by the transfer's own verified
+    // end, because this listing can already include segments the source
+    // sealed after the transfer listed its prefix (#407).
     let listing = client
         .list_sealed_segments(
             addr,
@@ -1098,14 +1107,17 @@ async fn repair(
                  once the source is stable"
             )
         })?;
-    let sealed_end = listing.iter().map(|entry| entry.next_offset).max();
-    // The seal's promise is checked against what the listing actually held:
+    // The proof listing's contents beyond the proof itself are deliberately
+    // unused: `transferred_end` is the bound everything below works from.
+    drop(listing);
+    // The seal's promise is checked against what the TRANSFER actually held:
     // retention runs after every append on the leader, so a produce landing
-    // between the seal and this listing can reclaim the freshly sealed
-    // segment under a bytes bound smaller than it. Nothing lies — the gap
-    // is measured and reported below — but the operator deserves the CAUSE
-    // named rather than a mysteriously shorter prefix (#306 review).
-    if let (Some(promised), Some(listed)) = (sealed_tail_end, sealed_end) {
+    // between the seal and the transfer's listing can reclaim the freshly
+    // sealed segment under a bytes bound smaller than it. Nothing lies —
+    // the gap is measured and reported below — but the operator deserves
+    // the CAUSE named rather than a mysteriously shorter prefix (#306
+    // review).
+    if let (Some(promised), Some(listed)) = (sealed_tail_end, transferred_end) {
         if listed < promised && !json {
             println!(
                 "note: the leader sealed through offset {promised}, but the transfer listing \
@@ -1134,7 +1146,7 @@ async fn repair(
             "warning: {from} reported no epoch history; the repaired replica will answer \
              \"unknown\" at its next reconciliation instead of proving its lineage"
         );
-    } else if let Some(tail) = sealed_end {
+    } else if let Some(tail) = transferred_end {
         let entries: Vec<vtop_broker::fencing_epochs::EpochStart> = history
             .iter()
             .map(|entry| vtop_broker::fencing_epochs::EpochStart {

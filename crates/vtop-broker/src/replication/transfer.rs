@@ -354,6 +354,25 @@ impl ReplicaPeerHandler for LeaderSegmentTransferHandler {
 /// operation with a beginning and an end, not a session, and reusing the
 /// replication dialer would start a replication stream as a side effect of
 /// running one.
+/// What a sealed-prefix transfer actually delivered (#407).
+///
+/// The `prefix_end` is the one honest bound for installing the transferred
+/// epoch history: it is the end of the prefix THIS transfer listed, verified,
+/// and holds — where a listing taken after the transfer can include segments
+/// the source sealed in between, and a bound from it would install lineage
+/// for records the replica does not have.
+#[derive(Debug)]
+pub struct TransferredPrefix {
+    /// Bundles installed by this run. A resumed transfer skips segments
+    /// already present and matching, so this can be shorter than the
+    /// listing while the prefix is complete.
+    pub installed: Vec<PathBuf>,
+    /// Max `next_offset` across every segment this transfer verified present
+    /// — freshly fetched or already matching. `None` when the source listed
+    /// nothing sealed.
+    pub prefix_end: Option<u64>,
+}
+
 pub struct SegmentTransferClient {
     connector: TlsConnector,
     /// Deadline PER ROUND TRIP, not per transfer: a sealed prefix can be
@@ -448,14 +467,17 @@ impl SegmentTransferClient {
     /// receiver swept at open.
     /// The source's sealed-segment listing, served UNDER THE FENCING CHECK.
     ///
-    /// Exists for two callers' reasons at once (#315): the listing's highest
-    /// `next_offset` is the sealed-prefix end a repair must bound the
-    /// installed epoch history by, and the fencing check makes the call a
-    /// proof — a source that lost its lease or adopted a newer epoch since
-    /// the transfer refuses it, so a repair that fetches the (unfenced)
-    /// epoch history and THEN succeeds here knows the source held the
-    /// credential epoch across the whole exchange. Epochs are strictly
-    /// monotonic, so there is no lose-and-regain path around that proof.
+    /// The fencing check is what this call exists for (#315): it makes the
+    /// call a proof — a source that lost its lease or adopted a newer epoch
+    /// since the transfer refuses it, so a repair that fetches the
+    /// (unfenced) epoch history and THEN succeeds here knows the source
+    /// held the credential epoch across the whole exchange. Epochs are
+    /// strictly monotonic, so there is no lose-and-regain path around that
+    /// proof. It is a PROOF and nothing more: the sealed-prefix end that
+    /// bounds an installed epoch history comes from the transfer's own
+    /// [`TransferredPrefix::prefix_end`], because the source can seal new
+    /// segments between the transfer's listing and this one, and a bound
+    /// taken here would cover records the transfer never copied (#407).
     pub async fn list_sealed_segments(
         &self,
         addr: SocketAddr,
@@ -518,7 +540,7 @@ impl SegmentTransferClient {
         range: &RangeIdentity,
         fencing_epoch: u64,
         receiver: &SegmentReceiver,
-    ) -> BrokerResult<Vec<PathBuf>> {
+    ) -> BrokerResult<TransferredPrefix> {
         let name = rustls::pki_types::ServerName::try_from(server_name.to_owned())
             .map_err(|error| {
                 crate::BrokerError::InvalidConfig(format!("server name {server_name:?}: {error}"))
@@ -573,7 +595,14 @@ impl SegmentTransferClient {
             crate::BrokerError::InvalidConfig(format!("transfer receiver: {problem}"))
         };
         let mut installed = Vec::new();
+        let mut prefix_end = None;
         for entry in listing {
+            // Every entry this loop completes — freshly fetched or already
+            // matching — is part of the prefix THIS transfer verified, and
+            // its end is the one honest bound for the epoch-history install
+            // (#407): a listing taken after the transfer can reach further
+            // than what was actually copied.
+            prefix_end = prefix_end.max(Some(entry.next_offset));
             // Identity, not just the offset. A segment already present at this
             // base offset can be from a previous incarnation of the range, and
             // skipping the fetch would leave this replica holding somebody
@@ -642,7 +671,10 @@ impl SegmentTransferClient {
             }
             installed.push(staged.install().map_err(receiver_error)?);
         }
-        Ok(installed)
+        Ok(TransferredPrefix {
+            installed,
+            prefix_end,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
