@@ -2803,6 +2803,13 @@ mod tests {
         // cannot be a write_atomic scratch file.
         let unrelated = dir.path().join(".notes.commit.backup.tmp");
         std::fs::write(&unrelated, b"operator notes, not ours").unwrap();
+        // A parseable UUID in a spelling write_atomic never emits (braced) —
+        // the classifier demands the writer's exact lowercase hyphenated
+        // form, so this is somebody else's file too (#407).
+        let braced = dir
+            .path()
+            .join(".notes.commit.{052480a2-9d38-4915-b5c1-773eb42625a7}.tmp");
+        std::fs::write(&braced, b"also not ours").unwrap();
 
         let reopened = SegmentSet::open_in(&env, dir.path())
             .expect("an unrelated dotted .tmp must not affect opening")
@@ -2811,6 +2818,11 @@ mod tests {
         assert!(
             unrelated.exists(),
             "a file that is not an interrupted atomic write must survive the sweep untouched"
+        );
+        assert!(
+            braced.exists(),
+            "a UUID spelling the writer never emits is not the writer's scratch: \
+             parseability alone must not make a file sweepable"
         );
     }
 

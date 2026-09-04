@@ -411,7 +411,16 @@ fn interrupted_atomic_write(name: &str) -> bool {
     let Some((target, uuid)) = stripped.rsplit_once('.') else {
         return false;
     };
-    if Uuid::parse_str(uuid).is_err() {
+    // Parseable is not enough: `Uuid::parse_str` accepts braced, urn,
+    // simple, and uppercase spellings, while `write_atomic` only ever emits
+    // the lowercase hyphenated form. Whatever qualifies here is DELETED at
+    // open, so the gate enforces the writer's exact syntax — a round-trip
+    // through the canonical form — or the doc comment above ("only names
+    // this crate can actually produce") would be a promise the code breaks.
+    let canonical = Uuid::parse_str(uuid)
+        .map(|parsed| parsed.as_hyphenated().to_string() == uuid)
+        .unwrap_or(false);
+    if !canonical {
         return false;
     }
     // The two range-level markers are single fixed names, so their scratch
@@ -1115,6 +1124,14 @@ mod tests {
             // are nobody's scratch files (#290).
             ".notes.retention-intent.00000000-0000-0000-0000-000000000002.tmp",
             ".notes.truncate-intent.00000000-0000-0000-0000-000000000003.tmp",
+            // UUID spellings `parse_str` accepts but `write_atomic` never
+            // emits — braced, uppercase, simple, urn. The gate demands the
+            // writer's exact lowercase hyphenated form, because whatever
+            // qualifies is deleted at open (#407).
+            ".notes.commit.{052480a2-9d38-4915-b5c1-773eb42625a7}.tmp",
+            ".notes.commit.052480A2-9D38-4915-B5C1-773EB42625A7.tmp",
+            ".notes.commit.052480a29d384915b5c1773eb42625a7.tmp",
+            ".notes.commit.urn:uuid:052480a2-9d38-4915-b5c1-773eb42625a7.tmp",
         ] {
             fs::write(directory.path().join(name), b"not ours").unwrap();
         }
