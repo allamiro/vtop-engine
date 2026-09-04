@@ -28,7 +28,7 @@ pub mod transfer;
 
 use crate::{
     storage_producer_id, BrokerError, BrokerResult, MetaFencingEpoch, MetaLeaseState,
-    ProducerEpochJournal, SegmentFormat,
+    ProducerEpochJournal, SegmentFormat, PROMOTION_MARKER_PRODUCER,
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -929,9 +929,39 @@ impl InProcessFollower {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state
+        let mut fetched = state
             .segment
-            .fetch_through(start_offset, max_bytes, max_records, hwm)
+            .fetch_through(start_offset, max_bytes, max_records, hwm);
+        if let Ok(batch) = &fetched {
+            // The byte budget excluded even the first committed record —
+            // the leader's wire path refetches exactly that record so the
+            // consumer always makes progress, and the two fetch surfaces
+            // must agree on when a cursor can move. Like the leader's
+            // guard, this reads the RAW batch before the visibility filter
+            // below: an all-marker batch arrives with an ADVANCED
+            // next_offset, so it cannot re-trigger the refetch.
+            if batch.records.is_empty()
+                && batch.next_offset == start_offset
+                && batch.next_offset < batch.high_watermark
+            {
+                fetched = state
+                    .segment
+                    .fetch_through(start_offset, usize::MAX, 1, hwm);
+            }
+        }
+        fetched
+            .map(|mut batch| {
+                // The same visibility rule as the leader's wire mapping —
+                // one predicate for both fetch surfaces (#240): the fault
+                // harness compares the two views record-for-record across
+                // failovers, and a marker visible on one side only would
+                // read as divergence. The batch's next_offset still steps
+                // over what the filter removed.
+                batch
+                    .records
+                    .retain(|record| crate::consumer_visible(&record.record));
+                batch
+            })
             .map_err(|source| BrokerError::InvalidConfig(source.to_string()))
     }
 
@@ -1012,6 +1042,23 @@ impl InProcessFollower {
                 BrokerError::ProducerFenced { .. } => (ErrorCode::Fenced, problem.to_string()),
                 other => (ErrorCode::Storage, other.to_string()),
             });
+        }
+        // A v1 frame stores the producer identity MERGED with the epoch, so
+        // a promotion marker written here would lose the reserved identity
+        // that keeps it invisible — and would surface as a phantom record if
+        // this follower ever serves a fetch or is promoted. Refusing keeps a
+        // mixed-format set honest: the marker stays unacked here and the
+        // leader's quorum count says so, instead of a hidden visibility leak
+        // saying nothing (#240).
+        if self.segment_format == SegmentFormat::V1
+            && request.producer_id == PROMOTION_MARKER_PRODUCER
+        {
+            return Err((
+                ErrorCode::InvalidRequest,
+                "a v1-format follower cannot store the promotion marker under its \
+                 recognizable identity, so it refuses the marker rather than hide the loss"
+                    .to_owned(),
+            ));
         }
         let (stored_id, stored_epoch) = match self.segment_format {
             SegmentFormat::V1 => (
@@ -1159,6 +1206,19 @@ impl InProcessFollower {
                     BrokerError::ProducerFenced { .. } => (ErrorCode::Fenced, problem.to_string()),
                     other => (ErrorCode::Storage, other.to_string()),
                 });
+            }
+            // Same refusal as the single-request path: a v1 frame cannot
+            // store the marker's reserved identity, and hiding that loss
+            // would be worse than failing the ack (#240).
+            if self.segment_format == SegmentFormat::V1
+                && request.producer_id == PROMOTION_MARKER_PRODUCER
+            {
+                return Err((
+                    ErrorCode::InvalidRequest,
+                    "a v1-format follower cannot store the promotion marker under its \
+                     recognizable identity, so it refuses the marker rather than hide the loss"
+                        .to_owned(),
+                ));
             }
             let (stored_id, stored_epoch) = match self.segment_format {
                 SegmentFormat::V1 => (
