@@ -109,6 +109,12 @@ for arg in "$@"; do
     continue
   fi
   case "$arg" in
+    -h|--help)
+      # This script's usage is the header above; cargo's is cargo's. Neither
+      # is served by compiling the workspace first.
+      awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"
+      printf '\nFor cargo'"'"'s own options: cargo test --help\n'
+      exit 0 ;;
     --message-format|--message-format=*)
       die "--message-format is this script's to choose: the compile phase needs cargo's JSON stream" ;;
     -p|--package|--exclude|--features|-F|--target|--target-dir|--manifest-path|\
@@ -245,6 +251,12 @@ PY
 if [[ -n "$TARGET_ARG" ]]; then
   TRIPLE="$TARGET_ARG"
 else
+  # tomllib arrived in Python 3.11; an older python3 passes the tool check
+  # above and fails inside the lookup with a traceback that names neither
+  # the version nor the way around it.
+  python3 -c 'import tomllib' 2>/dev/null \
+    || die "reading cargo's config for build.target needs Python 3.11 or newer (tomllib); \
+python3 here is $(python3 -V 2>&1). Upgrade, or pass --target to skip the lookup"
   TRIPLE="$(build_target)" || die "could not settle the build target"
 fi
 TRIPLE="${TRIPLE:-$HOST}"
@@ -389,6 +401,17 @@ plain_log() { # <file> — the log with its escape sequences removed
   [[ -f "$1" ]] || return 0
   sed "s/${ESC}\[[0-9;]*[A-Za-z]//g" "$1"
 }
+# rustc's rendered diagnostics from a log: each block from a `warning:` or
+# `error:` line to the blank line that closes it. The bar hides the log the
+# warnings were printed into, and a warning that vanishes because a test
+# run succeeded is a warning nobody fixes.
+diagnostics() { # <file>
+  plain_log "$1" | awk '
+    /^(warning|error)(\[[^]]*\])?: / { block = 1 }
+    /^ *(Compiling|Checking|Finished|Running|Doc-tests) / { block = 0 }
+    block { print }
+    block && /^$/ { block = 0 }'
+}
 sum_counts() { # <passed|failed> <file> — libtest's own totals, from its
   # `test result:` lines only: a test that PRINTS "7 passed" is not a result.
   plain_log "$2" | grep -hE '^test result: ' | grep -oE "[0-9]+ $1" | awk '{s+=$1} END{print s+0}'
@@ -417,6 +440,10 @@ if (( ! doc_only )); then
     printf '%scompile failed%s\n' "$RED" "$RESET"
     cat "$WORK/build.err"
     exit "$BUILD_RC"
+  fi
+  if plain_log "$WORK/build.err" | grep -qE '^warning(\[[^]]*\])?: '; then
+    printf '%swarnings from the compile%s\n' "$BOLD" "$RESET"
+    diagnostics "$WORK/build.err"
   fi
   if (( no_run )); then
     # Cargo's --no-run: compile, but don't run tests. The compile IS this
@@ -507,6 +534,11 @@ if [[ "$RUN_RC" -ne 0 ]]; then
   exit "$RUN_RC"
 fi
 
+# Doctests compile during the run, so their warnings land in the run log.
+if plain_log "$WORK/run.log" | grep -qE '^warning(\[[^]]*\])?: '; then
+  printf '%swarnings from the run%s\n' "$BOLD" "$RESET"
+  diagnostics "$WORK/run.log"
+fi
 if (( doc_only )); then
   printf '%s%d doctests passed%s\n' "$GREEN" "$passed" "$RESET"
 elif (( target_selected )); then
