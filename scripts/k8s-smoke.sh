@@ -136,29 +136,61 @@ whether the StatefulSet created anything is unknown"
 # pod, through the same resolv.conf the node process resolves with — and asks
 # EVERY pod about EVERY peer, because the record one pod's query finds says
 # nothing about the cache another pod's query lands on.
+# Settled means resolved to the pod's CURRENT address, not merely resolved
+# (review): across a pod recreation a cached positive answer can hand a peer
+# the DEAD pod's IP with a success exit code, which is precisely the
+# occurrence-three stall this gate exists to catch — so each answer is
+# compared against the target's live status.podIP. And a failed PROBE is not
+# a failed LOOKUP — the same attribution rule `await_pods_exist` states: an
+# exec the API server never answered says nothing about DNS, so the two are
+# tracked and reported apart, and each probe is bounded so one hung exec
+# cannot stretch the gate past its retry budget.
 await_peer_dns() { # namespace
   peer_ns="$1"
   unresolved=""
+  unprobed=""
   for _ in $(seq 1 60); do
     unresolved=""
-    for probe in 0 1 2; do
-      for name in 0 1 2; do
+    unprobed=""
+    for name in 0 1 2; do
+      want="$(kubectl -n "$peer_ns" get pod "${REL}-${name}" \
+        -o jsonpath='{.status.podIP}' 2>/dev/null || true)"
+      if [ -z "$want" ]; then
+        unprobed="$unprobed podIP(${REL}-${name})"
+        continue
+      fi
+      peer_fqdn="${REL}-${name}.${HEADLESS}.${peer_ns}.svc.${DOMAIN}"
+      for probe in 0 1 2; do
         [ "$probe" = "$name" ] && continue
-        kubectl -n "$peer_ns" exec "${REL}-${probe}" -- \
-          getent hosts "${REL}-${name}.${HEADLESS}.${peer_ns}.svc.${DOMAIN}" \
-          >/dev/null 2>&1 \
-          || unresolved="$unresolved ${REL}-${probe}->${REL}-${name}"
+        # `miss` is emitted by the REMOTE shell, so an empty answer can mean
+        # only one thing: the probe itself never ran to completion.
+        answer="$(timeout 15 kubectl -n "$peer_ns" exec "${REL}-${probe}" -- \
+          sh -c "getent hosts ${peer_fqdn} || echo miss" 2>/dev/null || true)"
+        if [ -z "$answer" ]; then
+          unprobed="$unprobed ${REL}-${probe}->${REL}-${name}"
+        elif [ "$answer" = "miss" ]; then
+          unresolved="$unresolved ${REL}-${probe}->${REL}-${name}"
+        else
+          got="${answer%%[[:space:]]*}"
+          [ "$got" = "$want" ] \
+            || unresolved="$unresolved ${REL}-${probe}->${REL}-${name}(stale:${got}!=${want})"
+        fi
       done
     done
-    [ -z "$unresolved" ] && return 0
+    [ -z "${unresolved}${unprobed}" ] && return 0
     sleep 2
   done
   # Self-diagnosing on failure, per #324's rule: name the lookups that never
-  # answered and show the two components that could be responsible, so a CI
-  # recurrence carries its own evidence instead of a bare timeout.
+  # answered — kept apart from the probes that never ran — and show the two
+  # components that could be responsible, so a CI recurrence carries its own
+  # evidence instead of a bare timeout.
   kubectl -n "$peer_ns" get endpointslices 2>/dev/null || true
   kubectl -n kube-system get pods -l k8s-app=kube-dns 2>/dev/null || true
-  fail "headless DNS never settled in ${peer_ns}: still unresolved after 60 attempts:${unresolved} (#416)"
+  [ -n "$unresolved" ] || fail "peer DNS in ${peer_ns} could not be OBSERVED: every lookup that \
+ran resolved correctly, but these probes never completed for 60 rounds:${unprobed} — an exec/API \
+problem, not a DNS verdict (#416)"
+  fail "headless DNS never settled in ${peer_ns}: still unresolved after 60 attempts:${unresolved}\
+${unprobed:+ (and these probes never completed:${unprobed})} (#416)"
 }
 
 # ---------------------------------------------------------------------------
