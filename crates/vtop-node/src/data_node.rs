@@ -2402,6 +2402,14 @@ impl crate::lease_agent::CandidateLocalView for SwitchingLocalView {
             .as_ref()
             .map_or_else(Vec::new, |view| view.epoch_starts())
     }
+
+    fn sealed_prefix_end(&self) -> Option<u64> {
+        self.delegate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(|view| view.sealed_prefix_end())
+    }
 }
 
 impl crate::observe::ReplicaObservation for SwitchingLocalView {

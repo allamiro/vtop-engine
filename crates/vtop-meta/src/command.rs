@@ -87,6 +87,7 @@ const COMMAND_KIND_CANCEL_RETENTION: u16 = 27;
 // every pinned golden vector for the existing command stays byte-exact.
 const COMMAND_KIND_ACQUIRE_RANGE_LEASE: u16 = 28;
 const COMMAND_KIND_RENEW_RANGE_LEASE: u16 = 29;
+const COMMAND_KIND_REPORT_PROMOTION_OUTCOME: u16 = 30;
 
 const RESPONSE_KIND_ACK: u16 = 1;
 const RESPONSE_KIND_TOPIC_CREATED: u16 = 2;
@@ -95,6 +96,7 @@ const RESPONSE_KIND_REJECTED: u16 = 4;
 const RESPONSE_KIND_GROUP_CREATED: u16 = 5;
 const RESPONSE_KIND_MEMBER_JOINED: u16 = 6;
 const RESPONSE_KIND_CURSOR_COMMITTED: u16 = 7;
+const RESPONSE_KIND_TRANSITION_RECORDED: u16 = 8;
 
 const ERROR_KIND_GENERATION_MISMATCH: u16 = 1;
 const ERROR_KIND_EPOCH_MISMATCH: u16 = 2;
@@ -193,6 +195,154 @@ pub struct RangeAssignment {
     pub range_uuid: Uuid,
 }
 
+/// Bound on the fenced-quorum answers a promotion report may carry: the
+/// replica set plus the transient extra a rebalance holds, with room.
+pub const MAX_TRANSITION_QUORUM: usize = 32;
+
+/// One fenced replica's answer at promotion, as the transition record keeps
+/// it (#240 item 5): who was asked, and the committed offset it reported
+/// once fenced at the new epoch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QuorumAnswer {
+    pub node_uuid: Uuid,
+    pub offset: u64,
+}
+
+/// Why a promotion was refused, as the transition record keeps it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromotionRefusal {
+    /// Too few replicas could be fenced and read to establish a boundary.
+    QuorumUnavailable,
+    /// The quorum proved a boundary the candidate's own log does not reach.
+    LeaderBehind,
+    /// Fewer than a majority of the fenced replicas were at or below the
+    /// candidate's own offset (Raft §5.4.1).
+    CandidateBehindVoters,
+}
+
+impl PromotionRefusal {
+    fn wire_tag(self) -> u8 {
+        match self {
+            PromotionRefusal::QuorumUnavailable => 1,
+            PromotionRefusal::LeaderBehind => 2,
+            PromotionRefusal::CandidateBehindVoters => 3,
+        }
+    }
+
+    pub(crate) fn from_wire(tag: u8) -> Result<Self, CodecError> {
+        match tag {
+            1 => Ok(PromotionRefusal::QuorumUnavailable),
+            2 => Ok(PromotionRefusal::LeaderBehind),
+            3 => Ok(PromotionRefusal::CandidateBehindVoters),
+            other => Err(CodecError::UnknownTag {
+                what: "promotion refusal",
+                tag: u32::from(other),
+            }),
+        }
+    }
+}
+
+/// What a grant became, reported by its holder (#240 item 5): the evidence
+/// the promotion computed and used to be discarded. `Served` is what the
+/// signed transition record asserts; everything in it is recomputable by a
+/// reader holding the record and the replicas — `votes` and `required` are
+/// carried so a checker can recompute them from `quorum` rather than trust
+/// them, and `boundary_offset` is `None` only for a standalone promotion,
+/// where there is no quorum and the node's own log is the boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PromotionOutcome {
+    Served {
+        boundary_offset: Option<u64>,
+        /// Sealed-segment identity at the transition (#306), when the
+        /// holder had one to report.
+        sealed_prefix_end: Option<u64>,
+        quorum: Vec<QuorumAnswer>,
+        votes: u32,
+        required: u32,
+    },
+    Refused {
+        reason: PromotionRefusal,
+    },
+}
+
+pub(crate) fn encode_promotion_outcome(
+    out: &mut Vec<u8>,
+    outcome: &PromotionOutcome,
+) -> Result<(), CodecError> {
+    match outcome {
+        PromotionOutcome::Served {
+            boundary_offset,
+            sealed_prefix_end,
+            quorum,
+            votes,
+            required,
+        } => {
+            put_u8(out, 1);
+            encode_optional_u64(out, *boundary_offset);
+            encode_optional_u64(out, *sealed_prefix_end);
+            if quorum.len() > MAX_TRANSITION_QUORUM {
+                return Err(CodecError::BoundExceeded {
+                    what: "promotion quorum answers",
+                    actual: quorum.len(),
+                    maximum: MAX_TRANSITION_QUORUM,
+                });
+            }
+            put_u16(out, quorum.len() as u16);
+            for answer in quorum {
+                put_uuid(out, answer.node_uuid);
+                put_u64(out, answer.offset);
+            }
+            put_u32(out, *votes);
+            put_u32(out, *required);
+        }
+        PromotionOutcome::Refused { reason } => {
+            put_u8(out, 2);
+            put_u8(out, reason.wire_tag());
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn decode_promotion_outcome(
+    reader: &mut Reader<'_>,
+) -> Result<PromotionOutcome, CodecError> {
+    match reader.u8("promotion outcome")? {
+        1 => {
+            let boundary_offset = decode_optional_u64(reader, "promotion boundary offset")?;
+            let sealed_prefix_end = decode_optional_u64(reader, "promotion sealed prefix end")?;
+            let count = reader.u16("promotion quorum answer count")? as usize;
+            if count > MAX_TRANSITION_QUORUM {
+                return Err(CodecError::BoundExceeded {
+                    what: "promotion quorum answers",
+                    actual: count,
+                    maximum: MAX_TRANSITION_QUORUM,
+                });
+            }
+            let mut quorum = Vec::with_capacity(count);
+            for _ in 0..count {
+                quorum.push(QuorumAnswer {
+                    node_uuid: reader.uuid("promotion quorum node")?,
+                    offset: reader.u64("promotion quorum offset")?,
+                });
+            }
+            Ok(PromotionOutcome::Served {
+                boundary_offset,
+                sealed_prefix_end,
+                quorum,
+                votes: reader.u32("promotion votes")?,
+                required: reader.u32("promotion required votes")?,
+            })
+        }
+        2 => Ok(PromotionOutcome::Refused {
+            reason: PromotionRefusal::from_wire(reader.u8("promotion refusal")?)?,
+        }),
+        other => Err(CodecError::UnknownTag {
+            what: "promotion outcome",
+            tag: u32::from(other),
+        }),
+    }
+}
+
 /// The full deterministic command set of stage-5 PR 1 plus stage-7 group and
 /// lineage-aware cursor commands.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -263,6 +413,26 @@ pub enum MetadataCommand {
         holder_node_uuid: Uuid,
         expected_fencing_epoch: u64,
         lease_duration_ms: u64,
+    },
+    /// Report what a grant became (#240 item 5): the holder of
+    /// `fencing_epoch` records the evidence its promotion computed — the
+    /// fenced quorum, the boundary it adopted, the §5.4.1 vote — or the
+    /// refusal that made it stand aside. Every grant already has a
+    /// transition record from the moment it is minted, so this only ever
+    /// fills in an outcome; a record whose holder never reports stays
+    /// visibly `Pending`, which is the honest shape of an epoch nobody
+    /// served under.
+    ///
+    /// Node-scoped: only the holder the epoch was granted to may report on
+    /// it, and a served transition is final — a later report cannot
+    /// rewrite what was proven.
+    ReportPromotionOutcome {
+        env: CommandEnvelope,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        holder_node_uuid: Uuid,
+        fencing_epoch: u64,
+        outcome: PromotionOutcome,
     },
     RegisterSealedSegment {
         env: CommandEnvelope,
@@ -520,6 +690,7 @@ impl MetadataCommand {
             | MetadataCommand::GrantRangeLease { env, .. }
             | MetadataCommand::AcquireRangeLease { env, .. }
             | MetadataCommand::RenewRangeLease { env, .. }
+            | MetadataCommand::ReportPromotionOutcome { env, .. }
             | MetadataCommand::ReleaseRangeLease { env, .. }
             | MetadataCommand::RegisterSealedSegment { env, .. }
             | MetadataCommand::MarkSegmentVerified { env, .. }
@@ -642,6 +813,22 @@ impl MetadataCommand {
                 put_uuid(&mut out, *holder_node_uuid);
                 put_u64(&mut out, *expected_fencing_epoch);
                 put_u64(&mut out, *lease_duration_ms);
+            }
+            MetadataCommand::ReportPromotionOutcome {
+                env,
+                topic_uuid,
+                range_uuid,
+                holder_node_uuid,
+                fencing_epoch,
+                outcome,
+            } => {
+                put_u16(&mut out, COMMAND_KIND_REPORT_PROMOTION_OUTCOME);
+                encode_envelope(&mut out, env);
+                put_uuid(&mut out, *topic_uuid);
+                put_uuid(&mut out, *range_uuid);
+                put_uuid(&mut out, *holder_node_uuid);
+                put_u64(&mut out, *fencing_epoch);
+                encode_promotion_outcome(&mut out, outcome)?;
             }
             MetadataCommand::RegisterSealedSegment {
                 env,
@@ -1130,6 +1317,14 @@ impl MetadataCommand {
                 expected_fencing_epoch: reader.u64("expected fencing epoch")?,
                 lease_duration_ms: reader.u64("lease duration ms")?,
             }),
+            COMMAND_KIND_REPORT_PROMOTION_OUTCOME => Ok(MetadataCommand::ReportPromotionOutcome {
+                env: decode_envelope(reader)?,
+                topic_uuid: reader.uuid("topic uuid")?,
+                range_uuid: reader.uuid("range uuid")?,
+                holder_node_uuid: reader.uuid("holder node uuid")?,
+                fencing_epoch: reader.u64("fencing epoch")?,
+                outcome: decode_promotion_outcome(reader)?,
+            }),
             COMMAND_KIND_RELEASE_RANGE_LEASE => Ok(MetadataCommand::ReleaseRangeLease {
                 env: decode_envelope(reader)?,
                 topic_uuid: reader.uuid("topic uuid")?,
@@ -1583,6 +1778,11 @@ pub enum MetadataResponse {
     CursorCommitted {
         checkpoint_generation: u64,
     },
+    /// A promotion outcome was recorded against the transition that minted
+    /// this epoch (#240 item 5).
+    TransitionRecorded {
+        fencing_epoch: u64,
+    },
     Rejected(MetadataError),
 }
 
@@ -1611,6 +1811,10 @@ impl MetadataResponse {
             }
             MetadataResponse::LeaseGranted { fencing_epoch } => {
                 put_u16(out, RESPONSE_KIND_LEASE_GRANTED);
+                put_u64(out, *fencing_epoch);
+            }
+            MetadataResponse::TransitionRecorded { fencing_epoch } => {
+                put_u16(out, RESPONSE_KIND_TRANSITION_RECORDED);
                 put_u64(out, *fencing_epoch);
             }
             MetadataResponse::GroupCreated {
@@ -1662,6 +1866,9 @@ impl MetadataResponse {
                 root_range_uuid: reader.uuid("root range uuid")?,
             }),
             RESPONSE_KIND_LEASE_GRANTED => Ok(MetadataResponse::LeaseGranted {
+                fencing_epoch: reader.u64("fencing epoch")?,
+            }),
+            RESPONSE_KIND_TRANSITION_RECORDED => Ok(MetadataResponse::TransitionRecorded {
                 fencing_epoch: reader.u64("fencing epoch")?,
             }),
             RESPONSE_KIND_GROUP_CREATED => Ok(MetadataResponse::GroupCreated {
@@ -2414,6 +2621,82 @@ mod tests {
             panic!("constructor changed variant");
         };
         assert_eq!(long.len(), MAX_ERROR_DETAIL_BYTES);
+    }
+
+    /// The promotion report round-trips byte-exactly in both shapes, its
+    /// quorum list is bounded on both sides, and its response has a kind of
+    /// its own (#240 item 5).
+    #[test]
+    fn report_promotion_outcome_round_trips_and_bounds_its_quorum() {
+        let env = CommandEnvelope {
+            request_id: Uuid::from_u128(0x77),
+            issued_at_ms: 1_700_000_000_000,
+        };
+        let served = MetadataCommand::ReportPromotionOutcome {
+            env,
+            topic_uuid: Uuid::from_u128(20),
+            range_uuid: Uuid::from_u128(21),
+            holder_node_uuid: Uuid::from_u128(10),
+            fencing_epoch: 4,
+            outcome: PromotionOutcome::Served {
+                boundary_offset: Some(401),
+                sealed_prefix_end: None,
+                quorum: vec![
+                    QuorumAnswer {
+                        node_uuid: Uuid::from_u128(10),
+                        offset: 401,
+                    },
+                    QuorumAnswer {
+                        node_uuid: Uuid::from_u128(11),
+                        offset: 400,
+                    },
+                ],
+                votes: 2,
+                required: 2,
+            },
+        };
+        assert_eq!(
+            MetadataCommand::decode(&served.encode().unwrap()).unwrap(),
+            served
+        );
+        let refused = MetadataCommand::ReportPromotionOutcome {
+            env,
+            topic_uuid: Uuid::from_u128(20),
+            range_uuid: Uuid::from_u128(21),
+            holder_node_uuid: Uuid::from_u128(10),
+            fencing_epoch: 5,
+            outcome: PromotionOutcome::Refused {
+                reason: PromotionRefusal::CandidateBehindVoters,
+            },
+        };
+        assert_eq!(
+            MetadataCommand::decode(&refused.encode().unwrap()).unwrap(),
+            refused
+        );
+
+        let MetadataCommand::ReportPromotionOutcome { outcome, .. } = &served else {
+            unreachable!()
+        };
+        let mut oversized = outcome.clone();
+        if let PromotionOutcome::Served { quorum, .. } = &mut oversized {
+            *quorum = (0..MAX_TRANSITION_QUORUM as u128 + 1)
+                .map(|node| QuorumAnswer {
+                    node_uuid: Uuid::from_u128(node),
+                    offset: 0,
+                })
+                .collect();
+        }
+        let mut out = Vec::new();
+        assert!(matches!(
+            encode_promotion_outcome(&mut out, &oversized),
+            Err(CodecError::BoundExceeded { .. })
+        ));
+
+        let response = MetadataResponse::TransitionRecorded { fencing_epoch: 4 };
+        assert_eq!(
+            MetadataResponse::decode(&response.encode().unwrap()).unwrap(),
+            response
+        );
     }
 
     #[test]

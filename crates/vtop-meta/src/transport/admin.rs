@@ -10,12 +10,14 @@ use super::tls::{server_name, TlsMaterial};
 use super::wire::{
     read_frame, write_frame, AdminAddLearnerRequest, AdminChangeMembershipRequest, AdminError,
     AdminInitRequest, AdminMembershipResponse, AdminProposeRequest, AdminProposeResponse,
-    AdminReadRangeLeaseRequest, AdminReadRangeLeaseResponse, AdminReadSegmentPlacementRequest,
+    AdminReadRangeLeaseRequest, AdminReadRangeLeaseResponse, AdminReadRangeTransitionsRequest,
+    AdminReadRangeTransitionsResponse, AdminReadSegmentPlacementRequest,
     AdminReadSegmentPlacementResponse, AdminStatusRequest, AdminStatusResponse, NotLeaderHint,
     TransportError, TransportResult, VtpmFrame, KIND_ADMIN_ADD_LEARNER_REQ,
     KIND_ADMIN_CHANGE_MEMBERSHIP_REQ, KIND_ADMIN_ERROR, KIND_ADMIN_INIT_REQ,
     KIND_ADMIN_MEMBERSHIP_RESP, KIND_ADMIN_PROPOSE_REQ, KIND_ADMIN_PROPOSE_RESP,
     KIND_ADMIN_READ_RANGE_LEASE_REQ, KIND_ADMIN_READ_RANGE_LEASE_RESP,
+    KIND_ADMIN_READ_RANGE_TRANSITIONS_REQ, KIND_ADMIN_READ_RANGE_TRANSITIONS_RESP,
     KIND_ADMIN_READ_SEGMENT_PLACEMENT_REQ, KIND_ADMIN_READ_SEGMENT_PLACEMENT_RESP,
     KIND_ADMIN_STATUS_REQ, KIND_ADMIN_STATUS_RESP,
 };
@@ -55,6 +57,12 @@ pub trait AdminHandler: Send + Sync {
         &self,
         request: AdminReadSegmentPlacementRequest,
     ) -> TransportResult<AdminReadSegmentPlacementResponse>;
+
+    /// Linearizable read of a range's transition chain (#240 item 5).
+    async fn read_range_transitions(
+        &self,
+        request: AdminReadRangeTransitionsRequest,
+    ) -> TransportResult<AdminReadRangeTransitionsResponse>;
 }
 
 /// Admin server, with or without TLS.
@@ -328,6 +336,18 @@ async fn dispatch_admin(
             Ok(VtpmFrame {
                 kind: KIND_ADMIN_READ_SEGMENT_PLACEMENT_RESP,
                 payload: response.encode(),
+            })
+        }
+        KIND_ADMIN_READ_RANGE_TRANSITIONS_REQ => {
+            let request = AdminReadRangeTransitionsRequest::decode(&frame.payload)?;
+            // A read: the chain is evidence anybody entitled to look at the
+            // cluster may check, and requiring command authority to read it
+            // would defeat the point of keeping it.
+            authorize(authorizer.authorize_read(identity))?;
+            let response = handler.read_range_transitions(request).await?;
+            Ok(VtpmFrame {
+                kind: KIND_ADMIN_READ_RANGE_TRANSITIONS_RESP,
+                payload: response.encode()?,
             })
         }
         KIND_ADMIN_PROPOSE_REQ => {
@@ -672,6 +692,39 @@ impl AdminClient {
     }
 
     /// Read a segment's placement through a linearizable fence.
+    /// Read a range's transition chain through a linearizable fence
+    /// (#240 item 5).
+    pub async fn read_range_transitions(
+        &self,
+        topic_uuid: uuid::Uuid,
+        range_uuid: uuid::Uuid,
+        from_epoch: u64,
+        limit: u16,
+    ) -> TransportResult<AdminReadRangeTransitionsResponse> {
+        let frame = self
+            .round_trip(VtpmFrame {
+                kind: KIND_ADMIN_READ_RANGE_TRANSITIONS_REQ,
+                payload: AdminReadRangeTransitionsRequest {
+                    topic_uuid,
+                    range_uuid,
+                    from_epoch,
+                    limit,
+                }
+                .encode(),
+            })
+            .await?;
+        match frame.kind {
+            KIND_ADMIN_READ_RANGE_TRANSITIONS_RESP => {
+                Ok(AdminReadRangeTransitionsResponse::decode(&frame.payload)?)
+            }
+            KIND_ADMIN_ERROR => {
+                let error = AdminError::decode(&frame.payload)?;
+                Err(TransportError::Protocol(error.message))
+            }
+            other => Err(TransportError::UnexpectedKind(other)),
+        }
+    }
+
     pub async fn read_segment_placement(
         &self,
         topic_uuid: uuid::Uuid,
@@ -1127,6 +1180,17 @@ mod tests {
     impl AdminHandler for CountingHandler {
         async fn status(&self) -> TransportResult<AdminStatusResponse> {
             Ok(stub_status(MetaNodeId(1)))
+        }
+
+        async fn read_range_transitions(
+            &self,
+            _request: AdminReadRangeTransitionsRequest,
+        ) -> TransportResult<AdminReadRangeTransitionsResponse> {
+            Ok(AdminReadRangeTransitionsResponse {
+                found: false,
+                transitions: Vec::new(),
+                read_at_applied_index: 0,
+            })
         }
 
         async fn read_segment_placement(
@@ -1816,6 +1880,12 @@ mod tests {
     #[async_trait]
     impl AdminHandler for NotLeaderHandler {
         async fn status(&self) -> TransportResult<AdminStatusResponse> {
+            self.refuse()
+        }
+        async fn read_range_transitions(
+            &self,
+            _: AdminReadRangeTransitionsRequest,
+        ) -> TransportResult<AdminReadRangeTransitionsResponse> {
             self.refuse()
         }
         async fn read_segment_placement(

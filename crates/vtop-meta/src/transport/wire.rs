@@ -80,6 +80,12 @@ pub const KIND_ADMIN_READ_RANGE_LEASE_REQ: u16 = 19;
 pub const KIND_ADMIN_READ_RANGE_LEASE_RESP: u16 = 20;
 pub const KIND_ADMIN_READ_SEGMENT_PLACEMENT_REQ: u16 = 21;
 pub const KIND_ADMIN_READ_SEGMENT_PLACEMENT_RESP: u16 = 22;
+pub const KIND_ADMIN_READ_RANGE_TRANSITIONS_REQ: u16 = 23;
+pub const KIND_ADMIN_READ_RANGE_TRANSITIONS_RESP: u16 = 24;
+
+/// The most transition records one read returns; a longer chain is paged
+/// with `from_epoch`.
+pub const MAX_TRANSITIONS_PER_READ: usize = 256;
 
 /// Bound for node ids carried in one admin membership request. This is
 /// intentionally tighter than the storage codec's compatibility ceiling.
@@ -747,6 +753,199 @@ impl AdminSegmentView {
             8 => "RetentionExpired",
             _ => return None,
         })
+    }
+}
+
+/// Which range's transition chain to read, from which epoch, how many at
+/// most (#240 item 5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdminReadRangeTransitionsRequest {
+    pub topic_uuid: Uuid,
+    pub range_uuid: Uuid,
+    /// The first epoch to return; the chain is read upward from here.
+    pub from_epoch: u64,
+    /// Clamped to [`MAX_TRANSITIONS_PER_READ`] by the server.
+    pub limit: u16,
+}
+
+impl AdminReadRangeTransitionsRequest {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_uuid(&mut out, self.topic_uuid);
+        put_uuid(&mut out, self.range_uuid);
+        put_u64(&mut out, self.from_epoch);
+        put_u16(&mut out, self.limit);
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut reader = Reader::new(bytes);
+        let request = Self {
+            topic_uuid: reader.uuid("topic uuid")?,
+            range_uuid: reader.uuid("range uuid")?,
+            from_epoch: reader.u64("from epoch")?,
+            limit: reader.u16("limit")?,
+        };
+        reader.finish()?;
+        Ok(request)
+    }
+}
+
+/// One transition record as the admin wire carries it: the state machine's
+/// [`crate::state::RangeTransitionRecord`], field for field, encoded with
+/// the same primitives the durable value uses so the two cannot drift in
+/// meaning.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdminTransitionView {
+    pub epoch_from: u64,
+    pub epoch_to: u64,
+    pub holder_from: Option<Uuid>,
+    pub holder_to: Uuid,
+    pub grant: crate::state::GrantKind,
+    pub granted_at_ms: i64,
+    pub granted_apply_index: u64,
+    pub outcome: crate::state::TransitionOutcome,
+}
+
+impl From<crate::state::RangeTransitionRecord> for AdminTransitionView {
+    fn from(record: crate::state::RangeTransitionRecord) -> Self {
+        Self {
+            epoch_from: record.epoch_from,
+            epoch_to: record.epoch_to,
+            holder_from: record.holder_from,
+            holder_to: record.holder_to,
+            grant: record.grant,
+            granted_at_ms: record.granted_at_ms,
+            granted_apply_index: record.granted_apply_index,
+            outcome: record.outcome,
+        }
+    }
+}
+
+impl AdminTransitionView {
+    fn encode_into(&self, out: &mut Vec<u8>) -> Result<(), CodecError> {
+        put_u64(out, self.epoch_from);
+        put_u64(out, self.epoch_to);
+        match self.holder_from {
+            None => put_u8(out, 0),
+            Some(holder) => {
+                put_u8(out, 1);
+                put_uuid(out, holder);
+            }
+        }
+        put_uuid(out, self.holder_to);
+        put_u8(
+            out,
+            match self.grant {
+                crate::state::GrantKind::Election => 1,
+                crate::state::GrantKind::Administrative => 2,
+            },
+        );
+        put_i64(out, self.granted_at_ms);
+        put_u64(out, self.granted_apply_index);
+        match &self.outcome {
+            crate::state::TransitionOutcome::Pending => put_u8(out, 0),
+            crate::state::TransitionOutcome::Reported {
+                outcome,
+                reported_at_ms,
+                reported_apply_index,
+            } => {
+                put_u8(out, 1);
+                crate::command::encode_promotion_outcome(out, outcome)?;
+                put_i64(out, *reported_at_ms);
+                put_u64(out, *reported_apply_index);
+            }
+        }
+        Ok(())
+    }
+
+    fn decode_from(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
+        Ok(Self {
+            epoch_from: reader.u64("transition epoch from")?,
+            epoch_to: reader.u64("transition epoch to")?,
+            holder_from: if reader.flag("transition holder-from presence")? {
+                Some(reader.uuid("transition holder from")?)
+            } else {
+                None
+            },
+            holder_to: reader.uuid("transition holder to")?,
+            grant: match reader.u8("transition grant kind")? {
+                1 => crate::state::GrantKind::Election,
+                2 => crate::state::GrantKind::Administrative,
+                other => {
+                    return Err(CodecError::UnknownTag {
+                        what: "transition grant kind",
+                        tag: u32::from(other),
+                    })
+                }
+            },
+            granted_at_ms: reader.i64("transition granted at")?,
+            granted_apply_index: reader.u64("transition granted apply index")?,
+            outcome: if reader.flag("transition outcome presence")? {
+                crate::state::TransitionOutcome::Reported {
+                    outcome: crate::command::decode_promotion_outcome(reader)?,
+                    reported_at_ms: reader.i64("transition reported at")?,
+                    reported_apply_index: reader.u64("transition reported apply index")?,
+                }
+            } else {
+                crate::state::TransitionOutcome::Pending
+            },
+        })
+    }
+}
+
+/// A range's transition chain, as of a linearizable read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdminReadRangeTransitionsResponse {
+    /// False when the range does not exist. A range that exists with no
+    /// transitions has simply never been granted.
+    pub found: bool,
+    /// In epoch order, from the requested epoch upward.
+    pub transitions: Vec<AdminTransitionView>,
+    pub read_at_applied_index: u64,
+}
+
+impl AdminReadRangeTransitionsResponse {
+    pub fn encode(&self) -> Result<Vec<u8>, CodecError> {
+        if self.transitions.len() > MAX_TRANSITIONS_PER_READ {
+            return Err(CodecError::BoundExceeded {
+                what: "transitions per read",
+                actual: self.transitions.len(),
+                maximum: MAX_TRANSITIONS_PER_READ,
+            });
+        }
+        let mut out = Vec::new();
+        put_u8(&mut out, u8::from(self.found));
+        put_u16(&mut out, self.transitions.len() as u16);
+        for transition in &self.transitions {
+            transition.encode_into(&mut out)?;
+        }
+        put_u64(&mut out, self.read_at_applied_index);
+        Ok(out)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut reader = Reader::new(bytes);
+        let found = reader.flag("found")?;
+        let count = reader.u16("transition count")? as usize;
+        if count > MAX_TRANSITIONS_PER_READ {
+            return Err(CodecError::BoundExceeded {
+                what: "transitions per read",
+                actual: count,
+                maximum: MAX_TRANSITIONS_PER_READ,
+            });
+        }
+        let mut transitions = Vec::with_capacity(count);
+        for _ in 0..count {
+            transitions.push(AdminTransitionView::decode_from(&mut reader)?);
+        }
+        let response = Self {
+            found,
+            transitions,
+            read_at_applied_index: reader.u64("read at applied index")?,
+        };
+        reader.finish()?;
+        Ok(response)
     }
 }
 
@@ -1635,6 +1834,71 @@ mod tests {
             PeerInstallResponse::decode(&install_resp.encode().unwrap()).unwrap(),
             install_resp
         );
+    }
+
+    /// The transition read round-trips in both outcome shapes and refuses a
+    /// page longer than the bound (#240 item 5).
+    #[test]
+    fn range_transitions_read_round_trips_and_is_bounded() {
+        let request = AdminReadRangeTransitionsRequest {
+            topic_uuid: Uuid::from_u128(20),
+            range_uuid: Uuid::from_u128(21),
+            from_epoch: 3,
+            limit: 16,
+        };
+        assert_eq!(
+            AdminReadRangeTransitionsRequest::decode(&request.encode()).unwrap(),
+            request
+        );
+        let pending = AdminTransitionView {
+            epoch_from: 0,
+            epoch_to: 1,
+            holder_from: None,
+            holder_to: Uuid::from_u128(10),
+            grant: crate::state::GrantKind::Election,
+            granted_at_ms: 1_000,
+            granted_apply_index: 4,
+            outcome: crate::state::TransitionOutcome::Pending,
+        };
+        let served = AdminTransitionView {
+            epoch_from: 1,
+            epoch_to: 2,
+            holder_from: Some(Uuid::from_u128(10)),
+            holder_to: Uuid::from_u128(11),
+            grant: crate::state::GrantKind::Administrative,
+            granted_at_ms: 2_000,
+            granted_apply_index: 9,
+            outcome: crate::state::TransitionOutcome::Reported {
+                outcome: crate::command::PromotionOutcome::Served {
+                    boundary_offset: Some(401),
+                    sealed_prefix_end: Some(300),
+                    quorum: vec![crate::command::QuorumAnswer {
+                        node_uuid: Uuid::from_u128(11),
+                        offset: 401,
+                    }],
+                    votes: 1,
+                    required: 1,
+                },
+                reported_at_ms: 2_500,
+                reported_apply_index: 12,
+            },
+        };
+        let response = AdminReadRangeTransitionsResponse {
+            found: true,
+            transitions: vec![pending, served],
+            read_at_applied_index: 12,
+        };
+        assert_eq!(
+            AdminReadRangeTransitionsResponse::decode(&response.encode().unwrap()).unwrap(),
+            response
+        );
+        let mut oversized = response.clone();
+        oversized.transitions =
+            vec![oversized.transitions[0].clone(); MAX_TRANSITIONS_PER_READ + 1];
+        assert!(matches!(
+            oversized.encode(),
+            Err(CodecError::BoundExceeded { .. })
+        ));
     }
 
     #[test]
