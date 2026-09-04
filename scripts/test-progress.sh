@@ -18,6 +18,13 @@
 # When a number cannot be obtained, the script refuses to run rather than
 # draw an invented one.
 #
+# CARGO RUNS THE TESTS. The run phase is one `cargo test` invocation with the
+# caller's exact arguments, and the bar is drawn from the `Running` and
+# `Doc-tests` lines cargo prints as it goes — so the working directory, the
+# configured runner, `[env]` configuration, dynamic-library paths, target
+# selection and doctests are all cargo's own, not an imitation of them. The
+# script never executes a test binary itself.
+#
 # Usage:
 #   scripts/test-progress.sh                       # whole workspace
 #   scripts/test-progress.sh -p vtop-broker        # cargo's package selection
@@ -27,27 +34,16 @@
 #   scripts/test-progress.sh lease -- --nocapture  # a test-name filter, too
 #
 # Arguments split exactly as `cargo test` splits them: options before `--`
-# are cargo's (package selection, features, target, lock flags), a bare
-# word before `--` is a test-name filter, and everything after `--` is the
-# harness's. A target selector (`--lib`, `--test NAME`, `--bin NAME`, …)
-# narrows the run as it does under cargo and, as under cargo, skips the
-# doctests; `--doc` runs only them, and is refused beside a selector as
-# cargo refuses it; `--no-run` compiles and stops. A `--manifest-path`
-# naming a workspace member selects that member, as it does under cargo.
-# The harness's thread count is cargo's own default unless TEST_THREADS is
-# set.
+# are cargo's, everything after `--` is the harness's, and both reach cargo
+# unchanged — the only arguments this script adds are `--no-run` with a JSON
+# message format for the compile phase and `--no-fail-fast` for the run
+# phase (so every binary runs and every failure is reported, rather than the
+# first). `--no-run` compiles and stops; `--message-format` is refused,
+# because the compile phase needs the JSON stream. The harness's thread
+# count is cargo's own default unless TEST_THREADS is set.
 #
-# Each binary runs from its package's root directory, as cargo runs it, and
-# through cargo's configured `target.<triple>.runner` when one is set — read
-# from the sources cargo reads, in cargo's precedence: `--config` overrides,
-# the environment, the project's `.cargo/config.toml` files upward from the
-# working directory, then the home one. The triple follows the same
-# precedence (`--target`, `CARGO_BUILD_TARGET`, `build.target`, the host).
-# A runner under a `[target.'cfg(...)']` table cannot be evaluated here and
-# is refused rather than silently bypassed.
-#
-# Exit status is the suite's: any failing binary or doctest fails the run,
-# and every failure is reprinted at the end so it is not lost above the bar.
+# Exit status is cargo's: any failing binary or doctest fails the run, and
+# every failure is reprinted at the end so it is not lost above the bar.
 set -uo pipefail
 
 BOLD=$'\033[1m'; RED=$'\033[31m'; GREEN=$'\033[32m'; RESET=$'\033[0m'
@@ -112,9 +108,10 @@ for arg in "$@"; do
     continue
   fi
   case "$arg" in
+    --message-format|--message-format=*)
+      die "--message-format is this script's to choose: the compile phase needs cargo's JSON stream" ;;
     -p|--package|--exclude|--features|-F|--target|--target-dir|--manifest-path|\
-    --profile|-j|--jobs|--test|--bin|--example|--bench|--color|--config|-Z|\
-    --message-format)
+    --profile|-j|--jobs|--test|--bin|--example|--bench|--color|--config|-Z)
       cargo_args+=("$arg"); expect_value="$arg" ;;
     -p?*)
       cargo_args+=("$arg"); packages+=("${arg#-p}") ;;
@@ -156,6 +153,9 @@ if (( doc_only && target_selected )); then
   # discovered as a doctest phase that reports nothing.
   die "can't mix --doc with other target selecting options"
 fi
+if (( doc_only && no_run )); then
+  die "can't mix --doc with --no-run"
+fi
 # `--workspace` is the DEFAULT selection, never an override: a caller who
 # named packages gets exactly those. An exclusion is not a selection — cargo
 # requires it alongside --workspace — so it keeps the default. A manifest
@@ -172,107 +172,13 @@ if [[ -n "${TEST_THREADS:-}" ]]; then
   esac
 fi
 
-# ---------------------------------------------------------------------------
-# Cargo's configuration, read the way cargo reads it. Cargo's own resolver
-# for this (`cargo config get`) is unstable, so the same sources are read
-# in the same precedence: `--config` overrides (a KEY=VALUE snippet or a
-# file path), the environment, every `.cargo/config[.toml]` from the working
-# directory upward, then the home one. Resolves the target triple
-# (`--target`, `CARGO_BUILD_TARGET`, `build.target`, host) and that
-# triple's runner, printed one field per line: `target=<triple>`, then
-# `runner=<argv element>` lines, then `cfg_runner=1` if any `[target.'cfg(…)']`
-# table names a runner — which this script cannot evaluate and refuses.
-# ---------------------------------------------------------------------------
 HOST="$(rustc -vV | sed -n 's/^host: //p')"
 [[ -n "$HOST" ]] || die "could not determine the host triple from rustc"
-cargo_config() {
-  python3 - "$HOST" "$TARGET_ARG" "$PWD" "${CARGO_HOME:-$HOME/.cargo}" \
-    ${config_overrides[@]+"${config_overrides[@]}"} <<'PY'
-import os, shlex, sys, tomllib
-
-host, target_arg, cwd, cargo_home, *overrides = sys.argv[1:]
-
-def merge(base, extra):
-    for key, value in extra.items():
-        if isinstance(value, dict) and isinstance(base.get(key), dict):
-            merge(base[key], value)
-        elif key not in base:  # higher precedence already set it
-            base[key] = value
-
-def load_file(path):
-    try:
-        with open(path, "rb") as handle:
-            return tomllib.load(handle)
-    except FileNotFoundError:
-        return {}
-
-config = {}
-# 1. --config overrides, in order (later ones win, so merge in reverse).
-for override in reversed(overrides):
-    if os.path.isfile(override):
-        merge(config, load_file(override))
-    else:
-        merge(config, tomllib.loads(override))
-# 2. The environment, for the two keys this script needs.
-if os.environ.get("CARGO_BUILD_TARGET"):
-    merge(config, {"build": {"target": os.environ["CARGO_BUILD_TARGET"]}})
-# 3. Project config files from cwd upward, then 4. the home directory's.
-paths = []
-here = cwd
-while True:
-    for name in ("config.toml", "config"):
-        paths.append(os.path.join(here, ".cargo", name))
-    parent = os.path.dirname(here)
-    if parent == here:
-        break
-    here = parent
-for name in ("config.toml", "config"):
-    paths.append(os.path.join(cargo_home, name))
-for path in paths:
-    merge(config, load_file(path))
-
-target = target_arg or config.get("build", {}).get("target") or host
-if isinstance(target, list):
-    target = target[0] if len(target) == 1 else host
-print(f"target={target}")
-
-env_runner = os.environ.get("CARGO_TARGET_" + target.upper().replace("-", "_") + "_RUNNER")
-tables = config.get("target", {})
-runner = None
-# --config overrides and files both landed in `config`; the environment
-# sits between them in cargo's precedence, so only a --config override
-# outranks it.
-# Later overrides win, as they do for cargo.
-for override in reversed(overrides):
-    snippet = load_file(override) if os.path.isfile(override) else tomllib.loads(override)
-    candidate = snippet.get("target", {}).get(target, {}).get("runner")
-    if candidate is not None:
-        runner = candidate
-        break
-if runner is None and env_runner:
-    runner = env_runner
-if runner is None:
-    runner = tables.get(target, {}).get("runner")
-if isinstance(runner, str):
-    runner = shlex.split(runner)
-for part in runner or []:
-    print(f"runner={part}")
-if any(key.startswith("cfg(") and "runner" in value for key, value in tables.items() if isinstance(value, dict)):
-    print("cfg_runner=1")
-PY
-}
-TRIPLE=""; RUNNER=(); CFG_RUNNER=0
-while IFS= read -r line; do
-  case "$line" in
-    target=*) TRIPLE="${line#target=}" ;;
-    runner=*) RUNNER+=("${line#runner=}") ;;
-    cfg_runner=1) CFG_RUNNER=1 ;;
-  esac
-done < <(cargo_config)
-[[ -n "$TRIPLE" ]] || die "could not resolve the build target from cargo's configuration"
-if (( CFG_RUNNER )); then
-  die "a runner is configured under a [target.'cfg(...)'] table, which this script cannot evaluate; run cargo test directly"
-fi
+# The triple the graph is resolved for: an explicit --target, else the host.
+# (CARGO_BUILD_TARGET and build.target are cargo's to honour in the build;
+# they only shape the denominator here, and an explicit --target covers the
+# cross case the denominator can see.)
+TRIPLE="${TARGET_ARG:-$HOST}"
 
 # ---------------------------------------------------------------------------
 # Phase 1 — compile. Numerator and denominator are the same unit — packages —
@@ -283,46 +189,61 @@ fi
 # same manifest, features, target and lock flags: the workspace's default
 # members (minus exclusions), or the packages named with -p.
 # ---------------------------------------------------------------------------
-cargo metadata --format-version 1 --filter-platform "$TRIPLE" \
-    ${metadata_args[@]+"${metadata_args[@]}"} > "$WORK/metadata.json" 2>"$WORK/metadata.err" \
-  || { cat "$WORK/metadata.err" >&2; die "cargo metadata failed; refusing to draw a guessed bar"; }
-TOTAL_PACKAGES="$(python3 - "$WORK/metadata.json" "$workspace_flag" "$MANIFEST_PATH" "${#packages[@]}" \
-    ${packages[@]+"${packages[@]}"} ${excludes[@]+"${excludes[@]}"} 2>>"$WORK/metadata.err" <<'PY'
-import json, os, sys
-with open(sys.argv.pop(1)) as handle:
+# The helper scripts are written to files ONCE and invoked by path: a here-
+# document nested inside a command substitution is parsed differently by the
+# bash 3.2 macOS ships (quotes and brackets in the body can end the
+# substitution early), and a script that runs on one bash and not another
+# is worse than one that never used the construct.
+cat > "$WORK/closure.py" <<'PY'
+# The dependency closure of the selected packages over cargo's resolve
+# graph. Modes: `count` prints how many packages the build will touch;
+# `libs` prints how many selected roots have a library target (the doctest
+# units cargo will run).
+import fnmatch, json, os, sys
+mode = sys.argv[1]
+with open(sys.argv[2]) as handle:
     meta = json.load(handle)
-workspace_flag = sys.argv[1] == "1"
-manifest_path = sys.argv[2]
-count = int(sys.argv[3])
-selected, excluded = sys.argv[4:4 + count], sys.argv[4 + count:]
+workspace_flag = sys.argv[3] == "1"
+manifest_path = sys.argv[4]
+count = int(sys.argv[5])
+selected, excluded = sys.argv[6:6 + count], sys.argv[6 + count:]
 by_id = {package["id"]: package for package in meta["packages"]}
 members = meta["workspace_members"]
 default_members = meta.get("workspace_default_members") or members
 if manifest_path and not workspace_flag and not selected:
-    # Cargo's default for an explicit manifest is the package it names.
+    # The default for an explicit manifest is the package it names, as
+    # under cargo.
     wanted = os.path.realpath(manifest_path)
-    named = [pid for pid in members if os.path.realpath(by_id[pid]["manifest_path"]) == wanted]
-    if named:
-        default_members = named
+    named_members = [pid for pid in members if os.path.realpath(by_id[pid]["manifest_path"]) == wanted]
+    if named_members:
+        default_members = named_members
 
 def named(spec, package):
-    # `-p` accepts a name, name@version, or a path; match the forms a person types.
+    # -p accepts a name (with the usual glob patterns), name@version, or a
+    # path; match the forms a person types.
     name = package["name"]
-    return spec in (name, f"{name}@{package['version']}", f"{name}:{package['version']}") \
-        or spec.rstrip("/") == package["manifest_path"].rsplit("/", 1)[0]
+    if spec in (name, name + "@" + package["version"], name + ":" + package["version"]):
+        return True
+    if spec.rstrip("/") == package["manifest_path"].rsplit("/", 1)[0]:
+        return True
+    return any(ch in spec for ch in "*?[") and fnmatch.fnmatchcase(name, spec)
 
 if selected:
     roots = []
     for spec in selected:
         matches = [pid for pid in members if named(spec, by_id[pid])]
         if not matches:
-            sys.exit(f"package `{spec}` is not a member of this workspace")
+            sys.exit("package " + spec + " is not a member of this workspace")
         roots.extend(matches)
 else:
     roots = list(members if workspace_flag else default_members)
 roots = [pid for pid in roots if not any(named(spec, by_id[pid]) for spec in excluded)]
 if not roots:
     sys.exit("the selection excludes every package")
+
+if mode == "libs":
+    print(sum(1 for pid in roots if any("lib" in target["kind"] or "rlib" in target["kind"] for target in by_id[pid]["targets"])))
+    sys.exit(0)
 
 deps = {node["id"]: node["deps"] for node in meta["resolve"]["nodes"]}
 root_set = set(roots)
@@ -333,9 +254,8 @@ while stack:
     if pid in seen:
         continue
     seen.add(pid)
-    # A root builds its dev-dependencies too — whether it was reached as a
-    # root or first met as another root's dependency — while a dependency
-    # builds only its normal and build dependencies.
+    # A root builds its dev-dependencies too, whichever way the walk reached
+    # it; a dependency builds only its normal and build dependencies.
     is_root = pid in root_set
     for dep in deps.get(pid, []):
         kinds = {kind.get("kind") for kind in dep.get("dep_kinds", [])} or {None}
@@ -343,7 +263,29 @@ while stack:
             stack.append(dep["pkg"])
 print(len(seen))
 PY
-)"
+cat > "$WORK/binaries.py" <<'PY'
+# How many distinct test executables the --no-run JSON stream produced.
+import json, sys
+seen = set()
+for line in open(sys.argv[1]):
+    try:
+        msg = json.loads(line)
+    except ValueError:
+        continue
+    exe = msg.get("executable")
+    if exe and msg.get("profile", {}).get("test"):
+        seen.add(exe)
+print(len(seen))
+PY
+closure() { # <mode> — the closure helper over the resolved metadata
+  python3 "$WORK/closure.py" "$1" "$WORK/metadata.json" "$workspace_flag" "$MANIFEST_PATH" \
+    "${#packages[@]}" ${packages[@]+"${packages[@]}"} ${excludes[@]+"${excludes[@]}"}
+}
+
+cargo metadata --format-version 1 --filter-platform "$TRIPLE" \
+    ${metadata_args[@]+"${metadata_args[@]}"} > "$WORK/metadata.json" 2>"$WORK/metadata.err" \
+  || { cat "$WORK/metadata.err" >&2; die "cargo metadata failed; refusing to draw a guessed bar"; }
+TOTAL_PACKAGES="$(closure count 2>>"$WORK/metadata.err")"
 [[ "${TOTAL_PACKAGES:-0}" -gt 0 ]] 2>/dev/null || {
   cat "$WORK/metadata.err" >&2
   die "cargo metadata did not yield a package count; refusing to draw a guessed bar"
@@ -362,7 +304,7 @@ sum_counts() { # <passed|failed> <file> — libtest's own totals, from its
   grep -hE '^test result: ' "$2" | grep -oE "[0-9]+ $1" | awk '{s+=$1} END{print s+0}'
 }
 
-passed=0; failed=0; failing_bins=(); TOTAL_BINS=0
+passed=0; failed=0; TOTAL_BINS=0
 
 if (( ! doc_only )); then
   printf '%scompiling%s (%s packages in the selection)\n' "$BOLD" "$RESET" "$TOTAL_PACKAGES"
@@ -394,97 +336,63 @@ if (( ! doc_only )); then
   fi
 
   # -------------------------------------------------------------------------
-  # Phase 2 — run. Each test binary is one unit, which is the granularity a
-  # person actually waits on: "12 of 19 binaries" answers "how much longer".
-  # Each line is `<executable>\t<package root>`: cargo runs every test from
-  # its package's root directory, and so does this.
+  # Phase 2 — run, THROUGH CARGO. The denominator is the number of test
+  # binaries the compile produced (plus the doctest targets cargo will
+  # build on the fly, counted as one unit per package with a library), and
+  # the numerator is the `Running …` / `Doc-tests …` lines cargo prints
+  # before each one — cargo's own progress, read as it happens.
   # -------------------------------------------------------------------------
-  python3 - "$WORK/build.json" > "$WORK/binaries" <<'PY' || exit 2
-import json, os, sys
-seen = []
-for line in open(sys.argv[1]):
-    try:
-        msg = json.loads(line)
-    except ValueError:
-        continue
-    # `executable` is non-null exactly for the artifacts cargo would run.
-    exe = msg.get("executable")
-    if exe and msg.get("profile", {}).get("test") and exe not in [e for e, _ in seen]:
-        seen.append((exe, os.path.dirname(msg["manifest_path"])))
-print("\n".join(f"{exe}\t{root}" for exe, root in seen))
-PY
-
-  TOTAL_BINS="$(grep -c . "$WORK/binaries" || true)"
+  TOTAL_BINS="$(python3 "$WORK/binaries.py" "$WORK/build.json")" || exit 2
   [[ "${TOTAL_BINS:-0}" -gt 0 ]] || {
-    # A build that produced nothing runnable is not a passing suite: cargo
-    # itself reports "running 0 tests" and exits 0 only when the selection
-    # legitimately has none, and we cannot tell that apart from a broken
-    # parse here — so say what happened and refuse to claim success.
+    # A build that produced nothing runnable is not a passing suite: say
+    # what happened and refuse to claim success.
     die "the build produced no test binaries (selection: ${cargo_args[*]})"
   }
-
-  printf '%srunning%s (%s test binaries' "$BOLD" "$RESET" "$TOTAL_BINS"
-  [[ "${#RUNNER[@]}" -gt 0 ]] && printf ' via runner %s' "${RUNNER[*]}"
-  printf ')\n'
-  ran=0
-  while IFS=$'\t' read -r exe root; do
-    name="$(basename "$exe" | sed 's/-[0-9a-f]\{16\}$//')"
-    bar "$ran" "$TOTAL_BINS" "$name"
-    # The `[@]+` expansions keep an empty array from tripping `set -u` on
-    # the bash 3.2 macOS ships.
-    (cd "$root" && ${RUNNER[@]+"${RUNNER[@]}"} "$exe" ${bin_args[@]+"${bin_args[@]}"}) \
-      > "$WORK/out.$ran" 2>&1
-    rc=$?
-    p="$(sum_counts passed "$WORK/out.$ran")"
-    f="$(sum_counts failed "$WORK/out.$ran")"
-    passed=$(( passed + p ))
-    failed=$(( failed + f ))
-    if [[ "$rc" -ne 0 ]]; then
-      failing_bins+=("$name:$WORK/out.$ran")
-    fi
-    ran=$(( ran + 1 ))
-    bar "$ran" "$TOTAL_BINS" "$name  ${GREEN}${passed} passed${RESET}$( [[ "$failed" -gt 0 ]] && printf ' %s%s failed%s' "$RED" "$failed" "$RESET" )"
-  done < "$WORK/binaries"
-  printf '\n'
 fi
 
-# ---------------------------------------------------------------------------
-# Phase 3 — doctests. `cargo test` runs them and this split flow would not:
-# `--no-run` cannot build them (rustdoc compiles them on the fly) and they
-# produce no binary to run. One unit, drawn while cargo runs them, so a
-# failing doctest fails the run exactly as it would under `cargo test`.
-# Skipped when the caller selected targets, as cargo skips them — and
-# cargo refuses `--doc` beside a target selector, so this must too.
-# ---------------------------------------------------------------------------
-if (( target_selected )); then
-  printf '%sdoctests%s skipped: a target selector was given, as under cargo test\n' "$BOLD" "$RESET"
-else
-  printf '%sdoctests%s\n' "$BOLD" "$RESET"
-  bar 0 1 "doctests"
-  cargo test "${cargo_args[@]}" --doc -- ${bin_args[@]+"${bin_args[@]}"} \
-    > "$WORK/out.doc" 2>&1
-  DOC_RC=$?
-  p="$(sum_counts passed "$WORK/out.doc")"
-  f="$(sum_counts failed "$WORK/out.doc")"
-  passed=$(( passed + p ))
-  failed=$(( failed + f ))
-  if [[ "$DOC_RC" -ne 0 ]]; then
-    failing_bins+=("doctests:$WORK/out.doc")
-  fi
-  bar 1 1 "doctests  ${GREEN}${passed} passed${RESET}$( [[ "$failed" -gt 0 ]] && printf ' %s%s failed%s' "$RED" "$failed" "$RESET" )"
-  printf '\n'
+# Doctest units: one per selected package with a library target, unless a
+# target selector (which skips doctests under cargo) was given.
+DOC_UNITS=0
+if (( ! target_selected )); then
+  DOC_UNITS="$(closure libs)" || exit 2
 fi
+TOTAL_UNITS=$(( TOTAL_BINS + DOC_UNITS ))
 
-if [[ "${#failing_bins[@]}" -gt 0 ]]; then
-  printf '\n%s%d binary/binaries failed%s\n' "$RED" "${#failing_bins[@]}" "$RESET"
-  for entry in "${failing_bins[@]}"; do
-    printf '\n%s=== %s ===%s\n' "$BOLD" "${entry%%:*}" "$RESET"
-    # The failure list and the panics, not the whole passing roll-call.
-    grep -E '^(test .*FAILED|thread .* panicked|assertion|---- .* stdout|error)' -A3 "${entry#*:}" \
-      | head -40
-  done
+printf '%srunning%s (%s test binaries, %s doctest targets, through cargo)\n' "$BOLD" "$RESET" "$TOTAL_BINS" "$DOC_UNITS"
+ran=0; passed=0; failed=0; current="cargo test"
+bar 0 "$TOTAL_UNITS" "$current"
+# `--no-fail-fast`: every binary runs, so the summary names every failure
+# rather than the first. Cargo's progress lines are on stderr; the tests'
+# own output is interleaved, and everything is kept for the failure report.
+cargo test ${cargo_args[@]+"${cargo_args[@]}"} --no-fail-fast -- ${bin_args[@]+"${bin_args[@]}"} \
+  > "$WORK/run.log" 2>&1 &
+RUN_PID=$!
+while :; do
+  alive=1; kill -0 "$RUN_PID" 2>/dev/null || alive=0
+  # Re-read the whole log each tick: cheap, and it needs no cursor state.
+  # POSIX classes, not \s: the sed macOS ships does not know \s, and a
+  # label that kept its indentation would be the only symptom.
+  ran="$(grep -cE '^[[:space:]]+(Running|Doc-tests) ' "$WORK/run.log" 2>/dev/null || true)"
+  ran="${ran:-0}"
+  current="$(grep -E '^[[:space:]]+(Running|Doc-tests) ' "$WORK/run.log" 2>/dev/null | tail -1 \
+    | sed -E 's/^[[:space:]]+//; s/ \(.*\)$//')"
+  passed="$(sum_counts passed "$WORK/run.log")"
+  failed="$(sum_counts failed "$WORK/run.log")"
+  bar "$ran" "$TOTAL_UNITS" "${current:-cargo test}  ${GREEN}${passed} passed${RESET}$( [[ "$failed" -gt 0 ]] && printf ' %s%s failed%s' "$RED" "$failed" "$RESET" )"
+  (( alive )) || break
+  sleep 0.3
+done
+wait "$RUN_PID"; RUN_RC=$?
+printf '\n'
+
+if [[ "$RUN_RC" -ne 0 ]]; then
+  printf '\n%scargo test exited %d%s\n' "$RED" "$RUN_RC" "$RESET"
+  # The failure list and the panics, not the whole passing roll-call; plus
+  # cargo's own closing summary of which binaries failed.
+  grep -E '^(test .*FAILED|thread .* panicked|assertion|---- .* stdout|error: |    [a-z_-]+ \(|failures:)' "$WORK/run.log" \
+    | head -60
   printf '\n%s%d passed, %d failed%s\n' "$RED" "$passed" "$failed" "$RESET"
-  exit 1
+  exit "$RUN_RC"
 fi
 
 if (( doc_only )); then
