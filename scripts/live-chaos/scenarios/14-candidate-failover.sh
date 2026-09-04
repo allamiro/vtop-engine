@@ -135,8 +135,8 @@ log "quorum produce resumed at epoch $NEW_EPOCH on candidate $NEW_LEADER's own a
 # is the §5.4.2 failure the marker exists to close.
 await_metric_at_least "$(data_metrics_addr "$((NEW_LEADER + 10))")" \
   vtop_broker_cluster_committed_offset "$ACKED" \
-  || fail "the promoted candidate's published watermark never reached the pre-kill \
-acknowledged floor ($ACKED): the §5.4.2 non-regression is broken"
+  "the promoted candidate's published watermark never reached the pre-kill acknowledged \
+floor: the §5.4.2 non-regression is broken"
 log "the published watermark covers the pre-kill acknowledged floor: §5.4.2 non-regression holds"
 
 # Content is verifiable only through $ACKED: the post-failover batch was

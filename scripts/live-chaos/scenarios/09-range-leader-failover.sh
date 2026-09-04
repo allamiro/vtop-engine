@@ -408,9 +408,9 @@ log "the new leader acknowledged fresh quorum writes"
 # here; a regression is the §5.4.2 failure this arc exists to close.
 await_metric_at_least "$(data_metrics_addr 0)" \
   vtop_broker_cluster_committed_offset "$ACKED" \
-  || fail "the promoted leader's published watermark never reached the pre-kill \
-acknowledged floor ($ACKED): the §5.4.2 non-regression is broken — records producers \
-were told were durable sit above what the new leadership publishes"
+  "the promoted leader's published watermark never reached the pre-kill acknowledged \
+floor: the §5.4.2 non-regression is broken — records producers were told were durable \
+sit above what the new leadership publishes"
 log "the published watermark covers the pre-kill acknowledged floor: §5.4.2 non-regression holds"
 
 # Retried while the boundary settles; the produce above guarantees it arrives.

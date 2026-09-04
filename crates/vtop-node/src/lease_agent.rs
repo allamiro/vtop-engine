@@ -447,14 +447,30 @@ impl LeasePublisher for BrokerLeasePublisher {
         // THE PROBED BOUNDARY IS A CANDIDATE, NOT A PUBLICATION (#240,
         // Raft §5.4.2): advancing the cluster watermark from the promotion
         // probe's arithmetic was the exact forbidden move — trusting a
-        // count over records written under earlier epochs. The offset is
-        // deliberately dropped here; the watermark stays at the durable
-        // floor the cell was seeded from, which under-publishes (safe)
-        // until an entry of THIS epoch is quorum-acked. That entry is the
-        // boundary marker published right after the view activates below —
-        // or the first produce, whichever lands first; both prove the
-        // prefix implicitly, which is §5.4.2's actual rule.
-        let _ = committed_offset;
+        // count over records written under earlier epochs. On a
+        // marker-capable range the offset is deliberately dropped; the
+        // watermark stays at the durable floor the cell was seeded from,
+        // which under-publishes (safe) until an entry of THIS epoch is
+        // quorum-acked — the boundary marker fired below, or the first
+        // produce, whichever lands first; both prove the prefix
+        // implicitly, which is §5.4.2's actual rule.
+        //
+        // A range the marker REFUSES BY NAME keeps the pre-marker path,
+        // exactly as the marker's own contract documents: a v1 frame
+        // cannot store the reserved identity and an unreplicated broker
+        // has no quorum to convince, and dropping the offset there would
+        // leave promotion with no publication at all — a repaired v1
+        // replica would serve nothing until the next produce.
+        if !self.broker.boundary_marker_supported() {
+            if let (Some(offset), Some(cluster)) =
+                (committed_offset, self.broker.cluster_committed())
+            {
+                cluster.advance_to(offset);
+            }
+            self.broker.adopt_fencing_epoch(fencing_epoch);
+            self.broker.meta_fencing_epoch().set(fencing_epoch);
+            return;
+        }
         // Both values must end up equal or the broker refuses every request.
         // The order is not a safety question — produce checks equality, so any
         // window between the two writes fails closed — but both must happen.
@@ -1870,6 +1886,94 @@ mod tests {
         );
         let (_, next_offset) = broker.local_offsets();
         assert_eq!(next_offset, 1, "exactly one marker record was appended");
+    }
+
+    /// A range the marker refuses by name keeps the pre-marker path: a v1
+    /// frame cannot store the reserved identity, so promotion on a v1
+    /// range still publishes the probed boundary directly — dropping it
+    /// there would leave a repaired v1 replica serving nothing until the
+    /// next produce, which is exactly what broke the live-chaos suite on
+    /// the first cut of this wiring.
+    #[test]
+    fn a_v1_range_keeps_the_pre_marker_publication_path() {
+        let range = marker_range();
+        let meta = MetaFencingEpoch::new(18);
+        let cluster = ClusterCommittedOffset::new(0);
+        let dir = tempfile::tempdir().unwrap();
+        let segment = ActiveSegment::create(
+            dir.path().join("range.active"),
+            vtop_log::SegmentDescriptor {
+                segment_id: Uuid::from_u128(0xD2),
+                topic: range.topic.clone(),
+                topic_epoch: range.topic_epoch,
+                lineage: RangeLineage {
+                    range_id: range.range_id,
+                    generation: range.range_generation,
+                    key_range: KeyRange::full(),
+                    parents: Vec::new(),
+                },
+                base_offset: 0,
+            },
+            vtop_log::SegmentConfig::default(),
+        )
+        .unwrap();
+        let follower_dir = tempfile::tempdir().unwrap();
+        let follower_segment = ActiveSegment::create(
+            follower_dir.path().join("range.active"),
+            vtop_log::SegmentDescriptor {
+                segment_id: Uuid::from_u128(0xE9),
+                topic: range.topic.clone(),
+                topic_epoch: range.topic_epoch,
+                lineage: RangeLineage {
+                    range_id: range.range_id,
+                    generation: range.range_generation,
+                    key_range: KeyRange::full(),
+                    parents: Vec::new(),
+                },
+                base_offset: 0,
+            },
+            vtop_log::SegmentConfig::default(),
+        )
+        .unwrap();
+        let follower = Arc::new(
+            InProcessFollower::new(
+                Uuid::from_u128(0xA2),
+                follower_segment,
+                ProducerEpochJournal::open(follower_dir.path().join("epochs")).unwrap(),
+                range.clone(),
+                18,
+                meta.clone(),
+                ClusterCommittedOffset::new(0),
+            )
+            .unwrap(),
+        );
+        let broker = Arc::new(
+            LocalBroker::with_replication(
+                segment,
+                ProducerEpochJournal::open(dir.path().join("epochs")).unwrap(),
+                range,
+                18,
+                meta,
+                US,
+                Some(cluster.clone()),
+                Some(Arc::new(InProcessReplicaSet::new(vec![follower]))
+                    as Arc<dyn vtop_broker::replication::ReplicaSet>),
+            )
+            .unwrap(),
+        );
+        let publisher = BrokerLeasePublisher::new(Arc::clone(&broker));
+        publisher.promote(18, Some(700));
+        assert_eq!(
+            cluster.get(),
+            700,
+            "a v1 range publishes the probed boundary directly — the pre-marker path the \
+             marker's refusal contract promises it keeps"
+        );
+        let (_, next_offset) = broker.local_offsets();
+        assert_eq!(
+            next_offset, 0,
+            "no marker record may have been written to a v1 log"
+        );
     }
 
     /// promote() runs on every renewal; the marker must not.

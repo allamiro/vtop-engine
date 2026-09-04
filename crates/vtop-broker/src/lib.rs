@@ -861,6 +861,18 @@ impl LocalBroker {
         self.held_fencing_epoch.fetch_max(epoch, Ordering::SeqCst) < epoch
     }
 
+    /// Whether this broker can publish the §5.4.2 boundary marker (#240):
+    /// replicated and v2-format. A v1 frame cannot store the reserved
+    /// identity (the marker refuses it by name) and an unreplicated broker
+    /// has no quorum to convince — both keep the pre-marker publication
+    /// path, and the promotion wiring asks HERE so that fallback lives in
+    /// one place.
+    pub fn boundary_marker_supported(&self) -> bool {
+        self.segment_format == SegmentFormat::V2
+            && self.cluster_committed.is_some()
+            && self.replicas.is_some()
+    }
+
     /// Append this epoch's boundary marker at the tail, prove it on a
     /// quorum, and only then publish the tail as the cluster high-water mark
     /// (#240 — Raft §5.4.2 in its actual form: commit an entry of your own
