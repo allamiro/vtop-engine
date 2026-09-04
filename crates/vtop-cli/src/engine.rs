@@ -1227,10 +1227,11 @@ impl Engine {
         // — see `BatchingConfig::source_poll_wait_ms`.
         let max_wait = Duration::from_millis(self.config.batching.source_poll_wait_ms);
 
-        // Bound the Kafka partition-metadata cache: drop entries for topics that
-        // no longer exist, so a broker that churns through short-lived topics
-        // does not grow the cache without limit. `sources` is the full live set
-        // this cycle, which is exactly what pruning needs.
+        // Bound the Kafka per-topic state: drop partition-metadata entries and
+        // retention-loss bookmarks for topics that no longer exist, so a broker
+        // that churns through short-lived topics does not grow either map
+        // without limit. `sources` is the full live set this cycle, which is
+        // exactly what pruning needs.
         #[cfg(feature = "kafka")]
         if *source_type == SourceType::Kafka {
             if let Some(k) = adapter
@@ -1296,18 +1297,25 @@ impl Engine {
                 productive_read_ms = report.productive_ms;
                 empty_read_ms = report.empty_ms;
                 failed_read_ms = report.failed_ms;
-                retention_lost = report.retention_lost_records;
-                if retention_lost > 0 {
-                    if let Some(mx) = telemetry::metrics() {
-                        // Engine-default tenant, like the whole-pass error
-                        // path above: the loss is an adapter-level
-                        // observation, not attributable to one configured
-                        // stream. The topic and partition are in the
-                        // adapter's warn line.
-                        let t = self.config.engine.tenant.clone();
+                retention_lost = report.retention_lost.iter().map(|l| l.records).sum();
+                if let Some(mx) = telemetry::metrics() {
+                    // The adapter observes loss per topic-partition, and the
+                    // topic names the stream — so each entry lands on the
+                    // tenant whose records were lost, resolved exactly as
+                    // `source_read_errors_total` resolves it below. The topic
+                    // itself stays in the adapter's warn line, not in the
+                    // labels: a per-topic label would mint a series per
+                    // topic, and the label set here matches the read-error
+                    // counter's on purpose.
+                    for loss in &report.retention_lost {
+                        let t = tenant_for_source(
+                            &self.streams,
+                            &self.config.engine.tenant,
+                            &loss.source_name,
+                        );
                         mx.retention_lost_records_total
                             .with_label_values(&[t.as_str(), source_type.as_str()])
-                            .inc_by(retention_lost);
+                            .inc_by(loss.records);
                     }
                 }
                 for outcome in report.outcomes {
@@ -1330,11 +1338,11 @@ impl Engine {
                                 // with the batch metrics for the same source
                                 // instead of always landing on the engine
                                 // default.
-                                let t = self
-                                    .streams
-                                    .lookup(&source.source_name)
-                                    .map(|s| s.tenant.clone())
-                                    .unwrap_or_else(|| self.config.engine.tenant.clone());
+                                let t = tenant_for_source(
+                                    &self.streams,
+                                    &self.config.engine.tenant,
+                                    &source.source_name,
+                                );
                                 mx.source_read_errors_total
                                     .with_label_values(&[t.as_str(), source_type.as_str()])
                                     .inc();
@@ -1976,6 +1984,19 @@ fn source_for_marker(requested: &DiscoveredSource, marker: &ProgressMarker) -> D
     }
 }
 
+/// The tenant a source's per-source metrics are charged to: the stream
+/// override when the source name matches a configured stream, the engine
+/// default otherwise — the same resolution the pipeline applies to batches.
+/// Shared by `source_read_errors_total` and `retention_lost_records_total` so
+/// a source's failures and its losses land beside its batches instead of
+/// always on the engine default.
+fn tenant_for_source(streams: &StreamsConfig, default_tenant: &str, source_name: &str) -> String {
+    streams
+        .lookup(source_name)
+        .map(|s| s.tenant.clone())
+        .unwrap_or_else(|| default_tenant.to_string())
+}
+
 /// Default format for an adapter, taken from the first matching stream of that
 /// source type, falling back to `Raw`.
 fn default_format_for(
@@ -2158,6 +2179,36 @@ mod tests {
         assert_eq!(
             source_for_marker(&requested, &marker_for_a).source_name,
             "topic_a"
+        );
+    }
+
+    /// The retention counter resolves each entry's tenant through the same
+    /// stream lookup the pipeline uses (#361): the loss arrives named by
+    /// topic, the topic names the stream, and the stream names the tenant.
+    #[test]
+    fn a_retention_loss_on_an_overridden_stream_is_charged_to_that_streams_tenant() {
+        let streams = StreamsConfig {
+            streams: vec![StreamConfig {
+                source_name: "app_events".into(),
+                source_type: SourceType::Kafka,
+                format: vtop_core::types::TelemetryFormat::Raw,
+                tenant: "acme".into(),
+                s3_source_name: None,
+                retention_class: None,
+            }],
+        };
+        assert_eq!(
+            tenant_for_source(&streams, "default", "app_events"),
+            "acme",
+            "the topic names the stream and the stream names the tenant — \
+             landing this loss on the engine default would report acme's \
+             lost records against a tenant that never owned them"
+        );
+        assert_eq!(
+            tenant_for_source(&streams, "default", "unconfigured_topic"),
+            "default",
+            "a source with no stream override falls back to the engine \
+             default, exactly where its batches land"
         );
     }
 

@@ -6,6 +6,7 @@
 
 use crate::base::{
     AdapterReadReport, DiscoveredSource, ReadResult, SourceAdapter, SourceReadOutcome,
+    SourceRetentionLoss,
 };
 use async_trait::async_trait;
 use rdkafka::config::ClientConfig;
@@ -14,7 +15,7 @@ use rdkafka::message::Message;
 use rdkafka::topic_partition_list::TopicPartitionList;
 use rdkafka::Offset;
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 use vtop_core::config::KafkaSourceConfig;
 use vtop_core::errors::VtopError;
@@ -323,10 +324,23 @@ pub struct KafkaSource {
     /// a read path to something retention's own timescale makes free.
     last_retention_check: Option<std::time::Instant>,
     /// Low watermark per (topic, partition) up to which retention loss has
-    /// already been COUNTED (#361). Never cleared on re-assignment: it
+    /// already been COUNTED (#361). Never cleared on re-assignment — it
     /// tracks a broker-side fact, not assignment state, and clearing it
-    /// would re-count the same lost records after every rebalance.
+    /// would re-count the same lost records after every rebalance — but
+    /// pruned with the live topic set (`prune_partition_cache`): the
+    /// bookmark lives exactly as long as the broker-side subject it
+    /// describes.
     reported_lost_through: HashMap<(String, i32), i64>,
+    /// Retention loss observed but not yet delivered, per topic (#361). The
+    /// bookmark above dedupes OBSERVATION; this accumulator guarantees
+    /// DELIVERY: the count reaches the engine only on a pass that returns
+    /// `Ok`, the check runs before the poll loop, and the bookmark scores a
+    /// re-observed gap zero — so loss observed in a pass that then failed
+    /// would otherwise never be counted at all. Whatever a check observes is
+    /// owed to the counter, and the first pass that completes pays it.
+    /// Deliberately NOT pruned with dead topics: observed loss stays owed
+    /// even if its topic died. BTreeMap so delivery order is deterministic.
+    pending_lost: BTreeMap<String, u64>,
     /// Partitions paused mid-pass (topic hit its budget); resumed at the
     /// start of the next pass.
     paused: Vec<(String, i32)>,
@@ -377,6 +391,7 @@ impl KafkaSource {
             delivered: HashMap::new(),
             last_retention_check: None,
             reported_lost_through: HashMap::new(),
+            pending_lost: BTreeMap::new(),
             paused: Vec::new(),
             stored_pending: std::collections::HashSet::new(),
             partitions: HashMap::new(),
@@ -409,12 +424,18 @@ impl KafkaSource {
     /// anything; it has only declined to say, and turning that into a read
     /// failure would trade a real archive for a diagnostic.
     ///
-    /// Returns the count of records NEWLY observed lost — deduplicated
-    /// against what previous checks already counted, so the caller can feed
-    /// a monotonic counter without double-counting a gap that persists
-    /// across checks. Passes where the interval gate skips the check return
-    /// zero, which is "nothing new observed", not "nothing lost".
-    fn report_retention_gaps(&mut self) -> u64 {
+    /// Accumulates the records NEWLY observed lost into `pending_lost`, per
+    /// topic — deduplicated against what previous checks already counted, so
+    /// the counter fed downstream counts each record exactly once however
+    /// long the gap persists. Per topic and not one sum, because the topic
+    /// names the stream and the stream names the tenant the loss belongs to.
+    /// Observation and delivery are split on purpose: the count reaches the
+    /// engine only via a pass that returns `Ok`, and this pass can still
+    /// fail after the check ran — the accumulator holds the debt until a
+    /// pass completes (see `pending_lost`). Passes where the interval gate
+    /// skips the check accumulate nothing, which is "nothing new observed",
+    /// not "nothing lost".
+    fn report_retention_gaps(&mut self) {
         // Retention moves on the scale of hours. Once a minute is free, and
         // an unbounded network call on a read path is the mistake #374 was
         // made of — so both the interval and each query are bounded.
@@ -422,12 +443,12 @@ impl KafkaSource {
             .last_retention_check
             .is_some_and(|at| at.elapsed() < RETENTION_CHECK_INTERVAL)
         {
-            return 0;
+            return;
         }
         self.last_retention_check = Some(std::time::Instant::now());
 
         let Some(consumer) = self.consumer.as_ref() else {
-            return 0;
+            return;
         };
         // ONE call for every partition, rather than one per partition: the
         // group's committed offsets are what a restart would resume from.
@@ -435,7 +456,6 @@ impl KafkaSource {
             .committed(std::time::Duration::from_secs(WATERMARK_TIMEOUT_SECONDS))
             .ok();
 
-        let mut newly_observed: u64 = 0;
         let mut newly_reported: Vec<((String, i32), i64)> = Vec::new();
         for (topic, partition) in &self.assigned {
             // The in-memory cursor is what this process would read next; the
@@ -463,11 +483,14 @@ impl KafkaSource {
             };
             if let Some(lost) = retention_gap(next_offset, low_watermark) {
                 let key = (topic.clone(), *partition);
-                newly_observed += newly_lost(
+                let newly = newly_lost(
                     next_offset,
                     low_watermark,
                     self.reported_lost_through.get(&key).copied(),
                 );
+                if newly > 0 {
+                    *self.pending_lost.entry(topic.clone()).or_insert(0) += newly;
+                }
                 newly_reported.push((key, low_watermark));
                 tracing::warn!(
                     topic = %topic,
@@ -492,7 +515,22 @@ impl KafkaSource {
                 .or_insert(low_watermark);
             *entry = (*entry).max(low_watermark);
         }
-        newly_observed
+    }
+
+    /// Convert everything observed-but-undelivered into report entries,
+    /// leaving the accumulator empty. Called ONLY on paths that return a
+    /// successful report — the empty-assignment early return included,
+    /// since a debt whose topic was deleted has no polling pass left to
+    /// wait for. A drain on a failing path is exactly the dropped count
+    /// `pending_lost` exists to prevent.
+    fn take_pending_losses(&mut self) -> Vec<SourceRetentionLoss> {
+        std::mem::take(&mut self.pending_lost)
+            .into_iter()
+            .map(|(source_name, records)| SourceRetentionLoss {
+                source_name,
+                records,
+            })
+            .collect()
     }
 
     fn consumer(&mut self) -> Result<&BaseConsumer, VtopError> {
@@ -509,14 +547,29 @@ impl KafkaSource {
         self.include.is_match(topic) && !self.exclude.is_match(topic)
     }
 
-    /// Drop cached partition lists for topics that no longer exist, so a broker
-    /// that churns through many short-lived topics does not grow the cache
+    /// Drop per-topic state for topics that no longer exist, so a broker that
+    /// churns through many short-lived topics does not grow the caches
     /// without bound.
     pub fn prune_partition_cache(&mut self, live_topics: &[String]) {
         let live: std::collections::HashSet<&str> =
             live_topics.iter().map(|s| s.as_str()).collect();
         self.partitions
             .retain(|topic, _| live.contains(topic.as_str()));
+        // The loss bookmark tracks a broker-side fact, so it lives exactly as
+        // long as the broker-side subject: a topic absent from live metadata
+        // can never report that gap again, and a topic recreated under the
+        // same name is a NEW subject whose loss must be counted from its own
+        // cursor — a stale bookmark would score the new topic's real loss
+        // zero until its watermark happened to pass it. A delete+recreate
+        // falling entirely inside one discovery cycle is indistinguishable
+        // with the metadata this API returns (names, not topic ids) and
+        // stays a documented gap: treating a watermark regression as a new
+        // incarnation instead would re-count counted loss on every routine
+        // leader change. `pending_lost` is deliberately NOT pruned — loss a
+        // check already observed is owed to the counter even if its topic
+        // died.
+        self.reported_lost_through
+            .retain(|(topic, _), _| live.contains(topic.as_str()));
     }
 
     /// Partition ids for `topic`, served from cache when fresh.
@@ -725,8 +778,12 @@ impl SourceAdapter for KafkaSource {
                 failed_ms: meta_failed_ms,
                 // The retention check has not run on this path — nothing is
                 // assigned, so there is no cursor a watermark could have
-                // passed.
-                retention_lost_records: 0,
+                // passed. But this IS a successful report, and loss a
+                // PREVIOUS pass observed and failed to deliver must not wait
+                // for a pass that polls: if the indebted topic was deleted,
+                // no such pass ever comes, and the debt would outlive its
+                // subject unpaid. Any pass that completes pays it.
+                retention_lost: self.take_pending_losses(),
             });
         }
         let consumer = self.consumer.as_ref().expect("consumer built above");
@@ -804,7 +861,7 @@ impl SourceAdapter for KafkaSource {
         // the wrong place, and each time for the same reason: the restart is
         // the case the check exists for, and the restart is the case where the
         // state it reads has not been built yet.
-        let retention_lost_records = self.report_retention_gaps();
+        self.report_retention_gaps();
         // The check takes `&mut self` (it advances its own clock), which ends
         // the borrow the assignment block held — so the poll loop takes its
         // own.
@@ -985,6 +1042,10 @@ impl SourceAdapter for KafkaSource {
         } else {
             (0, shared, 0)
         };
+        // Pay the retention debt HERE and only here: the error returns above
+        // drop the report on the floor, and with it any count it carried —
+        // the accumulator holds those until a pass gets this far.
+        let retention_lost = self.take_pending_losses();
         Ok(AdapterReadReport {
             outcomes: per_source
                 .into_iter()
@@ -1001,7 +1062,7 @@ impl SourceAdapter for KafkaSource {
             productive_ms,
             empty_ms,
             failed_ms: meta_failed_ms.saturating_add(poll_failed_ms),
-            retention_lost_records,
+            retention_lost,
         })
     }
 
@@ -1199,6 +1260,103 @@ mod tests {
         src.prune_partition_cache(&["live".to_string()]);
         assert!(src.partitions.contains_key("live"), "live topic kept");
         assert!(!src.partitions.contains_key("dead"), "dead topic dropped");
+    }
+
+    /// The report carries one entry per topic (#361): the topic names the
+    /// stream, and the stream names the tenant the loss is charged to — one
+    /// adapter-wide sum could only ever land on the engine default.
+    #[test]
+    fn losses_on_two_topics_are_reported_separately_not_as_one_sum() {
+        let mut src = KafkaSource::new(cfg(), TelemetryFormat::Cef).unwrap();
+        // Seed the accumulator as report_retention_gaps does: once per
+        // (topic, partition) observation, merged by topic.
+        *src.pending_lost.entry("t_a".into()).or_insert(0) += 3;
+        *src.pending_lost.entry("t_a".into()).or_insert(0) += 4;
+        *src.pending_lost.entry("t_b".into()).or_insert(0) += 5;
+
+        let delivered = src.take_pending_losses();
+        let entries: Vec<(&str, u64)> = delivered
+            .iter()
+            .map(|l| (l.source_name.as_str(), l.records))
+            .collect();
+        assert_eq!(
+            entries,
+            vec![("t_a", 7), ("t_b", 5)],
+            "partitions of one topic merge (they share a stream and a tenant), \
+             topics never do — a single sum would charge t_b's loss to \
+             whatever tenant t_a resolves to, or both to the engine default"
+        );
+    }
+
+    /// The bookmark lives exactly as long as the broker-side subject it
+    /// describes (#361): a topic recreated under a pruned name starts from
+    /// its own cursor, while the pending count — loss already OBSERVED — is
+    /// owed to the counter even after its topic died.
+    #[test]
+    fn a_dead_topics_loss_bookmark_is_dropped_so_a_recreated_topic_counts_its_own_loss() {
+        let mut src = KafkaSource::new(cfg(), TelemetryFormat::Cef).unwrap();
+        src.reported_lost_through.insert(("live".into(), 0), 350);
+        src.reported_lost_through.insert(("dead".into(), 0), 350);
+        src.pending_lost.insert("dead".into(), 9);
+
+        src.prune_partition_cache(&["live".to_string()]);
+
+        assert_eq!(
+            src.reported_lost_through.get(&("live".into(), 0)),
+            Some(&350),
+            "a live topic's bookmark must survive the prune, or every \
+             discovery cycle would re-count its whole standing gap"
+        );
+        assert!(
+            !src.reported_lost_through.contains_key(&("dead".into(), 0)),
+            "a topic absent from live metadata can never report that gap \
+             again — keeping its bookmark would score a recreated topic's \
+             real loss zero until the new watermark passed the stale one"
+        );
+        assert_eq!(
+            src.pending_lost.get("dead"),
+            Some(&9),
+            "observed loss is owed to the counter even if its topic died; \
+             pruning it would drop a count the warn line already announced"
+        );
+    }
+
+    /// REGRESSION shape for the delivery half of #361: the check observes a
+    /// gap and advances the bookmark, but its count reaches the engine only
+    /// on a pass that returns Ok — and the bookmark scores the same gap zero
+    /// on every later check. Without the accumulator, a pass that failed
+    /// after the check turned "counted exactly once" into "at most once".
+    #[test]
+    fn a_count_observed_in_a_failed_pass_is_delivered_by_the_next_successful_one() {
+        let mut src = KafkaSource::new(cfg(), TelemetryFormat::Cef).unwrap();
+        // Stage what a failed pass leaves behind: the observation accrued and
+        // the bookmark advanced, then the pass returned Err and the report —
+        // the only vehicle to the engine — was dropped.
+        *src.pending_lost.entry("t".into()).or_insert(0) += 250;
+        src.reported_lost_through.insert(("t".into(), 0), 350);
+
+        assert_eq!(
+            newly_lost(Some(100), 350, Some(350)),
+            0,
+            "the next check scores the unchanged gap zero — the bookmark \
+             dedupes observation, so delivery cannot rely on re-observing"
+        );
+        let delivered = src.take_pending_losses();
+        let entries: Vec<(&str, u64)> = delivered
+            .iter()
+            .map(|l| (l.source_name.as_str(), l.records))
+            .collect();
+        assert_eq!(
+            entries,
+            vec![("t", 250)],
+            "the first pass that completes pays the debt: the counter must \
+             never read 0 while the warn line said 250 records were lost"
+        );
+        assert!(
+            src.take_pending_losses().is_empty(),
+            "the drain empties the accumulator, so a second successful pass \
+             delivers nothing — anything else double-counts the same loss"
+        );
     }
 
     #[test]

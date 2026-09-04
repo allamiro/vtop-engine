@@ -323,7 +323,7 @@ impl SourceAdapter for SyslogSpoolSource {
             productive_ms: 0,
             empty_ms: 0,
             failed_ms: 0,
-            retention_lost_records: 0,
+            retention_lost: Vec::new(),
         };
         let mut any_records = false;
         let mut any_failed = false;
