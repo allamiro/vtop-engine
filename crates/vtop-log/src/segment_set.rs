@@ -3710,10 +3710,20 @@ mod tests {
             let mut successor = descriptor();
             successor.segment_id = Uuid::from_u128(0xF6);
             successor.base_offset = 3;
+            // The group and segment limits ride the record limit (review,
+            // round ten): a fixture keeping config()'s 512-byte group
+            // beside a seven-digit record limit encodes a config no
+            // validator accepts, and its length claim then holds no valid
+            // completion — the claim check would rightly quarantine it for
+            // a reason this test is not about.
             let bytes = crate::codec::encode_header(&crate::codec::SegmentHeader::new(
                 successor,
                 SegmentConfig {
                     max_record_bytes,
+                    max_group_bytes: u64::from(max_record_bytes)
+                        + crate::types::RECORD_FRAME_OVERHEAD_BYTES,
+                    max_segment_bytes: u64::from(max_record_bytes)
+                        + crate::types::RECORD_FRAME_OVERHEAD_BYTES,
                     ..config()
                 },
             ))
