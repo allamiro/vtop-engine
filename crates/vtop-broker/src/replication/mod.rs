@@ -46,7 +46,7 @@ pub use network::{
     address_now, FlowControlConfig, NetworkFollowerConfig, NetworkedReplicaSet, ReplicaPeerHandler,
     ReplicaPeerServer, ReplicaStatusClient, ReplicaTlsMaterial,
 };
-pub use transfer::{LeaderSegmentTransferHandler, SegmentTransferClient};
+pub use transfer::{LeaderSegmentTransferHandler, SegmentTransferClient, TransferredPrefix};
 
 /// Shared quorum-committed high-water mark for a range.
 ///

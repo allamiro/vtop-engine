@@ -255,6 +255,13 @@ fn harness() -> Harness {
 }
 
 fn transfer(h: &Harness, receiver: &SegmentReceiver) -> Result<Vec<std::path::PathBuf>, String> {
+    transfer_full(h, receiver).map(|transferred| transferred.installed)
+}
+
+fn transfer_full(
+    h: &Harness,
+    receiver: &SegmentReceiver,
+) -> Result<vtop_broker::replication::TransferredPrefix, String> {
     h.runtime
         .block_on(h.client.transfer_sealed_prefix(
             h.addr,
@@ -265,6 +272,39 @@ fn transfer(h: &Harness, receiver: &SegmentReceiver) -> Result<Vec<std::path::Pa
             receiver,
         ))
         .map_err(|error| error.to_string())
+}
+
+/// The transfer reports the end of the prefix IT verified (#407): the bound
+/// the epoch-history install uses, so a segment the source seals after the
+/// transfer's own listing can never widen what the repair claims to hold.
+#[test]
+fn the_transfer_reports_the_prefix_end_it_actually_verified() {
+    let h = harness();
+    let expected_end = h
+        .leader
+        .sealed_segment_handles()
+        .last()
+        .expect("harness seals a prefix")
+        .next_offset;
+    let receiver = SegmentReceiver::open(&Env::real(), h.destination.path()).unwrap();
+    let first = transfer_full(&h, &receiver).unwrap();
+    assert_eq!(
+        first.prefix_end,
+        Some(expected_end),
+        "the reported end is the transfer's own listing, nothing later"
+    );
+    // A resumed run fetches nothing — every bundle already matches — but it
+    // verified the same prefix and must say so, or a crashed-and-rerun
+    // repair would install its epoch history with no bound at all.
+    let again = transfer_full(&h, &receiver).unwrap();
+    assert!(
+        again.installed.is_empty(),
+        "a resume skips bundles that already match"
+    );
+    assert_eq!(
+        again.prefix_end, first.prefix_end,
+        "a resume verified the same prefix and reports the same end"
+    );
 }
 
 #[test]
@@ -529,7 +569,8 @@ fn a_transfer_torn_mid_artifact_leaves_the_directory_clean_and_resumable() {
             FENCING_EPOCH,
             &receiver,
         ))
-        .unwrap();
+        .unwrap()
+        .installed;
     assert_eq!(
         installed.len(),
         repaired.leader.sealed_segment_handles().len()
@@ -668,7 +709,8 @@ fn a_foreign_segment_at_the_same_offset_is_replaced_rather_than_stranding_the_re
                 FENCING_EPOCH,
                 &receiver,
             ))
-            .unwrap_or_else(|error| panic!("{label}: repair must not be stranded: {error}"));
+            .unwrap_or_else(|error| panic!("{label}: repair must not be stranded: {error}"))
+            .installed;
 
         // The whole prefix landed, including the offset that was occupied.
         assert_eq!(installed.len(), handles.len(), "{label}");
@@ -799,9 +841,10 @@ fn an_installed_epoch_history_lets_a_repaired_prefix_prove_its_lineage() {
         .next_offset;
 
     // The source's lineage: one epoch for the older records, another for the
-    // newer, and a third that begins exactly at the sealed end — which the
-    // repaired replica must NOT claim, because it holds nothing produced
-    // under it.
+    // newer, a third that begins exactly at the sealed end — true history
+    // this replica may keep, since it claims nothing below the tail (#407)
+    // — and a fourth strictly beyond it, which is lineage for records that
+    // were never transferred and must be dropped.
     let source_history = [
         EpochStart {
             epoch: 3,
@@ -815,14 +858,19 @@ fn an_installed_epoch_history_lets_a_repaired_prefix_prove_its_lineage() {
             epoch: 7,
             start_offset: prefix_end,
         },
+        EpochStart {
+            epoch: 9,
+            start_offset: prefix_end + 100,
+        },
     ];
     let journal_path = h.destination.path().join("fencing-epochs");
     let kept =
         install_transferred_history(&Env::real(), &journal_path, &source_history, prefix_end)
             .expect("install the source's history alongside the transferred prefix");
     assert_eq!(
-        kept, 2,
-        "the entry at the sealed end is not this replica's to claim"
+        kept, 3,
+        "the entry AT the sealed end names where an epoch began and claims nothing this \
+         replica lacks; only the one beyond it is dropped"
     );
 
     let set = SegmentSet::adopt_in(&Env::real(), h.destination.path(), Uuid::from_u128(0xFACE))

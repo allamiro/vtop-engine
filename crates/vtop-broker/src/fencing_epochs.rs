@@ -201,8 +201,6 @@ impl FencingEpochJournal {
         })
     }
 
-    /// Record that `epoch` begins at `start_offset` on this replica.
-    ///
     /// Record an epoch adoption, honoring what the journal already knows.
     ///
     /// The append path's [`Self::record`] is the right tool when this replica
@@ -236,6 +234,8 @@ impl FencingEpochJournal {
         self.record(epoch, start_offset)
     }
 
+    /// Record that `epoch` begins at `start_offset` on this replica.
+    ///
     /// Idempotent for an epoch already recorded, so a replica that re-observes
     /// its own current epoch — which a polling watcher does constantly — does
     /// not append a duplicate. Recording the SAME epoch at a different offset
@@ -501,11 +501,14 @@ impl FencingEpochJournal {
 /// fence still compares this history against the caller's and truncates at
 /// any genuine divergence.
 ///
-/// **Normalization:** entries with `start_offset >= tail` are dropped. The
-/// repaired replica holds only the sealed prefix; an entry beyond it would
-/// claim lineage for records the replica does not hold, and — concretely —
-/// would poison the journal at the next epoch adoption, because `record`
-/// refuses a new entry whose start offset is below the last one's.
+/// **Normalization:** entries with `start_offset` strictly above `tail` are
+/// dropped; an entry AT the tail is kept (#407 — it names where an epoch
+/// began, which is true whether or not the records above it were copied).
+/// The repaired replica holds only the sealed prefix; an entry beyond it
+/// would claim lineage for records the replica does not hold, and —
+/// concretely — would poison the journal at the next epoch adoption,
+/// because `record` refuses a new entry whose start offset is below the
+/// last one's.
 ///
 /// Idempotent for a re-run repair fetching the same history. A conflicting
 /// prior install fails loudly instead of merging — and the comparison covers
@@ -520,9 +523,17 @@ pub fn install_transferred_history(
     entries: &[EpochStart],
     tail: u64,
 ) -> BrokerResult<usize> {
+    // AT the tail is kept, strictly above is dropped (#407). An entry
+    // starting exactly at the sealed-prefix end claims no records this
+    // replica lacks — it names where an epoch began, which is true whether
+    // or not the records above it were copied — and keeping it means the
+    // replica's next adoption of that same epoch is the documented no-op
+    // instead of a fresh append. An entry strictly above the tail is
+    // lineage for records that were never transferred, and would poison the
+    // journal's non-decreasing rule the moment the replica appends.
     let incoming: Vec<EpochStart> = entries
         .iter()
-        .take_while(|entry| entry.start_offset < tail)
+        .take_while(|entry| entry.start_offset <= tail)
         .copied()
         .collect();
     let mut journal = FencingEpochJournal::open_in(env, &path)?;
@@ -571,28 +582,44 @@ mod tests {
             .collect()
     }
 
-    /// The transferred history is truncated to the sealed prefix: an entry at
-    /// or beyond the tail claims lineage for records the repaired replica
-    /// does not hold, and would poison the journal at the next adoption.
+    /// The transferred history keeps an entry AT the sealed-prefix end and
+    /// drops what lies strictly beyond it (#407). An entry at the tail
+    /// claims no records the replica lacks — it names where an epoch began,
+    /// and keeping it makes the replica's re-observation of that epoch the
+    /// documented adoption no-op. An entry beyond the tail is lineage for
+    /// records that were never transferred, and would poison the journal
+    /// at the next append.
     #[test]
-    fn installing_a_transferred_history_stops_at_the_tail() {
+    fn installing_a_transferred_history_keeps_the_tail_entry_and_drops_beyond() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("fencing-epochs");
-        let entries = starts(&[(1, 0), (3, 400), (5, 900)]);
+        let entries = starts(&[(1, 0), (3, 400), (5, 900), (7, 950)]);
 
         let installed =
             install_transferred_history(&Env::real(), &path, &entries, 900).expect("install");
 
-        assert_eq!(installed, 2, "the entry at the tail is not ours to claim");
+        assert_eq!(
+            installed, 3,
+            "the entry AT the tail is true history this replica may keep; only the one \
+             beyond it claims records that were never transferred"
+        );
         let reopened = FencingEpochJournal::open(&path).expect("reopen");
-        assert_eq!(reopened.entries(), &starts(&[(1, 0), (3, 400)])[..]);
-        // The next adoption can now append at the tail without violating the
-        // journal's non-decreasing offset rule — the exact poisoning the
-        // truncation exists to prevent.
+        assert_eq!(
+            reopened.entries(),
+            &starts(&[(1, 0), (3, 400), (5, 900)])[..]
+        );
+        // A later adoption at the same offset still works: the journal's
+        // non-decreasing rule admits an equal offset under a higher epoch,
+        // so keeping the tail entry poisons nothing.
         let mut journal = FencingEpochJournal::open(&path).expect("reopen for adoption");
         journal
             .record(6, 900)
-            .expect("adopting at the tail must work");
+            .expect("adopting at the tail must work with the tail entry present");
+        // And re-observing the installed epoch itself is the #315 no-op the
+        // kept entry exists to enable.
+        journal
+            .record_adoption(5, 900)
+            .expect("re-observing the installed epoch is a no-op, not a conflict");
     }
 
     /// A repair that crashes and re-runs fetches the same history again; the
