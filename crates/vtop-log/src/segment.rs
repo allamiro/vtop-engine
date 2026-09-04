@@ -2056,6 +2056,19 @@ fn torn_prefix_matches_template(candidate: &[u8], template: &[u8]) -> bool {
         return false;
     };
     let id_span = id_at..id_at + id_string.len();
+    // The length field is config-dependent, so its exact value is unknowable
+    // — but it is BOUNDABLE (review): any real successor's JSON is at least
+    // the narrowest template's and at most the codec's ceiling. A candidate
+    // that has all four length bytes and claims something outside that range
+    // is not a prefix of any real header; a cut inside the field leaves a
+    // prefix of the true value, which cannot be validated and is not held
+    // against it.
+    if candidate.len() >= 12 {
+        let claimed = u32::from_be_bytes(candidate[8..12].try_into().expect("fixed slice"));
+        if (claimed as usize) < template_json.len() || claimed > crate::codec::MAX_HEADER_BYTES {
+            return false;
+        }
+    }
     let comparable = candidate.len().saturating_sub(12).min(config_at);
     (0..comparable).all(|at| id_span.contains(&at) || candidate[12 + at] == template_json[at])
 }

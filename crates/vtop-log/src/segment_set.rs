@@ -3622,9 +3622,12 @@ mod tests {
     /// measure below this range's torn floor — damaged and restored under
     /// the roll-window name must quarantine, not sweep. What a torn write
     /// has and a foreign header lacks is prefix-consistency with the
-    /// expected successor: the foreign topic diverges inside the
-    /// deterministic descriptor region, so the classification refuses to
-    /// call it torn.
+    /// expected successor, checked in layers: an honestly-encoded short
+    /// foreign header claims a JSON length no real successor of this range
+    /// could have (this test's case), and one whose length field is also
+    /// damaged into range diverges byte-wise at its topic inside the
+    /// deterministic descriptor region. Either way the classification
+    /// refuses to call it torn.
     #[test]
     fn a_short_damaged_foreign_header_is_quarantined_not_deleted() {
         let directory = tempdir().unwrap();
@@ -3634,8 +3637,21 @@ mod tests {
         foreign.topic = "x".to_owned();
         foreign.segment_id = Uuid::from_u128(0xF5);
         foreign.base_offset = 3;
+        // The foreign header must land STRICTLY BELOW the torn floor to
+        // exercise the prefix-consistency path this test pins (review: the
+        // default config's wider digits exactly cancelled the topic's
+        // savings, so the floor check quarantined it before the prefix
+        // logic ever ran). The narrowest config makes the shortened topic
+        // the only length difference — decisively below the floor.
+        let narrowest = SegmentConfig {
+            max_record_bytes: 1,
+            max_group_bytes: 1,
+            max_segment_bytes: 1,
+            max_segment_records: 1,
+            index_stride: 1,
+        };
         let mut bytes =
-            crate::codec::encode_header(&crate::codec::SegmentHeader::new(foreign, config()))
+            crate::codec::encode_header(&crate::codec::SegmentHeader::new(foreign, narrowest))
                 .unwrap();
         let last = bytes.len() - 1;
         bytes[last] ^= 0xFF;

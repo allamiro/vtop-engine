@@ -315,8 +315,12 @@ sample_rejoining_follower() { # <seconds-left>
   fi
 }
 
-produce_deadline_base=$((SECONDS + PROGRESS_TIMEOUT_SECONDS))
-produce_deadline=$produce_deadline_base
+# MILLISECONDS end to end (review): keeping the deadline in whole seconds
+# discarded the accumulated extension's sub-second remainder at the very
+# check it exists to feed, so the advertised produce window could still
+# lose up to 999ms depending on timer phase.
+produce_deadline_base_ms=$(( $(date +%s%3N) + PROGRESS_TIMEOUT_SECONDS * 1000 ))
+produce_deadline_ms=$produce_deadline_base_ms
 diag_spent_ms=0
 attempts=0
 until "$VTOP_NODE" produce --client-config "$VERIFY_CFG" --addr "$(native_addr)" \
@@ -337,10 +341,10 @@ until "$VTOP_NODE" produce --client-config "$VERIFY_CFG" --addr "$(native_addr)"
   # per retry — the extension would then depend on scrape phase, the exact
   # timing coupling this budget exists to remove.
   sample_started_ms=$(date +%s%3N)
-  sample_rejoining_follower "$((produce_deadline - SECONDS))"
+  sample_rejoining_follower "$(( (produce_deadline_ms - sample_started_ms) / 1000 ))"
   diag_spent_ms=$((diag_spent_ms + $(date +%s%3N) - sample_started_ms))
-  produce_deadline=$((produce_deadline_base + diag_spent_ms / 1000))
-  if [[ $SECONDS -ge $produce_deadline ]]; then
+  produce_deadline_ms=$((produce_deadline_base_ms + diag_spent_ms))
+  if [[ $(date +%s%3N) -ge $produce_deadline_ms ]]; then
     if [[ "$REJOIN_GAP" -gt 0 ]]; then
       # NAMED FIRST, because it explains the observation rather than competing
       # with it: with the survivor below the new leader's tip, every replica
