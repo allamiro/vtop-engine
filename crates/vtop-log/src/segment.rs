@@ -2108,6 +2108,36 @@ fn forced_extra_digits(sealed: &AnyHeader, runs: &[(u128, bool)]) -> usize {
         + chunk_width
 }
 
+/// The mirror bound (#410, review round eleven): the MOST digits any valid
+/// completion of the observed runs can carry — closed values are exact,
+/// an open run contributes its widest continuation under the field's
+/// ceiling, and an unseen field the ceiling's own width. Feeds a
+/// `claim <= maximum` refusal, so over-approximation is the sound
+/// direction: a generous estimate only widens what is accepted.
+fn widest_extra_digits(sealed: &AnyHeader, runs: &[(u128, bool)]) -> usize {
+    fn digits(value: u128) -> usize {
+        value.to_string().len()
+    }
+    fn resolve(runs: &[(u128, bool)], at: usize, ceiling: u128) -> usize {
+        match runs.get(at) {
+            Some((value, true)) => digits(*value),
+            Some((value, false)) => continuation_range(*value, ceiling)
+                .map_or(digits(*value), |(_, widest)| digits(widest)),
+            None => digits(ceiling),
+        }
+    }
+    let chunk = match sealed {
+        AnyHeader::V1(_) => 0,
+        AnyHeader::V2(_) => resolve(runs, 5, u128::from(crate::types::MAX_CHUNK_SIZE_BYTES)) - 1,
+    };
+    (resolve(runs, 0, u128::from(crate::types::MAX_RECORD_BYTES)) - 1)
+        + (resolve(runs, 1, u128::from(crate::types::MAX_GROUP_BYTES)) - 1)
+        + (resolve(runs, 2, u128::from(crate::types::MAX_SEGMENT_BYTES)) - 1)
+        + (resolve(runs, 3, u128::from(crate::types::MAX_SEGMENT_RECORDS)) - 1)
+        + (resolve(runs, 4, u128::from(u32::MAX)) - 1)
+        + chunk
+}
+
 fn torn_prefix_matches_template(
     candidate: &[u8],
     template: &[u8],
@@ -2252,6 +2282,13 @@ fn torn_prefix_matches_template(
                 let extra_digits = forced_extra_digits(sealed, &runs);
                 let present = candidate.len() - 12;
                 if claimed <= present || claimed < template_json.len() + extra_digits {
+                    return None;
+                }
+                // ...and from ABOVE by the widest completion the observed
+                // runs still admit (review, round eleven): with every
+                // field closed but the last, a claim of the whole range's
+                // maximum names a json these bytes can never grow into.
+                if claimed > template_json.len() + widest_extra_digits(sealed, &runs) {
                     return None;
                 }
             }
