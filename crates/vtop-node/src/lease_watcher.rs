@@ -164,8 +164,41 @@ impl LeaseWatcher {
         // metadata thinks — a grant or a definite "no lease". Both are answers;
         // only an unreachable metadata plane leaves this follower ignorant.
         let mut ready = self.ready.clone();
+        // A watch that CLOSED without ever publishing `true` is "no shutdown
+        // will ever be requested", not "shutdown now" — the same rule the
+        // oneshot adapter pins (#408). Tracked so the loop stops selecting on
+        // a channel that would complete instantly forever.
+        let mut watch_closed = false;
         loop {
-            match self.observe().await {
+            // Raced against shutdown, and the abandoned result never
+            // publishes (#408): a SIGTERM landing mid-read used to wait out
+            // the request timeout before the drain could proceed — on an
+            // unresponsive metadata plane, the full five seconds — and a
+            // watcher that is stopping has no business acting on whatever
+            // that read eventually says.
+            let observed = if watch_closed {
+                self.observe().await
+            } else {
+                tokio::select! {
+                    observed = self.observe() => observed,
+                    changed = shutdown.changed() => {
+                        // The VALUE decides before the closure does
+                        // (review): a sender that published `true` and was
+                        // then dropped is a shutdown whose channel closed,
+                        // not a closure to park on.
+                        if *shutdown.borrow() {
+                            return;
+                        }
+                        if changed.is_err() {
+                            watch_closed = true;
+                            self.observe().await
+                        } else {
+                            continue;
+                        }
+                    }
+                }
+            };
+            match observed {
                 Ok(Some(epoch)) => {
                     if published != Some(epoch) {
                         tracing::info!(
@@ -216,9 +249,20 @@ impl LeaseWatcher {
                     }
                 }
             }
+            if watch_closed {
+                tokio::time::sleep(self.config.poll_interval).await;
+                continue;
+            }
             tokio::select! {
                 _ = tokio::time::sleep(self.config.poll_interval) => {}
-                _ = shutdown.changed() => {}
+                changed = shutdown.changed() => {
+                    // A closed watch completes instantly forever; without
+                    // the flag this select would never sleep again and the
+                    // watcher would hot-poll metadata (#408).
+                    if changed.is_err() {
+                        watch_closed = true;
+                    }
+                }
             }
             if *shutdown.borrow() {
                 // Nothing to release: a watcher only observes the lease. It

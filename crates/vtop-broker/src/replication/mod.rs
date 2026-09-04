@@ -766,7 +766,57 @@ impl InProcessFollower {
             state.segment.base_offset()
         };
         if divergence < base_offset {
-            return Ok(0);
+            // ...but "began below the base" is not "confined below the base"
+            // (#408): DivergesAt marks everything at or above it suspect,
+            // which includes every retained record. Whether the RETAINED
+            // stretch is actually disputed is answerable — clamp both
+            // histories to exactly the retained window [base, tail) and
+            // compare those (review: bounded on BOTH sides, so the fencing
+            // epoch's own tail adoption and a peer's idle-epoch future
+            // cannot manufacture disagreements about records nobody holds,
+            // and the comparison is exact equality with no asymmetric
+            // prefix tolerance to excuse a real one). Equal clamps confine
+            // the disagreement to records neither party holds any more:
+            // unprovable, touch nothing, exactly the #290 reasoning above.
+            // Unequal clamps mean retained records are attributed to
+            // DIFFERENT leaderships, and admitting that silently would hand
+            // back the split-brain read this vector exists to prevent — the
+            // fence fails loudly and the replica needs repair. An empty
+            // clamp on either side is "cannot vouch": unknown, touch
+            // nothing, as everywhere else. An empty WINDOW is nothing to
+            // dispute at all.
+            let tail = self.next_offset();
+            if tail <= base_offset {
+                return Ok(0);
+            }
+            let confined = {
+                let guard = self
+                    .fencing_epoch_journal
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard.as_ref().is_none_or(|journal| {
+                    let mine =
+                        crate::fencing_epochs::clamp_lineage(journal.entries(), base_offset, tail);
+                    let theirs = crate::fencing_epochs::clamp_lineage(
+                        leader_epoch_starts,
+                        base_offset,
+                        tail,
+                    );
+                    mine.is_empty() || theirs.is_empty() || mine == theirs
+                })
+            };
+            if confined {
+                return Ok(0);
+            }
+            return Err((
+                ErrorCode::WrongLineage,
+                format!(
+                    "the caller's history and this replica's disagree about who wrote records \
+                     this replica still retains (base offset {base_offset}); the dispute is not \
+                     confined to reclaimed records, so nothing can be silently admitted — this \
+                     replica needs repair"
+                ),
+            ));
         }
         match self.truncate_to(divergence) {
             Ok(outcome) => Ok(outcome.records_removed),
@@ -1309,6 +1359,22 @@ impl InProcessFollower {
         let visible = update.committed_high_watermark.min(local);
         self.cluster_committed.advance_to(visible);
         self.arm_committed_floor();
+        // The floor this update just advanced can make sealed segments
+        // eligible, and on a range that then goes idle no later append
+        // would ever reclaim them — the follower half of the leader's
+        // post-publish pass (#408 review). NOT under an fsync hold, for
+        // the same reason the apply barrier refuses there: deleting files
+        // breaks the injection's promise that held bytes die with a crash.
+        // (The floor-persist doctrine is untouched: nothing here fsyncs
+        // the sidecar; retention is its own bounded I/O with its own
+        // failure reporting.)
+        if !self.hold_fsync() {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.run_retention(&mut state.segment);
+        }
         Ok(())
     }
 }

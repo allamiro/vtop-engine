@@ -422,10 +422,22 @@ pub async fn run(
 fn oneshot_on_shutdown(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::sync::oneshot::Receiver<()> {
-    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let (mut sender, receiver) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         while !*shutdown.borrow() {
             if shutdown.changed().await.is_err() {
+                // The watch closed without ever publishing `true`. Dropping
+                // the oneshot sender here would CANCEL the receiver, and the
+                // serve loops read a canceled receiver as a completed signal
+                // — an embedder that merely dropped a sender it no longer
+                // needed would drain a healthy node (#408). So the sender is
+                // held — but only as long as anyone is LISTENING (review):
+                // parking unconditionally left this task pending forever
+                // after the server itself exited, and an embedder that
+                // restarts nodes would accumulate detached tasks. `closed()`
+                // keeps a live server's receiver pending and lets the
+                // adapter die with its server.
+                sender.closed().await;
                 return;
             }
         }
@@ -479,7 +491,8 @@ pub async fn serve(
         // prevent (#290).
         if retention.max_total_bytes == 0 {
             return Err(
-                "retention.max_total_bytes must be greater than zero; omit the retention block                  to disable retention"
+                "retention.max_total_bytes must be greater than zero; omit the retention \
+                 block to disable retention"
                     .to_owned(),
             );
         }
@@ -866,10 +879,19 @@ async fn run_leader(
             promotion_probe,
         )?;
         agent_task = Some(tokio::spawn(agent.run(release_lease_rx)));
-        // The drain wait must survive an in-flight admin round trip, whose
-        // own budget is the lease duration; past one full lease the release
-        // is moot anyway — the lease has lapsed on its own.
-        agent_drain = agent_drain.max(Duration::from_millis(lease.lease_duration_ms));
+        // The agent abandons its round the moment the release fires (#408),
+        // so the worst remaining chain is the shutdown path's own RPCs: the
+        // reconciliation read release() may need when the abandoned round
+        // died mid-acquisition, then the release proposal — two bounded
+        // deadlines back to back (review), with one more interval as real
+        // margin for scheduling between them. A full lease duration here was
+        // both too much and, for configurations with the renew interval near
+        // the lease duration, too little: an administrative lease has no
+        // expiry to fall back on, so dropping the task before
+        // ReleaseRangeLease is proposed leaves the stopped node assigned
+        // indefinitely.
+        agent_drain =
+            agent_drain.max(Duration::from_millis(lease.renew_interval_ms).saturating_mul(3));
     }
     observability.register(Box::new(BrokerCollector::new(
         Arc::clone(&broker),
@@ -1267,8 +1289,12 @@ async fn run_candidate(
     let agent = agent
         .with_ready_gate(observability.gate.clone())
         .with_stand_down(Arc::clone(&stand_down));
+    // Same derivation as run_leader's (#408): the agent abandons its round on
+    // release, so the budget covers the shutdown path's two bounded RPCs —
+    // the reconciliation read and the release proposal — plus one interval
+    // of scheduling margin (review), not a whole lease.
     let agent_drain = std::time::Duration::from_secs(5)
-        .max(std::time::Duration::from_millis(lease.lease_duration_ms));
+        .max(std::time::Duration::from_millis(lease.renew_interval_ms).saturating_mul(3));
     let mut agent_task = tokio::spawn(agent.run(release_lease_rx));
 
     // --- readiness ----------------------------------------------------------
@@ -1397,11 +1423,22 @@ async fn run_candidate(
     // leaves through the same drain, so handing the range back is not
     // something a new failure path can forget to do.
     let mut fatal: Option<String> = None;
+    // The oneshot adapters' rule, applied to the supervisor itself (review):
+    // a watch that CLOSED without ever publishing `true` is "no shutdown
+    // will ever be requested", never "shutdown now". Treating closure as a
+    // shutdown here while the adapters park would send this loop into a
+    // drain that waits on servers nobody signalled — and then return with
+    // both listeners still bound. Once closed, the arm stops being polled;
+    // the supervisor keeps supervising.
+    let mut shutdown_watch_closed = false;
     'supervisor: loop {
         tokio::select! {
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
+            changed = shutdown.changed(), if !shutdown_watch_closed => {
+                if *shutdown.borrow() {
                     break;
+                }
+                if changed.is_err() {
+                    shutdown_watch_closed = true;
                 }
             }
             // A plane dying under a live candidate is fail-stop (review): a
@@ -1570,9 +1607,19 @@ async fn run_candidate(
                                         }
                                     }
                                 }
-                                changed = shutdown.changed() => {
-                                    if changed.is_err() || *shutdown.borrow() {
+                                changed = shutdown.changed(), if !shutdown_watch_closed => {
+                                    // The same closed-watch rule as the
+                                    // outer select (review): a closure
+                                    // during the BUILD wait was still read
+                                    // as a shutdown here, sending the
+                                    // supervisor into an unsignalled drain
+                                    // with both listeners left bound. The
+                                    // value decides; closure parks the arm.
+                                    if *shutdown.borrow() {
                                         break 'supervisor;
+                                    }
+                                    if changed.is_err() {
+                                        shutdown_watch_closed = true;
                                     }
                                 }
                                 result = &mut native_task => {
@@ -1755,9 +1802,9 @@ async fn run_candidate(
     // Only one listener fails; the other is still serving, and nobody has told
     // it to stop — the shutdown watch belongs to the caller and this is not a
     // shutdown. The drain below awaits the native listener within
-    // `agent_drain`, which is at least a full lease duration, so a replica
-    // failure would have waited that entire window before releasing: exactly
-    // the delay this commit exists to remove, reintroduced on the other path.
+    // `agent_drain`, so a replica failure would have waited that entire
+    // window before releasing: exactly the delay this commit exists to
+    // remove, reintroduced on the other path.
     //
     // Aborted rather than asked politely, and the trade is deliberate. A
     // fail-stop has already decided this process cannot serve the range, so

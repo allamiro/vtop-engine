@@ -991,6 +991,7 @@ impl LeaseAgent {
             node = %self.node_uuid,
             "lease agent running"
         );
+        let mut release_closed = false;
         loop {
             if *release.borrow() {
                 break;
@@ -1021,14 +1022,96 @@ impl LeaseAgent {
                         "standing down: this node was granted an epoch it could not serve, \
                          so the lease goes back and this node sits out the next rounds"
                     );
-                    self.release().await;
+                    // Raced against the release signal exactly as the round
+                    // is (review): this release can spend two bounded
+                    // deadlines, and a shutdown arriving inside it used to
+                    // wait them out before the loop head could break —
+                    // leaving the FINAL release less drain budget than its
+                    // own two calls need. Abandoning loses nothing: the
+                    // exit-path release re-reconciles against metadata and
+                    // proposes with whatever epoch it finds.
+                    if release_closed {
+                        self.release().await;
+                    } else {
+                        tokio::select! {
+                            () = self.release() => {}
+                            changed = release.changed() => {
+                                if changed.is_err() {
+                                    release_closed = true;
+                                }
+                                // Only an actual `true` abandons — the loop
+                                // head breaks on it and the exit release
+                                // takes over. A closed watch or a spurious
+                                // wake finishes the hand-back here.
+                                if !*release.borrow() {
+                                    self.release().await;
+                                }
+                            }
+                        }
+                    }
                     self.publish_lost(fencing_epoch);
                 }
                 self.state = LeaseState::NotHeld;
                 self.held_until_ms = None;
                 self.campaign_hold_off_rounds = self.stand_aside_rounds();
+                // Re-checked AFTER the block (review, round six): the
+                // abandon arm above CONSUMES the watch notification, so the
+                // round's own race below can never wake for it — falling
+                // through would spend a full round plus its delay before
+                // the loop head looked again, exactly the starvation the
+                // race exists to prevent. The loss is published and the
+                // state reset either way; the exit release reconciles the
+                // epoch from metadata.
+                if *release.borrow() {
+                    break;
+                }
             }
-            let delay = match self.step().await {
+            // The round races the release (#408): an agent already inside
+            // `step()` used to finish it — up to one bounded deadline reading
+            // metadata and another renewing — before it ever looked at the
+            // flag again, and with `renew_interval` near the lease duration a
+            // valid configuration could run the drain budget dry before the
+            // ReleaseRangeLease proposal was even submitted. A holder that is
+            // leaving has no use for the abandoned round's answer; the loop
+            // head re-reads the flag, so the release path starts immediately
+            // and a spurious wake just re-races. A watch that CLOSED without
+            // publishing `true` is "no release will ever be requested" — the
+            // oneshot adapter's rule — not a reason to abandon rounds.
+            //
+            // One window stays open KNOWINGLY (review): dropping the step
+            // future does not cancel a proposal the admin server already
+            // decoded, so an abandoned AcquireRangeLease can commit AFTER
+            // the shutdown reconciliation read observed no lease. That
+            // shape is crash-equivalent — an acquisition always mints an
+            // EXPIRING lease (only the operator's grant path mints the
+            // non-expiring kind), so it lapses on its deadline exactly as a
+            // SIGKILL'd holder's would — and closing it would mean awaiting
+            // the in-flight proposal at shutdown, the very delay this race
+            // exists to remove.
+            let stepped = if release_closed {
+                self.step().await
+            } else {
+                tokio::select! {
+                    stepped = self.step() => stepped,
+                    changed = release.changed() => {
+                        // The VALUE decides before the closure does
+                        // (review): a sender that published `true` and was
+                        // then dropped is a release whose channel closed —
+                        // the loop head breaks on it — not a closure to
+                        // keep stepping through.
+                        if *release.borrow() {
+                            continue;
+                        }
+                        if changed.is_err() {
+                            release_closed = true;
+                            self.step().await
+                        } else {
+                            continue;
+                        }
+                    }
+                }
+            };
+            let delay = match stepped {
                 Ok(delay) => {
                     if self.range_missing {
                         // Definitive, not transient: metadata answered and
@@ -1095,9 +1178,20 @@ impl LeaseAgent {
                     self.config.poll_interval
                 }
             };
+            if release_closed {
+                tokio::time::sleep(delay).await;
+                continue;
+            }
             tokio::select! {
                 _ = tokio::time::sleep(delay) => {}
-                _ = release.changed() => {}
+                changed = release.changed() => {
+                    // A closed watch completes instantly forever; without the
+                    // flag this select would never sleep again and the agent
+                    // would hot-poll metadata (#408).
+                    if changed.is_err() {
+                        release_closed = true;
+                    }
+                }
             }
         }
         self.release().await;
@@ -1108,9 +1202,73 @@ impl LeaseAgent {
     /// already lost or taken, and blocking exit on metadata would trade a
     /// prompt failover for a hung shutdown, the exact inversion of the goal.
     async fn release(&mut self) {
-        let LeaseState::Held { fencing_epoch } = self.state else {
-            return;
+        // What THIS PROCESS recorded is not what metadata decided (review,
+        // twice over): the abandoned round can die after metadata committed
+        // an acquisition and before `self.state` caught up (NotHeld with a
+        // lease on record), and it can equally die during a re-grant's
+        // publish while `self.state` still names the PREVIOUS epoch — a
+        // release proposed at a stale epoch is refused, and an
+        // administrative lease has no expiry to mop up the refusal. One
+        // bounded read reconciles both shapes: whatever epoch metadata
+        // attributes to this node is the epoch the release names. The read
+        // failing falls back to what the agent recorded — best effort, as
+        // this whole path is — and a lease metadata attributes to someone
+        // else is not this node's to release. Loss is published only for a
+        // hold that was actually published.
+        let recorded = match self.state {
+            LeaseState::Held { fencing_epoch } => Some(fencing_epoch),
+            _ => None,
         };
+        let metadata_view = self
+            .bounded(
+                "read range lease at shutdown",
+                self.admin
+                    .read_range_lease(self.topic_uuid, self.range_uuid),
+            )
+            .await
+            .ok()
+            .map(|view| {
+                view.lease
+                    .filter(|lease| lease.holder_node_uuid == self.node_uuid)
+                    .map(|lease| lease.fencing_epoch)
+            });
+        let fencing_epoch = match (recorded, metadata_view) {
+            // Metadata answered: its attribution wins, stale or fresh.
+            (recorded, Some(Some(meta_epoch))) => {
+                if recorded.is_none() {
+                    tracing::warn!(
+                        range = %self.range_uuid,
+                        fencing_epoch = meta_epoch,
+                        "metadata says this node holds a lease this agent never \
+                         recorded (a round abandoned mid-acquisition); releasing it \
+                         before exit"
+                    );
+                } else if recorded != Some(meta_epoch) {
+                    tracing::warn!(
+                        range = %self.range_uuid,
+                        recorded = recorded.unwrap_or_default(),
+                        fencing_epoch = meta_epoch,
+                        "metadata attributes this node's lease to a newer epoch than \
+                         the agent recorded (a round abandoned mid-publish); the \
+                         release names metadata's epoch"
+                    );
+                }
+                meta_epoch
+            }
+            // Metadata answered and this node holds nothing: no proposal to
+            // make, but a hold that was published is still published as lost.
+            (recorded, Some(None)) => {
+                if let Some(epoch) = recorded {
+                    self.publish_lost(epoch);
+                }
+                return;
+            }
+            // The read failed: propose with what the agent recorded, the
+            // pre-reconciliation behavior — best effort either way.
+            (Some(recorded), None) => recorded,
+            (None, None) => return,
+        };
+        let was_published = recorded.is_some();
         let proposal = self
             .bounded(
                 "propose release",
@@ -1143,7 +1301,9 @@ impl LeaseAgent {
                 "lease release failed; the lease will lapse on its deadline"
             ),
         }
-        self.publish_lost(fencing_epoch);
+        if was_published {
+            self.publish_lost(fencing_epoch);
+        }
     }
 
     /// Every admin round trip is bounded by this. A blackholed endpoint (as

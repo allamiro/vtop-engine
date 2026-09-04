@@ -433,8 +433,17 @@ impl FencingEpochJournal {
     /// a divergence point and discarded a log the two replicas entirely agreed
     /// on. A verdict makes that mistake impossible to make quietly.
     pub fn compare_lineage(&self, other: &[EpochStart]) -> Lineage {
+        // CANONICALIZED before comparing (#408 review): an epoch adopted
+        // while idle writes nothing, and its successor starting at the same
+        // offset is the epoch that actually governs records from there. One
+        // replica recording the idle adoption and another not still
+        // attribute every record identically — comparing the raw vectors
+        // would call that divergence and mandate truncating records both
+        // sides agree on.
+        let mine_canonical = canonicalize_lineage(&self.entries);
+        let theirs_canonical = canonicalize_lineage(other);
         let mut compared = 0_usize;
-        for (mine, theirs) in self.entries.iter().zip(other.iter()) {
+        for (mine, theirs) in mine_canonical.iter().zip(theirs_canonical.iter()) {
             if mine.epoch != theirs.epoch || mine.start_offset != theirs.start_offset {
                 // Either different leadership at the same position in history,
                 // or the same epoch beginning in two different places — which
@@ -482,6 +491,85 @@ impl FencingEpochJournal {
     fn corrupt(message: String) -> BrokerError {
         BrokerError::EpochJournalCorrupt(format!("fencing-epoch journal: {message}"))
     }
+}
+
+/// Collapse every same-offset run to its last entry (#408): an epoch
+/// adopted while a replica was idle wrote nothing, and the epoch starting
+/// at the same offset after it is the one that actually governs records
+/// from there. Zero-record adoptions are bookkeeping, not history — and
+/// two replicas that disagree only about bookkeeping agree about every
+/// record either of them holds.
+pub fn canonicalize_lineage(entries: &[EpochStart]) -> Vec<EpochStart> {
+    let mut canonical: Vec<EpochStart> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        match canonical.last_mut() {
+            Some(last) if last.start_offset == entry.start_offset => *last = *entry,
+            _ => canonical.push(*entry),
+        }
+    }
+    canonical
+}
+
+/// Clamp a lineage vector to the history that governs exactly the retained
+/// window `[base, tail)` (#408): the entry owning `base`, re-anchored AT
+/// `base`, plus every entry starting inside the window.
+///
+/// Two replicas whose full vectors disagree may still agree about every
+/// record either of them RETAINS — retention reclaims a prefix, and a
+/// dispute confined to reclaimed records mandates nothing. The clamped
+/// views make that distinction checkable: equal clamps mean every retained
+/// record is attributed identically, unequal clamps mean retained records
+/// are attributed to different leaderships.
+///
+/// The window is bounded on BOTH sides deliberately (review): an entry at
+/// or beyond `tail` governs records this replica does not hold — the
+/// fencing epoch's own adoption entry sits exactly at the tail, and a peer
+/// that recorded a newer epoch while idle differs there legitimately —
+/// so including either side's future would manufacture disagreements about
+/// nothing, and tolerating them asymmetrically would excuse real ones.
+/// With both bounds in place the comparison is exact equality, no prefix
+/// tolerance needed.
+///
+/// Empty means the vector cannot vouch for `base` at all — unknown, which
+/// callers must treat as "prove nothing" exactly as everywhere else here.
+/// That answer is returned WHOLE (review): later in-window entries hanging
+/// off an unvouched base are not evidence, and returning them would let a
+/// caller mistake them for some.
+pub fn clamp_lineage(entries: &[EpochStart], base: u64, tail: u64) -> Vec<EpochStart> {
+    // An empty (or inverted) window holds no records to attribute; whatever
+    // the vector says about it is not retained-lineage evidence (review).
+    if tail <= base {
+        return Vec::new();
+    }
+    let Some(owner) = entries
+        .iter()
+        .rev()
+        .find(|entry| entry.start_offset <= base)
+    else {
+        return Vec::new();
+    };
+    let mut clamped = vec![EpochStart {
+        epoch: owner.epoch,
+        start_offset: base,
+    }];
+    // CANONICALIZED to the last epoch of every same-offset run (review): an
+    // epoch adopted while idle writes nothing, and its successor starting at
+    // the same offset is the epoch that actually governs records from there.
+    // One replica may have recorded the idle adoption and another not, yet
+    // both attribute every retained record identically — keeping the
+    // zero-record entry would make those histories compare unequal and
+    // reject a valid replica. (The base anchor is already canonical: the
+    // reverse owner search lands on the last entry at or below `base`.)
+    for entry in entries
+        .iter()
+        .filter(|entry| entry.start_offset > base && entry.start_offset < tail)
+    {
+        match clamped.last_mut() {
+            Some(last) if last.start_offset == entry.start_offset => *last = *entry,
+            _ => clamped.push(*entry),
+        }
+    }
+    clamped
 }
 
 /// Install a source-provided epoch history into a repaired range directory

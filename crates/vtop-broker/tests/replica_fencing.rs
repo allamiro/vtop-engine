@@ -431,6 +431,102 @@ fn a_divergence_below_the_retained_base_does_not_fail_the_fence() {
     assert_eq!(fenced.next_offset, next, "nothing held was discarded");
 }
 
+/// "Began below the retained base" is not "confined below it" (#408): a
+/// divergence verdict whose disagreement extends into records this replica
+/// still RETAINS must fail the fence, not be waved through as unprovable.
+/// The histories here disagree about who wrote the retained stretch itself —
+/// this side says the newer epoch took over before the base, the caller says
+/// the older epoch kept writing well past it — and silently admitting that
+/// would hand back the split-brain read the epoch vector exists to prevent.
+#[test]
+fn a_dispute_that_reaches_retained_records_fails_the_fence() {
+    let range = range_identity();
+    let dir = tempfile::tempdir().unwrap();
+    let descriptor = descriptor_for(&range, 0xE8);
+    let config = SegmentConfig {
+        max_record_bytes: 256,
+        max_group_bytes: 512,
+        max_segment_bytes: 512,
+        max_segment_records: 100,
+        index_stride: 2,
+    };
+    let mut set =
+        SegmentSet::create_in(&vtop_log::env::Env::real(), dir.path(), descriptor, config).unwrap();
+    for sequence in 0..40_u64 {
+        set.append_group(
+            &[LogRecord {
+                producer_id: PRODUCER,
+                producer_epoch: 0,
+                sequence,
+                timestamp_millis: 1_000,
+                attributes: 0,
+                key: b"k".to_vec(),
+                value: format!("v{sequence:04}").into_bytes(),
+            }],
+            Durability::Fsync,
+            Uuid::from_u128(60_000 + sequence as u128),
+        )
+        .unwrap();
+    }
+    let next = set.next_offset();
+    set.retain(
+        &RetentionPolicy {
+            max_total_bytes: 600,
+        },
+        next,
+    )
+    .unwrap();
+    let base = set.base_offset();
+    assert!(base > 2, "the front must have moved for this test to bite");
+
+    let epochs = ProducerEpochJournal::open(dir.path().join("epochs")).unwrap();
+    let meta = MetaFencingEpoch::new(OLD_EPOCH);
+    let node = Arc::new(
+        InProcessFollower::new(
+            FOLLOWER,
+            set,
+            epochs,
+            range,
+            OLD_EPOCH,
+            meta.clone(),
+            ClusterCommittedOffset::new(next),
+        )
+        .unwrap(),
+    );
+    // This replica: the newer epoch began just below the base, so it owns
+    // every retained record. The caller: the OLDER epoch kept writing
+    // through base+10. compare_lineage puts the divergence below the base —
+    // the old blanket shortcut's territory — but the retained records
+    // themselves are attributed to different leaderships.
+    let mut journal = FencingEpochJournal::open(dir.path().join("fencing-epochs")).unwrap();
+    journal.record(OLD_EPOCH, 0).unwrap();
+    journal.record(NEW_EPOCH, base - 2).unwrap();
+    node.set_fencing_epoch_journal(journal);
+
+    meta.set(NEW_EPOCH + 1);
+    let refused = node
+        .fence(
+            NEW_EPOCH + 1,
+            &[
+                EpochStart {
+                    epoch: OLD_EPOCH,
+                    start_offset: 0,
+                },
+                EpochStart {
+                    epoch: NEW_EPOCH,
+                    start_offset: base + 10,
+                },
+            ],
+        )
+        .expect_err("retained records attributed to different leaderships must fail the fence");
+    assert!(
+        refused.1.contains("still retains"),
+        "the refusal must say the dispute reaches retained records, so the operator reads \
+         'repair', not 'storage fault': {}",
+        refused.1
+    );
+}
+
 /// A caller that cannot vouch for its own history truncates nothing.
 ///
 /// Deleting records to satisfy a claim nobody made is the failure mode this
