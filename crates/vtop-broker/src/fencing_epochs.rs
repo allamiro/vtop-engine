@@ -501,11 +501,14 @@ impl FencingEpochJournal {
 /// fence still compares this history against the caller's and truncates at
 /// any genuine divergence.
 ///
-/// **Normalization:** entries with `start_offset >= tail` are dropped. The
-/// repaired replica holds only the sealed prefix; an entry beyond it would
-/// claim lineage for records the replica does not hold, and — concretely —
-/// would poison the journal at the next epoch adoption, because `record`
-/// refuses a new entry whose start offset is below the last one's.
+/// **Normalization:** entries with `start_offset` strictly above `tail` are
+/// dropped; an entry AT the tail is kept (#407 — it names where an epoch
+/// began, which is true whether or not the records above it were copied).
+/// The repaired replica holds only the sealed prefix; an entry beyond it
+/// would claim lineage for records the replica does not hold, and —
+/// concretely — would poison the journal at the next epoch adoption,
+/// because `record` refuses a new entry whose start offset is below the
+/// last one's.
 ///
 /// Idempotent for a re-run repair fetching the same history. A conflicting
 /// prior install fails loudly instead of merging — and the comparison covers

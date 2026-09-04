@@ -347,13 +347,6 @@ impl ReplicaPeerHandler for LeaderSegmentTransferHandler {
     }
 }
 
-/// One-shot puller of a leader's sealed prefix into a [`SegmentReceiver`].
-///
-/// Shaped like [`super::network::ReplicaStatusClient`] rather than the
-/// leader's persistent dialer, and for the same reason: a repair is an
-/// operation with a beginning and an end, not a session, and reusing the
-/// replication dialer would start a replication stream as a side effect of
-/// running one.
 /// What a sealed-prefix transfer actually delivered (#407).
 ///
 /// The `prefix_end` is the one honest bound for installing the transferred
@@ -373,6 +366,13 @@ pub struct TransferredPrefix {
     pub prefix_end: Option<u64>,
 }
 
+/// One-shot puller of a leader's sealed prefix into a [`SegmentReceiver`].
+///
+/// Shaped like [`super::network::ReplicaStatusClient`] rather than the
+/// leader's persistent dialer, and for the same reason: a repair is an
+/// operation with a beginning and an end, not a session, and reusing the
+/// replication dialer would start a replication stream as a side effect of
+/// running one.
 pub struct SegmentTransferClient {
     connector: TlsConnector,
     /// Deadline PER ROUND TRIP, not per transfer: a sealed prefix can be
