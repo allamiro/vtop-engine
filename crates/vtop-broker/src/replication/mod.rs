@@ -181,6 +181,13 @@ pub struct InProcessFollower {
     /// attach one — absent means the guard starts at zero, the pre-floor
     /// behaviour every older test pins.
     committed_floor: Mutex<Option<crate::committed_floor::CommittedFloorFile>>,
+    /// Whether arming is SETTLED — a nonzero floor is durable, no file is
+    /// attached, or the file gave up (#240). The fast-path guard so the
+    /// dispatch loop's per-frame [`Self::arm_committed_floor`] is a single
+    /// atomic load once arming is done, never a lock. Only while this is
+    /// false does arming take the file lock, and only in the transient
+    /// window before the first observed HWM is durable.
+    committed_floor_armed: AtomicBool,
     /// Sealed-prefix retention bound in bytes; 0 = disabled (#290).
     retention_max_total_bytes: std::sync::atomic::AtomicU64,
     state: Mutex<FollowerState>,
@@ -254,6 +261,7 @@ impl InProcessFollower {
             segment_format,
             cluster_committed,
             committed_floor: Mutex::new(None),
+            committed_floor_armed: AtomicBool::new(false),
             retention_max_total_bytes: std::sync::atomic::AtomicU64::new(0),
             state: Mutex::new(FollowerState {
                 segment,
@@ -403,10 +411,18 @@ impl InProcessFollower {
     /// setter that silently advanced it would move a value other components
     /// were told was theirs to observe.
     pub fn set_committed_floor(&self, file: crate::committed_floor::CommittedFloorFile) {
+        // A file that opened carrying a floor is already armed — the guard it
+        // seeds is live from the first fence, so arming never needs to run.
+        // A fresh (zero) file waits for the first observed HWM. Set the file
+        // before the flag so an arm racing the wiring sees the file it will
+        // read under the lock.
+        let already_armed = file.floor() != 0;
         *self
             .committed_floor
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(file);
+        self.committed_floor_armed
+            .store(already_armed, Ordering::Release);
     }
 
     /// Make the guard's floor durable when it advanced (#240); a no-op when
@@ -442,38 +458,65 @@ impl InProcessFollower {
         // value at least as fresh as the save it follows.
         let floor = self.cluster_committed.get();
         Self::save_floor_or_disable(&mut guard, floor);
+        self.settle_arming_if_done(floor, guard.is_none());
     }
 
-    /// One save from the dispatch path, once per file lifetime (#240): the
-    /// first observed HWM is the difference between an UNARMED guard and an
-    /// armed one — a crash before the next append barrier would otherwise
-    /// recover no floor at all, which is the exact window this file exists
-    /// to close. Every later frame only sharpens a guard that is already
-    /// armed, and waits for the next barrier, so the steady-state dispatch
-    /// loop stays I/O-free.
+    /// Make the first observed HWM durable without waiting for a later
+    /// barrier (#240): the difference between an UNARMED guard and an armed
+    /// one is whether a crash on the quiet tail recovers a floor at all, and
+    /// that is the exact window this file exists to close. Every later frame
+    /// only sharpens an already-armed guard and defers to the next barrier,
+    /// so this is a single atomic load once arming has settled — the
+    /// steady-state dispatch loop pays nothing.
     fn arm_committed_floor(&self) {
-        // try_lock, never lock: this runs in the dispatch loop, and the one
-        // thing that holds the lock for any length of time is a barrier
-        // persist mid-fsync — the very durability arming exists to request.
-        // Skipping is correct either way: if that persist saves a non-zero
-        // floor the guard is armed, and if not, the next frame tries again.
-        let mut guard = match self.committed_floor.try_lock() {
-            Ok(guard) => guard,
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => return,
-        };
-        let already_armed = match guard.as_ref() {
-            Some(file) => file.floor() != 0,
-            None => return,
-        };
-        if already_armed {
+        if self.committed_floor_armed.load(Ordering::Acquire) {
             return;
+        }
+        // Not yet settled, so take the lock — BLOCKING, not `try_lock`. An
+        // earlier revision skipped on contention, and both reviews of this
+        // PR found the race: the only thing that holds this lock for any
+        // time is a barrier persist mid-fsync, and if that persist read the
+        // cell before this HWM advanced it, skipping drops the one arming
+        // chance and a quiet-tail crash recovers zero. Blocking is bounded
+        // and self-limiting: a barrier running means appends are committing,
+        // so the cell is advancing and arming completes; and once it does,
+        // the atomic above means this lock is never taken from the dispatch
+        // path again.
+        let mut guard = self
+            .committed_floor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match guard.as_ref() {
+            // A file already carrying a floor (opened non-empty, or armed by
+            // a barrier between the load above and this lock) needs nothing;
+            // no file at all is a harness follower with nothing to arm.
+            Some(file) if file.floor() != 0 => {
+                self.committed_floor_armed.store(true, Ordering::Release);
+                return;
+            }
+            None => {
+                self.committed_floor_armed.store(true, Ordering::Release);
+                return;
+            }
+            Some(_) => {}
         }
         let floor = self.cluster_committed.get();
         if floor == 0 {
+            // Nothing acknowledged yet, so nothing to protect and no barrier
+            // to contend with; a later frame retries once the cell moves.
             return;
         }
         Self::save_floor_or_disable(&mut guard, floor);
+        self.settle_arming_if_done(floor, guard.is_none());
+    }
+
+    /// Arming is settled — the atomic fast path may short-circuit forever —
+    /// once a nonzero floor is durable OR the file has given up. A no-op
+    /// save of zero settles nothing: the guard still has nothing to recover.
+    fn settle_arming_if_done(&self, saved_floor: u64, file_disabled: bool) {
+        if saved_floor != 0 || file_disabled {
+            self.committed_floor_armed.store(true, Ordering::Release);
+        }
     }
 
     /// The one disable path for a floor that cannot persist: report once,
