@@ -205,3 +205,22 @@ def test_another_loopback_service_is_not_the_lab(tmp_path, monkeypatch):
         "the lab predicate is host AND port: a loopback service on another "
         "port is somebody else's store with somebody else's credentials"
     )
+
+
+def test_a_malformed_endpoint_is_not_the_lab_and_does_not_crash(
+        tmp_path, monkeypatch):
+    # urlsplit defers port validation to the .port property, which raises on
+    # a non-numeric port. The harness must not fall over before vtopctl even
+    # starts — a broken endpoint is the engine's configuration error to
+    # report, and it is certainly not the lab.
+    from lib import engine
+    monkeypatch.setattr(engine, "_ENV_FILE", str(tmp_path / ".env"))  # absent
+    for var in ("VTOP_S3_ENDPOINT_URL", "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    env = _backend_env({"backend": "s3_native",
+                        "endpoint_url": "http://localhost:not-a-port"})
+    assert "AWS_ACCESS_KEY_ID" not in env, (
+        "an endpoint the parser cannot even read is nobody's lab: injecting "
+        "credentials for it would only mask the real configuration error"
+    )

@@ -53,9 +53,17 @@ def _is_lab_endpoint(endpoint: str) -> bool:
     # means the operator brought an identity, and injecting the lab
     # fallbacks would OUTRANK it: environment keys beat profiles and
     # instance metadata in the SDK's credential chain.
-    parts = urlsplit(endpoint)
+    # A malformed endpoint is NOT the lab, and not this helper's error to
+    # raise: urlsplit defers port validation to the .port property, which
+    # throws on a non-numeric or out-of-range port — the engine's own config
+    # validation is where a broken endpoint should be reported.
+    try:
+        parts = urlsplit(endpoint)
+        port = parts.port
+    except ValueError:
+        return False
     return (parts.hostname in ("localhost", "127.0.0.1", "::1")
-            and parts.port == 9000)
+            and port == 9000)
 
 
 def write_engine_config(scenario, work_dir: str, state_db: str,
