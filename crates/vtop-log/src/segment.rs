@@ -2016,6 +2016,50 @@ pub(crate) fn roll_in_with(
     Ok((sealed, successor))
 }
 
+/// The placeholder id the torn-classification template is encoded with —
+/// distinctive so its 36-byte hyphenated span can be located inside the
+/// template JSON and excluded from the prefix comparison: a legitimate
+/// successor mints its own id there, and every other descriptor byte is
+/// deterministic from the sealed predecessor.
+const TORN_TEMPLATE_ID: Uuid = Uuid::from_u128(0xF0F0_F0F0_F0F0_F0F0_F0F0_F0F0_F0F0_F0F0);
+
+/// Whether `candidate` is consistent with being a torn PREFIX of the
+/// `template` successor header (#410): every available byte must agree
+/// with the template wherever the template is deterministic — the magic,
+/// and the descriptor JSON up to the config boundary — with the 4-byte
+/// length field (config-dependent) and the segment-id span (the
+/// successor's own fixed-width choice) excluded. A torn write can only
+/// ever be a prefix of a real header, so any divergence in those regions
+/// proves the file is something else — a foreign artifact to quarantine,
+/// never to delete.
+fn torn_prefix_matches_template(candidate: &[u8], template: &[u8]) -> bool {
+    if !candidate
+        .iter()
+        .take(8)
+        .zip(template.iter())
+        .all(|(have, want)| have == want)
+    {
+        return false;
+    }
+    if template.len() < 12 + crate::codec::CHECKSUM_LEN {
+        return false;
+    }
+    let template_json = &template[12..template.len() - crate::codec::CHECKSUM_LEN];
+    let id_string = TORN_TEMPLATE_ID.as_hyphenated().to_string();
+    let id_at = template_json
+        .windows(id_string.len())
+        .position(|window| window == id_string.as_bytes());
+    let config_at = template_json
+        .windows(b"\"config\":".len())
+        .position(|window| window == b"\"config\":");
+    let (Some(id_at), Some(config_at)) = (id_at, config_at) else {
+        return false;
+    };
+    let id_span = id_at..id_at + id_string.len();
+    let comparable = candidate.len().saturating_sub(12).min(config_at);
+    (0..comparable).all(|at| id_span.contains(&at) || candidate[12 + at] == template_json[at])
+}
+
 /// Rebuild the commit boundary of an EMPTY successor whose creation was
 /// interrupted between its primary file and its commit sidecar (#314
 /// review — the roll's LAST window), or discard one whose header write was
@@ -2118,9 +2162,24 @@ pub(crate) fn rebuild_empty_successor_commit(
             // unknown-magic arm — including torn files that happen to land
             // above the floor, because quarantine keeps evidence and
             // deletion cannot be undone.
-            let minimal_expected_len = match &inspection.header {
+            // Below the floor, one more proof obligation (review, round
+            // three): shortness alone shows the file is not a valid
+            // successor OF THIS RANGE — a complete foreign header with a
+            // shorter topic or lineage, damaged and restored under this
+            // name, would measure below the floor too, and deleting it
+            // destroys an operator's evidence. What separates the two is
+            // that a torn write can only ever be a PREFIX of a real
+            // successor header: every byte it has must agree with the
+            // template wherever the template is deterministic — the magic,
+            // and the descriptor JSON up to the config boundary — with the
+            // 4-byte length field (config-dependent) and the segment-id
+            // span (the successor's own choice, fixed-width) excluded. A
+            // foreign header diverges at its topic or lineage; a genuine
+            // torn prefix cannot.
+            let template = match &inspection.header {
                 AnyHeader::V1(sealed) => {
                     let mut expected = sealed.descriptor.clone();
+                    expected.segment_id = TORN_TEMPLATE_ID;
                     expected.base_offset = expected_base;
                     let narrowest = SegmentConfig {
                         max_record_bytes: 1,
@@ -2130,10 +2189,10 @@ pub(crate) fn rebuild_empty_successor_commit(
                         index_stride: 1,
                     };
                     encode_header(&SegmentHeader::new(expected, narrowest))
-                        .map(|encoded| encoded.len() as u64)
                 }
                 AnyHeader::V2(sealed) => {
                     let mut expected = sealed.descriptor.clone();
+                    expected.segment_id = TORN_TEMPLATE_ID;
                     expected.base_offset = expected_base;
                     let narrowest = SegmentConfigV2 {
                         max_record_bytes: 1,
@@ -2144,11 +2203,13 @@ pub(crate) fn rebuild_empty_successor_commit(
                         chunk_size: 1,
                     };
                     encode_header_v2(&SegmentHeaderV2::new(expected, narrowest))
-                        .map(|encoded| encoded.len() as u64)
                 }
             };
-            let provably_torn = match minimal_expected_len {
-                Ok(floor) => (bytes.len() as u64) < floor,
+            let provably_torn = match template {
+                Ok(template) => {
+                    (bytes.len() as u64) < template.len() as u64
+                        && torn_prefix_matches_template(&bytes, &template)
+                }
                 // A predecessor whose header cannot re-encode is not a
                 // state this repair understands; prove nothing.
                 Err(_) => false,

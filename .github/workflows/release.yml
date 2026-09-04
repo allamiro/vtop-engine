@@ -241,10 +241,13 @@ jobs:
           cp benchmarks/README.md "dist/$name/benchmarks/" 2>/dev/null || true
           cp .cargo/audit.toml "dist/$name/.cargo/" 2>/dev/null || true
           cp .github/workflows/release.yml "dist/$name/.github/workflows/" 2>/dev/null || true
-          # Three explicit assertions now, not two: the licenses the archive
-          # must never ship without, plus the security model CONTRIBUTING.md
-          # names — the sentinel for the docs tree having actually copied.
-          for required in LICENSE LICENSE-EE docs/SECURITY_MODEL.md; do
+          # Every file the closure DEPENDS on is asserted (review): the
+          # licenses the archive must never ship without, the security model
+          # as the sentinel for the docs tree having copied, and the three
+          # out-of-tree escapes — whose `|| true` copies would otherwise
+          # no-op silently the day one of them moves.
+          for required in LICENSE LICENSE-EE docs/SECURITY_MODEL.md \
+            benchmarks/README.md .cargo/audit.toml .github/workflows/release.yml; do
             [ -f "dist/$name/$required" ] \
               || { echo "::error::$required is missing from the release bundle"; exit 1; }
           done

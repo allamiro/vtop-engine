@@ -3617,6 +3617,43 @@ mod tests {
         );
     }
 
+    /// Shortness alone is not provenance (#410, review round three): a
+    /// complete header from ANOTHER range — a shorter topic makes it
+    /// measure below this range's torn floor — damaged and restored under
+    /// the roll-window name must quarantine, not sweep. What a torn write
+    /// has and a foreign header lacks is prefix-consistency with the
+    /// expected successor: the foreign topic diverges inside the
+    /// deterministic descriptor region, so the classification refuses to
+    /// call it torn.
+    #[test]
+    fn a_short_damaged_foreign_header_is_quarantined_not_deleted() {
+        let directory = tempdir().unwrap();
+        strand_after_seal(directory.path(), false);
+        let foreign_path = directory.path().join(format!("{}.active", segment_stem(3)));
+        let mut foreign = descriptor();
+        foreign.topic = "x".to_owned();
+        foreign.segment_id = Uuid::from_u128(0xF5);
+        foreign.base_offset = 3;
+        let mut bytes =
+            crate::codec::encode_header(&crate::codec::SegmentHeader::new(foreign, config()))
+                .unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        std::fs::write(&foreign_path, bytes).unwrap();
+
+        let refused = SegmentSet::open_in(&Env::real(), directory.path())
+            .map(|_| ())
+            .expect_err("a foreign artifact must keep the directory refused");
+        assert!(
+            !matches!(refused, LogError::TailSealedWithoutSuccessor { .. }),
+            "short is not torn: the foreign header must not have been swept: {refused}"
+        );
+        assert!(
+            foreign_path.exists(),
+            "the foreign artifact is an operator's evidence; quarantine preserves it"
+        );
+    }
+
     /// The roll's FIRST window: a crash mid-write of the successor's own
     /// header. The commit sidecar's absence proves creation never finished,
     /// so the torn file has never held a record and is discarded — the
