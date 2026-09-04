@@ -86,17 +86,24 @@ enum Command {
         /// Fail if the committed HWM is below this acknowledged floor.
         #[arg(long, default_value_t = 0)]
         expect_at_least: u64,
-        /// Byte-verify record CONTENT below this offset only; above it check
-        /// structure alone (contiguity, high watermark).
+        /// Byte-verify CONTENT for this many leading visible records; beyond
+        /// that check structure alone (monotonicity, high watermark).
         ///
-        /// Content is reconstructed from the offset, which is only predictable
-        /// for records this producer wrote contiguously from sequence 0. A
-        /// range that also holds records from another producer — or from this
-        /// one after a producer-epoch bump, whose sequences restart at 0 — has
-        /// a suffix whose content no reader can derive. Defaults to unbounded,
-        /// which is every existing caller.
+        /// Content is reconstructed from a record's position among the
+        /// visible records — the producer's records keep consecutive
+        /// sequences however the log spells their offsets, and the key must
+        /// carry the position. Only predictable for a range whose visible
+        /// records this producer wrote from sequence 0. Defaults to
+        /// unbounded, which is every existing caller.
         #[arg(long, default_value_t = u64::MAX)]
         verify_content_through: u64,
+        /// Offsets the consumer's view may legitimately skip before verify
+        /// fails. Zero — the default — is the dense contract: any skipped
+        /// offset is a lost record. A nonzero budget is for logs that
+        /// legitimately carry consumer-invisible records (#240's promotion
+        /// marker, once it exists).
+        #[arg(long, default_value_t = 0)]
+        max_offset_gaps: u64,
         #[arg(long, default_value_t = 512, value_parser = parse_batch)]
         batch: u32,
         #[arg(long, default_value_t = 128)]
@@ -246,6 +253,7 @@ async fn run(cli: Cli) -> Result<i32, String> {
             addr,
             expect_at_least,
             verify_content_through,
+            max_offset_gaps,
             batch,
             value_bytes,
         } => {
@@ -256,6 +264,7 @@ async fn run(cli: Cli) -> Result<i32, String> {
                     addr,
                     expect_at_least,
                     verify_content_through,
+                    max_offset_gaps,
                     batch,
                     value_bytes,
                 },
