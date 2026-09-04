@@ -500,15 +500,16 @@ fn a_v1_follower_refuses_the_marker_so_the_quorum_fails_honestly() {
     assert_eq!(h.cluster_committed.get(), 0, "nothing published");
 }
 
-/// A marker no follower will EVER accept must not stay in the log (#240
-/// slice 3 review): with every follower on a v1 frame the quorum can never
-/// form, and every later produce's base-offset chain would include the
-/// refused marker — followers one offset behind forever, quorum dead.
-/// Zero acks after the budget is the retraction's licence: nothing anywhere
-/// holds the marker, so removing it restores the pre-marker state exactly,
-/// and the produce that follows proves the chain is whole again.
+/// With every follower on a v1 frame the marker's quorum can never form
+/// (#240 slice 3): the refusal is the typed shortfall carrying the
+/// marker's offset, ZERO follower acks, and the watermark stays exactly
+/// where it was. Retraction was built for this shape and WITHDRAWN — the
+/// #265 lesson: no count and no snapshot proves a marker is held nowhere
+/// while same-epoch appends may still be in flight — and the
+/// configuration cannot arise in production, where nothing creates v2
+/// ranges yet; the v2 rollout owns format capability (#240).
 #[test]
-fn a_fully_refused_marker_is_retracted_and_produce_stays_whole() {
+fn an_all_v1_set_refuses_the_marker_with_zero_acks_and_an_unmoved_watermark() {
     let h = harness_config(true, [false, false]);
     let refused = h
         .leader
@@ -523,121 +524,15 @@ fn a_fully_refused_marker_is_retracted_and_produce_stays_whole() {
         panic!("the refusal must be the typed quorum shortfall: {refused}");
     };
     assert_eq!(follower_acks, 0, "v1 followers refuse; nobody acks");
-    assert!(
-        h.leader
-            .retract_unacked_boundary_marker(marker_offset)
-            .expect("a zero-ack marker at the tail retracts"),
-        "the retraction must report that it acted"
-    );
-    let (_, next_offset) = h.leader.local_offsets();
-    assert_eq!(next_offset, 0, "the log is back to its pre-marker state");
-
-    // The whole point: produce works, and the v1 followers ack it — the
-    // chain no longer routes through a record they refuse by name.
-    let produced = produce_ok(&h.leader, h.range.clone(), 0);
     assert_eq!(
-        produced.outcomes[0].offset, 0,
-        "the retracted marker's offset is minted to the real record"
+        marker_offset, 0,
+        "the shortfall names where the marker sits"
     );
     assert_eq!(
         h.cluster_committed.get(),
-        1,
-        "the produce quorum published — the v1 set is not wedged"
+        0,
+        "an unacked marker publishes nothing, however long it stays"
     );
-}
-
-/// The retraction truncates THROUGH an unacked suffix (#240 review, round
-/// three): a produce failing quorum during the retry budget appends
-/// locally above the refused marker, and a tail-equality guard would then
-/// leave the poison in place forever. Nothing above the marker can have
-/// quorum-acked — every ack chain routes through the marker the evidence
-/// says nobody holds — so the whole suffix goes with it. And the epoch
-/// journal is re-anchored: the marker sat exactly at the held epoch's
-/// recorded start, and losing that entry would attribute every later
-/// record to the PRECEDING epoch.
-#[test]
-fn retraction_clears_the_failed_suffix_and_reanchors_the_epoch() {
-    let h = harness_config(true, [false, false]);
-    // A journal, as production attaches: the re-anchor assertion below is
-    // vacuous without one.
-    h.leader.set_fencing_epoch_journal(
-        vtop_broker::fencing_epochs::FencingEpochJournal::open(
-            h._dirs[0].path().join("fencing-epochs"),
-        )
-        .unwrap(),
-    );
-    let refused = h
-        .leader
-        .publish_boundary_marker(FENCING_EPOCH)
-        .expect_err("no v1 follower may ack the marker");
-    let BrokerError::BoundaryMarkerUnacked { marker_offset, .. } = refused else {
-        panic!("the refusal must be the typed quorum shortfall: {refused}");
-    };
-    // A produce that fails quorum still appended locally above the marker.
-    let response = h.leader.handle(
-        Role::Producer,
-        WireFrame {
-            request_id: 300,
-            stream_id: 1,
-            message: Message::ProduceRequest(ProduceRequest {
-                range: h.range.clone(),
-                fencing_epoch: FENCING_EPOCH,
-                producer_id: PRODUCER,
-                producer_epoch: 1,
-                first_sequence: 0,
-                durability: WireDurability::Quorum,
-                records: vec![ProduceRecord {
-                    timestamp_millis: 1_000,
-                    key: b"stranded".to_vec(),
-                    value: b"failed the quorum".to_vec(),
-                }],
-            }),
-        },
-    );
-    assert!(
-        matches!(response.message, Message::Error(_)),
-        "the produce must fail its quorum behind the refused marker"
-    );
-    let (_, next_offset) = h.leader.local_offsets();
-    assert_eq!(next_offset, 2, "marker plus the stranded produce record");
-
-    assert!(
-        h.leader
-            .retract_unacked_boundary_marker(marker_offset)
-            .expect("a zero-ack marker retracts through its unacked suffix"),
-        "the retraction must act despite the suffix"
-    );
-    let (_, next_offset) = h.leader.local_offsets();
-    assert_eq!(next_offset, 0, "marker AND stranded suffix are gone");
-    assert!(
-        h.leader
-            .epoch_starts()
-            .iter()
-            .any(|entry| entry.epoch == FENCING_EPOCH && entry.start_offset == 0),
-        "the held epoch is re-anchored where the marker sat, or every later record \
-         would be attributed to the preceding epoch: {:?}",
-        h.leader.epoch_starts()
-    );
-    let produced = produce_ok(&h.leader, h.range.clone(), 0);
-    assert_eq!(produced.outcomes[0].offset, 0, "the chain is whole again");
-}
-
-/// The retraction refuses everything except its exact licence: a published/// The retraction refuses everything except its exact licence: a published
-/// marker is committed history, and a tail that moved past the marker means
-/// the chain was accepted somewhere after all.
-#[test]
-fn a_published_marker_is_never_retracted() {
-    let h = harness();
-    let published = h.leader.publish_boundary_marker(FENCING_EPOCH).unwrap();
-    assert_eq!(published, 1);
-    assert!(
-        !h.leader
-            .retract_unacked_boundary_marker(0)
-            .expect("the refusal is Ok(false), not an error"),
-        "a quorum-acked, published marker is committed history"
-    );
-    let (_, next_offset) = h.leader.local_offsets();
-    assert_eq!(next_offset, 1, "nothing was touched");
 }
 
 #[test]

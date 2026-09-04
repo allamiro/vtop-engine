@@ -349,93 +349,6 @@ impl QuorumProbe for ReplicaPlaneProbe {
 const MARKER_RETRY_ATTEMPTS: u32 = 40;
 const MARKER_RETRY_PAUSE: Duration = Duration::from_millis(250);
 
-/// Give up on a refused marker the SOUND way (#240 slice 3, review round
-/// three): a marker held anywhere must never be retracted — ack counts
-/// cannot prove absence, since a response can time out after the follower
-/// applied — so retraction requires all of: zero acknowledgements ever
-/// observed across every attempt, a fence-read in which a MAJORITY of the
-/// set answers, and every answering follower reading at or below the
-/// marker. The leader's own reading is excluded — it holds the marker by
-/// construction. A replica that did not answer and does hold a ghost copy
-/// rejoins as a divergent unacked suffix the fence's reconciliation
-/// truncates, the same residue a crash leaves. When the evidence cannot be
-/// gathered — no probe, no runtime, a ghost, a short quorum — the marker
-/// is KEPT and said so: a wedged mixed-format set needs the operator (or
-/// an upgrade), and a kept marker is recoverable where a wrong retraction
-/// is not.
-fn retract_refused_marker_with_evidence(
-    broker: &Arc<LocalBroker>,
-    probe: Option<&Arc<dyn QuorumProbe>>,
-    fencing_epoch: u64,
-    marker_offset: u64,
-    ever_acked: usize,
-    replication_factor: usize,
-) {
-    if ever_acked > 0 {
-        tracing::warn!(
-            fencing_epoch,
-            ever_acked,
-            replication_factor,
-            "boundary marker never reached a quorum within its retry budget but IS held by \
-             at least one follower; it stays, and catch-up completes the quorum"
-        );
-        return;
-    }
-    let evidence = probe.and_then(|probe| {
-        let handle = tokio::runtime::Handle::try_current().ok()?;
-        Some(handle.block_on(probe.probe(fencing_epoch)))
-    });
-    let Some(probes) = evidence else {
-        tracing::warn!(
-            fencing_epoch,
-            "boundary marker reached no follower and no fence-read evidence is available; \
-             the marker stays — produce on this set may need operator repair"
-        );
-        return;
-    };
-    let leader = broker.node_id();
-    let followers: Vec<_> = probes
-        .iter()
-        .filter(|reading| reading.node_id != leader)
-        .collect();
-    let answered = followers
-        .iter()
-        .filter(|reading| reading.local_committed_offset.is_some())
-        .count();
-    let ghost = followers.iter().any(|reading| {
-        reading
-            .local_committed_offset
-            .is_some_and(|offset| offset > marker_offset)
-    });
-    if ghost || 1 + answered < crate::promotion::majority(replication_factor) {
-        tracing::warn!(
-            fencing_epoch,
-            answered,
-            ghost,
-            replication_factor,
-            "boundary marker retraction refused: the fence-read could not prove absence \
-             (a holder, or too few answers); the marker stays"
-        );
-        return;
-    }
-    match broker.retract_unacked_boundary_marker(marker_offset) {
-        Ok(retracted) => tracing::warn!(
-            fencing_epoch,
-            replication_factor,
-            retracted,
-            "boundary marker reached no follower within its retry budget and a fenced \
-             majority reads below it; retracted so the produce chain stays whole — the \
-             first own-epoch produce quorum proves the prefix instead"
-        ),
-        Err(refused) => tracing::warn!(
-            fencing_epoch,
-            %refused,
-            "boundary marker retraction failed; the marker stays and produce on this set \
-             may need operator repair"
-        ),
-    }
-}
-
 /// Publish this epoch's boundary marker until it lands or the refusal turns
 /// terminal (#240, Raft §5.4.2 in its actual form): a new leader must not
 /// trust a count over records written under earlier epochs, so the
@@ -453,22 +366,13 @@ fn retract_refused_marker_with_evidence(
 /// design, and either way the first own-epoch produce quorum still proves
 /// the prefix — §5.4.2 is satisfied by whichever own-epoch entry lands
 /// first.
-fn publish_boundary_marker_until_settled(
-    broker: Arc<LocalBroker>,
-    probe: Option<Arc<dyn QuorumProbe>>,
-    fencing_epoch: u64,
-) {
+fn publish_boundary_marker_until_settled(broker: Arc<LocalBroker>, fencing_epoch: u64) {
     if broker.cluster_committed().is_none() {
         // The standalone boundary is the node's own log; the §5.4.2 hazard
         // is vacuous there and the marker would only be refused by name.
         return;
     }
     let attempts = move || {
-        // Acks EVER observed, not the last attempt's (review): an earlier
-        // attempt can have durably placed the marker on a follower whose
-        // later disconnect makes a fresh attempt read zero — and a marker
-        // held ANYWHERE must never be retracted.
-        let mut ever_acked = 0_usize;
         for attempt in 0..=MARKER_RETRY_ATTEMPTS {
             match broker.publish_boundary_marker(fencing_epoch) {
                 Ok(published) => {
@@ -485,15 +389,29 @@ fn publish_boundary_marker_until_settled(
                     replication_factor,
                     marker_offset,
                 }) => {
-                    ever_acked = ever_acked.max(follower_acks);
                     if attempt == MARKER_RETRY_ATTEMPTS {
-                        retract_refused_marker_with_evidence(
-                            &broker,
-                            probe.as_ref(),
+                        // The marker STAYS, whatever the count says
+                        // (review, rounds two through four): retraction was
+                        // built here and WITHDRAWN — the #265 lesson —
+                        // because no ack count, and no fence-read snapshot
+                        // either, can prove a marker is held nowhere while
+                        // same-epoch appends may still be in flight on the
+                        // replication plane. On the only v2 deployment
+                        // that exists — a format-homogeneous one; nothing
+                        // in production creates v2 ranges yet, and the
+                        // rollout that does owns capability negotiation
+                        // (#240) — a shortfall is transient and catch-up
+                        // completes the quorum; the kept marker is then
+                        // published by a later republish or superseded by
+                        // the produce path's own-epoch quorum.
+                        tracing::warn!(
                             fencing_epoch,
-                            marker_offset,
-                            ever_acked,
+                            follower_acks,
                             replication_factor,
+                            marker_offset,
+                            "boundary marker never reached a quorum within its retry \
+                             budget; it stays, and the watermark stands at the durable \
+                             floor until an own-epoch entry proves the prefix"
                         );
                         return;
                     }
@@ -522,12 +440,6 @@ fn publish_boundary_marker_until_settled(
 /// Publishes into a live broker.
 pub struct BrokerLeasePublisher {
     broker: Arc<LocalBroker>,
-    /// The fence-read instrument the marker retraction's evidence comes
-    /// from (#240 slice 3 review): ack counts cannot prove absence, so a
-    /// refused marker is retracted only after a fenced majority reads at
-    /// or below it. Absent — harnesses, standalone — the retraction is
-    /// skipped and the marker kept, which is the conservative side.
-    probe: Option<Arc<dyn QuorumProbe>>,
     /// The newest epoch this publisher has fired the boundary marker for
     /// (#240 slice 3). Keyed HERE, not on the broker's held epoch: a
     /// static-epoch leader is constructed already holding its granted
@@ -541,15 +453,8 @@ impl BrokerLeasePublisher {
     pub fn new(broker: Arc<LocalBroker>) -> Self {
         Self {
             broker,
-            probe: None,
             marker_published_for: std::sync::atomic::AtomicU64::new(0),
         }
-    }
-
-    /// Attach the fence-read probe the marker retraction's evidence needs.
-    pub fn with_probe(mut self, probe: Option<Arc<dyn QuorumProbe>>) -> Self {
-        self.probe = probe;
-        self
     }
 }
 
@@ -603,11 +508,7 @@ impl LeasePublisher for BrokerLeasePublisher {
             .fetch_max(fencing_epoch, std::sync::atomic::Ordering::SeqCst)
             < fencing_epoch
         {
-            publish_boundary_marker_until_settled(
-                Arc::clone(&self.broker),
-                self.probe.clone(),
-                fencing_epoch,
-            );
+            publish_boundary_marker_until_settled(Arc::clone(&self.broker), fencing_epoch);
         }
     }
 
