@@ -10,10 +10,10 @@
 #   test      test binaries run, out of the binaries cargo produced
 #   doctest   the documentation tests cargo would have run, as one unit
 #
-# Both denominators come from cargo itself (`cargo metadata` under the same
-# manifest, features, target and lock flags as the build, narrowed to the
-# dependency closure of the selected packages; and the JSON message stream
-# of `--no-run`), so the bar cannot drift from what is actually happening —
+# Both denominators come from cargo itself (`cargo tree` for the packages
+# the selection builds, under the same manifest, features, target and lock
+# flags as the build; `cargo metadata` for the doctest targets; and the JSON
+# message stream of `--no-run`), so the bar cannot drift from what is happening —
 # a progress bar that guesses is worse than none, because it is believed.
 # When a number cannot be obtained, the script refuses to run rather than
 # draw an invented one.
@@ -265,10 +265,15 @@ TRIPLE="${TRIPLE:-$HOST}"
 # Phase 1 — compile. Numerator and denominator are the same unit — packages —
 # so the bar cannot overrun: cargo emits one `compiler-artifact` per TARGET
 # (a library, its test harness, each integration test), so counting messages
-# would count one package several times. The denominator is the dependency
-# closure of the SELECTED packages in the resolve graph cargo builds for the
-# same manifest, features, target and lock flags: the workspace's default
-# members (minus exclusions), or the packages named with -p.
+# would count one package several times. The denominator is what `cargo
+# tree` resolves for the SELECTION — the workspace's default members (minus
+# exclusions), or the packages named with -p — under the same manifest,
+# features, target and lock flags. Not the `cargo metadata` graph: that one
+# resolves features WORKSPACE-WIDE, so an unselected member enabling a
+# feature on a shared dependency adds that dependency's optional deps to the
+# graph though `cargo test -p a` never builds them (review). Measured against
+# the artifacts the build actually produced, the metadata closure overcounted
+# on every probe and `cargo tree` matched to the package on every one.
 # ---------------------------------------------------------------------------
 # The helper scripts are written to files ONCE and invoked by path: a here-
 # document nested inside a command substitution is parsed differently by the
@@ -276,10 +281,9 @@ TRIPLE="${TRIPLE:-$HOST}"
 # substitution early), and a script that runs on one bash and not another
 # is worse than one that never used the construct.
 cat > "$WORK/closure.py" <<'PY'
-# The dependency closure of the selected packages over cargo's resolve
-# graph. Modes: `count` prints how many packages the build will touch;
-# `libs` prints how many selected roots have a library target (the doctest
-# units cargo will run).
+# The selected roots over cargo's metadata: `libs` prints how many of them
+# have a library target with doctests on (the doctest units cargo will run).
+# The package COUNT is cargo tree's, not this graph's — see the phase-1 note.
 import fnmatch, json, os, sys
 mode = sys.argv[1]
 with open(sys.argv[2]) as handle:
@@ -299,12 +303,23 @@ if manifest_path and not workspace_flag and not selected:
     if named_members:
         default_members = named_members
 
+def version_matches(wanted, version):
+    # A pkgid spec's version may be abbreviated: `0`, `0.1`, or `0.1.2` all
+    # name 0.1.2 (review).
+    return version == wanted or version.startswith(wanted + ".")
+
 def named(spec, package):
-    # -p accepts a name (with the usual glob patterns), name@version, or a
-    # path; match the forms a person types.
+    # -p accepts a name (with the usual glob patterns), name@version or
+    # name:version (version possibly abbreviated), or a path; match the
+    # forms a person types.
     name = package["name"]
-    if spec in (name, name + "@" + package["version"], name + ":" + package["version"]):
+    if spec == name:
         return True
+    for separator in ("@", ":"):
+        if separator in spec:
+            spec_name, wanted = spec.rsplit(separator, 1)
+            if spec_name == name and version_matches(wanted, package["version"]):
+                return True
     if spec.rstrip("/") == package["manifest_path"].rsplit("/", 1)[0]:
         return True
     return any(ch in spec for ch in "*?[") and fnmatch.fnmatchcase(name, spec)
@@ -335,24 +350,7 @@ if mode == "libs":
         and target.get("doctest", True)
         for target in by_id[pid]["targets"])))
     sys.exit(0)
-
-deps = {node["id"]: node["deps"] for node in meta["resolve"]["nodes"]}
-root_set = set(roots)
-seen = set()
-stack = list(roots)
-while stack:
-    pid = stack.pop()
-    if pid in seen:
-        continue
-    seen.add(pid)
-    # A root builds its dev-dependencies too, whichever way the walk reached
-    # it; a dependency builds only its normal and build dependencies.
-    is_root = pid in root_set
-    for dep in deps.get(pid, []):
-        kinds = {kind.get("kind") for kind in dep.get("dep_kinds", [])} or {None}
-        if is_root or kinds & {None, "build"}:
-            stack.append(dep["pkg"])
-print(len(seen))
+sys.exit("unknown mode " + mode)
 PY
 cat > "$WORK/binaries.py" <<'PY'
 # How many distinct test executables the --no-run JSON stream produced.
@@ -376,10 +374,29 @@ closure() { # <mode> — the closure helper over the resolved metadata
 cargo metadata --format-version 1 --filter-platform "$TRIPLE" \
     ${metadata_args[@]+"${metadata_args[@]}"} > "$WORK/metadata.json" 2>"$WORK/metadata.err" \
   || { cat "$WORK/metadata.err" >&2; die "cargo metadata failed; refusing to draw a guessed bar"; }
-TOTAL_PACKAGES="$(closure count 2>>"$WORK/metadata.err")"
+# The selection, spelled the way cargo test resolved it: `--workspace`
+# (with exclusions) when that is in force, else the named packages; a
+# manifest path alone rides in with the metadata arguments and selects what
+# it selects under cargo. Dev-dependencies ride along for the workspace
+# members shown, which is what the test build compiles.
+selection=()
+if (( workspace_flag )); then
+  selection+=(--workspace)
+  for excluded in ${excludes[@]+"${excludes[@]}"}; do
+    selection+=(--exclude "$excluded")
+  done
+else
+  for package in ${packages[@]+"${packages[@]}"}; do
+    selection+=(-p "$package")
+  done
+fi
+TOTAL_PACKAGES="$(cargo tree ${selection[@]+"${selection[@]}"} \
+    ${metadata_args[@]+"${metadata_args[@]}"} \
+    --target "$TRIPLE" --edges normal,build,dev --prefix none --format '{p}' 2>"$WORK/tree.err" \
+  | sed 's/ (\*)$//' | sort -u | grep -c .)"
 [[ "${TOTAL_PACKAGES:-0}" -gt 0 ]] 2>/dev/null || {
-  cat "$WORK/metadata.err" >&2
-  die "cargo metadata did not yield a package count; refusing to draw a guessed bar"
+  cat "$WORK/tree.err" >&2
+  die "cargo tree did not yield a package count; refusing to draw a guessed bar"
 }
 
 built_packages() {
@@ -441,7 +458,9 @@ if (( ! doc_only )); then
     cat "$WORK/build.err"
     exit "$BUILD_RC"
   fi
-  if plain_log "$WORK/build.err" | grep -qE '^warning(\[[^]]*\])?: '; then
+  # `>/dev/null`, not `-q`: under pipefail a grep that stops reading at the
+  # first match hands sed a broken pipe and the condition reads false.
+  if plain_log "$WORK/build.err" | grep -E '^warning(\[[^]]*\])?: ' >/dev/null; then
     printf '%swarnings from the compile%s\n' "$BOLD" "$RESET"
     diagnostics "$WORK/build.err"
   fi
@@ -460,11 +479,6 @@ if (( ! doc_only )); then
   # before each one — cargo's own progress, read as it happens.
   # -------------------------------------------------------------------------
   TOTAL_BINS="$(python3 "$WORK/binaries.py" "$WORK/build.json")" || exit 2
-  [[ "${TOTAL_BINS:-0}" -gt 0 ]] || {
-    # A build that produced nothing runnable is not a passing suite: say
-    # what happened and refuse to claim success.
-    die "the build produced no test binaries (selection: ${cargo_args[*]})"
-  }
 fi
 
 # Doctest units: one per selected package with a library target, unless a
@@ -474,6 +488,13 @@ if (( ! target_selected )); then
   DOC_UNITS="$(closure libs)" || exit 2
 fi
 TOTAL_UNITS=$(( TOTAL_BINS + DOC_UNITS ))
+if (( ! doc_only && TOTAL_UNITS == 0 )); then
+  # Nothing runnable AND no doctest target is not a passing suite: say so
+  # and refuse to claim success. Zero binaries ALONE is not fatal — a library
+  # with `test = false` and doctests still on builds no executable, and its
+  # doctests are compiled during the run (review).
+  die "the build produced no test binaries and the selection has no doctest targets (selection: ${cargo_args[*]})"
+fi
 
 printf '%srunning%s (%s test binaries, %s doctest targets, through cargo)\n' "$BOLD" "$RESET" "$TOTAL_BINS" "$DOC_UNITS"
 ran=0; passed=0; failed=0; current="cargo test"
@@ -524,18 +545,23 @@ printf '\n'
 
 if [[ "$RUN_RC" -ne 0 ]]; then
   printf '\n%scargo test exited %d%s\n' "$RED" "$RUN_RC" "$RESET"
-  # The failure list and the panics, not the whole passing roll-call; plus
-  # cargo's own closing summary of which binaries failed. Every failure,
-  # not the first sixty lines of them — the whole point of --no-fail-fast
-  # is that the summary is complete.
-  plain_log "$WORK/run.log" \
-    | grep -E '^(test .*FAILED|thread .* panicked|assertion|---- .* stdout|error: |    [a-z_-]+ \(|failures:)'
+  # The failures, not the passing roll-call, and every one of them — the
+  # whole point of --no-fail-fast is that the summary is complete.
+  # Every `failures:` section libtest prints — the captured output of each
+  # failed test, panic message and assertion bodies included, then the list
+  # — up to that binary's `test result:` line; plus rustc's rendered blocks,
+  # which is where a doctest that failed to compile says why (review).
+  plain_log "$WORK/run.log" | awk '
+    /^failures:$/ { show = 1 }
+    show { print }
+    /^test result: / { show = 0 }'
+  diagnostics "$WORK/run.log"
   printf '\n%s%d passed, %d failed%s\n' "$RED" "$passed" "$failed" "$RESET"
   exit "$RUN_RC"
 fi
 
 # Doctests compile during the run, so their warnings land in the run log.
-if plain_log "$WORK/run.log" | grep -qE '^warning(\[[^]]*\])?: '; then
+if plain_log "$WORK/run.log" | grep -E '^warning(\[[^]]*\])?: ' >/dev/null; then
   printf '%swarnings from the run%s\n' "$BOLD" "$RESET"
   diagnostics "$WORK/run.log"
 fi
