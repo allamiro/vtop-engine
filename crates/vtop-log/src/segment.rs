@@ -2032,7 +2032,11 @@ const TORN_TEMPLATE_ID: Uuid = Uuid::from_u128(0xF0F0_F0F0_F0F0_F0F0_F0F0_F0F0_F
 /// ever be a prefix of a real header, so any divergence in those regions
 /// proves the file is something else — a foreign artifact to quarantine,
 /// never to delete.
-fn torn_prefix_matches_template(candidate: &[u8], template: &[u8]) -> Option<Vec<(u128, bool)>> {
+fn torn_prefix_matches_template(
+    candidate: &[u8],
+    template: &[u8],
+    min_valid_json_len: usize,
+) -> Option<Vec<(u128, bool)>> {
     if !candidate
         .iter()
         .take(8)
@@ -2056,6 +2060,25 @@ fn torn_prefix_matches_template(candidate: &[u8], template: &[u8]) -> Option<Vec
         return None;
     };
     let id_span = id_at..id_at + id_string.len();
+    // The id's VALUE is the successor's own choice, but its SHAPE is not
+    // (review): the serializer emits exactly lowercase hex with hyphens at
+    // positions 8, 13, 18 and 23, so the observed bytes inside the span —
+    // a prefix, when the cut lands there — must spell that shape or the
+    // file was never a prefix of any header the codec wrote.
+    for at in id_span.clone() {
+        let candidate_at = 12 + at;
+        if candidate_at >= candidate.len() {
+            break;
+        }
+        let byte = candidate[candidate_at];
+        let canonical = match at - id_at {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase(),
+        };
+        if !canonical {
+            return None;
+        }
+    }
     // The length field is config-dependent, so its exact value is unknowable
     // — but it is BOUNDABLE (review): any real successor's JSON is at least
     // the narrowest template's and at most the codec's ceiling. A candidate
@@ -2075,8 +2098,11 @@ fn torn_prefix_matches_template(candidate: &[u8], template: &[u8]) -> Option<Vec
         let unknown_bits = 8 * (4 - length_bytes as u32);
         let lowest = prefix << unknown_bits;
         let highest = lowest | ((1_u64 << unknown_bits) - 1);
-        if highest < template_json.len() as u64
-            || lowest > u64::from(crate::codec::MAX_HEADER_BYTES)
+        // The lower bound is the smallest json the VALIDATOR accepts, not
+        // the narrowest shape (review): the all-ones template is
+        // deliberately invalid, so a claim clearing it can still name a
+        // json no real successor ever encoded.
+        if highest < min_valid_json_len as u64 || lowest > u64::from(crate::codec::MAX_HEADER_BYTES)
         {
             return None;
         }
@@ -2482,7 +2508,15 @@ pub(crate) fn rebuild_empty_successor_commit(
             // span (the successor's own choice, fixed-width) excluded. A
             // foreign header diverges at its topic or lineage; a genuine
             // torn prefix cannot.
-            let template = match &inspection.header {
+            // TWO reference encodings per format (review): the NARROWEST
+            // template gives the shape walk its byte layout and the floor
+            // its lower bound, while the smallest config the validator
+            // actually ACCEPTS gives the length claim its true minimum —
+            // the all-ones config is deliberately invalid (a group of one
+            // byte cannot fit any record frame), so a claim that only
+            // clears the narrowest shape can still name a json no real
+            // successor ever encoded.
+            let templates = match &inspection.header {
                 AnyHeader::V1(sealed) => {
                     let mut expected = sealed.descriptor.clone();
                     expected.segment_id = TORN_TEMPLATE_ID;
@@ -2494,7 +2528,20 @@ pub(crate) fn rebuild_empty_successor_commit(
                         max_segment_records: 1,
                         index_stride: 1,
                     };
-                    encode_header(&SegmentHeader::new(expected, narrowest))
+                    let smallest_valid = SegmentConfig {
+                        max_record_bytes: 1,
+                        max_group_bytes: 1 + crate::types::RECORD_FRAME_OVERHEAD_BYTES,
+                        max_segment_bytes: 1 + crate::types::RECORD_FRAME_OVERHEAD_BYTES,
+                        max_segment_records: 1,
+                        index_stride: 1,
+                    }
+                    .validate();
+                    smallest_valid.and_then(|smallest_valid| {
+                        Ok((
+                            encode_header(&SegmentHeader::new(expected.clone(), narrowest))?,
+                            encode_header(&SegmentHeader::new(expected, smallest_valid))?,
+                        ))
+                    })
                 }
                 AnyHeader::V2(sealed) => {
                     let mut expected = sealed.descriptor.clone();
@@ -2508,13 +2555,28 @@ pub(crate) fn rebuild_empty_successor_commit(
                         index_stride: 1,
                         chunk_size: 1,
                     };
-                    encode_header_v2(&SegmentHeaderV2::new(expected, narrowest))
+                    let smallest_valid = SegmentConfigV2 {
+                        max_record_bytes: 1,
+                        max_group_bytes: 1 + crate::codec_v2::RECORD_FRAME_OVERHEAD_BYTES_V2,
+                        max_segment_bytes: 1 + crate::codec_v2::RECORD_FRAME_OVERHEAD_BYTES_V2,
+                        max_segment_records: 1,
+                        index_stride: 1,
+                        chunk_size: crate::types::MIN_CHUNK_SIZE_BYTES,
+                    }
+                    .validate();
+                    smallest_valid.and_then(|smallest_valid| {
+                        Ok((
+                            encode_header_v2(&SegmentHeaderV2::new(expected.clone(), narrowest))?,
+                            encode_header_v2(&SegmentHeaderV2::new(expected, smallest_valid))?,
+                        ))
+                    })
                 }
             };
-            let provably_torn = match template {
-                Ok(template) => {
+            let provably_torn = match templates {
+                Ok((template, smallest_valid)) => {
+                    let min_valid_json_len = smallest_valid.len() - 12 - crate::codec::CHECKSUM_LEN;
                     (bytes.len() as u64) < template.len() as u64
-                        && torn_prefix_matches_template(&bytes, &template)
+                        && torn_prefix_matches_template(&bytes, &template, min_valid_json_len)
                             .is_some_and(|runs| config_prefix_extendable(&inspection.header, &runs))
                 }
                 // A predecessor whose header cannot re-encode is not a
@@ -5723,30 +5785,47 @@ mod tests {
             },
         ))
         .unwrap();
+        // The claim's true minimum is the smallest json the VALIDATOR
+        // accepts, not the narrowest shape (review, round nine) — computed
+        // here exactly as the caller computes it.
+        let smallest_valid = SegmentConfig {
+            max_record_bytes: 1,
+            max_group_bytes: 1 + crate::types::RECORD_FRAME_OVERHEAD_BYTES,
+            max_segment_bytes: 1 + crate::types::RECORD_FRAME_OVERHEAD_BYTES,
+            max_segment_records: 1,
+            index_stride: 1,
+        }
+        .validate()
+        .unwrap();
+        let real = encode_header(&SegmentHeader::new(descriptor(), smallest_valid)).unwrap();
+        let min_valid = real.len() - 12 - crate::codec::CHECKSUM_LEN;
         let magic = &template[..8];
         let mut impossible = magic.to_vec();
         impossible.push(0xff);
         assert!(
-            torn_prefix_matches_template(&impossible, &template).is_none(),
+            torn_prefix_matches_template(&impossible, &template, min_valid).is_none(),
             "a first length byte of 0xff cannot prefix any length under the ceiling"
         );
         let mut too_short = magic.to_vec();
         too_short.extend_from_slice(&[0x00, 0x00, 0x00]);
         assert!(
-            torn_prefix_matches_template(&too_short, &template).is_none(),
+            torn_prefix_matches_template(&too_short, &template, min_valid).is_none(),
             "three zero bytes cap the length at 255, below any real header of this range"
         );
         let mut plausible = magic.to_vec();
         plausible.push(0x00);
         assert!(
-            torn_prefix_matches_template(&plausible, &template).is_some(),
+            torn_prefix_matches_template(&plausible, &template, min_valid).is_some(),
             "a first byte of 0x00 admits every length a real header could carry"
         );
-        // The genuine prefix still classifies: cut at every length up to
-        // the config boundary, the template is its own torn write.
-        for cut in 0..template.len() - crate::codec::CHECKSUM_LEN {
+        // The genuine prefix still classifies: a REAL header — the
+        // smallest the validator accepts — torn at every length through
+        // its json must match (the all-ones template cannot play this
+        // role any more: its own claim sits below any valid config's, by
+        // design of the min-valid bound).
+        for cut in 0..real.len() - crate::codec::CHECKSUM_LEN {
             assert!(
-                torn_prefix_matches_template(&template[..cut], &template).is_some(),
+                torn_prefix_matches_template(&real[..cut], &template, min_valid).is_some(),
                 "a prefix of the real header must always match at cut {cut}"
             );
         }
@@ -5783,9 +5862,10 @@ mod tests {
         };
         let real = encode_header(&SegmentHeader::new(descriptor(), minimal)).unwrap();
         let json_len = u32::from_be_bytes(real[8..12].try_into().unwrap()) as usize;
+        let min_valid = json_len;
         let truncated_after_json = real[..12 + json_len].to_vec();
         assert!(
-            torn_prefix_matches_template(&truncated_after_json, &template).is_some(),
+            torn_prefix_matches_template(&truncated_after_json, &template, min_valid).is_some(),
             "under its true length the cut is a torn prefix"
         );
 
@@ -5793,7 +5873,7 @@ mod tests {
         let mut relabelled = truncated_after_json.clone();
         relabelled[8..12].copy_from_slice(&short_claim);
         assert!(
-            torn_prefix_matches_template(&relabelled, &template).is_none(),
+            torn_prefix_matches_template(&relabelled, &template, min_valid).is_none(),
             "a claim two bytes short of the config it fronts describes no header"
         );
 
@@ -5809,11 +5889,11 @@ mod tests {
         let mut mid_config = real[..cut_at].to_vec();
         mid_config[8..12].copy_from_slice(&short_claim);
         assert!(
-            torn_prefix_matches_template(&mid_config, &template).is_none(),
+            torn_prefix_matches_template(&mid_config, &template, min_valid).is_none(),
             "the digits already present have outgrown the claim; no continuation fits it"
         );
         assert!(
-            torn_prefix_matches_template(&real[..cut_at], &template).is_some(),
+            torn_prefix_matches_template(&real[..cut_at], &template, min_valid).is_some(),
             "the identical mid-config cut under its true length is a torn prefix"
         );
 
@@ -5822,14 +5902,14 @@ mod tests {
         let mut ends_here = real[..cut_at].to_vec();
         ends_here[8..12].copy_from_slice(&((cut_at - 12) as u32).to_be_bytes());
         assert!(
-            torn_prefix_matches_template(&ends_here, &template).is_none(),
+            torn_prefix_matches_template(&ends_here, &template, min_valid).is_none(),
             "a claim that ends mid-shape describes no header"
         );
 
         let mut long_claim = truncated_after_json.clone();
         long_claim[8..12].copy_from_slice(&((json_len + 3) as u32).to_be_bytes());
         assert!(
-            torn_prefix_matches_template(&long_claim, &template).is_none(),
+            torn_prefix_matches_template(&long_claim, &template, min_valid).is_none(),
             "a complete shape under a claim that says more JSON follows is no header either"
         );
 
@@ -5838,13 +5918,13 @@ mod tests {
         // hash is a torn write, a damaged one is not (review, round nine).
         let partial_checksum = real[..12 + json_len + 4].to_vec();
         assert!(
-            torn_prefix_matches_template(&partial_checksum, &template).is_some(),
+            torn_prefix_matches_template(&partial_checksum, &template, min_valid).is_some(),
             "four true checksum bytes after a complete json are a torn write"
         );
         let mut damaged_checksum = partial_checksum.clone();
         damaged_checksum[12 + json_len + 3] ^= 0xFF;
         assert!(
-            torn_prefix_matches_template(&damaged_checksum, &template).is_none(),
+            torn_prefix_matches_template(&damaged_checksum, &template, min_valid).is_none(),
             "a checksum byte the completed header cannot have produced is damage, not a cut"
         );
 
@@ -5853,7 +5933,7 @@ mod tests {
         let mut overlong = real.clone();
         overlong.push(0x00);
         assert!(
-            torn_prefix_matches_template(&overlong, &template).is_none(),
+            torn_prefix_matches_template(&overlong, &template, min_valid).is_none(),
             "a file longer than the header it claims to be is not its prefix"
         );
     }
