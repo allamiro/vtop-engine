@@ -411,6 +411,9 @@ impl BrokerLeasePublisher {
             return;
         }
         *pending = Some(epoch);
+        // The gate is raised UNDER the same lock that pends the marker, so
+        // no fetch can slip between the promotion and the refusal.
+        self.broker.set_boundary_pending(true);
         drop(pending);
         self.marker_changed.notify_one();
     }
@@ -425,6 +428,7 @@ impl BrokerLeasePublisher {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if *pending == Some(epoch) {
             *pending = None;
+            self.broker.set_boundary_pending(false);
             drop(pending);
             self.marker_changed.notify_one();
         }
@@ -449,6 +453,8 @@ impl BrokerLeasePublisher {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if *pending == Some(epoch) {
                     *pending = None;
+                    // Proven: the mark is published, and fetch may serve it.
+                    self.broker.set_boundary_pending(false);
                 }
                 Ok(Some(mark))
             }
@@ -2237,6 +2243,63 @@ mod tests {
         publisher.demote(FENCING_EPOCH);
         assert_eq!(publisher.pending_marker_epoch(), None);
         assert_eq!(h.cluster_committed.get(), 0, "nothing ever published");
+    }
+
+    /// While the marker is pending, fetch refuses — retryably — rather
+    /// than serve the durable floor, which may sit below a mark the
+    /// previous leader already published (review): a consumer must never
+    /// watch the mark move backwards across a failover. Produce is still
+    /// admitted, and publication reopens fetch.
+    #[test]
+    fn fetch_refuses_while_the_boundary_is_pending_and_serves_once_proven() {
+        let h = replicated_v2_harness();
+        let publisher = BrokerLeasePublisher::new(Arc::clone(&h.leader));
+        let fetch = |start: u64| {
+            h.leader.handle(
+                vtop_protocol::Role::Consumer,
+                vtop_protocol::WireFrame {
+                    request_id: 900 + start,
+                    stream_id: 1,
+                    message: vtop_protocol::Message::FetchRequest(vtop_protocol::FetchRequest {
+                        range: h.leader.range().clone(),
+                        fencing_epoch: FENCING_EPOCH,
+                        start_offset: start,
+                        max_bytes: 1 << 20,
+                        max_records: 64,
+                    }),
+                },
+            )
+        };
+        assert!(!h.leader.boundary_pending());
+        publisher.promote(FENCING_EPOCH, Some(0));
+        assert!(h.leader.boundary_pending(), "the promotion raised the gate");
+        match fetch(0).message {
+            vtop_protocol::Message::Error(error) => assert_eq!(
+                error.code,
+                vtop_protocol::ErrorCode::Overloaded,
+                "the refusal is the retryable kind, not a fence"
+            ),
+            other => panic!("fetch served before the boundary was proven: {other:?}"),
+        }
+        publisher
+            .try_publish_pending_boundary()
+            .expect("a healthy quorum acks the marker");
+        assert!(!h.leader.boundary_pending(), "publication lowered the gate");
+        assert!(
+            matches!(fetch(0).message, vtop_protocol::Message::FetchResponse(_)),
+            "fetch serves once the mark is proven"
+        );
+
+        // A demotion that retires the pending marker lowers the gate too: a
+        // fenced broker refuses for its own reason, not this one.
+        h.meta.set(FENCING_EPOCH + 1);
+        for follower in &h.followers {
+            follower.adopt_fencing_epoch(FENCING_EPOCH + 1);
+        }
+        publisher.promote(FENCING_EPOCH + 1, Some(1));
+        assert!(h.leader.boundary_pending());
+        publisher.demote(FENCING_EPOCH + 1);
+        assert!(!h.leader.boundary_pending());
     }
 
     /// Rounds can arrive reordered (review): a stale promotion must not

@@ -484,6 +484,7 @@ pub struct BrokerCollector {
     held_fencing_epoch: IntGaugeVec,
     meta_fencing_epoch: IntGaugeVec,
     lease_active: IntGaugeVec,
+    boundary_pending: IntGaugeVec,
 
     follower_durable_offset: IntGaugeVec,
     follower_lag_records: IntGaugeVec,
@@ -546,6 +547,12 @@ impl BrokerCollector {
             lease_active: gauge_vec(
                 "broker_lease_active",
                 "1 while metadata still records a live lease for this leaseholder; 0 once fenced",
+                &["topic", "range"],
+            )?,
+            boundary_pending: gauge_vec(
+                "broker_boundary_pending",
+                "1 while a promotion's boundary awaits its epoch's quorum-acked marker; fetch \
+                 refuses and the cluster HWM gauge shows the durable floor meanwhile (#240)",
                 &["topic", "range"],
             )?,
             follower_durable_offset: gauge_vec(
@@ -634,6 +641,7 @@ impl BrokerCollector {
             &self.next_offset,
             &self.cluster_committed,
             &self.held_fencing_epoch,
+            &self.boundary_pending,
             &self.meta_fencing_epoch,
             &self.lease_active,
             &self.follower_durable_offset,
@@ -683,6 +691,9 @@ impl BrokerCollector {
         // ownership while the next produce gets refused). The reverse order
         // could do exactly that.
         let meta_snapshot = self.broker.meta_fencing_epoch().try_snapshot();
+        self.boundary_pending
+            .with_label_values(&range)
+            .set(i64::from(self.broker.boundary_pending()));
         let held = self.broker.held_fencing_epoch();
         self.held_fencing_epoch
             .with_label_values(&range)

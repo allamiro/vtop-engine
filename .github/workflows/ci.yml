@@ -703,10 +703,11 @@ jobs:
               abort "candidate #{ordinal} has no lease block" unless configs[ordinal]["data"]["lease"]
               epoch = configs[ordinal]["data"].fetch("fencing_epoch")
               abort "candidate #{ordinal} fencing_epoch is #{epoch}, must be 0" unless epoch == 0
-              # The format knob's happy path (#240): the replicated CI values
-              # choose v2 so the smoke's failover publishes through the
-              # marker, and a render that silently dropped the key would
-              # revert the whole path to v1 while still deploying cleanly.
+              # The happy path of the format knob (#240): the replicated CI
+              # values choose v2 so the failover in the smoke test publishes
+              # through the marker, and a render that silently dropped the
+              # key would revert the whole path to v1 while deploying
+              # cleanly. (No apostrophes in this block; see above.)
               format = configs[ordinal]["data"].fetch("segment_format", nil)
               abort "candidate #{ordinal} segment_format is #{format.inspect}, must be v2" unless format == "v2"
             end
