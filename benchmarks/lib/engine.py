@@ -168,7 +168,12 @@ def _dotenv_overrides() -> dict[str, str]:
 
     Deliberately minimal (comments and blank lines skipped, one layer of
     matching quotes stripped, no interpolation): the harness is
-    dependency-light, and the lab's .env holds simple assignments.
+    dependency-light, and the lab's .env holds simple assignments. The
+    boundary of "minimal" is spelled out because reviews keep probing it:
+    a quoted value ends at its first closing quote — escape sequences are
+    not interpreted, so a credential containing the quote character itself
+    is outside this parser's charter (and Compose's escape-expansion rules
+    are exactly the complexity this harness refuses to re-implement).
 
     Inline comments follow Compose's own dotenv rule: an UNQUOTED value
     stops at the first whitespace-preceded ``#``; a quoted value keeps its
@@ -186,7 +191,7 @@ def _dotenv_overrides() -> dict[str, str]:
                     continue
                 key, _, value = line.partition("=")
                 value = value.strip()
-                if value[:1] in "\"'":
+                if value[:1] in ('"', "'"):
                     # A quoted value ends at its CLOSING quote; whatever
                     # follows — an inline comment, stray whitespace — is not
                     # part of it. Checking for a quote PAIR before stripping

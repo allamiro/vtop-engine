@@ -1865,6 +1865,29 @@ impl ReplicaStatusClient {
         self
     }
 
+    /// The TLS name for a dial, parsed only when a connector exists — a
+    /// plaintext client has no TLS name to validate — and BEFORE dialing
+    /// (review): an invalid name is a deterministic configuration error,
+    /// and discovering it only after a connect can cost the full timeout
+    /// against a silently dropping endpoint and read as a network fault.
+    /// One helper, because the parse/expect invariant tripled across the
+    /// status-plane methods and a triplet drifts (review).
+    fn tls_name(
+        &self,
+        server_name: &str,
+    ) -> BrokerResult<Option<rustls::pki_types::ServerName<'static>>> {
+        match self.connector.as_ref() {
+            Some(_) => rustls::pki_types::ServerName::try_from(server_name.to_owned())
+                .map(Some)
+                .map_err(|error| {
+                    crate::BrokerError::InvalidConfig(format!(
+                        "server name {server_name:?}: {error}"
+                    ))
+                }),
+            None => Ok(None),
+        }
+    }
+
     pub async fn status(
         &self,
         addr: SocketAddr,
@@ -1875,23 +1898,7 @@ impl ReplicaStatusClient {
         // One deadline for the whole exchange: a replica whose disk has stopped
         // answering will also stop answering here, and an operator running a
         // status command during an incident needs it to return.
-        // Parsed only when a connector exists (#410) — a plaintext client
-        // has no TLS name to validate — but BEFORE dialing (review): an
-        // invalid name is a deterministic configuration error, and
-        // discovering it only after a connect can cost the full timeout
-        // against a silently dropping endpoint and read as a network fault.
-        let tls_name = match self.connector.as_ref() {
-            Some(_) => Some(
-                rustls::pki_types::ServerName::try_from(server_name.to_owned())
-                    .map_err(|error| {
-                        crate::BrokerError::InvalidConfig(format!(
-                            "server name {server_name:?}: {error}"
-                        ))
-                    })?
-                    .to_owned(),
-            ),
-            None => None,
-        };
+        let tls_name = self.tls_name(server_name)?;
         timeout(self.timeout, async {
             let tcp = TcpStream::connect(addr)
                 .await
@@ -1970,23 +1977,7 @@ impl ReplicaStatusClient {
         fencing_epoch: u64,
         leader_epoch_starts: &[vtop_protocol::ReplicaEpochStart],
     ) -> BrokerResult<vtop_protocol::ReplicaFenceResponse> {
-        // Parsed only when a connector exists (#410) — a plaintext client
-        // has no TLS name to validate — but BEFORE dialing (review): an
-        // invalid name is a deterministic configuration error, and
-        // discovering it only after a connect can cost the full timeout
-        // against a silently dropping endpoint and read as a network fault.
-        let tls_name = match self.connector.as_ref() {
-            Some(_) => Some(
-                rustls::pki_types::ServerName::try_from(server_name.to_owned())
-                    .map_err(|error| {
-                        crate::BrokerError::InvalidConfig(format!(
-                            "server name {server_name:?}: {error}"
-                        ))
-                    })?
-                    .to_owned(),
-            ),
-            None => None,
-        };
+        let tls_name = self.tls_name(server_name)?;
         timeout(self.timeout, async {
             let tcp = TcpStream::connect(addr)
                 .await
@@ -2080,23 +2071,7 @@ impl ReplicaStatusClient {
         expected_node: Uuid,
         range: &RangeIdentity,
     ) -> BrokerResult<Vec<vtop_protocol::ReplicaEpochStart>> {
-        // Parsed only when a connector exists (#410) — a plaintext client
-        // has no TLS name to validate — but BEFORE dialing (review): an
-        // invalid name is a deterministic configuration error, and
-        // discovering it only after a connect can cost the full timeout
-        // against a silently dropping endpoint and read as a network fault.
-        let tls_name = match self.connector.as_ref() {
-            Some(_) => Some(
-                rustls::pki_types::ServerName::try_from(server_name.to_owned())
-                    .map_err(|error| {
-                        crate::BrokerError::InvalidConfig(format!(
-                            "server name {server_name:?}: {error}"
-                        ))
-                    })?
-                    .to_owned(),
-            ),
-            None => None,
-        };
+        let tls_name = self.tls_name(server_name)?;
         timeout(self.timeout, async {
             let tcp = TcpStream::connect(addr)
                 .await

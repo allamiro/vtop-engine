@@ -89,6 +89,25 @@ def test_an_inline_comment_is_not_part_of_the_password(
     )
 
 
+def test_an_explicitly_empty_filed_value_does_not_crash_the_parser(
+        tmp_path, monkeypatch):
+    # 'KEY=' files the empty string. The quote check used substring
+    # membership ('' in '"\'' is True), so the empty value indexed past its
+    # own end and the parser crashed instead of letting the documented
+    # blank-value fallback apply (review).
+    from lib import engine
+    monkeypatch.setattr(engine, "_ENV_FILE", str(tmp_path / ".env"))
+    (tmp_path / ".env").write_text(
+        "MINIO_ROOT_USER=\nMINIO_ROOT_PASSWORD=\n", encoding="utf-8")
+    for var in ("MINIO_ROOT_USER", "MINIO_ROOT_PASSWORD",
+                "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    env = _backend_env(minio_scenario())
+    assert env["AWS_ACCESS_KEY_ID"] == "minioadmin", (
+        "an explicitly blank filed credential falls back to the lab default"
+    )
+
+
 def test_a_hash_glued_to_the_value_is_content(tmp_path, monkeypatch):
     from lib import engine
     monkeypatch.setattr(engine, "_ENV_FILE", str(tmp_path / ".env"))

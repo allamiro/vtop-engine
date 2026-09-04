@@ -230,6 +230,17 @@ jobs:
           # the binaries, and a closed set stays closed by construction.
           mkdir -p "dist/$name/docs"
           cp -r docs/. "dist/$name/docs/" 2>/dev/null || true
+          # The docs tree's own links reach OUTSIDE it (review, round two):
+          # grep '\.\./' docs/*.md enumerates the full out-of-tree target
+          # set — ../README.md (already at the bundle root), the benchmarks
+          # README, the audit-exception file SECURITY_MODEL cites, and this
+          # workflow itself. Copied preserving layout so every relative
+          # link in the shipped tree resolves; the grep is the maintenance
+          # tool when a doc gains a new escape.
+          mkdir -p "dist/$name/benchmarks" "dist/$name/.cargo" "dist/$name/.github/workflows"
+          cp benchmarks/README.md "dist/$name/benchmarks/" 2>/dev/null || true
+          cp .cargo/audit.toml "dist/$name/.cargo/" 2>/dev/null || true
+          cp .github/workflows/release.yml "dist/$name/.github/workflows/" 2>/dev/null || true
           # Three explicit assertions now, not two: the licenses the archive
           # must never ship without, plus the security model CONTRIBUTING.md
           # names — the sentinel for the docs tree having actually copied.

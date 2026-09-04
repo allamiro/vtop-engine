@@ -2101,32 +2101,54 @@ pub(crate) fn rebuild_empty_successor_commit(
             // just failed, so after a decode failure nothing the file says
             // about itself is trusted — a corrupted-upward length would
             // make a full-length file look "shorter than its claim" and be
-            // deleted as torn. The expected length is derived from the
-            // PREDECESSOR's authenticated header instead: a roll writes the
-            // successor with the sealed segment's own config and
+            // deleted as torn. The FLOOR is derived from the PREDECESSOR's
+            // authenticated header instead: a roll keeps the sealed
             // descriptor, changing only the segment id (fixed-width in
-            // JSON) and the base offset (known exactly here) — so the byte
-            // length of a legitimate successor header is computable without
-            // trusting the candidate at all. Strictly shorter than that is
+            // JSON) and the base offset (known exactly here), so the
+            // descriptor's contribution to any legitimate successor
+            // header's length is exact. The CONFIG's is not (review, round
+            // two): a reconfiguring roll writes a REPLACEMENT config whose
+            // numeric fields may encode in fewer digits, and measuring
+            // against the sealed config would delete exactly the complete-
+            // but-damaged reconfigured successor this classification exists
+            // to preserve. So the floor takes every config field at its
+            // one-digit narrowest: a file strictly shorter than even that
+            // cannot be ANY complete successor header of this range and is
             // torn; everything else stays quarantined like the
-            // unknown-magic arm, including a foreign file whose length
-            // happens not to match.
-            let expected_len = match &inspection.header {
+            // unknown-magic arm — including torn files that happen to land
+            // above the floor, because quarantine keeps evidence and
+            // deletion cannot be undone.
+            let minimal_expected_len = match &inspection.header {
                 AnyHeader::V1(sealed) => {
                     let mut expected = sealed.descriptor.clone();
                     expected.base_offset = expected_base;
-                    encode_header(&SegmentHeader::new(expected, sealed.config))
+                    let narrowest = SegmentConfig {
+                        max_record_bytes: 1,
+                        max_group_bytes: 1,
+                        max_segment_bytes: 1,
+                        max_segment_records: 1,
+                        index_stride: 1,
+                    };
+                    encode_header(&SegmentHeader::new(expected, narrowest))
                         .map(|encoded| encoded.len() as u64)
                 }
                 AnyHeader::V2(sealed) => {
                     let mut expected = sealed.descriptor.clone();
                     expected.base_offset = expected_base;
-                    encode_header_v2(&SegmentHeaderV2::new(expected, sealed.config))
+                    let narrowest = SegmentConfigV2 {
+                        max_record_bytes: 1,
+                        max_group_bytes: 1,
+                        max_segment_bytes: 1,
+                        max_segment_records: 1,
+                        index_stride: 1,
+                        chunk_size: 1,
+                    };
+                    encode_header_v2(&SegmentHeaderV2::new(expected, narrowest))
                         .map(|encoded| encoded.len() as u64)
                 }
             };
-            let provably_torn = match expected_len {
-                Ok(expected) => (bytes.len() as u64) < expected,
+            let provably_torn = match minimal_expected_len {
+                Ok(floor) => (bytes.len() as u64) < floor,
                 // A predecessor whose header cannot re-encode is not a
                 // state this repair understands; prove nothing.
                 Err(_) => false,
