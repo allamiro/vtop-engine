@@ -23,10 +23,14 @@ vtop {{ .Chart.AppVersion }} — SEPARATED tiers (#287): {{ $metaCount }} metada
      vtopctl meta init --members {{ join "," $ids }} --config admin.yaml
      vtopctl meta status --config admin.yaml
 
-   admin.yaml must carry BOTH:
+   admin.yaml must carry BOTH of these — the name is the one that pod's
+   certificate carries, which is tls.serverName when you set one:
 
      endpoint: localhost:{{ .Values.ports.metaAdmin }}
-     server_name: {{ include "vtop.tierPodFqdn" (dict "root" . "tier" "meta" "ordinal" 0) }}
+     server_name: {{ include "vtop.tierServerName" (dict "root" . "tier" "meta" "ordinal" 0) }}
+
+   plus ca_cert/client_cert/client_key for your operator credentials.
+   `server_name` defaults to "localhost", which will NOT match — set it.
 
    Metadata node ids are meta-tier ordinal+1: {{ $metaSet }}-0 is node 1.
 {{- if .Values.meta.adminAuthorization.enabled }}
