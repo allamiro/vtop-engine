@@ -1869,7 +1869,7 @@ mod tests {
             granted_at_ms: 2_000,
             granted_apply_index: 9,
             outcome: crate::state::TransitionOutcome::Reported {
-                outcome: crate::command::PromotionOutcome::Served {
+                outcome: crate::command::PromotionOutcome::Established {
                     boundary_offset: Some(401),
                     sealed_prefix_end: Some(300),
                     quorum: vec![crate::command::QuorumAnswer {

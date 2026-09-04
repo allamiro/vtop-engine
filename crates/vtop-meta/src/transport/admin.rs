@@ -59,10 +59,18 @@ pub trait AdminHandler: Send + Sync {
     ) -> TransportResult<AdminReadSegmentPlacementResponse>;
 
     /// Linearizable read of a range's transition chain (#240 item 5).
+    ///
+    /// Defaulted to a refusal rather than required (review): the trait is
+    /// public, and a handler that serves no transitions must keep
+    /// compiling — and must answer "not served here", never nothing.
     async fn read_range_transitions(
         &self,
-        request: AdminReadRangeTransitionsRequest,
-    ) -> TransportResult<AdminReadRangeTransitionsResponse>;
+        _request: AdminReadRangeTransitionsRequest,
+    ) -> TransportResult<AdminReadRangeTransitionsResponse> {
+        Err(TransportError::Protocol(
+            "this admin handler does not serve transition reads".to_owned(),
+        ))
+    }
 }
 
 /// Admin server, with or without TLS.
@@ -691,7 +699,6 @@ impl AdminClient {
         }
     }
 
-    /// Read a segment's placement through a linearizable fence.
     /// Read a range's transition chain through a linearizable fence
     /// (#240 item 5).
     pub async fn read_range_transitions(
@@ -725,6 +732,7 @@ impl AdminClient {
         }
     }
 
+    /// Read a segment's placement through a linearizable fence.
     pub async fn read_segment_placement(
         &self,
         topic_uuid: uuid::Uuid,

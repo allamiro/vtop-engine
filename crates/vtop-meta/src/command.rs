@@ -243,15 +243,22 @@ impl PromotionRefusal {
 }
 
 /// What a grant became, reported by its holder (#240 item 5): the evidence
-/// the promotion computed and used to be discarded. `Served` is what the
-/// signed transition record asserts; everything in it is recomputable by a
-/// reader holding the record and the replicas — `votes` and `required` are
-/// carried so a checker can recompute them from `quorum` rather than trust
-/// them, and `boundary_offset` is `None` only for a standalone promotion,
-/// where there is no quorum and the node's own log is the boundary.
+/// the promotion computed and used to be discarded. `Established` asserts
+/// exactly what the verification PROVED — a quorum was fenced and read, a
+/// boundary was adopted, the §5.4.1 vote passed — and nothing more: not
+/// that the holder went on to serve, which no record could assert (a leader
+/// can die the millisecond after it activates, and a candidate whose lease
+/// moved during its build stands back down with the proof intact). A chain
+/// reader who needs "did it serve" reads the next link: a holder displaced
+/// at once shows as `holder_from` of an epoch minted moments later.
+/// Everything in it is recomputable by a reader holding the record and the
+/// replicas — `votes` and `required` are carried so a checker can recompute
+/// them from `quorum` rather than trust them, and `boundary_offset` is
+/// `None` only for a standalone promotion, where there is no quorum and the
+/// node's own log is the boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PromotionOutcome {
-    Served {
+    Established {
         boundary_offset: Option<u64>,
         /// Sealed-segment identity at the transition (#306), when the
         /// holder had one to report.
@@ -270,7 +277,7 @@ pub(crate) fn encode_promotion_outcome(
     outcome: &PromotionOutcome,
 ) -> Result<(), CodecError> {
     match outcome {
-        PromotionOutcome::Served {
+        PromotionOutcome::Established {
             boundary_offset,
             sealed_prefix_end,
             quorum,
@@ -325,7 +332,7 @@ pub(crate) fn decode_promotion_outcome(
                     offset: reader.u64("promotion quorum offset")?,
                 });
             }
-            Ok(PromotionOutcome::Served {
+            Ok(PromotionOutcome::Established {
                 boundary_offset,
                 sealed_prefix_end,
                 quorum,
@@ -424,7 +431,7 @@ pub enum MetadataCommand {
     /// served under.
     ///
     /// Node-scoped: only the holder the epoch was granted to may report on
-    /// it, and a served transition is final — a later report cannot
+    /// it, and an established transition is final — a later report cannot
     /// rewrite what was proven.
     ReportPromotionOutcome {
         env: CommandEnvelope,
@@ -2307,6 +2314,39 @@ mod tests {
                 expected_fencing_epoch: 4,
                 lease_duration_ms: 10_000,
             },
+            MetadataCommand::ReportPromotionOutcome {
+                env: envelope(33),
+                topic_uuid: Uuid::from_u128(20),
+                range_uuid: Uuid::from_u128(21),
+                holder_node_uuid: Uuid::from_u128(10),
+                fencing_epoch: 4,
+                outcome: PromotionOutcome::Established {
+                    boundary_offset: Some(401),
+                    sealed_prefix_end: Some(300),
+                    quorum: vec![
+                        QuorumAnswer {
+                            node_uuid: Uuid::from_u128(10),
+                            offset: 401,
+                        },
+                        QuorumAnswer {
+                            node_uuid: Uuid::from_u128(11),
+                            offset: 400,
+                        },
+                    ],
+                    votes: 2,
+                    required: 2,
+                },
+            },
+            MetadataCommand::ReportPromotionOutcome {
+                env: envelope(34),
+                topic_uuid: Uuid::from_u128(20),
+                range_uuid: Uuid::from_u128(21),
+                holder_node_uuid: Uuid::from_u128(10),
+                fencing_epoch: 5,
+                outcome: PromotionOutcome::Refused {
+                    reason: PromotionRefusal::LeaderBehind,
+                },
+            },
         ]
     }
 
@@ -2319,6 +2359,7 @@ mod tests {
                 root_range_uuid: Uuid::from_u128(21),
             },
             MetadataResponse::LeaseGranted { fencing_epoch: 9 },
+            MetadataResponse::TransitionRecorded { fencing_epoch: 9 },
             MetadataResponse::GroupCreated {
                 group_uuid: Uuid::from_u128(50),
                 generation: 0,
@@ -2638,7 +2679,7 @@ mod tests {
             range_uuid: Uuid::from_u128(21),
             holder_node_uuid: Uuid::from_u128(10),
             fencing_epoch: 4,
-            outcome: PromotionOutcome::Served {
+            outcome: PromotionOutcome::Established {
                 boundary_offset: Some(401),
                 sealed_prefix_end: None,
                 quorum: vec![
@@ -2678,7 +2719,7 @@ mod tests {
             unreachable!()
         };
         let mut oversized = outcome.clone();
-        if let PromotionOutcome::Served { quorum, .. } = &mut oversized {
+        if let PromotionOutcome::Established { quorum, .. } = &mut oversized {
             *quorum = (0..MAX_TRANSITION_QUORUM as u128 + 1)
                 .map(|node| QuorumAnswer {
                     node_uuid: Uuid::from_u128(node),

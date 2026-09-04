@@ -1734,7 +1734,7 @@ impl MetaStateMachine {
         fencing_epoch: u64,
         outcome: &PromotionOutcome,
     ) -> MetadataResponse {
-        if let PromotionOutcome::Served { quorum, .. } = outcome {
+        if let PromotionOutcome::Established { quorum, .. } = outcome {
             if quorum.len() > MAX_TRANSITION_QUORUM {
                 return reject(MetadataError::limit(format!(
                     "a promotion report may carry at most {MAX_TRANSITION_QUORUM} quorum answers"
@@ -1759,17 +1759,18 @@ impl MetaStateMachine {
                 transition.holder_to
             )));
         }
-        // A served transition is final: what a quorum proved cannot be
-        // rewritten by a later report. A refusal may be superseded — a
+        // An established transition is final: what a quorum proved cannot
+        // be rewritten by a later report. A refusal may be superseded — a
         // quorum miss is retryable, and the retry that succeeds at the same
         // epoch is exactly the report that should stand.
         if let TransitionOutcome::Reported {
-            outcome: PromotionOutcome::Served { .. },
+            outcome: PromotionOutcome::Established { .. },
             ..
         } = &transition.outcome
         {
             return reject(MetadataError::invalid_transition(format!(
-                "epoch {fencing_epoch} is already recorded as served; a served transition is final"
+                "epoch {fencing_epoch} is already recorded as established; an established \
+                 transition is final"
             )));
         }
         transition.outcome = TransitionOutcome::Reported {
@@ -4140,6 +4141,24 @@ impl MetaStateMachine {
                     reason: "value type does not match its key category",
                 });
             }
+            // A transition's invariants are part of its canonical form
+            // (review): the key names the epoch it minted, and a mint only
+            // ever moves the epoch forward. A snapshot that disagrees with
+            // either was not written by this state machine.
+            if let (
+                MetaKey::RangeTransition { fencing_epoch, .. },
+                MetaValue::RangeTransition(transition),
+            ) = (&typed_key, &value)
+            {
+                if transition.epoch_to != *fencing_epoch
+                    || transition.epoch_to <= transition.epoch_from
+                {
+                    return Err(CodecError::InvalidValue {
+                        what: "snapshot record",
+                        reason: "transition epochs disagree with the key or do not advance",
+                    });
+                }
+            }
             previous_key = Some(key.clone());
             records.insert(key, value);
         }
@@ -4467,13 +4486,13 @@ mod tests {
         machine.range_transitions(topic_uuid, range_uuid, 0, 64)
     }
 
-    fn served(
+    fn established(
         boundary: u64,
         quorum: &[(u128, u64)],
         votes: u32,
         required: u32,
     ) -> PromotionOutcome {
-        PromotionOutcome::Served {
+        PromotionOutcome::Established {
             boundary_offset: Some(boundary),
             sealed_prefix_end: None,
             quorum: quorum
@@ -4631,11 +4650,11 @@ mod tests {
     /// The holder's report fills in the outcome (#240 item 5): the fenced
     /// quorum, the adopted boundary and the vote are kept as data a checker
     /// can recompute from rather than trust. Only the holder may report; a
-    /// refusal may be superseded by the retry that succeeds; a served
+    /// refusal may be superseded by the retry that succeeds; an established
     /// transition is final; and an epoch never minted has no record to
     /// fill.
     #[test]
-    fn a_promotion_report_fills_the_holders_record_and_a_served_one_is_final() {
+    fn a_promotion_report_fills_the_holders_record_and_an_established_one_is_final() {
         let (mut machine, holder, topic_uuid, range_uuid) = leaseable_range(10);
         let generation = range_of(&machine, topic_uuid, range_uuid).generation;
         acquire(
@@ -4662,7 +4681,7 @@ mod tests {
                 topic_uuid,
                 range_uuid,
                 1,
-                served(0, &[], 0, 0)
+                established(0, &[], 0, 0)
             ),
             MetadataResponse::Rejected(MetadataError::InvalidTransition(_))
         ));
@@ -4677,7 +4696,7 @@ mod tests {
                 topic_uuid,
                 range_uuid,
                 7,
-                served(0, &[], 0, 0)
+                established(0, &[], 0, 0)
             ),
             MetadataResponse::Rejected(MetadataError::NotFound)
         ));
@@ -4699,7 +4718,7 @@ mod tests {
             MetadataResponse::TransitionRecorded { fencing_epoch: 1 }
         ));
         // ...may be superseded by the retry that succeeds at the same epoch.
-        let evidence = served(401, &[(10, 401), (11, 400), (12, 350)], 3, 2);
+        let evidence = established(401, &[(10, 401), (11, 400), (12, 350)], 3, 2);
         assert!(matches!(
             report(
                 &mut machine,
@@ -4723,7 +4742,7 @@ mod tests {
                 reported_apply_index: 7,
             }
         );
-        // Served is final: a later report cannot rewrite what was proven.
+        // Established is final: a later report cannot rewrite what was proven.
         assert!(matches!(
             report(
                 &mut machine,
@@ -4734,12 +4753,12 @@ mod tests {
                 topic_uuid,
                 range_uuid,
                 1,
-                served(0, &[], 0, 0)
+                established(0, &[], 0, 0)
             ),
             MetadataResponse::Rejected(MetadataError::InvalidTransition(_))
         ));
         // The quorum list is bounded in apply as well as on the wire.
-        let oversized = served(
+        let oversized = established(
             0,
             &(0..MAX_TRANSITION_QUORUM as u128 + 1)
                 .map(|node| (node, 0))
@@ -4773,6 +4792,54 @@ mod tests {
             ),
             MetadataResponse::Rejected(MetadataError::Limit(_))
         ));
+    }
+
+    /// A snapshot whose transition record disagrees with its key, or whose
+    /// epochs do not advance, is refused (review): the invariants are part
+    /// of the canonical form, not a courtesy of the writer.
+    #[test]
+    fn a_snapshot_transition_that_breaks_its_invariants_is_refused() {
+        let (mut machine, holder, topic_uuid, range_uuid) = leaseable_range(10);
+        let generation = range_of(&machine, topic_uuid, range_uuid).generation;
+        acquire(
+            &mut machine,
+            3,
+            3,
+            1_000,
+            holder,
+            topic_uuid,
+            range_uuid,
+            generation,
+            5_000,
+        );
+        let encoded = machine.encode_snapshot().unwrap();
+        let key = MetaKey::RangeTransition {
+            topic_uuid,
+            range_uuid,
+            fencing_epoch: 1,
+        }
+        .encode();
+        let key_at = encoded
+            .windows(key.len())
+            .position(|window| window == key.as_slice())
+            .expect("the transition key is in the snapshot");
+        // key, then u32 value length, then the value: tag, epoch_from,
+        // epoch_to.
+        let value_at = key_at + key.len() + 4;
+        assert_eq!(encoded[value_at], VALUE_TAG_RANGE_TRANSITION);
+        let mut not_advancing = encoded.clone();
+        not_advancing[value_at + 1..value_at + 9].copy_from_slice(&1_u64.to_be_bytes());
+        assert!(
+            MetaStateMachine::decode_snapshot(&not_advancing).is_err(),
+            "epoch_from == epoch_to is not a transition"
+        );
+        let mut disagreeing = encoded.clone();
+        disagreeing[value_at + 9..value_at + 17].copy_from_slice(&2_u64.to_be_bytes());
+        assert!(
+            MetaStateMachine::decode_snapshot(&disagreeing).is_err(),
+            "a value whose epoch_to is not the key's epoch was not written by this machine"
+        );
+        assert!(MetaStateMachine::decode_snapshot(&encoded).is_ok());
     }
 
     /// The record survives a snapshot byte-exactly in both outcomes, and its
@@ -4813,7 +4880,7 @@ mod tests {
             topic_uuid,
             range_uuid,
             2,
-            served(401, &[(10, 401), (11, 400)], 2, 2),
+            established(401, &[(10, 401), (11, 400)], 2, 2),
         );
         let encoded = machine.encode_snapshot().unwrap();
         let decoded = MetaStateMachine::decode_snapshot(&encoded).unwrap();

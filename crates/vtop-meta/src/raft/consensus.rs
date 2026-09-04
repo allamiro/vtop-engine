@@ -295,7 +295,9 @@ impl AdminReadRangeTransitions for OpenraftConsensus {
             .ensure_linearizable()
             .await
             .map_err(classify_read_error)?;
-        let limit = usize::from(limit).clamp(1, MAX_TRANSITIONS_PER_READ);
+        // The caller's maximum, capped at the page bound; zero is zero
+        // (review) — a maximum is not a hint.
+        let limit = usize::from(limit).min(MAX_TRANSITIONS_PER_READ);
         Ok(store.with_storage(|storage| {
             let read_at_applied_index = storage.last_applied();
             let state = storage.state();

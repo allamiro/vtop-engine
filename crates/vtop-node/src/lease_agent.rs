@@ -147,6 +147,13 @@ impl CandidateLocalView for vtop_broker::replication::InProcessFollower {
     fn epoch_starts(&self) -> Vec<vtop_broker::fencing_epochs::EpochStart> {
         self.epoch_starts()
     }
+
+    fn sealed_prefix_end(&self) -> Option<u64> {
+        // The candidate's view during its probe IS the follower it was
+        // (review): the sealed prefix it reports is the one it holds now,
+        // not the broker's after the build.
+        self.sealed_prefix_end()
+    }
 }
 
 pub struct ReplicaPlaneProbe {
@@ -585,7 +592,7 @@ impl Promoter {
                             .get(&self.node_uuid)
                             .copied()
                             .unwrap_or(committed_offset);
-                        self.evidence = Some(vtop_meta::PromotionOutcome::Served {
+                        self.evidence = Some(vtop_meta::PromotionOutcome::Established {
                             boundary_offset: Some(committed_offset),
                             sealed_prefix_end: probe.sealed_prefix_end(),
                             quorum: answered
@@ -692,7 +699,7 @@ impl Promoter {
             // the node's own log is the boundary. Recorded as served with
             // nothing to recompute, rather than left Pending as if nobody
             // had promoted.
-            self.evidence = Some(vtop_meta::PromotionOutcome::Served {
+            self.evidence = Some(vtop_meta::PromotionOutcome::Established {
                 boundary_offset: None,
                 sealed_prefix_end: None,
                 quorum: Vec::new(),
@@ -896,7 +903,7 @@ pub fn decide(
 
 /// Drives one range's lease against the metadata group.
 pub struct LeaseAgent {
-    admin: AdminClient,
+    admin: Arc<AdminClient>,
     config: LeaseAgentConfig,
     node_uuid: Uuid,
     topic_uuid: Uuid,
@@ -1002,7 +1009,7 @@ impl LeaseAgent {
     ) -> Result<Self, String> {
         config.validate()?;
         Ok(Self {
-            admin,
+            admin: Arc::new(admin),
             config,
             node_uuid,
             topic_uuid,
@@ -1621,7 +1628,7 @@ impl LeaseAgent {
 
     async fn publish_held(&mut self, fencing_epoch: u64, held_until_ms: Option<i64>) -> Promoted {
         let held = self.promoter.ensure(fencing_epoch).await;
-        self.report_outcome(fencing_epoch).await;
+        self.report_outcome(fencing_epoch);
         if !held {
             let quorum_miss = self.promoter.take_quorum_miss();
             if self.promoter.take_stand_aside() {
@@ -1646,48 +1653,84 @@ impl LeaseAgent {
 
     /// Report what the verification established, or why it refused, so the
     /// transition record metadata minted at grant time stops being Pending
-    /// (#240 item 5). Best effort and bounded: the record is evidence, not a
-    /// gate, so a report that cannot be delivered is logged and the epoch's
-    /// record stays visibly Pending — the honest shape of "nobody told
-    /// metadata what happened", and one a chain reader can see.
-    async fn report_outcome(&mut self, fencing_epoch: u64) {
+    /// (#240 item 5). Best effort, and OFF the renewal path (review): the
+    /// report runs as its own task with its own short deadline and its own
+    /// retries, so a slow or blackholed metadata leader can neither delay
+    /// the renewal that keeps the lease alive nor be told about the
+    /// promotion only once. A report that never lands is logged and the
+    /// epoch's record stays visibly Pending — the honest shape of "nobody
+    /// told metadata what happened", and one a chain reader can see.
+    fn report_outcome(&mut self, fencing_epoch: u64) {
         let Some(outcome) = self.promoter.take_evidence() else {
             return;
         };
-        let proposal = self
-            .bounded(
-                "report promotion outcome",
-                self.admin.propose(MetadataCommand::ReportPromotionOutcome {
-                    env: envelope(),
-                    topic_uuid: self.topic_uuid,
-                    range_uuid: self.range_uuid,
-                    holder_node_uuid: self.node_uuid,
-                    fencing_epoch,
-                    outcome,
-                }),
-            )
-            .await;
-        match proposal {
-            Ok(response) => match response.response {
-                MetadataResponse::TransitionRecorded { .. } => tracing::info!(
-                    range = %self.range_uuid,
-                    fencing_epoch,
-                    "promotion outcome recorded against the epoch's transition"
-                ),
-                other => tracing::warn!(
-                    range = %self.range_uuid,
-                    fencing_epoch,
-                    ?other,
-                    "metadata refused the promotion report; the transition stays as it was"
-                ),
-            },
-            Err(error) => tracing::warn!(
-                range = %self.range_uuid,
+        let admin = Arc::clone(&self.admin);
+        let (topic_uuid, range_uuid, node_uuid) =
+            (self.topic_uuid, self.range_uuid, self.node_uuid);
+        // Well inside one renew interval, so even the last attempt of the
+        // last retry cannot outlive the next renewal decision.
+        let attempt_deadline = (self.config.renew_interval / 4)
+            .clamp(Duration::from_millis(200), Duration::from_secs(2));
+        tokio::spawn(async move {
+            let command = MetadataCommand::ReportPromotionOutcome {
+                env: envelope(),
+                topic_uuid,
+                range_uuid,
+                holder_node_uuid: node_uuid,
                 fencing_epoch,
-                %error,
-                "promotion report not delivered; the transition stays Pending"
-            ),
-        }
+                outcome,
+            };
+            let mut backoff = Duration::from_millis(500);
+            for attempt in 1..=5_u32 {
+                match tokio::time::timeout(attempt_deadline, admin.propose(command.clone())).await {
+                    Ok(Ok(response)) => match response.response {
+                        MetadataResponse::TransitionRecorded { .. } => {
+                            tracing::info!(
+                                range = %range_uuid,
+                                fencing_epoch,
+                                attempt,
+                                "promotion outcome recorded against the epoch's transition"
+                            );
+                            return;
+                        }
+                        // A refusal is metadata's verdict, not a delivery
+                        // failure: the record is already established, the
+                        // epoch was granted to someone else, or the epoch
+                        // was never minted. Retrying cannot change it.
+                        other => {
+                            tracing::warn!(
+                                range = %range_uuid,
+                                fencing_epoch,
+                                ?other,
+                                "metadata refused the promotion report; the transition stays as it was"
+                            );
+                            return;
+                        }
+                    },
+                    Ok(Err(error)) => tracing::warn!(
+                        range = %range_uuid,
+                        fencing_epoch,
+                        attempt,
+                        %error,
+                        "promotion report not delivered; retrying"
+                    ),
+                    Err(_) => tracing::warn!(
+                        range = %range_uuid,
+                        fencing_epoch,
+                        attempt,
+                        deadline = ?attempt_deadline,
+                        "promotion report timed out; retrying"
+                    ),
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(5));
+            }
+            tracing::warn!(
+                range = %range_uuid,
+                fencing_epoch,
+                "promotion report abandoned after five attempts; the transition stays Pending"
+            );
+        });
     }
 
     /// Hold a quorum-missed epoch still for as long as the budget allows.
@@ -1968,7 +2011,7 @@ mod tests {
         let probe = fixed(vec![at(1, Some(90)), at(2, Some(80)), at(3, Some(95))], 3);
         let mut verifier = promoter(recorder.clone(), Some(probe));
         assert!(verifier.ensure(5).await);
-        let Some(vtop_meta::PromotionOutcome::Served {
+        let Some(vtop_meta::PromotionOutcome::Established {
             boundary_offset,
             quorum,
             votes,
@@ -1976,7 +2019,7 @@ mod tests {
             ..
         }) = verifier.take_evidence()
         else {
-            panic!("a served promotion leaves Served evidence");
+            panic!("an established promotion leaves Established evidence");
         };
         assert_eq!(
             boundary_offset,
@@ -2017,14 +2060,14 @@ mod tests {
         assert!(standalone.ensure(7).await);
         assert_eq!(
             standalone.take_evidence(),
-            Some(vtop_meta::PromotionOutcome::Served {
+            Some(vtop_meta::PromotionOutcome::Established {
                 boundary_offset: None,
                 sealed_prefix_end: None,
                 quorum: Vec::new(),
                 votes: 0,
                 required: 0,
             }),
-            "a standalone promotion is served with nothing to recompute, not left Pending"
+            "a standalone promotion is established with nothing to recompute, not left Pending"
         );
     }
 
