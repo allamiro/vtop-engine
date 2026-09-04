@@ -384,8 +384,9 @@ impl BrokerLeasePublisher {
 
     /// Whether promotion on this broker publishes through the marker: only a
     /// replicated v2 range can append one a quorum proves and consumers
-    /// never see.
-    fn gates_on_marker(&self) -> bool {
+    /// never see. Public so a role that knows the answer is "never" can
+    /// skip spawning a driver that would only ever park.
+    pub fn gates_on_marker(&self) -> bool {
         self.broker.cluster_committed().is_some()
             && self.broker.segment_format() == vtop_broker::SegmentFormat::V2
     }
@@ -398,12 +399,35 @@ impl BrokerLeasePublisher {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn set_pending_marker(&self, epoch: Option<u64>) {
-        *self
+    /// Pend `epoch`'s marker unless a newer epoch is already pending
+    /// (review): promotion rounds can arrive reordered, and a stale one
+    /// must not replace the marker the current epoch still owes.
+    fn pend_marker(&self, epoch: u64) {
+        let mut pending = self
             .pending_marker
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = epoch;
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if pending.is_some_and(|current| current > epoch) {
+            return;
+        }
+        *pending = Some(epoch);
+        drop(pending);
         self.marker_changed.notify_one();
+    }
+
+    /// Retire the pending marker only if it is `epoch`'s (review): a delayed
+    /// demotion or suspension naming an older epoch says nothing about the
+    /// newer epoch's marker, whose lease the broker still holds.
+    fn retire_marker(&self, epoch: u64) {
+        let mut pending = self
+            .pending_marker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *pending == Some(epoch) {
+            *pending = None;
+            drop(pending);
+            self.marker_changed.notify_one();
+        }
     }
 
     /// One attempt at the pending marker: `Ok(Some(mark))` published it,
@@ -550,7 +574,20 @@ impl LeasePublisher for BrokerLeasePublisher {
         if gated {
             // AFTER the epoch is adopted, so the driver's first attempt finds
             // a broker that holds the epoch rather than one that refuses it
-            // for a reason that will clear a microsecond later.
+            // for a reason that will clear a microsecond later. And only if
+            // the adoption stands (review): adoption is monotonic, so a
+            // stale round names an epoch the broker has moved past, and the
+            // marker it would pend is one the newer epoch's would supersede
+            // anyway — pending it would only displace the marker still owed.
+            if self.broker.held_fencing_epoch() != fencing_epoch {
+                tracing::debug!(
+                    range = %self.broker.range().range_id,
+                    fencing_epoch,
+                    held = self.broker.held_fencing_epoch(),
+                    "stale promotion round; the held epoch's marker stays pending"
+                );
+                return;
+            }
             tracing::info!(
                 range = %self.broker.range().range_id,
                 fencing_epoch,
@@ -558,7 +595,7 @@ impl LeasePublisher for BrokerLeasePublisher {
                 "promotion established a candidate boundary; publishing through this \
                  epoch's marker rather than by trusting the count (#240, §5.4.2)"
             );
-            self.set_pending_marker(Some(fencing_epoch));
+            self.pend_marker(fencing_epoch);
         }
     }
 
@@ -566,7 +603,7 @@ impl LeasePublisher for BrokerLeasePublisher {
         // Only the metadata view is cleared. The held epoch stays where it is:
         // it records what this process was last granted, and rewinding it
         // would let a later stale grant look current.
-        self.set_pending_marker(None);
+        self.retire_marker(fencing_epoch);
         self.broker.meta_fencing_epoch().clear_lease(fencing_epoch);
     }
 
@@ -578,7 +615,7 @@ impl LeasePublisher for BrokerLeasePublisher {
         // The pending marker goes too: a suspended lease refuses the marker,
         // and the re-promotion that lifts the suspension pends it again — a
         // republish at the same epoch rides the duplicate path.
-        self.set_pending_marker(None);
+        self.retire_marker(fencing_epoch);
         self.broker.meta_fencing_epoch().suspend(fencing_epoch);
     }
 }
@@ -2200,6 +2237,42 @@ mod tests {
         publisher.demote(FENCING_EPOCH);
         assert_eq!(publisher.pending_marker_epoch(), None);
         assert_eq!(h.cluster_committed.get(), 0, "nothing ever published");
+    }
+
+    /// Rounds can arrive reordered (review): a stale promotion must not
+    /// displace the marker the current epoch still owes, and a delayed
+    /// demotion or suspension naming an older epoch must not retire it.
+    #[test]
+    fn a_stale_round_neither_displaces_nor_retires_the_current_markers() {
+        let h = replicated_v2_harness();
+        let publisher = BrokerLeasePublisher::new(Arc::clone(&h.leader));
+        h.meta.set(FENCING_EPOCH + 1);
+        publisher.promote(FENCING_EPOCH + 1, Some(0));
+        assert_eq!(publisher.pending_marker_epoch(), Some(FENCING_EPOCH + 1));
+
+        // A reordered promotion at the older epoch: adoption is monotonic,
+        // so the broker stays at the newer epoch and so does the marker.
+        publisher.promote(FENCING_EPOCH, Some(0));
+        assert_eq!(h.leader.held_fencing_epoch(), FENCING_EPOCH + 1);
+        assert_eq!(
+            publisher.pending_marker_epoch(),
+            Some(FENCING_EPOCH + 1),
+            "a stale round must not displace the current epoch's marker"
+        );
+
+        // A delayed suspension and demotion naming the older epoch: neither
+        // says anything about the newer epoch's marker.
+        publisher.suspend(FENCING_EPOCH);
+        assert_eq!(publisher.pending_marker_epoch(), Some(FENCING_EPOCH + 1));
+        publisher.demote(FENCING_EPOCH);
+        assert_eq!(
+            publisher.pending_marker_epoch(),
+            Some(FENCING_EPOCH + 1),
+            "an older epoch's retirement leaves the newer marker pending"
+        );
+        // Naming the right epoch retires it.
+        publisher.demote(FENCING_EPOCH + 1);
+        assert_eq!(publisher.pending_marker_epoch(), None);
     }
 
     /// A v1-format replicated range keeps the direct publication path: its

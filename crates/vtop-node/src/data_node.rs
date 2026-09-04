@@ -158,6 +158,24 @@ impl RangeCreation {
     }
 }
 
+/// The cluster high-water mark a LEADER build starts from (#240, #402): the
+/// highest quorum mark this replica durably observed while following, read
+/// back from the committed-floor sidecar it kept then. A promotion
+/// publishes nothing until its own epoch's marker is proven, so this seed
+/// is what fetch serves and what metrics show in the meantime — seeded at
+/// zero, a failover exposed a mark below one the old leader had already
+/// published, for as long as the marker took (review). Seeded from the
+/// floor it serves only what a quorum once proved, and the cell only ever
+/// moves up from there. A replica that never observed a mark — freshly
+/// repaired, #402's stated residual — still starts at zero, because a floor
+/// nobody recorded cannot be invented.
+fn leader_cluster_cell(data_dir: &Path) -> ClusterCommittedOffset {
+    ClusterCommittedOffset::new(
+        vtop_broker::committed_floor::CommittedFloorFile::open(data_dir.join("committed-floor"))
+            .floor(),
+    )
+}
+
 /// The broker-side name of the format a set's tail is in.
 fn format_of(set: &SegmentSet) -> vtop_broker::SegmentFormat {
     if set.active().format_version() == vtop_log::FORMAT_VERSION_V2 {
@@ -832,7 +850,7 @@ async fn run_leader(
             config.fencing_epoch,
             meta,
             config.node_uuid,
-            Some(ClusterCommittedOffset::new(0)),
+            Some(leader_cluster_cell(&config.data_dir)),
             Some(replica_set as Arc<dyn ReplicaSet>),
         )
         .map_err(|error| error.to_string())?
@@ -943,9 +961,13 @@ async fn run_leader(
         // promotion itself (#240, §5.4.2): the driver appends and proves it,
         // retrying for as long as a majority cannot hold the tail, and lives
         // exactly as long as the agent that pends the epochs it publishes.
-        boundary_driver = Some(Aborting(tokio::spawn(
-            publisher.drive_boundary_marker(shutdown.clone()),
-        )));
+        // Only where a marker can exist (review): a standalone or v1 range
+        // never pends one, and a driver there would only ever park.
+        if publisher.gates_on_marker() {
+            boundary_driver = Some(Aborting(tokio::spawn(
+                publisher.drive_boundary_marker(shutdown.clone()),
+            )));
+        }
         // The agent abandons its round the moment the release fires (#408),
         // so the worst remaining chain is the shutdown path's own RPCs: the
         // reconciliation read release() may need when the abandoned round
@@ -1812,10 +1834,16 @@ async fn run_candidate(
                         std::io::stdout().flush().ok();
                         // The promotion pended this epoch's marker (#240);
                         // the driver publishes it — and every later
-                        // re-grant's — for as long as this role stands.
-                        let boundary_driver = Aborting(tokio::spawn(
-                            Arc::clone(&broker_publisher).drive_boundary_marker(shutdown.clone()),
-                        ));
+                        // re-grant's — for as long as this role stands. A
+                        // v1 range pends none, and gets no driver to park.
+                        let boundary_driver = Aborting(if broker_publisher.gates_on_marker() {
+                            tokio::spawn(
+                                Arc::clone(&broker_publisher)
+                                    .drive_boundary_marker(shutdown.clone()),
+                            )
+                        } else {
+                            tokio::spawn(async {})
+                        });
                         phase = Phase::Leading {
                             broker: built.broker,
                             publisher: broker_publisher,
@@ -2240,7 +2268,7 @@ async fn build_leader_phase(
             config.fencing_epoch,
             meta.clone(),
             config.node_uuid,
-            Some(ClusterCommittedOffset::new(0)),
+            Some(leader_cluster_cell(&config.data_dir)),
             Some(Arc::clone(&replicas) as Arc<dyn ReplicaSet>),
         )
         .map_err(|error| error.to_string())?,
@@ -2830,6 +2858,28 @@ mod tests {
             node_uuid: Uuid::from_u128(0xA1),
             fencing_epoch: 3,
         }
+    }
+
+    /// A leader build starts at the floor this replica observed as a
+    /// follower (#240, #402), never at zero while a floor is on disk: the
+    /// promotion publishes nothing until its marker is proven, and what is
+    /// served in the meantime must be a mark a quorum once proved.
+    #[test]
+    fn a_leader_build_starts_at_the_floor_it_observed_as_a_follower() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            leader_cluster_cell(dir.path()).get(),
+            0,
+            "no floor on disk: nothing was ever observed, and nothing is invented"
+        );
+        vtop_broker::committed_floor::CommittedFloorFile::open(dir.path().join("committed-floor"))
+            .save(301)
+            .unwrap();
+        assert_eq!(
+            leader_cluster_cell(dir.path()).get(),
+            301,
+            "the floor the follower persisted is where the leader starts"
+        );
     }
 
     /// The format knob applies at CREATION only (#240): a range asked for

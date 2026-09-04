@@ -94,10 +94,9 @@ log "$ACKED records acknowledged under quorum at candidate $WINNER's own address
 # never publish below it. Read after the produce completed, so it is the
 # settled mark rather than a racing lower bound; a failed read is a failure
 # of the scenario, never a silent zero.
-HWM_BEFORE="$(metric_value "$(data_metrics_addr "$((WINNER + 10))")" \
+HWM_BEFORE="$(sample_metric "$(data_metrics_addr "$((WINNER + 10))")" \
   vtop_broker_cluster_committed_offset)" \
   || fail "the leader's published high-water mark could not be read before the kill"
-HWM_BEFORE="${HWM_BEFORE%.*}"
 log "published high-water mark before the kill: $HWM_BEFORE"
 
 # --- kill the leader; a survivor takes the range, nothing restarts ----------

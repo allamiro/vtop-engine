@@ -763,6 +763,24 @@ metric_value() {
   printf '%s\n' "$value"
 }
 
+# sample_metric <addr> <metric> — one gauge's integer value, RETRIED under the
+# progress deadline (review): a single scrape can miss — the exporter holds a
+# lock the append path also takes and answers "absent" rather than block — and
+# a scenario that samples a healthy node must not abort on that. Persistent
+# absence still fails, through the caller, once the deadline passes.
+sample_metric() {
+  local addr="$1" metric="$2"
+  local deadline=$((SECONDS + PROGRESS_TIMEOUT_SECONDS)) value
+  while :; do
+    if value="$(metric_value "$addr" "$metric")"; then
+      printf '%s\n' "${value%.*}"
+      return 0
+    fi
+    [[ $SECONDS -lt $deadline ]] || return 1
+    sleep 0.2
+  done
+}
+
 # count_raft_leaders <meta-ids...> — how many nodes report themselves leader.
 # Anything but 1 is an incident: 0 is an outage, 2 is split brain.
 count_raft_leaders() {

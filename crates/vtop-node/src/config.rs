@@ -220,6 +220,13 @@ pub(crate) fn default_max_record_bytes() -> u32 {
 /// it for — the promotion boundary marker (#240), which only a v2 frame can
 /// carry under an identity consumers are shielded from. A v1 replicated
 /// range keeps the pre-marker publication path.
+///
+/// Known limit of v2 ranges, stated rather than discovered: the truncation
+/// intent marker records a v1 segment identity, so a v2 range that has
+/// ROLLED cannot be truncated across segments — a follower whose divergence
+/// point lies below its active segment refuses, fail-closed, and comes back
+/// through `vtopctl node repair` rather than in place (#429). Divergence
+/// inside the active segment reconciles as on v1.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum SegmentFormatConfig {

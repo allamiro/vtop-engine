@@ -95,9 +95,8 @@ await_acked_floor "$WORKDIR/acked" "$KILL_FLOOR"
 # keeps moving between this read and the kill — and a bound the failed read
 # must not silently zero: a healthy leader answers, and one that does not is
 # a scenario failure, not a mark of 0.
-HWM_BEFORE="$(metric_value "$(data_metrics_addr 0)" vtop_broker_cluster_committed_offset)" \
+HWM_BEFORE="$(sample_metric "$(data_metrics_addr 0)" vtop_broker_cluster_committed_offset)" \
   || fail "the leader's published high-water mark could not be read before the kill"
-HWM_BEFORE="${HWM_BEFORE%.*}"
 log "published high-water mark before the kill: $HWM_BEFORE"
 
 kill9_pid "$DL"
