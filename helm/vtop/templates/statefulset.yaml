@@ -1,4 +1,5 @@
 {{- include "vtop.deploymentGuards" . -}}
+{{- if eq (include "vtop.deploymentMode" .) "colocated" }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -236,3 +237,4 @@ spec:
         resources:
           requests:
             storage: {{ .Values.persistence.data.size }}
+{{- end }}

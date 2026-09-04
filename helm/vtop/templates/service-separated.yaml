@@ -1,0 +1,112 @@
+{{- if eq (include "vtop.deploymentMode" .) "separated" }}
+{{- /* SEPARATED MODE (#287): each tier gets its own headless Service — the
+       stable per-pod DNS its peer lists are built from — and its own client
+       Service. Both client Services carry the observability plane and the
+       `client` label, so a ServiceMonitor scrapes each pod exactly once; the
+       admin plane rides the metadata tier's client Service only on the same
+       opt-in, and for the same reason, as the co-located chart (per-pod
+       certificates give a load-balanced endpoint no name to verify). The
+       native plane is never on a Service: address the data pod that holds
+       the range through its headless FQDN. */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "vtop.tierHeadlessServiceName" (dict "root" . "tier" "meta") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vtop.labels" . | nindent 4 }}
+    vtop.allamiro.io/service: headless
+    vtop.allamiro.io/tier: meta
+spec:
+  clusterIP: None
+  # Peers must resolve each other BEFORE the quorum forms.
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "vtop.tierSelectorLabels" (dict "root" . "tier" "meta") | nindent 4 }}
+  ports:
+    - name: meta-peer
+      port: {{ .Values.ports.metaPeer }}
+      targetPort: meta-peer
+    - name: meta-admin
+      port: {{ .Values.ports.metaAdmin }}
+      targetPort: meta-admin
+    - name: obs
+      port: {{ .Values.ports.observability }}
+      targetPort: obs
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "vtop.tierHeadlessServiceName" (dict "root" . "tier" "data") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vtop.labels" . | nindent 4 }}
+    vtop.allamiro.io/service: headless
+    vtop.allamiro.io/tier: data
+spec:
+  clusterIP: None
+  # Replicas must resolve each other before the range's first quorum; the
+  # data tier also resolves the metadata tier's headless names for the lease.
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "vtop.tierSelectorLabels" (dict "root" . "tier" "data") | nindent 4 }}
+  ports:
+    - name: replica
+      port: {{ .Values.ports.replica }}
+      targetPort: replica
+    - name: native
+      port: {{ .Values.ports.native }}
+      targetPort: native
+    - name: obs
+      port: {{ .Values.ports.observability }}
+      targetPort: obs
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "vtop.tierName" (dict "root" . "tier" "meta") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vtop.labels" . | nindent 4 }}
+    vtop.allamiro.io/service: client
+    vtop.allamiro.io/tier: meta
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "vtop.tierSelectorLabels" (dict "root" . "tier" "meta") | nindent 4 }}
+  ports:
+    {{- if .Values.service.exposeMetaAdmin }}
+    - name: meta-admin
+      port: {{ .Values.ports.metaAdmin }}
+      targetPort: meta-admin
+    {{- end }}
+    - name: obs
+      port: {{ .Values.ports.observability }}
+      targetPort: obs
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "vtop.tierName" (dict "root" . "tier" "data") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vtop.labels" . | nindent 4 }}
+    vtop.allamiro.io/service: client
+    vtop.allamiro.io/tier: data
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "vtop.tierSelectorLabels" (dict "root" . "tier" "data") | nindent 4 }}
+  ports:
+    - name: obs
+      port: {{ .Values.ports.observability }}
+      targetPort: obs
+{{- end }}

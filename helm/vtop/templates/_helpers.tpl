@@ -132,19 +132,277 @@ render passes through them. Three refusals live here rather than scattered:
 */}}
 {{- define "vtop.deploymentGuards" -}}
 {{- $v := .Values -}}
-{{- $mode := "colocated" -}}
-{{- with $v.deployment -}}{{- $mode = default "colocated" .mode -}}{{- end -}}
-{{- if eq $mode "separated" -}}
-{{- fail "\n\ndeployment.mode=separated is #287 slice 2 and this chart version does not render it yet. It refuses rather than silently rendering the co-located shape: a separated deployment expects two tiers of processes, and getting one tier of combined ones would look like success while being the wrong cluster. Use mode colocated (the default) until the separated rendering ships." -}}
-{{- else if ne $mode "colocated" -}}
+{{- $mode := include "vtop.deploymentMode" . -}}
+{{- if and (ne $mode "colocated") (ne $mode "separated") -}}
 {{- fail (printf "\n\ndeployment.mode must be colocated or separated; got %q." $mode) -}}
 {{- end -}}
 {{- if $v.cluster.nodeUuids -}}
 {{- fail "\n\ncluster.nodeUuids moved to data.nodeUuids (#287). Metadata identities are Raft node ids derived from the pod ordinal (ordinal+1, the meta certificate CN) while these are broker UUIDs (the data certificate CN) — two different identities that shared one list only while the tiers were the same size. Move the list unchanged: data.nodeUuids." -}}
 {{- end -}}
+{{- if eq $mode "colocated" -}}
 {{- if eq (mod (int $v.replicaCount) 2) 0 -}}
 {{- fail (printf "\n\nreplicaCount %d is even, and the metadata plane is a Raft quorum: an even voter count tolerates no more failures than the odd count below it while raising the majority it must gather. Use %d or %d." (int $v.replicaCount) (sub (int $v.replicaCount) 1) (add1 (int $v.replicaCount))) -}}
 {{- end -}}
+{{- else -}}
+{{- /* SEPARATED (#287 slice 2). The tiers are sized independently and each
+       size is REQUIRED: guessing either would defeat the mode. The voter
+       count keeps the odd-only rule; the data count must match the identity
+       list it indexes; a replicated range needs a follower; and the tier
+       names must fit the DNS label budget with their suffixes attached. */ -}}
+{{- $metaCount := int (include "vtop.metaReplicaCount" .) -}}
+{{- $dataCount := int (include "vtop.dataReplicaCount" .) -}}
+{{- if lt $metaCount 1 -}}
+{{- fail "\n\ndeployment.mode is separated but deployment.meta.replicaCount is unset: the metadata tier is sized independently under this mode, and the chart refuses to guess a quorum size. Use 3 or 5." -}}
+{{- end -}}
+{{- if eq (mod $metaCount 2) 0 -}}
+{{- fail (printf "\n\ndeployment.meta.replicaCount %d is even, and the metadata plane is a Raft quorum: an even voter count tolerates no more failures than the odd count below it while raising the majority it must gather. Use %d or %d." $metaCount (sub $metaCount 1) (add1 $metaCount)) -}}
+{{- end -}}
+{{- if lt $dataCount 1 -}}
+{{- fail "\n\ndeployment.mode is separated but deployment.data.replicaCount is unset: the data tier is sized independently under this mode, and the chart refuses to guess. Size it by the data (one per data.nodeUuids entry)." -}}
+{{- end -}}
+{{- if ne (len $v.data.nodeUuids) $dataCount -}}
+{{- fail (printf "\n\ndata.nodeUuids has %d entries but deployment.data.replicaCount is %d: under separated mode the list is indexed by DATA-tier pod ordinal, one broker UUID per data replica, each equal to the CN of that pod's data-plane certificate." (len $v.data.nodeUuids) $dataCount) -}}
+{{- end -}}
+{{- if and (eq $v.data.topology "replicated") (lt $dataCount 2) -}}
+{{- fail (printf "\n\ndata.topology is \"replicated\" but deployment.data.replicaCount is %d: a replicated range needs at least one follower. Use topology \"standalone\" for a single data node." $dataCount) -}}
+{{- end -}}
+{{- if gt (len (include "vtop.fullname" .)) 49 -}}
+{{- fail (printf "\n\nthe release name renders a fullname of %d characters; under separated mode the tier Services append \"-data-headless\" (14) and the label budget is 63. Use fullnameOverride to shorten it to 49 or fewer." (len (include "vtop.fullname" .))) -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Deployment mode (#287): colocated unless deployment.mode says otherwise.
+*/}}
+{{- define "vtop.deploymentMode" -}}
+{{- $mode := "colocated" -}}
+{{- with .Values.deployment -}}{{- $mode = default "colocated" .mode -}}{{- end -}}
+{{- $mode -}}
+{{- end }}
+
+{{- define "vtop.metaReplicaCount" -}}
+{{- $count := 0 -}}
+{{- with .Values.deployment -}}{{- with .meta -}}{{- $count = int (default 0 .replicaCount) -}}{{- end -}}{{- end -}}
+{{- $count -}}
+{{- end }}
+
+{{- define "vtop.dataReplicaCount" -}}
+{{- $count := 0 -}}
+{{- with .Values.deployment -}}{{- with .data -}}{{- $count = int (default 0 .replicaCount) -}}{{- end -}}{{- end -}}
+{{- $count -}}
+{{- end }}
+
+{{/*
+Tier objects (#287 separated mode). Each tier is its own StatefulSet with its
+own headless Service, so a pod's stable name is
+<fullname>-<tier>-<ordinal>.<fullname>-<tier>-headless.<ns>.svc.<domain>.
+Expects (dict "root" $ "tier" "meta"|"data" [ "ordinal" <int> ]).
+*/}}
+{{- define "vtop.tierName" -}}
+{{- printf "%s-%s" (include "vtop.fullname" .root) .tier -}}
+{{- end }}
+
+{{- define "vtop.tierHeadlessServiceName" -}}
+{{- printf "%s-%s-headless" (include "vtop.fullname" .root) .tier -}}
+{{- end }}
+
+{{- define "vtop.tierPodFqdn" -}}
+{{- $root := .root -}}
+{{- printf "%s-%d.%s.%s.svc.%s" (include "vtop.tierName" .) (int .ordinal) (include "vtop.tierHeadlessServiceName" .) $root.Release.Namespace $root.Values.clusterDomain -}}
+{{- end }}
+
+{{/*
+rustls server name for a tier pod: the shared tls.serverName when set,
+otherwise the pod's own FQDN — the same rule as vtop.peerServerName.
+*/}}
+{{- define "vtop.tierServerName" -}}
+{{- if .root.Values.tls.serverName -}}
+{{- .root.Values.tls.serverName -}}
+{{- else -}}
+{{- include "vtop.tierPodFqdn" . -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Selector labels for one tier: the chart's selector labels plus the tier, so
+each StatefulSet, headless Service and PodDisruptionBudget selects exactly
+its own pods while a chart-wide selector (NetworkPolicy, ServiceMonitor)
+still spans both.
+*/}}
+{{- define "vtop.tierSelectorLabels" -}}
+{{ include "vtop.selectorLabels" .root }}
+vtop.allamiro.io/tier: {{ .tier }}
+{{- end }}
+
+{{/*
+The METADATA TIER config for one meta-tier pod ordinal (#287 separated): the
+MetaNodeConfig `vtop-node meta` deserializes, with its own observability
+endpoint — the standalone command owns one, unlike the co-located wrapper.
+Peers are the metadata tier's own pods. Expects (dict "root" $ "ordinal" <int>).
+*/}}
+{{- define "vtop.metaTierConfig" -}}
+{{- $root := .root -}}
+{{- $i := int .ordinal -}}
+{{- $v := $root.Values -}}
+{{- $metaCount := int (include "vtop.metaReplicaCount" $root) -}}
+{{- $clusterId := required "\n\ncluster.id is required: the cluster UUID shared by every node. The chart does not default identities — they must match the certificates you minted." $v.cluster.id -}}
+# Metadata-tier config for pod {{ include "vtop.tierName" (dict "root" $root "tier" "meta") }}-{{ $i }}.
+# Rendered by Helm; the container selects this file by its hostname ordinal.
+# Raft node id = pod ordinal + 1; the peer transport authenticates it against
+# the meta certificate's CN, so node-{{ $i }}.pem in tls.metaSecretName must
+# carry CN={{ add1 $i }}.
+node_id: {{ add1 $i }}
+cluster_id: {{ $clusterId }}
+data_dir: /var/lib/vtop/meta
+peer_listen: "0.0.0.0:{{ $v.ports.metaPeer }}"
+admin_listen: "0.0.0.0:{{ $v.ports.metaAdmin }}"
+# The full voter set, identical on every pod: the binary ignores a node's own
+# entry, and one shared list keeps the rendered configs diffable.
+peers:
+{{- range $j := until $metaCount }}
+  - { id: {{ add1 $j }}, addr: "{{ include "vtop.tierPodFqdn" (dict "root" $root "tier" "meta" "ordinal" $j) }}:{{ $v.ports.metaPeer }}", server_name: "{{ include "vtop.tierServerName" (dict "root" $root "tier" "meta" "ordinal" $j) }}" }
+{{- end }}
+tls:
+  ca: /etc/vtop/tls/meta/ca.pem
+  cert: /etc/vtop/tls/meta/node-{{ $i }}.pem
+  key: /etc/vtop/tls/meta/node-{{ $i }}-key.pem
+timers:
+  election_timeout_min_ms: {{ int $v.meta.timers.electionTimeoutMinMs }}
+  election_timeout_max_ms: {{ int $v.meta.timers.electionTimeoutMaxMs }}
+  heartbeat_interval_ms: {{ int $v.meta.timers.heartbeatIntervalMs }}
+{{- if $v.meta.adminAuthorization.enabled }}
+# Present-but-empty is the STRICTEST policy (nobody may run cluster-scoped
+# commands), absent is authenticate-only — the chart emits exactly what
+# meta.adminAuthorization asked for.
+admin_authorization:
+  operator_common_names: {{ toJson $v.meta.adminAuthorization.operatorCommonNames }}
+{{- end }}
+# This process's own endpoint. Unauthenticated (#78): keep it off public
+# networks (see networkPolicy).
+observability:
+  listen: "0.0.0.0:{{ $v.ports.observability }}"
+{{- end }}
+
+{{/*
+The DATA TIER config for one data-tier pod ordinal (#287 separated): the
+DataNodeConfig `vtop-node data` deserializes, with its own observability
+endpoint. Peers are the data tier's own pods; the lease reaches the METADATA
+tier — its first pod by default, every pod in admin_peers, each dialled at
+its own FQDN with its own certificate name, never a Service name (the same
+per-pod SAN rule the co-located render keeps). Expects (dict "root" $
+"ordinal" <int>).
+*/}}
+{{- define "vtop.dataTierConfig" -}}
+{{- $root := .root -}}
+{{- $i := int .ordinal -}}
+{{- $v := $root.Values -}}
+{{- $metaCount := int (include "vtop.metaReplicaCount" $root) -}}
+{{- $dataCount := int (include "vtop.dataReplicaCount" $root) -}}
+{{- $clusterId := required "\n\ncluster.id is required: the cluster UUID shared by every node. The chart does not default identities — they must match the certificates you minted." $v.cluster.id -}}
+{{- if ne (len (uniq $v.data.nodeUuids)) (len $v.data.nodeUuids) -}}
+{{- fail (printf "\n\ndata.nodeUuids contains duplicates: %v. Each data pod ordinal needs its OWN broker UUID — two pods sharing one identity would present the same identity to the metadata plane and race the same range lease." $v.data.nodeUuids) -}}
+{{- end -}}
+{{- $nodeUuid := index $v.data.nodeUuids $i -}}
+{{- if hasKey $v.data "leaderOrdinal" -}}
+{{- fail "\n\ndata.leaderOrdinal is retired (#284): \"replicated\" renders every pod as a CANDIDATE and the role follows the metadata lease, so failover no longer needs a re-render. Remove the value." -}}
+{{- end -}}
+# Data-tier config for pod {{ include "vtop.tierName" (dict "root" $root "tier" "data") }}-{{ $i }}.
+# Rendered by Helm; the container selects this file by its hostname ordinal.
+{{- if eq $v.data.topology "replicated" }}
+{{- if not $v.data.lease.enabled }}
+{{- fail "\n\ndata.topology \"replicated\" requires data.lease.enabled: candidates acquire the range through the metadata lease (#284). Without it no pod would ever lead." }}
+{{- end }}
+{{- if ne (int $v.data.fencingEpoch) 0 }}
+{{- fail (printf "\n\ndata.fencingEpoch is %d but must be 0 under \"replicated\": candidates learn their epoch from lease grants (minted from 1), and a static floor at or above the first grant refuses it." (int $v.data.fencingEpoch)) }}
+{{- end }}
+role: candidate
+# The SAME list on every data pod, self included — the binary skips its own
+# entry. Each peer is dialled at its OWN FQDN (never a Service name).
+peers:
+{{- range $ordinal := until $dataCount }}
+  - node_uuid: {{ index $v.data.nodeUuids $ordinal }}
+    addr: "{{ include "vtop.tierPodFqdn" (dict "root" $root "tier" "data" "ordinal" $ordinal) }}:{{ $v.ports.replica }}"
+    server_name: "{{ include "vtop.tierServerName" (dict "root" $root "tier" "data" "ordinal" $ordinal) }}"
+{{- end }}
+{{- else }}
+role: standalone
+{{- end }}
+# Must equal the CN of node-{{ $i }}.pem in the data-plane Secret.
+node_uuid: {{ $nodeUuid }}
+cluster_id: {{ $clusterId }}
+data_dir: /var/lib/vtop/data
+fencing_epoch: {{ int $v.data.fencingEpoch }}
+{{- if $v.data.segmentFormat }}
+{{- if not (has $v.data.segmentFormat (list "v1" "v2")) }}
+{{- fail (printf "\n\ndata.segmentFormat must be \"v1\" or \"v2\" (got %q): it is the on-disk format a NEW range is created in, and the binary refuses anything else." $v.data.segmentFormat) }}
+{{- end }}
+segment_format: {{ $v.data.segmentFormat }}
+{{- end }}
+range:
+  topic: {{ required "\n\ndata.range.topic is required: the wire-level topic name this range serves." $v.data.range.topic | quote }}
+  topic_epoch: {{ int $v.data.range.topicEpoch }}
+  range_id: {{ required "\n\ndata.range.rangeId is required: the range UUID (protocol-visible identity; the chart does not invent one)." $v.data.range.rangeId }}
+  range_generation: {{ int $v.data.range.rangeGeneration }}
+segment_id: {{ required "\n\ndata.segmentId is required: the segment UUID (protocol-visible identity; the chart does not invent one)." $v.data.segmentId }}
+native_listen: "0.0.0.0:{{ $v.ports.native }}"
+replica_listen: "0.0.0.0:{{ $v.ports.replica }}"
+replica_tls:
+  ca: /etc/vtop/tls/data/ca.pem
+  cert: /etc/vtop/tls/data/node-{{ $i }}.pem
+  key: /etc/vtop/tls/data/node-{{ $i }}-key.pem
+native_tls:
+  ca: /etc/vtop/tls/data/ca.pem
+  cert: /etc/vtop/tls/data/node-{{ $i }}.pem
+  key: /etc/vtop/tls/data/node-{{ $i }}-key.pem
+# The one client principal the produce/fetch authorizer accepts; never
+# defaulted by the chart (a default principal is a baked-in credential).
+principal_id: {{ required "\n\ndata.principalId is required: the UUID of the one client principal the produce/fetch authorizer accepts (must equal your client certificate's CN). The chart never defaults credentials (issue #81)." $v.data.principalId }}
+{{- if $v.data.lease.enabled }}
+{{- /* Under separated mode the co-located default (this process's own
+       loopback admin listener) names nothing: there is no metadata process
+       in this pod. The default is therefore replaced by the metadata tier's
+       first pod, at its own FQDN so the certificate has a name to verify.
+       Any other value is the operator's explicit choice and is honoured as
+       written — with serverName then theirs to set to match it. */ -}}
+{{- $metaZero := (dict "root" $root "tier" "meta" "ordinal" 0) -}}
+{{- $endpoint := $v.data.lease.adminEndpoint -}}
+{{- $serverName := $v.data.lease.serverName -}}
+{{- if or (not $endpoint) (eq $endpoint "127.0.0.1:9200") -}}
+{{- $endpoint = printf "%s:%d" (include "vtop.tierPodFqdn" $metaZero) (int $v.ports.metaAdmin) -}}
+{{- $serverName = default (include "vtop.tierServerName" $metaZero) $serverName -}}
+{{- else if not $serverName -}}
+{{- fail (printf "\n\ndata.lease.adminEndpoint is %q under separated mode: set data.lease.serverName to the name that endpoint's certificate carries (or leave adminEndpoint at its default to address the metadata tier's first pod)." $endpoint) -}}
+{{- end }}
+# Metadata-driven leadership (#223). The credential is this node's OWN
+# data-plane certificate (CN = node_uuid): the lease names this broker as
+# holder, and admin authorization (#238) refuses any other identity.
+lease:
+  admin_endpoint: "{{ $endpoint }}"
+  server_name: "{{ $serverName }}"
+  topic_uuid: {{ required "\n\ndata.lease.topicUuid is required when data.lease.enabled: metadata's UUID for the topic (NOT data.range.topic, which is the wire name)." $v.data.lease.topicUuid }}
+  tls:
+    ca: /etc/vtop/tls/data/ca.pem
+    cert: /etc/vtop/tls/data/node-{{ $i }}.pem
+    key: /etc/vtop/tls/data/node-{{ $i }}-key.pem
+  lease_duration_ms: {{ int $v.data.lease.leaseDurationMs }}
+  renew_interval_ms: {{ int $v.data.lease.renewIntervalMs }}
+  poll_interval_ms: {{ int $v.data.lease.pollIntervalMs }}
+  # EVERY metadata node, so a redirect can be followed (#292): only the Raft
+  # leader serves a lease read or proposal, and which pod leads is an
+  # election's outcome. Ids are 1-based meta-tier ordinals, matching the
+  # CNs in the metadata Secret.
+  admin_peers:
+{{- range $ordinal := until $metaCount }}
+    - node_id: {{ add1 $ordinal }}
+      endpoint: "{{ include "vtop.tierPodFqdn" (dict "root" $root "tier" "meta" "ordinal" $ordinal) }}:{{ $v.ports.metaAdmin }}"
+      server_name: "{{ include "vtop.tierServerName" (dict "root" $root "tier" "meta" "ordinal" $ordinal) }}"
+{{- end }}
+{{- end }}
+# This process's own endpoint. Unauthenticated (#78): keep it off public
+# networks (see networkPolicy).
+observability:
+  listen: "0.0.0.0:{{ $v.ports.observability }}"
 {{- end }}
 
 {{/*

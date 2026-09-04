@@ -18,6 +18,49 @@ one fate. Default: 3 replicas — the smallest quorum that survives one failure.
 | NetworkPolicy (optional) | Default-deny with the topology's exact allowances. |
 | ServiceMonitor (optional) | Requires the Prometheus Operator CRDs; render fails clearly without them. |
 
+## Deployment mode: co-located, or separated tiers (#287)
+
+`deployment.mode` selects which processes run:
+
+- **`colocated`** (default) — one StatefulSet of `vtop-node node` processes,
+  each hosting a metadata voter AND a data replica. Sized by `replicaCount`;
+  both tiers are the same size by construction. Everything below describes
+  this shape unless it says otherwise.
+- **`separated`** — a metadata tier and a data tier as TWO StatefulSets,
+  sized independently under `deployment.meta.replicaCount` (odd; even counts
+  are refused) and `deployment.data.replicaCount`. This is the split KRaft
+  made for the same reason: a Raft quorum wants to stay small and odd, a
+  data plane grows with the data, and co-location cannot grow one without
+  growing the other.
+
+Under `separated` the chart renders:
+
+| Object | Purpose |
+|---|---|
+| StatefulSet `<fullname>-meta` | `vtop-node meta` voters; PVC `meta`; TLS from `tls.metaSecretName`. |
+| StatefulSet `<fullname>-data` | `vtop-node data` replicas; PVC `data`; TLS from `tls.dataSecretName`. |
+| ConfigMap `<fullname>` | `meta-<ordinal>.yaml` and `data-<ordinal>.yaml`, one per pod of each tier. |
+| Services `<fullname>-meta-headless`, `<fullname>-data-headless` | Per-tier stable pod DNS (`<fullname>-<tier>-<ordinal>.<fullname>-<tier>-headless.<ns>.svc.<domain>`). |
+| Services `<fullname>-meta`, `<fullname>-data` | Per-tier client Services (observability; the admin plane on the meta one behind `service.exposeMetaAdmin`). |
+| PodDisruptionBudgets `<fullname>-meta`, `<fullname>-data` | One budget per tier, so a drain cannot take a voter and a replica together while reporting one unavailable. |
+
+Identity follows the same ordinal rule per tier: meta pod `<i>` is Raft node
+`i+1` with leaf `node-<i>.pem` in the metadata Secret; data pod `<i>` is
+`data.nodeUuids[i]` with leaf `node-<i>.pem` in the data Secret (the list is
+indexed by DATA-tier ordinal and must be exactly `deployment.data.replicaCount`
+long). Every leaf's SAN is that pod's own tier FQDN, as above.
+
+The data tier reaches metadata through the metadata tier's first pod
+(`data.lease.adminEndpoint` at its co-located default is replaced by that
+pod's FQDN, so the certificate has a name to verify) and carries every
+metadata pod in `admin_peers` so a redirect to the Raft leader is followed.
+Set `adminEndpoint` to anything else and `data.lease.serverName` becomes
+yours to set to match it.
+
+Release names are capped at 49 characters under `separated` (the tier
+Services append `-data-headless` inside the 63-character label budget);
+`fullnameOverride` shortens one that does not fit.
+
 ## How a pod knows who it is (ordinal → identity)
 
 A StatefulSet pod's hostname is `<statefulset>-<ordinal>`. The container's
