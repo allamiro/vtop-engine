@@ -230,16 +230,18 @@ protocol state machine (protocol §12).
 7. **verification failure prevents source commit** — the batch never advances to
    SOURCE_COMMITTED.
 
-**Verification strength (current code):** the engine supports **strong**
-(stored-content/service-computed checksum) and **backend-limited** (size /
-existence only) verification, the classes of protocol §17. Strong
-verification defaults on. `upload.require_strong_verification: false` is an
-explicit compatibility/lab opt-out that allows a backend-limited result to
-commit. `checksum.algorithm: none` verifies size and existence only and is
-classified backend-limited for the same reason — so under the default,
-batches produced with checksums disabled **refuse to commit**, and running
-that way requires both opt-outs deliberately: the algorithm choice and the
-strength opt-out, each visible in configuration.
+**Verification strength (current code):** protocol §17 names three classes —
+**strong** (stored-content/service-computed checksum), **backend-limited**
+(size/existence only), and **disabled checksum** (size-only by configuration,
+the weakest, an explicit opt-in). The engine's verification result carries a
+single strength flag, so the code REPORTS the third class through the same
+flag as the second: `checksum.algorithm: none` verifies size and existence
+only and surfaces as a backend-limited result. Strong verification defaults
+on, and `upload.require_strong_verification: false` is the explicit
+compatibility/lab opt-out that allows a non-strong result to commit — so
+under the default, batches produced with checksums disabled **refuse to
+commit**, and running that way requires both opt-outs deliberately: the
+algorithm choice and the strength opt-out, each visible in configuration.
 
 **ETag caveat:** S3 multipart ETags are **not** reliable MD5 checksums. The
 authoritative integrity value is VTOP's own **SHA-256/BLAKE3 manifest checksum**,

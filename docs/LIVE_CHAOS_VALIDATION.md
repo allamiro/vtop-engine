@@ -131,9 +131,10 @@ production cluster daemon.
 - Scenario 03 validates metadata voter replacement, and only that. The
   #180/#181 replacement-proof lifecycle for a sealed DATA replica is
   exercised end to end by scenario 12 — operator-driven, through
-  `vtopctl node repair` — so what remains unproven is narrower than it
-  used to be: automated repair with no operator in the loop, and the
-  active-tail gap scenario 12 itself documents as the #306 boundary.
+  `vtopctl node repair --seal-tail`, which seals the leader's active tail
+  into the transferable prefix and asserts the repaired replica holds the
+  full acknowledged floor (the closure #306 tracked) — so the one thing
+  still unproven here is automated repair with no operator in the loop.
 - The native data plane has quorum replication but no live leader election.
   Scenario 04 therefore proves acknowledged durability and same-directory
   recovery, not automatic data-plane failover.
