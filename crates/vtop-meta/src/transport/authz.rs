@@ -118,6 +118,12 @@ pub fn classify(command: &MetadataCommand) -> (CommandClass, Option<Uuid>) {
         }
         | MetadataCommand::RenewRangeLease {
             holder_node_uuid, ..
+        }
+        // A holder reports on its own grant and nobody else's (#240 item 5):
+        // the record is evidence about what THIS node proved, so the only
+        // identity that may fill it in is the one it was granted to.
+        | MetadataCommand::ReportPromotionOutcome {
+            holder_node_uuid, ..
         } => (CommandClass::NodeScoped, Some(*holder_node_uuid)),
         _ => (CommandClass::ClusterScoped, None),
     }

@@ -935,6 +935,19 @@ impl InProcessFollower {
             .committed_offset()
     }
 
+    /// Where this follower's sealed prefix ends (#306): the next offset of
+    /// its last sealed segment, `None` with nothing sealed. For the
+    /// transition record a promotion from this replica reports (#240).
+    pub fn sealed_prefix_end(&self) -> Option<u64> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .segment
+            .sealed()
+            .last()
+            .map(|reader| reader.next_offset())
+    }
+
     pub fn next_offset(&self) -> u64 {
         self.state
             .lock()

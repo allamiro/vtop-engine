@@ -39,9 +39,10 @@ pub mod transport;
 mod wire;
 
 pub use command::{
-    CommandEnvelope, MetadataCommand, MetadataError, MetadataResponse, NodeState, RangeAssignment,
-    VerificationMethod, MAX_ASSIGNED_RANGES, MAX_ERROR_DETAIL_BYTES, MAX_NODE_ADDR_BYTES,
-    MAX_TIER_BACKEND_ID_BYTES, MAX_TIER_OBJECT_URI_BYTES, MAX_TIER_VERSION_ID_BYTES,
+    CommandEnvelope, MetadataCommand, MetadataError, MetadataResponse, NodeState, PromotionOutcome,
+    PromotionRefusal, QuorumAnswer, RangeAssignment, VerificationMethod, MAX_ASSIGNED_RANGES,
+    MAX_ERROR_DETAIL_BYTES, MAX_NODE_ADDR_BYTES, MAX_TIER_BACKEND_ID_BYTES,
+    MAX_TIER_OBJECT_URI_BYTES, MAX_TIER_VERSION_ID_BYTES, MAX_TRANSITION_QUORUM,
 };
 pub use keys::{
     validate_group_name, validate_topic_name, MetaKey, MetaNodeId, MAX_GROUP_NAME_BYTES,
@@ -58,11 +59,11 @@ pub use raft::{
     RaftServerState, ReadFence, TlsRaftNetworkFactory,
 };
 pub use state::{
-    ConsumerGroupRecord, CursorCheckpointRecord, GroupMemberRecord, GroupNameRecord, KeyRecord,
-    KeyState, LeaseRecord, MetaStateMachine, MetaValue, NodeRecord, RangeRecord,
-    RebalanceIntentRecord, ReplacementProofRecord, SegmentPlacementRecord, SegmentRecord,
-    SegmentState, TierCopyRecord, TopicNameRecord, TopicRecord, TopicRetentionPolicyRecord,
-    DEDUP_CAPACITY,
+    ConsumerGroupRecord, CursorCheckpointRecord, GrantKind, GroupMemberRecord, GroupNameRecord,
+    KeyRecord, KeyState, LeaseRecord, MetaStateMachine, MetaValue, NodeRecord, RangeRecord,
+    RangeTransitionRecord, RebalanceIntentRecord, ReplacementProofRecord, SegmentPlacementRecord,
+    SegmentRecord, SegmentState, TierCopyRecord, TopicNameRecord, TopicRecord,
+    TopicRetentionPolicyRecord, TransitionOutcome, DEDUP_CAPACITY,
 };
 pub use storage::hardstate::{HardState, HardStateFile};
 pub use storage::log::{
@@ -74,8 +75,9 @@ pub use storage::snapshot::{MetaSnapshots, SnapshotMeta};
 pub use storage::{MetaStorage, MetaStorageConfig, MetaStoreError, MetaStoreResult};
 pub use transport::{
     resolve_endpoint, AdminCandidate, AdminClient, AdminHandler, AdminLeaseView,
-    AdminProposeResponse, AdminReadRangeLeaseRequest, AdminReadRangeLeaseResponse, AdminServer,
-    AdminStatusResponse, PeerClient, PeerRpcHandler, PeerServer, TlsMaterial, TransportError,
-    TransportResult, VtpmFrame, WireLogId,
+    AdminProposeResponse, AdminReadRangeLeaseRequest, AdminReadRangeLeaseResponse,
+    AdminReadRangeTransitionsRequest, AdminReadRangeTransitionsResponse, AdminServer,
+    AdminStatusResponse, AdminTransitionView, PeerClient, PeerRpcHandler, PeerServer, TlsMaterial,
+    TransportError, TransportResult, VtpmFrame, WireLogId,
 };
 pub use wire::CodecError;

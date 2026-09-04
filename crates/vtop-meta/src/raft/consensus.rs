@@ -16,8 +16,9 @@ use crate::raft::type_config::{MetaRaftTypeConfig, NodeId};
 use crate::state::MetaValue;
 use crate::transport::admin::AdminHandler;
 use crate::transport::wire::{
-    AdminLeaseView, AdminReadRangeLeaseResponse, AdminReadSegmentPlacementResponse,
-    AdminRebalanceIntentView, AdminSegmentView,
+    AdminLeaseView, AdminReadRangeLeaseResponse, AdminReadRangeTransitionsResponse,
+    AdminReadSegmentPlacementResponse, AdminRebalanceIntentView, AdminSegmentView,
+    AdminTransitionView, MAX_TRANSITIONS_PER_READ,
 };
 use crate::transport::wire::{
     AdminMembershipResponse, AdminProposeResponse, AdminStatusResponse, TransportError,
@@ -143,11 +144,28 @@ pub struct OpenraftConsensus {
     /// keep working; a read against one of those reports the store as
     /// unavailable rather than inventing an answer.
     store: Option<MetaRaftStore>,
+    /// The key transition statements are signed with when served (#240 item
+    /// 5). `None` serves them unsigned — stated on the wire as an absent
+    /// MAC, never as a MAC of nothing. Installed after construction because
+    /// the node resolves it from its environment once the store is open.
+    transition_mac_key: std::sync::RwLock<Option<[u8; 32]>>,
 }
 
 impl OpenraftConsensus {
     pub fn new(raft: MemRaft) -> Self {
-        Self { raft, store: None }
+        Self {
+            raft,
+            store: None,
+            transition_mac_key: std::sync::RwLock::new(None),
+        }
+    }
+
+    /// Sign served transition statements with `key` from now on.
+    pub fn set_transition_mac_key(&self, key: [u8; 32]) {
+        *self
+            .transition_mac_key
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(key);
     }
 
     /// Attach the applied state so this node can serve linearizable reads.
@@ -256,6 +274,84 @@ impl AdminReadRangeLease for OpenraftConsensus {
                 },
             }
         }))
+    }
+}
+
+/// Linearizable transition-chain read (#240 item 5), its own trait for the
+/// same reason the lease read is.
+#[async_trait]
+pub trait AdminReadRangeTransitions: Send + Sync {
+    async fn read_range_transitions(
+        &self,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        from_epoch: u64,
+        limit: u16,
+    ) -> ConsensusResult<AdminReadRangeTransitionsResponse>;
+}
+
+#[async_trait]
+impl AdminReadRangeTransitions for OpenraftConsensus {
+    async fn read_range_transitions(
+        &self,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        from_epoch: u64,
+        limit: u16,
+    ) -> ConsensusResult<AdminReadRangeTransitionsResponse> {
+        let Some(store) = self.store.as_ref() else {
+            return Err(ConsensusError::Message(
+                "this node was built without applied state and cannot serve reads".to_owned(),
+            ));
+        };
+        // Fence FIRST, as every admin read does: a chain served from a
+        // lagging copy could be missing its newest link, and "the record is
+        // not there" is exactly the observation this evidence exists to make
+        // meaningful.
+        self.raft
+            .ensure_linearizable()
+            .await
+            .map_err(classify_read_error)?;
+        // The caller's maximum, capped at the page bound; zero is zero
+        // (review) — a maximum is not a hint.
+        let limit = usize::from(limit).min(MAX_TRANSITIONS_PER_READ);
+        let key = *self
+            .transition_mac_key
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        store.with_storage(|storage| {
+            let read_at_applied_index = storage.last_applied();
+            let state = storage.state();
+            let found = matches!(
+                state.record(&MetaKey::Range {
+                    topic_uuid,
+                    range_uuid,
+                }),
+                Some(MetaValue::Range(_))
+            );
+            let mut transitions = Vec::new();
+            for record in state.range_transitions(topic_uuid, range_uuid, from_epoch, limit) {
+                // Signed HERE, at the serving path, over the key the read
+                // was for plus the canonical bytes the snapshot carries —
+                // see RangeTransitionRecord::mac for why not in apply.
+                let mac = match key {
+                    Some(key) => {
+                        Some(record.mac(&key, topic_uuid, range_uuid).map_err(|error| {
+                            ConsensusError::Message(format!("sign transition: {error}"))
+                        })?)
+                    }
+                    None => None,
+                };
+                let mut view = AdminTransitionView::from(record);
+                view.mac = mac;
+                transitions.push(view);
+            }
+            Ok(AdminReadRangeTransitionsResponse {
+                found,
+                transitions,
+                read_at_applied_index,
+            })
+        })
     }
 }
 
@@ -578,6 +674,21 @@ impl AdminHandler for OpenraftConsensus {
         AdminReadRangeLease::read_range_lease(self, request.topic_uuid, request.range_uuid)
             .await
             .map_err(to_transport_error)
+    }
+
+    async fn read_range_transitions(
+        &self,
+        request: crate::transport::wire::AdminReadRangeTransitionsRequest,
+    ) -> TransportResult<AdminReadRangeTransitionsResponse> {
+        AdminReadRangeTransitions::read_range_transitions(
+            self,
+            request.topic_uuid,
+            request.range_uuid,
+            request.from_epoch,
+            request.limit,
+        )
+        .await
+        .map_err(to_transport_error)
     }
 
     async fn read_segment_placement(

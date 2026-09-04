@@ -877,7 +877,10 @@ async fn run_leader(
                 &broker,
             ))),
             promotion_probe,
-        )?;
+        )?
+        // The standalone case has no probe to carry this node's view, and
+        // its transition record still wants the sealed prefix (#240 item 5).
+        .with_local_view(Arc::clone(&broker) as Arc<dyn crate::lease_agent::CandidateLocalView>);
         agent_task = Some(tokio::spawn(agent.run(release_lease_rx)));
         // The agent abandons its round the moment the release fires (#408),
         // so the worst remaining chain is the shutdown path's own RPCs: the
@@ -2401,6 +2404,14 @@ impl crate::lease_agent::CandidateLocalView for SwitchingLocalView {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
             .map_or_else(Vec::new, |view| view.epoch_starts())
+    }
+
+    fn sealed_prefix_end(&self) -> Option<u64> {
+        self.delegate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(|view| view.sealed_prefix_end())
     }
 }
 

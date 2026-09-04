@@ -1763,6 +1763,9 @@ fn print_response(response: &MetadataResponse) {
         } => println!(
             "topic_created uuid={topic_uuid} epoch={topic_epoch} root_range={root_range_uuid}"
         ),
+        MetadataResponse::TransitionRecorded { fencing_epoch } => {
+            println!("transition recorded fencing_epoch={fencing_epoch}")
+        }
         MetadataResponse::LeaseGranted { fencing_epoch } => {
             println!("lease_granted fencing_epoch={fencing_epoch}")
         }
