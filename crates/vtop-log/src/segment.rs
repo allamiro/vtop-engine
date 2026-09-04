@@ -2771,7 +2771,15 @@ pub(crate) fn rebuild_empty_successor_commit(
                         min_valid_json_len: smallest_valid.len() - 12 - crate::codec::CHECKSUM_LEN,
                         max_valid_json_len: widest_valid.len() - 12 - crate::codec::CHECKSUM_LEN,
                     };
-                    (bytes.len() as u64) < template.len() as u64
+                    // Shorter than every VALID complete successor, not
+                    // merely than the all-ones shape (review, round
+                    // thirteen): a torn write of the smallest
+                    // validator-accepted config missing only its last
+                    // checksum bytes is longer than the deliberately
+                    // invalid narrowest template, and the old gate
+                    // quarantined it before the prefix checks could prove
+                    // it torn.
+                    (bytes.len() as u64) < smallest_valid.len() as u64
                         && torn_prefix_matches_template(
                             &bytes,
                             &template,
