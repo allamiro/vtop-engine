@@ -2279,13 +2279,15 @@ pub struct ServerTlsMaterial {
     pub client_roots: rustls::RootCertStore,
 }
 
-/// Maps an authenticated TLS certificate chain and declared principal to the
-/// narrow role allowed on a session. The server has no permissive fallback:
-/// callers must supply an authorization policy explicitly.
 /// One native session's transport: TLS or, on a plaintext plane, the bare
 /// socket (#294). The session code is written once against this.
 type NativeStream = vtop_meta::transport::MaybeTls<TcpStream>;
 
+/// Maps an authenticated TLS certificate chain and declared principal to the
+/// narrow role allowed on a session. The server has no permissive fallback:
+/// callers must supply an authorization policy explicitly — and, for a
+/// plaintext plane, a second one, since there the declared principal is
+/// all there is to go on.
 pub trait SessionAuthorizer: Send + Sync + 'static {
     fn authorize(&self, peer_chain_der: &[Vec<u8>], principal_id: Uuid, role: Role) -> bool;
 
@@ -2789,21 +2791,26 @@ async fn serve_connection(
         metrics.session_refused_handshake();
         return Ok(());
     };
-    let authorized = if stream.is_encrypted() {
-        authorizer.authorize(&peer_chain_der, hello.principal_id, hello.role)
+    let (authorized, refusal) = if stream.is_encrypted() {
+        (
+            authorizer.authorize(&peer_chain_der, hello.principal_id, hello.role),
+            "certificate is not authorized for the requested principal and role",
+        )
     } else {
-        authorizer.authorize_unverified(hello.principal_id, hello.role)
+        // Say what was actually judged: there is no certificate on a
+        // plaintext plane, and telling the client one was refused would
+        // send it looking for a problem it does not have.
+        (
+            authorizer.authorize_unverified(hello.principal_id, hello.role),
+            "plaintext session: the declared principal and role are not accepted without a \
+             certificate",
+        )
     };
     if !authorized {
         metrics.session_refused_unauthorized();
         write_session_frame(
             &mut stream,
-            &error(
-                0,
-                0,
-                ErrorCode::Unauthorized,
-                "certificate is not authorized for the requested principal and role",
-            ),
+            &error(0, 0, ErrorCode::Unauthorized, refusal),
             initial_limits,
             config.idle_timeout,
         )
@@ -4518,17 +4525,21 @@ mod tests {
         let (_stream, response) =
             open_plaintext_and_hello(address, cluster_id, principal_id, Role::Producer, limits)
                 .await;
-        assert!(
-            matches!(
-                response.message,
-                Message::Error(ErrorResponse {
-                    code: ErrorCode::Unauthorized,
-                    ..
-                })
+        match response.message {
+            Message::Error(ErrorResponse {
+                code: ErrorCode::Unauthorized,
+                message,
+                ..
+            }) => assert!(
+                message.contains("plaintext session") && !message.contains("certificate is not"),
+                "the refusal must describe what was judged — a bare declaration, not a \
+                 certificate: {message}"
             ),
-            "the right principal, but nothing proves it and the authorizer never said that \
-             was acceptable: {response:?}"
-        );
+            other => panic!(
+                "the right principal, but nothing proves it and the authorizer never said that \
+                 was acceptable: {other:?}"
+            ),
+        }
         shutdown_tx.send(()).unwrap();
         server_task.await.unwrap().unwrap();
     }
