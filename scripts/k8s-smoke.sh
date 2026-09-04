@@ -125,6 +125,113 @@ whether the StatefulSet created anything is unknown"
   fail "namespace $1 never produced $2 pod(s) in 120s; the StatefulSet did not create them"
 }
 
+# The kube-DNS readiness gate (#416). Pod readiness proves a pod can serve;
+# it proves nothing about whether that pod's PEERS can spell its name. Three
+# CI failures in one day showed both shapes the gap takes on kind: headless
+# names that never resolve before readiness (a rejoin that times out), and a
+# Ready pod whose record its peers still cannot look up — replication to it
+# silently stalls at whatever it last applied, and the verify downstream
+# blames the replica. So every readiness wait for this release is followed by
+# this gate, which asks the only authority that matters — glibc inside each
+# pod, through the same resolv.conf the node process resolves with — and asks
+# EVERY pod about EVERY peer, because the record one pod's query finds says
+# nothing about the cache another pod's query lands on.
+# Settled means resolved to the pod's CURRENT address, not merely resolved
+# (review): across a pod recreation a cached positive answer can hand a peer
+# the DEAD pod's IP with a success exit code, which is precisely the
+# occurrence-three stall this gate exists to catch — so each answer is
+# compared against the target's live status.podIP.
+#
+# Attribution, the `await_pods_exist` rule applied three ways (review): a
+# hung LOOKUP is a DNS verdict — the resolver stalling is a way DNS fails —
+# so the lookup is bounded REMOTELY and reports its own exit code through
+# the sentinel; an exec that dies without delivering the remote shell's
+# output at all is the API path's failure, not DNS's; and a target with no
+# podIP yet is a pod that is not scheduled or started, which is neither.
+# Three lists, three names in the report, no component blamed unobserved.
+#
+# Wall-clock bounded, not round-counted (review): with every probe hanging,
+# sixty rounds of six 15-second timeouts would run ~90 minutes — past the CI
+# job's own ceiling, so the diagnostics below would never print. The
+# deadline keeps the worst case inside the budget the surrounding readiness
+# waits already set.
+await_peer_dns() { # namespace
+  peer_ns="$1"
+  unresolved=""
+  unprobed=""
+  unaddressed=""
+  gate_deadline=$((SECONDS + 240))
+  while [ "$SECONDS" -lt "$gate_deadline" ]; do
+    unresolved=""
+    unprobed=""
+    unaddressed=""
+    # Success needs a COMPLETE round (review): the mid-round deadline breaks
+    # below leave the lists exactly as far as the round got, and empty lists
+    # from a round that skipped its remaining probes are absence of
+    # evidence, not evidence — a gate that returned 0 there would wave
+    # through the very failure it was still measuring.
+    round_complete=1
+    for name in 0 1 2; do
+      # Re-checked inside the round too (review): with every remote call
+      # hanging, one full round costs ~105s of bounded timeouts, and a
+      # deadline probed only between rounds would overrun its own claim by
+      # most of a round. Past the deadline the round stops where it stands
+      # — at most one bounded probe late.
+      [ "$SECONDS" -lt "$gate_deadline" ] || { round_complete=0; break; }
+      want="$(timeout 15 kubectl -n "$peer_ns" get pod "${REL}-${name}" \
+        -o jsonpath='{.status.podIP}' 2>/dev/null || true)"
+      if [ -z "$want" ]; then
+        unaddressed="$unaddressed ${REL}-${name}"
+        continue
+      fi
+      peer_fqdn="${REL}-${name}.${HEADLESS}.${peer_ns}.svc.${DOMAIN}"
+      for probe in 0 1 2; do
+        [ "$probe" = "$name" ] && continue
+        [ "$SECONDS" -lt "$gate_deadline" ] || { round_complete=0; break; }
+        answer="$(timeout 15 kubectl -n "$peer_ns" exec "${REL}-${probe}" -- \
+          sh -c "timeout 10 getent hosts ${peer_fqdn} || echo miss:\$?" 2>/dev/null || true)"
+        case "$answer" in
+          "")
+            unprobed="$unprobed ${REL}-${probe}->${REL}-${name}"
+            ;;
+          miss:*)
+            # miss:2 is name-not-found; miss:124 is the remote lookup's own
+            # timeout — a hung resolver, still a DNS verdict.
+            unresolved="$unresolved ${REL}-${probe}->${REL}-${name}(${answer})"
+            ;;
+          *)
+            got="${answer%%[[:space:]]*}"
+            [ "$got" = "$want" ] \
+              || unresolved="$unresolved ${REL}-${probe}->${REL}-${name}(stale:${got}!=${want})"
+            ;;
+        esac
+      done
+    done
+    [ "$round_complete" = 1 ] && [ -z "${unresolved}${unprobed}${unaddressed}" ] && return 0
+    sleep 2
+  done
+  # Self-diagnosing on failure, per #324's rule: each list under its own
+  # name, plus the two components that could be responsible, so a CI
+  # recurrence carries its own evidence instead of a bare timeout. The dumps
+  # ride the same bound as the probes — kubectl's own --request-timeout
+  # defaults to never, and a diagnostic that hangs eats the attribution it
+  # exists to print (review).
+  timeout 15 kubectl -n "$peer_ns" get endpointslices 2>/dev/null || true
+  timeout 15 kubectl -n kube-system get pods -l k8s-app=kube-dns 2>/dev/null || true
+  # No failed lookup means NO DNS VERDICT (review): if everything that ran
+  # resolved correctly, blaming DNS would accuse the one component that was
+  # observed working. The bare-DNS message speaks only when a lookup failed.
+  [ -n "$unresolved" ] || fail "peer DNS in ${peer_ns} could not be OBSERVED before the gate's \
+deadline: every lookup that completed resolved correctly, so this is an API or scheduling \
+verdict, not a DNS one (#416):\
+${unaddressed:+ targets with no podIP:${unaddressed};}\
+${unprobed:+ probes that never completed:${unprobed};}"
+  fail "headless DNS never settled in ${peer_ns} within its deadline (#416):\
+${unresolved:+ unresolved lookups:${unresolved};}\
+${unaddressed:+ targets with no podIP — not scheduled/started, or the query failed:${unaddressed};}\
+${unprobed:+ probes that never completed — the exec/API path, not a DNS verdict:${unprobed};}"
+}
+
 # ---------------------------------------------------------------------------
 # Identities. The chart refuses to render without them by design (#81), so a
 # smoke test has to mint a real CA and per-ordinal leaves with the CNs and SANs
@@ -196,6 +303,9 @@ kubectl -n "$NS" wait --for=condition=ready pod -l "app.kubernetes.io/instance=$
     fail "pods never became Ready"
   }
 log "all pods Ready"
+log "gating on headless DNS: every pod must resolve every peer (#416)"
+await_peer_dns "$NS"
+log "peer DNS settled"
 
 # ---------------------------------------------------------------------------
 log "bootstrapping the metadata Raft group"
@@ -688,6 +798,9 @@ kubectl -n "$REPLICATED_NS" wait --for=condition=ready pod -l "app.kubernetes.io
     for o in 0 1 2; do echo "--- ${REL}-$o ---"; kubectl -n "$REPLICATED_NS" logs "${REL}-$o" --tail=30 || true; done
     fail "the replicated range never became Ready"
   }
+log "gating on the replicated range's headless DNS (#416)"
+await_peer_dns "$REPLICATED_NS"
+log "replicated peer DNS settled"
 
 # WHICH POD HOLDS THE RANGE IS AN ELECTION'S OUTCOME, NOT A RENDERED FACT.
 # The chart used to freeze the leader at ordinal 0, so this test could aim
@@ -990,6 +1103,14 @@ nothing is known about the recreated pod"
   fi
 }
 log "the deleted pod rejoined; all three replicas are Ready again"
+
+# The second gate is the one occurrence three taught: the recreated pod was
+# Ready, but its peers could not resolve its NEW record, so replication to it
+# stalled and the convergence check below blamed the replica. Readiness and
+# resolvability move independently across a pod recreation — gate on both.
+log "gating on post-failover headless DNS: peers must resolve the recreated pod (#416)"
+await_peer_dns "$REPLICATED_NS"
+log "post-failover peer DNS settled"
 
 # Every replica — INCLUDING the recreated pod — converges on the full total:
 # the 60 pre-delete records survived the failover, the 30 post-failover
