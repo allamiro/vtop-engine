@@ -375,10 +375,10 @@ flagged and collected below the tables.
 
 | Family | Stack | Function | Class |
 |---|---|---|---|
-| Cluster-plane TLS (admin, Raft peer, replica, native client) | rustls 0.23, **ring pinned at every construction site**, TLS 1.3 only, mutual, CN identity via `x509-parser` after chain validation | peer authentication, confidentiality, authorization input (CN is a Raft **safety** input on the peer plane) | security function |
+| Cluster-plane TLS (admin, Raft peer, replica, native client) | rustls 0.23, **ring pinned at every construction site**, TLS 1.3 only, mutual; CN identity via `x509-parser` after chain validation on the admin, Raft-peer and replica planes — the native-client plane never parses the subject (Q3 below) | peer authentication, confidentiality; authorization input where the CN is read (CN is a Raft **safety** input on the peer plane) — native sessions match the declared hello principal against config, not the certificate | security function |
 | Kafka source transport | librdkafka (vendored C, cmake) + **system OpenSSL** (`ssl`) + **system Cyrus SASL** (`sasl`) | broker TLS + SASL auth; plaintext unless configured (SHOULD-level, §2); missing password env is a hard startup error, never a silent downgrade | security function |
 | S3 upload transport + signing | AWS SDK: hyper 1 + hyper-rustls + rustls 0.23 with the SDK's **aws-lc-rs** provider, system roots; SigV4 HMAC-SHA-256 (SigV4a/P-256 available, never explicitly invoked) | endpoint TLS (scheme floor via `verify_tls`; cert verification not disableable) and per-request authentication | security function |
-| Postgres state store (`--features postgres`) | sqlx with `tls-rustls-ring-webpki` (the one place the workspace picks the stack); SCRAM-SHA-256 auth with ChaCha CSPRNG nonces | verify-full floor for remote hosts (§2, MUST); database authentication | security function |
+| Postgres state store (`--features postgres`) | sqlx with `tls-rustls-ring-webpki` (the one place the workspace picks the stack); SCRAM-SHA-256 auth with ChaCha CSPRNG nonces — but the **server** chooses the method: sqlx also answers legacy `md5` (and cleartext) password requests, with no client-side way to refuse | verify-full floor for remote hosts (§2, MUST); database authentication | security function |
 | Release supply chain | cosign keyless (Sigstore), SPDX SBOM, provenance, SHA256SUMS | image + artifact authenticity; SHA256SUMS alone is integrity only, and the release notes say so | security function |
 | Test-only material | `rcgen` (dev-deps), ECDSA P-256 + SHA-256 cert minting in `gen-certs.sh` / `k8s-smoke.sh`, PEM key loading (`TlsMaterial::from_pem_files`) as the production ingestion boundary | throwaway harness PKI; production operators bring their own PEM | security function (test scope) |
 
@@ -386,8 +386,17 @@ Two rustls crypto providers coexist in the tree by design: **ring** (pinned
 explicitly at every cluster-plane construction site, precisely because
 feature unification pulls aws-lc-rs into the lockfile) and the AWS SDK's
 own default for S3. First-party code contains **no HMAC, no SHA-1, no MD5**;
-those appear only inside the delegated stacks above. At-rest encryption is
-delegated to the storage layer (§7).
+those appear only inside the delegated stacks above. Of the delegated
+stacks, only the Postgres client will actually execute MD5 as an
+authentication primitive, and only when the server requests it. Closing
+that path is a server-side, two-part job: restrict the relevant
+`pg_hba.conf` rules to `scram-sha-256` (the HBA method chooses the
+exchange) and rotate any password set before the switch to
+`password_encryption = scram-sha-256` — that setting governs only how
+NEW passwords are stored, so a legacy MD5 verifier keeps the legacy
+exchange alive until its password is reset. A FIPS-shaped deployment
+does both, and only then can the MD5 path never be offered. At-rest
+encryption is delegated to the storage layer (§7).
 
 ### 16.3 The questions this inventory exists to ask
 
