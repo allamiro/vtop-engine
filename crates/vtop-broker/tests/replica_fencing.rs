@@ -18,6 +18,7 @@
 use std::sync::Arc;
 use tempfile::TempDir;
 use uuid::Uuid;
+use vtop_broker::committed_floor::CommittedFloorFile;
 use vtop_broker::fencing_epochs::{EpochStart, FencingEpochJournal};
 use vtop_broker::replication::{ClusterCommittedOffset, InProcessFollower};
 use vtop_broker::{MetaFencingEpoch, ProducerEpochJournal};
@@ -25,7 +26,9 @@ use vtop_log::{
     ActiveSegment, Durability, KeyRange, LogRecord, RangeLineage, RetentionPolicy, SegmentConfig,
     SegmentDescriptor, SegmentSet,
 };
-use vtop_protocol::{ErrorCode, ProduceRecord, RangeIdentity, ReplicaAppendRequest};
+use vtop_protocol::{
+    CommittedHwmUpdate, ErrorCode, ProduceRecord, RangeIdentity, ReplicaAppendRequest,
+};
 
 const FOLLOWER: Uuid = Uuid::from_u128(0xA2);
 const OLD_LEADER: Uuid = Uuid::from_u128(0xA1);
@@ -42,6 +45,21 @@ fn range_identity() -> RangeIdentity {
     }
 }
 
+fn descriptor_for(range: &RangeIdentity, segment_id: u128) -> SegmentDescriptor {
+    SegmentDescriptor {
+        segment_id: Uuid::from_u128(segment_id),
+        topic: range.topic.clone(),
+        topic_epoch: range.topic_epoch,
+        lineage: RangeLineage {
+            range_id: range.range_id,
+            generation: range.range_generation,
+            key_range: KeyRange::full(),
+            parents: Vec::new(),
+        },
+        base_offset: 0,
+    }
+}
+
 struct Harness {
     _dir: TempDir,
     range: RangeIdentity,
@@ -52,21 +70,9 @@ struct Harness {
 fn follower() -> Harness {
     let range = range_identity();
     let dir = tempfile::tempdir().unwrap();
-    let descriptor = SegmentDescriptor {
-        segment_id: Uuid::from_u128(0xE1),
-        topic: range.topic.clone(),
-        topic_epoch: range.topic_epoch,
-        lineage: RangeLineage {
-            range_id: range.range_id,
-            generation: range.range_generation,
-            key_range: KeyRange::full(),
-            parents: Vec::new(),
-        },
-        base_offset: 0,
-    };
     let segment = ActiveSegment::create(
         dir.path().join("range.active"),
-        descriptor,
+        descriptor_for(&range, 0xE1),
         SegmentConfig::default(),
     )
     .unwrap();
@@ -94,9 +100,14 @@ fn follower() -> Harness {
     }
 }
 
-fn append_at(h: &Harness, epoch: u64, leader: Uuid, offset: u64) -> Result<(), ErrorCode> {
-    let request = ReplicaAppendRequest {
-        range: h.range.clone(),
+fn append_request(
+    range: &RangeIdentity,
+    epoch: u64,
+    leader: Uuid,
+    offset: u64,
+) -> ReplicaAppendRequest {
+    ReplicaAppendRequest {
+        range: range.clone(),
         fencing_epoch: epoch,
         leader_node_id: leader,
         expected_base_offset: offset,
@@ -108,8 +119,45 @@ fn append_at(h: &Harness, epoch: u64, leader: Uuid, offset: u64) -> Result<(), E
             key: b"k".to_vec(),
             value: format!("v{offset}").into_bytes(),
         }],
-    };
-    h.node.apply_append(&request).map(|_| ()).map_err(|e| e.0)
+    }
+}
+
+fn append_at(h: &Harness, epoch: u64, leader: Uuid, offset: u64) -> Result<(), ErrorCode> {
+    h.node
+        .apply_append(&append_request(&h.range, epoch, leader, offset))
+        .map(|_| ())
+        .map_err(|e| e.0)
+}
+
+/// Rebuild a follower over `dir` exactly as `data_node` does after a
+/// restart: journals reopened from disk, the cluster-committed cell seeded
+/// from the committed-floor file, and the file handed back for further
+/// persists. This is the injection point the restart tests below exercise —
+/// nothing in memory survives into what this returns.
+fn follower_via_the_real_open_path(
+    dir: &TempDir,
+    range: &RangeIdentity,
+    meta: &MetaFencingEpoch,
+    segment: impl Into<SegmentSet>,
+) -> Arc<InProcessFollower> {
+    let committed_floor = CommittedFloorFile::open(dir.path().join("committed-floor"));
+    let node = Arc::new(
+        InProcessFollower::new(
+            FOLLOWER,
+            segment,
+            ProducerEpochJournal::open(dir.path().join("epochs")).unwrap(),
+            range.clone(),
+            OLD_EPOCH,
+            meta.clone(),
+            ClusterCommittedOffset::new(committed_floor.floor()),
+        )
+        .unwrap(),
+    );
+    node.set_fencing_epoch_journal(
+        FencingEpochJournal::open(dir.path().join("fencing-epochs")).unwrap(),
+    );
+    node.set_committed_floor(committed_floor);
+    node
 }
 
 /// The point of the whole thing: after fencing, the deposed leader's appends
@@ -300,18 +348,7 @@ fn a_diverged_replica_discards_the_deposed_leaders_records_while_fenced() {
 fn a_divergence_below_the_retained_base_does_not_fail_the_fence() {
     let range = range_identity();
     let dir = tempfile::tempdir().unwrap();
-    let descriptor = SegmentDescriptor {
-        segment_id: Uuid::from_u128(0xE7),
-        topic: range.topic.clone(),
-        topic_epoch: range.topic_epoch,
-        lineage: RangeLineage {
-            range_id: range.range_id,
-            generation: range.range_generation,
-            key_range: KeyRange::full(),
-            parents: Vec::new(),
-        },
-        base_offset: 0,
-    };
+    let descriptor = descriptor_for(&range, 0xE7);
     let config = SegmentConfig {
         max_record_bytes: 256,
         max_group_bytes: 512,
@@ -554,5 +591,415 @@ fn a_reconciliation_below_the_acknowledged_mark_fails_the_fence() {
         h.node.next_offset(),
         10,
         "and nothing may have been discarded on the way to refusing"
+    );
+}
+
+/// THE POINT OF #240's FLOOR. The truncation-below-acknowledged guard used
+/// to compare against a cell rebuilt at ZERO on every restart, role flip,
+/// and rebuild — vacuous precisely across the window in which a new
+/// leader's fence-and-reconcile arrives, because `observe_hwm` cannot
+/// re-arm the cell until the lease watcher adopts the current epoch. With
+/// the floor persisted at the commit barrier and read back at open, the
+/// same fence is REFUSED.
+#[test]
+fn a_restarted_follower_still_refuses_to_discard_what_it_acknowledged() {
+    let range = range_identity();
+    let dir = tempfile::tempdir().unwrap();
+
+    // First life: ten records under epoch 18, eight acknowledged by the
+    // cluster through the real HWM-frame path, floor persisted by the
+    // orderly shutdown.
+    {
+        let segment = ActiveSegment::create(
+            dir.path().join("range.active"),
+            descriptor_for(&range, 0xE1),
+            SegmentConfig::default(),
+        )
+        .unwrap();
+        let meta = MetaFencingEpoch::new(OLD_EPOCH);
+        let node = Arc::new(
+            InProcessFollower::new(
+                FOLLOWER,
+                segment,
+                ProducerEpochJournal::open(dir.path().join("epochs")).unwrap(),
+                range.clone(),
+                OLD_EPOCH,
+                meta.clone(),
+                ClusterCommittedOffset::new(0),
+            )
+            .unwrap(),
+        );
+        node.set_fencing_epoch_journal(
+            FencingEpochJournal::open(dir.path().join("fencing-epochs")).unwrap(),
+        );
+        node.set_committed_floor(CommittedFloorFile::open(dir.path().join("committed-floor")));
+        for offset in 0..10 {
+            node.apply_append(&append_request(&range, OLD_EPOCH, OLD_LEADER, offset))
+                .unwrap();
+        }
+        node.observe_hwm(&CommittedHwmUpdate {
+            range: range.clone(),
+            fencing_epoch: OLD_EPOCH,
+            committed_high_watermark: 8,
+        })
+        .expect("the leader's HWM frame");
+        node.quiesce().expect("orderly shutdown persists the floor");
+    }
+
+    // Second life over the SAME directory. Nothing in memory survives; the
+    // guard is whatever the open path can recover.
+    let meta = MetaFencingEpoch::new(OLD_EPOCH);
+    let node = follower_via_the_real_open_path(
+        &dir,
+        &range,
+        &meta,
+        ActiveSegment::recover(dir.path().join("range.active")).unwrap(),
+    );
+    assert_eq!(
+        node.cluster_committed().get(),
+        8,
+        "precondition: the floor survived the restart and seeded the cell"
+    );
+
+    // A new leader whose history puts divergence at 2 — beneath the eight
+    // acknowledged records.
+    let leader_history = [
+        EpochStart {
+            epoch: OLD_EPOCH,
+            start_offset: 0,
+        },
+        EpochStart {
+            epoch: NEW_EPOCH,
+            start_offset: 2,
+        },
+    ];
+    meta.set(NEW_EPOCH);
+    let refused = node.fence(NEW_EPOCH, &leader_history).expect_err(
+        "before the floor was persisted, this exact sequence rebuilt the guard at zero and \
+         the fence SILENTLY TRUNCATED eight acknowledged records; it must refuse instead",
+    );
+    assert!(
+        refused.1.contains("acknowledged"),
+        "the refusal must name what it protects: {}",
+        refused.1
+    );
+    assert_eq!(
+        node.next_offset(),
+        10,
+        "and nothing may have been discarded on the way to refusing"
+    );
+}
+
+/// The floor is protection, not a prerequisite. A directory with no
+/// committed-floor file — every directory written before the file existed,
+/// and every freshly repaired replica, since repair deliberately seeds no
+/// floor (nothing on the wire carries the source's cluster HWM safely: a
+/// source's `local_committed_offset` may legitimately EXCEED the quorum HWM
+/// and must never become a floor) — reconciles exactly as before. Pins the
+/// backward compatibility and the residual gap in one place.
+#[test]
+fn a_replica_without_a_floor_file_reconciles_exactly_as_before() {
+    let range = range_identity();
+    let dir = tempfile::tempdir().unwrap();
+
+    // An older node's first life: the same appends and acknowledgement, but
+    // no floor file was ever written.
+    {
+        let segment = ActiveSegment::create(
+            dir.path().join("range.active"),
+            descriptor_for(&range, 0xE1),
+            SegmentConfig::default(),
+        )
+        .unwrap();
+        let meta = MetaFencingEpoch::new(OLD_EPOCH);
+        let node = Arc::new(
+            InProcessFollower::new(
+                FOLLOWER,
+                segment,
+                ProducerEpochJournal::open(dir.path().join("epochs")).unwrap(),
+                range.clone(),
+                OLD_EPOCH,
+                meta.clone(),
+                ClusterCommittedOffset::new(0),
+            )
+            .unwrap(),
+        );
+        node.set_fencing_epoch_journal(
+            FencingEpochJournal::open(dir.path().join("fencing-epochs")).unwrap(),
+        );
+        for offset in 0..10 {
+            node.apply_append(&append_request(&range, OLD_EPOCH, OLD_LEADER, offset))
+                .unwrap();
+        }
+        node.observe_hwm(&CommittedHwmUpdate {
+            range: range.clone(),
+            fencing_epoch: OLD_EPOCH,
+            committed_high_watermark: 8,
+        })
+        .unwrap();
+        node.quiesce().unwrap();
+    }
+
+    let meta = MetaFencingEpoch::new(OLD_EPOCH);
+    let node = follower_via_the_real_open_path(
+        &dir,
+        &range,
+        &meta,
+        ActiveSegment::recover(dir.path().join("range.active")).unwrap(),
+    );
+    assert_eq!(
+        node.cluster_committed().get(),
+        0,
+        "no file, no floor — the pre-floor state, not an error"
+    );
+
+    let leader_history = [
+        EpochStart {
+            epoch: OLD_EPOCH,
+            start_offset: 0,
+        },
+        EpochStart {
+            epoch: NEW_EPOCH,
+            start_offset: 2,
+        },
+    ];
+    meta.set(NEW_EPOCH);
+    let fenced = node
+        .fence(NEW_EPOCH, &leader_history)
+        .expect("an absent floor must not refuse anything the old behaviour allowed");
+    assert_eq!(
+        fenced.truncated_records, 8,
+        "without a floor the divergent fence truncates through the acknowledged mark — the \
+         documented pre-floor behaviour, and the residual for a freshly repaired replica"
+    );
+    assert_eq!(fenced.next_offset, 2);
+}
+
+/// `run_retention`'s floor input is `min(cluster_committed, local)`; at
+/// zero it protects EVERY sealed segment from reclaim, so a restarted
+/// follower used to hold its whole disk until the first HWM frame arrived.
+/// The persisted floor makes reclaim live again from the first post-restart
+/// append.
+#[test]
+fn a_reopened_followers_retention_floor_starts_at_the_persisted_value_not_zero() {
+    let range = range_identity();
+    let dir = tempfile::tempdir().unwrap();
+    let config = SegmentConfig {
+        max_record_bytes: 256,
+        max_group_bytes: 512,
+        max_segment_bytes: 512,
+        max_segment_records: 100,
+        index_stride: 2,
+    };
+
+    // First life: a rolled range, everything acknowledged, floor persisted.
+    // Retention is OFF here so the sealed prefix survives intact into the
+    // restarts below.
+    {
+        let set = SegmentSet::create_in(
+            &vtop_log::env::Env::real(),
+            dir.path(),
+            descriptor_for(&range, 0xE8),
+            config,
+        )
+        .unwrap();
+        let meta = MetaFencingEpoch::new(OLD_EPOCH);
+        let node = Arc::new(
+            InProcessFollower::new(
+                FOLLOWER,
+                set,
+                ProducerEpochJournal::open(dir.path().join("epochs")).unwrap(),
+                range.clone(),
+                OLD_EPOCH,
+                meta.clone(),
+                ClusterCommittedOffset::new(0),
+            )
+            .unwrap(),
+        );
+        node.set_fencing_epoch_journal(
+            FencingEpochJournal::open(dir.path().join("fencing-epochs")).unwrap(),
+        );
+        node.set_committed_floor(CommittedFloorFile::open(dir.path().join("committed-floor")));
+        for offset in 0..40 {
+            node.apply_append(&append_request(&range, OLD_EPOCH, OLD_LEADER, offset))
+                .unwrap();
+        }
+        node.observe_hwm(&CommittedHwmUpdate {
+            range: range.clone(),
+            fencing_epoch: OLD_EPOCH,
+            committed_high_watermark: 40,
+        })
+        .unwrap();
+        node.quiesce().unwrap();
+    }
+
+    // Restarted WITHOUT the floor — the pre-floor shape: the cell sits at
+    // zero until the first HWM frame, and the append's retention pass
+    // reclaims nothing however far the policy is exceeded.
+    {
+        let set = SegmentSet::open_in(&vtop_log::env::Env::real(), dir.path())
+            .unwrap()
+            .expect("the range exists");
+        assert_eq!(set.base_offset(), 0, "precondition: nothing reclaimed yet");
+        let meta = MetaFencingEpoch::new(OLD_EPOCH);
+        let node = Arc::new(
+            InProcessFollower::new(
+                FOLLOWER,
+                set,
+                ProducerEpochJournal::open(dir.path().join("epochs")).unwrap(),
+                range.clone(),
+                OLD_EPOCH,
+                meta.clone(),
+                ClusterCommittedOffset::new(0),
+            )
+            .unwrap(),
+        );
+        node.set_fencing_epoch_journal(
+            FencingEpochJournal::open(dir.path().join("fencing-epochs")).unwrap(),
+        );
+        node.set_retention(Some(RetentionPolicy {
+            max_total_bytes: 600,
+        }));
+        node.apply_append(&append_request(&range, OLD_EPOCH, OLD_LEADER, 40))
+            .unwrap();
+        node.quiesce().unwrap();
+    }
+    {
+        let set = SegmentSet::open_in(&vtop_log::env::Env::real(), dir.path())
+            .unwrap()
+            .expect("the range exists");
+        assert_eq!(
+            set.base_offset(),
+            0,
+            "a floor of zero blocks every reclaim — the starvation the persisted floor \
+             exists to end"
+        );
+    }
+
+    // Restarted through the real open path: the recovered floor is 40, and
+    // the very next append's retention pass reclaims the acknowledged front.
+    {
+        let set = SegmentSet::open_in(&vtop_log::env::Env::real(), dir.path())
+            .unwrap()
+            .expect("the range exists");
+        let meta = MetaFencingEpoch::new(OLD_EPOCH);
+        let node = follower_via_the_real_open_path(&dir, &range, &meta, set);
+        assert_eq!(
+            node.cluster_committed().get(),
+            40,
+            "precondition: the floor survived the restart"
+        );
+        node.set_retention(Some(RetentionPolicy {
+            max_total_bytes: 600,
+        }));
+        node.apply_append(&append_request(&range, OLD_EPOCH, OLD_LEADER, 41))
+            .unwrap();
+        node.quiesce().unwrap();
+    }
+    let set = SegmentSet::open_in(&vtop_log::env::Env::real(), dir.path())
+        .unwrap()
+        .expect("the range exists");
+    assert!(
+        set.base_offset() > 0,
+        "reclaim below the recovered floor must proceed: a reopened follower's retention \
+         floor is the persisted value, not zero"
+    );
+}
+
+/// The cadence rule, both halves. The FIRST observed HWM arms the guard
+/// immediately — an unarmed floor plus a crash before the next append
+/// barrier would recover nothing, the exact window the file exists to
+/// close. Every LATER frame only sharpens an armed guard and waits for the
+/// commit barrier, where an fsync already exists: `observe_hwm` runs in
+/// the per-connection dispatch loop that also carries append frames and
+/// must stay I/O-free in the steady state. `quiesce` covers the quiet tail.
+#[test]
+fn the_first_hwm_arms_the_floor_and_later_frames_wait_for_the_barrier() {
+    let range = range_identity();
+    let dir = tempfile::tempdir().unwrap();
+    let floor_path = dir.path().join("committed-floor");
+    let segment = ActiveSegment::create(
+        dir.path().join("range.active"),
+        descriptor_for(&range, 0xE9),
+        SegmentConfig::default(),
+    )
+    .unwrap();
+    let meta = MetaFencingEpoch::new(OLD_EPOCH);
+    let node = Arc::new(
+        InProcessFollower::new(
+            FOLLOWER,
+            segment,
+            ProducerEpochJournal::open(dir.path().join("epochs")).unwrap(),
+            range.clone(),
+            OLD_EPOCH,
+            meta.clone(),
+            ClusterCommittedOffset::new(0),
+        )
+        .unwrap(),
+    );
+    node.set_fencing_epoch_journal(
+        FencingEpochJournal::open(dir.path().join("fencing-epochs")).unwrap(),
+    );
+    node.set_committed_floor(CommittedFloorFile::open(&floor_path));
+    let batch = |base: u64| {
+        [
+            append_request(&range, OLD_EPOCH, OLD_LEADER, base),
+            append_request(&range, OLD_EPOCH, OLD_LEADER, base + 1),
+        ]
+    };
+
+    node.apply_append_batch(&batch(0)).expect("first batch");
+    assert_eq!(
+        CommittedFloorFile::open(&floor_path).floor(),
+        0,
+        "no HWM has been observed yet; a barrier with nothing to protect saves nothing"
+    );
+    node.observe_hwm(&CommittedHwmUpdate {
+        range: range.clone(),
+        fencing_epoch: OLD_EPOCH,
+        committed_high_watermark: 2,
+    })
+    .unwrap();
+    assert_eq!(
+        CommittedFloorFile::open(&floor_path).floor(),
+        2,
+        "the FIRST observed HWM must arm the floor immediately: unarmed plus a crash \
+         before the next barrier would recover nothing, the exact window the file \
+         exists to close"
+    );
+
+    node.apply_append_batch(&batch(2)).expect("second batch");
+    node.observe_hwm(&CommittedHwmUpdate {
+        range: range.clone(),
+        fencing_epoch: OLD_EPOCH,
+        committed_high_watermark: 4,
+    })
+    .unwrap();
+    assert_eq!(
+        CommittedFloorFile::open(&floor_path).floor(),
+        2,
+        "a LATER frame must not do floor I/O — the guard is already armed, and the \
+         dispatch loop carrying the frame also carries append frames"
+    );
+
+    node.apply_append_batch(&batch(4)).expect("third batch");
+    assert_eq!(
+        CommittedFloorFile::open(&floor_path).floor(),
+        4,
+        "the commit barrier is where a sharpened floor becomes durable — one write per \
+         batch, and only when it advanced"
+    );
+
+    node.observe_hwm(&CommittedHwmUpdate {
+        range: range.clone(),
+        fencing_epoch: OLD_EPOCH,
+        committed_high_watermark: 6,
+    })
+    .unwrap();
+    node.quiesce().expect("orderly shutdown");
+    assert_eq!(
+        CommittedFloorFile::open(&floor_path).floor(),
+        6,
+        "quiesce persists the quiet tail the last commit barrier could not see"
     );
 }

@@ -345,6 +345,22 @@ replicated commit statement and cannot advance under a stale epoch. Recovery
 never advances beyond this marker and may truncate a surviving uncommitted
 tail.
 
+A follower additionally keeps a `committed-floor` sidecar: a fixed-size,
+checksummed, monotonic record of the highest cluster-committed high-water mark
+it has observed, written at the per-batch commit barrier and read back at open
+so the refuse-to-truncate-below-acknowledged guard survives restarts. The
+asymmetry is deliberate: a floor recovered too low merely weakens the guard to
+its pre-persistence behavior, while too high is prevented by construction —
+only values already clamped to the replica's own durable committed offset are
+ever written, so the recovered floor never exceeds what the replica durably
+holds. Saves alternate between two independently checksummed frames, writing
+only the one not holding the newest durable floor — so a torn write costs the
+frame being written, never the protection already earned, and a frame that
+fails its checksum is ignored rather than misread.
+This is follower-side state only. When a leader may publish a durable floor is
+part of the leadership-transition record design (#240) and is deliberately not
+decided here.
+
 ### 6.3 Sealed proof-carrying segment
 
 The canonical manifest binds:

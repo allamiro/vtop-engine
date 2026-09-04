@@ -176,6 +176,18 @@ pub struct InProcessFollower {
     meta_fencing_epoch: MetaFencingEpoch,
     segment_format: SegmentFormat,
     cluster_committed: ClusterCommittedOffset,
+    /// Durable shadow of `cluster_committed` (#240): read at open to seed the
+    /// cell, advanced at the commit barrier. `None` for harnesses that never
+    /// attach one — absent means the guard starts at zero, the pre-floor
+    /// behaviour every older test pins.
+    committed_floor: Mutex<Option<crate::committed_floor::CommittedFloorFile>>,
+    /// Whether arming is SETTLED — a nonzero floor is durable, no file is
+    /// attached, or the file gave up (#240). The fast-path guard so the
+    /// dispatch loop's per-frame [`Self::arm_committed_floor`] is a single
+    /// atomic load once arming is done, never a lock. Only while this is
+    /// false does arming take the file lock, and only in the transient
+    /// window before the first observed HWM is durable.
+    committed_floor_armed: AtomicBool,
     /// Sealed-prefix retention bound in bytes; 0 = disabled (#290).
     retention_max_total_bytes: std::sync::atomic::AtomicU64,
     state: Mutex<FollowerState>,
@@ -248,6 +260,8 @@ impl InProcessFollower {
             meta_fencing_epoch,
             segment_format,
             cluster_committed,
+            committed_floor: Mutex::new(None),
+            committed_floor_armed: AtomicBool::new(false),
             retention_max_total_bytes: std::sync::atomic::AtomicU64::new(0),
             state: Mutex::new(FollowerState {
                 segment,
@@ -336,6 +350,24 @@ impl InProcessFollower {
         }
     }
 
+    /// Durably commit the tail's boundary for an orderly shutdown (#280).
+    /// Same contract as [`crate::LocalBroker::quiesce`]: loses nothing if
+    /// skipped, spares the next open a torn-tail truncation. Also the
+    /// floor's final persist (#240): `observe_hwm` does no I/O, so the HWM
+    /// frames that arrive after the last committed append would otherwise be
+    /// exactly the lag the next restart starts with.
+    pub fn quiesce(&self) -> BrokerResult<u64> {
+        let committed = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.segment.commit().map_err(BrokerError::from)?
+        };
+        self.persist_committed_floor();
+        Ok(committed)
+    }
+
     /// Install the durable epoch→offset vector for this replica (#240).
     ///
     /// Seeds the held epoch only when both the vector and the log are empty;
@@ -343,17 +375,6 @@ impl InProcessFollower {
     /// that already holds records must report "unknown" instead. Also completes
     /// a truncation interrupted by a crash, per
     /// [`crate::LocalBroker::attach_epoch_journal_to_log`].
-    /// Durably commit the tail's boundary for an orderly shutdown (#280).
-    /// Same contract as [`crate::LocalBroker::quiesce`]: loses nothing if
-    /// skipped, spares the next open a torn-tail truncation.
-    pub fn quiesce(&self) -> BrokerResult<u64> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.segment.commit().map_err(BrokerError::from)
-    }
-
     pub fn set_fencing_epoch_journal(
         &self,
         mut journal: crate::fencing_epochs::FencingEpochJournal,
@@ -377,6 +398,145 @@ impl InProcessFollower {
             .fencing_epoch_journal
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(journal);
+    }
+
+    /// Attach the durable floor beneath `cluster_committed` (#240).
+    ///
+    /// Injected after construction like the fencing-epoch journal: the
+    /// deterministic harness builds followers with no disk at all, and the
+    /// wiring that has a data directory is the wiring that can supply the
+    /// file. Seeding the CELL from the file is deliberately the constructor's
+    /// job — `ClusterCommittedOffset::new(file.floor())` — not this setter's:
+    /// the cell is shared state a caller may already have cloned, and a
+    /// setter that silently advanced it would move a value other components
+    /// were told was theirs to observe.
+    pub fn set_committed_floor(&self, file: crate::committed_floor::CommittedFloorFile) {
+        // A file that opened carrying a floor is already armed — the guard it
+        // seeds is live from the first fence, so arming never needs to run.
+        // A fresh (zero) file waits for the first observed HWM. Set the file
+        // before the flag so an arm racing the wiring sees the file it will
+        // read under the lock.
+        let already_armed = file.floor() != 0;
+        *self
+            .committed_floor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(file);
+        self.committed_floor_armed
+            .store(already_armed, Ordering::Release);
+    }
+
+    /// Make the guard's floor durable when it advanced (#240); a no-op when
+    /// no file was attached.
+    ///
+    /// Called only where a durability barrier already exists — after a
+    /// committed append, single or batch, after [`Self::flush_held_fsync`]
+    /// releases held bytes, and from [`Self::quiesce`] — always AFTER the
+    /// state lock drops, because this needs only the shared cell and its own
+    /// file, and deliberately NOT from [`Self::observe_hwm`], which runs in
+    /// the per-connection dispatch loop that also carries append frames and
+    /// must stay I/O-free in the steady state ([`Self::arm_committed_floor`]
+    /// is the one bounded exception). The durable floor therefore lags the
+    /// cell by at most one append batch plus the quiet tail before quiesce.
+    /// That lag is safe
+    /// by the asymmetry [`crate::committed_floor`] states: a floor too low
+    /// only weakens the guard toward the pre-floor behaviour; it never
+    /// blocks legitimate work.
+    ///
+    /// A failed write is reported ONCE and persistence stops: the floor is
+    /// protection, not a liveness dependency, and failing the append path
+    /// over it would convert a damaged sidecar into an outage.
+    fn persist_committed_floor(&self) {
+        let mut guard = self
+            .committed_floor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // The cell is read UNDER the file lock: barriers overlap now that
+        // persists run outside the state lock, and a snapshot taken before
+        // the lock could arrive after a newer save — a regression the file
+        // rightly refuses, which the disable path would then read as damage
+        // and stop persistence for good. Read-in-lock makes every saved
+        // value at least as fresh as the save it follows.
+        let floor = self.cluster_committed.get();
+        Self::save_floor_or_disable(&mut guard, floor);
+        self.settle_arming_if_done(floor, guard.is_none());
+    }
+
+    /// Make the first observed HWM durable without waiting for a later
+    /// barrier (#240): the difference between an UNARMED guard and an armed
+    /// one is whether a crash on the quiet tail recovers a floor at all, and
+    /// that is the exact window this file exists to close. Every later frame
+    /// only sharpens an already-armed guard and defers to the next barrier,
+    /// so this is a single atomic load once arming has settled — the
+    /// steady-state dispatch loop pays nothing.
+    fn arm_committed_floor(&self) {
+        if self.committed_floor_armed.load(Ordering::Acquire) {
+            return;
+        }
+        // Not yet settled, so take the lock — BLOCKING, not `try_lock`. An
+        // earlier revision skipped on contention, and both reviews of this
+        // PR found the race: the only thing that holds this lock for any
+        // time is a barrier persist mid-fsync, and if that persist read the
+        // cell before this HWM advanced it, skipping drops the one arming
+        // chance and a quiet-tail crash recovers zero. Blocking is bounded
+        // and self-limiting: a barrier running means appends are committing,
+        // so the cell is advancing and arming completes; and once it does,
+        // the atomic above means this lock is never taken from the dispatch
+        // path again.
+        let mut guard = self
+            .committed_floor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match guard.as_ref() {
+            // A file already carrying a floor (opened non-empty, or armed by
+            // a barrier between the load above and this lock) needs nothing;
+            // no file at all is a harness follower with nothing to arm.
+            Some(file) if file.floor() != 0 => {
+                self.committed_floor_armed.store(true, Ordering::Release);
+                return;
+            }
+            None => {
+                self.committed_floor_armed.store(true, Ordering::Release);
+                return;
+            }
+            Some(_) => {}
+        }
+        let floor = self.cluster_committed.get();
+        if floor == 0 {
+            // Nothing acknowledged yet, so nothing to protect and no barrier
+            // to contend with; a later frame retries once the cell moves.
+            return;
+        }
+        Self::save_floor_or_disable(&mut guard, floor);
+        self.settle_arming_if_done(floor, guard.is_none());
+    }
+
+    /// Arming is settled — the atomic fast path may short-circuit forever —
+    /// once a nonzero floor is durable OR the file has given up. A no-op
+    /// save of zero settles nothing: the guard still has nothing to recover.
+    fn settle_arming_if_done(&self, saved_floor: u64, file_disabled: bool) {
+        if saved_floor != 0 || file_disabled {
+            self.committed_floor_armed.store(true, Ordering::Release);
+        }
+    }
+
+    /// The one disable path for a floor that cannot persist: report once,
+    /// keep serving, stop claiming durability until the next open. Shared by
+    /// the barrier persists and the arming save so the two can never drift
+    /// on what a failed write means.
+    fn save_floor_or_disable(
+        guard: &mut Option<crate::committed_floor::CommittedFloorFile>,
+        floor: u64,
+    ) {
+        let Some(file) = guard.as_mut() else {
+            return;
+        };
+        if let Err(problem) = file.save(floor) {
+            eprintln!(
+                "committed-floor persist failed; the in-memory guard keeps serving and the \
+                 durable floor stops advancing until the next open: {problem}"
+            );
+            *guard = None;
+        }
     }
 
     /// Discard every record at or above `offset` and drop the epoch entries
@@ -646,21 +806,28 @@ impl InProcessFollower {
 
     /// Commit any bytes held by [`Self::set_hold_fsync`].
     pub fn flush_held_fsync(&self) -> Result<u64, (ErrorCode, String)> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let committed = state.segment.commit().map_err(|problem| {
-            (
-                ErrorCode::Storage,
-                format!("follower {} flush_held_fsync: {problem}", self.node_id),
-            )
-        })?;
-        // The flush is the moment held appends become durable, and it may
-        // have rolled the tail — reclaim here too, or a follower flushed
-        // after a hold keeps its now-durable sealed prefix until the next
-        // append happens to arrive (#290).
-        self.run_retention(&mut state.segment);
+        let committed = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let committed = state.segment.commit().map_err(|problem| {
+                (
+                    ErrorCode::Storage,
+                    format!("follower {} flush_held_fsync: {problem}", self.node_id),
+                )
+            })?;
+            // The flush is the moment held appends become durable, and it may
+            // have rolled the tail — reclaim here too, or a follower flushed
+            // after a hold keeps its now-durable sealed prefix until the next
+            // append happens to arrive (#290).
+            self.run_retention(&mut state.segment);
+            committed
+        };
+        // A durability barrier like any committed append, so the floor rides
+        // it too (#240) — an HWM observed during the hold would otherwise
+        // wait for the next append or quiesce to become durable.
+        self.persist_committed_floor();
         Ok(committed)
     }
 
@@ -883,13 +1050,24 @@ impl InProcessFollower {
             Ok(_) => {
                 // Not under an fsync hold: the branch above already refused
                 // to roll there, and retention deletes files, which is even
-                // less compatible with "held bytes die with a crash".
-                if !self.hold_fsync() {
+                // less compatible with "held bytes die with a crash". The
+                // floor persist rides the same condition — this append was a
+                // durability barrier, held bytes were not — but runs after
+                // the state lock drops: it reads only the shared cell and
+                // its own file, and holding the follower's lock across a
+                // sidecar fsync would serialize every other lock user.
+                let barrier = !self.hold_fsync();
+                if barrier {
                     self.run_retention(&mut state.segment);
                 }
-                Ok(ReplicaAppendResponse {
+                let response = ReplicaAppendResponse {
                     local_committed_offset: state.segment.committed_offset(),
-                })
+                };
+                drop(state);
+                if barrier {
+                    self.persist_committed_floor();
+                }
+                Ok(response)
             }
             Err(problem) => Err((
                 match problem {
@@ -1037,8 +1215,14 @@ impl InProcessFollower {
         match state.segment.commit() {
             Ok(local_committed_offset) => {
                 // One pass per batch, after the commit, and never under an
-                // fsync hold — the hold path returned above (#290).
+                // fsync hold — the hold path returned above (#290). The floor
+                // persist rides the same barrier (#240) but AFTER the state
+                // lock drops: it reads only the shared cell and its own file,
+                // and holding the follower's lock across a sidecar fsync
+                // would serialize every other lock user behind it.
                 self.run_retention(&mut state.segment);
+                drop(state);
+                self.persist_committed_floor();
                 Ok(ReplicaAppendResponse {
                     local_committed_offset,
                 })
@@ -1064,6 +1248,7 @@ impl InProcessFollower {
         let local = self.local_committed_offset();
         let visible = update.committed_high_watermark.min(local);
         self.cluster_committed.advance_to(visible);
+        self.arm_committed_floor();
         Ok(())
     }
 }

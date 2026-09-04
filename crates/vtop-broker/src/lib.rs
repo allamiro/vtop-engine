@@ -27,6 +27,7 @@
 //! requests validate lineage against that store; membership join/leave/assign
 //! remain metadata commands (Raft-proposed in later wiring).
 
+pub mod committed_floor;
 pub mod fencing_epochs;
 pub mod group_commit;
 pub mod memory_budget;
@@ -94,6 +95,14 @@ pub enum BrokerError {
     },
     #[error("producer epoch journal is corrupt: {0}")]
     EpochJournalCorrupt(String),
+    /// The committed-floor file's own contract refusals — a regressing value
+    /// or a poisoned handle (#240). Its own variant, not `InvalidConfig`,
+    /// because the remedy differs: the floor is protection, never a liveness
+    /// dependency, so the caller stops persisting and keeps serving rather
+    /// than failing the request it was handling. Plain I/O failures on the
+    /// file stay [`BrokerError::Io`], which names the path.
+    #[error("committed-floor file: {0}")]
+    CommittedFloor(String),
     #[error("producer {producer_id} epoch {actual} is fenced by durable epoch {current}")]
     ProducerFenced {
         producer_id: Uuid,
