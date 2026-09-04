@@ -6,17 +6,26 @@
 # indistinguishable from a hung one. This splits it into the two phases cargo
 # already has and draws each of them against a real denominator:
 #
-#   compile   crates built, out of the workspace's crate count
+#   compile   packages built, out of the packages in the host's resolve graph
 #   test      test binaries run, out of the binaries cargo produced
 #
 # Both numbers come from cargo itself (`cargo metadata`, and the JSON message
 # stream of `--no-run`), so the bar cannot drift from what is actually
 # happening — a progress bar that guesses is worse than none, because it is
-# believed.
+# believed. When a number cannot be obtained, the script refuses to run
+# rather than draw an invented one.
 #
 # Usage:
-#   scripts/test-progress.sh                 # whole workspace
-#   scripts/test-progress.sh -p vtop-broker  # any cargo test args pass through
+#   scripts/test-progress.sh                       # whole workspace
+#   scripts/test-progress.sh -p vtop-broker        # cargo's package selection
+#   scripts/test-progress.sh -- --ignored          # everything after `--` goes
+#                                                  # to every test binary
+#   scripts/test-progress.sh lease -- --nocapture  # a test-name filter, too
+#
+# Arguments split exactly as `cargo test` splits them: options before `--`
+# are cargo's (package selection, features, target), a bare word before `--`
+# is a test-name filter, and everything after `--` is the harness's. The
+# harness's thread count is cargo's own default unless TEST_THREADS is set.
 #
 # Exit status is the suite's: any failing binary fails the run, and every
 # failure is reprinted at the end so it is not lost above the bar.
@@ -25,14 +34,19 @@ set -uo pipefail
 BOLD=$'\033[1m'; RED=$'\033[31m'; GREEN=$'\033[32m'; RESET=$'\033[0m'
 [[ -t 1 ]] || { BOLD=""; RED=""; GREEN=""; RESET=""; }
 
+die() { printf 'test-progress: %s\n' "$*" >&2; exit 2; }
+for tool in cargo rustc python3 awk; do
+  command -v "$tool" >/dev/null 2>&1 || die "$tool is required and was not found on PATH"
+done
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 bar() { # <done> <total> <label>
   local done="$1" total="$2" label="$3" width=32
   [[ "$total" -gt 0 ]] || total=1
+  [[ "$done" -gt "$total" ]] && done=$total
   local filled=$(( done * width / total ))
-  [[ "$filled" -gt "$width" ]] && filled=$width
   local pct=$(( done * 100 / total ))
   printf '\r%s[%s%s] %3d%%%s %-46s' \
     "$BOLD" \
@@ -42,27 +56,87 @@ bar() { # <done> <total> <label>
 }
 
 # ---------------------------------------------------------------------------
-# Phase 1 — compile. The denominator is the workspace's own crate count plus
-# its dependencies, which cargo will report as it goes; using the dependency
-# count rather than the workspace count keeps the bar honest on a cold build,
-# where the dependencies ARE the wait.
+# Argument split. cargo_args go to the compile; bin_args go to every test
+# binary. A bare word before `--` is cargo's positional test-name filter,
+# which cargo would itself hand to the binary — so it goes there here too.
+# Options that take a value are listed so their value is not mistaken for a
+# filter.
 # ---------------------------------------------------------------------------
-TOTAL_CRATES="$(cargo metadata --format-version 1 2>/dev/null \
-  | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["packages"]))' 2>/dev/null || echo 0)"
-[[ "$TOTAL_CRATES" -gt 0 ]] || TOTAL_CRATES=200
+cargo_args=(); bin_args=(); scoped=0; expect_value=0; past_sep=0
+for arg in "$@"; do
+  if (( past_sep )); then
+    bin_args+=("$arg")
+    continue
+  fi
+  if [[ "$arg" == "--" ]]; then
+    past_sep=1
+    continue
+  fi
+  if (( expect_value )); then
+    cargo_args+=("$arg"); expect_value=0
+    continue
+  fi
+  case "$arg" in
+    -p|--package|--exclude|--features|-F|--target|--target-dir|--manifest-path|\
+    --profile|-j|--jobs|--test|--bin|--example|--bench|--color|--config|-Z|\
+    --message-format)
+      cargo_args+=("$arg"); expect_value=1 ;;
+    -p*|--package=*|--exclude=*|--workspace|--all)
+      cargo_args+=("$arg") ;;
+    -*)
+      cargo_args+=("$arg") ;;
+    *)
+      bin_args+=("$arg") ;;
+  esac
+  case "$arg" in
+    -p|-p*|--package|--package=*|--workspace|--all|--exclude|--exclude=*) scoped=1 ;;
+  esac
+done
+# `--workspace` is the DEFAULT selection, never an override: a caller who
+# named packages gets exactly those.
+(( scoped )) || cargo_args=(--workspace "${cargo_args[@]}")
+if [[ -n "${TEST_THREADS:-}" ]]; then
+  case " ${bin_args[*]+"${bin_args[*]}"} " in
+    *" --test-threads"*) ;;
+    *) bin_args+=("--test-threads=$TEST_THREADS") ;;
+  esac
+fi
 
-printf '%scompiling%s (%s crates in the graph)\n' "$BOLD" "$RESET" "$TOTAL_CRATES"
-compiled=0
-cargo test --workspace --no-run --message-format=json "$@" \
+# ---------------------------------------------------------------------------
+# Phase 1 — compile. Numerator and denominator are the same unit — packages —
+# so the bar cannot overrun: cargo emits one `compiler-artifact` per TARGET
+# (a library, its test harness, each integration test), so counting messages
+# would count one package several times. The denominator is the resolve
+# graph filtered to this host, which is the set of packages cargo can build
+# here; a scoped run builds a subset of it and the bar says so.
+# ---------------------------------------------------------------------------
+HOST="$(rustc -vV | sed -n 's/^host: //p')"
+[[ -n "$HOST" ]] || die "could not determine the host triple from rustc"
+TOTAL_PACKAGES="$(cargo metadata --format-version 1 --filter-platform "$HOST" 2>"$WORK/metadata.err" \
+  | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["resolve"]["nodes"]))' 2>>"$WORK/metadata.err")"
+[[ "${TOTAL_PACKAGES:-0}" -gt 0 ]] || {
+  cat "$WORK/metadata.err" >&2
+  die "cargo metadata did not yield a package count; refusing to draw a guessed bar"
+}
+
+built_packages() {
+  # Distinct packages with at least one artifact so far; a missing file
+  # (the first poll on a cold build) is zero, not an error.
+  [[ -f "$WORK/build.json" ]] || { echo 0; return; }
+  grep '"reason":"compiler-artifact"' "$WORK/build.json" 2>/dev/null \
+    | grep -oE '"package_id":"[^"]*"' | sort -u | wc -l | tr -d ' '
+}
+
+printf '%scompiling%s (%s packages in the host graph)\n' "$BOLD" "$RESET" "$TOTAL_PACKAGES"
+cargo test "${cargo_args[@]}" --no-run --message-format=json \
   > "$WORK/build.json" 2> "$WORK/build.err" &
 BUILD_PID=$!
 while kill -0 "$BUILD_PID" 2>/dev/null; do
-  compiled="$(grep -c '"reason":"compiler-artifact"' "$WORK/build.json" 2>/dev/null || echo 0)"
-  bar "$compiled" "$TOTAL_CRATES" "building"
+  bar "$(built_packages)" "$TOTAL_PACKAGES" "building"
   sleep 0.3
 done
 wait "$BUILD_PID"; BUILD_RC=$?
-bar "$TOTAL_CRATES" "$TOTAL_CRATES" "built"
+bar "$(built_packages)" "$TOTAL_PACKAGES" "built"
 printf '\n'
 
 if [[ "$BUILD_RC" -ne 0 ]]; then
@@ -77,7 +151,7 @@ fi
 # Phase 2 — run. Each test binary is one unit, which is the granularity a
 # person actually waits on: "12 of 19 binaries" answers "how much longer".
 # ---------------------------------------------------------------------------
-python3 - "$WORK/build.json" > "$WORK/binaries" <<'PY'
+python3 - "$WORK/build.json" > "$WORK/binaries" <<'PY' || exit 2
 import json, sys
 seen = []
 for line in open(sys.argv[1]):
@@ -93,21 +167,32 @@ print("\n".join(seen))
 PY
 
 TOTAL_BINS="$(grep -c . "$WORK/binaries" || true)"
-[[ "${TOTAL_BINS:-0}" -gt 0 ]] || { printf 'no test binaries were produced\n'; exit 0; }
+[[ "${TOTAL_BINS:-0}" -gt 0 ]] || {
+  # A build that produced nothing runnable is not a passing suite: cargo
+  # itself reports "running 0 tests" and exits 0 only when the selection
+  # legitimately has none, and we cannot tell that apart from a broken
+  # parse here — so say what happened and refuse to claim success.
+  die "the build produced no test binaries (selection: ${cargo_args[*]})"
+}
+
+sum_counts() { # <pattern> <file> — total of the numbers libtest prints for <pattern>
+  grep -hoE "[0-9]+ $1" "$2" | awk '{s+=$1} END{print s+0}'
+}
 
 printf '%srunning%s (%s test binaries)\n' "$BOLD" "$RESET" "$TOTAL_BINS"
 ran=0; passed=0; failed=0; failing_bins=()
 while IFS= read -r exe; do
   name="$(basename "$exe" | sed 's/-[0-9a-f]\{16\}$//')"
   bar "$ran" "$TOTAL_BINS" "$name"
-  "$exe" --test-threads="${TEST_THREADS:-4}" > "$WORK/out.$ran" 2>&1
+  # The `[@]+` expansion keeps an empty array from tripping `set -u` on the
+  # bash 3.2 macOS ships.
+  "$exe" ${bin_args[@]+"${bin_args[@]}"} > "$WORK/out.$ran" 2>&1
   rc=$?
   # `test result: ok. N passed; M failed` — the counts, not a guess.
-  p="$(grep -hoE 'test result: [a-zA-Z]+\. [0-9]+ passed' "$WORK/out.$ran" \
-      | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | paste -sd+ - | bc 2>/dev/null || echo 0)"
-  f="$(grep -hoE '[0-9]+ failed' "$WORK/out.$ran" | grep -oE '[0-9]+' | paste -sd+ - | bc 2>/dev/null || echo 0)"
-  passed=$(( passed + ${p:-0} ))
-  failed=$(( failed + ${f:-0} ))
+  p="$(sum_counts passed "$WORK/out.$ran")"
+  f="$(sum_counts failed "$WORK/out.$ran")"
+  passed=$(( passed + p ))
+  failed=$(( failed + f ))
   if [[ "$rc" -ne 0 ]]; then
     failing_bins+=("$name:$WORK/out.$ran")
   fi
