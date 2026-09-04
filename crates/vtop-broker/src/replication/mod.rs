@@ -1359,6 +1359,22 @@ impl InProcessFollower {
         let visible = update.committed_high_watermark.min(local);
         self.cluster_committed.advance_to(visible);
         self.arm_committed_floor();
+        // The floor this update just advanced can make sealed segments
+        // eligible, and on a range that then goes idle no later append
+        // would ever reclaim them — the follower half of the leader's
+        // post-publish pass (#408 review). NOT under an fsync hold, for
+        // the same reason the apply barrier refuses there: deleting files
+        // breaks the injection's promise that held bytes die with a crash.
+        // (The floor-persist doctrine is untouched: nothing here fsyncs
+        // the sidecar; retention is its own bounded I/O with its own
+        // failure reporting.)
+        if !self.hold_fsync() {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.run_retention(&mut state.segment);
+        }
         Ok(())
     }
 }

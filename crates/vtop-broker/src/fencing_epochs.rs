@@ -433,8 +433,17 @@ impl FencingEpochJournal {
     /// a divergence point and discarded a log the two replicas entirely agreed
     /// on. A verdict makes that mistake impossible to make quietly.
     pub fn compare_lineage(&self, other: &[EpochStart]) -> Lineage {
+        // CANONICALIZED before comparing (#408 review): an epoch adopted
+        // while idle writes nothing, and its successor starting at the same
+        // offset is the epoch that actually governs records from there. One
+        // replica recording the idle adoption and another not still
+        // attribute every record identically — comparing the raw vectors
+        // would call that divergence and mandate truncating records both
+        // sides agree on.
+        let mine_canonical = canonicalize_lineage(&self.entries);
+        let theirs_canonical = canonicalize_lineage(other);
         let mut compared = 0_usize;
-        for (mine, theirs) in self.entries.iter().zip(other.iter()) {
+        for (mine, theirs) in mine_canonical.iter().zip(theirs_canonical.iter()) {
             if mine.epoch != theirs.epoch || mine.start_offset != theirs.start_offset {
                 // Either different leadership at the same position in history,
                 // or the same epoch beginning in two different places — which
@@ -482,6 +491,23 @@ impl FencingEpochJournal {
     fn corrupt(message: String) -> BrokerError {
         BrokerError::EpochJournalCorrupt(format!("fencing-epoch journal: {message}"))
     }
+}
+
+/// Collapse every same-offset run to its last entry (#408): an epoch
+/// adopted while a replica was idle wrote nothing, and the epoch starting
+/// at the same offset after it is the one that actually governs records
+/// from there. Zero-record adoptions are bookkeeping, not history — and
+/// two replicas that disagree only about bookkeeping agree about every
+/// record either of them holds.
+pub fn canonicalize_lineage(entries: &[EpochStart]) -> Vec<EpochStart> {
+    let mut canonical: Vec<EpochStart> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        match canonical.last_mut() {
+            Some(last) if last.start_offset == entry.start_offset => *last = *entry,
+            _ => canonical.push(*entry),
+        }
+    }
+    canonical
 }
 
 /// Clamp a lineage vector to the history that governs exactly the retained

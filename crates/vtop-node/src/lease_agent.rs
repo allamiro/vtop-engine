@@ -1040,6 +1040,17 @@ impl LeaseAgent {
             // and a spurious wake just re-races. A watch that CLOSED without
             // publishing `true` is "no release will ever be requested" — the
             // oneshot adapter's rule — not a reason to abandon rounds.
+            //
+            // One window stays open KNOWINGLY (review): dropping the step
+            // future does not cancel a proposal the admin server already
+            // decoded, so an abandoned AcquireRangeLease can commit AFTER
+            // the shutdown reconciliation read observed no lease. That
+            // shape is crash-equivalent — an acquisition always mints an
+            // EXPIRING lease (only the operator's grant path mints the
+            // non-expiring kind), so it lapses on its deadline exactly as a
+            // SIGKILL'd holder's would — and closing it would mean awaiting
+            // the in-flight proposal at shutdown, the very delay this race
+            // exists to remove.
             let stepped = if release_closed {
                 self.step().await
             } else {
