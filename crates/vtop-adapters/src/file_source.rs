@@ -114,10 +114,14 @@ impl FileSource {
             && seen.file_size == current.file_size
             // An UNKNOWN mtime never matches (#411): the identity records
             // the empty string when the filesystem cannot report a modified
-            // time, and letting "" equal "" would skip an in-place rewrite
-            // that preserved inode and size — indefinitely, on exactly the
-            // filesystems that give this check the least to work with. No
-            // mtime means fall through to a real read.
+            // time, and letting "" equal "" would park this file on a skip
+            // no evidence justifies. The claim is exactly that narrow
+            // (review): falling through opens the file and applies the
+            // adapter's append-only rules — it does not re-read content an
+            // in-place same-size rewrite replaced, which stat cannot detect
+            // WITH an mtime either (the changed-mtime rewrite reads nothing
+            // at EOF too). Unknown evidence forfeits the fast path; the
+            // append-only contract is unchanged.
             && !seen.mtime.is_empty()
             && seen.mtime == current.mtime
             // EQUALITY, not `>=` (review). A cursor beyond the file's end is

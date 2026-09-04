@@ -87,9 +87,11 @@ impl SyslogSpoolSource {
         seen.inode == current.inode
             && seen.file_size == current.file_size
             // An UNKNOWN mtime never matches (#411) — the same rule as
-            // `FileSource::can_skip`, for the same reason: "" == "" would
-            // skip an in-place rewrite that preserved inode and size, on
-            // exactly the filesystems that cannot report modification time.
+            // `FileSource::can_skip`, with the same narrow claim (review):
+            // unknown evidence forfeits the skip fast path; the read it
+            // falls through to applies the append-only contract, which no
+            // stat — mtime or not — can stretch to detecting an in-place
+            // same-size rewrite.
             && !seen.mtime.is_empty()
             && seen.mtime == current.mtime
             && cursor.read_byte == current.file_size

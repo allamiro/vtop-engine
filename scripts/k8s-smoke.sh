@@ -695,13 +695,15 @@ kubectl -n "$REPLICATED_NS" wait --for=condition=ready pod -l "app.kubernetes.io
 # the range through the metadata lease, so the holder must be ASKED for —
 # aiming at pod 0 now would fail two runs in three, looking like a produce
 # bug and actually being an assumption the topology no longer honours.
-lease_state() { # echoes "<holder-uuid> <fencing-epoch>", empty when no lease
+lease_state() { # [per-attempt-bound] — echoes "<holder> <epoch>", empty when no lease
   # Bounded per attempt (#411, the meta_admin_read precedent in
   # live-chaos lib.sh): this runs inside deadline-checked retry loops whose
   # only clock is between iterations, so one vtopctl read hanging on a
   # wedged forward would spend the whole produce window in a single call
-  # and the loop's deadline could never fire.
-  timeout --kill-after=1 10 \
+  # and the loop's deadline could never fire. A caller near its own
+  # deadline passes the smaller bound it can still afford (review).
+  local bound="${1:-10}"
+  timeout --kill-after=1 "$bound" \
     vtopctl --json meta range-lease --config "$WORK/r-admin-multi.yaml" \
     --topic-uuid "$TOPIC_UUID" --range-uuid "$RANGE_ID" 2>/dev/null \
     | python3 -c '
@@ -744,14 +746,20 @@ await_holder() { # [min-epoch] — echoes "<holder> <epoch>"
   # Wall-clock bounded, not iteration-counted (review): lease_state's own
   # per-attempt timeout means an iteration can cost twelve seconds against a
   # wedged forward, and ninety of those is eighteen minutes wearing a
-  # 180-second label. The deadline is the claim; the loop merely fills it.
-  local floor="${1:-0}" holder="" epoch="" holder_deadline=$((SECONDS + 180))
+  # 180-second label. The deadline is the claim; the loop merely fills it —
+  # and the FINAL probe is bounded by what remains of the claim (review,
+  # round two), so a probe started just inside the deadline cannot stretch
+  # the whole wait a further probe-plus-sleep past it.
+  local floor="${1:-0}" holder="" epoch="" left holder_deadline=$((SECONDS + 180))
   while [ "$SECONDS" -lt "$holder_deadline" ]; do
-    read -r holder epoch <<< "$(lease_state)" || true
+    left=$((holder_deadline - SECONDS))
+    [ "$left" -gt 10 ] && left=10
+    read -r holder epoch <<< "$(lease_state "$left")" || true
     if [ -n "$holder" ] && [ -n "$epoch" ] && [ "$epoch" -gt "$floor" ]; then
       printf '%s %s\n' "$holder" "$epoch"
       return 0
     fi
+    [ "$SECONDS" -lt "$holder_deadline" ] || break
     sleep 2
   done
   return 1
