@@ -484,6 +484,39 @@ impl FencingEpochJournal {
     }
 }
 
+/// Clamp a lineage vector to the history that still governs records at or
+/// above `base` (#408): the entry owning `base`, re-anchored AT `base`, plus
+/// every entry starting above it.
+///
+/// Two replicas whose full vectors disagree may still agree about every
+/// record either of them RETAINS — retention reclaims a prefix, and a
+/// dispute confined to reclaimed records mandates nothing. The clamped views
+/// make that distinction checkable: equal clamps mean the disagreement lives
+/// entirely below `base`, unequal clamps mean retained records are
+/// attributed to different leaderships. An empty clamp means the vector
+/// cannot vouch for `base` at all — unknown, which callers must treat as
+/// "prove nothing" exactly as everywhere else here.
+pub fn clamp_lineage(entries: &[EpochStart], base: u64) -> Vec<EpochStart> {
+    let mut clamped = Vec::new();
+    if let Some(owner) = entries
+        .iter()
+        .rev()
+        .find(|entry| entry.start_offset <= base)
+    {
+        clamped.push(EpochStart {
+            epoch: owner.epoch,
+            start_offset: base,
+        });
+    }
+    clamped.extend(
+        entries
+            .iter()
+            .filter(|entry| entry.start_offset > base)
+            .copied(),
+    );
+    clamped
+}
+
 /// Install a source-provided epoch history into a repaired range directory
 /// (#315).
 ///

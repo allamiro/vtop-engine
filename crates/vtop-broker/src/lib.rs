@@ -2095,6 +2095,21 @@ impl LocalBroker {
             fencing_epoch: hwm_epoch,
             committed_high_watermark: committed,
         });
+        // Second bounded retention pass, with the floor just published
+        // (#408). The under-lock pass above necessarily ran against the OLD
+        // quorum floor — a segment this group's roll sealed becomes
+        // reclaimable only once the floor advances past it, which happened
+        // two statements up. Without this pass that segment waits for the
+        // NEXT produce, and on a range that goes idle "next produce" is
+        // never. A no-op whenever nothing became eligible, so the steady
+        // state pays one atomic load and a size sum.
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.run_retention(&mut state.segment);
+        }
         batch
             .iter()
             .zip(wire_by_member)

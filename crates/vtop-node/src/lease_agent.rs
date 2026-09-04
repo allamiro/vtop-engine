@@ -991,6 +991,7 @@ impl LeaseAgent {
             node = %self.node_uuid,
             "lease agent running"
         );
+        let mut release_closed = false;
         loop {
             if *release.borrow() {
                 break;
@@ -1028,7 +1029,33 @@ impl LeaseAgent {
                 self.held_until_ms = None;
                 self.campaign_hold_off_rounds = self.stand_aside_rounds();
             }
-            let delay = match self.step().await {
+            // The round races the release (#408): an agent already inside
+            // `step()` used to finish it — up to one bounded deadline reading
+            // metadata and another renewing — before it ever looked at the
+            // flag again, and with `renew_interval` near the lease duration a
+            // valid configuration could run the drain budget dry before the
+            // ReleaseRangeLease proposal was even submitted. A holder that is
+            // leaving has no use for the abandoned round's answer; the loop
+            // head re-reads the flag, so the release path starts immediately
+            // and a spurious wake just re-races. A watch that CLOSED without
+            // publishing `true` is "no release will ever be requested" — the
+            // oneshot adapter's rule — not a reason to abandon rounds.
+            let stepped = if release_closed {
+                self.step().await
+            } else {
+                tokio::select! {
+                    stepped = self.step() => stepped,
+                    changed = release.changed() => {
+                        if changed.is_err() {
+                            release_closed = true;
+                            self.step().await
+                        } else {
+                            continue;
+                        }
+                    }
+                }
+            };
+            let delay = match stepped {
                 Ok(delay) => {
                     if self.range_missing {
                         // Definitive, not transient: metadata answered and
@@ -1095,9 +1122,20 @@ impl LeaseAgent {
                     self.config.poll_interval
                 }
             };
+            if release_closed {
+                tokio::time::sleep(delay).await;
+                continue;
+            }
             tokio::select! {
                 _ = tokio::time::sleep(delay) => {}
-                _ = release.changed() => {}
+                changed = release.changed() => {
+                    // A closed watch completes instantly forever; without the
+                    // flag this select would never sleep again and the agent
+                    // would hot-poll metadata (#408).
+                    if changed.is_err() {
+                        release_closed = true;
+                    }
+                }
             }
         }
         self.release().await;

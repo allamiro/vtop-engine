@@ -426,7 +426,15 @@ fn oneshot_on_shutdown(
     tokio::spawn(async move {
         while !*shutdown.borrow() {
             if shutdown.changed().await.is_err() {
-                return;
+                // The watch closed without ever publishing `true`. Dropping
+                // the oneshot sender here would CANCEL the receiver, and the
+                // serve loops read a canceled receiver as a completed signal
+                // — an embedder that merely dropped a sender it no longer
+                // needed would drain a healthy node (#408). Parking keeps
+                // the receiver pending forever, which is what "no shutdown
+                // was ever requested" means; the same shape
+                // `meta_node::wait_for_shutdown` already has.
+                std::future::pending::<()>().await;
             }
         }
         let _ = sender.send(());
@@ -479,7 +487,8 @@ pub async fn serve(
         // prevent (#290).
         if retention.max_total_bytes == 0 {
             return Err(
-                "retention.max_total_bytes must be greater than zero; omit the retention block                  to disable retention"
+                "retention.max_total_bytes must be greater than zero; omit the retention \
+                 block to disable retention"
                     .to_owned(),
             );
         }
@@ -866,10 +875,15 @@ async fn run_leader(
             promotion_probe,
         )?;
         agent_task = Some(tokio::spawn(agent.run(release_lease_rx)));
-        // The drain wait must survive an in-flight admin round trip, whose
-        // own budget is the lease duration; past one full lease the release
-        // is moot anyway — the lease has lapsed on its own.
-        agent_drain = agent_drain.max(Duration::from_millis(lease.lease_duration_ms));
+        // The agent abandons its round the moment the release fires (#408),
+        // so the worst remaining chain is the release proposal's own bounded
+        // deadline — one renew interval. Twice that is margin, not
+        // arithmetic. A full lease duration here was both too much and, for
+        // configurations with the renew interval near the lease duration,
+        // too little: an administrative lease has no expiry to fall back on,
+        // so dropping the task before ReleaseRangeLease is proposed leaves
+        // the stopped node assigned indefinitely.
+        agent_drain = agent_drain.max(Duration::from_millis(lease.renew_interval_ms) * 2);
     }
     observability.register(Box::new(BrokerCollector::new(
         Arc::clone(&broker),
@@ -1267,8 +1281,11 @@ async fn run_candidate(
     let agent = agent
         .with_ready_gate(observability.gate.clone())
         .with_stand_down(Arc::clone(&stand_down));
+    // Same derivation as run_leader's (#408): the agent abandons its round on
+    // release, so the budget covers the release proposal's bounded deadline
+    // with margin, not a whole lease.
     let agent_drain = std::time::Duration::from_secs(5)
-        .max(std::time::Duration::from_millis(lease.lease_duration_ms));
+        .max(std::time::Duration::from_millis(lease.renew_interval_ms) * 2);
     let mut agent_task = tokio::spawn(agent.run(release_lease_rx));
 
     // --- readiness ----------------------------------------------------------
@@ -1755,9 +1772,9 @@ async fn run_candidate(
     // Only one listener fails; the other is still serving, and nobody has told
     // it to stop — the shutdown watch belongs to the caller and this is not a
     // shutdown. The drain below awaits the native listener within
-    // `agent_drain`, which is at least a full lease duration, so a replica
-    // failure would have waited that entire window before releasing: exactly
-    // the delay this commit exists to remove, reintroduced on the other path.
+    // `agent_drain`, so a replica failure would have waited that entire
+    // window before releasing: exactly the delay this commit exists to
+    // remove, reintroduced on the other path.
     //
     // Aborted rather than asked politely, and the trade is deliberate. A
     // fail-stop has already decided this process cannot serve the range, so

@@ -766,7 +766,51 @@ impl InProcessFollower {
             state.segment.base_offset()
         };
         if divergence < base_offset {
-            return Ok(0);
+            // ...but "began below the base" is not "confined below the base"
+            // (#408): DivergesAt marks everything at or above it suspect,
+            // which includes every retained record. Whether the RETAINED
+            // stretch is actually disputed is answerable — clamp both
+            // histories to the base and compare those. Equal clamps confine
+            // the disagreement to records neither party holds any more:
+            // unprovable, touch nothing, exactly the #290 reasoning above.
+            // Unequal clamps mean retained records are attributed to
+            // DIFFERENT leaderships, and admitting that silently would hand
+            // back the split-brain read this vector exists to prevent — the
+            // fence fails loudly and the replica needs repair. An empty
+            // clamp on either side is "cannot vouch": unknown, touch
+            // nothing, as everywhere else.
+            let confined = {
+                let guard = self
+                    .fencing_epoch_journal
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard.as_ref().is_none_or(|journal| {
+                    let mine = crate::fencing_epochs::clamp_lineage(journal.entries(), base_offset);
+                    let theirs =
+                        crate::fencing_epochs::clamp_lineage(leader_epoch_starts, base_offset);
+                    // Compared as far as BOTH recorded — the same prefix rule
+                    // `compare_lineage` applies. This replica's journal
+                    // already carries the adoption entry for the epoch doing
+                    // the fencing, which the caller's vector legitimately
+                    // lacks; a longer clamp whose shared prefix matches is a
+                    // replica that recorded more, not a disagreement.
+                    mine.is_empty()
+                        || theirs.is_empty()
+                        || mine.iter().zip(theirs.iter()).all(|(m, t)| m == t)
+                })
+            };
+            if confined {
+                return Ok(0);
+            }
+            return Err((
+                ErrorCode::WrongLineage,
+                format!(
+                    "the caller's history and this replica's disagree about who wrote records \
+                     this replica still retains (base offset {base_offset}); the dispute is not \
+                     confined to reclaimed records, so nothing can be silently admitted — this \
+                     replica needs repair"
+                ),
+            ));
         }
         match self.truncate_to(divergence) {
             Ok(outcome) => Ok(outcome.records_removed),
