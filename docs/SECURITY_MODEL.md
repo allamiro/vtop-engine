@@ -109,7 +109,14 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are used as normat
   configured roots and the expected server identity (no insecure or
   accept-any verifiers). TLS peer authentication is mutual: server-side client
   verification alone does not protect a client from connecting to an imposter
-  broker.
+  broker. One scoped exception, and it is a lab tool rather than a client
+  deployment: the `vtop-node produce`/`verify` scenario client treats an
+  absent `tls` block in its config as a PLAINTEXT session (#294 slice 4) —
+  no certificate on either side, so no server authentication and no
+  confidentiality — and warns on every such connection. It exists so a
+  loopback lab can exercise a plaintext native plane end to end; nothing
+  a deployment ships uses it, and a node refuses to serve plaintext off
+  loopback unless told so by name.
 - Wire frames are length-bounded and BLAKE3-checksummed independently of TLS.
   The checksum detects accidental framing corruption; TLS provides peer
   authentication, confidentiality, and active-tamper protection.
@@ -345,7 +352,7 @@ the ignore list and the build re-audited.
 | Secret redaction in logs | **MUST** |
 | Native broker transport restricted to TLS 1.3 with client certificates | **MUST** (no deployment method can select the plaintext transport; see §2) |
 | Native broker sessions authorized by an explicit `SessionAuthorizer` | **MUST** |
-| Native clients validate the broker certificate and expected server identity | **MUST** |
+| Native clients validate the broker certificate and expected server identity | **MUST** (deployed clients; the loopback lab client may omit `tls` and connect plaintext, see §2) |
 | Native produce bound to the authenticated principal (`producer_id == principal_id`) | **MUST** |
 
 ---
@@ -381,7 +388,7 @@ flagged and collected below the tables.
 
 | Family | Stack | Function | Class |
 |---|---|---|---|
-| Cluster-plane TLS (admin, Raft peer, replica, native client) | rustls 0.23, **ring pinned at every construction site**, TLS 1.3 only, mutual; CN identity via `x509-parser` after chain validation on the admin, Raft-peer and replica planes — the native-client plane never parses the subject (Q3 below) | peer authentication, confidentiality; authorization input where the CN is read (CN is a Raft **safety** input on the peer plane) — native sessions match the declared hello principal against config, not the certificate | security function |
+| Cluster-plane TLS (admin, Raft peer, replica, native client; each plane also has a library-level plaintext mode no deployment method selects, §2) | rustls 0.23, **ring pinned at every construction site**, TLS 1.3 only, mutual; CN identity via `x509-parser` after chain validation on the admin, Raft-peer and replica planes — the native-client plane never parses the subject (Q3 below) | peer authentication, confidentiality; authorization input where the CN is read (CN is a Raft **safety** input on the peer plane) — native sessions match the declared hello principal against config, not the certificate | security function |
 | Kafka source transport | librdkafka (vendored C, cmake) + **system OpenSSL** (`ssl`) + **system Cyrus SASL** (`sasl`) | broker TLS + SASL auth; plaintext unless configured (SHOULD-level, §2); missing password env is a hard startup error, never a silent downgrade | security function |
 | S3 upload transport + signing | AWS SDK: hyper 1 + hyper-rustls + rustls 0.23 with the SDK's **aws-lc-rs** provider, system roots; SigV4 HMAC-SHA-256 (SigV4a/P-256 available, never explicitly invoked) | endpoint TLS (scheme floor via `verify_tls`; cert verification not disableable) and per-request authentication | security function |
 | Postgres state store (`--features postgres`) | sqlx with `tls-rustls-ring-webpki` (the one place the workspace picks the stack); SCRAM-SHA-256 auth with ChaCha CSPRNG nonces — but the **server** chooses the method: sqlx also answers legacy `md5` (and cleartext) password requests, with no client-side way to refuse | verify-full floor for remote hosts (§2, MUST); database authentication | security function |
