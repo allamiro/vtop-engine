@@ -1154,44 +1154,73 @@ impl LeaseAgent {
     /// already lost or taken, and blocking exit on metadata would trade a
     /// prompt failover for a hung shutdown, the exact inversion of the goal.
     async fn release(&mut self) {
-        // NotHeld here is what THIS PROCESS recorded, not what metadata
-        // decided (review): the abandoned round can die after metadata
-        // committed an acquisition — or after it reported an administrative
-        // hold — and before `self.state` caught up, and an administrative
-        // lease has no expiry to mop up the difference. One bounded read
-        // reconciles: if metadata says this node holds the range, the lease
-        // is released whether or not this agent ever knew it had it.
-        // Nothing was published for a lease never recorded, so there is no
-        // loss to publish in that branch — only the proposal.
-        let (fencing_epoch, was_published) = match self.state {
-            LeaseState::Held { fencing_epoch } => (fencing_epoch, true),
-            _ => {
-                let reconciled = self
-                    .bounded(
-                        "read range lease at shutdown",
-                        self.admin
-                            .read_range_lease(self.topic_uuid, self.range_uuid),
-                    )
-                    .await
-                    .ok()
-                    .and_then(|view| view.lease)
-                    .filter(|lease| lease.holder_node_uuid == self.node_uuid)
-                    .map(|lease| lease.fencing_epoch);
-                match reconciled {
-                    Some(epoch) => {
-                        tracing::warn!(
-                            range = %self.range_uuid,
-                            fencing_epoch = epoch,
-                            "metadata says this node holds a lease this agent never \
-                             recorded (a round abandoned mid-acquisition); releasing it \
-                             before exit"
-                        );
-                        (epoch, false)
-                    }
-                    None => return,
-                }
-            }
+        // What THIS PROCESS recorded is not what metadata decided (review,
+        // twice over): the abandoned round can die after metadata committed
+        // an acquisition and before `self.state` caught up (NotHeld with a
+        // lease on record), and it can equally die during a re-grant's
+        // publish while `self.state` still names the PREVIOUS epoch — a
+        // release proposed at a stale epoch is refused, and an
+        // administrative lease has no expiry to mop up the refusal. One
+        // bounded read reconciles both shapes: whatever epoch metadata
+        // attributes to this node is the epoch the release names. The read
+        // failing falls back to what the agent recorded — best effort, as
+        // this whole path is — and a lease metadata attributes to someone
+        // else is not this node's to release. Loss is published only for a
+        // hold that was actually published.
+        let recorded = match self.state {
+            LeaseState::Held { fencing_epoch } => Some(fencing_epoch),
+            _ => None,
         };
+        let metadata_view = self
+            .bounded(
+                "read range lease at shutdown",
+                self.admin
+                    .read_range_lease(self.topic_uuid, self.range_uuid),
+            )
+            .await
+            .ok()
+            .map(|view| {
+                view.lease
+                    .filter(|lease| lease.holder_node_uuid == self.node_uuid)
+                    .map(|lease| lease.fencing_epoch)
+            });
+        let fencing_epoch = match (recorded, metadata_view) {
+            // Metadata answered: its attribution wins, stale or fresh.
+            (recorded, Some(Some(meta_epoch))) => {
+                if recorded.is_none() {
+                    tracing::warn!(
+                        range = %self.range_uuid,
+                        fencing_epoch = meta_epoch,
+                        "metadata says this node holds a lease this agent never \
+                         recorded (a round abandoned mid-acquisition); releasing it \
+                         before exit"
+                    );
+                } else if recorded != Some(meta_epoch) {
+                    tracing::warn!(
+                        range = %self.range_uuid,
+                        recorded = recorded.unwrap_or_default(),
+                        fencing_epoch = meta_epoch,
+                        "metadata attributes this node's lease to a newer epoch than \
+                         the agent recorded (a round abandoned mid-publish); the \
+                         release names metadata's epoch"
+                    );
+                }
+                meta_epoch
+            }
+            // Metadata answered and this node holds nothing: no proposal to
+            // make, but a hold that was published is still published as lost.
+            (recorded, Some(None)) => {
+                if let Some(epoch) = recorded {
+                    self.publish_lost(epoch);
+                }
+                return;
+            }
+            // The read failed: propose with what the agent recorded, the
+            // pre-reconciliation behavior — best effort either way.
+            (Some(recorded), None) => recorded,
+            (None, None) => return,
+        };
+        let was_published = recorded.is_some();
         let proposal = self
             .bounded(
                 "propose release",

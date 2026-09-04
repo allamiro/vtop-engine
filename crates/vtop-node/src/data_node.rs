@@ -886,7 +886,8 @@ async fn run_leader(
         // expiry to fall back on, so dropping the task before
         // ReleaseRangeLease is proposed leaves the stopped node assigned
         // indefinitely.
-        agent_drain = agent_drain.max(Duration::from_millis(lease.renew_interval_ms) * 3);
+        agent_drain =
+            agent_drain.max(Duration::from_millis(lease.renew_interval_ms).saturating_mul(3));
     }
     observability.register(Box::new(BrokerCollector::new(
         Arc::clone(&broker),
@@ -1289,7 +1290,7 @@ async fn run_candidate(
     // the reconciliation read and the release proposal — plus one interval
     // of scheduling margin (review), not a whole lease.
     let agent_drain = std::time::Duration::from_secs(5)
-        .max(std::time::Duration::from_millis(lease.renew_interval_ms) * 3);
+        .max(std::time::Duration::from_millis(lease.renew_interval_ms).saturating_mul(3));
     let mut agent_task = tokio::spawn(agent.run(release_lease_rx));
 
     // --- readiness ----------------------------------------------------------

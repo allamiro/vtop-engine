@@ -510,6 +510,11 @@ impl FencingEpochJournal {
 /// off an unvouched base are not evidence, and returning them would let a
 /// caller mistake them for some.
 pub fn clamp_lineage(entries: &[EpochStart], base: u64, tail: u64) -> Vec<EpochStart> {
+    // An empty (or inverted) window holds no records to attribute; whatever
+    // the vector says about it is not retained-lineage evidence (review).
+    if tail <= base {
+        return Vec::new();
+    }
     let Some(owner) = entries
         .iter()
         .rev()
@@ -521,12 +526,23 @@ pub fn clamp_lineage(entries: &[EpochStart], base: u64, tail: u64) -> Vec<EpochS
         epoch: owner.epoch,
         start_offset: base,
     }];
-    clamped.extend(
-        entries
-            .iter()
-            .filter(|entry| entry.start_offset > base && entry.start_offset < tail)
-            .copied(),
-    );
+    // CANONICALIZED to the last epoch of every same-offset run (review): an
+    // epoch adopted while idle writes nothing, and its successor starting at
+    // the same offset is the epoch that actually governs records from there.
+    // One replica may have recorded the idle adoption and another not, yet
+    // both attribute every retained record identically — keeping the
+    // zero-record entry would make those histories compare unequal and
+    // reject a valid replica. (The base anchor is already canonical: the
+    // reverse owner search lands on the last entry at or below `base`.)
+    for entry in entries
+        .iter()
+        .filter(|entry| entry.start_offset > base && entry.start_offset < tail)
+    {
+        match clamped.last_mut() {
+            Some(last) if last.start_offset == entry.start_offset => *last = *entry,
+            _ => clamped.push(*entry),
+        }
+    }
     clamped
 }
 
