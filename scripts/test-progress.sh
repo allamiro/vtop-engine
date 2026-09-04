@@ -132,7 +132,13 @@ for arg in "$@"; do
     --workspace|--all)
       cargo_args+=("$arg"); workspace_flag=1 ;;
     --doc)
-      doc_only=1 ;;
+      # Kept for the run phase — it IS the selection — and remembered so
+      # the compile phase, which cargo refuses beside --doc, is skipped.
+      cargo_args+=("$arg"); doc_only=1 ;;
+    -q|--quiet)
+      die "quiet mode suppresses the Running/Doc-tests lines the bar is drawn from; run cargo test -q directly" ;;
+    -F?*)
+      cargo_args+=("$arg"); metadata_args+=("$arg") ;;
     --no-run)
       no_run=1 ;;
     --lib|--bins|--tests|--examples|--benches|--all-targets|\
@@ -174,11 +180,50 @@ fi
 
 HOST="$(rustc -vV | sed -n 's/^host: //p')"
 [[ -n "$HOST" ]] || die "could not determine the host triple from rustc"
-# The triple the graph is resolved for: an explicit --target, else the host.
-# (CARGO_BUILD_TARGET and build.target are cargo's to honour in the build;
-# they only shape the denominator here, and an explicit --target covers the
-# cross case the denominator can see.)
-TRIPLE="${TARGET_ARG:-$HOST}"
+# The triple the graph is resolved for, in cargo's precedence: --target,
+# then CARGO_BUILD_TARGET, then build.target from the config hierarchy
+# (--config overrides, then .cargo/config[.toml] upward from here, then the
+# home one; the extensionless file wins where both exist, as cargo warns it
+# does), then the host. The BUILD needs none of this — cargo resolves its
+# own target — but the denominator must describe the graph cargo builds.
+build_target() {
+  python3 - "$PWD" "${CARGO_HOME:-$HOME/.cargo}" ${config_overrides[@]+"${config_overrides[@]}"} <<'PY'
+import os, sys, tomllib
+cwd, cargo_home, *overrides = sys.argv[1:]
+def target_of(config):
+    target = config.get("build", {}).get("target")
+    if isinstance(target, list):
+        target = target[0] if len(target) == 1 else None
+    return target
+for override in reversed(overrides):
+    try:
+        config = tomllib.load(open(override, "rb")) if os.path.isfile(override) else tomllib.loads(override)
+    except (OSError, tomllib.TOMLDecodeError):
+        continue
+    if target_of(config):
+        print(target_of(config)); sys.exit(0)
+dirs = []
+here = cwd
+while True:
+    dirs.append(here)
+    parent = os.path.dirname(here)
+    if parent == here:
+        break
+    here = parent
+dirs.append(cargo_home)
+for directory in dirs:
+    for name in ("config", "config.toml"):
+        path = os.path.join(directory, ".cargo" if directory != cargo_home else "", name)
+        try:
+            config = tomllib.load(open(path, "rb"))
+        except (OSError, tomllib.TOMLDecodeError):
+            continue
+        if target_of(config):
+            print(target_of(config)); sys.exit(0)
+PY
+}
+TRIPLE="${TARGET_ARG:-${CARGO_BUILD_TARGET:-$(build_target)}}"
+TRIPLE="${TRIPLE:-$HOST}"
 
 # ---------------------------------------------------------------------------
 # Phase 1 — compile. Numerator and denominator are the same unit — packages —
@@ -242,7 +287,11 @@ if not roots:
     sys.exit("the selection excludes every package")
 
 if mode == "libs":
-    print(sum(1 for pid in roots if any("lib" in target["kind"] or "rlib" in target["kind"] for target in by_id[pid]["targets"])))
+    # A library with `doctest = false` produces no Doc-tests unit under
+    # cargo, so it must not be counted as one here.
+    print(sum(1 for pid in roots if any(
+        ("lib" in target["kind"] or "rlib" in target["kind"]) and target.get("doctest", True)
+        for target in by_id[pid]["targets"])))
     sys.exit(0)
 
 deps = {node["id"]: node["deps"] for node in meta["resolve"]["nodes"]}
@@ -360,6 +409,26 @@ TOTAL_UNITS=$(( TOTAL_BINS + DOC_UNITS ))
 
 printf '%srunning%s (%s test binaries, %s doctest targets, through cargo)\n' "$BOLD" "$RESET" "$TOTAL_BINS" "$DOC_UNITS"
 ran=0; passed=0; failed=0; current="cargo test"
+# A caller who asked for the tests' own output (--nocapture, --show-output)
+# gets it streamed as cargo prints it; a bar over a log nobody sees would
+# hide the very thing they asked for. The log is still kept for the counts.
+stream=0
+case " ${bin_args[*]+"${bin_args[*]}"} " in
+  *" --nocapture "*|*" --show-output "*) stream=1 ;;
+esac
+if (( stream )); then
+  cargo test ${cargo_args[@]+"${cargo_args[@]}"} --no-fail-fast -- ${bin_args[@]+"${bin_args[@]}"} 2>&1 \
+    | tee "$WORK/run.log"
+  RUN_RC="${PIPESTATUS[0]}"
+  passed="$(sum_counts passed "$WORK/run.log")"
+  failed="$(sum_counts failed "$WORK/run.log")"
+  if [[ "$RUN_RC" -ne 0 ]]; then
+    printf '\n%s%d passed, %d failed (cargo test exited %d)%s\n' "$RED" "$passed" "$failed" "$RUN_RC" "$RESET"
+    exit "$RUN_RC"
+  fi
+  printf '%s%d tests passed (output streamed as requested)%s\n' "$GREEN" "$passed" "$RESET"
+  exit 0
+fi
 bar 0 "$TOTAL_UNITS" "$current"
 # `--no-fail-fast`: every binary runs, so the summary names every failure
 # rather than the first. Cargo's progress lines are on stderr; the tests'
@@ -388,9 +457,10 @@ printf '\n'
 if [[ "$RUN_RC" -ne 0 ]]; then
   printf '\n%scargo test exited %d%s\n' "$RED" "$RUN_RC" "$RESET"
   # The failure list and the panics, not the whole passing roll-call; plus
-  # cargo's own closing summary of which binaries failed.
-  grep -E '^(test .*FAILED|thread .* panicked|assertion|---- .* stdout|error: |    [a-z_-]+ \(|failures:)' "$WORK/run.log" \
-    | head -60
+  # cargo's own closing summary of which binaries failed. Every failure,
+  # not the first sixty lines of them — the whole point of --no-fail-fast
+  # is that the summary is complete.
+  grep -E '^(test .*FAILED|thread .* panicked|assertion|---- .* stdout|error: |    [a-z_-]+ \(|failures:)' "$WORK/run.log"
   printf '\n%s%d passed, %d failed%s\n' "$RED" "$passed" "$failed" "$RESET"
   exit "$RUN_RC"
 fi
