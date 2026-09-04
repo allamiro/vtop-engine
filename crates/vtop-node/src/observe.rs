@@ -1066,6 +1066,13 @@ pub struct CandidateCollector {
     meta_fencing_epoch: IntGaugeVec,
     lease_active: IntGaugeVec,
     leading: IntGaugeVec,
+    /// Serializes refresh-plus-collect (#411 review): the coherent-pair
+    /// guarantee on `leading`/`lease_active` holds within one refresh, but
+    /// two concurrent scrapes could interleave their gauge writes between
+    /// one scrape's refresh and its read-out — emitting a pair no single
+    /// snapshot produced. Scrapes are rare and cheap; serializing them is
+    /// the whole fix.
+    scrape: std::sync::Mutex<()>,
 }
 
 impl CandidateCollector {
@@ -1116,6 +1123,7 @@ impl CandidateCollector {
                  currently fenced, and refusing writes",
                 &["topic", "range"],
             )?,
+            scrape: std::sync::Mutex::new(()),
         })
     }
 
@@ -1222,6 +1230,15 @@ impl Collector for CandidateCollector {
     }
 
     fn collect(&self) -> Vec<MetricFamily> {
+        // Refresh and read-out under one lock (#411 review): two concurrent
+        // scrapes could otherwise interleave their gauge writes between one
+        // scrape's refresh and its collect, emitting a leading/lease_active
+        // pair no single snapshot produced — the coherence the help text
+        // promises has to hold across scrapes, not only within a refresh.
+        let _serialized = self
+            .scrape
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.refresh();
         collect_all(&self.members())
     }

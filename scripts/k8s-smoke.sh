@@ -741,8 +741,12 @@ await_holder() { # [min-epoch] — echoes "<holder> <epoch>"
   # whether a survivor took over or the recreated pod won its own range back
   # (a legitimate outcome an exclusion would wrongly reject, and one this
   # test must not turn into a flake).
-  local floor="${1:-0}" holder="" epoch=""
-  for _ in $(seq 1 90); do
+  # Wall-clock bounded, not iteration-counted (review): lease_state's own
+  # per-attempt timeout means an iteration can cost twelve seconds against a
+  # wedged forward, and ninety of those is eighteen minutes wearing a
+  # 180-second label. The deadline is the claim; the loop merely fills it.
+  local floor="${1:-0}" holder="" epoch="" holder_deadline=$((SECONDS + 180))
+  while [ "$SECONDS" -lt "$holder_deadline" ]; do
     read -r holder epoch <<< "$(lease_state)" || true
     if [ -n "$holder" ] && [ -n "$epoch" ] && [ "$epoch" -gt "$floor" ]; then
       printf '%s %s\n' "$holder" "$epoch"
