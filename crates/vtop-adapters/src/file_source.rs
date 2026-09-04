@@ -439,6 +439,17 @@ fn dev_ino(_md: &std::fs::Metadata) -> Option<(u64, u64)> {
 /// matches thousands of files does not open them all at once.
 const FILE_READ_CONCURRENCY: usize = 8;
 
+/// One file's fate in a read pass: skipped because the stat proved the
+/// cursor already caught up (#100), carrying the identity the stat saw so
+/// the outcome's markers can name it — or read, successfully or not. The
+/// decision is made inside the bounded pipeline, so the deciding stat rides
+/// the same concurrency as the read it gates instead of serializing on the
+/// executor thread ahead of every read (#412).
+enum PassOutcome {
+    SkippedUnchanged(FileIdentity),
+    Read(Result<(Vec<Vec<u8>>, u64, bool, FileIdentity), VtopError>),
+}
+
 #[async_trait]
 impl SourceAdapter for FileSource {
     async fn discover_sources(&self) -> Result<Vec<DiscoveredSource>, VtopError> {
@@ -573,8 +584,11 @@ impl SourceAdapter for FileSource {
 
     /// Read every file CONCURRENTLY (#96 B2). Each file's read is independent
     /// — its own handle, its own snapshotted cursor — so disk I/O overlaps
-    /// instead of queueing behind the slowest file. Cursor updates are applied
-    /// serially after the joins, keeping all shared state on this thread.
+    /// instead of queueing behind the slowest file. The skip-deciding stat
+    /// rides inside the same bounded jobs (#412), so no file's metadata
+    /// latency is paid on the executor thread or ahead of another file's
+    /// read. Cursor updates are applied serially after the joins, keeping
+    /// all shared state on this thread.
     async fn read_all_batch_candidates(
         &mut self,
         sources: &[DiscoveredSource],
@@ -586,52 +600,70 @@ impl SourceAdapter for FileSource {
         let started = std::time::Instant::now();
 
         let whole_file = self.whole_file;
-        // STAT BEFORE READ (#100). A directory of rotated logs is mostly cold,
-        // and a stat costs a fraction of an open-seek-read. Files that have
-        // not moved since this cursor caught up with them are separated out
-        // here and never opened; what is left is the work the cycle actually
-        // has to do.
-        let mut jobs: Vec<(usize, String, u64)> = Vec::new();
-        let mut skipped: Vec<(usize, String, u64, FileIdentity)> = Vec::new();
-        for (i, s) in sources.iter().enumerate() {
-            let path = s.source_name.clone();
-            let cursor = self.cursors.entry(path.clone()).or_default();
-            let start = cursor.read_byte;
-            match Self::stat_identity(&path) {
-                Some(current) if Self::can_skip(cursor, &current) => {
-                    skipped.push((i, path, start, current));
-                }
-                _ => jobs.push((i, path, start)),
-            }
-        }
+        // STAT BEFORE READ (#100), decided INSIDE the bounded pipeline
+        // (#412). The signal is unchanged — a directory of rotated logs is
+        // mostly cold, and a stat costs a fraction of an open-seek-read —
+        // but the stats used to run as a sequential synchronous pre-pass on
+        // the executor thread, so a large directory on a slow or network
+        // filesystem serialized every stat before the first read dispatched,
+        // while the reads they gated went through tokio::fs. Only the cursor
+        // snapshot is taken up front; each job stats and decides for itself
+        // under the same bounded concurrency as the read it gates.
+        let jobs: Vec<(usize, String, u64, Option<FileIdentity>)> = sources
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let path = s.source_name.clone();
+                let cursor = self.cursors.entry(path.clone()).or_default();
+                (i, path, cursor.read_byte, cursor.seen.clone())
+            })
+            .collect();
+
+        let mut results: Vec<(usize, String, u64, PassOutcome)> =
+            futures::stream::iter(jobs.into_iter().map(|(i, path, start, seen)| async move {
+                // A path that cannot be stat'd is NOT skipped: it goes to
+                // the read, which reports the error properly instead of
+                // having it swallowed here as a silent skip.
+                let current = tokio::fs::metadata(&path)
+                    .await
+                    .ok()
+                    .map(|md| Self::identity_of(&md));
+                let snapshot = FileCursor {
+                    read_byte: start,
+                    seen,
+                    ..FileCursor::default()
+                };
+                let outcome = match current {
+                    Some(current) if Self::can_skip(&snapshot, &current) => {
+                        PassOutcome::SkippedUnchanged(current)
+                    }
+                    _ => PassOutcome::Read(
+                        Self::read_slice(path.clone(), start, max_records, max_bytes, whole_file)
+                            .await,
+                    ),
+                };
+                (i, path, start, outcome)
+            }))
+            .buffer_unordered(FILE_READ_CONCURRENCY)
+            .collect()
+            .await;
+        // buffer_unordered completes in I/O order; report in source order.
+        results.sort_by_key(|(i, ..)| *i);
         // COUNTED, not silent. The issue asks for deferred work to be visible,
         // and a cycle that skipped nine files out of ten is a very different
         // cycle from one that read all ten and found them empty — they look
         // identical in every other metric.
-        let skipped_count = skipped.len();
+        let skipped_count = results
+            .iter()
+            .filter(|(_, _, _, outcome)| matches!(outcome, PassOutcome::SkippedUnchanged(_)))
+            .count();
         if skipped_count > 0 {
             tracing::debug!(
                 skipped = skipped_count,
-                read = jobs.len(),
+                read = results.len() - skipped_count,
                 "file_cycle_skipped_unchanged"
             );
         }
-
-        let mut results: Vec<(
-            usize,
-            String,
-            u64,
-            Result<(Vec<Vec<u8>>, u64, bool, FileIdentity), VtopError>,
-        )> = futures::stream::iter(jobs.into_iter().map(|(i, path, start)| async move {
-            let res =
-                Self::read_slice(path.clone(), start, max_records, max_bytes, whole_file).await;
-            (i, path, start, res)
-        }))
-        .buffer_unordered(FILE_READ_CONCURRENCY)
-        .collect()
-        .await;
-        // buffer_unordered completes in I/O order; report in source order.
-        results.sort_by_key(|(i, ..)| *i);
 
         let mut report = AdapterReadReport {
             outcomes: Vec::with_capacity(results.len()),
@@ -642,13 +674,13 @@ impl SourceAdapter for FileSource {
         };
         let mut any_records = false;
         let mut any_failed = false;
-        // Skipped files report an empty read at the cursor they already hold,
-        // so the caller sees one outcome per source however the cycle got
-        // there. Pushed first and sorted back into source order at the end.
-        for (source_index, path, start, id) in skipped {
-            report.outcomes.push(SourceReadOutcome {
-                source_index,
-                result: Ok(vec![ReadResult {
+        // One loop in source order — the sort above already restored it, and
+        // a skipped file reports an empty read at the cursor it already
+        // holds, so the caller sees one outcome per source however the cycle
+        // got there.
+        for (source_index, path, start, outcome) in results {
+            let result = match outcome {
+                PassOutcome::SkippedUnchanged(id) => Ok(vec![ReadResult {
                     progress_start: Self::marker_from(&path, &id, start, start),
                     progress_end: Self::marker_from(&path, &id, start, start),
                     records: Vec::new(),
@@ -656,11 +688,7 @@ impl SourceAdapter for FileSource {
                     last_timestamp: None,
                     verbatim: false,
                 }]),
-            });
-        }
-        for (source_index, path, start, res) in results {
-            let result = match res {
-                Ok((records, end, verbatim, id)) => {
+                PassOutcome::Read(Ok((records, end, verbatim, id))) => {
                     let cursor = self.cursors.get_mut(&path).unwrap();
                     cursor.read_byte = end;
                     // What the read ACTUALLY observed, not what the stat saw
@@ -678,7 +706,7 @@ impl SourceAdapter for FileSource {
                         verbatim,
                     }])
                 }
-                Err(e) => {
+                PassOutcome::Read(Err(e)) => {
                     any_failed = true;
                     Err(e)
                 }
@@ -688,11 +716,6 @@ impl SourceAdapter for FileSource {
                 result,
             });
         }
-        // ONE ORDER OUT, whatever order the work happened in. Skipped files
-        // were appended before the read results, so without this the caller
-        // sees the cold files first and the hot ones after — source order is
-        // part of this report's contract and a skip must not change it.
-        report.outcomes.sort_by_key(|o| o.source_index);
         // The reads overlapped, so the pass's wall-clock is one shared bucket
         // (splitting per source would double-count it): productive if ANY file
         // yielded, else failed if ANY file errored, else empty. File reads
