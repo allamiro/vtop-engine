@@ -2088,33 +2088,21 @@ impl LocalBroker {
                         .collect();
                 }
             }
-            cluster.advance_to(leader_committed)
-        };
-        replicas.propagate_committed_hwm(&CommittedHwmUpdate {
-            range: hwm_range,
-            fencing_epoch: hwm_epoch,
-            committed_high_watermark: committed,
-        });
-        // Second bounded retention pass, with the floor just published
-        // (#408). The under-lock pass above necessarily ran against the OLD
-        // quorum floor — a segment this group's roll sealed becomes
-        // reclaimable only once the floor advances past it, which happened
-        // two statements up. Without this pass that segment waits for the
-        // NEXT produce, and on a range that goes idle "next produce" is
-        // never. A no-op whenever nothing became eligible, so the steady
-        // state pays one atomic load and a size sum.
-        //
-        // Under the SAME lease discipline as the first pass (review): that
-        // one ran inside the meta lock the append held, and a lease lost
-        // since the publication above means this broker mutates nothing
-        // further — reclamation is never essential, the next holder's own
-        // passes cover it, and "a fenced broker deletes no files" is a rule
-        // worth keeping absolute.
-        {
-            let meta = self.meta_fencing_epoch.lock();
-            if self
-                .check_range(&meta, &batch[0].request.range, hwm_epoch)
-                .is_ok()
+            let committed = cluster.advance_to(leader_committed);
+            // Second bounded retention pass, with the floor just published
+            // (#408), INSIDE the same lease-validated block that published
+            // it (review, both directions): a fenced broker deletes no
+            // files — the check above vouches for that under this very lock
+            // — and a revocation landing after publication cannot suppress
+            // the only pass that sees the floor it just published, which
+            // on an idle range would leave this node above max_total_bytes
+            // forever (no other holder can reclaim this node's files, and
+            // neither demotion nor quiesce runs retention). The under-lock
+            // pass in the prepared block necessarily ran against the OLD
+            // floor; this one is a no-op whenever nothing became eligible,
+            // so the steady state pays one atomic load and a size sum —
+            // the same cost profile as the first pass, under the same two
+            // locks in the same order.
             {
                 let mut state = self
                     .state
@@ -2122,7 +2110,13 @@ impl LocalBroker {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 self.run_retention(&mut state.segment);
             }
-        }
+            committed
+        };
+        replicas.propagate_committed_hwm(&CommittedHwmUpdate {
+            range: hwm_range,
+            fencing_epoch: hwm_epoch,
+            committed_high_watermark: committed,
+        });
         batch
             .iter()
             .zip(wire_by_member)
