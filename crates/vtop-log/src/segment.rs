@@ -2092,11 +2092,46 @@ fn torn_prefix_matches_template(candidate: &[u8], template: &[u8]) -> Option<Vec
     // digit runs. Corruption that flips a key byte or a brace diverges; a
     // genuine torn cut, ending anywhere inside the walk — or in the
     // checksum bytes after a complete shape — cannot.
-    if candidate.len().saturating_sub(12) > config_at {
-        return config_shape_runs(&candidate[12 + config_at..], &template_json[config_at..]);
+    let (runs, json_complete_at) = if candidate.len().saturating_sub(12) > config_at {
+        let (runs, complete_have) =
+            config_shape_runs(&candidate[12 + config_at..], &template_json[config_at..])?;
+        (runs, complete_have.map(|have| config_at + have))
+    } else {
+        (Vec::new(), None)
+    };
+    // The claim must describe THIS file's own json (review, round eight —
+    // the interval check above bounds it against the RANGE's possibilities,
+    // this one against the FILE's): a torn write carries its true length,
+    // so the bytes present are a prefix of a json exactly that long. A
+    // completed shape pins the json length exactly — the claim must equal
+    // it, and whatever follows can only be checksum — while a cut mid-json
+    // means the claim must at least cover what is already on disk. A file
+    // failing either was never a prefix of itself, whatever else it is.
+    if candidate.len() >= 12 {
+        let claimed =
+            u32::from_be_bytes(candidate[8..12].try_into().expect("fixed slice")) as usize;
+        match json_complete_at {
+            Some(json_len) => {
+                if claimed != json_len
+                    || candidate.len() - 12 - json_len > crate::codec::CHECKSUM_LEN
+                {
+                    return None;
+                }
+            }
+            None => {
+                if claimed < candidate.len() - 12 {
+                    return None;
+                }
+            }
+        }
     }
-    Some(Vec::new())
+    Some(runs)
 }
+
+/// One config digit run in field order — the parsed value and whether the
+/// candidate continued past it (only the final run can be open) — plus,
+/// for the full walk, where the json completed when it did.
+type ConfigRuns = (Vec<(u128, bool)>, Option<usize>);
 
 /// Walk the `template` config region's SHAPE against `candidate`: literal
 /// bytes must match, and each of the template's digit runs must be met by a
@@ -2110,7 +2145,7 @@ fn torn_prefix_matches_template(candidate: &[u8], template: &[u8]) -> Option<Vec
 /// candidate continued past the run, so the value is closed; only the final
 /// run can be open, and an open run is a prefix of an unknown wider value
 /// that no check may be held against.
-fn config_shape_runs(candidate: &[u8], template: &[u8]) -> Option<Vec<(u128, bool)>> {
+fn config_shape_runs(candidate: &[u8], template: &[u8]) -> Option<ConfigRuns> {
     let mut runs = Vec::new();
     let mut have = 0usize;
     let mut want = 0usize;
@@ -2152,7 +2187,10 @@ fn config_shape_runs(candidate: &[u8], template: &[u8]) -> Option<Vec<(u128, boo
             want += 1;
         }
     }
-    Some(runs)
+    // `want` exhausting the template means the candidate's json COMPLETED
+    // at `have` — the fact the caller's length cross-check needs (review,
+    // round eight); anything after it can only be checksum bytes.
+    Some((runs, (want == template.len()).then_some(have)))
 }
 
 /// Whether the candidate's config values can extend into any config the
