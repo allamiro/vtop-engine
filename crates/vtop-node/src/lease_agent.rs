@@ -1022,7 +1022,33 @@ impl LeaseAgent {
                         "standing down: this node was granted an epoch it could not serve, \
                          so the lease goes back and this node sits out the next rounds"
                     );
-                    self.release().await;
+                    // Raced against the release signal exactly as the round
+                    // is (review): this release can spend two bounded
+                    // deadlines, and a shutdown arriving inside it used to
+                    // wait them out before the loop head could break —
+                    // leaving the FINAL release less drain budget than its
+                    // own two calls need. Abandoning loses nothing: the
+                    // exit-path release re-reconciles against metadata and
+                    // proposes with whatever epoch it finds.
+                    if release_closed {
+                        self.release().await;
+                    } else {
+                        tokio::select! {
+                            () = self.release() => {}
+                            changed = release.changed() => {
+                                if changed.is_err() {
+                                    release_closed = true;
+                                }
+                                // Only an actual `true` abandons — the loop
+                                // head breaks on it and the exit release
+                                // takes over. A closed watch or a spurious
+                                // wake finishes the hand-back here.
+                                if !*release.borrow() {
+                                    self.release().await;
+                                }
+                            }
+                        }
+                    }
                     self.publish_lost(fencing_epoch);
                 }
                 self.state = LeaseState::NotHeld;
