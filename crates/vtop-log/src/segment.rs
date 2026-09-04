@@ -2106,6 +2106,17 @@ fn config_shape_matches(candidate: &[u8], template: &[u8]) -> bool {
                 // them is a digit: not a prefix of any real config.
                 return false;
             }
+            // The digits themselves have two checkable impossibilities
+            // (review, round six): canonical JSON never writes a leading
+            // zero — and a torn cut cannot manufacture one, since every
+            // prefix of a canonical number starts with its first digit —
+            // and no config field is wider than a u64, so a run past
+            // twenty digits describes a value no header ever encoded,
+            // truncated or not.
+            let run = &candidate[run_start..have];
+            if (run[0] == b'0' && run.len() > 1) || run.len() > 20 {
+                return false;
+            }
             while want < template.len() && template[want].is_ascii_digit() {
                 want += 1;
             }
