@@ -190,7 +190,7 @@ impl S3NativeBackend {
         let out = req
             .send()
             .await
-            .map_err(|e| sdk_failure("put_object", &uri, e))?;
+            .map_err(|e| sdk_failure("put_object", uri, e))?;
         tracing::info!(uri, "object uploaded via s3_native");
         // A suspended-versioning bucket reports the literal version "null",
         // which later writes overwrite — it is not an immutable pin. Surface
@@ -216,7 +216,7 @@ impl S3NativeBackend {
             .key(&key)
             .send()
             .await
-            .map_err(|e| sdk_failure("get_object", &object_uri, e))?;
+            .map_err(|e| sdk_failure("get_object", object_uri, e))?;
         digest_reader(algo, out.body.into_async_read())
             .await?
             .ok_or_else(|| VtopError::Upload("cannot hash with disabled checksum mode".into()))
@@ -339,7 +339,7 @@ impl UploadBackend for S3NativeBackend {
             .bucket(bucket)
             .send()
             .await
-            .map_err(|e| sdk_failure("get_bucket_versioning", &bucket, e))?;
+            .map_err(|e| sdk_failure("get_bucket_versioning", bucket, e))?;
         match out.status() {
             Some(BucketVersioningStatus::Enabled) => Ok(()),
             other => Err(VtopError::Upload(format!(
@@ -358,7 +358,7 @@ impl UploadBackend for S3NativeBackend {
             .key(&key)
             .send()
             .await
-            .map_err(|e| sdk_failure("get_object", &object_uri, e))?;
+            .map_err(|e| sdk_failure("get_object", object_uri, e))?;
         let bytes = out
             .body
             .collect()
@@ -380,7 +380,7 @@ impl UploadBackend for S3NativeBackend {
             .key(&key)
             .send()
             .await
-            .map_err(|e| sdk_failure("get_object", &object_uri, e))?;
+            .map_err(|e| sdk_failure("get_object", object_uri, e))?;
         if out
             .content_length()
             .is_some_and(|size| size < 0 || size as u64 > max_bytes as u64)
@@ -402,7 +402,7 @@ impl UploadBackend for S3NativeBackend {
             .checksum_mode(ChecksumMode::Enabled)
             .send()
             .await
-            .map_err(|e| sdk_failure("head_object", &object_uri, e))?;
+            .map_err(|e| sdk_failure("head_object", object_uri, e))?;
 
         // Only expose the checksum S3 itself computed over the stored body.
         // x-amz-meta-vtop-checksum is written by the uploader and therefore
@@ -489,7 +489,7 @@ impl UploadBackend for S3NativeBackend {
             .key(&key)
             .send()
             .await
-            .map_err(|e| sdk_failure("delete_object", &object_uri, e))?;
+            .map_err(|e| sdk_failure("delete_object", object_uri, e))?;
         Ok(())
     }
 
@@ -548,7 +548,7 @@ impl UploadBackend for S3NativeBackend {
         let out = req
             .send()
             .await
-            .map_err(|e| sdk_failure("create_multipart_upload", &object_uri, e))?;
+            .map_err(|e| sdk_failure("create_multipart_upload", object_uri, e))?;
         out.upload_id().map(str::to_owned).ok_or_else(|| {
             VtopError::Upload(format!(
                 "create_multipart_upload {object_uri}: service returned no upload id"
@@ -618,7 +618,7 @@ impl UploadBackend for S3NativeBackend {
             .multipart_upload(multipart)
             .send()
             .await
-            .map_err(|e| sdk_failure("complete_multipart_upload", &object_uri, e))?;
+            .map_err(|e| sdk_failure("complete_multipart_upload", object_uri, e))?;
         let version_id = out
             .version_id()
             .filter(|id| *id != "null")
@@ -640,7 +640,7 @@ impl UploadBackend for S3NativeBackend {
             .upload_id(upload_id)
             .send()
             .await
-            .map_err(|e| sdk_failure("abort_multipart_upload", &object_uri, e))?;
+            .map_err(|e| sdk_failure("abort_multipart_upload", object_uri, e))?;
         Ok(())
     }
 }

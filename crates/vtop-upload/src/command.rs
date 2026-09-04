@@ -131,7 +131,7 @@ impl CommandPolicy {
         if output.status.success() {
             Ok(())
         } else {
-            Err(exit_failure(&self.backend, operation, &output))
+            Err(exit_failure(self.backend, operation, &output))
         }
     }
 
@@ -142,7 +142,7 @@ impl CommandPolicy {
     ) -> Result<String, VtopError> {
         let output = self.capture(command, operation).await?;
         if !output.status.success() {
-            return Err(exit_failure(&self.backend, operation, &output));
+            return Err(exit_failure(self.backend, operation, &output));
         }
         let mut combined = output.stdout;
         combined.extend_from_slice(&output.stderr);
