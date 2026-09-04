@@ -413,11 +413,13 @@ impl InProcessFollower {
     /// no file was attached.
     ///
     /// Called only where a durability barrier already exists — after a
-    /// committed append, single or batch, and from [`Self::quiesce`] — and
-    /// deliberately NOT from [`Self::observe_hwm`], which runs in the
-    /// per-connection dispatch loop that also carries append frames and must
-    /// stay I/O-free. The durable floor therefore lags the cell by at most
-    /// one append batch plus the quiet tail before quiesce. That lag is safe
+    /// committed append, single or batch, after [`Self::flush_held_fsync`]
+    /// releases held bytes, and from [`Self::quiesce`] — always AFTER the
+    /// state lock drops, because this needs only the shared cell and its own
+    /// file, and deliberately NOT from [`Self::observe_hwm`], which runs in
+    /// the per-connection dispatch loop that also carries append frames and
+    /// must stay I/O-free. The durable floor therefore lags the cell by at
+    /// most one append batch plus the quiet tail before quiesce. That lag is safe
     /// by the asymmetry [`crate::committed_floor`] states: a floor too low
     /// only weakens the guard toward the pre-floor behaviour; it never
     /// blocks legitimate work.
@@ -710,21 +712,28 @@ impl InProcessFollower {
 
     /// Commit any bytes held by [`Self::set_hold_fsync`].
     pub fn flush_held_fsync(&self) -> Result<u64, (ErrorCode, String)> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let committed = state.segment.commit().map_err(|problem| {
-            (
-                ErrorCode::Storage,
-                format!("follower {} flush_held_fsync: {problem}", self.node_id),
-            )
-        })?;
-        // The flush is the moment held appends become durable, and it may
-        // have rolled the tail — reclaim here too, or a follower flushed
-        // after a hold keeps its now-durable sealed prefix until the next
-        // append happens to arrive (#290).
-        self.run_retention(&mut state.segment);
+        let committed = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let committed = state.segment.commit().map_err(|problem| {
+                (
+                    ErrorCode::Storage,
+                    format!("follower {} flush_held_fsync: {problem}", self.node_id),
+                )
+            })?;
+            // The flush is the moment held appends become durable, and it may
+            // have rolled the tail — reclaim here too, or a follower flushed
+            // after a hold keeps its now-durable sealed prefix until the next
+            // append happens to arrive (#290).
+            self.run_retention(&mut state.segment);
+            committed
+        };
+        // A durability barrier like any committed append, so the floor rides
+        // it too (#240) — an HWM observed during the hold would otherwise
+        // wait for the next append or quiesce to become durable.
+        self.persist_committed_floor();
         Ok(committed)
     }
 
@@ -949,14 +958,22 @@ impl InProcessFollower {
                 // to roll there, and retention deletes files, which is even
                 // less compatible with "held bytes die with a crash". The
                 // floor persist rides the same condition — this append was a
-                // durability barrier, held bytes were not.
-                if !self.hold_fsync() {
+                // durability barrier, held bytes were not — but runs after
+                // the state lock drops: it reads only the shared cell and
+                // its own file, and holding the follower's lock across a
+                // sidecar fsync would serialize every other lock user.
+                let barrier = !self.hold_fsync();
+                if barrier {
                     self.run_retention(&mut state.segment);
+                }
+                let response = ReplicaAppendResponse {
+                    local_committed_offset: state.segment.committed_offset(),
+                };
+                drop(state);
+                if barrier {
                     self.persist_committed_floor();
                 }
-                Ok(ReplicaAppendResponse {
-                    local_committed_offset: state.segment.committed_offset(),
-                })
+                Ok(response)
             }
             Err(problem) => Err((
                 match problem {
@@ -1105,9 +1122,12 @@ impl InProcessFollower {
             Ok(local_committed_offset) => {
                 // One pass per batch, after the commit, and never under an
                 // fsync hold — the hold path returned above (#290). The floor
-                // persist piggybacks here too (#240): one write per batch at
-                // a barrier that already fsynced, and only when it advanced.
+                // persist rides the same barrier (#240) but AFTER the state
+                // lock drops: it reads only the shared cell and its own file,
+                // and holding the follower's lock across a sidecar fsync
+                // would serialize every other lock user behind it.
                 self.run_retention(&mut state.segment);
+                drop(state);
                 self.persist_committed_floor();
                 Ok(ReplicaAppendResponse {
                     local_committed_offset,
