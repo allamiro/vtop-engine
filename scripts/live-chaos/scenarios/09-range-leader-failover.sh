@@ -20,6 +20,12 @@
 #   5. every replica's sealed artifact independently verifies.
 source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 
+# A v2 range (#240): the promotion boundary marker this scenario asserts is
+# a record only a v2 frame can carry under an identity consumers are
+# shielded from — a v1 range keeps the pre-marker publication path, and
+# the marker line awaited below would never appear.
+export CHAOS_SEGMENT_FORMAT=v2
+
 require_binaries
 init_workdir
 
@@ -81,6 +87,18 @@ PRODUCER=$!
 KILL_FLOOR=$((RECORDS / 10))
 [[ "$KILL_FLOOR" -ge 1 ]] || KILL_FLOOR=1
 await_acked_floor "$WORKDIR/acked" "$KILL_FLOOR"
+
+# THE PUBLISHED MARK, sampled the instant before the kill (#240, §5.4.2):
+# whatever high-water mark this leader had published is a claim consumers
+# may already have read, and the new leader must never publish a lower one.
+# A lower bound, deliberately — the producer is still running and the mark
+# keeps moving between this read and the kill — and a bound the failed read
+# must not silently zero: a healthy leader answers, and one that does not is
+# a scenario failure, not a mark of 0.
+HWM_BEFORE="$(metric_value "$(data_metrics_addr 0)" vtop_broker_cluster_committed_offset)" \
+  || fail "the leader's published high-water mark could not be read before the kill"
+HWM_BEFORE="${HWM_BEFORE%.*}"
+log "published high-water mark before the kill: $HWM_BEFORE"
 
 kill9_pid "$DL"
 stop_node_now "$DL"
@@ -405,8 +423,34 @@ log "the new leader acknowledged fresh quorum writes"
 # batch above it came from a bumped producer epoch whose sequences restart at
 # 0, so its bytes are not derivable from its offsets; it is still checked for
 # offset contiguity and against the high watermark.
-await_verified_floor "$VERIFY_CFG" "$(native_addr)" "$ACKED" "$ACKED"
+# One boundary marker per promoted epoch sits in the log, invisible to the
+# consumer (#240): epochs are minted from 1, so the current epoch bounds how
+# many offsets the consumer's view may skip — anything beyond is still loss.
+CHAOS_MAX_OFFSET_GAPS="$EPOCH_AFTER" \
+  await_verified_floor "$VERIFY_CFG" "$(native_addr)" "$ACKED" "$ACKED"
 log "every one of the $ACKED acknowledged records survived the failover, byte-exact"
+
+# --- a published high-water mark never regresses (#240, §5.4.2) -------------
+# The new leader did not publish the boundary its probe established: it
+# appended a marker of its own epoch, and published only once a quorum held
+# it. The evidence is the marker line in its own log — awaited, because the
+# marker can only quorum-ack once the rejoining follower reached the new
+# leader's tail, which the produce above is what forced. And the mark it
+# published must cover the one the dead leader had already published: the
+# invariant this whole item exists to establish.
+await_log_line "$WORKDIR/logs/data-promoted-$PROMOTE_N.log" \
+  "boundary_marker_published epoch=$EPOCH_AFTER" \
+  "the promoted leader must publish its boundary through a quorum-acked marker of its own \
+epoch, never by trusting the probe's count"
+await_metric_at_least "$(data_metrics_addr 0)" vtop_broker_cluster_committed_offset \
+  "$HWM_BEFORE" \
+  "the high-water mark REGRESSED across the failover: the dead leader had published \
+$HWM_BEFORE and the new leader publishes less"
+await_metric_at_least "$(data_metrics_addr 0)" vtop_broker_cluster_committed_offset \
+  "$ACKED" \
+  "the published high-water mark sits below the acknowledged floor after the failover"
+log "the new leader published its boundary through its own epoch's marker, at or above the \
+$HWM_BEFORE the old leader had published"
 
 # --- the dead leader must not be able to write again ------------------------
 # Restarting it against its old directory is the realistic operator mistake:

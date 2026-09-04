@@ -594,6 +594,10 @@ jobs:
             --set 'data.nodeUuids={aaaaaaaa-0000-0000-0000-0000000000a1,aaaaaaaa-0000-0000-0000-0000000000a2,aaaaaaaa-0000-0000-0000-0000000000a3,aaaaaaaa-0000-0000-0000-0000000000a4}'
           refuses "deployment.mode=colocated (separated is slice 2)" \
             -f helm/vtop/ci/default-values.yaml --set deployment.mode=separated
+          # The #240 format knob: a value the binary would refuse must be
+          # refused at render time, with the two it accepts named.
+          refuses_because 'data.segmentFormat must be "v1" or "v2"' \
+            -f helm/vtop/ci/default-values.yaml --set data.segmentFormat=v3
 
       # The REPLICATED shape, which until now nothing rendered at all — not
       # here, and not in the live smoke test either. It is the only topology

@@ -122,6 +122,10 @@
           "description": "RETIRED (#284). Kept in the schema only so the template's fail() can explain the migration instead of a bare additionalProperties rejection."
         },
         "fencingEpoch": { "$ref": "#/$defs/nonNegInt" },
+        "segmentFormat": {
+          "type": "string",
+          "description": "The on-disk format a NEW range is created in (#240): \"v1\", \"v2\", or empty for the binary's default (v1); creation-time only. Values are checked by the template's fail(), which names the accepted ones, rather than by a bare schema rejection."
+        },
         "range": {
           "type": "object",
           "additionalProperties": false,

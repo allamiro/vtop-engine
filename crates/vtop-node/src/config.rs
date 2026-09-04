@@ -209,6 +209,25 @@ pub(crate) fn default_max_record_bytes() -> u32 {
     16 * 1024 * 1024
 }
 
+/// The on-disk segment format a node creates a NEW range in.
+///
+/// Creation-time only, like the roll thresholds: an existing range keeps
+/// the format its tail already has, whatever this says, because the format
+/// is a property of the bytes on disk and a config edit cannot change them.
+/// The default is v1 so every existing config keeps creating exactly what
+/// it did. v2 is the proof-carrying format (#93 stage 4): real producer
+/// epochs in every frame, chunk proofs, and — what a replicated range wants
+/// it for — the promotion boundary marker (#240), which only a v2 frame can
+/// carry under an identity consumers are shielded from. A v1 replicated
+/// range keeps the pre-marker publication path.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SegmentFormatConfig {
+    #[default]
+    V1,
+    V2,
+}
+
 /// A data-plane node process (one range, mirroring the library harnesses).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -281,6 +300,10 @@ pub struct DataNodeConfig {
     /// unreachable in practice.
     #[serde(default = "default_max_record_bytes")]
     pub max_record_bytes: u32,
+    /// The segment format a NEW range is created in; see
+    /// [`SegmentFormatConfig`]. `v1` (the default) or `v2`.
+    #[serde(default)]
+    pub segment_format: SegmentFormatConfig,
     /// Node UUIDs allowed to pull this leader's sealed segments, beyond its
     /// own followers.
     ///
@@ -439,4 +462,38 @@ pub fn load<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|error| format!("read {}: {error}", path.display()))?;
     serde_yaml::from_str(&text).map_err(|error| format!("parse {}: {error}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn data_yaml(extra: &str) -> String {
+        format!(
+            "role: standalone\n\
+             node_uuid: aaaaaaaa-0000-0000-0000-0000000000a1\n\
+             cluster_id: aaaaaaaa-0000-0000-0000-0000000000c0\n\
+             data_dir: /tmp/vtop-config-test\n\
+             fencing_epoch: 1\n\
+             range: {{ topic: t, topic_epoch: 1, range_id: aaaaaaaa-0000-0000-0000-0000000000d0, range_generation: 0 }}\n\
+             segment_id: aaaaaaaa-0000-0000-0000-0000000000e0\n\
+             replica_tls: {{ ca: ca.pem, cert: node.pem, key: node-key.pem }}\n\
+             {extra}"
+        )
+    }
+
+    /// The format knob (#240): absent means v1, exactly what every existing
+    /// config created; `v2` is spelled in lowercase like the role, and a
+    /// value the binary could not create is refused at parse time rather
+    /// than discovered as a range that never starts.
+    #[test]
+    fn segment_format_defaults_to_v1_and_parses_v2() {
+        let default: DataNodeConfig = serde_yaml::from_str(&data_yaml("")).unwrap();
+        assert_eq!(default.segment_format, SegmentFormatConfig::V1);
+        let v2: DataNodeConfig = serde_yaml::from_str(&data_yaml("segment_format: v2\n")).unwrap();
+        assert_eq!(v2.segment_format, SegmentFormatConfig::V2);
+        let refused = serde_yaml::from_str::<DataNodeConfig>(&data_yaml("segment_format: v3\n"))
+            .expect_err("an unknown format is a config error");
+        assert!(refused.to_string().contains("v3"), "{refused}");
+    }
 }

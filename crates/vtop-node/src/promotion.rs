@@ -45,14 +45,25 @@
 //! they resurface. The truncation primitive exists and is bounded; what is
 //! missing is this module driving it from the divergence point.
 //!
-//! **Open, and subtler, from Raft §5.4.2:** a new leader must not commit
-//! entries from a previous term by counting replicas. The Raft-safe form is to
-//! append a marker in the new epoch and let prior entries commit implicitly
-//! once that is quorum-acked. VTOP gets the epoch for free from the lease mint;
-//! the marker record does not exist yet.
+//! **Closed, from Raft §5.4.2 (#240):** a new leader must not commit entries
+//! from a previous term by counting replicas. The boundary this module
+//! establishes is therefore a CANDIDATE value, never published as such: the
+//! broker publisher appends a marker record of the new epoch at its tail
+//! (`LocalBroker::publish_boundary_marker`, a reserved producer identity the
+//! consumer boundary filters), a driver proves it on a quorum — retrying for
+//! as long as a majority cannot hold the tail — and the published high-water
+//! mark is the marker's end, which covers the candidate because the election
+//! restriction guarantees the winner holds everything the boundary names.
+//! Until the marker is proven the watermark stays at the durable floor the
+//! broker opened with, and a produce that lands first commits the marker
+//! prefix implicitly, which is Raft's own rule. The invariant this buys: **a
+//! published high-water mark never regresses across a failover.** Standalone
+//! and v1-format ranges are not gated — the first has no quorum to convince,
+//! the second no marker its consumers could be shielded from.
 //!
 //! What is here is the floor computation, a fenced read to compute it from, and
-//! an honest refusal when a quorum cannot be reached.
+//! an honest refusal when a quorum cannot be reached; the publication lives
+//! with the broker publisher in `lease_agent`.
 //!
 //! # Why the quorum floor, and not the maximum
 //!

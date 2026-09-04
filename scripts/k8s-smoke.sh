@@ -944,21 +944,43 @@ log "quorum produce accepted $R_EXPECTED records on candidate $holder_ordinal"
 # returns while the third replica is still catching up, so this is POLLED
 # with a deadline rather than asserted once (an immediate assertion tests
 # the timing, not the replication, and flakes).
-await_all_committed() { # <expected>
-  local expected="$1" ordinal offset mport
+#
+# FLOOR PLUS CONVERGENCE, not exact equality (#240): every promotion appends
+# one boundary marker of its epoch to the log — a record the consumer never
+# sees but every replica durably holds — and how many elections a run holds
+# is not deterministic. So the offset is at least the records produced, and
+# every replica reports the SAME offset: the first says nothing acknowledged
+# was lost, the second says replication reached every replica. What exact
+# equality used to catch on top of that — a replica applying a record twice —
+# would still show as replicas disagreeing.
+await_all_committed() { # <expected-records>
+  local expected="$1" ordinal offset
+  local -a mports=() offsets=()
   for ordinal in 0 1 2; do
-    alloc_port; mport="$r_port"
-    forward_ns "$REPLICATED_NS" "${REL}-${ordinal}" "$mport" 9500
-    offset=""
-    for _ in $(seq 1 45); do
-      offset="$(committed_offset "$mport")"
-      [ "${offset:-0}" = "$expected" ] && break
-      sleep 2
-    done
-    [ "${offset:-0}" = "$expected" ] \
-      || fail "pod $ordinal has durably applied '${offset:-0}' of $expected records after 90s; replication is not reaching it"
-    log "pod $ordinal has durably applied all $expected records"
+    alloc_port; mports[ordinal]="$r_port"
+    forward_ns "$REPLICATED_NS" "${REL}-${ordinal}" "${mports[ordinal]}" 9500
   done
+  local settled=0
+  for _ in $(seq 1 45); do
+    settled=1
+    for ordinal in 0 1 2; do
+      offset="$(committed_offset "${mports[ordinal]}")"
+      offsets[ordinal]="${offset:-0}"
+      [ "${offsets[ordinal]}" -ge "$expected" ] || settled=0
+    done
+    if [ "$settled" = 1 ]; then
+      [ "${offsets[0]}" = "${offsets[1]}" ] && [ "${offsets[1]}" = "${offsets[2]}" ] || settled=0
+    fi
+    [ "$settled" = 1 ] && break
+    sleep 2
+  done
+  for ordinal in 0 1 2; do
+    [ "${offsets[ordinal]}" -ge "$expected" ] \
+      || fail "pod $ordinal has durably applied '${offsets[ordinal]}' of at least $expected records after 90s; replication is not reaching it"
+  done
+  [ "$settled" = 1 ] \
+    || fail "the replicas never converged after 90s: offsets ${offsets[0]}/${offsets[1]}/${offsets[2]} (at least $expected records plus the boundary markers of every election)"
+  log "every pod has durably applied all $expected records (offset ${offsets[0]}, including each election's boundary marker) and the three agree"
 }
 await_all_committed "$R_EXPECTED"
 log "replication verified in Kubernetes: quorum durability works and every replica holds the data"

@@ -20,6 +20,12 @@
 #      role transitions, not restarts.
 source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 
+# A v2 range (#240): the promotion boundary marker this scenario asserts is
+# a record only a v2 frame can carry under an identity consumers are
+# shielded from — a v1 range keeps the pre-marker publication path, and
+# the marker line awaited below would never appear.
+export CHAOS_SEGMENT_FORMAT=v2
+
 require_binaries
 init_workdir
 
@@ -84,6 +90,16 @@ await_acked_floor "$ACKED_FILE" "$RECORDS"
 ACKED="$(cat "$ACKED_FILE")"
 log "$ACKED records acknowledged under quorum at candidate $WINNER's own address"
 
+# The published mark before the kill (#240, §5.4.2): the new leader must
+# never publish below it. Read after the produce completed, so it is the
+# settled mark rather than a racing lower bound; a failed read is a failure
+# of the scenario, never a silent zero.
+HWM_BEFORE="$(metric_value "$(data_metrics_addr "$((WINNER + 10))")" \
+  vtop_broker_cluster_committed_offset)" \
+  || fail "the leader's published high-water mark could not be read before the kill"
+HWM_BEFORE="${HWM_BEFORE%.*}"
+log "published high-water mark before the kill: $HWM_BEFORE"
+
 # --- kill the leader; a survivor takes the range, nothing restarts ----------
 case "$WINNER" in
   1) VICTIM_PID="$C1" ;;
@@ -131,8 +147,27 @@ log "quorum produce resumed at epoch $NEW_EPOCH on candidate $NEW_LEADER's own a
 # written under a bumped producer epoch with sequences restarting at 0, so
 # its bytes are not reconstructible from offsets — structure is still
 # checked through the tail (await_verified_floor's own contract).
-await_verified_floor "$CLIENT_CFG2" "$(candidate_native_addr "$NEW_LEADER")" "$ACKED" "$ACKED"
+# One boundary marker per promoted epoch, invisible to the consumer (#240):
+# the current epoch bounds how many offsets the view may skip.
+CHAOS_MAX_OFFSET_GAPS="$NEW_EPOCH" \
+  await_verified_floor "$CLIENT_CFG2" "$(candidate_native_addr "$NEW_LEADER")" "$ACKED" "$ACKED"
 log "every one of the $ACKED pre-kill acknowledged records is intact after the failover"
+
+# --- a published high-water mark never regresses (#240, §5.4.2) -------------
+# In-place promotion is the same protocol as a restart's: the survivor that
+# took the range appended a marker of its new epoch and published only once
+# a quorum held it — the line in its log is the evidence — and what it
+# published covers what the killed leader had already published.
+await_log_line "$WORKDIR/logs/data-candidate-$NEW_LEADER.log" \
+  "boundary_marker_published epoch=$NEW_EPOCH" \
+  "the promoted candidate must publish its boundary through a quorum-acked marker of its \
+own epoch, never by trusting the probe's count"
+await_metric_at_least "$(data_metrics_addr "$((NEW_LEADER + 10))")" \
+  vtop_broker_cluster_committed_offset "$HWM_BEFORE" \
+  "the high-water mark REGRESSED across the in-place failover: the killed leader had \
+published $HWM_BEFORE and the survivor publishes less"
+log "the survivor published its boundary through its own epoch's marker, at or above the \
+$HWM_BEFORE the killed leader had published"
 
 # --- a candidate that cannot be measured cannot be operated ----------------
 # Pinned here because this suite is the composition proof and this gap walked
