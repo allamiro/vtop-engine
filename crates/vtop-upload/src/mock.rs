@@ -63,6 +63,10 @@ pub struct MockBackend {
     /// this counter's value (test interrupt/resume). `usize::MAX` disables.
     multipart_fail_after_parts: Arc<AtomicUsize>,
     multipart_parts_uploaded: Arc<AtomicUsize>,
+    /// `ensure_bucket` calls, counted so tests can pin how often the engine
+    /// pays the provisioning round trip — once per bucket per process, not
+    /// per batch (#102).
+    bucket_ensures: AtomicUsize,
 }
 
 impl Default for MockBackend {
@@ -83,6 +87,7 @@ impl MockBackend {
             corrupt_on_verify: false,
             multipart_fail_after_parts: Arc::new(AtomicUsize::new(usize::MAX)),
             multipart_parts_uploaded: Arc::new(AtomicUsize::new(0)),
+            bucket_ensures: AtomicUsize::new(0),
         }
     }
 
@@ -123,6 +128,10 @@ impl MockBackend {
 
     pub fn pending_multipart_count(&self) -> usize {
         self.multiparts.lock().unwrap().len()
+    }
+
+    pub fn ensure_bucket_calls(&self) -> usize {
+        self.bucket_ensures.load(Ordering::SeqCst)
     }
 
     /// True if the object exists in the mock store.
@@ -358,6 +367,13 @@ impl UploadBackend for MockBackend {
     }
 
     async fn verify_bucket_versioning(&self, _bucket: &str) -> Result<(), VtopError> {
+        Ok(())
+    }
+
+    /// Overrides the default no-op only to count: the trait's default would
+    /// succeed invisibly, and the count is the whole point of mocking this.
+    async fn ensure_bucket(&self, _bucket: &str) -> Result<(), VtopError> {
+        self.bucket_ensures.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
     fn supports_checksum_verification(&self) -> bool {

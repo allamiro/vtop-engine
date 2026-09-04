@@ -16,6 +16,10 @@ checksum: sha256
 backend: s3_native
 bucket: "vtop-bench-soak"
 endpoint_url: http://localhost:9000
+# No create_bucket opt-in: the compose init service provisions this bucket
+# beside the telemetry-* set, so the timed cycles — each a fresh vtopctl
+# process whose provisioning cache starts cold — carry zero control-plane
+# traffic into the measurement.
 batch_max_records: 50
 batch_max_bytes: 1048576
 batch_max_age_seconds: 5

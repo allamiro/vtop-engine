@@ -113,6 +113,28 @@ def test_a_blank_shell_variable_masks_the_filed_one(tmp_path, monkeypatch):
     assert env["AWS_SECRET_ACCESS_KEY"] == "minioadmin"
 
 
+def test_an_endpoint_supplied_only_by_env_still_gets_the_lab_credentials(
+        tmp_path, monkeypatch):
+    # The engine honors VTOP_S3_ENDPOINT_URL over its config, so a run can be
+    # aimed at the lab stack by environment alone — and must then resolve
+    # credentials exactly as if the scenario had named the endpoint. Gating on
+    # the scenario key only left such a run without the minioadmin fallbacks,
+    # failing every upload on credential resolution.
+    from lib import engine
+    monkeypatch.setattr(engine, "_ENV_FILE", str(tmp_path / ".env"))  # absent
+    monkeypatch.setenv("VTOP_S3_ENDPOINT_URL", "http://localhost:9000")
+    for var in ("MINIO_ROOT_USER", "MINIO_ROOT_PASSWORD",
+                "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    env = _backend_env({"backend": "s3_native"})
+    assert env["AWS_ACCESS_KEY_ID"] == "minioadmin", (
+        "the lab credential fallbacks must follow the same effective endpoint "
+        "the engine resolves, whichever channel supplied it"
+    )
+    assert env["AWS_SECRET_ACCESS_KEY"] == "minioadmin"
+    assert env["VTOP_S3_ENDPOINT_URL"] == "http://localhost:9000"
+
+
 def test_explicit_aws_credentials_still_win(tmp_path, monkeypatch):
     # setdefault semantics are load-bearing: an operator who points the
     # runner at real S3 with real AWS credentials must not have them
@@ -126,3 +148,83 @@ def test_explicit_aws_credentials_still_win(tmp_path, monkeypatch):
     env = _backend_env(minio_scenario())
     assert env["AWS_ACCESS_KEY_ID"] == "real-key"
     assert env["AWS_SECRET_ACCESS_KEY"] == "real-secret"
+
+
+def test_a_remote_endpoint_never_receives_the_lab_credentials(
+        tmp_path, monkeypatch):
+    # Environment keys outrank profiles and instance metadata in the SDK's
+    # credential chain, so injecting minioadmin for a NON-lab endpoint would
+    # replace the identity the operator brought — every upload would
+    # authenticate as a user the remote store has never heard of.
+    from lib import engine
+    monkeypatch.setattr(engine, "_ENV_FILE", str(tmp_path / ".env"))  # absent
+    for var in ("VTOP_S3_ENDPOINT_URL", "MINIO_ROOT_USER",
+                "MINIO_ROOT_PASSWORD", "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    env = _backend_env({"backend": "s3_native",
+                        "endpoint_url": "https://rgw.example.net:8443"})
+    assert "AWS_ACCESS_KEY_ID" not in env, (
+        "a remote endpoint means the operator brought an identity: the lab "
+        "fallbacks are for the loopback stack only"
+    )
+    assert env["VTOP_S3_ENDPOINT_URL"] == "https://rgw.example.net:8443", (
+        "the endpoint itself must still reach the engine; only the "
+        "credential fallbacks are lab-scoped"
+    )
+
+
+def test_the_environment_endpoint_outranks_the_scenario_field(monkeypatch):
+    # The engine resolves VTOP_S3_ENDPOINT_URL over its config file, so the
+    # harness must resolve in the same order: preferring the scenario field
+    # let a run write its config for one store while the engine talked to
+    # another.
+    from lib.engine import _effective_endpoint
+    monkeypatch.setenv("VTOP_S3_ENDPOINT_URL", "http://localhost:9000")
+    assert _effective_endpoint(
+        {"endpoint_url": "https://rgw.example.net:8443"}
+    ) == "http://localhost:9000", (
+        "whichever endpoint the engine will actually use is the one every "
+        "harness decision must key off"
+    )
+
+
+def test_another_loopback_service_is_not_the_lab(tmp_path, monkeypatch):
+    # Loopback alone is not the signal — the compose stack pins host port
+    # 9000, and a different local S3 stand-in (localstack, a second MinIO)
+    # has its own credentials that the minioadmin fallbacks would shadow.
+    from lib import engine
+    monkeypatch.setattr(engine, "_ENV_FILE", str(tmp_path / ".env"))  # absent
+    for var in ("VTOP_S3_ENDPOINT_URL", "MINIO_ROOT_USER",
+                "MINIO_ROOT_PASSWORD", "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    env = _backend_env({"backend": "s3_native",
+                        "endpoint_url": "http://localhost:4566"})
+    assert "AWS_ACCESS_KEY_ID" not in env, (
+        "the lab predicate is host AND port: a loopback service on another "
+        "port is somebody else's store with somebody else's credentials"
+    )
+
+
+def test_a_malformed_endpoint_is_not_the_lab_and_does_not_crash(
+        tmp_path, monkeypatch):
+    # urlsplit defers port validation to the .port property, which raises on
+    # a non-numeric port. The harness must not fall over before vtopctl even
+    # starts — a broken endpoint is the engine's configuration error to
+    # report, and it is certainly not the lab.
+    from lib import engine
+    monkeypatch.setattr(engine, "_ENV_FILE", str(tmp_path / ".env"))  # absent
+    for var in ("VTOP_S3_ENDPOINT_URL", "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    env = _backend_env({"backend": "s3_native",
+                        "endpoint_url": "http://localhost:not-a-port"})
+    assert "AWS_ACCESS_KEY_ID" not in env, (
+        "an endpoint the parser cannot even read is nobody's lab: injecting "
+        "credentials for it would only mask the real configuration error"
+    )
+    assert env["VTOP_S3_ENDPOINT_URL"] == "http://localhost:not-a-port", (
+        "the broken endpoint must still reach the engine: the configuration "
+        "error is the engine's to report, and dropping it here would hide it"
+    )

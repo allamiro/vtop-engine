@@ -85,6 +85,36 @@ def test_fallback_parse_ignores_comments_and_blanks():
     assert parsed == {"name": "y"}
 
 
+def test_fallback_parse_folds_a_block_scalar_and_keeps_the_keys_after_it():
+    parsed = _fallback_parse(
+        "name: soak\n"
+        "description: >-\n"
+        "  the seeder outruns the engine (#98): a real\n"
+        "  backlog accumulates\n"
+        "volume: 400\n"
+    )
+    assert parsed["description"] == (
+        "the seeder outruns the engine (#98): a real backlog accumulates"
+    ), (
+        "the '#98' is a citation inside prose, not a comment, and folded "
+        "lines join with spaces — the old parser stored the literal '>-' and "
+        "dropped the prose of every bundled soak scenario"
+    )
+    assert parsed["volume"] == 400, (
+        "flat parsing must resume at the first line back at the key's indent, "
+        "or every key after a description is silently lost"
+    )
+
+
+def test_fallback_parse_keeps_literal_block_lines_on_their_own_lines():
+    parsed = _fallback_parse("notes: |-\n  line one\n  line two\nafter: 1\n")
+    assert parsed["notes"] == "line one\nline two", (
+        "literal blocks promise line structure; folding them would change "
+        "what the scenario said"
+    )
+    assert parsed["after"] == 1
+
+
 @pytest.mark.parametrize(
     "raw,expected",
     [
@@ -129,3 +159,23 @@ def test_a_multiplier_that_rounds_to_zero_still_seeds_one_file():
     # drain, and reports a duration it never actually spent working.
     assert reseed_count(10, 0.01) == 1
     assert reseed_count(1, 0.0) == 1
+
+
+def test_every_bundled_scenario_survives_the_fallback_parser():
+    # The PyYAML-side parity test cannot run in the no-PyYAML lane, so this
+    # is that lane's own tripwire: no bundled scenario may parse into a
+    # block-scalar indicator literal — the exact corruption the folded
+    # descriptions used to produce.
+    import glob
+    import os
+    scen_dir = os.path.join(os.path.dirname(__file__), "..", "scenarios")
+    files = sorted(glob.glob(os.path.join(scen_dir, "*.yaml")))
+    assert files, "the bundled scenarios must be visible to this test"
+    for path in files:
+        with open(path, encoding="utf-8") as fh:
+            parsed = _fallback_parse(fh.read())
+        for key, value in parsed.items():
+            assert value not in (">", ">-", ">+", "|", "|-", "|+"), (
+                f"{os.path.basename(path)}: {key} parsed as a bare block "
+                "indicator — the fallback parser dropped its content"
+            )

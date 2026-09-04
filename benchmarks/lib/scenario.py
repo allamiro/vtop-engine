@@ -1,8 +1,9 @@
 """Scenario loading.
 
 A scenario is a small, flat YAML document. We use PyYAML when available and
-otherwise fall back to a minimal parser for the flat `key: value` subset used by
-the bundled scenarios — so the framework runs with no third-party deps.
+otherwise fall back to a minimal parser for the subset the bundled scenarios
+use — flat `key: value` lines plus folded/literal block scalars — so the
+framework runs with no third-party deps.
 """
 from __future__ import annotations
 
@@ -48,6 +49,10 @@ DEFAULTS: dict[str, Any] = {
     "sys_sample_interval": 1.0,     # seconds between system-metric samples
     "bucket": "telemetry-data",
     "endpoint_url": "",             # for backend=minio
+    # "" = derive from the backend (true only for the lab minio backend, false
+    # for everything else — see lib/engine.py). Provisioning a bucket against
+    # a real endpoint is a scenario's explicit opt-in, never an inference.
+    "create_bucket": "",
 }
 
 
@@ -99,9 +104,48 @@ def _coerce(value: str) -> Any:
     return v
 
 
+# The two YAML block-scalar styles, each bare or with a chomping indicator.
+# The bundled scenarios write their descriptions as `>-` blocks, and the old
+# line-at-a-time parser stored the literal ">-" and dropped the prose — while
+# the module promised it could read every bundled scenario.
+_BLOCK_INDICATORS = (">", ">-", ">+", "|", "|-", "|+")
+
+
 def _fallback_parse(text: str) -> dict[str, Any]:
     out: dict[str, Any] = {}
-    for raw in text.splitlines():
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        i += 1
+        # Block-scalar detection looks at the RAW post-colon value, before any
+        # comment stripping, and the block body is consumed verbatim: the "#98"
+        # and "#102" in the descriptions are citations inside prose, and a
+        # comment strip would truncate every line at the first one.
+        if ":" in raw and not raw.lstrip().startswith("#"):
+            key_part, _, val_part = raw.partition(":")
+            indicator = val_part.strip()
+            if indicator in _BLOCK_INDICATORS:
+                key_indent = len(raw) - len(raw.lstrip())
+                block: list[str] = []
+                while i < len(lines):
+                    nxt = lines[i]
+                    if nxt.strip() and len(nxt) - len(nxt.lstrip()) <= key_indent:
+                        break
+                    block.append(nxt)
+                    i += 1
+                # A deliberate approximation of YAML folding, kept only as
+                # large as the bundled scenarios need: folded (>) joins lines
+                # with spaces, literal (|) with newlines, interior blank
+                # lines are dropped rather than becoming paragraph breaks,
+                # and every chomping variant (bare, -, +) is treated as
+                # strip — trailing newlines never survive.
+                joiner = " " if indicator.startswith(">") else "\n"
+                out[key_part.strip()] = joiner.join(
+                    ln.strip() for ln in block if ln.strip())
+                # `i` already rests on the terminating line, so flat parsing
+                # resumes there and keys after the block still parse.
+                continue
         line = raw.split("#", 1)[0].rstrip()
         if not line.strip():
             continue

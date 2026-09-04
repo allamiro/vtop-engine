@@ -99,7 +99,8 @@ def main() -> int:
     input_glob = os.path.join(seed_dir, "*")
     # Keep the engine config OUT of the seed glob.
     config_path = os.path.join(os.path.dirname(state_db), "_engine.yaml")
-    engine.write_engine_config(sc, work_dir, state_db, input_glob, config_path)
+    engine.write_engine_config(sc, work_dir, state_db, input_glob, config_path,
+                               key_prefix=run_id)
 
     start = time.time()
     start_iso = iso_now()
@@ -406,14 +407,16 @@ def main() -> int:
     # (review). It measured the opposite of what it claimed: the more backlog
     # the soak built, the less the number had to do with recovery.
     #
-    # A second config over the SAME state store and an empty input directory
-    # isolates it: same ledger to open, nothing to process.
+    # A second config over the SAME state store, the SAME run_id object
+    # prefix, and an empty input directory isolates it: the recovery pass
+    # opens the very ledger world the soak built, with nothing to process.
     recovery_ms = 0
     if ledger_rows:
         empty_dir = tempfile.mkdtemp(prefix="vtop-recovery-empty-")
         recovery_config = os.path.join(os.path.dirname(state_db), "_recovery.yaml")
         engine.write_engine_config(
-            sc, work_dir, state_db, os.path.join(empty_dir, "*"), recovery_config)
+            sc, work_dir, state_db, os.path.join(empty_dir, "*"), recovery_config,
+            key_prefix=run_id)
         t0 = time.time()
         engine.process_once(binary, recovery_config, sc)
         recovery_ms = int((time.time() - t0) * 1000)

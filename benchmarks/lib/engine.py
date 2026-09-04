@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from urllib.parse import urlsplit
 
 
 def repo_root() -> str:
@@ -27,16 +28,67 @@ def vtopctl_path(build_if_missing: bool = True) -> str:
     return path
 
 
+def _effective_endpoint(scenario) -> str:
+    """The one answer to "which store is this run actually pointed at?".
+
+    The engine resolves VTOP_S3_ENDPOINT_URL over its config file
+    (vtop-upload s3_native.rs), so the environment must win here in the
+    same order: resolving the scenario field first let a run with both set
+    write its config for one store while the engine talked to another.
+    Everything that keys off the endpoint resolves it through this helper —
+    the written config's endpoint line and the lab credential fallbacks in
+    _backend_env alike — because an endpoint recognized by one and not the
+    other produced a bucket-creating config with credentials the server
+    never saw, and every upload failed on credential resolution.
+    """
+    return os.environ.get("VTOP_S3_ENDPOINT_URL", "") or scenario.get("endpoint_url", "")
+
+
+def _is_lab_endpoint(endpoint: str) -> bool:
+    # The compose stack publishes MinIO on the loopback interface at the
+    # FIXED host port 9000 (docker-compose.benchmark.yml pins it; only the
+    # bind address is overridable), and that one endpoint is the only one
+    # whose credentials this harness can know. Anything else — a remote
+    # store, or another loopback service such as localstack on :4566 —
+    # means the operator brought an identity, and injecting the lab
+    # fallbacks would OUTRANK it: environment keys beat profiles and
+    # instance metadata in the SDK's credential chain.
+    # A malformed endpoint is NOT the lab, and not this helper's error to
+    # raise: urlsplit defers port validation to the .port property, which
+    # throws on a non-numeric or out-of-range port — the engine's own config
+    # validation is where a broken endpoint should be reported.
+    try:
+        parts = urlsplit(endpoint)
+        port = parts.port
+    except ValueError:
+        return False
+    return (parts.hostname in ("localhost", "127.0.0.1", "::1")
+            and port == 9000)
+
+
 def write_engine_config(scenario, work_dir: str, state_db: str,
-                        input_glob: str, config_path: str) -> str:
+                        input_glob: str, config_path: str,
+                        key_prefix: str = "") -> str:
     backend = scenario.get("backend", "mock")
     bucket = scenario.get("bucket", "telemetry-data")
-    endpoint = scenario.get("endpoint_url", "") or os.environ.get("VTOP_S3_ENDPOINT_URL", "")
-    # An explicit endpoint means the lab stack, whichever backend speaks to
-    # it — s3_native against MinIO needs its bucket created exactly as the
-    # mc-based backend does. Real S3 (s3_native, no endpoint) keeps bucket
-    # creation out of the runtime identity (SECURITY_MODEL §5).
-    create_bucket = "true" if (backend == "minio" or (backend == "s3_native" and endpoint)) else "false"
+    endpoint = _effective_endpoint(scenario)
+    # Bucket provisioning is a scenario's EXPLICIT choice, never an inference
+    # from the endpoint: a real S3-compatible endpoint keeps CreateBucket out
+    # of the runtime identity (SECURITY_MODEL §5.2), so the inferred true
+    # either failed least-privilege credentials with AccessDenied or issued a
+    # real CreateBucket against production storage. Unset derives true only
+    # for backend=minio — inert, since the mc-based backend's ensure_bucket
+    # is the base no-op. No bundled scenario opts in: the compose init
+    # service provisions every lab bucket, soak included, so per-cycle
+    # subprocesses never carry CreateBucket into a measurement.
+    requested = scenario.get("create_bucket", "")
+    if requested == "":
+        create_bucket = "true" if backend == "minio" else "false"
+    else:
+        # PyYAML and the fallback parser both hand over a bool; a value that
+        # skipped the loader arrives as a string. A truthiness test would
+        # read the string "false" as an opt-in, so spell both forms out.
+        create_bucket = "true" if str(requested).strip().lower() == "true" else "false"
     whole_file = "true" if scenario.get("whole_file") or scenario.get("format") == "binary" else "false"
     checksum = scenario.get("checksum", "sha256")
     # The engine implements sha256 / blake3 / none; record the request as-is.
@@ -57,8 +109,13 @@ def write_engine_config(scenario, work_dir: str, state_db: str,
     # The #87 pipeline-width knob, surfaced so a scenario grid can vary it
     # (#102: object_upload p95 vs concurrency is the signal that decides
     # whether an adaptive controller has anything to react to). Absent =
-    # the engine default, exactly as before.
-    if scenario.get("max_concurrent_batches"):
+    # the engine default, exactly as before. Present — zero included — is
+    # written through, so the engine's own validation refuses it loudly
+    # (batching.max_concurrent_batches must be > 0, vtop-core config.rs): a
+    # truthiness check here ran the default width of 8 while summary.json
+    # recorded 0, mislabeling the very concurrency comparison the #102 grid
+    # exists to make.
+    if scenario.get("max_concurrent_batches") is not None:
         lines.append(
             f"  max_concurrent_batches: {scenario.get('max_concurrent_batches')}")
     lines += [
@@ -76,7 +133,11 @@ def write_engine_config(scenario, work_dir: str, state_db: str,
         "upload:",
         f"  backend: {backend}",
         f'  bucket: "{bucket}"',
-        '  prefix: ""',
+        # The bench bucket is durable across runs — the named volume survives
+        # `compose down` — so each run namespaces its objects under its
+        # run_id: attributable in the bucket, removable with one
+        # `mc rm -r --force`.
+        f'  prefix: "{key_prefix}"',
         f"  create_bucket: {create_bucket}",
         "  region: us-east-1",
         "  force_path_style: true",
@@ -129,11 +190,18 @@ def _dotenv_overrides() -> dict[str, str]:
 
 def _backend_env(scenario) -> dict[str, str]:
     env = dict(os.environ)
-    # s3_native pointed at the lab endpoint needs the same credentials the
-    # mc-based backend does; setdefault keeps real AWS credentials (already
-    # in the environment) winning over the lab fallbacks.
+    endpoint = _effective_endpoint(scenario)
+    if scenario.get("backend") == "s3_native" and endpoint:
+        # A no-op when the endpoint came from the environment: it is
+        # already set there, and setdefault leaves it alone.
+        env.setdefault("VTOP_S3_ENDPOINT_URL", endpoint)
+    # The lab fallbacks apply to the mc-based backend and to s3_native aimed
+    # at the LAB stack only — the loopback endpoint is the one whose
+    # credentials this harness can know, and setdefault keeps real AWS
+    # credentials (already in the environment) winning over the fallbacks.
     if scenario.get("backend") == "minio" or (
-            scenario.get("backend") == "s3_native" and scenario.get("endpoint_url")):
+            scenario.get("backend") == "s3_native" and endpoint
+            and _is_lab_endpoint(endpoint)):
         # The benchmark compose lets an operator override the SERVER's
         # credentials via MINIO_ROOT_USER / MINIO_ROOT_PASSWORD (issue #81).
         # The client must follow the same variables THROUGH THE SAME
@@ -161,8 +229,6 @@ def _backend_env(scenario) -> dict[str, str]:
         env.setdefault("AWS_REGION", "us-east-1")
         env.setdefault("VTOP_S3_FORCE_PATH_STYLE", "true")
         env.setdefault("VTOP_S3_VERIFY_TLS", "false")
-        if scenario.get("endpoint_url"):
-            env.setdefault("VTOP_S3_ENDPOINT_URL", scenario.get("endpoint_url"))
     return env
 
 

@@ -5,11 +5,13 @@ Kept separate so the rest of the scenario suite still runs when PyYAML is absent
 one most worth testing.
 """
 
+import glob
+import os
 import textwrap
 
 import pytest
 
-from lib.scenario import load_scenario
+from lib.scenario import _fallback_parse, load_scenario
 
 yaml = pytest.importorskip("yaml", reason="tests PyYAML-specific behaviour")
 
@@ -43,3 +45,23 @@ def test_valid_yaml_parses_real_structures(tmp_path):
     # A real YAML list - the flat fallback parser cannot produce this.
     assert s.values["formats"] == ["jsonl", "cef"]
     assert s.values["batch_max_records"] == 500
+
+
+def test_every_bundled_scenario_parses_the_same_under_both_parsers():
+    # The no-PyYAML mode is first-class — CI uninstalls PyYAML and reruns the
+    # suite — so which parser happens to load a scenario must never change
+    # what the run measures. This is the test that would have caught the
+    # fallback parser reading a `>-` description as the literal ">-": the
+    # subset the fallback covers is defined by the scenarios this repository
+    # actually ships, so every one of them is compared.
+    scenarios_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scenarios")
+    paths = sorted(glob.glob(os.path.join(scenarios_dir, "*.yaml")))
+    assert paths, "the bundled scenarios must be found, or this pins nothing"
+    for path in paths:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        assert _fallback_parse(text) == yaml.safe_load(text), (
+            f"{os.path.basename(path)} reads differently without PyYAML — "
+            "either extend the fallback parser or simplify the scenario"
+        )
