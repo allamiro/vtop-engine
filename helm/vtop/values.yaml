@@ -91,7 +91,7 @@ cluster:
 # CN rules the binary enforces:
 #   metaSecretName leaves:  CN = the DECIMAL meta node id, i.e. ordinal+1
 #                           ("node-0.pem" carries CN=1, "node-1.pem" CN=2, …)
-#   dataSecretName leaves:  CN = cluster.nodeUuids[ordinal]
+#   dataSecretName leaves:  CN = data.nodeUuids[ordinal]
 # Every leaf needs a SAN matching the server name peers dial — by default the
 # pod's headless-service FQDN (see tls.serverName).
 #

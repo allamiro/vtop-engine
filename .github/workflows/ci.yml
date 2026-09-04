@@ -542,6 +542,22 @@ jobs:
             fi
             echo "refused without $what"
           }
+          # Verbatim copy of the message-asserting helper from the
+          # replicated-guards step below — run blocks share no shell state.
+          refuses_because() {
+            expected="$1"; shift
+            if output=$(helm template vtop helm/vtop "$@" 2>&1); then
+              echo "::error::rendered successfully; expected a refusal mentioning: $expected"
+              exit 1
+            fi
+            if ! printf '%s' "$output" | grep -qF "$expected"; then
+              echo "::error::refused, but not for the expected reason."
+              echo "::error::wanted: $expected"
+              printf '%s\n' "$output" | tail -5
+              exit 1
+            fi
+            echo "refused because: $expected"
+          }
           refuses "any identities"
           # Every other identity supplied, so rendering REACHES the TLS check
           # instead of aborting earlier. The first version of this step set only
@@ -567,7 +583,15 @@ jobs:
           refuses "the nodeUuids migration (cluster.nodeUuids is retired)" \
             -f helm/vtop/ci/default-values.yaml \
             --set 'cluster.nodeUuids={aaaaaaaa-0000-0000-0000-0000000000a1,aaaaaaaa-0000-0000-0000-0000000000a2,aaaaaaaa-0000-0000-0000-0000000000a3}'
-          refuses "an odd metadata voter count" -f helm/vtop/ci/default-values.yaml --set replicaCount=4
+          # A MATCHING four-UUID list, so the render reaches the voter-count
+          # guard: with the file's three UUIDs and replicaCount=4 the length
+          # check refuses on its own, and this case stayed green with the
+          # even-voter guard deleted — the same blindness the TLS refusal
+          # above once had.
+          refuses_because "replicaCount 4 is even" \
+            -f helm/vtop/ci/default-values.yaml \
+            --set replicaCount=4 \
+            --set 'data.nodeUuids={aaaaaaaa-0000-0000-0000-0000000000a1,aaaaaaaa-0000-0000-0000-0000000000a2,aaaaaaaa-0000-0000-0000-0000000000a3,aaaaaaaa-0000-0000-0000-0000000000a4}'
           refuses "deployment.mode=colocated (separated is slice 2)" \
             -f helm/vtop/ci/default-values.yaml --set deployment.mode=separated
 
@@ -694,7 +718,9 @@ jobs:
           # Asserts the REASON, not just a non-zero exit. Helm exits non-zero
           # for any failure, so a check that only looks at the status can pass
           # while aborting somewhere else entirely — which is exactly how the
-          # TLS refusal above once tested nothing.
+          # TLS refusal above once tested nothing. A verbatim copy lives in
+          # the identities step above (run blocks share no shell state) —
+          # keep the two in step.
           refuses_because() {
             expected="$1"; shift
             if output=$(helm template vtop helm/vtop "$@" 2>&1); then
