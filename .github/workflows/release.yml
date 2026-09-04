@@ -7,7 +7,7 @@
 # re-runs fmt/clippy/test itself as a gate before publishing anything.
 #
 # Scope note: 0.x tags publish as GitHub **pre-releases**. VTOP is a prototype;
-# see docs/PRODUCTION_HA_PLAN.md §21 (Known limitations) before depending on it.
+# see docs/PRODUCTION_HA.md §19 (Known limitations) before depending on it.
 name: Release
 
 # Least privilege by default; the docker and release jobs elevate exactly what
@@ -567,7 +567,7 @@ jobs:
           body: |
             ## VTOP Engine v${{ needs.verify.outputs.version }}
 
-            > **Maturity:** VTOP is a **prototype / reference implementation**. The 0.x series signals that the API may still change, not that a tag is a preview — each release is signed, attested, and intended for use. Read [Known limitations](https://github.com/${{ github.repository }}/blob/main/docs/PRODUCTION_HA_PLAN.md) (§21) before depending on this in production.
+            > **Maturity:** VTOP is a **prototype / reference implementation**. The 0.x series signals that the API may still change, not that a tag is a preview — each release is signed, attested, and intended for use. Read [Known limitations](https://github.com/${{ github.repository }}/blob/main/docs/PRODUCTION_HA.md#19-known-limitations-current-code) (§19) before depending on this in production.
 
             ${{ steps.changelog.outputs.notes }}
 

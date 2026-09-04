@@ -8,7 +8,7 @@ reach the release page.
 Replace `VERSION` with the release you are installing, for example `0.3.0`.
 (This is the software release version; the VTOP *protocol* version carried
 inside manifests is separate — see
-[VTOP_PROTOCOL_DRAFT.md §11.2](VTOP_PROTOCOL_DRAFT.md#11-manifest-object).
+[VTOP_PROTOCOL_DRAFT.md §11.2](VTOP_PROTOCOL_DRAFT.md#112-field-reference).
 Likewise, "verifying" here means release-artifact verification, distinct from
 the protocol's object/manifest verification in §17.)
 

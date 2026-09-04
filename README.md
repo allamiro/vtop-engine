@@ -607,7 +607,7 @@ tests/integration_file_to_minio.rs
 > [!NOTE]
 > The manifest is written at `MANIFEST_UPLOADED`, before storage-side verification.
 >
-> The trailing `batch_id` token is a random suffix: replaying a batch currently writes a **new** object key rather than reproducing the same one — the open gap against the deterministic-naming rule of [docs/VTOP_PROTOCOL_DRAFT.md §15.1](docs/VTOP_PROTOCOL_DRAFT.md#15-object-and-bucket-naming).
+> The trailing `batch_id` token is a random suffix: replaying a batch currently writes a **new** object key rather than reproducing the same one — the open gap against the deterministic-naming rule of [docs/VTOP_PROTOCOL_DRAFT.md §15.1](docs/VTOP_PROTOCOL_DRAFT.md#151-object-key).
 >
 > The authoritative post-verification state lives in the state store and can be queried with `vtopctl status` or `vtopctl list-batches --json`.
 
@@ -723,7 +723,7 @@ VTOP is currently a prototype. The following limits are known and intentional.
 
 | Area | Current behavior | Planned direction |
 |---|---|---|
-| Deterministic object naming | not yet — `batch_id` embeds a timestamp + random suffix, so replay writes a **new** key (duplicate object, no data loss), against the MUST of [protocol §15.1](docs/VTOP_PROTOCOL_DRAFT.md#15-object-and-bucket-naming)/§16 | deterministic / content-addressed keys ([PRODUCTION_HA.md Phase 4](docs/PRODUCTION_HA.md)) |
+| Deterministic object naming | not yet — `batch_id` embeds a timestamp + random suffix, so replay writes a **new** key (duplicate object, no data loss), against the MUST of [protocol §15.1](docs/VTOP_PROTOCOL_DRAFT.md#151-object-key)/§16 | deterministic / content-addressed keys ([PRODUCTION_HA.md Phase 4](docs/PRODUCTION_HA.md)) |
 | Verification classes | strong (default) / backend-limited / disabled (size-only), per [protocol §17](docs/VTOP_PROTOCOL_DRAFT.md#17-verification-semantics); non-strong commit requires explicit opt-out | — |
 | Large objects | native S3 + mock support resumable multipart with persisted sessions (`vtopctl tier copy --multipart-state-dir`); compatibility backends still single-shot `put_object` | wire remaining backends / streaming rehydrate |
 | Large records / whole files | `max_bytes` is a hard per-source/per-batch ceiling; an oversized record is rejected without advancing source progress | raise the explicit budget only when the deployment has matching memory headroom |
