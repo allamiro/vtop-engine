@@ -82,11 +82,37 @@ fn open_segment(dir: &TempDir, segment_id: u128, range: &RangeIdentity) -> Activ
     .unwrap()
 }
 
+fn open_v1_segment(dir: &TempDir, segment_id: u128, range: &RangeIdentity) -> ActiveSegment {
+    // The callers that want v1: the format-refusal pins — the leader's own
+    // and the mixed-set follower's.
+    ActiveSegment::create(
+        dir.path().join("range.active"),
+        SegmentDescriptor {
+            segment_id: Uuid::from_u128(segment_id),
+            topic: range.topic.clone(),
+            topic_epoch: range.topic_epoch,
+            lineage: RangeLineage {
+                range_id: range.range_id,
+                generation: range.range_generation,
+                key_range: KeyRange::full(),
+                parents: Vec::new(),
+            },
+            base_offset: 0,
+        },
+        vtop_log::SegmentConfig::default(),
+    )
+    .unwrap()
+}
+
 fn harness() -> Harness {
-    harness_with_leader_format(true)
+    harness_config(true, [true, true])
 }
 
 fn harness_with_leader_format(leader_v2: bool) -> Harness {
+    harness_config(leader_v2, [true, true])
+}
+
+fn harness_config(leader_v2: bool, followers_v2: [bool; 2]) -> Harness {
     let range = range_identity();
     let meta = MetaFencingEpoch::new(FENCING_EPOCH);
     let cluster_committed = ClusterCommittedOffset::new(0);
@@ -95,24 +121,7 @@ fn harness_with_leader_format(leader_v2: bool) -> Harness {
     let leader_segment = if leader_v2 {
         open_segment(&leader_dir, 0xD1, &range)
     } else {
-        // The one caller that wants v1: the format-refusal pin below.
-        ActiveSegment::create(
-            leader_dir.path().join("range.active"),
-            SegmentDescriptor {
-                segment_id: Uuid::from_u128(0xD1),
-                topic: range.topic.clone(),
-                topic_epoch: range.topic_epoch,
-                lineage: RangeLineage {
-                    range_id: range.range_id,
-                    generation: range.range_generation,
-                    key_range: KeyRange::full(),
-                    parents: Vec::new(),
-                },
-                base_offset: 0,
-            },
-            vtop_log::SegmentConfig::default(),
-        )
-        .unwrap()
+        open_v1_segment(&leader_dir, 0xD1, &range)
     };
     let leader_epochs = ProducerEpochJournal::open(leader_dir.path().join("epochs")).unwrap();
 
@@ -120,7 +129,11 @@ fn harness_with_leader_format(leader_v2: bool) -> Harness {
     let mut followers = Vec::new();
     for (index, node_id) in [FOLLOWER_1, FOLLOWER_2].into_iter().enumerate() {
         let dir = tempfile::tempdir().unwrap();
-        let segment = open_segment(&dir, 0xE1 + index as u128, &range);
+        let segment = if followers_v2[index] {
+            open_segment(&dir, 0xE1 + index as u128, &range)
+        } else {
+            open_v1_segment(&dir, 0xE1 + index as u128, &range)
+        };
         let epochs = ProducerEpochJournal::open(dir.path().join("epochs")).unwrap();
         let follower_hwm = ClusterCommittedOffset::new(0);
         followers.push(Arc::new(
@@ -421,4 +434,148 @@ fn the_visibility_predicate_keys_on_the_reserved_identity_alone() {
         consumer_visible(&ordinary),
         "an ordinary producer's record is untouched even with an identical payload"
     );
+}
+
+#[test]
+fn a_producer_cannot_wear_the_markers_reserved_identity() {
+    let h = harness();
+    let response = h.leader.handle(
+        Role::Producer,
+        WireFrame {
+            request_id: 100,
+            stream_id: 1,
+            message: Message::ProduceRequest(ProduceRequest {
+                range: h.range.clone(),
+                fencing_epoch: FENCING_EPOCH,
+                producer_id: PROMOTION_MARKER_PRODUCER,
+                producer_epoch: 1,
+                first_sequence: 0,
+                durability: WireDurability::Quorum,
+                records: vec![ProduceRecord {
+                    timestamp_millis: 1_000,
+                    key: b"forged".to_vec(),
+                    value: b"disappears-from-every-fetch".to_vec(),
+                }],
+            }),
+        },
+    );
+    match response.message {
+        Message::Error(ErrorResponse { message, .. }) => assert!(
+            message.contains("reserved"),
+            "the refusal must say the identity is reserved — a record accepted under it \
+             would be silently withheld from every consumer: {message}"
+        ),
+        other => {
+            panic!("a produce under the reserved marker identity must be refused, got: {other:?}")
+        }
+    }
+    let (_, next_offset) = h.leader.local_offsets();
+    assert_eq!(next_offset, 0, "the forged record must never have appended");
+}
+
+#[test]
+fn a_v1_follower_refuses_the_marker_so_the_quorum_fails_honestly() {
+    // A v2 leader over two v1 followers: each follower would store the
+    // marker under an epoch-merged identity that `consumer_visible` can
+    // never recognize, so each refuses — and the leader's quorum count
+    // reports the truth instead of a hidden visibility leak.
+    let h = harness_config(true, [false, false]);
+    let refused = h
+        .leader
+        .publish_boundary_marker(FENCING_EPOCH)
+        .expect_err("no v1 follower may ack a marker it cannot hide");
+    assert!(
+        matches!(&refused, BrokerError::BoundaryMarker(message) if message.contains("not quorum-acked")),
+        "the failure surfaces as a quorum shortfall, because the refusal happened at the \
+         followers: {refused}"
+    );
+    for follower in &h.followers {
+        assert_eq!(
+            follower.local_committed_offset(),
+            0,
+            "the refusing follower must not have stored the unrecognizable marker"
+        );
+    }
+    assert_eq!(h.cluster_committed.get(), 0, "nothing published");
+}
+
+#[test]
+fn one_v2_follower_still_carries_the_quorum_past_a_v1_peer() {
+    // Mixed set, majority still possible: leader + the v2 follower are two
+    // of three. The v1 peer refuses and simply is not part of the proof.
+    let h = harness_config(true, [true, false]);
+    let published = h
+        .leader
+        .publish_boundary_marker(FENCING_EPOCH)
+        .expect("the v2 majority proves the boundary without the v1 peer");
+    assert_eq!(published, 1);
+    assert_eq!(
+        h.followers[0].local_committed_offset(),
+        1,
+        "the v2 follower holds the marker"
+    );
+    assert_eq!(
+        h.followers[1].local_committed_offset(),
+        0,
+        "the v1 follower refused it and stored nothing"
+    );
+}
+
+#[test]
+fn publication_refuses_a_watermark_this_broker_never_proved() {
+    let h = harness();
+    // A predecessor's quorum proved five records this broker does not hold.
+    h.cluster_committed.advance_to(5);
+    let refused = h
+        .leader
+        .publish_boundary_marker(FENCING_EPOCH)
+        .expect_err("a leader below the inherited watermark cannot prove a boundary over it");
+    assert!(
+        matches!(&refused, BrokerError::BoundaryMarker(message) if message.contains("exceeds")),
+        "the refusal must name the inherited-watermark gap: {refused}"
+    );
+    assert_eq!(
+        h.cluster_committed.get(),
+        5,
+        "the inherited watermark is untouched — refusing to relabel it is the point"
+    );
+    let (_, next_offset) = h.leader.local_offsets();
+    assert_eq!(
+        next_offset, 0,
+        "the refusal must fire before the marker appends, or the log grows a record \
+         whose publication was never legal"
+    );
+}
+
+#[test]
+fn a_starving_byte_budget_still_moves_the_followers_cursor() {
+    let h = harness();
+    h.leader.publish_boundary_marker(FENCING_EPOCH).unwrap();
+    produce_ok(&h.leader, h.range.clone(), 0);
+
+    // One byte covers no record frame. The raw refetch returns exactly the
+    // marker, the filter removes it, and the cursor STILL advances — an
+    // empty page whose cursor moved is progress, a stuck cursor is not.
+    let page = h.followers[0]
+        .fetch(0, 1, 64)
+        .expect("a starved budget is a small fetch, not an error");
+    assert!(
+        page.records.is_empty(),
+        "the only record under the budget was the marker, and it is not the consumer's"
+    );
+    assert_eq!(
+        page.next_offset, 1,
+        "the follower's cursor must step past the marker under any budget, exactly as \
+         the leader's wire guard promises"
+    );
+
+    let page = h.followers[0]
+        .fetch(1, 1, 64)
+        .expect("the second page rides the same guard");
+    assert_eq!(
+        page.records.len(),
+        1,
+        "the real record is served whole even though the budget never covered it"
+    );
+    assert_eq!(page.next_offset, 2);
 }

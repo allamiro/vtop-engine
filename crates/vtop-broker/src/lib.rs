@@ -870,7 +870,19 @@ impl LocalBroker {
     /// to convince — the standalone boundary is the node's own log and the
     /// §5.4.2 hazard is vacuous there) and on a v1-format range (the v1
     /// frame stores a producer identity merged with the epoch, so the
-    /// marker could never be recognized for consumer-side filtering).
+    /// marker could never be recognized for consumer-side filtering). A
+    /// v1-format FOLLOWER refuses the marker's append for the same reason,
+    /// so a mixed-format replica set fails the quorum count honestly
+    /// instead of storing a marker it can never hide.
+    ///
+    /// Two bounds it shares with the produce path deliberately, because a
+    /// marker that behaved differently from a produce would prove the wrong
+    /// thing: a follower BELOW the marker's base refuses the append and
+    /// simply never counts toward the quorum — catching that replica up is
+    /// #306's suffix repair, and the marker rides it when it lands; and a
+    /// follower AHEAD of the base acknowledges on durable coverage without
+    /// proving it holds the same bytes — #261, noted where that branch
+    /// lives.
     ///
     /// NOTHING CALLS THIS IN PRODUCTION YET: promotion wiring is its own
     /// slice, and this primitive ships first so the deterministic harnesses
@@ -909,6 +921,21 @@ impl LocalBroker {
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // A predecessor's quorum may have proven records this broker
+            // never durably held; publishing from here would relabel that
+            // inherited claim as THIS epoch's proof, when the quorum below
+            // covers only this log's tail. The election restriction makes
+            // the case unreachable for a properly promoted leader — the
+            // refusal keeps the primitive honest for every other caller.
+            let inherited = cluster.get();
+            let held = state.segment.committed_offset();
+            if inherited > held {
+                return Err(BrokerError::BoundaryMarker(format!(
+                    "the cluster watermark {inherited} exceeds this broker's committed tail \
+                     {held}; a leader that does not hold the committed prefix cannot prove a \
+                     boundary over it"
+                )));
+            }
             state
                 .producer_epochs
                 .accept(PROMOTION_MARKER_PRODUCER, fencing_epoch)?;
@@ -926,6 +953,10 @@ impl LocalBroker {
                 }],
                 Durability::Fsync,
             )?;
+            // Reclaim AFTER the append that may have rolled, under the same
+            // lock — the produce path's #290 promise, and a marker landing
+            // exactly on the byte bound is still an append that rolled.
+            self.run_retention(&mut state.segment);
             // A duplicate outcome is the republish path: the marker already
             // sits at its original offset, and the fan-out must retransmit
             // from there so a follower that missed it the first time can
@@ -1717,6 +1748,20 @@ impl LocalBroker {
                     reject_message(reason),
                 ));
             }
+        }
+        // The marker's whole visibility contract rests on nobody else ever
+        // wearing its identity: a client producing under the reserved UUID
+        // would have every record silently withheld from consumers, and a
+        // high enough epoch would fence marker publication through the
+        // shared journal. Principals are arbitrary configured UUIDs, so the
+        // reservation has to be enforced here, not assumed (#240).
+        if request.producer_id == PROMOTION_MARKER_PRODUCER {
+            return Some(error(
+                request_id,
+                stream_id,
+                ErrorCode::InvalidRequest,
+                "this producer identity is reserved for the promotion boundary marker",
+            ));
         }
         if request.durability != WireDurability::LocalFsync
             && request.durability != WireDurability::Quorum
