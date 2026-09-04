@@ -38,9 +38,10 @@
 # unchanged — the only arguments this script adds are `--no-run` with a JSON
 # message format for the compile phase and `--no-fail-fast` for the run
 # phase (so every binary runs and every failure is reported, rather than the
-# first). `--no-run` compiles and stops; `--message-format` is refused,
-# because the compile phase needs the JSON stream. The harness's thread
-# count is cargo's own default unless TEST_THREADS is set.
+# first; a caller's own `--no-fail-fast` is absorbed, since cargo refuses
+# the flag twice). `--no-run` compiles and stops; `--message-format` is
+# refused, because the compile phase needs the JSON stream. The harness's
+# thread count is cargo's own default unless TEST_THREADS is set.
 #
 # Exit status is cargo's: any failing binary or doctest fails the run, and
 # every failure is reprinted at the end so it is not lost above the bar.
@@ -81,7 +82,7 @@ bar() { # <done> <total> <label>
 # doctest phase; `--config` overrides feed the runner lookup.
 # ---------------------------------------------------------------------------
 cargo_args=(); bin_args=(); metadata_args=(); packages=(); excludes=(); config_overrides=()
-past_sep=0; expect_value=""; workspace_flag=0; target_selected=0; doc_only=0; no_run=0
+past_sep=0; expect_value=""; workspace_flag=0; target_selected=0; doc_only=0; no_run=0; target_args=0
 TARGET_ARG=""; MANIFEST_PATH=""
 for arg in "$@"; do
   if (( past_sep )); then
@@ -99,7 +100,7 @@ for arg in "$@"; do
       --exclude) excludes+=("$arg") ;;
       --manifest-path) metadata_args+=("$expect_value" "$arg"); MANIFEST_PATH="$arg" ;;
       --features|-F) metadata_args+=("$expect_value" "$arg") ;;
-      --target) TARGET_ARG="$arg" ;;
+      --target) TARGET_ARG="$arg"; target_args=$(( target_args + 1 )) ;;
       # A --config override shapes resolution (sources, net, registries)
       # as much as it shapes the runner, so metadata sees it too.
       --config) config_overrides+=("$arg"); metadata_args+=("$expect_value" "$arg") ;;
@@ -126,7 +127,7 @@ for arg in "$@"; do
     --locked|--offline|--frozen)
       cargo_args+=("$arg"); metadata_args+=("$arg") ;;
     --target=*)
-      cargo_args+=("$arg"); TARGET_ARG="${arg#--target=}" ;;
+      cargo_args+=("$arg"); TARGET_ARG="${arg#--target=}"; target_args=$(( target_args + 1 )) ;;
     --config=*)
       cargo_args+=("$arg"); config_overrides+=("${arg#--config=}"); metadata_args+=("$arg") ;;
     --workspace|--all)
@@ -135,6 +136,9 @@ for arg in "$@"; do
       # Kept for the run phase — it IS the selection — and remembered so
       # the compile phase, which cargo refuses beside --doc, is skipped.
       cargo_args+=("$arg"); doc_only=1 ;;
+    --no-fail-fast)
+      # The run phase adds this itself, and cargo refuses it twice.
+      ;;
     -q|--quiet)
       die "quiet mode suppresses the Running/Doc-tests lines the bar is drawn from; run cargo test -q directly" ;;
     -F?*)
@@ -154,6 +158,11 @@ for arg in "$@"; do
   esac
 done
 [[ -z "$expect_value" ]] || die "option $expect_value is missing its value"
+if (( target_args > 1 )); then
+  # Cargo builds the selection once per --target; the bar models one graph
+  # and would count one of them as the whole.
+  die "--target was given $target_args times; this script draws one graph — pick one target per run"
+fi
 if (( doc_only && target_selected )); then
   # Cargo's own refusal, reproduced before anything runs rather than
   # discovered as a doctest phase that reports nothing.
@@ -181,27 +190,38 @@ fi
 HOST="$(rustc -vV | sed -n 's/^host: //p')"
 [[ -n "$HOST" ]] || die "could not determine the host triple from rustc"
 # The triple the graph is resolved for, in cargo's precedence: --target,
-# then CARGO_BUILD_TARGET, then build.target from the config hierarchy
-# (--config overrides, then .cargo/config[.toml] upward from here, then the
-# home one; the extensionless file wins where both exist, as cargo warns it
-# does), then the host. The BUILD needs none of this — cargo resolves its
-# own target — but the denominator must describe the graph cargo builds.
+# then build.target from the config hierarchy — --config overrides FIRST
+# (a command-line override outranks the environment under cargo), then
+# CARGO_BUILD_TARGET, then .cargo/config[.toml] upward from here, then the
+# home one (the extensionless file wins where both exist, as cargo warns it
+# does) — then the host. A build.target that lists several triples is
+# refused rather than guessed at: cargo builds the selection once per
+# triple, and a bar drawn for one of them would count it as the whole. The
+# BUILD needs none of this — cargo resolves its own target — but the
+# denominator must describe the graph cargo builds.
 build_target() {
-  python3 - "$PWD" "${CARGO_HOME:-$HOME/.cargo}" ${config_overrides[@]+"${config_overrides[@]}"} <<'PY'
+  python3 - "$PWD" "${CARGO_HOME:-$HOME/.cargo}" "${CARGO_BUILD_TARGET:-}" \
+    ${config_overrides[@]+"${config_overrides[@]}"} <<'PY'
 import os, sys, tomllib
-cwd, cargo_home, *overrides = sys.argv[1:]
-def target_of(config):
+cwd, cargo_home, env_target, *overrides = sys.argv[1:]
+def target_of(config, where):
     target = config.get("build", {}).get("target")
     if isinstance(target, list):
-        target = target[0] if len(target) == 1 else None
+        if len(target) > 1:
+            sys.exit("build.target in " + where + " names " + str(len(target))
+                     + " triples; cargo builds the selection once per triple and this "
+                     "bar draws one graph. Pass --target to choose one for this run.")
+        target = target[0] if target else None
     return target
 for override in reversed(overrides):
     try:
         config = tomllib.load(open(override, "rb")) if os.path.isfile(override) else tomllib.loads(override)
     except (OSError, tomllib.TOMLDecodeError):
         continue
-    if target_of(config):
-        print(target_of(config)); sys.exit(0)
+    if target_of(config, "--config " + override):
+        print(target_of(config, override)); sys.exit(0)
+if env_target:
+    print(env_target); sys.exit(0)
 dirs = []
 here = cwd
 while True:
@@ -218,11 +238,15 @@ for directory in dirs:
             config = tomllib.load(open(path, "rb"))
         except (OSError, tomllib.TOMLDecodeError):
             continue
-        if target_of(config):
-            print(target_of(config)); sys.exit(0)
+        if target_of(config, path):
+            print(target_of(config, path)); sys.exit(0)
 PY
 }
-TRIPLE="${TARGET_ARG:-${CARGO_BUILD_TARGET:-$(build_target)}}"
+if [[ -n "$TARGET_ARG" ]]; then
+  TRIPLE="$TARGET_ARG"
+else
+  TRIPLE="$(build_target)" || die "could not settle the build target"
+fi
 TRIPLE="${TRIPLE:-$HOST}"
 
 # ---------------------------------------------------------------------------
@@ -274,12 +298,15 @@ def named(spec, package):
     return any(ch in spec for ch in "*?[") and fnmatch.fnmatchcase(name, spec)
 
 if selected:
-    roots = []
+    matched = []
     for spec in selected:
         matches = [pid for pid in members if named(spec, by_id[pid])]
         if not matches:
             sys.exit("package " + spec + " is not a member of this workspace")
-        roots.extend(matches)
+        matched.extend(matches)
+    # `--workspace -p a` selects the WORKSPACE under cargo: the -p is
+    # checked for existence and otherwise ignored, so it is here too.
+    roots = list(members) if workspace_flag else matched
 else:
     roots = list(members if workspace_flag else default_members)
 roots = [pid for pid in roots if not any(named(spec, by_id[pid]) for spec in excluded)]
@@ -288,9 +315,12 @@ if not roots:
 
 if mode == "libs":
     # A library with `doctest = false` produces no Doc-tests unit under
-    # cargo, so it must not be counted as one here.
+    # cargo, so it must not be counted as one here. A proc-macro crate IS
+    # a library for this purpose: cargo runs its doctests too, under a
+    # target kind that names neither lib nor rlib.
     print(sum(1 for pid in roots if any(
-        ("lib" in target["kind"] or "rlib" in target["kind"]) and target.get("doctest", True)
+        any(kind in target["kind"] for kind in ("lib", "rlib", "proc-macro"))
+        and target.get("doctest", True)
         for target in by_id[pid]["targets"])))
     sys.exit(0)
 
@@ -348,9 +378,20 @@ built_packages() {
     | grep -oE '"package_id":"[^"]*"' | sort -u | wc -l | tr -d ' '
 }
 
+# Cargo colours its status lines whenever `--color always` or
+# CARGO_TERM_COLOR=always says so — CI does — and a coloured `Running` line
+# carries escape sequences before its indentation, which the anchored
+# patterns below would never match. Every read of the log goes through
+# this. A literal escape byte, not `\e`: the sed macOS ships knows neither
+# that nor `\x1b`.
+ESC="$(printf '\033')"
+plain_log() { # <file> — the log with its escape sequences removed
+  [[ -f "$1" ]] || return 0
+  sed "s/${ESC}\[[0-9;]*[A-Za-z]//g" "$1"
+}
 sum_counts() { # <passed|failed> <file> — libtest's own totals, from its
   # `test result:` lines only: a test that PRINTS "7 passed" is not a result.
-  grep -hE '^test result: ' "$2" | grep -oE "[0-9]+ $1" | awk '{s+=$1} END{print s+0}'
+  plain_log "$2" | grep -hE '^test result: ' | grep -oE "[0-9]+ $1" | awk '{s+=$1} END{print s+0}'
 }
 
 passed=0; failed=0; TOTAL_BINS=0
@@ -441,9 +482,9 @@ while :; do
   # Re-read the whole log each tick: cheap, and it needs no cursor state.
   # POSIX classes, not \s: the sed macOS ships does not know \s, and a
   # label that kept its indentation would be the only symptom.
-  ran="$(grep -cE '^[[:space:]]+(Running|Doc-tests) ' "$WORK/run.log" 2>/dev/null || true)"
+  ran="$(plain_log "$WORK/run.log" | grep -cE '^[[:space:]]+(Running|Doc-tests) ' || true)"
   ran="${ran:-0}"
-  current="$(grep -E '^[[:space:]]+(Running|Doc-tests) ' "$WORK/run.log" 2>/dev/null | tail -1 \
+  current="$(plain_log "$WORK/run.log" | grep -E '^[[:space:]]+(Running|Doc-tests) ' | tail -1 \
     | sed -E 's/^[[:space:]]+//; s/ \(.*\)$//')"
   passed="$(sum_counts passed "$WORK/run.log")"
   failed="$(sum_counts failed "$WORK/run.log")"
@@ -460,7 +501,8 @@ if [[ "$RUN_RC" -ne 0 ]]; then
   # cargo's own closing summary of which binaries failed. Every failure,
   # not the first sixty lines of them — the whole point of --no-fail-fast
   # is that the summary is complete.
-  grep -E '^(test .*FAILED|thread .* panicked|assertion|---- .* stdout|error: |    [a-z_-]+ \(|failures:)' "$WORK/run.log"
+  plain_log "$WORK/run.log" \
+    | grep -E '^(test .*FAILED|thread .* panicked|assertion|---- .* stdout|error: |    [a-z_-]+ \(|failures:)'
   printf '\n%s%d passed, %d failed%s\n' "$RED" "$passed" "$failed" "$RESET"
   exit "$RUN_RC"
 fi
