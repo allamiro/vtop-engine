@@ -1065,11 +1065,15 @@ jobs:
       # A new release therefore joins the matrix the moment its tag exists,
       # so the immediately preceding release — the upgrade path most
       # operators actually take — cannot silently fall out of coverage.
+      # FINALS ONLY, stated as a policy rather than a sort subtlety (#409):
+      # a suffixed tag (v0.5.0-rc1) must never beat its final in last-wins,
+      # and the glob admits every major so v1.0.0 joins the day it exists.
       - name: Select the released tags to replay
         id: tags
         run: |
           set -euo pipefail
-          tags="$(git tag --list 'v0.*' --sort=version:refname \
+          tags="$(git tag --list 'v[0-9]*' --sort=version:refname \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
             | awk -F. '($1 "." $2) != "v0.1" { latest[$1 "." $2] = $0 } END { for (m in latest) print latest[m] }' \
             | sort -V | tr '\n' ' ')"
           [[ -n "${tags// /}" ]] || { echo "no release tags found"; exit 1; }
@@ -1107,11 +1111,12 @@ jobs:
             # The rolling profile's threshold keys exist from v0.3.0 (#313);
             # older releases refuse unknown config keys, which is itself the
             # compatibility contract, so they replay the legacy single-file
-            # shape — the exact claim open_range makes.
+            # shape — the exact claim open_range makes. A NUMERIC compare
+            # states that rule (#409); the glob it replaces enumerated digit
+            # ranges and would have been silently outgrown at v0.10.
             profile=legacy
-            case "$tag" in
-              v0.[3-9].*|v[1-9]*) profile=rolling ;;
-            esac
+            IFS=. read -r maj min _ <<< "${tag#v}"
+            if (( maj > 0 || min >= 3 )); then profile=rolling; fi
             UPGRADE_KEEP=1 UPGRADE_WORKDIR="$GITHUB_WORKSPACE/upgrade-$tag" \
             UPGRADE_NATIVE_PORT="$port" \
               scripts/upgrade-compat.sh "$tag" \
@@ -1124,7 +1129,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: upgrade-compat-logs
-          path: upgrade-v0*/logs
+          path: upgrade-v*/logs
           if-no-files-found: ignore
           retention-days: 7
 

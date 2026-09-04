@@ -289,7 +289,8 @@ target I/O arc (#100 #101 #102) with the measurements that gate it
 GitHub pre-releases to say so. **Upgrades are tested** (#291): CI proves a
 data directory written by the newest patch of each released minor series
 (v0.2+) opens under the current build, serves byte-exactly, and still serves
-after a restart; newly published tags join that matrix automatically. **Downgrades are not supported**
-— a newer release's directory may hold artifacts an older release cannot
-interpret, and nothing tests that path; going back means a fresh directory or
-a verified backup taken before the upgrade.
+after a restart; newly published tags join that matrix automatically.
+**Downgrades are not supported** — a newer release's directory may hold
+artifacts an older release cannot interpret, and nothing tests that path;
+going back means a fresh directory or a verified backup taken before the
+upgrade.
