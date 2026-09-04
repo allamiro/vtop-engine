@@ -2117,6 +2117,19 @@ fn torn_prefix_matches_template(candidate: &[u8], template: &[u8]) -> Option<Vec
                 {
                     return None;
                 }
+                // A complete json makes the checksum COMPUTABLE (review,
+                // round nine): it is the hash of exactly the bytes before
+                // it, all of which are present, so whatever trailing bytes
+                // the cut left must be a prefix of that hash. A trailing
+                // byte that disagrees was never written by `encode_header`
+                // — damage to a header that once existed whole, and
+                // evidence to keep.
+                let expected = blake3::hash(&candidate[..12 + json_len]);
+                if candidate[12 + json_len..]
+                    != expected.as_bytes()[..candidate.len() - 12 - json_len]
+                {
+                    return None;
+                }
             }
             None => {
                 // The digits already on disk bound the claim from below as
@@ -5818,6 +5831,21 @@ mod tests {
         assert!(
             torn_prefix_matches_template(&long_claim, &template).is_none(),
             "a complete shape under a claim that says more JSON follows is no header either"
+        );
+
+        // A complete json makes the checksum computable, so the checksum
+        // bytes a cut left behind are checkable: a genuine prefix of the
+        // hash is a torn write, a damaged one is not (review, round nine).
+        let partial_checksum = real[..12 + json_len + 4].to_vec();
+        assert!(
+            torn_prefix_matches_template(&partial_checksum, &template).is_some(),
+            "four true checksum bytes after a complete json are a torn write"
+        );
+        let mut damaged_checksum = partial_checksum.clone();
+        damaged_checksum[12 + json_len + 3] ^= 0xFF;
+        assert!(
+            torn_prefix_matches_template(&damaged_checksum, &template).is_none(),
+            "a checksum byte the completed header cannot have produced is damage, not a cut"
         );
 
         // More bytes than the claim allows for: magic, length, JSON, and a

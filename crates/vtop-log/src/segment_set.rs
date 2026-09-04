@@ -3819,6 +3819,64 @@ mod tests {
         assert!(!torn_path.exists());
     }
 
+    /// A cut inside the checksum leaves bytes the completed header makes
+    /// checkable (#410, review round nine): the true prefix of the hash is
+    /// a torn write and is swept; one damaged byte among them is a header
+    /// that once existed whole, and quarantines.
+    #[test]
+    fn a_damaged_partial_checksum_is_quarantined_not_deleted() {
+        let cut_in_checksum = |damage: bool| {
+            let mut successor = descriptor();
+            successor.segment_id = Uuid::from_u128(0xF8);
+            successor.base_offset = 3;
+            let bytes = crate::codec::encode_header(&crate::codec::SegmentHeader::new(
+                successor,
+                SegmentConfig {
+                    max_record_bytes: 1,
+                    max_group_bytes: 1 + crate::types::RECORD_FRAME_OVERHEAD_BYTES,
+                    max_segment_bytes: 1 + crate::types::RECORD_FRAME_OVERHEAD_BYTES,
+                    max_segment_records: 1,
+                    index_stride: 1,
+                },
+            ))
+            .unwrap();
+            let json_len = u32::from_be_bytes(bytes[8..12].try_into().unwrap()) as usize;
+            let mut cut = bytes[..12 + json_len + 4].to_vec();
+            if damage {
+                cut[12 + json_len + 3] ^= 0xFF;
+            }
+            cut
+        };
+
+        let quarantined = tempdir().unwrap();
+        strand_after_seal(quarantined.path(), false);
+        let artifact_path = quarantined
+            .path()
+            .join(format!("{}.active", segment_stem(3)));
+        std::fs::write(&artifact_path, cut_in_checksum(true)).unwrap();
+        let refused = SegmentSet::open_in(&Env::real(), quarantined.path())
+            .map(|_| ())
+            .expect_err("a damaged checksum must keep the directory refused");
+        assert!(
+            !matches!(refused, LogError::TailSealedWithoutSuccessor { .. }),
+            "a checksum byte the header cannot have produced is damage, and must not be swept: {refused}"
+        );
+        assert!(artifact_path.exists(), "the artifact is evidence and stays");
+
+        let swept = tempdir().unwrap();
+        strand_after_seal(swept.path(), false);
+        let torn_path = swept.path().join(format!("{}.active", segment_stem(3)));
+        std::fs::write(&torn_path, cut_in_checksum(false)).unwrap();
+        let refused = SegmentSet::open_in(&Env::real(), swept.path())
+            .map(|_| ())
+            .expect_err("a prefix without a usable tail must still refuse to open");
+        assert!(
+            matches!(refused, LogError::TailSealedWithoutSuccessor { .. }),
+            "a true prefix of the checksum is a torn write and is swept: {refused}"
+        );
+        assert!(!torn_path.exists());
+    }
+
     /// The roll's FIRST window: a crash mid-write of the successor's own
     /// header. The commit sidecar's absence proves creation never finished,
     /// so the torn file has never held a record and is discarded — the
