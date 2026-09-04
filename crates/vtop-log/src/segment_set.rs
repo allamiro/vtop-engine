@@ -3758,6 +3758,67 @@ mod tests {
         );
     }
 
+    /// The claim and the config must agree (#410, review rounds eight and
+    /// nine): a real minimal successor header, re-labelled with the
+    /// narrowest template's length (two bytes short of its own config) and
+    /// cut after its JSON, matched every earlier check byte for byte and
+    /// was deleted as torn. Under the true length the identical bytes ARE a
+    /// torn write and are swept; under the false one they are a header no
+    /// encoder produced, and quarantine.
+    #[test]
+    fn a_length_claim_that_cannot_describe_the_config_is_quarantined_not_deleted() {
+        let minimal_cut = |relabel: bool| {
+            let mut successor = descriptor();
+            successor.segment_id = Uuid::from_u128(0xF7);
+            successor.base_offset = 3;
+            let bytes = crate::codec::encode_header(&crate::codec::SegmentHeader::new(
+                successor,
+                SegmentConfig {
+                    max_record_bytes: 1,
+                    max_group_bytes: 1 + crate::types::RECORD_FRAME_OVERHEAD_BYTES,
+                    max_segment_bytes: 1 + crate::types::RECORD_FRAME_OVERHEAD_BYTES,
+                    max_segment_records: 1,
+                    index_stride: 1,
+                },
+            ))
+            .unwrap();
+            let json_len = u32::from_be_bytes(bytes[8..12].try_into().unwrap()) as usize;
+            let mut cut = bytes[..12 + json_len].to_vec();
+            if relabel {
+                cut[8..12].copy_from_slice(&((json_len - 2) as u32).to_be_bytes());
+            }
+            cut
+        };
+
+        let quarantined = tempdir().unwrap();
+        strand_after_seal(quarantined.path(), false);
+        let artifact_path = quarantined
+            .path()
+            .join(format!("{}.active", segment_stem(3)));
+        std::fs::write(&artifact_path, minimal_cut(true)).unwrap();
+        let refused = SegmentSet::open_in(&Env::real(), quarantined.path())
+            .map(|_| ())
+            .expect_err("a claim that cannot describe its config must keep the directory refused");
+        assert!(
+            !matches!(refused, LogError::TailSealedWithoutSuccessor { .. }),
+            "the re-labelled header is not torn and must not be swept: {refused}"
+        );
+        assert!(artifact_path.exists(), "the artifact is evidence and stays");
+
+        let swept = tempdir().unwrap();
+        strand_after_seal(swept.path(), false);
+        let torn_path = swept.path().join(format!("{}.active", segment_stem(3)));
+        std::fs::write(&torn_path, minimal_cut(false)).unwrap();
+        let refused = SegmentSet::open_in(&Env::real(), swept.path())
+            .map(|_| ())
+            .expect_err("a prefix without a usable tail must still refuse to open");
+        assert!(
+            matches!(refused, LogError::TailSealedWithoutSuccessor { .. }),
+            "the same bytes under their true length are a torn write and are swept: {refused}"
+        );
+        assert!(!torn_path.exists());
+    }
+
     /// The roll's FIRST window: a crash mid-write of the successor's own
     /// header. The commit sidecar's absence proves creation never finished,
     /// so the torn file has never held a record and is discarded — the

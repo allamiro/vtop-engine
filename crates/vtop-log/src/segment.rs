@@ -2119,7 +2119,19 @@ fn torn_prefix_matches_template(candidate: &[u8], template: &[u8]) -> Option<Vec
                 }
             }
             None => {
-                if claimed < candidate.len() - 12 {
+                // The digits already on disk bound the claim from below as
+                // well (review, round nine): the json is the template's
+                // length plus every digit a value carries beyond the
+                // template's one-digit narrowest, so a claim the observed
+                // digits have already outgrown describes no continuation of
+                // this file — and a claim exactly the bytes present says the
+                // json ends here, where the shape says it does not.
+                let extra_digits: usize = runs
+                    .iter()
+                    .map(|(value, _)| value.to_string().len() - 1)
+                    .sum();
+                let present = candidate.len() - 12;
+                if claimed <= present || claimed < template_json.len() + extra_digits {
                     return None;
                 }
             }
@@ -5725,6 +5737,97 @@ mod tests {
                 "a prefix of the real header must always match at cut {cut}"
             );
         }
+    }
+
+    /// A complete length claim fixes how many digits the config may carry
+    /// beyond the template's narrowest (#410, review rounds eight and nine):
+    /// a header re-labelled with a length two bytes short of its own config
+    /// is not something the encoder produced, however well its bytes match
+    /// one at a time — whether the cut lands after the JSON or inside the
+    /// config, where the digits already on disk have outgrown the claim.
+    /// The same bytes under their true length are the torn prefix they
+    /// claim to be.
+    #[test]
+    fn the_length_claim_must_describe_the_config_observed() {
+        let mut template_descriptor = descriptor();
+        template_descriptor.segment_id = TORN_TEMPLATE_ID;
+        let narrowest = SegmentConfig {
+            max_record_bytes: 1,
+            max_group_bytes: 1,
+            max_segment_bytes: 1,
+            max_segment_records: 1,
+            index_stride: 1,
+        };
+        let template = encode_header(&SegmentHeader::new(template_descriptor, narrowest)).unwrap();
+        // A REAL successor: the minimal valid config, two digits wider than
+        // the template (93 twice), truncated after its JSON.
+        let minimal = SegmentConfig {
+            max_record_bytes: 1,
+            max_group_bytes: 1 + crate::types::RECORD_FRAME_OVERHEAD_BYTES,
+            max_segment_bytes: 1 + crate::types::RECORD_FRAME_OVERHEAD_BYTES,
+            max_segment_records: 1,
+            index_stride: 1,
+        };
+        let real = encode_header(&SegmentHeader::new(descriptor(), minimal)).unwrap();
+        let json_len = u32::from_be_bytes(real[8..12].try_into().unwrap()) as usize;
+        let truncated_after_json = real[..12 + json_len].to_vec();
+        assert!(
+            torn_prefix_matches_template(&truncated_after_json, &template).is_some(),
+            "under its true length the cut is a torn prefix"
+        );
+
+        let short_claim = ((json_len - 2) as u32).to_be_bytes();
+        let mut relabelled = truncated_after_json.clone();
+        relabelled[8..12].copy_from_slice(&short_claim);
+        assert!(
+            torn_prefix_matches_template(&relabelled, &template).is_none(),
+            "a claim two bytes short of the config it fronts describes no header"
+        );
+
+        // The same false claim with the cut INSIDE the config, right after
+        // the first widened value: one extra digit is on disk against a
+        // budget of none, and no continuation can take it back.
+        let after_group = b"\"max_group_bytes\":93";
+        let cut_at = real
+            .windows(after_group.len())
+            .position(|window| window == after_group)
+            .expect("the group limit is encoded")
+            + after_group.len();
+        let mut mid_config = real[..cut_at].to_vec();
+        mid_config[8..12].copy_from_slice(&short_claim);
+        assert!(
+            torn_prefix_matches_template(&mid_config, &template).is_none(),
+            "the digits already present have outgrown the claim; no continuation fits it"
+        );
+        assert!(
+            torn_prefix_matches_template(&real[..cut_at], &template).is_some(),
+            "the identical mid-config cut under its true length is a torn prefix"
+        );
+
+        // A claim exactly the bytes present says the JSON ends where the
+        // shape says it does not.
+        let mut ends_here = real[..cut_at].to_vec();
+        ends_here[8..12].copy_from_slice(&((cut_at - 12) as u32).to_be_bytes());
+        assert!(
+            torn_prefix_matches_template(&ends_here, &template).is_none(),
+            "a claim that ends mid-shape describes no header"
+        );
+
+        let mut long_claim = truncated_after_json.clone();
+        long_claim[8..12].copy_from_slice(&((json_len + 3) as u32).to_be_bytes());
+        assert!(
+            torn_prefix_matches_template(&long_claim, &template).is_none(),
+            "a complete shape under a claim that says more JSON follows is no header either"
+        );
+
+        // More bytes than the claim allows for: magic, length, JSON, and a
+        // checksum is everything a header has.
+        let mut overlong = real.clone();
+        overlong.push(0x00);
+        assert!(
+            torn_prefix_matches_template(&overlong, &template).is_none(),
+            "a file longer than the header it claims to be is not its prefix"
+        );
     }
 
     /// An open run is filled with a real continuation of its digits, so a
