@@ -145,7 +145,9 @@ pub enum BrokerError {
     /// duplicate path — without string-matching, while every other marker
     /// refusal (fenced, v1, unreplicated) stays terminal.
     #[error(
-        "boundary marker not quorum-acked: {follower_acks} follower ack(s), need majority of          {replication_factor} — the boundary stays unpublished until a majority holds this          epoch's tail"
+        "boundary marker not quorum-acked: {follower_acks} follower ack(s), need majority of \
+         {replication_factor} — the boundary stays unpublished until a majority holds \
+         this epoch's tail"
     )]
     BoundaryMarkerUnacked {
         follower_acks: usize,

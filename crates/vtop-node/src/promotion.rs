@@ -45,11 +45,15 @@
 //! they resurface. The truncation primitive exists and is bounded; what is
 //! missing is this module driving it from the divergence point.
 //!
-//! **Open, and subtler, from Raft §5.4.2:** a new leader must not commit
-//! entries from a previous term by counting replicas. The Raft-safe form is to
-//! append a marker in the new epoch and let prior entries commit implicitly
-//! once that is quorum-acked. VTOP gets the epoch for free from the lease mint;
-//! the marker record does not exist yet.
+//! **Closed, from Raft §5.4.2 (#240):** a new leader must not commit entries
+//! from a previous term by counting replicas. The Raft-safe form is to append
+//! a marker in the new epoch and let prior entries commit implicitly once
+//! that is quorum-acked — and that is now what happens: VTOP gets the epoch
+//! for free from the lease mint, and promotion fires
+//! `LocalBroker::publish_boundary_marker` on v2 ranges the moment the view
+//! activates ("The boundary gates; the marker publishes" below). v1 ranges,
+//! which cannot store the marker's reserved identity, keep the pre-marker
+//! publication path by the marker's own refusal contract.
 //!
 //! What is here is the floor computation, a fenced read to compute it from, and
 //! an honest refusal when a quorum cannot be reached.
