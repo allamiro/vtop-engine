@@ -73,7 +73,7 @@ def test_an_inline_comment_is_not_part_of_the_password(
     from lib import engine
     monkeypatch.setattr(engine, "_ENV_FILE", str(tmp_path / ".env"))
     (tmp_path / ".env").write_text(
-        "MINIO_ROOT_USER=\"user # not a comment\"\n"
+        "MINIO_ROOT_USER=\"user # not a comment\" # a real comment\n"
         "MINIO_ROOT_PASSWORD=benchmarksecret # local MinIO\n",
         encoding="utf-8")
     for var in ("MINIO_ROOT_USER", "MINIO_ROOT_PASSWORD",
@@ -84,8 +84,8 @@ def test_an_inline_comment_is_not_part_of_the_password(
         "the inline comment belongs to the file, not the password"
     )
     assert env["AWS_ACCESS_KEY_ID"] == "user # not a comment", (
-        "a quoted value keeps its '#' — compose only strips comments from "
-        "unquoted values"
+        "a quoted value keeps its '#' and ends at its closing quote — the "
+        "comment after the quote goes, and so do the quotes themselves"
     )
 
 

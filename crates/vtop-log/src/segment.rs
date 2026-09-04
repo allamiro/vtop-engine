@@ -2094,20 +2094,42 @@ pub(crate) fn rebuild_empty_successor_commit(
             // JSON fails — and only the first is evidence that creation
             // never finished. A complete file that stopped decoding is
             // damage to something that once existed, and deleting damage
-            // destroys the evidence quarantine exists to preserve. So the
-            // torn classification re-derives what the file's own length
-            // prefix implies: both formats lay out 12 prefix bytes, then
-            // `json_len` of JSON, then the checksum. Shorter than its own
-            // claim (with a plausible claim) is torn; anything else stays
-            // quarantined like the unknown-magic arm.
-            let provably_torn = if bytes.len() < 12 {
-                true
-            } else {
-                let json_len = u32::from_be_bytes(bytes[8..12].try_into().expect("fixed slice"));
-                json_len > 0
-                    && json_len <= crate::codec::MAX_HEADER_BYTES
-                    && (bytes.len() as u64)
-                        < 12 + u64::from(json_len) + crate::codec::CHECKSUM_LEN as u64
+            // destroys the evidence quarantine exists to preserve.
+            //
+            // And the proof cannot come from the candidate's own length
+            // prefix (review): that field is covered by the checksum that
+            // just failed, so after a decode failure nothing the file says
+            // about itself is trusted — a corrupted-upward length would
+            // make a full-length file look "shorter than its claim" and be
+            // deleted as torn. The expected length is derived from the
+            // PREDECESSOR's authenticated header instead: a roll writes the
+            // successor with the sealed segment's own config and
+            // descriptor, changing only the segment id (fixed-width in
+            // JSON) and the base offset (known exactly here) — so the byte
+            // length of a legitimate successor header is computable without
+            // trusting the candidate at all. Strictly shorter than that is
+            // torn; everything else stays quarantined like the
+            // unknown-magic arm, including a foreign file whose length
+            // happens not to match.
+            let expected_len = match &inspection.header {
+                AnyHeader::V1(sealed) => {
+                    let mut expected = sealed.descriptor.clone();
+                    expected.base_offset = expected_base;
+                    encode_header(&SegmentHeader::new(expected, sealed.config))
+                        .map(|encoded| encoded.len() as u64)
+                }
+                AnyHeader::V2(sealed) => {
+                    let mut expected = sealed.descriptor.clone();
+                    expected.base_offset = expected_base;
+                    encode_header_v2(&SegmentHeaderV2::new(expected, sealed.config))
+                        .map(|encoded| encoded.len() as u64)
+                }
+            };
+            let provably_torn = match expected_len {
+                Ok(expected) => (bytes.len() as u64) < expected,
+                // A predecessor whose header cannot re-encode is not a
+                // state this repair understands; prove nothing.
+                Err(_) => false,
             };
             if !provably_torn {
                 return Ok(false);

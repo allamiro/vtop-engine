@@ -186,9 +186,18 @@ def _dotenv_overrides() -> dict[str, str]:
                     continue
                 key, _, value = line.partition("=")
                 value = value.strip()
-                if len(value) >= 2 and value[0] == value[-1] \
-                        and value[0] in "\"'":
-                    value = value[1:-1]
+                if value[:1] in "\"'":
+                    # A quoted value ends at its CLOSING quote; whatever
+                    # follows — an inline comment, stray whitespace — is not
+                    # part of it. Checking for a quote PAIR before stripping
+                    # the comment left the quotes inside the credential
+                    # whenever a comment followed the closing quote
+                    # (review). An unterminated quote is left exactly as
+                    # written — not this parser's error to invent a meaning
+                    # for.
+                    closing = value.find(value[0], 1)
+                    if closing != -1:
+                        value = value[1:closing]
                 else:
                     for at in range(1, len(value)):
                         if value[at] == "#" and value[at - 1].isspace():

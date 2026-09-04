@@ -218,15 +218,21 @@ jobs:
           # docs link to, the bundle carries.
           #
           # `2>/dev/null || true` is kept for the reason it was here before, but
-          # it now hides five possible absences rather than two, so the two that
-          # must never be missing are asserted explicitly.
+          # it hides every possible absence, so the files that must never be
+          # missing are asserted explicitly below.
           cp README.md LICENSE LICENSE-EE COMMERCIAL.md CONTRIBUTING.md \
             "dist/$name/" 2>/dev/null || true
-          # CONTRIBUTING.md sends a reader to docs/SECURITY_MODEL.md, so the
-          # closure rule above reaches one file deeper — shipped under docs/
-          # so the relative link resolves inside the archive (#410).
+          # CONTRIBUTING.md sends a reader to docs/SECURITY_MODEL.md, which
+          # itself links the protocol draft and its neighbours — the closure
+          # rule is transitive, and chasing it link by link is a game this
+          # step loses every time a doc gains a reference (review). The
+          # WHOLE docs tree ships instead: markdown weighs nothing next to
+          # the binaries, and a closed set stays closed by construction.
           mkdir -p "dist/$name/docs"
-          cp docs/SECURITY_MODEL.md "dist/$name/docs/" 2>/dev/null || true
+          cp -r docs/. "dist/$name/docs/" 2>/dev/null || true
+          # Three explicit assertions now, not two: the licenses the archive
+          # must never ship without, plus the security model CONTRIBUTING.md
+          # names — the sentinel for the docs tree having actually copied.
           for required in LICENSE LICENSE-EE docs/SECURITY_MODEL.md; do
             [ -f "dist/$name/$required" ] \
               || { echo "::error::$required is missing from the release bundle"; exit 1; }

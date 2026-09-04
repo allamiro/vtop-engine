@@ -315,7 +315,9 @@ sample_rejoining_follower() { # <seconds-left>
   fi
 }
 
-produce_deadline=$((SECONDS + PROGRESS_TIMEOUT_SECONDS))
+produce_deadline_base=$((SECONDS + PROGRESS_TIMEOUT_SECONDS))
+produce_deadline=$produce_deadline_base
+diag_spent_ms=0
 attempts=0
 until "$VTOP_NODE" produce --client-config "$VERIFY_CFG" --addr "$(native_addr)" \
   --records "$BATCH" --batch "$BATCH" \
@@ -329,10 +331,15 @@ until "$VTOP_NODE" produce --client-config "$VERIFY_CFG" --addr "$(native_addr)"
   # number of attempts inside it independent of how the metrics endpoint
   # answers. Each sample is still clamped to five seconds, so the loop's
   # total wall time stays bounded by produce time plus one clamp per failed
-  # attempt.
-  sample_started=$SECONDS
+  # attempt. Measured in MILLISECONDS and accumulated (review): bash's
+  # integer SECONDS charges a subsecond scrape as zero or one depending
+  # only on where it crosses a tick, and that rounding error compounds
+  # per retry — the extension would then depend on scrape phase, the exact
+  # timing coupling this budget exists to remove.
+  sample_started_ms=$(date +%s%3N)
   sample_rejoining_follower "$((produce_deadline - SECONDS))"
-  produce_deadline=$((produce_deadline + SECONDS - sample_started))
+  diag_spent_ms=$((diag_spent_ms + $(date +%s%3N) - sample_started_ms))
+  produce_deadline=$((produce_deadline_base + diag_spent_ms / 1000))
   if [[ $SECONDS -ge $produce_deadline ]]; then
     if [[ "$REJOIN_GAP" -gt 0 ]]; then
       # NAMED FIRST, because it explains the observation rather than competing

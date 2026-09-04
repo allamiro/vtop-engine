@@ -176,8 +176,16 @@ env_default() { # <key> — the value filed in ./.env, read by Compose's rules
   local value
   value="$(sed -n "s/^$1=//p" .env | tail -1)"
   case "$value" in
-    \"*\") value="${value#\"}"; value="${value%\"}" ;;
-    \'*\') value="${value#\'}"; value="${value%\'}" ;;
+    \"*)
+      # A quoted value ends at its CLOSING quote; an inline comment after
+      # it is not part of the credential (review — matching on a quote PAIR
+      # left the quotes inside the value whenever a comment followed). An
+      # unterminated quote stays exactly as written.
+      value="$(printf '%s' "$value" | sed -E 's/^"([^"]*)".*/\1/')"
+      ;;
+    \'*)
+      value="$(printf '%s' "$value" | sed -E "s/^'([^']*)'.*/\1/")"
+      ;;
     *)
       # Compose's dotenv rule for UNQUOTED values: an inline comment starts
       # at the first whitespace-preceded '#', and trailing whitespace goes.

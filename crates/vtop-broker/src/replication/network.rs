@@ -1875,6 +1875,23 @@ impl ReplicaStatusClient {
         // One deadline for the whole exchange: a replica whose disk has stopped
         // answering will also stop answering here, and an operator running a
         // status command during an incident needs it to return.
+        // Parsed only when a connector exists (#410) — a plaintext client
+        // has no TLS name to validate — but BEFORE dialing (review): an
+        // invalid name is a deterministic configuration error, and
+        // discovering it only after a connect can cost the full timeout
+        // against a silently dropping endpoint and read as a network fault.
+        let tls_name = match self.connector.as_ref() {
+            Some(_) => Some(
+                rustls::pki_types::ServerName::try_from(server_name.to_owned())
+                    .map_err(|error| {
+                        crate::BrokerError::InvalidConfig(format!(
+                            "server name {server_name:?}: {error}"
+                        ))
+                    })?
+                    .to_owned(),
+            ),
+            None => None,
+        };
         timeout(self.timeout, async {
             let tcp = TcpStream::connect(addr)
                 .await
@@ -1887,18 +1904,7 @@ impl ReplicaStatusClient {
             // this reports whatever replica answered the address.
             let mut stream = match self.connector.as_ref() {
                 Some(connector) => {
-                    // Parsed only where it is used (#410): a plaintext
-                    // client has no TLS name to validate, and refusing an
-                    // empty or invalid server_name before dialing made the
-                    // plaintext path fail on a field it never reads —
-                    // mirroring connect_and_session.
-                    let name = rustls::pki_types::ServerName::try_from(server_name.to_owned())
-                        .map_err(|error| {
-                            crate::BrokerError::InvalidConfig(format!(
-                                "server name {server_name:?}: {error}"
-                            ))
-                        })?
-                        .to_owned();
+                    let name = tls_name.expect("a connector implies a parsed TLS name");
                     let tls = connector.connect(name, tcp).await.map_err(|source| {
                         crate::BrokerError::Io {
                             path: PathBuf::from("replica-status-tls"),
@@ -1964,6 +1970,23 @@ impl ReplicaStatusClient {
         fencing_epoch: u64,
         leader_epoch_starts: &[vtop_protocol::ReplicaEpochStart],
     ) -> BrokerResult<vtop_protocol::ReplicaFenceResponse> {
+        // Parsed only when a connector exists (#410) — a plaintext client
+        // has no TLS name to validate — but BEFORE dialing (review): an
+        // invalid name is a deterministic configuration error, and
+        // discovering it only after a connect can cost the full timeout
+        // against a silently dropping endpoint and read as a network fault.
+        let tls_name = match self.connector.as_ref() {
+            Some(_) => Some(
+                rustls::pki_types::ServerName::try_from(server_name.to_owned())
+                    .map_err(|error| {
+                        crate::BrokerError::InvalidConfig(format!(
+                            "server name {server_name:?}: {error}"
+                        ))
+                    })?
+                    .to_owned(),
+            ),
+            None => None,
+        };
         timeout(self.timeout, async {
             let tcp = TcpStream::connect(addr)
                 .await
@@ -1975,18 +1998,7 @@ impl ReplicaStatusClient {
             // plane means the expected node UUID cannot be confirmed.
             let mut stream = match self.connector.as_ref() {
                 Some(connector) => {
-                    // Parsed only where it is used (#410): a plaintext
-                    // client has no TLS name to validate, and refusing an
-                    // empty or invalid server_name before dialing made the
-                    // plaintext path fail on a field it never reads —
-                    // mirroring connect_and_session.
-                    let name = rustls::pki_types::ServerName::try_from(server_name.to_owned())
-                        .map_err(|error| {
-                            crate::BrokerError::InvalidConfig(format!(
-                                "server name {server_name:?}: {error}"
-                            ))
-                        })?
-                        .to_owned();
+                    let name = tls_name.expect("a connector implies a parsed TLS name");
                     let tls = connector.connect(name, tcp).await.map_err(|source| {
                         crate::BrokerError::Io {
                             path: PathBuf::from("replica-fence-tls"),
@@ -2068,6 +2080,23 @@ impl ReplicaStatusClient {
         expected_node: Uuid,
         range: &RangeIdentity,
     ) -> BrokerResult<Vec<vtop_protocol::ReplicaEpochStart>> {
+        // Parsed only when a connector exists (#410) — a plaintext client
+        // has no TLS name to validate — but BEFORE dialing (review): an
+        // invalid name is a deterministic configuration error, and
+        // discovering it only after a connect can cost the full timeout
+        // against a silently dropping endpoint and read as a network fault.
+        let tls_name = match self.connector.as_ref() {
+            Some(_) => Some(
+                rustls::pki_types::ServerName::try_from(server_name.to_owned())
+                    .map_err(|error| {
+                        crate::BrokerError::InvalidConfig(format!(
+                            "server name {server_name:?}: {error}"
+                        ))
+                    })?
+                    .to_owned(),
+            ),
+            None => None,
+        };
         timeout(self.timeout, async {
             let tcp = TcpStream::connect(addr)
                 .await
@@ -2079,18 +2108,7 @@ impl ReplicaStatusClient {
             // plane means the expected node UUID cannot be confirmed.
             let mut stream = match self.connector.as_ref() {
                 Some(connector) => {
-                    // Parsed only where it is used (#410): a plaintext
-                    // client has no TLS name to validate, and refusing an
-                    // empty or invalid server_name before dialing made the
-                    // plaintext path fail on a field it never reads —
-                    // mirroring connect_and_session.
-                    let name = rustls::pki_types::ServerName::try_from(server_name.to_owned())
-                        .map_err(|error| {
-                            crate::BrokerError::InvalidConfig(format!(
-                                "server name {server_name:?}: {error}"
-                            ))
-                        })?
-                        .to_owned();
+                    let name = tls_name.expect("a connector implies a parsed TLS name");
                     let tls = connector.connect(name, tcp).await.map_err(|source| {
                         crate::BrokerError::Io {
                             path: PathBuf::from("replica-epoch-history-tls"),
