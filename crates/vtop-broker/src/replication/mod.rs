@@ -932,6 +932,18 @@ impl InProcessFollower {
         state
             .segment
             .fetch_through(start_offset, max_bytes, max_records, hwm)
+            .map(|mut batch| {
+                // The same visibility rule as the leader's wire mapping —
+                // one predicate for both fetch surfaces (#240): the fault
+                // harness compares the two views record-for-record across
+                // failovers, and a marker visible on one side only would
+                // read as divergence. The batch's next_offset still steps
+                // over what the filter removed.
+                batch
+                    .records
+                    .retain(|record| crate::consumer_visible(&record.record));
+                batch
+            })
             .map_err(|source| BrokerError::InvalidConfig(source.to_string()))
     }
 

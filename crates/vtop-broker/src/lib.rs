@@ -69,11 +69,38 @@ use vtop_meta::{
 use vtop_protocol::{
     encode_frame, read_frame, write_frame, ClientHello, CommitCursorResponse, CommittedHwmUpdate,
     Durability as WireDurability, ErrorCode, ErrorResponse, FetchCursorResponse, FetchResponse,
-    FetchedRecord, LineageCursor, Message, ProduceOutcome, ProduceResponse, ProtocolLimits,
-    RangeIdentity, ReplicaAppendRequest, Role, ServerHello, WireFrame, ABSOLUTE_MAX_FRAME_BYTES,
-    ABSOLUTE_MAX_RECORDS, DEFAULT_MAX_FRAME_BYTES, DEFAULT_MAX_RECORDS, PROTOCOL_MAJOR,
-    PROTOCOL_MINOR,
+    FetchedRecord, LineageCursor, Message, ProduceOutcome, ProduceRecord, ProduceResponse,
+    ProtocolLimits, RangeIdentity, ReplicaAppendRequest, Role, ServerHello, WireFrame,
+    ABSOLUTE_MAX_FRAME_BYTES, ABSOLUTE_MAX_RECORDS, DEFAULT_MAX_FRAME_BYTES, DEFAULT_MAX_RECORDS,
+    PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
+
+/// The reserved producer identity of the promotion boundary marker (#240).
+///
+/// A marker is an ORDINARY v2 record — the attributes bit stays reserved,
+/// because every shipped decoder reads a nonzero attributes as segment
+/// corruption and the replica wire cannot carry the bit — so what makes a
+/// record a marker is this identity alone: sixteen fixed bytes no real
+/// producer can mint, spelled so a hexdump names itself. A marker's producer
+/// epoch is the fencing epoch being promoted, which keeps the
+/// per-(producer, epoch) sequence rule honest at sequence zero, and ONE
+/// marker per epoch is the invariant that makes re-publishing the
+/// idempotent-retry path rather than a second record.
+pub const PROMOTION_MARKER_PRODUCER: Uuid = Uuid::from_bytes(*b"VTOP.PROMO.MARK1");
+
+/// Whether a stored record belongs to the CONSUMER's view of the log, as
+/// opposed to the replication plane's (#240).
+///
+/// Both fetch surfaces — the leader's wire mapping and the follower's —
+/// must answer through this one predicate: the fault harness compares the
+/// two views record-for-record across failovers, and a marker visible on
+/// one side only would read as divergence. The predicate keys on the
+/// stored producer identity, which is why the boundary marker exists only
+/// on v2-format ranges — the v1 frame stores a producer id MERGED with the
+/// epoch, and a merged identity can never equal the reserved constant.
+pub fn consumer_visible(record: &LogRecord) -> bool {
+    record.producer_id != PROMOTION_MARKER_PRODUCER
+}
 
 const EPOCH_MAGIC: &[u8; 8] = b"VTOPEPC1";
 const EPOCH_VERSION: u16 = 1;
@@ -103,6 +130,15 @@ pub enum BrokerError {
     /// file stay [`BrokerError::Io`], which names the path.
     #[error("committed-floor file: {0}")]
     CommittedFloor(String),
+    /// A boundary-marker publication that could not complete (#240): no
+    /// replication to convince, a v1 range whose merged producer identity
+    /// cannot carry the marker, a fence landing before publication, or a
+    /// quorum that never acked. Its own variant because the caller — the
+    /// promotion path — treats every one of these as "the boundary stays
+    /// unpublished, retry or stand down", which is a different remedy from
+    /// any storage or configuration failure.
+    #[error("boundary marker: {0}")]
+    BoundaryMarker(String),
     #[error("producer {producer_id} epoch {actual} is fenced by durable epoch {current}")]
     ProducerFenced {
         producer_id: Uuid,
@@ -813,6 +849,134 @@ impl LocalBroker {
         self.held_fencing_epoch.fetch_max(epoch, Ordering::SeqCst) < epoch
     }
 
+    /// Append this epoch's boundary marker at the tail, prove it on a
+    /// quorum, and only then publish the tail as the cluster high-water mark
+    /// (#240 — Raft §5.4.2 in its actual form: commit an entry of your own
+    /// term before trusting a count over earlier ones). Returns the
+    /// published mark.
+    ///
+    /// The epoch must already be adopted: the marker is a record OF the new
+    /// epoch, and it is held to the same range/epoch/lease rule as any
+    /// produce, on entry and again between the quorum ack and publication —
+    /// a lease stolen mid-flight leaves the watermark untouched, exactly as
+    /// the produce path promises. One marker per epoch, by construction:
+    /// the marker's identity is (reserved producer, this fencing epoch,
+    /// sequence zero), so re-publishing after a failed quorum rides the
+    /// duplicate path — the append yields the original offset, the fan-out
+    /// retransmits from it, and lagging followers catch up from the same
+    /// base a produce retry would use.
+    ///
+    /// Refused outright on an unreplicated broker (a marker has no quorum
+    /// to convince — the standalone boundary is the node's own log and the
+    /// §5.4.2 hazard is vacuous there) and on a v1-format range (the v1
+    /// frame stores a producer identity merged with the epoch, so the
+    /// marker could never be recognized for consumer-side filtering).
+    ///
+    /// NOTHING CALLS THIS IN PRODUCTION YET: promotion wiring is its own
+    /// slice, and this primitive ships first so the deterministic harnesses
+    /// can pin its behavior in isolation.
+    pub fn publish_boundary_marker(&self, fencing_epoch: u64) -> BrokerResult<u64> {
+        let Some(cluster) = self.cluster_committed.as_ref() else {
+            return Err(BrokerError::BoundaryMarker(
+                "this broker replicates to nobody, so there is no quorum to convince and \
+                 nothing this marker would prove"
+                    .to_owned(),
+            ));
+        };
+        let Some(replicas) = self.replicas.as_ref() else {
+            return Err(BrokerError::BoundaryMarker(
+                "cluster commit is configured but no replica set is attached".to_owned(),
+            ));
+        };
+        if self.segment_format == SegmentFormat::V1 {
+            return Err(BrokerError::BoundaryMarker(
+                "v1 frames store the producer identity merged with the epoch, so a marker \
+                 written there could never be recognized for filtering; v1 ranges keep the \
+                 pre-marker publication path"
+                    .to_owned(),
+            ));
+        }
+        let marker_key = b"promotion-boundary".to_vec();
+        // Append under the meta and state locks exactly as the produce path
+        // does: the committed offset the quorum is asked to prove must be
+        // the one this append established, or the acks prove someone else's
+        // boundary.
+        let (replicate_from, leader_committed) = {
+            let meta = self.meta_fencing_epoch.lock();
+            self.check_range(&meta, &self.range, fencing_epoch)
+                .map_err(|(_, message)| BrokerError::BoundaryMarker(message.to_owned()))?;
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state
+                .producer_epochs
+                .accept(PROMOTION_MARKER_PRODUCER, fencing_epoch)?;
+            let outcomes = state.segment.append_group_minting(
+                &[LogRecord {
+                    producer_id: PROMOTION_MARKER_PRODUCER,
+                    producer_epoch: fencing_epoch,
+                    sequence: 0,
+                    // The marker names no event; a synthetic timestamp would
+                    // only invite someone to read meaning into it.
+                    timestamp_millis: 0,
+                    attributes: 0,
+                    key: marker_key.clone(),
+                    value: Vec::new(),
+                }],
+                Durability::Fsync,
+            )?;
+            // A duplicate outcome is the republish path: the marker already
+            // sits at its original offset, and the fan-out must retransmit
+            // from there so a follower that missed it the first time can
+            // catch up — the same rule the produce path applies to
+            // all-duplicate retries.
+            let replicate_from = outcomes
+                .iter()
+                .map(|outcome| outcome.offset())
+                .min()
+                .unwrap_or_else(|| state.segment.next_offset().saturating_sub(1));
+            (replicate_from, state.segment.committed_offset())
+        };
+        let request = ReplicaAppendRequest {
+            range: self.range.clone(),
+            fencing_epoch,
+            leader_node_id: self.node_id,
+            expected_base_offset: replicate_from,
+            producer_id: PROMOTION_MARKER_PRODUCER,
+            producer_epoch: fencing_epoch,
+            first_sequence: 0,
+            records: vec![ProduceRecord {
+                timestamp_millis: 0,
+                key: marker_key,
+                value: Vec::new(),
+            }],
+        };
+        let quorum = replicas.replicate_append_batch(&[request], leader_committed);
+        if !quorum.has_quorum() {
+            return Err(BrokerError::BoundaryMarker(format!(
+                "not quorum-acked: {} follower ack(s), need majority of {} — the boundary \
+                 stays unpublished until a majority holds this epoch's tail",
+                quorum.follower_acks, quorum.replication_factor
+            )));
+        }
+        // Re-validate the lease before publishing, exactly as the produce
+        // path does — the quorum proved durability, not that this node still
+        // holds the range.
+        let committed = {
+            let meta = self.meta_fencing_epoch.lock();
+            self.check_range(&meta, &self.range, fencing_epoch)
+                .map_err(|(_, message)| BrokerError::BoundaryMarker(message.to_owned()))?;
+            cluster.advance_to(leader_committed)
+        };
+        replicas.propagate_committed_hwm(&CommittedHwmUpdate {
+            range: self.range.clone(),
+            fencing_epoch,
+            committed_high_watermark: committed,
+        });
+        Ok(committed)
+    }
+
     /// Bound this range's disk in bytes; `None` disables retention (#290).
     ///
     /// Takes effect on the next produce that appends. The bound covers
@@ -1301,6 +1465,12 @@ impl LocalBroker {
                     // record. Refetch exactly that record so the consumer
                     // always makes progress; the session layer enforces the
                     // negotiated wire-frame cap on the actual response.
+                    // This guard reads the RAW log batch, before the
+                    // visibility filter below, which is what keeps the two
+                    // from feeding back: a batch that was all markers
+                    // arrives here with an ADVANCED next_offset, so it
+                    // cannot re-trigger the refetch — the consumer sees an
+                    // empty response whose cursor moved, which IS progress.
                     if batch.records.is_empty()
                         && batch.next_offset == request.start_offset
                         && batch.next_offset < batch.high_watermark
@@ -1318,9 +1488,15 @@ impl LocalBroker {
                         request_id,
                         stream_id,
                         message: Message::FetchResponse(FetchResponse {
+                            // The visibility filter (#240): replication-plane
+                            // records stay physical in the log and invisible
+                            // on the consumer wire; next_offset still steps
+                            // over them, which slice one taught the shipped
+                            // consumers to honor.
                             records: batch
                                 .records
                                 .into_iter()
+                                .filter(|record| consumer_visible(&record.record))
                                 .map(|record| FetchedRecord {
                                     offset: record.offset,
                                     timestamp_millis: record.record.timestamp_millis,
