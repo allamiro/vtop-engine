@@ -1606,11 +1606,14 @@ meta_admin_membership() { # <node-id> <subcommand + args...>
       printf '%s\n' "$out" >&2
       return 1
     fi
+    sleep 0.3
+    # Gate AFTER the sleep, so no attempt runs past the advertised deadline:
+    # checked before, the sleep could carry the loop across it and buy one
+    # retry more than the timeout promises.
     if [[ $SECONDS -ge $deadline ]]; then
       printf '%s\n' "$out" >&2
       fail "membership change still refused as in-progress after ${ELECTION_TIMEOUT_SECONDS}s: the initial membership never committed"
     fi
-    sleep 0.3
   done
 }
 
