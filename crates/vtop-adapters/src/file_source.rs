@@ -445,9 +445,13 @@ const FILE_READ_CONCURRENCY: usize = 8;
 /// decision is made inside the bounded pipeline, so the deciding stat rides
 /// the same concurrency as the read it gates instead of serializing on the
 /// executor thread ahead of every read (#412).
+/// What a completed read hands back: the records, the byte the read ended
+/// at, whether they are verbatim, and the identity the read observed.
+type SliceRead = (Vec<Vec<u8>>, u64, bool, FileIdentity);
+
 enum PassOutcome {
     SkippedUnchanged(FileIdentity),
-    Read(Result<(Vec<Vec<u8>>, u64, bool, FileIdentity), VtopError>),
+    Read(Result<SliceRead, VtopError>),
 }
 
 #[async_trait]
