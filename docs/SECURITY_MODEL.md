@@ -89,12 +89,17 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are used as normat
 ### Native broker transport
 
 - The native broker transport is restricted to TLS 1.3 and requires a client
-  certificate chained to the configured client roots. The transport gained a
-  plaintext mode in #294 slice 3, but no node config key, `vtopctl` flag or
-  Helm value reaches it, so the restriction holds for every deployable
-  configuration; #294 is where selecting it would be decided, and a plaintext
+  certificate chained to the configured client roots. The transport gained
+  plaintext modes in #294 slices 3 and 4 (the replica plane, then the native
+  produce/fetch plane), but no node config key, `vtopctl` flag or Helm value
+  reaches either, so the restriction holds for every deployable
+  configuration; #294 is where selecting it would be decided. A plaintext
   replica plane refuses the verbs whose authorization depends on a client
-  certificate.
+  certificate; a plaintext native plane admits a session only if the
+  deployment's `SessionAuthorizer` accepts the declared principal without a
+  certificate in so many words (`authorize_unverified`, refusing by default),
+  and both refuse at bind time to serve on a non-loopback address unless
+  constructed with the exposure acknowledged by name.
 - Certificate validity alone does not grant a role. The embedding deployment
   **MUST** supply a `SessionAuthorizer` that binds the peer certificate chain,
   declared principal ID, and requested producer/consumer role. Produce requests
@@ -309,7 +314,7 @@ the ignore list and the build re-audited.
 | Manifest authentication | Optional | Keyed BLAKE3 MAC; required when configured. |
 | Chain of custody (object ↔ source markers) | Yes | Manifest binds object hash to covered markers. |
 | Replay safety / no premature commit | Yes | Enforced in state machine, state store, and pipeline. |
-| Transport confidentiality | Yes (native broker) / Configurable (Kafka, S3, PostgreSQL) | Every deployable configuration of the native broker is TLS 1.3 mTLS: the transport gained a plaintext mode in #294 slice 3, but no node config key, `vtopctl` flag or Helm value reaches it, so plaintext is not selectable by any deployment method today. A plaintext replica plane also refuses the verbs whose authorization depends on a client certificate. Kafka/S3/PostgreSQL confidentiality is configured on those clients, not implemented in core. |
+| Transport confidentiality | Yes (native broker) / Configurable (Kafka, S3, PostgreSQL) | Every deployable configuration of the native broker is TLS 1.3 mTLS: the transport gained plaintext modes in #294 slices 3 and 4 (replica and native planes), but no node config key, `vtopctl` flag or Helm value reaches them, so plaintext is not selectable by any deployment method today. A plaintext replica plane also refuses the verbs whose authorization depends on a client certificate, and a plaintext native plane admits only principals the authorizer accepts unverified by name. Kafka/S3/PostgreSQL confidentiality is configured on those clients, not implemented in core. |
 | PostgreSQL transport authentication | Yes for remote hosts | Non-loopback connections require `sslmode=verify-full`; loopback/socket plaintext is limited to local operation. |
 | Backend-limited verification disclosure | Yes | Size-only mode is labeled and rejected by default. |
 | Data-at-rest encryption | Not by VTOP | Delegated to storage layer (SSE/bucket default). |
