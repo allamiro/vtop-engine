@@ -422,7 +422,7 @@ pub async fn run(
 fn oneshot_on_shutdown(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::sync::oneshot::Receiver<()> {
-    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let (mut sender, receiver) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         while !*shutdown.borrow() {
             if shutdown.changed().await.is_err() {
@@ -430,11 +430,15 @@ fn oneshot_on_shutdown(
                 // the oneshot sender here would CANCEL the receiver, and the
                 // serve loops read a canceled receiver as a completed signal
                 // — an embedder that merely dropped a sender it no longer
-                // needed would drain a healthy node (#408). Parking keeps
-                // the receiver pending forever, which is what "no shutdown
-                // was ever requested" means; the same shape
-                // `meta_node::wait_for_shutdown` already has.
-                std::future::pending::<()>().await;
+                // needed would drain a healthy node (#408). So the sender is
+                // held — but only as long as anyone is LISTENING (review):
+                // parking unconditionally left this task pending forever
+                // after the server itself exited, and an embedder that
+                // restarts nodes would accumulate detached tasks. `closed()`
+                // keeps a live server's receiver pending and lets the
+                // adapter die with its server.
+                sender.closed().await;
+                return;
             }
         }
         let _ = sender.send(());
