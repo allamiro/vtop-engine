@@ -876,14 +876,17 @@ async fn run_leader(
         )?;
         agent_task = Some(tokio::spawn(agent.run(release_lease_rx)));
         // The agent abandons its round the moment the release fires (#408),
-        // so the worst remaining chain is the release proposal's own bounded
-        // deadline — one renew interval. Twice that is margin, not
-        // arithmetic. A full lease duration here was both too much and, for
-        // configurations with the renew interval near the lease duration,
-        // too little: an administrative lease has no expiry to fall back on,
-        // so dropping the task before ReleaseRangeLease is proposed leaves
-        // the stopped node assigned indefinitely.
-        agent_drain = agent_drain.max(Duration::from_millis(lease.renew_interval_ms) * 2);
+        // so the worst remaining chain is the shutdown path's own RPCs: the
+        // reconciliation read release() may need when the abandoned round
+        // died mid-acquisition, then the release proposal — two bounded
+        // deadlines back to back (review), with one more interval as real
+        // margin for scheduling between them. A full lease duration here was
+        // both too much and, for configurations with the renew interval near
+        // the lease duration, too little: an administrative lease has no
+        // expiry to fall back on, so dropping the task before
+        // ReleaseRangeLease is proposed leaves the stopped node assigned
+        // indefinitely.
+        agent_drain = agent_drain.max(Duration::from_millis(lease.renew_interval_ms) * 3);
     }
     observability.register(Box::new(BrokerCollector::new(
         Arc::clone(&broker),
@@ -1282,10 +1285,11 @@ async fn run_candidate(
         .with_ready_gate(observability.gate.clone())
         .with_stand_down(Arc::clone(&stand_down));
     // Same derivation as run_leader's (#408): the agent abandons its round on
-    // release, so the budget covers the release proposal's bounded deadline
-    // with margin, not a whole lease.
+    // release, so the budget covers the shutdown path's two bounded RPCs —
+    // the reconciliation read and the release proposal — plus one interval
+    // of scheduling margin (review), not a whole lease.
     let agent_drain = std::time::Duration::from_secs(5)
-        .max(std::time::Duration::from_millis(lease.renew_interval_ms) * 2);
+        .max(std::time::Duration::from_millis(lease.renew_interval_ms) * 3);
     let mut agent_task = tokio::spawn(agent.run(release_lease_rx));
 
     // --- readiness ----------------------------------------------------------
@@ -1598,9 +1602,19 @@ async fn run_candidate(
                                         }
                                     }
                                 }
-                                changed = shutdown.changed() => {
-                                    if changed.is_err() || *shutdown.borrow() {
+                                changed = shutdown.changed(), if !shutdown_watch_closed => {
+                                    // The same closed-watch rule as the
+                                    // outer select (review): a closure
+                                    // during the BUILD wait was still read
+                                    // as a shutdown here, sending the
+                                    // supervisor into an unsignalled drain
+                                    // with both listeners left bound. The
+                                    // value decides; closure parks the arm.
+                                    if *shutdown.borrow() {
                                         break 'supervisor;
+                                    }
+                                    if changed.is_err() {
+                                        shutdown_watch_closed = true;
                                     }
                                 }
                                 result = &mut native_task => {
