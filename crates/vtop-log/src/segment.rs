@@ -2099,13 +2099,62 @@ fn forced_extra_digits(sealed: &AnyHeader, runs: &[(u128, bool)]) -> usize {
     let (_, segment_width) = resolve(runs, 2, group.max(1));
     let (_, records_width) = resolve(runs, 3, 1);
     let (_, stride_width) = resolve(runs, 4, 1);
-    let chunk_width = chunk_floor.map_or(0, |floor| resolve(runs, 5, floor).1 - 1);
+    // The chunk's widths come from its attainable powers of two (review,
+    // round twelve), not from a plain floor: an open "6" reaches 65536 at
+    // five digits, and nothing else in the band spells it.
+    let chunk_width = if chunk_floor.is_some() {
+        chunk_width_bounds(runs.get(5)).0 - 1
+    } else {
+        0
+    };
     (record_width - 1)
         + (group_width - 1)
         + (segment_width - 1)
         + (records_width - 1)
         + (stride_width - 1)
         + chunk_width
+}
+
+/// The chunk field's digit widths over its ATTAINABLE values (#410,
+/// review round twelve): a chunk size is one of the nine powers of two in
+/// its band, so an open run's admissible widths come from the powers that
+/// spell the observed digits as a prefix — not from every number under
+/// the ceiling. `None` when nothing in the band spells the prefix, which
+/// the extendability judge refuses on its own; width bounds then fall
+/// back to the observed width, keeping this a pure width question.
+fn chunk_width_bounds(run: Option<&(u128, bool)>) -> (usize, usize) {
+    let band: Vec<u128> = {
+        let mut powers = Vec::new();
+        let mut chunk = crate::types::MIN_CHUNK_SIZE_BYTES as u128;
+        while chunk <= crate::types::MAX_CHUNK_SIZE_BYTES as u128 {
+            powers.push(chunk);
+            chunk *= 2;
+        }
+        powers
+    };
+    match run {
+        None => (
+            band.first().map_or(1, |p| p.to_string().len()),
+            band.last().map_or(1, |p| p.to_string().len()),
+        ),
+        Some((value, true)) => {
+            let width = value.to_string().len();
+            (width, width)
+        }
+        Some((value, false)) => {
+            let spelled = value.to_string();
+            let widths: Vec<usize> = band
+                .iter()
+                .map(|p| p.to_string())
+                .filter(|p| p.starts_with(&spelled))
+                .map(|p| p.len())
+                .collect();
+            match (widths.iter().min(), widths.iter().max()) {
+                (Some(&narrow), Some(&wide)) => (narrow, wide),
+                _ => (spelled.len(), spelled.len()),
+            }
+        }
+    }
 }
 
 /// The mirror bound (#410, review round eleven): the MOST digits any valid
@@ -2128,7 +2177,9 @@ fn widest_extra_digits(sealed: &AnyHeader, runs: &[(u128, bool)]) -> usize {
     }
     let chunk = match sealed {
         AnyHeader::V1(_) => 0,
-        AnyHeader::V2(_) => resolve(runs, 5, u128::from(crate::types::MAX_CHUNK_SIZE_BYTES)) - 1,
+        // The chunk's widest width comes from its attainable powers of two
+        // (review, round twelve), not from every number under the ceiling.
+        AnyHeader::V2(_) => chunk_width_bounds(runs.get(5)).1 - 1,
     };
     (resolve(runs, 0, u128::from(crate::types::MAX_RECORD_BYTES)) - 1)
         + (resolve(runs, 1, u128::from(crate::types::MAX_GROUP_BYTES)) - 1)
