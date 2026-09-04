@@ -31,8 +31,11 @@
 # word before `--` is a test-name filter, and everything after `--` is the
 # harness's. A target selector (`--lib`, `--test NAME`, `--bin NAME`, …)
 # narrows the run as it does under cargo and, as under cargo, skips the
-# doctests; `--doc` runs only them. The harness's thread count is cargo's
-# own default unless TEST_THREADS is set.
+# doctests; `--doc` runs only them, and is refused beside a selector as
+# cargo refuses it; `--no-run` compiles and stops. A `--manifest-path`
+# naming a workspace member selects that member, as it does under cargo.
+# The harness's thread count is cargo's own default unless TEST_THREADS is
+# set.
 #
 # Each binary runs from its package's root directory, as cargo runs it, and
 # through cargo's configured `target.<triple>.runner` when one is set — read
@@ -82,8 +85,8 @@ bar() { # <done> <total> <label>
 # doctest phase; `--config` overrides feed the runner lookup.
 # ---------------------------------------------------------------------------
 cargo_args=(); bin_args=(); metadata_args=(); packages=(); excludes=(); config_overrides=()
-past_sep=0; expect_value=""; workspace_flag=0; target_selected=0; doc_only=0
-TARGET_ARG=""
+past_sep=0; expect_value=""; workspace_flag=0; target_selected=0; doc_only=0; no_run=0
+TARGET_ARG=""; MANIFEST_PATH=""
 for arg in "$@"; do
   if (( past_sep )); then
     bin_args+=("$arg")
@@ -98,9 +101,12 @@ for arg in "$@"; do
     case "$expect_value" in
       -p|--package) packages+=("$arg") ;;
       --exclude) excludes+=("$arg") ;;
-      --manifest-path|--features|-F) metadata_args+=("$expect_value" "$arg") ;;
+      --manifest-path) metadata_args+=("$expect_value" "$arg"); MANIFEST_PATH="$arg" ;;
+      --features|-F) metadata_args+=("$expect_value" "$arg") ;;
       --target) TARGET_ARG="$arg" ;;
-      --config) config_overrides+=("$arg") ;;
+      # A --config override shapes resolution (sources, net, registries)
+      # as much as it shapes the runner, so metadata sees it too.
+      --config) config_overrides+=("$arg"); metadata_args+=("$expect_value" "$arg") ;;
     esac
     expect_value=""
     continue
@@ -116,19 +122,24 @@ for arg in "$@"; do
       cargo_args+=("$arg"); packages+=("${arg#--package=}") ;;
     --exclude=*)
       cargo_args+=("$arg"); excludes+=("${arg#--exclude=}") ;;
-    --manifest-path=*|--features=*|--all-features|--no-default-features)
+    --manifest-path=*)
+      cargo_args+=("$arg"); metadata_args+=("$arg"); MANIFEST_PATH="${arg#--manifest-path=}" ;;
+    --features=*|--all-features|--no-default-features)
       cargo_args+=("$arg"); metadata_args+=("$arg") ;;
     --locked|--offline|--frozen)
       cargo_args+=("$arg"); metadata_args+=("$arg") ;;
     --target=*)
       cargo_args+=("$arg"); TARGET_ARG="${arg#--target=}" ;;
     --config=*)
-      cargo_args+=("$arg"); config_overrides+=("${arg#--config=}") ;;
+      cargo_args+=("$arg"); config_overrides+=("${arg#--config=}"); metadata_args+=("$arg") ;;
     --workspace|--all)
       cargo_args+=("$arg"); workspace_flag=1 ;;
     --doc)
       doc_only=1 ;;
-    --lib|--bins|--tests|--examples|--benches|--all-targets)
+    --no-run)
+      no_run=1 ;;
+    --lib|--bins|--tests|--examples|--benches|--all-targets|\
+    --test=*|--bin=*|--example=*|--bench=*)
       cargo_args+=("$arg"); target_selected=1 ;;
     -*)
       cargo_args+=("$arg") ;;
@@ -140,10 +151,17 @@ for arg in "$@"; do
   esac
 done
 [[ -z "$expect_value" ]] || die "option $expect_value is missing its value"
+if (( doc_only && target_selected )); then
+  # Cargo's own refusal, reproduced before anything runs rather than
+  # discovered as a doctest phase that reports nothing.
+  die "can't mix --doc with other target selecting options"
+fi
 # `--workspace` is the DEFAULT selection, never an override: a caller who
 # named packages gets exactly those. An exclusion is not a selection — cargo
-# requires it alongside --workspace — so it keeps the default.
-if (( ! workspace_flag )) && [[ "${#packages[@]}" -eq 0 ]]; then
+# requires it alongside --workspace — so it keeps the default. A manifest
+# path IS a selection under cargo (the package it names), so it keeps the
+# default off and the closure below resolves to that package.
+if (( ! workspace_flag )) && [[ "${#packages[@]}" -eq 0 && -z "$MANIFEST_PATH" ]]; then
   cargo_args=(--workspace ${cargo_args[@]+"${cargo_args[@]}"})
   workspace_flag=1
 fi
@@ -224,7 +242,8 @@ runner = None
 # --config overrides and files both landed in `config`; the environment
 # sits between them in cargo's precedence, so only a --config override
 # outranks it.
-for override in overrides:
+# Later overrides win, as they do for cargo.
+for override in reversed(overrides):
     snippet = load_file(override) if os.path.isfile(override) else tomllib.loads(override)
     candidate = snippet.get("target", {}).get(target, {}).get("runner")
     if candidate is not None:
@@ -267,17 +286,24 @@ fi
 cargo metadata --format-version 1 --filter-platform "$TRIPLE" \
     ${metadata_args[@]+"${metadata_args[@]}"} > "$WORK/metadata.json" 2>"$WORK/metadata.err" \
   || { cat "$WORK/metadata.err" >&2; die "cargo metadata failed; refusing to draw a guessed bar"; }
-TOTAL_PACKAGES="$(python3 - "$WORK/metadata.json" "$workspace_flag" "${#packages[@]}" \
+TOTAL_PACKAGES="$(python3 - "$WORK/metadata.json" "$workspace_flag" "$MANIFEST_PATH" "${#packages[@]}" \
     ${packages[@]+"${packages[@]}"} ${excludes[@]+"${excludes[@]}"} 2>>"$WORK/metadata.err" <<'PY'
-import json, sys
+import json, os, sys
 with open(sys.argv.pop(1)) as handle:
     meta = json.load(handle)
 workspace_flag = sys.argv[1] == "1"
-count = int(sys.argv[2])
-selected, excluded = sys.argv[3:3 + count], sys.argv[3 + count:]
+manifest_path = sys.argv[2]
+count = int(sys.argv[3])
+selected, excluded = sys.argv[4:4 + count], sys.argv[4 + count:]
 by_id = {package["id"]: package for package in meta["packages"]}
 members = meta["workspace_members"]
 default_members = meta.get("workspace_default_members") or members
+if manifest_path and not workspace_flag and not selected:
+    # Cargo's default for an explicit manifest is the package it names.
+    wanted = os.path.realpath(manifest_path)
+    named = [pid for pid in members if os.path.realpath(by_id[pid]["manifest_path"]) == wanted]
+    if named:
+        default_members = named
 
 def named(spec, package):
     # `-p` accepts a name, name@version, or a path; match the forms a person types.
@@ -299,19 +325,22 @@ if not roots:
     sys.exit("the selection excludes every package")
 
 deps = {node["id"]: node["deps"] for node in meta["resolve"]["nodes"]}
+root_set = set(roots)
 seen = set()
-stack = [(pid, True) for pid in roots]
+stack = list(roots)
 while stack:
-    pid, is_root = stack.pop()
+    pid = stack.pop()
     if pid in seen:
         continue
     seen.add(pid)
+    # A root builds its dev-dependencies too — whether it was reached as a
+    # root or first met as another root's dependency — while a dependency
+    # builds only its normal and build dependencies.
+    is_root = pid in root_set
     for dep in deps.get(pid, []):
         kinds = {kind.get("kind") for kind in dep.get("dep_kinds", [])} or {None}
-        # A root builds its dev-dependencies too; a dependency builds only
-        # its normal and build dependencies.
         if is_root or kinds & {None, "build"}:
-            stack.append((dep["pkg"], False))
+            stack.append(dep["pkg"])
 print(len(seen))
 PY
 )"
@@ -356,6 +385,12 @@ if (( ! doc_only )); then
     printf '%scompile failed%s\n' "$RED" "$RESET"
     cat "$WORK/build.err"
     exit "$BUILD_RC"
+  fi
+  if (( no_run )); then
+    # Cargo's --no-run: compile, but don't run tests. The compile IS this
+    # script's first phase, so the request is honoured by stopping here.
+    printf '%scompiled; --no-run given, nothing executed%s\n' "$GREEN" "$RESET"
+    exit 0
   fi
 
   # -------------------------------------------------------------------------
