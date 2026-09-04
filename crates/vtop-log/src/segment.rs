@@ -2032,17 +2032,17 @@ const TORN_TEMPLATE_ID: Uuid = Uuid::from_u128(0xF0F0_F0F0_F0F0_F0F0_F0F0_F0F0_F
 /// ever be a prefix of a real header, so any divergence in those regions
 /// proves the file is something else — a foreign artifact to quarantine,
 /// never to delete.
-fn torn_prefix_matches_template(candidate: &[u8], template: &[u8]) -> bool {
+fn torn_prefix_matches_template(candidate: &[u8], template: &[u8]) -> Option<Vec<(u128, bool)>> {
     if !candidate
         .iter()
         .take(8)
         .zip(template.iter())
         .all(|(have, want)| have == want)
     {
-        return false;
+        return None;
     }
     if template.len() < 12 + crate::codec::CHECKSUM_LEN {
-        return false;
+        return None;
     }
     let template_json = &template[12..template.len() - crate::codec::CHECKSUM_LEN];
     let id_string = TORN_TEMPLATE_ID.as_hyphenated().to_string();
@@ -2053,7 +2053,7 @@ fn torn_prefix_matches_template(candidate: &[u8], template: &[u8]) -> bool {
         .windows(b"\"config\":".len())
         .position(|window| window == b"\"config\":");
     let (Some(id_at), Some(config_at)) = (id_at, config_at) else {
-        return false;
+        return None;
     };
     let id_span = id_at..id_at + id_string.len();
     // The length field is config-dependent, so its exact value is unknowable
@@ -2066,12 +2066,12 @@ fn torn_prefix_matches_template(candidate: &[u8], template: &[u8]) -> bool {
     if candidate.len() >= 12 {
         let claimed = u32::from_be_bytes(candidate[8..12].try_into().expect("fixed slice"));
         if (claimed as usize) < template_json.len() || claimed > crate::codec::MAX_HEADER_BYTES {
-            return false;
+            return None;
         }
     }
     let comparable = candidate.len().saturating_sub(12).min(config_at);
     if !(0..comparable).all(|at| id_span.contains(&at) || candidate[12 + at] == template_json[at]) {
-        return false;
+        return None;
     }
     // The config region is unknown in VALUE but not in SHAPE (review, round
     // five): its key names and punctuation are fixed by the codec — only
@@ -2081,18 +2081,25 @@ fn torn_prefix_matches_template(candidate: &[u8], template: &[u8]) -> bool {
     // genuine torn cut, ending anywhere inside the walk — or in the
     // checksum bytes after a complete shape — cannot.
     if candidate.len().saturating_sub(12) > config_at {
-        return config_shape_matches(&candidate[12 + config_at..], &template_json[config_at..]);
+        return config_shape_runs(&candidate[12 + config_at..], &template_json[config_at..]);
     }
-    true
+    Some(Vec::new())
 }
 
-/// Whether `candidate` walks the `template` config region's SHAPE: literal
+/// Walk the `template` config region's SHAPE against `candidate`: literal
 /// bytes must match, and each of the template's digit runs must be met by a
 /// nonempty digit run in the candidate (of any width — real configs encode
 /// wider than the narrowest template). A candidate that ends mid-walk is a
 /// consistent prefix; bytes remaining after the shape completes are the
 /// checksum's and are not judged.
-fn config_shape_matches(candidate: &[u8], template: &[u8]) -> bool {
+///
+/// `None` means the shape diverged. `Some(runs)` carries each candidate
+/// digit run as `(value, completed)` in field order — completed meaning the
+/// candidate continued past the run, so the value is closed; only the final
+/// run can be open, and an open run is a prefix of an unknown wider value
+/// that no check may be held against.
+fn config_shape_runs(candidate: &[u8], template: &[u8]) -> Option<Vec<(u128, bool)>> {
+    let mut runs = Vec::new();
     let mut have = 0usize;
     let mut want = 0usize;
     while have < candidate.len() && want < template.len() {
@@ -2104,7 +2111,7 @@ fn config_shape_matches(candidate: &[u8], template: &[u8]) -> bool {
             if have == run_start {
                 // Bytes exist where a digit run must begin, and none of
                 // them is a digit: not a prefix of any real config.
-                return false;
+                return None;
             }
             // The digits themselves have two checkable impossibilities
             // (review, round six): canonical JSON never writes a leading
@@ -2115,20 +2122,117 @@ fn config_shape_matches(candidate: &[u8], template: &[u8]) -> bool {
             // truncated or not.
             let run = &candidate[run_start..have];
             if (run[0] == b'0' && run.len() > 1) || run.len() > 20 {
-                return false;
+                return None;
             }
+            let mut value: u128 = 0;
+            for digit in run {
+                value = value * 10 + u128::from(digit - b'0');
+            }
+            runs.push((value, have < candidate.len()));
             while want < template.len() && template[want].is_ascii_digit() {
                 want += 1;
             }
         } else {
             if candidate[have] != template[want] {
-                return false;
+                return None;
             }
             have += 1;
             want += 1;
         }
     }
-    true
+    Some(runs)
+}
+
+/// Whether the candidate's COMPLETED config values can extend into any
+/// config the codec would actually write (#410, review round seven): a
+/// value whose closing comma is present is final, and a final combination
+/// the real `validate()` refuses — a group limit too small for its own
+/// record limit, a chunk size that is not a power of two — is a config no
+/// successor ever encoded, truncated or not. Judged by the REAL validator
+/// over the completed prefix with forward-feasible fills for everything
+/// still open (1 or the field ceiling, whichever direction its chained
+/// constraint needs), so the rules live in one place. An open final run is
+/// a prefix of an unknown wider value and is filled, never judged.
+fn config_prefix_extendable(sealed: &AnyHeader, runs: &[(u128, bool)]) -> bool {
+    fn completed(runs: &[(u128, bool)], at: usize) -> Option<u128> {
+        runs.get(at)
+            .and_then(|(value, done)| done.then_some(*value))
+    }
+    fn narrow<T: TryFrom<u128>>(value: u128) -> Option<T> {
+        T::try_from(value).ok()
+    }
+    match sealed {
+        AnyHeader::V1(_) => {
+            let Some(max_record_bytes) = completed(runs, 0).map_or(Some(1_u32), narrow::<u32>)
+            else {
+                return false;
+            };
+            let Some(max_group_bytes) =
+                completed(runs, 1).map_or(Some(crate::types::MAX_GROUP_BYTES), narrow::<u64>)
+            else {
+                return false;
+            };
+            let Some(max_segment_bytes) =
+                completed(runs, 2).map_or(Some(crate::types::MAX_SEGMENT_BYTES), narrow::<u64>)
+            else {
+                return false;
+            };
+            let Some(max_segment_records) = completed(runs, 3).map_or(Some(1_u64), narrow::<u64>)
+            else {
+                return false;
+            };
+            let Some(index_stride) = completed(runs, 4).map_or(Some(1_u32), narrow::<u32>) else {
+                return false;
+            };
+            SegmentConfig {
+                max_record_bytes,
+                max_group_bytes,
+                max_segment_bytes,
+                max_segment_records,
+                index_stride,
+            }
+            .validate()
+            .is_ok()
+        }
+        AnyHeader::V2(_) => {
+            let Some(max_record_bytes) = completed(runs, 0).map_or(Some(1_u32), narrow::<u32>)
+            else {
+                return false;
+            };
+            let Some(max_group_bytes) =
+                completed(runs, 1).map_or(Some(crate::types::MAX_GROUP_BYTES), narrow::<u64>)
+            else {
+                return false;
+            };
+            let Some(max_segment_bytes) =
+                completed(runs, 2).map_or(Some(crate::types::MAX_SEGMENT_BYTES), narrow::<u64>)
+            else {
+                return false;
+            };
+            let Some(max_segment_records) = completed(runs, 3).map_or(Some(1_u64), narrow::<u64>)
+            else {
+                return false;
+            };
+            let Some(index_stride) = completed(runs, 4).map_or(Some(1_u32), narrow::<u32>) else {
+                return false;
+            };
+            let Some(chunk_size) =
+                completed(runs, 5).map_or(Some(crate::types::MIN_CHUNK_SIZE_BYTES), narrow::<u32>)
+            else {
+                return false;
+            };
+            SegmentConfigV2 {
+                max_record_bytes,
+                max_group_bytes,
+                max_segment_bytes,
+                max_segment_records,
+                index_stride,
+                chunk_size,
+            }
+            .validate()
+            .is_ok()
+        }
+    }
 }
 
 /// Rebuild the commit boundary of an EMPTY successor whose creation was
@@ -2280,6 +2384,7 @@ pub(crate) fn rebuild_empty_successor_commit(
                 Ok(template) => {
                     (bytes.len() as u64) < template.len() as u64
                         && torn_prefix_matches_template(&bytes, &template)
+                            .is_some_and(|runs| config_prefix_extendable(&inspection.header, &runs))
                 }
                 // A predecessor whose header cannot re-encode is not a
                 // state this repair understands; prove nothing.
