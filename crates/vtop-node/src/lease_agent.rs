@@ -572,6 +572,15 @@ impl LeasePublisher for BrokerLeasePublisher {
                 cluster.advance_to(offset);
             }
         }
+        if gated {
+            // THE GATE GOES UP BEFORE THE LEASE GOES LIVE (review): a fetch
+            // that takes the metadata lock between activation and the gate
+            // would pass its lease check and serve the unproven floor. Raised
+            // first, a fetch in that window is refused — retryably — and
+            // nothing is served that this epoch has not proven. A stale
+            // round restores the gate to whatever the current marker needs.
+            self.broker.set_boundary_pending(true);
+        }
         // Both values must end up equal or the broker refuses every request.
         // The order is not a safety question — produce checks equality, so any
         // window between the two writes fails closed — but both must happen.
@@ -592,6 +601,8 @@ impl LeasePublisher for BrokerLeasePublisher {
                     held = self.broker.held_fencing_epoch(),
                     "stale promotion round; the held epoch's marker stays pending"
                 );
+                self.broker
+                    .set_boundary_pending(self.pending_marker_epoch().is_some());
                 return;
             }
             tracing::info!(
@@ -609,8 +620,11 @@ impl LeasePublisher for BrokerLeasePublisher {
         // Only the metadata view is cleared. The held epoch stays where it is:
         // it records what this process was last granted, and rewinding it
         // would let a later stale grant look current.
-        self.retire_marker(fencing_epoch);
+        // FENCE FIRST, gate second (review): a fetch between the two would
+        // otherwise pass an active lease and find the gate already down.
+        // Deactivated first, it is refused as fenced, which is the truth.
         self.broker.meta_fencing_epoch().clear_lease(fencing_epoch);
+        self.retire_marker(fencing_epoch);
     }
 
     fn suspend(&self, fencing_epoch: u64) {
@@ -620,9 +634,10 @@ impl LeasePublisher for BrokerLeasePublisher {
         // live lease until an external epoch change.
         // The pending marker goes too: a suspended lease refuses the marker,
         // and the re-promotion that lifts the suspension pends it again — a
-        // republish at the same epoch rides the duplicate path.
-        self.retire_marker(fencing_epoch);
+        // republish at the same epoch rides the duplicate path. Suspended
+        // FIRST, then retired, for the reason `demote` gives.
         self.broker.meta_fencing_epoch().suspend(fencing_epoch);
+        self.retire_marker(fencing_epoch);
     }
 }
 
@@ -2336,6 +2351,15 @@ mod tests {
         // Naming the right epoch retires it.
         publisher.demote(FENCING_EPOCH + 1);
         assert_eq!(publisher.pending_marker_epoch(), None);
+        assert!(
+            !h.leader.boundary_pending(),
+            "a stale round must not leave the gate up once nothing is pending"
+        );
+        publisher.promote(FENCING_EPOCH, Some(0));
+        assert!(
+            !h.leader.boundary_pending(),
+            "a stale round after retirement restores the gate to nothing-pending"
+        );
     }
 
     /// A v1-format replicated range keeps the direct publication path: its
