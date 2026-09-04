@@ -484,34 +484,47 @@ impl FencingEpochJournal {
     }
 }
 
-/// Clamp a lineage vector to the history that still governs records at or
-/// above `base` (#408): the entry owning `base`, re-anchored AT `base`, plus
-/// every entry starting above it.
+/// Clamp a lineage vector to the history that governs exactly the retained
+/// window `[base, tail)` (#408): the entry owning `base`, re-anchored AT
+/// `base`, plus every entry starting inside the window.
 ///
 /// Two replicas whose full vectors disagree may still agree about every
 /// record either of them RETAINS — retention reclaims a prefix, and a
-/// dispute confined to reclaimed records mandates nothing. The clamped views
-/// make that distinction checkable: equal clamps mean the disagreement lives
-/// entirely below `base`, unequal clamps mean retained records are
-/// attributed to different leaderships. An empty clamp means the vector
-/// cannot vouch for `base` at all — unknown, which callers must treat as
-/// "prove nothing" exactly as everywhere else here.
-pub fn clamp_lineage(entries: &[EpochStart], base: u64) -> Vec<EpochStart> {
-    let mut clamped = Vec::new();
-    if let Some(owner) = entries
+/// dispute confined to reclaimed records mandates nothing. The clamped
+/// views make that distinction checkable: equal clamps mean every retained
+/// record is attributed identically, unequal clamps mean retained records
+/// are attributed to different leaderships.
+///
+/// The window is bounded on BOTH sides deliberately (review): an entry at
+/// or beyond `tail` governs records this replica does not hold — the
+/// fencing epoch's own adoption entry sits exactly at the tail, and a peer
+/// that recorded a newer epoch while idle differs there legitimately —
+/// so including either side's future would manufacture disagreements about
+/// nothing, and tolerating them asymmetrically would excuse real ones.
+/// With both bounds in place the comparison is exact equality, no prefix
+/// tolerance needed.
+///
+/// Empty means the vector cannot vouch for `base` at all — unknown, which
+/// callers must treat as "prove nothing" exactly as everywhere else here.
+/// That answer is returned WHOLE (review): later in-window entries hanging
+/// off an unvouched base are not evidence, and returning them would let a
+/// caller mistake them for some.
+pub fn clamp_lineage(entries: &[EpochStart], base: u64, tail: u64) -> Vec<EpochStart> {
+    let Some(owner) = entries
         .iter()
         .rev()
         .find(|entry| entry.start_offset <= base)
-    {
-        clamped.push(EpochStart {
-            epoch: owner.epoch,
-            start_offset: base,
-        });
-    }
+    else {
+        return Vec::new();
+    };
+    let mut clamped = vec![EpochStart {
+        epoch: owner.epoch,
+        start_offset: base,
+    }];
     clamped.extend(
         entries
             .iter()
-            .filter(|entry| entry.start_offset > base)
+            .filter(|entry| entry.start_offset > base && entry.start_offset < tail)
             .copied(),
     );
     clamped

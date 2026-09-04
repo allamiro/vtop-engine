@@ -2103,12 +2103,25 @@ impl LocalBroker {
         // NEXT produce, and on a range that goes idle "next produce" is
         // never. A no-op whenever nothing became eligible, so the steady
         // state pays one atomic load and a size sum.
+        //
+        // Under the SAME lease discipline as the first pass (review): that
+        // one ran inside the meta lock the append held, and a lease lost
+        // since the publication above means this broker mutates nothing
+        // further — reclamation is never essential, the next holder's own
+        // passes cover it, and "a fenced broker deletes no files" is a rule
+        // worth keeping absolute.
         {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            self.run_retention(&mut state.segment);
+            let meta = self.meta_fencing_epoch.lock();
+            if self
+                .check_range(&meta, &batch[0].request.range, hwm_epoch)
+                .is_ok()
+            {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                self.run_retention(&mut state.segment);
+            }
         }
         batch
             .iter()

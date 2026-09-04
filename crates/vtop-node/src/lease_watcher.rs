@@ -182,11 +182,16 @@ impl LeaseWatcher {
                 tokio::select! {
                     observed = self.observe() => observed,
                     changed = shutdown.changed() => {
+                        // The VALUE decides before the closure does
+                        // (review): a sender that published `true` and was
+                        // then dropped is a shutdown whose channel closed,
+                        // not a closure to park on.
+                        if *shutdown.borrow() {
+                            return;
+                        }
                         if changed.is_err() {
                             watch_closed = true;
                             self.observe().await
-                        } else if *shutdown.borrow() {
-                            return;
                         } else {
                             continue;
                         }

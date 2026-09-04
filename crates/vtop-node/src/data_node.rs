@@ -1414,11 +1414,22 @@ async fn run_candidate(
     // leaves through the same drain, so handing the range back is not
     // something a new failure path can forget to do.
     let mut fatal: Option<String> = None;
+    // The oneshot adapters' rule, applied to the supervisor itself (review):
+    // a watch that CLOSED without ever publishing `true` is "no shutdown
+    // will ever be requested", never "shutdown now". Treating closure as a
+    // shutdown here while the adapters park would send this loop into a
+    // drain that waits on servers nobody signalled — and then return with
+    // both listeners still bound. Once closed, the arm stops being polled;
+    // the supervisor keeps supervising.
+    let mut shutdown_watch_closed = false;
     'supervisor: loop {
         tokio::select! {
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
+            changed = shutdown.changed(), if !shutdown_watch_closed => {
+                if *shutdown.borrow() {
                     break;
+                }
+                if changed.is_err() {
+                    shutdown_watch_closed = true;
                 }
             }
             // A plane dying under a live candidate is fail-stop (review): a

@@ -1046,6 +1046,14 @@ impl LeaseAgent {
                 tokio::select! {
                     stepped = self.step() => stepped,
                     changed = release.changed() => {
+                        // The VALUE decides before the closure does
+                        // (review): a sender that published `true` and was
+                        // then dropped is a release whose channel closed —
+                        // the loop head breaks on it — not a closure to
+                        // keep stepping through.
+                        if *release.borrow() {
+                            continue;
+                        }
                         if changed.is_err() {
                             release_closed = true;
                             self.step().await
@@ -1146,8 +1154,43 @@ impl LeaseAgent {
     /// already lost or taken, and blocking exit on metadata would trade a
     /// prompt failover for a hung shutdown, the exact inversion of the goal.
     async fn release(&mut self) {
-        let LeaseState::Held { fencing_epoch } = self.state else {
-            return;
+        // NotHeld here is what THIS PROCESS recorded, not what metadata
+        // decided (review): the abandoned round can die after metadata
+        // committed an acquisition — or after it reported an administrative
+        // hold — and before `self.state` caught up, and an administrative
+        // lease has no expiry to mop up the difference. One bounded read
+        // reconciles: if metadata says this node holds the range, the lease
+        // is released whether or not this agent ever knew it had it.
+        // Nothing was published for a lease never recorded, so there is no
+        // loss to publish in that branch — only the proposal.
+        let (fencing_epoch, was_published) = match self.state {
+            LeaseState::Held { fencing_epoch } => (fencing_epoch, true),
+            _ => {
+                let reconciled = self
+                    .bounded(
+                        "read range lease at shutdown",
+                        self.admin
+                            .read_range_lease(self.topic_uuid, self.range_uuid),
+                    )
+                    .await
+                    .ok()
+                    .and_then(|view| view.lease)
+                    .filter(|lease| lease.holder_node_uuid == self.node_uuid)
+                    .map(|lease| lease.fencing_epoch);
+                match reconciled {
+                    Some(epoch) => {
+                        tracing::warn!(
+                            range = %self.range_uuid,
+                            fencing_epoch = epoch,
+                            "metadata says this node holds a lease this agent never \
+                             recorded (a round abandoned mid-acquisition); releasing it \
+                             before exit"
+                        );
+                        (epoch, false)
+                    }
+                    None => return,
+                }
+            }
         };
         let proposal = self
             .bounded(
@@ -1181,7 +1224,9 @@ impl LeaseAgent {
                 "lease release failed; the lease will lapse on its deadline"
             ),
         }
-        self.publish_lost(fencing_epoch);
+        if was_published {
+            self.publish_lost(fencing_epoch);
+        }
     }
 
     /// Every admin round trip is bounded by this. A blackholed endpoint (as

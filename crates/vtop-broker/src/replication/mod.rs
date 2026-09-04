@@ -770,7 +770,12 @@ impl InProcessFollower {
             // (#408): DivergesAt marks everything at or above it suspect,
             // which includes every retained record. Whether the RETAINED
             // stretch is actually disputed is answerable — clamp both
-            // histories to the base and compare those. Equal clamps confine
+            // histories to exactly the retained window [base, tail) and
+            // compare those (review: bounded on BOTH sides, so the fencing
+            // epoch's own tail adoption and a peer's idle-epoch future
+            // cannot manufacture disagreements about records nobody holds,
+            // and the comparison is exact equality with no asymmetric
+            // prefix tolerance to excuse a real one). Equal clamps confine
             // the disagreement to records neither party holds any more:
             // unprovable, touch nothing, exactly the #290 reasoning above.
             // Unequal clamps mean retained records are attributed to
@@ -778,25 +783,26 @@ impl InProcessFollower {
             // back the split-brain read this vector exists to prevent — the
             // fence fails loudly and the replica needs repair. An empty
             // clamp on either side is "cannot vouch": unknown, touch
-            // nothing, as everywhere else.
+            // nothing, as everywhere else. An empty WINDOW is nothing to
+            // dispute at all.
+            let tail = self.next_offset();
+            if tail <= base_offset {
+                return Ok(0);
+            }
             let confined = {
                 let guard = self
                     .fencing_epoch_journal
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 guard.as_ref().is_none_or(|journal| {
-                    let mine = crate::fencing_epochs::clamp_lineage(journal.entries(), base_offset);
-                    let theirs =
-                        crate::fencing_epochs::clamp_lineage(leader_epoch_starts, base_offset);
-                    // Compared as far as BOTH recorded — the same prefix rule
-                    // `compare_lineage` applies. This replica's journal
-                    // already carries the adoption entry for the epoch doing
-                    // the fencing, which the caller's vector legitimately
-                    // lacks; a longer clamp whose shared prefix matches is a
-                    // replica that recorded more, not a disagreement.
-                    mine.is_empty()
-                        || theirs.is_empty()
-                        || mine.iter().zip(theirs.iter()).all(|(m, t)| m == t)
+                    let mine =
+                        crate::fencing_epochs::clamp_lineage(journal.entries(), base_offset, tail);
+                    let theirs = crate::fencing_epochs::clamp_lineage(
+                        leader_epoch_starts,
+                        base_offset,
+                        tail,
+                    );
+                    mine.is_empty() || theirs.is_empty() || mine == theirs
                 })
             };
             if confined {
