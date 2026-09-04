@@ -434,23 +434,14 @@ impl InProcessFollower {
             .committed_floor
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(file) = guard.as_mut() else {
-            return;
-        };
         // The cell is read UNDER the file lock: barriers overlap now that
         // persists run outside the state lock, and a snapshot taken before
         // the lock could arrive after a newer save — a regression the file
-        // rightly refuses, which the error path below would then read as
-        // damage and disable persistence for good. Read-in-lock makes every
-        // saved value at least as fresh as the save it follows.
+        // rightly refuses, which the disable path would then read as damage
+        // and stop persistence for good. Read-in-lock makes every saved
+        // value at least as fresh as the save it follows.
         let floor = self.cluster_committed.get();
-        if let Err(problem) = file.save(floor) {
-            eprintln!(
-                "committed-floor persist failed; the in-memory guard keeps serving and the \
-                 durable floor stops advancing until the next open: {problem}"
-            );
-            *guard = None;
-        }
+        Self::save_floor_or_disable(&mut guard, floor);
     }
 
     /// One save from the dispatch path, once per file lifetime (#240): the
@@ -461,20 +452,41 @@ impl InProcessFollower {
     /// armed, and waits for the next barrier, so the steady-state dispatch
     /// loop stays I/O-free.
     fn arm_committed_floor(&self) {
-        let mut guard = self
-            .committed_floor
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(file) = guard.as_mut() else {
-            return;
+        // try_lock, never lock: this runs in the dispatch loop, and the one
+        // thing that holds the lock for any length of time is a barrier
+        // persist mid-fsync — the very durability arming exists to request.
+        // Skipping is correct either way: if that persist saves a non-zero
+        // floor the guard is armed, and if not, the next frame tries again.
+        let mut guard = match self.committed_floor.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
         };
-        if file.floor() != 0 {
+        let already_armed = match guard.as_ref() {
+            Some(file) => file.floor() != 0,
+            None => return,
+        };
+        if already_armed {
             return;
         }
         let floor = self.cluster_committed.get();
         if floor == 0 {
             return;
         }
+        Self::save_floor_or_disable(&mut guard, floor);
+    }
+
+    /// The one disable path for a floor that cannot persist: report once,
+    /// keep serving, stop claiming durability until the next open. Shared by
+    /// the barrier persists and the arming save so the two can never drift
+    /// on what a failed write means.
+    fn save_floor_or_disable(
+        guard: &mut Option<crate::committed_floor::CommittedFloorFile>,
+        floor: u64,
+    ) {
+        let Some(file) = guard.as_mut() else {
+            return;
+        };
         if let Err(problem) = file.save(floor) {
             eprintln!(
                 "committed-floor persist failed; the in-memory guard keeps serving and the \
