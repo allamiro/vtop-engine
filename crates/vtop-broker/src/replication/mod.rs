@@ -418,8 +418,10 @@ impl InProcessFollower {
     /// state lock drops, because this needs only the shared cell and its own
     /// file, and deliberately NOT from [`Self::observe_hwm`], which runs in
     /// the per-connection dispatch loop that also carries append frames and
-    /// must stay I/O-free. The durable floor therefore lags the cell by at
-    /// most one append batch plus the quiet tail before quiesce. That lag is safe
+    /// must stay I/O-free in the steady state ([`Self::arm_committed_floor`]
+    /// is the one bounded exception). The durable floor therefore lags the
+    /// cell by at most one append batch plus the quiet tail before quiesce.
+    /// That lag is safe
     /// by the asymmetry [`crate::committed_floor`] states: a floor too low
     /// only weakens the guard toward the pre-floor behaviour; it never
     /// blocks legitimate work.
@@ -428,7 +430,6 @@ impl InProcessFollower {
     /// protection, not a liveness dependency, and failing the append path
     /// over it would convert a damaged sidecar into an outage.
     fn persist_committed_floor(&self) {
-        let floor = self.cluster_committed.get();
         let mut guard = self
             .committed_floor
             .lock()
@@ -436,6 +437,44 @@ impl InProcessFollower {
         let Some(file) = guard.as_mut() else {
             return;
         };
+        // The cell is read UNDER the file lock: barriers overlap now that
+        // persists run outside the state lock, and a snapshot taken before
+        // the lock could arrive after a newer save — a regression the file
+        // rightly refuses, which the error path below would then read as
+        // damage and disable persistence for good. Read-in-lock makes every
+        // saved value at least as fresh as the save it follows.
+        let floor = self.cluster_committed.get();
+        if let Err(problem) = file.save(floor) {
+            eprintln!(
+                "committed-floor persist failed; the in-memory guard keeps serving and the \
+                 durable floor stops advancing until the next open: {problem}"
+            );
+            *guard = None;
+        }
+    }
+
+    /// One save from the dispatch path, once per file lifetime (#240): the
+    /// first observed HWM is the difference between an UNARMED guard and an
+    /// armed one — a crash before the next append barrier would otherwise
+    /// recover no floor at all, which is the exact window this file exists
+    /// to close. Every later frame only sharpens a guard that is already
+    /// armed, and waits for the next barrier, so the steady-state dispatch
+    /// loop stays I/O-free.
+    fn arm_committed_floor(&self) {
+        let mut guard = self
+            .committed_floor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(file) = guard.as_mut() else {
+            return;
+        };
+        if file.floor() != 0 {
+            return;
+        }
+        let floor = self.cluster_committed.get();
+        if floor == 0 {
+            return;
+        }
         if let Err(problem) = file.save(floor) {
             eprintln!(
                 "committed-floor persist failed; the in-memory guard keeps serving and the \
@@ -1154,6 +1193,7 @@ impl InProcessFollower {
         let local = self.local_committed_offset();
         let visible = update.committed_high_watermark.min(local);
         self.cluster_committed.advance_to(visible);
+        self.arm_committed_floor();
         Ok(())
     }
 }

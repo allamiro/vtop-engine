@@ -906,13 +906,15 @@ fn a_reopened_followers_retention_floor_starts_at_the_persisted_value_not_zero()
     );
 }
 
-/// The durable floor advances at the commit barrier — where an fsync
-/// already exists — and NOT on the HWM frame: `observe_hwm` runs in the
-/// per-connection dispatch loop that also carries append frames and must
-/// stay I/O-free. `quiesce` covers the quiet tail so an orderly shutdown
-/// loses nothing to that lag.
+/// The cadence rule, both halves. The FIRST observed HWM arms the guard
+/// immediately — an unarmed floor plus a crash before the next append
+/// barrier would recover nothing, the exact window the file exists to
+/// close. Every LATER frame only sharpens an armed guard and waits for the
+/// commit barrier, where an fsync already exists: `observe_hwm` runs in
+/// the per-connection dispatch loop that also carries append frames and
+/// must stay I/O-free in the steady state. `quiesce` covers the quiet tail.
 #[test]
-fn the_floor_advances_with_the_commit_barrier_not_with_every_hwm_frame() {
+fn the_first_hwm_arms_the_floor_and_later_frames_wait_for_the_barrier() {
     let range = range_identity();
     let dir = tempfile::tempdir().unwrap();
     let floor_path = dir.path().join("committed-floor");
@@ -947,6 +949,11 @@ fn the_floor_advances_with_the_commit_barrier_not_with_every_hwm_frame() {
     };
 
     node.apply_append_batch(&batch(0)).expect("first batch");
+    assert_eq!(
+        CommittedFloorFile::open(&floor_path).floor(),
+        0,
+        "no HWM has been observed yet; a barrier with nothing to protect saves nothing"
+    );
     node.observe_hwm(&CommittedHwmUpdate {
         range: range.clone(),
         fencing_epoch: OLD_EPOCH,
@@ -954,35 +961,45 @@ fn the_floor_advances_with_the_commit_barrier_not_with_every_hwm_frame() {
     })
     .unwrap();
     assert_eq!(
-        node.cluster_committed().get(),
-        2,
-        "the cell advances on the frame"
-    );
-    assert_eq!(
         CommittedFloorFile::open(&floor_path).floor(),
-        0,
-        "the HWM frame must not have done floor I/O — the dispatch loop carrying it also \
-         carries append frames"
+        2,
+        "the FIRST observed HWM must arm the floor immediately: unarmed plus a crash \
+         before the next barrier would recover nothing, the exact window the file \
+         exists to close"
     );
 
     node.apply_append_batch(&batch(2)).expect("second batch");
-    assert_eq!(
-        CommittedFloorFile::open(&floor_path).floor(),
-        2,
-        "the commit barrier is where the floor becomes durable — one write per batch, and \
-         only when it advanced"
-    );
-
     node.observe_hwm(&CommittedHwmUpdate {
         range: range.clone(),
         fencing_epoch: OLD_EPOCH,
         committed_high_watermark: 4,
     })
     .unwrap();
-    node.quiesce().expect("orderly shutdown");
+    assert_eq!(
+        CommittedFloorFile::open(&floor_path).floor(),
+        2,
+        "a LATER frame must not do floor I/O — the guard is already armed, and the \
+         dispatch loop carrying the frame also carries append frames"
+    );
+
+    node.apply_append_batch(&batch(4)).expect("third batch");
     assert_eq!(
         CommittedFloorFile::open(&floor_path).floor(),
         4,
+        "the commit barrier is where a sharpened floor becomes durable — one write per \
+         batch, and only when it advanced"
+    );
+
+    node.observe_hwm(&CommittedHwmUpdate {
+        range: range.clone(),
+        fencing_epoch: OLD_EPOCH,
+        committed_high_watermark: 6,
+    })
+    .unwrap();
+    node.quiesce().expect("orderly shutdown");
+    assert_eq!(
+        CommittedFloorFile::open(&floor_path).floor(),
+        6,
         "quiesce persists the quiet tail the last commit barrier could not see"
     );
 }

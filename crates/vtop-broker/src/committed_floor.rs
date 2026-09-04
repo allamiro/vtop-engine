@@ -60,12 +60,16 @@
 //! it does not recognize (`catalog.rs::classify_artifact`), and this name
 //! shares no suffix with anything the catalog or the transfer sweep acts on.
 //! The floor is persisted at durability barriers that already exist — the
-//! follower's per-batch commit and `quiesce` — never from `observe_hwm`,
-//! which runs in the per-connection dispatch loop that also carries append
-//! frames and must stay I/O-free. The durable floor may therefore lag the
-//! cell by one append batch plus the quiet tail before shutdown; a lagging
-//! floor only weakens the guard toward yesterday's behaviour, never blocks
-//! legitimate work.
+//! follower's per-append commits, the held-fsync flush, and `quiesce` — and
+//! not from `observe_hwm`, which runs in the per-connection dispatch loop
+//! that also carries append frames and must stay I/O-free in the steady
+//! state. The one bounded exception is ARMING: the first observed HWM is
+//! the difference between no floor at all and an armed guard, so it saves
+//! immediately, once per file lifetime; every later frame only sharpens an
+//! armed guard and waits for the next barrier. The durable floor may
+//! therefore lag the cell by one append batch plus the quiet tail before
+//! shutdown; a lagging floor only weakens the guard toward yesterday's
+//! behaviour, never blocks legitimate work.
 //!
 //! Follower-side only, deliberately. The leader's committed cell is not
 //! persisted here: when a LEADER may publish a floor is bound up with the
