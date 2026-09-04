@@ -1039,7 +1039,22 @@ impl LocalBroker {
             let meta = self.meta_fencing_epoch.lock();
             self.check_range(&meta, &self.range, fencing_epoch)
                 .map_err(|(_, message)| BrokerError::BoundaryMarker(message.to_owned()))?;
-            cluster.advance_to(leader_committed)
+            let committed = cluster.advance_to(leader_committed);
+            // Reclaim with the floor just published, inside the same
+            // lease-validated block — the produce path's own post-publish
+            // rule (#408, applied here on review): the pass before the
+            // fan-out ran against the OLD floor, and a marker append that
+            // rolled leaves a segment only THIS publication makes eligible.
+            // On an idle promoted range no later produce would ever reclaim
+            // it.
+            {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                self.run_retention(&mut state.segment);
+            }
+            committed
         };
         replicas.propagate_committed_hwm(&CommittedHwmUpdate {
             range: self.range.clone(),

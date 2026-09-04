@@ -346,8 +346,16 @@ impl QuorumProbe for ReplicaPlaneProbe {
 /// catch-up; past it, the first own-epoch produce quorum proves the prefix
 /// instead, and an idle range simply keeps serving at the durable floor,
 /// which under-publishes and is safe.
+#[cfg(not(test))]
 const MARKER_RETRY_ATTEMPTS: u32 = 40;
+#[cfg(not(test))]
 const MARKER_RETRY_PAUSE: Duration = Duration::from_millis(250);
+// The unit pins exercise the exhaustion and re-fire paths inline, where
+// the production budget would be ten seconds of real sleeping per test.
+#[cfg(test)]
+const MARKER_RETRY_ATTEMPTS: u32 = 1;
+#[cfg(test)]
+const MARKER_RETRY_PAUSE: Duration = Duration::from_millis(2);
 
 /// Publish this epoch's boundary marker until it lands or the refusal turns
 /// terminal (#240, Raft §5.4.2 in its actual form): a new leader must not
@@ -503,11 +511,27 @@ impl LeasePublisher for BrokerLeasePublisher {
         // marker either landed on the first promote or exhausted its
         // budget, and the produce path's own-epoch quorum covers the
         // remainder either way.
-        if self
+        let newly_adopted_epoch = self
             .marker_published_for
             .fetch_max(fencing_epoch, std::sync::atomic::Ordering::SeqCst)
-            < fencing_epoch
-        {
+            < fencing_epoch;
+        // RE-ARMED while the tail stays unpublished (review): a marker that
+        // reached nobody inside its budget — followers down, a full command
+        // channel — leaves the local tail above the watermark, and a gate
+        // that fired strictly once per epoch would never offer it again
+        // even after the followers return. Each renewal re-fires while
+        // that gap stands; republication is idempotent (the duplicate path
+        // re-fans-out from the original offset), and on a healthy range
+        // the tail equals the watermark so steady state never re-fires. A
+        // contended offset read skips this round — the next renewal is the
+        // retry.
+        let unpublished_tail = !newly_adopted_epoch
+            && self
+                .broker
+                .cluster_committed()
+                .zip(self.broker.try_local_offsets())
+                .is_some_and(|(cell, (committed, _))| cell.get() < committed);
+        if newly_adopted_epoch || unpublished_tail {
             publish_boundary_marker_until_settled(Arc::clone(&self.broker), fencing_epoch);
         }
     }
@@ -1843,6 +1867,19 @@ mod tests {
         Arc<LocalBroker>,
         ClusterCommittedOffset,
     ) {
+        let (dirs, publisher, broker, cluster, _) = replicated_publisher_with_followers(epoch);
+        (dirs, publisher, broker, cluster)
+    }
+
+    fn replicated_publisher_with_followers(
+        epoch: u64,
+    ) -> (
+        Vec<tempfile::TempDir>,
+        BrokerLeasePublisher,
+        Arc<LocalBroker>,
+        ClusterCommittedOffset,
+        Vec<Arc<InProcessFollower>>,
+    ) {
         let range = marker_range();
         let meta = MetaFencingEpoch::new(epoch);
         let cluster = ClusterCommittedOffset::new(0);
@@ -1872,6 +1909,7 @@ mod tests {
             ));
             dirs.push(dir);
         }
+        let follower_handles = followers.clone();
         let replica_set = Arc::new(InProcessReplicaSet::new(followers));
         let broker = Arc::new(
             LocalBroker::with_replication(
@@ -1887,7 +1925,7 @@ mod tests {
             .unwrap(),
         );
         let publisher = BrokerLeasePublisher::new(Arc::clone(&broker));
-        (dirs, publisher, broker, cluster)
+        (dirs, publisher, broker, cluster, follower_handles)
     }
 
     /// Promotion no longer publishes the probe's arithmetic (#240, §5.4.2):
@@ -1993,6 +2031,48 @@ mod tests {
         assert_eq!(
             next_offset, 0,
             "no marker record may have been written to a v1 log"
+        );
+    }
+
+    /// A marker that reached nobody is offered again once the tail sits
+    /// above the watermark (review): the once-per-epoch gate alone would
+    /// never re-fire after the retry budget died against unreachable
+    /// followers, wedging an idle range forever. A renewal with the gap
+    /// standing republishes — idempotently, from the original offset — and
+    /// a healthy range (tail equals watermark) never re-fires.
+    #[test]
+    fn a_marker_nobody_reached_refires_on_the_next_renewal() {
+        let (_dirs, publisher, broker, cluster, followers) =
+            replicated_publisher_with_followers(18);
+        for follower in &followers {
+            follower.set_online(false);
+        }
+        publisher.promote(18, None);
+        assert_eq!(
+            cluster.get(),
+            0,
+            "with every follower unreachable the marker publishes nothing"
+        );
+        let (_, next_offset) = broker.local_offsets();
+        assert_eq!(
+            next_offset, 1,
+            "the unacked marker sits in the leader's log"
+        );
+
+        for follower in &followers {
+            follower.set_online(true);
+        }
+        publisher.promote(18, None);
+        assert_eq!(
+            cluster.get(),
+            1,
+            "the renewal re-fired while the tail stood above the watermark, and the \
+             duplicate path carried the quorum"
+        );
+        let (_, next_offset) = broker.local_offsets();
+        assert_eq!(
+            next_offset, 1,
+            "republication is the SAME marker, not a second one"
         );
     }
 
