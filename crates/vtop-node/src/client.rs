@@ -251,26 +251,45 @@ pub async fn produce(config: &ClientConfig, args: ProduceArgs) -> Result<i32, St
 pub struct VerifyArgs {
     pub addr: String,
     pub expect_at_least: u64,
-    /// Byte-verify content below this offset; above it, check structure only.
+    /// Byte-verify content for this many leading VISIBLE records; beyond
+    /// that, check structure only.
     ///
-    /// Expected content is derived from the offset, which is predictable only
-    /// for records written contiguously from sequence 0 by this producer. A
-    /// range holding anything else — records from another producer, or from
-    /// this one after a producer-epoch bump restarts its sequences — has a
-    /// suffix no reader can reconstruct. `u64::MAX` verifies everything, which
-    /// is the right default for a range this producer wholly owns.
+    /// Expected content derives from a record's position among the records
+    /// the fetch actually returns, because the producer's records keep
+    /// consecutive sequences however the log spells their offsets — the key
+    /// carries the sequence, and it must match the position. That is
+    /// predictable only for a range whose visible records this producer
+    /// wrote from sequence 0; anything else — another producer's records, or
+    /// this one's after an epoch bump restarted its sequences — has a suffix
+    /// no reader can reconstruct. `u64::MAX` verifies everything, which is
+    /// the right default for a range this producer wholly owns.
     pub verify_content_through: u64,
+    /// Offsets the consumer's view may legitimately skip before this run
+    /// fails. Zero — the default, and every existing caller — is the dense
+    /// contract: a skipped offset is a lost record and fails loudly. A
+    /// nonzero budget is for logs that legitimately carry consumer-invisible
+    /// records (#240's promotion marker, once it exists), where the caller
+    /// knows how many skips to expect and anything beyond that is still a
+    /// loss.
+    pub max_offset_gaps: u64,
     pub batch: u32,
     pub value_bytes: usize,
 }
 
-/// Fetch offset 0 → committed HWM, checking every record's offset contiguity
-/// and byte-verifying content below `verify_content_through`. Fails if the HWM
-/// is below the acknowledged floor or a verified record's content mismatches.
+/// Fetch offset 0 → committed HWM, checking offset monotonicity and
+/// byte-verifying content for the first `verify_content_through` visible
+/// records. The cursor honors `FetchResponse.next_offset`, which is what
+/// makes the wire gap-tolerant; the `max_offset_gaps` budget is what keeps
+/// gap tolerance from quietly becoming loss tolerance — at the default of
+/// zero, this is exactly the dense contiguity contract this tool has always
+/// enforced. Fails if the HWM or the visible record count is below the
+/// acknowledged floor, or a verified record's content mismatches.
 pub async fn verify(config: &ClientConfig, args: VerifyArgs) -> Result<i32, String> {
     let mut session = connect(config, &args.addr, Role::Consumer).await?;
     let mut request_id: u64 = 0;
     let mut next_offset: u64 = 0;
+    let mut records_seen: u64 = 0;
+    let mut gaps: u64 = 0;
     let high_watermark;
     loop {
         request_id += 1;
@@ -322,6 +341,7 @@ pub async fn verify(config: &ClientConfig, args: VerifyArgs) -> Result<i32, Stri
                 response.committed_high_watermark
             ));
         }
+        let before = next_offset;
         for record in &response.records {
             if record.offset >= response.committed_high_watermark {
                 return Err(format!(
@@ -329,35 +349,78 @@ pub async fn verify(config: &ClientConfig, args: VerifyArgs) -> Result<i32, Stri
                     record.offset, response.committed_high_watermark
                 ));
             }
-            if record.offset != next_offset {
+            if record.offset < next_offset {
                 return Err(format!(
-                    "expected offset {next_offset}, fetched {}",
+                    "offset went backwards: expected at least {next_offset}, fetched {}",
                     record.offset
                 ));
             }
-            if next_offset < args.verify_content_through
-                && (record.key != next_offset.to_be_bytes()
-                    || record.value != record_value(next_offset, args.value_bytes))
-            {
-                return Err(format!("record {next_offset} content mismatch"));
+            gaps += record.offset - next_offset;
+            if records_seen < args.verify_content_through {
+                // The expected record is named by its POSITION among the
+                // visible records, not by its offset: the producer's records
+                // keep consecutive sequences however the log spells their
+                // offsets, and the key carries the sequence — so a swapped
+                // or misplaced record still fails by name here.
+                if record.key != records_seen.to_be_bytes()
+                    || record.value != record_value(records_seen, args.value_bytes)
+                {
+                    return Err(format!(
+                        "record at offset {} content mismatch: expected the producer's \
+                         record {records_seen}",
+                        record.offset
+                    ));
+                }
             }
-            next_offset += 1;
+            next_offset = record.offset + 1;
+            records_seen += 1;
+        }
+        // The server's cursor may step past trailing offsets it chose not to
+        // return; honoring it is the gap-tolerant half of the wire contract
+        // that consumers previously ignored.
+        if response.next_offset > next_offset {
+            gaps += response.next_offset - next_offset;
+            next_offset = response.next_offset;
+        }
+        if gaps > args.max_offset_gaps {
+            return Err(format!(
+                "{gaps} offset(s) missing from the consumer's view, over the {} this run \
+                 tolerates: beyond the declared budget a skipped offset is a lost record",
+                args.max_offset_gaps
+            ));
+        }
+        if next_offset > response.committed_high_watermark {
+            return Err(format!(
+                "cursor {next_offset} passed the committed high watermark {}",
+                response.committed_high_watermark
+            ));
         }
         if next_offset == response.committed_high_watermark {
             high_watermark = response.committed_high_watermark;
             break;
         }
-        if response.records.is_empty() {
+        if next_offset == before {
             return Err(format!(
                 "no progress at offset {next_offset} below high watermark {}",
                 response.committed_high_watermark
             ));
         }
     }
-    println!("verify_done records={next_offset} high_watermark={high_watermark}");
+    println!(
+        "verify_done records={records_seen} next_offset={next_offset} gaps={gaps} \
+         high_watermark={high_watermark}"
+    );
     if high_watermark < args.expect_at_least {
         return Err(format!(
             "high watermark {high_watermark} is below the acknowledged floor {}",
+            args.expect_at_least
+        ));
+    }
+    if records_seen < args.expect_at_least {
+        return Err(format!(
+            "only {records_seen} records visible, below the acknowledged floor {}: a \
+             high watermark can clear the floor on invisible offsets alone, and the \
+             floor is a promise about RECORDS",
             args.expect_at_least
         ));
     }

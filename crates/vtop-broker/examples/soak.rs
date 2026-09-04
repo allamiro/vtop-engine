@@ -481,16 +481,25 @@ async fn fetch_all(
             other => return Err(format!("unexpected fetch reply: {other:?}")),
         };
         for record in &response.records {
+            // The soak owns its range densely, so contiguity stays a hard
+            // requirement here — a skipped offset IS a lost record. Content
+            // is still named by the record's position among the visible
+            // records (the sequence the key carries), the derivation rule
+            // shared with `vtop-node verify`, so the two tools cannot drift
+            // on what "the producer's record N" means.
             if record.offset != next_offset {
                 return Err(format!(
                     "expected offset {next_offset}, fetched {}",
                     record.offset
                 ));
             }
-            if record.key != next_offset.to_be_bytes()
-                || record.value != record_value(next_offset, value_bytes)
+            if record.key != verified.to_be_bytes()
+                || record.value != record_value(verified, value_bytes)
             {
-                return Err(format!("record {next_offset} content mismatch"));
+                return Err(format!(
+                    "record at offset {next_offset} content mismatch: expected the \
+                     producer's record {verified}"
+                ));
             }
             next_offset += 1;
             verified += 1;
