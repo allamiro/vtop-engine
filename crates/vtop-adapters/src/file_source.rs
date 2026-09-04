@@ -112,6 +112,17 @@ impl FileSource {
         };
         seen.inode == current.inode
             && seen.file_size == current.file_size
+            // An UNKNOWN mtime never matches (#411): the identity records
+            // the empty string when the filesystem cannot report a modified
+            // time, and letting "" equal "" would park this file on a skip
+            // no evidence justifies. The claim is exactly that narrow
+            // (review): falling through opens the file and applies the
+            // adapter's append-only rules — it does not re-read content an
+            // in-place same-size rewrite replaced, which stat cannot detect
+            // WITH an mtime either (the changed-mtime rewrite reads nothing
+            // at EOF too). Unknown evidence forfeits the fast path; the
+            // append-only contract is unchanged.
+            && !seen.mtime.is_empty()
             && seen.mtime == current.mtime
             // EQUALITY, not `>=` (review). A cursor beyond the file's end is
             // not a caught-up cursor, it is an inconsistency — the file shrank
@@ -1379,6 +1390,30 @@ mod tests {
             third[0].records,
             vec![b"c".to_vec()],
             "the appended record is read on the very next cycle, not after a backoff"
+        );
+    }
+
+    /// A file whose mtime the filesystem cannot report is never skipped
+    /// (#411): the identity records the empty string there, and letting ""
+    /// match "" would skip an in-place rewrite that preserved inode and
+    /// size — indefinitely, on exactly the filesystems that give the check
+    /// the least to work with. Unknown must fall through to a real read.
+    #[test]
+    fn a_file_whose_mtime_cannot_be_read_is_never_skipped() {
+        let identity = FileIdentity {
+            inode: Some(42),
+            file_size: 7,
+            mtime: String::new(),
+        };
+        let cursor = FileCursor {
+            read_byte: 7,
+            committed_byte: 7,
+            seen: Some(identity.clone()),
+        };
+        assert!(
+            !FileSource::can_skip(&cursor, &identity),
+            "inode and size agree and the cursor is caught up, but an unknown \
+             mtime is not evidence the content is unchanged"
         );
     }
 

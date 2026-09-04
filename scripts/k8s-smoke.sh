@@ -808,8 +808,16 @@ log "replicated peer DNS settled"
 # the range through the metadata lease, so the holder must be ASKED for —
 # aiming at pod 0 now would fail two runs in three, looking like a produce
 # bug and actually being an assumption the topology no longer honours.
-lease_state() { # echoes "<holder-uuid> <fencing-epoch>", empty when no lease
-  vtopctl --json meta range-lease --config "$WORK/r-admin-multi.yaml" \
+lease_state() { # [per-attempt-bound] — echoes "<holder> <epoch>", empty when no lease
+  # Bounded per attempt (#411, the meta_admin_read precedent in
+  # live-chaos lib.sh): this runs inside deadline-checked retry loops whose
+  # only clock is between iterations, so one vtopctl read hanging on a
+  # wedged forward would spend the whole produce window in a single call
+  # and the loop's deadline could never fire. A caller near its own
+  # deadline passes the smaller bound it can still afford (review).
+  local bound="${1:-10}"
+  timeout --kill-after=1 "$bound" \
+    vtopctl --json meta range-lease --config "$WORK/r-admin-multi.yaml" \
     --topic-uuid "$TOPIC_UUID" --range-uuid "$RANGE_ID" 2>/dev/null \
     | python3 -c '
 import json, sys
@@ -848,13 +856,29 @@ await_holder() { # [min-epoch] — echoes "<holder> <epoch>"
   # whether a survivor took over or the recreated pod won its own range back
   # (a legitimate outcome an exclusion would wrongly reject, and one this
   # test must not turn into a flake).
-  local floor="${1:-0}" holder="" epoch=""
-  for _ in $(seq 1 90); do
-    read -r holder epoch <<< "$(lease_state)" || true
+  # Wall-clock bounded, not iteration-counted (review): lease_state's own
+  # per-attempt timeout means an iteration can cost twelve seconds against a
+  # wedged forward, and ninety of those is eighteen minutes wearing a
+  # 180-second label. The deadline is the claim; the loop merely fills it —
+  # and the FINAL probe is bounded by what remains of the claim (review,
+  # round two), so a probe started just inside the deadline cannot stretch
+  # the whole wait a further probe-plus-sleep past it.
+  local floor="${1:-0}" holder="" epoch="" left holder_deadline=$((SECONDS + 180))
+  while [ "$SECONDS" -lt "$holder_deadline" ]; do
+    left=$((holder_deadline - SECONDS))
+    # `timeout 0` means UNBOUNDED (review): a tick landing between the
+    # loop condition and this arithmetic makes `left` zero and would turn
+    # the tightest probe into the only unlimited one.
+    [ "$left" -ge 1 ] || break
+    [ "$left" -gt 10 ] && left=10
+    read -r holder epoch <<< "$(lease_state "$left")" || true
     if [ -n "$holder" ] && [ -n "$epoch" ] && [ "$epoch" -gt "$floor" ]; then
       printf '%s %s\n' "$holder" "$epoch"
       return 0
     fi
+    # The sleep only runs when a whole interval fits (review): a probe
+    # returning with a second to spare must not buy two more.
+    [ $((holder_deadline - SECONDS)) -ge 2 ] || break
     sleep 2
   done
   return 1
