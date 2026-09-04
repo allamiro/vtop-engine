@@ -1017,6 +1017,18 @@ async fn run_leader(
         // Contention serves the LAST DECIDED verdict rather than guessing in
         // either direction: a broker mid-append is working, and a broker that
         // was fenced a scrape ago is still fenced.
+        // The gate first, and outside the snapshot (review): an atomic read
+        // no append can contend, and a leader refusing every fetch is not
+        // ready whatever the lease view says — including a cached "ready"
+        // from before the marker went pending.
+        if probe_broker.boundary_pending() {
+            last_ready.store(false, std::sync::atomic::Ordering::Relaxed);
+            return vtop_observe::Readiness::not_ready(format!(
+                "leading at epoch {}, but the boundary marker is not yet quorum-acknowledged; \
+                 fetch is refused until it is",
+                probe_broker.held_fencing_epoch()
+            ));
+        }
         match lease.try_snapshot() {
             None => {
                 if last_ready.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1420,6 +1432,19 @@ async fn run_candidate(
     observability.set_readiness_probe(Arc::new(move || {
         match probe_flag.load(std::sync::atomic::Ordering::Relaxed) {
             1 => match probe_slot.current() {
+                // The gate first, and outside the snapshot (review): it is
+                // an atomic read that no append can contend, and a leader
+                // refusing every fetch is not ready whatever the lease view
+                // says — including a cached "ready" from before the marker
+                // went pending.
+                Some(broker) if broker.boundary_pending() => {
+                    probe_last_probe.store(false, std::sync::atomic::Ordering::Relaxed);
+                    vtop_observe::Readiness::not_ready(format!(
+                        "leading at epoch {}, but the boundary marker is not yet \
+                         quorum-acknowledged; fetch is refused until it is",
+                        broker.held_fencing_epoch()
+                    ))
+                }
                 Some(broker) => match probe_meta.try_snapshot() {
                     Some((epoch, live)) => {
                         let held = broker.held_fencing_epoch();
@@ -2624,7 +2649,7 @@ impl crate::observe::ReplicaObservation for SwitchingLocalView {
     /// view's empty answers — held epoch 0, leading false — as though a role
     /// had given them, rewinding a monotonic gauge and leaving the departed
     /// leader's `lease_active` of 1 standing beside it. Holding the read lock
-    /// across all three makes that interleaving unrepresentable.
+    /// across all four makes that interleaving unrepresentable.
     ///
     /// Safe to hold it across them because every call under this guard is an
     /// atomic load or a `try_` read: the guard cannot park a transition behind

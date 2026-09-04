@@ -1213,12 +1213,6 @@ impl CandidateCollector {
                 self.held_fencing_epoch
                     .with_label_values(&range)
                     .set(held as i64);
-                // From the same snapshot as `leading`, so the pair cannot
-                // straddle a transition (review). Knowledge, always: a role
-                // that does not lead has nothing pending.
-                self.boundary_pending
-                    .with_label_values(&range)
-                    .set(i64::from(boundary_pending));
                 // ONE COHERENT PAIR OR NONE (#411): `leading` and
                 // `lease_active` are documented to be read together, and
                 // writing a fresh role beside a stale lease sample would
@@ -1249,6 +1243,13 @@ impl CandidateCollector {
                     self.leading
                         .with_label_values(&range)
                         .set(i64::from(leading));
+                    // Under the SAME condition as `leading` (review): the
+                    // pair is read together, so it is written together — a
+                    // contended snapshot leaves both standing, and a fresh
+                    // one writes both from one observation.
+                    self.boundary_pending
+                        .with_label_values(&range)
+                        .set(i64::from(boundary_pending));
                 }
             }
             None => {
