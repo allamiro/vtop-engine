@@ -984,6 +984,7 @@ pub trait ReplicaObservation: Send + Sync {
             meta: self.try_meta_fencing_epoch(),
             held: self.held_fencing_epoch(),
             leading: self.is_leading(),
+            boundary_pending: self.boundary_pending(),
         })
     }
 }
@@ -998,6 +999,12 @@ pub struct RoleReading {
     pub held: u64,
     /// Whether this replica SERVES the range.
     pub leading: bool,
+    /// Whether the serving role's boundary marker is still pending (#240).
+    /// Part of the SAME reading as `leading` (review): read separately, a
+    /// transition between the two calls could pair the departed leader's
+    /// `leading` with the follower's `pending`, or the inverse — and the
+    /// gauge's whole purpose is to be read beside `leading`.
+    pub boundary_pending: bool,
 }
 
 impl ReplicaObservation for LocalBroker {
@@ -1201,10 +1208,17 @@ impl CandidateCollector {
                 meta,
                 held,
                 leading,
+                boundary_pending,
             }) => {
                 self.held_fencing_epoch
                     .with_label_values(&range)
                     .set(held as i64);
+                // From the same snapshot as `leading`, so the pair cannot
+                // straddle a transition (review). Knowledge, always: a role
+                // that does not lead has nothing pending.
+                self.boundary_pending
+                    .with_label_values(&range)
+                    .set(i64::from(boundary_pending));
                 // ONE COHERENT PAIR OR NONE (#411): `leading` and
                 // `lease_active` are documented to be read together, and
                 // writing a fresh role beside a stale lease sample would
@@ -1247,20 +1261,14 @@ impl CandidateCollector {
                 // down.
                 self.lease_active.with_label_values(&range).set(0);
                 self.leading.with_label_values(&range).set(0);
+                // No role, nothing pending — knowledge, written down.
+                self.boundary_pending.with_label_values(&range).set(0);
                 // The epoch gauges keep their last reading on purpose: the
                 // switching view would answer 0, and writing that rewinds a
                 // monotonic gauge to a number this replica left long ago,
                 // which reads as a replica that lost its history.
             }
         }
-        // Knowledge, always: a role that leads answers from its gate, and a
-        // role that does not — or no role at all — has nothing pending. So
-        // an operator reading a cluster HWM below the durable floor can tell
-        // a pending proof from a regression on the candidate topology, where
-        // the marker gating actually happens (review).
-        self.boundary_pending
-            .with_label_values(&range)
-            .set(i64::from(self.view.boundary_pending()));
     }
 }
 
@@ -1789,6 +1797,7 @@ mod tests {
                     meta: Some((3, false)),
                     held: 3,
                     leading: true,
+                    boundary_pending: false,
                 })
             }
         }
@@ -1861,6 +1870,7 @@ mod tests {
                     meta: Some((4, true)),
                     held: 4,
                     leading: true,
+                    boundary_pending: false,
                 })
             }
         }

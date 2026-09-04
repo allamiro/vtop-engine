@@ -2639,6 +2639,10 @@ impl crate::observe::ReplicaObservation for SwitchingLocalView {
             meta: view.try_meta_fencing_epoch(),
             held: view.held_fencing_epoch(),
             leading: view.is_leading(),
+            // Under the SAME lock as the rest (review): the collector pairs
+            // this with `leading`, and a transition between two separate
+            // reads could hand it one role's leading and another's pending.
+            boundary_pending: view.boundary_pending(),
         })
     }
 }
