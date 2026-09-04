@@ -13,11 +13,22 @@
        `vtop-node meta` or `vtop-node data` — not the co-located wrapper. */}}
 {{- $metaCount := int (include "vtop.metaReplicaCount" .) }}
 {{- $dataCount := int (include "vtop.dataReplicaCount" .) }}
-{{- /* Per-tier resource overrides; an empty override inherits `resources`. */}}
+{{- /* Per-tier overrides; an empty override inherits the chart-wide value. */}}
 {{- $metaResources := .Values.resources }}
 {{- with .Values.deployment.meta.resources }}{{ $metaResources = . }}{{ end }}
 {{- $dataResources := .Values.resources }}
 {{- with .Values.deployment.data.resources }}{{ $dataResources = . }}{{ end }}
+{{- $metaAffinity := .Values.affinity }}
+{{- with .Values.deployment.meta.affinity }}{{ $metaAffinity = . }}{{ end }}
+{{- $dataAffinity := .Values.affinity }}
+{{- with .Values.deployment.data.affinity }}{{ $dataAffinity = . }}{{ end }}
+{{- /* Each tier hashes ONLY its own config files (review): one ConfigMap
+       carries both tiers, and hashing the whole of it would roll the
+       metadata quorum for a data-only change. */}}
+{{- $metaConfig := "" }}
+{{- range $i := until $metaCount }}{{ $metaConfig = printf "%s%s" $metaConfig (include "vtop.metaTierConfig" (dict "root" $ "ordinal" $i)) }}{{ end }}
+{{- $dataConfig := "" }}
+{{- range $i := until $dataCount }}{{ $dataConfig = printf "%s%s" $dataConfig (include "vtop.dataTierConfig" (dict "root" $ "ordinal" $i)) }}{{ end }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -45,8 +56,8 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
       annotations:
-        # A config edit changes this hash and rolls the set.
-        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        # A META config edit changes this hash and rolls this tier only.
+        checksum/config: {{ $metaConfig | sha256sum }}
         {{- if .Values.metrics.prometheusAnnotations }}
         prometheus.io/scrape: "true"
         prometheus.io/port: {{ .Values.ports.observability | quote }}
@@ -80,13 +91,13 @@ spec:
       topologySpreadConstraints:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- if .Values.affinity }}
+      {{- if $metaAffinity }}
       affinity:
-        {{- toYaml .Values.affinity | nindent 8 }}
+        {{- toYaml $metaAffinity | nindent 8 }}
       {{- else }}
       # Prefer spreading VOTERS across nodes; two on one node turn a node
-      # failure into a quorum loss. Set .Values.affinity to a required rule
-      # for production.
+      # failure into a quorum loss. Set deployment.meta.affinity (or the
+      # chart-wide .Values.affinity) to a required rule for production.
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -216,7 +227,8 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
       annotations:
-        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        # A DATA config edit changes this hash and rolls this tier only.
+        checksum/config: {{ $dataConfig | sha256sum }}
         {{- if .Values.metrics.prometheusAnnotations }}
         prometheus.io/scrape: "true"
         prometheus.io/port: {{ .Values.ports.observability | quote }}
@@ -253,12 +265,14 @@ spec:
       topologySpreadConstraints:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- if .Values.affinity }}
+      {{- if $dataAffinity }}
       affinity:
-        {{- toYaml .Values.affinity | nindent 8 }}
+        {{- toYaml $dataAffinity | nindent 8 }}
       {{- else }}
       # Prefer spreading REPLICAS across nodes: a replicated range with two
-      # replicas on one node loses its quorum with that node.
+      # replicas on one node loses its quorum with that node. Set
+      # deployment.data.affinity (or the chart-wide .Values.affinity) to a
+      # required rule for production.
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:

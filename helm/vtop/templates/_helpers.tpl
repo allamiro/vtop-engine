@@ -173,6 +173,36 @@ render passes through them. Three refusals live here rather than scattered:
 {{- end }}
 
 {{/*
+The data-role refusals both render paths share (review: one copy, so the
+messages cannot drift between the co-located and the separated shapes).
+No output; only failures. Expects the root context.
+
+  - a retired key is retired in every shape, checked BEFORE the topology
+    branch: a standalone values file still carrying `leaderOrdinal` would
+    otherwise render happily and only fail the day somebody switched it to
+    `replicated` — the moment they can least afford a surprise.
+  - candidates take the range FROM the lease; without it no pod would ever
+    lead. Renders-then-cannot-work is the worst configuration error, so it
+    fails at render time.
+  - grants are minted from 1; a static floor at or above the first grant
+    would refuse the very grant that makes a candidate lead.
+*/}}
+{{- define "vtop.dataGuards" -}}
+{{- $v := .Values -}}
+{{- if hasKey $v.data "leaderOrdinal" -}}
+{{- fail "\n\ndata.leaderOrdinal is retired (#284): \"replicated\" renders every pod as a CANDIDATE and the role follows the metadata lease, so failover no longer needs a re-render. Remove the value." -}}
+{{- end -}}
+{{- if eq $v.data.topology "replicated" -}}
+{{- if not $v.data.lease.enabled -}}
+{{- fail "\n\ndata.topology \"replicated\" requires data.lease.enabled: candidates acquire the range through the metadata lease (#284). Without it no pod would ever lead." -}}
+{{- end -}}
+{{- if ne (int $v.data.fencingEpoch) 0 -}}
+{{- fail (printf "\n\ndata.fencingEpoch is %d but must be 0 under \"replicated\": candidates learn their epoch from lease grants (minted from 1), and a static floor at or above the first grant refuses it." (int $v.data.fencingEpoch)) -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Deployment mode (#287): colocated unless deployment.mode says otherwise.
 */}}
 {{- define "vtop.deploymentMode" -}}
@@ -300,22 +330,19 @@ per-pod SAN rule the co-located render keeps). Expects (dict "root" $
 {{- $metaCount := int (include "vtop.metaReplicaCount" $root) -}}
 {{- $dataCount := int (include "vtop.dataReplicaCount" $root) -}}
 {{- $clusterId := required "\n\ncluster.id is required: the cluster UUID shared by every node. The chart does not default identities — they must match the certificates you minted." $v.cluster.id -}}
+{{- /* The deployment guards run here too (review): the ConfigMap renders
+       before the StatefulSet, and an unsized tier would otherwise die on an
+       index error inside this template instead of on the guard that names
+       the problem. */ -}}
+{{- include "vtop.deploymentGuards" $root -}}
+{{- include "vtop.dataGuards" $root -}}
 {{- if ne (len (uniq $v.data.nodeUuids)) (len $v.data.nodeUuids) -}}
 {{- fail (printf "\n\ndata.nodeUuids contains duplicates: %v. Each data pod ordinal needs its OWN broker UUID — two pods sharing one identity would present the same identity to the metadata plane and race the same range lease." $v.data.nodeUuids) -}}
 {{- end -}}
 {{- $nodeUuid := index $v.data.nodeUuids $i -}}
-{{- if hasKey $v.data "leaderOrdinal" -}}
-{{- fail "\n\ndata.leaderOrdinal is retired (#284): \"replicated\" renders every pod as a CANDIDATE and the role follows the metadata lease, so failover no longer needs a re-render. Remove the value." -}}
-{{- end -}}
 # Data-tier config for pod {{ include "vtop.tierName" (dict "root" $root "tier" "data") }}-{{ $i }}.
 # Rendered by Helm; the container selects this file by its hostname ordinal.
 {{- if eq $v.data.topology "replicated" }}
-{{- if not $v.data.lease.enabled }}
-{{- fail "\n\ndata.topology \"replicated\" requires data.lease.enabled: candidates acquire the range through the metadata lease (#284). Without it no pod would ever lead." }}
-{{- end }}
-{{- if ne (int $v.data.fencingEpoch) 0 }}
-{{- fail (printf "\n\ndata.fencingEpoch is %d but must be 0 under \"replicated\": candidates learn their epoch from lease grants (minted from 1), and a static floor at or above the first grant refuses it." (int $v.data.fencingEpoch)) }}
-{{- end }}
 role: candidate
 # The SAME list on every data pod, self included — the binary skips its own
 # entry. Each peer is dialled at its OWN FQDN (never a Service name).
@@ -369,8 +396,16 @@ principal_id: {{ required "\n\ndata.principalId is required: the UUID of the one
 {{- $endpoint := $v.data.lease.adminEndpoint -}}
 {{- $serverName := $v.data.lease.serverName -}}
 {{- if or (not $endpoint) (eq $endpoint "127.0.0.1:9200") -}}
+{{- /* The endpoint is the metadata tier's first pod, so the name is that
+       pod's (or the shared tls.serverName) and nothing else: a serverName
+       carried over from a co-located values file would name a pod that is
+       not being dialled, and the lease would fail its handshake in
+       production (review). Refused rather than silently overridden. */ -}}
+{{- if $serverName -}}
+{{- fail (printf "\n\ndata.lease.serverName is %q but data.lease.adminEndpoint is at its default: under separated mode the default endpoint is the metadata tier's first pod, whose certificate name the chart derives (tls.serverName, else the pod's own FQDN). Remove data.lease.serverName, or set adminEndpoint explicitly to the endpoint that name belongs to." $serverName) -}}
+{{- end -}}
 {{- $endpoint = printf "%s:%d" (include "vtop.tierPodFqdn" $metaZero) (int $v.ports.metaAdmin) -}}
-{{- $serverName = default (include "vtop.tierServerName" $metaZero) $serverName -}}
+{{- $serverName = include "vtop.tierServerName" $metaZero -}}
 {{- else if not $serverName -}}
 {{- fail (printf "\n\ndata.lease.adminEndpoint is %q under separated mode: set data.lease.serverName to the name that endpoint's certificate carries (or leave adminEndpoint at its default to address the metadata tier's first pod)." $endpoint) -}}
 {{- end }}
@@ -485,29 +520,10 @@ data:
          `leaderOrdinal` value, which made failover a helm upgrade; that value
          is retired, and setting it now fails the render rather than being
          silently ignored. */ -}}
-  {{- /* Checked BEFORE the topology branch (review): a retired key is retired
-         in every shape. A standalone values file still carrying
-         `leaderOrdinal` would otherwise render happily and only fail the day
-         somebody switched it to `replicated` — which is the moment they can
-         least afford a surprise. */ -}}
-  {{- if hasKey $v.data "leaderOrdinal" }}
-  {{- fail "\n\ndata.leaderOrdinal is retired (#284): \"replicated\" renders every pod as a CANDIDATE and the role follows the metadata lease, so failover no longer needs a re-render. Remove the value." }}
-  {{- end }}
+  {{- include "vtop.dataGuards" $root -}}
   {{- if eq $v.data.topology "replicated" }}
   {{- if lt (int $v.replicaCount) 2 }}
   {{- fail (printf "\n\ndata.topology is \"replicated\" but replicaCount is %d: a replicated range needs at least one follower. Use topology \"standalone\" for a single node." (int $v.replicaCount)) }}
-  {{- end }}
-  {{- /* Candidates take the range FROM the lease; without it no pod would
-         ever lead and every pod would sit as a follower of nobody. This
-         renders-then-cannot-work, the worst kind of configuration error, so
-         it fails at render time instead. */ -}}
-  {{- if not $v.data.lease.enabled }}
-  {{- fail "\n\ndata.topology \"replicated\" requires data.lease.enabled: candidates acquire the range through the metadata lease (#284). Without it no pod would ever lead." }}
-  {{- end }}
-  {{- /* Grants are minted from 1; a static floor at or above the first grant
-         would refuse the very grant that makes a candidate lead. */ -}}
-  {{- if ne (int $v.data.fencingEpoch) 0 }}
-  {{- fail (printf "\n\ndata.fencingEpoch is %d but must be 0 under \"replicated\": candidates learn their epoch from lease grants (minted from 1), and a static floor at or above the first grant refuses it." (int $v.data.fencingEpoch)) }}
   {{- end }}
   role: candidate
   peers:

@@ -651,6 +651,11 @@ jobs:
               peers = d.fetch("peers").map { |p| p.fetch("addr") }
               want = (0..2).map { |j| "vtop-data-#{j}.vtop-data-headless.default.svc.cluster.local:9300" }
               abort "data-#{i} peers #{peers} are not the data tier #{want}" unless peers == want
+              # Addresses are what the replica plane dials; identities are
+              # what quorum arithmetic counts (review). The peer list must
+              # carry every data identity exactly once.
+              peer_ids = d.fetch("peers").map { |p| p.fetch("node_uuid") }
+              abort "data-#{i} peer identities #{peer_ids} are not the data tier #{uuids}" unless peer_ids == uuids
               lease = d.fetch("lease")
               # The lease reaches the METADATA tier, at a pod name the
               # certificate can be verified against — never the co-located

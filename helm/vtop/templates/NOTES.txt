@@ -14,8 +14,7 @@ vtop {{ .Chart.AppVersion }} — SEPARATED tiers (#287): {{ $metaCount }} metada
      kubectl -n {{ $ns }} get pods -l app.kubernetes.io/instance={{ .Release.Name }},app.kubernetes.io/name={{ include "vtop.name" . }} -w
 
 2. Readiness is a LEVEL with reasons on every pod (/readyz on port {{ .Values.ports.observability }}).
-   Metadata pods report Ready before a Raft leader exists — by design. Data
-   pods stay NOT READY until the metadata exchange below finds their range.
+   Metadata pods report Ready before a Raft leader exists — by design.
 
 3. Bootstrap the metadata Raft group ONCE, against a SPECIFIC metadata pod
    (each presents a certificate whose SAN is its own headless FQDN):
@@ -42,8 +41,9 @@ vtop {{ .Chart.AppVersion }} — SEPARATED tiers (#287): {{ $metaCount }} metada
    leaves are node-<ordinal>.pem in {{ include "vtop.dataSecretName" . }}.
 {{- if eq .Values.data.topology "replicated" }}
 
-5. ONE range across the data tier, every data pod a CANDIDATE (#284). After
-   `meta init`, create the topic and register each DATA pod once:
+5. ONE range across the data tier, every data pod a CANDIDATE (#284). Data
+   pods stay NOT READY until the metadata exchange below finds their range.
+   After `meta init`, create the topic and register each DATA pod once:
 
      vtopctl meta create-topic --name {{ .Values.data.range.topic }} --topic-uuid {{ .Values.data.lease.topicUuid }} --root-range-uuid {{ .Values.data.range.rangeId }} --config admin.yaml
 {{- range $i := until $dataCount }}
