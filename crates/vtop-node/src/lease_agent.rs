@@ -1054,6 +1054,17 @@ impl LeaseAgent {
                 self.state = LeaseState::NotHeld;
                 self.held_until_ms = None;
                 self.campaign_hold_off_rounds = self.stand_aside_rounds();
+                // Re-checked AFTER the block (review, round six): the
+                // abandon arm above CONSUMES the watch notification, so the
+                // round's own race below can never wake for it — falling
+                // through would spend a full round plus its delay before
+                // the loop head looked again, exactly the starvation the
+                // race exists to prevent. The loss is published and the
+                // state reset either way; the exit release reconciles the
+                // epoch from metadata.
+                if *release.borrow() {
+                    break;
+                }
             }
             // The round races the release (#408): an agent already inside
             // `step()` used to finish it — up to one bounded deadline reading
