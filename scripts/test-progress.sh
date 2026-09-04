@@ -6,16 +6,17 @@
 # indistinguishable from a hung one. This splits it into the phases cargo
 # already has and draws each of them against a real denominator:
 #
-#   compile   packages built, out of the packages in the selection's graph
+#   compile   packages built, out of the packages the selection resolves to
 #   test      test binaries run, out of the binaries cargo produced
 #   doctest   the documentation tests cargo would have run, as one unit
 #
-# Both denominators come from cargo itself (`cargo metadata` with the same
-# manifest, features and target as the build, and the JSON message stream of
-# `--no-run`), so the bar cannot drift from what is actually happening — a
-# progress bar that guesses is worse than none, because it is believed. When
-# a number cannot be obtained, the script refuses to run rather than draw an
-# invented one.
+# Both denominators come from cargo itself (`cargo metadata` under the same
+# manifest, features, target and lock flags as the build, narrowed to the
+# dependency closure of the selected packages; and the JSON message stream
+# of `--no-run`), so the bar cannot drift from what is actually happening —
+# a progress bar that guesses is worse than none, because it is believed.
+# When a number cannot be obtained, the script refuses to run rather than
+# draw an invented one.
 #
 # Usage:
 #   scripts/test-progress.sh                       # whole workspace
@@ -26,12 +27,21 @@
 #   scripts/test-progress.sh lease -- --nocapture  # a test-name filter, too
 #
 # Arguments split exactly as `cargo test` splits them: options before `--`
-# are cargo's (package selection, features, target), a bare word before `--`
-# is a test-name filter, and everything after `--` is the harness's. The
-# harness's thread count is cargo's own default unless TEST_THREADS is set.
-# Each binary runs through cargo's configured `target.<triple>.runner` when
-# one is set, from the same sources cargo reads (the environment, then the
-# project's `.cargo/config.toml` files, then the home one).
+# are cargo's (package selection, features, target, lock flags), a bare
+# word before `--` is a test-name filter, and everything after `--` is the
+# harness's. A target selector (`--lib`, `--test NAME`, `--bin NAME`, …)
+# narrows the run as it does under cargo and, as under cargo, skips the
+# doctests; `--doc` runs only them. The harness's thread count is cargo's
+# own default unless TEST_THREADS is set.
+#
+# Each binary runs from its package's root directory, as cargo runs it, and
+# through cargo's configured `target.<triple>.runner` when one is set — read
+# from the sources cargo reads, in cargo's precedence: `--config` overrides,
+# the environment, the project's `.cargo/config.toml` files upward from the
+# working directory, then the home one. The triple follows the same
+# precedence (`--target`, `CARGO_BUILD_TARGET`, `build.target`, the host).
+# A runner under a `[target.'cfg(...)']` table cannot be evaluated here and
+# is refused rather than silently bypassed.
 #
 # Exit status is the suite's: any failing binary or doctest fails the run,
 # and every failure is reprinted at the end so it is not lost above the bar.
@@ -66,13 +76,14 @@ bar() { # <done> <total> <label>
 # binary. A bare word before `--` is cargo's positional test-name filter,
 # which cargo would itself hand to the binary — so it goes there here too.
 # Options that take a value are listed so their value is not mistaken for a
-# filter. The graph-shaping options (manifest, features, target) are ALSO
-# collected for `cargo metadata`, so the denominator describes the graph
-# the build actually resolves rather than the default one.
+# filter. What shapes the graph or the resolution (manifest, features,
+# target, lock flags) is ALSO collected for `cargo metadata`; what selects
+# packages is collected for the closure; what selects targets decides the
+# doctest phase; `--config` overrides feed the runner lookup.
 # ---------------------------------------------------------------------------
-cargo_args=(); bin_args=(); metadata_args=(); scoped=0; past_sep=0
-expect_value=""   # the option whose value the next argument is, if any
-TARGET=""
+cargo_args=(); bin_args=(); metadata_args=(); packages=(); excludes=(); config_overrides=()
+past_sep=0; expect_value=""; workspace_flag=0; target_selected=0; doc_only=0
+TARGET_ARG=""
 for arg in "$@"; do
   if (( past_sep )); then
     bin_args+=("$arg")
@@ -85,8 +96,11 @@ for arg in "$@"; do
   if [[ -n "$expect_value" ]]; then
     cargo_args+=("$arg")
     case "$expect_value" in
+      -p|--package) packages+=("$arg") ;;
+      --exclude) excludes+=("$arg") ;;
       --manifest-path|--features|-F) metadata_args+=("$expect_value" "$arg") ;;
-      --target) TARGET="$arg" ;;
+      --target) TARGET_ARG="$arg" ;;
+      --config) config_overrides+=("$arg") ;;
     esac
     expect_value=""
     continue
@@ -96,27 +110,43 @@ for arg in "$@"; do
     --profile|-j|--jobs|--test|--bin|--example|--bench|--color|--config|-Z|\
     --message-format)
       cargo_args+=("$arg"); expect_value="$arg" ;;
-    --manifest-path=*|--features=*)
+    -p?*)
+      cargo_args+=("$arg"); packages+=("${arg#-p}") ;;
+    --package=*)
+      cargo_args+=("$arg"); packages+=("${arg#--package=}") ;;
+    --exclude=*)
+      cargo_args+=("$arg"); excludes+=("${arg#--exclude=}") ;;
+    --manifest-path=*|--features=*|--all-features|--no-default-features)
       cargo_args+=("$arg"); metadata_args+=("$arg") ;;
-    --all-features|--no-default-features)
+    --locked|--offline|--frozen)
       cargo_args+=("$arg"); metadata_args+=("$arg") ;;
     --target=*)
-      cargo_args+=("$arg"); TARGET="${arg#--target=}" ;;
+      cargo_args+=("$arg"); TARGET_ARG="${arg#--target=}" ;;
+    --config=*)
+      cargo_args+=("$arg"); config_overrides+=("${arg#--config=}") ;;
+    --workspace|--all)
+      cargo_args+=("$arg"); workspace_flag=1 ;;
+    --doc)
+      doc_only=1 ;;
+    --lib|--bins|--tests|--examples|--benches|--all-targets)
+      cargo_args+=("$arg"); target_selected=1 ;;
     -*)
       cargo_args+=("$arg") ;;
     *)
       bin_args+=("$arg") ;;
   esac
-  # `--exclude` is NOT a selection: cargo requires it alongside --workspace,
-  # so an exclusion alone must keep the default workspace selection.
   case "$arg" in
-    -p|-p*|--package|--package=*|--workspace|--all) scoped=1 ;;
+    --test|--bin|--example|--bench) target_selected=1 ;;
   esac
 done
 [[ -z "$expect_value" ]] || die "option $expect_value is missing its value"
 # `--workspace` is the DEFAULT selection, never an override: a caller who
-# named packages gets exactly those.
-(( scoped )) || cargo_args=(--workspace ${cargo_args[@]+"${cargo_args[@]}"})
+# named packages gets exactly those. An exclusion is not a selection — cargo
+# requires it alongside --workspace — so it keeps the default.
+if (( ! workspace_flag )) && [[ "${#packages[@]}" -eq 0 ]]; then
+  cargo_args=(--workspace ${cargo_args[@]+"${cargo_args[@]}"})
+  workspace_flag=1
+fi
 if [[ -n "${TEST_THREADS:-}" ]]; then
   case " ${bin_args[*]+"${bin_args[*]}"} " in
     *" --test-threads"*) ;;
@@ -124,27 +154,51 @@ if [[ -n "${TEST_THREADS:-}" ]]; then
   esac
 fi
 
+# ---------------------------------------------------------------------------
+# Cargo's configuration, read the way cargo reads it. Cargo's own resolver
+# for this (`cargo config get`) is unstable, so the same sources are read
+# in the same precedence: `--config` overrides (a KEY=VALUE snippet or a
+# file path), the environment, every `.cargo/config[.toml]` from the working
+# directory upward, then the home one. Resolves the target triple
+# (`--target`, `CARGO_BUILD_TARGET`, `build.target`, host) and that
+# triple's runner, printed one field per line: `target=<triple>`, then
+# `runner=<argv element>` lines, then `cfg_runner=1` if any `[target.'cfg(…)']`
+# table names a runner — which this script cannot evaluate and refuses.
+# ---------------------------------------------------------------------------
 HOST="$(rustc -vV | sed -n 's/^host: //p')"
 [[ -n "$HOST" ]] || die "could not determine the host triple from rustc"
-TRIPLE="${TARGET:-$HOST}"
+cargo_config() {
+  python3 - "$HOST" "$TARGET_ARG" "$PWD" "${CARGO_HOME:-$HOME/.cargo}" \
+    ${config_overrides[@]+"${config_overrides[@]}"} <<'PY'
+import os, shlex, sys, tomllib
 
-# ---------------------------------------------------------------------------
-# The configured target runner, resolved the way cargo resolves it: the
-# environment variable first, then every `.cargo/config.toml` from the
-# working directory upward, then the home directory's. Cargo's own resolver
-# for this is unstable on the command line (`cargo config get` needs -Z), so
-# the same sources are read directly; a runner is a string or an argv list.
-# ---------------------------------------------------------------------------
-runner_for() { # <triple> — prints the runner argv, one element per line
-  local triple="$1" env_name
-  env_name="CARGO_TARGET_$(printf '%s' "$triple" | tr 'a-z-' 'A-Z_')_RUNNER"
-  if [[ -n "${!env_name:-}" ]]; then
-    printf '%s\n' "${!env_name}"
-    return
-  fi
-  python3 - "$triple" "$PWD" "${CARGO_HOME:-$HOME/.cargo}" <<'PY'
-import os, sys, tomllib
-triple, cwd, cargo_home = sys.argv[1], sys.argv[2], sys.argv[3]
+host, target_arg, cwd, cargo_home, *overrides = sys.argv[1:]
+
+def merge(base, extra):
+    for key, value in extra.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            merge(base[key], value)
+        elif key not in base:  # higher precedence already set it
+            base[key] = value
+
+def load_file(path):
+    try:
+        with open(path, "rb") as handle:
+            return tomllib.load(handle)
+    except FileNotFoundError:
+        return {}
+
+config = {}
+# 1. --config overrides, in order (later ones win, so merge in reverse).
+for override in reversed(overrides):
+    if os.path.isfile(override):
+        merge(config, load_file(override))
+    else:
+        merge(config, tomllib.loads(override))
+# 2. The environment, for the two keys this script needs.
+if os.environ.get("CARGO_BUILD_TARGET"):
+    merge(config, {"build": {"target": os.environ["CARGO_BUILD_TARGET"]}})
+# 3. Project config files from cwd upward, then 4. the home directory's.
 paths = []
 here = cwd
 while True:
@@ -157,44 +211,111 @@ while True:
 for name in ("config.toml", "config"):
     paths.append(os.path.join(cargo_home, name))
 for path in paths:
-    try:
-        with open(path, "rb") as handle:
-            config = tomllib.load(handle)
-    except FileNotFoundError:
-        continue
-    runner = config.get("target", {}).get(triple, {}).get("runner")
-    if runner is None:
-        continue
-    if isinstance(runner, str):
-        print(runner)
-    else:
-        print("\n".join(runner))
-    break
+    merge(config, load_file(path))
+
+target = target_arg or config.get("build", {}).get("target") or host
+if isinstance(target, list):
+    target = target[0] if len(target) == 1 else host
+print(f"target={target}")
+
+env_runner = os.environ.get("CARGO_TARGET_" + target.upper().replace("-", "_") + "_RUNNER")
+tables = config.get("target", {})
+runner = None
+# --config overrides and files both landed in `config`; the environment
+# sits between them in cargo's precedence, so only a --config override
+# outranks it.
+for override in overrides:
+    snippet = load_file(override) if os.path.isfile(override) else tomllib.loads(override)
+    candidate = snippet.get("target", {}).get(target, {}).get("runner")
+    if candidate is not None:
+        runner = candidate
+        break
+if runner is None and env_runner:
+    runner = env_runner
+if runner is None:
+    runner = tables.get(target, {}).get("runner")
+if isinstance(runner, str):
+    runner = shlex.split(runner)
+for part in runner or []:
+    print(f"runner={part}")
+if any(key.startswith("cfg(") and "runner" in value for key, value in tables.items() if isinstance(value, dict)):
+    print("cfg_runner=1")
 PY
 }
-RUNNER=()
-while IFS= read -r part; do
-  [[ -n "$part" ]] && RUNNER+=("$part")
-done < <(runner_for "$TRIPLE")
-# A single-string runner is a shell word list, exactly as cargo treats it.
-if [[ "${#RUNNER[@]}" -eq 1 ]]; then
-  # shellcheck disable=SC2206 # word-splitting the configured string is the point
-  RUNNER=(${RUNNER[0]})
+TRIPLE=""; RUNNER=(); CFG_RUNNER=0
+while IFS= read -r line; do
+  case "$line" in
+    target=*) TRIPLE="${line#target=}" ;;
+    runner=*) RUNNER+=("${line#runner=}") ;;
+    cfg_runner=1) CFG_RUNNER=1 ;;
+  esac
+done < <(cargo_config)
+[[ -n "$TRIPLE" ]] || die "could not resolve the build target from cargo's configuration"
+if (( CFG_RUNNER )); then
+  die "a runner is configured under a [target.'cfg(...)'] table, which this script cannot evaluate; run cargo test directly"
 fi
 
 # ---------------------------------------------------------------------------
 # Phase 1 — compile. Numerator and denominator are the same unit — packages —
 # so the bar cannot overrun: cargo emits one `compiler-artifact` per TARGET
 # (a library, its test harness, each integration test), so counting messages
-# would count one package several times. The denominator is the resolve
-# graph for the SAME manifest, features and target as the build, filtered
-# to the platform being built for; a scoped run builds a subset of it and
-# the bar says so.
+# would count one package several times. The denominator is the dependency
+# closure of the SELECTED packages in the resolve graph cargo builds for the
+# same manifest, features, target and lock flags: the workspace's default
+# members (minus exclusions), or the packages named with -p.
 # ---------------------------------------------------------------------------
-TOTAL_PACKAGES="$(cargo metadata --format-version 1 --filter-platform "$TRIPLE" \
-    ${metadata_args[@]+"${metadata_args[@]}"} 2>"$WORK/metadata.err" \
-  | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["resolve"]["nodes"]))' 2>>"$WORK/metadata.err")"
-[[ "${TOTAL_PACKAGES:-0}" -gt 0 ]] || {
+cargo metadata --format-version 1 --filter-platform "$TRIPLE" \
+    ${metadata_args[@]+"${metadata_args[@]}"} > "$WORK/metadata.json" 2>"$WORK/metadata.err" \
+  || { cat "$WORK/metadata.err" >&2; die "cargo metadata failed; refusing to draw a guessed bar"; }
+TOTAL_PACKAGES="$(python3 - "$WORK/metadata.json" "$workspace_flag" "${#packages[@]}" \
+    ${packages[@]+"${packages[@]}"} ${excludes[@]+"${excludes[@]}"} 2>>"$WORK/metadata.err" <<'PY'
+import json, sys
+with open(sys.argv.pop(1)) as handle:
+    meta = json.load(handle)
+workspace_flag = sys.argv[1] == "1"
+count = int(sys.argv[2])
+selected, excluded = sys.argv[3:3 + count], sys.argv[3 + count:]
+by_id = {package["id"]: package for package in meta["packages"]}
+members = meta["workspace_members"]
+default_members = meta.get("workspace_default_members") or members
+
+def named(spec, package):
+    # `-p` accepts a name, name@version, or a path; match the forms a person types.
+    name = package["name"]
+    return spec in (name, f"{name}@{package['version']}", f"{name}:{package['version']}") \
+        or spec.rstrip("/") == package["manifest_path"].rsplit("/", 1)[0]
+
+if selected:
+    roots = []
+    for spec in selected:
+        matches = [pid for pid in members if named(spec, by_id[pid])]
+        if not matches:
+            sys.exit(f"package `{spec}` is not a member of this workspace")
+        roots.extend(matches)
+else:
+    roots = list(members if workspace_flag else default_members)
+roots = [pid for pid in roots if not any(named(spec, by_id[pid]) for spec in excluded)]
+if not roots:
+    sys.exit("the selection excludes every package")
+
+deps = {node["id"]: node["deps"] for node in meta["resolve"]["nodes"]}
+seen = set()
+stack = [(pid, True) for pid in roots]
+while stack:
+    pid, is_root = stack.pop()
+    if pid in seen:
+        continue
+    seen.add(pid)
+    for dep in deps.get(pid, []):
+        kinds = {kind.get("kind") for kind in dep.get("dep_kinds", [])} or {None}
+        # A root builds its dev-dependencies too; a dependency builds only
+        # its normal and build dependencies.
+        if is_root or kinds & {None, "build"}:
+            stack.append((dep["pkg"], False))
+print(len(seen))
+PY
+)"
+[[ "${TOTAL_PACKAGES:-0}" -gt 0 ]] 2>/dev/null || {
   cat "$WORK/metadata.err" >&2
   die "cargo metadata did not yield a package count; refusing to draw a guessed bar"
 }
@@ -207,33 +328,44 @@ built_packages() {
     | grep -oE '"package_id":"[^"]*"' | sort -u | wc -l | tr -d ' '
 }
 
-printf '%scompiling%s (%s packages in the graph)\n' "$BOLD" "$RESET" "$TOTAL_PACKAGES"
-# `json-render-diagnostics`: artifacts stay on stdout as JSON for the bar,
-# and rustc's diagnostics are rendered to stderr as a person would read them
-# — plain `json` buries the actual error inside `compiler-message` records.
-cargo test "${cargo_args[@]}" --no-run --message-format=json-render-diagnostics \
-  > "$WORK/build.json" 2> "$WORK/build.err" &
-BUILD_PID=$!
-while kill -0 "$BUILD_PID" 2>/dev/null; do
-  bar "$(built_packages)" "$TOTAL_PACKAGES" "building"
-  sleep 0.3
-done
-wait "$BUILD_PID"; BUILD_RC=$?
-bar "$(built_packages)" "$TOTAL_PACKAGES" "built"
-printf '\n'
+sum_counts() { # <passed|failed> <file> — libtest's own totals, from its
+  # `test result:` lines only: a test that PRINTS "7 passed" is not a result.
+  grep -hE '^test result: ' "$2" | grep -oE "[0-9]+ $1" | awk '{s+=$1} END{print s+0}'
+}
 
-if [[ "$BUILD_RC" -ne 0 ]]; then
-  printf '%scompile failed%s\n' "$RED" "$RESET"
-  cat "$WORK/build.err"
-  exit "$BUILD_RC"
-fi
+passed=0; failed=0; failing_bins=(); TOTAL_BINS=0
 
-# ---------------------------------------------------------------------------
-# Phase 2 — run. Each test binary is one unit, which is the granularity a
-# person actually waits on: "12 of 19 binaries" answers "how much longer".
-# ---------------------------------------------------------------------------
-python3 - "$WORK/build.json" > "$WORK/binaries" <<'PY' || exit 2
-import json, sys
+if (( ! doc_only )); then
+  printf '%scompiling%s (%s packages in the selection)\n' "$BOLD" "$RESET" "$TOTAL_PACKAGES"
+  # `json-render-diagnostics`: artifacts stay on stdout as JSON for the bar,
+  # and rustc's diagnostics are rendered to stderr as a person would read
+  # them — plain `json` buries the actual error inside `compiler-message`
+  # records.
+  cargo test "${cargo_args[@]}" --no-run --message-format=json-render-diagnostics \
+    > "$WORK/build.json" 2> "$WORK/build.err" &
+  BUILD_PID=$!
+  while kill -0 "$BUILD_PID" 2>/dev/null; do
+    bar "$(built_packages)" "$TOTAL_PACKAGES" "building"
+    sleep 0.3
+  done
+  wait "$BUILD_PID"; BUILD_RC=$?
+  bar "$(built_packages)" "$TOTAL_PACKAGES" "built"
+  printf '\n'
+
+  if [[ "$BUILD_RC" -ne 0 ]]; then
+    printf '%scompile failed%s\n' "$RED" "$RESET"
+    cat "$WORK/build.err"
+    exit "$BUILD_RC"
+  fi
+
+  # -------------------------------------------------------------------------
+  # Phase 2 — run. Each test binary is one unit, which is the granularity a
+  # person actually waits on: "12 of 19 binaries" answers "how much longer".
+  # Each line is `<executable>\t<package root>`: cargo runs every test from
+  # its package's root directory, and so does this.
+  # -------------------------------------------------------------------------
+  python3 - "$WORK/build.json" > "$WORK/binaries" <<'PY' || exit 2
+import json, os, sys
 seen = []
 for line in open(sys.argv[1]):
     try:
@@ -242,68 +374,71 @@ for line in open(sys.argv[1]):
         continue
     # `executable` is non-null exactly for the artifacts cargo would run.
     exe = msg.get("executable")
-    if exe and msg.get("profile", {}).get("test") and exe not in seen:
-        seen.append(exe)
-print("\n".join(seen))
+    if exe and msg.get("profile", {}).get("test") and exe not in [e for e, _ in seen]:
+        seen.append((exe, os.path.dirname(msg["manifest_path"])))
+print("\n".join(f"{exe}\t{root}" for exe, root in seen))
 PY
 
-TOTAL_BINS="$(grep -c . "$WORK/binaries" || true)"
-[[ "${TOTAL_BINS:-0}" -gt 0 ]] || {
-  # A build that produced nothing runnable is not a passing suite: cargo
-  # itself reports "running 0 tests" and exits 0 only when the selection
-  # legitimately has none, and we cannot tell that apart from a broken
-  # parse here — so say what happened and refuse to claim success.
-  die "the build produced no test binaries (selection: ${cargo_args[*]})"
-}
+  TOTAL_BINS="$(grep -c . "$WORK/binaries" || true)"
+  [[ "${TOTAL_BINS:-0}" -gt 0 ]] || {
+    # A build that produced nothing runnable is not a passing suite: cargo
+    # itself reports "running 0 tests" and exits 0 only when the selection
+    # legitimately has none, and we cannot tell that apart from a broken
+    # parse here — so say what happened and refuse to claim success.
+    die "the build produced no test binaries (selection: ${cargo_args[*]})"
+  }
 
-sum_counts() { # <passed|failed> <file> — libtest's own totals, from its
-  # `test result:` lines only: a test that PRINTS "7 passed" is not a result.
-  grep -hE '^test result: ' "$2" | grep -oE "[0-9]+ $1" | awk '{s+=$1} END{print s+0}'
-}
-
-printf '%srunning%s (%s test binaries' "$BOLD" "$RESET" "$TOTAL_BINS"
-[[ "${#RUNNER[@]}" -gt 0 ]] && printf ' via runner %s' "${RUNNER[*]}"
-printf ')\n'
-ran=0; passed=0; failed=0; failing_bins=()
-while IFS= read -r exe; do
-  name="$(basename "$exe" | sed 's/-[0-9a-f]\{16\}$//')"
-  bar "$ran" "$TOTAL_BINS" "$name"
-  # The `[@]+` expansions keep an empty array from tripping `set -u` on the
-  # bash 3.2 macOS ships.
-  ${RUNNER[@]+"${RUNNER[@]}"} "$exe" ${bin_args[@]+"${bin_args[@]}"} > "$WORK/out.$ran" 2>&1
-  rc=$?
-  p="$(sum_counts passed "$WORK/out.$ran")"
-  f="$(sum_counts failed "$WORK/out.$ran")"
-  passed=$(( passed + p ))
-  failed=$(( failed + f ))
-  if [[ "$rc" -ne 0 ]]; then
-    failing_bins+=("$name:$WORK/out.$ran")
-  fi
-  ran=$(( ran + 1 ))
-  bar "$ran" "$TOTAL_BINS" "$name  ${GREEN}${passed} passed${RESET}$( [[ "$failed" -gt 0 ]] && printf ' %s%s failed%s' "$RED" "$failed" "$RESET" )"
-done < "$WORK/binaries"
-printf '\n'
+  printf '%srunning%s (%s test binaries' "$BOLD" "$RESET" "$TOTAL_BINS"
+  [[ "${#RUNNER[@]}" -gt 0 ]] && printf ' via runner %s' "${RUNNER[*]}"
+  printf ')\n'
+  ran=0
+  while IFS=$'\t' read -r exe root; do
+    name="$(basename "$exe" | sed 's/-[0-9a-f]\{16\}$//')"
+    bar "$ran" "$TOTAL_BINS" "$name"
+    # The `[@]+` expansions keep an empty array from tripping `set -u` on
+    # the bash 3.2 macOS ships.
+    (cd "$root" && ${RUNNER[@]+"${RUNNER[@]}"} "$exe" ${bin_args[@]+"${bin_args[@]}"}) \
+      > "$WORK/out.$ran" 2>&1
+    rc=$?
+    p="$(sum_counts passed "$WORK/out.$ran")"
+    f="$(sum_counts failed "$WORK/out.$ran")"
+    passed=$(( passed + p ))
+    failed=$(( failed + f ))
+    if [[ "$rc" -ne 0 ]]; then
+      failing_bins+=("$name:$WORK/out.$ran")
+    fi
+    ran=$(( ran + 1 ))
+    bar "$ran" "$TOTAL_BINS" "$name  ${GREEN}${passed} passed${RESET}$( [[ "$failed" -gt 0 ]] && printf ' %s%s failed%s' "$RED" "$failed" "$RESET" )"
+  done < "$WORK/binaries"
+  printf '\n'
+fi
 
 # ---------------------------------------------------------------------------
 # Phase 3 — doctests. `cargo test` runs them and this split flow would not:
 # `--no-run` cannot build them (rustdoc compiles them on the fly) and they
 # produce no binary to run. One unit, drawn while cargo runs them, so a
 # failing doctest fails the run exactly as it would under `cargo test`.
+# Skipped when the caller selected targets, as cargo skips them — and
+# cargo refuses `--doc` beside a target selector, so this must too.
 # ---------------------------------------------------------------------------
-printf '%sdoctests%s\n' "$BOLD" "$RESET"
-bar 0 1 "doctests"
-cargo test "${cargo_args[@]}" --doc -- ${bin_args[@]+"${bin_args[@]}"} \
-  > "$WORK/out.doc" 2>&1
-DOC_RC=$?
-p="$(sum_counts passed "$WORK/out.doc")"
-f="$(sum_counts failed "$WORK/out.doc")"
-passed=$(( passed + p ))
-failed=$(( failed + f ))
-if [[ "$DOC_RC" -ne 0 ]]; then
-  failing_bins+=("doctests:$WORK/out.doc")
+if (( target_selected )); then
+  printf '%sdoctests%s skipped: a target selector was given, as under cargo test\n' "$BOLD" "$RESET"
+else
+  printf '%sdoctests%s\n' "$BOLD" "$RESET"
+  bar 0 1 "doctests"
+  cargo test "${cargo_args[@]}" --doc -- ${bin_args[@]+"${bin_args[@]}"} \
+    > "$WORK/out.doc" 2>&1
+  DOC_RC=$?
+  p="$(sum_counts passed "$WORK/out.doc")"
+  f="$(sum_counts failed "$WORK/out.doc")"
+  passed=$(( passed + p ))
+  failed=$(( failed + f ))
+  if [[ "$DOC_RC" -ne 0 ]]; then
+    failing_bins+=("doctests:$WORK/out.doc")
+  fi
+  bar 1 1 "doctests  ${GREEN}${passed} passed${RESET}$( [[ "$failed" -gt 0 ]] && printf ' %s%s failed%s' "$RED" "$failed" "$RESET" )"
+  printf '\n'
 fi
-bar 1 1 "doctests  ${GREEN}${passed} passed${RESET}$( [[ "$failed" -gt 0 ]] && printf ' %s%s failed%s' "$RED" "$failed" "$RESET" )"
-printf '\n'
 
 if [[ "${#failing_bins[@]}" -gt 0 ]]; then
   printf '\n%s%d binary/binaries failed%s\n' "$RED" "${#failing_bins[@]}" "$RESET"
@@ -317,4 +452,10 @@ if [[ "${#failing_bins[@]}" -gt 0 ]]; then
   exit 1
 fi
 
-printf '%s%d tests passed across %d binaries plus doctests%s\n' "$GREEN" "$passed" "$TOTAL_BINS" "$RESET"
+if (( doc_only )); then
+  printf '%s%d doctests passed%s\n' "$GREEN" "$passed" "$RESET"
+elif (( target_selected )); then
+  printf '%s%d tests passed across %d binaries%s\n' "$GREEN" "$passed" "$TOTAL_BINS" "$RESET"
+else
+  printf '%s%d tests passed across %d binaries plus doctests%s\n' "$GREEN" "$passed" "$TOTAL_BINS" "$RESET"
+fi
