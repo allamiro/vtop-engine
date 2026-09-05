@@ -25,7 +25,10 @@ use tokio::time::{sleep, timeout};
 use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use uuid::Uuid;
-use vtop_meta::transport::MaybeTls;
+use vtop_meta::transport::{
+    judge_dialect, tls_handshake_hint, warn_rate_limited, with_tls_handshake_hint, DialectVerdict,
+    MaybeTls,
+};
 use vtop_protocol::{
     read_frame, write_frame, CommittedHwmUpdate, ErrorCode, ErrorResponse, Message, ProtocolLimits,
     RangeIdentity, ReplicaAppendBatchRequest, ReplicaAppendRequest, ReplicaAppendResponse,
@@ -520,6 +523,18 @@ async fn serve_follower_connection(
     handler: Arc<dyn ReplicaPeerHandler>,
     local_id: Uuid,
 ) -> BrokerResult<()> {
+    // Judged before the handshake or the first frame (#294 slice 6): a peer
+    // speaking the other transport is refused by name instead of failing as
+    // a bad magic here and a reset there.
+    let verdict = judge_dialect(&tcp, "replica", "replica_transport", acceptor.is_some())
+        .await
+        .map_err(|source| crate::BrokerError::Io {
+            path: std::path::PathBuf::from("replica-peer-accept"),
+            source,
+        })?;
+    if let DialectVerdict::Refused(message) = verdict {
+        return Err(crate::BrokerError::CrossMode(message));
+    }
     let mut stream = match acceptor {
         Some(acceptor) => {
             let tls = acceptor
@@ -1229,7 +1244,26 @@ impl FollowerDriver {
                         .await
                     {
                         Ok(Ok(stream)) => stream,
-                        _ => return SessionOutcome::Disconnected,
+                        Ok(Err(error)) => {
+                            // Named, once per window (review): this dialer
+                            // retries every backoff, and a transport
+                            // mismatch was a silent reconnect loop with the
+                            // hint nowhere.
+                            warn_rate_limited(
+                                // Keyed by the PLANE (review), like the server side: one
+                                // line per window for the whole replication plane, not
+                                // one per follower.
+                                "replica-driver",
+                                &format!(
+                                    "replica {} at {}: TLS handshake failed: {error}{}",
+                                    self.config.node_id,
+                                    self.config.addr,
+                                    tls_handshake_hint(&error)
+                                ),
+                            );
+                            return SessionOutcome::Disconnected;
+                        }
+                        Err(_) => return SessionOutcome::Disconnected,
                     };
                 // Skipped EXPLICITLY under plaintext below, not folded into a
                 // helper that tolerates a missing certificate: this check is
@@ -1915,7 +1949,7 @@ impl ReplicaStatusClient {
                     let tls = connector.connect(name, tcp).await.map_err(|source| {
                         crate::BrokerError::Io {
                             path: PathBuf::from("replica-status-tls"),
-                            source,
+                            source: with_tls_handshake_hint(source),
                         }
                     })?;
                     assert_peer_uuid(peer_certs_client(&tls), expected_node)?;
@@ -1993,7 +2027,7 @@ impl ReplicaStatusClient {
                     let tls = connector.connect(name, tcp).await.map_err(|source| {
                         crate::BrokerError::Io {
                             path: PathBuf::from("replica-fence-tls"),
-                            source,
+                            source: with_tls_handshake_hint(source),
                         }
                     })?;
                     assert_peer_uuid(peer_certs_client(&tls), expected_node)?;
@@ -2087,7 +2121,7 @@ impl ReplicaStatusClient {
                     let tls = connector.connect(name, tcp).await.map_err(|source| {
                         crate::BrokerError::Io {
                             path: PathBuf::from("replica-epoch-history-tls"),
-                            source,
+                            source: with_tls_handshake_hint(source),
                         }
                     })?;
                     assert_peer_uuid(peer_certs_client(&tls), expected_node)?;
@@ -2230,6 +2264,61 @@ mod tests {
     use super::*;
     use crate::memory_budget::MemoryBudgetConfig;
     use vtop_protocol::{ProduceRecord, RangeIdentity};
+
+    /// #294 slice 6: a TLS hello on a plaintext replica plane is refused by
+    /// name before the handler is asked anything.
+    #[tokio::test]
+    async fn a_tls_hello_on_a_plaintext_replica_plane_is_refused_naming_both_sides() {
+        use tokio::io::AsyncWriteExt;
+        struct Unreached;
+        impl ReplicaPeerHandler for Unreached {
+            fn node_id(&self) -> Uuid {
+                Uuid::from_u128(1)
+            }
+            fn apply_append(
+                &self,
+                _: &ReplicaAppendRequest,
+            ) -> Result<ReplicaAppendResponse, (ErrorCode, String)> {
+                unreachable!("refused before any frame")
+            }
+            fn apply_append_batch(
+                &self,
+                _: &[ReplicaAppendRequest],
+            ) -> Result<ReplicaAppendResponse, (ErrorCode, String)> {
+                unreachable!("refused before any frame")
+            }
+            fn observe_hwm(&self, _: &CommittedHwmUpdate) -> Result<(), (ErrorCode, String)> {
+                unreachable!("refused before any frame")
+            }
+            fn status(
+                &self,
+                _: &RangeIdentity,
+            ) -> Result<ReplicaStatusResponse, (ErrorCode, String)> {
+                unreachable!("refused before any frame")
+            }
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let (tcp, _) = listener.accept().await.unwrap();
+        client
+            .write_all(&[0x16, 0x03, 0x01, 0x00, 0x40])
+            .await
+            .unwrap();
+        let refused = serve_follower_connection(None, tcp, Arc::new(Unreached), Uuid::from_u128(1))
+            .await
+            .unwrap_err();
+        let crate::BrokerError::CrossMode(message) = refused else {
+            panic!("expected a cross-mode refusal, got {refused}")
+        };
+        assert!(
+            message.contains("opened a TLS handshake")
+                && message.contains("`replica_transport: plaintext`")
+                && message.contains("`transport: plaintext`"),
+            "{message}"
+        );
+        drop(client);
+    }
 
     /// The plaintext status plane never evaluates TLS naming (#410): an
     /// empty `server_name` used to fail with `InvalidConfig` BEFORE

@@ -106,6 +106,11 @@ pub enum TransportError {
     ChecksumMismatch,
     #[error("tls: {0}")]
     Tls(String),
+    /// The peer spoke the other transport (#294 slice 6). Named on both
+    /// sides — see [`crate::transport::cross_mode_refusal`] — so the one
+    /// refusal an operator can act on is not folded into `Tls` or `BadMagic`.
+    #[error("{0}")]
+    CrossMode(String),
     #[error("identity: {0}")]
     Identity(String),
     #[error("io: {0}")]

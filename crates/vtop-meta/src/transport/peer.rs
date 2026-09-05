@@ -4,7 +4,7 @@
 //! pairs. The [`crate::raft::network`] adapter opens a short-lived
 //! connection per RPC in this slice (no connection pool yet).
 
-use super::maybe_tls::MaybeTls;
+use super::maybe_tls::{judge_dialect, tls_handshake_hint, DialectVerdict, MaybeTls};
 use super::tls::{assert_peer_identity, server_name, TlsMaterial};
 use super::wire::{
     read_frame, write_frame, PeerAppendRequest, PeerAppendResponse, PeerInstallRequest,
@@ -183,6 +183,14 @@ async fn serve_connection(
     handler: Arc<dyn PeerRpcHandler>,
     _local_id: MetaNodeId,
 ) -> TransportResult<()> {
+    // Judged before the handshake or the first frame (#294 slice 6): a peer
+    // speaking the other transport is refused by name instead of failing as
+    // a bad magic here and a reset there.
+    if let DialectVerdict::Refused(message) =
+        judge_dialect(&tcp, "peer", "peer_transport", acceptor.is_some()).await?
+    {
+        return Err(TransportError::CrossMode(message));
+    }
     let mut stream = match acceptor {
         Some(acceptor) => MaybeTls::Tls(Box::new(
             acceptor
@@ -410,10 +418,12 @@ impl PeerClient {
         let mut stream = match self.connector.as_ref() {
             Some(connector) => {
                 let name = server_name(&self.server_name)?;
-                let stream = connector
-                    .connect(name, tcp)
-                    .await
-                    .map_err(|error| TransportError::Tls(format!("peer connect: {error}")))?;
+                let stream = connector.connect(name, tcp).await.map_err(|error| {
+                    TransportError::Tls(format!(
+                        "peer connect: {error}{}",
+                        tls_handshake_hint(&error)
+                    ))
+                })?;
                 MaybeTls::Tls(Box::new(stream.into()))
             }
             None => MaybeTls::Plain(tcp),
@@ -579,6 +589,34 @@ mod tests {
         assert!(response.vote_granted);
         assert_eq!(response.vote.term, 3);
         server_task.abort();
+    }
+
+    /// #294 slice 6: a TLS hello on a plaintext peer plane is refused by
+    /// name, before any frame is read.
+    #[tokio::test]
+    async fn a_tls_hello_on_a_plaintext_peer_plane_is_refused_naming_both_sides() {
+        use tokio::io::AsyncWriteExt;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let (tcp, _) = listener.accept().await.unwrap();
+        client
+            .write_all(&[0x16, 0x03, 0x01, 0x00, 0x40])
+            .await
+            .unwrap();
+        let refused = serve_connection(None, tcp, Arc::new(EchoHandler), MetaNodeId(1))
+            .await
+            .unwrap_err();
+        let TransportError::CrossMode(message) = refused else {
+            panic!("expected a cross-mode refusal, got {refused}")
+        };
+        assert!(
+            message.contains("opened a TLS handshake")
+                && message.contains("`peer_transport: plaintext`")
+                && message.contains("`transport: plaintext`"),
+            "{message}"
+        );
+        drop(client);
     }
 
     /// THE COST, executed rather than described. On a plaintext plane a peer

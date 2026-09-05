@@ -133,6 +133,14 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are used as normat
   a scraper the CA vouches for is served. Misconfigured TLS disables the
   endpoint rather than serving it plaintext, and a plaintext probe against a
   TLS endpoint is closed at the handshake.
+- Cross-mode is refused by name on every plane (#294 slice 6). A plane's
+  transport is fixed by configuration before any socket exists; on accept,
+  the plane peeks at the first byte — a TLS handshake record, or the `V`
+  every vtop frame opens with — and a peer speaking the other transport is
+  closed with a warning that names both sides: what the peer spoke, the
+  plane's knob, and the two ways to make them agree. Nothing is negotiated,
+  so the check cannot be used to downgrade. A TLS client whose handshake was
+  closed unanswered adds the same hint to its own error.
 
 
 ## 3. Credential handling

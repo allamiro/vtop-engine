@@ -34,6 +34,7 @@ use uuid::Uuid;
 use vtop_log::{
     sealed_artifact_path, SegmentPresence, SegmentReceiver, StagedSegment, TransferArtifact,
 };
+use vtop_meta::transport::with_tls_handshake_hint;
 use vtop_protocol::{
     read_frame, write_frame, ErrorCode, FetchSegmentChunkRequest, FetchSegmentChunkResponse,
     ListSealedSegmentsRequest, Message, RangeIdentity, SealedSegmentEntry, SegmentArtifact,
@@ -427,7 +428,7 @@ impl SegmentTransferClient {
                 .await
                 .map_err(|source| crate::BrokerError::Io {
                     path: PathBuf::from("seal-tail-tls"),
-                    source,
+                    source: with_tls_handshake_hint(source),
                 })
         })
         .await
@@ -503,7 +504,7 @@ impl SegmentTransferClient {
                 .await
                 .map_err(|source| crate::BrokerError::Io {
                     path: PathBuf::from("segment-listing-tls"),
-                    source,
+                    source: with_tls_handshake_hint(source),
                 })
         })
         .await
@@ -558,7 +559,7 @@ impl SegmentTransferClient {
                 .await
                 .map_err(|source| crate::BrokerError::Io {
                     path: PathBuf::from("segment-transfer-tls"),
-                    source,
+                    source: with_tls_handshake_hint(source),
                 })
         })
         .await
