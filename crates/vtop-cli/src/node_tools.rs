@@ -213,6 +213,18 @@ fn load_config(path: &Path) -> Result<NodeClientConfig, String> {
     if config.replicas.is_empty() {
         return Err(format!("{} lists no replicas", path.display()));
     }
+    // One entry per replica (review): a node listed twice would be asked
+    // twice, and a set with a repeat would pass for the whole set.
+    let mut seen = std::collections::BTreeSet::new();
+    for replica in &config.replicas {
+        if !seen.insert(replica.node_uuid) {
+            return Err(format!(
+                "{} lists replica {} more than once; each replica is one entry",
+                path.display(),
+                replica.node_uuid
+            ));
+        }
+    }
     if config
         .replicas
         .iter()
@@ -269,6 +281,47 @@ fn client(config: &NodeClientConfig, timeout: Duration) -> Result<ReplicaStatusC
     })
     .map(|client| client.with_timeout(timeout))
     .map_err(|error| error.to_string())
+}
+
+/// Each replica's epoch vector (#240) for the transitions audit's cross-check:
+/// which fencing epoch wrote each stretch of its log, or why it could not be
+/// asked. Same config as `node status`, one fresh client per replica.
+pub(crate) async fn epoch_vectors(
+    path: &Path,
+    timeout: Duration,
+    audited_range: Uuid,
+) -> Result<Vec<crate::meta_tools::ReplicaEpochVector>, String> {
+    let config = load_config(path)?;
+    // The config must name the range being audited (review): a config for
+    // another range would lend that range's vectors to this audit, and a
+    // matching one would make the requested range look checked.
+    refuse_other_range(path, config.range.range_id, audited_range)?;
+    let range = config.range.identity();
+    let mut vectors = Vec::with_capacity(config.replicas.len());
+    for replica in &config.replicas {
+        let endpoint = resolve_endpoint(&replica.addr).map_err(|error| error.to_string());
+        let outcome = match (client(&config, timeout), endpoint) {
+            (Ok(client), Ok(addr)) => client
+                .epoch_history(addr, &replica.server_name, replica.node_uuid, &range)
+                .await
+                .map_err(|error| error.to_string()),
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        };
+        vectors.push((replica.node_uuid, replica.addr.clone(), outcome));
+    }
+    Ok(vectors)
+}
+
+/// The node-status config's range against the one the audit named.
+fn refuse_other_range(path: &Path, configured: Uuid, audited: Uuid) -> Result<(), String> {
+    if configured == audited {
+        return Ok(());
+    }
+    Err(format!(
+        "{} names range {configured}, but the audit is of range {audited}: a replica's \
+         epoch vector belongs to one range, and this config's replicas serve another",
+        path.display()
+    ))
 }
 
 async fn collect(
@@ -1373,6 +1426,44 @@ fn common_config_hint() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #240 (review): a node listed twice is refused, so a set is one entry
+    /// per replica before anything is asked of it.
+    #[test]
+    fn a_replicas_config_naming_one_node_twice_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replicas.yaml");
+        std::fs::write(
+            &path,
+            "range: { topic: t, topic_epoch: 1, range_id: 00000000-0000-0000-0000-000000000001, range_generation: 1 }\n\
+             ca_cert: ca.pem\nclient_cert: c.pem\nclient_key: k.pem\n\
+             replicas:\n\
+               - { node_uuid: 00000000-0000-0000-0000-00000000000a, addr: \"127.0.0.1:1\", server_name: a }\n\
+               - { node_uuid: 00000000-0000-0000-0000-00000000000a, addr: \"127.0.0.1:2\", server_name: a }\n",
+        )
+        .unwrap();
+        let refused = load_config(&path).unwrap_err();
+        assert!(
+            refused.contains("more than once") && refused.contains("0000000a"),
+            "{refused}"
+        );
+    }
+
+    /// #240 (review): the replicas config must be for the range being
+    /// audited, or its vectors would be read as that range's.
+    #[test]
+    fn a_replicas_config_for_another_range_is_refused_by_name() {
+        let path = Path::new("replicas.yaml");
+        let (this, other) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        assert!(refuse_other_range(path, this, this).is_ok());
+        let refused = refuse_other_range(path, other, this).unwrap_err();
+        assert!(
+            refused.contains("replicas.yaml")
+                && refused.contains(&other.to_string())
+                && refused.contains(&this.to_string()),
+            "{refused}"
+        );
+    }
     use vtop_protocol::ReplicaStatusResponse;
 
     fn config() -> NodeClientConfig {
