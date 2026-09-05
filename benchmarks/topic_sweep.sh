@@ -114,7 +114,11 @@ FAILED_CELLS=""
 CSV="$OUT_DIR/topic_sweep.csv"
 echo "topics,records_produced,observe_seconds,kafka_cycles,records_read,avg_read_phase_ms,avg_empty_wait_pct,objects_archived" > "$CSV"
 
-kafka() { docker compose exec -T kafka /opt/kafka/bin/"$@"; }
+kafka() { # <tool> <args...>: a Kafka CLI tool inside the broker container
+  local tool="$1"
+  shift
+  docker compose exec -T kafka "/opt/kafka/bin/$tool" "$@"
+}
 
 # Run kafka-init to completion before any cell, so its seed topics exist when
 # the first purge happens rather than arriving after it.
@@ -155,9 +159,46 @@ purge_foreign_topics() { # $1 = the prefix this cell owns, empty for "none"
     if [ -n "$own" ] && case "$topic" in "${own}-"*) true ;; *) false ;; esac; then
       continue
     fi
+    # `</dev/null`: `docker compose exec` reads the loop's stdin otherwise
+    # and swallows the rest of the listing, so only the first topic was
+    # ever deleted and the stray check below failed every cell.
     kafka kafka-topics.sh --bootstrap-server localhost:9092 --delete \
-      --topic "$topic" >/dev/null 2>&1 || true
+      --topic "$topic" >/dev/null 2>&1 </dev/null || true
   done <<< "$listing"
+  # Deletion is asynchronous on the broker: `--delete` returns once the
+  # request is accepted, and the topic stays in the listing until the
+  # controller has removed it — long enough, on a fresh KRaft broker, for the
+  # stray check below to read the seed topics as survivors and fail a cell
+  # that was clean a second later. Wait for the listing to agree, bounded.
+  # A listing the broker fails to answer is UNKNOWN, never zero: the wait
+  # keeps probing to its deadline and then fails the cell, instead of
+  # reading silence as a clean broker. The listing is captured once per
+  # probe and judged in bash — no grep on a pipe, which under pipefail can
+  # turn a hit into SIGPIPE.
+  local deadline=$(( SECONDS + 60 )) answered=0 remaining=-1
+  while (( SECONDS < deadline )); do
+    if listing="$(kafka kafka-topics.sh --bootstrap-server localhost:9092 --list 2>/dev/null)"; then
+      answered=1
+      remaining=0
+      while IFS= read -r topic; do
+        [ -n "$topic" ] || continue
+        case "$topic" in
+          __*) continue ;;
+        esac
+        if [ -n "$own" ] && case "$topic" in "${own}-"*) true ;; *) false ;; esac; then
+          continue
+        fi
+        remaining=$(( remaining + 1 ))
+      done <<< "$listing"
+      [ "$remaining" -eq 0 ] && return 0
+    else
+      answered=0
+    fi
+    sleep 1
+  done
+  [ "$answered" -eq 1 ] \
+    || fail "the broker stopped answering topic listings during the purge; the cell cannot know whether it is clean"
+  # Survivors past the deadline are reported by the stray check that follows.
 }
 
 cleanup() {
@@ -203,6 +244,29 @@ kafka kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1 \
 # are present for the first purge rather than arriving after it.
 seed_kafka_init
 
+# The group coordinator is not ready the moment the broker answers a topic
+# listing: the first consumer to join creates __consumer_offsets, and an
+# engine started before that skips its first pass on NotCoordinator — which
+# the first cell then reports as a failed source and withholds its row. A
+# throwaway consumer on a seed topic warms it; the listing says when it is.
+log "warming the group coordinator"
+kafka kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic cef_events \
+  --group topic-sweep-warm --from-beginning --timeout-ms 8000 >/dev/null 2>&1 </dev/null || true
+coordinator_deadline=$(( SECONDS + 30 ))
+coordinator_up=0
+while (( SECONDS < coordinator_deadline )); do
+  # The listing captured, then judged in bash: `grep -q` on the pipe could
+  # SIGPIPE the listing under pipefail and read a present coordinator as
+  # absent.
+  if listing="$(kafka kafka-topics.sh --bootstrap-server localhost:9092 --list 2>/dev/null)" \
+    && [[ $'\n'"$listing"$'\n' == *$'\n__consumer_offsets\n'* ]]; then
+    coordinator_up=1
+    break
+  fi
+  sleep 1
+done
+[ "$coordinator_up" -eq 1 ] \
+  || fail "the group coordinator never came up (__consumer_offsets absent); the first cell would skip its first pass"
 for count in "${COUNTS[@]}"; do
   log "=== $count topic(s), $TOTAL_RECORDS records spread across them ==="
 
