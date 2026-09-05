@@ -23,11 +23,19 @@ KCAT="$(command -v kcat || command -v kafkacat || true)"
 [[ -n "$KCAT" ]] || fail "scenario 17 needs kcat, librdkafka's client: brew install kcat / apt-get install kafkacat"
 init_workdir
 
-KAFKA_PORT="${CHAOS_KAFKA_PORT:-$((NATIVE_PORT + 21))}"
+# kafka-1 of the lib's port families (kafka-0 is scenario 16's), judged for
+# collisions in preflight and moved with CHAOS_KAFKA_BASE_PORT.
+KAFKA_PORT="$(kafka_port 1)"
 RECORDS="${CHAOS_KAFKA_RECORDS:-20000}"
-require_integer_in_range CHAOS_KAFKA_PORT "$KAFKA_PORT" 1024 65535
+ACK_FLOOR="${CHAOS_KAFKA_ACK_FLOOR:-$((RECORDS / 4))}"
+# The producer is paced — a pause every PACE_EVERY records — so the stream
+# lasts seconds instead of the one second librdkafka needs for 20,000 small
+# records, and the follower kill lands INSIDE it.
+PACE_EVERY="${CHAOS_KAFKA_PACE_EVERY:-500}"
+PACE_SLEEP="${CHAOS_KAFKA_PACE_SLEEP:-0.2}"
 require_integer_in_range CHAOS_KAFKA_RECORDS "$RECORDS" 2 10000000
-HALF=$((RECORDS / 2))
+require_integer_in_range CHAOS_KAFKA_ACK_FLOOR "$ACK_FLOOR" 1 "$RECORDS"
+require_integer_in_range CHAOS_KAFKA_PACE_EVERY "$PACE_EVERY" 1 "$RECORDS"
 [[ -n "${TOPIC:-}" ]] || fail "lib.sh did not set TOPIC"
 
 F1_PID="$(start_follower 1)"
@@ -53,32 +61,59 @@ awk -v n="$RECORDS" 'BEGIN {
   for (i = 1; i <= n; i++) printf "k%06d:v%06d-%08x\n", i, i, int(rand() * 4294967295)
 }' > "$INPUT"
 
-# librdkafka's producer with acks=all: every delivery report is a quorum
-# acknowledgement from the native broker behind the gateway. `-K:` splits
-# each line into key and value; `-p 0` is the range's one partition.
+# ONE librdkafka producer for the whole stream, in the background, with
+# acks=all: every delivery report is a quorum acknowledgement from the
+# native broker behind the gateway. `-K:` splits each line into key and
+# value; `-p 0` is the range's one partition. The same process must be
+# alive when the follower dies and finish clean afterwards (review): two
+# producers around the kill would prove nothing about a stream surviving it.
 # CHAOS_KCAT_DEBUG=broker,protocol,msg turns on librdkafka's own trace, the
 # first thing to read when a delivery fails.
 # (Expanded with the `[@]+` idiom below: bash 3.2 treats an empty array as
 # unset under `set -u`.)
 KCAT_DEBUG=()
 [[ -n "${CHAOS_KCAT_DEBUG:-}" ]] && KCAT_DEBUG=(-d "$CHAOS_KCAT_DEBUG")
-kcat_produce() { # <from-line> <to-line>
-  sed -n "$1,$2p" "$INPUT" | "$KCAT" -P -b "127.0.0.1:$KAFKA_PORT" -t "$TOPIC" -p 0 -K: \
+awk -v every="$PACE_EVERY" -v pause="$PACE_SLEEP" \
+  '{ print; fflush(); if (NR % every == 0) system("sleep " pause) }' "$INPUT" \
+  | "$KCAT" -P -b "127.0.0.1:$KAFKA_PORT" -t "$TOPIC" -p 0 -K: \
     -X acks=all -X enable.idempotence=false -X message.timeout.ms=60000 ${KCAT_DEBUG[@]+"${KCAT_DEBUG[@]}"} \
-    >> "$WORKDIR/logs/kcat-produce.log" 2>&1
+    > "$WORKDIR/logs/kcat-produce.log" 2>&1 &
+PRODUCER=$!
+echo "$PRODUCER" >> "$WORKDIR/pids"
+
+# The watermark through the gateway's own ListOffsets (`kcat -Q`, LATEST):
+# the count of records the cluster has acknowledged so far.
+kafka_watermark() {
+  "$KCAT" -Q -b "127.0.0.1:$KAFKA_PORT" -t "$TOPIC:0:-1" 2>/dev/null | awk '{ print $NF }'
 }
-kcat_produce 1 "$HALF" \
-  || fail "the first half was not produced: $(tail -3 "$WORKDIR/logs/kcat-produce.log")"
-log "records 1..$HALF produced through the gateway with acks=all"
+# Wait for real progress, then kill a follower while the producer is still
+# streaming — and prove it was.
+deadline=$((SECONDS + PROGRESS_TIMEOUT_SECONDS))
+until [[ "$(kafka_watermark)" =~ ^[0-9]+$ && "$(kafka_watermark)" -ge "$ACK_FLOOR" ]]; do
+  [[ $SECONDS -lt $deadline ]] || fail "the producer made no progress to $ACK_FLOOR: $(tail -3 "$WORKDIR/logs/kcat-produce.log")"
+  kill -0 "$PRODUCER" 2>/dev/null || fail "the producer ended before reaching the floor: $(tail -3 "$WORKDIR/logs/kcat-produce.log")"
+  sleep 0.1
+done
+kill -0 "$PRODUCER" 2>/dev/null \
+  || fail "the producer finished before the kill could land inside its stream; slow it with CHAOS_KAFKA_PACE_SLEEP"
+log "watermark past $ACK_FLOOR with the producer still streaming"
 
 # A follower dies hard. The leader and follower 1 are still a majority of
 # three, so the stream must go on — and every acknowledgement is still a
 # quorum acknowledgement.
 kill -9 "$F2_PID"
-log "follower 2 killed with SIGKILL; the leader and follower 1 are the quorum left"
-kcat_produce $((HALF + 1)) "$RECORDS" \
-  || fail "produce did not continue across the follower kill: $(tail -3 "$WORKDIR/logs/kcat-produce.log")"
-log "records $((HALF + 1))..$RECORDS produced on the quorum left"
+log "follower 2 killed with SIGKILL mid-stream; the leader and follower 1 are the quorum left"
+set +e
+wait "$PRODUCER"
+PRODUCER_EXIT=$?
+set -e
+[[ $PRODUCER_EXIT -eq 0 ]] \
+  || fail "the producer exited $PRODUCER_EXIT after the follower kill: $(tail -3 "$WORKDIR/logs/kcat-produce.log")"
+! grep -q 'Delivery failed' "$WORKDIR/logs/kcat-produce.log" \
+  || fail "a delivery failed across the follower kill: $(grep -m 3 'Delivery failed' "$WORKDIR/logs/kcat-produce.log")"
+WATERMARK="$(kafka_watermark)"
+[[ "$WATERMARK" -eq "$RECORDS" ]] || fail "the watermark is $WATERMARK after the stream, not $RECORDS"
+log "the same producer finished all $RECORDS records across the kill; the watermark is $RECORDS"
 
 # The same client reads the partition back from the beginning: `-o beginning`
 # is a ListOffsets for the earliest offset, `-e` stops at the high watermark
