@@ -42,6 +42,16 @@ pub enum WireError {
     VarIntOverflow { field: &'static str, width: u32 },
     #[error("{field} carried {len} bytes of trailing data that no schema claims")]
     Trailing { field: &'static str, len: usize },
+    /// An array declaring more elements than any honest request carries
+    /// (review): the per-element cost of an empty name is two bytes, so a
+    /// frame under the byte bound can still declare millions, and the bound
+    /// has to be on the count.
+    #[error("{field} declares {declared} element(s), above the {limit}-element ceiling")]
+    TooMany {
+        field: &'static str,
+        declared: usize,
+        limit: usize,
+    },
 }
 
 /// The largest string or byte block this codec will materialise from a length

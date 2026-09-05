@@ -6,18 +6,30 @@ rust-version.workspace = true
 license.workspace = true
 description = "Kafka wire-compatibility gateway over the native VTOP broker (#225)."
 
+[features]
+# The native backend over `LocalBroker` (#225): on by default, since the
+# gateway is built to sit on the engine; a lab wanting only the in-memory
+# backend and the codecs can opt out.
+default = ["native"]
+native = ["dep:vtop-broker", "dep:vtop-protocol"]
+
 [dependencies]
 thiserror = { workspace = true }
-tokio = { version = "1", default-features = false, features = ["io-util", "net", "rt", "time", "macros"] }
+vtop-broker = { workspace = true, optional = true }
+vtop-protocol = { workspace = true, optional = true }
+tokio = { version = "1", default-features = false, features = ["io-util", "net", "rt", "sync", "time", "macros"] }
 tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
+vtop-log = { workspace = true }
 tokio = { version = "1", default-features = false, features = [
     "io-util",
     "net",
     "macros",
     "rt",
     "rt-multi-thread",
+    "sync",
     "time",
 ] }

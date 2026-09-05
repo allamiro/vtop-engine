@@ -1335,6 +1335,38 @@ impl LocalBroker {
     /// append. Metrics collection must use [`Self::try_local_offsets`] instead:
     /// a scrape that blocks takes the observability endpoint down with a
     /// stalling disk.
+    /// The earliest offset still held: the log's base after retention has
+    /// reclaimed what it reclaimed. What a consumer's `log_start_offset` is
+    /// (#225), and the floor below which a read is refused as retained.
+    /// Queues behind an append the way [`Self::local_offsets`] does.
+    pub fn earliest_offset(&self) -> u64 {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.segment.base_offset()
+    }
+
+    /// The retained floor and the committed high watermark of the log, from
+    /// ONE snapshot (#225): what a Kafka consumer is told the log spans. The
+    /// watermark is the one a fetch reports — the cluster's committed
+    /// offset clipped to what this log holds, or the log's own when no
+    /// cluster commit is known. Read under one lock, so retention rolling
+    /// segments between two reads cannot pair a floor with a watermark it
+    /// never shared a log with.
+    pub fn retained_bounds(&self) -> (u64, u64) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let committed = state.segment.committed_offset();
+        let high_watermark = self
+            .cluster_committed()
+            .map(|hwm| hwm.get().min(committed))
+            .unwrap_or(committed);
+        (state.segment.base_offset(), high_watermark)
+    }
+
     pub fn local_offsets(&self) -> (u64, u64) {
         let state = self
             .state
