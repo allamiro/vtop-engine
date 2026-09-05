@@ -1022,6 +1022,20 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
             };
             let config = load_admin_config(&common.config)?;
             let client = connect(&config)?;
+            // The replicas FIRST (review): a grant that lands between the two
+            // reads then lands after the vectors, so any epoch a replica holds
+            // is one the chain, read afterwards, has seen granted — a stray is
+            // a stray, never an artefact of timing.
+            let vectors = match replicas.as_deref() {
+                Some(path) => Some(
+                    crate::node_tools::epoch_vectors(
+                        path,
+                        std::time::Duration::from_millis(replica_timeout_ms),
+                    )
+                    .await?,
+                ),
+                None => None,
+            };
             // The WHOLE chain, paged (review): the server clamps a read to
             // its own maximum, so one read of a long history is a window,
             // and an audit over a window is not an audit of the range.
@@ -1065,23 +1079,11 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
                 from_epoch,
                 Some(lease.fencing_epoch),
             )?;
-            // The replicas' own account (#240): each epoch vector, read over
-            // the replica plane, held to the chain the metadata holds.
-            let cross = match replicas.as_deref() {
-                Some(path) => {
-                    let vectors = crate::node_tools::epoch_vectors(
-                        path,
-                        std::time::Duration::from_millis(replica_timeout_ms),
-                    )
-                    .await?;
-                    Some(cross_check_epoch_vectors(
-                        &transitions,
-                        from_epoch.max(1),
-                        &vectors,
-                    ))
-                }
-                None => None,
-            };
+            // The replicas' own account (#240): each epoch vector held to the
+            // chain the metadata holds.
+            let cross = vectors
+                .as_deref()
+                .map(|vectors| cross_check_epoch_vectors(&transitions, from_epoch.max(1), vectors));
             if json {
                 println!(
                     "{}",
@@ -2043,11 +2045,21 @@ pub enum EpochFinding {
 /// vector or why it could not be asked.
 pub type ReplicaEpochVector = (Uuid, String, Result<Vec<ReplicaEpochStart>, String>);
 
+/// What a replica said about its history.
+#[derive(Debug, PartialEq, Eq)]
+pub enum EpochVector {
+    Known(Vec<ReplicaEpochStart>),
+    /// An empty answer is UNKNOWN by the handler's own contract (review): an
+    /// older peer, or a journal it cannot read. Not "nothing to flag".
+    Unknown,
+    Unreachable(String),
+}
+
 #[derive(Debug)]
 pub struct ReplicaEpochCheck {
     pub node_uuid: Uuid,
     pub addr: String,
-    pub vector: Result<Vec<ReplicaEpochStart>, String>,
+    pub vector: EpochVector,
     pub findings: Vec<EpochFinding>,
 }
 
@@ -2057,10 +2069,12 @@ pub struct EpochCrossCheck {
 }
 
 impl EpochCrossCheck {
-    pub fn unreachable(&self) -> usize {
+    /// Replicas that could not be checked: unreachable, or with no history
+    /// to check.
+    pub fn unchecked(&self) -> usize {
         self.replicas
             .iter()
-            .filter(|replica| replica.vector.is_err())
+            .filter(|replica| !matches!(replica.vector, EpochVector::Known(_)))
             .count()
     }
 
@@ -2071,14 +2085,14 @@ impl EpochCrossCheck {
             .sum()
     }
 
-    /// A replica that could not be asked fails the cross-check too: the
+    /// A replica that could not be checked fails the cross-check too: the
     /// operator asked for it, and "not checked" is not "checked".
     pub fn verdict(&self) -> Result<(), String> {
         let mut reasons = Vec::new();
-        if self.unreachable() > 0 {
+        if self.unchecked() > 0 {
             reasons.push(format!(
-                "{} replica(s) could not be asked for their epoch vector",
-                self.unreachable()
+                "{} replica(s) could not be checked (unreachable, or no epoch history)",
+                self.unchecked()
             ));
         }
         if self.findings() > 0 {
@@ -2098,11 +2112,16 @@ impl EpochCrossCheck {
         let mut lines = Vec::new();
         for replica in &self.replicas {
             match &replica.vector {
-                Err(error) => lines.push(format!(
+                EpochVector::Unreachable(error) => lines.push(format!(
                     "replica {} {}: UNREACHABLE: {error}",
                     replica.node_uuid, replica.addr
                 )),
-                Ok(vector) => {
+                EpochVector::Unknown => lines.push(format!(
+                    "replica {} {}: UNKNOWN: no epoch history (an older peer, or a journal it \
+                     cannot read)",
+                    replica.node_uuid, replica.addr
+                )),
+                EpochVector::Known(vector) => {
                     let epochs: Vec<String> = vector
                         .iter()
                         .map(|start| format!("{}@{}", start.epoch, start.start_offset))
@@ -2141,9 +2160,9 @@ impl EpochCrossCheck {
             }
         }
         lines.push(format!(
-            "epoch vectors: {} replica(s), {} unreachable, {} finding(s)",
+            "epoch vectors: {} replica(s), {} not checked, {} finding(s)",
             self.replicas.len(),
-            self.unreachable(),
+            self.unchecked(),
             self.findings()
         ));
         lines
@@ -2155,7 +2174,11 @@ impl EpochCrossCheck {
             .iter()
             .map(|replica| {
                 let (epochs, error) = match &replica.vector {
-                    Ok(vector) => (
+                    EpochVector::Unknown => (
+                        serde_json::Value::Null,
+                        serde_json::Value::String("unknown: no epoch history".to_owned()),
+                    ),
+                    EpochVector::Known(vector) => (
                         serde_json::Value::Array(
                             vector
                                 .iter()
@@ -2169,7 +2192,7 @@ impl EpochCrossCheck {
                         ),
                         serde_json::Value::Null,
                     ),
-                    Err(error) => (
+                    EpochVector::Unreachable(error) => (
                         serde_json::Value::Null,
                         serde_json::Value::String(error.clone()),
                     ),
@@ -2205,25 +2228,28 @@ impl EpochCrossCheck {
             .collect();
         serde_json::json!({
             "replicas": replicas,
-            "unreachable": self.unreachable(),
+            "unchecked": self.unchecked(),
             "findings": self.findings(),
         })
     }
 }
 
 /// Hold each replica's epoch vector to the chain (#240): every epoch a
-/// replica wrote under must have been granted, and none may start below the
-/// boundary its promotion proved committed — records the quorum proved were
-/// written under an earlier epoch cannot have been written over under a later
-/// one. A new leader's own epoch may start ABOVE its boundary (it keeps the
-/// longer tail it was elected for); never below. Epochs below `from_epoch`
-/// were not read, and are not judged.
+/// replica wrote under must have been granted, and the HOLDER's first write
+/// under its epoch may not sit below the boundary its promotion proved
+/// committed — records the quorum proved were written under an earlier epoch
+/// cannot have been written over under a later one. The holder only
+/// (review): a follower behind at promotion adopts the new epoch at its own
+/// tail, legitimately below the boundary, as the leader replicates what it
+/// missed. A new leader's own epoch may start ABOVE its boundary (it keeps
+/// the longer tail it was elected for); never below. Epochs below
+/// `from_epoch` were not read, and are not judged.
 pub fn cross_check_epoch_vectors(
     chain: &[AdminTransitionView],
     from_epoch: u64,
     vectors: &[ReplicaEpochVector],
 ) -> EpochCrossCheck {
-    let granted: std::collections::BTreeMap<u64, Option<u64>> = chain
+    let granted: std::collections::BTreeMap<u64, (Uuid, Option<u64>)> = chain
         .iter()
         .map(|view| {
             let boundary = match &view.outcome {
@@ -2236,15 +2262,19 @@ pub fn cross_check_epoch_vectors(
                 } => *boundary_offset,
                 _ => None,
             };
-            (view.epoch_to, boundary)
+            (view.epoch_to, (view.holder_to, boundary))
         })
         .collect();
     let replicas = vectors
         .iter()
         .map(|(node_uuid, addr, vector)| {
-            let findings = match vector {
-                Err(_) => Vec::new(),
-                Ok(vector) => vector
+            let vector = match vector {
+                Err(error) => EpochVector::Unreachable(error.clone()),
+                Ok(vector) if vector.is_empty() => EpochVector::Unknown,
+                Ok(vector) => EpochVector::Known(vector.clone()),
+            };
+            let findings = match &vector {
+                EpochVector::Known(vector) => vector
                     .iter()
                     .filter(|start| start.epoch >= from_epoch)
                     .filter_map(|start| match granted.get(&start.epoch) {
@@ -2252,7 +2282,9 @@ pub fn cross_check_epoch_vectors(
                             epoch: start.epoch,
                             start_offset: start.start_offset,
                         }),
-                        Some(Some(boundary)) if start.start_offset < *boundary => {
+                        Some((holder, Some(boundary)))
+                            if holder == node_uuid && start.start_offset < *boundary =>
+                        {
                             Some(EpochFinding::BelowBoundary {
                                 epoch: start.epoch,
                                 start_offset: start.start_offset,
@@ -2262,11 +2294,12 @@ pub fn cross_check_epoch_vectors(
                         Some(_) => None,
                     })
                     .collect(),
+                EpochVector::Unknown | EpochVector::Unreachable(_) => Vec::new(),
             };
             ReplicaEpochCheck {
                 node_uuid: *node_uuid,
                 addr: addr.clone(),
-                vector: vector.clone(),
+                vector,
                 findings,
             }
         })
@@ -2658,13 +2691,20 @@ mod tests {
     use super::*;
 
     /// #240: a replica's epoch vector is held to the chain — an epoch no
-    /// grant explains, or one starting below the boundary its promotion
-    /// proved, is a finding; a replica that cannot be asked fails the check
+    /// grant explains, or the holder's epoch starting below the boundary its
+    /// promotion proved, is a finding; a follower behind at promotion is not;
+    /// a replica that cannot be asked, or has no history, fails the check
     /// rather than passing it.
     #[test]
     fn epoch_vectors_are_held_to_the_chain() {
-        let holder = Uuid::from_u128(0xa);
-        let established = |epoch_to: u64, boundary: u64| AdminTransitionView {
+        let (a, b, c, d, e) = (
+            Uuid::from_u128(1),
+            Uuid::from_u128(2),
+            Uuid::from_u128(3),
+            Uuid::from_u128(4),
+            Uuid::from_u128(5),
+        );
+        let established = |epoch_to: u64, holder: Uuid, boundary: u64| AdminTransitionView {
             epoch_from: epoch_to - 1,
             epoch_to,
             holder_from: None,
@@ -2685,28 +2725,36 @@ mod tests {
             },
             mac: None,
         };
-        let chain = vec![established(1, 0), established(2, 120), established(3, 340)];
+        let chain = vec![
+            established(1, a, 0),
+            established(2, a, 120),
+            established(3, b, 340),
+        ];
         let start = |epoch, start_offset| ReplicaEpochStart {
             epoch,
             start_offset,
         };
-        let (a, b, c) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
         let vectors = vec![
-            // The elected leader kept a longer tail: epoch 3 starts above
-            // its boundary, which is allowed.
+            // The old holder, caught up under epoch 3 from its own tail: not
+            // the holder of 3, so its boundary does not bind it.
             (
                 a,
                 "a:1".to_owned(),
                 Ok(vec![start(1, 0), start(2, 120), start(3, 400)]),
             ),
-            // Written over below the proven boundary, then under an epoch
-            // nobody granted.
+            // The holder of epoch 3, written over below the boundary its
+            // quorum proved, then under an epoch nobody granted.
             (
                 b,
                 "b:1".to_owned(),
                 Ok(vec![start(1, 0), start(3, 300), start(4, 500)]),
             ),
             (c, "c:1".to_owned(), Err("connection refused".to_owned())),
+            // A follower behind at promotion adopts epoch 3 at its own tail
+            // (review): legitimate, and clean.
+            (d, "d:1".to_owned(), Ok(vec![start(1, 0), start(3, 50)])),
+            // No history at all is UNKNOWN, not clean (review).
+            (e, "e:1".to_owned(), Ok(Vec::new())),
         ];
         let check = cross_check_epoch_vectors(&chain, 1, &vectors);
         assert!(
@@ -2728,11 +2776,16 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(check.unreachable(), 1);
+        assert!(
+            check.replicas[3].findings.is_empty(),
+            "a lagging follower is clean"
+        );
+        assert_eq!(check.replicas[4].vector, EpochVector::Unknown);
+        assert_eq!(check.unchecked(), 2, "unreachable and unknown alike");
         assert_eq!(check.findings(), 2);
         let refusal = check.verdict().unwrap_err();
         assert!(
-            refusal.contains("1 replica(s) could not be asked")
+            refusal.contains("2 replica(s) could not be checked")
                 && refusal.contains("2 epoch-vector finding(s)"),
             "{refusal}"
         );
@@ -2740,13 +2793,16 @@ mod tests {
         assert!(
             text.contains("BELOW BOUNDARY: epoch 3 starts at 300, its promotion proved 340")
                 && text.contains("STRAY EPOCH 4 starting at 500")
-                && text.contains("UNREACHABLE: connection refused"),
+                && text.contains("UNREACHABLE: connection refused")
+                && text.contains("UNKNOWN: no epoch history"),
             "{text}"
         );
         let json = check.json();
         assert_eq!(json["findings"], 2);
+        assert_eq!(json["unchecked"], 2);
         assert_eq!(json["replicas"][1]["findings"][0]["kind"], "below_boundary");
         assert!(json["replicas"][2]["epochs"].is_null());
+        assert!(json["replicas"][4]["epochs"].is_null());
 
         // Epochs below the epoch read were not read, and are not judged.
         let later = cross_check_epoch_vectors(&chain[1..], 2, &vectors[..1]);
