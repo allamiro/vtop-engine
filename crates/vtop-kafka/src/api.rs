@@ -17,6 +17,10 @@ use crate::wire::{Decoder, Encoder, WireError};
 /// serve. Checked BEFORE anything is allocated for the count.
 pub const MAX_TOPICS: usize = 1024;
 pub const MAX_PARTITIONS: usize = 1024;
+/// And across the WHOLE request (review): the two ceilings above multiply to
+/// a million partition entries in a frame under the byte bound, each of them
+/// a bridge call; one request may carry this many in total.
+pub const MAX_PARTITIONS_PER_REQUEST: usize = 4096;
 
 /// The longest error message written to the wire: a STRING is an `i16`
 /// length, and a message that quoted a maximal transactional id would not
@@ -30,6 +34,24 @@ fn bounded(d: &mut Decoder<'_>, field: &'static str, limit: usize) -> Result<usi
             field,
             declared,
             limit,
+        });
+    }
+    Ok(declared)
+}
+
+/// The partitions of one topic, counted against the request-wide ceiling.
+fn partitions_within(
+    d: &mut Decoder<'_>,
+    field: &'static str,
+    total: &mut usize,
+) -> Result<usize, WireError> {
+    let declared = bounded(d, field, MAX_PARTITIONS)?;
+    *total += declared;
+    if *total > MAX_PARTITIONS_PER_REQUEST {
+        return Err(WireError::TooMany {
+            field,
+            declared: *total,
+            limit: MAX_PARTITIONS_PER_REQUEST,
         });
     }
     Ok(declared)
@@ -222,9 +244,10 @@ pub fn decode_produce(d: &mut Decoder<'_>, _version: i16) -> Result<ProduceReque
     let timeout_ms = d.i32("produce.timeoutMs")?;
     let topic_count = bounded(d, "produce.topicData", MAX_TOPICS)?;
     let mut topics = Vec::with_capacity(topic_count);
+    let mut total = 0;
     for _ in 0..topic_count {
         let name = d.string("produce.topicData.name")?.to_owned();
-        let partition_count = bounded(d, "produce.partitionData", MAX_PARTITIONS)?;
+        let partition_count = partitions_within(d, "produce.partitionData", &mut total)?;
         let mut partitions = Vec::with_capacity(partition_count);
         for _ in 0..partition_count {
             let index = d.i32("produce.partitionData.index")?;
@@ -331,9 +354,10 @@ pub fn decode_fetch(d: &mut Decoder<'_>, version: i16) -> Result<FetchRequest, W
     };
     let topic_count = bounded(d, "fetch.topics", MAX_TOPICS)?;
     let mut topics = Vec::with_capacity(topic_count);
+    let mut total = 0;
     for _ in 0..topic_count {
         let name = d.string("fetch.topics.topic")?.to_owned();
-        let partition_count = bounded(d, "fetch.topics.partitions", MAX_PARTITIONS)?;
+        let partition_count = partitions_within(d, "fetch.topics.partitions", &mut total)?;
         let mut partitions = Vec::with_capacity(partition_count);
         for _ in 0..partition_count {
             let index = d.i32("fetch.partitions.partition")?;
@@ -455,9 +479,10 @@ pub fn decode_list_offsets(
     };
     let topic_count = bounded(d, "listOffsets.topics", MAX_TOPICS)?;
     let mut topics = Vec::with_capacity(topic_count);
+    let mut total = 0;
     for _ in 0..topic_count {
         let name = d.string("listOffsets.topics.name")?.to_owned();
-        let partition_count = bounded(d, "listOffsets.topics.partitions", MAX_PARTITIONS)?;
+        let partition_count = partitions_within(d, "listOffsets.topics.partitions", &mut total)?;
         let mut partitions = Vec::with_capacity(partition_count);
         for _ in 0..partition_count {
             let index = d.i32("listOffsets.partitions.partitionIndex")?;
@@ -798,6 +823,25 @@ mod tests {
                 field: "listOffsets.topics",
                 ..
             })
+        ));
+    }
+
+    /// The per-topic ceilings multiply (review): a request is also capped
+    /// on the partitions it carries in total.
+    #[test]
+    fn partitions_are_capped_across_the_whole_request() {
+        let mut e = Encoder::new();
+        e.i32(-1); // replica_id
+        e.array_len(MAX_TOPICS);
+        for _ in 0..MAX_TOPICS {
+            e.string("t");
+            e.array_len(MAX_PARTITIONS);
+            e.raw(&vec![0_u8; 12 * MAX_PARTITIONS]); // index + timestamp per entry
+        }
+        let bytes = e.into_vec();
+        assert!(matches!(
+            decode_list_offsets(&mut Decoder::new(&bytes), 1),
+            Err(WireError::TooMany { field: "listOffsets.topics.partitions", limit, .. }) if limit == MAX_PARTITIONS_PER_REQUEST
         ));
     }
 

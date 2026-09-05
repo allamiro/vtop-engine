@@ -164,6 +164,35 @@ impl Bridge for NativeBridge {
         if batches.is_empty() || batches.iter().any(|batch| batch.records.is_empty()) {
             return Err(ErrorCode::InvalidRecord);
         }
+        // The native record has no null (review), and a shape the log cannot
+        // hold is refused rather than bent: a null VALUE is a tombstone, and
+        // storing it as empty bytes would read back as a real empty message;
+        // a present-but-empty KEY would read back as null, since an empty
+        // native key is how a null key is kept. A null key and an empty
+        // native key are one shape and round-trip as null; everything else
+        // round-trips exactly.
+        for (which, batch) in batches.iter().enumerate() {
+            for (index, record) in batch.records.iter().enumerate() {
+                if record.value.is_none() {
+                    tracing::warn!(
+                        which,
+                        index,
+                        "native produce refused: a null value (tombstone) has no representation in \
+                         the native log; send an empty value, or none of this record"
+                    );
+                    return Err(ErrorCode::InvalidRecord);
+                }
+                if matches!(&record.key, Some(key) if key.is_empty()) {
+                    tracing::warn!(
+                        which,
+                        index,
+                        "native produce refused: an empty key would read back as null; send a null \
+                         key (no key) instead"
+                    );
+                    return Err(ErrorCode::InvalidRecord);
+                }
+            }
+        }
         // The whole set is ONE native append (review): the broker takes a
         // request's records atomically, so a set is acknowledged whole or
         // refused whole, never half durable for a client to retry into.
@@ -172,8 +201,6 @@ impl Bridge for NativeBridge {
             .flat_map(|batch| batch.records.iter())
             .map(|record| ProduceRecord {
                 timestamp_millis: record.timestamp_millis,
-                // The native record has no null: a Kafka null key or value
-                // arrives as empty bytes, and reads back as empty.
                 key: record.key.clone().unwrap_or_default(),
                 value: record.value.clone().unwrap_or_default(),
             })
@@ -212,6 +239,7 @@ impl Bridge for NativeBridge {
                 Ok(Appended {
                     base_offset,
                     log_append_time_ms: -1,
+                    log_start_offset: self.broker.earliest_offset() as i64,
                 })
             }
             Message::Error(error) => {
@@ -430,10 +458,11 @@ mod tests {
             2
         );
         assert_eq!(second.high_watermark("events").unwrap(), 3);
-        let mut epochs: Vec<u64> = (0..64).map(|_| mint_producer_epoch()).collect();
-        let sorted = epochs.clone();
-        epochs.dedup();
-        assert_eq!(epochs, sorted, "minted epochs are strictly increasing");
+        let epochs: Vec<u64> = (0..64).map(|_| mint_producer_epoch()).collect();
+        assert!(
+            epochs.windows(2).all(|pair| pair[0] < pair[1]),
+            "minted epochs are strictly increasing: {epochs:?}"
+        );
     }
 
     fn batch(values: &[(&str, Option<&str>)]) -> RecordBatch {
@@ -503,6 +532,35 @@ mod tests {
             bridge.fetch("events", 4, 1 << 20).unwrap_err(),
             ErrorCode::OffsetOutOfRange
         );
+    }
+
+    /// The shapes the native log cannot hold are refused, not bent (review):
+    /// a null value and an empty key; a null key round-trips as null.
+    #[test]
+    fn a_tombstone_and_an_empty_key_are_refused_and_a_null_key_round_trips() {
+        let (_dir, broker) = broker();
+        let bridge = bridge(broker);
+        let mut tombstone = batch(&[("a", None)]);
+        tombstone.records[0].value = None;
+        assert_eq!(
+            bridge.produce("events", &[tombstone]).unwrap_err(),
+            ErrorCode::InvalidRecord
+        );
+        assert_eq!(
+            bridge
+                .produce("events", &[batch(&[("a", Some(""))])])
+                .unwrap_err(),
+            ErrorCode::InvalidRecord
+        );
+        assert_eq!(bridge.bounds("events").unwrap(), (0, 0), "nothing landed");
+        bridge
+            .produce("events", &[batch(&[("a", None), ("b", Some("k"))])])
+            .unwrap();
+        let decoded =
+            RecordBatch::decode(&bridge.fetch("events", 0, 1 << 20).unwrap().records).unwrap();
+        assert_eq!(decoded.records[0].key, None);
+        assert_eq!(decoded.records[1].key.as_deref(), Some(b"k".as_slice()));
+        assert_eq!(decoded.records[0].value.as_deref(), Some(b"a".as_slice()));
     }
 
     /// A two-batch set is one native append (review): contiguous, one
