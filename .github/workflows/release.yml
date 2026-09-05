@@ -218,11 +218,36 @@ jobs:
           # docs link to, the bundle carries.
           #
           # `2>/dev/null || true` is kept for the reason it was here before, but
-          # it now hides five possible absences rather than two, so the two that
-          # must never be missing are asserted explicitly.
+          # it hides every possible absence, so the files that must never be
+          # missing are asserted explicitly below.
           cp README.md LICENSE LICENSE-EE COMMERCIAL.md CONTRIBUTING.md \
             "dist/$name/" 2>/dev/null || true
-          for required in LICENSE LICENSE-EE; do
+          # CONTRIBUTING.md sends a reader to docs/SECURITY_MODEL.md, which
+          # itself links the protocol draft and its neighbours — the closure
+          # rule is transitive, and chasing it link by link is a game this
+          # step loses every time a doc gains a reference (review). The
+          # WHOLE docs tree ships instead: markdown weighs nothing next to
+          # the binaries, and a closed set stays closed by construction.
+          mkdir -p "dist/$name/docs"
+          cp -r docs/. "dist/$name/docs/" 2>/dev/null || true
+          # The docs tree's own links reach OUTSIDE it (review, round two):
+          # grep '\.\./' docs/*.md enumerates the full out-of-tree target
+          # set — ../README.md (already at the bundle root), the benchmarks
+          # README, the audit-exception file SECURITY_MODEL cites, and this
+          # workflow itself. Copied preserving layout so every relative
+          # link in the shipped tree resolves; the grep is the maintenance
+          # tool when a doc gains a new escape.
+          mkdir -p "dist/$name/benchmarks" "dist/$name/.cargo" "dist/$name/.github/workflows"
+          cp benchmarks/README.md "dist/$name/benchmarks/" 2>/dev/null || true
+          cp .cargo/audit.toml "dist/$name/.cargo/" 2>/dev/null || true
+          cp .github/workflows/release.yml "dist/$name/.github/workflows/" 2>/dev/null || true
+          # Every file the closure DEPENDS on is asserted (review): the
+          # licenses the archive must never ship without, the security model
+          # as the sentinel for the docs tree having copied, and the three
+          # out-of-tree escapes — whose `|| true` copies would otherwise
+          # no-op silently the day one of them moves.
+          for required in LICENSE LICENSE-EE docs/SECURITY_MODEL.md \
+            benchmarks/README.md .cargo/audit.toml .github/workflows/release.yml; do
             [ -f "dist/$name/$required" ] \
               || { echo "::error::$required is missing from the release bundle"; exit 1; }
           done

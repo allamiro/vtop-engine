@@ -2016,6 +2016,551 @@ pub(crate) fn roll_in_with(
     Ok((sealed, successor))
 }
 
+/// The placeholder id the torn-classification template is encoded with —
+/// distinctive so its 36-byte hyphenated span can be located inside the
+/// template JSON and excluded from the prefix comparison: a legitimate
+/// successor mints its own id there, and every other descriptor byte is
+/// deterministic from the sealed predecessor.
+const TORN_TEMPLATE_ID: Uuid = Uuid::from_u128(0xF0F0_F0F0_F0F0_F0F0_F0F0_F0F0_F0F0_F0F0);
+
+/// Whether `candidate` is consistent with being a torn PREFIX of the
+/// `template` successor header (#410): every available byte must agree
+/// with the template wherever the template is deterministic — the magic,
+/// and the descriptor JSON up to the config boundary — with the 4-byte
+/// length field (config-dependent) and the segment-id span (the
+/// successor's own fixed-width choice) excluded. A torn write can only
+/// ever be a prefix of a real header, so any divergence in those regions
+/// proves the file is something else — a foreign artifact to quarantine,
+/// never to delete.
+/// The claim's admissible interval, both ends derived from the VALIDATOR
+/// (#410, review round ten): the smallest json a config it accepts can
+/// produce, and the largest — every field at its ceiling, which validates
+/// by construction since the ceilings are mutually consistent. A claim
+/// outside this interval names a json no successor of this range ever
+/// encoded, whatever the codec's raw MAX_HEADER_BYTES would tolerate.
+struct TornClaimBounds {
+    min_valid_json_len: usize,
+    max_valid_json_len: usize,
+}
+
+/// How many digits beyond the template's one-per-field narrowest ANY valid
+/// completion of the observed runs must carry (#410, review round ten): a
+/// closed value contributes its own width, an open run its smallest
+/// spelled continuation at or above the chain's floor, and an unobserved
+/// field the width of its forced minimum — the validator's chain (group at
+/// least the record plus frame overhead, segment at least the group, the
+/// v2 chunk at least its band's floor) propagates through whichever of
+/// those is in play. Under-approximation is the sound direction here: this
+/// feeds a `claim >= minimum` refusal, so any shortfall in the estimate
+/// only widens what is accepted, never deletes a genuine prefix.
+fn forced_extra_digits(sealed: &AnyHeader, runs: &[(u128, bool)]) -> usize {
+    fn digits(value: u128) -> usize {
+        value.to_string().len()
+    }
+    /// The smallest continuation of `observed` at or above `floor`, as
+    /// (value, digits): appending zeros yields the smallest continuation of
+    /// each length, and a lone zero admits no continuation at all.
+    fn min_continuation(observed: u128, floor: u128) -> (u128, usize) {
+        if observed == 0 {
+            return (0, 1);
+        }
+        // A width admits the floor when its LARGEST spelling of the prefix
+        // reaches it — 9 continues to 93 at width two, even though the
+        // width's smallest continuation (90) sits below 93. Judging widths
+        // by their smallest continuation overshot by a digit and deleted
+        // genuine prefixes of exactly the minimal valid config.
+        let mut width = digits(observed);
+        let mut smallest_of_width = observed;
+        let mut largest_of_width = observed;
+        while largest_of_width < floor {
+            smallest_of_width = smallest_of_width.saturating_mul(10);
+            largest_of_width = largest_of_width.saturating_mul(10).saturating_add(9);
+            width += 1;
+        }
+        (smallest_of_width.max(floor), width)
+    }
+    fn resolve(runs: &[(u128, bool)], at: usize, floor: u128) -> (u128, usize) {
+        match runs.get(at) {
+            Some((value, true)) => (*value, digits(*value)),
+            Some((value, false)) => min_continuation(*value, floor),
+            None => (floor, digits(floor)),
+        }
+    }
+    let (overhead, chunk_floor) = match sealed {
+        AnyHeader::V1(_) => (crate::types::RECORD_FRAME_OVERHEAD_BYTES as u128, None),
+        AnyHeader::V2(_) => (
+            crate::codec_v2::RECORD_FRAME_OVERHEAD_BYTES_V2 as u128,
+            Some(crate::types::MIN_CHUNK_SIZE_BYTES as u128),
+        ),
+    };
+    let (record, record_width) = resolve(runs, 0, 1);
+    let group_floor = record.saturating_add(overhead).max(1);
+    let (group, group_width) = resolve(runs, 1, group_floor);
+    let (_, segment_width) = resolve(runs, 2, group.max(1));
+    let (_, records_width) = resolve(runs, 3, 1);
+    let (_, stride_width) = resolve(runs, 4, 1);
+    // The chunk's widths come from its attainable powers of two (review,
+    // round twelve), not from a plain floor: an open "6" reaches 65536 at
+    // five digits, and nothing else in the band spells it.
+    let chunk_width = if chunk_floor.is_some() {
+        chunk_width_bounds(runs.get(5)).0 - 1
+    } else {
+        0
+    };
+    (record_width - 1)
+        + (group_width - 1)
+        + (segment_width - 1)
+        + (records_width - 1)
+        + (stride_width - 1)
+        + chunk_width
+}
+
+/// The chunk field's digit widths over its ATTAINABLE values (#410,
+/// review round twelve): a chunk size is one of the nine powers of two in
+/// its band, so an open run's admissible widths come from the powers that
+/// spell the observed digits as a prefix — not from every number under
+/// the ceiling. `None` when nothing in the band spells the prefix, which
+/// the extendability judge refuses on its own; width bounds then fall
+/// back to the observed width, keeping this a pure width question.
+fn chunk_width_bounds(run: Option<&(u128, bool)>) -> (usize, usize) {
+    let band: Vec<u128> = {
+        let mut powers = Vec::new();
+        let mut chunk = crate::types::MIN_CHUNK_SIZE_BYTES as u128;
+        while chunk <= crate::types::MAX_CHUNK_SIZE_BYTES as u128 {
+            powers.push(chunk);
+            chunk *= 2;
+        }
+        powers
+    };
+    match run {
+        None => (
+            band.first().map_or(1, |p| p.to_string().len()),
+            band.last().map_or(1, |p| p.to_string().len()),
+        ),
+        Some((value, true)) => {
+            let width = value.to_string().len();
+            (width, width)
+        }
+        Some((value, false)) => {
+            let spelled = value.to_string();
+            let widths: Vec<usize> = band
+                .iter()
+                .map(|p| p.to_string())
+                .filter(|p| p.starts_with(&spelled))
+                .map(|p| p.len())
+                .collect();
+            match (widths.iter().min(), widths.iter().max()) {
+                (Some(&narrow), Some(&wide)) => (narrow, wide),
+                _ => (spelled.len(), spelled.len()),
+            }
+        }
+    }
+}
+
+/// The mirror bound (#410, review round eleven): the MOST digits any valid
+/// completion of the observed runs can carry — closed values are exact,
+/// an open run contributes its widest continuation under the field's
+/// ceiling, and an unseen field the ceiling's own width. Feeds a
+/// `claim <= maximum` refusal, so over-approximation is the sound
+/// direction: a generous estimate only widens what is accepted.
+fn widest_extra_digits(sealed: &AnyHeader, runs: &[(u128, bool)]) -> usize {
+    fn digits(value: u128) -> usize {
+        value.to_string().len()
+    }
+    fn resolve(runs: &[(u128, bool)], at: usize, ceiling: u128) -> usize {
+        match runs.get(at) {
+            Some((value, true)) => digits(*value),
+            Some((value, false)) => continuation_range(*value, ceiling)
+                .map_or(digits(*value), |(_, widest)| digits(widest)),
+            None => digits(ceiling),
+        }
+    }
+    let chunk = match sealed {
+        AnyHeader::V1(_) => 0,
+        // The chunk's widest width comes from its attainable powers of two
+        // (review, round twelve), not from every number under the ceiling.
+        AnyHeader::V2(_) => chunk_width_bounds(runs.get(5)).1 - 1,
+    };
+    (resolve(runs, 0, u128::from(crate::types::MAX_RECORD_BYTES)) - 1)
+        + (resolve(runs, 1, u128::from(crate::types::MAX_GROUP_BYTES)) - 1)
+        + (resolve(runs, 2, u128::from(crate::types::MAX_SEGMENT_BYTES)) - 1)
+        + (resolve(runs, 3, u128::from(crate::types::MAX_SEGMENT_RECORDS)) - 1)
+        + (resolve(runs, 4, u128::from(u32::MAX)) - 1)
+        + chunk
+}
+
+fn torn_prefix_matches_template(
+    candidate: &[u8],
+    template: &[u8],
+    sealed: &AnyHeader,
+    bounds: &TornClaimBounds,
+) -> Option<Vec<(u128, bool)>> {
+    if !candidate
+        .iter()
+        .take(8)
+        .zip(template.iter())
+        .all(|(have, want)| have == want)
+    {
+        return None;
+    }
+    if template.len() < 12 + crate::codec::CHECKSUM_LEN {
+        return None;
+    }
+    let template_json = &template[12..template.len() - crate::codec::CHECKSUM_LEN];
+    let id_string = TORN_TEMPLATE_ID.as_hyphenated().to_string();
+    let id_at = template_json
+        .windows(id_string.len())
+        .position(|window| window == id_string.as_bytes());
+    let config_at = template_json
+        .windows(b"\"config\":".len())
+        .position(|window| window == b"\"config\":");
+    let (Some(id_at), Some(config_at)) = (id_at, config_at) else {
+        return None;
+    };
+    let id_span = id_at..id_at + id_string.len();
+    // The id's VALUE is the successor's own choice, but its SHAPE is not
+    // (review): the serializer emits exactly lowercase hex with hyphens at
+    // positions 8, 13, 18 and 23, so the observed bytes inside the span —
+    // a prefix, when the cut lands there — must spell that shape or the
+    // file was never a prefix of any header the codec wrote.
+    for at in id_span.clone() {
+        let candidate_at = 12 + at;
+        if candidate_at >= candidate.len() {
+            break;
+        }
+        let byte = candidate[candidate_at];
+        let canonical = match at - id_at {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase(),
+        };
+        if !canonical {
+            return None;
+        }
+    }
+    // The length field is config-dependent, so its exact value is unknowable
+    // — but it is BOUNDABLE (review): any real successor's JSON is at least
+    // the narrowest template's and at most the codec's ceiling. A candidate
+    // claiming something outside that range is not a prefix of any real
+    // header. That holds for a cut INSIDE the field too (review, round
+    // eight): the bytes present are the high-order bytes of a big-endian
+    // value, so with `k` of four in hand the true length lies in
+    // `[prefix << 8(4-k), prefix << 8(4-k) | (2^(8(4-k)) - 1)]` — and a
+    // first byte of `0xff` already names a length above the ceiling
+    // whatever the missing bytes were. Only the interval is judged; the
+    // unknown low-order bytes are never guessed.
+    let length_bytes = candidate.len().saturating_sub(8).min(4);
+    if length_bytes > 0 {
+        let prefix = candidate[8..8 + length_bytes]
+            .iter()
+            .fold(0_u64, |acc, byte| (acc << 8) | u64::from(*byte));
+        let unknown_bits = 8 * (4 - length_bytes as u32);
+        let lowest = prefix << unknown_bits;
+        let highest = lowest | ((1_u64 << unknown_bits) - 1);
+        // BOTH bounds come from the validator (review, rounds nine and
+        // ten): the all-ones template is deliberately invalid, so a claim
+        // clearing its shape can still name a json no real successor ever
+        // encoded — and the codec's raw ceiling is far above what any
+        // valid config's bounded decimal widths can reach, so a claim of a
+        // megabyte names nothing this range could produce either.
+        if highest < bounds.min_valid_json_len as u64 || lowest > bounds.max_valid_json_len as u64 {
+            return None;
+        }
+    }
+    let comparable = candidate.len().saturating_sub(12).min(config_at);
+    if !(0..comparable).all(|at| id_span.contains(&at) || candidate[12 + at] == template_json[at]) {
+        return None;
+    }
+    // The config region is unknown in VALUE but not in SHAPE (review, round
+    // five): its key names and punctuation are fixed by the codec — only
+    // the digit runs vary — so a candidate that reaches past the config
+    // boundary must interleave the template's literal chunks with nonempty
+    // digit runs. Corruption that flips a key byte or a brace diverges; a
+    // genuine torn cut, ending anywhere inside the walk — or in the
+    // checksum bytes after a complete shape — cannot.
+    let (runs, json_complete_at) = if candidate.len().saturating_sub(12) > config_at {
+        let (runs, complete_have) =
+            config_shape_runs(&candidate[12 + config_at..], &template_json[config_at..])?;
+        (runs, complete_have.map(|have| config_at + have))
+    } else {
+        (Vec::new(), None)
+    };
+    // The claim must describe THIS file's own json (review, round eight —
+    // the interval check above bounds it against the RANGE's possibilities,
+    // this one against the FILE's): a torn write carries its true length,
+    // so the bytes present are a prefix of a json exactly that long. A
+    // completed shape pins the json length exactly — the claim must equal
+    // it, and whatever follows can only be checksum — while a cut mid-json
+    // means the claim must at least cover what is already on disk. A file
+    // failing either was never a prefix of itself, whatever else it is.
+    if candidate.len() >= 12 {
+        let claimed =
+            u32::from_be_bytes(candidate[8..12].try_into().expect("fixed slice")) as usize;
+        match json_complete_at {
+            Some(json_len) => {
+                if claimed != json_len
+                    || candidate.len() - 12 - json_len > crate::codec::CHECKSUM_LEN
+                {
+                    return None;
+                }
+                // A complete json makes the checksum COMPUTABLE (review,
+                // round nine): it is the hash of exactly the bytes before
+                // it, all of which are present, so whatever trailing bytes
+                // the cut left must be a prefix of that hash. A trailing
+                // byte that disagrees was never written by `encode_header`
+                // — damage to a header that once existed whole, and
+                // evidence to keep.
+                let expected = blake3::hash(&candidate[..12 + json_len]);
+                if candidate[12 + json_len..]
+                    != expected.as_bytes()[..candidate.len() - 12 - json_len]
+                {
+                    return None;
+                }
+            }
+            None => {
+                // The digits already on disk bound the claim from below as
+                // well (review, round nine): the json is the template's
+                // length plus every digit a value carries beyond the
+                // template's one-digit narrowest, so a claim the observed
+                // digits have already outgrown describes no continuation of
+                // this file — and a claim exactly the bytes present says the
+                // json ends here, where the shape says it does not.
+                // ...and the validator's chain forces widths on fields
+                // not yet seen (review, round ten): closing the record
+                // limit at eight digits forces the group and segment
+                // limits to at least eight digits each, so a claim with
+                // room for only the digits observed cannot contain any
+                // valid completion.
+                let extra_digits = forced_extra_digits(sealed, &runs);
+                let present = candidate.len() - 12;
+                if claimed <= present || claimed < template_json.len() + extra_digits {
+                    return None;
+                }
+                // ...and from ABOVE by the widest completion the observed
+                // runs still admit (review, round eleven): with every
+                // field closed but the last, a claim of the whole range's
+                // maximum names a json these bytes can never grow into.
+                if claimed > template_json.len() + widest_extra_digits(sealed, &runs) {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(runs)
+}
+
+/// One config digit run in field order — the parsed value and whether the
+/// candidate continued past it (only the final run can be open) — plus,
+/// for the full walk, where the json completed when it did.
+type ConfigRuns = (Vec<(u128, bool)>, Option<usize>);
+
+/// Walk the `template` config region's SHAPE against `candidate`: literal
+/// bytes must match, and each of the template's digit runs must be met by a
+/// nonempty digit run in the candidate (of any width — real configs encode
+/// wider than the narrowest template). A candidate that ends mid-walk is a
+/// consistent prefix; bytes remaining after the shape completes are the
+/// checksum's and are not judged.
+///
+/// `None` means the shape diverged. `Some(runs)` carries each candidate
+/// digit run as `(value, completed)` in field order — completed meaning the
+/// candidate continued past the run, so the value is closed; only the final
+/// run can be open, and an open run is a prefix of an unknown wider value
+/// that no check may be held against.
+fn config_shape_runs(candidate: &[u8], template: &[u8]) -> Option<ConfigRuns> {
+    let mut runs = Vec::new();
+    let mut have = 0usize;
+    let mut want = 0usize;
+    while have < candidate.len() && want < template.len() {
+        if template[want].is_ascii_digit() {
+            let run_start = have;
+            while have < candidate.len() && candidate[have].is_ascii_digit() {
+                have += 1;
+            }
+            if have == run_start {
+                // Bytes exist where a digit run must begin, and none of
+                // them is a digit: not a prefix of any real config.
+                return None;
+            }
+            // The digits themselves have two checkable impossibilities
+            // (review, round six): canonical JSON never writes a leading
+            // zero — and a torn cut cannot manufacture one, since every
+            // prefix of a canonical number starts with its first digit —
+            // and no config field is wider than a u64, so a run past
+            // twenty digits describes a value no header ever encoded,
+            // truncated or not.
+            let run = &candidate[run_start..have];
+            if (run[0] == b'0' && run.len() > 1) || run.len() > 20 {
+                return None;
+            }
+            let mut value: u128 = 0;
+            for digit in run {
+                value = value * 10 + u128::from(digit - b'0');
+            }
+            runs.push((value, have < candidate.len()));
+            while want < template.len() && template[want].is_ascii_digit() {
+                want += 1;
+            }
+        } else {
+            if candidate[have] != template[want] {
+                return None;
+            }
+            have += 1;
+            want += 1;
+        }
+    }
+    // `want` exhausting the template means the candidate's json COMPLETED
+    // at `have` — the fact the caller's length cross-check needs (review,
+    // round eight); anything after it can only be checksum bytes.
+    Some((runs, (want == template.len()).then_some(have)))
+}
+
+/// Whether the candidate's config values can extend into any config the
+/// codec would actually write (#410, review rounds seven and eight): a
+/// value whose closing byte is present is final, and a final combination
+/// the real `validate()` refuses — a group limit too small for its own
+/// record limit, a chunk size that is not a power of two — is a config no
+/// successor ever encoded, truncated or not. Judged by the REAL validator
+/// so the rules live in one place, with every field not fully known filled
+/// by the most forgiving value it could still take:
+///
+/// - a field the cut never reached takes 1 or its ceiling, whichever
+///   direction its chained constraint needs;
+/// - an OPEN run — the cut fell inside its digits — is not unknown: the
+///   true value is a CONTINUATION of the digits seen, so it is at least the
+///   run's own value and its decimal spelling begins with those digits.
+///   `70000000` cut mid-run can never become anything below seventy
+///   million, so a record limit that already exceeds its ceiling is refused
+///   rather than filled with `1`. The fill is the smallest continuation
+///   where the chain wants small, the largest continuation under the
+///   ceiling where it wants large, and the only power of two among the
+///   continuations for the chunk size.
+///
+/// The fields arrive in encoding order and an open run can only be the
+/// last, so every fill sits AFTER every closed value in the chain — which
+/// is what makes "most forgiving" well-defined: the chained constraints
+/// only ever look back at closed values.
+fn config_prefix_extendable(sealed: &AnyHeader, runs: &[(u128, bool)]) -> bool {
+    /// How a field not fully known is filled: the smallest value it could
+    /// still be, or the largest at or under `ceiling`.
+    #[derive(Clone, Copy)]
+    enum Fill {
+        Smallest,
+        LargestUnder(u128),
+    }
+    fn field<T: TryFrom<u128>>(
+        runs: &[(u128, bool)],
+        at: usize,
+        absent: T,
+        fill: Fill,
+    ) -> Option<T> {
+        let value = match runs.get(at) {
+            None => return Some(absent),
+            Some((value, true)) => *value,
+            Some((value, false)) => match fill {
+                Fill::Smallest => *value,
+                Fill::LargestUnder(ceiling) => continuation_range(*value, ceiling)?.1,
+            },
+        };
+        T::try_from(value).ok()
+    }
+    /// The chunk size must be a power of two in its band, so an open run is
+    /// extendable exactly when one of those nine values spells the digits
+    /// seen as its prefix.
+    fn chunk_size(runs: &[(u128, bool)]) -> Option<u32> {
+        let (value, closed) = match runs.get(5) {
+            None => return Some(crate::types::MIN_CHUNK_SIZE_BYTES),
+            Some(run) => *run,
+        };
+        if closed {
+            return u32::try_from(value).ok();
+        }
+        let digits = value.to_string();
+        let mut power = crate::types::MIN_CHUNK_SIZE_BYTES;
+        while power <= crate::types::MAX_CHUNK_SIZE_BYTES {
+            if power.to_string().starts_with(&digits) {
+                return Some(power);
+            }
+            power = power.checked_mul(2)?;
+        }
+        None
+    }
+    let Some(max_record_bytes) = field(runs, 0, 1_u32, Fill::Smallest) else {
+        return false;
+    };
+    let Some(max_group_bytes) = field(
+        runs,
+        1,
+        crate::types::MAX_GROUP_BYTES,
+        Fill::LargestUnder(u128::from(crate::types::MAX_GROUP_BYTES)),
+    ) else {
+        return false;
+    };
+    let Some(max_segment_bytes) = field(
+        runs,
+        2,
+        crate::types::MAX_SEGMENT_BYTES,
+        Fill::LargestUnder(u128::from(crate::types::MAX_SEGMENT_BYTES)),
+    ) else {
+        return false;
+    };
+    let Some(max_segment_records) = field(runs, 3, 1_u64, Fill::Smallest) else {
+        return false;
+    };
+    let Some(index_stride) = field(runs, 4, 1_u32, Fill::Smallest) else {
+        return false;
+    };
+    match sealed {
+        AnyHeader::V1(_) => SegmentConfig {
+            max_record_bytes,
+            max_group_bytes,
+            max_segment_bytes,
+            max_segment_records,
+            index_stride,
+        }
+        .validate()
+        .is_ok(),
+        AnyHeader::V2(_) => {
+            let Some(chunk_size) = chunk_size(runs) else {
+                return false;
+            };
+            SegmentConfigV2 {
+                max_record_bytes,
+                max_group_bytes,
+                max_segment_bytes,
+                max_segment_records,
+                index_stride,
+                chunk_size,
+            }
+            .validate()
+            .is_ok()
+        }
+    }
+}
+
+/// The values an open digit run can still become: every number whose
+/// decimal spelling BEGINS with the digits seen — the run itself, or the
+/// run followed by more digits — never an arbitrary number at or above it.
+/// Returns the smallest such value and the largest at or under `ceiling`,
+/// or `None` when none fits: the run alone already exceeds the ceiling. A
+/// lone `0` admits no further digit (canonical JSON writes no leading
+/// zero), so it continues only as itself.
+fn continuation_range(prefix: u128, ceiling: u128) -> Option<(u128, u128)> {
+    if prefix > ceiling {
+        return None;
+    }
+    if prefix == 0 {
+        return Some((0, 0));
+    }
+    let mut scale: u128 = 1;
+    while let Some(wider) = scale.checked_mul(10) {
+        match prefix.checked_mul(wider) {
+            Some(lowest) if lowest <= ceiling => scale = wider,
+            _ => break,
+        }
+    }
+    let lowest = prefix * scale;
+    Some((prefix, (lowest + (scale - 1)).min(ceiling)))
+}
+
 /// Rebuild the commit boundary of an EMPTY successor whose creation was
 /// interrupted between its primary file and its commit sidecar (#314
 /// review — the roll's LAST window), or discard one whose header write was
@@ -2088,13 +2633,175 @@ pub(crate) fn rebuild_empty_successor_commit(
             return Ok(false);
         }
         Err(_) => {
-            // A TORN HEADER, and provably nothing else: the commit sidecar
-            // is written only after the primary file is complete and synced,
-            // so its absence — a caller precondition — means creation never
-            // finished, and a file whose creation never finished has never
-            // held a record. Discarding it is the counterpart of sweeping
-            // the roll-window sidecar: the layout becomes "sealed prefix,
-            // no tail", whose recovery is adoption.
+            // TORN means PROVABLY SHORT, not merely undecodable (#410): the
+            // decoder returns the same `Corrupt` for a file cut off
+            // mid-header and for a FULL-LENGTH header whose checksum or
+            // JSON fails — and only the first is evidence that creation
+            // never finished. A complete file that stopped decoding is
+            // damage to something that once existed, and deleting damage
+            // destroys the evidence quarantine exists to preserve.
+            //
+            // And the proof cannot come from the candidate's own length
+            // prefix (review): that field is covered by the checksum that
+            // just failed, so after a decode failure nothing the file says
+            // about itself is trusted — a corrupted-upward length would
+            // make a full-length file look "shorter than its claim" and be
+            // deleted as torn. The FLOOR is derived from the PREDECESSOR's
+            // authenticated header instead: a roll keeps the sealed
+            // descriptor, changing only the segment id (fixed-width in
+            // JSON) and the base offset (known exactly here), so the
+            // descriptor's contribution to any legitimate successor
+            // header's length is exact. The CONFIG's is not (review, round
+            // two): a reconfiguring roll writes a REPLACEMENT config whose
+            // numeric fields may encode in fewer digits, and measuring
+            // against the sealed config would delete exactly the complete-
+            // but-damaged reconfigured successor this classification exists
+            // to preserve. So the floor takes every config field at its
+            // one-digit narrowest: a file strictly shorter than even that
+            // cannot be ANY complete successor header of this range and is
+            // torn; everything else stays quarantined like the
+            // unknown-magic arm — including torn files that happen to land
+            // above the floor, because quarantine keeps evidence and
+            // deletion cannot be undone.
+            // Below the floor, one more proof obligation (review, round
+            // three): shortness alone shows the file is not a valid
+            // successor OF THIS RANGE — a complete foreign header with a
+            // shorter topic or lineage, damaged and restored under this
+            // name, would measure below the floor too, and deleting it
+            // destroys an operator's evidence. What separates the two is
+            // that a torn write can only ever be a PREFIX of a real
+            // successor header: every byte it has must agree with the
+            // template wherever the template is deterministic — the magic,
+            // and the descriptor JSON up to the config boundary — with the
+            // 4-byte length field (config-dependent) and the segment-id
+            // span (the successor's own choice, fixed-width) excluded. A
+            // foreign header diverges at its topic or lineage; a genuine
+            // torn prefix cannot.
+            // TWO reference encodings per format (review): the NARROWEST
+            // template gives the shape walk its byte layout and the floor
+            // its lower bound, while the smallest config the validator
+            // actually ACCEPTS gives the length claim its true minimum —
+            // the all-ones config is deliberately invalid (a group of one
+            // byte cannot fit any record frame), so a claim that only
+            // clears the narrowest shape can still name a json no real
+            // successor ever encoded.
+            let templates = match &inspection.header {
+                AnyHeader::V1(sealed) => {
+                    let mut expected = sealed.descriptor.clone();
+                    expected.segment_id = TORN_TEMPLATE_ID;
+                    expected.base_offset = expected_base;
+                    let narrowest = SegmentConfig {
+                        max_record_bytes: 1,
+                        max_group_bytes: 1,
+                        max_segment_bytes: 1,
+                        max_segment_records: 1,
+                        index_stride: 1,
+                    };
+                    let smallest_valid = SegmentConfig {
+                        max_record_bytes: 1,
+                        max_group_bytes: 1 + crate::types::RECORD_FRAME_OVERHEAD_BYTES,
+                        max_segment_bytes: 1 + crate::types::RECORD_FRAME_OVERHEAD_BYTES,
+                        max_segment_records: 1,
+                        index_stride: 1,
+                    }
+                    .validate();
+                    let widest_valid = SegmentConfig {
+                        max_record_bytes: crate::types::MAX_RECORD_BYTES,
+                        max_group_bytes: crate::types::MAX_GROUP_BYTES,
+                        max_segment_bytes: crate::types::MAX_SEGMENT_BYTES,
+                        max_segment_records: crate::types::MAX_SEGMENT_RECORDS,
+                        index_stride: u32::MAX,
+                    }
+                    .validate();
+                    smallest_valid.and_then(|smallest_valid| {
+                        let widest_valid = widest_valid?;
+                        Ok((
+                            encode_header(&SegmentHeader::new(expected.clone(), narrowest))?,
+                            encode_header(&SegmentHeader::new(expected.clone(), smallest_valid))?,
+                            encode_header(&SegmentHeader::new(expected, widest_valid))?,
+                        ))
+                    })
+                }
+                AnyHeader::V2(sealed) => {
+                    let mut expected = sealed.descriptor.clone();
+                    expected.segment_id = TORN_TEMPLATE_ID;
+                    expected.base_offset = expected_base;
+                    let narrowest = SegmentConfigV2 {
+                        max_record_bytes: 1,
+                        max_group_bytes: 1,
+                        max_segment_bytes: 1,
+                        max_segment_records: 1,
+                        index_stride: 1,
+                        chunk_size: 1,
+                    };
+                    let smallest_valid = SegmentConfigV2 {
+                        max_record_bytes: 1,
+                        max_group_bytes: 1 + crate::codec_v2::RECORD_FRAME_OVERHEAD_BYTES_V2,
+                        max_segment_bytes: 1 + crate::codec_v2::RECORD_FRAME_OVERHEAD_BYTES_V2,
+                        max_segment_records: 1,
+                        index_stride: 1,
+                        chunk_size: crate::types::MIN_CHUNK_SIZE_BYTES,
+                    }
+                    .validate();
+                    let widest_valid = SegmentConfigV2 {
+                        max_record_bytes: crate::types::MAX_RECORD_BYTES,
+                        max_group_bytes: crate::types::MAX_GROUP_BYTES,
+                        max_segment_bytes: crate::types::MAX_SEGMENT_BYTES,
+                        max_segment_records: crate::types::MAX_SEGMENT_RECORDS,
+                        index_stride: u32::MAX,
+                        chunk_size: crate::types::MAX_CHUNK_SIZE_BYTES,
+                    }
+                    .validate();
+                    smallest_valid.and_then(|smallest_valid| {
+                        let widest_valid = widest_valid?;
+                        Ok((
+                            encode_header_v2(&SegmentHeaderV2::new(expected.clone(), narrowest))?,
+                            encode_header_v2(&SegmentHeaderV2::new(
+                                expected.clone(),
+                                smallest_valid,
+                            ))?,
+                            encode_header_v2(&SegmentHeaderV2::new(expected, widest_valid))?,
+                        ))
+                    })
+                }
+            };
+            let provably_torn = match templates {
+                Ok((template, smallest_valid, widest_valid)) => {
+                    let bounds = TornClaimBounds {
+                        min_valid_json_len: smallest_valid.len() - 12 - crate::codec::CHECKSUM_LEN,
+                        max_valid_json_len: widest_valid.len() - 12 - crate::codec::CHECKSUM_LEN,
+                    };
+                    // Shorter than every VALID complete successor, not
+                    // merely than the all-ones shape (review, round
+                    // thirteen): a torn write of the smallest
+                    // validator-accepted config missing only its last
+                    // checksum bytes is longer than the deliberately
+                    // invalid narrowest template, and the old gate
+                    // quarantined it before the prefix checks could prove
+                    // it torn.
+                    (bytes.len() as u64) < smallest_valid.len() as u64
+                        && torn_prefix_matches_template(
+                            &bytes,
+                            &template,
+                            &inspection.header,
+                            &bounds,
+                        )
+                        .is_some_and(|runs| config_prefix_extendable(&inspection.header, &runs))
+                }
+                // A predecessor whose header cannot re-encode is not a
+                // state this repair understands; prove nothing.
+                Err(_) => false,
+            };
+            if !provably_torn {
+                return Ok(false);
+            }
+            // The commit sidecar is written only after the primary file is
+            // complete and synced, so its absence — a caller precondition —
+            // plus the short read above means creation never finished, and
+            // a file whose creation never finished has never held a record.
+            // Discarding it is the counterpart of sweeping the roll-window
+            // sidecar: the layout becomes "sealed prefix, no tail", whose
+            // recovery is adoption.
             env.storage
                 .remove_file(active_path)
                 .map_err(|source| io_error(active_path, source))?;
@@ -5249,5 +5956,290 @@ mod tests {
              after a crash landed inside a write (#310): {:?}",
             catalog.quarantined
         );
+    }
+
+    /// An open digit run's continuations are the numbers that SPELL its
+    /// digits as a prefix — not every number at or above it (#410, review
+    /// round eight). `7` can become 70 or 799 but never 8 or 64.
+    #[test]
+    fn a_continuation_spells_the_digits_seen_not_any_number_above_them() {
+        assert_eq!(continuation_range(7, 99), Some((7, 79)));
+        assert_eq!(continuation_range(7, 75), Some((7, 75)));
+        assert_eq!(continuation_range(99, 100), Some((99, 99)));
+        assert_eq!(continuation_range(1, 1), Some((1, 1)));
+        // Already past the ceiling: nothing appended to the digits can
+        // bring the value back under it.
+        assert_eq!(continuation_range(100, 99), None);
+        // A lone zero admits no further digit under canonical encoding.
+        assert_eq!(continuation_range(0, 99), Some((0, 0)));
+    }
+
+    /// A cut inside the 4-byte length field leaves a PREFIX of a big-endian
+    /// value, and that prefix bounds the value from both sides: one byte
+    /// of `0xff` names a length above the codec ceiling whatever the three
+    /// missing bytes were, while one byte of `0x00` admits every real
+    /// length. Only the interval is judged (review, round eight).
+    #[test]
+    fn a_partial_length_prefix_is_bounded_not_ignored() {
+        let mut template_descriptor = descriptor();
+        template_descriptor.segment_id = TORN_TEMPLATE_ID;
+        let template = encode_header(&SegmentHeader::new(
+            template_descriptor,
+            SegmentConfig {
+                max_record_bytes: 1,
+                max_group_bytes: 1,
+                max_segment_bytes: 1,
+                max_segment_records: 1,
+                index_stride: 1,
+            },
+        ))
+        .unwrap();
+        // The claim's true minimum is the smallest json the VALIDATOR
+        // accepts, not the narrowest shape (review, round nine) — computed
+        // here exactly as the caller computes it.
+        let smallest_valid = SegmentConfig {
+            max_record_bytes: 1,
+            max_group_bytes: 1 + crate::types::RECORD_FRAME_OVERHEAD_BYTES,
+            max_segment_bytes: 1 + crate::types::RECORD_FRAME_OVERHEAD_BYTES,
+            max_segment_records: 1,
+            index_stride: 1,
+        }
+        .validate()
+        .unwrap();
+        let real = encode_header(&SegmentHeader::new(descriptor(), smallest_valid)).unwrap();
+        let min_valid = real.len() - 12 - crate::codec::CHECKSUM_LEN;
+        let sealed = AnyHeader::V1(SegmentHeader::new(descriptor(), smallest_valid));
+        let widest = encode_header(&SegmentHeader::new(
+            descriptor(),
+            SegmentConfig {
+                max_record_bytes: crate::types::MAX_RECORD_BYTES,
+                max_group_bytes: crate::types::MAX_GROUP_BYTES,
+                max_segment_bytes: crate::types::MAX_SEGMENT_BYTES,
+                max_segment_records: crate::types::MAX_SEGMENT_RECORDS,
+                index_stride: u32::MAX,
+            }
+            .validate()
+            .unwrap(),
+        ))
+        .unwrap();
+        let bounds = TornClaimBounds {
+            min_valid_json_len: min_valid,
+            max_valid_json_len: widest.len() - 12 - crate::codec::CHECKSUM_LEN,
+        };
+        let magic = &template[..8];
+        let mut impossible = magic.to_vec();
+        impossible.push(0xff);
+        assert!(
+            torn_prefix_matches_template(&impossible, &template, &sealed, &bounds).is_none(),
+            "a first length byte of 0xff cannot prefix any length under the ceiling"
+        );
+        let mut too_short = magic.to_vec();
+        too_short.extend_from_slice(&[0x00, 0x00, 0x00]);
+        assert!(
+            torn_prefix_matches_template(&too_short, &template, &sealed, &bounds).is_none(),
+            "three zero bytes cap the length at 255, below any real header of this range"
+        );
+        let mut plausible = magic.to_vec();
+        plausible.push(0x00);
+        assert!(
+            torn_prefix_matches_template(&plausible, &template, &sealed, &bounds).is_some(),
+            "a first byte of 0x00 admits every length a real header could carry"
+        );
+        // The genuine prefix still classifies: a REAL header — the
+        // smallest the validator accepts — torn at every length through
+        // its json must match (the all-ones template cannot play this
+        // role any more: its own claim sits below any valid config's, by
+        // design of the min-valid bound).
+        for cut in 0..real.len() - crate::codec::CHECKSUM_LEN {
+            assert!(
+                torn_prefix_matches_template(&real[..cut], &template, &sealed, &bounds).is_some(),
+                "a prefix of the real header must always match at cut {cut}"
+            );
+        }
+    }
+
+    /// A complete length claim fixes how many digits the config may carry
+    /// beyond the template's narrowest (#410, review rounds eight and nine):
+    /// a header re-labelled with a length two bytes short of its own config
+    /// is not something the encoder produced, however well its bytes match
+    /// one at a time — whether the cut lands after the JSON or inside the
+    /// config, where the digits already on disk have outgrown the claim.
+    /// The same bytes under their true length are the torn prefix they
+    /// claim to be.
+    #[test]
+    fn the_length_claim_must_describe_the_config_observed() {
+        let mut template_descriptor = descriptor();
+        template_descriptor.segment_id = TORN_TEMPLATE_ID;
+        let narrowest = SegmentConfig {
+            max_record_bytes: 1,
+            max_group_bytes: 1,
+            max_segment_bytes: 1,
+            max_segment_records: 1,
+            index_stride: 1,
+        };
+        let template = encode_header(&SegmentHeader::new(template_descriptor, narrowest)).unwrap();
+        // A REAL successor: the minimal valid config, two digits wider than
+        // the template (93 twice), truncated after its JSON.
+        let minimal = SegmentConfig {
+            max_record_bytes: 1,
+            max_group_bytes: 1 + crate::types::RECORD_FRAME_OVERHEAD_BYTES,
+            max_segment_bytes: 1 + crate::types::RECORD_FRAME_OVERHEAD_BYTES,
+            max_segment_records: 1,
+            index_stride: 1,
+        };
+        let real = encode_header(&SegmentHeader::new(descriptor(), minimal)).unwrap();
+        let json_len = u32::from_be_bytes(real[8..12].try_into().unwrap()) as usize;
+        let min_valid = json_len;
+        let sealed = AnyHeader::V1(SegmentHeader::new(descriptor(), minimal));
+        let widest = encode_header(&SegmentHeader::new(
+            descriptor(),
+            SegmentConfig {
+                max_record_bytes: crate::types::MAX_RECORD_BYTES,
+                max_group_bytes: crate::types::MAX_GROUP_BYTES,
+                max_segment_bytes: crate::types::MAX_SEGMENT_BYTES,
+                max_segment_records: crate::types::MAX_SEGMENT_RECORDS,
+                index_stride: u32::MAX,
+            }
+            .validate()
+            .unwrap(),
+        ))
+        .unwrap();
+        let bounds = TornClaimBounds {
+            min_valid_json_len: min_valid,
+            max_valid_json_len: widest.len() - 12 - crate::codec::CHECKSUM_LEN,
+        };
+        let truncated_after_json = real[..12 + json_len].to_vec();
+        assert!(
+            torn_prefix_matches_template(&truncated_after_json, &template, &sealed, &bounds)
+                .is_some(),
+            "under its true length the cut is a torn prefix"
+        );
+
+        let short_claim = ((json_len - 2) as u32).to_be_bytes();
+        let mut relabelled = truncated_after_json.clone();
+        relabelled[8..12].copy_from_slice(&short_claim);
+        assert!(
+            torn_prefix_matches_template(&relabelled, &template, &sealed, &bounds).is_none(),
+            "a claim two bytes short of the config it fronts describes no header"
+        );
+
+        // The same false claim with the cut INSIDE the config, right after
+        // the first widened value: one extra digit is on disk against a
+        // budget of none, and no continuation can take it back.
+        let after_group = b"\"max_group_bytes\":93";
+        let cut_at = real
+            .windows(after_group.len())
+            .position(|window| window == after_group)
+            .expect("the group limit is encoded")
+            + after_group.len();
+        let mut mid_config = real[..cut_at].to_vec();
+        mid_config[8..12].copy_from_slice(&short_claim);
+        assert!(
+            torn_prefix_matches_template(&mid_config, &template, &sealed, &bounds).is_none(),
+            "the digits already present have outgrown the claim; no continuation fits it"
+        );
+        assert!(
+            torn_prefix_matches_template(&real[..cut_at], &template, &sealed, &bounds).is_some(),
+            "the identical mid-config cut under its true length is a torn prefix"
+        );
+
+        // A claim exactly the bytes present says the JSON ends where the
+        // shape says it does not.
+        let mut ends_here = real[..cut_at].to_vec();
+        ends_here[8..12].copy_from_slice(&((cut_at - 12) as u32).to_be_bytes());
+        assert!(
+            torn_prefix_matches_template(&ends_here, &template, &sealed, &bounds).is_none(),
+            "a claim that ends mid-shape describes no header"
+        );
+
+        let mut long_claim = truncated_after_json.clone();
+        long_claim[8..12].copy_from_slice(&((json_len + 3) as u32).to_be_bytes());
+        assert!(
+            torn_prefix_matches_template(&long_claim, &template, &sealed, &bounds).is_none(),
+            "a complete shape under a claim that says more JSON follows is no header either"
+        );
+
+        // A complete json makes the checksum computable, so the checksum
+        // bytes a cut left behind are checkable: a genuine prefix of the
+        // hash is a torn write, a damaged one is not (review, round nine).
+        let partial_checksum = real[..12 + json_len + 4].to_vec();
+        assert!(
+            torn_prefix_matches_template(&partial_checksum, &template, &sealed, &bounds).is_some(),
+            "four true checksum bytes after a complete json are a torn write"
+        );
+        let mut damaged_checksum = partial_checksum.clone();
+        damaged_checksum[12 + json_len + 3] ^= 0xFF;
+        assert!(
+            torn_prefix_matches_template(&damaged_checksum, &template, &sealed, &bounds).is_none(),
+            "a checksum byte the completed header cannot have produced is damage, not a cut"
+        );
+
+        // More bytes than the claim allows for: magic, length, JSON, and a
+        // checksum is everything a header has.
+        let mut overlong = real.clone();
+        overlong.push(0x00);
+        assert!(
+            torn_prefix_matches_template(&overlong, &template, &sealed, &bounds).is_none(),
+            "a file longer than the header it claims to be is not its prefix"
+        );
+    }
+
+    /// An open run is filled with a real continuation of its digits, so a
+    /// record limit already past its ceiling is refused instead of being
+    /// filled with `1`, and a chunk-size run no power of two spells is
+    /// refused instead of being filled with the minimum (#410, review round
+    /// eight). Everything the round-seven fill accepted honestly still is.
+    #[test]
+    fn an_open_run_is_judged_by_what_it_can_still_become() {
+        let v1 = AnyHeader::V1(SegmentHeader::new(descriptor(), config()));
+        // Seventy million cut mid-run: every continuation exceeds the
+        // 64 MiB record ceiling.
+        assert!(!config_prefix_extendable(&v1, &[(70_000_000, false)]));
+        // Seven million: a valid record limit as it stands.
+        assert!(config_prefix_extendable(&v1, &[(7_000_000, false)]));
+        // A record limit closed at 1024 and a group limit open at `1`: the
+        // largest continuation under the group ceiling (199_999_999) holds
+        // the record plus its frame, so the pair is extendable — and a
+        // group limit open at `3` when the record limit is closed at 60 MiB
+        // is not, because 39_999_999 is the widest `3…` that fits under the
+        // ceiling and no `3…` between that and 300 million exists.
+        assert!(config_prefix_extendable(&v1, &[(1024, true), (1, false)]));
+        assert!(!config_prefix_extendable(
+            &v1,
+            &[(60 * 1024 * 1024, true), (3, false)]
+        ));
+        // An open lone zero is exactly zero, which no field accepts.
+        assert!(!config_prefix_extendable(&v1, &[(0, false)]));
+
+        let v2 = AnyHeader::V2(SegmentHeaderV2::new(
+            descriptor_v2(),
+            SegmentConfigV2 {
+                max_record_bytes: 1024,
+                max_group_bytes: 4096,
+                max_segment_bytes: 16 * 1024,
+                max_segment_records: 100,
+                index_stride: 2,
+                chunk_size: crate::types::MIN_CHUNK_SIZE_BYTES,
+            },
+        ));
+        let closed = [
+            (1024, true),
+            (4096, true),
+            (16 * 1024, true),
+            (100, true),
+            (2, true),
+        ];
+        let with_chunk = |run: (u128, bool)| {
+            let mut runs = closed.to_vec();
+            runs.push(run);
+            runs
+        };
+        // 131072 = 2^17 spells `1`; nothing in the band spells `9` or `3`.
+        assert!(config_prefix_extendable(&v2, &with_chunk((1, false))));
+        assert!(config_prefix_extendable(&v2, &with_chunk((13, false))));
+        assert!(!config_prefix_extendable(&v2, &with_chunk((9, false))));
+        assert!(!config_prefix_extendable(&v2, &with_chunk((3, false))));
+        assert!(config_prefix_extendable(&v2, &with_chunk((65536, true))));
+        assert!(!config_prefix_extendable(&v2, &with_chunk((65537, true))));
     }
 }

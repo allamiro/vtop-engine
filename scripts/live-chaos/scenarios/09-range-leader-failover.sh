@@ -315,14 +315,36 @@ sample_rejoining_follower() { # <seconds-left>
   fi
 }
 
-produce_deadline=$((SECONDS + PROGRESS_TIMEOUT_SECONDS))
+# MILLISECONDS end to end (review): keeping the deadline in whole seconds
+# discarded the accumulated extension's sub-second remainder at the very
+# check it exists to feed, so the advertised produce window could still
+# lose up to 999ms depending on timer phase.
+produce_deadline_base_ms=$(( $(date +%s%3N) + PROGRESS_TIMEOUT_SECONDS * 1000 ))
+produce_deadline_ms=$produce_deadline_base_ms
+diag_spent_ms=0
 attempts=0
 until "$VTOP_NODE" produce --client-config "$VERIFY_CFG" --addr "$(native_addr)" \
   --records "$BATCH" --batch "$BATCH" \
   --durability quorum > "$WORKDIR/logs/produce-after-failover.log" 2>&1; do
   attempts=$((attempts + 1))
-  sample_rejoining_follower "$((produce_deadline - SECONDS))"
-  if [[ $SECONDS -ge $produce_deadline ]]; then
+  # Diagnostics are charged to their own budget (#410): the scrape used to
+  # ride inside the produce window, so a slow /metrics endpoint spent up to
+  # five seconds of produce attempts per failure — the diagnosis competing
+  # with the thing it diagnoses. Extending the deadline by exactly what the
+  # sample spent keeps the ADVERTISED produce bound honest while making the
+  # number of attempts inside it independent of how the metrics endpoint
+  # answers. Each sample is still clamped to five seconds, so the loop's
+  # total wall time stays bounded by produce time plus one clamp per failed
+  # attempt. Measured in MILLISECONDS and accumulated (review): bash's
+  # integer SECONDS charges a subsecond scrape as zero or one depending
+  # only on where it crosses a tick, and that rounding error compounds
+  # per retry — the extension would then depend on scrape phase, the exact
+  # timing coupling this budget exists to remove.
+  sample_started_ms=$(date +%s%3N)
+  sample_rejoining_follower "$(( (produce_deadline_ms - sample_started_ms) / 1000 ))"
+  diag_spent_ms=$((diag_spent_ms + $(date +%s%3N) - sample_started_ms))
+  produce_deadline_ms=$((produce_deadline_base_ms + diag_spent_ms))
+  if [[ $(date +%s%3N) -ge $produce_deadline_ms ]]; then
     if [[ "$REJOIN_GAP" -gt 0 ]]; then
       # NAMED FIRST, because it explains the observation rather than competing
       # with it: with the survivor below the new leader's tip, every replica
