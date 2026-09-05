@@ -1397,6 +1397,7 @@ async fn run_leader(
     // as the configured principal at the durability the range can honour,
     // served on the listener bound above and stopped by the node's shutdown.
     let mut kafka_task = None;
+    let mut kafka_drain = Duration::from_secs(6);
     let kafka_addr = match config.kafka.as_ref().zip(kafka_listener) {
         Some((kafka, (kafka_listener, bound))) => {
             // An identity of the gateway's own (review), never the
@@ -1420,33 +1421,31 @@ async fn run_leader(
                     fetch_max_records: MAX_RECORDS,
                 },
             );
-            let gateway = vtop_kafka::Gateway::new(
-                Arc::new(bridge),
-                vtop_kafka::GatewayConfig {
-                    advertised_host: kafka
-                        .advertised_host
-                        .clone()
-                        .unwrap_or_else(|| bound.ip().to_string()),
-                    advertised_port: kafka
-                        .advertised_port
-                        .map(i32::from)
-                        .unwrap_or_else(|| i32::from(bound.port())),
-                    node_id: kafka.node_id,
-                    cluster_id: Some(config.cluster_id.to_string()),
-                    max_fetch_wait: Duration::from_millis(kafka.max_fetch_wait_ms),
-                    ..vtop_kafka::GatewayConfig::default()
-                },
-            );
+            let gateway_config = vtop_kafka::GatewayConfig {
+                advertised_host: kafka
+                    .advertised_host
+                    .clone()
+                    .unwrap_or_else(|| bound.ip().to_string()),
+                advertised_port: kafka
+                    .advertised_port
+                    .map(i32::from)
+                    .unwrap_or_else(|| i32::from(bound.port())),
+                node_id: kafka.node_id,
+                cluster_id: Some(config.cluster_id.to_string()),
+                max_fetch_wait: Duration::from_millis(kafka.max_fetch_wait_ms),
+                ..vtop_kafka::GatewayConfig::default()
+            };
+            // Joined for a little longer than the gateway's own drain
+            // (review): the handle is never dropped while `serve` can still
+            // be waiting on a session.
+            kafka_drain = gateway_config.drain_timeout + Duration::from_secs(1);
+            let gateway = vtop_kafka::Gateway::new(Arc::new(bridge), gateway_config);
             let kafka_shutdown = shutdown.clone();
             // Kept, to be joined before the range is handed back (review):
             // `serve` returns only once every session has answered its
             // in-flight request, so the drain below covers Kafka appends
             // the way it covers native ones.
-            kafka_task = Some(tokio::spawn(async move {
-                if let Err(error) = gateway.serve(kafka_listener, kafka_shutdown).await {
-                    tracing::warn!(%error, "kafka gateway exited");
-                }
-            }));
+            kafka_task = Some(tokio::spawn(gateway.serve(kafka_listener, kafka_shutdown)));
             eprintln!(
                 "warning: kafka gateway on {bound} speaks Kafka's protocol, which carries no vtop \
                  identity: every peer that reaches it produces and fetches as producer \
@@ -1475,10 +1474,28 @@ async fn run_leader(
     );
     use std::io::Write;
     std::io::stdout().flush().ok();
-    server
-        .serve(listener, shutdown_rx)
-        .await
-        .map_err(|error| format!("native server exited: {error}"))?;
+    let native = server.serve(listener, shutdown_rx);
+    tokio::pin!(native);
+    let served = match kafka_task.take() {
+        None => native.await,
+        Some(mut kafka) => tokio::select! {
+            served = &mut native => {
+                kafka_task = Some(kafka);
+                served
+            }
+            // The gateway ending first is the shutdown both share — the
+            // native server is about to return too — or its listener failing
+            // (review): a leader whose advertised Kafka endpoint is gone must
+            // not stay ready, so the node exits the way it does when the
+            // native server fails, and a restart brings both back.
+            ended = &mut kafka => match ended {
+                Ok(Ok(())) => native.await,
+                Ok(Err(error)) => return Err(format!("kafka gateway exited: {error}")),
+                Err(error) => return Err(format!("kafka gateway task failed: {error}")),
+            },
+        },
+    };
+    served.map_err(|error| format!("native server exited: {error}"))?;
     // Orderly stop (#280). The native listener is closed and sessions are
     // drained; the lease agent — racing on the same signal — releases the
     // range so failover need not wait out the lease deadline, and the final
@@ -1494,8 +1511,8 @@ async fn run_leader(
     // no Kafka append can land after the range is released or after the
     // final boundary below is committed.
     if let Some(task) = kafka_task {
-        if tokio::time::timeout(agent_drain, task).await.is_err() {
-            eprintln!("kafka gateway did not drain within {agent_drain:?}; releasing anyway");
+        if tokio::time::timeout(kafka_drain, task).await.is_err() {
+            eprintln!("kafka gateway did not drain within {kafka_drain:?}; releasing anyway");
         }
     }
     // Stop admitting and drain FIRST (the serve above has returned), only

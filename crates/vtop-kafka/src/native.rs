@@ -143,10 +143,10 @@ impl NativeBridge {
 /// partition's leader any more; a storage or overload refusal is a timeout
 /// the client retries; a sequence conflict or a malformed request is a bad
 /// record the client must not retry blindly.
-/// How many invisible stretches one fetch follows before answering empty:
-/// markers are rare, so one is the case; the bound keeps a pathological log
-/// from turning one fetch into a scan.
-const MAX_INVISIBLE_HOPS: usize = 64;
+/// The byte budget a fetch widens to after a stretch with nothing visible:
+/// enough to cross a run of markers in a few hops, whatever the client's own
+/// partition budget was.
+const INVISIBLE_HOP_BUDGET: u32 = 1 << 20;
 
 fn kafka_code(code: NativeCode) -> ErrorCode {
     match code {
@@ -262,13 +262,13 @@ impl Bridge for NativeBridge {
         self.known(topic)?;
         let start_offset = u64::try_from(offset).map_err(|_| ErrorCode::OffsetOutOfRange)?;
         let mut from = start_offset;
-        let mut hops = 0;
+        let mut budget = u32::try_from(max_bytes).unwrap_or(u32::MAX);
         let response = loop {
             let request = FetchRequest {
                 range: self.broker.range().clone(),
                 fencing_epoch: self.broker.held_fencing_epoch(),
                 start_offset: from,
-                max_bytes: u32::try_from(max_bytes).unwrap_or(u32::MAX),
+                max_bytes: budget,
                 max_records: self.config.fetch_max_records,
             };
             let reply = self
@@ -281,16 +281,19 @@ impl Bridge for NativeBridge {
                     }
                     // A stretch with nothing visible but a moved cursor — a
                     // promotion marker the broker filters from consumer output
-                    // (review): follow the cursor. A Kafka client has no
-                    // cursor of its own to move; handed an empty set at this
-                    // offset it would ask for it forever.
+                    // (review): follow the cursor, until a visible record or
+                    // the watermark. A Kafka client has no cursor of its own
+                    // to move, and no cap belongs here either: an answer
+                    // short of visible data parks the client on this offset
+                    // for good. The cursor moves forward on every hop, so
+                    // the walk ends with the log; after the first hop the
+                    // budget widens so a run of markers is crossed in a few.
                     if response.records.is_empty()
                         && response.next_offset > from
                         && response.next_offset < response.committed_high_watermark
-                        && hops < MAX_INVISIBLE_HOPS
                     {
                         from = response.next_offset;
-                        hops += 1;
+                        budget = budget.max(INVISIBLE_HOP_BUDGET);
                         continue;
                     }
                     break response;

@@ -14,7 +14,8 @@ use crate::api::{
     encode_fetch, encode_list_offsets, encode_metadata, encode_produce, FetchPartitionResponse,
     FetchRequest, FetchTopicResponse, ListOffsetsPartitionResponse, ListOffsetsRequest,
     ListOffsetsTopicResponse, MetadataBroker, MetadataRequest, MetadataResponse, MetadataTopic,
-    ProducePartitionResponse, ProduceRequest, ProduceTopicResponse, TIMESTAMP_LATEST,
+    ProducePartitionResponse, ProduceRequest, ProduceTopicResponse, TIMESTAMP_EARLIEST,
+    TIMESTAMP_LATEST,
 };
 use crate::bridge::{Bridge, Fetched};
 use crate::messages::{
@@ -132,6 +133,10 @@ pub struct Gateway {
     config: GatewayConfig,
     sessions: Arc<tokio::sync::Semaphore>,
     refused_sessions: std::sync::atomic::AtomicU64,
+    /// Set once `serve` stops accepting (review): a frame completed after
+    /// that is dropped, never answered, so nothing starts a bridge call
+    /// after the embedder was told the gateway is done.
+    closed: std::sync::atomic::AtomicBool,
 }
 
 impl Gateway {
@@ -142,6 +147,7 @@ impl Gateway {
             config,
             sessions,
             refused_sessions: std::sync::atomic::AtomicU64::new(0),
+            closed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -205,11 +211,17 @@ impl Gateway {
                 }
             }
         }
-        // The drain (review): every session sees the same signal between
-        // frames and closes — one mid-request answers it first — and their
-        // slots come back. Holding every slot is holding proof that no
-        // request is in flight; past `drain_timeout` the embedder is told,
-        // and proceeds on its own judgement.
+        // Closed before the drain (review): a request already read is
+        // answered, one still arriving is dropped, and none starts a bridge
+        // call after this. The drain then waits for the answers in flight:
+        // every session closes between frames and its slot comes back.
+        // Holding every slot is holding proof that no request is in flight;
+        // past `drain_timeout` the embedder is told, and what is still in a
+        // bridge call holds the broker's own lock, which the embedder's
+        // final commit takes after it.
+        gateway
+            .closed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let slots = u32::try_from(gateway.config.max_sessions.max(1)).unwrap_or(u32::MAX);
         if tokio::time::timeout(
             gateway.config.drain_timeout,
@@ -267,9 +279,17 @@ impl Gateway {
             let len = len as usize;
             let mut body = Vec::with_capacity(len.min(INITIAL_FRAME_CAPACITY));
             let mut rest = (&mut socket).take(len as u64);
-            match tokio::time::timeout(self.config.frame_read_timeout, rest.read_to_end(&mut body))
-                .await
-            {
+            // A frame still arriving when shutdown comes is dropped (review):
+            // it was never a request, and waiting for its tail would hold
+            // the drain for `frame_read_timeout`.
+            let read = tokio::select! {
+                read = tokio::time::timeout(self.config.frame_read_timeout, rest.read_to_end(&mut body)) => read,
+                _ = shutdown_signalled(&mut shutdown) => {
+                    tracing::debug!(len, received = body.len(), "kafka session closed on shutdown mid-frame");
+                    return Ok(());
+                }
+            };
+            match read {
                 Err(_) => {
                     tracing::warn!(
                         len,
@@ -282,6 +302,13 @@ impl Gateway {
                 // The peer went away mid-frame: a session over, not a request.
                 Ok(Ok(received)) if received < len => return Ok(()),
                 Ok(Ok(_)) => {}
+            }
+            // Read whole, but after the gateway closed (review): dropped, so
+            // no bridge call starts past the point the embedder was told
+            // none would.
+            if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+                tracing::debug!("kafka request arrived after the gateway closed; dropped");
+                return Ok(());
             }
             match self.answer(&body).await {
                 Answer::Reply(bytes) => socket.write_all(&frame(&bytes)).await?,
@@ -721,19 +748,30 @@ impl Gateway {
             for partition in topic.partitions {
                 let (error, offset) = if partition.index != 0 {
                     (ErrorCode::UnknownTopicOrPartition, -1)
-                } else if partition.timestamp == TIMESTAMP_LATEST {
+                } else if partition.timestamp == TIMESTAMP_LATEST
+                    || partition.timestamp == TIMESTAMP_EARLIEST
+                {
+                    // LATEST is the watermark, EARLIEST the retained floor:
+                    // both are one snapshot of the bridge's bounds, and
+                    // `-o beginning` on a stock client is the latter.
                     match self.bounds(&topic.name).await {
-                        Ok((_, high_watermark)) => (ErrorCode::None, high_watermark),
+                        Ok((log_start, high_watermark)) => (
+                            ErrorCode::None,
+                            if partition.timestamp == TIMESTAMP_LATEST {
+                                high_watermark
+                            } else {
+                                log_start
+                            },
+                        ),
                         Err(error) => (error, -1),
                     }
                 } else {
-                    // EARLIEST has no exact accessor and by-timestamp no
-                    // index behind it: refused by name, not answered with a
-                    // scan.
+                    // By-timestamp has no index behind it: refused by name,
+                    // not answered with a scan.
                     tracing::warn!(
                         topic = %topic.name,
                         timestamp = partition.timestamp,
-                        "kafka ListOffsets refused: only LATEST (-1) is served in phase 1 (#225)"
+                        "kafka ListOffsets refused: only LATEST (-1) and EARLIEST (-2) are served in phase 1 (#225)"
                     );
                     (ErrorCode::UnsupportedVersion, -1)
                 };
@@ -977,6 +1015,44 @@ mod tests {
             .expect("serve returns once the sessions are gone")
             .unwrap()
             .unwrap();
+    }
+
+    /// A frame still arriving when shutdown comes is dropped, not answered
+    /// (review), and the drain does not wait for its tail.
+    #[tokio::test]
+    async fn a_frame_arriving_across_shutdown_is_dropped_and_the_drain_does_not_wait_for_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop, rx) = tokio::sync::watch::channel(false);
+        let gateway = Gateway::new(
+            Arc::new(MemoryBridge::with_topics(["events"])),
+            GatewayConfig {
+                advertised_port: addr.port() as i32,
+                frame_read_timeout: Duration::from_secs(30),
+                ..GatewayConfig::default()
+            },
+        );
+        let serving = tokio::spawn(gateway.serve(listener, rx));
+        let mut slow = TcpStream::connect(addr).await.unwrap();
+        let whole = request(18, 0, 7, &[]);
+        slow.write_all(&whole[..6]).await.unwrap(); // the length and a byte or two
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        stop.send(true).unwrap();
+        let started = std::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(3), serving)
+            .await
+            .expect("serve returns without waiting out the frame read timeout")
+            .unwrap()
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        // The rest of the frame finds a closed connection, not an answer.
+        let _ = slow.write_all(&whole[6..]).await;
+        let mut rest = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(2), slow.read_to_end(&mut rest)).await;
+        assert!(
+            matches!(read, Ok(Ok(0)) | Ok(Err(_))),
+            "closed, not answered: {read:?}"
+        );
     }
 
     /// A bridge stuck past the fetch ceiling answers `REQUEST_TIMED_OUT` at
@@ -1750,8 +1826,8 @@ mod tests {
             ErrorCode::UnknownTopicOrPartition.as_i16()
         );
 
-        // EARLIEST and by-timestamp: only LATEST is served.
-        for timestamp in [-2_i64, 1_700_000_000_000] {
+        // By-timestamp: LATEST and EARLIEST are served, nothing else.
+        for timestamp in [1_700_000_000_000_i64] {
             let mut body = Encoder::new();
             body.i32(-1);
             body.array_len(1);
