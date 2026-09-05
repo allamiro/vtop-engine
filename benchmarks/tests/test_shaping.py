@@ -13,6 +13,7 @@ from lib.shaping import (
     Shape,
     ShapingError,
     apply,
+    require_endpoint_through_proxy,
     shaped,
 )
 
@@ -119,6 +120,57 @@ def test_a_refused_toxic_fails_the_run_by_name():
     client = ScriptedClient(statuses={("POST", "/proxies/minio/toxics"): 400})
     with pytest.raises(ShapingError, match="vtop_bandwidth_up"):
         apply(Shape("http://x", "minio", 1250, 0, 0), client)
+
+
+class HalfRefusingClient(ScriptedClient):
+    """Accepts the first toxic and refuses the second."""
+
+    def request(self, method, path, body=None):
+        self.calls.append((method, path, body))
+        if method == "POST":
+            posts = sum(1 for m, _, _ in self.calls if m == "POST")
+            return (201 if posts == 1 else 400), None
+        return {"GET": 200, "DELETE": 204}[method], None
+
+
+def test_half_a_shape_is_rolled_back_before_the_failure_is_reported():
+    client = HalfRefusingClient()
+    with pytest.raises(ShapingError, match="removed again"):
+        apply(Shape("http://x", "minio", 1250, 100, 0), client)
+    # After the refused POST: every toxic of ours deleted again.
+    tail = [(m, p) for m, p, _ in client.calls[-4:]]
+    assert tail == [("DELETE", f"/proxies/minio/toxics/{n}") for n in TOXIC_NAMES]
+
+
+class FailingRemovalClient(ScriptedClient):
+    """Removes cleanly before the shape is applied, and fails one removal
+    on the way out — the leftover this test is about."""
+
+    def request(self, method, path, body=None):
+        applied = any(m == "POST" for m, _, _ in self.calls)
+        self.calls.append((method, path, body))
+        if method == "DELETE" and applied and path.endswith("vtop_latency_up"):
+            return 500, None
+        return {"GET": 200, "POST": 201, "DELETE": 204}[method], None
+
+
+def test_a_removal_that_fails_is_reported_not_announced_as_removed():
+    client = FailingRemovalClient()
+    sc = scenario(shaping_api_url="http://127.0.0.1:8474", shaping_latency_ms=100)
+    with pytest.raises(ShapingError, match="vtop_latency_up \\(HTTP 500\\)"):
+        with shaped(sc, client_factory=lambda url: client, log=lambda _: None):
+            pass
+    # Every name was still tried before the report.
+    deletes = [p for m, p, _ in client.calls if m == "DELETE"]
+    assert len(deletes) >= 2 * len(TOXIC_NAMES), "cleared before apply and again on exit"
+
+
+def test_an_endpoint_override_that_bypasses_the_proxy_is_refused():
+    sc = scenario(shaping_api_url="http://127.0.0.1:8474", shaping_bandwidth_kbps=10,
+                  endpoint_url="http://localhost:9100")
+    require_endpoint_through_proxy(sc, "http://localhost:9100")
+    with pytest.raises(ShapingError, match="around it"):
+        require_endpoint_through_proxy(sc, "http://localhost:9000")
 
 
 def test_the_shape_is_removed_on_every_exit():

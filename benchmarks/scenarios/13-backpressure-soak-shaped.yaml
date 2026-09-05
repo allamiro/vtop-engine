@@ -4,12 +4,14 @@ description: >-
   against live MinIO, but the upload path runs through toxiproxy shaped to a
   WAN — 10 Mbps each way, 100 ms round trip with jitter. The signal is what
   the upload stage does when the NETWORK, not the store, is the bottleneck:
-  object_upload p95 against the pipe rather than the disk, the backlog
-  deficit growing instead of inflight_batches or memory, and — with
-  batching.adaptive_width enabled in the engine config — vtop_upload_width
-  backing off the throttles a saturated pipe turns into. Requires the shaped
-  stack, docker compose -f benchmarks/docker-compose.benchmark.yml --profile
-  shaped up -d, and unshapes the pipe when it ends.
+  object_upload p95 against the pipe rather than the disk, and the backlog
+  deficit growing instead of inflight_batches or memory — the raw signal
+  the #102 width controller consumes. The controller itself lives in the
+  engine process and this harness runs one process per cycle, so watching
+  it back off needs a long-lived vtopctl run against this same stack.
+  Requires the shaped stack, docker compose -f
+  benchmarks/docker-compose.benchmark.yml --profile shaped up -d, and
+  unshapes the pipe when it ends.
 volume: 400
 file_size: small
 format: jsonl

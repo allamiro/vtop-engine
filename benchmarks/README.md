@@ -158,8 +158,8 @@ What the run answers, and where to read it:
 |----------|----------|
 | does a thin pipe grow the **deficit** or the **queues**? | `backlog_metrics.csv` should climb while `inflight_batches` and memory stay bounded — the #98 hypothesis-1 shape, now reachable on purpose |
 | is the wait attributed honestly? | `object_upload_ms` p95 carries the pipe; `total_ms` grows by the same, not more |
-| does the engine back off? | with `batching.adaptive_width.enabled` in the engine config, `vtop_upload_width` follows the throttles a saturated pipe turns into (#102) |
-| does it recover? | unshape (the runner does) and the next cycle's `object_upload_ms` returns to the store's own number, without a restart |
+| what does the controller see? | the raw signal #102's width controller consumes — `object_upload_ms` against the pipe and `upload_throttled_total` when the store pushes back. The controller itself lives in the engine process, and this harness runs one `process-once` per cycle, so its width resets every cycle: observing the back-off needs a long-lived `vtopctl run` against the same shaped stack, which is where the #102 measurement belongs |
+| what is the control? | the runner unshapes the pipe on every way out, so a following unshaped run of scenario 12 is the comparison — same seeder, same store, no pipe |
 
 ## 8. Clean benchmark data
 

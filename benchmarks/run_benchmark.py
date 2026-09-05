@@ -81,6 +81,11 @@ def main() -> int:
     # fails the run before it costs anything, and a shaped scenario never
     # runs unshaped under its own name.
     shape = shaping.Shape.from_scenario(sc)
+    if shape is not None:
+        # The engine must go THROUGH the proxy the shape is on: an endpoint
+        # override (VTOP_S3_ENDPOINT_URL outranks the scenario) would send it
+        # around the toxics while the summary said shaped.
+        shaping.require_endpoint_through_proxy(sc, engine.effective_endpoint(sc))
     run_id = new_run_id(sc.name)
     writer = ResultsWriter(results_root, run_id)
     print(f"[bench] scenario={sc.name} run_id={run_id}")

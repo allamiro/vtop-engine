@@ -28,6 +28,13 @@ def vtopctl_path(build_if_missing: bool = True) -> str:
     return path
 
 
+def effective_endpoint(scenario) -> str:
+    """The endpoint the engine will actually be pointed at: the environment's
+    override when set, else the scenario's. Public so a shaped run can check
+    it is the proxy's (#403)."""
+    return _effective_endpoint(scenario)
+
+
 def _effective_endpoint(scenario) -> str:
     """The one answer to "which store is this run actually pointed at?".
 

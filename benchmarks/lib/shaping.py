@@ -168,16 +168,48 @@ def apply(shape: Shape, client: ToxiproxyClient) -> None:
         raise ShapingError(f"toxiproxy answered HTTP {status} for proxy {shape.proxy!r}")
     clear(shape, client)
     for toxic in shape.toxics():
-        status, _ = client.request("POST", f"/proxies/{shape.proxy}/toxics", toxic)
+        try:
+            status, _ = client.request("POST", f"/proxies/{shape.proxy}/toxics", toxic)
+        except ShapingError:
+            # Half a shape is not a shape: what was accepted is removed
+            # before the failure is reported, so nothing lingers for the
+            # next run.
+            clear(shape, client)
+            raise
         if status not in (200, 201):
+            clear(shape, client)
             raise ShapingError(
-                f"toxiproxy refused toxic {toxic['name']} on {shape.proxy!r} (HTTP {status})")
+                f"toxiproxy refused toxic {toxic['name']} on {shape.proxy!r} (HTTP {status}); "
+                "the toxics accepted before it were removed again")
 
 
 def clear(shape: Shape, client: ToxiproxyClient) -> None:
-    """Remove our toxics, by name; absent ones are not an error."""
+    """Remove our toxics, by name. Absent ones are fine; a removal that FAILS
+    is reported after every name was tried, because a toxic left behind
+    shapes the next run without saying so."""
+    stayed = []
     for name in TOXIC_NAMES:
-        client.request("DELETE", f"/proxies/{shape.proxy}/toxics/{name}")
+        status, _ = client.request("DELETE", f"/proxies/{shape.proxy}/toxics/{name}")
+        if status not in (200, 204, 404):
+            stayed.append(f"{name} (HTTP {status})")
+    if stayed:
+        raise ShapingError(
+            f"toxiproxy did not remove {', '.join(stayed)} from {shape.proxy!r}: the pipe is "
+            "still shaped — remove them by hand or restart the shaped stack")
+
+
+def require_endpoint_through_proxy(scenario, effective_endpoint: str) -> None:
+    """A shaped scenario's engine must reach the store through the proxy the
+    shape is on. The scenario's own `endpoint_url` names the proxy; an
+    environment override that differs would bypass the toxics while the
+    summary recorded a shape."""
+    declared = str(scenario.get("endpoint_url", "") or "")
+    if effective_endpoint != declared:
+        raise ShapingError(
+            f"the effective endpoint {effective_endpoint!r} is not the scenario's "
+            f"{declared!r}: a shaped run must go through the proxy the shape is on, and "
+            "VTOP_S3_ENDPOINT_URL is sending the engine around it — unset it, or point it "
+            "at the proxy")
 
 
 @contextmanager
