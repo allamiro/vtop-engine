@@ -110,6 +110,77 @@ pub struct ObservabilityConfig {
     pub tls: Option<ObservabilityTls>,
 }
 
+/// The Kafka gateway on a data node (#225).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KafkaGatewayConfig {
+    /// `host:port` the Kafka listener binds. Loopback unless `any_interface`.
+    pub listen: String,
+    /// Kafka has no vtop identity: a listener off loopback admits any peer
+    /// that can reach it, and must be asked for by name.
+    #[serde(default)]
+    pub any_interface: bool,
+    /// What Metadata tells clients to connect to. Default: the bound address
+    /// — right on loopback, wrong behind a NAT or a Service, where these are
+    /// set to what clients dial.
+    #[serde(default)]
+    pub advertised_host: Option<String>,
+    #[serde(default)]
+    pub advertised_port: Option<u16>,
+    /// The Kafka topic name; the range's wire topic unless set.
+    #[serde(default)]
+    pub topic: Option<String>,
+    /// The broker id Metadata reports; the leader of the one partition.
+    #[serde(default = "default_kafka_node_id")]
+    pub node_id: i32,
+    /// The longest a fetch waits for data, whatever the client asked.
+    #[serde(default = "default_kafka_max_fetch_wait_ms")]
+    pub max_fetch_wait_ms: u64,
+}
+
+fn default_kafka_node_id() -> i32 {
+    1
+}
+
+fn default_kafka_max_fetch_wait_ms() -> u64 {
+    5_000
+}
+
+/// The gateway's own refusals (#225), judged from the config before a port
+/// is bound: only a leader or standalone serves one, and its listener stays
+/// on loopback unless the config says otherwise by name.
+pub fn refuse_kafka_gateway_misuse(
+    role: DataRole,
+    kafka: Option<&KafkaGatewayConfig>,
+) -> Result<(), String> {
+    let Some(kafka) = kafka else {
+        return Ok(());
+    };
+    if !matches!(role, DataRole::Leader | DataRole::Standalone) {
+        return Err(format!(
+            "`kafka` is configured on a {role:?} node: the gateway is served by a leader or \
+             standalone only — it holds one broker, and a candidate's changes with the lease \
+             (#225)"
+        ));
+    }
+    if !kafka.any_interface {
+        let loopback = kafka
+            .listen
+            .rsplit_once(':')
+            .map(|(host, _)| host.trim_matches(['[', ']']))
+            .is_some_and(|host| host == "127.0.0.1" || host == "localhost" || host == "::1");
+        if !loopback {
+            return Err(format!(
+                "`kafka.listen: {}` is off loopback: Kafka's protocol carries no vtop identity, \
+                 so this listener admits any peer that can reach it. Bind it to 127.0.0.1, or \
+                 spell out `kafka.any_interface: true` and put a network policy in front of it",
+                kafka.listen
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The observability endpoint's TLS material (#294 slice 4).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -462,6 +533,16 @@ pub struct DataNodeConfig {
     /// detecting it needs field presence to survive deserialization.
     #[serde(default)]
     pub observability: Option<ObservabilityConfig>,
+    /// A Kafka wire-protocol listener over this range (#225), served by a
+    /// leader or standalone node beside the native plane: one topic (the
+    /// range's wire topic unless named), one partition, appending as
+    /// `principal_id` — the gateway's single native identity. Refused on a
+    /// candidate or follower: the bridge holds one broker, and a candidate's
+    /// changes with the lease. The listener speaks Kafka's own protocol,
+    /// which carries no vtop identity, so it binds loopback only unless
+    /// `any_interface` is spelled out.
+    #[serde(default)]
+    pub kafka: Option<KafkaGatewayConfig>,
     /// Bytes a segment may reach before the range rolls to a new one.
     ///
     /// CONFIGURABLE, because segment size is an operational choice and it was
@@ -793,6 +874,47 @@ impl LeaseConfig {
 #[cfg(test)]
 mod transport_tests {
     use super::*;
+
+    /// #225: the gateway is a leader's or standalone's, and stays on
+    /// loopback unless asked off it by name.
+    #[test]
+    fn a_kafka_gateway_is_refused_on_a_candidate_and_off_loopback_unless_named() {
+        let kafka = |listen: &str, any_interface| KafkaGatewayConfig {
+            listen: listen.to_owned(),
+            any_interface,
+            advertised_host: None,
+            advertised_port: None,
+            topic: None,
+            node_id: 1,
+            max_fetch_wait_ms: 5_000,
+        };
+        assert!(refuse_kafka_gateway_misuse(DataRole::Leader, None).is_ok());
+        assert!(refuse_kafka_gateway_misuse(
+            DataRole::Standalone,
+            Some(&kafka("127.0.0.1:9092", false))
+        )
+        .is_ok());
+        assert!(
+            refuse_kafka_gateway_misuse(DataRole::Leader, Some(&kafka("[::1]:9092", false)))
+                .is_ok()
+        );
+        let refused =
+            refuse_kafka_gateway_misuse(DataRole::Candidate, Some(&kafka("127.0.0.1:9092", false)))
+                .unwrap_err();
+        assert!(
+            refused.contains("Candidate") && refused.contains("lease"),
+            "{refused}"
+        );
+        let refused =
+            refuse_kafka_gateway_misuse(DataRole::Standalone, Some(&kafka("0.0.0.0:9092", false)))
+                .unwrap_err();
+        assert!(refused.contains("any_interface"), "{refused}");
+        assert!(refuse_kafka_gateway_misuse(
+            DataRole::Standalone,
+            Some(&kafka("0.0.0.0:9092", true))
+        )
+        .is_ok());
+    }
 
     /// #294 (review): a redirect peer may be on the other side of a rolling
     /// transport migration, and the lease client keeps TLS material as long
