@@ -67,6 +67,13 @@ pub struct MockBackend {
     /// pays the provisioning round trip — once per bucket per process, not
     /// per batch (#102).
     bucket_ensures: AtomicUsize,
+    /// How many upcoming OBJECT puts answer with a throttle (#102), counted
+    /// down as they are refused; `throttled_manifest_puts` is the manifest
+    /// stage's own budget, so a test can throttle either stage by name
+    /// (review) — an object put always precedes its manifest put, so one
+    /// shared budget could never reach the manifest stage.
+    throttled_object_puts: AtomicUsize,
+    throttled_manifest_puts: AtomicUsize,
 }
 
 impl Default for MockBackend {
@@ -88,6 +95,37 @@ impl MockBackend {
             multipart_fail_after_parts: Arc::new(AtomicUsize::new(usize::MAX)),
             multipart_parts_uploaded: Arc::new(AtomicUsize::new(0)),
             bucket_ensures: AtomicUsize::new(0),
+            throttled_object_puts: AtomicUsize::new(0),
+            throttled_manifest_puts: AtomicUsize::new(0),
+        }
+    }
+
+    /// The next `count` OBJECT puts answer as an overloaded store does
+    /// (#102): `UploadThrottled`, nothing stored.
+    pub fn with_throttled_puts(self, count: usize) -> Self {
+        self.throttled_object_puts.store(count, Ordering::SeqCst);
+        self
+    }
+
+    /// The next `count` MANIFEST puts answer with a throttle (#102); the
+    /// object put before each still lands.
+    pub fn with_throttled_manifest_puts(self, count: usize) -> Self {
+        self.throttled_manifest_puts.store(count, Ordering::SeqCst);
+        self
+    }
+
+    fn take_throttle(&self, budget: &AtomicUsize, uri: &str) -> Result<(), VtopError> {
+        let refused = budget
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok();
+        if refused {
+            Err(VtopError::UploadThrottled(format!(
+                "mock put {uri}: SlowDown (http 503): please reduce your request rate"
+            )))
+        } else {
+            Ok(())
         }
     }
 
@@ -200,6 +238,7 @@ impl UploadBackend for MockBackend {
         object_uri: &str,
         checksum: Option<ObjectChecksum<'_>>,
     ) -> Result<StoredObject, VtopError> {
+        self.take_throttle(&self.throttled_object_puts, object_uri)?;
         let version_id = self
             .store(local_path, object_uri, checksum.map(|c| c.hex))
             .await?;
@@ -214,6 +253,7 @@ impl UploadBackend for MockBackend {
         manifest_uri: &str,
         checksum: Option<ObjectChecksum<'_>>,
     ) -> Result<StoredManifest, VtopError> {
+        self.take_throttle(&self.throttled_manifest_puts, manifest_uri)?;
         let version_id = self
             .store(local_path, manifest_uri, checksum.map(|c| c.hex))
             .await?;
