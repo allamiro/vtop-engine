@@ -117,8 +117,10 @@ pub enum MetaCommand {
         /// fails the audit by name.
         #[arg(long)]
         replicas: Option<std::path::PathBuf>,
-        /// Per-replica timeout for the epoch-vector read.
-        #[arg(long, default_value_t = 5_000)]
+        /// Per-replica timeout for the epoch-vector read. Zero would time
+        /// every read out and call healthy replicas unreachable, so it is
+        /// refused.
+        #[arg(long, default_value_t = 5_000, value_parser = clap::value_parser!(u64).range(1..))]
         replica_timeout_ms: u64,
     },
     /// Propose `RegisterNode` through the Consensus façade.
