@@ -415,17 +415,22 @@ TOTAL_PACKAGES="$(cargo tree ${selection[@]+"${selection[@]}"} \
 }
 
 built_packages() {
-  # Distinct packages with at least one COMPILED artifact so far — a build
-  # script's executable is not one (review): it is emitted before the
-  # script has run, and a package with a slow build script would otherwise
-  # read as built for the whole of it. A dependency has exactly one
-  # artifact, so this is exact for all but the selected roots, whose extra
-  # test targets can complete a little after the package first counts. A
-  # missing file (the first poll on a cold build) is zero, not an error.
+  # Distinct packages with at least one COMPILED artifact, or whose build
+  # script has RUN, so far. A build script's executable is neither (review):
+  # it is emitted before the script has run, and a package with a slow build
+  # script would otherwise read as built for the whole of it — while the
+  # `build-script-executed` message that follows the run counts, so a
+  # package the build touches only for its script still reaches the bar
+  # (review, round two). A dependency has exactly one artifact, so this is
+  # exact for all but the selected roots, whose extra test targets can
+  # complete a little after the package first counts. A missing file (the
+  # first poll on a cold build) is zero, not an error.
   [[ -f "$WORK/build.json" ]] || { echo 0; return; }
-  grep '"reason":"compiler-artifact"' "$WORK/build.json" 2>/dev/null \
-    | grep -v '"kind":\["custom-build"\]' \
-    | grep -oE '"package_id":"[^"]*"' | sort -u | wc -l | tr -d ' '
+  {
+    grep '"reason":"compiler-artifact"' "$WORK/build.json" 2>/dev/null \
+      | grep -v '"kind":\["custom-build"\]'
+    grep '"reason":"build-script-executed"' "$WORK/build.json" 2>/dev/null
+  } | grep -oE '"package_id":"[^"]*"' | sort -u | wc -l | tr -d ' '
 }
 
 # Cargo colours its status lines whenever `--color always` or
