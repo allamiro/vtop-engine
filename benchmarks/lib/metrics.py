@@ -21,7 +21,8 @@ CSV_HEADERS: dict[str, list[str]] = {
         "ledger_bytes", "ledger_rows", "ledger_bytes_per_batch", "recovery_ms",
         "final_backlog_bytes", "total_seeded_bytes",
         "throughput_files_per_sec", "throughput_mb_per_sec", "avg_latency_ms",
-        "p50_latency_ms", "p95_latency_ms", "p99_latency_ms", "cpu_avg_percent",
+        "p50_latency_ms", "p95_latency_ms", "p99_latency_ms",
+        "upload_p50_ms", "upload_p95_ms", "cpu_avg_percent",
         "cpu_max_percent", "memory_avg_mb", "memory_max_mb", "disk_read_mb",
         "disk_write_mb", "network_tx_mb", "network_rx_mb", "error_count",
         # The pipe the run was measured through (#403); empty when unshaped.
@@ -181,6 +182,7 @@ def _summary_md(s: dict) -> str:
         f"| Compression ratio (avg) | {g('compression_ratio_avg')} |",
         f"| Avg batch duration | {g('avg_batch_duration_ms')} ms |",
         f"| Latency p50 / p95 / p99 | {g('p50_latency_ms')} / {g('p95_latency_ms')} / {g('p99_latency_ms')} ms |",
+        f"| Upload leg p50 / p95 | {g('upload_p50_ms')} / {g('upload_p95_ms')} ms |",
         f"| Errors | {g('error_count')} |",
         f"| Failed / successful batches | {g('failed_batches')} / {g('successful_batches')} |",
         f"| CPU avg / max | {g('cpu_avg_percent')}% / {g('cpu_max_percent')}% |",

@@ -38,7 +38,7 @@ COMPARE_COLS = [
     "replayed_files", "cpu_max_percent", "memory_max_mb",
     # The pipe a shaped run was measured through (#403); empty when unshaped.
     "shaping_proxy", "shaping_bandwidth_kbps", "shaping_latency_ms", "shaping_jitter_ms",
-    "shaping_scope",
+    "shaping_scope", "upload_p95_ms",
 ]
 
 

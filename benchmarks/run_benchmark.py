@@ -114,6 +114,7 @@ def main() -> int:
     start = time.time()
     start_iso = iso_now()
     batch_total_ms = []
+    batch_upload_ms = []  # the store's share of each batch (#403)
     out_objects = 0
     out_bytes = 0
     in_bytes = 0
@@ -137,7 +138,7 @@ def main() -> int:
     # The pipe is shaped for exactly the block the measurements come from,
     # and unshaped on every way out of it (#403).
     with SystemMonitor(emit_sys, interval=float(sc.get("sys_sample_interval", 1.0))), \
-            shaping.shaped(sc, endpoint=engine.effective_endpoint(sc)):
+            shaping.shaped(sc, endpoint=engine.effective_endpoint(sc), shape=shape):
         # initial seed
         # A --seed-dir the caller supplied may already hold input. Those bytes
         # reach `bytes_archived`, so they must reach `bytes_seeded` too or the
@@ -268,6 +269,8 @@ def main() -> int:
                 # upload metrics
                 b, k = parse_bucket_key(o.get("object_uri"))
                 up_ms = m.get("object_upload_ms", 0) or 0
+                if up_ms:
+                    batch_upload_ms.append(up_ms)
                 speed = (cbytes / 1e6) / (up_ms / 1000.0) if up_ms else 0.0
                 writer.row("upload_metrics.csv", {
                     "run_id": run_id, "batch_id": bid, "object_key": k,
@@ -458,6 +461,10 @@ def main() -> int:
         "p50_latency_ms": percentile(batch_total_ms, 50),
         "p95_latency_ms": percentile(batch_total_ms, 95),
         "p99_latency_ms": percentile(batch_total_ms, 99),
+        # The upload leg alone (#403): the number a shaped pipe moves first,
+        # and the raw signal #102's width controller consumes.
+        "upload_p50_ms": percentile(batch_upload_ms, 50),
+        "upload_p95_ms": percentile(batch_upload_ms, 95),
         "compression_ratio_avg": round(sum(comp_ratios) / len(comp_ratios), 3) if comp_ratios else 0,
         "error_count": errors, "failed_batches": failed, "successful_batches": success,
         "backend": sc.get("backend", "mock"),

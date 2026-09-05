@@ -47,6 +47,13 @@ from urllib.parse import urlsplit
 TOXIC_PREFIX = "vtop_"
 TOXIC_KINDS = ("bandwidth_up", "bandwidth_down", "latency_up", "latency_down")
 
+# The claim (review): ownership of a proxy is taken by creating this toxic,
+# which toxiproxy refuses with 409 when the name already exists — one atomic
+# step, where "read the proxy, see it empty, install" was two, and two runs
+# racing to the same proxy could both see it empty. A zero-millisecond
+# latency toxic shapes nothing; it is there to be refused.
+LOCK_TOXIC = TOXIC_PREFIX + "lock"
+
 
 def new_run_token() -> str:
     import os
@@ -97,6 +104,11 @@ class Shape:
 
     def toxic_name(self, kind: str) -> str:
         return f"{TOXIC_PREFIX}{self.run_token}_{kind}"
+
+    @staticmethod
+    def lock_toxic() -> dict[str, Any]:
+        return {"name": LOCK_TOXIC, "type": "latency", "stream": "downstream",
+                "toxicity": 1.0, "attributes": {"latency": 0, "jitter": 0}}
 
     @classmethod
     def from_scenario(cls, scenario) -> Shape | None:
@@ -225,39 +237,59 @@ def _listener_port(listen: Any) -> int | None:
 
 
 def apply(shape: Shape, client: ToxiproxyClient, endpoint: str | None = None) -> None:
-    """Install the shape on its proxy, replacing any toxic of ours already
-    there. With `endpoint`, the engine's effective endpoint must name the
-    proxy's own listener port: a scenario declaring the store's direct port
-    would otherwise bypass every toxic while the summary recorded a shape."""
-    status, proxy = client.request("GET", f"/proxies/{shape.proxy}")
+    """Claim the proxy, check it, and install the shape on it. With
+    `endpoint`, the engine's effective endpoint must name the proxy's own
+    listener port: a scenario declaring the store's direct port would
+    otherwise bypass every toxic while the summary recorded a shape."""
+    # The claim first (review), and atomic: toxiproxy refuses a toxic whose
+    # name exists with 409, so of two runs racing to one proxy exactly one
+    # holds the lock — the other is refused here, before it reads anything.
+    status, _ = client.request("POST", f"/proxies/{shape.proxy}/toxics", shape.lock_toxic())
     if status == 404:
         raise ShapingError(
             f"toxiproxy has no proxy {shape.proxy!r}: the shaped stack registers it "
             "from benchmarks/toxiproxy.json at startup")
+    if status == 409:
+        raise ShapingError(
+            f"proxy {shape.proxy!r} is claimed by another shaped run (its {LOCK_TOXIC} toxic is "
+            "present). Wait for it; if that run was interrupted before it cleaned up, remove "
+            f"its toxics — DELETE {shape.api_url}/proxies/{shape.proxy}/toxics/{LOCK_TOXIC} and "
+            "its vtop_<token>_* toxics — or restart the shaped stack")
+    if status not in (200, 201):
+        raise ShapingError(f"toxiproxy answered HTTP {status} claiming proxy {shape.proxy!r}")
+    # Claimed: every refusal from here releases the claim on the way out.
+    try:
+        _check_and_install(shape, client, endpoint)
+    except ShapingError:
+        clear(shape, client)
+        raise
+
+
+def _check_and_install(shape: Shape, client: ToxiproxyClient, endpoint: str | None) -> None:
+    status, proxy = client.request("GET", f"/proxies/{shape.proxy}")
     if status != 200:
         raise ShapingError(f"toxiproxy answered HTTP {status} for proxy {shape.proxy!r}")
-    # Any toxic already on the proxy refuses the run (review): another run's
-    # (live, or an interrupted one's leftover — one run cannot tell which) or
-    # somebody's hand-made one. Either would shape the run on top of the
+    # Any OTHER toxic already on the proxy refuses the run (review): another
+    # run's (an interrupted one's leftover, since a live one holds the lock)
+    # or somebody's hand-made one. Either would shape the run on top of the
     # scenario's shape while the summary said otherwise; nothing is deleted
     # or stacked on.
     present = sorted(
         str(t.get("name")) for t in ((proxy or {}).get("toxics") or [])
-        if isinstance(t, dict) and t.get("enabled", True))
+        if isinstance(t, dict) and t.get("enabled", True) and t.get("name") != LOCK_TOXIC)
     if present:
         ours = [name for name in present if name.startswith(TOXIC_PREFIX)]
         theirs = [name for name in present if not name.startswith(TOXIC_PREFIX)]
         detail = []
         if ours:
-            detail.append(f"{ours} from another shaped run (live, or interrupted before it "
-                          "cleaned up)")
+            detail.append(f"{ours} from another shaped run (interrupted before it cleaned up)")
         if theirs:
             detail.append(f"{theirs} not this harness's")
         raise ShapingError(
             f"proxy {shape.proxy!r} already carries toxic(s): {'; '.join(detail)}. They would "
-            "shape this run on top of its own shape and the summary would not say so. Wait for "
-            "the other run, or remove them: DELETE {api}/proxies/{proxy}/toxics/<name>, or "
-            "restart the shaped stack".replace("{api}", shape.api_url).replace("{proxy}", shape.proxy))
+            "shape this run on top of its own shape and the summary would not say so. Remove "
+            f"them — DELETE {shape.api_url}/proxies/{shape.proxy}/toxics/<name> — or restart the "
+            "shaped stack")
     if shape.proxy == BUNDLED_PROXY and (proxy or {}).get("upstream") != BUNDLED_UPSTREAM:
         raise ShapingError(
             f"proxy {BUNDLED_PROXY!r} forwards to {(proxy or {}).get('upstream')!r}, not the "
@@ -271,16 +303,8 @@ def apply(shape: Shape, client: ToxiproxyClient, endpoint: str | None = None) ->
                 f"the engine's endpoint {endpoint!r} does not reach proxy {shape.proxy!r}, "
                 f"which listens on port {listener}: the run would go around the shape")
     for toxic in shape.toxics():
-        try:
-            status, _ = client.request("POST", f"/proxies/{shape.proxy}/toxics", toxic)
-        except ShapingError:
-            # Half a shape is not a shape: what was accepted is removed
-            # before the failure is reported, so nothing lingers for the
-            # next run.
-            clear(shape, client)
-            raise
+        status, _ = client.request("POST", f"/proxies/{shape.proxy}/toxics", toxic)
         if status not in (200, 201):
-            clear(shape, client)
             raise ShapingError(
                 f"toxiproxy refused toxic {toxic['name']} on {shape.proxy!r} (HTTP {status}); "
                 "the toxics accepted before it were removed again")
@@ -291,7 +315,9 @@ def clear(shape: Shape, client: ToxiproxyClient) -> None:
     are fine; a removal that FAILS is reported after every name was tried,
     because a toxic left behind shapes the next run without saying so."""
     stayed = []
-    for name in shape.toxic_names():
+    # The claim goes last: a removal that stops halfway leaves the proxy
+    # claimed, so the next run is refused instead of shaped twice.
+    for name in [*shape.toxic_names(), LOCK_TOXIC]:
         # Every name is tried whatever the previous one did (review): a
         # reset on one removal must not leave the others installed.
         try:
@@ -356,13 +382,16 @@ def require_endpoint_through_proxy(scenario, effective_endpoint: str) -> None:
 @contextmanager
 def shaped(scenario, client_factory: Callable[[str], ToxiproxyClient] = ToxiproxyClient,
            log: Callable[[str], None] = print,
-           endpoint: str | None = None) -> Iterator[Shape | None]:
+           endpoint: str | None = None,
+           shape: Shape | None = None) -> Iterator[Shape | None]:
     """Shape the pipe for the duration of the block, and unshape it after.
 
     The removal runs on every exit — a failed run, a keyboard interrupt — so
     a following unshaped scenario never inherits a pipe it did not ask for.
     """
-    shape = Shape.from_scenario(scenario)
+    # The instance the caller judged, when it has one (review): its run token
+    # names the toxics, and the summary records that same token.
+    shape = shape if shape is not None else Shape.from_scenario(scenario)
     if shape is None:
         yield None
         return

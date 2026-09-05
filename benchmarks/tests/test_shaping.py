@@ -9,6 +9,7 @@ import pytest
 from lib.engine import _is_lab_endpoint
 from lib.scenario import Scenario, load_scenario
 from lib.shaping import (
+    LOCK_TOXIC,
     TOXIC_KINDS,
     Shape,
     ShapingError,
@@ -33,7 +34,9 @@ class ScriptedClient:
     def request(self, method, path, body=None):
         self.calls.append((method, path, body))
         default = {"GET": 200, "POST": 201, "DELETE": 204}[method]
-        status = self.statuses.get((method, path), default)
+        # A status may be scripted per toxic name, or per method and path.
+        named = (method, path, (body or {}).get("name")) if isinstance(body, dict) else None
+        status = self.statuses.get(named, self.statuses.get((method, path), default))
         payload = (
             {"name": "minio", "listen": "[::]:9100", "upstream": "minio:9000", "toxics": []}
             if method == "GET" else None)
@@ -103,8 +106,9 @@ def test_cleanup_tries_every_toxic_past_a_transport_error():
     with pytest.raises(ShapingError, match="_bandwidth_up \\(toxiproxy"):
         with shaped(sc, client_factory=lambda url: client, log=lambda _: None):
             pass
-    tail = [p for m, p, _ in client.calls[-4:] if m == "DELETE"]
-    assert len(tail) == 4, "the other three were still attempted"
+    tail = [p for m, p, _ in client.calls[-5:] if m == "DELETE"]
+    assert len(tail) == 5, "the other three, and the claim, were still attempted"
+    assert tail[-1].endswith(LOCK_TOXIC), "the claim goes last"
 
 
 def test_bad_knobs_are_refused_by_name():
@@ -143,15 +147,37 @@ def test_latency_only_and_bandwidth_only_shapes_carry_only_their_toxics():
 # --------------------------------------------------------------------------
 
 
-def test_apply_checks_the_proxy_and_installs_this_runs_toxics():
+def test_apply_claims_the_proxy_checks_it_and_installs_this_runs_toxics():
     client = ScriptedClient()
     shape = Shape("http://127.0.0.1:8474", "minio", 1250, 100, 20, "cafe0001")
     apply(shape, client)
     methods = [(m, p) for m, p, _ in client.calls]
-    assert methods[0] == ("GET", "/proxies/minio")
-    assert methods[1:] == [("POST", "/proxies/minio/toxics")] * 4
-    assert [b["name"] for _, _, b in client.calls[1:]] == shape.toxic_names()
+    # The claim first, then the look, then the shape.
+    assert methods[0] == ("POST", "/proxies/minio/toxics")
+    assert client.calls[0][2]["name"] == LOCK_TOXIC
+    assert client.calls[0][2]["attributes"] == {"latency": 0, "jitter": 0}, "shapes nothing"
+    assert methods[1] == ("GET", "/proxies/minio")
+    assert methods[2:] == [("POST", "/proxies/minio/toxics")] * 4
+    assert [b["name"] for _, _, b in client.calls[2:]] == shape.toxic_names()
     assert all(n.startswith("vtop_cafe0001_") for n in shape.toxic_names())
+
+
+def test_a_proxy_claimed_by_another_run_is_refused_at_the_claim():
+    client = ScriptedClient(statuses={("POST", "/proxies/minio/toxics", LOCK_TOXIC): 409})
+    with pytest.raises(ShapingError, match="claimed by another shaped run"):
+        apply(Shape("http://x", "minio", 1250, 0, 0), client)
+    assert len(client.calls) == 1, "refused at the claim: nothing read, nothing installed, nothing deleted"
+
+
+def test_shaped_installs_the_shape_it_was_given():
+    client = ScriptedClient()
+    sc = scenario(shaping_api_url="http://127.0.0.1:8474", shaping_bandwidth_kbps=1250)
+    given = Shape.from_scenario(sc)
+    with shaped(sc, client_factory=lambda url: client, log=lambda _: None, shape=given) as shape:
+        assert shape is given
+    installed = [b["name"] for m, _, b in client.calls if m == "POST" and b["name"] != LOCK_TOXIC]
+    assert installed == [t["name"] for t in given.toxics()], "the judged instance's token"
+    assert all(n.startswith(f"vtop_{given.run_token}_") for n in installed)
 
 
 def test_a_proxy_already_shaped_by_another_run_is_refused_not_replaced():
@@ -163,9 +189,12 @@ def test_a_proxy_already_shaped_by_another_run_is_refused_not_replaced():
             return status, payload
 
     client = Occupied()
+    shape = Shape("http://x", "minio", 1250, 0, 0)
     with pytest.raises(ShapingError, match="another shaped run"):
-        apply(Shape("http://x", "minio", 1250, 0, 0), client)
-    assert not any(m == "DELETE" for m, _, _ in client.calls), "another run's toxics are never deleted"
+        apply(shape, client)
+    deleted = [p.rsplit("/", 1)[1] for m, p, _ in client.calls if m == "DELETE"]
+    assert deleted == [*shape.toxic_names(), LOCK_TOXIC], "only this run's names, and its claim"
+    assert "vtop_deadbeef_latency_up" not in deleted, "another run's toxics are never deleted"
 
 
 def test_the_bundled_proxy_name_must_front_the_bundled_store():
@@ -195,14 +224,15 @@ def test_a_foreign_toxic_on_the_proxy_is_refused_by_name():
 
 
 def test_a_missing_proxy_names_the_file_that_registers_it():
-    client = ScriptedClient(statuses={("GET", "/proxies/minio"): 404})
+    client = ScriptedClient(statuses={("POST", "/proxies/minio/toxics"): 404})
     with pytest.raises(ShapingError, match="toxiproxy.json"):
         apply(Shape("http://x", "minio", 1250, 0, 0), client)
     assert len(client.calls) == 1, "nothing is applied to a proxy that is not there"
 
 
 def test_a_refused_toxic_fails_the_run_by_name():
-    client = ScriptedClient(statuses={("POST", "/proxies/minio/toxics"): 400})
+    client = ScriptedClient(
+        statuses={("POST", "/proxies/minio/toxics", "vtop_run_bandwidth_up"): 400})
     with pytest.raises(ShapingError, match="_bandwidth_up"):
         apply(Shape("http://x", "minio", 1250, 0, 0), client)
 
@@ -216,7 +246,7 @@ class HalfRefusingClient(ScriptedClient):
         self.calls.append((method, path, body))
         if method == "POST":
             posts = sum(1 for m, _, _ in self.calls if m == "POST")
-            return (201 if posts == 1 else 400), None
+            return (201 if posts <= 2 else 400), None  # the claim, one toxic, then no
         return {"GET": 200, "DELETE": 204}[method], None
 
 
@@ -225,9 +255,11 @@ def test_half_a_shape_is_rolled_back_before_the_failure_is_reported():
     shape = Shape("http://x", "minio", 1250, 100, 0)
     with pytest.raises(ShapingError, match="removed again"):
         apply(shape, client)
-    # After the refused POST: every toxic of this run deleted again.
-    tail = [(m, p) for m, p, _ in client.calls[-4:]]
-    assert tail == [("DELETE", f"/proxies/minio/toxics/{n}") for n in shape.toxic_names()]
+    # After the refused POST: every toxic of this run deleted again, and the
+    # claim released last.
+    tail = [(m, p) for m, p, _ in client.calls[-5:]]
+    assert tail == [("DELETE", f"/proxies/minio/toxics/{n}")
+                    for n in [*shape.toxic_names(), LOCK_TOXIC]]
 
 
 class FailingRemovalClient(ScriptedClient):
@@ -252,7 +284,7 @@ def test_a_removal_that_fails_is_reported_not_announced_as_removed():
             pass
     # Every name was still tried before the report.
     deletes = [p for m, p, _ in client.calls if m == "DELETE"]
-    assert len(deletes) == len(TOXIC_KINDS), "every name tried on exit"
+    assert len(deletes) == len(TOXIC_KINDS) + 1, "every name, and the claim, tried on exit"
 
 
 def test_an_endpoint_that_is_not_the_proxys_listener_is_refused():
@@ -297,7 +329,8 @@ def test_the_shape_is_removed_on_every_exit():
         assert shape.bandwidth_kbps == 1250
         applied = len(client.calls)
     removed = client.calls[applied:]
-    assert removed == [("DELETE", f"/proxies/minio/toxics/{n}", None) for n in shape.toxic_names()]
+    assert removed == [("DELETE", f"/proxies/minio/toxics/{n}", None)
+                       for n in [*shape.toxic_names(), LOCK_TOXIC]]
     assert any("shaping minio" in line for line in lines)
     assert any("removed" in line for line in lines)
 
@@ -308,7 +341,8 @@ def test_the_shape_is_removed_on_every_exit():
         with shaped(sc, client_factory=lambda url: client, log=lambda _: None) as shape:
             names = shape.toxic_names()
             raise RuntimeError("boom")
-    assert client.calls[-4:] == [("DELETE", f"/proxies/minio/toxics/{n}", None) for n in names]
+    assert client.calls[-5:] == [("DELETE", f"/proxies/minio/toxics/{n}", None)
+                                 for n in [*names, LOCK_TOXIC]]
 
 
 def test_an_unshaped_scenario_touches_nothing():
