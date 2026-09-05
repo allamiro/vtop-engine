@@ -8,7 +8,7 @@ description = "Kafka wire-compatibility gateway over the native VTOP broker (#22
 
 [dependencies]
 thiserror = { workspace = true }
-tokio = { version = "1", default-features = false, features = ["io-util", "net", "rt", "time", "macros"] }
+tokio = { version = "1", default-features = false, features = ["io-util", "net", "rt", "sync", "time", "macros"] }
 tracing = { workspace = true }
 uuid = { workspace = true }
 
@@ -19,5 +19,6 @@ tokio = { version = "1", default-features = false, features = [
     "macros",
     "rt",
     "rt-multi-thread",
+    "sync",
     "time",
 ] }
