@@ -406,12 +406,14 @@ pub async fn maybe_start_from_env(source: Arc<dyn MetricsSource>) -> Option<Sock
 /// The TLS preflight for the env form (review): validated BEFORE a caller
 /// builds anything it would otherwise pay for — the engine initializes its
 /// registry only once both the address and the TLS half are usable, since a
-/// registry nobody can scrape is hot-path cost with no observer. Refused,
-/// not downgraded: a misconfigured pair disables the endpoint rather than
-/// serving it plaintext.
-pub fn tls_from_env_or_disabled() -> Option<Option<TlsSettings>> {
-    match tls_from_env() {
-        Ok(tls) => Some(tls),
+/// registry nobody can scrape is hot-path cost with no observer. Validated
+/// all the way to the acceptor (review): decoding a certificate and a key
+/// proves nothing about whether they belong together, and that is the
+/// common mistake. Refused, not downgraded: a misconfigured pair disables
+/// the endpoint rather than serving it plaintext.
+pub fn tls_from_env_or_disabled() -> Option<Option<TlsAcceptor>> {
+    match tls_from_env().and_then(|tls| tls.map(TlsSettings::acceptor).transpose()) {
+        Ok(acceptor) => Some(acceptor),
         Err(reason) => {
             tracing::error!(
                 %reason,
@@ -429,13 +431,9 @@ pub fn tls_from_env_or_disabled() -> Option<Option<TlsSettings>> {
 pub async fn start_lenient(
     addr: SocketAddr,
     source: Arc<dyn MetricsSource>,
-    tls: Option<TlsSettings>,
+    acceptor: Option<TlsAcceptor>,
 ) -> Option<SocketAddr> {
-    let started = match tls {
-        Some(settings) => start_tls(addr, source, settings).await,
-        None => start(addr, source).await,
-    };
-    match started {
+    match start_with(addr, source, acceptor).await {
         Ok(bound) => Some(bound),
         Err(e) => {
             // Bind failure (port in use, permissions) must not be fatal here:
@@ -845,6 +843,26 @@ mod tests {
         .await
         .expect("served to the scraper the CA vouches for");
         assert_eq!(status, StatusCode::OK);
+    }
+
+    /// A certificate and a key that do not belong together decode fine and
+    /// fail only at the acceptor (review): the preflight must go that far.
+    #[test]
+    fn a_mismatched_certificate_and_key_are_refused_by_the_acceptor() {
+        let (chain, _key_a, _) = tls_identity("localhost");
+        let (_chain_b, key_b, _) = tls_identity("localhost");
+        let refused = TlsSettings {
+            certificate_chain: chain,
+            private_key: key_b,
+            client_roots: None,
+        }
+        .acceptor()
+        .err()
+        .expect("a mismatched pair must be refused");
+        assert!(
+            !refused.is_empty(),
+            "mismatched pair must be refused by name"
+        );
     }
 
     /// The env form is both halves or neither; never a silent plaintext
