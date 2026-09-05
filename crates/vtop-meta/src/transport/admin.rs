@@ -13,15 +13,16 @@ use super::wire::{
     AdminReadGroupCursorRequest, AdminReadGroupCursorResponse, AdminReadRangeLeaseRequest,
     AdminReadRangeLeaseResponse, AdminReadRangeTransitionsRequest,
     AdminReadRangeTransitionsResponse, AdminReadSegmentPlacementRequest,
-    AdminReadSegmentPlacementResponse, AdminStatusRequest, AdminStatusResponse, NotLeaderHint,
-    TransportError, TransportResult, VtpmFrame, KIND_ADMIN_ADD_LEARNER_REQ,
-    KIND_ADMIN_CHANGE_MEMBERSHIP_REQ, KIND_ADMIN_ERROR, KIND_ADMIN_INIT_REQ,
-    KIND_ADMIN_MEMBERSHIP_RESP, KIND_ADMIN_PROPOSE_REQ, KIND_ADMIN_PROPOSE_RESP,
-    KIND_ADMIN_READ_GROUP_CURSOR_REQ, KIND_ADMIN_READ_GROUP_CURSOR_RESP,
+    AdminReadSegmentPlacementResponse, AdminReadTopicRangesRequest, AdminReadTopicRangesResponse,
+    AdminStatusRequest, AdminStatusResponse, NotLeaderHint, TransportError, TransportResult,
+    VtpmFrame, KIND_ADMIN_ADD_LEARNER_REQ, KIND_ADMIN_CHANGE_MEMBERSHIP_REQ, KIND_ADMIN_ERROR,
+    KIND_ADMIN_INIT_REQ, KIND_ADMIN_MEMBERSHIP_RESP, KIND_ADMIN_PROPOSE_REQ,
+    KIND_ADMIN_PROPOSE_RESP, KIND_ADMIN_READ_GROUP_CURSOR_REQ, KIND_ADMIN_READ_GROUP_CURSOR_RESP,
     KIND_ADMIN_READ_RANGE_LEASE_REQ, KIND_ADMIN_READ_RANGE_LEASE_RESP,
     KIND_ADMIN_READ_RANGE_TRANSITIONS_REQ, KIND_ADMIN_READ_RANGE_TRANSITIONS_RESP,
     KIND_ADMIN_READ_SEGMENT_PLACEMENT_REQ, KIND_ADMIN_READ_SEGMENT_PLACEMENT_RESP,
-    KIND_ADMIN_STATUS_REQ, KIND_ADMIN_STATUS_RESP,
+    KIND_ADMIN_READ_TOPIC_RANGES_REQ, KIND_ADMIN_READ_TOPIC_RANGES_RESP, KIND_ADMIN_STATUS_REQ,
+    KIND_ADMIN_STATUS_RESP,
 };
 use crate::command::MetadataCommand;
 use crate::keys::MetaNodeId;
@@ -82,6 +83,18 @@ pub trait AdminHandler: Send + Sync {
     ) -> TransportResult<AdminReadGroupCursorResponse> {
         Err(TransportError::Protocol(
             "this admin handler does not serve group cursor reads".to_owned(),
+        ))
+    }
+
+    /// Linearizable read of a topic's ranges in partition order (#457 slice
+    /// 3): what a Kafka gateway answers Metadata with. Defaulted to a
+    /// refusal, as the reads above are.
+    async fn read_topic_ranges(
+        &self,
+        _request: AdminReadTopicRangesRequest,
+    ) -> TransportResult<AdminReadTopicRangesResponse> {
+        Err(TransportError::Protocol(
+            "this admin handler does not serve topic range reads".to_owned(),
         ))
     }
 }
@@ -387,6 +400,17 @@ async fn dispatch_admin(
             let response = handler.read_group_cursor(request).await?;
             Ok(VtpmFrame {
                 kind: KIND_ADMIN_READ_GROUP_CURSOR_RESP,
+                payload: response.encode()?,
+            })
+        }
+        KIND_ADMIN_READ_TOPIC_RANGES_REQ => {
+            let request = AdminReadTopicRangesRequest::decode(&frame.payload)?;
+            // A read: the shape of a topic is evidence anybody entitled to
+            // look at the cluster may check.
+            authorize(authorizer.authorize_read(identity))?;
+            let response = handler.read_topic_ranges(request).await?;
+            Ok(VtpmFrame {
+                kind: KIND_ADMIN_READ_TOPIC_RANGES_RESP,
                 payload: response.encode()?,
             })
         }
@@ -766,6 +790,30 @@ impl AdminClient {
 
     /// Linearizable read of what `group_uuid` committed on `range_uuid`
     /// (#457 slice 2b).
+    /// A topic's ranges in partition order (#457 slice 3), through the same
+    /// linearizable fence as every admin read.
+    pub async fn read_topic_ranges(
+        &self,
+        topic_uuid: uuid::Uuid,
+    ) -> TransportResult<AdminReadTopicRangesResponse> {
+        let frame = self
+            .round_trip(VtpmFrame {
+                kind: KIND_ADMIN_READ_TOPIC_RANGES_REQ,
+                payload: AdminReadTopicRangesRequest { topic_uuid }.encode(),
+            })
+            .await?;
+        match frame.kind {
+            KIND_ADMIN_READ_TOPIC_RANGES_RESP => {
+                Ok(AdminReadTopicRangesResponse::decode(&frame.payload)?)
+            }
+            KIND_ADMIN_ERROR => {
+                let error = AdminError::decode(&frame.payload)?;
+                Err(TransportError::Protocol(error.message))
+            }
+            other => Err(TransportError::UnexpectedKind(other)),
+        }
+    }
+
     pub async fn read_group_cursor(
         &self,
         group_uuid: uuid::Uuid,

@@ -447,6 +447,21 @@ Cutover records a barrier offset for each parent and the ordered child mapping.
 Parent ranges remain readable until all durable consumer cursors and retention
 rules permit retirement.
 
+A topic holds one or more ranges (#457). It is created as one range covering
+the whole key space, and `SetTopicPartitions` replaces that with several — one
+per Kafka partition — by halving the space as `KeyRange::children` does, so
+every prefix is canonical and the set is exactly disjoint: no key falls in two
+partitions and none falls outside. The count is therefore a power of two, the
+root range keeps partition 0, and the partitions are declared once, before the
+topic is held or written: redrawing them under a client that has already
+produced is the split problem, and splitting is not served yet. Ranges are read
+back in key-space order, which is the order a Kafka client sees as partition 0,
+1, 2 — derived, not stored, so every node and the operator's tool number them
+identically without asking each other. `vtopctl meta topic-ranges` reads them
+through the same linearizable fence as every admin read, with the lineage each
+cursor on them is bound to and the node holding each range now, including when
+that lease runs out.
+
 A cursor may stand UNPINNED (#457, #468): a nil segment id, bound to the topic
 epoch and the range's lineage generation, its record offset the position. This
 is how a Kafka consumer group's committed offset lives on the plane — a

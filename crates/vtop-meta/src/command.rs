@@ -90,6 +90,13 @@ const COMMAND_KIND_RENEW_RANGE_LEASE: u16 = 29;
 const COMMAND_KIND_REPORT_PROMOTION_OUTCOME: u16 = 30;
 const COMMAND_KIND_COMMIT_GROUP_CURSOR_FENCED: u16 = 31;
 const COMMAND_KIND_ENSURE_GROUP_MEMBER_FOR_RANGE: u16 = 32;
+const COMMAND_KIND_SET_TOPIC_PARTITIONS: u16 = 33;
+
+/// Ranges one topic may hold (#457 slice 3). A Kafka client sees one
+/// partition per range, and a partition index is an integer it remembers, so
+/// the ceiling is what a client can be asked to carry rather than what the
+/// plane could store.
+pub const MAX_RANGES_PER_TOPIC: usize = 1024;
 
 /// Why a fenced cursor commit is refused (#457 slice 2b): the commit did not
 /// come from the range's current leaseholder at its current fencing epoch. A
@@ -547,6 +554,29 @@ pub enum MetadataCommand {
         group_uuid: Uuid,
         member_uuid: Uuid,
     },
+    /// The partitions a topic is served as (#457 slice 3): a topic is created
+    /// with one range covering the whole key space, and this replaces it with
+    /// several — one per Kafka partition, each led by whichever node holds
+    /// that range's lease.
+    ///
+    /// The plane derives the key space itself, by halving as
+    /// `vtop_log::KeyRange::children` does, so every range is canonical and
+    /// the set is exactly disjoint: no key can fall in two partitions and
+    /// none falls outside. That makes the partition count a power of two, and
+    /// the root range keeps its identity as partition 0 — a node already
+    /// configured for it keeps serving it.
+    ///
+    /// Declared once, before the topic is used: the plane refuses this on a
+    /// topic whose range has ever been leased or written, because moving a
+    /// key's partition under a client that has already produced to it is the
+    /// split problem, and splitting is not served yet. An operator's act,
+    /// like `CreateTopic`: cluster-scoped.
+    SetTopicPartitions {
+        env: CommandEnvelope,
+        topic_uuid: Uuid,
+        /// The ids for partitions 1..n; partition 0 stays the root range.
+        additional_range_uuids: Vec<Uuid>,
+    },
     /// The membership a range's gateway needs, in one fenced step (#457 slice
     /// 2b): the group exists, this member is in it, and it holds this range.
     /// Idempotent and deterministic — the state machine sees what stands and
@@ -787,6 +817,7 @@ impl MetadataCommand {
             | MetadataCommand::CommitGroupCursor { env, .. }
             | MetadataCommand::CommitGroupCursorFenced { env, .. }
             | MetadataCommand::EnsureGroupMemberForRange { env, .. }
+            | MetadataCommand::SetTopicPartitions { env, .. }
             | MetadataCommand::HeartbeatMember { env, .. }
             | MetadataCommand::ExpireStaleMember { env, .. }
             | MetadataCommand::SetNodePlacementAttrs { env, .. }
@@ -1048,6 +1079,26 @@ impl MetadataCommand {
                 put_u64(&mut out, *record_index);
                 encode_optional_uuid(&mut out, *lineage_transition_id);
                 encode_optional_u64(&mut out, *expected_checkpoint_generation);
+            }
+            MetadataCommand::SetTopicPartitions {
+                env,
+                topic_uuid,
+                additional_range_uuids,
+            } => {
+                if additional_range_uuids.len() >= MAX_RANGES_PER_TOPIC {
+                    return Err(CodecError::BoundExceeded {
+                        what: "topic partitions",
+                        actual: additional_range_uuids.len() + 1,
+                        maximum: MAX_RANGES_PER_TOPIC,
+                    });
+                }
+                put_u16(&mut out, COMMAND_KIND_SET_TOPIC_PARTITIONS);
+                encode_envelope(&mut out, env);
+                put_uuid(&mut out, *topic_uuid);
+                put_u16(&mut out, additional_range_uuids.len() as u16);
+                for range_uuid in additional_range_uuids {
+                    put_uuid(&mut out, *range_uuid);
+                }
             }
             MetadataCommand::EnsureGroupMemberForRange {
                 env,
@@ -1553,6 +1604,27 @@ impl MetadataCommand {
                     "expected checkpoint generation",
                 )?,
             }),
+            COMMAND_KIND_SET_TOPIC_PARTITIONS => {
+                let env = decode_envelope(reader)?;
+                let topic_uuid = reader.uuid("topic uuid")?;
+                let count = reader.u16("additional range count")? as usize;
+                if count >= MAX_RANGES_PER_TOPIC {
+                    return Err(CodecError::BoundExceeded {
+                        what: "topic partitions",
+                        actual: count + 1,
+                        maximum: MAX_RANGES_PER_TOPIC,
+                    });
+                }
+                let mut additional_range_uuids = Vec::with_capacity(count);
+                for _ in 0..count {
+                    additional_range_uuids.push(reader.uuid("range uuid")?);
+                }
+                Ok(MetadataCommand::SetTopicPartitions {
+                    env,
+                    topic_uuid,
+                    additional_range_uuids,
+                })
+            }
             COMMAND_KIND_ENSURE_GROUP_MEMBER_FOR_RANGE => {
                 let env = decode_envelope(reader)?;
                 let name = reader.bounded_str(MAX_GROUP_NAME_BYTES, "group name")?;

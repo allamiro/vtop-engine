@@ -72,6 +72,38 @@ pub enum MetaCommand {
         #[arg(long)]
         request_id: Option<Uuid>,
     },
+    /// Declare the partitions a topic is served as (#457 slice 3).
+    ///
+    /// A topic is created as one range covering the whole key space; this
+    /// replaces it with several, one per Kafka partition. The plane halves
+    /// the key space itself, so the count is a power of two and the root
+    /// range keeps partition 0 — pass the ids for partitions 1..n. Declared
+    /// once, before the topic is used: a topic already held or written keeps
+    /// the partitions it serves.
+    SetPartitions {
+        #[command(flatten)]
+        common: MetaCommonArgs,
+        #[arg(long)]
+        topic_uuid: Uuid,
+        /// The range id for each partition after 0, in order; give the flag
+        /// once per partition.
+        #[arg(long = "range-uuid", required = true)]
+        additional_range_uuids: Vec<Uuid>,
+        #[arg(long)]
+        issued_at_ms: i64,
+        #[arg(long)]
+        request_id: Option<Uuid>,
+    },
+    /// A topic's ranges in partition order (#457 slice 3), through the same
+    /// linearizable fence as every admin read: what a Kafka client sees as
+    /// partition 0, 1, 2, with the lineage each cursor on them is bound to
+    /// and the node holding each one now.
+    TopicRanges {
+        #[command(flatten)]
+        common: MetaCommonArgs,
+        #[arg(long)]
+        topic_uuid: Uuid,
+    },
     /// Read a range's current lease through a linearizable fence (#223).
     ///
     /// The read an election makes before it acts: it reports the holder, the
@@ -1050,6 +1082,92 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
                 root_range_uuid,
             };
             propose_and_print(&common.config, command, json).await
+        }
+        MetaCommand::SetPartitions {
+            common,
+            topic_uuid,
+            additional_range_uuids,
+            issued_at_ms,
+            request_id,
+        } => {
+            let command = MetadataCommand::SetTopicPartitions {
+                env: CommandEnvelope {
+                    request_id: request_id.unwrap_or_else(Uuid::new_v4),
+                    issued_at_ms,
+                },
+                topic_uuid,
+                additional_range_uuids,
+            };
+            propose_and_print(&common.config, command, json).await
+        }
+        MetaCommand::TopicRanges { common, topic_uuid } => {
+            let config = load_admin_config(&common.config)?;
+            let client = connect(&config)?;
+            let view = client
+                .read_topic_ranges(topic_uuid)
+                .await
+                .map_err(|error| error.to_string())?;
+            note_redirects(&client);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "topic_found": view.topic_found,
+                        "topic_epoch": view.topic_epoch,
+                        "read_at_applied_index": view.read_at_applied_index,
+                        "partitions": view.ranges.iter().enumerate().map(|(partition, range)| {
+                            serde_json::json!({
+                                "partition": partition,
+                                "range_uuid": range.range_uuid,
+                                "key_prefix": range.key_prefix,
+                                "key_prefix_bits": range.key_prefix_bits,
+                                "generation": range.generation,
+                                "lineage_generation": range.lineage_generation,
+                                "fencing_epoch": range.fencing_epoch,
+                                "holder_node_uuid": range.holder_node_uuid,
+                                "lease_fencing_epoch": range.holder_node_uuid
+                                    .map(|_| range.lease_fencing_epoch),
+                                "lease_expires_at_ms": range.lease_expires_at_ms,
+                            })
+                        }).collect::<Vec<_>>(),
+                    }))
+                    .map_err(|error| error.to_string())?
+                );
+            } else if !view.topic_found {
+                println!("topic {topic_uuid} not found");
+            } else {
+                println!(
+                    "topic {topic_uuid} epoch={} partitions={} read_at_applied_index={}",
+                    view.topic_epoch,
+                    view.ranges.len(),
+                    view.read_at_applied_index
+                );
+                for (partition, range) in view.ranges.iter().enumerate() {
+                    println!(
+                        "  partition {partition} range={} key_prefix={}/{} generation={} lineage={} fencing_epoch={} holder={}",
+                        range.range_uuid,
+                        range.key_prefix,
+                        range.key_prefix_bits,
+                        range.generation,
+                        range.lineage_generation,
+                        range.fencing_epoch,
+                        range
+                            .holder_node_uuid
+                            .map(|holder| {
+                                format!(
+                                    "{holder} at epoch {} until {}",
+                                    range.lease_fencing_epoch,
+                                    range
+                                        .lease_expires_at_ms
+                                        .map(|ms| ms.to_string())
+                                        .unwrap_or_else(|| "never".to_owned())
+                                )
+                            })
+                            .unwrap_or_else(|| "none".to_owned()),
+                    );
+                }
+            }
+            Ok(())
         }
         MetaCommand::RangeLease {
             common,
@@ -3328,6 +3446,51 @@ transport: plaintext
                 .expect_err("a blank domain leaves RF > 1 refused for the same reason as before");
         }
         check_failure_domain("rack-a").expect("a real domain is the accepted case");
+    }
+
+    /// #457 slice 3: `set-partitions` asks for a range id per partition after
+    /// zero, and refuses to be called with none — the plane decides the key
+    /// space, so there is nothing else to give it.
+    #[test]
+    fn set_partitions_takes_a_range_id_per_partition() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct Harness {
+            #[command(subcommand)]
+            command: MetaCommand,
+        }
+
+        let topic = node(1).to_string();
+        let base = [
+            "vtopctl",
+            "set-partitions",
+            "--config",
+            "/nonexistent/meta.yaml",
+            "--topic-uuid",
+            topic.as_str(),
+            "--issued-at-ms",
+            "1",
+        ];
+        let parse = |extra: &[&str]| {
+            Harness::try_parse_from(base.iter().copied().chain(extra.iter().copied()))
+        };
+        let (one, two, three) = (
+            node(2).to_string(),
+            node(3).to_string(),
+            node(4).to_string(),
+        );
+        assert!(parse(&["--range-uuid", &one]).is_ok());
+        let ok = parse(&[
+            "--range-uuid",
+            &one,
+            "--range-uuid",
+            &two,
+            "--range-uuid",
+            &three,
+        ]);
+        assert!(ok.is_ok(), "{:?}", ok.err().map(|e| e.to_string()));
+        assert!(parse(&[]).is_err(), "a partition needs a range to be");
     }
 
     /// #457 slice 2b: `group-cursor` names the group one way — by UUID, or

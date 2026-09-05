@@ -18,8 +18,8 @@ use crate::transport::admin::AdminHandler;
 use crate::transport::wire::{
     AdminGroupCursorView, AdminLeaseView, AdminReadGroupCursorResponse,
     AdminReadRangeLeaseResponse, AdminReadRangeTransitionsResponse,
-    AdminReadSegmentPlacementResponse, AdminRebalanceIntentView, AdminSegmentView,
-    AdminTransitionView, MAX_TRANSITIONS_PER_READ,
+    AdminReadSegmentPlacementResponse, AdminReadTopicRangesResponse, AdminRebalanceIntentView,
+    AdminSegmentView, AdminTopicRangeView, AdminTransitionView, MAX_TRANSITIONS_PER_READ,
 };
 use crate::transport::wire::{
     AdminMembershipResponse, AdminProposeResponse, AdminStatusResponse, TransportError,
@@ -350,6 +350,71 @@ impl AdminReadRangeTransitions for OpenraftConsensus {
             Ok(AdminReadRangeTransitionsResponse {
                 found,
                 transitions,
+                read_at_applied_index,
+            })
+        })
+    }
+}
+
+/// Linearizable read of a topic's ranges in partition order (#457 slice 3),
+/// its own trait for the same reason the reads beside it are.
+#[async_trait]
+pub trait AdminReadTopicRanges: Send + Sync {
+    async fn read_topic_ranges(
+        &self,
+        topic_uuid: Uuid,
+    ) -> ConsensusResult<AdminReadTopicRangesResponse>;
+}
+
+#[async_trait]
+impl AdminReadTopicRanges for OpenraftConsensus {
+    async fn read_topic_ranges(
+        &self,
+        topic_uuid: Uuid,
+    ) -> ConsensusResult<AdminReadTopicRangesResponse> {
+        let Some(store) = self.store.as_ref() else {
+            return Err(ConsensusError::Message(
+                "this node was built without applied state and cannot serve reads".to_owned(),
+            ));
+        };
+        // Fence FIRST, as every admin read does: a gateway that built its
+        // partition map from a lagging copy would name the wrong leader, or
+        // miss a range entirely, and send clients somewhere that cannot
+        // serve them.
+        self.raft
+            .ensure_linearizable()
+            .await
+            .map_err(classify_read_error)?;
+        store.with_storage(|storage| {
+            let read_at_applied_index = storage.last_applied();
+            let state = storage.state();
+            let topic_epoch = match state.record(&MetaKey::Topic { topic_uuid }) {
+                Some(MetaValue::Topic(topic)) => Some(topic.topic_epoch),
+                _ => None,
+            };
+            let ranges = state
+                .topic_ranges(topic_uuid)
+                .into_iter()
+                .map(|(range_uuid, range)| AdminTopicRangeView {
+                    range_uuid,
+                    key_prefix: range.key_prefix,
+                    key_prefix_bits: range.key_prefix_bits,
+                    generation: range.generation,
+                    lineage_generation: range.lineage_generation,
+                    fencing_epoch: range.fencing_epoch,
+                    holder_node_uuid: range.lease.as_ref().map(|lease| lease.holder_node_uuid),
+                    lease_fencing_epoch: range
+                        .lease
+                        .as_ref()
+                        .map(|lease| lease.fencing_epoch)
+                        .unwrap_or(0),
+                    lease_expires_at_ms: range.lease.as_ref().and_then(|lease| lease.expires_at_ms),
+                })
+                .collect();
+            Ok(AdminReadTopicRangesResponse {
+                topic_found: topic_epoch.is_some(),
+                topic_epoch: topic_epoch.unwrap_or(0),
+                ranges,
                 read_at_applied_index,
             })
         })
@@ -747,6 +812,15 @@ impl AdminHandler for OpenraftConsensus {
         )
         .await
         .map_err(to_transport_error)
+    }
+
+    async fn read_topic_ranges(
+        &self,
+        request: crate::transport::wire::AdminReadTopicRangesRequest,
+    ) -> TransportResult<AdminReadTopicRangesResponse> {
+        AdminReadTopicRanges::read_topic_ranges(self, request.topic_uuid)
+            .await
+            .map_err(to_transport_error)
     }
 
     async fn read_group_cursor(

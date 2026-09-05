@@ -86,6 +86,9 @@ pub const KIND_ADMIN_READ_RANGE_TRANSITIONS_RESP: u16 = 24;
 // Kafka gateway answers OffsetFetch with, linearizable like every admin read.
 pub const KIND_ADMIN_READ_GROUP_CURSOR_REQ: u16 = 25;
 pub const KIND_ADMIN_READ_GROUP_CURSOR_RESP: u16 = 26;
+/// A topic's ranges, in partition order (#457 slice 3).
+pub const KIND_ADMIN_READ_TOPIC_RANGES_REQ: u16 = 27;
+pub const KIND_ADMIN_READ_TOPIC_RANGES_RESP: u16 = 28;
 
 /// The most transition records one read returns; a longer chain is paged
 /// with `from_epoch`.
@@ -1176,6 +1179,170 @@ impl AdminReadGroupCursorResponse {
     }
 }
 
+/// Which topic to read the ranges of (#457 slice 3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdminReadTopicRangesRequest {
+    pub topic_uuid: Uuid,
+}
+
+impl AdminReadTopicRangesRequest {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_uuid(&mut out, self.topic_uuid);
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut reader = Reader::new(bytes);
+        let request = Self {
+            topic_uuid: reader.uuid("topic uuid")?,
+        };
+        reader.finish()?;
+        Ok(request)
+    }
+}
+
+/// One range of a topic, as the admin wire carries it (#457 slice 3): what a
+/// gateway needs to present the range as a Kafka partition — where it sits in
+/// the key space (which is the partition order), the lineage a cursor on it
+/// is bound to, and who holds it now, if anyone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdminTopicRangeView {
+    pub range_uuid: Uuid,
+    pub key_prefix: u64,
+    pub key_prefix_bits: u8,
+    pub generation: u64,
+    pub lineage_generation: u64,
+    pub fencing_epoch: u64,
+    /// The live lease, when one is held.
+    pub holder_node_uuid: Option<Uuid>,
+    /// The epoch that lease was granted at; meaningless without a holder.
+    pub lease_fencing_epoch: u64,
+    /// When that lease runs out, where it does (review): a record still
+    /// naming a holder is not proof the holder still has it, and a gateway
+    /// that could not tell would route clients to an expired leader. `None`
+    /// with a holder is an administrative grant, which never expires.
+    pub lease_expires_at_ms: Option<i64>,
+}
+
+impl AdminTopicRangeView {
+    pub(crate) fn encode_into(&self, out: &mut Vec<u8>) {
+        put_uuid(out, self.range_uuid);
+        put_u64(out, self.key_prefix);
+        put_u8(out, self.key_prefix_bits);
+        put_u64(out, self.generation);
+        put_u64(out, self.lineage_generation);
+        put_u64(out, self.fencing_epoch);
+        match self.holder_node_uuid {
+            None => put_u8(out, 0),
+            Some(holder) => {
+                put_u8(out, 1);
+                put_uuid(out, holder);
+            }
+        }
+        put_u64(out, self.lease_fencing_epoch);
+        match self.lease_expires_at_ms {
+            None => put_u8(out, 0),
+            Some(expires_at_ms) => {
+                put_u8(out, 1);
+                put_i64(out, expires_at_ms);
+            }
+        }
+    }
+
+    pub(crate) fn decode_from(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
+        Ok(Self {
+            range_uuid: reader.uuid("range uuid")?,
+            key_prefix: reader.u64("key prefix")?,
+            key_prefix_bits: reader.u8("key prefix bits")?,
+            generation: reader.u64("range generation")?,
+            lineage_generation: reader.u64("lineage generation")?,
+            fencing_epoch: reader.u64("fencing epoch")?,
+            holder_node_uuid: match reader.u8("holder flag")? {
+                0 => None,
+                1 => Some(reader.uuid("holder node uuid")?),
+                _ => {
+                    return Err(CodecError::InvalidValue {
+                        what: "holder flag",
+                        reason: "must be 0 or 1",
+                    })
+                }
+            },
+            lease_fencing_epoch: reader.u64("lease fencing epoch")?,
+            lease_expires_at_ms: match reader.u8("lease deadline flag")? {
+                0 => None,
+                1 => Some(reader.i64("lease expires at ms")?),
+                _ => {
+                    return Err(CodecError::InvalidValue {
+                        what: "lease deadline flag",
+                        reason: "must be 0 or 1",
+                    })
+                }
+            },
+        })
+    }
+}
+
+/// A topic's ranges in partition order, and the applied index the read was
+/// served at (#457 slice 3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdminReadTopicRangesResponse {
+    pub topic_found: bool,
+    /// The topic's epoch: the identity every cursor on these ranges is bound
+    /// to, and what tells a gateway the topic it serves is still the one it
+    /// was configured for.
+    pub topic_epoch: u64,
+    pub ranges: Vec<AdminTopicRangeView>,
+    pub read_at_applied_index: u64,
+}
+
+impl AdminReadTopicRangesResponse {
+    pub fn encode(&self) -> Result<Vec<u8>, CodecError> {
+        if self.ranges.len() > crate::command::MAX_RANGES_PER_TOPIC {
+            return Err(CodecError::BoundExceeded {
+                what: "topic ranges",
+                actual: self.ranges.len(),
+                maximum: crate::command::MAX_RANGES_PER_TOPIC,
+            });
+        }
+        let mut out = Vec::new();
+        put_u8(&mut out, u8::from(self.topic_found));
+        put_u64(&mut out, self.topic_epoch);
+        put_u16(&mut out, self.ranges.len() as u16);
+        for range in &self.ranges {
+            range.encode_into(&mut out);
+        }
+        put_u64(&mut out, self.read_at_applied_index);
+        Ok(out)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut reader = Reader::new(bytes);
+        let topic_found = reader.flag("topic found")?;
+        let topic_epoch = reader.u64("topic epoch")?;
+        let count = reader.u16("range count")? as usize;
+        if count > crate::command::MAX_RANGES_PER_TOPIC {
+            return Err(CodecError::BoundExceeded {
+                what: "topic ranges",
+                actual: count,
+                maximum: crate::command::MAX_RANGES_PER_TOPIC,
+            });
+        }
+        let mut ranges = Vec::with_capacity(count);
+        for _ in 0..count {
+            ranges.push(AdminTopicRangeView::decode_from(&mut reader)?);
+        }
+        let response = Self {
+            topic_found,
+            topic_epoch,
+            ranges,
+            read_at_applied_index: reader.u64("read at applied index")?,
+        };
+        reader.finish()?;
+        Ok(response)
+    }
+}
+
 /// Which segment to read the placement for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AdminReadSegmentPlacementRequest {
@@ -2209,6 +2376,73 @@ mod tests {
     /// response — with no cursor, with an unpinned one, with a pinned one
     /// carrying a lineage transition id — and refuses a presence flag that
     /// is neither 0 nor 1.
+    #[test]
+    fn topic_ranges_read_round_trips() {
+        let request = AdminReadTopicRangesRequest {
+            topic_uuid: Uuid::from_u128(20),
+        };
+        assert_eq!(
+            AdminReadTopicRangesRequest::decode(&request.encode()).unwrap(),
+            request
+        );
+        let held = AdminTopicRangeView {
+            range_uuid: Uuid::from_u128(21),
+            key_prefix: 0,
+            key_prefix_bits: 0,
+            generation: 3,
+            lineage_generation: 0,
+            fencing_epoch: 2,
+            holder_node_uuid: Some(Uuid::from_u128(10)),
+            lease_fencing_epoch: 2,
+            lease_expires_at_ms: Some(1_700_000_000_000),
+        };
+        let free = AdminTopicRangeView {
+            range_uuid: Uuid::from_u128(22),
+            key_prefix: 1 << 63,
+            key_prefix_bits: 1,
+            generation: 0,
+            lineage_generation: 0,
+            fencing_epoch: 0,
+            holder_node_uuid: None,
+            lease_fencing_epoch: 0,
+            lease_expires_at_ms: None,
+        };
+        for response in [
+            AdminReadTopicRangesResponse {
+                topic_found: true,
+                topic_epoch: 4,
+                ranges: vec![held, free],
+                read_at_applied_index: 99,
+            },
+            AdminReadTopicRangesResponse {
+                topic_found: false,
+                topic_epoch: 0,
+                ranges: Vec::new(),
+                read_at_applied_index: 7,
+            },
+        ] {
+            let bytes = response.encode().unwrap();
+            assert_eq!(
+                AdminReadTopicRangesResponse::decode(&bytes).unwrap(),
+                response
+            );
+        }
+        // A holder flag that is neither 0 nor 1 is refused, not guessed.
+        let mut bytes = AdminReadTopicRangesResponse {
+            topic_found: true,
+            topic_epoch: 1,
+            ranges: vec![free],
+            read_at_applied_index: 1,
+        }
+        .encode()
+        .unwrap();
+        // The holder flag sits before the lease epoch, its deadline flag and
+        // the applied index.
+        let flag = bytes.len() - 8 - 1 - 8 - 1;
+        bytes[flag] = 2;
+        assert!(AdminReadTopicRangesResponse::decode(&bytes).is_err());
+    }
+
     #[test]
     fn group_cursor_read_round_trips() {
         let request = AdminReadGroupCursorRequest {

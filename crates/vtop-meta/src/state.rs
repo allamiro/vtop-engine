@@ -1292,6 +1292,11 @@ impl MetaStateMachine {
                 lineage_transition_id: *lineage_transition_id,
                 expected_checkpoint_generation: *expected_checkpoint_generation,
             }),
+            MetadataCommand::SetTopicPartitions {
+                topic_uuid,
+                additional_range_uuids,
+                ..
+            } => self.set_topic_partitions(*topic_uuid, additional_range_uuids),
             MetadataCommand::EnsureGroupMemberForRange {
                 name,
                 group_uuid,
@@ -2558,6 +2563,135 @@ impl MetaStateMachine {
         group.generation = next_group_generation;
         MetadataResponse::Ack {
             generation: next_member_generation,
+        }
+    }
+
+    /// A topic's ranges, in partition order (#457 slice 3): by key prefix,
+    /// then by the range's own id where two share one — the order a Kafka
+    /// client sees as partition 0, 1, 2. Deterministic, so every node and the
+    /// operator's tool number the partitions the same way without asking each
+    /// other.
+    pub fn topic_ranges(&self, topic_uuid: Uuid) -> Vec<(Uuid, RangeRecord)> {
+        let start = MetaKey::Range {
+            topic_uuid,
+            range_uuid: Uuid::nil(),
+        }
+        .encode();
+        let end = MetaKey::Range {
+            topic_uuid,
+            range_uuid: Uuid::from_u128(u128::MAX),
+        }
+        .encode();
+        let mut ranges: Vec<(Uuid, RangeRecord)> = self
+            .records
+            .range(start..=end)
+            .filter_map(
+                |(key_bytes, value)| match (MetaKey::decode(key_bytes), value) {
+                    (Ok(MetaKey::Range { range_uuid, .. }), MetaValue::Range(range)) => {
+                        Some((range_uuid, range.clone()))
+                    }
+                    _ => None,
+                },
+            )
+            .collect();
+        // By where the range begins in the key space, not by how wide it is
+        // (review): partition numbers follow the key space's own order, and a
+        // narrower range that begins earlier still comes first.
+        ranges.sort_by_key(|(range_uuid, range)| {
+            (range.key_prefix, range.key_prefix_bits, *range_uuid)
+        });
+        ranges
+    }
+
+    /// The partitions a topic is served as (#457 slice 3): the root range is
+    /// replaced by `1 + additional.len()` ranges covering the key space
+    /// exactly, derived by halving as `vtop_log::KeyRange::children` does, so
+    /// every prefix is canonical and no key falls in two partitions or in
+    /// none. That makes the count a power of two.
+    ///
+    /// Declared once, before the topic is used: the topic must still hold
+    /// only its root range, and that range must never have been leased,
+    /// fenced or written — moving a key's partition under a client that has
+    /// already produced to it is the split problem, and splitting is not
+    /// served yet. The root keeps its identity as partition 0, so a node
+    /// already configured for it keeps serving it.
+    fn set_topic_partitions(&mut self, topic_uuid: Uuid, additional: &[Uuid]) -> MetadataResponse {
+        let topic_key = MetaKey::Topic { topic_uuid }.encode();
+        if !matches!(self.records.get(&topic_key), Some(MetaValue::Topic(_))) {
+            return reject(MetadataError::NotFound);
+        }
+        let partitions = additional.len() + 1;
+        if partitions > crate::command::MAX_RANGES_PER_TOPIC {
+            return reject(MetadataError::limit(format!(
+                "a topic is served as at most {} partitions",
+                crate::command::MAX_RANGES_PER_TOPIC
+            )));
+        }
+        if !partitions.is_power_of_two() || partitions < 2 {
+            return reject(MetadataError::invalid_transition(
+                "a topic's partition count is a power of two above one: the key space is halved, \
+                 and every partition is one canonical prefix",
+            ));
+        }
+        let existing = self.topic_ranges(topic_uuid);
+        let [(root_uuid, root)] = existing.as_slice() else {
+            return reject(MetadataError::invalid_transition(
+                "this topic is already served as more than one partition",
+            ));
+        };
+        let (root_uuid, root) = (*root_uuid, root.clone());
+        if root.lease.is_some() || root.fencing_epoch != 0 || root.generation != 0 {
+            return reject(MetadataError::invalid_transition(
+                "the topic has been held or written; its partitions cannot be redrawn without a \
+                 split, which is not served yet",
+            ));
+        }
+        // Nothing may already stand under the ids being handed out, and none
+        // may repeat: two partitions cannot be one range.
+        let mut seen = BTreeMap::new();
+        seen.insert(root_uuid, ());
+        for range_uuid in additional {
+            if seen.insert(*range_uuid, ()).is_some() {
+                return reject(MetadataError::invalid_transition(
+                    "the partition ids repeat; each partition is its own range",
+                ));
+            }
+            let range_key = MetaKey::Range {
+                topic_uuid,
+                range_uuid: *range_uuid,
+            }
+            .encode();
+            if self.records.contains_key(&range_key) {
+                return reject(MetadataError::AlreadyExists);
+            }
+        }
+        // The key space, halved: partition i covers the block whose top
+        // `bits` are i.
+        let bits = partitions.trailing_zeros() as u8;
+        let prefix_of = |partition: usize| (partition as u64) << (64 - u32::from(bits));
+        for (partition, range_uuid) in std::iter::once(root_uuid)
+            .chain(additional.iter().copied())
+            .enumerate()
+        {
+            let range_key = MetaKey::Range {
+                topic_uuid,
+                range_uuid,
+            }
+            .encode();
+            self.records.insert(
+                range_key,
+                MetaValue::Range(RangeRecord {
+                    generation: 0,
+                    key_prefix: prefix_of(partition),
+                    key_prefix_bits: bits,
+                    fencing_epoch: 0,
+                    lineage_generation: 0,
+                    lease: None,
+                }),
+            );
+        }
+        MetadataResponse::Ack {
+            generation: partitions as u64,
         }
     }
 
@@ -5489,6 +5623,156 @@ mod tests {
             ),
             MetadataResponse::Rejected(MetadataError::InvalidTransition(reason))
                 if reason.contains("lineage change")
+        ));
+    }
+
+    /// A topic is declared as several partitions before it is used (#457
+    /// slice 3): the root range keeps partition 0 and the key space is halved
+    /// among them, canonically and disjointly, in key-space order. A count
+    /// that is not a power of two, a repeated id, an id already standing, a
+    /// topic already partitioned and a topic that has been held or written
+    /// are each refused by name.
+    #[test]
+    fn a_topic_is_declared_as_partitions_that_halve_the_key_space() {
+        let (mut machine, node, topic_uuid, root_range) = leaseable_range(10);
+        let ids: Vec<Uuid> = (1..4).map(|i| Uuid::from_u128(0x90 + i)).collect();
+        let set = |env: u128, additional: Vec<Uuid>| MetadataCommand::SetTopicPartitions {
+            env: envelope(env),
+            topic_uuid,
+            additional_range_uuids: additional,
+        };
+        assert!(
+            matches!(
+                machine.apply(30, &set(30, ids[..2].to_vec())),
+                MetadataResponse::Rejected(MetadataError::InvalidTransition(reason))
+                    if reason.contains("power of two")
+            ),
+            "three partitions cannot halve the key space"
+        );
+        let MetadataResponse::Ack { generation } = machine.apply(31, &set(31, ids[..3].to_vec()))
+        else {
+            panic!("four partitions are declared")
+        };
+        assert_eq!(generation, 4);
+        let ranges = machine.topic_ranges(topic_uuid);
+        assert_eq!(
+            ranges.iter().map(|(uuid, _)| *uuid).collect::<Vec<_>>(),
+            vec![root_range, ids[0], ids[1], ids[2]],
+            "the root keeps partition 0, in key-space order"
+        );
+        assert_eq!(
+            ranges
+                .iter()
+                .map(|(_, range)| (range.key_prefix, range.key_prefix_bits))
+                .collect::<Vec<_>>(),
+            vec![(0, 2), (1 << 62, 2), (2 << 62, 2), (3 << 62, 2)],
+            "canonical quarters of the key space"
+        );
+        // Every key falls in exactly one partition.
+        for key in [0u64, 1, 1 << 62, (1 << 63) + 7, u64::MAX] {
+            let holders: Vec<usize> = ranges
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, range))| {
+                    let mask = u64::MAX << (64 - u32::from(range.key_prefix_bits));
+                    key & mask == range.key_prefix
+                })
+                .map(|(partition, _)| partition)
+                .collect();
+            assert_eq!(holders.len(), 1, "key {key} falls in {holders:?}");
+        }
+        // Already partitioned.
+        assert!(matches!(
+            machine.apply(32, &set(32, vec![Uuid::from_u128(0x99)])),
+            MetadataResponse::Rejected(MetadataError::InvalidTransition(_))
+        ));
+        // A fresh topic: repeated ids, standing ids, and a held root.
+        let other_topic = Uuid::from_u128(0x200);
+        let other_root = Uuid::from_u128(0x201);
+        assert!(matches!(
+            machine.apply(
+                33,
+                &MetadataCommand::CreateTopic {
+                    env: envelope(33),
+                    name: "other.v1".to_owned(),
+                    topic_uuid: other_topic,
+                    root_range_uuid: other_root,
+                }
+            ),
+            MetadataResponse::TopicCreated { .. }
+        ));
+        let other = |env: u128, additional: Vec<Uuid>| MetadataCommand::SetTopicPartitions {
+            env: envelope(env),
+            topic_uuid: other_topic,
+            additional_range_uuids: additional,
+        };
+        let twin = Uuid::from_u128(0x202);
+        assert!(matches!(
+            machine.apply(34, &other(34, vec![twin, twin, Uuid::from_u128(0x203)])),
+            MetadataResponse::Rejected(MetadataError::InvalidTransition(_))
+        ));
+        assert!(
+            matches!(
+                machine.apply(35, &other(35, vec![Uuid::from_u128(0x204)])),
+                MetadataResponse::Ack { .. }
+            ),
+            "two partitions on a fresh topic"
+        );
+        // A topic whose root has been taken keeps the partitions it serves.
+        let held_topic = Uuid::from_u128(0x300);
+        let held_root = Uuid::from_u128(0x301);
+        assert!(matches!(
+            machine.apply(
+                36,
+                &MetadataCommand::CreateTopic {
+                    env: envelope(36),
+                    name: "held.v1".to_owned(),
+                    topic_uuid: held_topic,
+                    root_range_uuid: held_root,
+                }
+            ),
+            MetadataResponse::TopicCreated { .. }
+        ));
+        let generation = range_of(&machine, held_topic, held_root).generation;
+        assert!(matches!(
+            acquire(
+                &mut machine,
+                37,
+                37,
+                1_000,
+                node,
+                held_topic,
+                held_root,
+                generation,
+                60_000,
+            ),
+            MetadataResponse::LeaseGranted { .. }
+        ));
+        assert!(
+            matches!(
+                machine.apply(
+                    38,
+                    &MetadataCommand::SetTopicPartitions {
+                        env: envelope(38),
+                        topic_uuid: held_topic,
+                        additional_range_uuids: vec![twin],
+                    }
+                ),
+                MetadataResponse::Rejected(MetadataError::InvalidTransition(reason))
+                    if reason.contains("held or written")
+            ),
+            "a topic in use keeps the partitions it was serving"
+        );
+        assert!(matches!(
+            machine.apply(
+                39,
+                &MetadataCommand::SetTopicPartitions {
+                    env: envelope(39),
+                    topic_uuid: Uuid::from_u128(0xdead),
+                    additional_range_uuids: vec![twin],
+                }
+            ),
+            MetadataResponse::Rejected(MetadataError::NotFound)
         ));
     }
 
