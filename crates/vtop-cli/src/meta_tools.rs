@@ -1936,8 +1936,14 @@ pub struct VoteAudit {
     /// real could have produced (review). A standalone promotion has no
     /// quorum and nothing to answer.
     pub holder_answered: bool,
+    /// The recorded boundary is the one the quorum proves (review): the
+    /// `required`-th highest answer, as the promoter takes it; `None` for
+    /// a standalone promotion, which proves none.
+    pub boundary_ok: bool,
     /// The recomputation agrees, the holder answered, no replica is
-    /// counted twice, AND the recorded vote reached the majority.
+    /// counted twice, the majority required is at least a majority of the
+    /// replicas that answered, the boundary is the quorum's, AND the
+    /// recorded vote reached it.
     pub ok: bool,
 }
 
@@ -2082,9 +2088,11 @@ pub fn audit_transitions(
                 // without the holder's answer is not evidence at all.
                 let standalone = quorum.is_empty() && *required == 0;
                 // A replicated promotion always records the majority it
-                // needed (review): a quorum with a `required` of zero is
-                // evidence no promotion could produce.
-                let majority_recorded = standalone || *required > 0;
+                // needed (review): the replication factor is at least the
+                // number of replicas that answered and the majority grows
+                // with it, so `required` below a majority of the answers is
+                // evidence no promotion could produce — and so is zero.
+                let majority_recorded = standalone || (*required as usize) > answers.len() / 2;
                 let holder_answer = answers.get(&view.holder_to).copied();
                 let holder_answered = standalone || holder_answer.is_some();
                 let candidate_offset = holder_answer.or(*boundary_offset).unwrap_or(0);
@@ -2092,8 +2100,20 @@ pub fn audit_transitions(
                     .values()
                     .filter(|offset| **offset <= candidate_offset)
                     .count() as u32;
+                // The boundary the quorum proves, as the promoter takes it
+                // (review): the `required`-th highest answer. Recorded
+                // arbitrarily, it would pass a boundary no quorum reached.
+                let proven_boundary = if standalone {
+                    None
+                } else {
+                    let mut offsets: Vec<u64> = answers.values().copied().collect();
+                    offsets.sort_unstable_by(|a, b| b.cmp(a));
+                    offsets.get((*required as usize).saturating_sub(1)).copied()
+                };
+                let boundary_ok = *boundary_offset == proven_boundary;
                 let ok = holder_answered
                     && majority_recorded
+                    && boundary_ok
                     && !duplicated
                     && recomputed == *votes
                     && *votes >= *required;
@@ -2105,6 +2125,7 @@ pub fn audit_transitions(
                     recomputed,
                     required: *required,
                     holder_answered,
+                    boundary_ok,
                     ok,
                 })
             }
@@ -2169,6 +2190,8 @@ fn outcome_text(view: &AdminTransitionView, record: &TransitionAudit) -> String 
                                 "ok"
                             } else if !vote.holder_answered {
                                 "HOLDER ABSENT FROM QUORUM"
+                            } else if !vote.boundary_ok {
+                                "BOUNDARY NOT THE QUORUM'S"
                             } else {
                                 "VOTE MISMATCH"
                             }
@@ -2253,7 +2276,7 @@ fn transition_json(view: &AdminTransitionView, record: &TransitionAudit) -> serd
         "granted_apply_index": view.granted_apply_index,
         "link_ok": record.link_ok,
         "vote": record.vote.as_ref().map(|vote| serde_json::json!({
-            "recorded": vote.recorded, "recomputed": vote.recomputed, "required": vote.required, "holder_answered": vote.holder_answered, "ok": vote.ok,
+            "recorded": vote.recorded, "recomputed": vote.recomputed, "required": vote.required, "holder_answered": vote.holder_answered, "boundary_ok": vote.boundary_ok, "ok": vote.ok,
         })),
         "mac": record.mac.word(),
         "outcome": outcome,
@@ -2837,6 +2860,46 @@ client_key: /tmp/client.key
             !zero.records[0].vote.as_ref().unwrap().ok,
             "required = 0 with a quorum is no evidence"
         );
+
+        // A majority smaller than a majority of the answers is impossible
+        // (review): three answers need at least two.
+        let mut small = views.clone();
+        if let TransitionOutcome::Reported {
+            outcome:
+                PromotionOutcome::Established {
+                    required, votes, ..
+                },
+            ..
+        } = &mut small[0].outcome
+        {
+            *required = 1;
+            *votes = 2;
+        }
+        small[0].mac = Some(small[0].record().mac(&key, topic, range).unwrap());
+        let one = audit_transitions(&small, Some(&key), topic, range, 1, None).unwrap();
+        assert!(
+            !one.records[0].vote.as_ref().unwrap().ok,
+            "required = 1 of three is no majority"
+        );
+
+        // The boundary must be the required-th highest answer (review): the
+        // fixture's 90 is the second of {95, 90, 80}; a recorded 0 is not.
+        let mut low = views.clone();
+        if let TransitionOutcome::Reported {
+            outcome:
+                PromotionOutcome::Established {
+                    boundary_offset, ..
+                },
+            ..
+        } = &mut low[0].outcome
+        {
+            *boundary_offset = Some(0);
+        }
+        low[0].mac = Some(low[0].record().mac(&key, topic, range).unwrap());
+        let wrong = audit_transitions(&low, Some(&key), topic, range, 1, None).unwrap();
+        let vote = wrong.records[0].vote.as_ref().unwrap();
+        assert!(!vote.boundary_ok && !vote.ok, "{vote:?}");
+        assert!(transition_line(&low[0], &wrong.records[0]).contains("BOUNDARY NOT THE QUORUM"));
 
         let mut overstated = views.clone();
         if let TransitionOutcome::Reported {
