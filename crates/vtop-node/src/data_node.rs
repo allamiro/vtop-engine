@@ -1077,6 +1077,32 @@ async fn run_leader(
     };
 
     let broker = Arc::new(broker);
+    // The status server BUILT here (review), before the lease agent exists:
+    // its constructor resolves the replica plane's TLS material, and a
+    // certificate that plane cannot read must fail the process before this
+    // node could acquire a lease it would never serve — the listener was
+    // already bound early for the same reason; now the server is too.
+    let status_server = match status_listener {
+        Some(listener) => Some((
+            listener,
+            replica_server(
+                &config,
+                Arc::new(LeaderStatusReplica {
+                    broker: Arc::clone(&broker),
+                    node_id: config.node_uuid,
+                    transfer: LeaderSegmentTransferHandler::new(Arc::clone(&broker)),
+                    transfer_allowed: config
+                        .followers
+                        .iter()
+                        .map(|follower| follower.node_uuid)
+                        .chain(config.transfer_peers.iter().copied())
+                        .collect(),
+                }) as Arc<dyn ReplicaPeerHandler>,
+            )
+            .map_err(|error| error.to_string())?,
+        )),
+        None => None,
+    };
     // Same epoch history a follower keeps (#240). A leader needs its own: the
     // range's history is the union of what each replica recorded, and a leader
     // that could not say which epoch wrote its tail is exactly the replica a
@@ -1319,23 +1345,8 @@ async fn run_leader(
     // RPC, so `vtopctl node status` can measure follower lag against the
     // leader's own boundary rather than against the furthest-ahead follower.
     // Status only: see LeaderStatusReplica.
-    let status_addr = match config.replica_listen.as_ref().zip(status_listener) {
-        Some((status_listen, status_listener)) => {
-            let status_server = replica_server(
-                &config,
-                Arc::new(LeaderStatusReplica {
-                    broker: Arc::clone(&broker),
-                    node_id: config.node_uuid,
-                    transfer: LeaderSegmentTransferHandler::new(Arc::clone(&broker)),
-                    transfer_allowed: config
-                        .followers
-                        .iter()
-                        .map(|follower| follower.node_uuid)
-                        .chain(config.transfer_peers.iter().copied())
-                        .collect(),
-                }) as Arc<dyn ReplicaPeerHandler>,
-            )
-            .map_err(|error| error.to_string())?;
+    let status_addr = match config.replica_listen.as_ref().zip(status_server) {
+        Some((status_listen, (status_listener, status_server))) => {
             let status_shutdown = oneshot_on_shutdown(shutdown.clone());
             tokio::spawn(async move {
                 if let Err(error) = status_server.serve(status_listener, status_shutdown).await {
