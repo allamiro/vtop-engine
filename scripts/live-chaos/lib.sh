@@ -137,7 +137,8 @@ preflight_settings() {
   [[ "$CHAOS_PROFILE" =~ ^[A-Za-z0-9_-]+$ ]] \
     || fail "CHAOS_PROFILE contains unsupported characters: '$CHAOS_PROFILE'"
   case "$CHAOS_TRANSPORT" in
-    tls|plaintext) ;;
+    tls) ;;
+    plaintext) log "CHAOS_TRANSPORT=plaintext: every plane without TLS, on loopback; candidates and promotion are refused in this mode" ;;
     *) fail "CHAOS_TRANSPORT must be tls or plaintext, not '$CHAOS_TRANSPORT'" ;;
   esac
   require_integer_in_range CHAOS_META_PEER_BASE_PORT "$META_PEER_BASE_PORT" 1024 65529
@@ -1215,6 +1216,10 @@ start_leader_with_lease() {
 # hold the same active segment.
 start_promoted_follower() {
   local n="$1" id="$2" pid cfg uuid cert other other_uuid
+  # A promoted follower is a leased replicated leader, which the node refuses
+  # on a plaintext replica plane (scenario 15 asserts exactly that) — refused
+  # here by name (review).
+  transport_plaintext && fail "start_promoted_follower: promotion cannot run under CHAOS_TRANSPORT=plaintext (a leased replicated leader needs a TLS replica plane)"
   case "$n" in
     1) uuid="$FOLLOWER1_UUID"; cert="data-2"; other=2; other_uuid="$FOLLOWER2_UUID" ;;
     2) uuid="$FOLLOWER2_UUID"; cert="data-3"; other=1; other_uuid="$FOLLOWER1_UUID" ;;
@@ -1380,8 +1385,15 @@ emit_colocated_config() {
     echo "  segment_id: $SEGMENT_ID"
     echo "  native_listen: \"$(colocated_native_addr "$id")\""
     echo "  replica_listen: \"$(replica_addr $((id - 1)))\""
-    echo "  replica_tls: { ca: $CERTS/ca.pem, cert: $CERTS/$cert.pem, key: $CERTS/$cert-key.pem }"
-    echo "  native_tls: { ca: $CERTS/ca.pem, cert: $CERTS/$cert.pem, key: $CERTS/$cert-key.pem }"
+    if transport_plaintext; then
+      # The meta half above came from emit_meta_config, which already wrote
+      # its transport knobs; the data half follows the same switch (review).
+      echo "  replica_transport: plaintext"
+      echo "  native_transport: plaintext"
+    else
+      echo "  replica_tls: { ca: $CERTS/ca.pem, cert: $CERTS/$cert.pem, key: $CERTS/$cert-key.pem }"
+      echo "  native_tls: { ca: $CERTS/ca.pem, cert: $CERTS/$cert.pem, key: $CERTS/$cert-key.pem }"
+    fi
     echo "  principal_id: $PRINCIPAL_ID"
     echo "observability: { listen: \"$(data_metrics_addr $((id - 1)))\" }"
   } | install_config "$cfg"
@@ -1422,6 +1434,10 @@ candidate_identity() { # <n: 1|2|3> — echoes "<uuid> <cert-basename>"
 # emit_candidate_config <n: 1|2|3> <meta-id>
 emit_candidate_config() {
   local n="$1" id="$2"
+  # A candidate promotes over the replica plane, and the node refuses that on
+  # a plaintext one (fences are refused there) — refused HERE by name rather
+  # than three layers down in a node log (review).
+  transport_plaintext && fail "emit_candidate_config: candidates cannot run under CHAOS_TRANSPORT=plaintext (promotion needs a TLS replica plane)"
   local uuid cert
   read -r uuid cert <<<"$(candidate_identity "$n")"
   local cfg="$WORKDIR/data-candidate-$n.yaml"

@@ -56,6 +56,10 @@ CLIENT_CFG="$(emit_client_config)"
   || fail "verify over plaintext failed (see $WORKDIR/logs/verify.log)"
 log "quorum produce + byte-exact verify over plaintext: $RECORDS records"
 
+# A quorum acknowledges the leader and ONE follower (review): the other may
+# still be applying, so both are awaited under the progress deadline before
+# their offsets are read.
+await_replicas_settled "$RECORDS" "$(emit_node_status_config)"
 PROBE_CFG="$(emit_replica_probe_config)"
 for n in 1 2; do
   STATUS="$("$VTOP_NODE" replica-status --client-config "$PROBE_CFG" --addr "$(replica_addr "$n")")"
