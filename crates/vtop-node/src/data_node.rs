@@ -2619,7 +2619,7 @@ impl crate::lease_agent::CandidateLocalView for SwitchingLocalView {
             .and_then(|view| view.sealed_prefix_end())
     }
 
-    fn fence_for_probe(&self, fencing_epoch: u64) -> Result<(), String> {
+    fn fence_for_probe(&self, fencing_epoch: u64) -> Result<u64, String> {
         // NO DELEGATE IS NO VOTE (review, #439). An empty slot is not an
         // empty log: the supervisor clears the old role before installing
         // the next one, so a probe landing in that window would read zero

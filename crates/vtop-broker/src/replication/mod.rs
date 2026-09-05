@@ -649,21 +649,46 @@ impl InProcessFollower {
     /// atomic maximum that an in-flight append can straddle: checked at
     /// the old epoch, applied after the "stopped" offset was read.
     ///
-    /// Fencing moves forward only, exactly as the wire fence rules: an
-    /// epoch below the one already held means the grant this probe acts
-    /// on has been superseded, and the refusal is the caller's cue to
-    /// abstain rather than vouch for a boundary metadata has moved past.
-    pub fn fence_locally(&self, epoch: u64) -> Result<(), (ErrorCode, String)> {
+    /// Fencing moves forward only, exactly as the wire fence rules: a held
+    /// epoch that stands above the one being fenced — before this call or
+    /// raced into it — means the grant this probe acts on was superseded,
+    /// and the refusal is the caller's cue to abstain rather than vouch
+    /// for a boundary metadata has moved past. On success the return value
+    /// IS the vote: the committed offset read inside the same critical
+    /// section that stopped the log.
+    pub fn fence_locally(&self, epoch: u64) -> Result<u64, (ErrorCode, String)> {
         let _meta = self.meta_fencing_epoch.lock();
+        self.adopt_fencing_epoch(epoch);
+        // RE-READ AFTER ADOPTING, not guarded before (review): adoption
+        // elsewhere — the lease watcher observing a rival's grant — does
+        // not take the meta lock, so a pre-check is a measurement a
+        // concurrent adopt can invalidate before the no-op fetch_max
+        // lands. Monotonicity makes the post-read decisive: held above
+        // `epoch` means the grant this probe acts on was superseded while
+        // it was being fenced, and the moment the rival's own adoption is
+        // complete its appends are admissible again — so an offset counted
+        // here would be a vote for a dead grant from a log about to move.
         let held = self.held_fencing_epoch();
-        if epoch < held {
+        if held != epoch {
             return Err((
                 ErrorCode::Fenced,
-                format!("local fence at epoch {epoch} is below this replica's held epoch {held}"),
+                format!(
+                    "local fence at epoch {epoch} was overtaken by this replica's held \
+                     epoch {held}"
+                ),
             ));
         }
-        self.adopt_fencing_epoch(epoch);
-        Ok(())
+        // THE VOTE IS READ INSIDE THE SAME CRITICAL SECTION. Returned from
+        // here rather than sampled by the caller afterwards (review): the
+        // meta lock is what holds rival adoption's appends out, and any
+        // read taken after it drops is a measurement of something that may
+        // already be moving again — the exact distinction `FenceOutcome`'s
+        // doc draws for the wire fence.
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Ok(state.segment.committed_offset())
     }
 
     pub fn fence(
