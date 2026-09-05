@@ -505,6 +505,56 @@ jobs:
         run: |
           helm lint helm/vtop -f helm/vtop/ci/default-values.yaml
           helm lint helm/vtop -f helm/vtop/ci/separated-values.yaml
+          helm lint helm/vtop -f helm/vtop/ci/plaintext-values.yaml
+
+      # The plaintext shape (#294): every plane without TLS renders WITHOUT a
+      # Secret, as the node's spelled-out any-interface form, and never a tls
+      # block — and only when acknowledged. Asserted on the rendered config,
+      # not on the exit code: a chart that rendered the TLS shape under the
+      # plaintext values would also exit zero.
+      - name: Plaintext planes render as spelled out, and only when acknowledged
+        run: |
+          set -euo pipefail
+          helm template vtop helm/vtop -f helm/vtop/ci/plaintext-values.yaml > /tmp/plaintext.yaml
+          for knob in peer_transport admin_transport replica_transport native_transport; do
+            grep -q "$knob: plaintext-on-any-interface" /tmp/plaintext.yaml \
+              || { echo "::error::plaintext render lacks $knob: plaintext-on-any-interface"; exit 1; }
+          done
+          if grep -qE '^\s*(replica_tls|native_tls|tls):' /tmp/plaintext.yaml; then
+            echo "::error::plaintext render still carries a tls block"; exit 1
+          fi
+          if grep -q 'tls-meta\|tls-data' /tmp/plaintext.yaml; then
+            echo "::error::plaintext render still mounts a TLS Secret"; exit 1
+          fi
+          # The lease dials the admin plane, and the plaintext values enable
+          # it: the dial must be plaintext too, or the data pod would try a
+          # TLS handshake against a plaintext admin listener.
+          # Anchored to the lease's own line: the listener knobs carry the same
+          # substring, and matching them would be the no-op this replaces.
+          grep -qE '^\s*transport: plaintext$' /tmp/plaintext.yaml \
+            || { echo "::error::plaintext render does not dial the admin plane plaintext"; exit 1; }
+          echo "plaintext shape renders as spelled out, with no Secret"
+          # Observability TLS, on BOTH shapes: the Secret mounted and named,
+          # every probe on HTTPS, the config carrying the paths, the
+          # annotation saying https.
+          observe_render() {
+            local values="$1" probes="$2" out="$3"
+            helm template vtop helm/vtop -f "$values" \
+              --set observability.tls.secretName=vtop-observe-tls > "$out"
+            test "$(grep -c 'scheme: HTTPS' "$out")" -ge "$probes" \
+              || { echo "::error::$values: observability TLS did not switch every probe to HTTPS"; exit 1; }
+            grep -q 'cert: /etc/vtop/tls/observe/cert.pem' "$out" \
+              || { echo "::error::$values: observability TLS not in the rendered config"; exit 1; }
+            grep -q 'mountPath: /etc/vtop/tls/observe' "$out" \
+              || { echo "::error::$values: the observability Secret is not mounted"; exit 1; }
+            grep -q 'secretName: "vtop-observe-tls"' "$out" \
+              || { echo "::error::$values: the observability Secret is not referenced"; exit 1; }
+            grep -q 'prometheus.io/scheme: https' "$out" \
+              || { echo "::error::$values: observability TLS not in the scrape annotations"; exit 1; }
+          }
+          observe_render helm/vtop/ci/default-values.yaml 3 /tmp/observe.yaml
+          observe_render helm/vtop/ci/separated-values.yaml 6 /tmp/observe-separated.yaml
+          echo "observability TLS renders end to end on both shapes"
 
       - name: Render the documented happy path
         run: |
@@ -606,6 +656,19 @@ jobs:
           # are required, the voter count stays odd, the identity list is
           # indexed by data-tier ordinal, and an explicit admin endpoint
           # needs the name its certificate carries.
+          # The #294 transport guards: a plaintext plane must be acknowledged,
+          # a value outside tls|plaintext is refused by name, and an admin
+          # plane that cannot enforce a policy refuses to carry one.
+          refuses_because "transport.acknowledgePlaintext is false" \
+            -f helm/vtop/ci/default-values.yaml --set transport.native=plaintext
+          refuses_because 'transport.peer must be "tls" or "plaintext"' \
+            -f helm/vtop/ci/default-values.yaml --set transport.peer=mtls
+          refuses_because "transport.admin is plaintext but meta.adminAuthorization.enabled is true" \
+            -f helm/vtop/ci/plaintext-values.yaml --set meta.adminAuthorization.enabled=true
+          # A replicated range is candidates, and the node refuses a candidate
+          # on a plaintext replica plane; the chart refuses first.
+          refuses_because "transport.replica is plaintext but data.topology is replicated" \
+            -f helm/vtop/ci/plaintext-values.yaml --set data.topology=replicated
           refuses_because "deployment.meta.replicaCount is unset" \
             -f helm/vtop/ci/separated-values.yaml --set deployment.meta.replicaCount=0
           refuses_because "deployment.data.replicaCount is unset" \

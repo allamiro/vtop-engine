@@ -37,13 +37,16 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: {{ .Values.ports.observability | quote }}
         prometheus.io/path: /metrics
+        {{- if .Values.observability.tls.secretName }}
+        prometheus.io/scheme: https
+        {{- end }}
         {{- end }}
         {{- /* Same for the chart-managed annotations. checksum/config is what
                rolls the set when the ConfigMap changes; a user value that
                replaced it would silently disable config-triggered rollouts,
                and pods would keep running against a config that no longer
                exists. */}}
-        {{- with (omit .Values.podAnnotations "checksum/config" "prometheus.io/scrape" "prometheus.io/port" "prometheus.io/path") }}
+        {{- with (omit .Values.podAnnotations "checksum/config" "prometheus.io/scrape" "prometheus.io/port" "prometheus.io/path" "prometheus.io/scheme") }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
@@ -150,6 +153,9 @@ spec:
             httpGet:
               path: /healthz
               port: obs
+              {{- if .Values.observability.tls.secretName }}
+              scheme: HTTPS
+              {{- end }}
             periodSeconds: {{ int .Values.probes.startup.periodSeconds }}
             failureThreshold: {{ int .Values.probes.startup.failureThreshold }}
             timeoutSeconds: {{ int .Values.probes.startup.timeoutSeconds }}
@@ -162,6 +168,9 @@ spec:
             httpGet:
               path: /readyz
               port: obs
+              {{- if .Values.observability.tls.secretName }}
+              scheme: HTTPS
+              {{- end }}
             periodSeconds: {{ int .Values.probes.readiness.periodSeconds }}
             failureThreshold: {{ int .Values.probes.readiness.failureThreshold }}
             timeoutSeconds: {{ int .Values.probes.readiness.timeoutSeconds }}
@@ -174,6 +183,9 @@ spec:
             httpGet:
               path: /healthz
               port: obs
+              {{- if .Values.observability.tls.secretName }}
+              scheme: HTTPS
+              {{- end }}
             periodSeconds: {{ int .Values.probes.liveness.periodSeconds }}
             failureThreshold: {{ int .Values.probes.liveness.failureThreshold }}
             timeoutSeconds: {{ int .Values.probes.liveness.timeoutSeconds }}
@@ -185,12 +197,21 @@ spec:
             - name: config
               mountPath: /etc/vtop/config
               readOnly: true
+            {{- if .Values.observability.tls.secretName }}
+            - name: tls-observe
+              mountPath: /etc/vtop/tls/observe
+              readOnly: true
+            {{- end }}
+            {{- if include "vtop.metaNeedsTls" . }}
             - name: tls-meta
               mountPath: /etc/vtop/tls/meta
               readOnly: true
+            {{- end }}
+            {{- if include "vtop.dataNeedsTls" . }}
             - name: tls-data
               mountPath: /etc/vtop/tls/data
               readOnly: true
+            {{- end }}
             - name: meta
               mountPath: /var/lib/vtop/meta
             - name: data
@@ -202,7 +223,14 @@ spec:
         - name: config
           configMap:
             name: {{ include "vtop.fullname" . }}
+        {{- if .Values.observability.tls.secretName }}
+        - name: tls-observe
+          secret:
+            secretName: {{ .Values.observability.tls.secretName | quote }}
+            defaultMode: 0440
+        {{- end }}
         # User-supplied Secrets only — the render fails above if unnamed.
+        {{- if include "vtop.metaNeedsTls" . }}
         - name: tls-meta
           secret:
             # Quoted: an unquoted name that happens to be `true`, `no`, or a
@@ -210,10 +238,13 @@ spec:
             # rejected on a type error rather than on anything meaningful.
             secretName: {{ include "vtop.metaSecretName" . | quote }}
             defaultMode: 0440
+        {{- end }}
+        {{- if include "vtop.dataNeedsTls" . }}
         - name: tls-data
           secret:
             secretName: {{ include "vtop.dataSecretName" . | quote }}
             defaultMode: 0440
+        {{- end }}
         {{- with .Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}
         {{- end }}

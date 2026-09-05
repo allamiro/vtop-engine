@@ -96,6 +96,30 @@
         "serverName": { "type": "string" }
       }
     },
+    "transport": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "peer": { "type": "string" },
+        "admin": { "type": "string" },
+        "replica": { "type": "string" },
+        "native": { "type": "string" },
+        "acknowledgePlaintext": { "type": "boolean" }
+      }
+    },
+    "observability": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "tls": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "secretName": { "type": "string" }
+          }
+        }
+      }
+    },
     "meta": {
       "type": "object",
       "additionalProperties": false,
@@ -276,7 +300,8 @@
             "enabled": { "type": "boolean" },
             "interval": { "type": "string" },
             "scrapeTimeout": { "type": "string" },
-            "labels": { "type": "object" }
+            "labels": { "type": "object" },
+            "tlsConfig": { "type": "object" }
           }
         }
       }
