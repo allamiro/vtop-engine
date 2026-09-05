@@ -515,22 +515,19 @@ impl<'a> Pipeline<'a> {
             .map(|h| ObjectChecksum::new(algo.as_str(), h));
 
         let t = Instant::now();
-        self.attempts.fetch_add(1, Ordering::Relaxed);
-        if let Err(e) = self
-            .backend
-            .put_object(&compressed.path, &object_uri, object_ck)
-            .await
-        {
-            note_upload_throttle(
-                &e,
-                "object_upload",
-                [
-                    tenant.as_str(),
-                    source.source_type.as_str(),
-                    format.extension(),
-                ],
-                &self.throttles,
-            );
+        if let Err(e) = note_store_request(
+            self.backend
+                .put_object(&compressed.path, &object_uri, object_ck)
+                .await,
+            "object_upload",
+            [
+                tenant.as_str(),
+                source.source_type.as_str(),
+                format.extension(),
+            ],
+            &self.attempts,
+            &self.throttles,
+        ) {
             fail!(format!("object upload failed: {e}"));
         }
         metrics.object_upload_ms = t.elapsed().as_millis() as u64;
@@ -591,24 +588,21 @@ impl<'a> Pipeline<'a> {
 
         // ---- OBJECT_UPLOADED -> MANIFEST_UPLOADED -----------------------
         let t = Instant::now();
-        self.attempts.fetch_add(1, Ordering::Relaxed);
-        let stored_manifest = match self
-            .backend
-            .put_manifest(&manifest_path, &manifest_uri, manifest_ck)
-            .await
-        {
+        let stored_manifest = match note_store_request(
+            self.backend
+                .put_manifest(&manifest_path, &manifest_uri, manifest_ck)
+                .await,
+            "manifest_upload",
+            [
+                tenant.as_str(),
+                source.source_type.as_str(),
+                format.extension(),
+            ],
+            &self.attempts,
+            &self.throttles,
+        ) {
             Ok(stored) => stored,
             Err(e) => {
-                note_upload_throttle(
-                    &e,
-                    "manifest_upload",
-                    [
-                        tenant.as_str(),
-                        source.source_type.as_str(),
-                        format.extension(),
-                    ],
-                    &self.throttles,
-                );
                 fail!(format!("manifest upload failed: {e}"))
             }
         };
@@ -644,23 +638,19 @@ impl<'a> Pipeline<'a> {
         // 2) the stored object matches size + checksum,
         // A throttled verification is the store asking for less traffic too
         // (review): counted like an upload, so the cycle's verdict sees it.
-        self.attempts.fetch_add(1, Ordering::Relaxed);
-        let obj_v = self
-            .backend
-            .verify_object(&object_uri, compressed.size_bytes, object_ck)
-            .await
-            .inspect_err(|e| {
-                note_upload_throttle(
-                    e,
-                    "object_verify",
-                    [
-                        tenant.as_str(),
-                        source.source_type.as_str(),
-                        format.extension(),
-                    ],
-                    &self.throttles,
-                )
-            })?;
+        let obj_v = note_store_request(
+            self.backend
+                .verify_object(&object_uri, compressed.size_bytes, object_ck)
+                .await,
+            "object_verify",
+            [
+                tenant.as_str(),
+                source.source_type.as_str(),
+                format.extension(),
+            ],
+            &self.attempts,
+            &self.throttles,
+        )?;
         if !obj_v.passed {
             if let Some(mx) = telemetry::metrics() {
                 mx.verification_failures_total
@@ -674,23 +664,19 @@ impl<'a> Pipeline<'a> {
             fail!(format!("object verification failed: {}", obj_v.message));
         }
         // 3) the stored manifest matches size + checksum.
-        self.attempts.fetch_add(1, Ordering::Relaxed);
-        let man_v = self
-            .backend
-            .verify_object(&manifest_uri, manifest_size, manifest_ck)
-            .await
-            .inspect_err(|e| {
-                note_upload_throttle(
-                    e,
-                    "manifest_verify",
-                    [
-                        tenant.as_str(),
-                        source.source_type.as_str(),
-                        format.extension(),
-                    ],
-                    &self.throttles,
-                )
-            })?;
+        let man_v = note_store_request(
+            self.backend
+                .verify_object(&manifest_uri, manifest_size, manifest_ck)
+                .await,
+            "manifest_verify",
+            [
+                tenant.as_str(),
+                source.source_type.as_str(),
+                format.extension(),
+            ],
+            &self.attempts,
+            &self.throttles,
+        )?;
         if !man_v.passed {
             if let Some(mx) = telemetry::metrics() {
                 mx.verification_failures_total
