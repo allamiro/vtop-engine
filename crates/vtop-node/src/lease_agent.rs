@@ -869,6 +869,87 @@ enum Promoted {
 /// Separate from [`LeaseAgent`] so the transitions can be tested without an
 /// admin client — the interesting behaviour here is not "can we reach
 /// metadata", it is what happens when a quorum will not answer.
+/// Records a promotion's outcome on its transition record in metadata
+/// (#240 item 5) — and, for an established boundary, does so BEFORE the
+/// boundary is exposed (#449, review): a boundary a client has seen must be
+/// in the chain a later promotion reads its floor from. A holder that dies
+/// between the record and the promote leaves a floor higher than anything it
+/// published, which is safe; one that dies between the grant and the record
+/// never published, so its `Pending` record is rightly no floor.
+#[async_trait::async_trait]
+pub trait TransitionReporter: Send + Sync {
+    async fn report(
+        &self,
+        fencing_epoch: u64,
+        outcome: vtop_meta::PromotionOutcome,
+    ) -> Result<(), String>;
+}
+
+/// The reporter over the admin plane: a bounded proposal, retried a few
+/// times with backoff, that returns only once metadata answered
+/// `TransitionRecorded` — or the reason it did not.
+struct AdminTransitionReporter {
+    admin: Arc<AdminClient>,
+    topic_uuid: Uuid,
+    range_uuid: Uuid,
+    node_uuid: Uuid,
+    attempt_deadline: Duration,
+}
+
+#[async_trait::async_trait]
+impl TransitionReporter for AdminTransitionReporter {
+    async fn report(
+        &self,
+        fencing_epoch: u64,
+        outcome: vtop_meta::PromotionOutcome,
+    ) -> Result<(), String> {
+        let command = MetadataCommand::ReportPromotionOutcome {
+            env: envelope(),
+            topic_uuid: self.topic_uuid,
+            range_uuid: self.range_uuid,
+            holder_node_uuid: self.node_uuid,
+            fencing_epoch,
+            outcome,
+        };
+        let mut backoff = Duration::from_millis(500);
+        let mut last = String::new();
+        for attempt in 1..=5_u32 {
+            match tokio::time::timeout(self.attempt_deadline, self.admin.propose(command.clone()))
+                .await
+            {
+                Ok(Ok(response)) => match response.response {
+                    MetadataResponse::TransitionRecorded { .. } => {
+                        tracing::info!(
+                            range = %self.range_uuid,
+                            fencing_epoch,
+                            attempt,
+                            "promotion outcome recorded against the epoch's transition"
+                        );
+                        return Ok(());
+                    }
+                    other => {
+                        return Err(format!(
+                            "metadata refused the promotion report ({other:?}); the transition \
+                             stays as it was"
+                        ));
+                    }
+                },
+                Ok(Err(error)) => last = format!("promotion report not delivered: {error}"),
+                Err(_) => {
+                    last = format!(
+                        "promotion report not answered within {:?}",
+                        self.attempt_deadline
+                    )
+                }
+            }
+            tracing::warn!(range = %self.range_uuid, fencing_epoch, attempt, %last, "retrying");
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(4));
+        }
+        Err(format!("{last} (after 5 attempts)"))
+    }
+}
+
 struct Promoter {
     /// Set by the quorum-miss arm; read and cleared by the caller (#375).
     quorum_miss: bool,
@@ -880,7 +961,11 @@ struct Promoter {
     /// the agent to report to metadata (#240 item 5) — the evidence the
     /// promotion computes and used to discard. Taken by the caller; a
     /// verification that was skipped (epoch already verified) leaves none.
+    /// The outcome of the verification in progress, reported through
+    /// `reporter` before the boundary is exposed (established) or before the
+    /// refusal is acted on (refused).
     evidence: Option<vtop_meta::PromotionOutcome>,
+    reporter: Arc<dyn TransitionReporter>,
     publisher: Arc<dyn LeasePublisher>,
     probe: Option<Arc<dyn QuorumProbe>>,
     /// The epoch whose boundary has already been verified.
@@ -900,6 +985,10 @@ struct Promoter {
     /// replica its own refusal named, because a suspended non-leader
     /// receives no replication with which to become eligible.
     stand_aside: bool,
+    /// The highest boundary any earlier promotion of this range published,
+    /// read from metadata's transition chain before each verification
+    /// (#449): the boundary established here must not fall below it.
+    published_floor: Option<u64>,
 }
 
 impl Promoter {
@@ -920,6 +1009,7 @@ impl Promoter {
                     &probes,
                     probe.replication_factor(),
                     self.node_uuid,
+                    self.published_floor,
                 ) {
                     crate::promotion::Promotion::Established {
                         committed_offset,
@@ -986,6 +1076,7 @@ impl Promoter {
                         self.evidence = Some(vtop_meta::PromotionOutcome::Refused {
                             reason: vtop_meta::PromotionRefusal::QuorumUnavailable,
                         });
+                        self.report_refusal(fencing_epoch).await;
                         self.suspended(fencing_epoch);
                         return false;
                     }
@@ -1009,6 +1100,7 @@ impl Promoter {
                         self.evidence = Some(vtop_meta::PromotionOutcome::Refused {
                             reason: vtop_meta::PromotionRefusal::LeaderBehind,
                         });
+                        self.report_refusal(fencing_epoch).await;
                         self.suspended(fencing_epoch);
                         return false;
                     }
@@ -1038,6 +1130,32 @@ impl Promoter {
                         self.evidence = Some(vtop_meta::PromotionOutcome::Refused {
                             reason: vtop_meta::PromotionRefusal::CandidateBehindVoters,
                         });
+                        self.report_refusal(fencing_epoch).await;
+                        self.suspended(fencing_epoch);
+                        return false;
+                    }
+                    crate::promotion::Promotion::BelowPublished {
+                        committed_offset,
+                        published_floor,
+                        most_complete,
+                    } => {
+                        tracing::warn!(
+                            range = %self.range_uuid,
+                            fencing_epoch,
+                            committed_offset,
+                            published_floor,
+                            most_complete_node = %most_complete.0,
+                            most_complete_offset = most_complete.1,
+                            "refusing promotion: the boundary this quorum proves sits below a \
+                             watermark an earlier promotion published (#449); a published \
+                             watermark must never regress, so the lease lapses for the replica \
+                             that holds the published prefix"
+                        );
+                        self.stand_aside = true;
+                        self.evidence = Some(vtop_meta::PromotionOutcome::Refused {
+                            reason: vtop_meta::PromotionRefusal::BelowPublished,
+                        });
+                        self.report_refusal(fencing_epoch).await;
                         self.suspended(fencing_epoch);
                         return false;
                     }
@@ -1060,10 +1178,46 @@ impl Promoter {
                 required: 0,
             });
         }
+        // PERSIST BEFORE EXPOSE (#449, review): the boundary goes into the
+        // transition record — where the next promotion reads its floor —
+        // before any client can observe it. A report that does not land is
+        // not a boundary nobody will know about: the epoch is held still and
+        // the next round verifies again.
+        if let Some(outcome) = self.evidence.take() {
+            if let Err(error) = self.reporter.report(fencing_epoch, outcome).await {
+                tracing::warn!(
+                    range = %self.range_uuid,
+                    fencing_epoch,
+                    committed_offset,
+                    %error,
+                    "refusing to expose the boundary this round: its transition record could \
+                     not be written first, and a boundary metadata does not hold cannot floor \
+                     the next promotion (#449)"
+                );
+                self.quorum_miss = true;
+                self.suspended(fencing_epoch);
+                return false;
+            }
+        }
         self.publisher.promote(fencing_epoch, committed_offset);
         self.verified_epoch = Some(fencing_epoch);
         tracing::info!(range = %self.range_uuid, fencing_epoch, "range lease held");
         true
+    }
+
+    /// A refusal is recorded too, best effort: it is evidence, not a floor,
+    /// and a report that fails must not change the verdict.
+    async fn report_refusal(&mut self, fencing_epoch: u64) {
+        if let Some(outcome) = self.evidence.take() {
+            if let Err(error) = self.reporter.report(fencing_epoch, outcome).await {
+                tracing::warn!(
+                    range = %self.range_uuid,
+                    fencing_epoch,
+                    %error,
+                    "the promotion refusal was not recorded on the transition"
+                );
+            }
+        }
     }
 
     fn lost(&mut self, fencing_epoch: u64) {
@@ -1097,12 +1251,6 @@ impl Promoter {
     /// it, because one verdict funds one hold-off.
     fn take_stand_aside(&mut self) -> bool {
         std::mem::take(&mut self.stand_aside)
-    }
-
-    /// The last verification's evidence, if a verification ran; reading
-    /// clears it, because one verification funds one report.
-    fn take_evidence(&mut self) -> Option<vtop_meta::PromotionOutcome> {
-        self.evidence.take()
     }
 }
 
@@ -1495,8 +1643,9 @@ impl LeaseAgent {
         probe: Option<Arc<dyn QuorumProbe>>,
     ) -> Result<Self, String> {
         config.validate()?;
+        let admin = Arc::new(admin);
         Ok(Self {
-            admin: Arc::new(admin),
+            admin: Arc::clone(&admin),
             config,
             node_uuid,
             topic_uuid,
@@ -1505,12 +1654,21 @@ impl LeaseAgent {
                 quorum_miss: false,
                 local_view: None,
                 evidence: None,
+                reporter: Arc::new(AdminTransitionReporter {
+                    admin: Arc::clone(&admin),
+                    topic_uuid,
+                    range_uuid,
+                    node_uuid,
+                    attempt_deadline: (config.renew_interval / 4)
+                        .clamp(Duration::from_millis(200), Duration::from_secs(2)),
+                }),
                 publisher,
                 probe,
                 verified_epoch: None,
                 node_uuid,
                 range_uuid,
                 stand_aside: false,
+                published_floor: None,
             },
             state: LeaseState::NotHeld,
             ready: None,
@@ -2188,9 +2346,77 @@ impl LeaseAgent {
         ))
     }
 
+    /// The highest boundary any earlier promotion of this range published,
+    /// from metadata's transition chain (#449): the floor `establish_above`
+    /// holds the new boundary to. Every Established record in chain order
+    /// counts, whatever the audit later says of its vote; `None` when no
+    /// promotion has published a boundary yet.
+    async fn read_published_floor(&self) -> Result<Option<u64>, String> {
+        const PAGE: u16 = 256;
+        let mut from_epoch = 1;
+        let mut floor: Option<u64> = None;
+        loop {
+            let page = self
+                .bounded(
+                    "read range transitions",
+                    self.admin.read_range_transitions(
+                        self.topic_uuid,
+                        self.range_uuid,
+                        from_epoch,
+                        PAGE,
+                    ),
+                )
+                .await?;
+            if !page.found {
+                return Ok(None);
+            }
+            for view in &page.transitions {
+                if let vtop_meta::TransitionOutcome::Reported {
+                    outcome:
+                        vtop_meta::PromotionOutcome::Established {
+                            boundary_offset: Some(boundary),
+                            ..
+                        },
+                    ..
+                } = &view.outcome
+                {
+                    floor = Some(floor.map_or(*boundary, |seen| seen.max(*boundary)));
+                }
+            }
+            match page.transitions.last() {
+                Some(last) if page.transitions.len() == usize::from(PAGE) => {
+                    from_epoch = last.epoch_to.saturating_add(1);
+                }
+                _ => return Ok(floor),
+            }
+        }
+    }
+
     async fn publish_held(&mut self, fencing_epoch: u64, held_until_ms: Option<i64>) -> Promoted {
+        // The published watermark first (#449): read before a verification,
+        // so the boundary about to be established is held to it. A floor
+        // that cannot be read is not a floor of zero — the epoch is held
+        // still and the next round reads again, the same way a quorum that
+        // did not answer is treated.
+        if self.promoter.verified_epoch != Some(fencing_epoch) {
+            match self.read_published_floor().await {
+                Ok(floor) => self.promoter.published_floor = floor,
+                Err(error) => {
+                    tracing::warn!(
+                        range = %self.range_uuid,
+                        fencing_epoch,
+                        %error,
+                        "refusing promotion this round: the published watermark could not be \
+                         read from metadata, so the boundary cannot be held to it (#449)"
+                    );
+                    self.promoter.suspended(fencing_epoch);
+                    self.state = LeaseState::NotHeld;
+                    self.held_until_ms = None;
+                    return Promoted::QuorumMissed;
+                }
+            }
+        }
         let held = self.promoter.ensure(fencing_epoch).await;
-        self.report_outcome(fencing_epoch);
         if !held {
             let quorum_miss = self.promoter.take_quorum_miss();
             if self.promoter.take_stand_aside() {
@@ -2211,90 +2437,6 @@ impl LeaseAgent {
         self.state = LeaseState::Held { fencing_epoch };
         self.held_until_ms = held_until_ms;
         Promoted::Yes
-    }
-
-    /// Report what the verification established, or why it refused, so the
-    /// transition record metadata minted at grant time stops being Pending
-    /// (#240 item 5). Best effort, and OFF the renewal path (review): the
-    /// report runs as its own task with its own short deadline and its own
-    /// retries, so a slow or blackholed metadata leader can neither delay
-    /// the renewal that keeps the lease alive nor be told about the
-    /// promotion only once. A report that never lands is logged and the
-    /// epoch's record stays visibly Pending — the honest shape of "nobody
-    /// told metadata what happened", and one a chain reader can see.
-    fn report_outcome(&mut self, fencing_epoch: u64) {
-        let Some(outcome) = self.promoter.take_evidence() else {
-            return;
-        };
-        let admin = Arc::clone(&self.admin);
-        let (topic_uuid, range_uuid, node_uuid) =
-            (self.topic_uuid, self.range_uuid, self.node_uuid);
-        // Each ATTEMPT is bounded well inside one renew interval; the task as
-        // a whole may outlive several renewals (five attempts plus backoff
-        // is up to ~13s at the default cadence), and that is fine precisely
-        // because it is detached — no renewal ever waits on it (review).
-        let attempt_deadline = (self.config.renew_interval / 4)
-            .clamp(Duration::from_millis(200), Duration::from_secs(2));
-        tokio::spawn(async move {
-            let command = MetadataCommand::ReportPromotionOutcome {
-                env: envelope(),
-                topic_uuid,
-                range_uuid,
-                holder_node_uuid: node_uuid,
-                fencing_epoch,
-                outcome,
-            };
-            let mut backoff = Duration::from_millis(500);
-            for attempt in 1..=5_u32 {
-                match tokio::time::timeout(attempt_deadline, admin.propose(command.clone())).await {
-                    Ok(Ok(response)) => match response.response {
-                        MetadataResponse::TransitionRecorded { .. } => {
-                            tracing::info!(
-                                range = %range_uuid,
-                                fencing_epoch,
-                                attempt,
-                                "promotion outcome recorded against the epoch's transition"
-                            );
-                            return;
-                        }
-                        // A refusal is metadata's verdict, not a delivery
-                        // failure: the record is already established, the
-                        // epoch was granted to someone else, or the epoch
-                        // was never minted. Retrying cannot change it.
-                        other => {
-                            tracing::warn!(
-                                range = %range_uuid,
-                                fencing_epoch,
-                                ?other,
-                                "metadata refused the promotion report; the transition stays as it was"
-                            );
-                            return;
-                        }
-                    },
-                    Ok(Err(error)) => tracing::warn!(
-                        range = %range_uuid,
-                        fencing_epoch,
-                        attempt,
-                        %error,
-                        "promotion report not delivered; retrying"
-                    ),
-                    Err(_) => tracing::warn!(
-                        range = %range_uuid,
-                        fencing_epoch,
-                        attempt,
-                        deadline = ?attempt_deadline,
-                        "promotion report timed out; retrying"
-                    ),
-                }
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(5));
-            }
-            tracing::warn!(
-                range = %range_uuid,
-                fencing_epoch,
-                "promotion report abandoned after five attempts; the transition stays Pending"
-            );
-        });
     }
 
     /// Hold a quorum-missed epoch still for as long as the budget allows.
@@ -3137,6 +3279,80 @@ mod tests {
     /// the way `establish` counts it, the refusal named by its reason — and
     /// a skipped re-verification leaves nothing, so nothing is reported
     /// twice.
+    /// A boundary below the watermark the range already published is refused
+    /// (#449), the holder stands aside for the replica that holds the
+    /// prefix, and the refusal is the evidence the transition record keeps.
+    #[tokio::test]
+    async fn a_boundary_below_the_published_watermark_is_refused_and_the_holder_stands_aside() {
+        let recorder = Arc::new(Recorder::default());
+        // Node 3 held the published 95; the other two are behind, so this
+        // majority's k-th highest is 90.
+        let probe = fixed(vec![at(1, Some(90)), at(2, Some(80)), at(3, Some(95))], 3);
+        let mut verifier = promoter(recorder.clone(), Some(probe.clone()));
+        verifier.published_floor = Some(95);
+        assert!(!verifier.ensure(5).await, "90 is below the published 95");
+        assert_eq!(
+            recorder.last_reported(),
+            Some(vtop_meta::PromotionOutcome::Refused {
+                reason: vtop_meta::PromotionRefusal::BelowPublished,
+            })
+        );
+        assert!(
+            verifier.take_stand_aside(),
+            "the replica holding 95 should win"
+        );
+        assert_eq!(recorder.suspended.lock().unwrap().as_slice(), &[5]);
+        assert!(recorder.promoted.lock().unwrap().is_empty());
+        // At the floor, the same quorum promotes.
+        let mut verifier = promoter(recorder.clone(), Some(probe));
+        verifier.published_floor = Some(90);
+        assert!(verifier.ensure(6).await);
+        assert_eq!(
+            recorder.promoted.lock().unwrap().last(),
+            Some(&(6, Some(90)))
+        );
+    }
+
+    /// PERSIST BEFORE EXPOSE (#449, review): a boundary metadata did not
+    /// record is not promoted — the epoch is held still for the next round —
+    /// so a later promotion can never read a floor lower than what clients
+    /// saw. Once metadata answers, the same verification promotes.
+    #[tokio::test]
+    async fn an_unrecorded_boundary_is_not_exposed() {
+        let recorder = Arc::new(Recorder::default());
+        recorder
+            .refuse_reports
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let probe = fixed(vec![at(1, Some(90)), at(2, Some(80)), at(3, Some(95))], 3);
+        let mut verifier = promoter(recorder.clone(), Some(probe));
+        assert!(!verifier.ensure(5).await, "no record, no boundary");
+        assert!(
+            recorder.promoted.lock().unwrap().is_empty(),
+            "nothing exposed"
+        );
+        assert_eq!(recorder.suspended.lock().unwrap().as_slice(), &[5]);
+        assert!(
+            verifier.take_quorum_miss(),
+            "held still, like a quorum that did not answer"
+        );
+        assert!(
+            !verifier.take_stand_aside(),
+            "nobody else is the better holder"
+        );
+        recorder
+            .refuse_reports
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            verifier.ensure(5).await,
+            "the next round records, then promotes"
+        );
+        assert_eq!(recorder.reported_count(), 1);
+        assert_eq!(
+            recorder.promoted.lock().unwrap().as_slice(),
+            &[(5, Some(90))]
+        );
+    }
+
     #[tokio::test]
     async fn a_verification_leaves_the_evidence_the_transition_record_keeps() {
         let recorder = Arc::new(Recorder::default());
@@ -3149,7 +3365,7 @@ mod tests {
             votes,
             required,
             ..
-        }) = verifier.take_evidence()
+        }) = recorder.last_reported()
         else {
             panic!("an established promotion leaves Established evidence");
         };
@@ -3168,13 +3384,20 @@ mod tests {
             "nodes 1 and 2 are at or below the candidate's 90; node 3 is not"
         );
         assert_eq!(required, 2);
-        assert!(
-            verifier.take_evidence().is_none(),
-            "one verification funds one report"
+        assert_eq!(
+            recorder.reported_count(),
+            1,
+            "one verification funds one report, and it was recorded BEFORE the promote"
+        );
+        assert_eq!(
+            recorder.promoted.lock().unwrap().len(),
+            1,
+            "the boundary was exposed once, after its record"
         );
         assert!(verifier.ensure(5).await, "already verified");
-        assert!(
-            verifier.take_evidence().is_none(),
+        assert_eq!(
+            recorder.reported_count(),
+            1,
             "a skipped re-verification computes nothing and reports nothing"
         );
 
@@ -3182,16 +3405,16 @@ mod tests {
         let mut verifier = promoter(recorder.clone(), Some(probe));
         assert!(!verifier.ensure(6).await);
         assert_eq!(
-            verifier.take_evidence(),
+            recorder.last_reported(),
             Some(vtop_meta::PromotionOutcome::Refused {
                 reason: vtop_meta::PromotionRefusal::QuorumUnavailable
             })
         );
 
-        let mut standalone = promoter(recorder, None);
+        let mut standalone = promoter(recorder.clone(), None);
         assert!(standalone.ensure(7).await);
         assert_eq!(
-            standalone.take_evidence(),
+            recorder.last_reported(),
             Some(vtop_meta::PromotionOutcome::Established {
                 boundary_offset: None,
                 sealed_prefix_end: None,
@@ -3218,7 +3441,7 @@ mod tests {
         standalone.local_view = Some(Arc::new(SealedAt(300)));
         assert!(standalone.ensure(8).await);
         assert!(matches!(
-            standalone.take_evidence(),
+            recorder.last_reported(),
             Some(vtop_meta::PromotionOutcome::Established {
                 sealed_prefix_end: Some(300),
                 ..
@@ -3255,14 +3478,22 @@ mod tests {
         LocalBroker::new(segment, epochs, range, epoch).unwrap()
     }
 
-    fn promoter(
+    fn promoter(recorder: Arc<Recorder>, probe: Option<Arc<dyn QuorumProbe>>) -> Promoter {
+        promoter_with(recorder.clone(), recorder, probe)
+    }
+
+    /// A promoter over a publisher that is not the recorder (a real broker
+    /// publisher), with `reporter` as its transition reporter.
+    fn promoter_with(
         publisher: Arc<dyn LeasePublisher>,
+        reporter: Arc<dyn TransitionReporter>,
         probe: Option<Arc<dyn QuorumProbe>>,
     ) -> Promoter {
         Promoter {
             quorum_miss: false,
             local_view: None,
             evidence: None,
+            reporter,
             publisher,
             probe,
             verified_epoch: None,
@@ -3270,6 +3501,7 @@ mod tests {
             // Matches `at(1, ..)`: the tests' candidate is node 1.
             node_uuid: Uuid::from_u128(1),
             range_uuid: Uuid::from_u128(21),
+            published_floor: None,
         }
     }
 
@@ -3278,6 +3510,41 @@ mod tests {
         promoted: std::sync::Mutex<Vec<(u64, Option<u64>)>>,
         demoted: std::sync::Mutex<Vec<u64>>,
         suspended: std::sync::Mutex<Vec<u64>>,
+        /// Outcomes reported to metadata, in order; `refuse_reports` makes
+        /// every report fail, the way an unreachable metadata plane would.
+        reported: std::sync::Mutex<Vec<(u64, vtop_meta::PromotionOutcome)>>,
+        refuse_reports: std::sync::atomic::AtomicBool,
+    }
+
+    impl Recorder {
+        fn last_reported(&self) -> Option<vtop_meta::PromotionOutcome> {
+            self.reported
+                .lock()
+                .unwrap()
+                .last()
+                .map(|(_, outcome)| outcome.clone())
+        }
+        fn reported_count(&self) -> usize {
+            self.reported.lock().unwrap().len()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TransitionReporter for Recorder {
+        async fn report(
+            &self,
+            fencing_epoch: u64,
+            outcome: vtop_meta::PromotionOutcome,
+        ) -> Result<(), String> {
+            if self
+                .refuse_reports
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err("metadata unreachable (test)".to_owned());
+            }
+            self.reported.lock().unwrap().push((fencing_epoch, outcome));
+            Ok(())
+        }
     }
 
     impl LeasePublisher for Recorder {
@@ -3347,7 +3614,7 @@ mod tests {
     async fn a_refused_promotion_suspends_rather_than_stranding_or_poisoning() {
         let recorder = Arc::new(Recorder::default());
         let mut promoter = promoter(
-            Arc::clone(&recorder) as Arc<dyn LeasePublisher>,
+            Arc::clone(&recorder),
             Some(fixed(vec![at(1, Some(10)), at(2, None), at(3, None)], 3)),
         );
 
@@ -3414,7 +3681,7 @@ mod tests {
         // Node 1 answers 100 and holds the floor, but node 2 is ahead at
         // 101: one vote of a required two — the §5.4.1 refusal.
         let mut behind = promoter(
-            Arc::clone(&recorder) as Arc<dyn LeasePublisher>,
+            Arc::clone(&recorder),
             Some(fixed(vec![at(1, Some(100)), at(2, Some(101))], 3)),
         );
         assert!(!behind.ensure(7).await);
@@ -3428,7 +3695,7 @@ mod tests {
         );
 
         let mut miss = promoter(
-            Arc::clone(&recorder) as Arc<dyn LeasePublisher>,
+            Arc::clone(&recorder),
             Some(fixed(vec![at(1, Some(10)), at(2, None), at(3, None)], 3)),
         );
         assert!(!miss.ensure(8).await);
@@ -3451,7 +3718,7 @@ mod tests {
         let recorder = Arc::new(Recorder::default());
 
         let mut miss = promoter(
-            Arc::clone(&recorder) as Arc<dyn LeasePublisher>,
+            Arc::clone(&recorder),
             Some(fixed(vec![at(1, Some(10)), at(2, None), at(3, None)], 3)),
         );
         assert!(!miss.ensure(8).await);
@@ -3467,7 +3734,7 @@ mod tests {
 
         // Node 2 is ahead, so this is the §5.4.1 refusal, not a miss.
         let mut behind = promoter(
-            Arc::clone(&recorder) as Arc<dyn LeasePublisher>,
+            Arc::clone(&recorder),
             Some(fixed(vec![at(1, Some(100)), at(2, Some(101))], 3)),
         );
         assert!(!behind.ensure(9).await);
@@ -3568,8 +3835,9 @@ mod tests {
         let publisher: Arc<dyn LeasePublisher> =
             Arc::new(BrokerLeasePublisher::new(Arc::clone(&broker)));
         let probe = fixed(vec![at(1, Some(10)), at(2, None), at(3, None)], 3);
-        let mut promoter = promoter(
+        let mut promoter = promoter_with(
             Arc::clone(&publisher),
+            Arc::new(Recorder::default()),
             Some(Arc::clone(&probe) as Arc<dyn QuorumProbe>),
         );
 
@@ -3604,7 +3872,7 @@ mod tests {
     async fn a_leader_behind_the_boundary_refuses_and_suspends() {
         let recorder = Arc::new(Recorder::default());
         let mut promoter = promoter(
-            Arc::clone(&recorder) as Arc<dyn LeasePublisher>,
+            Arc::clone(&recorder),
             Some(fixed(
                 vec![at(1, Some(50)), at(2, Some(90)), at(3, Some(90))],
                 3,
@@ -3707,7 +3975,7 @@ mod tests {
         let recorder = Arc::new(Recorder::default());
         let probe = fixed(vec![at(1, Some(10)), at(2, Some(10))], 2);
         let mut promoter = promoter(
-            Arc::clone(&recorder) as Arc<dyn LeasePublisher>,
+            Arc::clone(&recorder),
             Some(Arc::clone(&probe) as Arc<dyn QuorumProbe>),
         );
 
@@ -3734,7 +4002,7 @@ mod tests {
         // Three replicas, majority 2. The leader is fenced by construction; one
         // follower refused the fence and reports absent.
         let mut promoter = promoter(
-            Arc::clone(&recorder) as Arc<dyn LeasePublisher>,
+            Arc::clone(&recorder),
             Some(fixed(vec![at(1, Some(90)), at(2, None), at(3, None)], 3)),
         );
 
@@ -3753,7 +4021,7 @@ mod tests {
         let recorder = Arc::new(Recorder::default());
         let probe = fixed(vec![at(1, Some(10)), at(2, Some(10))], 2);
         let mut promoter = promoter(
-            Arc::clone(&recorder) as Arc<dyn LeasePublisher>,
+            Arc::clone(&recorder),
             Some(Arc::clone(&probe) as Arc<dyn QuorumProbe>),
         );
 
@@ -3778,7 +4046,7 @@ mod tests {
     async fn the_established_boundary_is_published_with_the_epoch() {
         let recorder = Arc::new(Recorder::default());
         let mut promoter = promoter(
-            Arc::clone(&recorder) as Arc<dyn LeasePublisher>,
+            Arc::clone(&recorder),
             Some(fixed(
                 vec![at(1, Some(90)), at(2, Some(90)), at(3, Some(50))],
                 3,
@@ -3794,7 +4062,7 @@ mod tests {
     #[tokio::test]
     async fn a_standalone_range_promotes_without_a_probe() {
         let recorder = Arc::new(Recorder::default());
-        let mut promoter = promoter(Arc::clone(&recorder) as Arc<dyn LeasePublisher>, None);
+        let mut promoter = promoter(Arc::clone(&recorder), None);
         assert!(promoter.ensure(5).await);
         assert_eq!(*recorder.promoted.lock().unwrap(), vec![(5, None)]);
     }

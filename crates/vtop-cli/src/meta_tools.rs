@@ -1137,6 +1137,50 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
                 }
                 return Ok(());
             }
+            // The floor the window's first boundary is held to (#449): every
+            // boundary published before `from_epoch`, read from the chain's
+            // head. A read that fails leaves the check unverified, and the
+            // audit says so rather than passing on a window it cannot judge.
+            let prior_published: Option<Option<u64>> = if from_epoch.max(1) == 1 {
+                Some(None)
+            } else {
+                let client_ref = &client;
+                match read_chain_consistently(
+                    move |next_from, limit| async move {
+                        client_ref
+                            .read_range_transitions(topic_uuid, range_uuid, next_from, limit)
+                            .await
+                            .map_err(|error| error.to_string())
+                    },
+                    1,
+                    limit,
+                )
+                .await
+                {
+                    Ok(Some((earlier, _))) => Some(
+                        earlier
+                            .iter()
+                            .filter(|view| view.epoch_to < from_epoch)
+                            .filter_map(|view| match &view.outcome {
+                                TransitionOutcome::Reported {
+                                    outcome:
+                                        PromotionOutcome::Established {
+                                            boundary_offset: Some(boundary),
+                                            ..
+                                        },
+                                    ..
+                                } => Some(*boundary),
+                                _ => None,
+                            })
+                            .max(),
+                    ),
+                    Ok(None) => Some(None),
+                    Err(error) => {
+                        eprintln!("warning: the chain before epoch {from_epoch} could not be read for the published-watermark floor: {error}");
+                        None
+                    }
+                }
+            };
             let audit = audit_transitions(
                 &transitions,
                 key.as_ref(),
@@ -1144,6 +1188,7 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
                 range_uuid,
                 from_epoch,
                 Some(lease.fencing_epoch),
+                prior_published,
             )?;
             // The replicas' own account (#240): each epoch vector held to the
             // chain the metadata holds.
@@ -1161,6 +1206,8 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
                             "transitions": audit.records.len(),
                             "broken_links": audit.broken_links,
                             "vote_disagreements": audit.vote_disagreements,
+                            "boundary_regressions": audit.boundary_regressions,
+                            "regression_floor_known": !audit.regression_floor_unknown,
                             "mac": { "verified": audit.verified, "unsigned": audit.unsigned, "unverified": audit.unverified, "mismatch": audit.mismatches },
                         },
                         "epoch_vectors": cross.as_ref().map(EpochCrossCheck::json),
@@ -2026,6 +2073,10 @@ pub struct TransitionAudit {
     /// quorum the way the holder counted it, beside what it recorded.
     pub vote: Option<VoteAudit>,
     pub mac: MacVerdict,
+    /// The highest boundary an earlier promotion published, when this
+    /// promotion's boundary fell below it (#449): a published watermark
+    /// that went backwards.
+    pub regressed_below: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2085,6 +2136,13 @@ pub struct ChainAudit {
     pub reaches_current: Option<(u64, bool)>,
     pub broken_links: usize,
     pub vote_disagreements: usize,
+    /// Promotions whose boundary fell below one an earlier promotion
+    /// published (#449).
+    pub boundary_regressions: usize,
+    /// The audit started past the chain's head and the boundaries published
+    /// before it could not be read, so the regression check is unverified
+    /// for this window (#449).
+    pub regression_floor_unknown: bool,
     pub verified: usize,
     pub unsigned: usize,
     pub unverified: usize,
@@ -2392,6 +2450,20 @@ impl ChainAudit {
                 self.vote_disagreements
             ));
         }
+        if self.boundary_regressions > 0 {
+            reasons.push(format!(
+                "{} promotion(s) whose boundary fell below a watermark an earlier promotion \
+                 published (#449)",
+                self.boundary_regressions
+            ));
+        }
+        if self.regression_floor_unknown {
+            reasons.push(
+                "the boundaries published before this window could not be read, so a \
+                 regression against them would go unseen (#449)"
+                    .to_owned(),
+            );
+        }
         if self.mismatches > 0 {
             reasons.push(format!("{} MAC mismatch(es)", self.mismatches));
         }
@@ -2416,6 +2488,11 @@ pub fn audit_transitions(
     range_uuid: Uuid,
     from_epoch: u64,
     current_epoch: Option<u64>,
+    // The highest boundary published BEFORE `from_epoch`, when the audit
+    // starts past the chain's head (#449): `Some(known)` seeds the
+    // regression check, `None` says the earlier chain could not be read
+    // and the check is unverified for this window.
+    prior_published: Option<Option<u64>>,
 ) -> Result<ChainAudit, String> {
     // Read up from `from_epoch`, the chain must end at the epoch the range
     // holds now; a range still at its genesis has no transition to show.
@@ -2438,8 +2515,35 @@ pub fn audit_transitions(
     // Epoch 0 is the range's genesis, established by no transition: asked
     // from 0, the first record to expect is the one that made epoch 1.
     let mut expected_to = from_epoch.max(1);
+    // The highest boundary published so far along the chain (#449): every
+    // later promotion's boundary is held to it.
+    let mut highest_published: Option<u64> = match prior_published {
+        Some(prior) => prior,
+        None => {
+            audit.regression_floor_unknown = from_epoch > 1;
+            None
+        }
+    };
     for view in views {
         let link_ok = view.epoch_to == expected_to && view.epoch_from + 1 == view.epoch_to;
+        let regressed_below = match &view.outcome {
+            TransitionOutcome::Reported {
+                outcome:
+                    PromotionOutcome::Established {
+                        boundary_offset: Some(boundary),
+                        ..
+                    },
+                ..
+            } => {
+                let regressed = highest_published.filter(|published| boundary < published);
+                if regressed.is_some() {
+                    audit.boundary_regressions += 1;
+                }
+                highest_published = Some(highest_published.map_or(*boundary, |h| h.max(*boundary)));
+                regressed
+            }
+            _ => None,
+        };
         if !link_ok {
             audit.broken_links += 1;
         }
@@ -2536,7 +2640,12 @@ pub fn audit_transitions(
             MacVerdict::Unsigned => audit.unsigned += 1,
             MacVerdict::Unverified => audit.unverified += 1,
         }
-        audit.records.push(TransitionAudit { link_ok, vote, mac });
+        audit.records.push(TransitionAudit {
+            link_ok,
+            vote,
+            mac,
+            regressed_below,
+        });
     }
     Ok(audit)
 }
@@ -2588,8 +2697,12 @@ fn outcome_text(view: &AdminTransitionView, record: &TransitionAudit) -> String 
                     .map(|answer| format!("{}:{}", answer.node_uuid, answer.offset))
                     .collect::<Vec<_>>()
                     .join(",");
+                let regression = record
+                    .regressed_below
+                    .map(|published| format!(" BOUNDARY BELOW PUBLISHED {published}"))
+                    .unwrap_or_default();
                 format!(
-                    "established boundary={} sealed_prefix_end={} {vote} quorum=[{quorum}] reported_at_ms={reported_at_ms} reported_apply_index={reported_apply_index}",
+                    "established boundary={} sealed_prefix_end={} {vote}{regression} quorum=[{quorum}] reported_at_ms={reported_at_ms} reported_apply_index={reported_apply_index}",
                     boundary_offset.map(|n| n.to_string()).unwrap_or_else(|| "none".to_owned()),
                     sealed_prefix_end.map(|n| n.to_string()).unwrap_or_else(|| "none".to_owned()),
                 )
@@ -2713,6 +2826,7 @@ fn transition_json(view: &AdminTransitionView, record: &TransitionAudit) -> serd
     serde_json::json!({
         "epoch_from": view.epoch_from,
         "epoch_to": view.epoch_to,
+        "boundary_regressed_below": record.regressed_below,
         "holder_from": view.holder_from,
         "holder_to": view.holder_to,
         "grant": grant_word(view.grant),
@@ -3312,6 +3426,27 @@ transport: plaintext
     /// presented as another range fail; a gap in the epochs is a broken
     /// link; a vote that does not recompute from its own quorum is named;
     /// and without a key a signed statement is unverified, never verified.
+    /// An audit that starts past the chain's head cannot judge a regression
+    /// against boundaries it has not read (#449): given them, it does; not
+    /// given them, its verdict says so instead of passing.
+    #[test]
+    fn a_partial_audit_says_when_its_floor_is_unknown() {
+        let key = [7_u8; 32];
+        let (topic, range) = (Uuid::from_u128(0x11), Uuid::from_u128(0x12));
+        let unknown = audit_transitions(&[], Some(&key), topic, range, 3, None, None).unwrap();
+        assert!(unknown.regression_floor_unknown);
+        assert!(unknown.verdict().unwrap_err().contains("could not be read"));
+        let known =
+            audit_transitions(&[], Some(&key), topic, range, 3, None, Some(Some(100))).unwrap();
+        assert!(!known.regression_floor_unknown);
+        assert!(known.verdict().is_ok());
+        let head = audit_transitions(&[], Some(&key), topic, range, 1, None, None).unwrap();
+        assert!(
+            !head.regression_floor_unknown,
+            "from the head there is nothing earlier to have read"
+        );
+    }
+
     #[test]
     fn a_transition_chain_is_audited_against_the_identity_asked_for() {
         use vtop_meta::{PromotionRefusal, QuorumAnswer};
@@ -3388,7 +3523,8 @@ transport: plaintext
             view.mac = Some(view.record().mac(&key, topic, range).unwrap());
         }
 
-        let audit = audit_transitions(&views, Some(&key), topic, range, 1, None).unwrap();
+        let audit =
+            audit_transitions(&views, Some(&key), topic, range, 1, None, Some(None)).unwrap();
         assert!(audit.verdict().is_ok(), "{audit:?}");
         assert_eq!(audit.verified, 3);
         assert!(audit.records.iter().all(|record| record.link_ok));
@@ -3401,7 +3537,7 @@ transport: plaintext
             (2, 2, 2, true)
         );
         assert!(
-            audit_transitions(&views, Some(&key), topic, range, 0, None)
+            audit_transitions(&views, Some(&key), topic, range, 0, None, Some(None))
                 .unwrap()
                 .verdict()
                 .is_ok(),
@@ -3409,15 +3545,23 @@ transport: plaintext
         );
         assert!(audit.records[1].vote.is_none() && audit.records[2].vote.is_none());
 
-        let relabelled =
-            audit_transitions(&views, Some(&key), topic, Uuid::from_u128(0x72), 1, None).unwrap();
+        let relabelled = audit_transitions(
+            &views,
+            Some(&key),
+            topic,
+            Uuid::from_u128(0x72),
+            1,
+            None,
+            Some(None),
+        )
+        .unwrap();
         assert_eq!(
             relabelled.mismatches, 3,
             "another range's chain is not this one's"
         );
         assert!(relabelled.verdict().unwrap_err().contains("MAC mismatch"));
 
-        let unchecked = audit_transitions(&views, None, topic, range, 1, None).unwrap();
+        let unchecked = audit_transitions(&views, None, topic, range, 1, None, Some(None)).unwrap();
         assert_eq!(
             (unchecked.unverified, unchecked.verified),
             (3, 0),
@@ -3431,7 +3575,8 @@ transport: plaintext
         let mut gapped = views.clone();
         gapped[2].epoch_from = 5;
         gapped[2].mac = Some(gapped[2].record().mac(&key, topic, range).unwrap());
-        let gap = audit_transitions(&gapped, Some(&key), topic, range, 1, None).unwrap();
+        let gap =
+            audit_transitions(&gapped, Some(&key), topic, range, 1, None, Some(None)).unwrap();
         assert_eq!(gap.broken_links, 1);
         assert!(!gap.records[2].link_ok && gap.records[1].link_ok);
         assert!(gap.verdict().unwrap_err().contains("broken link"));
@@ -3442,14 +3587,17 @@ transport: plaintext
         jumped[2].epoch_from = 3;
         jumped[2].epoch_to = 4;
         jumped[2].mac = Some(jumped[2].record().mac(&key, topic, range).unwrap());
-        let jump = audit_transitions(&jumped, Some(&key), topic, range, 1, None).unwrap();
+        let jump =
+            audit_transitions(&jumped, Some(&key), topic, range, 1, None, Some(None)).unwrap();
         assert_eq!(jump.broken_links, 1, "epoch 3 is missing between 2 and 4");
-        let headless = audit_transitions(&views[1..], Some(&key), topic, range, 1, None).unwrap();
+        let headless =
+            audit_transitions(&views[1..], Some(&key), topic, range, 1, None, Some(None)).unwrap();
         assert!(
             !headless.records[0].link_ok && headless.records[1].link_ok,
             "asked from epoch 1, the chain must begin at epoch 1"
         );
-        let mid = audit_transitions(&views[1..], Some(&key), topic, range, 2, None).unwrap();
+        let mid =
+            audit_transitions(&views[1..], Some(&key), topic, range, 2, None, Some(None)).unwrap();
         assert!(
             mid.verdict().is_ok(),
             "asked from epoch 2, it may begin there"
@@ -3459,29 +3607,50 @@ transport: plaintext
         // chain that reaches it passes, one that stops short is missing its
         // tail, and a range at its genesis has nothing to show.
         assert!(
-            audit_transitions(&views, Some(&key), topic, range, 1, Some(3))
+            audit_transitions(&views, Some(&key), topic, range, 1, Some(3), Some(None))
                 .unwrap()
                 .verdict()
                 .is_ok()
         );
         assert!(
-            audit_transitions(&views[..2], Some(&key), topic, range, 1, Some(1))
-                .unwrap()
-                .verdict()
-                .is_ok(),
+            audit_transitions(
+                &views[..2],
+                Some(&key),
+                topic,
+                range,
+                1,
+                Some(1),
+                Some(None)
+            )
+            .unwrap()
+            .verdict()
+            .is_ok(),
             "a grant that landed after the snapshot only makes the chain longer"
         );
-        let short = audit_transitions(&views[..2], Some(&key), topic, range, 1, Some(3)).unwrap();
+        let short = audit_transitions(
+            &views[..2],
+            Some(&key),
+            topic,
+            range,
+            1,
+            Some(3),
+            Some(None),
+        )
+        .unwrap();
         assert_eq!(short.reaches_current, Some((3, false)));
         assert!(short.verdict().unwrap_err().contains("tail missing"));
-        assert!(audit_transitions(&[], Some(&key), topic, range, 1, Some(0))
-            .unwrap()
-            .verdict()
-            .is_ok());
-        assert!(audit_transitions(&[], Some(&key), topic, range, 1, Some(2))
-            .unwrap()
-            .verdict()
-            .is_err());
+        assert!(
+            audit_transitions(&[], Some(&key), topic, range, 1, Some(0), Some(None))
+                .unwrap()
+                .verdict()
+                .is_ok()
+        );
+        assert!(
+            audit_transitions(&[], Some(&key), topic, range, 1, Some(2), Some(None))
+                .unwrap()
+                .verdict()
+                .is_err()
+        );
 
         // A quorum naming one replica twice counts it once (review).
         let mut doubled = views.clone();
@@ -3495,7 +3664,8 @@ transport: plaintext
             quorum.push(again);
         }
         doubled[0].mac = Some(doubled[0].record().mac(&key, topic, range).unwrap());
-        let dup = audit_transitions(&doubled, Some(&key), topic, range, 1, None).unwrap();
+        let dup =
+            audit_transitions(&doubled, Some(&key), topic, range, 1, None, Some(None)).unwrap();
         let vote = dup.records[0].vote.as_ref().unwrap();
         assert_eq!(
             (vote.recomputed, vote.ok),
@@ -3514,7 +3684,8 @@ transport: plaintext
             quorum.retain(|answer| answer.node_uuid != holder_a);
         }
         absent[0].mac = Some(absent[0].record().mac(&key, topic, range).unwrap());
-        let gone = audit_transitions(&absent, Some(&key), topic, range, 1, None).unwrap();
+        let gone =
+            audit_transitions(&absent, Some(&key), topic, range, 1, None, Some(None)).unwrap();
         let vote = gone.records[0].vote.as_ref().unwrap();
         assert!(!vote.holder_answered && !vote.ok, "{vote:?}");
         assert!(transition_line(&absent[0], &gone.records[0]).contains("HOLDER ABSENT"));
@@ -3531,7 +3702,8 @@ transport: plaintext
             reported_apply_index: 12,
         };
         standalone[0].mac = Some(standalone[0].record().mac(&key, topic, range).unwrap());
-        let alone = audit_transitions(&standalone, Some(&key), topic, range, 1, None).unwrap();
+        let alone =
+            audit_transitions(&standalone, Some(&key), topic, range, 1, None, Some(None)).unwrap();
         assert!(
             alone.records[0].vote.as_ref().unwrap().ok,
             "nothing to answer, nothing missing"
@@ -3552,7 +3724,8 @@ transport: plaintext
             *votes = 2;
         }
         needless[0].mac = Some(needless[0].record().mac(&key, topic, range).unwrap());
-        let zero = audit_transitions(&needless, Some(&key), topic, range, 1, None).unwrap();
+        let zero =
+            audit_transitions(&needless, Some(&key), topic, range, 1, None, Some(None)).unwrap();
         assert!(
             !zero.records[0].vote.as_ref().unwrap().ok,
             "required = 0 with a quorum is no evidence"
@@ -3573,7 +3746,7 @@ transport: plaintext
             *votes = 2;
         }
         small[0].mac = Some(small[0].record().mac(&key, topic, range).unwrap());
-        let one = audit_transitions(&small, Some(&key), topic, range, 1, None).unwrap();
+        let one = audit_transitions(&small, Some(&key), topic, range, 1, None, Some(None)).unwrap();
         assert!(
             !one.records[0].vote.as_ref().unwrap().ok,
             "required = 1 of three is no majority"
@@ -3593,7 +3766,7 @@ transport: plaintext
             *boundary_offset = Some(0);
         }
         low[0].mac = Some(low[0].record().mac(&key, topic, range).unwrap());
-        let wrong = audit_transitions(&low, Some(&key), topic, range, 1, None).unwrap();
+        let wrong = audit_transitions(&low, Some(&key), topic, range, 1, None, Some(None)).unwrap();
         let vote = wrong.records[0].vote.as_ref().unwrap();
         assert!(!vote.boundary_ok && !vote.ok, "{vote:?}");
         assert!(transition_line(&low[0], &wrong.records[0]).contains("BOUNDARY NOT THE QUORUM"));
@@ -3607,7 +3780,8 @@ transport: plaintext
             *votes = 3;
         }
         overstated[0].mac = Some(overstated[0].record().mac(&key, topic, range).unwrap());
-        let vote = audit_transitions(&overstated, Some(&key), topic, range, 1, None).unwrap();
+        let vote =
+            audit_transitions(&overstated, Some(&key), topic, range, 1, None, Some(None)).unwrap();
         assert_eq!(
             vote.vote_disagreements, 1,
             "three votes are claimed; the quorum shows two at or below the holder"
@@ -3616,7 +3790,8 @@ transport: plaintext
 
         let mut unsigned = views.clone();
         unsigned[1].mac = None;
-        let some = audit_transitions(&unsigned, Some(&key), topic, range, 1, None).unwrap();
+        let some =
+            audit_transitions(&unsigned, Some(&key), topic, range, 1, None, Some(None)).unwrap();
         assert_eq!((some.verified, some.unsigned), (2, 1));
         assert!(
             some.verdict().is_ok(),

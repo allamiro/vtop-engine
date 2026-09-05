@@ -173,6 +173,20 @@ pub enum Promotion {
         /// lease agent should let win the range instead.
         most_complete: (Uuid, u64),
     },
+    /// The boundary this quorum proves sits below a watermark an earlier
+    /// promotion of the range already published (#449). Two majority-sized
+    /// answer sets need share only one member, so the k-th highest offset
+    /// of this one can fall under what the last one vouched for — and
+    /// publishing it would hand consumers a watermark that went backwards
+    /// and truncate acknowledged records off the one replica still holding
+    /// them. Refused: the replica that holds the published prefix should
+    /// win the range instead.
+    BelowPublished {
+        committed_offset: u64,
+        published_floor: u64,
+        /// The most complete replica observed.
+        most_complete: (Uuid, u64),
+    },
 }
 
 /// Majority of a replica set, including the leader itself.
@@ -202,7 +216,25 @@ pub fn majority(replica_count: usize) -> usize {
 /// ([`Promotion::LeaderBehind`]): publishing it would let the produce fast
 /// path acknowledge writes into offsets occupied by committed records the
 /// leader never held.
-pub fn establish(probes: &[ReplicaProbe], replication_factor: usize, leader_id: Uuid) -> Promotion {
+/// Held ABOVE a watermark the range already published (#449).
+///
+/// `published_floor` is the highest boundary any earlier promotion of this
+/// range published — what metadata's transition chain holds — and the
+/// boundary established here must not fall below it. It can: the quorum's
+/// k-th highest offset is computed over whichever majority answered THIS
+/// fence, and two majorities need share only one member, so a candidate
+/// whose answer set is mostly behind can prove a boundary under the one the
+/// last leader published. That boundary would be a watermark going
+/// backwards for every consumer, and reconciliation would truncate the
+/// acknowledged records above it off the one replica still holding them.
+/// `None` is a range with no published boundary yet, or a caller that
+/// cannot supply one; the check is then not made, and the caller says so.
+pub fn establish(
+    probes: &[ReplicaProbe],
+    replication_factor: usize,
+    leader_id: Uuid,
+    published_floor: Option<u64>,
+) -> Promotion {
     debug_assert!(
         probes.len() <= replication_factor,
         "more probes ({}) than configured replicas ({replication_factor})",
@@ -234,7 +266,34 @@ pub fn establish(probes: &[ReplicaProbe], replication_factor: usize, leader_id: 
     // highest offset that `required` replicas can each vouch for.
     let mut offsets: Vec<u64> = answered.values().copied().collect();
     offsets.sort_unstable_by(|a, b| b.cmp(a));
-    let committed_offset = offsets[required - 1];
+    let mut committed_offset = offsets[required - 1];
+    // The published watermark first (#449). A boundary under it is not
+    // published as it stands: the floor was quorum-proven by the promotion
+    // that published it, so a candidate that HOLDS the floor may publish the
+    // floor itself — raised to the published floor, the followers behind it
+    // reconciled up from the leader as usual (review: refusing every
+    // candidate, the floor's holder included, would leave the range
+    // unleadable). A candidate below the floor is refused, and the replica
+    // that holds the most is named as the one that should win instead.
+    if let Some(published_floor) = published_floor {
+        if committed_offset < published_floor {
+            let candidate_offset = answered.get(&leader_id).copied();
+            if candidate_offset.is_some_and(|held| held >= published_floor) {
+                committed_offset = published_floor;
+            } else {
+                let most_complete = answered
+                    .iter()
+                    .max_by_key(|(_, offset)| **offset)
+                    .map(|(node, offset)| (*node, *offset))
+                    .expect("a quorum answered");
+                return Promotion::BelowPublished {
+                    committed_offset,
+                    published_floor,
+                    most_complete,
+                };
+            }
+        }
+    }
     // The candidate must itself hold the boundary it is about to publish.
     let leader_committed_offset = answered.get(&leader_id).copied();
     if leader_committed_offset.is_none_or(|leader_offset| leader_offset < committed_offset) {
@@ -322,12 +381,64 @@ mod tests {
     /// passed — and B's acknowledged record was then reconciled away under
     /// C's boundary. The election restriction refuses C: only one fenced
     /// replica is at or below C's offset, and one is not a majority.
+    /// The boundary never falls below a watermark the range already
+    /// published (#449): two majorities that share one member can prove a
+    /// lower k-th offset, and that is refused, naming the replica that
+    /// holds the most.
+    #[test]
+    fn a_boundary_below_the_published_watermark_is_refused() {
+        // Replica 3 held the previously published 100; the other two are
+        // behind, so the k-th highest of this majority is 90.
+        let probes = [probe(1, Some(90)), probe(2, Some(80)), probe(3, Some(100))];
+        // A candidate below the floor is refused, naming the replica that
+        // holds it.
+        assert_eq!(
+            establish(&probes, 3, Uuid::from_u128(1), Some(100)),
+            Promotion::BelowPublished {
+                committed_offset: 90,
+                published_floor: 100,
+                most_complete: (Uuid::from_u128(3), 100),
+            },
+            "90 is below the published 100, and node 1 does not hold 100"
+        );
+        // The candidate that HOLDS the floor publishes the floor, not the
+        // lower order statistic: the range stays leadable by its holder.
+        assert!(
+            matches!(
+                establish(&probes, 3, Uuid::from_u128(3), Some(100)),
+                Promotion::Established {
+                    committed_offset: 100,
+                    ..
+                }
+            ),
+            "{:?}",
+            establish(&probes, 3, Uuid::from_u128(3), Some(100))
+        );
+        // At the floor, or with no floor to hold, the boundary stands as
+        // the quorum proved it.
+        assert!(matches!(
+            establish(&probes, 3, Uuid::from_u128(3), Some(90)),
+            Promotion::Established {
+                committed_offset: 90,
+                ..
+            }
+        ));
+        assert!(matches!(
+            establish(&probes, 3, Uuid::from_u128(3), None),
+            Promotion::Established {
+                committed_offset: 90,
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn a_candidate_a_fenced_replica_would_refuse_the_vote_is_not_promoted() {
         let outcome = establish(
             &[probe(2, Some(101)), probe(3, Some(100))],
             3,
             Uuid::from_u128(3),
+            None,
         );
         assert_eq!(
             outcome,
@@ -349,6 +460,7 @@ mod tests {
             &[probe(2, Some(101)), probe(3, Some(100))],
             3,
             Uuid::from_u128(2),
+            None,
         );
         match outcome {
             Promotion::Established {
@@ -377,6 +489,7 @@ mod tests {
             ],
             5,
             Uuid::from_u128(3),
+            None,
         );
         match outcome {
             Promotion::Established {
@@ -404,6 +517,7 @@ mod tests {
             &[probe(1, Some(100)), probe(2, Some(90)), probe(3, Some(50))],
             3,
             Uuid::from_u128(1),
+            None,
         );
         let Promotion::Established {
             committed_offset, ..
@@ -429,6 +543,7 @@ mod tests {
             ],
             3,
             Uuid::from_u128(1),
+            None,
         );
         assert!(matches!(
             promotion,
@@ -447,6 +562,7 @@ mod tests {
             &[probe(1, Some(100)), probe(2, Some(100)), probe(3, Some(0))],
             3,
             Uuid::from_u128(1),
+            None,
         );
         assert!(matches!(
             promotion,
@@ -465,6 +581,7 @@ mod tests {
             &[probe(1, Some(100)), probe(2, None), probe(3, None)],
             3,
             Uuid::from_u128(1),
+            None,
         );
         assert_eq!(
             promotion,
@@ -483,6 +600,7 @@ mod tests {
             &[probe(1, Some(100)), probe(2, Some(100)), probe(3, None)],
             3,
             Uuid::from_u128(1),
+            None,
         );
         assert!(
             matches!(
@@ -506,6 +624,7 @@ mod tests {
             &[probe(1, Some(50)), probe(2, Some(90)), probe(3, Some(90))],
             3,
             Uuid::from_u128(1),
+            None,
         );
         assert_eq!(
             promotion,
@@ -524,6 +643,7 @@ mod tests {
             &[probe(1, Some(90)), probe(2, Some(90)), probe(3, Some(100))],
             3,
             Uuid::from_u128(1),
+            None,
         );
         assert!(matches!(
             promotion,
@@ -543,6 +663,7 @@ mod tests {
             &[probe(1, None), probe(2, Some(90)), probe(3, Some(90))],
             3,
             Uuid::from_u128(1),
+            None,
         );
         assert_eq!(
             promotion,
@@ -557,7 +678,7 @@ mod tests {
     /// single-replica deployments unpromotable.
     #[test]
     fn a_single_replica_range_promotes_on_its_own_view() {
-        let promotion = establish(&[probe(1, Some(42))], 1, Uuid::from_u128(1));
+        let promotion = establish(&[probe(1, Some(42))], 1, Uuid::from_u128(1), None);
         assert!(matches!(
             promotion,
             Promotion::Established {
@@ -573,7 +694,8 @@ mod tests {
             establish(
                 &[probe(1, None), probe(2, None), probe(3, None)],
                 3,
-                Uuid::from_u128(1)
+                Uuid::from_u128(1),
+                None,
             ),
             Promotion::QuorumUnavailable { answered: 0, .. }
         ));
