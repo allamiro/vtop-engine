@@ -40,6 +40,23 @@ pub struct NativeBridgeConfig {
     pub durability: Durability,
     /// The most records one fetch asks the broker for.
     pub fetch_max_records: u32,
+    /// The most records one native append carries. The replica plane frames
+    /// an append whole, and a follower refuses a frame over its limit
+    /// (`DEFAULT_MAX_RECORDS`) — silently, from the leader's side, as a
+    /// quorum that never arrives. A Kafka batch is up to 10 000 records by
+    /// a stock client's default, so a set is appended in as many native
+    /// appends as this allows, in order.
+    pub max_append_records: usize,
+    /// The most record bytes one native append carries, for the same
+    /// reason against the plane's frame limit. One record above it is
+    /// refused as too large.
+    pub max_append_bytes: usize,
+}
+
+/// Bytes a record costs on the native wire, roughly: its key, its value,
+/// and the framing around them.
+fn record_wire_bytes(record: &ProduceRecord) -> usize {
+    record.key.len() + record.value.len() + 32
 }
 
 /// The sequence space of one live bridge: the next sequence to reserve, and
@@ -143,6 +160,42 @@ impl NativeBridge {
 /// partition's leader any more; a storage or overload refusal is a timeout
 /// the client retries; a sequence conflict or a malformed request is a bad
 /// record the client must not retry blindly.
+/// The set cut into appends the plane can frame: at most `max_records`
+/// records and about `max_bytes` bytes each, in order. A record that alone
+/// exceeds the byte bound has no append that can carry it.
+fn split_for_the_plane(
+    records: Vec<ProduceRecord>,
+    max_records: usize,
+    max_bytes: usize,
+) -> Result<Vec<Vec<ProduceRecord>>, ErrorCode> {
+    let mut appends: Vec<Vec<ProduceRecord>> = Vec::new();
+    let mut current: Vec<ProduceRecord> = Vec::new();
+    let mut current_bytes = 0;
+    for record in records {
+        let bytes = record_wire_bytes(&record);
+        if bytes > max_bytes {
+            tracing::warn!(
+                bytes,
+                max_bytes,
+                "native produce refused: one record exceeds what a native append can carry"
+            );
+            return Err(ErrorCode::MessageTooLarge);
+        }
+        if !current.is_empty()
+            && (current.len() >= max_records || current_bytes + bytes > max_bytes)
+        {
+            appends.push(std::mem::take(&mut current));
+            current_bytes = 0;
+        }
+        current_bytes += bytes;
+        current.push(record);
+    }
+    if !current.is_empty() {
+        appends.push(current);
+    }
+    Ok(appends)
+}
+
 /// The byte budget a fetch widens to after a stretch with nothing visible:
 /// enough to cross a run of markers in a few hops, whatever the client's own
 /// partition budget was.
@@ -198,9 +251,6 @@ impl Bridge for NativeBridge {
                 }
             }
         }
-        // The whole set is ONE native append (review): the broker takes a
-        // request's records atomically, so a set is acknowledged whole or
-        // refused whole, never half durable for a client to retry into.
         let records: Vec<ProduceRecord> = batches
             .iter()
             .flat_map(|batch| batch.records.iter())
@@ -210,7 +260,20 @@ impl Bridge for NativeBridge {
                 value: record.value.clone().unwrap_or_default(),
             })
             .collect();
-        let count = records.len() as u64;
+        // The set becomes native appends the replica plane can frame
+        // (review): at most `max_append_records` records and
+        // `max_append_bytes` bytes each, in the set's order. Within one
+        // append the broker is atomic — acknowledged whole or refused whole.
+        // Across appends it is not: a failure after the first leaves the
+        // earlier ones durable and the client told the set failed, and a
+        // retry then duplicates them — the same retry-duplicates limitation
+        // a bridge without idempotence has on a timeout, and the reason the
+        // split is as coarse as the plane allows.
+        let appends = split_for_the_plane(
+            records,
+            self.config.max_append_records.max(1),
+            self.config.max_append_bytes.max(1),
+        )?;
         // Reserved and spent under ONE lock (review): the broker requires
         // contiguous sequences in arrival order, so no other produce may
         // reach it between this reservation and this append — and the
@@ -220,42 +283,52 @@ impl Bridge for NativeBridge {
             .sequences
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let first_sequence = sequences.next;
-        let request = ProduceRequest {
-            range: self.broker.range().clone(),
-            fencing_epoch: self.broker.held_fencing_epoch(),
-            producer_id: self.config.producer_id,
-            producer_epoch: self.producer_epoch,
-            first_sequence,
-            durability: self.config.durability,
-            records,
-        };
-        let reply = self
-            .broker
-            .handle(Role::Producer, self.frame(Message::ProduceRequest(request)));
-        match reply.message {
-            Message::ProduceResponse(response) => {
-                let base_offset = response
-                    .outcomes
-                    .first()
-                    .map(|outcome| outcome.offset as i64)
-                    .ok_or(ErrorCode::InvalidRecord)?;
-                sequences.next = first_sequence + count;
-                Ok(Appended {
-                    base_offset,
-                    log_append_time_ms: -1,
-                    log_start_offset: self.broker.earliest_offset() as i64,
-                })
-            }
-            Message::Error(error) => {
-                tracing::warn!(code = ?error.code, message = %error.message, "native produce refused");
-                Err(kafka_code(error.code))
-            }
-            other => {
-                tracing::warn!(?other, "native produce answered with an unexpected message");
-                Err(ErrorCode::InvalidRecord)
+        let mut base_offset = None;
+        for (which, records) in appends.into_iter().enumerate() {
+            let count = records.len() as u64;
+            let first_sequence = sequences.next;
+            let request = ProduceRequest {
+                range: self.broker.range().clone(),
+                fencing_epoch: self.broker.held_fencing_epoch(),
+                producer_id: self.config.producer_id,
+                producer_epoch: self.producer_epoch,
+                first_sequence,
+                durability: self.config.durability,
+                records,
+            };
+            let reply = self
+                .broker
+                .handle(Role::Producer, self.frame(Message::ProduceRequest(request)));
+            match reply.message {
+                Message::ProduceResponse(response) => {
+                    let offset = response
+                        .outcomes
+                        .first()
+                        .map(|outcome| outcome.offset as i64)
+                        .ok_or(ErrorCode::InvalidRecord)?;
+                    base_offset.get_or_insert(offset);
+                    sequences.next = first_sequence + count;
+                }
+                Message::Error(error) => {
+                    tracing::warn!(
+                        code = ?error.code,
+                        message = %error.message,
+                        append = which,
+                        "native produce refused"
+                    );
+                    return Err(kafka_code(error.code));
+                }
+                other => {
+                    tracing::warn!(?other, "native produce answered with an unexpected message");
+                    return Err(ErrorCode::InvalidRecord);
+                }
             }
         }
+        Ok(Appended {
+            base_offset: base_offset.ok_or(ErrorCode::InvalidRecord)?,
+            log_append_time_ms: -1,
+            log_start_offset: self.broker.earliest_offset() as i64,
+        })
     }
 
     fn fetch(&self, topic: &str, offset: i64, max_bytes: usize) -> Result<Fetched, ErrorCode> {
@@ -414,7 +487,60 @@ mod tests {
             producer_id: Uuid::from_u128(0xabc),
             durability,
             fetch_max_records: 1024,
+            max_append_records: 4096,
+            max_append_bytes: 4 << 20,
         }
+    }
+
+    /// A set larger than one native append is appended in order across
+    /// several (review): a stock client's default batch is 10 000 records
+    /// and the replica plane frames 4 096.
+    #[test]
+    fn a_large_set_is_appended_in_order_across_several_native_appends() {
+        let (_dir, broker) = broker();
+        let bridge = NativeBridge::new(
+            Arc::clone(&broker),
+            NativeBridgeConfig {
+                max_append_records: 2,
+                ..config(Durability::LocalFsync)
+            },
+        );
+        let values = ["a", "b", "c", "d", "e"];
+        let records: Vec<(&str, Option<&str>)> = values.iter().map(|v| (*v, None)).collect();
+        let appended = bridge.produce("events", &[batch(&records)]).unwrap();
+        assert_eq!(appended.base_offset, 0);
+        assert_eq!(bridge.bounds("events").unwrap(), (0, 5));
+        assert_eq!(
+            bridge.next_sequence(),
+            5,
+            "one sequence per record across the appends"
+        );
+        let all =
+            RecordBatch::decode(&bridge.fetch("events", 0, 1 << 20).unwrap().records).unwrap();
+        let got: Vec<&[u8]> = all
+            .records
+            .iter()
+            .map(|r| r.value.as_deref().unwrap())
+            .collect();
+        assert_eq!(got, vec![b"a".as_slice(), b"b", b"c", b"d", b"e"]);
+        // By bytes, the same way; and one record too large for any append
+        // is refused as such.
+        let bridge = NativeBridge::new(
+            Arc::clone(&broker),
+            NativeBridgeConfig {
+                max_append_bytes: 40,
+                ..config(Durability::LocalFsync)
+            },
+        );
+        assert!(bridge.produce("events", &[batch(&records)]).is_ok());
+        assert_eq!(bridge.bounds("events").unwrap(), (0, 10));
+        let big = "x".repeat(64);
+        assert_eq!(
+            bridge
+                .produce("events", &[batch(&[(big.as_str(), None)])])
+                .unwrap_err(),
+            ErrorCode::MessageTooLarge
+        );
     }
 
     fn bridge(broker: Arc<LocalBroker>) -> NativeBridge {

@@ -1427,6 +1427,11 @@ async fn run_leader(
                         vtop_protocol::Durability::LocalFsync
                     },
                     fetch_max_records: MAX_RECORDS,
+                    // What the replica plane frames per append (review): a
+                    // follower refuses a larger frame, and from here that
+                    // looks like a quorum that never arrives.
+                    max_append_records: vtop_protocol::DEFAULT_MAX_RECORDS as usize,
+                    max_append_bytes: (vtop_protocol::DEFAULT_MAX_FRAME_BYTES / 2) as usize,
                 },
             );
             let gateway_config = vtop_kafka::GatewayConfig {
