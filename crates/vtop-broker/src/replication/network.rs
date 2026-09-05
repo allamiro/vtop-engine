@@ -30,10 +30,10 @@ use vtop_meta::transport::{
     MaybeTls,
 };
 use vtop_protocol::{
-    read_frame, write_frame, CommittedHwmUpdate, ErrorCode, ErrorResponse, Message, ProtocolLimits,
-    RangeIdentity, ReplicaAppendBatchRequest, ReplicaAppendRequest, ReplicaAppendResponse,
-    ReplicaStatusRequest, ReplicaStatusResponse, WireFrame, DEFAULT_MAX_FRAME_BYTES,
-    DEFAULT_MAX_RECORDS,
+    read_frame, write_frame, CommittedHwmUpdate, ErrorCode, ErrorResponse, Message, ProtocolError,
+    ProtocolLimits, RangeIdentity, ReplicaAppendBatchRequest, ReplicaAppendRequest,
+    ReplicaAppendResponse, ReplicaStatusRequest, ReplicaStatusResponse, WireFrame,
+    DEFAULT_MAX_FRAME_BYTES, DEFAULT_MAX_RECORDS,
 };
 
 pub(crate) const REPLICA_LIMITS: ProtocolLimits = ProtocolLimits {
@@ -493,7 +493,7 @@ impl ReplicaPeerServer {
                 _ = &mut shutdown => break Ok(()),
                 _ = connections.join_next(), if !connections.is_empty() => {}
                 accepted = listener.accept() => {
-                    let (tcp, _peer) = match accepted {
+                    let (tcp, peer) = match accepted {
                         Ok(accepted) => accepted,
                         Err(source) => {
                             break Err(crate::BrokerError::Io {
@@ -506,7 +506,35 @@ impl ReplicaPeerServer {
                     let handler = Arc::clone(&self.handler);
                     let local_id = self.local_id;
                     connections.spawn(async move {
-                        let _ = serve_follower_connection(acceptor, tcp, handler, local_id).await;
+                        // A session that ends on a protocol refusal is SAID
+                        // (#453): the leader on the other end sees only a
+                        // missing ack, and without this line nobody sees why.
+                        // Ordinary ends — a leader gone, a reset — stay quiet,
+                        // as before.
+                        match serve_follower_connection(acceptor, tcp, handler, local_id).await {
+                            // A leader gone, a reset: an ordinary end, quiet.
+                            Ok(()) | Err(crate::BrokerError::Protocol(ProtocolError::Io(_))) => {}
+                            Err(crate::BrokerError::Protocol(ProtocolError::Limit(what))) => {
+                                warn_rate_limited(
+                                    "replica-server",
+                                    &format!(
+                                        "replica session from {peer} refused a frame over the \
+                                         plane's limits and closed ({what}); the leader sees a \
+                                         missing ack, not this refusal (#453)"
+                                    ),
+                                );
+                            }
+                            Err(crate::BrokerError::Protocol(problem)) => {
+                                warn_rate_limited(
+                                    "replica-server",
+                                    &format!(
+                                        "replica session from {peer} closed on a protocol \
+                                         error: {problem}"
+                                    ),
+                                );
+                            }
+                            Err(_) => {}
+                        }
                     });
                 }
             }
@@ -1562,13 +1590,30 @@ impl FollowerDriver {
             stream_id: 0,
             message,
         };
-        if write_frame(stream, &frame, REPLICA_LIMITS).await.is_err() {
+        if let Err(problem) = write_frame(stream, &frame, REPLICA_LIMITS).await {
             if catch_up_charged {
                 // The batch never re-entered the buffer; its transferred
                 // charge dies with this session.
                 self.budget.release_catch_up(bytes as u64);
             }
             drop(response_tx);
+            if let ProtocolError::Limit(what) = &problem {
+                // A frame the plane cannot carry is refused HERE, once (#453):
+                // as a disconnect it would be requeued and retransmitted on
+                // every reconnect, poisoning the session for good. The batch
+                // gets no ack and the session goes on. The leader's own
+                // pre-check keeps its appends under the limits, so this is a
+                // frame from somewhere else.
+                warn_rate_limited(
+                    "replica-driver",
+                    &format!(
+                        "replica {}: an append the plane cannot frame was refused before it was \
+                         sent ({what}); it gets no ack and is not retried (#453)",
+                        self.channel.node_id
+                    ),
+                );
+                return Ok(());
+            }
             return Err(SessionOutcome::Disconnected);
         }
         push_retransmission(

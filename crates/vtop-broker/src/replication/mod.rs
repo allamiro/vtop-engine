@@ -24,6 +24,7 @@
 
 pub mod fault;
 pub mod network;
+pub(crate) use network::REPLICA_LIMITS;
 pub mod transfer;
 
 use crate::{
