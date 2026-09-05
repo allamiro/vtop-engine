@@ -492,8 +492,13 @@ async fn accept_loop(
                         // negotiated: a plaintext probe against a TLS
                         // endpoint fails its handshake here and is closed.
                         Some(acceptor) => {
-                            match tokio::time::timeout(
-                                TLS_HANDSHAKE_TIMEOUT,
+                            // The earlier of the handshake's own budget and the
+                            // connection deadline (review): a task scheduled late
+                            // must not carry the handshake past the deadline.
+                            let handshake_deadline =
+                                deadline.min(tokio::time::Instant::now() + TLS_HANDSHAKE_TIMEOUT);
+                            match tokio::time::timeout_at(
+                                handshake_deadline,
                                 acceptor.accept(stream),
                             )
                             .await
