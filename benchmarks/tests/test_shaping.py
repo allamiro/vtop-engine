@@ -182,10 +182,24 @@ def test_the_recorded_shape_says_it_is_per_connection():
 
 def test_an_endpoint_override_that_bypasses_the_proxy_is_refused():
     sc = scenario(shaping_api_url="http://127.0.0.1:8474", shaping_bandwidth_kbps=10,
-                  endpoint_url="http://localhost:9100")
+                  endpoint_url="http://localhost:9100", backend="s3_native")
     require_endpoint_through_proxy(sc, "http://localhost:9100")
     with pytest.raises(ShapingError, match="around it"):
         require_endpoint_through_proxy(sc, "http://localhost:9000")
+
+
+def test_only_a_backend_that_dials_the_endpoint_can_be_shaped():
+    sc = scenario(shaping_api_url="http://127.0.0.1:8474", shaping_bandwidth_kbps=10,
+                  endpoint_url="http://localhost:9100", backend="mock")
+    with pytest.raises(ShapingError, match="never dials endpoint_url"):
+        require_endpoint_through_proxy(sc, "http://localhost:9100")
+
+
+def test_a_remote_store_on_the_proxys_port_is_not_the_proxy():
+    sc = scenario(shaping_api_url="http://127.0.0.1:8474", shaping_bandwidth_kbps=10,
+                  endpoint_url="http://store.example:9100", backend="s3_native")
+    with pytest.raises(ShapingError, match="not the proxy"):
+        require_endpoint_through_proxy(sc, "http://store.example:9100")
 
 
 def test_the_shape_is_removed_on_every_exit():

@@ -235,11 +235,43 @@ def clear(shape: Shape, client: ToxiproxyClient) -> None:
             "still shaped — remove them by hand or restart the shaped stack")
 
 
+SHAPEABLE_BACKENDS = ("s3_native",)
+
+
+def _host_of(url: str) -> str | None:
+    """The host, with the loopback spellings unified: the proxy is published
+    on the same host the toxiproxy API is, and 'localhost' and '127.0.0.1'
+    are that host twice."""
+    try:
+        host = urlsplit(url).hostname
+    except ValueError:
+        return None
+    if host in ("localhost", "127.0.0.1", "::1"):
+        return "loopback"
+    return host
+
+
 def require_endpoint_through_proxy(scenario, effective_endpoint: str) -> None:
     """A shaped scenario's engine must reach the store through the proxy the
     shape is on. The scenario's own `endpoint_url` names the proxy; an
     environment override that differs would bypass the toxics while the
-    summary recorded a shape."""
+    summary recorded a shape. Only a backend that dials the endpoint can be
+    shaped at all — a mock or local backend measures nothing through it —
+    and the endpoint's host must be the host the toxiproxy API is reached
+    at: a remote store on the proxy's port is not the proxy."""
+    backend = str(scenario.get("backend", "") or "")
+    if backend not in SHAPEABLE_BACKENDS:
+        raise ShapingError(
+            f"backend {backend!r} never dials endpoint_url, so a shape on it would measure "
+            f"nothing through the pipe and record a shape anyway; a shaped scenario needs one "
+            f"of {list(SHAPEABLE_BACKENDS)}")
+    api_host = _host_of(str(scenario.get("shaping_api_url", "") or ""))
+    endpoint_host = _host_of(effective_endpoint)
+    if endpoint_host is None or endpoint_host != api_host:
+        raise ShapingError(
+            f"the endpoint {effective_endpoint!r} is on host {endpoint_host!r} but toxiproxy is "
+            f"reached at host {api_host!r}: the proxy is published beside its API, and a store "
+            "elsewhere on the same port is not the proxy")
     declared = str(scenario.get("endpoint_url", "") or "")
     if effective_endpoint != declared:
         raise ShapingError(
