@@ -1013,6 +1013,13 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
             // and an audit over a window is not an audit of the range.
             // `--limit` is the page size; the chain is read page after page
             // from the last epoch seen until a page comes back empty.
+            // The range's CURRENT epoch, snapshotted BEFORE the pages are read
+            // (review): the chain must reach at least this epoch; a grant that
+            // lands while the pages are being read only makes it longer.
+            let lease = client
+                .read_range_lease(topic_uuid, range_uuid)
+                .await
+                .map_err(|error| error.to_string())?;
             let mut transitions = Vec::new();
             let mut next_from = from_epoch;
             let mut read_at_applied_index = 0;
@@ -1036,13 +1043,6 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
                 }
                 next_from = last + 1;
             }
-            // The range's CURRENT epoch bounds the chain from above (review): a
-            // chain that stops short of it is missing its tail, and a tail
-            // that is missing is exactly what a tampered history looks like.
-            let lease = client
-                .read_range_lease(topic_uuid, range_uuid)
-                .await
-                .map_err(|error| error.to_string())?;
             note_redirects(&client);
             if !found || !lease.found {
                 if json {
@@ -1969,9 +1969,10 @@ impl MacVerdict {
 #[derive(Debug, Default)]
 pub struct ChainAudit {
     pub records: Vec<TransitionAudit>,
-    /// The epoch the range is at now, when the reader knew it, and whether
-    /// the chain read reaches it: `Some((current, false))` is a chain with
-    /// its tail missing.
+    /// The epoch the range was at when the reader began, and whether the
+    /// chain read reaches at least that far: `Some((current, false))` is a
+    /// chain with its tail missing. A grant that lands mid-read only makes
+    /// the chain longer, never shorter, so "at least" is the right bound.
     pub reaches_current: Option<(u64, bool)>,
     pub broken_links: usize,
     pub vote_disagreements: usize,
@@ -2031,7 +2032,7 @@ pub fn audit_transitions(
         let last = views
             .last()
             .map_or(from_epoch.max(1) - 1, |view| view.epoch_to);
-        (current, last == current)
+        (current, last >= current)
     });
     let mut audit = ChainAudit {
         reaches_current,
@@ -2080,6 +2081,10 @@ pub fn audit_transitions(
                 // nothing required) has no answer to give; a replicated one
                 // without the holder's answer is not evidence at all.
                 let standalone = quorum.is_empty() && *required == 0;
+                // A replicated promotion always records the majority it
+                // needed (review): a quorum with a `required` of zero is
+                // evidence no promotion could produce.
+                let majority_recorded = standalone || *required > 0;
                 let holder_answer = answers.get(&view.holder_to).copied();
                 let holder_answered = standalone || holder_answer.is_some();
                 let candidate_offset = holder_answer.or(*boundary_offset).unwrap_or(0);
@@ -2087,8 +2092,11 @@ pub fn audit_transitions(
                     .values()
                     .filter(|offset| **offset <= candidate_offset)
                     .count() as u32;
-                let ok =
-                    holder_answered && !duplicated && recomputed == *votes && *votes >= *required;
+                let ok = holder_answered
+                    && majority_recorded
+                    && !duplicated
+                    && recomputed == *votes
+                    && *votes >= *required;
                 if !ok {
                     audit.vote_disagreements += 1;
                 }
@@ -2736,6 +2744,13 @@ client_key: /tmp/client.key
                 .verdict()
                 .is_ok()
         );
+        assert!(
+            audit_transitions(&views[..2], Some(&key), topic, range, 1, Some(1))
+                .unwrap()
+                .verdict()
+                .is_ok(),
+            "a grant that landed after the snapshot only makes the chain longer"
+        );
         let short = audit_transitions(&views[..2], Some(&key), topic, range, 1, Some(3)).unwrap();
         assert_eq!(short.reaches_current, Some((3, false)));
         assert!(short.verdict().unwrap_err().contains("tail missing"));
@@ -2800,6 +2815,27 @@ client_key: /tmp/client.key
         assert!(
             alone.records[0].vote.as_ref().unwrap().ok,
             "nothing to answer, nothing missing"
+        );
+
+        // A replicated quorum claiming to have needed nobody is malformed
+        // (review): the promoter always records the majority it needed.
+        let mut needless = views.clone();
+        if let TransitionOutcome::Reported {
+            outcome:
+                PromotionOutcome::Established {
+                    required, votes, ..
+                },
+            ..
+        } = &mut needless[0].outcome
+        {
+            *required = 0;
+            *votes = 2;
+        }
+        needless[0].mac = Some(needless[0].record().mac(&key, topic, range).unwrap());
+        let zero = audit_transitions(&needless, Some(&key), topic, range, 1, None).unwrap();
+        assert!(
+            !zero.records[0].vote.as_ref().unwrap().ok,
+            "required = 0 with a quorum is no evidence"
         );
 
         let mut overstated = views.clone();
