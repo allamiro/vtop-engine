@@ -22,10 +22,21 @@ use crate::api::{
     ProducePartitionResponse, ProduceRequest, ProduceTopicResponse, TIMESTAMP_EARLIEST,
     TIMESTAMP_LATEST,
 };
+use crate::api_groups::{
+    consumer_assignment_partitions, decode_find_coordinator, decode_heartbeat, decode_join_group,
+    decode_leave_group, decode_offset_commit, decode_offset_fetch, decode_sync_group,
+    encode_error_only, encode_find_coordinator, encode_join_group, encode_offset_commit,
+    encode_offset_fetch, encode_sync_group, FindCoordinatorRequest, FindCoordinatorResponse,
+    JoinGroupRequest, JoinGroupResponse, OffsetCommitRequest, OffsetCommitTopicResponse,
+    OffsetFetchPartitionResponse, OffsetFetchRequest, OffsetFetchResponse,
+    OffsetFetchTopicResponse, SyncGroupRequest, SyncGroupResponse, MAX_OFFSET_METADATA_BYTES,
+};
 use crate::bridge::{Bridge, Fetched, Sequenced};
+use crate::groups::{Coordinator, GroupConfig, JoinRequest, Joined, SyncStanding};
 use crate::messages::{
     frame, write_response_header, ApiKey, ErrorCode, HeaderVerdict, RequestHeader,
 };
+use crate::offsets::{Committed, OffsetStore};
 use crate::records::{BatchError, RecordBatch};
 use crate::turnstile::Turnstile;
 use crate::wire::{Decoder, Encoder};
@@ -75,6 +86,15 @@ pub struct GatewayConfig {
     /// embedder that hands its range back after `serve` returns knows no
     /// append is still in flight through the gateway.
     pub drain_timeout: Duration,
+    /// How the group coordinator bounds and paces itself (#457 slice 2).
+    pub groups: GroupConfig,
+    /// The group protocol's ceiling (review): the longest an offset store —
+    /// or a bridge call made on the group protocol's behalf: the topics a
+    /// commit, a fetch or an assignment is checked against, a commit's
+    /// watermark — is waited for. A commit or a fetch not answered by then is
+    /// `REQUEST_TIMED_OUT`, and the embedder's drain, which adds this to its
+    /// budget, never returns while such a call can still be running.
+    pub max_offset_wait: Duration,
 }
 
 impl Default for GatewayConfig {
@@ -92,6 +112,8 @@ impl Default for GatewayConfig {
             idle_timeout: Duration::from_secs(600),
             max_sessions: 256,
             drain_timeout: Duration::from_secs(5),
+            groups: GroupConfig::default(),
+            max_offset_wait: Duration::from_secs(10),
         }
     }
 }
@@ -151,6 +173,20 @@ pub struct Gateway {
     /// waits until that append is done. An entry lives while a ticket is
     /// outstanding.
     producer_order: Arc<std::sync::Mutex<HashMap<ProducerKey, Arc<Turnstile>>>>,
+    /// The consumer groups this gateway coordinates (#457 slice 2).
+    groups: Arc<Coordinator>,
+    /// Where committed offsets live; `None` refuses commits by name.
+    offsets: Option<Arc<dyn OffsetStore>>,
+    /// Each group's commits in turn (review): a commit is judged under its
+    /// generation and then written, and a slow write must not let a later
+    /// commit — a newer generation's, after the member lapsed — be judged,
+    /// written and then overtaken by the older one landing last. One turn
+    /// per group, held from the judgment through the store's answer under
+    /// the request deadline; an entry lives while a turn is outstanding.
+    commit_order: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Commits refused for want of a store, for a warning that does not
+    /// repeat itself per request.
+    offsetless_refusals: std::sync::atomic::AtomicU64,
     bridge: Arc<dyn Bridge>,
     config: GatewayConfig,
     sessions: Arc<tokio::sync::Semaphore>,
@@ -162,7 +198,27 @@ pub struct Gateway {
 }
 
 impl Gateway {
+    /// The store committed offsets go to. Without one, OffsetCommit is
+    /// refused by name and OffsetFetch answers that nothing is committed —
+    /// both true — rather than the gateway remembering what it would forget.
+    pub fn with_offsets(mut self, store: Arc<dyn OffsetStore>) -> Self {
+        self.offsets = Some(store);
+        self
+    }
+
     pub fn new(bridge: Arc<dyn Bridge>, config: GatewayConfig) -> Self {
+        if config.groups.min_session_timeout <= config.max_fetch_wait {
+            // Said once, at construction (review): a session may be shorter
+            // than one long poll, and a heartbeat queued behind that poll on
+            // the same connection is read after the session it keeps alive
+            // has lapsed.
+            tracing::warn!(
+                min_session_timeout = ?config.groups.min_session_timeout,
+                max_fetch_wait = ?config.max_fetch_wait,
+                "kafka gateway: the minimum session timeout does not clear the fetch ceiling; a heartbeat queued behind a long poll can outlive its session"
+            );
+        }
+        let group_config = config.groups.clone();
         let sessions = Arc::new(tokio::sync::Semaphore::new(config.max_sessions.max(1)));
         Self {
             bridge,
@@ -170,6 +226,10 @@ impl Gateway {
             sessions,
             refused_sessions: std::sync::atomic::AtomicU64::new(0),
             producer_order: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            groups: Arc::new(Coordinator::new(group_config)),
+            offsets: None,
+            commit_order: std::sync::Mutex::new(HashMap::new()),
+            offsetless_refusals: std::sync::atomic::AtomicU64::new(0),
             closed: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -189,6 +249,27 @@ impl Gateway {
         if *shutdown.borrow() {
             return Ok(());
         }
+        // The coordinator's clock (#457 slice 2): lapsed sessions, rounds
+        // whose window closed, minted ids nobody came back for. Stops with
+        // the listener; a dropped shutdown sender is not a signal here either.
+        let sweeper = {
+            let groups = Arc::clone(&gateway.groups);
+            let mut shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_millis(250));
+                let mut watching = true;
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => groups.sweep(std::time::Instant::now()),
+                        changed = shutdown.changed(), if watching => match changed {
+                            Ok(()) if *shutdown.borrow() => break,
+                            Ok(()) => {}
+                            Err(_) => watching = false,
+                        },
+                    }
+                }
+            })
+        };
         let mut watching = true;
         loop {
             tokio::select! {
@@ -242,12 +323,18 @@ impl Gateway {
         // past `drain_timeout` the embedder is told, and what is still in a
         // bridge call holds the broker's own lock, which the embedder's
         // final commit takes after it.
+        sweeper.abort();
+        // Parked joins and syncs are released now (review), so the drain
+        // below is bounded by the produce and fetch ceilings, never by a
+        // rebalance timeout.
+        gateway.groups.shutdown();
         gateway
             .closed
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        // Every session ends within the bridge ceilings — `max_produce_wait`
-        // and `max_fetch_wait` bound the calls, and shutdown is heard
-        // between frames — so waiting for every slot is bounded by config,
+        // Every session ends within the ceilings — `max_produce_wait`,
+        // `max_fetch_wait` and `max_offset_wait` bound the calls (review),
+        // and shutdown is heard between frames — so waiting for every slot is
+        // bounded by config,
         // not by hope (review): `drain_timeout` is where the wait is
         // reported, and the sum of the ceilings past it is where a session
         // still open is a bug, said at error. `serve` returning is the
@@ -269,6 +356,7 @@ impl Gateway {
             );
             let ceilings = gateway.config.max_produce_wait
                 + gateway.config.max_fetch_wait
+                + gateway.config.max_offset_wait
                 + gateway.config.drain_timeout;
             if tokio::time::timeout(ceilings, &mut drain).await.is_err() {
                 tracing::error!(
@@ -455,6 +543,89 @@ impl Gateway {
                     Err(error) => Err(error),
                 }
             }
+            ApiKey::FindCoordinator => {
+                match consumed(
+                    decode_find_coordinator(&mut d, version),
+                    &d,
+                    "FindCoordinator",
+                ) {
+                    Ok(request) => {
+                        let response = self.find_coordinator(request);
+                        encode_find_coordinator(&mut out, version, &response);
+                        Ok(None)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            ApiKey::JoinGroup => {
+                match consumed(decode_join_group(&mut d, version), &d, "JoinGroup") {
+                    Ok(request) => {
+                        let response = self
+                            .join_group(request, version, header.client_id.as_deref())
+                            .await;
+                        encode_join_group(&mut out, version, &response);
+                        Ok(None)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            ApiKey::SyncGroup => {
+                match consumed(decode_sync_group(&mut d, version), &d, "SyncGroup") {
+                    Ok(request) => {
+                        let response = self.sync_group(request).await;
+                        encode_sync_group(&mut out, version, &response);
+                        Ok(None)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            ApiKey::Heartbeat => match consumed(decode_heartbeat(&mut d, version), &d, "Heartbeat")
+            {
+                Ok(request) => {
+                    let error = self
+                        .groups
+                        .heartbeat(&request.group_id, request.generation_id, &request.member_id)
+                        .err()
+                        .unwrap_or(ErrorCode::None);
+                    encode_error_only(&mut out, version, error);
+                    Ok(None)
+                }
+                Err(error) => Err(error),
+            },
+            ApiKey::LeaveGroup => {
+                match consumed(decode_leave_group(&mut d, version), &d, "LeaveGroup") {
+                    Ok(request) => {
+                        let error = self
+                            .groups
+                            .leave(&request.group_id, &request.member_id)
+                            .err()
+                            .unwrap_or(ErrorCode::None);
+                        encode_error_only(&mut out, version, error);
+                        Ok(None)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            ApiKey::OffsetCommit => {
+                match consumed(decode_offset_commit(&mut d, version), &d, "OffsetCommit") {
+                    Ok(request) => {
+                        let topics = self.offset_commit(request).await;
+                        encode_offset_commit(&mut out, version, &topics);
+                        Ok(None)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            ApiKey::OffsetFetch => {
+                match consumed(decode_offset_fetch(&mut d, version), &d, "OffsetFetch") {
+                    Ok(request) => {
+                        let response = self.offset_fetch(request).await;
+                        encode_offset_fetch(&mut out, version, &response);
+                        Ok(None)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
         };
         match served {
             Ok(None) => Answer::Reply(out.into_vec()),
@@ -483,12 +654,20 @@ impl Gateway {
     async fn metadata(&self, request: MetadataRequest) -> MetadataResponse {
         let names = match request.topics {
             Some(names) => names,
-            None => {
-                let bridge = Arc::clone(&self.bridge);
-                tokio::task::spawn_blocking(move || bridge.topics())
-                    .await
-                    .unwrap_or_default()
-            }
+            // Under the same ceiling as the bounds lookups below (review): a
+            // Metadata naming no topics waits on the bridge no longer than one
+            // naming them all. Not done in time: answered with none, and said
+            // — a Metadata naming no topics has no slot for a code.
+            None => self
+                .served_topics(tokio::time::Instant::now() + self.config.max_fetch_wait)
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!(
+                        ?error,
+                        "kafka Metadata: the bridge did not enumerate its topics within the ceiling; answered with none"
+                    );
+                    Vec::new()
+                }),
         };
         let mut topics = Vec::with_capacity(names.len());
         for name in names {
@@ -530,6 +709,533 @@ impl Gateway {
     }
 
     /// `Err` closes the connection: the one produce shape with no answer.
+    /// The bridge's topics, off the runtime's threads (review): a backend's
+    /// `topics()` may wait on a lock or storage — and no longer than the
+    /// caller's deadline (review): an enumeration not done by then is
+    /// `REQUEST_TIMED_OUT`, so no request waits on the bridge past its
+    /// ceiling, and the drain's budget holds.
+    async fn served_topics(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<Vec<String>, ErrorCode> {
+        // Nothing is spawned past the deadline (review): a blocking task
+        // cannot be cancelled, and a deadline the turn or the membership
+        // check already spent must not leave one behind.
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ErrorCode::RequestTimedOut);
+        }
+        let bridge = Arc::clone(&self.bridge);
+        tokio::time::timeout_at(
+            deadline,
+            tokio::task::spawn_blocking(move || bridge.topics()),
+        )
+        .await
+        .map(|joined| joined.map_err(|_| ErrorCode::RequestTimedOut))
+        .unwrap_or(Err(ErrorCode::RequestTimedOut))
+    }
+
+    /// FindCoordinator (#457 slice 2): this gateway is the coordinator of
+    /// every group it serves — one range, one partition, one leader — so the
+    /// answer is itself, for any group. A transaction key is out of scope, by
+    /// name; an empty key names no group.
+    fn find_coordinator(&self, request: FindCoordinatorRequest) -> FindCoordinatorResponse {
+        let refused = |error: ErrorCode, message: &str| FindCoordinatorResponse {
+            error,
+            error_message: Some(message.to_owned()),
+            node_id: -1,
+            host: String::new(),
+            port: -1,
+        };
+        if request.key_type != 0 {
+            tracing::warn!(
+                key = %request.key,
+                key_type = request.key_type,
+                "kafka FindCoordinator refused: transactions are out of scope (#457 non-goal); \
+                 groups (key_type 0) are coordinated here"
+            );
+            return refused(
+                ErrorCode::UnsupportedForMessageFormat,
+                "transactions are out of scope; this gateway coordinates groups only",
+            );
+        }
+        if request.key.is_empty() {
+            return refused(
+                ErrorCode::InvalidGroupId,
+                "an empty group id names no group",
+            );
+        }
+        FindCoordinatorResponse {
+            error: ErrorCode::None,
+            error_message: None,
+            node_id: self.config.node_id,
+            host: self.config.advertised_host.clone(),
+            port: self.config.advertised_port,
+        }
+    }
+
+    /// JoinGroup: held by the coordinator until the round completes.
+    async fn join_group(
+        &self,
+        request: JoinGroupRequest,
+        version: i16,
+        client_id: Option<&str>,
+    ) -> JoinGroupResponse {
+        if request.group_instance_id.is_some() {
+            tracing::warn!(
+                group = %request.group_id,
+                "kafka JoinGroup: static membership (group.instance.id) is not honoured by this \
+                 gateway; the member is treated as dynamic"
+            );
+        }
+        let millis = |ms: i32| Duration::from_millis(u64::try_from(ms).unwrap_or(0));
+        let member_id_sent = request.member_id.clone();
+        let joined = self
+            .groups
+            .join(JoinRequest {
+                group_id: request.group_id,
+                member_id: request.member_id,
+                client_id: client_id.unwrap_or("client").to_owned(),
+                protocol_type: request.protocol_type,
+                protocols: request.protocols,
+                session_timeout: millis(request.session_timeout_ms),
+                rebalance_timeout: millis(request.rebalance_timeout_ms),
+                require_member_id: version >= 4,
+            })
+            .await;
+        match joined {
+            Ok(Joined::Complete(outcome)) => JoinGroupResponse {
+                error: ErrorCode::None,
+                generation_id: outcome.generation,
+                protocol_name: outcome.protocol_name,
+                leader: outcome.leader,
+                member_id: outcome.member_id,
+                members: outcome.members,
+            },
+            Ok(Joined::MemberIdRequired(member_id)) => JoinGroupResponse {
+                error: ErrorCode::MemberIdRequired,
+                generation_id: -1,
+                protocol_name: String::new(),
+                leader: String::new(),
+                member_id,
+                members: Vec::new(),
+            },
+            Err(error) => JoinGroupResponse {
+                error,
+                generation_id: -1,
+                protocol_name: String::new(),
+                leader: String::new(),
+                member_id: member_id_sent,
+                members: Vec::new(),
+            },
+        }
+    }
+
+    /// SyncGroup: the leader's assignments are the client-side assignor's,
+    /// run through this gateway's topic map before any member sees them.
+    async fn sync_group(&self, request: SyncGroupRequest) -> SyncGroupResponse {
+        // Membership, generation, state and leadership first (review): a
+        // stale member's retry hears the coordinator's own code, not a
+        // verdict on assignments it is not entitled to make. Only the leader
+        // of a completing round has its assignments judged, and only a
+        // consumer group's are readable; `sync` judges again under its lock
+        // when it applies them.
+        match self
+            .groups
+            .check_sync(&request.group_id, request.generation_id, &request.member_id)
+        {
+            Err(error) => {
+                return SyncGroupResponse {
+                    error,
+                    assignment: Vec::new(),
+                }
+            }
+            Ok(SyncStanding::Leader)
+                if self.groups.protocol_type(&request.group_id).as_deref() == Some("consumer") =>
+            {
+                // The check's bridge call waits on the group protocol's
+                // ceiling (review), as a commit's does — and is made once per
+                // request (review), not once per assignment.
+                let deadline = tokio::time::Instant::now() + self.config.max_offset_wait;
+                if let Err((error, member, reason)) = self
+                    .assignments_served(&request.assignments, deadline)
+                    .await
+                {
+                    tracing::warn!(
+                        group = %request.group_id,
+                        member = %member,
+                        ?error,
+                        %reason,
+                        "kafka SyncGroup refused"
+                    );
+                    return SyncGroupResponse {
+                        error,
+                        assignment: Vec::new(),
+                    };
+                }
+            }
+            Ok(_) => {}
+        }
+        match self
+            .groups
+            .sync(
+                &request.group_id,
+                request.generation_id,
+                &request.member_id,
+                request.assignments,
+            )
+            .await
+        {
+            Ok(assignment) => SyncGroupResponse {
+                error: ErrorCode::None,
+                assignment,
+            },
+            Err(error) => SyncGroupResponse {
+                error,
+                assignment: Vec::new(),
+            },
+        }
+    }
+
+    /// Every partition a consumer-protocol assignment names must be one this
+    /// gateway serves: partition 0 of a topic behind the bridge — every
+    /// assignment judged against ONE enumeration of the topics (review), made
+    /// only when an assignment names anything, so a SyncGroup of a thousand
+    /// assignments is one bridge call, not a thousand. An assignment that
+    /// names more is `InconsistentGroupProtocol`, with the member it was for;
+    /// a bridge that did not enumerate its topics by the deadline is
+    /// `RequestTimedOut` — its own code, not the assignment's (review).
+    async fn assignments_served(
+        &self,
+        assignments: &[(String, Vec<u8>)],
+        deadline: tokio::time::Instant,
+    ) -> Result<(), (ErrorCode, String, String)> {
+        let mut decoded = Vec::new();
+        for (member, assignment) in assignments {
+            if assignment.is_empty() {
+                continue;
+            }
+            let partitions = consumer_assignment_partitions(assignment).map_err(|error| {
+                (
+                    ErrorCode::InconsistentGroupProtocol,
+                    member.clone(),
+                    format!("malformed assignment: {error}"),
+                )
+            })?;
+            decoded.push((member, partitions));
+        }
+        if decoded.is_empty() {
+            return Ok(());
+        }
+        let served = self.served_topics(deadline).await.map_err(|error| {
+            (
+                error,
+                String::new(),
+                "the bridge did not enumerate its topics within the ceiling".to_owned(),
+            )
+        })?;
+        for (member, partitions) in decoded {
+            for (topic, partition) in partitions {
+                if partition != 0 || !served.contains(&topic) {
+                    return Err((
+                        ErrorCode::InconsistentGroupProtocol,
+                        member.clone(),
+                        format!(
+                            "partition {partition} of {topic:?}: this gateway serves partition 0 of {served:?}"
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn no_offset_store(&self, api: &str) {
+        let refused = self
+            .offsetless_refusals
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if refused.is_power_of_two() {
+            tracing::warn!(
+                api,
+                refused,
+                "kafka {api} refused: this gateway has no durable offset store (the metadata \
+                 plane's cursor is #457's next slice); a committed offset it would forget is not \
+                 taken"
+            );
+        }
+    }
+
+    /// OffsetCommit: a member's commit under its generation, or a simple
+    /// consumer's; every partition judged by name, then the store's. A
+    /// group's commits take turns (review): judgment and write are one turn,
+    /// so an older commit's slow write cannot land after a newer commit's.
+    async fn offset_commit(&self, request: OffsetCommitRequest) -> Vec<OffsetCommitTopicResponse> {
+        // One deadline for the whole request (review): the cap bounds the
+        // request, not each of up to 4 096 entries in turn — the turn, the
+        // watermark lookups and the store's writes all wait on it.
+        let deadline = tokio::time::Instant::now() + self.config.max_offset_wait;
+        let order = self.commit_turn(&request.group_id);
+        let topics = match tokio::time::timeout_at(deadline, order.lock()).await {
+            Ok(_turn) => self.commit_in_turn(&request, deadline).await,
+            Err(_) => every_partition(&request, ErrorCode::RequestTimedOut),
+        };
+        self.commit_turn_done(&request.group_id, order);
+        topics
+    }
+
+    /// The group's turn for commits: one per group, made on first use.
+    fn commit_turn(&self, group: &str) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(
+            self.commit_order
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(group.to_owned())
+                .or_default(),
+        )
+    }
+
+    /// The turn is over; an entry nobody else holds is dropped, so the map
+    /// names the groups committing now, not every group ever named.
+    fn commit_turn_done(&self, group: &str, order: Arc<tokio::sync::Mutex<()>>) {
+        let mut orders = self
+            .commit_order
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Ours and the map's: nobody else is waiting or holding.
+        if Arc::strong_count(&order) == 2 {
+            orders.remove(group);
+        }
+    }
+
+    /// The commit itself, under the group's turn.
+    async fn commit_in_turn(
+        &self,
+        request: &OffsetCommitRequest,
+        deadline: tokio::time::Instant,
+    ) -> Vec<OffsetCommitTopicResponse> {
+        // Membership first (review): a stale generation or an unknown member
+        // is answered as such whatever the bridge does next — a client acts
+        // on that code, rejoining or correcting its identity, and a bridge
+        // error in its place would read as a transient storage fault.
+        if let Err(error) =
+            self.groups
+                .check_commit(&request.group_id, request.generation_id, &request.member_id)
+        {
+            return every_partition(request, error);
+        }
+        let served = match self.served_topics(deadline).await {
+            Ok(served) => served,
+            Err(error) => return every_partition(request, error),
+        };
+        // The watermark of every topic named (review, #468): a committed
+        // offset is the next one to consume, so it may reach the watermark
+        // and no further — a position past what exists would be a cursor
+        // metadata cannot bound, and a group lying itself out of retention's
+        // protection. The head is known HERE, at the bridge, and nowhere
+        // else. Each lookup waits on the request deadline (review): a bridge
+        // blocked on its storage or its lock is not a wait the cap leaves
+        // unbounded, and a watermark not given in time is a commit not taken.
+        let mut watermarks: HashMap<String, Result<i64, ErrorCode>> = HashMap::new();
+        for topic in &request.topics {
+            if served.contains(&topic.name) && !watermarks.contains_key(&topic.name) {
+                // Nothing is spawned for a topic the deadline has already
+                // passed (review): a blocking task cannot be cancelled, so a
+                // lookup that ate the deadline must not leave one behind for
+                // each of up to 1 024 topics — those are answered as the
+                // timed-out one was.
+                let watermark = if tokio::time::Instant::now() >= deadline {
+                    Err(ErrorCode::RequestTimedOut)
+                } else {
+                    let bridge = Arc::clone(&self.bridge);
+                    let name = topic.name.clone();
+                    tokio::time::timeout_at(
+                        deadline,
+                        tokio::task::spawn_blocking(move || bridge.high_watermark(&name)),
+                    )
+                    .await
+                    .map(|joined| joined.unwrap_or(Err(ErrorCode::RequestTimedOut)))
+                    .unwrap_or(Err(ErrorCode::RequestTimedOut))
+                };
+                watermarks.insert(topic.name.clone(), watermark);
+            }
+        }
+        let mut topics = Vec::with_capacity(request.topics.len());
+        for topic in &request.topics {
+            let mut partitions = Vec::with_capacity(topic.partitions.len());
+            for p in &topic.partitions {
+                let watermark = watermarks.get(&topic.name);
+                let refused = if p.partition != 0 || !served.contains(&topic.name) {
+                    Some(ErrorCode::UnknownTopicOrPartition)
+                } else if p.offset < 0 {
+                    // -1 is the wire's "nothing committed"; a position below
+                    // zero is not one a consumer resumes from (review).
+                    Some(ErrorCode::OffsetOutOfRange)
+                } else if let Some(Err(error)) = watermark {
+                    // A watermark the bridge refused, or did not give before
+                    // the deadline: its code, not a guess.
+                    Some(*error)
+                } else if matches!(watermark, Some(Ok(w)) if p.offset > *w) {
+                    // Past the watermark: not a position a consumer can
+                    // resume from.
+                    Some(ErrorCode::OffsetOutOfRange)
+                } else if p
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|m| m.len() > MAX_OFFSET_METADATA_BYTES)
+                {
+                    Some(ErrorCode::OffsetMetadataTooLarge)
+                } else {
+                    None
+                };
+                let error = match (refused, &self.offsets) {
+                    (Some(error), _) => error,
+                    (None, None) => {
+                        self.no_offset_store("OffsetCommit");
+                        ErrorCode::UnsupportedForMessageFormat
+                    }
+                    (None, Some(store)) => tokio::time::timeout_at(
+                        deadline,
+                        store.commit(
+                            &request.group_id,
+                            &topic.name,
+                            p.partition,
+                            Committed {
+                                offset: p.offset,
+                                metadata: p.metadata.clone(),
+                            },
+                        ),
+                    )
+                    .await
+                    .unwrap_or(Err(ErrorCode::RequestTimedOut))
+                    .err()
+                    .unwrap_or(ErrorCode::None),
+                };
+                partitions.push((p.partition, error));
+            }
+            topics.push(OffsetCommitTopicResponse {
+                name: topic.name.clone(),
+                partitions,
+            });
+        }
+        topics
+    }
+
+    /// OffsetFetch: what the store holds; without a store, nothing is
+    /// committed anywhere, and -1 says so truthfully, so a client falls back
+    /// to its reset policy instead of failing.
+    async fn offset_fetch(&self, request: OffsetFetchRequest) -> OffsetFetchResponse {
+        let deadline = tokio::time::Instant::now() + self.config.max_offset_wait;
+        if request.group_id.is_empty() {
+            // Every asked partition says so (review): v1 has no group-level
+            // field to carry the code, and an empty answer there would read
+            // as success.
+            return OffsetFetchResponse {
+                error: ErrorCode::InvalidGroupId,
+                topics: every_asked(
+                    request.topics.unwrap_or_default(),
+                    ErrorCode::InvalidGroupId,
+                ),
+            };
+        }
+        // Named topics, or — a null list at v2+ — every partition the group
+        // has COMMITTED (review): what the store holds for the group, not the
+        // topics served; with no store, nothing is committed anywhere.
+        let asked: Vec<(String, Vec<i32>)> = match request.topics {
+            Some(asked) => asked,
+            None => {
+                // A null topic list at v2+: every partition the group has
+                // COMMITTED, answered from the stored rows themselves
+                // (review) — a committed offset for a topic this gateway no
+                // longer serves is still what the group committed. With no
+                // store, nothing is committed anywhere.
+                let Some(store) = &self.offsets else {
+                    return OffsetFetchResponse {
+                        error: ErrorCode::None,
+                        topics: Vec::new(),
+                    };
+                };
+                return match tokio::time::timeout_at(deadline, store.committed(&request.group_id))
+                    .await
+                    .unwrap_or(Err(ErrorCode::RequestTimedOut))
+                {
+                    Ok(rows) => {
+                        // Grouped by topic in one pass (review): a map, not
+                        // a scan of every topic seen so far for each row.
+                        let mut by_topic: std::collections::BTreeMap<
+                            String,
+                            Vec<OffsetFetchPartitionResponse>,
+                        > = std::collections::BTreeMap::new();
+                        for (topic, partition, committed) in rows {
+                            by_topic
+                                .entry(topic)
+                                .or_default()
+                                .push(OffsetFetchPartitionResponse {
+                                    partition,
+                                    offset: committed.offset,
+                                    metadata: committed.metadata,
+                                    error: ErrorCode::None,
+                                });
+                        }
+                        let topics: Vec<OffsetFetchTopicResponse> = by_topic
+                            .into_iter()
+                            .map(|(name, partitions)| OffsetFetchTopicResponse { name, partitions })
+                            .collect();
+                        OffsetFetchResponse {
+                            error: ErrorCode::None,
+                            topics,
+                        }
+                    }
+                    Err(error) => OffsetFetchResponse {
+                        error,
+                        topics: Vec::new(),
+                    },
+                };
+            }
+        };
+        // A named partition is the store's answer (review), whatever this
+        // gateway serves today: a committed offset for a topic that moved on
+        // is still what the group committed, as the null-topic answer above
+        // already holds, and a client naming its assignment must be able to
+        // resume by it. The bridge is not consulted; nothing here waits on it.
+        let mut topics = Vec::with_capacity(asked.len());
+        for (name, parts) in asked {
+            let mut partitions = Vec::with_capacity(parts.len());
+            for partition in parts {
+                let none = |error: ErrorCode| OffsetFetchPartitionResponse {
+                    partition,
+                    offset: -1,
+                    metadata: None,
+                    error,
+                };
+                let answer = match &self.offsets {
+                    None => none(ErrorCode::None),
+                    Some(store) => match tokio::time::timeout_at(
+                        deadline,
+                        store.fetch(&request.group_id, &name, partition),
+                    )
+                    .await
+                    .unwrap_or(Err(ErrorCode::RequestTimedOut))
+                    {
+                        Ok(Some(committed)) => OffsetFetchPartitionResponse {
+                            partition,
+                            offset: committed.offset,
+                            metadata: committed.metadata,
+                            error: ErrorCode::None,
+                        },
+                        Ok(None) => none(ErrorCode::None),
+                        Err(error) => none(error),
+                    },
+                };
+                partitions.push(answer);
+            }
+            topics.push(OffsetFetchTopicResponse { name, partitions });
+        }
+        OffsetFetchResponse {
+            error: ErrorCode::None,
+            topics,
+        }
+    }
+
     /// An idempotent producer's id and epoch (#457): minted here, unique in
     /// this process and across its restarts on a sane clock, epoch zero. A
     /// transactional id is refused by name — transactions are out of scope —
@@ -1117,6 +1823,45 @@ fn split_batches(mut bytes: &[u8]) -> Result<Vec<RecordBatch>, (ErrorCode, Strin
         bytes = &bytes[len..];
     }
     Ok(batches)
+}
+
+/// Every partition an OffsetFetch asked for, answered with one code and no
+/// offset.
+fn every_asked(asked: Vec<(String, Vec<i32>)>, error: ErrorCode) -> Vec<OffsetFetchTopicResponse> {
+    asked
+        .into_iter()
+        .map(|(name, parts)| OffsetFetchTopicResponse {
+            name,
+            partitions: parts
+                .into_iter()
+                .map(|partition| OffsetFetchPartitionResponse {
+                    partition,
+                    offset: -1,
+                    metadata: None,
+                    error,
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// Every partition of an OffsetCommit answered with one code.
+fn every_partition(
+    request: &OffsetCommitRequest,
+    error: ErrorCode,
+) -> Vec<OffsetCommitTopicResponse> {
+    request
+        .topics
+        .iter()
+        .map(|topic| OffsetCommitTopicResponse {
+            name: topic.name.clone(),
+            partitions: topic
+                .partitions
+                .iter()
+                .map(|p| (p.partition, error))
+                .collect(),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1709,7 +2454,7 @@ mod tests {
             d.i16("error").unwrap(),
             ErrorCode::UnsupportedVersion.as_i16()
         );
-        assert_eq!(d.array_len("keys").unwrap(), Some(6));
+        assert_eq!(d.array_len("keys").unwrap(), Some(13));
 
         // v0 on the same connection: served.
         let reply = exchange(&mut socket, &request(18, 0, 10, &[]))
@@ -2037,6 +2782,1438 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(read_fetch(&reply, 4).1, 3, "three records, in order");
+    }
+
+    // ---- the group protocol on the wire (#457 slice 2) ----
+    async fn start_groups(
+        bridge: Arc<dyn Bridge>,
+        store: Option<Arc<dyn OffsetStore>>,
+    ) -> (SocketAddr, tokio::sync::watch::Sender<bool>) {
+        start_groups_tuned(bridge, store, |_| {}).await
+    }
+    async fn start_groups_tuned(
+        bridge: Arc<dyn Bridge>,
+        store: Option<Arc<dyn OffsetStore>>,
+        tune: impl FnOnce(&mut GatewayConfig),
+    ) -> (SocketAddr, tokio::sync::watch::Sender<bool>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let mut config = GatewayConfig {
+            advertised_port: addr.port() as i32,
+            groups: GroupConfig {
+                initial_rebalance_delay: Duration::from_millis(50),
+                ..GroupConfig::default()
+            },
+            ..GatewayConfig::default()
+        };
+        tune(&mut config);
+        let mut gateway = Gateway::new(bridge, config);
+        if let Some(store) = store {
+            gateway = gateway.with_offsets(store);
+        }
+        tokio::spawn(gateway.serve(listener, rx));
+        (addr, tx)
+    }
+    fn find_coordinator_body(version: i16, key: &str, key_type: i8) -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.string(key);
+        if version >= 1 {
+            e.i8(key_type);
+        }
+        e.into_vec()
+    }
+    /// (error, node id, host, port)
+    fn read_find_coordinator(reply: &[u8], version: i16) -> (i16, i32, String, i32) {
+        let mut d = Decoder::new(reply);
+        if version >= 1 {
+            d.i32("throttle").unwrap();
+        }
+        let error = d.i16("error").unwrap();
+        if version >= 1 {
+            d.nullable_string("message").unwrap();
+        }
+        let node = d.i32("node").unwrap();
+        let host = d.string("host").unwrap().to_owned();
+        let port = d.i32("port").unwrap();
+        assert!(d.is_empty());
+        (error, node, host, port)
+    }
+    fn join_body(version: i16, group: &str, member: &str, protocols: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.string(group);
+        e.i32(10_000);
+        if version >= 1 {
+            e.i32(10_000);
+        }
+        e.string(member);
+        if version >= 5 {
+            e.nullable_string(None);
+        }
+        e.string("consumer");
+        e.array_len(protocols.len());
+        for (name, metadata) in protocols {
+            e.string(name);
+            e.nullable_bytes(Some(metadata));
+        }
+        e.into_vec()
+    }
+    struct JoinRead {
+        error: i16,
+        generation: i32,
+        protocol: String,
+        leader: String,
+        member_id: String,
+        members: Vec<(String, Vec<u8>)>,
+    }
+    fn read_join(reply: &[u8], version: i16) -> JoinRead {
+        let mut d = Decoder::new(reply);
+        if version >= 2 {
+            d.i32("throttle").unwrap();
+        }
+        let error = d.i16("error").unwrap();
+        let generation = d.i32("generation").unwrap();
+        let protocol = d.string("protocol").unwrap().to_owned();
+        let leader = d.string("leader").unwrap().to_owned();
+        let member_id = d.string("member").unwrap().to_owned();
+        let count = d.array_len("members").unwrap().unwrap_or(0);
+        let mut members = Vec::new();
+        for _ in 0..count {
+            let id = d.string("id").unwrap().to_owned();
+            if version >= 5 {
+                d.nullable_string("instance").unwrap();
+            }
+            let metadata = d
+                .nullable_bytes("metadata")
+                .unwrap()
+                .unwrap_or_default()
+                .to_vec();
+            members.push((id, metadata));
+        }
+        assert!(d.is_empty(), "trailing bytes");
+        JoinRead {
+            error,
+            generation,
+            protocol,
+            leader,
+            member_id,
+            members,
+        }
+    }
+    fn sync_body(
+        version: i16,
+        group: &str,
+        generation: i32,
+        member: &str,
+        assignments: &[(&str, &[u8])],
+    ) -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.string(group);
+        e.i32(generation);
+        e.string(member);
+        if version >= 3 {
+            e.nullable_string(None);
+        }
+        e.array_len(assignments.len());
+        for (member, assignment) in assignments {
+            e.string(member);
+            e.nullable_bytes(Some(assignment));
+        }
+        e.into_vec()
+    }
+    fn read_sync(reply: &[u8], version: i16) -> (i16, Vec<u8>) {
+        let mut d = Decoder::new(reply);
+        if version >= 1 {
+            d.i32("throttle").unwrap();
+        }
+        let error = d.i16("error").unwrap();
+        let assignment = d
+            .nullable_bytes("assignment")
+            .unwrap()
+            .unwrap_or_default()
+            .to_vec();
+        assert!(d.is_empty());
+        (error, assignment)
+    }
+    fn heartbeat_body(version: i16, group: &str, generation: i32, member: &str) -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.string(group);
+        e.i32(generation);
+        e.string(member);
+        if version >= 3 {
+            e.nullable_string(None);
+        }
+        e.into_vec()
+    }
+    fn leave_body(group: &str, member: &str) -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.string(group);
+        e.string(member);
+        e.into_vec()
+    }
+    fn read_error_only(reply: &[u8], version: i16) -> i16 {
+        let mut d = Decoder::new(reply);
+        if version >= 1 {
+            d.i32("throttle").unwrap();
+        }
+        let error = d.i16("error").unwrap();
+        assert!(d.is_empty());
+        error
+    }
+    /// A `ConsumerProtocolAssignment` as a leader's assignor writes it.
+    fn consumer_assignment(topic: &str, partitions: &[i32]) -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.i16(0);
+        e.array_len(1);
+        e.string(topic);
+        e.array_len(partitions.len());
+        for p in partitions {
+            e.i32(*p);
+        }
+        e.nullable_bytes(None);
+        e.into_vec()
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn offset_commit_body(
+        version: i16,
+        group: &str,
+        generation: i32,
+        member: &str,
+        topic: &str,
+        partition: i32,
+        offset: i64,
+        metadata: Option<&str>,
+    ) -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.string(group);
+        e.i32(generation);
+        e.string(member);
+        if version >= 7 {
+            e.nullable_string(None);
+        }
+        e.array_len(1);
+        e.string(topic);
+        e.array_len(1);
+        e.i32(partition);
+        e.i64(offset);
+        if version >= 6 {
+            e.i32(-1);
+        }
+        e.nullable_string(metadata);
+        e.into_vec()
+    }
+    /// A commit of partition 0 of several topics, v7.
+    fn offset_commit_many_body(group: &str, topics: &[(&str, i64)]) -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.string(group);
+        e.i32(-1);
+        e.string("");
+        e.nullable_string(None);
+        e.array_len(topics.len());
+        for (topic, offset) in topics {
+            e.string(topic);
+            e.array_len(1);
+            e.i32(0);
+            e.i64(*offset);
+            e.i32(-1);
+            e.nullable_string(None);
+        }
+        e.into_vec()
+    }
+    fn read_offset_commit(reply: &[u8], version: i16) -> Vec<(i32, i16)> {
+        let mut d = Decoder::new(reply);
+        if version >= 3 {
+            d.i32("throttle").unwrap();
+        }
+        let topics = d.array_len("topics").unwrap().unwrap_or(0);
+        let mut out = Vec::new();
+        for _ in 0..topics {
+            d.string("name").unwrap();
+            let partitions = d.array_len("partitions").unwrap().unwrap_or(0);
+            for _ in 0..partitions {
+                out.push((d.i32("partition").unwrap(), d.i16("error").unwrap()));
+            }
+        }
+        assert!(d.is_empty());
+        out
+    }
+    fn offset_fetch_body(version: i16, group: &str, topics: Option<&[(&str, &[i32])]>) -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.string(group);
+        match topics {
+            None => {
+                assert!(version >= 2, "a null topic list is v2+");
+                e.i32(-1);
+            }
+            Some(topics) => {
+                e.array_len(topics.len());
+                for (name, partitions) in topics {
+                    e.string(name);
+                    e.array_len(partitions.len());
+                    for p in *partitions {
+                        e.i32(*p);
+                    }
+                }
+            }
+        }
+        e.into_vec()
+    }
+    type FetchedOffsets = Vec<(String, Vec<(i32, i64, Option<String>, i16)>)>;
+    /// (group-level error, topics with (partition, offset, metadata, error))
+    fn read_offset_fetch(reply: &[u8], version: i16) -> (i16, FetchedOffsets) {
+        let mut d = Decoder::new(reply);
+        if version >= 3 {
+            d.i32("throttle").unwrap();
+        }
+        let count = d.array_len("topics").unwrap().unwrap_or(0);
+        let mut topics = Vec::new();
+        for _ in 0..count {
+            let name = d.string("name").unwrap().to_owned();
+            let partitions = d.array_len("partitions").unwrap().unwrap_or(0);
+            let mut out = Vec::new();
+            for _ in 0..partitions {
+                let partition = d.i32("partition").unwrap();
+                let offset = d.i64("offset").unwrap();
+                if version >= 5 {
+                    d.i32("epoch").unwrap();
+                }
+                let metadata = d.nullable_string("metadata").unwrap().map(str::to_owned);
+                let error = d.i16("error").unwrap();
+                out.push((partition, offset, metadata, error));
+            }
+            topics.push((name, out));
+        }
+        let error = if version >= 2 {
+            d.i16("error").unwrap()
+        } else {
+            0
+        };
+        assert!(d.is_empty());
+        (error, topics)
+    }
+
+    /// FindCoordinator names this gateway for every group, at every served
+    /// version; a transaction key and an empty key are refused by name.
+    #[tokio::test]
+    async fn find_coordinator_names_this_gateway_for_every_group() {
+        let (addr, _stop) =
+            start_groups(Arc::new(MemoryBridge::with_topics(["events"])), None).await;
+        for version in [0, 1, 2] {
+            let reply = call(
+                addr,
+                10,
+                version,
+                1,
+                &find_coordinator_body(version, "g", 0),
+            )
+            .await
+            .unwrap();
+            let (error, node, host, port) = read_find_coordinator(&reply, version);
+            assert_eq!((error, node), (0, 1), "v{version}");
+            assert_eq!((host.as_str(), port), ("127.0.0.1", i32::from(addr.port())));
+        }
+        let reply = call(addr, 10, 2, 2, &find_coordinator_body(2, "tx", 1))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_find_coordinator(&reply, 2).0,
+            ErrorCode::UnsupportedForMessageFormat.as_i16()
+        );
+        let reply = call(addr, 10, 1, 3, &find_coordinator_body(1, "", 0))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_find_coordinator(&reply, 1).0,
+            ErrorCode::InvalidGroupId.as_i16()
+        );
+        // v3 is flexible: outside the served range, closed at the header.
+        let mut refused = Encoder::new();
+        refused.i16(10);
+        refused.i16(3);
+        refused.i32(4);
+        refused.nullable_string(Some("c"));
+        refused.i8(0);
+        let mut socket = TcpStream::connect(addr).await.unwrap();
+        assert!(exchange(&mut socket, &frame(refused.as_slice()))
+            .await
+            .is_none());
+    }
+
+    /// One member over the wire: a v5 join without an id is told to come back
+    /// with one; the rejoin completes with the member as leader at
+    /// generation 1 and its own metadata in the member list; its sync hands
+    /// back the assignment it wrote; heartbeats at the generation are fine, a
+    /// stale generation is illegal, a stranger is unknown; a leave ends it.
+    #[tokio::test]
+    async fn a_group_forms_syncs_heartbeats_and_leaves_over_the_wire() {
+        let (addr, _stop) =
+            start_groups(Arc::new(MemoryBridge::with_topics(["events"])), None).await;
+        let mut socket = TcpStream::connect(addr).await.unwrap();
+        let protocols: &[(&str, &[u8])] = &[("range", b"sub-events")];
+        let reply = exchange(
+            &mut socket,
+            &request(11, 5, 1, &join_body(5, "g", "", protocols)),
+        )
+        .await
+        .unwrap();
+        let first = read_join(&reply[4..], 5);
+        assert_eq!(first.error, ErrorCode::MemberIdRequired.as_i16());
+        assert!(
+            first.member_id.starts_with("test-client-"),
+            "{}",
+            first.member_id
+        );
+        let id = first.member_id;
+        let reply = exchange(
+            &mut socket,
+            &request(11, 5, 2, &join_body(5, "g", &id, protocols)),
+        )
+        .await
+        .unwrap();
+        let joined = read_join(&reply[4..], 5);
+        assert_eq!((joined.error, joined.generation), (0, 1));
+        assert_eq!(
+            (joined.leader.as_str(), joined.member_id.as_str()),
+            (id.as_str(), id.as_str())
+        );
+        assert_eq!(joined.protocol, "range");
+        assert_eq!(joined.members, vec![(id.clone(), b"sub-events".to_vec())]);
+        let assignment = consumer_assignment("events", &[0]);
+        let reply = exchange(
+            &mut socket,
+            &request(14, 3, 3, &sync_body(3, "g", 1, &id, &[(&id, &assignment)])),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_sync(&reply[4..], 3), (0, assignment.clone()));
+        let reply = exchange(
+            &mut socket,
+            &request(12, 3, 4, &heartbeat_body(3, "g", 1, &id)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_error_only(&reply[4..], 3), 0);
+        let reply = exchange(
+            &mut socket,
+            &request(12, 0, 5, &heartbeat_body(0, "g", 0, &id)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_error_only(&reply[4..], 0),
+            ErrorCode::IllegalGeneration.as_i16()
+        );
+        let reply = exchange(
+            &mut socket,
+            &request(12, 1, 6, &heartbeat_body(1, "g", 1, "nobody")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_error_only(&reply[4..], 1),
+            ErrorCode::UnknownMemberId.as_i16()
+        );
+        let reply = exchange(&mut socket, &request(13, 1, 7, &leave_body("g", &id)))
+            .await
+            .unwrap();
+        assert_eq!(read_error_only(&reply[4..], 1), 0);
+        let reply = exchange(
+            &mut socket,
+            &request(12, 3, 8, &heartbeat_body(3, "g", 1, &id)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_error_only(&reply[4..], 3),
+            ErrorCode::UnknownMemberId.as_i16(),
+            "gone"
+        );
+    }
+
+    /// Two members of one group over one partition (the acceptance's shape,
+    /// on one range): both join one generation, the leader sees both, the
+    /// follower's sync is parked until the leader's, the assignor gives the
+    /// one partition to one member and none to the other; the leader leaves,
+    /// the follower's heartbeat says rebalance, its rejoin leads generation
+    /// 2, and an assignment naming a partition this gateway does not serve is
+    /// refused.
+    #[tokio::test]
+    async fn two_members_one_partition_and_the_assignor_gives_it_to_one() {
+        let (addr, _stop) =
+            start_groups(Arc::new(MemoryBridge::with_topics(["events"])), None).await;
+        let protocols: &[(&str, &[u8])] = &[("range", b"sub")];
+        let mut a = TcpStream::connect(addr).await.unwrap();
+        let mut b = TcpStream::connect(addr).await.unwrap();
+        let join_a = request(11, 2, 1, &join_body(2, "g", "", protocols));
+        let join_b = request(11, 2, 2, &join_body(2, "g", "", protocols));
+        let (ra, rb) = tokio::join!(exchange(&mut a, &join_a), async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            exchange(&mut b, &join_b).await
+        });
+        let ja = read_join(&ra.unwrap()[4..], 2);
+        let jb = read_join(&rb.unwrap()[4..], 2);
+        assert_eq!(
+            (ja.error, jb.error, ja.generation, jb.generation),
+            (0, 0, 1, 1)
+        );
+        assert_eq!(ja.leader, jb.leader);
+        let (leader, follower, mut ls, mut fs) = if ja.leader == ja.member_id {
+            (ja, jb, a, b)
+        } else {
+            (jb, ja, b, a)
+        };
+        assert_eq!(leader.members.len(), 2);
+        assert!(follower.members.is_empty());
+        let p0 = consumer_assignment("events", &[0]);
+        let follower_sync = request(14, 1, 3, &sync_body(1, "g", 1, &follower.member_id, &[]));
+        let leader_sync = request(
+            14,
+            1,
+            4,
+            &sync_body(
+                1,
+                "g",
+                1,
+                &leader.member_id,
+                &[(&leader.member_id, &p0), (&follower.member_id, &[])],
+            ),
+        );
+        let (rf, rl) = tokio::join!(exchange(&mut fs, &follower_sync), async {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            exchange(&mut ls, &leader_sync).await
+        });
+        assert_eq!(
+            read_sync(&rl.unwrap()[4..], 1),
+            (0, p0.clone()),
+            "the leader has the partition"
+        );
+        assert_eq!(
+            read_sync(&rf.unwrap()[4..], 1),
+            (0, Vec::new()),
+            "the follower has none"
+        );
+        let reply = exchange(
+            &mut fs,
+            &request(12, 1, 5, &heartbeat_body(1, "g", 1, &follower.member_id)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_error_only(&reply[4..], 1), 0);
+        // The leader leaves; the follower must rejoin, and leads.
+        let reply = exchange(
+            &mut ls,
+            &request(13, 1, 6, &leave_body("g", &leader.member_id)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_error_only(&reply[4..], 1), 0);
+        let reply = exchange(
+            &mut fs,
+            &request(12, 1, 7, &heartbeat_body(1, "g", 1, &follower.member_id)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_error_only(&reply[4..], 1),
+            ErrorCode::RebalanceInProgress.as_i16()
+        );
+        let reply = exchange(
+            &mut fs,
+            &request(11, 2, 8, &join_body(2, "g", &follower.member_id, protocols)),
+        )
+        .await
+        .unwrap();
+        let again = read_join(&reply[4..], 2);
+        assert_eq!((again.error, again.generation), (0, 2));
+        assert_eq!(again.leader, follower.member_id);
+        // A partition this gateway does not serve: refused, and the group
+        // stays in its round.
+        let p5 = consumer_assignment("events", &[5]);
+        let reply = exchange(
+            &mut fs,
+            &request(
+                14,
+                1,
+                9,
+                &sync_body(
+                    1,
+                    "g",
+                    2,
+                    &follower.member_id,
+                    &[(&follower.member_id, &p5)],
+                ),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_sync(&reply[4..], 1).0,
+            ErrorCode::InconsistentGroupProtocol.as_i16()
+        );
+        let reply = exchange(
+            &mut fs,
+            &request(
+                14,
+                1,
+                10,
+                &sync_body(
+                    1,
+                    "g",
+                    2,
+                    &follower.member_id,
+                    &[(&follower.member_id, &p0)],
+                ),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_sync(&reply[4..], 1), (0, p0));
+    }
+
+    /// Committed offsets live in the store: a commit is read back, survives a
+    /// gateway rebuilt over the same store, is judged by name per partition
+    /// and by membership; without a store, a commit is refused by name and a
+    /// fetch says nothing is committed — which is true.
+    #[tokio::test]
+    async fn offsets_live_in_the_store_and_are_refused_by_name_without_one() {
+        let store: Arc<dyn OffsetStore> = Arc::new(crate::offsets::MemoryOffsetStore::default());
+        let bridge = Arc::new(MemoryBridge::with_topics(["events", "audit"]));
+        let (addr, _stop) = start_groups(bridge.clone(), Some(Arc::clone(&store))).await;
+        // Fifty records, so a commit up to 50 is a position that exists.
+        let values: Vec<String> = (0..50).map(|i| format!("v{i}")).collect();
+        let refs: Vec<&str> = values.iter().map(String::as_str).collect();
+        let reply = call(
+            addr,
+            0,
+            8,
+            100,
+            &produce_body("events", 0, -1, None, &batch_bytes(&refs, false)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_produce(&reply, 8).0, 0);
+        // Past the watermark is not a position (review, #468); the watermark
+        // itself — the next offset to consume — is.
+        let reply = call(
+            addr,
+            8,
+            7,
+            101,
+            &offset_commit_body(7, "g", -1, "", "events", 0, 51, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_offset_commit(&reply, 7),
+            vec![(0, ErrorCode::OffsetOutOfRange.as_i16())]
+        );
+        let reply = call(
+            addr,
+            8,
+            7,
+            102,
+            &offset_commit_body(7, "g", -1, "", "events", 0, 50, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_offset_commit(&reply, 7), vec![(0, 0)]);
+        let reply = call(
+            addr,
+            8,
+            7,
+            1,
+            &offset_commit_body(7, "g", -1, "", "events", 0, 42, Some("m")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_offset_commit(&reply, 7), vec![(0, 0)]);
+        let reply = call(
+            addr,
+            9,
+            5,
+            2,
+            &offset_fetch_body(5, "g", Some(&[("events", &[0, 3])])),
+        )
+        .await
+        .unwrap();
+        let (error, topics) = read_offset_fetch(&reply, 5);
+        assert_eq!(error, 0);
+        assert_eq!(
+            topics,
+            vec![(
+                "events".to_owned(),
+                vec![(0, 42, Some("m".to_owned()), 0), (3, -1, None, 0)]
+            )]
+        );
+        // A null topic list at v2+: what the group COMMITTED — events, not
+        // the served-but-uncommitted audit.
+        let reply = call(addr, 9, 2, 3, &offset_fetch_body(2, "g", None))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_offset_fetch(&reply, 2).1,
+            vec![("events".to_owned(), vec![(0, 42, Some("m".to_owned()), 0)])]
+        );
+        // A gateway that no longer serves the topic still answers a
+        // null-topic fetch with what the group committed there.
+        let (moved, _stop5) = start_groups(
+            Arc::new(MemoryBridge::with_topics(["other"])),
+            Some(Arc::clone(&store)),
+        )
+        .await;
+        let reply = call(moved, 9, 2, 13, &offset_fetch_body(2, "g", None))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_offset_fetch(&reply, 2).1,
+            vec![("events".to_owned(), vec![(0, 42, Some("m".to_owned()), 0)])]
+        );
+        // A negative offset is not a position: refused, nothing stored.
+        let reply = call(
+            addr,
+            8,
+            7,
+            12,
+            &offset_commit_body(7, "g", -1, "", "events", 0, -5, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_offset_commit(&reply, 7),
+            vec![(0, ErrorCode::OffsetOutOfRange.as_i16())]
+        );
+        // An empty group id commits nothing, even as a simple consumer.
+        let reply = call(
+            addr,
+            8,
+            7,
+            11,
+            &offset_commit_body(7, "", -1, "", "events", 0, 1, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_offset_commit(&reply, 7),
+            vec![(0, ErrorCode::InvalidGroupId.as_i16())]
+        );
+        // Metadata over the cap; a membership the group does not know.
+        let long = "x".repeat(MAX_OFFSET_METADATA_BYTES + 1);
+        let reply = call(
+            addr,
+            8,
+            7,
+            4,
+            &offset_commit_body(7, "g", -1, "", "events", 0, 43, Some(&long)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_offset_commit(&reply, 7),
+            vec![(0, ErrorCode::OffsetMetadataTooLarge.as_i16())]
+        );
+        let reply = call(
+            addr,
+            8,
+            7,
+            5,
+            &offset_commit_body(7, "g", 7, "someone", "events", 0, 43, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_offset_commit(&reply, 7),
+            vec![(0, ErrorCode::IllegalGeneration.as_i16())]
+        );
+        // A gateway rebuilt over the same store: the offset is the store's.
+        let (again, _stop2) = start_groups(bridge, Some(store)).await;
+        let reply = call(
+            again,
+            9,
+            1,
+            6,
+            &offset_fetch_body(1, "g", Some(&[("events", &[0])])),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_offset_fetch(&reply, 1).1[0].1[0].1, 42);
+        // No store: a commit is refused by name, a fetch has nothing.
+        let (bare, _stop3) =
+            start_groups(Arc::new(MemoryBridge::with_topics(["events"])), None).await;
+        let reply = call(
+            bare,
+            8,
+            7,
+            7,
+            &offset_commit_body(7, "g", -1, "", "events", 0, 0, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_offset_commit(&reply, 7),
+            vec![(0, ErrorCode::UnsupportedForMessageFormat.as_i16())]
+        );
+        let reply = call(
+            bare,
+            9,
+            5,
+            8,
+            &offset_fetch_body(5, "g", Some(&[("events", &[0])])),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_offset_fetch(&reply, 5),
+            (0, vec![("events".to_owned(), vec![(0, -1, None, 0)])])
+        );
+    }
+
+    /// A bridge whose watermark lookup stalls: the commit is
+    /// `REQUEST_TIMED_OUT` at the cap (review), not held for as long as the
+    /// bridge takes — and the lookups it counts are ONE (review): once the
+    /// deadline has passed, no further blocking task is spawned.
+    struct StalledWatermarkBridge(MemoryBridge, std::sync::atomic::AtomicUsize);
+    impl Bridge for StalledWatermarkBridge {
+        fn topics(&self) -> Vec<String> {
+            self.0.topics()
+        }
+        fn produce(
+            &self,
+            topic: &str,
+            batches: &[RecordBatch],
+            sequenced: Option<Sequenced>,
+        ) -> Result<crate::bridge::Appended, ErrorCode> {
+            self.0.produce(topic, batches, sequenced)
+        }
+        fn fetch(&self, topic: &str, offset: i64, max_bytes: usize) -> Result<Fetched, ErrorCode> {
+            self.0.fetch(topic, offset, max_bytes)
+        }
+        fn bounds(&self, topic: &str) -> Result<(i64, i64), ErrorCode> {
+            self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Far past the cap; short enough that the runtime's shutdown is
+            // not held on it for long.
+            std::thread::sleep(Duration::from_secs(2));
+            self.0.bounds(topic)
+        }
+    }
+    #[tokio::test]
+    async fn a_stalled_watermark_lookup_is_timed_out_at_the_cap() {
+        let topics: Vec<String> = (0..10).map(|i| format!("t{i}")).collect();
+        let bridge = Arc::new(StalledWatermarkBridge(
+            MemoryBridge::with_topics(topics.clone()),
+            std::sync::atomic::AtomicUsize::new(0),
+        ));
+        let (addr, _stop) = start_groups_tuned(
+            Arc::clone(&bridge) as Arc<dyn Bridge>,
+            Some(Arc::new(crate::offsets::MemoryOffsetStore::default())),
+            |c| c.max_offset_wait = Duration::from_millis(100),
+        )
+        .await;
+        let started = tokio::time::Instant::now();
+        let named: Vec<(&str, i64)> = topics.iter().map(|t| (t.as_str(), 0)).collect();
+        let reply = call(addr, 8, 7, 1, &offset_commit_many_body("g", &named))
+            .await
+            .unwrap();
+        let answers = read_offset_commit(&reply, 7);
+        assert_eq!(answers.len(), 10);
+        assert!(
+            answers
+                .iter()
+                .all(|(_, error)| *error == ErrorCode::RequestTimedOut.as_i16()),
+            "{answers:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "bounded by the cap, not by the bridge"
+        );
+        assert_eq!(
+            bridge.1.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one lookup ate the deadline; none was spawned after it"
+        );
+    }
+
+    /// A bridge that counts its enumerations: a SyncGroup of several
+    /// assignments is judged against one (review).
+    struct CountingTopicsBridge(MemoryBridge, std::sync::atomic::AtomicUsize);
+    impl Bridge for CountingTopicsBridge {
+        fn topics(&self) -> Vec<String> {
+            self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.0.topics()
+        }
+        fn produce(
+            &self,
+            topic: &str,
+            batches: &[RecordBatch],
+            sequenced: Option<Sequenced>,
+        ) -> Result<crate::bridge::Appended, ErrorCode> {
+            self.0.produce(topic, batches, sequenced)
+        }
+        fn fetch(&self, topic: &str, offset: i64, max_bytes: usize) -> Result<Fetched, ErrorCode> {
+            self.0.fetch(topic, offset, max_bytes)
+        }
+        fn bounds(&self, topic: &str) -> Result<(i64, i64), ErrorCode> {
+            self.0.bounds(topic)
+        }
+    }
+    #[tokio::test]
+    async fn a_sync_group_enumerates_the_topics_once() {
+        let bridge = Arc::new(CountingTopicsBridge(
+            MemoryBridge::with_topics(["events"]),
+            std::sync::atomic::AtomicUsize::new(0),
+        ));
+        let (addr, _stop) = start_groups(Arc::clone(&bridge) as Arc<dyn Bridge>, None).await;
+        let reply = call(
+            addr,
+            11,
+            2,
+            1,
+            &join_body(2, "g", "", &[("range", b"m".as_slice())]),
+        )
+        .await
+        .unwrap();
+        let joined = read_join(&reply, 2);
+        assert_eq!((joined.error, joined.generation), (0, 1));
+        let before = bridge.1.load(std::sync::atomic::Ordering::SeqCst);
+        let assignment = consumer_assignment("events", &[0]);
+        let reply = call(
+            addr,
+            14,
+            1,
+            2,
+            &sync_body(
+                1,
+                "g",
+                1,
+                &joined.member_id,
+                &[
+                    (joined.member_id.as_str(), assignment.as_slice()),
+                    ("someone-else", assignment.as_slice()),
+                    ("a-third", assignment.as_slice()),
+                ],
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_sync(&reply, 1).0, 0);
+        assert_eq!(
+            bridge.1.load(std::sync::atomic::Ordering::SeqCst) - before,
+            1,
+            "three assignments, one enumeration"
+        );
+    }
+
+    /// A deadline already spent spawns no enumeration (review): the answer
+    /// is `REQUEST_TIMED_OUT` and the bridge is not asked.
+    #[tokio::test]
+    async fn a_spent_deadline_spawns_no_enumeration() {
+        let bridge = Arc::new(CountingTopicsBridge(
+            MemoryBridge::with_topics(["events"]),
+            std::sync::atomic::AtomicUsize::new(0),
+        ));
+        let gateway = Gateway::new(
+            Arc::clone(&bridge) as Arc<dyn Bridge>,
+            GatewayConfig::default(),
+        );
+        let spent = tokio::time::Instant::now() - Duration::from_millis(1);
+        assert_eq!(
+            gateway.served_topics(spent).await,
+            Err(ErrorCode::RequestTimedOut)
+        );
+        assert_eq!(bridge.1.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(gateway
+            .served_topics(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+            .is_ok());
+        assert_eq!(bridge.1.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A SyncGroup is judged on membership before its assignments (review):
+    /// a stale generation carrying a malformed assignment is
+    /// `ILLEGAL_GENERATION`, a stranger's is `UNKNOWN_MEMBER_ID`, and the
+    /// bridge is not asked for either.
+    #[tokio::test]
+    async fn a_sync_group_is_judged_on_membership_before_its_assignments() {
+        let bridge = Arc::new(CountingTopicsBridge(
+            MemoryBridge::with_topics(["events"]),
+            std::sync::atomic::AtomicUsize::new(0),
+        ));
+        let (addr, _stop) = start_groups(Arc::clone(&bridge) as Arc<dyn Bridge>, None).await;
+        let reply = call(
+            addr,
+            11,
+            2,
+            1,
+            &join_body(2, "g", "", &[("range", b"m".as_slice())]),
+        )
+        .await
+        .unwrap();
+        let joined = read_join(&reply, 2);
+        assert_eq!((joined.error, joined.generation), (0, 1));
+        let before = bridge.1.load(std::sync::atomic::Ordering::SeqCst);
+        let garbage = b"not an assignment".to_vec();
+        let reply = call(
+            addr,
+            14,
+            1,
+            2,
+            &sync_body(
+                1,
+                "g",
+                7,
+                &joined.member_id,
+                &[(joined.member_id.as_str(), garbage.as_slice())],
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_sync(&reply, 1).0,
+            ErrorCode::IllegalGeneration.as_i16()
+        );
+        let reply = call(
+            addr,
+            14,
+            1,
+            3,
+            &sync_body(1, "g", 1, "stranger", &[("stranger", garbage.as_slice())]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_sync(&reply, 1).0, ErrorCode::UnknownMemberId.as_i16());
+        assert_eq!(
+            bridge.1.load(std::sync::atomic::Ordering::SeqCst),
+            before,
+            "no enumeration for a member not entitled to assign"
+        );
+    }
+
+    /// A named fetch is the store's answer whatever the gateway serves
+    /// (review): an offset committed for a topic this gateway no longer
+    /// serves is still what the group committed, and a client naming its
+    /// assignment resumes by it.
+    #[tokio::test]
+    async fn a_named_fetch_is_the_stores_answer_whatever_the_gateway_serves() {
+        let store = Arc::new(crate::offsets::MemoryOffsetStore::default());
+        store
+            .commit(
+                "g",
+                "audit",
+                0,
+                crate::offsets::Committed {
+                    offset: 7,
+                    metadata: None,
+                },
+            )
+            .await
+            .unwrap();
+        let (addr, _stop) = start_groups(
+            Arc::new(MemoryBridge::with_topics(["events"])),
+            Some(store as Arc<dyn OffsetStore>),
+        )
+        .await;
+        let reply = call(
+            addr,
+            9,
+            5,
+            1,
+            &offset_fetch_body(5, "g", Some(&[("audit", &[0])])),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_offset_fetch(&reply, 5),
+            (0, vec![("audit".to_owned(), vec![(0, 7, None, 0)])])
+        );
+    }
+
+    /// The default minimum session clears the fetch ceiling (review): a
+    /// heartbeat queued behind a long poll on the same connection is read
+    /// before the session it keeps alive can lapse.
+    #[test]
+    fn the_default_minimum_session_clears_the_fetch_ceiling() {
+        assert!(
+            GroupConfig::default().min_session_timeout > GatewayConfig::default().max_fetch_wait
+        );
+    }
+
+    /// An empty group id on OffsetFetch is refused per partition (review):
+    /// v1 has no group-level field, so the code rides on every asked
+    /// partition; v2+ carries it in both places.
+    #[tokio::test]
+    async fn an_empty_group_id_on_offset_fetch_is_refused_per_partition() {
+        let (addr, _stop) = start_groups(
+            Arc::new(MemoryBridge::with_topics(["events"])),
+            Some(Arc::new(crate::offsets::MemoryOffsetStore::default())),
+        )
+        .await;
+        for version in [1i16, 5] {
+            let reply = call(
+                addr,
+                9,
+                version,
+                i32::from(version),
+                &offset_fetch_body(version, "", Some(&[("events", &[0])])),
+            )
+            .await
+            .unwrap();
+            let (error, topics) = read_offset_fetch(&reply, version);
+            assert_eq!(
+                topics,
+                vec![(
+                    "events".to_owned(),
+                    vec![(0, -1, None, ErrorCode::InvalidGroupId.as_i16())]
+                )],
+                "v{version}"
+            );
+            if version >= 2 {
+                assert_eq!(error, ErrorCode::InvalidGroupId.as_i16());
+            }
+        }
+    }
+
+    /// A bridge whose topic enumeration stalls (review): a commit and a fetch
+    /// are `REQUEST_TIMED_OUT` at the cap, every partition of them, not held
+    /// for as long as the bridge takes.
+    struct StalledTopicsBridge(MemoryBridge);
+    impl Bridge for StalledTopicsBridge {
+        fn topics(&self) -> Vec<String> {
+            std::thread::sleep(Duration::from_secs(2));
+            self.0.topics()
+        }
+        fn produce(
+            &self,
+            topic: &str,
+            batches: &[RecordBatch],
+            sequenced: Option<Sequenced>,
+        ) -> Result<crate::bridge::Appended, ErrorCode> {
+            self.0.produce(topic, batches, sequenced)
+        }
+        fn fetch(&self, topic: &str, offset: i64, max_bytes: usize) -> Result<Fetched, ErrorCode> {
+            self.0.fetch(topic, offset, max_bytes)
+        }
+        fn bounds(&self, topic: &str) -> Result<(i64, i64), ErrorCode> {
+            self.0.bounds(topic)
+        }
+    }
+    #[tokio::test]
+    async fn a_stalled_topic_enumeration_is_timed_out_at_the_cap() {
+        let (addr, _stop) = start_groups_tuned(
+            Arc::new(StalledTopicsBridge(MemoryBridge::with_topics(["events"]))),
+            Some(Arc::new(crate::offsets::MemoryOffsetStore::default())),
+            |c| c.max_offset_wait = Duration::from_millis(100),
+        )
+        .await;
+        let started = tokio::time::Instant::now();
+        let reply = call(
+            addr,
+            8,
+            7,
+            1,
+            &offset_commit_body(7, "g", -1, "", "events", 0, 0, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_offset_commit(&reply, 7),
+            vec![(0, ErrorCode::RequestTimedOut.as_i16())]
+        );
+        // A stale membership is answered as such, not as the bridge's
+        // timeout (review).
+        let reply = call(
+            addr,
+            8,
+            7,
+            3,
+            &offset_commit_body(7, "g", 7, "someone", "events", 0, 0, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_offset_commit(&reply, 7),
+            vec![(0, ErrorCode::IllegalGeneration.as_i16())]
+        );
+        let reply = call(
+            addr,
+            9,
+            5,
+            2,
+            &offset_fetch_body(5, "g", Some(&[("events", &[0])])),
+        )
+        .await
+        .unwrap();
+        // A fetch is the store's answer and never asks the bridge (review):
+        // nothing committed, at once.
+        assert_eq!(
+            read_offset_fetch(&reply, 5),
+            (0, vec![("events".to_owned(), vec![(0, -1, None, 0)])])
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "bounded by the cap, not by the bridge"
+        );
+    }
+
+    /// A store whose first write for group "g" is slow (review): the group's
+    /// commits take turns, so the slow one lands first and the one behind it
+    /// last — never overtaken — while another group's commit is not held
+    /// behind it.
+    #[derive(Default)]
+    struct SlowFirstStore {
+        landed: std::sync::Mutex<Vec<(String, i64)>>,
+        slowed: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl OffsetStore for SlowFirstStore {
+        async fn commit(
+            &self,
+            group: &str,
+            _: &str,
+            _: i32,
+            committed: crate::offsets::Committed,
+        ) -> Result<(), ErrorCode> {
+            if group == "g" && !self.slowed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+            }
+            self.landed
+                .lock()
+                .unwrap()
+                .push((group.to_owned(), committed.offset));
+            Ok(())
+        }
+        async fn fetch(
+            &self,
+            group: &str,
+            _: &str,
+            _: i32,
+        ) -> Result<Option<crate::offsets::Committed>, ErrorCode> {
+            Ok(self
+                .landed
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|(g, _)| g == group)
+                .map(|(_, offset)| crate::offsets::Committed {
+                    offset: *offset,
+                    metadata: None,
+                }))
+        }
+        async fn committed(
+            &self,
+            _: &str,
+        ) -> Result<Vec<(String, i32, crate::offsets::Committed)>, ErrorCode> {
+            Ok(Vec::new())
+        }
+    }
+    #[tokio::test]
+    async fn a_groups_commits_take_turns_and_another_groups_do_not_wait() {
+        let store = Arc::new(SlowFirstStore::default());
+        let bridge = Arc::new(MemoryBridge::with_topics(["events"]));
+        let (addr, _stop) =
+            start_groups(bridge, Some(Arc::clone(&store) as Arc<dyn OffsetStore>)).await;
+        // Fifty records, so the commits below are positions that exist.
+        let values: Vec<String> = (0..50).map(|i| format!("v{i}")).collect();
+        let refs: Vec<&str> = values.iter().map(String::as_str).collect();
+        let reply = call(
+            addr,
+            0,
+            8,
+            100,
+            &produce_body("events", 0, -1, None, &batch_bytes(&refs, false)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_produce(&reply, 8).0, 0);
+        let slow = {
+            let body = offset_commit_body(7, "g", -1, "", "events", 0, 10, None);
+            tokio::spawn(async move { call(addr, 8, 7, 1, &body).await.unwrap() })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let started = tokio::time::Instant::now();
+        let behind = {
+            let body = offset_commit_body(7, "g", -1, "", "events", 0, 20, None);
+            tokio::spawn(async move { call(addr, 8, 7, 2, &body).await.unwrap() })
+        };
+        let other = call(
+            addr,
+            8,
+            7,
+            3,
+            &offset_commit_body(7, "h", -1, "", "events", 0, 5, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_offset_commit(&other, 7), vec![(0, 0)]);
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "another group's turn is its own"
+        );
+        assert_eq!(read_offset_commit(&slow.await.unwrap(), 7), vec![(0, 0)]);
+        assert_eq!(read_offset_commit(&behind.await.unwrap(), 7), vec![(0, 0)]);
+        let landed: Vec<i64> = store
+            .landed
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(g, _)| g == "g")
+            .map(|(_, offset)| *offset)
+            .collect();
+        assert_eq!(landed, vec![10, 20], "in request order: the slow one first");
+        let reply = call(
+            addr,
+            9,
+            5,
+            4,
+            &offset_fetch_body(5, "g", Some(&[("events", &[0])])),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_offset_fetch(&reply, 5).1[0].1[0].1, 20);
+    }
+
+    /// The drain waits for an offset call at its own ceiling (review): with
+    /// produce, fetch and drain ceilings far shorter than the offset ceiling,
+    /// `serve` returns only once a commit in flight on a store that never
+    /// answers has met that ceiling — never with the session still inside
+    /// the store.
+    #[tokio::test]
+    async fn the_drain_waits_for_an_offset_call_at_its_own_ceiling() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let config = GatewayConfig {
+            advertised_port: addr.port() as i32,
+            max_produce_wait: Duration::from_millis(50),
+            max_fetch_wait: Duration::from_millis(50),
+            drain_timeout: Duration::from_millis(50),
+            max_offset_wait: Duration::from_millis(600),
+            ..GatewayConfig::default()
+        };
+        let gateway = Gateway::new(Arc::new(MemoryBridge::with_topics(["events"])), config)
+            .with_offsets(Arc::new(HangingStore));
+        let serve = tokio::spawn(gateway.serve(listener, rx));
+        let commit = tokio::spawn(async move {
+            call(
+                addr,
+                8,
+                7,
+                1,
+                &offset_commit_body(7, "g", -1, "", "events", 0, 0, None),
+            )
+            .await
+            .unwrap()
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let started = tokio::time::Instant::now();
+        tx.send(true).unwrap();
+        serve.await.unwrap().unwrap();
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(350) && waited < Duration::from_secs(3),
+            "returned after the offset ceiling, not the produce and fetch ones: {waited:?}"
+        );
+        assert_eq!(
+            read_offset_commit(&commit.await.unwrap(), 7),
+            vec![(0, ErrorCode::RequestTimedOut.as_i16())]
+        );
+    }
+
+    /// A store that never answers (review): the commit and the fetch are
+    /// `REQUEST_TIMED_OUT` at the gateway's offset cap, not held for good.
+    struct HangingStore;
+    #[async_trait::async_trait]
+    impl OffsetStore for HangingStore {
+        async fn commit(
+            &self,
+            _: &str,
+            _: &str,
+            _: i32,
+            _: crate::offsets::Committed,
+        ) -> Result<(), ErrorCode> {
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+        async fn fetch(
+            &self,
+            _: &str,
+            _: &str,
+            _: i32,
+        ) -> Result<Option<crate::offsets::Committed>, ErrorCode> {
+            std::future::pending::<()>().await;
+            Ok(None)
+        }
+        async fn committed(
+            &self,
+            _: &str,
+        ) -> Result<Vec<(String, i32, crate::offsets::Committed)>, ErrorCode> {
+            std::future::pending::<()>().await;
+            Ok(Vec::new())
+        }
+    }
+    #[tokio::test]
+    async fn a_store_that_never_answers_is_timed_out_at_the_cap() {
+        let topics: Vec<String> = (0..10).map(|i| format!("t{i}")).collect();
+        let mut served = vec!["events".to_owned()];
+        served.extend(topics.iter().cloned());
+        let (addr, _stop) = start_groups_tuned(
+            Arc::new(MemoryBridge::with_topics(served)),
+            Some(Arc::new(HangingStore)),
+            |c| c.max_offset_wait = Duration::from_millis(100),
+        )
+        .await;
+        let started = tokio::time::Instant::now();
+        let reply = call(
+            addr,
+            8,
+            7,
+            1,
+            &offset_commit_body(7, "g", -1, "", "events", 0, 0, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_offset_commit(&reply, 7),
+            vec![(0, ErrorCode::RequestTimedOut.as_i16())]
+        );
+        let reply = call(
+            addr,
+            9,
+            5,
+            2,
+            &offset_fetch_body(5, "g", Some(&[("events", &[0])])),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_offset_fetch(&reply, 5).1[0].1[0].3,
+            ErrorCode::RequestTimedOut.as_i16()
+        );
+        let reply = call(addr, 9, 5, 3, &offset_fetch_body(5, "g", None))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_offset_fetch(&reply, 5).0,
+            ErrorCode::RequestTimedOut.as_i16()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "bounded by the cap, thrice"
+        );
+        // Many entries, one cap (review): the second and later entries find
+        // the request's deadline spent and are timed out at once.
+        let started = tokio::time::Instant::now();
+        let many: Vec<(&str, i64)> = topics.iter().map(|t| (t.as_str(), 0)).collect();
+        let reply = call(addr, 8, 7, 4, &offset_commit_many_body("g", &many))
+            .await
+            .unwrap();
+        let answers = read_offset_commit(&reply, 7);
+        assert_eq!(answers.len(), 10);
+        assert_eq!(answers[0].1, ErrorCode::RequestTimedOut.as_i16());
+        assert!(
+            started.elapsed() < Duration::from_millis(1_500),
+            "ten topics, one cap: {:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]

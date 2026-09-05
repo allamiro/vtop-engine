@@ -27,7 +27,11 @@ pub const MAX_PARTITIONS_PER_REQUEST: usize = 4096;
 /// fit. Clipped at a UTF-8 boundary, never split mid-character.
 pub const MAX_ERROR_MESSAGE_BYTES: usize = 1024;
 
-fn bounded(d: &mut Decoder<'_>, field: &'static str, limit: usize) -> Result<usize, WireError> {
+pub(crate) fn bounded(
+    d: &mut Decoder<'_>,
+    field: &'static str,
+    limit: usize,
+) -> Result<usize, WireError> {
     let declared = d.array_len(field)?.unwrap_or(0);
     if declared > limit {
         return Err(WireError::TooMany {
@@ -40,7 +44,7 @@ fn bounded(d: &mut Decoder<'_>, field: &'static str, limit: usize) -> Result<usi
 }
 
 /// The partitions of one topic, counted against the request-wide ceiling.
-fn partitions_within(
+pub(crate) fn partitions_within(
     d: &mut Decoder<'_>,
     field: &'static str,
     total: &mut usize,
@@ -81,6 +85,13 @@ pub fn encode_api_versions(out: &mut Encoder, version: i16, error: ErrorCode) {
         ApiKey::Metadata,
         ApiKey::ApiVersions,
         ApiKey::InitProducerId,
+        ApiKey::FindCoordinator,
+        ApiKey::JoinGroup,
+        ApiKey::SyncGroup,
+        ApiKey::Heartbeat,
+        ApiKey::LeaveGroup,
+        ApiKey::OffsetCommit,
+        ApiKey::OffsetFetch,
     ];
     out.array_len(keys.len());
     for key in keys {
@@ -920,7 +931,7 @@ mod tests {
             let mut d = Decoder::new(&bytes);
             assert_eq!(d.i16("error").unwrap(), 0);
             let n = d.array_len("keys").unwrap().unwrap();
-            assert_eq!(n, 6);
+            assert_eq!(n, 13);
             for _ in 0..n {
                 let key = ApiKey::from_i16(d.i16("key").unwrap()).unwrap();
                 let (min, max) = key.version_range();

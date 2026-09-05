@@ -25,6 +25,15 @@ pub enum ApiKey {
     ApiVersions,
     /// Idempotent producers (#457): the id and epoch a client's batches carry.
     InitProducerId,
+    /// Consumer groups (#457, slice 2): this gateway coordinates every group
+    /// it serves, and keeps their committed offsets through an offset store.
+    FindCoordinator,
+    JoinGroup,
+    SyncGroup,
+    Heartbeat,
+    LeaveGroup,
+    OffsetCommit,
+    OffsetFetch,
 }
 
 impl ApiKey {
@@ -36,6 +45,13 @@ impl ApiKey {
             3 => Some(Self::Metadata),
             18 => Some(Self::ApiVersions),
             22 => Some(Self::InitProducerId),
+            10 => Some(Self::FindCoordinator),
+            11 => Some(Self::JoinGroup),
+            14 => Some(Self::SyncGroup),
+            12 => Some(Self::Heartbeat),
+            13 => Some(Self::LeaveGroup),
+            8 => Some(Self::OffsetCommit),
+            9 => Some(Self::OffsetFetch),
             _ => None,
         }
     }
@@ -48,6 +64,13 @@ impl ApiKey {
             Self::Metadata => 3,
             Self::ApiVersions => 18,
             Self::InitProducerId => 22,
+            Self::FindCoordinator => 10,
+            Self::JoinGroup => 11,
+            Self::SyncGroup => 14,
+            Self::Heartbeat => 12,
+            Self::LeaveGroup => 13,
+            Self::OffsetCommit => 8,
+            Self::OffsetFetch => 9,
         }
     }
 
@@ -77,6 +100,19 @@ impl ApiKey {
             // v3+ carry a producer id and epoch to bump — the transactional
             // re-init this gateway does not have.
             Self::InitProducerId => (0, 1),
+            // The group protocol, up to the last classic version of each
+            // (#457 slice 2). OffsetCommit starts at v5: v0 and v1 carry a
+            // per-partition timestamp, v2 to v4 a per-commit retention time
+            // (retired at v5), and a version whose contract the store cannot
+            // keep is not offered (review). OffsetFetch starts at v1: v0 read
+            // ZooKeeper-era offsets.
+            Self::FindCoordinator => (0, 2),
+            Self::JoinGroup => (0, 5),
+            Self::SyncGroup => (0, 3),
+            Self::Heartbeat => (0, 3),
+            Self::LeaveGroup => (0, 2),
+            Self::OffsetCommit => (5, 7),
+            Self::OffsetFetch => (1, 5),
             // v0 always answers, by protocol rule: a client that knows nothing
             // about this broker sends ApiVersions v0 to find out what it can
             // speak, so refusing v0 would refuse the conversation that
@@ -114,6 +150,13 @@ impl ApiKey {
             Self::Metadata => version >= 9,
             Self::ApiVersions => version >= 3,
             Self::InitProducerId => version >= 2,
+            Self::FindCoordinator => version >= 3,
+            Self::JoinGroup => version >= 6,
+            Self::SyncGroup => version >= 4,
+            Self::Heartbeat => version >= 4,
+            Self::LeaveGroup => version >= 4,
+            Self::OffsetCommit => version >= 8,
+            Self::OffsetFetch => version >= 6,
         }
     }
 
@@ -125,6 +168,13 @@ impl ApiKey {
             Self::Metadata => "Metadata",
             Self::ApiVersions => "ApiVersions",
             Self::InitProducerId => "InitProducerId",
+            Self::FindCoordinator => "FindCoordinator",
+            Self::JoinGroup => "JoinGroup",
+            Self::SyncGroup => "SyncGroup",
+            Self::Heartbeat => "Heartbeat",
+            Self::LeaveGroup => "LeaveGroup",
+            Self::OffsetCommit => "OffsetCommit",
+            Self::OffsetFetch => "OffsetFetch",
         }
     }
 }
@@ -163,6 +213,27 @@ pub enum ErrorCode {
     DuplicateSequenceNumber = 46,
     /// A batch naming a producer id with an epoch below zero.
     InvalidProducerEpoch = 47,
+    /// A commit's metadata over the cap.
+    OffsetMetadataTooLarge = 12,
+    /// The gateway cannot hold another group right now; a client retries.
+    CoordinatorNotAvailable = 15,
+    /// A member speaking for a generation the group has left behind.
+    IllegalGeneration = 22,
+    /// Members that cannot agree on a protocol, or an assignment that names
+    /// what this gateway does not serve.
+    InconsistentGroupProtocol = 23,
+    /// An empty group id.
+    InvalidGroupId = 24,
+    /// A member the group does not know.
+    UnknownMemberId = 25,
+    /// A session timeout outside the bounds the coordinator serves.
+    InvalidSessionTimeout = 26,
+    /// The group is rebalancing: rejoin.
+    RebalanceInProgress = 27,
+    /// KIP-394: a first join must come back with the id minted for it.
+    MemberIdRequired = 79,
+    /// One member over the group's cap.
+    GroupMaxSizeReached = 84,
 }
 
 impl ErrorCode {
@@ -230,7 +301,9 @@ impl RequestHeader {
                 code: ErrorCode::UnsupportedVersion,
                 reason: format!(
                     "api key {api_key} is not served by this gateway (Produce, Fetch, \
-                     ListOffsets, Metadata, ApiVersions, InitProducerId)"
+                     ListOffsets, Metadata, ApiVersions, InitProducerId, and the group protocol: \
+                     FindCoordinator, JoinGroup, SyncGroup, Heartbeat, LeaveGroup, OffsetCommit, \
+                     OffsetFetch)"
                 ),
             });
         };
@@ -461,6 +534,13 @@ mod tests {
             ApiKey::Metadata,
             ApiKey::ApiVersions,
             ApiKey::InitProducerId,
+            ApiKey::FindCoordinator,
+            ApiKey::JoinGroup,
+            ApiKey::SyncGroup,
+            ApiKey::Heartbeat,
+            ApiKey::LeaveGroup,
+            ApiKey::OffsetCommit,
+            ApiKey::OffsetFetch,
         ] {
             let (min, max) = key.version_range();
             for version in min..=max {
@@ -521,6 +601,13 @@ mod tests {
             ApiKey::Metadata,
             ApiKey::ApiVersions,
             ApiKey::InitProducerId,
+            ApiKey::FindCoordinator,
+            ApiKey::JoinGroup,
+            ApiKey::SyncGroup,
+            ApiKey::Heartbeat,
+            ApiKey::LeaveGroup,
+            ApiKey::OffsetCommit,
+            ApiKey::OffsetFetch,
         ] {
             assert_eq!(ApiKey::from_i16(key.as_i16()), Some(key));
         }
