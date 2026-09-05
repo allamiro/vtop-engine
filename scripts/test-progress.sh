@@ -496,8 +496,9 @@ if (( ! doc_only )); then
   # Phase 2 — run, THROUGH CARGO. The denominator is the number of test
   # binaries the compile produced (plus the doctest targets cargo will
   # build on the fly, counted as one unit per package with a library), and
-  # the numerator is the `Running …` / `Doc-tests …` lines cargo prints
-  # before each one — cargo's own progress, read as it happens.
+  # the numerator is the `test result:` lines libtest prints as each one
+  # finishes — cargo's own progress, read as it happens; the `Running …` /
+  # `Doc-tests …` line names the unit under way.
   # -------------------------------------------------------------------------
   TOTAL_BINS="$(python3 "$WORK/binaries.py" "$WORK/build.json")" || exit 2
 fi
