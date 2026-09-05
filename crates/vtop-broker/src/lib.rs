@@ -162,6 +162,10 @@ pub enum BrokerError {
     Task(#[from] tokio::task::JoinError),
     #[error("{0} timed out")]
     Timeout(&'static str),
+    /// The peer spoke the other transport (#294 slice 6); named on both
+    /// sides, see `vtop_meta::transport::cross_mode_refusal`.
+    #[error("{0}")]
+    CrossMode(String),
     #[error("segment storage error: {0}")]
     Segment(#[from] vtop_log::LogError),
 }
@@ -2642,6 +2646,10 @@ impl NativeServer {
                         drop(socket);
                         continue;
                     }
+                    // The handshake budget starts HERE, at accept (review):
+                    // the permit is already held, so scheduler delay before
+                    // the session task first runs is inside the budget too.
+                    let deadline = tokio::time::Instant::now() + self.config.handshake_timeout;
                     let context = SessionContext {
                         acceptor: self.acceptor.clone(),
                         broker,
@@ -2652,7 +2660,7 @@ impl NativeServer {
                     };
                     sessions.spawn(async move {
                         let _permit = permit;
-                        let _ = serve_connection(socket, peer, context).await;
+                        let _ = serve_connection(socket, peer, context, deadline).await;
                     });
                 }
             }
@@ -2762,6 +2770,7 @@ async fn serve_connection(
     socket: TcpStream,
     _peer: SocketAddr,
     context: SessionContext,
+    deadline: tokio::time::Instant,
 ) -> BrokerResult<()> {
     let SessionContext {
         acceptor,
@@ -2771,9 +2780,48 @@ async fn serve_connection(
         config,
         metrics,
     } = context;
+    // ONE budget for everything before a session exists (review): the
+    // dialect judgment, the TLS accept and the first frame share the
+    // deadline the accept loop computed, so a peer that speaks one byte late
+    // cannot hold a session permit for a budget per stage.
+    // Judged FIRST, within that budget (#294 slice 6): a peer that speaks
+    // the other transport is refused by name and counted as a refused
+    // handshake, instead of failing as a reset on its side and a bad magic
+    // on this one.
+    let judged = tokio::time::timeout_at(
+        deadline,
+        vtop_meta::transport::judge_dialect(
+            &socket,
+            "native",
+            "native_transport",
+            acceptor.is_some(),
+        ),
+    )
+    .await;
+    match judged {
+        Err(_) => {
+            metrics.session_refused_handshake();
+            return Err(BrokerError::Timeout("transport judgment"));
+        }
+        Ok(Err(source)) => {
+            metrics.session_refused_handshake();
+            return Err(BrokerError::Io {
+                path: PathBuf::from("native-accept"),
+                source,
+            });
+        }
+        Ok(Ok(vtop_meta::transport::DialectVerdict::Refused(message))) => {
+            metrics.session_refused_handshake();
+            return Err(BrokerError::CrossMode(message));
+        }
+        Ok(Ok(
+            vtop_meta::transport::DialectVerdict::Agrees
+            | vtop_meta::transport::DialectVerdict::Unjudged,
+        )) => {}
+    }
     let mut stream = match acceptor {
         Some(acceptor) => {
-            let handshake = timeout(config.handshake_timeout, acceptor.accept(socket)).await;
+            let handshake = tokio::time::timeout_at(deadline, acceptor.accept(socket)).await;
             match handshake {
                 Err(_) => {
                     metrics.session_refused_handshake();
@@ -2803,22 +2851,18 @@ async fn serve_connection(
         max_frame_bytes: config.max_frame_bytes,
         max_records: config.max_records_per_frame,
     };
-    let frame = match timeout(
-        config.handshake_timeout,
-        read_frame(&mut stream, initial_limits),
-    )
-    .await
-    {
-        Err(_) => {
-            metrics.session_refused_handshake();
-            return Err(BrokerError::Timeout("protocol handshake"));
-        }
-        Ok(Err(problem)) => {
-            metrics.session_refused_handshake();
-            return Err(problem.into());
-        }
-        Ok(Ok(frame)) => frame,
-    };
+    let frame =
+        match tokio::time::timeout_at(deadline, read_frame(&mut stream, initial_limits)).await {
+            Err(_) => {
+                metrics.session_refused_handshake();
+                return Err(BrokerError::Timeout("protocol handshake"));
+            }
+            Ok(Err(problem)) => {
+                metrics.session_refused_handshake();
+                return Err(problem.into());
+            }
+            Ok(Ok(frame)) => frame,
+        };
     let Some(WireFrame {
         request_id: 0,
         stream_id: 0,
@@ -4655,6 +4699,101 @@ mod tests {
             handshake_timeout: Duration::from_secs(2),
             idle_timeout: Duration::from_secs(2),
         }
+    }
+
+    /// #294 slice 6: a TLS client on a plaintext native plane is refused by
+    /// name — counted as a refused handshake and closed before any frame is
+    /// read — rather than failing as a bad magic that names neither side.
+    #[tokio::test]
+    async fn a_tls_hello_on_a_plaintext_native_plane_is_refused_before_any_frame_is_read() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        struct Nobody;
+        impl SessionAuthorizer for Nobody {
+            fn authorize(&self, _: &[Vec<u8>], _: Uuid, _: Role) -> bool {
+                unreachable!("refused before a hello")
+            }
+            fn authorize_unverified(&self, _: Uuid, _: Role) -> bool {
+                unreachable!("refused before a hello")
+            }
+        }
+        let (_dir, broker, _range) = fixture();
+        let server = NativeServer::plaintext(
+            broker,
+            Arc::new(Nobody),
+            test_server_config(Uuid::from_u128(30)),
+        )
+        .unwrap();
+        let metrics = Arc::clone(server.metrics());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server_task = tokio::spawn(server.serve(listener, shutdown_rx));
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client
+            .write_all(&[0x16, 0x03, 0x01, 0x00, 0x40])
+            .await
+            .unwrap();
+        let mut reply = [0_u8; 8];
+        // Closed unanswered: an end of stream, or the reset a close with
+        // unread bytes produces — never a frame.
+        match client.read(&mut reply).await {
+            Ok(0) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+            other => panic!("expected the socket closed without a frame, got {other:?}"),
+        }
+        assert_eq!(metrics.sessions_refused_handshake_total(), 1);
+        shutdown_tx.send(()).unwrap();
+        server_task.await.unwrap().unwrap();
+    }
+
+    /// #294 slice 6 (review): the dialect judgment, the handshake and the
+    /// first frame share ONE budget. A peer that speaks its first byte just
+    /// inside the budget and nothing more is closed when the budget ends,
+    /// not a budget later.
+    #[tokio::test]
+    async fn the_handshake_budget_is_one_deadline_across_judgment_and_first_frame() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        struct Unasked;
+        impl SessionAuthorizer for Unasked {
+            fn authorize(&self, _: &[Vec<u8>], _: Uuid, _: Role) -> bool {
+                unreachable!("no hello ever arrives")
+            }
+            fn authorize_unverified(&self, _: Uuid, _: Role) -> bool {
+                unreachable!("no hello ever arrives")
+            }
+        }
+        let budget = std::time::Duration::from_millis(1_000);
+        let (_dir, broker, _range) = fixture();
+        let mut config = test_server_config(Uuid::from_u128(30));
+        config.handshake_timeout = budget;
+        let server = NativeServer::plaintext(broker, Arc::new(Unasked), config).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server_task = tokio::spawn(server.serve(listener, shutdown_rx));
+
+        let started = std::time::Instant::now();
+        let mut client = TcpStream::connect(address).await.unwrap();
+        tokio::time::sleep(budget * 7 / 10).await;
+        client.write_all(b"V").await.unwrap();
+        let mut reply = [0_u8; 8];
+        match client.read(&mut reply).await {
+            Ok(0) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+            other => panic!("expected the socket closed without a frame, got {other:?}"),
+        }
+        let held = started.elapsed();
+        assert!(
+            held >= budget * 9 / 10,
+            "closed before the budget ended: {held:?}"
+        );
+        assert!(
+            held < budget * 16 / 10,
+            "held for a budget per stage rather than one: {held:?}"
+        );
+        shutdown_tx.send(()).unwrap();
+        server_task.await.unwrap().unwrap();
     }
 
     async fn open_plaintext_and_hello(

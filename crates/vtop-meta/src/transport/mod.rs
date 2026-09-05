@@ -32,7 +32,10 @@ pub use admin::{
     resolve_endpoint, stub_status, AdminCandidate, AdminClient, AdminHandler, AdminServer,
 };
 pub use authz::{AdminAuthorizer, AdminIdentity, CommandClass, Refusal};
-pub use maybe_tls::MaybeTls;
+pub use maybe_tls::{
+    cross_mode_refusal, judge_dialect, sniff_dialect, tls_handshake_hint, warn_rate_limited,
+    with_tls_handshake_hint, DialectVerdict, MaybeTls, WireDialect,
+};
 pub use peer::{PeerClient, PeerRpcHandler, PeerServer};
 pub use tls::{
     assert_peer_identity, build_client_connector, build_server_acceptor, common_name_from_cert,

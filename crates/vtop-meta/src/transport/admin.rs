@@ -5,7 +5,7 @@
 //! façade. Openraft types never cross this boundary.
 
 use super::authz::{AdminAuthorizer, AdminIdentity, Refusal};
-use super::maybe_tls::MaybeTls;
+use super::maybe_tls::{judge_dialect, tls_handshake_hint, DialectVerdict, MaybeTls};
 use super::tls::{server_name, TlsMaterial};
 use super::wire::{
     read_frame, write_frame, AdminAddLearnerRequest, AdminChangeMembershipRequest, AdminError,
@@ -219,6 +219,14 @@ async fn serve_admin_connection(
     handler: Arc<dyn AdminHandler>,
     authorizer: Arc<AdminAuthorizer>,
 ) -> TransportResult<()> {
+    // Judged before the handshake or the first frame (#294 slice 6): a peer
+    // speaking the other transport is refused by name instead of failing as
+    // a bad magic here and a reset there.
+    if let DialectVerdict::Refused(message) =
+        judge_dialect(&tcp, "admin", "admin_transport", acceptor.is_some()).await?
+    {
+        return Err(TransportError::CrossMode(message));
+    }
     let mut stream = match acceptor {
         Some(acceptor) => MaybeTls::Tls(Box::new(
             acceptor
@@ -1123,7 +1131,12 @@ impl AdminClient {
             connector
                 .connect(name, tcp)
                 .await
-                .map_err(|error| TransportError::Tls(format!("admin connect: {error}")))?
+                .map_err(|error| {
+                    TransportError::Tls(format!(
+                        "admin connect: {error}{}",
+                        tls_handshake_hint(&error)
+                    ))
+                })?
                 .into(),
         )))
     }
@@ -1515,6 +1528,64 @@ mod tests {
         assert_eq!(client.status().await.unwrap().node_id, MetaNodeId(1));
 
         task.abort();
+    }
+
+    /// #294 slice 6: the admin plane refuses a peer speaking the other
+    /// transport by name, in both directions, before any frame or handshake.
+    #[tokio::test]
+    async fn the_admin_plane_refuses_a_cross_mode_peer_naming_both_sides() {
+        use tokio::io::AsyncWriteExt;
+        async fn accepted_with(first_bytes: &[u8]) -> TcpStream {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            client.write_all(first_bytes).await.unwrap();
+            // Held open: the judgment must not depend on a hang-up.
+            std::mem::forget(client);
+            server
+        }
+        let handler = Arc::new(CountingHandler::default()) as Arc<dyn AdminHandler>;
+
+        // A TLS hello on a plaintext plane.
+        let tcp = accepted_with(&[0x16, 0x03, 0x01, 0x00, 0x40]).await;
+        let refused = serve_admin_connection(
+            None,
+            tcp,
+            Arc::clone(&handler),
+            Arc::new(AdminAuthorizer::permissive()),
+        )
+        .await
+        .unwrap_err();
+        let TransportError::CrossMode(message) = refused else {
+            panic!("expected a cross-mode refusal, got {refused}")
+        };
+        assert!(
+            message.contains("opened a TLS handshake")
+                && message.contains("`admin_transport: plaintext`"),
+            "{message}"
+        );
+
+        // A plaintext frame on a TLS plane.
+        let pki = SharedPki::new();
+        let acceptor = crate::transport::tls::build_server_acceptor(pki.server_material()).unwrap();
+        let tcp = accepted_with(b"VTPM\0\x01").await;
+        let refused = serve_admin_connection(
+            Some(acceptor),
+            tcp,
+            handler,
+            Arc::new(AdminAuthorizer::permissive()),
+        )
+        .await
+        .unwrap_err();
+        let TransportError::CrossMode(message) = refused else {
+            panic!("expected a cross-mode refusal, got {refused}")
+        };
+        assert!(
+            message.contains("sent a plaintext frame")
+                && message.contains("`admin_transport: tls`"),
+            "{message}"
+        );
     }
 
     /// The escape hatch works, and has to be typed to get it.

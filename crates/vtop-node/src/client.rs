@@ -126,7 +126,12 @@ async fn connect(config: &ClientConfig, addr: &str, role: Role) -> Result<Sessio
                 connector
                     .connect(name, socket)
                     .await
-                    .map_err(|error| format!("tls {addr}: {error}"))?
+                    .map_err(|error| {
+                        format!(
+                            "tls {addr}: {error}{}",
+                            vtop_meta::transport::tls_handshake_hint(&error)
+                        )
+                    })?
                     .into(),
             ))
         }
@@ -527,7 +532,12 @@ pub async fn replica_status(
                 connector
                     .connect(name, socket)
                     .await
-                    .map_err(|error| format!("tls {addr}: {error}"))?
+                    .map_err(|error| {
+                        format!(
+                            "tls {addr}: {error}{}",
+                            vtop_meta::transport::tls_handshake_hint(&error)
+                        )
+                    })?
                     .into(),
             ))
         }
