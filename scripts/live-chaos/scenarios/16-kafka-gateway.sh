@@ -66,17 +66,18 @@ kafka_exchange() {
 }
 
 # ApiVersions v0, correlation 7, client id "chaos": the reply carries the
-# correlation back, no error, and the six served api keys — the phase-1
-# five and InitProducerId (key 22, v0..=1; #457 slice 1), whose entry is
-# checked by its bytes so a gateway that forgot it is caught here.
+# correlation back, no error, and the thirteen served api keys — the
+# phase-1 five, InitProducerId (key 22, v0..=1; #457 slice 1), whose entry is
+# checked by its bytes so a gateway that forgot it is caught here, and the
+# group protocol's seven (#457 slice 2).
 REPLY="$(kafka_exchange "001200000000000700056368616f73")"
 [[ "$REPLY" == 000000070000* ]] \
   || fail "ApiVersions v0 did not answer correlation 7 without error: $REPLY"
-[[ "$REPLY" == 00000007000000000006* ]] \
-  || fail "ApiVersions v0 did not list six api keys: $REPLY"
+[[ "$REPLY" == 0000000700000000000d* ]] \
+  || fail "ApiVersions v0 did not list thirteen api keys: $REPLY"
 [[ "$REPLY" == *001600000001* ]] \
   || fail "ApiVersions v0 did not list InitProducerId v0..=1 (0016 0000 0001): $REPLY"
-log "ApiVersions v0 answered: correlation echoed, no error, six api keys served (InitProducerId among them)"
+log "ApiVersions v0 answered: correlation echoed, no error, thirteen api keys served (InitProducerId and the group protocol among them)"
 
 # Metadata v1, correlation 8, every topic (a null array): the reply names
 # the range's topic and this gateway as its one broker.

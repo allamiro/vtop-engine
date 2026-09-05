@@ -1467,6 +1467,7 @@ async fn run_leader(
             kafka_drain = gateway_config.drain_timeout
                 + gateway_config.max_produce_wait
                 + gateway_config.max_fetch_wait
+                + gateway_config.max_offset_wait
                 + Duration::from_secs(1);
             let gateway = vtop_kafka::Gateway::new(Arc::new(bridge), gateway_config);
             let kafka_shutdown = shutdown.clone();
