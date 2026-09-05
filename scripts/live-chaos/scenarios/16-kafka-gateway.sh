@@ -17,8 +17,9 @@ source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 require_binaries
 init_workdir
 
-KAFKA_PORT="${CHAOS_KAFKA_PORT:-$((NATIVE_PORT + 20))}"
-require_integer_in_range CHAOS_KAFKA_PORT "$KAFKA_PORT" 1024 65535
+# kafka-0 of the lib's port families: judged for collisions in preflight
+# with every other listener, moved with CHAOS_KAFKA_BASE_PORT.
+KAFKA_PORT="$(kafka_port 0)"
 
 CFG="$WORKDIR/data-standalone-kafka.yaml"
 {

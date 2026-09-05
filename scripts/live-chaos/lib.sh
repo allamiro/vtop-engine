@@ -63,6 +63,10 @@ META_PEER_BASE_PORT="${CHAOS_META_PEER_BASE_PORT:-9100}"
 META_ADMIN_BASE_PORT="${CHAOS_META_ADMIN_BASE_PORT:-9200}"
 REPLICA_BASE_PORT="${CHAOS_REPLICA_BASE_PORT:-9300}"
 NATIVE_PORT="${CHAOS_NATIVE_PORT:-9400}"
+# The Kafka gateway listeners (#225): kafka-0 for the standalone of scenario
+# 16, kafka-1 for the leader of scenario 17. Above the candidate natives
+# (NATIVE_PORT + 11..13) so the default layout has no overlap.
+KAFKA_BASE_PORT="${CHAOS_KAFKA_BASE_PORT:-$((NATIVE_PORT + 20))}"
 # Observability endpoints (#224). Every node gets one so scenarios can gate on
 # /readyz instead of grepping stdout: a ready marker is a one-shot edge, and a
 # scenario that needs to know whether a node is STILL ready after a partition or
@@ -148,6 +152,7 @@ preflight_settings() {
   # so the ceiling leaves that headroom — the same reasoning as the metrics
   # bases below.
   require_integer_in_range CHAOS_NATIVE_PORT "$NATIVE_PORT" 1024 65522
+  require_integer_in_range CHAOS_KAFKA_BASE_PORT "$KAFKA_BASE_PORT" 1024 65534
   # Ceilings are the highest port each family actually derives: metadata ids
   # run 1..5 so the top base is 65535-5, and data indices run 0..3 — index 3 is
   # the replacement replica (#242) — so the top base is 65535-3. A tighter bound
@@ -179,6 +184,10 @@ preflight_settings() {
   done
   labels+=("native")
   endpoints+=("$(native_addr)")
+  for id in 0 1; do
+    labels+=("kafka-$id")
+    endpoints+=("$(kafka_addr "$id")")
+  done
   for id in 0 1 2 3; do
     labels+=("data-metrics-$id")
     endpoints+=("$(data_metrics_addr "$id")")
@@ -1421,6 +1430,11 @@ start_colocated_node() {
 # above performs.
 
 candidate_native_addr() { echo "$DATA_HOST:$((NATIVE_PORT + 10 + $1))"; }
+# Loopback by name, not $DATA_HOST (review): the Kafka listener is bound and
+# dialled on 127.0.0.1 by both scenarios (the gateway admits whoever reaches
+# it), so the collision scan must judge the port on the host that will use it.
+kafka_addr() { echo "127.0.0.1:$((KAFKA_BASE_PORT + $1))"; }
+kafka_port() { echo "$((KAFKA_BASE_PORT + $1))"; }
 
 candidate_identity() { # <n: 1|2|3> — echoes "<uuid> <cert-basename>"
   case "$1" in

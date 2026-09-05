@@ -1196,6 +1196,13 @@ jobs:
             echo "note: sysctl unavailable on this image; relying on the probe"
           unshare -rm bash -c 'mount -t tmpfs -o size=1m tmpfs /mnt && echo "mount namespaces OK"'
 
+      # Scenario 17 drives the Kafka gateway with a stock client: kafkacat is
+      # librdkafka, the library under every non-JVM Kafka client (#225).
+      - name: Install a stock Kafka client for scenario 17
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq kafkacat
+
       - name: Build harness binaries
         run: |
           cargo build -p vtop-node --bin vtop-node
