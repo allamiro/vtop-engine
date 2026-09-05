@@ -146,6 +146,30 @@ def test_apply_checks_the_proxy_replaces_our_toxics_and_installs_the_shape():
     assert [b["name"] for _, _, b in client.calls[5:]] == list(TOXIC_NAMES)
 
 
+def test_a_foreign_toxic_on_the_proxy_is_refused_by_name():
+    class Occupied(ScriptedClient):
+        def request(self, method, path, body=None):
+            status, payload = super().request(method, path, body)
+            if method == "GET":
+                payload = dict(payload, toxics=[
+                    {"name": "vtop_latency_up", "enabled": True},   # ours: replaced, not refused
+                    {"name": "someones_slow_close", "enabled": True},
+                ])
+            return status, payload
+
+    with pytest.raises(ShapingError, match="someones_slow_close"):
+        apply(Shape("http://x", "minio", 1250, 0, 0), Occupied())
+
+    class OnlyOurs(ScriptedClient):
+        def request(self, method, path, body=None):
+            status, payload = super().request(method, path, body)
+            if method == "GET":
+                payload = dict(payload, toxics=[{"name": "vtop_bandwidth_up", "enabled": True}])
+            return status, payload
+
+    apply(Shape("http://x", "minio", 1250, 0, 0), OnlyOurs())
+
+
 def test_a_missing_proxy_names_the_file_that_registers_it():
     client = ScriptedClient(statuses={("GET", "/proxies/minio"): 404})
     with pytest.raises(ShapingError, match="toxiproxy.json"):

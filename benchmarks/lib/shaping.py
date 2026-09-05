@@ -205,6 +205,16 @@ def apply(shape: Shape, client: ToxiproxyClient, endpoint: str | None = None) ->
             "from benchmarks/toxiproxy.json at startup")
     if status != 200:
         raise ShapingError(f"toxiproxy answered HTTP {status} for proxy {shape.proxy!r}")
+    # A toxic that is not ours (review) would stack with the shape and go
+    # unrecorded: refused by name, never measured through.
+    foreign = sorted(
+        str(t.get("name")) for t in ((proxy or {}).get("toxics") or [])
+        if isinstance(t, dict) and t.get("name") not in TOXIC_NAMES and t.get("enabled", True))
+    if foreign:
+        raise ShapingError(
+            f"proxy {shape.proxy!r} already carries toxic(s) {foreign} that are not this "
+            "harness's: they would shape the run on top of the scenario's shape and the "
+            "summary would not say so — remove them, or run without this proxy")
     if endpoint is not None:
         listener = _listener_port((proxy or {}).get("listen"))
         wanted = _port_of(endpoint)
