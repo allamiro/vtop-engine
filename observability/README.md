@@ -78,8 +78,40 @@ GET /readyz    readiness
 | `vtop_compression_ratio` | histogram | Compression effectiveness |
 | `vtop_inflight_batches` | gauge | Accumulated but not sealed |
 | `vtop_source_read_errors_total` | counter | An unhealthy source, which is otherwise invisible |
+| `vtop_retention_lost_records_total{tenant,source_type}` | counter | Records the broker's retention removed before the engine read them — **never archived; any increase is an incident** (#98, #454). Charted on the engine dashboard's retention-loss row; the one provisioned alert fires on it. See [retention loss](#retention-loss). |
 | `vtop_upload_throttled_total{stage}` | counter | The store asking for less concurrency, not more retries (#102) |
 | `vtop_upload_width` | gauge | Uploads in flight this cycle: the configured width, or the adaptive controller's (#102) |
+
+### Retention loss
+
+`vtop_retention_lost_records_total` counts records a Kafka source lost to the
+broker's retention before the engine read them. The engine detects the loss
+when a fetch is refused as out of range below the topic's oldest offset, counts
+the gap, resets to the new oldest offset and logs a WARN naming the rule:
+*retention removed records this source had not read: the commit rule covers
+records the engine read, and these were never read, never manifested and never
+verified.* The #98 soak saw it fire once, for 27,582,996 records, when a 120 s
+retention outran an engine reading 6k rec/s against a 200k rec/s inflow.
+
+Those records will never be archived; the engine cannot prevent that, only
+name it. The remedy is operational: size retention above the worst-case lag
+(`retention.ms` well past how long the engine may fall behind), and watch the
+Kafka dashboard's lag against it. The alert rule **Records lost to retention**
+fires on any increase; the engine dashboard's retention-loss row shows the
+total and when it happened.
+
+Two things about that counter are deliberate. The engine **primes** it (and
+`vtop_source_read_errors_total`) at zero for every `(tenant, source_type)` pair
+it can charge — the default tenant and each configured stream's tenant, per
+enabled source — when it starts, because a counter whose first sample is
+already the loss shows no `increase()`: the first incident would be the one
+the alert missed. The rule's query also admits a series at its first
+appearance, for an engine older than the primer. And the counter is
+**process-local**, like every counter this exporter serves: an engine that
+restarts within one scrape interval of a loss takes the loss with it, and the
+dashboard's total starts again from zero. The durable record of a loss is the
+WARN line the adapter logs, which Loki keeps; the counter and the alert are
+how you notice it.
 
 ### Design decisions worth knowing
 
@@ -152,7 +184,14 @@ panel.
 - `MINIO_PROMETHEUS_AUTH_TYPE=public` disables auth on MinIO's metrics endpoint —
   **never do that outside a lab**;
 - Alloy holds a (read-only) docker socket to discover containers and read logs;
-- no alerting rules yet.
+- one alert rule, file-provisioned from
+  `grafana/provisioning/alerting/vtop-alerts.yaml`: **Records lost to
+  retention** fires on any increase of `vtop_retention_lost_records_total`
+  (#454). No contact point is provisioned, so it shows in Grafana's alert list
+  and on the engine dashboard, and goes nowhere else — wire a contact point and
+  a notification policy for a real deployment. Grafana creates the rule's
+  `VTOP` folder at boot; the dashboard seeder adopts it, so the rule and the
+  dashboards share one folder.
 
 See [`docs/PRODUCTION_HA.md`](../docs/PRODUCTION_HA.md) for what a
 production topology requires.

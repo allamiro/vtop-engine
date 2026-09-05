@@ -1326,6 +1326,8 @@ impl Engine {
             }
         }
 
+        prime_source_counters(&config, &streams, adapters.keys());
+
         let width = WidthController::new(
             config.batching.max_concurrent_batches,
             config.batching.adaptive_width.min_width,
@@ -2246,6 +2248,41 @@ fn tenant_for_source(streams: &StreamsConfig, default_tenant: &str, source_name:
         .unwrap_or_else(|| default_tenant.to_string())
 }
 
+/// Every `(tenant, source_type)` pair the engine can charge a read error or a
+/// retention loss to gets its counter children at zero before the first read
+/// (#454). A counter child that first appears already at N has no earlier
+/// sample, so `increase()` and `rate()` over it are empty for that first — and,
+/// for a one-off loss, only — step: the alert on retention loss would never
+/// fire for a fresh deployment's first incident. Primed, the first loss is a
+/// step from zero. The pairs are the ones `tenant_for_source` can resolve to:
+/// the engine default and each configured stream's tenant, per enabled source.
+fn prime_source_counters<'a>(
+    config: &VtopConfig,
+    streams: &StreamsConfig,
+    source_types: impl Iterator<Item = &'a SourceType>,
+) {
+    let Some(mx) = telemetry::metrics() else {
+        return;
+    };
+    for source_type in source_types {
+        let mut tenants: Vec<&str> = vec![config.engine.tenant.as_str()];
+        tenants.extend(
+            streams
+                .streams
+                .iter()
+                .filter(|s| s.source_type == *source_type)
+                .map(|s| s.tenant.as_str()),
+        );
+        tenants.sort_unstable();
+        tenants.dedup();
+        for tenant in tenants {
+            let labels = [tenant, source_type.as_str()];
+            let _ = mx.source_read_errors_total.with_label_values(&labels);
+            let _ = mx.retention_lost_records_total.with_label_values(&labels);
+        }
+    }
+}
+
 /// Default format for an adapter, taken from the first matching stream of that
 /// source type, falling back to `Raw`.
 fn default_format_for(
@@ -2589,6 +2626,63 @@ mod tests {
     /// The throttle counter is process-wide, so tests that throttle the mock
     /// and read deltas of it run one at a time.
     static THROTTLE_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A counter whose first sample is already the loss shows no increase
+    /// (#454, review): building the engine primes both per-source counters at
+    /// zero for every tenant/source pair it can charge, read back here through
+    /// the registry as a scrape would.
+    #[tokio::test]
+    async fn source_counters_are_primed_at_zero_before_the_first_read() {
+        let mx = telemetry::init().unwrap();
+        fn primed(family: &str, tenant: &str) -> Option<u64> {
+            let mx = telemetry::init().unwrap();
+            mx.registry
+                .gather()
+                .iter()
+                .filter(|f| f.name().ends_with(family))
+                .flat_map(|f| f.get_metric().iter())
+                .find(|m| {
+                    let labels = m.get_label();
+                    labels
+                        .iter()
+                        .any(|l| l.name() == "tenant" && l.value() == tenant)
+                        && labels
+                            .iter()
+                            .any(|l| l.name() == "source_type" && l.value() == "file")
+                })
+                .map(|m| m.get_counter().get_value() as u64)
+        }
+        let _ = mx;
+        assert!(
+            primed("retention_lost_records_total", "primed-default").is_none(),
+            "nothing is charged before an engine exists"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        let input = dir.path().join("in.log");
+        std::fs::write(&input, "a line\n").unwrap();
+        let mut cfg = file_config(
+            work.to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        cfg.engine.tenant = "primed-default".into();
+        let streams = StreamsConfig { streams: vec![] };
+        let _engine = Engine::new(cfg, streams).await.unwrap();
+
+        assert_eq!(
+            primed("retention_lost_records_total", "primed-default"),
+            Some(0),
+            "the default tenant's loss counter exists at zero before any read"
+        );
+        assert_eq!(
+            primed("source_read_errors_total", "primed-default"),
+            Some(0),
+            "and so does its read-error counter"
+        );
+    }
 
     #[tokio::test]
     async fn a_throttled_upload_is_counted_apart_and_the_batch_is_not_committed() {

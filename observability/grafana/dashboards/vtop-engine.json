@@ -922,6 +922,123 @@
         "sortOrder": "Descending"
       },
       "id": 22
+    },
+    {
+      "type": "row",
+      "title": "Retention loss (records the broker removed before the engine read them)",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 48
+      },
+      "collapsed": false,
+      "panels": [],
+      "id": 23
+    },
+    {
+      "type": "stat",
+      "title": "Lost to retention (total)",
+      "description": "Records a Kafka source lost to the broker's retention before the engine read them (#98, #454). The engine counts them and logs a WARN naming the rule; nothing else on this dashboard shows them, and they will never be archived. Any non-zero value is an incident: size retention above worst-case lag, or catch the engine up. The alert rule 'Records lost to retention' fires on any increase.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 6,
+        "x": 0,
+        "y": 49
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "sum(vtop_retention_lost_records_total{tenant=~\"$tenant\", source_type=~\"$source_type\"}) or vector(0)",
+          "legendFormat": "lost"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNonNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "text": {
+          "valueSize": 22
+        },
+        "textMode": "value",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "showPercentChange": false,
+        "wideLayout": true
+      },
+      "pluginVersion": "13.1.0",
+      "id": 24
+    },
+    {
+      "type": "timeseries",
+      "title": "Records lost to retention (per minute)",
+      "description": "When the loss happened and how much of it: the broker removes whole segments, so this arrives in steps, one per retention pass that outran the engine. Read it against the Kafka dashboard's lag: loss follows lag that exceeded the topic's retention. (No $format filter: the loss is counted before any record is parsed.)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 18,
+        "x": 6,
+        "y": 49
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          },
+          "expr": "sum by (tenant, source_type) (increase(vtop_retention_lost_records_total{tenant=~\"$tenant\", source_type=~\"$source_type\"}[1m]))",
+          "legendFormat": "{{tenant}}/{{source_type}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {},
+      "id": 25
     }
   ]
 }
