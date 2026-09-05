@@ -204,6 +204,18 @@ fn load_config(path: &Path) -> Result<NodeClientConfig, String> {
     if config.replicas.is_empty() {
         return Err(format!("{} lists no replicas", path.display()));
     }
+    // One entry per replica (review): a node listed twice would be asked
+    // twice, and a set with a repeat would pass for the whole set.
+    let mut seen = std::collections::BTreeSet::new();
+    for replica in &config.replicas {
+        if !seen.insert(replica.node_uuid) {
+            return Err(format!(
+                "{} lists replica {} more than once; each replica is one entry",
+                path.display(),
+                replica.node_uuid
+            ));
+        }
+    }
     if config
         .replicas
         .iter()
@@ -1374,6 +1386,28 @@ fn common_config_hint() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #240 (review): a node listed twice is refused, so a set is one entry
+    /// per replica before anything is asked of it.
+    #[test]
+    fn a_replicas_config_naming_one_node_twice_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replicas.yaml");
+        std::fs::write(
+            &path,
+            "range: { topic: t, topic_epoch: 1, range_id: 00000000-0000-0000-0000-000000000001, range_generation: 1 }\n\
+             ca_cert: ca.pem\nclient_cert: c.pem\nclient_key: k.pem\n\
+             replicas:\n\
+               - { node_uuid: 00000000-0000-0000-0000-00000000000a, addr: \"127.0.0.1:1\", server_name: a }\n\
+               - { node_uuid: 00000000-0000-0000-0000-00000000000a, addr: \"127.0.0.1:2\", server_name: a }\n",
+        )
+        .unwrap();
+        let refused = load_config(&path).unwrap_err();
+        assert!(
+            refused.contains("more than once") && refused.contains("0000000a"),
+            "{refused}"
+        );
+    }
 
     /// #240 (review): the replicas config must be for the range being
     /// audited, or its vectors would be read as that range's.
