@@ -37,6 +37,7 @@ pub fn file_config(
             ledger_prune_batch: 500,
         },
         batching: BatchingConfig {
+            adaptive_width: Default::default(),
             max_records: 10_000,
             max_bytes: 104_857_600,
             max_batch_age_seconds: 60,
@@ -147,6 +148,7 @@ pub fn pipeline<'a>(
     config: &'a VtopConfig,
 ) -> Pipeline<'a> {
     Pipeline {
+        throttles: Arc::default(),
         store,
         backend,
         config,

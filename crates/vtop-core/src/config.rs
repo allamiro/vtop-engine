@@ -298,6 +298,39 @@ pub struct BatchingConfig {
     /// cannot weaken it.
     #[serde(default = "default_max_concurrent_batches")]
     pub max_concurrent_batches: usize,
+    /// Let the upload width follow the object store's throttles (#102).
+    #[serde(default)]
+    pub adaptive_width: AdaptiveWidthConfig,
+}
+
+/// The adaptive upload width (#102): `max_concurrent_batches` becomes the
+/// CEILING, and each cycle the store answered with a throttle halves the
+/// width in flight while each clean cycle grows it by one, never below
+/// `min_width`. Off by default — the ceiling is then the width, as before —
+/// because a controller tuned against a store nobody is loading converges to
+/// its initial guess and looks like it works.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdaptiveWidthConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// The floor the width never goes below, however hard the store
+    /// throttles: forward progress must stay possible, which is the piece
+    /// the reverted poll-window heuristic (#99) was missing.
+    #[serde(default = "default_min_width")]
+    pub min_width: usize,
+}
+
+impl Default for AdaptiveWidthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_width: default_min_width(),
+        }
+    }
+}
+
+fn default_min_width() -> usize {
+    1
 }
 
 fn default_max_records() -> usize {
@@ -649,6 +682,16 @@ impl VtopConfig {
                  instead of backing off"
                     .into(),
             ));
+        }
+        if self.batching.adaptive_width.min_width == 0
+            || self.batching.adaptive_width.min_width > self.batching.max_concurrent_batches
+        {
+            return Err(VtopError::Config(format!(
+                "batching.adaptive_width.min_width must be between 1 and \
+                 batching.max_concurrent_batches ({}): a floor of zero would flush nothing, and \
+                 one above the ceiling is not a floor",
+                self.batching.max_concurrent_batches
+            )));
         }
         if self.batching.max_concurrent_batches == 0 {
             return Err(VtopError::Config(

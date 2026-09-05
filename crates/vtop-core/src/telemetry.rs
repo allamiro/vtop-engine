@@ -85,6 +85,10 @@ pub struct Metrics {
     /// Batches accumulated but not yet sealed. A gauge that climbs without
     /// bound means sealing has stalled.
     pub inflight_batches: IntGauge,
+    /// Uploads the engine keeps in flight this cycle (#102): the configured
+    /// width, or the adaptive controller's current one. Read beside
+    /// `upload_throttled_total`: a width that fell is a store that asked.
+    pub upload_width: IntGauge,
     /// Cycles where a source read failed and was skipped (the engine retries
     /// next cycle). A steady rate means a source is unhealthy.
     ///
@@ -248,6 +252,11 @@ impl Metrics {
             "Batches accumulated in memory but not yet sealed",
         ))?;
         registry.register(Box::new(inflight_batches.clone()))?;
+        let upload_width = IntGauge::with_opts(Opts::new(
+            "upload_width",
+            "Uploads kept in flight this cycle: the configured width, or the adaptive controller's current width when batching.adaptive_width is enabled",
+        ))?;
+        registry.register(Box::new(upload_width.clone()))?;
 
         Ok(Self {
             registry,
@@ -265,6 +274,7 @@ impl Metrics {
             batch_duration_seconds,
             compression_ratio,
             inflight_batches,
+            upload_width,
             source_read_errors_total,
             retention_lost_records_total,
             upload_throttled_total,
