@@ -59,6 +59,17 @@ pub trait LeasePublisher: Send + Sync {
     /// the boundary a quorum proved (`None` for a standalone range, which has
     /// no quorum to prove anything).
     fn promote(&self, fencing_epoch: u64, committed_offset: Option<u64>);
+    /// A renewal succeeded at `fencing_epoch`, which the publisher already
+    /// promoted. Default no-op: for most publishers a renewal changes
+    /// nothing they own. The broker publisher overrides it to re-offer the
+    /// boundary marker (#240 slice 3, review): promotion is verified once
+    /// per epoch transition, so `promote` does NOT run on renewals — a
+    /// marker that exhausted its budget against unreachable followers
+    /// would otherwise never be offered again, leaving the watermark
+    /// pinned below the tail for the rest of the epoch. This hook is the
+    /// per-renewal heartbeat that closes that gap, and it must stay cheap:
+    /// it runs every renew interval on a healthy range.
+    fn renewed(&self, _fencing_epoch: u64) {}
     /// This node no longer holds the range at `fencing_epoch` — metadata has
     /// moved on (a rival grant, a refused renewal, a released lease). The
     /// epoch is finished for this process.
@@ -485,6 +496,39 @@ impl BrokerLeasePublisher {
             marker_published_for: std::sync::atomic::AtomicU64::new(0),
         }
     }
+
+    /// Fire the boundary marker if it is due: unconditionally on a `forced`
+    /// offer (a newly adopted epoch), otherwise only while the local
+    /// committed tail stands above the published watermark — the signature
+    /// of a marker (or any own-epoch entry) that never reached a quorum.
+    /// Republication is idempotent: the duplicate path re-fans-out from
+    /// the original offset, so re-offering an already-standing marker
+    /// costs one round trip and changes nothing. On a healthy range the
+    /// tail equals the watermark and this is a no-op, which is what lets
+    /// it run on every renewal. A contended offset read skips this round —
+    /// the next renewal is the retry. One attempt is in flight at a time
+    /// (review): the flag is taken before spawning and released by the
+    /// attempt itself on every exit path, so short renew intervals cannot
+    /// stack blocking retry budgets.
+    fn offer_marker(&self, fencing_epoch: u64, forced: bool) {
+        let unpublished_tail = || {
+            self.broker
+                .cluster_committed()
+                .zip(self.broker.try_local_offsets())
+                .is_some_and(|(cell, (committed, _))| cell.get() < committed)
+        };
+        if (forced || unpublished_tail())
+            && !self
+                .marker_in_flight
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            publish_boundary_marker_until_settled(
+                Arc::clone(&self.broker),
+                Arc::clone(&self.marker_in_flight),
+                fencing_epoch,
+            );
+        }
+    }
 }
 
 impl LeasePublisher for BrokerLeasePublisher {
@@ -525,43 +569,31 @@ impl LeasePublisher for BrokerLeasePublisher {
         // window between the two writes fails closed — but both must happen.
         self.broker.adopt_fencing_epoch(fencing_epoch);
         self.broker.meta_fencing_epoch().set(fencing_epoch);
-        // ONCE PER EPOCH — promote() also runs on every renewal, and
-        // re-firing there would fan a duplicate append to the followers
-        // every renew interval for a boundary already standing. A
-        // same-epoch reactivation after a suspension skips it too: the
-        // marker either landed on the first promote or exhausted its
-        // budget, and the produce path's own-epoch quorum covers the
-        // remainder either way.
+        // FORCED once per epoch — a same-epoch re-promotion after a
+        // suspension must not unconditionally re-fan the marker append at
+        // the followers. Keyed HERE, not on the broker's held epoch: a
+        // static-epoch leader is constructed already holding its granted
+        // epoch, so adoption never reads as new there. An epoch whose
+        // forced offer was swallowed — the in-flight guard coalescing it
+        // into a dying older-epoch attempt (review) — is not lost:
+        // [`Self::renewed`] re-offers on every renewal while the tail
+        // stands unpublished, and this epoch is the current one it names.
         let newly_adopted_epoch = self
             .marker_published_for
             .fetch_max(fencing_epoch, std::sync::atomic::Ordering::SeqCst)
             < fencing_epoch;
-        // RE-ARMED while the tail stays unpublished (review): a marker that
-        // reached nobody inside its budget — followers down, a full command
-        // channel — leaves the local tail above the watermark, and a gate
-        // that fired strictly once per epoch would never offer it again
-        // even after the followers return. Each renewal re-fires while
-        // that gap stands; republication is idempotent (the duplicate path
-        // re-fans-out from the original offset), and on a healthy range
-        // the tail equals the watermark so steady state never re-fires. A
-        // contended offset read skips this round — the next renewal is the
-        // retry.
-        let unpublished_tail = !newly_adopted_epoch
-            && self
-                .broker
-                .cluster_committed()
-                .zip(self.broker.try_local_offsets())
-                .is_some_and(|(cell, (committed, _))| cell.get() < committed);
-        if (newly_adopted_epoch || unpublished_tail)
-            && !self
-                .marker_in_flight
-                .swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
-            publish_boundary_marker_until_settled(
-                Arc::clone(&self.broker),
-                Arc::clone(&self.marker_in_flight),
-                fencing_epoch,
-            );
+        self.offer_marker(fencing_epoch, newly_adopted_epoch);
+    }
+
+    fn renewed(&self, fencing_epoch: u64) {
+        // THE RENEWAL-PATH RE-OFFER (review): `promote` runs once per
+        // epoch transition, not per renewal, so a marker that exhausted
+        // its budget against unreachable followers — or was coalesced away
+        // by an attempt still draining for a fenced older epoch — must be
+        // re-offered from HERE or it never will be. Unforced: on a healthy
+        // range the tail equals the watermark and this is two atomic loads.
+        if self.broker.boundary_marker_supported() {
+            self.offer_marker(fencing_epoch, false);
         }
     }
 
@@ -728,6 +760,14 @@ impl Promoter {
     /// boundary first if this epoch has not been verified yet.
     async fn ensure(&mut self, fencing_epoch: u64) -> bool {
         if self.verified_epoch == Some(fencing_epoch) {
+            // What this short-circuit spares is the PROBE — re-verifying an
+            // unchanged epoch every renewal is pure cost (below). The
+            // publisher still gets the renewal tick (review): without it,
+            // `promote` never runs again this epoch, and a boundary marker
+            // that exhausted its retry budget while the followers were
+            // down would stay unpublished forever — the watermark pinned
+            // below the tail until the next produce happens to land.
+            self.publisher.renewed(fencing_epoch);
             return true;
         }
         let committed_offset = match self.probe.as_ref() {
@@ -2066,9 +2106,12 @@ mod tests {
     /// A marker that reached nobody is offered again once the tail sits
     /// above the watermark (review): the once-per-epoch gate alone would
     /// never re-fire after the retry budget died against unreachable
-    /// followers, wedging an idle range forever. A renewal with the gap
-    /// standing republishes — idempotently, from the original offset — and
-    /// a healthy range (tail equals watermark) never re-fires.
+    /// followers, wedging an idle range forever. THROUGH `renewed`, not a
+    /// second `promote` (review) — promotion is verified once per epoch
+    /// transition, so renewals never reach `promote` in production; the
+    /// per-renewal hook is the only path that can carry this re-offer. It
+    /// republishes idempotently, from the original offset, and a healthy
+    /// range (tail equals watermark) never re-fires.
     #[test]
     fn a_marker_nobody_reached_refires_on_the_next_renewal() {
         let (_dirs, publisher, broker, cluster, followers) =
@@ -2091,7 +2134,7 @@ mod tests {
         for follower in &followers {
             follower.set_online(true);
         }
-        publisher.promote(18, None);
+        publisher.renewed(18);
         assert_eq!(
             cluster.get(),
             1,
@@ -2105,13 +2148,17 @@ mod tests {
         );
     }
 
-    /// promote() runs on every renewal; the marker must not.
+    /// Neither a same-epoch re-promotion nor the per-renewal hook may fan
+    /// a duplicate append while the marker already stands: on a healthy
+    /// range the tail equals the watermark, so every repeat offer is a
+    /// no-op.
     #[test]
     fn a_renewal_does_not_republish_the_marker() {
         let (_dirs, publisher, broker, cluster) = replicated_publisher(18);
         publisher.promote(18, None);
         publisher.promote(18, None);
-        publisher.promote(18, None);
+        publisher.renewed(18);
+        publisher.renewed(18);
         let (_, next_offset) = broker.local_offsets();
         assert_eq!(
             next_offset, 1,
@@ -2358,6 +2405,7 @@ mod tests {
     #[derive(Default)]
     struct Recorder {
         promoted: std::sync::Mutex<Vec<(u64, Option<u64>)>>,
+        renewed: std::sync::Mutex<Vec<u64>>,
         demoted: std::sync::Mutex<Vec<u64>>,
         suspended: std::sync::Mutex<Vec<u64>>,
     }
@@ -2368,6 +2416,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((fencing_epoch, committed_offset));
+        }
+        fn renewed(&self, fencing_epoch: u64) {
+            self.renewed.lock().unwrap().push(fencing_epoch);
         }
         fn demote(&self, fencing_epoch: u64) {
             self.demoted.lock().unwrap().push(fencing_epoch);
@@ -2868,6 +2919,42 @@ mod tests {
         );
         assert!(promoter.ensure(5).await);
         assert_eq!(*recorder.promoted.lock().unwrap(), vec![(5, Some(90))]);
+    }
+
+    /// A renewal at an already-verified epoch skips the probe but still
+    /// ticks the publisher (review). Verification is once per epoch
+    /// transition, so `promote` never runs again this epoch — without the
+    /// tick, a boundary marker that exhausted its retry budget while the
+    /// followers were down would never be offered again, and the watermark
+    /// would sit below the tail until the next produce happened to land.
+    #[tokio::test]
+    async fn a_renewal_at_a_verified_epoch_ticks_the_publisher_without_reprobing() {
+        let recorder = Arc::new(Recorder::default());
+        let probe = fixed(vec![at(1, Some(90)), at(2, Some(90)), at(3, Some(50))], 3);
+        let mut promoter = promoter(
+            Arc::clone(&recorder) as Arc<dyn LeasePublisher>,
+            Some(Arc::clone(&probe) as Arc<dyn QuorumProbe>),
+        );
+        assert!(promoter.ensure(5).await);
+        assert!(promoter.ensure(5).await);
+        assert!(promoter.ensure(5).await);
+        assert_eq!(
+            probe.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "an unchanged epoch is verified once — re-probing every renewal is the \
+             cost the short-circuit exists to spare"
+        );
+        assert_eq!(
+            *recorder.promoted.lock().unwrap(),
+            vec![(5, Some(90))],
+            "promotion publishes once per epoch transition"
+        );
+        assert_eq!(
+            *recorder.renewed.lock().unwrap(),
+            vec![5, 5],
+            "each short-circuited renewal must still reach the publisher, or a marker \
+             that exhausted its budget is never re-offered"
+        );
     }
 
     /// A standalone range has no quorum to establish against and must still
