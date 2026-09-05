@@ -14,6 +14,7 @@ use vtop_meta::{
     resolve_endpoint, AdminCandidate, AdminClient, AdminStatusResponse, MetaNodeId,
     MetadataCommand, MetadataResponse, TlsMaterial, WireLogId,
 };
+use vtop_meta::{AdminTransitionView, GrantKind, PromotionOutcome, TransitionOutcome};
 
 #[derive(Subcommand, Debug)]
 pub enum MetaCommand {
@@ -82,6 +83,31 @@ pub enum MetaCommand {
         topic_uuid: Uuid,
         #[arg(long)]
         range_uuid: Uuid,
+    },
+    /// The range's leadership-transition chain (#240 item 5), audited: each
+    /// link's epoch continuity, each established promotion's vote recomputed
+    /// from the quorum it recorded, and — given --mac-key-env — each
+    /// statement's MAC verified against the range identity asked for here,
+    /// never one carried in the reply. Exits non-zero when any check fails.
+    Transitions {
+        #[command(flatten)]
+        common: MetaCommonArgs,
+        #[arg(long)]
+        topic_uuid: Uuid,
+        #[arg(long)]
+        range_uuid: Uuid,
+        /// The first epoch to read; the chain is read upward from here.
+        #[arg(long, default_value_t = 1)]
+        from_epoch: u64,
+        /// Records per page; the whole chain is read, page after page,
+        /// whatever the page size (the server clamps it to its own maximum).
+        /// A page of zero would read nothing and pass, so it is refused.
+        #[arg(long, default_value_t = 256, value_parser = clap::value_parser!(u16).range(1..))]
+        limit: u16,
+        /// Environment variable holding the 32-byte hex MAC key. Without it a
+        /// signed statement is reported unverified, never verified.
+        #[arg(long)]
+        mac_key_env: Option<String>,
     },
     /// Propose `RegisterNode` through the Consensus façade.
     RegisterNode {
@@ -968,6 +994,97 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
             }
             Ok(())
         }
+        MetaCommand::Transitions {
+            common,
+            topic_uuid,
+            range_uuid,
+            from_epoch,
+            limit,
+            mac_key_env,
+        } => {
+            let key = match mac_key_env.as_deref() {
+                Some(name) => Some(mac_key_from_env(name)?),
+                None => None,
+            };
+            let config = load_admin_config(&common.config)?;
+            let client = connect(&config)?;
+            // The WHOLE chain, paged (review): the server clamps a read to
+            // its own maximum, so one read of a long history is a window,
+            // and an audit over a window is not an audit of the range.
+            // `--limit` is the page size; the chain is read page after page
+            // from the last epoch seen until a page comes back empty.
+            // The range's CURRENT epoch, snapshotted BEFORE the pages are read
+            // (review): the chain must reach at least this epoch; a grant that
+            // lands while the pages are being read only makes it longer.
+            let lease = client
+                .read_range_lease(topic_uuid, range_uuid)
+                .await
+                .map_err(|error| error.to_string())?;
+            let client_ref = &client;
+            let read = read_chain_consistently(
+                move |next_from, limit| async move {
+                    client_ref
+                        .read_range_transitions(topic_uuid, range_uuid, next_from, limit)
+                        .await
+                        .map_err(|error| error.to_string())
+                },
+                from_epoch,
+                limit,
+            )
+            .await?;
+            note_redirects(&client);
+            let found = read.is_some() && lease.found;
+            let (transitions, read_at_applied_index) = read.unwrap_or_default();
+            if !found {
+                if json {
+                    println!("{}", serde_json::json!({ "found": false }));
+                } else {
+                    println!("range not found");
+                }
+                return Ok(());
+            }
+            let audit = audit_transitions(
+                &transitions,
+                key.as_ref(),
+                topic_uuid,
+                range_uuid,
+                from_epoch,
+                Some(lease.fencing_epoch),
+            )?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "found": true,
+                        "read_at_applied_index": read_at_applied_index,
+                        "transitions": transitions.iter().zip(&audit.records).map(|(view, record)| transition_json(view, record)).collect::<Vec<_>>(),
+                        "summary": {
+                            "transitions": audit.records.len(),
+                            "broken_links": audit.broken_links,
+                            "vote_disagreements": audit.vote_disagreements,
+                            "mac": { "verified": audit.verified, "unsigned": audit.unsigned, "unverified": audit.unverified, "mismatch": audit.mismatches },
+                        },
+                    }))
+                    .map_err(|error| error.to_string())?
+                );
+            } else {
+                for (view, record) in transitions.iter().zip(&audit.records) {
+                    println!("{}", transition_line(view, record));
+                }
+                println!(
+                    "{} transition(s) from epoch {from_epoch} (read at applied index {}); links: {} broken; votes: {} disagree; mac: {} verified, {} unsigned, {} unverified, {} MISMATCH",
+                    audit.records.len(),
+                    read_at_applied_index,
+                    audit.broken_links,
+                    audit.vote_disagreements,
+                    audit.verified,
+                    audit.unsigned,
+                    audit.unverified,
+                    audit.mismatches
+                );
+            }
+            audit.verdict()
+        }
         MetaCommand::RegisterNode {
             common,
             node_uuid,
@@ -1786,9 +1903,559 @@ fn print_response(response: &MetadataResponse) {
     }
 }
 
+/// What the reader could establish about one transition statement (#240
+/// item 5), each verdict its own word so a summary can count them apart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransitionAudit {
+    /// The epoch this record's `epoch_from` had to equal the previous
+    /// record's `epoch_to`; the first record read has nothing before it.
+    pub link_ok: bool,
+    /// For an established promotion: the vote recomputed from the recorded
+    /// quorum the way the holder counted it, beside what it recorded.
+    pub vote: Option<VoteAudit>,
+    pub mac: MacVerdict,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VoteAudit {
+    pub recorded: u32,
+    pub recomputed: u32,
+    pub required: u32,
+    /// The holder answered its own fencing round. The promoter cannot
+    /// establish without the candidate's answer (`LeaderBehind` otherwise),
+    /// so a replicated quorum that omits the holder is evidence nothing
+    /// real could have produced (review). A standalone promotion has no
+    /// quorum and nothing to answer.
+    pub holder_answered: bool,
+    /// The recorded boundary is the one the quorum proves (review): the
+    /// `required`-th highest answer, as the promoter takes it; `None` for
+    /// a standalone promotion, which proves none.
+    pub boundary_ok: bool,
+    /// The recomputation agrees, the holder answered, no replica is
+    /// counted twice, the majority required is at least a majority of the
+    /// replicas that answered, the boundary is the quorum's, AND the
+    /// recorded vote reached it.
+    pub ok: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MacVerdict {
+    /// The served MAC is the key's MAC over this record as a transition of
+    /// the range asked for.
+    Verified,
+    /// A MAC was served and the key does not vouch for it — or vouches for
+    /// it as another range's.
+    Mismatch,
+    /// No MAC was served: the serving node has no key.
+    Unsigned,
+    /// A MAC was served and no key was given to check it.
+    Unverified,
+}
+
+impl MacVerdict {
+    fn word(self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::Mismatch => "MISMATCH",
+            Self::Unsigned => "unsigned",
+            Self::Unverified => "unverified",
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct ChainAudit {
+    pub records: Vec<TransitionAudit>,
+    /// The epoch the range was at when the reader began, and whether the
+    /// chain read reaches at least that far: `Some((current, false))` is a
+    /// chain with its tail missing. A grant that lands mid-read only makes
+    /// the chain longer, never shorter, so "at least" is the right bound.
+    pub reaches_current: Option<(u64, bool)>,
+    pub broken_links: usize,
+    pub vote_disagreements: usize,
+    pub verified: usize,
+    pub unsigned: usize,
+    pub unverified: usize,
+    pub mismatches: usize,
+}
+
+impl ChainAudit {
+    /// The command's exit: a broken link, a vote that does not recompute,
+    /// or a MAC the key refuses each fails the audit by name.
+    pub fn verdict(&self) -> Result<(), String> {
+        let mut reasons = Vec::new();
+        if let Some((current, false)) = self.reaches_current {
+            reasons.push(format!(
+                "the chain stops before the range's current epoch {current} (tail missing)"
+            ));
+        }
+        if self.broken_links > 0 {
+            reasons.push(format!("{} broken link(s)", self.broken_links));
+        }
+        if self.vote_disagreements > 0 {
+            reasons.push(format!(
+                "{} promotion(s) whose recorded vote does not recompute from its quorum",
+                self.vote_disagreements
+            ));
+        }
+        if self.mismatches > 0 {
+            reasons.push(format!("{} MAC mismatch(es)", self.mismatches));
+        }
+        if reasons.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "transition chain audit failed: {}",
+                reasons.join("; ")
+            ))
+        }
+    }
+}
+
+/// Audit a chain as read, in order, against the identity the reader asked
+/// for (#240 item 5). Nothing in the reply is trusted for the MAC check but
+/// the record bytes the view rebuilds; the identity comes from the caller.
+pub fn audit_transitions(
+    views: &[AdminTransitionView],
+    key: Option<&[u8; 32]>,
+    topic_uuid: Uuid,
+    range_uuid: Uuid,
+    from_epoch: u64,
+    current_epoch: Option<u64>,
+) -> Result<ChainAudit, String> {
+    // Read up from `from_epoch`, the chain must end at the epoch the range
+    // holds now; a range still at its genesis has no transition to show.
+    let reaches_current = current_epoch.map(|current| {
+        let last = views
+            .last()
+            .map_or(from_epoch.max(1) - 1, |view| view.epoch_to);
+        (current, last >= current)
+    });
+    let mut audit = ChainAudit {
+        reaches_current,
+        ..ChainAudit::default()
+    };
+    // Every epoch is minted as exactly the previous one plus one, by both
+    // grant paths — so the chain from `from_epoch` upward must present
+    // EVERY epoch in turn (review): a record that jumps, or a first record
+    // above the epoch asked for, is a missing record, not a legitimate
+    // silence. Continuity is on the epoch, not the holder: a released lease
+    // is followed by a grant from nobody, legitimately.
+    // Epoch 0 is the range's genesis, established by no transition: asked
+    // from 0, the first record to expect is the one that made epoch 1.
+    let mut expected_to = from_epoch.max(1);
+    for view in views {
+        let link_ok = view.epoch_to == expected_to && view.epoch_from + 1 == view.epoch_to;
+        if !link_ok {
+            audit.broken_links += 1;
+        }
+        expected_to = view.epoch_to + 1;
+        let vote = match &view.outcome {
+            TransitionOutcome::Reported {
+                outcome:
+                    PromotionOutcome::Established {
+                        boundary_offset,
+                        quorum,
+                        votes,
+                        required,
+                        ..
+                    },
+                ..
+            } => {
+                // ONE answer per replica (review): the promoter built its
+                // evidence from a map keyed by node, and neither the report
+                // validation nor the wire enforce uniqueness, so a quorum
+                // naming the holder twice must not count it twice.
+                let mut answers = std::collections::BTreeMap::new();
+                let mut duplicated = false;
+                for answer in quorum {
+                    if answers.insert(answer.node_uuid, answer.offset).is_some() {
+                        duplicated = true;
+                    }
+                }
+                // The holder's own offset, as the promoter used it: its
+                // answer in the quorum. A standalone promotion (no quorum,
+                // nothing required) has no answer to give; a replicated one
+                // without the holder's answer is not evidence at all.
+                let standalone = quorum.is_empty() && *required == 0;
+                // A replicated promotion always records the majority it
+                // needed (review): the replication factor is at least the
+                // number of replicas that answered and the majority grows
+                // with it, so `required` below a majority of the answers is
+                // evidence no promotion could produce — and so is zero.
+                let majority_recorded = standalone || (*required as usize) > answers.len() / 2;
+                let holder_answer = answers.get(&view.holder_to).copied();
+                let holder_answered = standalone || holder_answer.is_some();
+                let candidate_offset = holder_answer.or(*boundary_offset).unwrap_or(0);
+                let recomputed = answers
+                    .values()
+                    .filter(|offset| **offset <= candidate_offset)
+                    .count() as u32;
+                // The boundary the quorum proves, as the promoter takes it
+                // (review): the `required`-th highest answer. Recorded
+                // arbitrarily, it would pass a boundary no quorum reached.
+                let proven_boundary = if standalone {
+                    None
+                } else {
+                    let mut offsets: Vec<u64> = answers.values().copied().collect();
+                    offsets.sort_unstable_by(|a, b| b.cmp(a));
+                    offsets.get((*required as usize).saturating_sub(1)).copied()
+                };
+                let boundary_ok = *boundary_offset == proven_boundary;
+                let ok = holder_answered
+                    && majority_recorded
+                    && boundary_ok
+                    && !duplicated
+                    && recomputed == *votes
+                    && *votes >= *required;
+                if !ok {
+                    audit.vote_disagreements += 1;
+                }
+                Some(VoteAudit {
+                    recorded: *votes,
+                    recomputed,
+                    required: *required,
+                    holder_answered,
+                    boundary_ok,
+                    ok,
+                })
+            }
+            _ => None,
+        };
+        let mac = match (key, view.mac.is_some()) {
+            (_, false) => MacVerdict::Unsigned,
+            (None, true) => MacVerdict::Unverified,
+            (Some(key), true) => {
+                if view
+                    .verify_mac(key, topic_uuid, range_uuid)
+                    .map_err(|error| format!("re-encode transition {}: {error}", view.epoch_to))?
+                {
+                    MacVerdict::Verified
+                } else {
+                    MacVerdict::Mismatch
+                }
+            }
+        };
+        match mac {
+            MacVerdict::Verified => audit.verified += 1,
+            MacVerdict::Mismatch => audit.mismatches += 1,
+            MacVerdict::Unsigned => audit.unsigned += 1,
+            MacVerdict::Unverified => audit.unverified += 1,
+        }
+        audit.records.push(TransitionAudit { link_ok, vote, mac });
+    }
+    Ok(audit)
+}
+
+fn grant_word(grant: GrantKind) -> &'static str {
+    match grant {
+        GrantKind::Election => "election",
+        GrantKind::Administrative => "administrative",
+    }
+}
+
+fn outcome_text(view: &AdminTransitionView, record: &TransitionAudit) -> String {
+    match &view.outcome {
+        TransitionOutcome::Pending => "pending".to_owned(),
+        TransitionOutcome::Reported {
+            outcome,
+            reported_at_ms,
+            reported_apply_index,
+        } => match outcome {
+            PromotionOutcome::Established {
+                boundary_offset,
+                sealed_prefix_end,
+                quorum,
+                ..
+            } => {
+                let vote = record
+                    .vote
+                    .as_ref()
+                    .map(|vote| {
+                        format!(
+                            "votes={}/{} recomputed={} {}",
+                            vote.recorded,
+                            vote.required,
+                            vote.recomputed,
+                            if vote.ok {
+                                "ok"
+                            } else if !vote.holder_answered {
+                                "HOLDER ABSENT FROM QUORUM"
+                            } else if !vote.boundary_ok {
+                                "BOUNDARY NOT THE QUORUM'S"
+                            } else {
+                                "VOTE MISMATCH"
+                            }
+                        )
+                    })
+                    .unwrap_or_default();
+                let quorum = quorum
+                    .iter()
+                    .map(|answer| format!("{}:{}", answer.node_uuid, answer.offset))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!(
+                    "established boundary={} sealed_prefix_end={} {vote} quorum=[{quorum}] reported_at_ms={reported_at_ms} reported_apply_index={reported_apply_index}",
+                    boundary_offset.map(|n| n.to_string()).unwrap_or_else(|| "none".to_owned()),
+                    sealed_prefix_end.map(|n| n.to_string()).unwrap_or_else(|| "none".to_owned()),
+                )
+            }
+            PromotionOutcome::Refused { reason } => format!(
+                "refused reason={reason:?} reported_at_ms={reported_at_ms} reported_apply_index={reported_apply_index}"
+            ),
+        },
+    }
+}
+
+/// Read a range's whole chain, page after page, and accept only pages that
+/// describe ONE applied state (review): a chain read across several applied
+/// indices may hold a record from before a transition next to one from after
+/// it, and an audit of that is an audit of nothing. Pages carrying the same
+/// index are one read; otherwise the chain is read again and accepted only
+/// when two passes agree — after three disagreeing passes the chain is
+/// moving faster than it can be read, and the audit says so instead of
+/// presenting the last pass as a snapshot.
+///
+/// `Ok(None)` is a range that does not exist.
+async fn read_chain_consistently<F, Fut>(
+    mut fetch: F,
+    from_epoch: u64,
+    limit: u16,
+) -> Result<Option<(Vec<AdminTransitionView>, u64)>, String>
+where
+    F: FnMut(u64, u16) -> Fut,
+    Fut: std::future::Future<
+        Output = Result<vtop_meta::transport::wire::AdminReadRangeTransitionsResponse, String>,
+    >,
+{
+    const PASSES: usize = 3;
+    let mut previous: Option<Vec<AdminTransitionView>> = None;
+    let mut span = (0, 0);
+    for _ in 0..PASSES {
+        let mut chain = Vec::new();
+        let mut next_from = from_epoch;
+        let mut first_index = None;
+        let mut last_index;
+        loop {
+            let page = fetch(next_from, limit).await?;
+            if !page.found {
+                return Ok(None);
+            }
+            first_index.get_or_insert(page.read_at_applied_index);
+            last_index = page.read_at_applied_index;
+            let Some(last) = page.transitions.last().map(|view| view.epoch_to) else {
+                break;
+            };
+            chain.extend(page.transitions);
+            if last == u64::MAX {
+                break;
+            }
+            next_from = last + 1;
+        }
+        let first_index = first_index.unwrap_or(last_index);
+        span = (first_index, last_index);
+        if first_index == last_index || previous.as_ref() == Some(&chain) {
+            return Ok(Some((chain, last_index)));
+        }
+        previous = Some(chain);
+    }
+    Err(format!(
+        "the transition chain changed while it was being read: {PASSES} passes disagreed, the \
+         last spanning applied index {}..{}; re-run the audit",
+        span.0, span.1
+    ))
+}
+
+fn transition_line(view: &AdminTransitionView, record: &TransitionAudit) -> String {
+    format!(
+        "epoch {}->{} holder {}->{} grant={} granted_at_ms={} apply_index={} link={} outcome={} mac={}",
+        view.epoch_from,
+        view.epoch_to,
+        view.holder_from
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "none".to_owned()),
+        view.holder_to,
+        grant_word(view.grant),
+        view.granted_at_ms,
+        view.granted_apply_index,
+        if record.link_ok { "ok" } else { "BROKEN" },
+        outcome_text(view, record),
+        record.mac.word(),
+    )
+}
+
+fn transition_json(view: &AdminTransitionView, record: &TransitionAudit) -> serde_json::Value {
+    let outcome = match &view.outcome {
+        TransitionOutcome::Pending => serde_json::json!({ "kind": "pending" }),
+        TransitionOutcome::Reported {
+            outcome,
+            reported_at_ms,
+            reported_apply_index,
+        } => match outcome {
+            PromotionOutcome::Established {
+                boundary_offset,
+                sealed_prefix_end,
+                quorum,
+                votes,
+                required,
+            } => serde_json::json!({
+                "kind": "established",
+                "boundary_offset": boundary_offset,
+                "sealed_prefix_end": sealed_prefix_end,
+                "quorum": quorum.iter().map(|answer| serde_json::json!({ "node_uuid": answer.node_uuid, "offset": answer.offset })).collect::<Vec<_>>(),
+                "votes": votes,
+                "required": required,
+                "reported_at_ms": reported_at_ms,
+                "reported_apply_index": reported_apply_index,
+            }),
+            PromotionOutcome::Refused { reason } => serde_json::json!({
+                "kind": "refused",
+                "reason": format!("{reason:?}"),
+                "reported_at_ms": reported_at_ms,
+                "reported_apply_index": reported_apply_index,
+            }),
+        },
+    };
+    serde_json::json!({
+        "epoch_from": view.epoch_from,
+        "epoch_to": view.epoch_to,
+        "holder_from": view.holder_from,
+        "holder_to": view.holder_to,
+        "grant": grant_word(view.grant),
+        "granted_at_ms": view.granted_at_ms,
+        "granted_apply_index": view.granted_apply_index,
+        "link_ok": record.link_ok,
+        "vote": record.vote.as_ref().map(|vote| serde_json::json!({
+            "recorded": vote.recorded, "recomputed": vote.recomputed, "required": vote.required, "holder_answered": vote.holder_answered, "boundary_ok": vote.boundary_ok, "ok": vote.ok,
+        })),
+        "mac": record.mac.word(),
+        "outcome": outcome,
+    })
+}
+
+/// The 32-byte MAC key from an environment variable, as 64 hex characters
+/// — the same shape the metadata node reads at startup.
+fn mac_key_from_env(name: &str) -> Result<[u8; 32], String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("--mac-key-env must name a non-empty environment variable".to_owned());
+    }
+    let value = std::env::var(name).map_err(|_| {
+        format!("MAC key environment variable {name} is missing or not valid Unicode")
+    })?;
+    let hex = value.trim();
+    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!(
+            "{name} must hold exactly 64 hex characters (a 32-byte key), not {} character(s)",
+            hex.len()
+        ));
+    }
+    let mut key = [0_u8; 32];
+    for (index, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let pair = std::str::from_utf8(chunk).map_err(|error| error.to_string())?;
+        key[index] = u8::from_str_radix(pair, 16).map_err(|error| error.to_string())?;
+    }
+    Ok(key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The chain is accepted only as ONE applied state (review): pages that
+    /// straddle a transition are read again, two agreeing passes are the
+    /// read, and three disagreeing passes are a refusal, not a snapshot.
+    #[tokio::test]
+    async fn a_chain_read_across_applied_states_is_accepted_only_when_two_passes_agree() {
+        use std::cell::RefCell;
+        use std::collections::VecDeque;
+        use vtop_meta::transport::wire::AdminReadRangeTransitionsResponse as Page;
+        use vtop_meta::PromotionRefusal;
+        let holder = Uuid::from_u128(0xa);
+        let view = |epoch_to: u64, outcome: TransitionOutcome| AdminTransitionView {
+            epoch_from: epoch_to - 1,
+            epoch_to,
+            holder_from: None,
+            holder_to: holder,
+            grant: GrantKind::Election,
+            granted_at_ms: 1_000 * epoch_to as i64,
+            granted_apply_index: 10 * epoch_to,
+            outcome,
+            mac: None,
+        };
+        let page = |transitions: Vec<AdminTransitionView>, index: u64| Page {
+            found: true,
+            transitions,
+            read_at_applied_index: index,
+        };
+        let reported = |at: i64| TransitionOutcome::Reported {
+            outcome: PromotionOutcome::Refused {
+                reason: PromotionRefusal::QuorumUnavailable,
+            },
+            reported_at_ms: at,
+            reported_apply_index: 22,
+        };
+        // Pass 1 straddles a transition: epoch 2 is pending on its first
+        // page and the index moves under its second. Pass 2 is one state.
+        let script = RefCell::new(VecDeque::from(vec![
+            page(
+                vec![view(1, reported(1)), view(2, TransitionOutcome::Pending)],
+                10,
+            ),
+            page(vec![view(3, TransitionOutcome::Pending)], 12),
+            page(vec![], 12),
+            page(vec![view(1, reported(1)), view(2, reported(2))], 13),
+            page(vec![view(3, TransitionOutcome::Pending)], 13),
+            page(vec![], 13),
+        ]));
+        let asked = RefCell::new(Vec::new());
+        let fetch = |from: u64, limit: u16| {
+            asked.borrow_mut().push((from, limit));
+            std::future::ready(Ok(script.borrow_mut().pop_front().expect("scripted page")))
+        };
+        let (chain, index) = read_chain_consistently(fetch, 1, 2).await.unwrap().unwrap();
+        assert_eq!(index, 13, "the agreeing pass's index");
+        assert_eq!(chain.len(), 3);
+        assert!(
+            matches!(chain[1].outcome, TransitionOutcome::Reported { .. }),
+            "the second pass's record, not the first's"
+        );
+        assert_eq!(
+            *asked.borrow(),
+            vec![(1, 2), (3, 2), (4, 2), (1, 2), (3, 2), (4, 2)],
+            "paged from the last epoch seen, twice"
+        );
+
+        // Three passes that never agree: a refusal naming the span, not the
+        // last pass dressed as a snapshot.
+        let mut moving = VecDeque::new();
+        for pass in 0..3_i64 {
+            moving.push_back(page(vec![view(1, reported(pass))], 20 + pass as u64 * 2));
+            moving.push_back(page(vec![], 21 + pass as u64 * 2));
+        }
+        let script = RefCell::new(moving);
+        let fetch = |_: u64, _: u16| {
+            std::future::ready(Ok(script.borrow_mut().pop_front().expect("scripted page")))
+        };
+        let refused = read_chain_consistently(fetch, 1, 2).await.unwrap_err();
+        assert!(
+            refused.contains("re-run the audit") && refused.contains("24..25"),
+            "{refused}"
+        );
+
+        // A range that does not exist is `None`, on the first page.
+        let fetch = |_: u64, _: u16| {
+            std::future::ready(Ok(Page {
+                found: false,
+                transitions: Vec::new(),
+                read_at_applied_index: 0,
+            }))
+        };
+        assert!(read_chain_consistently(fetch, 1, 2)
+            .await
+            .unwrap()
+            .is_none());
+    }
 
     #[test]
     fn parse_node_state_accepts_canonical_names() {
@@ -2086,5 +2753,342 @@ client_key: /tmp/client.key
     #[test]
     fn no_proposal_renders_nothing() {
         assert!(proposal_text(&None).is_empty());
+    }
+
+    /// The audit trusts nothing in the reply but the record bytes (#240
+    /// item 5): a chain signed for THIS range verifies; the same records
+    /// presented as another range fail; a gap in the epochs is a broken
+    /// link; a vote that does not recompute from its own quorum is named;
+    /// and without a key a signed statement is unverified, never verified.
+    #[test]
+    fn a_transition_chain_is_audited_against_the_identity_asked_for() {
+        use vtop_meta::{PromotionRefusal, QuorumAnswer};
+        let topic = Uuid::from_u128(0x70);
+        let range = Uuid::from_u128(0x71);
+        let key = [0x11_u8; 32];
+        let holder_a = Uuid::from_u128(0xa1);
+        let holder_b = Uuid::from_u128(0xa2);
+        let mut views = vec![
+            AdminTransitionView {
+                epoch_from: 0,
+                epoch_to: 1,
+                holder_from: None,
+                holder_to: holder_a,
+                grant: GrantKind::Election,
+                granted_at_ms: 1_000,
+                granted_apply_index: 10,
+                outcome: TransitionOutcome::Reported {
+                    outcome: PromotionOutcome::Established {
+                        boundary_offset: Some(90),
+                        sealed_prefix_end: None,
+                        quorum: vec![
+                            QuorumAnswer {
+                                node_uuid: holder_a,
+                                offset: 90,
+                            },
+                            QuorumAnswer {
+                                node_uuid: holder_b,
+                                offset: 80,
+                            },
+                            QuorumAnswer {
+                                node_uuid: Uuid::from_u128(0xa3),
+                                offset: 95,
+                            },
+                        ],
+                        votes: 2,
+                        required: 2,
+                    },
+                    reported_at_ms: 1_500,
+                    reported_apply_index: 12,
+                },
+                mac: None,
+            },
+            AdminTransitionView {
+                epoch_from: 1,
+                epoch_to: 2,
+                holder_from: Some(holder_a),
+                holder_to: holder_b,
+                grant: GrantKind::Election,
+                granted_at_ms: 2_000,
+                granted_apply_index: 20,
+                outcome: TransitionOutcome::Reported {
+                    outcome: PromotionOutcome::Refused {
+                        reason: PromotionRefusal::QuorumUnavailable,
+                    },
+                    reported_at_ms: 2_500,
+                    reported_apply_index: 22,
+                },
+                mac: None,
+            },
+            AdminTransitionView {
+                epoch_from: 2,
+                epoch_to: 3,
+                holder_from: None,
+                holder_to: holder_a,
+                grant: GrantKind::Administrative,
+                granted_at_ms: 3_000,
+                granted_apply_index: 30,
+                outcome: TransitionOutcome::Pending,
+                mac: None,
+            },
+        ];
+        for view in &mut views {
+            view.mac = Some(view.record().mac(&key, topic, range).unwrap());
+        }
+
+        let audit = audit_transitions(&views, Some(&key), topic, range, 1, None).unwrap();
+        assert!(audit.verdict().is_ok(), "{audit:?}");
+        assert_eq!(audit.verified, 3);
+        assert!(audit.records.iter().all(|record| record.link_ok));
+        let vote = audit.records[0]
+            .vote
+            .as_ref()
+            .expect("an established promotion is recomputed");
+        assert_eq!(
+            (vote.recorded, vote.recomputed, vote.required, vote.ok),
+            (2, 2, 2, true)
+        );
+        assert!(
+            audit_transitions(&views, Some(&key), topic, range, 0, None)
+                .unwrap()
+                .verdict()
+                .is_ok(),
+            "asked from the genesis epoch 0, the chain that made epoch 1 is intact"
+        );
+        assert!(audit.records[1].vote.is_none() && audit.records[2].vote.is_none());
+
+        let relabelled =
+            audit_transitions(&views, Some(&key), topic, Uuid::from_u128(0x72), 1, None).unwrap();
+        assert_eq!(
+            relabelled.mismatches, 3,
+            "another range's chain is not this one's"
+        );
+        assert!(relabelled.verdict().unwrap_err().contains("MAC mismatch"));
+
+        let unchecked = audit_transitions(&views, None, topic, range, 1, None).unwrap();
+        assert_eq!(
+            (unchecked.unverified, unchecked.verified),
+            (3, 0),
+            "no key, no verdict"
+        );
+        assert!(
+            unchecked.verdict().is_ok(),
+            "unverified is not a failure; it is an absence"
+        );
+
+        let mut gapped = views.clone();
+        gapped[2].epoch_from = 5;
+        gapped[2].mac = Some(gapped[2].record().mac(&key, topic, range).unwrap());
+        let gap = audit_transitions(&gapped, Some(&key), topic, range, 1, None).unwrap();
+        assert_eq!(gap.broken_links, 1);
+        assert!(!gap.records[2].link_ok && gap.records[1].link_ok);
+        assert!(gap.verdict().unwrap_err().contains("broken link"));
+
+        // A record that jumps an epoch is a missing record, and so is a
+        // first record above the epoch asked for (review).
+        let mut jumped = views.clone();
+        jumped[2].epoch_from = 3;
+        jumped[2].epoch_to = 4;
+        jumped[2].mac = Some(jumped[2].record().mac(&key, topic, range).unwrap());
+        let jump = audit_transitions(&jumped, Some(&key), topic, range, 1, None).unwrap();
+        assert_eq!(jump.broken_links, 1, "epoch 3 is missing between 2 and 4");
+        let headless = audit_transitions(&views[1..], Some(&key), topic, range, 1, None).unwrap();
+        assert!(
+            !headless.records[0].link_ok && headless.records[1].link_ok,
+            "asked from epoch 1, the chain must begin at epoch 1"
+        );
+        let mid = audit_transitions(&views[1..], Some(&key), topic, range, 2, None).unwrap();
+        assert!(
+            mid.verdict().is_ok(),
+            "asked from epoch 2, it may begin there"
+        );
+
+        // The range's current epoch bounds the chain from above (review): a
+        // chain that reaches it passes, one that stops short is missing its
+        // tail, and a range at its genesis has nothing to show.
+        assert!(
+            audit_transitions(&views, Some(&key), topic, range, 1, Some(3))
+                .unwrap()
+                .verdict()
+                .is_ok()
+        );
+        assert!(
+            audit_transitions(&views[..2], Some(&key), topic, range, 1, Some(1))
+                .unwrap()
+                .verdict()
+                .is_ok(),
+            "a grant that landed after the snapshot only makes the chain longer"
+        );
+        let short = audit_transitions(&views[..2], Some(&key), topic, range, 1, Some(3)).unwrap();
+        assert_eq!(short.reaches_current, Some((3, false)));
+        assert!(short.verdict().unwrap_err().contains("tail missing"));
+        assert!(audit_transitions(&[], Some(&key), topic, range, 1, Some(0))
+            .unwrap()
+            .verdict()
+            .is_ok());
+        assert!(audit_transitions(&[], Some(&key), topic, range, 1, Some(2))
+            .unwrap()
+            .verdict()
+            .is_err());
+
+        // A quorum naming one replica twice counts it once (review).
+        let mut doubled = views.clone();
+        if let TransitionOutcome::Reported {
+            outcome: PromotionOutcome::Established { quorum, .. },
+            ..
+        } = &mut doubled[0].outcome
+        {
+            quorum.retain(|answer| answer.node_uuid == holder_a);
+            let again = quorum[0];
+            quorum.push(again);
+        }
+        doubled[0].mac = Some(doubled[0].record().mac(&key, topic, range).unwrap());
+        let dup = audit_transitions(&doubled, Some(&key), topic, range, 1, None).unwrap();
+        let vote = dup.records[0].vote.as_ref().unwrap();
+        assert_eq!(
+            (vote.recomputed, vote.ok),
+            (1, false),
+            "the holder twice is one replica"
+        );
+
+        // A replicated quorum that omits the holder is evidence nothing real
+        // could have produced (review); a standalone promotion has none.
+        let mut absent = views.clone();
+        if let TransitionOutcome::Reported {
+            outcome: PromotionOutcome::Established { quorum, .. },
+            ..
+        } = &mut absent[0].outcome
+        {
+            quorum.retain(|answer| answer.node_uuid != holder_a);
+        }
+        absent[0].mac = Some(absent[0].record().mac(&key, topic, range).unwrap());
+        let gone = audit_transitions(&absent, Some(&key), topic, range, 1, None).unwrap();
+        let vote = gone.records[0].vote.as_ref().unwrap();
+        assert!(!vote.holder_answered && !vote.ok, "{vote:?}");
+        assert!(transition_line(&absent[0], &gone.records[0]).contains("HOLDER ABSENT"));
+        let mut standalone = views.clone();
+        standalone[0].outcome = TransitionOutcome::Reported {
+            outcome: PromotionOutcome::Established {
+                boundary_offset: None,
+                sealed_prefix_end: None,
+                quorum: Vec::new(),
+                votes: 0,
+                required: 0,
+            },
+            reported_at_ms: 1_500,
+            reported_apply_index: 12,
+        };
+        standalone[0].mac = Some(standalone[0].record().mac(&key, topic, range).unwrap());
+        let alone = audit_transitions(&standalone, Some(&key), topic, range, 1, None).unwrap();
+        assert!(
+            alone.records[0].vote.as_ref().unwrap().ok,
+            "nothing to answer, nothing missing"
+        );
+
+        // A replicated quorum claiming to have needed nobody is malformed
+        // (review): the promoter always records the majority it needed.
+        let mut needless = views.clone();
+        if let TransitionOutcome::Reported {
+            outcome:
+                PromotionOutcome::Established {
+                    required, votes, ..
+                },
+            ..
+        } = &mut needless[0].outcome
+        {
+            *required = 0;
+            *votes = 2;
+        }
+        needless[0].mac = Some(needless[0].record().mac(&key, topic, range).unwrap());
+        let zero = audit_transitions(&needless, Some(&key), topic, range, 1, None).unwrap();
+        assert!(
+            !zero.records[0].vote.as_ref().unwrap().ok,
+            "required = 0 with a quorum is no evidence"
+        );
+
+        // A majority smaller than a majority of the answers is impossible
+        // (review): three answers need at least two.
+        let mut small = views.clone();
+        if let TransitionOutcome::Reported {
+            outcome:
+                PromotionOutcome::Established {
+                    required, votes, ..
+                },
+            ..
+        } = &mut small[0].outcome
+        {
+            *required = 1;
+            *votes = 2;
+        }
+        small[0].mac = Some(small[0].record().mac(&key, topic, range).unwrap());
+        let one = audit_transitions(&small, Some(&key), topic, range, 1, None).unwrap();
+        assert!(
+            !one.records[0].vote.as_ref().unwrap().ok,
+            "required = 1 of three is no majority"
+        );
+
+        // The boundary must be the required-th highest answer (review): the
+        // fixture's 90 is the second of {95, 90, 80}; a recorded 0 is not.
+        let mut low = views.clone();
+        if let TransitionOutcome::Reported {
+            outcome:
+                PromotionOutcome::Established {
+                    boundary_offset, ..
+                },
+            ..
+        } = &mut low[0].outcome
+        {
+            *boundary_offset = Some(0);
+        }
+        low[0].mac = Some(low[0].record().mac(&key, topic, range).unwrap());
+        let wrong = audit_transitions(&low, Some(&key), topic, range, 1, None).unwrap();
+        let vote = wrong.records[0].vote.as_ref().unwrap();
+        assert!(!vote.boundary_ok && !vote.ok, "{vote:?}");
+        assert!(transition_line(&low[0], &wrong.records[0]).contains("BOUNDARY NOT THE QUORUM"));
+
+        let mut overstated = views.clone();
+        if let TransitionOutcome::Reported {
+            outcome: PromotionOutcome::Established { votes, .. },
+            ..
+        } = &mut overstated[0].outcome
+        {
+            *votes = 3;
+        }
+        overstated[0].mac = Some(overstated[0].record().mac(&key, topic, range).unwrap());
+        let vote = audit_transitions(&overstated, Some(&key), topic, range, 1, None).unwrap();
+        assert_eq!(
+            vote.vote_disagreements, 1,
+            "three votes are claimed; the quorum shows two at or below the holder"
+        );
+        assert!(vote.verdict().unwrap_err().contains("does not recompute"));
+
+        let mut unsigned = views.clone();
+        unsigned[1].mac = None;
+        let some = audit_transitions(&unsigned, Some(&key), topic, range, 1, None).unwrap();
+        assert_eq!((some.verified, some.unsigned), (2, 1));
+        assert!(
+            some.verdict().is_ok(),
+            "an unsigned statement is not a forged one"
+        );
+        assert_eq!(
+            transition_line(&unsigned[1], &some.records[1])
+                .matches("mac=unsigned")
+                .count(),
+            1
+        );
+    }
+
+    /// The key comes from the environment as 64 hex characters, or not at all.
+    #[test]
+    fn the_mac_key_is_read_from_the_environment_as_hex() {
+        let name = "VTOP_TEST_TRANSITION_MAC_KEY";
+        std::env::set_var(name, "0123456789abcdef".repeat(4));
+        let key = mac_key_from_env(name).unwrap();
+        assert_eq!(&key[..4], &[0x01, 0x23, 0x45, 0x67]);
+        std::env::set_var(name, "abc");
+        assert!(mac_key_from_env(name).unwrap_err().contains("64 hex"));
+        std::env::remove_var(name);
+        assert!(mac_key_from_env(name).unwrap_err().contains("missing"));
+        assert!(mac_key_from_env(" ").unwrap_err().contains("non-empty"));
     }
 }
