@@ -330,7 +330,7 @@ impl ReplicaPeerHandler for InProcessFollower {
 /// Three planes making the same decision three different ways would be worse
 /// than any one of the ways.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PlaintextExposure {
+pub(crate) enum PlaintextExposure {
     /// The default, and a refusal rather than a warning: loopback or nothing.
     LoopbackOnly,
     /// Explicitly acknowledged at the call site.
