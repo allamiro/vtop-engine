@@ -38,6 +38,8 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 rdkafka = { version = "0.39", features = ["cmake-build", "ssl", "sasl"] }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-smithy-runtime-api = "1"
+aws-smithy-types = "1"
 # Default features minus legacy "rustls": that feature drags the unmaintained
 # hyper 0.14 + rustls 0.21 connector (rustls-webpki 0.101 advisories) alongside
 # the modern rustls 0.23 client the SDK actually uses.

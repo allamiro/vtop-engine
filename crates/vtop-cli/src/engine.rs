@@ -490,6 +490,15 @@ impl<'a> Pipeline<'a> {
             .put_object(&compressed.path, &object_uri, object_ck)
             .await
         {
+            note_upload_throttle(
+                &e,
+                "object_upload",
+                [
+                    tenant.as_str(),
+                    source.source_type.as_str(),
+                    format.extension(),
+                ],
+            );
             fail!(format!("object upload failed: {e}"));
         }
         metrics.object_upload_ms = t.elapsed().as_millis() as u64;
@@ -556,7 +565,18 @@ impl<'a> Pipeline<'a> {
             .await
         {
             Ok(stored) => stored,
-            Err(e) => fail!(format!("manifest upload failed: {e}")),
+            Err(e) => {
+                note_upload_throttle(
+                    &e,
+                    "manifest_upload",
+                    [
+                        tenant.as_str(),
+                        source.source_type.as_str(),
+                        format.extension(),
+                    ],
+                );
+                fail!(format!("manifest upload failed: {e}"))
+            }
         };
         // The hardened profile pins recovery to this exact stored version;
         // an upload the store did not version cannot be pinned, so it cannot
@@ -920,6 +940,22 @@ impl PendingBuffer {
             verbatim: self.verbatim,
         })
     }
+}
+
+/// Count a throttle apart from every other upload failure (#102). The batch
+/// fails and replays either way; what changes is what an operator sees. A
+/// store asking for less is a signal a same-rate retry only worsens, and
+/// until #102's controller consumes it, the counter is how it is seen.
+fn note_upload_throttle(error: &VtopError, stage: &str, labels: [&str; 3]) {
+    if !error.is_upload_throttle() {
+        return;
+    }
+    if let Some(mx) = telemetry::metrics() {
+        mx.upload_throttled_total
+            .with_label_values(&[labels[0], labels[1], labels[2], stage])
+            .inc();
+    }
+    tracing::warn!(stage, error = %error, "upload_throttled");
 }
 
 /// The full engine: config, streams, state store, upload backend, adapters.
@@ -2369,6 +2405,108 @@ mod tests {
         assert!(
             flushed[0].committed,
             "flushed batch must commit after verify"
+        );
+    }
+
+    /// #102: a throttle is counted apart from other upload failures, and the
+    /// batch fails without committing exactly as any failed upload does — the
+    /// classification changes what an operator sees, not what the engine
+    /// does with the batch.
+    #[tokio::test]
+    async fn a_throttled_upload_is_counted_apart_and_the_batch_is_not_committed() {
+        // Read back through the registry, as a scrape would: the family
+        // name is the exported one and the stage is the label.
+        fn throttled_so_far(stage: &str) -> u64 {
+            let mx = telemetry::init().unwrap();
+            mx.registry
+                .gather()
+                .iter()
+                .filter(|family| family.name().ends_with("upload_throttled_total"))
+                .flat_map(|family| family.get_metric().iter())
+                .filter(|metric| {
+                    metric
+                        .get_label()
+                        .iter()
+                        .any(|label| label.name() == "stage" && label.value() == stage)
+                })
+                .map(|metric| metric.get_counter().get_value() as u64)
+                .sum()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        let input = dir.path().join("in.log");
+        std::fs::write(&input, "a line\n").unwrap();
+        let mut cfg = file_config(
+            work.to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        cfg.batching.max_batch_age_seconds = 3_600;
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        let mock = Arc::new(vtop_upload::MockBackend::new().with_throttled_puts(1));
+        engine.backend = mock.clone();
+
+        let object_before = throttled_so_far("object_upload");
+        let manifest_before = throttled_so_far("manifest_upload");
+        let outcomes = engine.run_source(SourceType::File, true).await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(
+            outcomes[0].final_state,
+            BatchState::Failed,
+            "a throttled put fails the batch the way any failed put does"
+        );
+        assert!(
+            !outcomes[0].committed,
+            "nothing verified, nothing committed"
+        );
+        assert_eq!(
+            throttled_so_far("object_upload") - object_before,
+            1,
+            "the throttle is counted apart, on the stage that saw it"
+        );
+        assert_eq!(
+            throttled_so_far("manifest_upload") - manifest_before,
+            0,
+            "the manifest was never attempted"
+        );
+
+        // The manifest stage has its own accounting, so it needs its own
+        // throttle (review): the object put lands, the manifest put is
+        // refused, and only `manifest_upload` moves. Same test function on
+        // purpose — the registry is process-wide, and two tests reading
+        // deltas of the same counter in parallel would race each other.
+        let input = dir.path().join("in-manifest.log");
+        std::fs::write(&input, "another line\n").unwrap();
+        let mut cfg = file_config(
+            dir.path().join("work-manifest").to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        cfg.batching.max_batch_age_seconds = 3_600;
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        engine.backend = Arc::new(vtop_upload::MockBackend::new().with_throttled_manifest_puts(1));
+        let object_before = throttled_so_far("object_upload");
+        let manifest_before = throttled_so_far("manifest_upload");
+        let outcomes = engine.run_source(SourceType::File, true).await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].final_state, BatchState::Failed);
+        assert!(!outcomes[0].committed);
+        assert_eq!(
+            throttled_so_far("object_upload") - object_before,
+            0,
+            "the object put landed"
+        );
+        assert_eq!(
+            throttled_so_far("manifest_upload") - manifest_before,
+            1,
+            "the manifest stage counts its own throttle"
         );
     }
 

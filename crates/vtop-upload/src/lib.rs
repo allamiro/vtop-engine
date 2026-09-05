@@ -80,3 +80,4 @@ pub async fn build_backend(cfg: &UploadConfig) -> Result<Arc<dyn UploadBackend>,
     };
     Ok(backend)
 }
+pub use base::{is_throttle_code, is_throttle_status, looks_throttled, THROTTLE_ERROR_CODES};

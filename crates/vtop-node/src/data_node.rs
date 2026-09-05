@@ -137,11 +137,60 @@ pub struct SegmentRoll {
 /// contents, not their stems — so no migration step exists to get wrong.
 /// New ranges take offset-based stems (`range-<base>.active`), the naming
 /// rolling itself produces.
+/// What a NEW range is created as (#240): the on-disk format, and — for
+/// v2, whose descriptor records its creator — the identity doing the
+/// creating. Creation-time only: an existing range keeps the format its
+/// tail already has, exactly as it keeps its roll thresholds.
+#[derive(Clone, Copy, Debug)]
+struct RangeCreation {
+    format: crate::config::SegmentFormatConfig,
+    node_uuid: Uuid,
+    fencing_epoch: u64,
+}
+
+impl RangeCreation {
+    fn from_config(config: &DataNodeConfig) -> Self {
+        Self {
+            format: config.segment_format,
+            node_uuid: config.node_uuid,
+            fencing_epoch: config.fencing_epoch,
+        }
+    }
+}
+
+/// The cluster high-water mark a LEADER build starts from (#240, #402): the
+/// highest quorum mark this replica durably observed while following, read
+/// back from the committed-floor sidecar it kept then. A promotion
+/// publishes nothing until its own epoch's marker is proven, so this seed
+/// is what fetch serves and what metrics show in the meantime — seeded at
+/// zero, a failover exposed a mark below one the old leader had already
+/// published, for as long as the marker took (review). Seeded from the
+/// floor it serves only what a quorum once proved, and the cell only ever
+/// moves up from there. A replica that never observed a mark — freshly
+/// repaired, #402's stated residual — still starts at zero, because a floor
+/// nobody recorded cannot be invented.
+fn leader_cluster_cell(data_dir: &Path) -> ClusterCommittedOffset {
+    ClusterCommittedOffset::new(
+        vtop_broker::committed_floor::CommittedFloorFile::open(data_dir.join("committed-floor"))
+            .floor(),
+    )
+}
+
+/// The broker-side name of the format a set's tail is in.
+fn format_of(set: &SegmentSet) -> vtop_broker::SegmentFormat {
+    if set.active().format_version() == vtop_log::FORMAT_VERSION_V2 {
+        vtop_broker::SegmentFormat::V2
+    } else {
+        vtop_broker::SegmentFormat::V1
+    }
+}
+
 fn open_range(
     data_dir: &Path,
     segment_id: Uuid,
     range: &RangeIdentity,
     roll: SegmentRoll,
+    creation: RangeCreation,
 ) -> Result<(SegmentSet, Option<RecoveryReport>), String> {
     let env = Env::real();
     if let Some(set) = SegmentSet::open_in(&env, data_dir).map_err(|error| error.to_string())? {
@@ -187,27 +236,53 @@ fn open_range(
         }
         return Ok((set, Some(report)));
     }
-    let descriptor = SegmentDescriptor {
-        segment_id,
-        topic: range.topic.clone(),
-        topic_epoch: range.topic_epoch,
-        lineage: RangeLineage {
-            range_id: range.range_id,
-            generation: range.range_generation,
-            key_range: KeyRange::full(),
-            parents: Vec::new(),
-        },
-        base_offset: 0,
+    let lineage = RangeLineage {
+        range_id: range.range_id,
+        generation: range.range_generation,
+        key_range: KeyRange::full(),
+        parents: Vec::new(),
     };
-    let config = SegmentConfig {
-        max_segment_bytes: roll.max_bytes,
-        max_segment_records: roll.max_records,
-        max_group_bytes: roll.max_group_bytes,
-        max_record_bytes: roll.max_record_bytes,
-        ..SegmentConfig::default()
-    };
-    let set = SegmentSet::create_in(&env, data_dir, descriptor, config)
-        .map_err(|error| error.to_string())?;
+    let set = match creation.format {
+        crate::config::SegmentFormatConfig::V1 => {
+            let descriptor = SegmentDescriptor {
+                segment_id,
+                topic: range.topic.clone(),
+                topic_epoch: range.topic_epoch,
+                lineage,
+                base_offset: 0,
+            };
+            let config = SegmentConfig {
+                max_segment_bytes: roll.max_bytes,
+                max_segment_records: roll.max_records,
+                max_group_bytes: roll.max_group_bytes,
+                max_record_bytes: roll.max_record_bytes,
+                ..SegmentConfig::default()
+            };
+            SegmentSet::create_in(&env, data_dir, descriptor, config)
+        }
+        crate::config::SegmentFormatConfig::V2 => {
+            let descriptor = vtop_log::SegmentDescriptorV2 {
+                segment_id,
+                topic: range.topic.clone(),
+                topic_epoch: range.topic_epoch,
+                lineage,
+                base_offset: 0,
+                segment_generation: 0,
+                creation_node_id: creation.node_uuid,
+                creation_fencing_epoch: creation.fencing_epoch,
+            };
+            let config = vtop_log::SegmentConfigV2 {
+                max_segment_bytes: roll.max_bytes,
+                max_segment_records: roll.max_records,
+                max_group_bytes: roll.max_group_bytes,
+                max_record_bytes: roll.max_record_bytes,
+                ..vtop_log::SegmentConfigV2::default()
+            };
+            SegmentSet::create_v2_in(&env, data_dir, descriptor, config)
+        }
+    }
+    .map_err(|error| error.to_string())?;
+    println!("range_created format=v{}", set.active().format_version());
     Ok((set, None))
 }
 
@@ -466,6 +541,7 @@ pub async fn serve(
             max_group_bytes: config.max_group_bytes,
             max_record_bytes: config.max_record_bytes,
         },
+        RangeCreation::from_config(&config),
     )?;
     let epochs = ProducerEpochJournal::open(config.data_dir.join("epochs"))
         .map_err(|error| error.to_string())?;
@@ -774,7 +850,7 @@ async fn run_leader(
             config.fencing_epoch,
             meta,
             config.node_uuid,
-            Some(ClusterCommittedOffset::new(0)),
+            Some(leader_cluster_cell(&config.data_dir)),
             Some(replica_set as Arc<dyn ReplicaSet>),
         )
         .map_err(|error| error.to_string())?
@@ -843,6 +919,7 @@ async fn run_leader(
     // server has drained (#280).
     let (release_lease, release_lease_rx) = tokio::sync::watch::channel(false);
     let mut agent_task = None;
+    let mut boundary_driver = None;
     let mut agent_drain = std::time::Duration::from_secs(5);
     if let Some(lease) = config.lease.as_ref() {
         // Followers learn granted epochs on their own now (#239), so a
@@ -863,6 +940,9 @@ async fn run_leader(
                  fencing_epoch and will refuse appends at a newly granted epoch"
             );
         }
+        let publisher = Arc::new(crate::lease_agent::BrokerLeasePublisher::new(Arc::clone(
+            &broker,
+        )));
         let agent = crate::lease_agent::LeaseAgent::new(
             lease_admin_client(lease)?,
             crate::lease_agent::LeaseAgentConfig {
@@ -873,15 +953,24 @@ async fn run_leader(
             config.node_uuid,
             lease.topic_uuid,
             config.range.range_id,
-            Arc::new(crate::lease_agent::BrokerLeasePublisher::new(Arc::clone(
-                &broker,
-            ))),
+            Arc::clone(&publisher) as Arc<dyn crate::lease_agent::LeasePublisher>,
             promotion_probe,
         )?
         // The standalone case has no probe to carry this node's view, and
         // its transition record still wants the sealed prefix (#240 item 5).
         .with_local_view(Arc::clone(&broker) as Arc<dyn crate::lease_agent::CandidateLocalView>);
         agent_task = Some(tokio::spawn(agent.run(release_lease_rx)));
+        // The boundary is published through this epoch's marker, not by the
+        // promotion itself (#240, §5.4.2): the driver appends and proves it,
+        // retrying for as long as a majority cannot hold the tail, and lives
+        // exactly as long as the agent that pends the epochs it publishes.
+        // Only where a marker can exist (review): a standalone or v1 range
+        // never pends one, and a driver there would only ever park.
+        if publisher.gates_on_marker() {
+            boundary_driver = Some(Aborting(tokio::spawn(
+                publisher.drive_boundary_marker(shutdown.clone()),
+            )));
+        }
         // The agent abandons its round the moment the release fires (#408),
         // so the worst remaining chain is the shutdown path's own RPCs: the
         // reconciliation read release() may need when the abandoned round
@@ -931,9 +1020,26 @@ async fn run_leader(
         // Contention serves the LAST DECIDED verdict rather than guessing in
         // either direction: a broker mid-append is working, and a broker that
         // was fenced a scrape ago is still fenced.
+        // The gate first, and outside the snapshot (review): an atomic read
+        // no append can contend, and a leader refusing every fetch is not
+        // ready whatever the lease view says — including a cached "ready"
+        // from before the marker went pending.
+        if probe_broker.boundary_pending() {
+            last_ready.store(false, std::sync::atomic::Ordering::Relaxed);
+            return vtop_observe::Readiness::not_ready(format!(
+                "leading at epoch {}, but the boundary marker is not yet quorum-acknowledged; \
+                 fetch is refused until it is",
+                probe_broker.held_fencing_epoch()
+            ));
+        }
         match lease.try_snapshot() {
             None => {
-                if last_ready.load(std::sync::atomic::Ordering::Relaxed) {
+                // The gate again, beside the cached verdict (review): a
+                // marker raised between the read above and here would
+                // otherwise ride out on a "ready" decided before it.
+                if last_ready.load(std::sync::atomic::Ordering::Relaxed)
+                    && !probe_broker.boundary_pending()
+                {
                     vtop_observe::Readiness::Ready
                 } else {
                     vtop_observe::Readiness::not_ready(
@@ -948,10 +1054,18 @@ async fn run_leader(
                 // leader as fenced forever — draining the one process that is
                 // actually authorized to serve.
                 let held = probe_broker.held_fencing_epoch();
-                let ready = live && epoch == held;
+                // And not while the boundary marker is pending (#240): a
+                // leader that refuses every fetch is not ready to serve.
+                let pending = probe_broker.boundary_pending();
+                let ready = live && epoch == held && !pending;
                 last_ready.store(ready, std::sync::atomic::Ordering::Relaxed);
                 if ready {
                     vtop_observe::Readiness::Ready
+                } else if live && epoch == held {
+                    vtop_observe::Readiness::not_ready(format!(
+                        "leading at epoch {held}, but the boundary marker is not yet \
+                         quorum-acknowledged; fetch is refused until it is"
+                    ))
                 } else if live {
                     vtop_observe::Readiness::not_ready(format!(
                         "metadata lease moved to epoch {epoch}; this leaseholder is fenced at {held}"
@@ -972,7 +1086,9 @@ async fn run_leader(
         ServerConfig {
             cluster_id: config.cluster_id,
             node_id: config.node_uuid,
-            segment_format: vtop_broker::SegmentFormat::V1,
+            // The broker derived this from the tail on disk; the server
+            // must agree or it refuses every session.
+            segment_format: broker.segment_format(),
             max_frame_bytes: MAX_FRAME_BYTES,
             max_records_per_frame: MAX_RECORDS,
             window_bytes: WINDOW_BYTES,
@@ -1062,6 +1178,9 @@ async fn run_leader(
     if let Some(task) = agent_task {
         let _ = tokio::time::timeout(agent_drain, task).await;
     }
+    // After the agent: its release demotes the broker, which retires any
+    // pending marker, so the driver has nothing left to publish.
+    drop(boundary_driver);
     match broker.quiesce() {
         Ok(committed) => println!(
             "data_node_stopped role={} node={} committed={committed}",
@@ -1099,6 +1218,10 @@ async fn run_candidate(
         "candidate requires a lease block: the role follows the lease, and a node that \
                 cannot observe the lease has no role to follow",
     )?;
+    // The wire mapping follows the bytes on disk, never a constant: a server
+    // told v1 over a v2 tail (or the reverse) refuses every session, and the
+    // candidate binds its server once, before any role holds the range.
+    let on_disk_format = format_of(&set);
     if !config.followers.is_empty() {
         return Err(
             "candidate takes `peers` (the whole symmetric replica set); `followers` is \
@@ -1199,7 +1322,7 @@ async fn run_candidate(
         ServerConfig {
             cluster_id: config.cluster_id,
             node_id: config.node_uuid,
-            segment_format: vtop_broker::SegmentFormat::V1,
+            segment_format: on_disk_format,
             max_frame_bytes: MAX_FRAME_BYTES,
             max_records_per_frame: MAX_RECORDS,
             window_bytes: WINDOW_BYTES,
@@ -1317,12 +1440,37 @@ async fn run_candidate(
     observability.set_readiness_probe(Arc::new(move || {
         match probe_flag.load(std::sync::atomic::Ordering::Relaxed) {
             1 => match probe_slot.current() {
+                // The gate first, and outside the snapshot (review): it is
+                // an atomic read that no append can contend, and a leader
+                // refusing every fetch is not ready whatever the lease view
+                // says — including a cached "ready" from before the marker
+                // went pending.
+                Some(broker) if broker.boundary_pending() => {
+                    probe_last_probe.store(false, std::sync::atomic::Ordering::Relaxed);
+                    vtop_observe::Readiness::not_ready(format!(
+                        "leading at epoch {}, but the boundary marker is not yet \
+                         quorum-acknowledged; fetch is refused until it is",
+                        broker.held_fencing_epoch()
+                    ))
+                }
                 Some(broker) => match probe_meta.try_snapshot() {
                     Some((epoch, live)) => {
-                        let ready = live && epoch == broker.held_fencing_epoch();
+                        let held = broker.held_fencing_epoch();
+                        // A leader whose boundary marker is still pending
+                        // refuses every fetch (#240): advertising it as
+                        // ready would route consumers to the one process
+                        // guaranteed to turn them away. The gate is an
+                        // atomic, read without contention.
+                        let pending = broker.boundary_pending();
+                        let ready = live && epoch == held && !pending;
                         probe_last_probe.store(ready, std::sync::atomic::Ordering::Relaxed);
                         if ready {
                             vtop_observe::Readiness::Ready
+                        } else if live && epoch == held {
+                            vtop_observe::Readiness::not_ready(format!(
+                                "leading at epoch {held}, but the boundary marker is not yet \
+                                 quorum-acknowledged; fetch is refused until it is"
+                            ))
                         } else {
                             vtop_observe::Readiness::not_ready(
                                 "leading, but the lease view is not live at the held epoch"
@@ -1331,7 +1479,10 @@ async fn run_candidate(
                         }
                     }
                     None => {
-                        if probe_last_probe.load(std::sync::atomic::Ordering::Relaxed) {
+                        // The gate again, beside the cached verdict (review).
+                        if probe_last_probe.load(std::sync::atomic::Ordering::Relaxed)
+                            && !broker.boundary_pending()
+                        {
                             vtop_observe::Readiness::Ready
                         } else {
                             vtop_observe::Readiness::not_ready(
@@ -1592,6 +1743,7 @@ async fn run_candidate(
                                                 config.segment_id,
                                                 &range,
                                                 roll,
+                                                RangeCreation::from_config(&config),
                                             )?;
                                             let epochs = ProducerEpochJournal::open(
                                                 config.data_dir.join("epochs"),
@@ -1701,7 +1853,13 @@ async fn run_candidate(
                             }
                             drop(built);
                             let (set, _) =
-                                open_range(&config.data_dir, config.segment_id, &range, roll)?;
+                                open_range(
+                                &config.data_dir,
+                                config.segment_id,
+                                &range,
+                                roll,
+                                RangeCreation::from_config(&config),
+                            )?;
                             let epochs =
                                 ProducerEpochJournal::open(config.data_dir.join("epochs"))
                                     .map_err(|error| error.to_string())?;
@@ -1730,10 +1888,23 @@ async fn run_candidate(
                             config.node_uuid
                         );
                         std::io::stdout().flush().ok();
+                        // The promotion pended this epoch's marker (#240);
+                        // the driver publishes it — and every later
+                        // re-grant's — for as long as this role stands. A
+                        // v1 range pends none, and gets no driver to park.
+                        let boundary_driver = Aborting(if broker_publisher.gates_on_marker() {
+                            tokio::spawn(
+                                Arc::clone(&broker_publisher)
+                                    .drive_boundary_marker(shutdown.clone()),
+                            )
+                        } else {
+                            tokio::spawn(async {})
+                        });
                         phase = Phase::Leading {
                             broker: built.broker,
                             publisher: broker_publisher,
                             _replicas: built.replicas,
+                            _boundary_driver: boundary_driver,
                         };
                     }
                     (Phase::Leading { broker, publisher: leader_publisher, .. },
@@ -1782,7 +1953,13 @@ async fn run_candidate(
                         }
                         drop(broker);
                         let (set, _) =
-                            open_range(&config.data_dir, config.segment_id, &range, roll)?;
+                            open_range(
+                                &config.data_dir,
+                                config.segment_id,
+                                &range,
+                                roll,
+                                RangeCreation::from_config(&config),
+                            )?;
                         let epochs = ProducerEpochJournal::open(config.data_dir.join("epochs"))
                             .map_err(|error| error.to_string())?;
                         let follower = build_follower(set, epochs)?;
@@ -2055,8 +2232,23 @@ enum Phase {
         publisher: Arc<crate::lease_agent::BrokerLeasePublisher>,
         /// Held so the follower drivers live exactly as long as the role.
         _replicas: Arc<NetworkedReplicaSet>,
+        /// The boundary-marker driver (#240): publishes each promoted
+        /// epoch's high-water mark once its marker is quorum-acked, and is
+        /// aborted with the role so it can never run against the next
+        /// leader build's publisher.
+        _boundary_driver: Aborting,
     },
     Transitioning,
+}
+
+/// A task that must not outlive its owner: aborted on drop, so a driver
+/// spawned for one leader build can never touch the next.
+struct Aborting(tokio::task::JoinHandle<()>);
+
+impl Drop for Aborting {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// A leader BUILT but not yet serving: nothing in it is installed,
@@ -2079,7 +2271,13 @@ async fn build_leader_phase(
     roll: SegmentRoll,
     meta: &MetaFencingEpoch,
 ) -> Result<BuiltLeader, String> {
-    let (set, _recovery) = open_range(&config.data_dir, config.segment_id, range, roll)?;
+    let (set, _recovery) = open_range(
+        &config.data_dir,
+        config.segment_id,
+        range,
+        roll,
+        RangeCreation::from_config(config),
+    )?;
     let epochs = ProducerEpochJournal::open(config.data_dir.join("epochs"))
         .map_err(|error| error.to_string())?;
     let follower_configs = peers
@@ -2126,7 +2324,7 @@ async fn build_leader_phase(
             config.fencing_epoch,
             meta.clone(),
             config.node_uuid,
-            Some(ClusterCommittedOffset::new(0)),
+            Some(leader_cluster_cell(&config.data_dir)),
             Some(Arc::clone(&replicas) as Arc<dyn ReplicaSet>),
         )
         .map_err(|error| error.to_string())?,
@@ -2456,13 +2654,21 @@ impl crate::observe::ReplicaObservation for SwitchingLocalView {
             .is_some_and(|view| view.is_leading())
     }
 
+    fn boundary_pending(&self) -> bool {
+        self.delegate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|view| view.boundary_pending())
+    }
+
     /// ONE acquisition for the whole reading, which is the point of it
     /// (review). Asked question by question, `clear()` could land between "is
     /// a role installed?" and the answers, and the scrape would publish this
     /// view's empty answers — held epoch 0, leading false — as though a role
     /// had given them, rewinding a monotonic gauge and leaving the departed
     /// leader's `lease_active` of 1 standing beside it. Holding the read lock
-    /// across all three makes that interleaving unrepresentable.
+    /// across all four makes that interleaving unrepresentable.
     ///
     /// Safe to hold it across them because every call under this guard is an
     /// atomic load or a `try_` read: the guard cannot park a transition behind
@@ -2477,6 +2683,10 @@ impl crate::observe::ReplicaObservation for SwitchingLocalView {
             meta: view.try_meta_fencing_epoch(),
             held: view.held_fencing_epoch(),
             leading: view.is_leading(),
+            // Under the SAME lock as the rest (review): the collector pairs
+            // this with `leading`, and a transition between two separate
+            // reads could hand it one role's leading and another's pending.
+            boundary_pending: view.boundary_pending(),
         })
     }
 }
@@ -2714,6 +2924,110 @@ mod tests {
         }
     }
 
+    fn test_creation() -> RangeCreation {
+        creation_in(crate::config::SegmentFormatConfig::V1)
+    }
+
+    fn creation_in(format: crate::config::SegmentFormatConfig) -> RangeCreation {
+        RangeCreation {
+            format,
+            node_uuid: Uuid::from_u128(0xA1),
+            fencing_epoch: 3,
+        }
+    }
+
+    /// A leader build starts at the floor this replica observed as a
+    /// follower (#240, #402), never at zero while a floor is on disk: the
+    /// promotion publishes nothing until its marker is proven, and what is
+    /// served in the meantime must be a mark a quorum once proved.
+    #[test]
+    fn a_leader_build_starts_at_the_floor_it_observed_as_a_follower() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            leader_cluster_cell(dir.path()).get(),
+            0,
+            "no floor on disk: nothing was ever observed, and nothing is invented"
+        );
+        vtop_broker::committed_floor::CommittedFloorFile::open(dir.path().join("committed-floor"))
+            .save(301)
+            .unwrap();
+        assert_eq!(
+            leader_cluster_cell(dir.path()).get(),
+            301,
+            "the floor the follower persisted is where the leader starts"
+        );
+    }
+
+    /// The format knob applies at CREATION only (#240): a range asked for
+    /// in v2 is created v2 with the node as its recorded creator, reopens
+    /// v2 whatever the config says next, and a v1 range reopened under a
+    /// v2 config stays v1 — the bytes on disk decide, as with the roll
+    /// thresholds.
+    #[test]
+    fn the_segment_format_is_decided_at_creation_and_kept_on_reopen() {
+        use crate::config::SegmentFormatConfig;
+        let range = test_range();
+
+        let v2 = tempfile::tempdir().unwrap();
+        let (set, recovery) = open_range(
+            v2.path(),
+            Uuid::from_u128(0xD5),
+            &range,
+            test_roll(),
+            creation_in(SegmentFormatConfig::V2),
+        )
+        .unwrap();
+        assert!(recovery.is_none(), "a fresh range has nothing to recover");
+        assert_eq!(format_of(&set), vtop_broker::SegmentFormat::V2);
+        let descriptor = set
+            .active()
+            .descriptor_v2()
+            .expect("a v2 tail carries a v2 descriptor");
+        assert_eq!(descriptor.creation_node_id, Uuid::from_u128(0xA1));
+        assert_eq!(descriptor.creation_fencing_epoch, 3);
+        assert_eq!(descriptor.lineage.range_id, range.range_id);
+        drop(set);
+        let (reopened, recovery) = open_range(
+            v2.path(),
+            Uuid::from_u128(0xD5),
+            &range,
+            test_roll(),
+            creation_in(SegmentFormatConfig::V1),
+        )
+        .unwrap();
+        assert!(recovery.is_some(), "an existing range reports its recovery");
+        assert_eq!(
+            format_of(&reopened),
+            vtop_broker::SegmentFormat::V2,
+            "the config says v1 now; the bytes on disk say v2, and they win"
+        );
+
+        let v1 = tempfile::tempdir().unwrap();
+        let (set, _) = open_range(
+            v1.path(),
+            Uuid::from_u128(0xD6),
+            &range,
+            test_roll(),
+            creation_in(SegmentFormatConfig::V1),
+        )
+        .unwrap();
+        assert_eq!(format_of(&set), vtop_broker::SegmentFormat::V1);
+        drop(set);
+        let (reopened, _) = open_range(
+            v1.path(),
+            Uuid::from_u128(0xD6),
+            &range,
+            test_roll(),
+            creation_in(SegmentFormatConfig::V2),
+        )
+        .unwrap();
+        assert_eq!(
+            format_of(&reopened),
+            vtop_broker::SegmentFormat::V1,
+            "asking for v2 over an existing v1 range changes nothing"
+        );
+    }
+
     use super::*;
     use vtop_log::{Durability, LogRecord};
 
@@ -2892,8 +3206,14 @@ mod tests {
     fn a_fresh_directory_creates_the_first_segment_under_the_offset_stem() {
         let dir = tempfile::tempdir().unwrap();
         let range = test_range();
-        let (set, recovery) =
-            open_range(dir.path(), Uuid::from_u128(0xD1), &range, test_roll()).unwrap();
+        let (set, recovery) = open_range(
+            dir.path(),
+            Uuid::from_u128(0xD1),
+            &range,
+            test_roll(),
+            test_creation(),
+        )
+        .unwrap();
         assert!(recovery.is_none(), "nothing existed to recover");
         assert_eq!(set.next_offset(), 0);
         assert!(
@@ -2939,8 +3259,14 @@ mod tests {
             }
         }
 
-        let (set, recovery) =
-            open_range(dir.path(), Uuid::from_u128(0xD3), &range, test_roll()).unwrap();
+        let (set, recovery) = open_range(
+            dir.path(),
+            Uuid::from_u128(0xD3),
+            &range,
+            test_roll(),
+            test_creation(),
+        )
+        .unwrap();
         assert!(recovery.is_some(), "the legacy segment was recovered");
         assert_eq!(set.next_offset(), 3);
         assert!(set.sealed().is_empty(), "a legacy layout is a set of one");
@@ -3028,6 +3354,7 @@ mod tests {
             Uuid::from_u128(0xD4),
             &test_range(),
             test_roll(),
+            test_creation(),
         ) else {
             panic!("a quarantined bundle must refuse startup");
         };
@@ -3174,7 +3501,14 @@ mod tests {
         use crate::lease_agent::LeasePublisher;
         let dir = tempfile::tempdir().unwrap();
         let range = test_range();
-        let (set, _) = open_range(dir.path(), Uuid::from_u128(0xD9), &range, test_roll()).unwrap();
+        let (set, _) = open_range(
+            dir.path(),
+            Uuid::from_u128(0xD9),
+            &range,
+            test_roll(),
+            test_creation(),
+        )
+        .unwrap();
         let epochs = ProducerEpochJournal::open(dir.path().join("epochs")).unwrap();
         let meta = MetaFencingEpoch::new_inactive(0);
         let broker = Arc::new(

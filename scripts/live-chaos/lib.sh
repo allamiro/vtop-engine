@@ -423,6 +423,11 @@ emit_leader_config() {
     echo "cluster_id: $CLUSTER_ID"
     echo "data_dir: $WORKDIR/data-leader"
     echo "fencing_epoch: $FENCING_EPOCH"
+    # The on-disk format a NEW range is created in (#240): unset keeps the
+    # binary's default. Scenarios that assert the promotion boundary marker
+    # set v2, the only format whose frames can carry one.
+    [[ -n "${CHAOS_SEGMENT_FORMAT:-}" ]] \
+      && echo "segment_format: $CHAOS_SEGMENT_FORMAT"
     # Left at the engine default unless a scenario asks otherwise. A scenario
     # that needs SEALED segments — the only kind that transfer — sets this small
     # so the range rolls under its own load instead of being sealed offline,
@@ -525,6 +530,11 @@ emit_follower_config() {
     echo "cluster_id: $CLUSTER_ID"
     echo "data_dir: $dir"
     echo "fencing_epoch: $epoch"
+    # The on-disk format a NEW range is created in (#240): unset keeps the
+    # binary's default. Scenarios that assert the promotion boundary marker
+    # set v2, the only format whose frames can carry one.
+    [[ -n "${CHAOS_SEGMENT_FORMAT:-}" ]] \
+      && echo "segment_format: $CHAOS_SEGMENT_FORMAT"
     [[ -n "${CHAOS_MAX_SEGMENT_BYTES:-}" ]] \
       && echo "max_segment_bytes: $CHAOS_MAX_SEGMENT_BYTES"
     [[ -n "${CHAOS_MAX_SEGMENT_RECORDS:-}" ]] \
@@ -753,6 +763,24 @@ metric_value() {
   printf '%s\n' "$value"
 }
 
+# sample_metric <addr> <metric> — one gauge's integer value, RETRIED under the
+# progress deadline (review): a single scrape can miss — the exporter holds a
+# lock the append path also takes and answers "absent" rather than block — and
+# a scenario that samples a healthy node must not abort on that. Persistent
+# absence still fails, through the caller, once the deadline passes.
+sample_metric() {
+  local addr="$1" metric="$2"
+  local deadline=$((SECONDS + PROGRESS_TIMEOUT_SECONDS)) value
+  while :; do
+    if value="$(metric_value "$addr" "$metric")"; then
+      printf '%s\n' "${value%.*}"
+      return 0
+    fi
+    [[ $SECONDS -lt $deadline ]] || return 1
+    sleep 0.2
+  done
+}
+
 # count_raft_leaders <meta-ids...> — how many nodes report themselves leader.
 # Anything but 1 is an incident: 0 is an outage, 2 is split brain.
 count_raft_leaders() {
@@ -962,6 +990,14 @@ await_verified_floor() {
   # times out reporting a durability failure that is really an argument
   # mismatch.
   [[ -n "$value_bytes" ]] && bound+=(--value-bytes "$value_bytes")
+  # THE OFFSETS A CONSUMER MAY LEGITIMATELY NEVER SEE (#240): every promotion
+  # on a v2 range appends one boundary marker — a record the consumer
+  # boundary filters — so the consumer's view skips one offset per epoch that
+  # was ever promoted. A scenario that runs v2 sets this to an upper bound it
+  # can justify (epochs are minted from 1, so the current epoch bounds the
+  # markers); zero, the default and every v1 scenario, keeps the dense
+  # contract where any skipped offset is a lost record.
+  [[ -n "${CHAOS_MAX_OFFSET_GAPS:-}" ]] && bound+=(--max-offset-gaps "$CHAOS_MAX_OFFSET_GAPS")
   while :; do
     if "$VTOP_NODE" verify --client-config "$cfg" --addr "$addr" \
       --expect-at-least "$floor" ${bound[@]+"${bound[@]}"} \
@@ -1151,6 +1187,11 @@ start_promoted_follower() {
     echo "cluster_id: $CLUSTER_ID"
     echo "data_dir: $WORKDIR/data-follower-$n"
     echo "fencing_epoch: 0"
+    # The on-disk format a NEW range is created in (#240): unset keeps the
+    # binary's default. Scenarios that assert the promotion boundary marker
+    # set v2, the only format whose frames can carry one.
+    [[ -n "${CHAOS_SEGMENT_FORMAT:-}" ]] \
+      && echo "segment_format: $CHAOS_SEGMENT_FORMAT"
     emit_range_yaml
     echo "segment_id: $SEGMENT_ID"
     echo "native_listen: \"$(native_addr)\""
@@ -1287,6 +1328,11 @@ emit_colocated_config() {
     echo "  cluster_id: $CLUSTER_ID"
     echo "  data_dir: $WORKDIR/data-colocated-$id"
     echo "  fencing_epoch: $FENCING_EPOCH"
+    # The on-disk format a NEW range is created in (#240): unset keeps the
+    # binary's default. Scenarios that assert the promotion boundary marker
+    # set v2, the only format whose frames can carry one.
+    [[ -n "${CHAOS_SEGMENT_FORMAT:-}" ]] \
+      && echo "  segment_format: $CHAOS_SEGMENT_FORMAT"
     echo "  $(emit_range_yaml)"
     echo "  segment_id: $SEGMENT_ID"
     echo "  native_listen: \"$(colocated_native_addr "$id")\""
@@ -1345,6 +1391,11 @@ emit_candidate_config() {
     # from 1, and a floor above a real grant would ignore it forever (see
     # emit_leader_config_with_lease).
     echo "fencing_epoch: 0"
+    # The on-disk format a NEW range is created in (#240): unset keeps the
+    # binary's default. Scenarios that assert the promotion boundary marker
+    # set v2, the only format whose frames can carry one.
+    [[ -n "${CHAOS_SEGMENT_FORMAT:-}" ]] \
+      && echo "segment_format: $CHAOS_SEGMENT_FORMAT"
     [[ -n "${CHAOS_MAX_SEGMENT_BYTES:-}" ]] \
       && echo "max_segment_bytes: $CHAOS_MAX_SEGMENT_BYTES"
     [[ -n "${CHAOS_MAX_SEGMENT_RECORDS:-}" ]] \

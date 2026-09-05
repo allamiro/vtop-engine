@@ -320,6 +320,112 @@ pub(crate) async fn read_command_bounded(
     }
 }
 
+/// S3's throttling error codes, as the AWS SDK's own retry classifier lists
+/// them (#102). A code on this list means the store wants fewer requests,
+/// whichever tool relayed it.
+pub const THROTTLE_ERROR_CODES: &[&str] = &[
+    "Throttling",
+    "ThrottlingException",
+    "ThrottledException",
+    "RequestThrottledException",
+    "TooManyRequestsException",
+    "TooManyRequests",
+    "ProvisionedThroughputExceededException",
+    "RequestLimitExceeded",
+    "BandwidthLimitExceeded",
+    "LimitExceededException",
+    "RequestThrottled",
+    "SlowDown",
+    "PriorRequestNotComplete",
+];
+
+/// Whether an S3 error code is a throttle (#102).
+pub fn is_throttle_code(code: &str) -> bool {
+    THROTTLE_ERROR_CODES.contains(&code)
+}
+
+/// Whether an HTTP status carries a throttle on its own: 429 by definition,
+/// and 503, which is how S3 says `SlowDown` (#102).
+pub fn is_throttle_status(status: u16) -> bool {
+    matches!(status, 429 | 503)
+}
+
+/// Whether a tool's output relays a throttle (#102), read from the places
+/// the tools put an error CODE or STATUS — never from the output at large,
+/// where an object key named `SlowDown/` would be mistaken for one (review):
+///
+/// - awscli: `An error occurred (SlowDown) when calling the PutObject …`
+/// - s3cmd:  `ERROR: S3 error: 503 (SlowDown): Please reduce your request rate.`
+/// - mc:     `mc: <ERROR> … Please reduce your request rate.` — mc prints no
+///   code, only S3's message, so that sentence (S3's own wording for every
+///   throttle) is the one message-text match; and a bare `429 Too Many
+///   Requests` / `503 Service Unavailable` status line as any of them may
+///   relay it from a proxy.
+pub fn looks_throttled(text: &str) -> bool {
+    // The LAST non-empty line only (review): it is the tool's verdict, and
+    // an earlier line — a retry it reported and recovered from, say — is
+    // not. This is also the line the error message carries.
+    text.lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .is_some_and(line_relays_throttle)
+}
+
+fn line_relays_throttle(line: &str) -> bool {
+    // awscli: the code in parentheses right after "error occurred".
+    if let Some(rest) = line.split("error occurred (").nth(1) {
+        if let Some(code) = rest.split(')').next() {
+            if is_throttle_code(code) {
+                return true;
+            }
+        }
+    }
+    // s3cmd: "S3 error: <status> (<code>)".
+    if let Some(rest) = line.split("S3 error: ").nth(1) {
+        let mut parts = rest.splitn(2, ' ');
+        let status = parts.next().unwrap_or_default().trim_end_matches(':');
+        if status.parse::<u16>().is_ok_and(is_throttle_status) {
+            return true;
+        }
+        if let Some(code) = parts.next().and_then(|tail| {
+            tail.strip_prefix('(')
+                .and_then(|inner| inner.split(')').next())
+        }) {
+            if is_throttle_code(code) {
+                return true;
+            }
+        }
+    }
+    // A status line with its reason phrase, as a proxy relays it: the line
+    // IS the status, optionally behind an `HTTP/1.1 ` or `HTTP ` prefix —
+    // not a phrase found somewhere inside a line (review), where an object
+    // key could put it.
+    let status_line = line
+        .trim()
+        .trim_start_matches("HTTP/1.1 ")
+        .trim_start_matches("HTTP/1.0 ")
+        .trim_start_matches("HTTP/2 ")
+        .trim_start_matches("HTTP ");
+    if status_line.starts_with("429 Too Many Requests")
+        || status_line.starts_with("503 Service Unavailable")
+    {
+        return true;
+    }
+    // S3's message for every throttle, which mc relays without the code.
+    line.contains("Please reduce your request rate")
+}
+
+/// The engine's error for a failed backend call, told apart by what the
+/// evidence says (#102).
+pub(crate) fn upload_failure(detail: String, evidence: &str) -> VtopError {
+    if looks_throttled(evidence) {
+        VtopError::UploadThrottled(detail)
+    } else {
+        VtopError::Upload(detail)
+    }
+}
+
 /// Pluggable object-storage backend.
 #[async_trait]
 pub trait UploadBackend: Send + Sync {
@@ -517,6 +623,55 @@ pub fn parse_s3_uri(uri: &str) -> Result<(String, String), VtopError> {
         return Err(VtopError::Upload(format!("malformed s3 uri: {uri}")));
     }
     Ok((bucket.to_string(), key.to_string()))
+}
+
+#[cfg(test)]
+mod throttle_tests {
+    use super::*;
+
+    /// The vocabulary matches what the three CLIs actually print for a
+    /// throttled put, and nothing about an ordinary failure (#102).
+    #[test]
+    fn a_throttle_is_recognised_in_every_tools_words_and_in_no_others() {
+        for relayed in [
+            "An error occurred (SlowDown) when calling the PutObject operation (reached max retries: 4): Please reduce your request rate.",
+            "ERROR: S3 error: 503 (SlowDown): Please reduce your request rate.",
+            "ERROR: S3 error: 429 (TooManyRequests)",
+            "mc: <ERROR> Failed to copy `x`. Please reduce your request rate.",
+            "An error occurred (Throttling) when calling the PutObject operation",
+            "upload failed: s3://bucket/key\nAn error occurred (RequestLimitExceeded) when calling the PutObject operation",
+            "HTTP 429 Too Many Requests",
+            "HTTP/1.1 503 Service Unavailable",
+            "503 Service Unavailable",
+        ] {
+            assert!(looks_throttled(relayed), "{relayed}");
+            assert!(matches!(
+                upload_failure("put".into(), relayed),
+                VtopError::UploadThrottled(_)
+            ));
+        }
+        for ordinary in [
+            "An error occurred (NoSuchBucket) when calling the PutObject operation",
+            "ERROR: S3 error: 403 (AccessDenied)",
+            "mc: <ERROR> Unable to validate source `x`: file does not exist",
+            "connection reset by peer",
+            // An earlier line's throttle is not the verdict (review).
+            "An error occurred (SlowDown) when calling the PutObject operation; retrying\nAn error occurred (AccessDenied) when calling the PutObject operation",
+            // A key that happens to be named after a code is not a code (review).
+            "An error occurred (AccessDenied) when calling the PutObject operation: s3://bucket/SlowDown/Throttling.log",
+            "upload failed: s3://bucket/TooManyRequests/file to s3://bucket/503 Service/Unavailable",
+            "ERROR: S3 error: 403 (AccessDenied): s3://bucket/SlowDown",
+        ] {
+            assert!(!looks_throttled(ordinary), "{ordinary}");
+            assert!(matches!(
+                upload_failure("put".into(), ordinary),
+                VtopError::Upload(_)
+            ));
+        }
+        assert!(is_throttle_status(429) && is_throttle_status(503));
+        assert!(!is_throttle_status(500) && !is_throttle_status(404));
+        assert!(is_throttle_code("SlowDown") && !is_throttle_code("NoSuchKey"));
+    }
 }
 
 #[cfg(test)]

@@ -10,6 +10,8 @@ description = "Pluggable S3-compatible upload backends for the VTOP Engine with 
 vtop-core = { workspace = true }
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
+aws-smithy-runtime-api = { workspace = true }
+aws-smithy-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }

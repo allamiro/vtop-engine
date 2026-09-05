@@ -366,34 +366,322 @@ impl QuorumProbe for ReplicaPlaneProbe {
     }
 }
 
+/// What one successful marker publication proved: the epoch whose marker
+/// is now quorum-acked, and the high-water mark it published (review).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublishedMarker {
+    pub epoch: u64,
+    pub committed: u64,
+}
+
 /// Publishes into a live broker.
+///
+/// On a replicated v2 range the probed boundary is NOT published here (#240,
+/// Raft §5.4.2): a boundary established by counting other replicas' pasts is
+/// a CANDIDATE value, and the only thing that may raise the published
+/// high-water mark is an entry of this epoch that a quorum holds. So
+/// `promote` adopts the epoch and stashes the candidate; the driver
+/// ([`Self::drive_boundary_marker`]) appends the epoch's marker, proves it on
+/// a quorum, and publishes the marker's END — which covers the candidate,
+/// because the election restriction (§5.4.1, #342) guarantees the winner
+/// holds everything the boundary names. Until then the watermark stays at
+/// the durable floor the broker opened with (#402), so consumers see
+/// nothing this epoch has not proven and a produce that lands first commits
+/// the marker prefix implicitly, which is Raft's own rule.
+///
+/// The consequence is deliberate: on a range where a majority cannot hold
+/// the new leader's tail, promotion establishes, appends, and then refuses
+/// to publish until repair closes the gap. Failover on such a range is
+/// slower to serve; the alternative was publishing a boundary nothing
+/// proved. A v1-format range keeps the pre-marker publication path — its
+/// frame cannot carry a marker consumers could be shielded from — and a
+/// standalone range has no quorum to convince and no other past to trust,
+/// so neither is gated.
 pub struct BrokerLeasePublisher {
     broker: Arc<LocalBroker>,
+    /// The epoch whose boundary marker has yet to be quorum-acked, if any.
+    /// Cleared by publication, or by a demotion or suspension — a fenced
+    /// leader's marker refuses anyway, and the driver must not spin on it.
+    pending_marker: std::sync::Mutex<Option<u64>>,
+    /// Woken on every change to `pending_marker`, so the driver waits
+    /// rather than polls.
+    marker_changed: tokio::sync::Notify,
 }
 
 impl BrokerLeasePublisher {
     pub fn new(broker: Arc<LocalBroker>) -> Self {
-        Self { broker }
+        Self {
+            broker,
+            pending_marker: std::sync::Mutex::new(None),
+            marker_changed: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Whether promotion on this broker publishes through the marker: only a
+    /// replicated v2 range can append one a quorum proves and consumers
+    /// never see. Public so a role that knows the answer is "never" can
+    /// skip spawning a driver that would only ever park.
+    pub fn gates_on_marker(&self) -> bool {
+        self.broker.cluster_committed().is_some()
+            && self.broker.segment_format() == vtop_broker::SegmentFormat::V2
+    }
+
+    /// The epoch whose boundary is established but not yet published.
+    pub fn pending_marker_epoch(&self) -> Option<u64> {
+        *self
+            .pending_marker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Pend `epoch`'s marker unless a newer epoch is already pending
+    /// (review): promotion rounds can arrive reordered, and a stale one
+    /// must not replace the marker the current epoch still owes.
+    fn pend_marker(&self, epoch: u64) {
+        let mut pending = self
+            .pending_marker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if pending.is_some_and(|current| current > epoch) {
+            return;
+        }
+        *pending = Some(epoch);
+        // The gate is raised UNDER the same lock that pends the marker, so
+        // no fetch can slip between the promotion and the refusal.
+        self.broker.set_boundary_pending(true);
+        drop(pending);
+        self.marker_changed.notify_one();
+    }
+
+    /// Retire the pending marker only if it is `epoch`'s (review): a delayed
+    /// demotion or suspension naming an older epoch says nothing about the
+    /// newer epoch's marker, whose lease the broker still holds.
+    fn retire_marker(&self, epoch: u64) {
+        let mut pending = self
+            .pending_marker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *pending == Some(epoch) {
+            *pending = None;
+            self.broker.set_boundary_pending(false);
+            drop(pending);
+            self.marker_changed.notify_one();
+        }
+    }
+
+    /// One attempt at the pending marker, answering only the mark: the
+    /// tests' shorthand over [`Self::publish_pending_boundary`].
+    #[cfg(test)]
+    pub fn try_publish_pending_boundary(&self) -> Result<Option<u64>, String> {
+        self.publish_pending_boundary()
+            .map(|published| published.map(|published| published.committed))
+    }
+
+    /// One attempt at the pending marker: `Ok(Some(published))` names the
+    /// epoch whose marker went out and the mark it published, `Ok(None)`
+    /// found nothing pending, `Err` names why it stays pending. The pending
+    /// epoch is read INSIDE this call, so a re-grant between a caller's own
+    /// read and this one publishes the newer marker — and a caller that
+    /// reports the epoch must report the one answered here, not the one it
+    /// captured (review). Synchronous and blocking (an fsync plus a
+    /// replication round trip), so the driver runs it on the blocking pool.
+    pub fn publish_pending_boundary(&self) -> Result<Option<PublishedMarker>, String> {
+        let Some(epoch) = self.pending_marker_epoch() else {
+            return Ok(None);
+        };
+        match self.broker.publish_boundary_marker(epoch) {
+            Ok(mark) => {
+                // Cleared only if this is still the epoch that was pending: a
+                // re-grant between the attempt and here is a newer marker to
+                // publish, not a job done.
+                let mut pending = self
+                    .pending_marker
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if *pending == Some(epoch) {
+                    *pending = None;
+                    // Proven: the mark is published, and fetch may serve it.
+                    self.broker.set_boundary_pending(false);
+                }
+                Ok(Some(PublishedMarker {
+                    epoch,
+                    committed: mark,
+                }))
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    /// Publish every pending boundary marker until told to stop: retried
+    /// with a bounded backoff while a quorum cannot hold the marker, woken
+    /// the moment a new promotion or a demotion changes what is pending.
+    /// The retry is the whole point — the refusal is the #340 wall, and the
+    /// boundary must publish the instant repair closes the gap, without a
+    /// restart and without anybody re-promoting.
+    ///
+    /// A closed shutdown watch is not a shutdown: the arm stops being polled
+    /// and the driver keeps serving whoever still owns it, the same rule the
+    /// supervisor's adapters follow.
+    pub async fn drive_boundary_marker(
+        self: Arc<Self>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
+        let mut attempts: u32 = 0;
+        let mut watch_closed = false;
+        loop {
+            if *shutdown.borrow() {
+                return;
+            }
+            let Some(epoch) = self.pending_marker_epoch() else {
+                attempts = 0;
+                tokio::select! {
+                    _ = self.marker_changed.notified() => {}
+                    changed = shutdown.changed(), if !watch_closed => {
+                        if changed.is_err() {
+                            watch_closed = true;
+                        } else if *shutdown.borrow() {
+                            return;
+                        }
+                    }
+                }
+                continue;
+            };
+            let publisher = Arc::clone(&self);
+            let outcome =
+                tokio::task::spawn_blocking(move || publisher.publish_pending_boundary()).await;
+            match outcome {
+                Ok(Ok(Some(PublishedMarker {
+                    epoch: published,
+                    committed,
+                }))) => {
+                    attempts = 0;
+                    // THE EPOCH THAT WENT OUT, not the one read above
+                    // (review): a re-grant between the two publishes the
+                    // newer marker, and the harness waits for that one by
+                    // number.
+                    tracing::info!(
+                        range = %self.broker.range().range_id,
+                        fencing_epoch = published,
+                        committed_high_watermark = committed,
+                        "boundary marker quorum-acked; the high-water mark is published"
+                    );
+                    // The harness-readable line, beside the structured one:
+                    // scenarios assert this exact event.
+                    println!(
+                        "boundary_marker_published epoch={published} committed={committed} range={}",
+                        self.broker.range().range_id
+                    );
+                    use std::io::Write;
+                    std::io::stdout().flush().ok();
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(reason)) => {
+                    attempts = attempts.saturating_add(1);
+                    // The first refusal and every twentieth after it: the
+                    // condition is expected to persist for as long as repair
+                    // takes, and a log line per attempt would bury the
+                    // reason under its own repetitions.
+                    if attempts == 1 || attempts.is_multiple_of(20) {
+                        tracing::warn!(
+                            range = %self.broker.range().range_id,
+                            fencing_epoch = epoch,
+                            attempts,
+                            %reason,
+                            "boundary marker not yet published; the high-water mark stays \
+                             at the durable floor until a majority holds this epoch's tail"
+                        );
+                    }
+                    let backoff = std::time::Duration::from_millis(
+                        250_u64.saturating_mul(1_u64 << attempts.min(3)),
+                    );
+                    tokio::select! {
+                        _ = tokio::time::sleep(backoff) => {}
+                        _ = self.marker_changed.notified() => {}
+                        changed = shutdown.changed(), if !watch_closed => {
+                            if changed.is_err() {
+                                watch_closed = true;
+                            } else if *shutdown.borrow() {
+                                return;
+                            }
+                        }
+                    }
+                }
+                Err(join) => {
+                    tracing::error!(%join, "boundary marker attempt panicked; retrying");
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            }
+        }
     }
 }
 
 impl LeasePublisher for BrokerLeasePublisher {
     fn promote(&self, fencing_epoch: u64, committed_offset: Option<u64>) {
-        if let (Some(offset), Some(cluster)) = (committed_offset, self.broker.cluster_committed()) {
-            cluster.advance_to(offset);
+        let gated = self.gates_on_marker();
+        if !gated {
+            // The pre-marker publication path, kept ONLY where no marker can
+            // exist: a v1 range cannot shield consumers from one, and a
+            // standalone range (no cluster cell) has nothing to prove and
+            // nothing to publish here either.
+            if let (Some(offset), Some(cluster)) =
+                (committed_offset, self.broker.cluster_committed())
+            {
+                cluster.advance_to(offset);
+            }
+        }
+        if gated {
+            // THE GATE GOES UP BEFORE THE LEASE GOES LIVE (review): a fetch
+            // that takes the metadata lock between activation and the gate
+            // would pass its lease check and serve the unproven floor. Raised
+            // first, a fetch in that window is refused — retryably — and
+            // nothing is served that this epoch has not proven. A stale
+            // round restores the gate to whatever the current marker needs.
+            self.broker.set_boundary_pending(true);
         }
         // Both values must end up equal or the broker refuses every request.
         // The order is not a safety question — produce checks equality, so any
         // window between the two writes fails closed — but both must happen.
         self.broker.adopt_fencing_epoch(fencing_epoch);
         self.broker.meta_fencing_epoch().set(fencing_epoch);
+        if gated {
+            // AFTER the epoch is adopted, so the driver's first attempt finds
+            // a broker that holds the epoch rather than one that refuses it
+            // for a reason that will clear a microsecond later. And only if
+            // the adoption stands (review): adoption is monotonic, so a
+            // stale round names an epoch the broker has moved past, and the
+            // marker it would pend is one the newer epoch's would supersede
+            // anyway — pending it would only displace the marker still owed.
+            if self.broker.held_fencing_epoch() != fencing_epoch {
+                tracing::debug!(
+                    range = %self.broker.range().range_id,
+                    fencing_epoch,
+                    held = self.broker.held_fencing_epoch(),
+                    "stale promotion round; the held epoch's marker stays pending"
+                );
+                self.broker
+                    .set_boundary_pending(self.pending_marker_epoch().is_some());
+                return;
+            }
+            tracing::info!(
+                range = %self.broker.range().range_id,
+                fencing_epoch,
+                candidate_boundary = ?committed_offset,
+                "promotion established a candidate boundary; publishing through this \
+                 epoch's marker rather than by trusting the count (#240, §5.4.2)"
+            );
+            self.pend_marker(fencing_epoch);
+        }
     }
 
     fn demote(&self, fencing_epoch: u64) {
         // Only the metadata view is cleared. The held epoch stays where it is:
         // it records what this process was last granted, and rewinding it
         // would let a later stale grant look current.
+        // FENCE FIRST, gate second (review): a fetch between the two would
+        // otherwise pass an active lease and find the gate already down.
+        // Deactivated first, it is refused as fenced, which is the truth.
         self.broker.meta_fencing_epoch().clear_lease(fencing_epoch);
+        self.retire_marker(fencing_epoch);
     }
 
     fn suspend(&self, fencing_epoch: u64) {
@@ -401,7 +689,12 @@ impl LeasePublisher for BrokerLeasePublisher {
         // after which a successful re-promotion at the same epoch could never
         // reactivate the view — the broker would stay fenced under its own
         // live lease until an external epoch change.
+        // The pending marker goes too: a suspended lease refuses the marker,
+        // and the re-promotion that lifts the suspension pends it again — a
+        // republish at the same epoch rides the duplicate path. Suspended
+        // FIRST, then retired, for the reason `demote` gives.
         self.broker.meta_fencing_epoch().suspend(fencing_epoch);
+        self.retire_marker(fencing_epoch);
     }
 }
 
@@ -2016,6 +2309,414 @@ mod tests {
             "the granted epoch records history; rewinding it would let a later \
              stale grant look current"
         );
+    }
+
+    /// A replicated v2 range publishes NOTHING at promotion (#240, §5.4.2):
+    /// the probed boundary is a candidate, the cell stays where it was, and
+    /// the epoch's marker is what pends. Driving the marker once against a
+    /// healthy quorum publishes the marker's end — which covers the
+    /// candidate — and clears the pending epoch.
+    #[test]
+    fn a_replicated_v2_promotion_publishes_only_through_its_marker() {
+        let h = replicated_v2_harness();
+        let publisher = BrokerLeasePublisher::new(Arc::clone(&h.leader));
+
+        publisher.promote(FENCING_EPOCH, Some(0));
+        assert_eq!(h.leader.held_fencing_epoch(), FENCING_EPOCH);
+        assert_eq!(
+            h.cluster_committed.get(),
+            0,
+            "the candidate boundary must not raise the cell: that is the counted-majority \
+             trust the marker exists to replace"
+        );
+        assert_eq!(publisher.pending_marker_epoch(), Some(FENCING_EPOCH));
+
+        let published = publisher
+            .try_publish_pending_boundary()
+            .expect("a healthy quorum acks the marker");
+        assert_eq!(
+            published,
+            Some(1),
+            "the marker sits at offset 0, so the published mark is its end"
+        );
+        assert_eq!(h.cluster_committed.get(), 1);
+        assert_eq!(
+            publisher.pending_marker_epoch(),
+            None,
+            "publication is what retires the pending epoch"
+        );
+        assert_eq!(
+            publisher.try_publish_pending_boundary(),
+            Ok(None),
+            "nothing pending means nothing to do — not a second marker"
+        );
+    }
+
+    /// The #340 wall, in miniature: while no majority can hold the marker
+    /// the boundary stays unpublished and PENDING, and the moment the
+    /// quorum returns the same pending epoch publishes — no restart, no
+    /// re-promotion, and no second marker.
+    #[test]
+    fn a_pending_marker_publishes_the_moment_a_quorum_returns() {
+        let h = replicated_v2_harness();
+        let publisher = BrokerLeasePublisher::new(Arc::clone(&h.leader));
+        h.followers[0].set_online(false);
+        h.followers[1].set_online(false);
+
+        publisher.promote(FENCING_EPOCH, Some(0));
+        let refused = publisher
+            .try_publish_pending_boundary()
+            .expect_err("no majority holds the marker, so nothing may publish");
+        assert!(
+            refused.contains("not quorum-acked"),
+            "the refusal must name the quorum, not something incidental: {refused}"
+        );
+        assert_eq!(
+            h.cluster_committed.get(),
+            0,
+            "unpublished, as §5.4.2 requires"
+        );
+        assert_eq!(
+            publisher.pending_marker_epoch(),
+            Some(FENCING_EPOCH),
+            "a refusal keeps the epoch pending for the next attempt"
+        );
+
+        h.followers[0].set_online(true);
+        assert_eq!(
+            publisher.try_publish_pending_boundary(),
+            Ok(Some(1)),
+            "one follower back is a majority of three; the retry publishes"
+        );
+        let (_, next_offset) = h.leader.local_offsets();
+        assert_eq!(
+            next_offset, 1,
+            "the retry rode the duplicate path: one marker, not one per attempt"
+        );
+    }
+
+    /// The driver itself, end to end on a runtime: it publishes what pends,
+    /// keeps retrying through a refusal, and picks up a re-grant at a newer
+    /// epoch without being poked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_driver_publishes_pending_boundaries_until_stopped() {
+        let h = replicated_v2_harness();
+        let publisher = Arc::new(BrokerLeasePublisher::new(Arc::clone(&h.leader)));
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        let driver = tokio::spawn(Arc::clone(&publisher).drive_boundary_marker(stop_rx));
+
+        // Refused first: the driver must not give up.
+        h.followers[0].set_online(false);
+        h.followers[1].set_online(false);
+        publisher.promote(FENCING_EPOCH, Some(0));
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert_eq!(
+            h.cluster_committed.get(),
+            0,
+            "nothing publishes without a quorum"
+        );
+        assert_eq!(publisher.pending_marker_epoch(), Some(FENCING_EPOCH));
+
+        h.followers[0].set_online(true);
+        h.followers[1].set_online(true);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while publisher.pending_marker_epoch().is_some() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            h.cluster_committed.get(),
+            1,
+            "the retry published once quorum returned"
+        );
+
+        // A re-grant at a newer epoch pends a new marker; the driver wakes.
+        // The followers adopt the epoch first, as their lease watchers do in
+        // production — a follower still at the old epoch refuses the
+        // marker, which is fencing working, not the driver failing.
+        h.meta.set(FENCING_EPOCH + 1);
+        for follower in &h.followers {
+            follower.adopt_fencing_epoch(FENCING_EPOCH + 1);
+        }
+        publisher.promote(FENCING_EPOCH + 1, Some(1));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while publisher.pending_marker_epoch().is_some() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            h.cluster_committed.get(),
+            2,
+            "the newer epoch's marker is a second record and publishes its own end"
+        );
+
+        let _ = stop.send(true);
+        tokio::time::timeout(std::time::Duration::from_secs(5), driver)
+            .await
+            .expect("the driver exits on shutdown")
+            .unwrap();
+    }
+
+    /// A demotion or suspension retires the pending marker: a fenced or
+    /// suspended leader's marker refuses anyway, and the driver must not
+    /// spin against it. The re-promotion that lifts a suspension pends the
+    /// epoch again.
+    #[test]
+    fn demotion_and_suspension_retire_the_pending_marker() {
+        let h = replicated_v2_harness();
+        let publisher = BrokerLeasePublisher::new(Arc::clone(&h.leader));
+
+        publisher.promote(FENCING_EPOCH, Some(0));
+        assert_eq!(publisher.pending_marker_epoch(), Some(FENCING_EPOCH));
+        publisher.suspend(FENCING_EPOCH);
+        assert_eq!(publisher.pending_marker_epoch(), None);
+        publisher.promote(FENCING_EPOCH, Some(0));
+        assert_eq!(
+            publisher.pending_marker_epoch(),
+            Some(FENCING_EPOCH),
+            "lifting the suspension pends the same epoch again"
+        );
+        publisher.demote(FENCING_EPOCH);
+        assert_eq!(publisher.pending_marker_epoch(), None);
+        assert_eq!(h.cluster_committed.get(), 0, "nothing ever published");
+    }
+
+    /// While the marker is pending, fetch refuses — retryably — rather
+    /// than serve the durable floor, which may sit below a mark the
+    /// previous leader already published (review): a consumer must never
+    /// watch the mark move backwards across a failover. Produce is still
+    /// admitted, and publication reopens fetch.
+    #[test]
+    fn fetch_refuses_while_the_boundary_is_pending_and_serves_once_proven() {
+        let h = replicated_v2_harness();
+        let publisher = BrokerLeasePublisher::new(Arc::clone(&h.leader));
+        let fetch = |start: u64| {
+            h.leader.handle(
+                vtop_protocol::Role::Consumer,
+                vtop_protocol::WireFrame {
+                    request_id: 900 + start,
+                    stream_id: 1,
+                    message: vtop_protocol::Message::FetchRequest(vtop_protocol::FetchRequest {
+                        range: h.leader.range().clone(),
+                        fencing_epoch: FENCING_EPOCH,
+                        start_offset: start,
+                        max_bytes: 1 << 20,
+                        max_records: 64,
+                    }),
+                },
+            )
+        };
+        assert!(!h.leader.boundary_pending());
+        publisher.promote(FENCING_EPOCH, Some(0));
+        assert!(h.leader.boundary_pending(), "the promotion raised the gate");
+        match fetch(0).message {
+            vtop_protocol::Message::Error(error) => assert_eq!(
+                error.code,
+                vtop_protocol::ErrorCode::Overloaded,
+                "the refusal is the retryable kind, not a fence"
+            ),
+            other => panic!("fetch served before the boundary was proven: {other:?}"),
+        }
+        publisher
+            .try_publish_pending_boundary()
+            .expect("a healthy quorum acks the marker");
+        assert!(!h.leader.boundary_pending(), "publication lowered the gate");
+        assert!(
+            matches!(fetch(0).message, vtop_protocol::Message::FetchResponse(_)),
+            "fetch serves once the mark is proven"
+        );
+
+        // A demotion that retires the pending marker lowers the gate too: a
+        // fenced broker refuses for its own reason, not this one.
+        h.meta.set(FENCING_EPOCH + 1);
+        for follower in &h.followers {
+            follower.adopt_fencing_epoch(FENCING_EPOCH + 1);
+        }
+        publisher.promote(FENCING_EPOCH + 1, Some(1));
+        assert!(h.leader.boundary_pending());
+        publisher.demote(FENCING_EPOCH + 1);
+        assert!(!h.leader.boundary_pending());
+    }
+
+    /// Rounds can arrive reordered (review): a stale promotion must not
+    /// displace the marker the current epoch still owes, and a delayed
+    /// demotion or suspension naming an older epoch must not retire it.
+    #[test]
+    fn a_stale_round_neither_displaces_nor_retires_the_current_markers() {
+        let h = replicated_v2_harness();
+        let publisher = BrokerLeasePublisher::new(Arc::clone(&h.leader));
+        h.meta.set(FENCING_EPOCH + 1);
+        publisher.promote(FENCING_EPOCH + 1, Some(0));
+        assert_eq!(publisher.pending_marker_epoch(), Some(FENCING_EPOCH + 1));
+
+        // A reordered promotion at the older epoch: adoption is monotonic,
+        // so the broker stays at the newer epoch and so does the marker.
+        publisher.promote(FENCING_EPOCH, Some(0));
+        assert_eq!(h.leader.held_fencing_epoch(), FENCING_EPOCH + 1);
+        assert_eq!(
+            publisher.pending_marker_epoch(),
+            Some(FENCING_EPOCH + 1),
+            "a stale round must not displace the current epoch's marker"
+        );
+
+        // A delayed suspension and demotion naming the older epoch: neither
+        // says anything about the newer epoch's marker.
+        publisher.suspend(FENCING_EPOCH);
+        assert_eq!(publisher.pending_marker_epoch(), Some(FENCING_EPOCH + 1));
+        publisher.demote(FENCING_EPOCH);
+        assert_eq!(
+            publisher.pending_marker_epoch(),
+            Some(FENCING_EPOCH + 1),
+            "an older epoch's retirement leaves the newer marker pending"
+        );
+        // Naming the right epoch retires it.
+        publisher.demote(FENCING_EPOCH + 1);
+        assert_eq!(publisher.pending_marker_epoch(), None);
+        assert!(
+            !h.leader.boundary_pending(),
+            "a stale round must not leave the gate up once nothing is pending"
+        );
+        publisher.promote(FENCING_EPOCH, Some(0));
+        assert!(
+            !h.leader.boundary_pending(),
+            "a stale round after retirement restores the gate to nothing-pending"
+        );
+    }
+
+    /// A v1-format replicated range keeps the direct publication path: its
+    /// frame cannot carry a marker consumers could be shielded from, so the
+    /// probed boundary is published as before and nothing pends.
+    #[test]
+    fn a_v1_range_keeps_the_pre_marker_publication_path() {
+        let h = replicated_harness(false);
+        let publisher = BrokerLeasePublisher::new(Arc::clone(&h.leader));
+        publisher.promote(FENCING_EPOCH, Some(3));
+        assert_eq!(
+            h.cluster_committed.get(),
+            3,
+            "a v1 range publishes the probed boundary directly, as it always did"
+        );
+        assert_eq!(publisher.pending_marker_epoch(), None);
+        assert_eq!(publisher.try_publish_pending_boundary(), Ok(None));
+    }
+
+    const FENCING_EPOCH: u64 = 18;
+
+    struct ReplicatedHarness {
+        _dirs: Vec<tempfile::TempDir>,
+        meta: vtop_broker::MetaFencingEpoch,
+        leader: Arc<LocalBroker>,
+        followers: Vec<Arc<vtop_broker::replication::InProcessFollower>>,
+        cluster_committed: vtop_broker::replication::ClusterCommittedOffset,
+    }
+
+    fn replicated_v2_harness() -> ReplicatedHarness {
+        replicated_harness(true)
+    }
+
+    /// The boundary-marker harness's shape (vtop-broker/tests): one leader,
+    /// two in-process followers, a shared metadata view, starting fenced at
+    /// an epoch below the one the tests promote to.
+    fn replicated_harness(v2: bool) -> ReplicatedHarness {
+        use vtop_broker::replication::{
+            ClusterCommittedOffset, InProcessFollower, InProcessReplicaSet, ReplicaSet,
+        };
+        let range = vtop_protocol::RangeIdentity {
+            topic: "events.v1".to_owned(),
+            topic_epoch: 1,
+            range_id: Uuid::from_u128(0xC1),
+            range_generation: 0,
+        };
+        let lineage = vtop_log::RangeLineage {
+            range_id: range.range_id,
+            generation: 0,
+            key_range: vtop_log::KeyRange::full(),
+            parents: Vec::new(),
+        };
+        let segment = |dir: &tempfile::TempDir, id: u128, node: Uuid| {
+            if v2 {
+                vtop_log::ActiveSegment::create_v2(
+                    dir.path().join("range.active"),
+                    vtop_log::SegmentDescriptorV2 {
+                        segment_id: Uuid::from_u128(id),
+                        topic: range.topic.clone(),
+                        topic_epoch: range.topic_epoch,
+                        lineage: lineage.clone(),
+                        base_offset: 0,
+                        segment_generation: 0,
+                        creation_node_id: node,
+                        creation_fencing_epoch: FENCING_EPOCH,
+                    },
+                    vtop_log::SegmentConfigV2::default(),
+                )
+                .unwrap()
+            } else {
+                vtop_log::ActiveSegment::create(
+                    dir.path().join("range.active"),
+                    vtop_log::SegmentDescriptor {
+                        segment_id: Uuid::from_u128(id),
+                        topic: range.topic.clone(),
+                        topic_epoch: range.topic_epoch,
+                        lineage: lineage.clone(),
+                        base_offset: 0,
+                    },
+                    vtop_log::SegmentConfig::default(),
+                )
+                .unwrap()
+            }
+        };
+        let leader_id = Uuid::from_u128(0xA1);
+        // Fenced below the promoted epoch until `promote` adopts it, exactly
+        // as a freshly granted leader is.
+        let meta = vtop_broker::MetaFencingEpoch::new(FENCING_EPOCH - 1);
+        let cluster_committed = ClusterCommittedOffset::new(0);
+        let leader_dir = tempfile::tempdir().unwrap();
+        let leader_segment = segment(&leader_dir, 0xD1, leader_id);
+        let leader_epochs =
+            vtop_broker::ProducerEpochJournal::open(leader_dir.path().join("epochs")).unwrap();
+        let mut dirs = vec![leader_dir];
+        let mut followers = Vec::new();
+        for (index, node_id) in [Uuid::from_u128(0xA2), Uuid::from_u128(0xA3)]
+            .into_iter()
+            .enumerate()
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let follower_segment = segment(&dir, 0xE1 + index as u128, node_id);
+            let epochs =
+                vtop_broker::ProducerEpochJournal::open(dir.path().join("epochs")).unwrap();
+            followers.push(Arc::new(
+                InProcessFollower::new(
+                    node_id,
+                    follower_segment,
+                    epochs,
+                    range.clone(),
+                    FENCING_EPOCH,
+                    meta.clone(),
+                    ClusterCommittedOffset::new(0),
+                )
+                .unwrap(),
+            ));
+            dirs.push(dir);
+        }
+        let replica_set = Arc::new(InProcessReplicaSet::new(followers.clone()));
+        let leader = Arc::new(
+            LocalBroker::with_replication(
+                leader_segment,
+                leader_epochs,
+                range,
+                FENCING_EPOCH - 1,
+                meta.clone(),
+                leader_id,
+                Some(cluster_committed.clone()),
+                Some(replica_set as Arc<dyn ReplicaSet>),
+            )
+            .unwrap(),
+        );
+        ReplicatedHarness {
+            _dirs: dirs,
+            meta,
+            leader,
+            followers,
+            cluster_committed,
+        }
     }
 
     /// A verification leaves the evidence the transition record keeps

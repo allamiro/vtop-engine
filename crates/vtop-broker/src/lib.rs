@@ -36,6 +36,7 @@ pub mod server_metrics;
 
 use crate::group_commit::{GroupCommitConfig, GroupCommitCoordinator, QueuedProduce};
 use crate::memory_budget::{reject_message, BudgetReservation, ConnectionBudget};
+use crate::replication::network::PlaintextExposure;
 use crate::replication::{ClusterCommittedOffset, ReplicaSet};
 
 pub use crate::group_commit::{FlushReason, GroupCommitMetrics, GroupCommitSample};
@@ -630,6 +631,14 @@ pub struct LocalBroker {
     /// Quorum-committed high-water mark. When set, fetch never exposes above it
     /// and `Durability::Quorum` produce waits for it to cover the append.
     cluster_committed: Option<ClusterCommittedOffset>,
+    /// Set while a promotion has established a boundary it has not yet
+    /// proven through this epoch's marker (#240, §5.4.2). Fetch refuses
+    /// while it is set: the cell holds the durable floor, which is a mark a
+    /// quorum once proved but may sit below what the previous leader had
+    /// already published, and a consumer that read the higher mark must not
+    /// watch it move backwards. Produce is admitted — it is what commits the
+    /// marker prefix implicitly when it lands first.
+    boundary_pending: AtomicBool,
     /// Sealed-prefix retention bound in bytes; 0 = retention disabled (#290).
     /// Atomic so operators can set it after construction without a lock, and
     /// the produce path can read it inside the state-lock critical section.
@@ -762,6 +771,7 @@ impl LocalBroker {
             segment_format,
             retention_max_total_bytes: std::sync::atomic::AtomicU64::new(0),
             cluster_committed,
+            boundary_pending: AtomicBool::new(false),
             replicas,
             node_id,
             group_checkpoints: None,
@@ -1251,6 +1261,19 @@ impl LocalBroker {
         self.cluster_committed.as_ref()
     }
 
+    /// Whether a promotion's boundary is established but not yet proven by
+    /// this epoch's quorum-acked marker; fetch refuses while it is.
+    pub fn boundary_pending(&self) -> bool {
+        self.boundary_pending.load(Ordering::SeqCst)
+    }
+
+    /// Raise or clear the boundary-pending gate. Raised by the promotion
+    /// that pends a marker, cleared by the marker's publication or by the
+    /// demotion or suspension that retires it.
+    pub fn set_boundary_pending(&self, pending: bool) {
+        self.boundary_pending.store(pending, Ordering::SeqCst);
+    }
+
     /// The range this broker leads.
     pub fn range(&self) -> &RangeIdentity {
         &self.range
@@ -1476,6 +1499,21 @@ impl LocalBroker {
                     self.check_range(&meta, &request.range, request.fencing_epoch)
                 {
                     return error(request_id, stream_id, code, message);
+                }
+                // A boundary this epoch has not proven is not served (#240,
+                // §5.4.2): the cell holds the durable floor, and a consumer
+                // that read the previous leader's higher mark must never
+                // watch the mark move backwards. Retryable, as the quorum
+                // shortfall it waits on is — the same code a produce gets
+                // when its own quorum does not arrive.
+                if self.boundary_pending() {
+                    return error(
+                        request_id,
+                        stream_id,
+                        ErrorCode::Overloaded,
+                        "promotion boundary not yet proven: this epoch's marker awaits a \
+                         quorum; retry",
+                    );
                 }
                 let mut state = self
                     .state
@@ -2278,11 +2316,30 @@ pub struct ServerTlsMaterial {
     pub client_roots: rustls::RootCertStore,
 }
 
+/// One native session's transport: TLS or, on a plaintext plane, the bare
+/// socket (#294). The session code is written once against this.
+type NativeStream = vtop_meta::transport::MaybeTls<TcpStream>;
+
 /// Maps an authenticated TLS certificate chain and declared principal to the
 /// narrow role allowed on a session. The server has no permissive fallback:
-/// callers must supply an authorization policy explicitly.
+/// callers must supply an authorization policy explicitly — and, for a
+/// plaintext plane, a second one, since there the declared principal is
+/// all there is to go on.
 pub trait SessionAuthorizer: Send + Sync + 'static {
     fn authorize(&self, peer_chain_der: &[Vec<u8>], principal_id: Uuid, role: Role) -> bool;
+
+    /// The decision for a session that arrived WITHOUT a certificate — a
+    /// plaintext native plane (#294). Refuses by default: an authorizer
+    /// written against a certificate chain must say in so many words that
+    /// a bare, self-declared principal is acceptable to it, because on a
+    /// plaintext plane the declaration is the whole of the evidence. The
+    /// TLS path never calls this; it never has an empty chain to ask about,
+    /// since rustls has already verified a client certificate by the time
+    /// the hello arrives.
+    fn authorize_unverified(&self, principal_id: Uuid, role: Role) -> bool {
+        let _ = (principal_id, role);
+        false
+    }
 }
 
 /// The broker behind a listener that OUTLIVES any one broker (#284).
@@ -2339,7 +2396,11 @@ impl BrokerSlot {
 pub struct NativeServer {
     broker: Arc<BrokerSlot>,
     authorizer: Arc<dyn SessionAuthorizer>,
-    acceptor: TlsAcceptor,
+    /// `None` is a plaintext plane (#294): sessions arrive without a
+    /// certificate and are admitted only by
+    /// [`SessionAuthorizer::authorize_unverified`].
+    acceptor: Option<TlsAcceptor>,
+    exposure: PlaintextExposure,
     config: ServerConfig,
     sessions: Arc<Semaphore>,
     requests: Arc<Semaphore>,
@@ -2403,12 +2464,98 @@ impl NativeServer {
         Ok(Self {
             broker,
             authorizer,
-            acceptor: TlsAcceptor::from(Arc::new(tls_config)),
+            acceptor: Some(TlsAcceptor::from(Arc::new(tls_config))),
+            exposure: PlaintextExposure::LoopbackOnly,
             sessions: Arc::new(Semaphore::new(config.max_sessions)),
             requests: Arc::new(Semaphore::new(config.max_inflight_requests)),
             metrics: Arc::new(ServerMetrics::new()),
             config,
         })
+    }
+
+    /// A native plane WITHOUT TLS (#294), for a loopback lab or a segment
+    /// where something else supplies the transport security this plane is
+    /// giving up. Refuses at bind time to serve on anything but a loopback
+    /// address; see [`Self::plaintext_on_any_interface`] for the exposed
+    /// form.
+    ///
+    /// What the plane still enforces, and what it cannot: every session
+    /// declares a principal and a role in its hello, and the authorizer's
+    /// [`SessionAuthorizer::authorize_unverified`] decides on that
+    /// declaration ALONE — there is no certificate to bind it to. The
+    /// broker beneath is unchanged: producer epochs still fence stale
+    /// sessions, the fencing epoch still gates every request, cursors are
+    /// still bound to the principal. So the mode's headline cost is
+    /// exactly this: anything that can reach the port and knows a
+    /// principal's UUID can produce and consume as that principal. The
+    /// UUID is not a secret — it appears in every configuration file the
+    /// principal is named in — which is why the default exposure is
+    /// loopback only.
+    pub fn plaintext(
+        broker: Arc<LocalBroker>,
+        authorizer: Arc<dyn SessionAuthorizer>,
+        config: ServerConfig,
+    ) -> BrokerResult<Self> {
+        if config.segment_format != broker.segment_format() {
+            return Err(BrokerError::InvalidConfig(format!(
+                "configured segment format {:?} does not match the broker's active segment ({:?})",
+                config.segment_format,
+                broker.segment_format()
+            )));
+        }
+        Self::over_slot_plaintext(Arc::new(BrokerSlot::holding(broker)), authorizer, config)
+    }
+
+    /// [`Self::plaintext`] over a [`BrokerSlot`], for a listener that
+    /// outlives the broker behind it.
+    pub fn over_slot_plaintext(
+        broker: Arc<BrokerSlot>,
+        authorizer: Arc<dyn SessionAuthorizer>,
+        config: ServerConfig,
+    ) -> BrokerResult<Self> {
+        config.validate()?;
+        Ok(Self {
+            broker,
+            authorizer,
+            acceptor: None,
+            exposure: PlaintextExposure::LoopbackOnly,
+            sessions: Arc::new(Semaphore::new(config.max_sessions)),
+            requests: Arc::new(Semaphore::new(config.max_inflight_requests)),
+            metrics: Arc::new(ServerMetrics::new()),
+            config,
+        })
+    }
+
+    /// A plaintext native plane on a NON-LOOPBACK address, acknowledged
+    /// explicitly (#294). A separate constructor rather than a flag, as on
+    /// the replica plane, because the risk deserves a name at the call
+    /// site: read [`Self::plaintext`] for what an unidentified caller on
+    /// this port can do. Legitimate inside a sidecar mesh or on a trusted
+    /// segment that supplies the authentication this plane no longer does.
+    pub fn plaintext_on_any_interface(
+        broker: Arc<LocalBroker>,
+        authorizer: Arc<dyn SessionAuthorizer>,
+        config: ServerConfig,
+    ) -> BrokerResult<Self> {
+        let mut server = Self::plaintext(broker, authorizer, config)?;
+        server.exposure = PlaintextExposure::AnyInterface;
+        Ok(server)
+    }
+
+    /// [`Self::plaintext_on_any_interface`] over a [`BrokerSlot`].
+    pub fn over_slot_plaintext_on_any_interface(
+        broker: Arc<BrokerSlot>,
+        authorizer: Arc<dyn SessionAuthorizer>,
+        config: ServerConfig,
+    ) -> BrokerResult<Self> {
+        let mut server = Self::over_slot_plaintext(broker, authorizer, config)?;
+        server.exposure = PlaintextExposure::AnyInterface;
+        Ok(server)
+    }
+
+    /// Whether sessions on this plane arrive under TLS.
+    pub fn is_encrypted(&self) -> bool {
+        self.acceptor.is_some()
     }
 
     /// This server's request-path counters (#224).
@@ -2426,6 +2573,34 @@ impl NativeServer {
         listener: TcpListener,
         mut shutdown: oneshot::Receiver<()>,
     ) -> BrokerResult<()> {
+        // CHECKED AT BIND TIME, as on the admin, peer, and replica planes
+        // (#294): the question is about the address this endpoint is
+        // reachable on, so answering it once means a misconfigured
+        // deployment fails to start rather than serving until the first
+        // unwanted client arrives.
+        if self.acceptor.is_none() {
+            let bound = listener.local_addr().map_err(|source| BrokerError::Io {
+                path: PathBuf::from("tcp-listener"),
+                source,
+            })?;
+            if self.exposure == PlaintextExposure::LoopbackOnly && !bound.ip().is_loopback() {
+                return Err(BrokerError::InvalidConfig(format!(
+                    "refusing to serve a plaintext native endpoint on {bound}: it is not a \
+                     loopback address, and a plaintext session carries no certificate — the \
+                     principal it declares is the whole of the evidence, so anything that can \
+                     reach this port and knows a principal's UUID can produce and consume as \
+                     that principal. Bind to 127.0.0.1 for local use, enable TLS to expose \
+                     it, or construct the server with `plaintext_on_any_interface` if that is \
+                     genuinely intended."
+                )));
+            }
+            eprintln!(
+                "warning: native endpoint {bound} is PLAINTEXT: sessions carry no certificate, \
+                 so a principal is whatever the client declares. Sessions are admitted only if \
+                 the authorizer accepts unverified principals; the fencing epoch, producer \
+                 epochs, and cursor binding still apply."
+            );
+        }
         let mut sessions = JoinSet::new();
         loop {
             tokio::select! {
@@ -2495,7 +2670,7 @@ impl NativeServer {
 }
 
 async fn write_session_frame(
-    stream: &mut tokio_rustls::server::TlsStream<TcpStream>,
+    stream: &mut NativeStream,
     frame: &WireFrame,
     limits: ProtocolLimits,
     write_timeout: Duration,
@@ -2575,7 +2750,7 @@ impl Drop for RequestRecord<'_> {
 /// list is where a future edit swaps two `Arc`s of compatible type without the
 /// compiler noticing.
 struct SessionContext {
-    acceptor: TlsAcceptor,
+    acceptor: Option<TlsAcceptor>,
     broker: Arc<LocalBroker>,
     authorizer: Arc<dyn SessionAuthorizer>,
     requests: Arc<Semaphore>,
@@ -2596,24 +2771,29 @@ async fn serve_connection(
         config,
         metrics,
     } = context;
-    let handshake = timeout(config.handshake_timeout, acceptor.accept(socket)).await;
-    let mut stream = match handshake {
-        Err(_) => {
-            metrics.session_refused_handshake();
-            return Err(BrokerError::Timeout("TLS handshake"));
+    let mut stream = match acceptor {
+        Some(acceptor) => {
+            let handshake = timeout(config.handshake_timeout, acceptor.accept(socket)).await;
+            match handshake {
+                Err(_) => {
+                    metrics.session_refused_handshake();
+                    return Err(BrokerError::Timeout("TLS handshake"));
+                }
+                Ok(Err(source)) => {
+                    metrics.session_refused_handshake();
+                    return Err(BrokerError::Io {
+                        path: PathBuf::from("tls-session"),
+                        source,
+                    });
+                }
+                Ok(Ok(stream)) => NativeStream::Tls(Box::new(stream.into())),
+            }
         }
-        Ok(Err(source)) => {
-            metrics.session_refused_handshake();
-            return Err(BrokerError::Io {
-                path: PathBuf::from("tls-session"),
-                source,
-            });
-        }
-        Ok(Ok(stream)) => stream,
+        // A plaintext plane (#294): no handshake, no certificate, and the
+        // authorizer is asked a different question below.
+        None => NativeStream::Plain(socket),
     };
     let peer_chain_der = stream
-        .get_ref()
-        .1
         .peer_certificates()
         .unwrap_or_default()
         .iter()
@@ -2648,16 +2828,26 @@ async fn serve_connection(
         metrics.session_refused_handshake();
         return Ok(());
     };
-    if !authorizer.authorize(&peer_chain_der, hello.principal_id, hello.role) {
+    let (authorized, refusal) = if stream.is_encrypted() {
+        (
+            authorizer.authorize(&peer_chain_der, hello.principal_id, hello.role),
+            "certificate is not authorized for the requested principal and role",
+        )
+    } else {
+        // Say what was actually judged: there is no certificate on a
+        // plaintext plane, and telling the client one was refused would
+        // send it looking for a problem it does not have.
+        (
+            authorizer.authorize_unverified(hello.principal_id, hello.role),
+            "plaintext session: the declared principal and role are not accepted without a \
+             certificate",
+        )
+    };
+    if !authorized {
         metrics.session_refused_unauthorized();
         write_session_frame(
             &mut stream,
-            &error(
-                0,
-                0,
-                ErrorCode::Unauthorized,
-                "certificate is not authorized for the requested principal and role",
-            ),
+            &error(0, 0, ErrorCode::Unauthorized, refusal),
             initial_limits,
             config.idle_timeout,
         )
@@ -3122,7 +3312,7 @@ async fn serve_connection(
 }
 
 async fn write_session_bytes(
-    stream: &mut tokio_rustls::server::TlsStream<TcpStream>,
+    stream: &mut NativeStream,
     encoded: &[u8],
     write_timeout: Duration,
 ) -> BrokerResult<()> {
@@ -4205,6 +4395,276 @@ mod tests {
             .connect(ServerName::try_from("localhost").unwrap(), socket)
             .await
             .unwrap();
+        write_frame(
+            &mut stream,
+            &WireFrame {
+                request_id: 0,
+                stream_id: 0,
+                message: Message::ClientHello(ClientHello {
+                    cluster_id,
+                    principal_id,
+                    role,
+                    minimum_major: PROTOCOL_MAJOR,
+                    maximum_major: PROTOCOL_MAJOR,
+                    requested_max_frame_bytes: limits.max_frame_bytes,
+                    requested_max_records: limits.max_records,
+                    requested_max_inflight_requests: 1,
+                    initial_window_bytes: u64::from(limits.max_frame_bytes),
+                    session_nonce: [7; 32],
+                }),
+            },
+            limits,
+        )
+        .await
+        .unwrap();
+        let hello = read_frame(&mut stream, limits).await.unwrap().unwrap();
+        (stream, hello)
+    }
+    /// A plaintext native plane (#294) admits a session on the declared
+    /// principal alone, and only when the authorizer accepts unverified
+    /// principals in so many words; everything beneath the hello — producer
+    /// fencing, fetch of committed data — behaves exactly as under TLS.
+    #[tokio::test]
+    async fn a_plaintext_native_plane_admits_only_principals_the_authorizer_accepts_unverified() {
+        struct PlaintextLab {
+            principal_id: Uuid,
+        }
+        impl SessionAuthorizer for PlaintextLab {
+            fn authorize(&self, _: &[Vec<u8>], _: Uuid, _: Role) -> bool {
+                unreachable!("a plaintext plane never has a certificate chain to ask about")
+            }
+            fn authorize_unverified(&self, principal_id: Uuid, role: Role) -> bool {
+                principal_id == self.principal_id && matches!(role, Role::Producer | Role::Consumer)
+            }
+        }
+        let (_dir, broker, range) = fixture();
+        let cluster_id = Uuid::from_u128(30);
+        let principal_id = Uuid::from_u128(32);
+        let server = NativeServer::plaintext(
+            broker,
+            Arc::new(PlaintextLab { principal_id }),
+            test_server_config(cluster_id),
+        )
+        .unwrap();
+        assert!(!server.is_encrypted());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server_task = tokio::spawn(server.serve(listener, shutdown_rx));
+        let limits = ProtocolLimits {
+            max_frame_bytes: 16 * 1024,
+            max_records: 32,
+        };
+
+        let (rejected, response) = open_plaintext_and_hello(
+            address,
+            cluster_id,
+            Uuid::from_u128(999),
+            Role::Producer,
+            limits,
+        )
+        .await;
+        assert!(
+            matches!(
+                response.message,
+                Message::Error(ErrorResponse {
+                    code: ErrorCode::Unauthorized,
+                    ..
+                })
+            ),
+            "a principal the authorizer does not name is refused: {response:?}"
+        );
+        drop(rejected);
+
+        let (mut producer, hello) =
+            open_plaintext_and_hello(address, cluster_id, principal_id, Role::Producer, limits)
+                .await;
+        assert!(
+            matches!(hello.message, Message::ServerHello(_)),
+            "{hello:?}"
+        );
+        write_frame(
+            &mut producer,
+            &produce(range.clone(), principal_id, 1, 0, 2),
+            limits,
+        )
+        .await
+        .unwrap();
+        let produced = read_frame(&mut producer, limits).await.unwrap().unwrap();
+        let Message::ProduceResponse(produced) = produced.message else {
+            panic!("expected produce response, got {produced:?}")
+        };
+        assert_eq!(produced.committed_next_offset, 1);
+        drop(producer);
+
+        let (mut consumer, hello) =
+            open_plaintext_and_hello(address, cluster_id, principal_id, Role::Consumer, limits)
+                .await;
+        assert!(
+            matches!(hello.message, Message::ServerHello(_)),
+            "{hello:?}"
+        );
+        write_frame(
+            &mut consumer,
+            &WireFrame {
+                request_id: 1,
+                stream_id: 1,
+                message: Message::FetchRequest(FetchRequest {
+                    range,
+                    fencing_epoch: 7,
+                    start_offset: 0,
+                    max_bytes: 4096,
+                    max_records: 10,
+                }),
+            },
+            limits,
+        )
+        .await
+        .unwrap();
+        let fetched = read_frame(&mut consumer, limits).await.unwrap().unwrap();
+        let Message::FetchResponse(fetched) = fetched.message else {
+            panic!("expected fetch response, got {fetched:?}")
+        };
+        assert_eq!(fetched.records.len(), 1);
+        assert_eq!(fetched.committed_high_watermark, 1);
+        drop(consumer);
+
+        shutdown_tx.send(()).unwrap();
+        server_task.await.unwrap().unwrap();
+    }
+
+    /// An authorizer written against a certificate chain admits NOTHING on
+    /// a plaintext plane unless it opts in (#294): the default answer to
+    /// an unverified principal is no, even for the principal it would
+    /// have accepted under TLS.
+    #[tokio::test]
+    async fn a_certificate_authorizer_admits_nothing_over_plaintext_by_default() {
+        let (_dir, broker, _range) = fixture();
+        let cluster_id = Uuid::from_u128(30);
+        let principal_id = Uuid::from_u128(32);
+        let server = NativeServer::plaintext(
+            broker,
+            Arc::new(TestAuthorizer {
+                leaf_der: Vec::new(),
+                principal_id,
+            }),
+            test_server_config(cluster_id),
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server_task = tokio::spawn(server.serve(listener, shutdown_rx));
+        let limits = ProtocolLimits {
+            max_frame_bytes: 16 * 1024,
+            max_records: 32,
+        };
+        let (_stream, response) =
+            open_plaintext_and_hello(address, cluster_id, principal_id, Role::Producer, limits)
+                .await;
+        match response.message {
+            Message::Error(ErrorResponse {
+                code: ErrorCode::Unauthorized,
+                message,
+                ..
+            }) => assert!(
+                message.contains("plaintext session") && !message.contains("certificate is not"),
+                "the refusal must describe what was judged — a bare declaration, not a \
+                 certificate: {message}"
+            ),
+            other => panic!(
+                "the right principal, but nothing proves it and the authorizer never said that \
+                 was acceptable: {other:?}"
+            ),
+        }
+        shutdown_tx.send(()).unwrap();
+        server_task.await.unwrap().unwrap();
+    }
+
+    /// A plaintext native plane refuses to bind off loopback unless the
+    /// exposure is acknowledged by name (#294) — and the check is at bind,
+    /// before any client could reach it.
+    #[tokio::test]
+    async fn a_plaintext_native_plane_refuses_to_bind_off_loopback_unless_told_so_by_name() {
+        let (_dir, broker, _range) = fixture();
+        let cluster_id = Uuid::from_u128(30);
+        let principal_id = Uuid::from_u128(32);
+        let authorizer = Arc::new(TestAuthorizer {
+            leaf_der: Vec::new(),
+            principal_id,
+        });
+        let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+        let refused = NativeServer::plaintext(
+            Arc::clone(&broker),
+            authorizer.clone(),
+            test_server_config(cluster_id),
+        )
+        .unwrap()
+        .serve(listener, shutdown_rx)
+        .await;
+        match refused {
+            Err(BrokerError::InvalidConfig(reason)) => {
+                assert!(reason.contains("plaintext native endpoint"), "{reason}");
+                assert!(reason.contains("plaintext_on_any_interface"), "{reason}");
+            }
+            other => panic!("expected a bind-time refusal, got {other:?}"),
+        }
+
+        let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server = NativeServer::plaintext_on_any_interface(
+            broker,
+            authorizer,
+            test_server_config(cluster_id),
+        )
+        .unwrap();
+        let server_task = tokio::spawn(server.serve(listener, shutdown_rx));
+        let limits = ProtocolLimits {
+            max_frame_bytes: 16 * 1024,
+            max_records: 32,
+        };
+        let (_stream, response) = open_plaintext_and_hello(
+            SocketAddr::from(([127, 0, 0, 1], port)),
+            cluster_id,
+            principal_id,
+            Role::Producer,
+            limits,
+        )
+        .await;
+        assert!(
+            matches!(response.message, Message::Error(_)),
+            "acknowledged exposure serves the socket; the certificate authorizer still refuses \
+             the unverified principal: {response:?}"
+        );
+        shutdown_tx.send(()).unwrap();
+        server_task.await.unwrap().unwrap();
+    }
+
+    fn test_server_config(cluster_id: Uuid) -> ServerConfig {
+        ServerConfig {
+            cluster_id,
+            node_id: Uuid::from_u128(31),
+            segment_format: SegmentFormat::V1,
+            max_frame_bytes: 16 * 1024,
+            max_records_per_frame: 32,
+            window_bytes: 16 * 1024,
+            max_sessions: 4,
+            max_inflight_requests: 2,
+            handshake_timeout: Duration::from_secs(2),
+            idle_timeout: Duration::from_secs(2),
+        }
+    }
+
+    async fn open_plaintext_and_hello(
+        address: SocketAddr,
+        cluster_id: Uuid,
+        principal_id: Uuid,
+        role: Role,
+        limits: ProtocolLimits,
+    ) -> (TcpStream, WireFrame) {
+        let mut stream = TcpStream::connect(address).await.unwrap();
         write_frame(
             &mut stream,
             &WireFrame {

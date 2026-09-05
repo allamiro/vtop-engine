@@ -28,6 +28,10 @@ data:
   # Candidates learn their epoch from lease grants (minted from 1); the static
   # floor must sit below the first grant. Enforced at render time.
   fencingEpoch: 0
+  # v2, so the failover the smoke test drives publishes its boundary through
+  # the quorum-acked marker (#240) rather than the pre-marker path a v1 range
+  # keeps — and so the smoke test's offset assertions cover the marker.
+  segmentFormat: v2
   lease:
     # Required under `replicated` and enforced at render time: candidates
     # acquire the range through the metadata lease (#284) — without it no pod
