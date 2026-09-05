@@ -1390,9 +1390,12 @@ async fn run_candidate(
         recorded_through: std::sync::atomic::AtomicU64::new(0),
     });
     let (release_lease, release_lease_rx) = tokio::sync::watch::channel(false);
-    // Set when a granted epoch turns out to be unservable (#367); the agent
-    // releases it and sits out the next rounds rather than renewing it.
-    let stand_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Raised when a granted epoch turns out to be unservable (#367); the
+    // agent releases it and sits out the next rounds rather than renewing
+    // it. A signal, not a bare flag (review, #410): the raise wakes the
+    // agent out of its pacing sleep or in-flight round, so the hand-back
+    // starts now rather than up to a renew interval later.
+    let stand_down = Arc::new(crate::lease_agent::StandDownSignal::new());
     let agent = crate::lease_agent::LeaseAgent::new(
         lease_admin_client(lease)?,
         crate::lease_agent::LeaseAgentConfig {
@@ -1733,10 +1736,7 @@ async fn run_candidate(
                                                  letting another candidate take the \
                                                  range: {error}"
                                             );
-                                            stand_down.store(
-                                                true,
-                                                std::sync::atomic::Ordering::SeqCst,
-                                            );
+                                            stand_down.raise();
                                             publisher.set_target(None);
                                             let (set, _) = open_range(
                                                 &config.data_dir,
@@ -1994,6 +1994,13 @@ async fn run_candidate(
     // anything an abort interrupts was never acknowledged — while a range
     // nobody can serve is a range nobody else can take.
     if fatal.is_some() {
+        // NOT READY BEFORE NOT SERVING (review, #410). A fatal exit while
+        // FOLLOWING left the flag at 0, and 0 answers /readyz with Ready
+        // unconditionally — so for the whole fatal drain the orchestrator
+        // kept routing to a process that had already decided to die. The
+        // transition verdict is the honest one: this process is leaving
+        // the range, whatever role it held.
+        role_flag.store(2, std::sync::atomic::Ordering::Relaxed);
         native_task.abort();
         replica_task.abort();
         // Aborted handles must not be awaited again below.
@@ -2610,6 +2617,28 @@ impl crate::lease_agent::CandidateLocalView for SwitchingLocalView {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
             .and_then(|view| view.sealed_prefix_end())
+    }
+
+    fn fence_for_probe(&self, fencing_epoch: u64) -> Result<u64, String> {
+        // NO DELEGATE IS NO VOTE (review, #439). An empty slot is not an
+        // empty log: the supervisor clears the old role before installing
+        // the next one, so a probe landing in that window would read zero
+        // over a directory that holds real records — and "nothing can
+        // append right now" does not make zero the committed offset. The
+        // refusal makes the probe abstain; the window is one role flip
+        // wide, and the next round re-probes an installed view.
+        self.delegate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map_or(
+                Err(
+                    "no role is installed to fence; a vote here would be a zero read \
+                     over a log mid-handoff"
+                        .to_owned(),
+                ),
+                |view| view.fence_for_probe(fencing_epoch),
+            )
     }
 }
 
@@ -3361,6 +3390,22 @@ mod tests {
         assert!(
             problem.contains("InvalidArtifact") && problem.contains("stray.active"),
             "the refusal must name the reason and the path: {problem}"
+        );
+    }
+
+    /// An empty view slot abstains from the promotion probe rather than
+    /// voting zero (review, #439): the supervisor clears the old role
+    /// before installing the next one, and a probe landing in that window
+    /// would count an empty slot as an empty log over a directory that
+    /// holds real records.
+    #[test]
+    fn a_cleared_view_slot_abstains_from_the_probe_instead_of_voting_zero() {
+        use crate::lease_agent::CandidateLocalView;
+        let view = SwitchingLocalView::empty();
+        assert!(
+            view.fence_for_probe(5).is_err(),
+            "a probe across a role flip must abstain; a zero vote from a cleared slot \
+             can drag the established boundary below records the directory holds"
         );
     }
 

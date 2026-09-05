@@ -120,6 +120,23 @@ pub trait CandidateLocalView: Send + Sync {
     fn sealed_prefix_end(&self) -> Option<u64> {
         None
     }
+    /// Stop this view's log at `fencing_epoch` and return the vote — the
+    /// committed offset AS STOPPED (review, #410, twice). Every REMOTE
+    /// vote in the promotion probe is read from a log the fence RPC has
+    /// just stopped; a view a deposed leader can still append to through
+    /// the replication plane must be stopped the same way, or the local
+    /// vote is taken from a moving log and the boundary can be
+    /// established below a tail still growing under the old epoch. The
+    /// vote comes back from the fence itself rather than a read after it
+    /// (second round): between an Ok and a separate read, a rival's
+    /// adoption can reopen the log, and the read measures something
+    /// already moving again. The default stops nothing and reads
+    /// directly, and is only for views nothing else can write to — a
+    /// standing leader's broker already refuses appends away from the
+    /// epoch it holds.
+    fn fence_for_probe(&self, _fencing_epoch: u64) -> Result<u64, String> {
+        Ok(self.local_committed_offset())
+    }
 }
 
 impl CandidateLocalView for LocalBroker {
@@ -153,6 +170,21 @@ impl CandidateLocalView for vtop_broker::replication::InProcessFollower {
         // (review): the sealed prefix it reports is the one it holds now,
         // not the broker's after the build.
         self.sealed_prefix_end()
+    }
+
+    fn fence_for_probe(&self, fencing_epoch: u64) -> Result<u64, String> {
+        // Under the append paths' own critical section (review, #439):
+        // bare adoption is an atomic maximum an in-flight append can
+        // straddle — checked at the old epoch, applied after the
+        // "stopped" offset was read. `fence_locally` owns the trust
+        // argument (this epoch is the process's own authenticated read of
+        // its grant, not a peer's claim), the serialization, and the vote
+        // itself — read inside the same critical section, because a rival
+        // adoption arriving right after the fence reopens the log and a
+        // separate read would measure it moving. A refusal means the
+        // grant was superseded, and the probe abstains.
+        self.fence_locally(fencing_epoch)
+            .map_err(|(code, reason)| format!("{code:?}: {reason}"))
     }
 }
 
@@ -220,20 +252,41 @@ impl ReplicaPlaneProbe {
 #[async_trait::async_trait]
 impl QuorumProbe for ReplicaPlaneProbe {
     async fn probe(&self, fencing_epoch: u64) -> Vec<crate::promotion::ReplicaProbe> {
-        // The leader's own disk, read with the BLOCKING accessor. Promotion is
-        // a request handler, not a scrape: it is allowed to queue behind an
-        // append. The non-blocking variant would have the leader abstain from
-        // its own quorum under momentary lock contention, which in a 2-replica
-        // range turns a lock hold into a refused promotion.
+        // THE LOCAL LOG IS STOPPED BEFORE IT IS COUNTED (review, #410).
+        // Every remote vote below is read from a log its fence has just
+        // stopped, and the local one gets no exemption: a candidate's view
+        // is the follower it still is, and the deposed leader can keep
+        // appending to it through the replication plane until it is fenced
+        // — so an unfenced local vote is taken from a moving log, and the
+        // boundary could be established below a tail still growing under
+        // the old epoch. Still no fence RPC to itself — the fence is a
+        // method call on the view, and a view nothing else can write to
+        // (a standing leader's broker) answers without doing anything.
         //
-        // No fence RPC to itself. This process holds the epoch it is promoting
-        // at — that is what made it the candidate — so nothing else can be
-        // writing here under an older one. Dialling its own port to be told so
-        // would add a failure mode without adding a fact.
-        let local_committed = self.view.local_committed_offset();
+        // A view that cannot be stopped ABSTAINS rather than votes — the
+        // refusal doctrine: `establish` needs the candidate's own probe to
+        // cover the boundary, so an abstention refuses this round and the
+        // next grant or retry re-probes.
+        let local_committed_offset = match self.view.fence_for_probe(fencing_epoch) {
+            // The vote arrives FROM the fence — measured inside the same
+            // critical section that stopped the log, because a rival
+            // adoption right after the fence reopens it (review). Blocking
+            // is fine here: promotion is a request handler, not a scrape,
+            // and it is allowed to queue behind an append.
+            Ok(offset) => Some(offset),
+            Err(reason) => {
+                tracing::warn!(
+                    fencing_epoch,
+                    %reason,
+                    "the local replica could not be stopped for the probe; abstaining \
+                     from our own quorum rather than voting from a moving log"
+                );
+                None
+            }
+        };
         let mut probes = vec![crate::promotion::ReplicaProbe {
             node_id: self.node_uuid,
-            local_committed_offset: Some(local_committed),
+            local_committed_offset,
         }];
         // This candidate's own lineage, sent with every fence so each replica
         // can reconcile against it while it is stopped. Empty when this node
@@ -1201,6 +1254,125 @@ pub fn decide(
     }
 }
 
+/// What the stood-down latch says about a round's decision (review, #410).
+///
+/// A pure function for the same reason [`QuorumMissBudget`] is one: the
+/// policy is the part worth testing — that a refused hand-back cannot
+/// become the next round's renewal — and the surrounding method needs a
+/// live admin client.
+///
+/// A STOOD-DOWN EPOCH IS NOT RENEWED BACK TO LIFE. The stand-down's
+/// release is best-effort; when it was refused or timed out, metadata
+/// still names this node, the next read decides `Renew` (or
+/// `HeldAdministratively` — which has no lapse to mop up a failed
+/// hand-back at all), and renewing would re-promote the exact build the
+/// supervisor just watched fail — the campaign hold-off cannot help,
+/// because it only guards `Acquire`. While the latch stands, a round that
+/// finds this node named AT ANY EPOCH retries the hand-back — the
+/// abandoned acquisition's delayed commit can surface above the latch —
+/// and an EMPTY read is not proof it never will (review, fourth round):
+/// a proposal the server decoded can commit after any number of reads
+/// that showed no lease, so emptiness holds the latch through the
+/// campaign hold-off window rather than clearing it. What does clear it:
+/// the hold-off running out with metadata still naming nobody (the
+/// realistic commit window is long spent), a rival's live grant, or the
+/// range vanishing — the latter two because the zombie proposal applies
+/// against that state and is refused by it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StoodDownVerdict {
+    /// Metadata still names this node — at ANY epoch — while the latch
+    /// stands: hand that epoch back instead of renewing it.
+    RetryHandBack { fencing_epoch: u64 },
+    /// Metadata names nobody, but the abandoned proposal could still
+    /// commit: keep the latch and let the hold-off tick — the Acquire arm
+    /// stands aside this round either way.
+    HoldingThrough,
+    /// Metadata's answer refutes the stood-down grant (or the hold-off
+    /// window outlived any realistic delayed commit); the latch is spent.
+    Cleared,
+    /// No latch stands.
+    NotLatched,
+}
+
+fn stood_down_verdict(
+    latched: bool,
+    hold_off_active: bool,
+    decision: &LeaseDecision,
+) -> StoodDownVerdict {
+    if !latched {
+        return StoodDownVerdict::NotLatched;
+    }
+    match *decision {
+        // ANY self-owned epoch, not just one remembered (review, second
+        // round): the delayed commit mints whatever epoch it mints, and a
+        // legitimate re-grant only ever arrives through the Acquire arm —
+        // which cannot run while this latch stands.
+        LeaseDecision::Renew { fencing_epoch }
+        | LeaseDecision::HeldAdministratively { fencing_epoch } => {
+            StoodDownVerdict::RetryHandBack { fencing_epoch }
+        }
+        // Nobody holds the range. NOT proof the abandoned proposal died
+        // (review, fourth round) — it can commit after this read — so the
+        // latch rides out the hold-off, which the fall-through Acquire arm
+        // is spending on standing aside anyway. Once the hold-off is gone,
+        // an empty answer has held for the whole window and the latch
+        // yields to the campaign.
+        LeaseDecision::Acquire { .. } if hold_off_active => StoodDownVerdict::HoldingThrough,
+        // A rival's live grant or a deleted range refutes the zombie at
+        // its own apply — a proposal against a live lease or a missing
+        // range is refused by the state machine — and a spent hold-off
+        // over an empty range is the window outliving the commit.
+        _ => StoodDownVerdict::Cleared,
+    }
+}
+
+/// The supervisor's stand-down order (#367): this node was granted an epoch
+/// it cannot serve, so the lease must go back and the node must sit out.
+///
+/// A flag AND a waker, not a bare flag (review, #410): the agent reads the
+/// flag at its loop head, and between loop heads it is asleep on its pacing
+/// delay or parked inside a bounded metadata RPC — up to a renew interval
+/// away. A store nothing wakes for leaves the unservable epoch renewable
+/// for that whole window, and the next renewal re-publishes the hold the
+/// supervisor is trying to give back. The notify delivers the order into
+/// the agent's waits; the flag stays the truth the loop head consumes.
+pub struct StandDownSignal {
+    flag: std::sync::atomic::AtomicBool,
+    wake: tokio::sync::Notify,
+}
+
+impl StandDownSignal {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        Self {
+            flag: std::sync::atomic::AtomicBool::new(false),
+            wake: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Order the agent to hand its epoch back, and wake it to do so now.
+    pub fn raise(&self) {
+        self.flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        // `notify_one` stores a permit when nobody is waiting, so an order
+        // raised between the agent's waits is delivered to its next one.
+        self.wake.notify_one();
+    }
+
+    /// Consume the order. The loop head owns this; a raise is handled once.
+    fn take(&self) -> bool {
+        self.flag.swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Resolves when an order is raised. Pending forever when no signal is
+    /// wired, so a select branch over an absent signal simply never fires.
+    async fn raised(signal: &Option<Arc<StandDownSignal>>) {
+        match signal {
+            Some(signal) => signal.wake.notified().await,
+            None => std::future::pending().await,
+        }
+    }
+}
+
 /// Drives one range's lease against the metadata group.
 pub struct LeaseAgent {
     admin: Arc<AdminClient>,
@@ -1224,7 +1396,22 @@ pub struct LeaseAgent {
     /// The eligibility stand-aside in `publish_held` cannot cover this. That
     /// one fires BEFORE a grant, on a refusal the promoter made; this fires
     /// AFTER one, on a failure only the supervisor can see.
-    stand_down: Option<Arc<std::sync::atomic::AtomicBool>>,
+    stand_down: Option<Arc<StandDownSignal>>,
+    /// The epoch this node stood down FROM, held until metadata stops
+    /// naming this node for it (review, #410). Handing the lease back is
+    /// best-effort: when the release proposal is refused or times out,
+    /// metadata still records this node as holder, the next read decides
+    /// `Renew`, and without this latch the agent would re-promote and the
+    /// supervisor would retry the exact build that just failed — the
+    /// campaign hold-off cannot help, because it only guards `Acquire`.
+    /// While latched, a round that finds this node named at ANY epoch
+    /// retries the hand-back instead of renewing — a delayed acquisition
+    /// commit can surface an epoch the stand-down never saw (review,
+    /// twice: first above the epoch it latched, then after a
+    /// reconciliation that found nothing, which is why this is a fact and
+    /// not an epoch) — and only an answer that stops naming this node
+    /// clears it. See [`stood_down_verdict`].
+    stood_down_latched: bool,
     /// A persistent handle on the same gate, kept so a range that goes
     /// missing AFTER the gate opened can revoke readiness — the consumable
     /// `ready` above only governs the first open (review).
@@ -1328,6 +1515,7 @@ impl LeaseAgent {
             state: LeaseState::NotHeld,
             ready: None,
             stand_down: None,
+            stood_down_latched: false,
             gate: None,
             gate_degraded: false,
             range_missing: false,
@@ -1346,10 +1534,10 @@ impl LeaseAgent {
         self
     }
 
-    /// Share the flag a supervisor sets when it cannot serve an epoch it was
-    /// granted (#367). See [`LeaseAgent::stand_down`].
-    pub fn with_stand_down(mut self, flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
-        self.stand_down = Some(flag);
+    /// Share the signal a supervisor raises when it cannot serve an epoch it
+    /// was granted (#367). See [`LeaseAgent::stand_down`].
+    pub fn with_stand_down(mut self, signal: Arc<StandDownSignal>) -> Self {
+        self.stand_down = Some(signal);
         self
     }
 
@@ -1406,45 +1594,66 @@ impl LeaseAgent {
             // climbs, the survivors starve. So the release is paired with the
             // same hold-off an eligibility refusal takes: hand it back AND sit
             // out, long enough for somebody else to win uncontested.
-            if self
-                .stand_down
-                .as_ref()
-                .is_some_and(|flag| flag.swap(false, std::sync::atomic::Ordering::SeqCst))
-            {
-                if let LeaseState::Held { fencing_epoch } = self.state {
-                    tracing::warn!(
-                        range = %self.range_uuid,
-                        fencing_epoch,
-                        "standing down: this node was granted an epoch it could not serve, \
-                         so the lease goes back and this node sits out the next rounds"
-                    );
-                    // Raced against the release signal exactly as the round
-                    // is (review): this release can spend two bounded
-                    // deadlines, and a shutdown arriving inside it used to
-                    // wait them out before the loop head could break —
-                    // leaving the FINAL release less drain budget than its
-                    // own two calls need. Abandoning loses nothing: the
-                    // exit-path release re-reconciles against metadata and
-                    // proposes with whatever epoch it finds.
-                    if release_closed {
-                        self.release().await;
-                    } else {
-                        tokio::select! {
-                            () = self.release() => {}
-                            changed = release.changed() => {
-                                if changed.is_err() {
-                                    release_closed = true;
-                                }
-                                // Only an actual `true` abandons — the loop
-                                // head breaks on it and the exit release
-                                // takes over. A closed watch or a spurious
-                                // wake finishes the hand-back here.
-                                if !*release.borrow() {
-                                    self.release().await;
-                                }
+            if self.stand_down.as_ref().is_some_and(|signal| signal.take()) {
+                // NOT GATED ON `LeaseState::Held` (review, #439). The wake
+                // that delivers this order can cancel the round that was
+                // publishing the grant — AFTER metadata committed the
+                // acquisition, BEFORE `self.state` caught up — so a
+                // stand-down that only released what it recorded would skip
+                // both the hand-back and the latch exactly when the build
+                // failure races the grant, and the next read would renew
+                // the unservable epoch back to life. `release()` already
+                // reconciles: whatever epoch metadata attributes to this
+                // node is the epoch it hands back, recorded or not.
+                let held = match self.state {
+                    LeaseState::Held { fencing_epoch } => Some(fencing_epoch),
+                    _ => None,
+                };
+                tracing::warn!(
+                    range = %self.range_uuid,
+                    recorded_epoch = held,
+                    "standing down: this node was granted an epoch it could not serve, \
+                     so the lease goes back and this node sits out the next rounds"
+                );
+                // Raced against the release signal exactly as the round
+                // is (review): this release can spend two bounded
+                // deadlines, and a shutdown arriving inside it used to
+                // wait them out before the loop head could break —
+                // leaving the FINAL release less drain budget than its
+                // own two calls need. Abandoning loses nothing: the
+                // exit-path release re-reconciles against metadata and
+                // proposes with whatever epoch it finds.
+                if release_closed {
+                    self.release().await;
+                } else {
+                    tokio::select! {
+                        () = self.release() => {}
+                        changed = release.changed() => {
+                            if changed.is_err() {
+                                release_closed = true;
+                            }
+                            // Only an actual `true` abandons — the loop
+                            // head breaks on it and the exit release
+                            // takes over. A closed watch or a spurious
+                            // wake finishes the hand-back here.
+                            if !*release.borrow() {
+                                self.release().await;
                             }
                         }
                     }
+                }
+                // LATCHED UNCONDITIONALLY (review, third round) — not on
+                // what the release found. The abandoned acquisition can
+                // commit AFTER the reconciliation read, so "metadata
+                // attributed nothing to us" is an answer the delayed
+                // commit can invalidate a moment later — with the latch
+                // dropped, that grant would arrive as an ordinary Renew
+                // and re-promote the failed build. The latch is the fact
+                // that this node stood down; which epoch metadata names is
+                // re-read every round it stands, and only an answer that
+                // names nobody-us clears it.
+                self.stood_down_latched = true;
+                if let Some(fencing_epoch) = held {
                     self.publish_lost(fencing_epoch);
                 }
                 self.state = LeaseState::NotHeld;
@@ -1484,11 +1693,26 @@ impl LeaseAgent {
             // SIGKILL'd holder's would — and closing it would mean awaiting
             // the in-flight proposal at shutdown, the very delay this race
             // exists to remove.
+            // Cloned out of `self` so the wake branch can ride the same
+            // select as the mutably-borrowed step.
+            let stand_down = self.stand_down.clone();
             let stepped = if release_closed {
-                self.step().await
+                tokio::select! {
+                    stepped = self.step() => stepped,
+                    // The stand-down order interrupts the round exactly as
+                    // the release does (review, #410): an agent parked in a
+                    // bounded metadata RPC used to finish it — and possibly
+                    // renew the unservable epoch — before the loop head
+                    // looked at the flag again. Dropping the step is the
+                    // release race's documented shape: crash-equivalent,
+                    // and a node about to hand the epoch back has no use
+                    // for the abandoned round's answer.
+                    () = StandDownSignal::raised(&stand_down) => continue,
+                }
             } else {
                 tokio::select! {
                     stepped = self.step() => stepped,
+                    () = StandDownSignal::raised(&stand_down) => continue,
                     changed = release.changed() => {
                         // The VALUE decides before the closure does
                         // (review): a sender that published `true` and was
@@ -1575,11 +1799,19 @@ impl LeaseAgent {
                 }
             };
             if release_closed {
-                tokio::time::sleep(delay).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    // The pacing delay is the other wait the order must cut
+                    // short (review, #410): with the renew interval near
+                    // the lease duration, sleeping it out leaves the
+                    // unservable epoch on the books for most of a lifetime.
+                    () = StandDownSignal::raised(&self.stand_down) => {}
+                }
                 continue;
             }
             tokio::select! {
                 _ = tokio::time::sleep(delay) => {}
+                () = StandDownSignal::raised(&self.stand_down) => {}
                 changed = release.changed() => {
                     // A closed watch completes instantly forever; without the
                     // flag this select would never sleep again and the agent
@@ -1742,6 +1974,27 @@ impl LeaseAgent {
             )
             .await?;
         let decision = decide(&view, self.node_uuid, now_ms());
+        match stood_down_verdict(
+            self.stood_down_latched,
+            self.campaign_hold_off_rounds > 0,
+            &decision,
+        ) {
+            StoodDownVerdict::RetryHandBack { fencing_epoch } => {
+                tracing::warn!(
+                    range = %self.range_uuid,
+                    fencing_epoch,
+                    "metadata still names this node while it stands down; retrying \
+                     the hand-back instead of renewing"
+                );
+                self.release().await;
+                return Ok(self.config.poll_interval);
+            }
+            // The latch stays; the Acquire arm below spends a hold-off
+            // round standing aside, which is the wait this verdict wants.
+            StoodDownVerdict::HoldingThrough => {}
+            StoodDownVerdict::Cleared => self.stood_down_latched = false,
+            StoodDownVerdict::NotLatched => {}
+        }
         match decision {
             LeaseDecision::Renew { fencing_epoch } => {
                 // Trust exactly what metadata reported until the renewal
@@ -2140,6 +2393,106 @@ mod tests {
             fencing_epoch: 4,
             expires_at_ms,
         })
+    }
+
+    /// A stood-down epoch is not renewed back to life (review, #410). The
+    /// hand-back is best-effort; when it fails, metadata still names this
+    /// node and the next read decides Renew — and without the latch that
+    /// renewal re-promotes the exact leader build the supervisor just
+    /// watched fail. The administrative dialect matters most: it has no
+    /// lapse to mop up a failed hand-back, so the retry is the ONLY exit.
+    #[test]
+    fn a_stood_down_epoch_is_handed_back_again_not_renewed() {
+        assert_eq!(
+            stood_down_verdict(true, true, &LeaseDecision::Renew { fencing_epoch: 4 }),
+            StoodDownVerdict::RetryHandBack { fencing_epoch: 4 },
+            "a refused hand-back must not become the next round's renewal"
+        );
+        assert_eq!(
+            stood_down_verdict(
+                true,
+                true,
+                &LeaseDecision::HeldAdministratively { fencing_epoch: 4 }
+            ),
+            StoodDownVerdict::RetryHandBack { fencing_epoch: 4 },
+            "an administrative lease cannot lapse, so retrying the hand-back is the \
+             only way it ever leaves this node"
+        );
+        // A SELF-OWNED EPOCH THE STAND-DOWN NEVER SAW is the abandoned
+        // acquisition, not a fresh grant (review, second round): a
+        // legitimate re-grant only ever arrives through the Acquire arm,
+        // which cannot run while the latch stands.
+        assert_eq!(
+            stood_down_verdict(true, true, &LeaseDecision::Renew { fencing_epoch: 6 }),
+            StoodDownVerdict::RetryHandBack { fencing_epoch: 6 },
+            "a delayed acquisition commit surfaces at an epoch the latch never saw, \
+             and it is still the failed build's grant to hand back"
+        );
+        // AN EMPTY READ IS NOT PROOF (review, fourth round): the abandoned
+        // proposal was decoded by the server and can commit after any
+        // number of reads that showed no lease, so emptiness holds the
+        // latch while the hold-off ticks.
+        assert_eq!(
+            stood_down_verdict(
+                true,
+                true,
+                &LeaseDecision::Acquire {
+                    expected_range_generation: 7,
+                }
+            ),
+            StoodDownVerdict::HoldingThrough,
+            "one empty read cannot clear the latch: the cancelled acquisition can \
+             still commit, and an unlatched agent would serve it as an ordinary Renew"
+        );
+        // What DOES clear it: an answer the zombie proposal is refused
+        // against at its own apply, or the hold-off outliving any
+        // realistic commit.
+        assert_eq!(
+            stood_down_verdict(true, true, &LeaseDecision::Wait { fencing_epoch: 5 }),
+            StoodDownVerdict::Cleared,
+            "a rival's live grant refuses the zombie proposal at apply time, so the \
+             latch has nothing left to guard"
+        );
+        assert_eq!(
+            stood_down_verdict(
+                true,
+                false,
+                &LeaseDecision::Acquire {
+                    expected_range_generation: 7,
+                }
+            ),
+            StoodDownVerdict::Cleared,
+            "an empty answer that held for the whole hold-off window has outlived \
+             any realistic delayed commit; holding longer would wedge the campaign"
+        );
+        assert_eq!(
+            stood_down_verdict(false, true, &LeaseDecision::Renew { fencing_epoch: 4 }),
+            StoodDownVerdict::NotLatched
+        );
+    }
+
+    /// The stand-down order reaches a parked agent (review, #410): the raise
+    /// stores a permit, so a wait that begins after it still wakes, and the
+    /// flag is consumed exactly once by the loop head.
+    #[tokio::test]
+    async fn a_stand_down_raise_wakes_a_parked_wait_and_is_consumed_once() {
+        let signal = Arc::new(StandDownSignal::new());
+        let wired = Some(Arc::clone(&signal));
+        signal.raise();
+        tokio::time::timeout(Duration::from_secs(1), StandDownSignal::raised(&wired))
+            .await
+            .expect("a raise before the wait began must still wake it — the permit is stored");
+        assert!(signal.take(), "the loop head consumes the order");
+        assert!(
+            !signal.take(),
+            "consumed once: a second loop head must not stand down again"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), StandDownSignal::raised(&None),)
+                .await
+                .is_err(),
+            "an absent signal never fires its select branch"
+        );
     }
 
     #[test]
@@ -2717,6 +3070,66 @@ mod tests {
             followers,
             cluster_committed,
         }
+    }
+
+    /// The candidate's local vote is counted only from a stopped log
+    /// (review, #410). Every remote vote comes from a log the fence RPC
+    /// just stopped; the local follower got an exemption on the grounds
+    /// that nothing else writes to it — false in candidate mode, where the
+    /// deposed leader keeps appending through the replication plane until
+    /// the follower is fenced. The view's probe fence must stop those
+    /// appends BEFORE the offset is read, and a grant a newer fence has
+    /// already superseded must abstain rather than vouch for a boundary
+    /// metadata has moved past.
+    #[test]
+    fn the_candidates_local_vote_is_counted_only_from_a_stopped_log() {
+        let h = replicated_v2_harness();
+        let follower = &h.followers[0];
+        // The deposed leader's world: metadata still shows its epoch live,
+        // and its stream is still appending.
+        h.meta.set(FENCING_EPOCH);
+        let append_at = |epoch: u64, expected_base_offset: u64| {
+            follower.apply_append(&vtop_protocol::ReplicaAppendRequest {
+                range: h.leader.range().clone(),
+                fencing_epoch: epoch,
+                leader_node_id: Uuid::from_u128(0xA1),
+                expected_base_offset,
+                producer_id: Uuid::from_u128(0xBB),
+                producer_epoch: 1,
+                first_sequence: expected_base_offset,
+                records: vec![vtop_protocol::ProduceRecord {
+                    timestamp_millis: 1_000,
+                    key: b"k".to_vec(),
+                    value: b"v".to_vec(),
+                }],
+            })
+        };
+        append_at(FENCING_EPOCH, 0)
+            .expect("the deposed leader's stream is live before the probe fence");
+
+        let view: &dyn CandidateLocalView = follower.as_ref();
+        let vote = view
+            .fence_for_probe(FENCING_EPOCH + 1)
+            .expect("the probe fence adopts the grant this process read from metadata");
+        assert_eq!(
+            vote, 1,
+            "the vote IS the fence's answer, measured inside the critical section \
+             that stopped the log"
+        );
+        assert_eq!(
+            follower.held_fencing_epoch(),
+            FENCING_EPOCH + 1,
+            "the fence is the adoption: held must rise to the probed grant"
+        );
+        append_at(FENCING_EPOCH, 1).expect_err(
+            "an append from the deposed leader after the probe fence must refuse — \
+             otherwise the local vote was taken from a moving log",
+        );
+
+        view.fence_for_probe(FENCING_EPOCH).expect_err(
+            "a grant below the fence already held is superseded; voting on it would \
+             vouch for a boundary metadata has moved past",
+        );
     }
 
     /// A verification leaves the evidence the transition record keeps
