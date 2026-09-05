@@ -196,6 +196,25 @@ fn split_for_the_plane(
     Ok(appends)
 }
 
+/// The records that fit `max_bytes` on Kafka's wire, roughly, and at least
+/// the first: what a widened hop found, cut back to what the client asked.
+fn within_budget(
+    records: Vec<vtop_protocol::FetchedRecord>,
+    max_bytes: usize,
+) -> Vec<vtop_protocol::FetchedRecord> {
+    let mut spent = 0_usize;
+    let mut kept = Vec::with_capacity(records.len());
+    for record in records {
+        let cost = record.key.len() + record.value.len() + 24;
+        if !kept.is_empty() && spent + cost > max_bytes {
+            break;
+        }
+        spent += cost;
+        kept.push(record);
+    }
+    kept
+}
+
 /// The byte budget a fetch widens to after a stretch with nothing visible:
 /// enough to cross a run of markers in a few hops, whatever the client's own
 /// partition budget was.
@@ -382,10 +401,14 @@ impl Bridge for NativeBridge {
             }
         };
         let high_watermark = response.committed_high_watermark as i64;
+        // A hop widened the budget to cross markers, never to hand the client
+        // more than it asked (review): the visible records found are cut
+        // back to the client's own budget, at least one kept — the
+        // at-least-one-batch rule a Kafka broker keeps too.
+        let records = within_budget(response.records, max_bytes);
         {
             {
-                let records: Vec<Record> = response
-                    .records
+                let records: Vec<Record> = records
                     .iter()
                     .map(|record| Record {
                         offset: record.offset as i64,
@@ -721,6 +744,11 @@ mod tests {
         let decoded = RecordBatch::decode(&fetched.records).unwrap();
         assert_eq!(decoded.base_offset, 2, "the record after the marker");
         assert_eq!(decoded.records[0].value.as_deref(), Some(b"b".as_slice()));
+        assert_eq!(
+            decoded.records.len(),
+            1,
+            "the widened hop hands back the client's budget: one record, not the log"
+        );
         // From the start: both visible records, the marker absent.
         let all =
             RecordBatch::decode(&bridge.fetch("events", 0, 1 << 20).unwrap().records).unwrap();

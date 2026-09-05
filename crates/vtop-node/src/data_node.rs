@@ -1427,11 +1427,22 @@ async fn run_leader(
                         vtop_protocol::Durability::LocalFsync
                     },
                     fetch_max_records: MAX_RECORDS,
-                    // What the replica plane frames per append (review): a
-                    // follower refuses a larger frame, and from here that
-                    // looks like a quorum that never arrives.
-                    max_append_records: vtop_protocol::DEFAULT_MAX_RECORDS as usize,
-                    max_append_bytes: (vtop_protocol::DEFAULT_MAX_FRAME_BYTES / 2) as usize,
+                    // What one append may carry (review): on a replicated
+                    // range, what the replica plane frames — a follower
+                    // refuses a larger frame, and from here that looks like a
+                    // quorum that never arrives (#453); standalone, the
+                    // node's own session limits, so a stock client's default
+                    // batch is one append and all-or-nothing.
+                    max_append_records: if replicated {
+                        vtop_protocol::DEFAULT_MAX_RECORDS as usize
+                    } else {
+                        MAX_RECORDS as usize
+                    },
+                    max_append_bytes: if replicated {
+                        (vtop_protocol::DEFAULT_MAX_FRAME_BYTES / 2) as usize
+                    } else {
+                        (MAX_FRAME_BYTES / 2) as usize
+                    },
                 },
             );
             let gateway_config = vtop_kafka::GatewayConfig {
@@ -1448,10 +1459,14 @@ async fn run_leader(
                 max_fetch_wait: Duration::from_millis(kafka.max_fetch_wait_ms),
                 ..vtop_kafka::GatewayConfig::default()
             };
-            // Joined for a little longer than the gateway's own drain
-            // (review): the handle is never dropped while `serve` can still
-            // be waiting on a session.
-            kafka_drain = gateway_config.drain_timeout + Duration::from_secs(1);
+            // Joined for longer than every wait inside `serve` (review): its
+            // drain reports at `drain_timeout` and gives up only past the
+            // bridge ceilings, so this handle is never dropped while a
+            // session can still be inside a bridge call.
+            kafka_drain = gateway_config.drain_timeout
+                + gateway_config.max_produce_wait
+                + gateway_config.max_fetch_wait
+                + Duration::from_secs(1);
             let gateway = vtop_kafka::Gateway::new(Arc::new(bridge), gateway_config);
             let kafka_shutdown = shutdown.clone();
             // Kept, to be joined before the range is handed back (review):

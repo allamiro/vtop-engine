@@ -5,7 +5,8 @@
 //! Metadata over the bridge's topics with one partition each, Produce of
 //! uncompressed non-transactional v2 batches without headers, Fetch with the
 //! long-poll emulated here (the broker returns immediately at the watermark),
-//! and ListOffsets LATEST. Everything else is refused with the code a client's
+//! and ListOffsets LATEST and EARLIEST (the watermark and the retained
+//! floor; by-timestamp has no index behind it). Everything else is refused with the code a client's
 //! retry policy can act on, and the reason is logged where an operator reads —
 //! never a silent drop, never a plausible lie.
 
@@ -222,18 +223,38 @@ impl Gateway {
         gateway
             .closed
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        // Every session ends within the bridge ceilings — `max_produce_wait`
+        // and `max_fetch_wait` bound the calls, and shutdown is heard
+        // between frames — so waiting for every slot is bounded by config,
+        // not by hope (review): `drain_timeout` is where the wait is
+        // reported, and the sum of the ceilings past it is where a session
+        // still open is a bug, said at error. `serve` returning is the
+        // proof the embedder relies on before it hands its range back.
         let slots = u32::try_from(gateway.config.max_sessions.max(1)).unwrap_or(u32::MAX);
-        if tokio::time::timeout(
-            gateway.config.drain_timeout,
-            gateway.sessions.acquire_many(slots),
-        )
-        .await
-        .is_err()
+        let open = |gateway: &Gateway| {
+            slots - u32::try_from(gateway.sessions.available_permits()).unwrap_or(0)
+        };
+        let drain = gateway.sessions.acquire_many(slots);
+        tokio::pin!(drain);
+        if tokio::time::timeout(gateway.config.drain_timeout, &mut drain)
+            .await
+            .is_err()
         {
             tracing::warn!(
-                open = slots - u32::try_from(gateway.sessions.available_permits()).unwrap_or(0),
-                "kafka gateway stopped with sessions still open past the drain timeout"
+                open = open(&gateway),
+                "kafka gateway still draining past drain_timeout: a session is inside a bridge \
+                 call, which ends at its own ceiling"
             );
+            let ceilings = gateway.config.max_produce_wait
+                + gateway.config.max_fetch_wait
+                + gateway.config.drain_timeout;
+            if tokio::time::timeout(ceilings, &mut drain).await.is_err() {
+                tracing::error!(
+                    open = open(&gateway),
+                    "kafka gateway stopped with sessions still open past every ceiling; a \
+                     session that outlives its bridge call's ceiling is a bug"
+                );
+            }
         }
         Ok(())
     }
@@ -1015,6 +1036,39 @@ mod tests {
             .expect("serve returns once the sessions are gone")
             .unwrap()
             .unwrap();
+    }
+
+    /// ListOffsets EARLIEST is the retained floor and LATEST the watermark
+    /// (review): what a stock consumer's `-o beginning` and `-o end` ask.
+    #[tokio::test]
+    async fn list_offsets_serves_the_retained_floor_as_earliest_and_the_watermark_as_latest() {
+        let memory = Arc::new(MemoryBridge::with_topics(["events"]));
+        let bridge: Arc<dyn Bridge> = memory.clone();
+        let (addr, _stop) = start(bridge).await;
+        let three = RecordBatch::decode(&batch_bytes(&["a", "b", "c"], false)).unwrap();
+        memory.produce("events", &[three]).unwrap();
+        let (floor, watermark) = memory.bounds("events").unwrap();
+        for (timestamp, expected, what) in [
+            (TIMESTAMP_EARLIEST, floor, "EARLIEST is the retained floor"),
+            (TIMESTAMP_LATEST, watermark, "LATEST is the watermark"),
+        ] {
+            let mut body = Encoder::new();
+            body.i32(-1); // replica_id
+            body.array_len(1);
+            body.string("events");
+            body.array_len(1);
+            body.i32(0); // partition
+            body.i64(timestamp);
+            let reply = call(addr, 2, 1, 9, body.as_slice()).await.unwrap();
+            let mut d = Decoder::new(&reply);
+            assert_eq!(d.array_len("topics").unwrap(), Some(1));
+            assert_eq!(d.string("name").unwrap(), "events");
+            assert_eq!(d.array_len("partitions").unwrap(), Some(1));
+            assert_eq!(d.i32("partition").unwrap(), 0);
+            assert_eq!(d.i16("error").unwrap(), 0, "{what}");
+            d.i64("timestamp").unwrap();
+            assert_eq!(d.i64("offset").unwrap(), expected, "{what}");
+        }
     }
 
     /// A frame still arriving when shutdown comes is dropped, not answered
