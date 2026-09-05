@@ -50,6 +50,18 @@ pub struct GatewayConfig {
     /// append runs on — and a retry may then duplicate, which is the
     /// single-writer limitation the native bridge documents.
     pub max_produce_wait: Duration,
+    /// The longest a request body may take to arrive once its length is
+    /// read (review): a frame is read as it comes, never allocated in full
+    /// on the announced length, and a peer that announces a length and
+    /// stops sending is closed here rather than held.
+    pub frame_read_timeout: Duration,
+    /// A connection with no request for this long is closed, as Kafka's
+    /// own `connections.max.idle.ms` closes one.
+    pub idle_timeout: Duration,
+    /// Sessions open at once. One over is accepted and closed, with a
+    /// warning, so what a peer can hold here is bounded by
+    /// `max_sessions * max_frame_bytes` and not by how many sockets it opens.
+    pub max_sessions: usize,
 }
 
 impl Default for GatewayConfig {
@@ -63,7 +75,29 @@ impl Default for GatewayConfig {
             max_fetch_wait: Duration::from_secs(5),
             fetch_poll_interval: Duration::from_millis(50),
             max_produce_wait: Duration::from_secs(30),
+            frame_read_timeout: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(600),
+            max_sessions: 256,
         }
+    }
+}
+
+/// A frame's buffer starts this large and grows with the bytes received.
+const INITIAL_FRAME_CAPACITY: usize = 64 * 1024;
+
+/// A bridge call awaited only until `ceiling` (review). The call itself
+/// cannot be cancelled — a real backend may be behind an fsync or a held
+/// lock — so past the ceiling the client is told `REQUEST_TIMED_OUT` while
+/// the call runs on, and the configured maximum is a bound the response
+/// honours rather than a hope.
+async fn until<T>(
+    ceiling: tokio::time::Instant,
+    call: tokio::task::JoinHandle<Result<T, ErrorCode>>,
+) -> Result<T, ErrorCode> {
+    match tokio::time::timeout_at(ceiling, call).await {
+        Ok(Ok(outcome)) => outcome,
+        // Panicked, or past the ceiling: the same answer.
+        Ok(Err(_)) | Err(_) => Err(ErrorCode::RequestTimedOut),
     }
 }
 
@@ -77,11 +111,19 @@ enum Answer {
 pub struct Gateway {
     bridge: Arc<dyn Bridge>,
     config: GatewayConfig,
+    sessions: Arc<tokio::sync::Semaphore>,
+    refused_sessions: std::sync::atomic::AtomicU64,
 }
 
 impl Gateway {
     pub fn new(bridge: Arc<dyn Bridge>, config: GatewayConfig) -> Self {
-        Self { bridge, config }
+        let sessions = Arc::new(tokio::sync::Semaphore::new(config.max_sessions.max(1)));
+        Self {
+            bridge,
+            config,
+            sessions,
+            refused_sessions: std::sync::atomic::AtomicU64::new(0),
+        }
     }
 
     /// Serve until `shutdown` reads `true`. A dropped sender is not a signal
@@ -111,8 +153,31 @@ impl Gateway {
                 }
                 accepted = listener.accept() => {
                     let (socket, peer) = accepted?;
+                    // One slot per session (review); none free is a closed
+                    // socket, at once, and a warning that thins out as the
+                    // refusals pile up rather than one line per attempt.
+                    let permit = match Arc::clone(&gateway.sessions).try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            let refused = gateway
+                                .refused_sessions
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                + 1;
+                            if refused.is_power_of_two() {
+                                tracing::warn!(
+                                    %peer,
+                                    open = gateway.config.max_sessions,
+                                    refused,
+                                    "kafka session refused: every session slot is open; connection closed"
+                                );
+                            }
+                            drop(socket);
+                            continue;
+                        }
+                    };
                     let gateway = Arc::clone(&gateway);
                     tokio::spawn(async move {
+                        let _slot = permit;
                         if let Err(error) = gateway.session(socket).await {
                             tracing::debug!(%peer, %error, "kafka session ended");
                         }
@@ -124,10 +189,17 @@ impl Gateway {
 
     async fn session(self: Arc<Self>, mut socket: TcpStream) -> std::io::Result<()> {
         loop {
-            let len = match socket.read_i32().await {
-                Ok(len) => len,
-                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-                Err(error) => return Err(error),
+            let len = match tokio::time::timeout(self.config.idle_timeout, socket.read_i32()).await
+            {
+                Err(_) => {
+                    tracing::debug!("kafka session idle past the limit; connection closed");
+                    return Ok(());
+                }
+                Ok(Ok(len)) => len,
+                Ok(Err(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    return Ok(())
+                }
+                Ok(Err(error)) => return Err(error),
             };
             if len < 0 || len as usize > self.config.max_frame_bytes {
                 tracing::warn!(
@@ -137,8 +209,29 @@ impl Gateway {
                 );
                 return Ok(());
             }
-            let mut body = vec![0_u8; len as usize];
-            socket.read_exact(&mut body).await?;
+            // The body as it arrives (review): the buffer grows with the
+            // bytes received, never with the length announced, and the wait
+            // for the rest of a frame has an end. A peer that announces
+            // 32 MiB and stops holds what it sent, for `frame_read_timeout`.
+            let len = len as usize;
+            let mut body = Vec::with_capacity(len.min(INITIAL_FRAME_CAPACITY));
+            let mut rest = (&mut socket).take(len as u64);
+            match tokio::time::timeout(self.config.frame_read_timeout, rest.read_to_end(&mut body))
+                .await
+            {
+                Err(_) => {
+                    tracing::warn!(
+                        len,
+                        received = body.len(),
+                        "kafka request body not delivered within the frame read timeout; connection closed"
+                    );
+                    return Ok(());
+                }
+                Ok(Err(error)) => return Err(error),
+                // The peer went away mid-frame: a session over, not a request.
+                Ok(Ok(received)) if received < len => return Ok(()),
+                Ok(Ok(_)) => {}
+            }
             match self.answer(&body).await {
                 Answer::Reply(bytes) => socket.write_all(&frame(&bytes)).await?,
                 Answer::Close(reason) => {
@@ -239,9 +332,11 @@ impl Gateway {
     async fn bounds(&self, name: &str) -> Result<(i64, i64), ErrorCode> {
         let bridge = Arc::clone(&self.bridge);
         let name = name.to_owned();
-        tokio::task::spawn_blocking(move || bridge.bounds(&name))
-            .await
-            .unwrap_or(Err(ErrorCode::RequestTimedOut))
+        until(
+            tokio::time::Instant::now() + self.config.max_fetch_wait,
+            tokio::task::spawn_blocking(move || bridge.bounds(&name)),
+        )
+        .await
     }
 
     async fn metadata(&self, request: MetadataRequest) -> MetadataResponse {
@@ -256,21 +351,29 @@ impl Gateway {
         };
         let mut topics = Vec::with_capacity(names.len());
         for name in names {
-            topics.push(if self.bounds(&name).await.is_ok() {
-                MetadataTopic {
+            topics.push(match self.bounds(&name).await {
+                Ok(_) => MetadataTopic {
                     error: ErrorCode::None,
                     name,
                     leader: Some(self.config.node_id),
-                }
-            } else {
+                },
                 // Never created here, whatever `allow_auto_topic_creation`
                 // said: a topic is a range the metadata plane granted, not
                 // a name a producer typed.
-                MetadataTopic {
+                Err(ErrorCode::UnknownTopicOrPartition) => MetadataTopic {
                     error: ErrorCode::UnknownTopicOrPartition,
                     name,
                     leader: None,
-                }
+                },
+                // A topic the bridge knows but cannot vouch for right now
+                // (review) — fenced, overloaded, storage trouble — keeps its
+                // own code and no leader: the client retries its metadata,
+                // instead of reading an existing range as absent.
+                Err(error) => MetadataTopic {
+                    error,
+                    name,
+                    leader: None,
+                },
             });
         }
         MetadataResponse {
@@ -453,6 +556,11 @@ impl Gateway {
         let wait = Duration::from_millis(request.max_wait_ms.max(0) as u64)
             .min(self.config.max_fetch_wait);
         let deadline = tokio::time::Instant::now() + wait;
+        // Every bridge call of this request is awaited to the configured
+        // maximum at most (review), whatever the client asked: a bridge
+        // stuck behind a slow fsync answers `REQUEST_TIMED_OUT` at the
+        // ceiling instead of holding the response open.
+        let ceiling = tokio::time::Instant::now() + self.config.max_fetch_wait;
         let min_bytes = usize::try_from(request.min_bytes.max(0)).unwrap_or(usize::MAX);
         loop {
             let mut topics = Vec::with_capacity(request.topics.len());
@@ -475,19 +583,21 @@ impl Gateway {
                         let bridge = Arc::clone(&self.bridge);
                         let name = topic.name.clone();
                         let offset = partition.fetch_offset;
-                        tokio::task::spawn_blocking(move || {
-                            let (log_start_offset, high_watermark) = bridge.bounds(&name)?;
-                            if offset < log_start_offset || offset > high_watermark {
-                                return Err(ErrorCode::OffsetOutOfRange);
-                            }
-                            Ok(Fetched {
-                                records: Vec::new(),
-                                high_watermark,
-                                log_start_offset,
-                            })
-                        })
+                        until(
+                            ceiling,
+                            tokio::task::spawn_blocking(move || {
+                                let (log_start_offset, high_watermark) = bridge.bounds(&name)?;
+                                if offset < log_start_offset || offset > high_watermark {
+                                    return Err(ErrorCode::OffsetOutOfRange);
+                                }
+                                Ok(Fetched {
+                                    records: Vec::new(),
+                                    high_watermark,
+                                    log_start_offset,
+                                })
+                            }),
+                        )
                         .await
-                        .unwrap_or(Err(ErrorCode::RequestTimedOut))
                     } else {
                         let bridge = Arc::clone(&self.bridge);
                         let name = topic.name.clone();
@@ -495,9 +605,13 @@ impl Gateway {
                         let budget = usize::try_from(partition.max_bytes.max(1))
                             .unwrap_or(usize::MAX)
                             .min(remaining);
-                        tokio::task::spawn_blocking(move || bridge.fetch(&name, offset, budget))
-                            .await
-                            .unwrap_or(Err(ErrorCode::RequestTimedOut))
+                        until(
+                            ceiling,
+                            tokio::task::spawn_blocking(move || {
+                                bridge.fetch(&name, offset, budget)
+                            }),
+                        )
+                        .await
                     };
                     partitions.push(match outcome {
                         Ok(Fetched {
@@ -652,20 +766,170 @@ mod tests {
     use std::net::SocketAddr;
 
     async fn start(bridge: Arc<dyn Bridge>) -> (SocketAddr, tokio::sync::watch::Sender<bool>) {
+        start_with(bridge, |_| {}).await
+    }
+
+    async fn start_with(
+        bridge: Arc<dyn Bridge>,
+        tune: impl FnOnce(&mut GatewayConfig),
+    ) -> (SocketAddr, tokio::sync::watch::Sender<bool>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = tokio::sync::watch::channel(false);
-        let gateway = Gateway::new(
-            bridge,
-            GatewayConfig {
-                advertised_port: addr.port() as i32,
-                max_fetch_wait: Duration::from_millis(500),
-                fetch_poll_interval: Duration::from_millis(10),
-                ..GatewayConfig::default()
-            },
-        );
+        let mut config = GatewayConfig {
+            advertised_port: addr.port() as i32,
+            max_fetch_wait: Duration::from_millis(500),
+            fetch_poll_interval: Duration::from_millis(10),
+            ..GatewayConfig::default()
+        };
+        tune(&mut config);
+        let gateway = Gateway::new(bridge, config);
         tokio::spawn(gateway.serve(listener, rx));
         (addr, tx)
+    }
+
+    /// A bridge that delegates to memory after a pause — a backend behind
+    /// a slow fsync — or answers `bounds` with a code of its own.
+    struct Behind {
+        inner: MemoryBridge,
+        pause: Duration,
+        bounds: Option<ErrorCode>,
+    }
+    impl Bridge for Behind {
+        fn topics(&self) -> Vec<String> {
+            self.inner.topics()
+        }
+        fn produce(
+            &self,
+            topic: &str,
+            batches: &[RecordBatch],
+        ) -> Result<crate::bridge::Appended, ErrorCode> {
+            self.inner.produce(topic, batches)
+        }
+        fn fetch(&self, topic: &str, offset: i64, max_bytes: usize) -> Result<Fetched, ErrorCode> {
+            std::thread::sleep(self.pause);
+            self.inner.fetch(topic, offset, max_bytes)
+        }
+        fn bounds(&self, topic: &str) -> Result<(i64, i64), ErrorCode> {
+            std::thread::sleep(self.pause);
+            match self.bounds {
+                Some(code) => Err(code),
+                None => self.inner.bounds(topic),
+            }
+        }
+    }
+
+    /// A body is read as it arrives and waited for only so long (review):
+    /// a peer that announces a frame and stops sending is closed, not held
+    /// with the announced length allocated.
+    #[tokio::test]
+    async fn a_frame_announced_and_not_sent_is_closed_at_the_read_timeout() {
+        let (addr, _stop) = start_with(Arc::new(MemoryBridge::with_topics(["events"])), |c| {
+            c.frame_read_timeout = Duration::from_millis(100)
+        })
+        .await;
+        let mut socket = TcpStream::connect(addr).await.unwrap();
+        socket
+            .write_all(&(16 * 1024 * 1024_i32).to_be_bytes())
+            .await
+            .unwrap();
+        socket.write_all(&[0_u8; 8]).await.unwrap(); // and then nothing
+        let started = std::time::Instant::now();
+        let mut rest = Vec::new();
+        let read =
+            tokio::time::timeout(Duration::from_secs(3), socket.read_to_end(&mut rest)).await;
+        assert!(matches!(read, Ok(Ok(0))), "closed by the gateway: {read:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "at the timeout, not later"
+        );
+    }
+
+    /// Sessions over the cap are closed at once (review), and a slot freed
+    /// is a slot served.
+    #[tokio::test]
+    async fn sessions_over_the_cap_are_closed_and_a_freed_slot_is_served() {
+        let (addr, _stop) = start_with(Arc::new(MemoryBridge::with_topics(["events"])), |c| {
+            c.max_sessions = 1
+        })
+        .await;
+        let mut first = TcpStream::connect(addr).await.unwrap();
+        assert!(exchange(&mut first, &request(18, 0, 1, &[]))
+            .await
+            .is_some());
+        let mut second = TcpStream::connect(addr).await.unwrap();
+        assert!(
+            exchange(&mut second, &request(18, 0, 2, &[]))
+                .await
+                .is_none(),
+            "the second session is refused while the first holds the slot"
+        );
+        drop(first);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut third = TcpStream::connect(addr).await.unwrap();
+        assert!(
+            exchange(&mut third, &request(18, 0, 3, &[]))
+                .await
+                .is_some(),
+            "the slot the first session freed serves the third"
+        );
+    }
+
+    /// A bridge stuck past the fetch ceiling answers `REQUEST_TIMED_OUT` at
+    /// the ceiling (review), whatever `max_wait_ms` asked.
+    #[tokio::test]
+    async fn a_bridge_stuck_past_the_ceiling_times_the_fetch_out_at_the_ceiling() {
+        let (addr, _stop) = start(Arc::new(Behind {
+            inner: MemoryBridge::with_topics(["events"]),
+            pause: Duration::from_millis(1_200),
+            bounds: None,
+        }))
+        .await;
+        let started = std::time::Instant::now();
+        let reply = call(addr, 1, 4, 1, &fetch_body(4, "events", 0, 0, 0))
+            .await
+            .unwrap();
+        let (error, _, _) = read_fetch(&reply, 4);
+        assert_eq!(error, ErrorCode::RequestTimedOut.as_i16());
+        assert!(
+            started.elapsed() < Duration::from_millis(1_000),
+            "answered at the 500 ms ceiling, not after the 1.2 s bridge: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A topic the bridge knows but cannot vouch for keeps the bridge's code
+    /// in Metadata (review): fenced is not absent.
+    #[tokio::test]
+    async fn metadata_keeps_a_transient_bridge_error_instead_of_calling_the_topic_unknown() {
+        let (addr, _stop) = start(Arc::new(Behind {
+            inner: MemoryBridge::with_topics(["events"]),
+            pause: Duration::ZERO,
+            bounds: Some(ErrorCode::NotLeaderOrFollower),
+        }))
+        .await;
+        let mut body = Encoder::new();
+        body.array_len(1);
+        body.string("events");
+        body.bool(true);
+        let reply = call(addr, 3, 4, 2, body.as_slice()).await.unwrap();
+        let mut d = Decoder::new(&reply);
+        d.i32("throttle").unwrap();
+        d.array_len("brokers").unwrap();
+        d.i32("node").unwrap();
+        d.string("host").unwrap();
+        d.i32("port").unwrap();
+        d.nullable_string("rack").unwrap();
+        d.nullable_string("cluster").unwrap();
+        d.i32("controller").unwrap();
+        d.array_len("topics").unwrap();
+        assert_eq!(
+            d.i16("error").unwrap(),
+            ErrorCode::NotLeaderOrFollower.as_i16()
+        );
+        assert_eq!(d.string("name").unwrap(), "events");
+        d.bool("internal").unwrap();
+        assert_eq!(d.array_len("partitions").unwrap(), Some(0));
     }
 
     fn request(key: i16, version: i16, correlation: i32, body: &[u8]) -> Vec<u8> {

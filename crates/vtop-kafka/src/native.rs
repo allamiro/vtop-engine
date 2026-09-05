@@ -311,33 +311,14 @@ impl Bridge for NativeBridge {
 
     fn bounds(&self, topic: &str) -> Result<(i64, i64), ErrorCode> {
         self.known(topic)?;
-        // The watermark asked from the log's END (review), never from offset
-        // zero: once retention has reclaimed the prefix, a fetch from zero
-        // is refused as retained, and the watermark would vanish with it. A
-        // fetch at the next offset carries the committed high watermark and
-        // no records, and the broker accepts it. The floor is the broker's
-        // own. `local_offsets` queues behind an append the way a request
-        // handler may.
-        let (_, next_offset) = self.broker.local_offsets();
-        let request = FetchRequest {
-            range: self.broker.range().clone(),
-            fencing_epoch: self.broker.held_fencing_epoch(),
-            start_offset: next_offset,
-            max_bytes: 1,
-            max_records: 1,
-        };
-        match self
-            .broker
-            .handle(Role::Consumer, self.frame(Message::FetchRequest(request)))
-            .message
-        {
-            Message::FetchResponse(response) => Ok((
-                self.broker.earliest_offset() as i64,
-                response.committed_high_watermark as i64,
-            )),
-            Message::Error(error) => Err(kafka_code(error.code)),
-            _ => Err(ErrorCode::InvalidRecord),
-        }
+        // One snapshot of the log (review): the retained floor and the
+        // committed watermark read under one lock, never a fetch at an
+        // offset read a moment earlier — under appends with retention, two
+        // segment rolls between the two could reclaim that offset and turn
+        // a healthy topic's bounds into OFFSET_OUT_OF_RANGE. The watermark
+        // is the same one a fetch reports.
+        let (floor, high_watermark) = self.broker.retained_bounds();
+        Ok((floor as i64, high_watermark as i64))
     }
 }
 

@@ -381,7 +381,9 @@ pub fn decode_fetch(d: &mut Decoder<'_>, version: i16) -> Result<FetchRequest, W
         let forgotten = bounded(d, "fetch.forgottenTopicsData", MAX_TOPICS)?;
         for _ in 0..forgotten {
             d.string("fetch.forgottenTopicsData.topic")?;
-            let n = bounded(d, "fetch.forgottenTopicsData.partitions", MAX_PARTITIONS)?;
+            // Counted against the same request-wide cap as the fetched
+            // partitions (review): a forgotten list is iterated too.
+            let n = partitions_within(d, "fetch.forgottenTopicsData.partitions", &mut total)?;
             for _ in 0..n {
                 d.i32("fetch.forgottenTopicsData.partitions")?;
             }
@@ -842,6 +844,32 @@ mod tests {
         assert!(matches!(
             decode_list_offsets(&mut Decoder::new(&bytes), 1),
             Err(WireError::TooMany { field: "listOffsets.topics.partitions", limit, .. }) if limit == MAX_PARTITIONS_PER_REQUEST
+        ));
+    }
+
+    /// The forgotten list of a Fetch v7+ is iterated like the fetched one,
+    /// and counts against the same request-wide cap (review).
+    #[test]
+    fn forgotten_partitions_count_against_the_request_cap() {
+        let mut e = Encoder::new();
+        e.i32(-1); // replica_id
+        e.i32(500); // max_wait_ms
+        e.i32(1); // min_bytes
+        e.i32(1 << 20); // max_bytes
+        e.i8(0); // isolation
+        e.i32(0); // session_id
+        e.i32(-1); // session_epoch
+        e.array_len(0); // topics
+        e.array_len(MAX_TOPICS); // forgotten
+        for _ in 0..MAX_TOPICS {
+            e.string("t");
+            e.array_len(MAX_PARTITIONS);
+            e.raw(&vec![0_u8; 4 * MAX_PARTITIONS]);
+        }
+        let bytes = e.into_vec();
+        assert!(matches!(
+            decode_fetch(&mut Decoder::new(&bytes), 7),
+            Err(WireError::TooMany { field: "fetch.forgottenTopicsData.partitions", limit, .. }) if limit == MAX_PARTITIONS_PER_REQUEST
         ));
     }
 

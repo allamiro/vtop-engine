@@ -1343,6 +1343,26 @@ impl LocalBroker {
         state.segment.base_offset()
     }
 
+    /// The retained floor and the committed high watermark of the log, from
+    /// ONE snapshot (#225): what a Kafka consumer is told the log spans. The
+    /// watermark is the one a fetch reports — the cluster's committed
+    /// offset clipped to what this log holds, or the log's own when no
+    /// cluster commit is known. Read under one lock, so retention rolling
+    /// segments between two reads cannot pair a floor with a watermark it
+    /// never shared a log with.
+    pub fn retained_bounds(&self) -> (u64, u64) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let committed = state.segment.committed_offset();
+        let high_watermark = self
+            .cluster_committed()
+            .map(|hwm| hwm.get().min(committed))
+            .unwrap_or(committed);
+        (state.segment.base_offset(), high_watermark)
+    }
+
     pub fn local_offsets(&self) -> (u64, u64) {
         let state = self
             .state
