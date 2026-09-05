@@ -308,11 +308,26 @@ def version_matches(wanted, version):
     # name 0.1.2 (review).
     return version == wanted or version.startswith(wanted + ".")
 
+def source_of(pkgid):
+    # "path+file:///x#name@1.0" -> "file:///x"; the kind prefix is optional in
+    # a spec and the fragment is not part of the source.
+    source = pkgid.split("#", 1)[0]
+    return source.split("+", 1)[1] if "+" in source.split("://", 1)[0] else source
+
 def named(spec, package):
     # -p accepts a name (with the usual glob patterns), name@version or
-    # name:version (version possibly abbreviated), or a path; match the
-    # forms a person types.
+    # name:version (version possibly abbreviated), a path, or a fully
+    # qualified pkgid (`path+file:///x#0.1.0`, `file:///x#name@0.1.0`);
+    # match the forms a person types (review).
     name = package["name"]
+    if "#" in spec:
+        source, fragment = spec.rsplit("#", 1)
+        if source_of(source).rstrip("/") != source_of(package["id"]).rstrip("/"):
+            return False
+        if "@" in fragment:
+            spec_name, wanted = fragment.split("@", 1)
+            return spec_name == name and version_matches(wanted, package["version"])
+        return version_matches(fragment, package["version"])
     if spec == name:
         return True
     for separator in ("@", ":"):
@@ -400,10 +415,16 @@ TOTAL_PACKAGES="$(cargo tree ${selection[@]+"${selection[@]}"} \
 }
 
 built_packages() {
-  # Distinct packages with at least one artifact so far; a missing file
-  # (the first poll on a cold build) is zero, not an error.
+  # Distinct packages with at least one COMPILED artifact so far — a build
+  # script's executable is not one (review): it is emitted before the
+  # script has run, and a package with a slow build script would otherwise
+  # read as built for the whole of it. A dependency has exactly one
+  # artifact, so this is exact for all but the selected roots, whose extra
+  # test targets can complete a little after the package first counts. A
+  # missing file (the first poll on a cold build) is zero, not an error.
   [[ -f "$WORK/build.json" ]] || { echo 0; return; }
   grep '"reason":"compiler-artifact"' "$WORK/build.json" 2>/dev/null \
+    | grep -v '"kind":\["custom-build"\]' \
     | grep -oE '"package_id":"[^"]*"' | sort -u | wc -l | tr -d ' '
 }
 
@@ -498,12 +519,13 @@ fi
 
 printf '%srunning%s (%s test binaries, %s doctest targets, through cargo)\n' "$BOLD" "$RESET" "$TOTAL_BINS" "$DOC_UNITS"
 ran=0; passed=0; failed=0; current="cargo test"
-# A caller who asked for the tests' own output (--nocapture, --show-output)
-# gets it streamed as cargo prints it; a bar over a log nobody sees would
-# hide the very thing they asked for. The log is still kept for the counts.
+# A caller who asked for the tests' own output (--nocapture in either
+# spelling, --show-output) or for the harness's (--list, --help) gets it
+# streamed as cargo prints it; a bar over a log nobody sees would hide the
+# very thing they asked for. The log is still kept for the counts.
 stream=0
 case " ${bin_args[*]+"${bin_args[*]}"} " in
-  *" --nocapture "*|*" --show-output "*) stream=1 ;;
+  *" --nocapture "*|*" --no-capture "*|*" --show-output "*|*" --list "*|*" --help "*|*" -h "*) stream=1 ;;
 esac
 if (( stream )); then
   cargo test ${cargo_args[@]+"${cargo_args[@]}"} --no-fail-fast -- ${bin_args[@]+"${bin_args[@]}"} 2>&1 \
@@ -530,7 +552,10 @@ while :; do
   # Re-read the whole log each tick: cheap, and it needs no cursor state.
   # POSIX classes, not \s: the sed macOS ships does not know \s, and a
   # label that kept its indentation would be the only symptom.
-  ran="$(plain_log "$WORK/run.log" | grep -cE '^[[:space:]]+(Running|Doc-tests) ' || true)"
+  # FINISHED units, not started ones (review): `Running` precedes a binary,
+  # `test result:` closes it (and closes each doctest unit), so a single
+  # slow binary reads as in progress rather than complete.
+  ran="$(plain_log "$WORK/run.log" | grep -cE '^test result: ' || true)"
   ran="${ran:-0}"
   current="$(plain_log "$WORK/run.log" | grep -E '^[[:space:]]+(Running|Doc-tests) ' | tail -1 \
     | sed -E 's/^[[:space:]]+//; s/ \(.*\)$//')"
