@@ -128,6 +128,39 @@ Three outputs answer the questions the issue asks:
 | `ledger_bytes` / `ledger_rows` / `ledger_bytes_per_batch` | ledger growth. Rows scale with BATCH count, so a low `batch_max_records` grows the ledger far faster per byte archived than a flood does — this is tested *better* small than large |
 | `recovery_ms` | what it costs to open that ledger afterwards, with no work left to do (#77 loads the whole thing into memory at startup) |
 
+### Bandwidth-shaped soak (#403)
+
+Every soak above runs over a loopback with unbounded bandwidth, so nothing
+measures how the engine degrades when the upload link — not the store — is
+the bottleneck. That is the normal condition at an edge site archiving over a
+WAN. `13-backpressure-soak-shaped.yaml` is scenario 12 with the upload path
+routed through [toxiproxy](https://github.com/Shopify/toxiproxy): no root, no
+`CAP_NET_ADMIN`, and a shape per scenario.
+
+```bash
+docker compose -f benchmarks/docker-compose.benchmark.yml --profile shaped up -d
+python3 benchmarks/run_benchmark.py benchmarks/scenarios/13-backpressure-soak-shaped.yaml
+docker compose -f benchmarks/docker-compose.benchmark.yml --profile shaped down
+```
+
+The scenario names the shape with flat keys — `shaping_api_url` (empty means
+unshaped), `shaping_proxy`, `shaping_bandwidth_kbps` (KB/s, each direction),
+`shaping_latency_ms` (round trip, split across the directions) and
+`shaping_jitter_ms` — and points `endpoint_url` at the proxy on `:9100`. The
+runner installs the toxics for exactly the measured block and removes them on
+every way out of it, so a following unshaped run never inherits the pipe; the
+shape is recorded in `summary.json` under `shaping`, so a p95 is never read
+without the link it was measured through.
+
+What the run answers, and where to read it:
+
+| question | reads on |
+|----------|----------|
+| does a thin pipe grow the **deficit** or the **queues**? | `backlog_metrics.csv` should climb while `inflight_batches` and memory stay bounded — the #98 hypothesis-1 shape, now reachable on purpose |
+| is the wait attributed honestly? | `object_upload_ms` p95 carries the pipe; `total_ms` grows by the same, not more |
+| does the engine back off? | with `batching.adaptive_width.enabled` in the engine config, `vtop_upload_width` follows the throttles a saturated pipe turns into (#102) |
+| does it recover? | unshape (the runner does) and the next cycle's `object_upload_ms` returns to the store's own number, without a restart |
+
 ## 8. Clean benchmark data
 
 ```bash
@@ -168,7 +201,8 @@ Copy any file in `scenarios/`, change the knobs, drop it in `scenarios/`.
 Every parameter is configurable (see `lib/scenario.py` `DEFAULTS`):
 volume, file_size, format, batch_max_records/bytes/age, compression(+level),
 checksum, backend, duration_seconds, fault, sys_sample_interval, bucket,
-endpoint_url. `run_matrix.py --all` automatically picks it up.
+endpoint_url, and the `shaping_*` keys (§7). `run_matrix.py --all`
+automatically picks it up.
 
 ## Benchmark matrix coverage
 
@@ -184,6 +218,7 @@ endpoint_url. `run_matrix.py --all` automatically picks it up.
 | Failure conditions | ✅ verification failure, replay/recovery | `backend: mock_fail`, `fault: replay` |
 | Runtime duration | ✅ any (`duration_seconds`) | 5 min / 30 min / 1 h presets easy to add |
 | Sustained backpressure | ✅ `seed_concurrently` + `backlog_multiplier` | a real deficit, not just sustained load — scenario `11-backpressure-soak` (#98) |
+| Bandwidth-shaped upload | ✅ toxiproxy on the `shaped` profile, `shaping_*` keys | the upload link as the bottleneck — scenario `13-backpressure-soak-shaped` (#403) |
 
 ## Native segment write amp / proof overhead (#189)
 

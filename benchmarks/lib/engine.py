@@ -62,8 +62,10 @@ def _is_lab_endpoint(endpoint: str) -> bool:
         port = parts.port
     except ValueError:
         return False
+    # 9100 is the same lab MinIO behind the shaped stack's toxiproxy (#403):
+    # the pipe changes, the store and its lab credentials do not.
     return (parts.hostname in ("localhost", "127.0.0.1", "::1")
-            and port == 9000)
+            and port in (9000, 9100))
 
 
 def write_engine_config(scenario, work_dir: str, state_db: str,

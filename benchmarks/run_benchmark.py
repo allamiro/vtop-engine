@@ -26,7 +26,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from lib import engine, seed  # noqa: E402
+from lib import engine, seed, shaping  # noqa: E402
 from lib.metrics import ResultsWriter, iso_now, new_run_id, percentile  # noqa: E402
 from lib.scenario import load_scenario, reseed_count  # noqa: E402
 from lib.sysmon import SystemMonitor  # noqa: E402
@@ -77,6 +77,10 @@ def main() -> int:
     os.makedirs(results_root, exist_ok=True)
 
     sc = load_scenario(args.scenario)
+    # The shape is judged HERE, before a seed byte exists (#403): a bad knob
+    # fails the run before it costs anything, and a shaped scenario never
+    # runs unshaped under its own name.
+    shape = shaping.Shape.from_scenario(sc)
     run_id = new_run_id(sc.name)
     writer = ResultsWriter(results_root, run_id)
     print(f"[bench] scenario={sc.name} run_id={run_id}")
@@ -125,7 +129,10 @@ def main() -> int:
         row.update(sample)
         writer.row("system_metrics.csv", row)
 
-    with SystemMonitor(emit_sys, interval=float(sc.get("sys_sample_interval", 1.0))):
+    # The pipe is shaped for exactly the block the measurements come from,
+    # and unshaped on every way out of it (#403).
+    with SystemMonitor(emit_sys, interval=float(sc.get("sys_sample_interval", 1.0))), \
+            shaping.shaped(sc):
         # initial seed
         # A --seed-dir the caller supplied may already hold input. Those bytes
         # reach `bytes_archived`, so they must reach `bytes_seeded` too or the
@@ -449,6 +456,9 @@ def main() -> int:
         "compression_ratio_avg": round(sum(comp_ratios) / len(comp_ratios), 3) if comp_ratios else 0,
         "error_count": errors, "failed_batches": failed, "successful_batches": success,
         "backend": sc.get("backend", "mock"),
+        # The pipe the numbers were measured through, or None (#403): a p95
+        # is never read without it.
+        "shaping": shape.describe() if shape else None,
     }
     # CPU/mem summary from the system-metrics samples written during the run.
     summary.update(_sys_summary(writer.dir))
@@ -525,4 +535,10 @@ def _bottleneck(s):
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except shaping.ShapingError as exc:
+        # The pipe could not be shaped (#403): one line naming what to start,
+        # and a non-zero exit — not a traceback for a stack that is not up.
+        print(f"[bench] {exc}", file=sys.stderr)
+        raise SystemExit(2) from None

@@ -53,6 +53,13 @@ DEFAULTS: dict[str, Any] = {
     # for everything else — see lib/engine.py). Provisioning a bucket against
     # a real endpoint is a scenario's explicit opt-in, never an inference.
     "create_bucket": "",
+    # Bandwidth shaping between the engine and the store (#403), see
+    # lib/shaping.py. "" = unshaped; the rest matter only when it is set.
+    "shaping_api_url": "",
+    "shaping_proxy": "minio",
+    "shaping_bandwidth_kbps": 0,
+    "shaping_latency_ms": 0,
+    "shaping_jitter_ms": 0,
 }
 
 
