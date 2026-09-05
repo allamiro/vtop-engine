@@ -89,7 +89,10 @@ impl HardStateFile {
 
     /// Persist a new hard state atomically. Raft safety guards are enforced
     /// here, next to the bytes: the term can never regress, and within a
-    /// term a cast vote can never change or be forgotten.
+    /// term a cast vote can never change or be forgotten — with the one
+    /// exception the raft library's vote ordering requires (#465): the term's elected
+    /// leader, as a COMMITTED vote, over this node's uncommitted vote for a
+    /// candidate that lost.
     pub fn save(&mut self, next: HardState) -> MetaStoreResult<()> {
         if self.poisoned {
             return Err(MetaStoreError::Poisoned("hard state"));
@@ -103,10 +106,27 @@ impl HardStateFile {
         if next.term == self.state.term {
             if let Some(current_vote) = self.state.voted_for {
                 if next.voted_for != Some(current_vote) {
-                    return Err(MetaStoreError::InvalidConfig(format!(
-                        "vote in term {} cannot change from node {} to {:?}",
-                        next.term, current_vote, next.voted_for
-                    )));
+                    // A cast vote never changes within a term — that is the
+                    // double vote Raft forbids — except for the one change
+                    // the raft library asks for and is entitled to (#465): a
+                    // COMMITTED vote for another node is the term's elected
+                    // leader, and a vote a quorum granted outranks this
+                    // node's uncommitted vote for a candidate that lost.
+                    // Saving it changes no election; it records the one
+                    // that happened, and refusing it wedged the node behind
+                    // a storage error on every message the leader sent. A
+                    // committed vote for yet another node cannot exist under
+                    // single-term-leader and is refused; so is any
+                    // uncommitted change, and so is forgetting a vote.
+                    let leader_announced = next.vote_committed
+                        && !self.state.vote_committed
+                        && next.voted_for.is_some();
+                    if !leader_announced {
+                        return Err(MetaStoreError::InvalidConfig(format!(
+                            "vote in term {} cannot change from node {} to {:?}",
+                            next.term, current_vote, next.voted_for
+                        )));
+                    }
                 }
             }
             // Within a term the committed flag is monotonic too: forgetting
@@ -284,6 +304,88 @@ mod tests {
             vote_committed: false,
         })
         .unwrap();
+    }
+
+    /// The elected leader's committed vote is saved over this node's
+    /// uncommitted vote for the candidate that lost (#465): the raft library asks
+    /// for exactly that, and refusing it wedged the node. Nothing else the
+    /// guards refuse is loosened: a second committed leader in the term, an
+    /// uncommitting, and a forgetting are still refused, and the leader's
+    /// vote is what a reopen finds.
+    #[test]
+    fn the_elected_leaders_committed_vote_is_saved_over_an_uncommitted_vote_for_the_loser() {
+        let (_sim, env) = sim_env();
+        let mut file = HardStateFile::open_in(&env, "/meta/meta.hardstate").unwrap();
+        file.save(HardState {
+            term: 4,
+            voted_for: Some(MetaNodeId(1)),
+            vote_committed: false,
+        })
+        .unwrap();
+        file.save(HardState {
+            term: 4,
+            voted_for: Some(MetaNodeId(3)),
+            vote_committed: true,
+        })
+        .unwrap();
+        assert_eq!(
+            file.state(),
+            &HardState {
+                term: 4,
+                voted_for: Some(MetaNodeId(3)),
+                vote_committed: true,
+            }
+        );
+        // Two leaders in one term cannot be; a store does not paper over it.
+        assert!(matches!(
+            file.save(HardState {
+                term: 4,
+                voted_for: Some(MetaNodeId(2)),
+                vote_committed: true,
+            }),
+            Err(MetaStoreError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            file.save(HardState {
+                term: 4,
+                voted_for: Some(MetaNodeId(3)),
+                vote_committed: false,
+            }),
+            Err(MetaStoreError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            file.save(HardState {
+                term: 4,
+                voted_for: None,
+                vote_committed: true,
+            }),
+            Err(MetaStoreError::InvalidConfig(_))
+        ));
+        // An uncommitted change is still the double vote, in a fresh term too.
+        file.save(HardState {
+            term: 5,
+            voted_for: Some(MetaNodeId(1)),
+            vote_committed: false,
+        })
+        .unwrap();
+        assert!(matches!(
+            file.save(HardState {
+                term: 5,
+                voted_for: Some(MetaNodeId(2)),
+                vote_committed: false,
+            }),
+            Err(MetaStoreError::InvalidConfig(_))
+        ));
+        drop(file);
+        let reopened = HardStateFile::open_in(&env, "/meta/meta.hardstate").unwrap();
+        assert_eq!(
+            reopened.state(),
+            &HardState {
+                term: 5,
+                voted_for: Some(MetaNodeId(1)),
+                vote_committed: false,
+            }
+        );
     }
 
     #[test]
