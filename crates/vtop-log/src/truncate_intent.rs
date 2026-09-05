@@ -34,7 +34,8 @@
 
 use crate::producer_snapshot::ProducerSnapshot;
 use crate::{
-    KeyRange, LogError, ParentRange, RangeLineage, SegmentConfig, SegmentDescriptor, VtopLogResult,
+    KeyRange, LogError, ParentRange, RangeLineage, SegmentConfig, SegmentConfigV2,
+    SegmentDescriptor, SegmentDescriptorV2, VtopLogResult,
 };
 use uuid::Uuid;
 
@@ -43,7 +44,18 @@ use uuid::Uuid;
 pub(crate) const TRUNCATE_INTENT_FILE: &str = "range.truncate-intent";
 
 const MAGIC: &[u8; 8] = b"VTOPTIN1";
+/// A marker whose replacement is a v1 segment. Byte-for-byte the original
+/// format: a marker written before this distinction existed decodes as this
+/// version, which matters because a marker's whole purpose is to survive a
+/// crash — including a crash the process upgrades across (#429).
 const VERSION: u16 = 1;
+/// A marker whose replacement is a v2 segment, carrying the descriptor
+/// fields v1 has no room for: segment generation, creation node, creation
+/// epoch, and the chunk size the config needs (#429). A separate version
+/// rather than a flag inside v1's layout, so an older binary that finds one
+/// refuses it whole — recovery deletes segments on this file's word, and a
+/// partial understanding of it must not act.
+const VERSION_V2: u16 = 2;
 
 /// A segment the truncation removes: its identity, and the base offset that
 /// names every file it owns via `segment_stem`.
@@ -53,19 +65,55 @@ pub(crate) struct DoomedSegment {
     pub(crate) base_offset: u64,
 }
 
+/// The replacement tail's identity and limits, in the format of the tail it
+/// replaces (#429). Keyed on the TAIL's format because the replacement is the
+/// segment appends continue into: a v2 range must come back as a v2 segment
+/// with its generation, creation node and creation epoch carried byte-exactly
+/// — the same fields a rolled successor inherits unchanged — or the rebuilt
+/// tail would have a different identity than the one the truncation replaced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ReplacementTail {
+    V1 {
+        descriptor: SegmentDescriptor,
+        config: SegmentConfig,
+    },
+    V2 {
+        descriptor: SegmentDescriptorV2,
+        config: SegmentConfigV2,
+    },
+}
+
+impl ReplacementTail {
+    pub(crate) fn base_offset(&self) -> u64 {
+        match self {
+            Self::V1 { descriptor, .. } => descriptor.base_offset,
+            Self::V2 { descriptor, .. } => descriptor.base_offset,
+        }
+    }
+
+    /// Test-only: the pins that stage a marker by hand assert the rebuilt
+    /// tail carries the marker's identity, whichever arm holds it.
+    #[cfg(test)]
+    pub(crate) fn segment_id(&self) -> Uuid {
+        match self {
+            Self::V1 { descriptor, .. } => descriptor.segment_id,
+            Self::V2 { descriptor, .. } => descriptor.segment_id,
+        }
+    }
+}
+
 /// Everything recovery needs to finish an interrupted cross-segment
 /// truncation, with no other file consulted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TruncateIntent {
     /// First offset the range no longer holds once the truncation completes.
     pub(crate) target_offset: u64,
-    /// The replacement tail's full identity. Its `base_offset` must equal
-    /// `target_offset`; the encoding stores the offset once and rebuilds the
-    /// descriptor from it, so the two cannot drift apart on disk.
-    pub(crate) replacement: SegmentDescriptor,
-    /// The limits the replacement is created with, inherited from the tail it
-    /// replaces exactly as a rolled successor inherits them.
-    pub(crate) config: SegmentConfig,
+    /// The replacement tail's full identity and limits, inherited from the
+    /// tail it replaces exactly as a rolled successor inherits them. Its
+    /// `base_offset` must equal `target_offset`; the encoding stores the
+    /// offset once and rebuilds the descriptor from it, so the two cannot
+    /// drift apart on disk.
+    pub(crate) replacement: ReplacementTail,
     /// Segments to delete, in ascending base-offset order. The first begins
     /// at the cut; the last is the old tail.
     pub(crate) doomed: Vec<DoomedSegment>,
@@ -80,19 +128,43 @@ impl TruncateIntent {
         // The descriptor's base offset is not stored separately, so a value
         // that disagrees with the target would be silently "repaired" on the
         // way back in. Refuse to write it instead.
-        if self.replacement.base_offset != self.target_offset {
+        if self.replacement.base_offset() != self.target_offset {
             return Err(LogError::InvalidConfig(format!(
                 "truncation intent replacement begins at {} but the cut is at {}",
-                self.replacement.base_offset, self.target_offset
+                self.replacement.base_offset(),
+                self.target_offset
             )));
         }
         let mut out = Vec::new();
         out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&VERSION.to_be_bytes());
+        out.extend_from_slice(
+            &match self.replacement {
+                ReplacementTail::V1 { .. } => VERSION,
+                ReplacementTail::V2 { .. } => VERSION_V2,
+            }
+            .to_be_bytes(),
+        );
         out.extend_from_slice(&self.target_offset.to_be_bytes());
 
-        out.extend_from_slice(self.replacement.segment_id.as_bytes());
-        let topic = self.replacement.topic.as_bytes();
+        // The identity core is laid out identically in both versions — the
+        // version says what FOLLOWS the lineage, so a v1 marker's bytes stay
+        // exactly what every earlier binary wrote and read.
+        let (segment_id, topic, topic_epoch, lineage) = match &self.replacement {
+            ReplacementTail::V1 { descriptor, .. } => (
+                descriptor.segment_id,
+                descriptor.topic.as_str(),
+                descriptor.topic_epoch,
+                &descriptor.lineage,
+            ),
+            ReplacementTail::V2 { descriptor, .. } => (
+                descriptor.segment_id,
+                descriptor.topic.as_str(),
+                descriptor.topic_epoch,
+                &descriptor.lineage,
+            ),
+        };
+        out.extend_from_slice(segment_id.as_bytes());
+        let topic = topic.as_bytes();
         // Topics are capped at 249 bytes by descriptor validation; u16 is
         // checked anyway so a hand-built descriptor cannot truncate silently.
         let topic_len = u16::try_from(topic.len()).map_err(|_| {
@@ -100,24 +172,42 @@ impl TruncateIntent {
         })?;
         out.extend_from_slice(&topic_len.to_be_bytes());
         out.extend_from_slice(topic);
-        out.extend_from_slice(&self.replacement.topic_epoch.to_be_bytes());
-        out.extend_from_slice(self.replacement.lineage.range_id.as_bytes());
-        out.extend_from_slice(&self.replacement.lineage.generation.to_be_bytes());
-        out.extend_from_slice(&self.replacement.lineage.key_range.prefix.to_be_bytes());
-        out.push(self.replacement.lineage.key_range.prefix_bits);
-        out.extend_from_slice(&(self.replacement.lineage.parents.len() as u32).to_be_bytes());
-        for parent in &self.replacement.lineage.parents {
+        out.extend_from_slice(&topic_epoch.to_be_bytes());
+        out.extend_from_slice(lineage.range_id.as_bytes());
+        out.extend_from_slice(&lineage.generation.to_be_bytes());
+        out.extend_from_slice(&lineage.key_range.prefix.to_be_bytes());
+        out.push(lineage.key_range.prefix_bits);
+        out.extend_from_slice(&(lineage.parents.len() as u32).to_be_bytes());
+        for parent in &lineage.parents {
             out.extend_from_slice(parent.range_id.as_bytes());
             out.extend_from_slice(&parent.generation.to_be_bytes());
             out.extend_from_slice(&parent.key_range.prefix.to_be_bytes());
             out.push(parent.key_range.prefix_bits);
         }
 
-        out.extend_from_slice(&self.config.max_record_bytes.to_be_bytes());
-        out.extend_from_slice(&self.config.max_group_bytes.to_be_bytes());
-        out.extend_from_slice(&self.config.max_segment_bytes.to_be_bytes());
-        out.extend_from_slice(&self.config.max_segment_records.to_be_bytes());
-        out.extend_from_slice(&self.config.index_stride.to_be_bytes());
+        match &self.replacement {
+            ReplacementTail::V1 { config, .. } => {
+                out.extend_from_slice(&config.max_record_bytes.to_be_bytes());
+                out.extend_from_slice(&config.max_group_bytes.to_be_bytes());
+                out.extend_from_slice(&config.max_segment_bytes.to_be_bytes());
+                out.extend_from_slice(&config.max_segment_records.to_be_bytes());
+                out.extend_from_slice(&config.index_stride.to_be_bytes());
+            }
+            ReplacementTail::V2 { descriptor, config } => {
+                // The fields v1 has no room for (#429): the identity a
+                // rolled successor inherits unchanged, and the chunk size
+                // without which a v2 header cannot be written.
+                out.extend_from_slice(&descriptor.segment_generation.to_be_bytes());
+                out.extend_from_slice(descriptor.creation_node_id.as_bytes());
+                out.extend_from_slice(&descriptor.creation_fencing_epoch.to_be_bytes());
+                out.extend_from_slice(&config.max_record_bytes.to_be_bytes());
+                out.extend_from_slice(&config.max_group_bytes.to_be_bytes());
+                out.extend_from_slice(&config.max_segment_bytes.to_be_bytes());
+                out.extend_from_slice(&config.max_segment_records.to_be_bytes());
+                out.extend_from_slice(&config.index_stride.to_be_bytes());
+                out.extend_from_slice(&config.chunk_size.to_be_bytes());
+            }
+        }
 
         out.extend_from_slice(&(self.doomed.len() as u32).to_be_bytes());
         for doomed in &self.doomed {
@@ -153,7 +243,7 @@ impl TruncateIntent {
             return Err(corrupt("bad magic"));
         }
         let version = reader.u16()?;
-        if version != VERSION {
+        if version != VERSION && version != VERSION_V2 {
             return Err(corrupt(&format!("unsupported version {version}")));
         }
         let target_offset = reader.u64()?;
@@ -182,12 +272,53 @@ impl TruncateIntent {
             });
         }
 
-        let config = SegmentConfig {
-            max_record_bytes: reader.u32()?,
-            max_group_bytes: reader.u64()?,
-            max_segment_bytes: reader.u64()?,
-            max_segment_records: reader.u64()?,
-            index_stride: reader.u32()?,
+        let lineage = RangeLineage {
+            range_id,
+            generation,
+            key_range,
+            parents,
+        };
+        let replacement = if version == VERSION_V2 {
+            let segment_generation = reader.u64()?;
+            let creation_node_id = reader.uuid()?;
+            let creation_fencing_epoch = reader.u64()?;
+            ReplacementTail::V2 {
+                descriptor: SegmentDescriptorV2 {
+                    segment_id,
+                    topic,
+                    topic_epoch,
+                    lineage,
+                    base_offset: target_offset,
+                    segment_generation,
+                    creation_node_id,
+                    creation_fencing_epoch,
+                },
+                config: SegmentConfigV2 {
+                    max_record_bytes: reader.u32()?,
+                    max_group_bytes: reader.u64()?,
+                    max_segment_bytes: reader.u64()?,
+                    max_segment_records: reader.u64()?,
+                    index_stride: reader.u32()?,
+                    chunk_size: reader.u32()?,
+                },
+            }
+        } else {
+            ReplacementTail::V1 {
+                descriptor: SegmentDescriptor {
+                    segment_id,
+                    topic,
+                    topic_epoch,
+                    lineage,
+                    base_offset: target_offset,
+                },
+                config: SegmentConfig {
+                    max_record_bytes: reader.u32()?,
+                    max_group_bytes: reader.u64()?,
+                    max_segment_bytes: reader.u64()?,
+                    max_segment_records: reader.u64()?,
+                    index_stride: reader.u32()?,
+                },
+            }
         };
 
         let doomed_count = reader.u32()? as usize;
@@ -234,19 +365,7 @@ impl TruncateIntent {
 
         Ok(Self {
             target_offset,
-            replacement: SegmentDescriptor {
-                segment_id,
-                topic,
-                topic_epoch,
-                lineage: RangeLineage {
-                    range_id,
-                    generation,
-                    key_range,
-                    parents,
-                },
-                base_offset: target_offset,
-            },
-            config,
+            replacement,
             doomed,
             inherited,
         })
@@ -337,34 +456,40 @@ mod tests {
         ProducerSnapshot { producers, epochs }
     }
 
+    fn lineage() -> RangeLineage {
+        RangeLineage {
+            range_id: Uuid::from_u128(100),
+            generation: 1,
+            key_range: KeyRange {
+                prefix: 0,
+                prefix_bits: 1,
+            },
+            parents: vec![crate::ParentRange {
+                range_id: Uuid::from_u128(99),
+                generation: 0,
+                key_range: KeyRange::full(),
+            }],
+        }
+    }
+
     fn intent() -> TruncateIntent {
         TruncateIntent {
             target_offset: 16,
-            replacement: SegmentDescriptor {
-                segment_id: Uuid::from_u128(77),
-                topic: "events.v1".to_owned(),
-                topic_epoch: 7,
-                lineage: RangeLineage {
-                    range_id: Uuid::from_u128(100),
-                    generation: 1,
-                    key_range: KeyRange {
-                        prefix: 0,
-                        prefix_bits: 1,
-                    },
-                    parents: vec![crate::ParentRange {
-                        range_id: Uuid::from_u128(99),
-                        generation: 0,
-                        key_range: KeyRange::full(),
-                    }],
+            replacement: ReplacementTail::V1 {
+                descriptor: SegmentDescriptor {
+                    segment_id: Uuid::from_u128(77),
+                    topic: "events.v1".to_owned(),
+                    topic_epoch: 7,
+                    lineage: lineage(),
+                    base_offset: 16,
                 },
-                base_offset: 16,
-            },
-            config: SegmentConfig {
-                max_record_bytes: 256,
-                max_group_bytes: 512,
-                max_segment_bytes: 512,
-                max_segment_records: 100,
-                index_stride: 2,
+                config: SegmentConfig {
+                    max_record_bytes: 256,
+                    max_group_bytes: 512,
+                    max_segment_bytes: 512,
+                    max_segment_records: 100,
+                    index_stride: 2,
+                },
             },
             doomed: vec![
                 DoomedSegment {
@@ -380,9 +505,48 @@ mod tests {
         }
     }
 
+    fn v2_intent() -> TruncateIntent {
+        TruncateIntent {
+            replacement: ReplacementTail::V2 {
+                descriptor: SegmentDescriptorV2 {
+                    segment_id: Uuid::from_u128(77),
+                    topic: "events.v1".to_owned(),
+                    topic_epoch: 7,
+                    lineage: lineage(),
+                    base_offset: 16,
+                    segment_generation: 4,
+                    creation_node_id: Uuid::from_u128(0xA1),
+                    creation_fencing_epoch: 9,
+                },
+                config: SegmentConfigV2 {
+                    max_record_bytes: 256,
+                    max_group_bytes: 512,
+                    max_segment_bytes: 512,
+                    max_segment_records: 100,
+                    index_stride: 2,
+                    chunk_size: 128,
+                },
+            },
+            ..intent()
+        }
+    }
+
     #[test]
     fn an_intent_round_trips() {
         let original = intent();
+        let decoded = TruncateIntent::decode(&original.encode().unwrap()).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    /// A v2 replacement carries the fields v1 has no room for — segment
+    /// generation, creation node, creation epoch, chunk size — and every one
+    /// must survive the round trip byte-exactly: recovery re-creates the
+    /// replacement from these bytes alone, and a v2 tail rebuilt with a
+    /// different identity than the one it replaced is the wrong-identity
+    /// failure the old refusal existed to prevent (#429).
+    #[test]
+    fn a_v2_intent_round_trips_with_its_identity_fields() {
+        let original = v2_intent();
         let decoded = TruncateIntent::decode(&original.encode().unwrap()).unwrap();
         assert_eq!(decoded, original);
     }
@@ -392,6 +556,27 @@ mod tests {
     #[test]
     fn encoding_is_deterministic() {
         assert_eq!(intent().encode().unwrap(), intent().encode().unwrap());
+        assert_eq!(v2_intent().encode().unwrap(), v2_intent().encode().unwrap());
+    }
+
+    /// A v1 replacement still writes format version 1 — byte-for-byte the
+    /// pre-#429 marker. A marker's purpose is to survive a crash, including
+    /// one the process is UPGRADED across: an older binary must be able to
+    /// finish a v1 truncation this binary staged, and this binary must
+    /// finish one an older binary staged, which both reduce to the v1 bytes
+    /// never changing. The v2 marker takes a new version for the inverse
+    /// reason: an older binary that cannot understand it must refuse it
+    /// whole rather than delete segments on a partial reading.
+    #[test]
+    fn a_v1_marker_keeps_the_original_version_and_a_v2_marker_declares_itself() {
+        let v1 = intent().encode().unwrap();
+        assert_eq!(&v1[8..10], &1u16.to_be_bytes(), "v1 markers must stay v1");
+        let v2 = v2_intent().encode().unwrap();
+        assert_eq!(
+            &v2[8..10],
+            &2u16.to_be_bytes(),
+            "a v2 marker must announce a version older binaries refuse"
+        );
     }
 
     /// An intent with an empty frontier is the cut-at-the-range-base case and
@@ -409,17 +594,18 @@ mod tests {
     /// recovery deleting the wrong ones.
     #[test]
     fn every_single_byte_flip_is_refused() {
-        let pristine = intent().encode().unwrap();
-        for index in 0..pristine.len() {
-            let mut damaged = pristine.clone();
-            damaged[index] ^= 0xff;
-            assert!(
-                matches!(
-                    TruncateIntent::decode(&damaged),
-                    Err(LogError::Corrupt { .. })
-                ),
-                "flip at byte {index} was accepted"
-            );
+        for pristine in [intent().encode().unwrap(), v2_intent().encode().unwrap()] {
+            for index in 0..pristine.len() {
+                let mut damaged = pristine.clone();
+                damaged[index] ^= 0xff;
+                assert!(
+                    matches!(
+                        TruncateIntent::decode(&damaged),
+                        Err(LogError::Corrupt { .. })
+                    ),
+                    "flip at byte {index} was accepted"
+                );
+            }
         }
     }
 
@@ -499,7 +685,17 @@ mod tests {
     #[test]
     fn a_replacement_off_the_cut_is_refused_at_encode() {
         let mut broken = intent();
-        broken.replacement.base_offset = 99;
+        let ReplacementTail::V1 { descriptor, .. } = &mut broken.replacement else {
+            unreachable!("the fixture is v1");
+        };
+        descriptor.base_offset = 99;
+        assert!(matches!(broken.encode(), Err(LogError::InvalidConfig(_))));
+
+        let mut broken = v2_intent();
+        let ReplacementTail::V2 { descriptor, .. } = &mut broken.replacement else {
+            unreachable!("the fixture is v2");
+        };
+        descriptor.base_offset = 99;
         assert!(matches!(broken.encode(), Err(LogError::InvalidConfig(_))));
     }
 }

@@ -1319,8 +1319,10 @@ mod tests {
         let marker = directory.path().join(super::TRUNCATE_INTENT_FILE);
         let intent = TruncateIntent {
             target_offset: 1,
-            replacement: descriptor(21, 1),
-            config: config(),
+            replacement: crate::truncate_intent::ReplacementTail::V1 {
+                descriptor: descriptor(21, 1),
+                config: config(),
+            },
             doomed: vec![crate::truncate_intent::DoomedSegment {
                 segment_id: Uuid::from_u128(22),
                 base_offset: 1,
