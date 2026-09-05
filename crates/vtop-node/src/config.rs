@@ -218,6 +218,18 @@ pub fn refuse_kafka_gateway_misuse(
             kafka.node_id
         ));
     }
+    // The node id is the low byte of every producer id this gateway mints
+    // (#457, review): two leaders of one range whose ids differed by 256
+    // would mint the same id in the same microsecond, and two clients would
+    // share one sequence space. Refused here, and refused again at the mint
+    // should a config reach the gateway some other way.
+    if kafka.node_id > 255 {
+        return Err(format!(
+            "`kafka.node_id: {}` is above 255: the id is the low byte of every idempotent \
+             producer id this gateway mints (#457), so ids must be 0..=255. Use a smaller id",
+            kafka.node_id
+        ));
+    }
     if kafka.advertised_port == Some(0) {
         return Err(
             "`kafka.advertised_port: 0` is not a port clients can dial: set the port they \
@@ -1006,6 +1018,14 @@ mod transport_tests {
                 .unwrap_err()
                 .contains("node_id: -1")
         );
+        let mut wide = kafka("127.0.0.1:9092", false);
+        wide.node_id = 256;
+        assert!(refuse_kafka_gateway_misuse(DataRole::Leader, Some(&wide))
+            .unwrap_err()
+            .contains("above 255"));
+        let mut widest = kafka("127.0.0.1:9092", false);
+        widest.node_id = 255;
+        assert!(refuse_kafka_gateway_misuse(DataRole::Leader, Some(&widest)).is_ok());
         let mut zero = kafka("127.0.0.1:9092", false);
         zero.advertised_port = Some(0);
         assert!(refuse_kafka_gateway_misuse(DataRole::Leader, Some(&zero))

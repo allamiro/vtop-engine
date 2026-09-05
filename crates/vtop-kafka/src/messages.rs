@@ -23,6 +23,8 @@ pub enum ApiKey {
     ListOffsets,
     Metadata,
     ApiVersions,
+    /// Idempotent producers (#457): the id and epoch a client's batches carry.
+    InitProducerId,
 }
 
 impl ApiKey {
@@ -33,6 +35,7 @@ impl ApiKey {
             2 => Some(Self::ListOffsets),
             3 => Some(Self::Metadata),
             18 => Some(Self::ApiVersions),
+            22 => Some(Self::InitProducerId),
             _ => None,
         }
     }
@@ -44,6 +47,7 @@ impl ApiKey {
             Self::ListOffsets => 2,
             Self::Metadata => 3,
             Self::ApiVersions => 18,
+            Self::InitProducerId => 22,
         }
     }
 
@@ -68,6 +72,11 @@ impl ApiKey {
             Self::Fetch => (4, 11),
             Self::ListOffsets => (1, 5),
             Self::Metadata => (1, 8),
+            // v0 and v1 are the idempotent-only shapes: a transactional id
+            // (refused here) and a transaction timeout. v2 is flexible, and
+            // v3+ carry a producer id and epoch to bump — the transactional
+            // re-init this gateway does not have.
+            Self::InitProducerId => (0, 1),
             // v0 always answers, by protocol rule: a client that knows nothing
             // about this broker sends ApiVersions v0 to find out what it can
             // speak, so refusing v0 would refuse the conversation that
@@ -104,6 +113,7 @@ impl ApiKey {
             Self::ListOffsets => version >= 6,
             Self::Metadata => version >= 9,
             Self::ApiVersions => version >= 3,
+            Self::InitProducerId => version >= 2,
         }
     }
 
@@ -114,6 +124,7 @@ impl ApiKey {
             Self::ListOffsets => "ListOffsets",
             Self::Metadata => "Metadata",
             Self::ApiVersions => "ApiVersions",
+            Self::InitProducerId => "InitProducerId",
         }
     }
 }
@@ -142,6 +153,16 @@ pub enum ErrorCode {
     UnsupportedCompressionType = 76,
     /// Transactions and anything else out of scope.
     UnsupportedForMessageFormat = 43,
+    /// An idempotent batch whose sequence is not the next one (#457): a gap,
+    /// or a new producer not starting at zero. A client treats it as fatal
+    /// for that producer, which is right — its own bookkeeping disagrees
+    /// with the log's.
+    OutOfOrderSequenceNumber = 45,
+    /// A retry the log has already persisted but can no longer verify — its
+    /// sequence fell below the dedup window. A client treats it as delivered.
+    DuplicateSequenceNumber = 46,
+    /// A batch naming a producer id with an epoch below zero.
+    InvalidProducerEpoch = 47,
 }
 
 impl ErrorCode {
@@ -208,8 +229,8 @@ impl RequestHeader {
                 },
                 code: ErrorCode::UnsupportedVersion,
                 reason: format!(
-                    "api key {api_key} is not served by this gateway (phase 1: Produce, Fetch, \
-                     ListOffsets, Metadata, ApiVersions)"
+                    "api key {api_key} is not served by this gateway (Produce, Fetch, \
+                     ListOffsets, Metadata, ApiVersions, InitProducerId)"
                 ),
             });
         };
@@ -310,7 +331,7 @@ mod tests {
     /// broker that is down.
     #[test]
     fn an_unserved_api_is_refused_with_a_correlation_id_to_answer_on() {
-        let bytes = header_bytes(22, 0, None).into_vec(); // InitProducerId
+        let bytes = header_bytes(19, 0, None).into_vec(); // CreateTopics
         let mut d = Decoder::new(&bytes);
         match RequestHeader::decode(&mut d).unwrap() {
             HeaderVerdict::Refuse {
@@ -320,7 +341,7 @@ mod tests {
             } => {
                 assert_eq!(header.correlation_id, 7);
                 assert_eq!(code, ErrorCode::UnsupportedVersion);
-                assert!(reason.contains("22"), "{reason}");
+                assert!(reason.contains("19"), "{reason}");
             }
             other => panic!("expected Refuse, got {other:?}"),
         }
@@ -393,7 +414,7 @@ mod tests {
     #[test]
     fn an_unknown_api_key_is_refused_without_guessing_its_encoding() {
         let mut e = Encoder::new();
-        e.i16(22); // InitProducerId
+        e.i16(19); // CreateTopics
         e.i16(4);
         e.i32(11);
         e.raw(&[0xff, 0xff, 0xff, 0xff]); // not a valid client id in either form
@@ -439,6 +460,7 @@ mod tests {
             ApiKey::ListOffsets,
             ApiKey::Metadata,
             ApiKey::ApiVersions,
+            ApiKey::InitProducerId,
         ] {
             let (min, max) = key.version_range();
             for version in min..=max {
@@ -498,6 +520,7 @@ mod tests {
             ApiKey::ListOffsets,
             ApiKey::Metadata,
             ApiKey::ApiVersions,
+            ApiKey::InitProducerId,
         ] {
             assert_eq!(ApiKey::from_i16(key.as_i16()), Some(key));
         }
