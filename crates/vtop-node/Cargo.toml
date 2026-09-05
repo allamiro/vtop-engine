@@ -26,6 +26,7 @@ vtop-broker = { workspace = true }
 vtop-log = { workspace = true }
 vtop-meta = { workspace = true }
 vtop-observe = { workspace = true }
+vtop-kafka = { workspace = true }
 vtop-protocol = { workspace = true }
 
 [dev-dependencies]

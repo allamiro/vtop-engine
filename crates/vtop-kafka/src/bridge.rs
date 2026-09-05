@@ -43,11 +43,16 @@ pub trait Bridge: Send + Sync + 'static {
     /// Every topic this backend serves, for a Metadata request naming none.
     fn topics(&self) -> Vec<String>;
 
-    /// Append a set of decoded batches, ALL OR NOTHING (review): a produce
-    /// set is one acknowledgement, and a set half appended would be durable
-    /// data the client retries into duplicates. The backend assigns the base
-    /// offset; every batch carries at least one record (the listener judges
-    /// that), and offsets run contiguously across the set.
+    /// Append a set of decoded batches. A produce set is one acknowledgement,
+    /// and within one native append the backend is ALL OR NOTHING (review).
+    /// A backend whose plane cannot frame the whole set in one append (the
+    /// native replica plane frames 4 096 records) appends it in order across
+    /// several; a failure after the first leaves that prefix durable and the
+    /// client told the set failed, which a retry duplicates — the same
+    /// limitation a timeout has on a bridge without idempotence, and what
+    /// InitProducerId (phase 2) is for. The backend assigns the base offset;
+    /// every batch carries at least one record (the listener judges that),
+    /// and offsets run contiguously across the set.
     fn produce(&self, topic: &str, batches: &[RecordBatch]) -> Result<Appended, ErrorCode>;
 
     /// Batches from `offset` on, up to about `max_bytes` — always at least

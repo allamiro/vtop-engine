@@ -10,7 +10,8 @@
 //! of the same directory), not failover.
 
 use crate::config::{
-    check_plaintext_bound, check_plaintext_exposure, refuse_plaintext_promotion, PlaneTransport,
+    check_plaintext_bound, check_plaintext_exposure, kafka_producer_id,
+    refuse_kafka_gateway_misuse, refuse_plaintext_promotion, PlaneTransport,
 };
 use crate::config::{DataNodeConfig, DataRole};
 use crate::observe::{
@@ -648,6 +649,7 @@ pub async fn run(
         !config.followers.is_empty(),
         config.replica_transport,
     )?;
+    refuse_kafka_gateway_misuse(config.role, config.kafka.as_ref())?;
     let endpoint = config.observability.take().unwrap_or_default();
     let metrics_addr = observability.serve(&endpoint).await?;
     serve(config, &observability, metrics_addr, shutdown).await
@@ -1012,9 +1014,49 @@ async fn run_leader(
         }
         None => None,
     };
+    // The Kafka gateway's listener (#225), bound here for the same reason:
+    // a port that cannot be bound must refuse startup before this node could
+    // hold a lease it would never serve. The gateway itself is built once
+    // the broker exists, below.
+    let kafka_listener = match config.kafka.as_ref() {
+        Some(kafka) => {
+            let listener = TcpListener::bind(&kafka.listen)
+                .await
+                .map_err(|error| format!("bind kafka {}: {error}", kafka.listen))?;
+            let bound = listener.local_addr().map_err(|error| error.to_string())?;
+            // The address the bind RESOLVED to is judged too (review): a
+            // hostname in `listen` passes the literal check and can land
+            // off loopback, and a wildcard bound with nothing to advertise
+            // would publish 0.0.0.0 to every client.
+            if !kafka.any_interface && !bound.ip().is_loopback() {
+                return Err(format!(
+                    "`kafka.listen: {}` resolved off loopback at {bound}: Kafka's protocol carries \
+                     no vtop identity, so this listener admits any peer that can reach it. Bind it \
+                     to 127.0.0.1, or spell out `kafka.any_interface: true`",
+                    kafka.listen
+                ));
+            }
+            if bound.ip().is_unspecified() && kafka.advertised_host.is_none() {
+                return Err(format!(
+                    "`kafka.listen: {}` bound every interface at {bound} and no \
+                     `kafka.advertised_host` is set: set it to what clients dial",
+                    kafka.listen
+                ));
+            }
+            Some((listener, bound))
+        }
+        None => None,
+    };
     let principal = config
         .principal_id
         .ok_or("leader/standalone requires principal_id")?;
+    // The gateway's identity judged HERE (review), before the lease agent
+    // exists: a refusal is a startup error with nothing acquired yet, never
+    // an exit that leaves a lease for its deadline to reclaim.
+    let kafka_producer = match config.kafka.as_ref() {
+        Some(kafka) => Some(kafka_producer_id(principal, kafka)?),
+        None => None,
+    };
 
     // Kept beside the broker: the collector needs the concrete replica set for
     // per-follower lag, which the `dyn ReplicaSet` the broker holds does not
@@ -1358,10 +1400,95 @@ async fn run_leader(
         None => None,
     };
 
+    // The Kafka gateway (#225): the native bridge over THIS broker, appending
+    // as the configured principal at the durability the range can honour,
+    // served on the listener bound above and stopped by the node's shutdown.
+    let mut kafka_task = None;
+    let mut kafka_drain = Duration::from_secs(6);
+    let kafka_addr = match config.kafka.as_ref().zip(kafka_listener) {
+        Some((kafka, (kafka_listener, bound))) => {
+            // An identity of the gateway's own (review), never the
+            // principal: the journal keys producer epochs by UUID, and the
+            // gateway's minted epoch would fence a native client appending
+            // as the principal with ordinary epochs. Judged above, before
+            // the lease agent started.
+            let kafka_producer = kafka_producer.expect("judged with the config above");
+            let bridge = vtop_kafka::NativeBridge::new(
+                Arc::clone(&broker),
+                vtop_kafka::NativeBridgeConfig {
+                    topic: kafka
+                        .topic
+                        .clone()
+                        .unwrap_or_else(|| config.range.topic.clone()),
+                    producer_id: kafka_producer,
+                    durability: if replicated {
+                        vtop_protocol::Durability::Quorum
+                    } else {
+                        vtop_protocol::Durability::LocalFsync
+                    },
+                    fetch_max_records: MAX_RECORDS,
+                    // What one append may carry (review): on a replicated
+                    // range, what the replica plane frames — a follower
+                    // refuses a larger frame, and from here that looks like a
+                    // quorum that never arrives (#453); standalone, the
+                    // node's own session limits, so a stock client's default
+                    // batch is one append and all-or-nothing.
+                    max_append_records: if replicated {
+                        vtop_protocol::DEFAULT_MAX_RECORDS as usize
+                    } else {
+                        MAX_RECORDS as usize
+                    },
+                    max_append_bytes: if replicated {
+                        (vtop_protocol::DEFAULT_MAX_FRAME_BYTES / 2) as usize
+                    } else {
+                        (MAX_FRAME_BYTES / 2) as usize
+                    },
+                },
+            )
+            .map_err(|error| format!("kafka gateway: {error}"))?;
+            let gateway_config = vtop_kafka::GatewayConfig {
+                advertised_host: kafka
+                    .advertised_host
+                    .clone()
+                    .unwrap_or_else(|| bound.ip().to_string()),
+                advertised_port: kafka
+                    .advertised_port
+                    .map(i32::from)
+                    .unwrap_or_else(|| i32::from(bound.port())),
+                node_id: kafka.node_id,
+                cluster_id: Some(config.cluster_id.to_string()),
+                max_fetch_wait: Duration::from_millis(kafka.max_fetch_wait_ms),
+                ..vtop_kafka::GatewayConfig::default()
+            };
+            // Joined for longer than every wait inside `serve` (review): its
+            // drain reports at `drain_timeout` and gives up only past the
+            // bridge ceilings, so this handle is never dropped while a
+            // session can still be inside a bridge call.
+            kafka_drain = gateway_config.drain_timeout
+                + gateway_config.max_produce_wait
+                + gateway_config.max_fetch_wait
+                + Duration::from_secs(1);
+            let gateway = vtop_kafka::Gateway::new(Arc::new(bridge), gateway_config);
+            let kafka_shutdown = shutdown.clone();
+            // Kept, to be joined before the range is handed back (review):
+            // `serve` returns only once every session has answered its
+            // in-flight request, so the drain below covers Kafka appends
+            // the way it covers native ones.
+            kafka_task = Some(tokio::spawn(gateway.serve(kafka_listener, kafka_shutdown)));
+            eprintln!(
+                "warning: kafka gateway on {bound} speaks Kafka's protocol, which carries no vtop \
+                 identity: every peer that reaches it produces and fetches as producer \
+                 {kafka_producer} (derived from principal {principal}) (#225 phase 1)"
+            );
+            Some(bound)
+        }
+        None => None,
+    };
+
     let shutdown_rx = oneshot_on_shutdown(shutdown.clone());
     observability.gate.mark_ready();
     println!(
-        "data_node_ready role={} node={} native={listen}{}{}",
+        "data_node_ready role={} node={} native={listen}{}{}{}",
         if replicated { "leader" } else { "standalone" },
         config.node_uuid,
         status_addr
@@ -1369,14 +1496,43 @@ async fn run_leader(
             .unwrap_or_default(),
         metrics_addr
             .map(|addr| format!(" metrics={addr}"))
+            .unwrap_or_default(),
+        kafka_addr
+            .map(|addr| format!(" kafka={addr}"))
             .unwrap_or_default()
     );
     use std::io::Write;
     std::io::stdout().flush().ok();
-    server
-        .serve(listener, shutdown_rx)
-        .await
-        .map_err(|error| format!("native server exited: {error}"))?;
+    let native = server.serve(listener, shutdown_rx);
+    tokio::pin!(native);
+    let served = match kafka_task.take() {
+        None => native.await,
+        Some(mut kafka) => tokio::select! {
+            served = &mut native => {
+                kafka_task = Some(kafka);
+                served
+            }
+            // The gateway ending first is the shutdown both share — the
+            // native server is about to return too — or its listener failing
+            // (review): a leader whose advertised Kafka endpoint is gone must
+            // not stay ready, so the node exits the way it does when the
+            // native server fails, and a restart brings both back.
+            ended = &mut kafka => match ended {
+                Ok(Ok(())) => native.await,
+                Ok(Err(error)) => return Err(format!("kafka gateway exited: {error}")),
+                Err(error) => return Err(format!("kafka gateway task failed: {error}")),
+            },
+        },
+    };
+    if let Err(error) = served {
+        // The native server failing takes the gateway with it (review): its
+        // accept loop is aborted before the error returns, so no Kafka
+        // session is admitted to a node that is on its way out.
+        if let Some(task) = kafka_task.take() {
+            task.abort();
+        }
+        return Err(format!("native server exited: {error}"));
+    }
     // Orderly stop (#280). The native listener is closed and sessions are
     // drained; the lease agent — racing on the same signal — releases the
     // range so failover need not wait out the lease deadline, and the final
@@ -1386,6 +1542,16 @@ async fn run_leader(
         if replicated { "leader" } else { "standalone" },
         config.node_uuid
     );
+    // The Kafka gateway drains on the same signal (review): its accept loop
+    // has stopped, and its `serve` returns once every session has finished
+    // the request it was in — joined HERE, before the lease goes back, so
+    // no Kafka append can land after the range is released or after the
+    // final boundary below is committed.
+    if let Some(task) = kafka_task {
+        if tokio::time::timeout(kafka_drain, task).await.is_err() {
+            eprintln!("kafka gateway did not drain within {kafka_drain:?}; releasing anyway");
+        }
+    }
     // Stop admitting and drain FIRST (the serve above has returned), only
     // then hand the range back — see the channel's comment for why the order
     // is load-bearing.

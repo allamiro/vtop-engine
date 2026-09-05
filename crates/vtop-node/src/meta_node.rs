@@ -89,6 +89,23 @@ pub async fn serve(
         }
     }
 
+    // Both planes' exposure judged before Raft starts (#294, review): a
+    // refusal is a startup error, never a warning behind a consensus node
+    // that has already sent its first peer RPC — or behind an announced
+    // readiness. The bound addresses are judged again after the binds.
+    check_plaintext_exposure(
+        config.peer_transport,
+        &config.peer_listen,
+        "peer",
+        "peer_transport",
+    )?;
+    check_plaintext_exposure(
+        config.admin_transport,
+        &config.admin_listen,
+        "admin",
+        "admin_transport",
+    )?;
+
     // EVERY tls plane's material before Raft starts (review): a certificate
     // the admin plane cannot read must fail the process before it campaigns,
     // not after it has sent peer RPCs it can never expose an admin endpoint
@@ -143,20 +160,6 @@ pub async fn serve(
         tracing::info!("leadership-transition statements are signed (key from {name})");
     }
 
-    // Both planes judged before either binds (#294, review): a refusal is a
-    // startup error, never a warning behind an already-announced readiness.
-    check_plaintext_exposure(
-        config.peer_transport,
-        &config.peer_listen,
-        "peer",
-        "peer_transport",
-    )?;
-    check_plaintext_exposure(
-        config.admin_transport,
-        &config.admin_listen,
-        "admin",
-        "admin_transport",
-    )?;
     let peer_listener = TcpListener::bind(&config.peer_listen)
         .await
         .map_err(|error| format!("bind {}: {error}", config.peer_listen))?;

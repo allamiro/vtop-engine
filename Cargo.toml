@@ -74,7 +74,7 @@ blake3 = "1"
 openraft = { version = "=0.9.25", features = ["single-term-leader", "storage-v2", "loosen-follower-log-revert"] }
 hex = "0.4"
 base64 = "0.23"
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 flate2 = "1"
 zstd = "0.13"
@@ -104,6 +104,7 @@ vtop-protocol = { path = "crates/vtop-protocol", version = "0.4.0" }
 vtop-broker = { path = "crates/vtop-broker", version = "0.4.0" }
 vtop-meta = { path = "crates/vtop-meta", version = "0.4.0" }
 vtop-observe = { path = "crates/vtop-observe", version = "0.4.0" }
+vtop-kafka = { path = "crates/vtop-kafka", version = "0.4.0" }
 vtop-adapters = { path = "crates/vtop-adapters", version = "0.4.0", default-features = false }
 vtop-upload = { path = "crates/vtop-upload", version = "0.4.0" }
 vtop-state = { path = "crates/vtop-state", version = "0.4.0" }

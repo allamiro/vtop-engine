@@ -5,7 +5,8 @@
 //! Metadata over the bridge's topics with one partition each, Produce of
 //! uncompressed non-transactional v2 batches without headers, Fetch with the
 //! long-poll emulated here (the broker returns immediately at the watermark),
-//! and ListOffsets LATEST. Everything else is refused with the code a client's
+//! and ListOffsets LATEST and EARLIEST (the watermark and the retained
+//! floor; by-timestamp has no index behind it). Everything else is refused with the code a client's
 //! retry policy can act on, and the reason is logged where an operator reads —
 //! never a silent drop, never a plausible lie.
 
@@ -14,7 +15,8 @@ use crate::api::{
     encode_fetch, encode_list_offsets, encode_metadata, encode_produce, FetchPartitionResponse,
     FetchRequest, FetchTopicResponse, ListOffsetsPartitionResponse, ListOffsetsRequest,
     ListOffsetsTopicResponse, MetadataBroker, MetadataRequest, MetadataResponse, MetadataTopic,
-    ProducePartitionResponse, ProduceRequest, ProduceTopicResponse, TIMESTAMP_LATEST,
+    ProducePartitionResponse, ProduceRequest, ProduceTopicResponse, TIMESTAMP_EARLIEST,
+    TIMESTAMP_LATEST,
 };
 use crate::bridge::{Bridge, Fetched};
 use crate::messages::{
@@ -62,6 +64,11 @@ pub struct GatewayConfig {
     /// warning, so what a peer can hold here is bounded by
     /// `max_sessions * max_frame_bytes` and not by how many sockets it opens.
     pub max_sessions: usize,
+    /// How long `serve` waits, after the accept loop stops, for every
+    /// session to finish the request it is in and close (review): an
+    /// embedder that hands its range back after `serve` returns knows no
+    /// append is still in flight through the gateway.
+    pub drain_timeout: Duration,
 }
 
 impl Default for GatewayConfig {
@@ -78,12 +85,29 @@ impl Default for GatewayConfig {
             frame_read_timeout: Duration::from_secs(30),
             idle_timeout: Duration::from_secs(600),
             max_sessions: 256,
+            drain_timeout: Duration::from_secs(5),
         }
     }
 }
 
 /// A frame's buffer starts this large and grows with the bytes received.
 const INITIAL_FRAME_CAPACITY: usize = 64 * 1024;
+
+/// What ListOffsets answers as the timestamp of a boundary lookup: unknown.
+const TIMESTAMP_UNKNOWN: i64 = -1;
+
+/// Resolves when `shutdown` reads `true`; never on a dropped sender, which
+/// is not a signal (see `serve`).
+async fn shutdown_signalled(shutdown: &mut tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        if shutdown.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
 
 /// A bridge call awaited only until `ceiling` (review). The call itself
 /// cannot be cancelled — a real backend may be behind an fsync or a held
@@ -113,6 +137,10 @@ pub struct Gateway {
     config: GatewayConfig,
     sessions: Arc<tokio::sync::Semaphore>,
     refused_sessions: std::sync::atomic::AtomicU64,
+    /// Set once `serve` stops accepting (review): a frame completed after
+    /// that is dropped, never answered, so nothing starts a bridge call
+    /// after the embedder was told the gateway is done.
+    closed: std::sync::atomic::AtomicBool,
 }
 
 impl Gateway {
@@ -123,6 +151,7 @@ impl Gateway {
             config,
             sessions,
             refused_sessions: std::sync::atomic::AtomicU64::new(0),
+            closed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -146,7 +175,7 @@ impl Gateway {
             tokio::select! {
                 changed = shutdown.changed(), if watching => {
                     match changed {
-                        Ok(()) if *shutdown.borrow() => return Ok(()),
+                        Ok(()) if *shutdown.borrow() => break,
                         Ok(()) => {}
                         Err(_) => watching = false,
                     }
@@ -176,21 +205,79 @@ impl Gateway {
                         }
                     };
                     let gateway = Arc::clone(&gateway);
+                    let session_shutdown = shutdown.clone();
                     tokio::spawn(async move {
                         let _slot = permit;
-                        if let Err(error) = gateway.session(socket).await {
+                        if let Err(error) = gateway.session(socket, session_shutdown).await {
                             tracing::debug!(%peer, %error, "kafka session ended");
                         }
                     });
                 }
             }
         }
+        // Closed before the drain (review): a request already read is
+        // answered, one still arriving is dropped, and none starts a bridge
+        // call after this. The drain then waits for the answers in flight:
+        // every session closes between frames and its slot comes back.
+        // Holding every slot is holding proof that no request is in flight;
+        // past `drain_timeout` the embedder is told, and what is still in a
+        // bridge call holds the broker's own lock, which the embedder's
+        // final commit takes after it.
+        gateway
+            .closed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // Every session ends within the bridge ceilings — `max_produce_wait`
+        // and `max_fetch_wait` bound the calls, and shutdown is heard
+        // between frames — so waiting for every slot is bounded by config,
+        // not by hope (review): `drain_timeout` is where the wait is
+        // reported, and the sum of the ceilings past it is where a session
+        // still open is a bug, said at error. `serve` returning is the
+        // proof the embedder relies on before it hands its range back.
+        let slots = u32::try_from(gateway.config.max_sessions.max(1)).unwrap_or(u32::MAX);
+        let open = |gateway: &Gateway| {
+            slots - u32::try_from(gateway.sessions.available_permits()).unwrap_or(0)
+        };
+        let drain = gateway.sessions.acquire_many(slots);
+        tokio::pin!(drain);
+        if tokio::time::timeout(gateway.config.drain_timeout, &mut drain)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                open = open(&gateway),
+                "kafka gateway still draining past drain_timeout: a session is inside a bridge \
+                 call, which ends at its own ceiling"
+            );
+            let ceilings = gateway.config.max_produce_wait
+                + gateway.config.max_fetch_wait
+                + gateway.config.drain_timeout;
+            if tokio::time::timeout(ceilings, &mut drain).await.is_err() {
+                tracing::error!(
+                    open = open(&gateway),
+                    "kafka gateway stopped with sessions still open past every ceiling; a \
+                     session that outlives its bridge call's ceiling is a bug"
+                );
+            }
+        }
+        Ok(())
     }
 
-    async fn session(self: Arc<Self>, mut socket: TcpStream) -> std::io::Result<()> {
+    async fn session(
+        self: Arc<Self>,
+        mut socket: TcpStream,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> std::io::Result<()> {
         loop {
-            let len = match tokio::time::timeout(self.config.idle_timeout, socket.read_i32()).await
-            {
+            // Between frames is where shutdown is heard (review): a request
+            // already read is answered before the connection closes.
+            let read = tokio::select! {
+                read = tokio::time::timeout(self.config.idle_timeout, socket.read_i32()) => read,
+                _ = shutdown_signalled(&mut shutdown) => {
+                    tracing::debug!("kafka session closed on shutdown");
+                    return Ok(());
+                }
+            };
+            let len = match read {
                 Err(_) => {
                     tracing::debug!("kafka session idle past the limit; connection closed");
                     return Ok(());
@@ -216,9 +303,17 @@ impl Gateway {
             let len = len as usize;
             let mut body = Vec::with_capacity(len.min(INITIAL_FRAME_CAPACITY));
             let mut rest = (&mut socket).take(len as u64);
-            match tokio::time::timeout(self.config.frame_read_timeout, rest.read_to_end(&mut body))
-                .await
-            {
+            // A frame still arriving when shutdown comes is dropped (review):
+            // it was never a request, and waiting for its tail would hold
+            // the drain for `frame_read_timeout`.
+            let read = tokio::select! {
+                read = tokio::time::timeout(self.config.frame_read_timeout, rest.read_to_end(&mut body)) => read,
+                _ = shutdown_signalled(&mut shutdown) => {
+                    tracing::debug!(len, received = body.len(), "kafka session closed on shutdown mid-frame");
+                    return Ok(());
+                }
+            };
+            match read {
                 Err(_) => {
                     tracing::warn!(
                         len,
@@ -231,6 +326,13 @@ impl Gateway {
                 // The peer went away mid-frame: a session over, not a request.
                 Ok(Ok(received)) if received < len => return Ok(()),
                 Ok(Ok(_)) => {}
+            }
+            // Read whole, but after the gateway closed (review): dropped, so
+            // no bridge call starts past the point the embedder was told
+            // none would.
+            if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+                tracing::debug!("kafka request arrived after the gateway closed; dropped");
+                return Ok(());
             }
             match self.answer(&body).await {
                 Answer::Reply(bytes) => socket.write_all(&frame(&bytes)).await?,
@@ -670,26 +772,43 @@ impl Gateway {
             for partition in topic.partitions {
                 let (error, offset) = if partition.index != 0 {
                     (ErrorCode::UnknownTopicOrPartition, -1)
-                } else if partition.timestamp == TIMESTAMP_LATEST {
+                } else if partition.timestamp == TIMESTAMP_LATEST
+                    || partition.timestamp == TIMESTAMP_EARLIEST
+                {
+                    // LATEST is the watermark, EARLIEST the retained floor:
+                    // both are one snapshot of the bridge's bounds, and
+                    // `-o beginning` on a stock client is the latter.
                     match self.bounds(&topic.name).await {
-                        Ok((_, high_watermark)) => (ErrorCode::None, high_watermark),
+                        Ok((log_start, high_watermark)) => (
+                            ErrorCode::None,
+                            if partition.timestamp == TIMESTAMP_LATEST {
+                                high_watermark
+                            } else {
+                                log_start
+                            },
+                        ),
                         Err(error) => (error, -1),
                     }
                 } else {
-                    // EARLIEST has no exact accessor and by-timestamp no
-                    // index behind it: refused by name, not answered with a
-                    // scan.
+                    // By-timestamp has no index behind it: refused by name,
+                    // not answered with a scan.
                     tracing::warn!(
                         topic = %topic.name,
                         timestamp = partition.timestamp,
-                        "kafka ListOffsets refused: only LATEST (-1) is served in phase 1 (#225)"
+                        "kafka ListOffsets refused: only LATEST (-1) and EARLIEST (-2) are served in phase 1 (#225)"
                     );
                     (ErrorCode::UnsupportedVersion, -1)
                 };
                 partitions.push(ListOffsetsPartitionResponse {
                     index: partition.index,
                     error,
-                    timestamp: partition.timestamp,
+                    // A boundary lookup has no timestamp of its own (review):
+                    // Kafka answers -1, unknown, never the request's sentinel.
+                    timestamp: if error == ErrorCode::None {
+                        TIMESTAMP_UNKNOWN
+                    } else {
+                        partition.timestamp
+                    },
                     offset,
                 });
             }
@@ -872,6 +991,134 @@ mod tests {
                 .await
                 .is_some(),
             "the slot the first session freed serves the third"
+        );
+    }
+
+    /// Shutdown drains (review): a request in flight is answered, an idle
+    /// session is closed, and `serve` returns only after both.
+    #[tokio::test]
+    async fn shutdown_answers_the_request_in_flight_closes_idle_sessions_and_then_returns() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop, rx) = tokio::sync::watch::channel(false);
+        let gateway = Gateway::new(
+            Arc::new(MemoryBridge::with_topics(["events"])),
+            GatewayConfig {
+                advertised_port: addr.port() as i32,
+                max_fetch_wait: Duration::from_secs(2),
+                fetch_poll_interval: Duration::from_millis(10),
+                ..GatewayConfig::default()
+            },
+        );
+        let serving = tokio::spawn(gateway.serve(listener, rx));
+
+        let mut idle = TcpStream::connect(addr).await.unwrap();
+        assert!(exchange(&mut idle, &request(18, 0, 1, &[])).await.is_some());
+        let mut busy = TcpStream::connect(addr).await.unwrap();
+        // A long poll at the watermark: in flight when the signal comes.
+        busy.write_all(&request(1, 4, 2, &fetch_body(4, "events", 0, 0, 600)))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        stop.send(true).unwrap();
+
+        let started = std::time::Instant::now();
+        let len = busy
+            .read_i32()
+            .await
+            .expect("the in-flight fetch is answered");
+        let mut reply = vec![0_u8; len as usize];
+        busy.read_exact(&mut reply).await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(1_000),
+            "answered when its own poll ends, not held past it: {:?}",
+            started.elapsed()
+        );
+        let mut rest = Vec::new();
+        assert_eq!(
+            idle.read_to_end(&mut rest).await.unwrap(),
+            0,
+            "the idle session is closed"
+        );
+        tokio::time::timeout(Duration::from_secs(3), serving)
+            .await
+            .expect("serve returns once the sessions are gone")
+            .unwrap()
+            .unwrap();
+    }
+
+    /// ListOffsets EARLIEST is the retained floor and LATEST the watermark
+    /// (review): what a stock consumer's `-o beginning` and `-o end` ask.
+    #[tokio::test]
+    async fn list_offsets_serves_the_retained_floor_as_earliest_and_the_watermark_as_latest() {
+        let memory = Arc::new(MemoryBridge::with_topics(["events"]));
+        let bridge: Arc<dyn Bridge> = memory.clone();
+        let (addr, _stop) = start(bridge).await;
+        let three = RecordBatch::decode(&batch_bytes(&["a", "b", "c"], false)).unwrap();
+        memory.produce("events", &[three]).unwrap();
+        let (floor, watermark) = memory.bounds("events").unwrap();
+        for (timestamp, expected, what) in [
+            (TIMESTAMP_EARLIEST, floor, "EARLIEST is the retained floor"),
+            (TIMESTAMP_LATEST, watermark, "LATEST is the watermark"),
+        ] {
+            let mut body = Encoder::new();
+            body.i32(-1); // replica_id
+            body.array_len(1);
+            body.string("events");
+            body.array_len(1);
+            body.i32(0); // partition
+            body.i64(timestamp);
+            let reply = call(addr, 2, 1, 9, body.as_slice()).await.unwrap();
+            let mut d = Decoder::new(&reply);
+            assert_eq!(d.array_len("topics").unwrap(), Some(1));
+            assert_eq!(d.string("name").unwrap(), "events");
+            assert_eq!(d.array_len("partitions").unwrap(), Some(1));
+            assert_eq!(d.i32("partition").unwrap(), 0);
+            assert_eq!(d.i16("error").unwrap(), 0, "{what}");
+            assert_eq!(
+                d.i64("timestamp").unwrap(),
+                TIMESTAMP_UNKNOWN,
+                "a boundary lookup answers an unknown timestamp, not its own sentinel"
+            );
+            assert_eq!(d.i64("offset").unwrap(), expected, "{what}");
+        }
+    }
+
+    /// A frame still arriving when shutdown comes is dropped, not answered
+    /// (review), and the drain does not wait for its tail.
+    #[tokio::test]
+    async fn a_frame_arriving_across_shutdown_is_dropped_and_the_drain_does_not_wait_for_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop, rx) = tokio::sync::watch::channel(false);
+        let gateway = Gateway::new(
+            Arc::new(MemoryBridge::with_topics(["events"])),
+            GatewayConfig {
+                advertised_port: addr.port() as i32,
+                frame_read_timeout: Duration::from_secs(30),
+                ..GatewayConfig::default()
+            },
+        );
+        let serving = tokio::spawn(gateway.serve(listener, rx));
+        let mut slow = TcpStream::connect(addr).await.unwrap();
+        let whole = request(18, 0, 7, &[]);
+        slow.write_all(&whole[..6]).await.unwrap(); // the length and a byte or two
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        stop.send(true).unwrap();
+        let started = std::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(3), serving)
+            .await
+            .expect("serve returns without waiting out the frame read timeout")
+            .unwrap()
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        // The rest of the frame finds a closed connection, not an answer.
+        let _ = slow.write_all(&whole[6..]).await;
+        let mut rest = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(2), slow.read_to_end(&mut rest)).await;
+        assert!(
+            matches!(read, Ok(Ok(0)) | Ok(Err(_))),
+            "closed, not answered: {read:?}"
         );
     }
 
@@ -1646,8 +1893,8 @@ mod tests {
             ErrorCode::UnknownTopicOrPartition.as_i16()
         );
 
-        // EARLIEST and by-timestamp: only LATEST is served.
-        for timestamp in [-2_i64, 1_700_000_000_000] {
+        // By-timestamp: LATEST and EARLIEST are served, nothing else.
+        for timestamp in [1_700_000_000_000_i64] {
             let mut body = Encoder::new();
             body.i32(-1);
             body.array_len(1);

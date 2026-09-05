@@ -60,6 +60,7 @@ impl ColocatedNodeConfig {
             !self.data.followers.is_empty(),
             self.data.replica_transport,
         )?;
+        crate::config::refuse_kafka_gateway_misuse(self.data.role, self.data.kafka.as_ref())?;
         // Fail loudly rather than picking a winner. A config that names three
         // listen addresses and gets one is a config whose author has a wrong
         // model of the process. PRESENCE of the block is what is rejected —

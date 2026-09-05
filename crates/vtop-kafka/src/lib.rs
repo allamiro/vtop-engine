@@ -37,6 +37,6 @@ pub use bridge::{Appended, Bridge, Fetched, MemoryBridge};
 pub use gateway::{Gateway, GatewayConfig};
 pub use messages::{ApiKey, ErrorCode, HeaderVerdict, RequestHeader};
 #[cfg(feature = "native")]
-pub use native::{NativeBridge, NativeBridgeConfig};
+pub use native::{EpochsExhausted, NativeBridge, NativeBridgeConfig};
 pub use records::{Record, RecordBatch};
 pub use wire::{Decoder, Encoder, WireError};
