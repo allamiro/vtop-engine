@@ -1,0 +1,25 @@
+# CI render of the PLAINTEXT shape (#294): every plane without TLS, said
+# twice, and no Secret named — the chart must render without one. Nothing
+# here is a credential. See helm/vtop/README.md, "Transport".
+cluster:
+  id: 11111111-2222-3333-4444-555555555555
+transport:
+  peer: plaintext
+  admin: plaintext
+  replica: plaintext
+  native: plaintext
+  acknowledgePlaintext: true
+data:
+  nodeUuids:
+    - aaaaaaaa-0000-0000-0000-0000000000a1
+    - aaaaaaaa-0000-0000-0000-0000000000a2
+    - aaaaaaaa-0000-0000-0000-0000000000a3
+  range:
+    topic: telemetry
+    rangeId: aaaaaaaa-0000-0000-0000-0000000000c1
+  segmentId: aaaaaaaa-0000-0000-0000-0000000000d1
+  principalId: aaaaaaaa-0000-0000-0000-0000000000ce
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi

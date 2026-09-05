@@ -103,11 +103,54 @@ credentials and refuses to render without yours — a lab compose that shipped
 default credentials is exactly how issue #81 happened.
 */}}
 {{- define "vtop.metaSecretName" -}}
+{{- if include "vtop.metaNeedsTls" . -}}
 {{- required "\n\nTLS is required and never defaulted: set tls.metaSecretName to an existing Secret holding the metadata-plane mTLS material (keys: ca.pem, node-<ordinal>.pem, node-<ordinal>-key.pem; leaf CN = the decimal meta node id, ordinal+1). This chart ships no default credentials (issue #81). See helm/vtop/README.md for the full Secret contract." .Values.tls.metaSecretName -}}
+{{- else -}}
+{{- .Values.tls.metaSecretName -}}
+{{- end -}}
 {{- end }}
 
 {{- define "vtop.dataSecretName" -}}
+{{- if include "vtop.dataNeedsTls" . -}}
 {{- required "\n\nTLS is required and never defaulted: set tls.dataSecretName to an existing Secret holding the data/replica-plane mTLS material (keys: ca.pem, node-<ordinal>.pem, node-<ordinal>-key.pem; leaf CN = data.nodeUuids[ordinal]). This chart ships no default credentials (issue #81). See helm/vtop/README.md for the full Secret contract." .Values.tls.dataSecretName -}}
+{{- else -}}
+{{- .Values.tls.dataSecretName -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Per-plane transport (#294). Every value is checked, and a plaintext plane
+renders only when transport.acknowledgePlaintext is true: on the wire a
+plaintext plane has no peer authentication and no confidentiality, and a
+chart that rendered that from one line would be the lab compose of #81 with
+better manners. The admin plane also refuses to carry an enforcing policy it
+could not enforce — the node refuses that config before Raft starts, and the
+chart says so at render time instead.
+*/}}
+{{- define "vtop.transportGuards" -}}
+{{- $t := .Values.transport -}}
+{{- range $plane, $mode := (dict "peer" $t.peer "admin" $t.admin "replica" $t.replica "native" $t.native) -}}
+{{- if not (has (toString $mode) (list "tls" "plaintext")) -}}
+{{- fail (printf "\n\ntransport.%s must be \"tls\" or \"plaintext\" (got %q)." $plane (toString $mode)) -}}
+{{- end -}}
+{{- if and (eq (toString $mode) "plaintext") (not $t.acknowledgePlaintext) -}}
+{{- fail (printf "\n\ntransport.%s is plaintext but transport.acknowledgePlaintext is false. A plaintext plane in a cluster has no peer authentication and no confidentiality on the wire; the chart renders it only when that is said twice. Set transport.acknowledgePlaintext: true, or leave the plane at tls." $plane) -}}
+{{- end -}}
+{{- end -}}
+{{- if and (eq (toString $t.admin) "plaintext") .Values.meta.adminAuthorization.enabled -}}
+{{- fail "\n\ntransport.admin is plaintext but meta.adminAuthorization.enabled is true: without a client certificate there is no caller identity to enforce the policy against, and the node refuses that config before Raft starts. Disable the policy, or serve the admin plane with tls." -}}
+{{- end -}}
+{{- end }}
+
+{{/* "true" when any metadata-side plane is TLS, so the meta Secret is needed. */}}
+{{- define "vtop.metaNeedsTls" -}}
+{{- if or (eq (toString .Values.transport.peer) "tls") (eq (toString .Values.transport.admin) "tls") -}}true{{- end -}}
+{{- end }}
+
+{{/* "true" when the data pod needs its Secret: a TLS replica or native
+plane, or a lease dialling a TLS admin plane with the data-plane identity. */}}
+{{- define "vtop.dataNeedsTls" -}}
+{{- if or (eq (toString .Values.transport.replica) "tls") (eq (toString .Values.transport.native) "tls") (and .Values.data.lease.enabled (eq (toString .Values.transport.admin) "tls")) -}}true{{- end -}}
 {{- end }}
 
 {{/*
@@ -132,6 +175,7 @@ render passes through them. Three refusals live here rather than scattered:
 */}}
 {{- define "vtop.deploymentGuards" -}}
 {{- $v := .Values -}}
+{{- include "vtop.transportGuards" . -}}
 {{- $mode := include "vtop.deploymentMode" . -}}
 {{- if and (ne $mode "colocated") (ne $mode "separated") -}}
 {{- fail (printf "\n\ndeployment.mode must be colocated or separated; got %q." $mode) -}}
@@ -316,10 +360,22 @@ peers:
 {{- range $j := until $metaCount }}
   - { id: {{ add1 $j }}, addr: "{{ include "vtop.tierPodFqdn" (dict "root" $root "tier" "meta" "ordinal" $j) }}:{{ $v.ports.metaPeer }}", server_name: "{{ include "vtop.tierServerName" (dict "root" $root "tier" "meta" "ordinal" $j) }}" }
 {{- end }}
+{{- include "vtop.transportGuards" $root }}
+{{- if eq (toString $v.transport.peer) "plaintext" }}
+# The Raft peer plane without TLS (#294), acknowledged in values. Pods have
+# no loopback peers, so this is the node's spelled-out any-interface form;
+# the node warns at every start that the Raft sender is self-asserted.
+peer_transport: plaintext-on-any-interface
+{{- end }}
+{{- if eq (toString $v.transport.admin) "plaintext" }}
+admin_transport: plaintext-on-any-interface
+{{- end }}
+{{- if include "vtop.metaNeedsTls" $root }}
 tls:
   ca: /etc/vtop/tls/meta/ca.pem
   cert: /etc/vtop/tls/meta/node-{{ $i }}.pem
   key: /etc/vtop/tls/meta/node-{{ $i }}-key.pem
+{{- end }}
 timers:
   election_timeout_min_ms: {{ int $v.meta.timers.electionTimeoutMinMs }}
   election_timeout_max_ms: {{ int $v.meta.timers.electionTimeoutMaxMs }}
@@ -335,10 +391,18 @@ admin_authorization:
 # The key itself is in the environment, from meta.transitionMacKey (#240).
 transition_mac_key_env: VTOP_TRANSITION_MAC_KEY
 {{- end }}
-# This process's own endpoint. Unauthenticated (#78): keep it off public
-# networks (see networkPolicy).
+# This process's own endpoint. Unauthenticated (#78) — and plaintext unless
+# observability.tls names a Secret: keep it off public networks (see
+# networkPolicy).
 observability:
   listen: "0.0.0.0:{{ $v.ports.observability }}"
+{{- if $v.observability.tls.secretName }}
+  # TLS 1.3, server-only (#294 slice 4): probes and scrapers keep working,
+  # the CA-holding scraper verifies. The mutual form is not rendered here.
+  tls:
+    cert: /etc/vtop/tls/observe/cert.pem
+    key: /etc/vtop/tls/observe/key.pem
+{{- end }}
 {{- end }}
 
 {{/*
@@ -401,14 +465,27 @@ range:
 segment_id: {{ required "\n\ndata.segmentId is required: the segment UUID (protocol-visible identity; the chart does not invent one)." $v.data.segmentId }}
 native_listen: "0.0.0.0:{{ $v.ports.native }}"
 replica_listen: "0.0.0.0:{{ $v.ports.replica }}"
+{{- if eq (toString $v.transport.replica) "plaintext" }}
+# The replica plane without TLS (#294), acknowledged in values: replication
+# is served, but fencing and promotion are refused there, so this range
+# replicates and does not fail over. The node says so at every start.
+replica_transport: plaintext-on-any-interface
+{{- else }}
 replica_tls:
   ca: /etc/vtop/tls/data/ca.pem
   cert: /etc/vtop/tls/data/node-{{ $i }}.pem
   key: /etc/vtop/tls/data/node-{{ $i }}-key.pem
+{{- end }}
+{{- if eq (toString $v.transport.native) "plaintext" }}
+# The native plane without TLS (#294): the principal below is admitted on
+# its declaration alone.
+native_transport: plaintext-on-any-interface
+{{- else }}
 native_tls:
   ca: /etc/vtop/tls/data/ca.pem
   cert: /etc/vtop/tls/data/node-{{ $i }}.pem
   key: /etc/vtop/tls/data/node-{{ $i }}-key.pem
+{{- end }}
 # The one client principal the produce/fetch authorizer accepts; never
 # defaulted by the chart (a default principal is a baked-in credential).
 principal_id: {{ required "\n\ndata.principalId is required: the UUID of the one client principal the produce/fetch authorizer accepts (must equal your client certificate's CN). The chart never defaults credentials (issue #81)." $v.data.principalId }}
@@ -443,10 +520,15 @@ lease:
   admin_endpoint: "{{ $endpoint }}"
   server_name: "{{ $serverName }}"
   topic_uuid: {{ required "\n\ndata.lease.topicUuid is required when data.lease.enabled: metadata's UUID for the topic (NOT data.range.topic, which is the wire name)." $v.data.lease.topicUuid }}
+{{- if eq (toString $v.transport.admin) "plaintext" }}
+  # Dialled the way the admin plane listens (#294): plaintext, no identity.
+  transport: plaintext
+{{- else }}
   tls:
     ca: /etc/vtop/tls/data/ca.pem
     cert: /etc/vtop/tls/data/node-{{ $i }}.pem
     key: /etc/vtop/tls/data/node-{{ $i }}-key.pem
+{{- end }}
   lease_duration_ms: {{ int $v.data.lease.leaseDurationMs }}
   renew_interval_ms: {{ int $v.data.lease.renewIntervalMs }}
   poll_interval_ms: {{ int $v.data.lease.pollIntervalMs }}
@@ -461,10 +543,18 @@ lease:
       server_name: "{{ include "vtop.tierServerName" (dict "root" $root "tier" "meta" "ordinal" $ordinal) }}"
 {{- end }}
 {{- end }}
-# This process's own endpoint. Unauthenticated (#78): keep it off public
-# networks (see networkPolicy).
+# This process's own endpoint. Unauthenticated (#78) — and plaintext unless
+# observability.tls names a Secret: keep it off public networks (see
+# networkPolicy).
 observability:
   listen: "0.0.0.0:{{ $v.ports.observability }}"
+{{- if $v.observability.tls.secretName }}
+  # TLS 1.3, server-only (#294 slice 4): probes and scrapers keep working,
+  # the CA-holding scraper verifies. The mutual form is not rendered here.
+  tls:
+    cert: /etc/vtop/tls/observe/cert.pem
+    key: /etc/vtop/tls/observe/key.pem
+{{- end }}
 {{- end }}
 
 {{/*
@@ -516,10 +606,20 @@ meta:
 {{- range $j := until (int $v.replicaCount) }}
     - { id: {{ add1 $j }}, addr: "{{ include "vtop.podFqdn" (dict "root" $root "ordinal" $j) }}:{{ $v.ports.metaPeer }}", server_name: "{{ include "vtop.peerServerName" (dict "root" $root "ordinal" $j) }}" }
 {{- end }}
+{{- if eq (toString $v.transport.peer) "plaintext" }}
+  # The Raft peer plane without TLS (#294), acknowledged in values: the
+  # node's spelled-out any-interface form, since pods have no loopback peers.
+  peer_transport: plaintext-on-any-interface
+{{- end }}
+{{- if eq (toString $v.transport.admin) "plaintext" }}
+  admin_transport: plaintext-on-any-interface
+{{- end }}
+{{- if include "vtop.metaNeedsTls" $root }}
   tls:
     ca: /etc/vtop/tls/meta/ca.pem
     cert: /etc/vtop/tls/meta/node-{{ $i }}.pem
     key: /etc/vtop/tls/meta/node-{{ $i }}-key.pem
+{{- end }}
   timers:
     election_timeout_min_ms: {{ int $v.meta.timers.electionTimeoutMinMs }}
     election_timeout_max_ms: {{ int $v.meta.timers.electionTimeoutMaxMs }}
@@ -604,14 +704,25 @@ data:
   # Status-only handler on the leader/standalone: lets `vtopctl node status`
   # measure lag against this replica's boundary. Write paths refuse.
   replica_listen: "0.0.0.0:{{ $v.ports.replica }}"
+{{- if eq (toString $v.transport.replica) "plaintext" }}
+  # The replica plane without TLS (#294), acknowledged in values: fencing
+  # and promotion are refused there, so this range replicates and does not
+  # fail over. The node says so at every start.
+  replica_transport: plaintext-on-any-interface
+{{- else }}
   replica_tls:
     ca: /etc/vtop/tls/data/ca.pem
     cert: /etc/vtop/tls/data/node-{{ $i }}.pem
     key: /etc/vtop/tls/data/node-{{ $i }}-key.pem
+{{- end }}
+{{- if eq (toString $v.transport.native) "plaintext" }}
+  native_transport: plaintext-on-any-interface
+{{- else }}
   native_tls:
     ca: /etc/vtop/tls/data/ca.pem
     cert: /etc/vtop/tls/data/node-{{ $i }}.pem
     key: /etc/vtop/tls/data/node-{{ $i }}-key.pem
+{{- end }}
   # The one client principal the produce/fetch authorizer accepts; never
   # defaulted by the chart (a default principal is a baked-in credential).
   principal_id: {{ required "\n\ndata.principalId is required: the UUID of the one client principal the produce/fetch authorizer accepts (must equal your client certificate's CN). The chart never defaults credentials (issue #81)." $v.data.principalId }}
@@ -623,10 +734,15 @@ data:
     admin_endpoint: "{{ $v.data.lease.adminEndpoint }}"
     server_name: "{{ default (include "vtop.peerServerName" (dict "root" $root "ordinal" $i)) $v.data.lease.serverName }}"
     topic_uuid: {{ required "\n\ndata.lease.topicUuid is required when data.lease.enabled: metadata's UUID for the topic (NOT data.range.topic, which is the wire name)." $v.data.lease.topicUuid }}
+{{- if eq (toString $v.transport.admin) "plaintext" }}
+    # Dialled the way the admin plane listens (#294): plaintext, no identity.
+    transport: plaintext
+{{- else }}
     tls:
       ca: /etc/vtop/tls/data/ca.pem
       cert: /etc/vtop/tls/data/node-{{ $i }}.pem
       key: /etc/vtop/tls/data/node-{{ $i }}-key.pem
+{{- end }}
     lease_duration_ms: {{ int $v.data.lease.leaseDurationMs }}
     renew_interval_ms: {{ int $v.data.lease.renewIntervalMs }}
     poll_interval_ms: {{ int $v.data.lease.pollIntervalMs }}
@@ -657,4 +773,11 @@ data:
 # unauthenticated (#78): keep it off public networks (see networkPolicy).
 observability:
   listen: "0.0.0.0:{{ $v.ports.observability }}"
+{{- if $v.observability.tls.secretName }}
+  # TLS 1.3, server-only (#294 slice 4): probes and scrapers keep working,
+  # the CA-holding scraper verifies. The mutual form is not rendered here.
+  tls:
+    cert: /etc/vtop/tls/observe/cert.pem
+    key: /etc/vtop/tls/observe/key.pem
+{{- end }}
 {{- end }}

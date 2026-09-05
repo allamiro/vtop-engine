@@ -136,6 +136,41 @@ tls:
   serverName: ""
 
 # ---------------------------------------------------------------------------
+# Per-plane transport (#294). `tls` (the default) is mutual TLS from the
+# Secrets above; `plaintext` serves that plane with no TLS at all. Pods have
+# no loopback peers, so a plaintext plane is rendered as the node's
+# spelled-out `plaintext-on-any-interface`, and the node prints its warning
+# at every start. That is a cluster with NO peer authentication and NO
+# confidentiality on that plane's wire — so the chart refuses to render a
+# plaintext plane until transport.acknowledgePlaintext is also true: a
+# downgrade has to be typed twice. The lease dials the admin plane and
+# follows transport.admin. A Secret is required only for the planes left at
+# tls; with every plane plaintext the chart renders without any.
+# ---------------------------------------------------------------------------
+transport:
+  peer: tls
+  admin: tls
+  replica: tls
+  native: tls
+  acknowledgePlaintext: false
+
+# ---------------------------------------------------------------------------
+# Observability endpoint TLS (#294 slice 4). Empty (the default) serves
+# /metrics, /healthz and /readyz plaintext, which is what kubelet probes and
+# most scrapers expect on a private interface. A Secret name switches the
+# endpoint to TLS 1.3, server-only: keys `cert.pem` and `key.pem`. The
+# chart never renders the mutual form (a client CA), because kubelet
+# httpGet probes cannot present a certificate — a deployment wanting it
+# writes `client_ca` into a hand-written config and switches to exec probes.
+# With TLS set, the probes use scheme HTTPS (unverified, as kubelet does),
+# the scrape annotations say https, and the ServiceMonitor scrapes https
+# with metrics.serviceMonitor.tlsConfig.
+# ---------------------------------------------------------------------------
+observability:
+  tls:
+    secretName: ""
+
+# ---------------------------------------------------------------------------
 # Metadata role (`meta:` block of the rendered config).
 # ---------------------------------------------------------------------------
 meta:
@@ -432,6 +467,11 @@ metrics:
     # Extra labels for the ServiceMonitor (e.g. release: prometheus) so your
     # Prometheus's selector picks it up.
     labels: {}
+    # With observability.tls.secretName set, the endpoint is scraped over
+    # https and this is the ServiceMonitor's tlsConfig verbatim — a CA
+    # reference (`ca.secret`) and `serverName`, or insecureSkipVerify for a
+    # lab. Empty means Prometheus verifies against its own roots.
+    tlsConfig: {}
 
 serviceAccount:
   # A dedicated ServiceAccount with automountServiceAccountToken: false —
