@@ -987,14 +987,31 @@ async fn run_leader(
     // Judged HERE, not by the bind (review): the status listener below
     // serves from a detached task, and a refusal there would be a warning
     // after readiness was announced.
-    if let Some(status_listen) = config.replica_listen.as_ref() {
-        check_plaintext_exposure(
-            config.replica_transport,
-            status_listen,
-            "replica",
-            "replica_transport",
-        )?;
-    }
+    // Bound and judged HERE as well (review), before the lease agent exists:
+    // a status listener whose hostname resolves off loopback must refuse
+    // startup before this node could acquire a lease it would never serve —
+    // the same reason the native listener above is bound early.
+    let status_listener = match config.replica_listen.as_ref() {
+        Some(status_listen) => {
+            check_plaintext_exposure(
+                config.replica_transport,
+                status_listen,
+                "replica",
+                "replica_transport",
+            )?;
+            let listener = TcpListener::bind(status_listen)
+                .await
+                .map_err(|error| format!("bind {status_listen}: {error}"))?;
+            check_plaintext_bound(
+                config.replica_transport,
+                listener.local_addr().map_err(|error| error.to_string())?,
+                "replica",
+                "replica_transport",
+            )?;
+            Some(listener)
+        }
+        None => None,
+    };
     let principal = config
         .principal_id
         .ok_or("leader/standalone requires principal_id")?;
@@ -1302,8 +1319,8 @@ async fn run_leader(
     // RPC, so `vtopctl node status` can measure follower lag against the
     // leader's own boundary rather than against the furthest-ahead follower.
     // Status only: see LeaderStatusReplica.
-    let status_addr = match config.replica_listen.as_ref() {
-        Some(status_listen) => {
+    let status_addr = match config.replica_listen.as_ref().zip(status_listener) {
+        Some((status_listen, status_listener)) => {
             let status_server = replica_server(
                 &config,
                 Arc::new(LeaderStatusReplica {
@@ -1319,17 +1336,6 @@ async fn run_leader(
                 }) as Arc<dyn ReplicaPeerHandler>,
             )
             .map_err(|error| error.to_string())?;
-            let status_listener = TcpListener::bind(status_listen)
-                .await
-                .map_err(|error| format!("bind {status_listen}: {error}"))?;
-            check_plaintext_bound(
-                config.replica_transport,
-                status_listener
-                    .local_addr()
-                    .map_err(|error| error.to_string())?,
-                "replica",
-                "replica_transport",
-            )?;
             let status_shutdown = oneshot_on_shutdown(shutdown.clone());
             tokio::spawn(async move {
                 if let Err(error) = status_server.serve(status_listener, status_shutdown).await {
