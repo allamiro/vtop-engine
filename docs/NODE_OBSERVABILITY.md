@@ -29,6 +29,28 @@ interface, never a public one. It enforces a 16-connection cap and a
 10-second per-connection deadline so a client that can reach the port cannot
 spawn unbounded work.
 
+The endpoint can be served over TLS (#294 slice 4). In a node config:
+
+```yaml
+observability:
+  listen: "0.0.0.0:9500"
+  tls:
+    cert: /etc/vtop/tls/observe/cert.pem
+    key: /etc/vtop/tls/observe/key.pem
+    # client_ca: /etc/vtop/tls/observe/scrapers-ca.pem   # set → mutual TLS
+```
+
+Server-only TLS keeps kubelet probes working (`scheme: HTTPS`; the kubelet does
+not verify the certificate) and lets Prometheus verify the endpoint against its
+CA. `client_ca` makes the endpoint mutual: only a scraper presenting a
+certificate under that CA is served, and a kubelet probe — which presents none
+— is refused at the handshake, so pair it with an exec probe or leave it off.
+The engine's env-configured endpoint takes the same three as
+`VTOP_METRICS_TLS_CERT`, `VTOP_METRICS_TLS_KEY` and `VTOP_METRICS_TLS_CLIENT_CA`;
+half a pair disables the endpoint rather than serving it plaintext. The
+transport is the one configured, never negotiated: a plaintext probe against a
+TLS endpoint is closed at the handshake, not answered.
+
 ### Enabling it
 
 The engine is opt-in through the environment, because a single-binary lab

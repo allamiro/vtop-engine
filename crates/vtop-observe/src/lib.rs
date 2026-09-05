@@ -30,6 +30,7 @@ pub mod server;
 
 pub use readiness::{Readiness, ReadinessGate};
 pub use server::{
-    addr_from_env, maybe_start_from_env, start, MetricsError, MetricsSource, RegistrySource,
-    ADDR_ENV, CONNECTION_DEADLINE, MAX_CONNECTIONS,
+    addr_from_env, maybe_start_from_env, start, start_tls, tls_from_env, MetricsError,
+    MetricsSource, RegistrySource, TlsSettings, ADDR_ENV, CONNECTION_DEADLINE, MAX_CONNECTIONS,
+    TLS_CERT_ENV, TLS_CLIENT_CA_ENV, TLS_KEY_ENV,
 };

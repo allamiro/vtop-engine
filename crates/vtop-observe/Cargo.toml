@@ -11,6 +11,11 @@ http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 prometheus = { workspace = true }
+rustls = { workspace = true }
 tokio = { workspace = true }
+tokio-rustls = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+rcgen = { workspace = true }

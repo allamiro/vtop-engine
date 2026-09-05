@@ -97,8 +97,27 @@ impl Default for MetaTimersConfig {
 #[serde(deny_unknown_fields)]
 pub struct ObservabilityConfig {
     /// `host:port` for `/metrics`, `/healthz`, and `/readyz`. Bind it to a
-    /// private interface: the endpoint is unauthenticated by design (#78).
+    /// private interface: the endpoint is unauthenticated (#78) unless `tls`
+    /// below makes it mutual.
     pub listen: Option<String>,
+    /// TLS for the endpoint (#294 slice 4). Absent, the endpoint is
+    /// plaintext — the default, since kubelet probes and most scrapers expect
+    /// it that way on a private interface. Present, it serves TLS 1.3 with
+    /// `cert` and `key`; `client_ca` set makes it MUTUAL, and then only a
+    /// scraper holding a certificate under that CA is served — a kubelet
+    /// probe, which presents none, is refused at the handshake.
+    #[serde(default)]
+    pub tls: Option<ObservabilityTls>,
+}
+
+/// The observability endpoint's TLS material (#294 slice 4).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservabilityTls {
+    pub cert: PathBuf,
+    pub key: PathBuf,
+    #[serde(default)]
+    pub client_ca: Option<PathBuf>,
 }
 
 /// A metadata Raft node process.

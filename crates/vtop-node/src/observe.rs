@@ -177,9 +177,21 @@ impl NodeObservability {
             gate: self.gate.clone(),
             probe: Arc::clone(&self.probe),
         });
-        let bound = vtop_observe::start(addr, source)
-            .await
-            .map_err(|error| format!("bind observability endpoint {listen}: {error}"))?;
+        // Over TLS when the config says so (#294 slice 4); a material problem
+        // is fatal like a bind failure, never a plaintext endpoint instead.
+        let bound = match config.tls.as_ref() {
+            Some(tls) => {
+                let settings = vtop_observe::TlsSettings::from_pem_files(
+                    &tls.cert,
+                    &tls.key,
+                    tls.client_ca.as_deref(),
+                )
+                .map_err(|error| format!("observability tls: {error}"))?;
+                vtop_observe::start_tls(addr, source, settings).await
+            }
+            None => vtop_observe::start(addr, source).await,
+        }
+        .map_err(|error| format!("bind observability endpoint {listen}: {error}"))?;
         Ok(Some(bound))
     }
 }
