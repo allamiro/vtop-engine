@@ -170,14 +170,35 @@ purge_foreign_topics() { # $1 = the prefix this cell owns, empty for "none"
   # controller has removed it — long enough, on a fresh KRaft broker, for the
   # stray check below to read the seed topics as survivors and fail a cell
   # that was clean a second later. Wait for the listing to agree, bounded.
-  local deadline=$(( SECONDS + 60 )) remaining
-  while :; do
-    remaining="$(kafka kafka-topics.sh --bootstrap-server localhost:9092 --list 2>/dev/null \
-      | grep -v '^__' | { if [ -n "$own" ]; then grep -cv "^${own}-"; else grep -c .; fi; } || true)"
-    [ "${remaining:-0}" -eq 0 ] && break
-    [ "$SECONDS" -lt "$deadline" ] || break
+  # A listing the broker fails to answer is UNKNOWN, never zero: the wait
+  # keeps probing to its deadline and then fails the cell, instead of
+  # reading silence as a clean broker. The listing is captured once per
+  # probe and judged in bash — no grep on a pipe, which under pipefail can
+  # turn a hit into SIGPIPE.
+  local deadline=$(( SECONDS + 60 )) answered=0 remaining=-1
+  while (( SECONDS < deadline )); do
+    if listing="$(kafka kafka-topics.sh --bootstrap-server localhost:9092 --list 2>/dev/null)"; then
+      answered=1
+      remaining=0
+      while IFS= read -r topic; do
+        [ -n "$topic" ] || continue
+        case "$topic" in
+          __*) continue ;;
+        esac
+        if [ -n "$own" ] && case "$topic" in "${own}-"*) true ;; *) false ;; esac; then
+          continue
+        fi
+        remaining=$(( remaining + 1 ))
+      done <<< "$listing"
+      [ "$remaining" -eq 0 ] && return 0
+    else
+      answered=0
+    fi
     sleep 1
   done
+  [ "$answered" -eq 1 ] \
+    || fail "the broker stopped answering topic listings during the purge; the cell cannot know whether it is clean"
+  # Survivors past the deadline are reported by the stray check that follows.
 }
 
 cleanup() {
@@ -231,11 +252,20 @@ seed_kafka_init
 log "warming the group coordinator"
 kafka kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic cef_events \
   --group topic-sweep-warm --from-beginning --timeout-ms 8000 >/dev/null 2>&1 </dev/null || true
-for _ in $(seq 1 30); do
-  kafka kafka-topics.sh --bootstrap-server localhost:9092 --list 2>/dev/null | grep -q '^__consumer_offsets$' && break
+coordinator_deadline=$(( SECONDS + 30 ))
+coordinator_up=0
+while (( SECONDS < coordinator_deadline )); do
+  # The listing captured, then judged in bash: `grep -q` on the pipe could
+  # SIGPIPE the listing under pipefail and read a present coordinator as
+  # absent.
+  if listing="$(kafka kafka-topics.sh --bootstrap-server localhost:9092 --list 2>/dev/null)" \
+    && [[ $'\n'"$listing"$'\n' == *$'\n__consumer_offsets\n'* ]]; then
+    coordinator_up=1
+    break
+  fi
   sleep 1
 done
-kafka kafka-topics.sh --bootstrap-server localhost:9092 --list 2>/dev/null | grep -q '^__consumer_offsets$' \
+[ "$coordinator_up" -eq 1 ] \
   || fail "the group coordinator never came up (__consumer_offsets absent); the first cell would skip its first pass"
 for count in "${COUNTS[@]}"; do
   log "=== $count topic(s), $TOTAL_RECORDS records spread across them ==="
