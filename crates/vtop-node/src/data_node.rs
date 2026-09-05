@@ -1390,9 +1390,12 @@ async fn run_candidate(
         recorded_through: std::sync::atomic::AtomicU64::new(0),
     });
     let (release_lease, release_lease_rx) = tokio::sync::watch::channel(false);
-    // Set when a granted epoch turns out to be unservable (#367); the agent
-    // releases it and sits out the next rounds rather than renewing it.
-    let stand_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Raised when a granted epoch turns out to be unservable (#367); the
+    // agent releases it and sits out the next rounds rather than renewing
+    // it. A signal, not a bare flag (review, #410): the raise wakes the
+    // agent out of its pacing sleep or in-flight round, so the hand-back
+    // starts now rather than up to a renew interval later.
+    let stand_down = Arc::new(crate::lease_agent::StandDownSignal::new());
     let agent = crate::lease_agent::LeaseAgent::new(
         lease_admin_client(lease)?,
         crate::lease_agent::LeaseAgentConfig {
@@ -1733,10 +1736,7 @@ async fn run_candidate(
                                                  letting another candidate take the \
                                                  range: {error}"
                                             );
-                                            stand_down.store(
-                                                true,
-                                                std::sync::atomic::Ordering::SeqCst,
-                                            );
+                                            stand_down.raise();
                                             publisher.set_target(None);
                                             let (set, _) = open_range(
                                                 &config.data_dir,
@@ -1994,6 +1994,13 @@ async fn run_candidate(
     // anything an abort interrupts was never acknowledged — while a range
     // nobody can serve is a range nobody else can take.
     if fatal.is_some() {
+        // NOT READY BEFORE NOT SERVING (review, #410). A fatal exit while
+        // FOLLOWING left the flag at 0, and 0 answers /readyz with Ready
+        // unconditionally — so for the whole fatal drain the orchestrator
+        // kept routing to a process that had already decided to die. The
+        // transition verdict is the honest one: this process is leaving
+        // the range, whatever role it held.
+        role_flag.store(2, std::sync::atomic::Ordering::Relaxed);
         native_task.abort();
         replica_task.abort();
         // Aborted handles must not be awaited again below.
@@ -2610,6 +2617,16 @@ impl crate::lease_agent::CandidateLocalView for SwitchingLocalView {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
             .and_then(|view| view.sealed_prefix_end())
+    }
+
+    fn fence_for_probe(&self, fencing_epoch: u64) -> Result<(), String> {
+        // No delegate is no log AND no writer: the probe's vote is the
+        // empty replica's honest zero, and there is nothing to stop.
+        self.delegate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map_or(Ok(()), |view| view.fence_for_probe(fencing_epoch))
     }
 }
 
