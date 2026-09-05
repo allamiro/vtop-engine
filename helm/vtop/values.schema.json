@@ -100,10 +100,10 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "peer": { "type": "string", "enum": ["tls", "plaintext"] },
-        "admin": { "type": "string", "enum": ["tls", "plaintext"] },
-        "replica": { "type": "string", "enum": ["tls", "plaintext"] },
-        "native": { "type": "string", "enum": ["tls", "plaintext"] },
+        "peer": { "type": "string" },
+        "admin": { "type": "string" },
+        "replica": { "type": "string" },
+        "native": { "type": "string" },
         "acknowledgePlaintext": { "type": "boolean" }
       }
     },
