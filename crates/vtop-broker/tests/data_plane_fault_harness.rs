@@ -679,8 +679,10 @@ fn a_bandwidth_starved_follower_lags_by_its_budget_and_recovers() {
         c.ctx()
     );
     // Idle ticks never accrue past the burst: a full bucket carries one
-    // record at once, then the pipe's rate applies again.
-    c.replica_set.advance_tick(30);
+    // record at once, then the pipe's rate applies again — and an idle
+    // span of any length is one jump of the clock, not a scan per tick
+    // (review).
+    c.replica_set.advance_tick(1_000_000_000);
     c.produce(5)
         .unwrap_or_else(|e| panic!("{}: {e:?}", c.ctx()));
     assert_eq!(c.followers[0].local_committed_offset(), 6, "{}", c.ctx());
@@ -689,7 +691,7 @@ fn a_bandwidth_starved_follower_lags_by_its_budget_and_recovers() {
     assert_eq!(
         c.followers[0].local_committed_offset(),
         6,
-        "{}: thirty idle ticks bought one record, not ten",
+        "{}: a billion idle ticks bought one record, not a billion",
         c.ctx()
     );
 

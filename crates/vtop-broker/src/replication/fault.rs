@@ -199,18 +199,54 @@ impl FaultInjectingReplicaSet {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // TICK BY TICK (review): a bucket refills and releases as each tick
-        // passes, so what crosses a pipe in nine ticks is the same whether
-        // they are asked for at once or one at a time. Refilling once for
-        // the whole span and draining once after would cap the refill at
-        // the burst and release a single append where the pipe carried
-        // three.
-        for _ in 0..ticks {
-            state.tick = state.tick.saturating_add(1);
-            Self::refill(&mut state, 1);
+        // EVENT BY EVENT (review, twice): a bucket refills and releases as
+        // the ticks pass, so what crosses a pipe in nine ticks is the same
+        // whether they are asked for at once or one at a time — refilling
+        // once for the whole span would cap at the burst and release one
+        // append where the pipe carried three. But a billion idle ticks are
+        // not a billion scans: the clock jumps straight to the next tick at
+        // which anything can happen (a delayed delivery coming due, or a
+        // held append's bytes accruing), refills for exactly that span, and
+        // drains there; an idle span is one jump.
+        let target = state.tick.saturating_add(ticks);
+        while state.tick < target {
+            let next = Self::next_event_tick(&state).unwrap_or(target).min(target);
+            let step = next.saturating_sub(state.tick).max(1);
+            state.tick = state.tick.saturating_add(step);
+            Self::refill(&mut state, step);
             let tick = state.tick;
             Self::drain_due(&self.inner, &mut state, tick);
         }
+    }
+
+    /// The next tick, after the current one, at which some follower's
+    /// queue can move: a delayed append or HWM update coming due, or a
+    /// budget-held append accruing the bytes it waits for. `None` when
+    /// nothing is waiting on the clock.
+    fn next_event_tick(state: &FaultState) -> Option<u64> {
+        let now = state.tick;
+        let mut next: Option<u64> = None;
+        let mut consider = |tick: u64| {
+            if tick > now {
+                next = Some(next.map_or(tick, |best| best.min(tick)));
+            }
+        };
+        for slot in &state.followers {
+            if let Some(front) = slot.delayed_appends.front() {
+                if front.deliver_at > now {
+                    consider(front.deliver_at);
+                } else if slot.fault.bytes_per_tick > 0 {
+                    let needed = append_bytes(&front.requests).min(slot.fault.burst());
+                    let short = needed.saturating_sub(slot.budget);
+                    let ticks = short.div_ceil(slot.fault.bytes_per_tick).max(1);
+                    consider(now.saturating_add(ticks));
+                }
+            }
+            if let Some(front) = slot.delayed_hwm.front() {
+                consider(front.deliver_at.max(now + 1));
+            }
+        }
+        next
     }
 
     /// Refill every follower's bucket for `ticks` elapsed, capped at the
