@@ -101,7 +101,8 @@ pub enum MetaCommand {
         from_epoch: u64,
         /// Records per page; the whole chain is read, page after page,
         /// whatever the page size (the server clamps it to its own maximum).
-        #[arg(long, default_value_t = 256)]
+        /// A page of zero would read nothing and pass, so it is refused.
+        #[arg(long, default_value_t = 256, value_parser = clap::value_parser!(u16).range(1..))]
         limit: u16,
         /// Environment variable holding the 32-byte hex MAC key. Without it a
         /// signed statement is reported unverified, never verified.
@@ -1035,8 +1036,15 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
                 }
                 next_from = last + 1;
             }
+            // The range's CURRENT epoch bounds the chain from above (review): a
+            // chain that stops short of it is missing its tail, and a tail
+            // that is missing is exactly what a tampered history looks like.
+            let lease = client
+                .read_range_lease(topic_uuid, range_uuid)
+                .await
+                .map_err(|error| error.to_string())?;
             note_redirects(&client);
-            if !found {
+            if !found || !lease.found {
                 if json {
                     println!("{}", serde_json::json!({ "found": false }));
                 } else {
@@ -1050,6 +1058,7 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
                 topic_uuid,
                 range_uuid,
                 from_epoch,
+                Some(lease.fencing_epoch),
             )?;
             if json {
                 println!(
@@ -1960,6 +1969,10 @@ impl MacVerdict {
 #[derive(Debug, Default)]
 pub struct ChainAudit {
     pub records: Vec<TransitionAudit>,
+    /// The epoch the range is at now, when the reader knew it, and whether
+    /// the chain read reaches it: `Some((current, false))` is a chain with
+    /// its tail missing.
+    pub reaches_current: Option<(u64, bool)>,
     pub broken_links: usize,
     pub vote_disagreements: usize,
     pub verified: usize,
@@ -1973,6 +1986,11 @@ impl ChainAudit {
     /// or a MAC the key refuses each fails the audit by name.
     pub fn verdict(&self) -> Result<(), String> {
         let mut reasons = Vec::new();
+        if let Some((current, false)) = self.reaches_current {
+            reasons.push(format!(
+                "the chain stops before the range's current epoch {current} (tail missing)"
+            ));
+        }
         if self.broken_links > 0 {
             reasons.push(format!("{} broken link(s)", self.broken_links));
         }
@@ -2005,8 +2023,20 @@ pub fn audit_transitions(
     topic_uuid: Uuid,
     range_uuid: Uuid,
     from_epoch: u64,
+    current_epoch: Option<u64>,
 ) -> Result<ChainAudit, String> {
-    let mut audit = ChainAudit::default();
+    // Read up from `from_epoch`, the chain must end at the epoch the range
+    // holds now; a range still at its genesis has no transition to show.
+    let reaches_current = current_epoch.map(|current| {
+        let last = views
+            .last()
+            .map_or(from_epoch.max(1) - 1, |view| view.epoch_to);
+        (current, last == current)
+    });
+    let mut audit = ChainAudit {
+        reaches_current,
+        ..ChainAudit::default()
+    };
     // Every epoch is minted as exactly the previous one plus one, by both
     // grant paths — so the chain from `from_epoch` upward must present
     // EVERY epoch in turn (review): a record that jumps, or a first record
@@ -2630,7 +2660,7 @@ client_key: /tmp/client.key
             view.mac = Some(view.record().mac(&key, topic, range).unwrap());
         }
 
-        let audit = audit_transitions(&views, Some(&key), topic, range, 1).unwrap();
+        let audit = audit_transitions(&views, Some(&key), topic, range, 1, None).unwrap();
         assert!(audit.verdict().is_ok(), "{audit:?}");
         assert_eq!(audit.verified, 3);
         assert!(audit.records.iter().all(|record| record.link_ok));
@@ -2643,7 +2673,7 @@ client_key: /tmp/client.key
             (2, 2, 2, true)
         );
         assert!(
-            audit_transitions(&views, Some(&key), topic, range, 0)
+            audit_transitions(&views, Some(&key), topic, range, 0, None)
                 .unwrap()
                 .verdict()
                 .is_ok(),
@@ -2652,14 +2682,14 @@ client_key: /tmp/client.key
         assert!(audit.records[1].vote.is_none() && audit.records[2].vote.is_none());
 
         let relabelled =
-            audit_transitions(&views, Some(&key), topic, Uuid::from_u128(0x72), 1).unwrap();
+            audit_transitions(&views, Some(&key), topic, Uuid::from_u128(0x72), 1, None).unwrap();
         assert_eq!(
             relabelled.mismatches, 3,
             "another range's chain is not this one's"
         );
         assert!(relabelled.verdict().unwrap_err().contains("MAC mismatch"));
 
-        let unchecked = audit_transitions(&views, None, topic, range, 1).unwrap();
+        let unchecked = audit_transitions(&views, None, topic, range, 1, None).unwrap();
         assert_eq!(
             (unchecked.unverified, unchecked.verified),
             (3, 0),
@@ -2673,7 +2703,7 @@ client_key: /tmp/client.key
         let mut gapped = views.clone();
         gapped[2].epoch_from = 5;
         gapped[2].mac = Some(gapped[2].record().mac(&key, topic, range).unwrap());
-        let gap = audit_transitions(&gapped, Some(&key), topic, range, 1).unwrap();
+        let gap = audit_transitions(&gapped, Some(&key), topic, range, 1, None).unwrap();
         assert_eq!(gap.broken_links, 1);
         assert!(!gap.records[2].link_ok && gap.records[1].link_ok);
         assert!(gap.verdict().unwrap_err().contains("broken link"));
@@ -2684,18 +2714,39 @@ client_key: /tmp/client.key
         jumped[2].epoch_from = 3;
         jumped[2].epoch_to = 4;
         jumped[2].mac = Some(jumped[2].record().mac(&key, topic, range).unwrap());
-        let jump = audit_transitions(&jumped, Some(&key), topic, range, 1).unwrap();
+        let jump = audit_transitions(&jumped, Some(&key), topic, range, 1, None).unwrap();
         assert_eq!(jump.broken_links, 1, "epoch 3 is missing between 2 and 4");
-        let headless = audit_transitions(&views[1..], Some(&key), topic, range, 1).unwrap();
+        let headless = audit_transitions(&views[1..], Some(&key), topic, range, 1, None).unwrap();
         assert!(
             !headless.records[0].link_ok && headless.records[1].link_ok,
             "asked from epoch 1, the chain must begin at epoch 1"
         );
-        let mid = audit_transitions(&views[1..], Some(&key), topic, range, 2).unwrap();
+        let mid = audit_transitions(&views[1..], Some(&key), topic, range, 2, None).unwrap();
         assert!(
             mid.verdict().is_ok(),
             "asked from epoch 2, it may begin there"
         );
+
+        // The range's current epoch bounds the chain from above (review): a
+        // chain that reaches it passes, one that stops short is missing its
+        // tail, and a range at its genesis has nothing to show.
+        assert!(
+            audit_transitions(&views, Some(&key), topic, range, 1, Some(3))
+                .unwrap()
+                .verdict()
+                .is_ok()
+        );
+        let short = audit_transitions(&views[..2], Some(&key), topic, range, 1, Some(3)).unwrap();
+        assert_eq!(short.reaches_current, Some((3, false)));
+        assert!(short.verdict().unwrap_err().contains("tail missing"));
+        assert!(audit_transitions(&[], Some(&key), topic, range, 1, Some(0))
+            .unwrap()
+            .verdict()
+            .is_ok());
+        assert!(audit_transitions(&[], Some(&key), topic, range, 1, Some(2))
+            .unwrap()
+            .verdict()
+            .is_err());
 
         // A quorum naming one replica twice counts it once (review).
         let mut doubled = views.clone();
@@ -2709,7 +2760,7 @@ client_key: /tmp/client.key
             quorum.push(again);
         }
         doubled[0].mac = Some(doubled[0].record().mac(&key, topic, range).unwrap());
-        let dup = audit_transitions(&doubled, Some(&key), topic, range, 1).unwrap();
+        let dup = audit_transitions(&doubled, Some(&key), topic, range, 1, None).unwrap();
         let vote = dup.records[0].vote.as_ref().unwrap();
         assert_eq!(
             (vote.recomputed, vote.ok),
@@ -2728,7 +2779,7 @@ client_key: /tmp/client.key
             quorum.retain(|answer| answer.node_uuid != holder_a);
         }
         absent[0].mac = Some(absent[0].record().mac(&key, topic, range).unwrap());
-        let gone = audit_transitions(&absent, Some(&key), topic, range, 1).unwrap();
+        let gone = audit_transitions(&absent, Some(&key), topic, range, 1, None).unwrap();
         let vote = gone.records[0].vote.as_ref().unwrap();
         assert!(!vote.holder_answered && !vote.ok, "{vote:?}");
         assert!(transition_line(&absent[0], &gone.records[0]).contains("HOLDER ABSENT"));
@@ -2745,7 +2796,7 @@ client_key: /tmp/client.key
             reported_apply_index: 12,
         };
         standalone[0].mac = Some(standalone[0].record().mac(&key, topic, range).unwrap());
-        let alone = audit_transitions(&standalone, Some(&key), topic, range, 1).unwrap();
+        let alone = audit_transitions(&standalone, Some(&key), topic, range, 1, None).unwrap();
         assert!(
             alone.records[0].vote.as_ref().unwrap().ok,
             "nothing to answer, nothing missing"
@@ -2760,7 +2811,7 @@ client_key: /tmp/client.key
             *votes = 3;
         }
         overstated[0].mac = Some(overstated[0].record().mac(&key, topic, range).unwrap());
-        let vote = audit_transitions(&overstated, Some(&key), topic, range, 1).unwrap();
+        let vote = audit_transitions(&overstated, Some(&key), topic, range, 1, None).unwrap();
         assert_eq!(
             vote.vote_disagreements, 1,
             "three votes are claimed; the quorum shows two at or below the holder"
@@ -2769,7 +2820,7 @@ client_key: /tmp/client.key
 
         let mut unsigned = views.clone();
         unsigned[1].mac = None;
-        let some = audit_transitions(&unsigned, Some(&key), topic, range, 1).unwrap();
+        let some = audit_transitions(&unsigned, Some(&key), topic, range, 1, None).unwrap();
         assert_eq!((some.verified, some.unsigned), (2, 1));
         assert!(
             some.verdict().is_ok(),
