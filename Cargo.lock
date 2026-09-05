@@ -4119,7 +4119,10 @@ dependencies = [
  "hyper",
  "hyper-util",
  "prometheus",
+ "rcgen",
+ "rustls",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
 ]

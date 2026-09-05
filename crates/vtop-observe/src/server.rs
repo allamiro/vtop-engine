@@ -39,15 +39,31 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use prometheus::{Encoder, Registry, TextEncoder};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::RootCertStore;
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
+use tokio_rustls::TlsAcceptor;
 
 /// Environment variable holding the listen address, e.g. `0.0.0.0:9090`.
 pub const ADDR_ENV: &str = "VTOP_METRICS_ADDR";
+/// TLS for the env-configured endpoint (#294 slice 4): the server certificate
+/// chain and its key, both or neither — see [`tls_from_env`].
+pub const TLS_CERT_ENV: &str = "VTOP_METRICS_TLS_CERT";
+pub const TLS_KEY_ENV: &str = "VTOP_METRICS_TLS_KEY";
+/// A CA whose certificates scrapers must present; set, the endpoint is
+/// mutual.
+pub const TLS_CLIENT_CA_ENV: &str = "VTOP_METRICS_TLS_CLIENT_CA";
+/// A TLS client that never finishes its handshake releases its permit here,
+/// like a socket that never sends headers does at `HEADER_READ_TIMEOUT`.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Maximum concurrent connections. A scrape stack is a handful of pollers;
 /// far beyond that is either a misconfiguration or an exhaustion attempt, and
@@ -191,6 +207,85 @@ async fn route(
     })
 }
 
+/// TLS for the endpoint (#294 slice 4): the inverse of the cluster planes'
+/// gap — they could not be turned off, this could not be turned on.
+///
+/// Server-only by default: a kubelet probe presents no certificate and a
+/// Prometheus scrape verifies the chain against its own CA, and both keep
+/// working. `client_roots` makes it MUTUAL: only a scraper holding a
+/// certificate under those roots is served, and a probe that cannot present
+/// one is refused at the handshake — which is the point of asking for it.
+#[derive(Debug)]
+pub struct TlsSettings {
+    pub certificate_chain: Vec<CertificateDer<'static>>,
+    pub private_key: PrivateKeyDer<'static>,
+    pub client_roots: Option<RootCertStore>,
+}
+
+impl TlsSettings {
+    /// Load from PEM files; `client_ca` given makes the endpoint mutual.
+    pub fn from_pem_files(
+        cert: &Path,
+        key: &Path,
+        client_ca: Option<&Path>,
+    ) -> Result<Self, String> {
+        let certificate_chain = pem_certs(cert)?;
+        let private_key = PrivateKeyDer::from_pem_file(key)
+            .map_err(|error| format!("parse key {}: {error}", key.display()))?;
+        let client_roots = match client_ca {
+            None => None,
+            Some(ca) => {
+                let mut roots = RootCertStore::empty();
+                for cert in pem_certs(ca)? {
+                    roots
+                        .add(cert)
+                        .map_err(|error| format!("add client CA {}: {error}", ca.display()))?;
+                }
+                Some(roots)
+            }
+        };
+        Ok(Self {
+            certificate_chain,
+            private_key,
+            client_roots,
+        })
+    }
+
+    /// The acceptor: TLS 1.3 only, on ring, like every other plane.
+    pub fn acceptor(self) -> Result<TlsAcceptor, String> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let builder = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(|error| error.to_string())?;
+        let config = match self.client_roots {
+            Some(roots) => {
+                let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+                    Arc::new(roots),
+                    provider,
+                )
+                .build()
+                .map_err(|error| error.to_string())?;
+                builder.with_client_cert_verifier(verifier)
+            }
+            None => builder.with_no_client_auth(),
+        }
+        .with_single_cert(self.certificate_chain, self.private_key)
+        .map_err(|error| error.to_string())?;
+        Ok(TlsAcceptor::from(Arc::new(config)))
+    }
+}
+
+fn pem_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
+    let certs: Vec<_> = CertificateDer::pem_file_iter(path)
+        .map_err(|error| format!("open certificates {}: {error}", path.display()))?
+        .collect::<Result<_, _>>()
+        .map_err(|error| format!("parse certificates {}: {error}", path.display()))?;
+    if certs.is_empty() {
+        return Err(format!("no certificates in {}", path.display()));
+    }
+    Ok(certs)
+}
+
 /// Bind and serve the endpoint on an explicitly configured address.
 ///
 /// Returns the bound address. Unlike [`maybe_start_from_env`], a bind failure is
@@ -201,11 +296,79 @@ pub async fn start(
     addr: SocketAddr,
     source: Arc<dyn MetricsSource>,
 ) -> Result<SocketAddr, std::io::Error> {
+    start_with(addr, source, None).await
+}
+
+/// [`start`], over TLS (#294 slice 4). A settings problem is an error like a
+/// bind failure: the operator asked for TLS, and a plaintext endpoint in its
+/// place would be the downgrade nobody asked for.
+pub async fn start_tls(
+    addr: SocketAddr,
+    source: Arc<dyn MetricsSource>,
+    settings: TlsSettings,
+) -> Result<SocketAddr, std::io::Error> {
+    let acceptor = settings.acceptor().map_err(std::io::Error::other)?;
+    start_with(addr, source, Some(acceptor)).await
+}
+
+async fn start_with(
+    addr: SocketAddr,
+    source: Arc<dyn MetricsSource>,
+    acceptor: Option<TlsAcceptor>,
+) -> Result<SocketAddr, std::io::Error> {
     let listener = TcpListener::bind(addr).await?;
     let bound = listener.local_addr().unwrap_or(addr);
-    tracing::info!(%bound, "observability endpoint listening (/metrics, /healthz, /readyz)");
-    tokio::spawn(accept_loop(listener, source));
+    let transport = if acceptor.is_some() {
+        "tls"
+    } else {
+        "plaintext"
+    };
+    tracing::info!(
+        %bound,
+        transport,
+        "observability endpoint listening (/metrics, /healthz, /readyz)"
+    );
+    tokio::spawn(accept_loop(listener, source, acceptor));
     Ok(bound)
+}
+
+/// The endpoint's TLS from the environment: `TLS_CERT_ENV` and `TLS_KEY_ENV`
+/// both, or neither. One without the other is a refusal rather than a
+/// plaintext endpoint — a downgrade nobody asked for is the one thing this
+/// path must never produce — and so is a client CA with no certificate to be
+/// mutual with.
+pub fn tls_from_env() -> Result<Option<TlsSettings>, String> {
+    fn path(name: &str) -> Option<PathBuf> {
+        std::env::var_os(name)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    }
+    tls_from_values(
+        path(TLS_CERT_ENV),
+        path(TLS_KEY_ENV),
+        path(TLS_CLIENT_CA_ENV),
+    )
+}
+
+fn tls_from_values(
+    cert: Option<PathBuf>,
+    key: Option<PathBuf>,
+    client_ca: Option<PathBuf>,
+) -> Result<Option<TlsSettings>, String> {
+    match (cert, key) {
+        (None, None) if client_ca.is_some() => Err(format!(
+            "{TLS_CLIENT_CA_ENV} is set without {TLS_CERT_ENV} and {TLS_KEY_ENV}: a client CA \
+             needs a server certificate to be mutual with"
+        )),
+        (None, None) => Ok(None),
+        (Some(cert), Some(key)) => {
+            TlsSettings::from_pem_files(&cert, &key, client_ca.as_deref()).map(Some)
+        }
+        _ => Err(format!(
+            "{TLS_CERT_ENV} and {TLS_KEY_ENV} must be set together: one without the other is \
+             neither TLS nor a plaintext endpoint anyone asked for"
+        )),
+    }
 }
 
 /// The configured listen address, or `None` when the endpoint is disabled or
@@ -236,7 +399,41 @@ pub fn addr_from_env() -> Option<SocketAddr> {
 /// Never returns an error: a telemetry problem must not stop the process.
 pub async fn maybe_start_from_env(source: Arc<dyn MetricsSource>) -> Option<SocketAddr> {
     let addr = addr_from_env()?;
-    match start(addr, source).await {
+    let tls = tls_from_env_or_disabled()?;
+    start_lenient(addr, source, tls).await
+}
+
+/// The TLS preflight for the env form (review): validated BEFORE a caller
+/// builds anything it would otherwise pay for — the engine initializes its
+/// registry only once both the address and the TLS half are usable, since a
+/// registry nobody can scrape is hot-path cost with no observer. Validated
+/// all the way to the acceptor (review): decoding a certificate and a key
+/// proves nothing about whether they belong together, and that is the
+/// common mistake. Refused, not downgraded: a misconfigured pair disables
+/// the endpoint rather than serving it plaintext.
+pub fn tls_from_env_or_disabled() -> Option<Option<TlsAcceptor>> {
+    match tls_from_env().and_then(|tls| tls.map(TlsSettings::acceptor).transpose()) {
+        Ok(acceptor) => Some(acceptor),
+        Err(reason) => {
+            tracing::error!(
+                %reason,
+                "metrics endpoint TLS misconfigured; the endpoint is disabled rather than \
+                 served plaintext"
+            );
+            None
+        }
+    }
+}
+
+/// Start with settings the caller already validated, never failing the
+/// process: the env form's second half, for a caller that ran the
+/// preflights itself.
+pub async fn start_lenient(
+    addr: SocketAddr,
+    source: Arc<dyn MetricsSource>,
+    acceptor: Option<TlsAcceptor>,
+) -> Option<SocketAddr> {
+    match start_with(addr, source, acceptor).await {
         Ok(bound) => Some(bound),
         Err(e) => {
             // Bind failure (port in use, permissions) must not be fatal here:
@@ -247,7 +444,11 @@ pub async fn maybe_start_from_env(source: Arc<dyn MetricsSource>) -> Option<Sock
     }
 }
 
-async fn accept_loop(listener: TcpListener, source: Arc<dyn MetricsSource>) {
+async fn accept_loop(
+    listener: TcpListener,
+    source: Arc<dyn MetricsSource>,
+    acceptor: Option<TlsAcceptor>,
+) {
     let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     // Rejection logging is rate-limited: at capacity, a flooding client
     // triggers one rejection per accepted connection, and a synchronous
@@ -280,33 +481,38 @@ async fn accept_loop(listener: TcpListener, source: Arc<dyn MetricsSource>) {
                     continue;
                 };
                 let source = Arc::clone(&source);
+                let acceptor = acceptor.clone();
+                // ONE deadline from accept (review): the handshake's shorter
+                // limit sits inside it, so a TLS peer cannot hold a permit
+                // for a handshake budget and then a whole connection's.
+                let deadline = tokio::time::Instant::now() + CONNECTION_DEADLINE;
                 tokio::spawn(async move {
-                    let service = service_fn(move |req| {
-                        let source = Arc::clone(&source);
-                        async move { route(req, source).await }
-                    });
-                    let conn = hyper::server::conn::http1::Builder::new()
-                        // One request per connection: a keep-alive poller
-                        // would otherwise park on a permit between scrapes
-                        // and MAX_CONNECTIONS idle pollers would starve the
-                        // endpoint. Prometheus reconnects per scrape fine.
-                        .keep_alive(false)
-                        // hyper needs an explicit timer to enforce its own
-                        // timeouts; without one, setting header_read_timeout
-                        // panics at the first request rather than failing at
-                        // build time.
-                        .timer(TokioTimer::new())
-                        // A socket that never sends headers releases its
-                        // permit in seconds rather than holding it for the
-                        // full connection deadline.
-                        .header_read_timeout(HEADER_READ_TIMEOUT)
-                        .serve_connection(TokioIo::new(stream), service);
-                    match tokio::time::timeout(CONNECTION_DEADLINE, conn).await {
-                        Err(_) => {
-                            tracing::debug!(%peer, "metrics connection hit deadline; closed")
+                    match acceptor {
+                        // The transport is the one configured, never
+                        // negotiated: a plaintext probe against a TLS
+                        // endpoint fails its handshake here and is closed.
+                        Some(acceptor) => {
+                            // The earlier of the handshake's own budget and the
+                            // connection deadline (review): a task scheduled late
+                            // must not carry the handshake past the deadline.
+                            let handshake_deadline =
+                                deadline.min(tokio::time::Instant::now() + TLS_HANDSHAKE_TIMEOUT);
+                            match tokio::time::timeout_at(
+                                handshake_deadline,
+                                acceptor.accept(stream),
+                            )
+                            .await
+                            {
+                                Ok(Ok(tls)) => serve_io(tls, source, peer, deadline).await,
+                                Ok(Err(error)) => {
+                                    tracing::debug!(%peer, %error, "metrics TLS handshake failed; closed")
+                                }
+                                Err(_) => {
+                                    tracing::debug!(%peer, "metrics TLS handshake hit deadline; closed")
+                                }
+                            }
                         }
-                        Ok(Err(e)) => tracing::debug!(error = %e, "metrics connection closed"),
-                        Ok(Ok(())) => {}
+                        None => serve_io(stream, source, peer, deadline).await,
                     }
                     drop(permit);
                 });
@@ -330,6 +536,41 @@ async fn accept_loop(listener: TcpListener, source: Arc<dyn MetricsSource>) {
                 tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
             }
         }
+    }
+}
+
+/// One connection, over whichever stream the configured transport produced.
+async fn serve_io<IO>(
+    io: IO,
+    source: Arc<dyn MetricsSource>,
+    peer: SocketAddr,
+    deadline: tokio::time::Instant,
+) where
+    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let service = service_fn(move |req| {
+        let source = Arc::clone(&source);
+        async move { route(req, source).await }
+    });
+    let conn = hyper::server::conn::http1::Builder::new()
+        // One request per connection: a keep-alive poller would otherwise
+        // park on a permit between scrapes and MAX_CONNECTIONS idle pollers
+        // would starve the endpoint. Prometheus reconnects per scrape fine.
+        .keep_alive(false)
+        // hyper needs an explicit timer to enforce its own timeouts; without
+        // one, setting header_read_timeout panics at the first request
+        // rather than failing at build time.
+        .timer(TokioTimer::new())
+        // A socket that never sends headers releases its permit in seconds
+        // rather than holding it for the full connection deadline.
+        .header_read_timeout(HEADER_READ_TIMEOUT)
+        .serve_connection(TokioIo::new(io), service);
+    match tokio::time::timeout_at(deadline, conn).await {
+        Err(_) => {
+            tracing::debug!(%peer, "metrics connection hit deadline; closed")
+        }
+        Ok(Err(e)) => tracing::debug!(error = %e, "metrics connection closed"),
+        Ok(Ok(())) => {}
     }
 }
 
@@ -471,5 +712,190 @@ mod tests {
             start(addr, source).await.is_err(),
             "a configured address that cannot bind must be reported, not logged and dropped"
         );
+    }
+
+    fn parse_response(raw: &[u8]) -> Option<(StatusCode, String)> {
+        let response = String::from_utf8_lossy(raw).to_string();
+        let code = response.split_whitespace().nth(1)?.parse::<u16>().ok()?;
+        let body = response
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b.to_string())
+            .unwrap_or_default();
+        Some((StatusCode::from_u16(code).ok()?, body))
+    }
+
+    type Identity = (
+        Vec<CertificateDer<'static>>,
+        PrivateKeyDer<'static>,
+        RootCertStore,
+    );
+
+    /// A self-signed identity, and a root store that trusts exactly it.
+    fn tls_identity(name: &str) -> Identity {
+        let identity = rcgen::generate_simple_self_signed(vec![name.to_owned()]).unwrap();
+        let chain = vec![identity.cert.der().clone()];
+        let key = PrivateKeyDer::from(rustls::pki_types::PrivatePkcs8KeyDer::from(
+            identity.signing_key.serialize_der(),
+        ));
+        let mut roots = RootCertStore::empty();
+        roots.add(identity.cert.der().clone()).unwrap();
+        (chain, key, roots)
+    }
+
+    /// A raw GET over TLS; `None` when the endpoint closed without answering.
+    async fn tls_get(
+        addr: SocketAddr,
+        roots: RootCertStore,
+        client: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
+        path: &str,
+    ) -> Option<(StatusCode, String)> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let builder = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots);
+        let config = match client {
+            Some((chain, key)) => builder.with_client_auth_cert(chain, key).unwrap(),
+            None => builder.with_no_client_auth(),
+        };
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let mut stream = connector.connect(name, tcp).await.ok()?;
+        stream
+            .write_all(format!("GET {path} HTTP/1.1\r\nHost: probe\r\n\r\n").as_bytes())
+            .await
+            .ok()?;
+        let mut raw = Vec::new();
+        let _ = stream.read_to_end(&mut raw).await;
+        parse_response(&raw)
+    }
+
+    /// #294 slice 4: the endpoint serves over TLS, and a plaintext probe is
+    /// closed at the handshake rather than answered — the transport is the
+    /// one configured, never negotiated down.
+    #[tokio::test]
+    async fn a_tls_endpoint_serves_the_routes_and_closes_a_plaintext_probe() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (chain, key, roots) = tls_identity("localhost");
+        let source = Arc::new(RegistrySource::new(
+            registry_with_a_counter(),
+            ReadinessGate::ready(),
+        ));
+        let addr = start_tls(
+            "127.0.0.1:0".parse().unwrap(),
+            source,
+            TlsSettings {
+                certificate_chain: chain,
+                private_key: key,
+                client_roots: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let (status, body) = tls_get(addr, roots.clone(), None, "/metrics")
+            .await
+            .expect("served over TLS");
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("vtop_probe_total"), "{body}");
+        assert_eq!(
+            tls_get(addr, roots, None, "/readyz").await.unwrap().0,
+            StatusCode::OK
+        );
+
+        let mut plain = tokio::net::TcpStream::connect(addr).await.unwrap();
+        plain
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: probe\r\n\r\n")
+            .await
+            .unwrap();
+        let mut raw = Vec::new();
+        let _ = plain.read_to_end(&mut raw).await;
+        assert!(
+            parse_response(&raw).is_none(),
+            "a plaintext probe must not be answered: {}",
+            String::from_utf8_lossy(&raw)
+        );
+    }
+
+    /// With a client CA the endpoint is mutual: a scraper with no
+    /// certificate is refused at the handshake, one under the CA is served.
+    #[tokio::test]
+    async fn a_mutual_tls_endpoint_serves_only_a_scraper_with_a_certificate() {
+        let (server_chain, server_key, server_roots) = tls_identity("localhost");
+        let (client_chain, client_key, client_roots) = tls_identity("prometheus");
+        let source = Arc::new(RegistrySource::new(
+            registry_with_a_counter(),
+            ReadinessGate::ready(),
+        ));
+        let addr = start_tls(
+            "127.0.0.1:0".parse().unwrap(),
+            source,
+            TlsSettings {
+                certificate_chain: server_chain,
+                private_key: server_key,
+                client_roots: Some(client_roots),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            tls_get(addr, server_roots.clone(), None, "/healthz")
+                .await
+                .is_none(),
+            "no certificate, no answer"
+        );
+        let (status, _) = tls_get(
+            addr,
+            server_roots,
+            Some((client_chain, client_key)),
+            "/healthz",
+        )
+        .await
+        .expect("served to the scraper the CA vouches for");
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// A certificate and a key that do not belong together decode fine and
+    /// fail only at the acceptor (review): the preflight must go that far.
+    #[test]
+    fn a_mismatched_certificate_and_key_are_refused_by_the_acceptor() {
+        let (chain, _key_a, _) = tls_identity("localhost");
+        let (_chain_b, key_b, _) = tls_identity("localhost");
+        let refused = TlsSettings {
+            certificate_chain: chain,
+            private_key: key_b,
+            client_roots: None,
+        }
+        .acceptor()
+        .err()
+        .expect("a mismatched pair must be refused");
+        assert!(
+            !refused.is_empty(),
+            "mismatched pair must be refused by name"
+        );
+    }
+
+    /// The env form is both halves or neither; never a silent plaintext
+    /// endpoint where TLS was half-asked for.
+    #[test]
+    fn tls_from_the_environment_is_both_halves_or_neither() {
+        assert!(tls_from_values(None, None, None).unwrap().is_none());
+        let half = tls_from_values(Some("cert.pem".into()), None, None).unwrap_err();
+        assert!(
+            half.contains(TLS_CERT_ENV) && half.contains(TLS_KEY_ENV),
+            "{half}"
+        );
+        let orphan = tls_from_values(None, None, Some("ca.pem".into())).unwrap_err();
+        assert!(orphan.contains(TLS_CLIENT_CA_ENV), "{orphan}");
+        let missing = tls_from_values(
+            Some("/nonexistent/cert.pem".into()),
+            Some("/nonexistent/key.pem".into()),
+            None,
+        )
+        .unwrap_err();
+        assert!(missing.contains("/nonexistent/cert.pem"), "{missing}");
     }
 }

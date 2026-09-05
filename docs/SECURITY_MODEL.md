@@ -126,6 +126,14 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are used as normat
   authentication, confidentiality, and active-tamper protection.
 - Session count, global in-flight work, negotiated record/frame limits, idle
   timeouts, and fetch-response byte credit are explicit resource boundaries.
+- The observability endpoint (`/metrics`, `/healthz`, `/readyz`) **MAY** be
+  served over TLS 1.3 (#294 slice 4): `observability.tls` in a node config, or
+  `VTOP_METRICS_TLS_CERT`/`_KEY` for the engine. Server-only by default so
+  probes and scrapers keep working; a client CA makes it mutual, and then only
+  a scraper the CA vouches for is served. Misconfigured TLS disables the
+  endpoint rather than serving it plaintext, and a plaintext probe against a
+  TLS endpoint is closed at the handshake.
+
 
 ## 3. Credential handling
 

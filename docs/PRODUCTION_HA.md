@@ -699,6 +699,8 @@ path needed by the distributed options is already implemented (§6.3).
 | `RUST_LOG` | log filter |
 | `VTOP_STATE_STORE` | PostgreSQL URL when named by `engine.state_store.env`; remote URLs require `sslmode=verify-full` |
 | `VTOP_METRICS_ADDR` | opt-in Prometheus metrics + readiness endpoint (e.g. `0.0.0.0:9090`); nothing listens unless set |
+| `VTOP_METRICS_TLS_CERT` / `VTOP_METRICS_TLS_KEY` | serve the metrics endpoint over TLS 1.3 (#294): both or neither — half a pair disables the endpoint rather than serving it plaintext |
+| `VTOP_METRICS_TLS_CLIENT_CA` | with the pair above, make the endpoint mutual: only scrapers presenting a certificate under this CA are served |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | S3 credentials |
 | `AWS_REGION` | S3 region |
 | `VTOP_S3_ENDPOINT_URL` | S3/MinIO endpoint |
