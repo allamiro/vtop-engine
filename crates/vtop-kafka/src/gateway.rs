@@ -93,6 +93,9 @@ impl Default for GatewayConfig {
 /// A frame's buffer starts this large and grows with the bytes received.
 const INITIAL_FRAME_CAPACITY: usize = 64 * 1024;
 
+/// What ListOffsets answers as the timestamp of a boundary lookup: unknown.
+const TIMESTAMP_UNKNOWN: i64 = -1;
+
 /// Resolves when `shutdown` reads `true`; never on a dropped sender, which
 /// is not a signal (see `serve`).
 async fn shutdown_signalled(shutdown: &mut tokio::sync::watch::Receiver<bool>) {
@@ -799,7 +802,13 @@ impl Gateway {
                 partitions.push(ListOffsetsPartitionResponse {
                     index: partition.index,
                     error,
-                    timestamp: partition.timestamp,
+                    // A boundary lookup has no timestamp of its own (review):
+                    // Kafka answers -1, unknown, never the request's sentinel.
+                    timestamp: if error == ErrorCode::None {
+                        TIMESTAMP_UNKNOWN
+                    } else {
+                        partition.timestamp
+                    },
                     offset,
                 });
             }
@@ -1066,7 +1075,11 @@ mod tests {
             assert_eq!(d.array_len("partitions").unwrap(), Some(1));
             assert_eq!(d.i32("partition").unwrap(), 0);
             assert_eq!(d.i16("error").unwrap(), 0, "{what}");
-            d.i64("timestamp").unwrap();
+            assert_eq!(
+                d.i64("timestamp").unwrap(),
+                TIMESTAMP_UNKNOWN,
+                "a boundary lookup answers an unknown timestamp, not its own sentinel"
+            );
             assert_eq!(d.i64("offset").unwrap(), expected, "{what}");
         }
     }

@@ -1444,7 +1444,8 @@ async fn run_leader(
                         (MAX_FRAME_BYTES / 2) as usize
                     },
                 },
-            );
+            )
+            .map_err(|error| format!("kafka gateway: {error}"))?;
             let gateway_config = vtop_kafka::GatewayConfig {
                 advertised_host: kafka
                     .advertised_host

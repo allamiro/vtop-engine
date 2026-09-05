@@ -211,6 +211,13 @@ pub fn refuse_kafka_gateway_misuse(
                 .to_owned(),
         );
     }
+    if kafka.node_id < 0 {
+        return Err(format!(
+            "`kafka.node_id: {}` is negative: Kafka reads -1 as \"no leader\", and Metadata names \
+             this id as the broker, the controller and every partition's leader. Use 0 or above",
+            kafka.node_id
+        ));
+    }
     if kafka.advertised_port == Some(0) {
         return Err(
             "`kafka.advertised_port: 0` is not a port clients can dial: set the port they \
@@ -992,6 +999,13 @@ mod transport_tests {
         assert!(refuse_kafka_gateway_misuse(DataRole::Leader, Some(&blank))
             .unwrap_err()
             .contains("blank"));
+        let mut negative = kafka("127.0.0.1:9092", false);
+        negative.node_id = -1;
+        assert!(
+            refuse_kafka_gateway_misuse(DataRole::Leader, Some(&negative))
+                .unwrap_err()
+                .contains("node_id: -1")
+        );
         let mut zero = kafka("127.0.0.1:9092", false);
         zero.advertised_port = Some(0);
         assert!(refuse_kafka_gateway_misuse(DataRole::Leader, Some(&zero))

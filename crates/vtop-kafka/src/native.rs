@@ -70,6 +70,20 @@ struct SequenceSpace {
     next: u64,
 }
 
+/// The producer-epoch space has no room above what the journal or this
+/// process already holds: the bridge cannot be built with an epoch the
+/// broker would take as new.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EpochsExhausted;
+
+impl std::fmt::Display for EpochsExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the producer-epoch space is exhausted: no epoch above what the journal holds")
+    }
+}
+
+impl std::error::Error for EpochsExhausted {}
+
 pub struct NativeBridge {
     broker: Arc<LocalBroker>,
     config: NativeBridgeConfig,
@@ -87,18 +101,29 @@ pub struct NativeBridge {
 /// behind that leader's would otherwise mint below it — every append fenced
 /// until the clock caught up. Durable state orders the mint; the clock only
 /// keeps two bridges in one process apart.
-fn mint_producer_epoch_above(journal: Option<u64>) -> u64 {
+fn mint_producer_epoch_above(journal: Option<u64>) -> Result<u64, EpochsExhausted> {
     static LAST: AtomicU64 = AtomicU64::new(0);
+    // An epoch space with no room above what the journal or this process
+    // holds is refused (review), never reused: a reused epoch with a fresh
+    // sequence space would be the broker's duplicate check defeated.
+    let above_journal = match journal {
+        Some(u64::MAX) => return Err(EpochsExhausted),
+        Some(held) => held + 1,
+        None => 0,
+    };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_micros() as u64)
         .unwrap_or(1)
-        .max(journal.map_or(0, |held| held.saturating_add(1)));
+        .max(above_journal);
     let mut previous = LAST.load(Ordering::SeqCst);
     loop {
-        let candidate = now.max(previous.saturating_add(1));
+        if previous == u64::MAX {
+            return Err(EpochsExhausted);
+        }
+        let candidate = now.max(previous + 1);
         match LAST.compare_exchange(previous, candidate, Ordering::SeqCst, Ordering::SeqCst) {
-            Ok(_) => return candidate,
+            Ok(_) => return Ok(candidate),
             Err(seen) => previous = seen,
         }
     }
@@ -110,9 +135,13 @@ impl NativeBridge {
     /// the broker keeps per-epoch sequence state, so a new epoch — sequences
     /// from zero, as a restarted Kafka producer's own — is the honest start.
     /// The old epoch's state stays behind it, as it should.
-    pub fn new(broker: Arc<LocalBroker>, config: NativeBridgeConfig) -> Self {
+    pub fn new(
+        broker: Arc<LocalBroker>,
+        config: NativeBridgeConfig,
+    ) -> Result<Self, EpochsExhausted> {
         let held = broker.producer_epoch_of(config.producer_id);
-        Self::with_producer_epoch(broker, config, mint_producer_epoch_above(held))
+        let epoch = mint_producer_epoch_above(held)?;
+        Ok(Self::with_producer_epoch(broker, config, epoch))
     }
 
     /// Build with a chosen epoch. For a caller that allocates epochs itself
@@ -535,7 +564,8 @@ mod tests {
                 max_append_records: 2,
                 ..config(Durability::LocalFsync)
             },
-        );
+        )
+        .unwrap();
         let values = ["a", "b", "c", "d", "e"];
         let records: Vec<(&str, Option<&str>)> = values.iter().map(|v| (*v, None)).collect();
         let appended = bridge.produce("events", &[batch(&records)]).unwrap();
@@ -562,7 +592,8 @@ mod tests {
                 max_append_bytes: 40,
                 ..config(Durability::LocalFsync)
             },
-        );
+        )
+        .unwrap();
         assert!(bridge.produce("events", &[batch(&records)]).is_ok());
         assert_eq!(bridge.bounds("events").unwrap(), (0, 10));
         let big = "x".repeat(64);
@@ -575,7 +606,7 @@ mod tests {
     }
 
     fn bridge(broker: Arc<LocalBroker>) -> NativeBridge {
-        NativeBridge::new(broker, config(Durability::LocalFsync))
+        NativeBridge::new(broker, config(Durability::LocalFsync)).unwrap()
     }
 
     /// A refused append leaves no hole (review): the reservation stands only
@@ -642,7 +673,9 @@ mod tests {
             2
         );
         assert_eq!(second.high_watermark("events").unwrap(), 3);
-        let epochs: Vec<u64> = (0..64).map(|_| mint_producer_epoch_above(None)).collect();
+        let epochs: Vec<u64> = (0..64)
+            .map(|_| mint_producer_epoch_above(None).unwrap())
+            .collect();
         assert!(
             epochs.windows(2).all(|pair| pair[0] < pair[1]),
             "minted epochs are strictly increasing: {epochs:?}"
@@ -679,6 +712,11 @@ mod tests {
                 .base_offset,
             1,
             "appends instead of being fenced"
+        );
+        // No room above the journal: refused, never the same epoch again.
+        assert_eq!(
+            mint_producer_epoch_above(Some(u64::MAX)),
+            Err(EpochsExhausted)
         );
     }
 
