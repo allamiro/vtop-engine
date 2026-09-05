@@ -80,6 +80,7 @@ pub fn encode_api_versions(out: &mut Encoder, version: i16, error: ErrorCode) {
         ApiKey::ListOffsets,
         ApiKey::Metadata,
         ApiKey::ApiVersions,
+        ApiKey::InitProducerId,
     ];
     out.array_len(keys.len());
     for key in keys {
@@ -919,7 +920,7 @@ mod tests {
             let mut d = Decoder::new(&bytes);
             assert_eq!(d.i16("error").unwrap(), 0);
             let n = d.array_len("keys").unwrap().unwrap();
-            assert_eq!(n, 5);
+            assert_eq!(n, 6);
             for _ in 0..n {
                 let key = ApiKey::from_i16(d.i16("key").unwrap()).unwrap();
                 let (min, max) = key.version_range();
@@ -931,4 +932,43 @@ mod tests {
             d.expect_consumed("apiVersions").unwrap();
         }
     }
+}
+
+// --------------------------------------------------------------- InitProducerId
+
+/// InitProducerId v0..=1 (#457): a transactional id — refused here, transactions
+/// are out of scope — and a transaction timeout there is no transaction for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitProducerIdRequest {
+    pub transactional_id: Option<String>,
+    pub transaction_timeout_ms: i32,
+}
+
+pub fn decode_init_producer_id(
+    d: &mut Decoder<'_>,
+    _version: i16,
+) -> Result<InitProducerIdRequest, WireError> {
+    let transactional_id = d
+        .nullable_string("initProducerId.transactionalId")?
+        .map(str::to_owned);
+    let transaction_timeout_ms = d.i32("initProducerId.transactionTimeoutMs")?;
+    Ok(InitProducerIdRequest {
+        transactional_id,
+        transaction_timeout_ms,
+    })
+}
+
+/// The v0/v1 response: throttle, error, and the id and epoch the client's
+/// batches will carry from now on (-1 and -1 beside an error).
+pub fn encode_init_producer_id(
+    out: &mut Encoder,
+    _version: i16,
+    error: ErrorCode,
+    producer_id: i64,
+    producer_epoch: i16,
+) {
+    out.i32(0); // throttle_time_ms
+    out.i16(error.as_i16());
+    out.i64(producer_id);
+    out.i16(producer_epoch);
 }

@@ -31,9 +31,10 @@ pub mod messages;
 #[cfg(feature = "native")]
 pub mod native;
 pub mod records;
+mod turnstile;
 pub mod wire;
 
-pub use bridge::{Appended, Bridge, Fetched, MemoryBridge};
+pub use bridge::{Appended, Bridge, Fetched, MemoryBridge, Sequenced};
 pub use gateway::{Gateway, GatewayConfig};
 pub use messages::{ApiKey, ErrorCode, HeaderVerdict, RequestHeader};
 #[cfg(feature = "native")]

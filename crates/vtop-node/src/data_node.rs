@@ -1478,7 +1478,8 @@ async fn run_leader(
             eprintln!(
                 "warning: kafka gateway on {bound} speaks Kafka's protocol, which carries no vtop \
                  identity: every peer that reaches it produces and fetches as producer \
-                 {kafka_producer} (derived from principal {principal}) (#225 phase 1)"
+                 {kafka_producer} (derived from principal {principal}), and an idempotent producer as an \
+                 identity derived from the range and its own id, the same on every replica (#225, #457)"
             );
             Some(bound)
         }

@@ -33,12 +33,15 @@ RECORDS="${CHAOS_KAFKA_RECORDS:-20000}"
 # refused here by name rather than failing at the kill.
 require_integer_in_range CHAOS_KAFKA_RECORDS "$RECORDS" 5000 10000000
 # The floor the kill waits for, and the pacing, both scale to the run.
-ACK_FLOOR="${CHAOS_KAFKA_ACK_FLOOR:-$(( RECORDS / 4 ))}"
+ACK_FLOOR="${CHAOS_KAFKA_ACK_FLOOR:-$(( 10#$RECORDS / 4 ))}"
 # The producer is paced — a pause every PACE_EVERY records, one fortieth of
 # the run — so the stream lasts seconds instead of the one second librdkafka
 # needs for 20,000 small records, and the follower kill lands INSIDE it.
-PACE_EVERY="${CHAOS_KAFKA_PACE_EVERY:-$(( RECORDS / 40 ))}"
+PACE_EVERY="${CHAOS_KAFKA_PACE_EVERY:-$(( 10#$RECORDS / 40 ))}"
 PACE_SLEEP="${CHAOS_KAFKA_PACE_SLEEP:-0.2}"
+# The pace reaches awk's system() as text (review): a non-negative decimal.
+[[ "$PACE_SLEEP" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+  || fail "CHAOS_KAFKA_PACE_SLEEP must be a non-negative decimal, got '$PACE_SLEEP'"
 require_integer_in_range CHAOS_KAFKA_ACK_FLOOR "$ACK_FLOOR" 1 "$RECORDS"
 require_integer_in_range CHAOS_KAFKA_PACE_EVERY "$PACE_EVERY" 1 "$RECORDS"
 [[ -n "${TOPIC:-}" ]] || fail "lib.sh did not set TOPIC"

@@ -1,29 +1,35 @@
 //! The listener (#225): Kafka frames in, the bridge behind, and every gap a
 //! refusal by name.
 //!
-//! What phase 1 serves is exactly what the engine can honestly back today:
+//! What is served is exactly what the engine can honestly back today:
 //! Metadata over the bridge's topics with one partition each, Produce of
 //! uncompressed non-transactional v2 batches without headers, Fetch with the
 //! long-poll emulated here (the broker returns immediately at the watermark),
-//! and ListOffsets LATEST and EARLIEST (the watermark and the retained
-//! floor; by-timestamp has no index behind it). Everything else is refused with the code a client's
-//! retry policy can act on, and the reason is logged where an operator reads —
+//! ListOffsets LATEST and EARLIEST (the watermark and the retained floor;
+//! by-timestamp has no index behind it), and — #457 — InitProducerId for
+//! idempotent producers: a batch carrying the id and epoch minted here is
+//! appended under that producer's own sequences, so a retry after a timeout
+//! appends once. Everything else is refused with the code a client's retry
+//! policy can act on, and the reason is logged where an operator reads —
 //! never a silent drop, never a plausible lie.
 
 use crate::api::{
-    decode_fetch, decode_list_offsets, decode_metadata, decode_produce, encode_api_versions,
-    encode_fetch, encode_list_offsets, encode_metadata, encode_produce, FetchPartitionResponse,
-    FetchRequest, FetchTopicResponse, ListOffsetsPartitionResponse, ListOffsetsRequest,
+    decode_fetch, decode_init_producer_id, decode_list_offsets, decode_metadata, decode_produce,
+    encode_api_versions, encode_fetch, encode_init_producer_id, encode_list_offsets,
+    encode_metadata, encode_produce, FetchPartitionResponse, FetchRequest, FetchTopicResponse,
+    InitProducerIdRequest, ListOffsetsPartitionResponse, ListOffsetsRequest,
     ListOffsetsTopicResponse, MetadataBroker, MetadataRequest, MetadataResponse, MetadataTopic,
     ProducePartitionResponse, ProduceRequest, ProduceTopicResponse, TIMESTAMP_EARLIEST,
     TIMESTAMP_LATEST,
 };
-use crate::bridge::{Bridge, Fetched};
+use crate::bridge::{Bridge, Fetched, Sequenced};
 use crate::messages::{
     frame, write_response_header, ApiKey, ErrorCode, HeaderVerdict, RequestHeader,
 };
 use crate::records::{BatchError, RecordBatch};
+use crate::turnstile::Turnstile;
 use crate::wire::{Decoder, Encoder};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -132,7 +138,19 @@ enum Answer {
     Close(String),
 }
 
+/// One idempotent producer on one topic, as the gateway orders its sets.
+type ProducerKey = (String, i64, i16);
+
 pub struct Gateway {
+    /// Each idempotent producer's place in line (#457, review): the ticket is
+    /// taken in the session's request order, BEFORE the append is handed to
+    /// the blocking pool — a pool may start two queued tasks in either order,
+    /// so a ticket taken inside the task could reverse two sets of one
+    /// producer, a reordering the client never made and reads as fatal. The
+    /// task then waits its turn on the pool, and a set behind a timed-out one
+    /// waits until that append is done. An entry lives while a ticket is
+    /// outstanding.
+    producer_order: Arc<std::sync::Mutex<HashMap<ProducerKey, Arc<Turnstile>>>>,
     bridge: Arc<dyn Bridge>,
     config: GatewayConfig,
     sessions: Arc<tokio::sync::Semaphore>,
@@ -151,6 +169,7 @@ impl Gateway {
             config,
             sessions,
             refused_sessions: std::sync::atomic::AtomicU64::new(0),
+            producer_order: Arc::new(std::sync::Mutex::new(HashMap::new())),
             closed: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -416,6 +435,26 @@ impl Gateway {
                     Err(error) => Err(error),
                 }
             }
+            ApiKey::InitProducerId => {
+                match consumed(
+                    decode_init_producer_id(&mut d, version),
+                    &d,
+                    "InitProducerId",
+                ) {
+                    Ok(request) => {
+                        let (error, producer_id, producer_epoch) = self.init_producer_id(request);
+                        encode_init_producer_id(
+                            &mut out,
+                            version,
+                            error,
+                            producer_id,
+                            producer_epoch,
+                        );
+                        Ok(None)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
         };
         match served {
             Ok(None) => Answer::Reply(out.into_vec()),
@@ -491,6 +530,40 @@ impl Gateway {
     }
 
     /// `Err` closes the connection: the one produce shape with no answer.
+    /// An idempotent producer's id and epoch (#457): minted here, unique in
+    /// this process and across its restarts on a sane clock, epoch zero. A
+    /// transactional id is refused by name — transactions are out of scope —
+    /// with the code the produce path gives them, so a client fails at the
+    /// first step rather than at its first commit.
+    fn init_producer_id(&self, request: InitProducerIdRequest) -> (ErrorCode, i64, i16) {
+        if let Some(transactional_id) = request.transactional_id {
+            tracing::warn!(
+                %transactional_id,
+                "kafka InitProducerId refused: transactions are out of scope (#457 non-goal); \
+                 idempotence without a transactional id is served"
+            );
+            return (ErrorCode::UnsupportedForMessageFormat, -1, -1);
+        }
+        // The node id becomes the low byte of the minted id: an id that does
+        // not fit is not truncated into another gateway's byte (review), it
+        // is a gateway that cannot mint — refused by name, and the node's
+        // config check refuses such an id before a gateway is ever built.
+        let Ok(node_id) = u8::try_from(self.config.node_id) else {
+            tracing::warn!(
+                node_id = self.config.node_id,
+                "kafka InitProducerId refused: node_id is outside 0..=255, the byte every minted \
+                 producer id carries; this gateway cannot mint idempotent producers apart"
+            );
+            return (ErrorCode::UnsupportedForMessageFormat, -1, -1);
+        };
+        let producer_id = mint_producer_id(node_id);
+        tracing::debug!(
+            producer_id,
+            "kafka InitProducerId: minted an idempotent producer id"
+        );
+        (ErrorCode::None, producer_id, 0)
+    }
+
     async fn produce(&self, request: ProduceRequest) -> Result<Vec<ProduceTopicResponse>, String> {
         if request.acks == 0 {
             // acks=0 has no representation here: the broker acknowledges what
@@ -618,6 +691,10 @@ impl Gateway {
                 ));
             }
         }
+        // An idempotent set's identity, judged whole before the bridge sees
+        // it (#457): one producer, contiguous sequences, or a refusal that
+        // appends nothing.
+        let sequenced = sequenced_identity(&batches)?;
         let bridge = Arc::clone(&self.bridge);
         let topic = topic.to_owned();
         // The bridge is synchronous and a real one fsyncs: off the runtime's
@@ -625,14 +702,56 @@ impl Gateway {
         // one append (review) — whole or not at all — and the wait for it
         // is bounded by the client's `timeout_ms` under the gateway's cap:
         // the append cannot be cancelled, so past the bound the client is
-        // told it timed out while the append runs on.
+        // told it timed out while the append runs on — and an idempotent
+        // producer's retry of it then appends nothing. Judged BEFORE a place
+        // in line is taken (review): a ticket taken and never served would
+        // hold every later set of the producer forever.
         if tokio::time::Instant::now() >= deadline {
             return Err((
                 ErrorCode::RequestTimedOut,
                 "the request's deadline passed before this partition was reached".to_owned(),
             ));
         }
-        let append = tokio::task::spawn_blocking(move || bridge.produce(&topic, &batches));
+        // The place in line, taken now — in this session's request order —
+        // and waited for on the pool (review). The ticket is taken INSIDE
+        // the map's critical section: between finding the entry and taking
+        // a ticket, a finished append could find the entry idle and remove
+        // it, and a second entry for the same producer would be a second
+        // queue running beside the first.
+        let ordered = sequenced.map(|sequenced| {
+            let key: ProducerKey = (
+                topic.clone(),
+                sequenced.producer_id,
+                sequenced.producer_epoch,
+            );
+            let mut order = self
+                .producer_order
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let entry = Arc::clone(order.entry(key.clone()).or_default());
+            let ticket = entry.enter();
+            drop(order);
+            (key, entry, ticket)
+        });
+        let order = Arc::clone(&self.producer_order);
+        let append = tokio::task::spawn_blocking(move || {
+            let turn = ordered
+                .as_ref()
+                .map(|(_, turnstile, ticket)| turnstile.wait_turn(*ticket));
+            let outcome = bridge.produce(&topic, &batches, sequenced);
+            drop(turn);
+            if let Some((key, turnstile, _)) = ordered {
+                // Under the map lock, so a set arriving now either finds the
+                // entry and takes a ticket (and it stays) or finds none.
+                let mut order = order
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if turnstile.idle() {
+                    order.remove(&key);
+                }
+            }
+            outcome
+        });
         match tokio::time::timeout_at(deadline, append).await {
             Ok(Ok(Ok(appended))) => Ok(appended),
             Ok(Ok(Err(code))) => {
@@ -835,6 +954,129 @@ fn consumed<T>(
 }
 
 /// Every batch in a RECORDS field, each decoded and judged, in order.
+/// A produce set's producer identity (#457): `None` when no batch names a
+/// producer (the shared, non-idempotent path), the shared id, epoch and
+/// first sequence when every batch names the same producer and their
+/// sequences run contiguously across the set. Anything between is refused
+/// with the code a client acts on: a set is idempotent whole or not at all.
+fn sequenced_identity(batches: &[RecordBatch]) -> Result<Option<Sequenced>, (ErrorCode, String)> {
+    let first = &batches[0];
+    if first.producer_id < 0 {
+        if first.producer_id != -1 {
+            return Err((
+                ErrorCode::InvalidRecord,
+                format!(
+                    "batch 0 names producer id {}, which is neither -1 (no producer) nor an id \
+                     InitProducerId minted",
+                    first.producer_id
+                ),
+            ));
+        }
+        if let Some(which) = batches.iter().position(|batch| batch.producer_id != -1) {
+            return Err((
+                ErrorCode::InvalidRecord,
+                format!(
+                    "batch {which} names producer {} while batch 0 names none: a set is idempotent \
+                     whole or not at all",
+                    batches[which].producer_id
+                ),
+            ));
+        }
+        return Ok(None);
+    }
+    if first.producer_epoch < 0 {
+        return Err((
+            ErrorCode::InvalidProducerEpoch,
+            format!(
+                "batch 0 names producer {} with epoch {}: an idempotent batch's epoch is 0 or more",
+                first.producer_id, first.producer_epoch
+            ),
+        ));
+    }
+    if first.base_sequence < 0 {
+        return Err((
+            ErrorCode::OutOfOrderSequenceNumber,
+            format!(
+                "batch 0 names producer {} with base sequence {}: sequences start at 0",
+                first.producer_id, first.base_sequence
+            ),
+        ));
+    }
+    let mut expected = i64::from(first.base_sequence);
+    for (which, batch) in batches.iter().enumerate() {
+        if (batch.producer_id, batch.producer_epoch) != (first.producer_id, first.producer_epoch) {
+            return Err((
+                ErrorCode::InvalidRecord,
+                format!(
+                    "batch {which} names producer {}/{} while batch 0 names {}/{}: one set, one \
+                     producer",
+                    batch.producer_id,
+                    batch.producer_epoch,
+                    first.producer_id,
+                    first.producer_epoch
+                ),
+            ));
+        }
+        if i64::from(batch.base_sequence) != expected {
+            return Err((
+                ErrorCode::OutOfOrderSequenceNumber,
+                format!(
+                    "batch {which} starts at sequence {} where {expected} was expected: sequences \
+                     run contiguously across a set",
+                    batch.base_sequence
+                ),
+            ));
+        }
+        expected += batch.records.len() as i64;
+    }
+    if expected > i64::from(i32::MAX) {
+        // Kafka's sequences wrap at i32::MAX; the native log's do not. A
+        // producer that far into one session is refused rather than
+        // wrapped into a sequence the log would read as a gap.
+        return Err((
+            ErrorCode::InvalidRecord,
+            format!(
+                "the set's sequences would pass {}: this gateway does not wrap a producer's \
+                 sequences (#457)",
+                i32::MAX
+            ),
+        ));
+    }
+    Ok(Some(Sequenced {
+        producer_id: first.producer_id,
+        producer_epoch: first.producer_epoch,
+        first_sequence: first.base_sequence,
+    }))
+}
+
+/// An idempotent producer id (#457): microseconds since the epoch, bumped
+/// past the previous mint when two are minted in one instant — unique in
+/// this process, and across its restarts on any sane clock — with this
+/// gateway's node id in the low byte (review), so the leaders a range has
+/// over its life mint apart even in the same microsecond: the identity a
+/// batch carries lives in the range's replicated log, which every one of
+/// them appends to in turn. The id is a byte by type, never by truncation.
+fn mint_producer_id(node_id: u8) -> i64 {
+    static LAST_MICROS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX >> 9))
+        .unwrap_or(1);
+    let mut previous = LAST_MICROS.load(std::sync::atomic::Ordering::SeqCst);
+    loop {
+        let candidate = now.max(previous.saturating_add(1));
+        match LAST_MICROS.compare_exchange(
+            previous,
+            candidate,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        ) {
+            Ok(_) => return (candidate << 8) | i64::from(node_id),
+            Err(seen) => previous = seen,
+        }
+    }
+}
+
 fn split_batches(mut bytes: &[u8]) -> Result<Vec<RecordBatch>, (ErrorCode, String)> {
     let mut batches = Vec::new();
     while !bytes.is_empty() {
@@ -907,6 +1149,36 @@ mod tests {
         (addr, tx)
     }
 
+    /// A bridge whose FIRST append takes `pause` — a backend behind a slow
+    /// quorum, once — over memory.
+    struct SlowProduce {
+        inner: MemoryBridge,
+        pause: Duration,
+        slept: std::sync::atomic::AtomicBool,
+    }
+    impl Bridge for SlowProduce {
+        fn topics(&self) -> Vec<String> {
+            self.inner.topics()
+        }
+        fn produce(
+            &self,
+            topic: &str,
+            batches: &[RecordBatch],
+            sequenced: Option<Sequenced>,
+        ) -> Result<crate::bridge::Appended, ErrorCode> {
+            if !self.slept.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(self.pause);
+            }
+            self.inner.produce(topic, batches, sequenced)
+        }
+        fn fetch(&self, topic: &str, offset: i64, max_bytes: usize) -> Result<Fetched, ErrorCode> {
+            self.inner.fetch(topic, offset, max_bytes)
+        }
+        fn bounds(&self, topic: &str) -> Result<(i64, i64), ErrorCode> {
+            self.inner.bounds(topic)
+        }
+    }
+
     /// A bridge that delegates to memory after a pause — a backend behind
     /// a slow fsync — or answers `bounds` with a code of its own.
     struct Behind {
@@ -922,8 +1194,9 @@ mod tests {
             &self,
             topic: &str,
             batches: &[RecordBatch],
+            sequenced: Option<Sequenced>,
         ) -> Result<crate::bridge::Appended, ErrorCode> {
-            self.inner.produce(topic, batches)
+            self.inner.produce(topic, batches, sequenced)
         }
         fn fetch(&self, topic: &str, offset: i64, max_bytes: usize) -> Result<Fetched, ErrorCode> {
             std::thread::sleep(self.pause);
@@ -1055,7 +1328,7 @@ mod tests {
         let bridge: Arc<dyn Bridge> = memory.clone();
         let (addr, _stop) = start(bridge).await;
         let three = RecordBatch::decode(&batch_bytes(&["a", "b", "c"], false)).unwrap();
-        memory.produce("events", &[three]).unwrap();
+        memory.produce("events", &[three], None).unwrap();
         let (floor, watermark) = memory.bounds("events").unwrap();
         for (timestamp, expected, what) in [
             (TIMESTAMP_EARLIEST, floor, "EARLIEST is the retained floor"),
@@ -1232,6 +1505,43 @@ mod tests {
         RecordBatch::encode(0, -1, -1, -1, &records)
     }
 
+    /// A batch as an idempotent producer sends it: its id, epoch and base
+    /// sequence in the batch header.
+    fn sequenced_batch_bytes(
+        values: &[&str],
+        producer_id: i64,
+        producer_epoch: i16,
+        base_sequence: i32,
+    ) -> Vec<u8> {
+        let records: Vec<Record> = values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| Record {
+                offset: i as i64,
+                timestamp_millis: 1_700_000_000_000 + i as i64,
+                key: None,
+                value: Some(v.as_bytes().to_vec()),
+                headers: Vec::new(),
+            })
+            .collect();
+        RecordBatch::encode(0, producer_id, producer_epoch, base_sequence, &records)
+    }
+    fn init_producer_id_body(transactional: Option<&str>) -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.nullable_string(transactional);
+        e.i32(60_000);
+        e.into_vec()
+    }
+    /// (error code, producer id, producer epoch).
+    fn read_init_producer_id(reply: &[u8]) -> (i16, i64, i16) {
+        let mut d = Decoder::new(reply);
+        d.i32("throttle").unwrap();
+        let error = d.i16("error").unwrap();
+        let producer_id = d.i64("producer_id").unwrap();
+        let producer_epoch = d.i16("producer_epoch").unwrap();
+        assert!(d.is_empty(), "trailing bytes");
+        (error, producer_id, producer_epoch)
+    }
     fn produce_body(
         topic: &str,
         partition: i32,
@@ -1399,7 +1709,7 @@ mod tests {
             d.i16("error").unwrap(),
             ErrorCode::UnsupportedVersion.as_i16()
         );
-        assert_eq!(d.array_len("keys").unwrap(), Some(5));
+        assert_eq!(d.array_len("keys").unwrap(), Some(6));
 
         // v0 on the same connection: served.
         let reply = exchange(&mut socket, &request(18, 0, 10, &[]))
@@ -1540,6 +1850,195 @@ mod tests {
 
     /// A RECORDS field holding two batches appends both (review): the
     /// decoder's stop at the first declared length is not the set's end.
+    /// InitProducerId (#457) mints a distinct, increasing id per call with
+    /// epoch zero, in v0 and v1; a transactional id is refused by name; the
+    /// flexible v2 is outside the served range and closed at the header.
+    #[tokio::test]
+    async fn init_producer_id_mints_distinct_ids_and_refuses_a_transactional_one() {
+        let (addr, _stop) = start(Arc::new(MemoryBridge::with_topics(["events"]))).await;
+        let mut minted = Vec::new();
+        for version in [0, 1] {
+            let reply = call(addr, 22, version, 1, &init_producer_id_body(None))
+                .await
+                .unwrap();
+            let (error, producer_id, producer_epoch) = read_init_producer_id(&reply);
+            assert_eq!((error, producer_epoch), (0, 0));
+            assert!(producer_id > 0);
+            minted.push(producer_id);
+        }
+        assert!(minted[1] > minted[0], "distinct, increasing: {minted:?}");
+        assert_eq!(
+            minted[0] & 0xff,
+            minted[1] & 0xff,
+            "the low byte is this gateway's node id, on every mint"
+        );
+        assert!(
+            minted[1] >> 8 > minted[0] >> 8,
+            "the microseconds above it increase"
+        );
+        // A node id that does not fit the byte is not truncated into another
+        // gateway's: it cannot mint, and says so.
+        let (wide, _stop) = start_with(Arc::new(MemoryBridge::with_topics(["events"])), |c| {
+            c.node_id = 257;
+        })
+        .await;
+        let reply = call(wide, 22, 1, 4, &init_producer_id_body(None))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_init_producer_id(&reply),
+            (ErrorCode::UnsupportedForMessageFormat.as_i16(), -1, -1)
+        );
+        let reply = call(addr, 22, 1, 2, &init_producer_id_body(Some("tx-1")))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_init_producer_id(&reply),
+            (ErrorCode::UnsupportedForMessageFormat.as_i16(), -1, -1)
+        );
+        // v2 is flexible: refused at the header, and the connection closed.
+        let mut refused = Encoder::new();
+        refused.i16(22);
+        refused.i16(2);
+        refused.i32(3);
+        refused.nullable_string(Some("c"));
+        refused.i8(0);
+        let mut socket = TcpStream::connect(addr).await.unwrap();
+        assert!(exchange(&mut socket, &frame(refused.as_slice()))
+            .await
+            .is_none());
+    }
+
+    /// The acceptance (#457): an idempotent producer's retried batch appends
+    /// once. Through the wire: the same bytes twice are one append and the
+    /// same base offset; the next sequence appends; a gap, a mixed set, a
+    /// non-contiguous set and a bad epoch are refused by the code a client
+    /// acts on, and append nothing.
+    #[tokio::test]
+    async fn an_idempotent_retry_is_acknowledged_once_with_its_original_offset() {
+        let (addr, _stop) = start(Arc::new(MemoryBridge::with_topics(["events"]))).await;
+        let produce = |correlation: i32, set: Vec<u8>| async move {
+            let reply = call(
+                addr,
+                0,
+                8,
+                correlation,
+                &produce_body("events", 0, -1, None, &set),
+            )
+            .await
+            .unwrap();
+            read_produce(&reply, 8)
+        };
+        let watermark = || async move {
+            let reply = call(addr, 1, 4, 99, &fetch_body(4, "events", 0, 0, 0))
+                .await
+                .unwrap();
+            read_fetch(&reply, 4).1
+        };
+        let first = sequenced_batch_bytes(&["a", "b"], 7, 0, 0);
+        assert_eq!(produce(1, first.clone()).await, (0, 0, None));
+        assert_eq!(produce(2, first.clone()).await, (0, 0, None), "the retry");
+        assert_eq!(watermark().await, 2, "appended once");
+        assert_eq!(
+            produce(3, sequenced_batch_bytes(&["c"], 7, 0, 2)).await,
+            (0, 2, None)
+        );
+        let (error, _, message) = produce(4, sequenced_batch_bytes(&["x"], 7, 0, 5)).await;
+        assert_eq!(error, ErrorCode::OutOfOrderSequenceNumber.as_i16());
+        assert!(message.is_some());
+        // Two batches in one set, contiguous: one identity, one append.
+        let mut set = sequenced_batch_bytes(&["d"], 7, 0, 3);
+        set.extend_from_slice(&sequenced_batch_bytes(&["e"], 7, 0, 4));
+        assert_eq!(produce(5, set).await, (0, 3, None));
+        assert_eq!(watermark().await, 5);
+        // Not contiguous: refused whole.
+        let mut set = sequenced_batch_bytes(&["f"], 7, 0, 5);
+        set.extend_from_slice(&sequenced_batch_bytes(&["g"], 7, 0, 7));
+        let (error, _, message) = produce(6, set).await;
+        assert_eq!(error, ErrorCode::OutOfOrderSequenceNumber.as_i16());
+        assert!(message.unwrap().contains("batch 1 starts at sequence 7"));
+        // Mixed with a batch naming no producer: refused whole.
+        let mut set = sequenced_batch_bytes(&["f"], 7, 0, 5);
+        set.extend_from_slice(&batch_bytes(&["g"], false));
+        let (error, _, message) = produce(7, set).await;
+        assert_eq!(error, ErrorCode::InvalidRecord.as_i16());
+        assert!(message.unwrap().contains("one set, one producer"));
+        let (error, _, _) = produce(8, sequenced_batch_bytes(&["f"], 7, -1, 5)).await;
+        assert_eq!(error, ErrorCode::InvalidProducerEpoch.as_i16());
+        let (error, _, message) = produce(10, sequenced_batch_bytes(&["f"], -2, -1, -1)).await;
+        assert_eq!(
+            error,
+            ErrorCode::InvalidRecord.as_i16(),
+            "-2 is nobody's producer id"
+        );
+        assert!(message.unwrap().contains("neither -1"));
+        assert_eq!(watermark().await, 5, "every refusal appended nothing");
+        // A set naming no producer is the shared path, unchanged.
+        assert_eq!(produce(9, batch_bytes(&["h"], false)).await, (0, 5, None));
+    }
+
+    /// A set behind a timed-out one waits for it and lands after (review):
+    /// the first set's append outlives the gateway's produce cap, the client
+    /// is told it timed out, and its next set arrives while the first is
+    /// still appending. Its place in line was taken in request order, so it
+    /// waits for the first set to land and then lands at the offset after it
+    /// — never before it, where its sequence would be a gap. The wait is
+    /// short of the second set's own deadline here; a client whose wait is
+    /// not retries, and the retry meets the same order.
+    #[tokio::test]
+    async fn a_set_behind_a_timed_out_one_waits_for_it_and_lands_after() {
+        let bridge = Arc::new(SlowProduce {
+            inner: MemoryBridge::with_topics(["events"]),
+            pause: Duration::from_millis(600),
+            slept: Default::default(),
+        });
+        let (addr, _stop) = start_with(bridge, |c| {
+            c.max_produce_wait = Duration::from_millis(400);
+        })
+        .await;
+        let mut socket = TcpStream::connect(addr).await.unwrap();
+        let first = produce_body(
+            "events",
+            0,
+            -1,
+            None,
+            &sequenced_batch_bytes(&["a", "b"], 7, 0, 0),
+        );
+        let reply = exchange(&mut socket, &request(0, 8, 1, &first))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_produce(&reply[4..], 8).0,
+            ErrorCode::RequestTimedOut.as_i16(),
+            "the first set outlives the cap"
+        );
+        let started = tokio::time::Instant::now();
+        let second = produce_body(
+            "events",
+            0,
+            -1,
+            None,
+            &sequenced_batch_bytes(&["c"], 7, 0, 2),
+        );
+        let reply = exchange(&mut socket, &request(0, 8, 2, &second))
+            .await
+            .unwrap();
+        let (error, base, _) = read_produce(&reply[4..], 8);
+        assert_eq!(
+            (error, base),
+            (0, 2),
+            "landed after the first set, not before it"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(150),
+            "it waited for the first set's append to finish"
+        );
+        let reply = call(addr, 1, 4, 3, &fetch_body(4, "events", 0, 0, 0))
+            .await
+            .unwrap();
+        assert_eq!(read_fetch(&reply, 4).1, 3, "three records, in order");
+    }
+
     #[tokio::test]
     async fn every_batch_in_a_produce_set_is_appended_in_order() {
         let (addr, _stop) = start(Arc::new(MemoryBridge::with_topics(["events"]))).await;
@@ -1622,9 +2121,10 @@ mod tests {
                 &self,
                 topic: &str,
                 batches: &[RecordBatch],
+                sequenced: Option<Sequenced>,
             ) -> Result<crate::bridge::Appended, ErrorCode> {
                 std::thread::sleep(Duration::from_millis(300));
-                self.0.produce(topic, batches)
+                self.0.produce(topic, batches, sequenced)
             }
             fn fetch(
                 &self,
