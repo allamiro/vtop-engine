@@ -74,5 +74,31 @@ services:
         done
         echo "benchmark buckets ready"
 
+  # The shaped path (#403): toxiproxy between the engine and MinIO, on the
+  # `shaped` profile so the unshaped scenarios never pay for it. The engine
+  # talks to 127.0.0.1:9100 instead of :9000; the runner installs the toxics
+  # a scenario names through the API on :8474 for the run, and removes them
+  # afterwards. The proxy itself is registered from toxiproxy.json at start.
+  #   docker compose -f benchmarks/docker-compose.benchmark.yml --profile shaped up -d
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    container_name: vtop-bench-toxiproxy
+    profiles: ["shaped"]
+    command: ["-host=0.0.0.0", "-config=/etc/toxiproxy/proxies.json"]
+    ports:
+      - "${VTOP_BIND_ADDR:-127.0.0.1}:9100:9100"
+      - "${VTOP_BIND_ADDR:-127.0.0.1}:8474:8474"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    pids_limit: 256
+    mem_limit: 256m
+    read_only: true
+    volumes:
+      - ./toxiproxy.json:/etc/toxiproxy/proxies.json:ro
+    depends_on:
+      minio:
+        condition: service_healthy
+
 volumes:
   bench-minio-data:

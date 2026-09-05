@@ -1,0 +1,47 @@
+name: backpressure-soak-shaped
+description: >-
+  Scenario 12 over a thin pipe (#403): the same seeder-outruns-engine deficit
+  against live MinIO, but the upload path runs through toxiproxy shaped to a
+  WAN — 10 Mbps each way, 100 ms round trip with jitter. The signal is what
+  the upload stage does when the NETWORK, not the store, is the bottleneck:
+  object_upload p95 against the pipe rather than the disk, and the backlog
+  deficit growing instead of inflight_batches or memory — the raw signal
+  the #102 width controller consumes. The controller itself lives in the
+  engine process and this harness runs one process per cycle, so watching
+  it back off needs a long-lived vtopctl run against this same stack.
+  Requires the shaped stack, docker compose -f
+  benchmarks/docker-compose.benchmark.yml --profile shaped up -d, and
+  unshapes the pipe when it ends.
+volume: 400
+file_size: small
+format: jsonl
+compression: gzip
+checksum: sha256
+backend: s3_native
+bucket: "vtop-bench-soak"
+# The proxy, not the store: toxiproxy listens on 9100 and forwards to MinIO
+# on 9000 through whatever shape this file names.
+endpoint_url: http://localhost:9100
+shaping_api_url: http://127.0.0.1:8474
+shaping_proxy: minio
+# 10 Mbps = 1250 KB/s, each direction. A remote site's uplink, not a LAN.
+shaping_bandwidth_kbps: 1250
+# A continent's round trip, split across the two directions, with the
+# jitter a real WAN carries.
+shaping_latency_ms: 100
+shaping_jitter_ms: 20
+batch_max_records: 50
+batch_max_bytes: 1048576
+batch_max_age_seconds: 5
+# ONE upload at a time (review): toxiproxy's bandwidth toxic limits each
+# CONNECTION, so at a wider setting the aggregate is the shape times the
+# connections in flight. One batch in flight is one connection, and then the
+# per-connection number IS the pipe. Widen it only to measure per-connection
+# shaping, and read the numbers as such.
+max_concurrent_batches: 1
+backlog_multiplier: 1.5
+seed_concurrently: true
+seed_interval_seconds: 1.0
+duration_seconds: 300
+fault: none
+sys_sample_interval: 2.0

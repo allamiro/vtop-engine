@@ -26,7 +26,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from lib import engine, seed  # noqa: E402
+from lib import engine, seed, shaping  # noqa: E402
 from lib.metrics import ResultsWriter, iso_now, new_run_id, percentile  # noqa: E402
 from lib.scenario import load_scenario, reseed_count  # noqa: E402
 from lib.sysmon import SystemMonitor  # noqa: E402
@@ -77,6 +77,15 @@ def main() -> int:
     os.makedirs(results_root, exist_ok=True)
 
     sc = load_scenario(args.scenario)
+    # The shape is judged HERE, before a seed byte exists (#403): a bad knob
+    # fails the run before it costs anything, and a shaped scenario never
+    # runs unshaped under its own name.
+    shape = shaping.Shape.from_scenario(sc)
+    if shape is not None:
+        # The engine must go THROUGH the proxy the shape is on: an endpoint
+        # override (VTOP_S3_ENDPOINT_URL outranks the scenario) would send it
+        # around the toxics while the summary said shaped.
+        shaping.require_endpoint_through_proxy(sc, engine.effective_endpoint(sc))
     run_id = new_run_id(sc.name)
     writer = ResultsWriter(results_root, run_id)
     print(f"[bench] scenario={sc.name} run_id={run_id}")
@@ -105,6 +114,7 @@ def main() -> int:
     start = time.time()
     start_iso = iso_now()
     batch_total_ms = []
+    batch_upload_ms = []  # the store's share of each batch (#403)
     out_objects = 0
     out_bytes = 0
     in_bytes = 0
@@ -125,7 +135,10 @@ def main() -> int:
         row.update(sample)
         writer.row("system_metrics.csv", row)
 
-    with SystemMonitor(emit_sys, interval=float(sc.get("sys_sample_interval", 1.0))):
+    # The pipe is shaped for exactly the block the measurements come from,
+    # and unshaped on every way out of it (#403).
+    with SystemMonitor(emit_sys, interval=float(sc.get("sys_sample_interval", 1.0))), \
+            shaping.shaped(sc, endpoint=engine.effective_endpoint(sc), shape=shape):
         # initial seed
         # A --seed-dir the caller supplied may already hold input. Those bytes
         # reach `bytes_archived`, so they must reach `bytes_seeded` too or the
@@ -256,6 +269,8 @@ def main() -> int:
                 # upload metrics
                 b, k = parse_bucket_key(o.get("object_uri"))
                 up_ms = m.get("object_upload_ms", 0) or 0
+                if up_ms:
+                    batch_upload_ms.append(up_ms)
                 speed = (cbytes / 1e6) / (up_ms / 1000.0) if up_ms else 0.0
                 writer.row("upload_metrics.csv", {
                     "run_id": run_id, "batch_id": bid, "object_key": k,
@@ -446,9 +461,18 @@ def main() -> int:
         "p50_latency_ms": percentile(batch_total_ms, 50),
         "p95_latency_ms": percentile(batch_total_ms, 95),
         "p99_latency_ms": percentile(batch_total_ms, 99),
+        # The upload leg alone (#403): the number a shaped pipe moves first,
+        # and the raw signal #102's width controller consumes.
+        "upload_p50_ms": percentile(batch_upload_ms, 50),
+        "upload_p95_ms": percentile(batch_upload_ms, 95),
         "compression_ratio_avg": round(sum(comp_ratios) / len(comp_ratios), 3) if comp_ratios else 0,
         "error_count": errors, "failed_batches": failed, "successful_batches": success,
         "backend": sc.get("backend", "mock"),
+        # The pipe the numbers were measured through, or None (#403): a p95
+        # is never read without it.
+        "shaping": shape.describe() if shape else None,
+        # And flat, for the CSV, the summary table and the matrix (review).
+        **(shape.flat_columns() if shape else {}),
     }
     # CPU/mem summary from the system-metrics samples written during the run.
     summary.update(_sys_summary(writer.dir))
@@ -525,4 +549,10 @@ def _bottleneck(s):
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except shaping.ShapingError as exc:
+        # The pipe could not be shaped (#403): one line naming what to start,
+        # and a non-zero exit — not a traceback for a stack that is not up.
+        print(f"[bench] {exc}", file=sys.stderr)
+        raise SystemExit(2) from None

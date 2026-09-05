@@ -128,6 +128,47 @@ Three outputs answer the questions the issue asks:
 | `ledger_bytes` / `ledger_rows` / `ledger_bytes_per_batch` | ledger growth. Rows scale with BATCH count, so a low `batch_max_records` grows the ledger far faster per byte archived than a flood does — this is tested *better* small than large |
 | `recovery_ms` | what it costs to open that ledger afterwards, with no work left to do (#77 loads the whole thing into memory at startup) |
 
+### Bandwidth-shaped soak (#403)
+
+Every soak above runs over a loopback with unbounded bandwidth, so nothing
+measures how the engine degrades when the upload link — not the store — is
+the bottleneck. That is the normal condition at an edge site archiving over a
+WAN. `13-backpressure-soak-shaped.yaml` is scenario 12 with the upload path
+routed through [toxiproxy](https://github.com/Shopify/toxiproxy): no root, no
+`CAP_NET_ADMIN`, and a shape per scenario.
+
+```bash
+docker compose -f benchmarks/docker-compose.benchmark.yml --profile shaped up -d
+python3 benchmarks/run_benchmark.py benchmarks/scenarios/13-backpressure-soak-shaped.yaml
+docker compose -f benchmarks/docker-compose.benchmark.yml --profile shaped down
+```
+
+The scenario names the shape with flat keys — `shaping_api_url` (empty means
+unshaped), `shaping_proxy`, `shaping_bandwidth_kbps` (KB/s, each direction,
+**per connection**: toxiproxy limits each connection it proxies, so the
+aggregate is the shape times the uploads in flight — scenario 13 keeps
+`max_concurrent_batches: 1`, which makes one connection the pipe),
+`shaping_latency_ms` (round trip, split across the directions) and
+`shaping_jitter_ms` — and points `endpoint_url` at the proxy on `:9100`. The
+runner installs the toxics for exactly the measured block and removes them on
+every way out of it, so a following unshaped run never inherits the pipe; the
+shape is recorded in `summary.json` under `shaping`, as flat `shaping_*`
+columns in `metrics.csv` and the matrix comparison, and as a row in
+`summary.md`, so a p95 is never read without the link it was measured through.
+Toxics are named per run (`vtop_<token>_…`) behind a `vtop_lock` claim toxic
+that toxiproxy refuses to create twice, so of two runs racing to one proxy
+exactly one shapes it; a proxy already carrying any other toxic — an
+interrupted run's or a hand-made one — refuses the run rather than stack.
+
+What the run answers, and where to read it:
+
+| question | reads on |
+|----------|----------|
+| does a thin pipe grow the **deficit** rather than the process? | `backlog_metrics.csv` should climb while `memory_max_mb` in `metrics.csv` stays bounded — the #98 hypothesis-1 shape, now reachable on purpose. (The engine's own queue gauges, `inflight_batches` and `upload_throttled_total`, are not scraped by this harness; read them off the engine's `/metrics` if you run it with `VTOP_METRICS_ADDR`.) |
+| is the wait attributed honestly? | `upload_p95_ms` in `summary.json` / `metrics.csv` — the p95 of the per-batch `object_upload_ms`, which `upload_metrics.csv` carries per object as `upload_duration_ms` — grows by the pipe; `p95_latency_ms` (the whole batch) grows by the same, not more |
+| what does the controller see? | the raw signal #102's width controller consumes — the per-batch `object_upload_ms`, summarized as `upload_p50_ms` / `upload_p95_ms`, against the pipe. The controller itself lives in the engine process, and this harness runs one `process-once` per cycle, so its width resets every cycle: observing the back-off (and the throttle counter it reacts to) needs a long-lived `vtopctl run` against the same shaped stack with its `/metrics` scraped, which is where the #102 measurement belongs |
+| what is the control? | the runner unshapes the pipe on every way out, so a following unshaped run of scenario 12 is the comparison — same seeder, same store, no pipe |
+
 ## 8. Clean benchmark data
 
 ```bash
@@ -168,7 +209,8 @@ Copy any file in `scenarios/`, change the knobs, drop it in `scenarios/`.
 Every parameter is configurable (see `lib/scenario.py` `DEFAULTS`):
 volume, file_size, format, batch_max_records/bytes/age, compression(+level),
 checksum, backend, duration_seconds, fault, sys_sample_interval, bucket,
-endpoint_url. `run_matrix.py --all` automatically picks it up.
+endpoint_url, and the `shaping_*` keys (§7). `run_matrix.py --all`
+automatically picks it up.
 
 ## Benchmark matrix coverage
 
@@ -184,6 +226,7 @@ endpoint_url. `run_matrix.py --all` automatically picks it up.
 | Failure conditions | ✅ verification failure, replay/recovery | `backend: mock_fail`, `fault: replay` |
 | Runtime duration | ✅ any (`duration_seconds`) | 5 min / 30 min / 1 h presets easy to add |
 | Sustained backpressure | ✅ `seed_concurrently` + `backlog_multiplier` | a real deficit, not just sustained load — scenario `11-backpressure-soak` (#98) |
+| Bandwidth-shaped upload | ✅ toxiproxy on the `shaped` profile, `shaping_*` keys | the upload link as the bottleneck — scenario `13-backpressure-soak-shaped` (#403) |
 
 ## Native segment write amp / proof overhead (#189)
 
