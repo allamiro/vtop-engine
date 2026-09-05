@@ -99,7 +99,8 @@ pub enum MetaCommand {
         /// The first epoch to read; the chain is read upward from here.
         #[arg(long, default_value_t = 1)]
         from_epoch: u64,
-        /// Records per read; the server clamps to its own maximum.
+        /// Records per page; the whole chain is read, page after page,
+        /// whatever the page size (the server clamps it to its own maximum).
         #[arg(long, default_value_t = 256)]
         limit: u16,
         /// Environment variable holding the 32-byte hex MAC key. Without it a
@@ -1006,12 +1007,36 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
             };
             let config = load_admin_config(&common.config)?;
             let client = connect(&config)?;
-            let response = client
-                .read_range_transitions(topic_uuid, range_uuid, from_epoch, limit)
-                .await
-                .map_err(|error| error.to_string())?;
+            // The WHOLE chain, paged (review): the server clamps a read to
+            // its own maximum, so one read of a long history is a window,
+            // and an audit over a window is not an audit of the range.
+            // `--limit` is the page size; the chain is read page after page
+            // from the last epoch seen until a page comes back empty.
+            let mut transitions = Vec::new();
+            let mut next_from = from_epoch;
+            let mut read_at_applied_index = 0;
+            let mut found = true;
+            loop {
+                let page = client
+                    .read_range_transitions(topic_uuid, range_uuid, next_from, limit)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if !page.found {
+                    found = false;
+                    break;
+                }
+                read_at_applied_index = page.read_at_applied_index;
+                let Some(last) = page.transitions.last().map(|view| view.epoch_to) else {
+                    break;
+                };
+                transitions.extend(page.transitions);
+                if last == u64::MAX {
+                    break;
+                }
+                next_from = last + 1;
+            }
             note_redirects(&client);
-            if !response.found {
+            if !found {
                 if json {
                     println!("{}", serde_json::json!({ "found": false }));
                 } else {
@@ -1020,7 +1045,7 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
                 return Ok(());
             }
             let audit = audit_transitions(
-                &response.transitions,
+                &transitions,
                 key.as_ref(),
                 topic_uuid,
                 range_uuid,
@@ -1031,8 +1056,8 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "found": true,
-                        "read_at_applied_index": response.read_at_applied_index,
-                        "transitions": response.transitions.iter().zip(&audit.records).map(|(view, record)| transition_json(view, record)).collect::<Vec<_>>(),
+                        "read_at_applied_index": read_at_applied_index,
+                        "transitions": transitions.iter().zip(&audit.records).map(|(view, record)| transition_json(view, record)).collect::<Vec<_>>(),
                         "summary": {
                             "transitions": audit.records.len(),
                             "broken_links": audit.broken_links,
@@ -1043,13 +1068,13 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
                     .map_err(|error| error.to_string())?
                 );
             } else {
-                for (view, record) in response.transitions.iter().zip(&audit.records) {
+                for (view, record) in transitions.iter().zip(&audit.records) {
                     println!("{}", transition_line(view, record));
                 }
                 println!(
                     "{} transition(s) from epoch {from_epoch} (read at applied index {}); links: {} broken; votes: {} disagree; mac: {} verified, {} unsigned, {} unverified, {} MISMATCH",
                     audit.records.len(),
-                    response.read_at_applied_index,
+                    read_at_applied_index,
                     audit.broken_links,
                     audit.vote_disagreements,
                     audit.verified,
@@ -1896,7 +1921,14 @@ pub struct VoteAudit {
     pub recorded: u32,
     pub recomputed: u32,
     pub required: u32,
-    /// The recomputation agrees AND the recorded vote reached the majority.
+    /// The holder answered its own fencing round. The promoter cannot
+    /// establish without the candidate's answer (`LeaderBehind` otherwise),
+    /// so a replicated quorum that omits the holder is evidence nothing
+    /// real could have produced (review). A standalone promotion has no
+    /// quorum and nothing to answer.
+    pub holder_answered: bool,
+    /// The recomputation agrees, the holder answered, no replica is
+    /// counted twice, AND the recorded vote reached the majority.
     pub ok: bool,
 }
 
@@ -1981,7 +2013,9 @@ pub fn audit_transitions(
     // above the epoch asked for, is a missing record, not a legitimate
     // silence. Continuity is on the epoch, not the holder: a released lease
     // is followed by a grant from nobody, legitimately.
-    let mut expected_to = from_epoch;
+    // Epoch 0 is the range's genesis, established by no transition: asked
+    // from 0, the first record to expect is the one that made epoch 1.
+    let mut expected_to = from_epoch.max(1);
     for view in views {
         let link_ok = view.epoch_to == expected_to && view.epoch_from + 1 == view.epoch_to;
         if !link_ok {
@@ -2012,17 +2046,19 @@ pub fn audit_transitions(
                     }
                 }
                 // The holder's own offset, as the promoter used it: its
-                // answer in the quorum, else the boundary it established.
-                let candidate_offset = answers
-                    .get(&view.holder_to)
-                    .copied()
-                    .or(*boundary_offset)
-                    .unwrap_or(0);
+                // answer in the quorum. A standalone promotion (no quorum,
+                // nothing required) has no answer to give; a replicated one
+                // without the holder's answer is not evidence at all.
+                let standalone = quorum.is_empty() && *required == 0;
+                let holder_answer = answers.get(&view.holder_to).copied();
+                let holder_answered = standalone || holder_answer.is_some();
+                let candidate_offset = holder_answer.or(*boundary_offset).unwrap_or(0);
                 let recomputed = answers
                     .values()
                     .filter(|offset| **offset <= candidate_offset)
                     .count() as u32;
-                let ok = !duplicated && recomputed == *votes && *votes >= *required;
+                let ok =
+                    holder_answered && !duplicated && recomputed == *votes && *votes >= *required;
                 if !ok {
                     audit.vote_disagreements += 1;
                 }
@@ -2030,6 +2066,7 @@ pub fn audit_transitions(
                     recorded: *votes,
                     recomputed,
                     required: *required,
+                    holder_answered,
                     ok,
                 })
             }
@@ -2090,7 +2127,13 @@ fn outcome_text(view: &AdminTransitionView, record: &TransitionAudit) -> String 
                             vote.recorded,
                             vote.required,
                             vote.recomputed,
-                            if vote.ok { "ok" } else { "VOTE MISMATCH" }
+                            if vote.ok {
+                                "ok"
+                            } else if !vote.holder_answered {
+                                "HOLDER ABSENT FROM QUORUM"
+                            } else {
+                                "VOTE MISMATCH"
+                            }
                         )
                     })
                     .unwrap_or_default();
@@ -2172,7 +2215,7 @@ fn transition_json(view: &AdminTransitionView, record: &TransitionAudit) -> serd
         "granted_apply_index": view.granted_apply_index,
         "link_ok": record.link_ok,
         "vote": record.vote.as_ref().map(|vote| serde_json::json!({
-            "recorded": vote.recorded, "recomputed": vote.recomputed, "required": vote.required, "ok": vote.ok,
+            "recorded": vote.recorded, "recomputed": vote.recomputed, "required": vote.required, "holder_answered": vote.holder_answered, "ok": vote.ok,
         })),
         "mac": record.mac.word(),
         "outcome": outcome,
@@ -2599,6 +2642,13 @@ client_key: /tmp/client.key
             (vote.recorded, vote.recomputed, vote.required, vote.ok),
             (2, 2, 2, true)
         );
+        assert!(
+            audit_transitions(&views, Some(&key), topic, range, 0)
+                .unwrap()
+                .verdict()
+                .is_ok(),
+            "asked from the genesis epoch 0, the chain that made epoch 1 is intact"
+        );
         assert!(audit.records[1].vote.is_none() && audit.records[2].vote.is_none());
 
         let relabelled =
@@ -2665,6 +2715,40 @@ client_key: /tmp/client.key
             (vote.recomputed, vote.ok),
             (1, false),
             "the holder twice is one replica"
+        );
+
+        // A replicated quorum that omits the holder is evidence nothing real
+        // could have produced (review); a standalone promotion has none.
+        let mut absent = views.clone();
+        if let TransitionOutcome::Reported {
+            outcome: PromotionOutcome::Established { quorum, .. },
+            ..
+        } = &mut absent[0].outcome
+        {
+            quorum.retain(|answer| answer.node_uuid != holder_a);
+        }
+        absent[0].mac = Some(absent[0].record().mac(&key, topic, range).unwrap());
+        let gone = audit_transitions(&absent, Some(&key), topic, range, 1).unwrap();
+        let vote = gone.records[0].vote.as_ref().unwrap();
+        assert!(!vote.holder_answered && !vote.ok, "{vote:?}");
+        assert!(transition_line(&absent[0], &gone.records[0]).contains("HOLDER ABSENT"));
+        let mut standalone = views.clone();
+        standalone[0].outcome = TransitionOutcome::Reported {
+            outcome: PromotionOutcome::Established {
+                boundary_offset: None,
+                sealed_prefix_end: None,
+                quorum: Vec::new(),
+                votes: 0,
+                required: 0,
+            },
+            reported_at_ms: 1_500,
+            reported_apply_index: 12,
+        };
+        standalone[0].mac = Some(standalone[0].record().mac(&key, topic, range).unwrap());
+        let alone = audit_transitions(&standalone, Some(&key), topic, range, 1).unwrap();
+        assert!(
+            alone.records[0].vote.as_ref().unwrap().ok,
+            "nothing to answer, nothing missing"
         );
 
         let mut overstated = views.clone();
