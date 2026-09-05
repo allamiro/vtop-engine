@@ -767,8 +767,8 @@ fn connect(config: &MetaAdminConfig) -> Result<AdminClient, String> {
             return Err(
                 "TLS material is needed — the admin config is `transport: tls` (the default), \
                  or a peer is — but ca_cert, client_cert and client_key are not all set: give \
-                 the PEM paths, or set `transport: plaintext` on the config and every peer \
-                 whose admin_transport is plaintext"
+                 the PEM paths, or set `transport: plaintext` on the config and change any peer \
+                 with `transport: tls` to `transport: plaintext`"
                     .to_owned(),
             );
         };

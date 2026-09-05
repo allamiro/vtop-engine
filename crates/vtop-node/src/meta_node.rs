@@ -101,6 +101,12 @@ pub async fn serve(
         PlaneTransport::Tls => Some(tls::meta_material(config.tls_for("admin")?)?),
         PlaneTransport::Plaintext | PlaneTransport::PlaintextOnAnyInterface => None,
     };
+    // And a policy the admin plane could never enforce (review): refused
+    // from the config, here, rather than by the server after Raft is up.
+    crate::config::refuse_unenforceable_admin_policy(
+        config.admin_transport,
+        config.admin_authorization.is_some(),
+    )?;
     let env = Env::real();
     let node = start_meta_node(
         &env,

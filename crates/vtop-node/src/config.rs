@@ -662,6 +662,31 @@ pub fn lease_tls_missing_for_peers(peers: &[LeaseAdminPeer]) -> String {
     )
 }
 
+/// An enforcing admin policy on a plaintext admin plane can never apply —
+/// there is no certificate, so no caller identity to match — and
+/// `AdminServer::plaintext` refuses it. Judged HERE too, from the config
+/// alone (review): the server is built after Raft has started, and a node
+/// that can never expose its admin endpoint must fail before it campaigns.
+pub fn refuse_unenforceable_admin_policy(
+    transport: PlaneTransport,
+    policy_present: bool,
+) -> Result<(), String> {
+    if matches!(transport, PlaneTransport::Tls) || !policy_present {
+        return Ok(());
+    }
+    let knob = match transport {
+        PlaneTransport::Tls => unreachable!("returned above"),
+        PlaneTransport::Plaintext => "plaintext",
+        PlaneTransport::PlaintextOnAnyInterface => "plaintext-on-any-interface",
+    };
+    Err(format!(
+        "`admin_transport: {knob}` cannot enforce `admin_authorization`: without a client \
+         certificate there is no caller identity to match, so the policy would be a fiction. \
+         Remove the policy (a plaintext admin plane permits every reachable peer, and says so at \
+         startup), or serve the plane with `admin_transport: tls`"
+    ))
+}
+
 /// Whether dialing the admin plane needs TLS material at all (#294): when the
 /// lease's own transport is TLS, or any redirect peer's is.
 pub fn lease_needs_tls(transport: ClientTransport, peers: &[LeaseAdminPeer]) -> bool {
@@ -754,6 +779,26 @@ mod transport_tests {
     /// #294 (review): a redirect peer may be on the other side of a rolling
     /// transport migration, and the lease client keeps TLS material as long
     /// as any peer needs it.
+    /// A policy no plaintext plane can enforce is refused from the config
+    /// alone (review), before Raft could start.
+    #[test]
+    fn an_admin_policy_on_a_plaintext_admin_plane_is_refused_by_the_config() {
+        use PlaneTransport::*;
+        assert!(refuse_unenforceable_admin_policy(Tls, true).is_ok());
+        assert!(refuse_unenforceable_admin_policy(Plaintext, false).is_ok());
+        let refused = refuse_unenforceable_admin_policy(Plaintext, true).unwrap_err();
+        assert!(
+            refused.contains("`admin_transport: plaintext`")
+                && refused.contains("`admin_transport: tls`"),
+            "{refused}"
+        );
+        assert!(
+            refuse_unenforceable_admin_policy(PlaintextOnAnyInterface, true)
+                .unwrap_err()
+                .contains("plaintext-on-any-interface")
+        );
+    }
+
     /// The refusal blames the peer, not the lease (review).
     #[test]
     fn a_missing_lease_tls_is_blamed_on_the_peer_that_needs_it() {
