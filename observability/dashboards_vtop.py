@@ -265,6 +265,32 @@ engine = dash(
                desc="Logs carry the high-cardinality detail (batch_id, object "
                     "URI) that must never be a metric label. When a stat above "
                     "goes red, the reason is here."),
+
+        # ---- Retention loss ----------------------------------------------------
+        _row("Retention loss (records the broker removed before the engine read them)", 48),
+        _stat("Lost to retention (total)", {"h": 7, "w": 6, "x": 0, "y": 49},
+              _q('sum(vtop_retention_lost_records_total'
+                 '{tenant=~"$tenant", source_type=~"$source_type"}) or vector(0)',
+                 "lost"),
+              unit="short",
+              thresholds=RED_ON_ANY,
+              desc="Records a Kafka source lost to the broker's retention before "
+                   "the engine read them (#98, #454). The engine counts them and "
+                   "logs a WARN naming the rule; nothing else on this dashboard "
+                   "shows them, and they will never be archived. Any non-zero "
+                   "value is an incident: size retention above worst-case lag, "
+                   "or catch the engine up. The alert rule 'Records lost to "
+                   "retention' fires on any increase."),
+        _panel("Records lost to retention (per minute)", {"h": 7, "w": 18, "x": 6, "y": 49},
+               _q('sum by (tenant, source_type) (increase(vtop_retention_lost_records_total'
+                  '{tenant=~"$tenant", source_type=~"$source_type"}[1m]))',
+                  "{{tenant}}/{{source_type}}"),
+               desc="When the loss happened and how much of it: the broker "
+                    "removes whole segments, so this arrives in steps, one per "
+                    "retention pass that outran the engine. Read it against the "
+                    "Kafka dashboard's lag: loss follows lag that exceeded the "
+                    "topic's retention. (No $format filter: the loss is counted "
+                    "before any record is parsed.)"),
     ],
     ["vtop", "engine"],
 )

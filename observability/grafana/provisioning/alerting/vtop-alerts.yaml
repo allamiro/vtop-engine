@@ -1,0 +1,87 @@
+apiVersion: 1
+
+# The lab's alert rules, file-provisioned (#454). Provisioned rules are
+# read-only in Grafana's UI, which is right for a rule: it should say the same
+# thing in every lab. No contact point is provisioned, so a firing rule shows
+# in Grafana's alert list and on the dashboard's state, and goes nowhere else —
+# wire a contact point and a notification policy for a real deployment.
+#
+# The folder is named by title: Grafana's provisioner creates it at boot with
+# a uid of its own (a folderUid key here is ignored; tested on 13.2), and the
+# dashboard seeder adopts that folder rather than minting a second one with
+# the same name - see seed-dashboards.sh.
+groups:
+  - orgId: 1
+    name: vtop
+    folder: VTOP
+    interval: 1m
+    rules:
+      # The engine counts records a Kafka source lost to the broker's retention
+      # before it read them: `vtop_retention_lost_records_total`, with a WARN
+      # naming the rule when it happens (#98 confirmed it fires: 27,582,996
+      # records in one pass when a 120 s retention outran an engine reading
+      # 6k rec/s against a 200k rec/s inflow). Those records will never be
+      # archived. Any increase is worth a page: the remedy — size retention
+      # above worst-case lag, or catch the engine up — is operational, and
+      # the loss is invisible on every other panel. The counter is
+      # process-local like every counter this exporter serves: a restart in
+      # the same scrape interval as a loss hides the loss from the counter;
+      # the WARN line the adapter logs is the durable record (see README).
+      - uid: vtop-retention-loss
+        title: Records lost to retention
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: mimir
+            model:
+              refId: A
+              instant: true
+              # increase() needs two samples of a series; a counter child that
+              # first appears already at N shows none. The engine primes every
+              # (tenant, source_type) child at zero when it starts, so a loss is
+              # a step from zero; the second branch admits a series that appears
+              # unprimed (an engine older than the primer) at its first sample.
+              expr: sum by (tenant, source_type) (increase(vtop_retention_lost_records_total[5m]) or (vtop_retention_lost_records_total unless vtop_retention_lost_records_total offset 5m))
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+                  operator:
+                    type: and
+                  query:
+                    params: [C]
+                  reducer:
+                    type: last
+                    params: []
+                  type: query
+              intervalMs: 1000
+              maxDataPoints: 43200
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        isPaused: false
+        labels:
+          severity: page
+          service: vtop-engine
+        annotations:
+          summary: "VTOP lost records to Kafka retention"
+          description: >-
+            {{ printf "%.0f" $values.A.Value }} records on tenant {{ $labels.tenant }} ({{ $labels.source_type }})
+            were removed by the broker's retention before the engine read them in the last
+            five minutes. They will never be archived. Size retention above the worst-case
+            lag and check consumer lag; the engine's log carries the WARN naming the rule.
+          runbook_url: "https://github.com/allamiro/vtop-engine/blob/main/observability/README.md#retention-loss"
