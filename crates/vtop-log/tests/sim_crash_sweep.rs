@@ -827,9 +827,10 @@ fn range_record(sequence: u64) -> LogRecord {
     }
 }
 
-fn build_rolled_range(env: &Env) -> SegmentSet {
-    let mut set =
-        SegmentSet::create_in(env, Path::new(ROOT), range_descriptor(), range_config()).unwrap();
+/// The one workload both sweeps run: identical fill, identical roll count
+/// expectations, so the two formats' sweeps cannot silently diverge
+/// (review).
+fn fill_rolled_range(mut set: SegmentSet) -> SegmentSet {
     for sequence in 0..30 {
         set.append_group(
             &[range_record(sequence)],
@@ -845,53 +846,48 @@ fn build_rolled_range(env: &Env) -> SegmentSet {
     set
 }
 
+fn build_rolled_range(env: &Env) -> SegmentSet {
+    fill_rolled_range(
+        SegmentSet::create_in(env, Path::new(ROOT), range_descriptor(), range_config()).unwrap(),
+    )
+}
+
 /// The same rolled workload in the proof-carrying v2 format (#429): the
 /// truncation sweep must hold for the format whose intent marker carries the
 /// extra identity fields, or the marker's v2 arm is proven only by unit
 /// round-trips and never by a crash.
 fn build_rolled_range_v2(env: &Env) -> SegmentSet {
-    let mut set = SegmentSet::create_v2_in(
-        env,
-        Path::new(ROOT),
-        vtop_log::SegmentDescriptorV2 {
-            segment_id: Uuid::from_u128(1),
-            topic: "events.v1".to_owned(),
-            topic_epoch: 7,
-            lineage: RangeLineage::root(Uuid::from_u128(100)),
-            base_offset: 0,
-            segment_generation: 3,
-            creation_node_id: Uuid::from_u128(500),
-            creation_fencing_epoch: 5,
-        },
-        vtop_log::SegmentConfigV2 {
-            max_record_bytes: 256,
-            max_group_bytes: 1024,
-            max_segment_bytes: 4096,
-            // Rolls by COUNT rather than bytes: v2 frames carry proof
-            // overhead, and a byte bound tuned for v1 would make the roll
-            // pattern differ between the two sweeps for no reason the
-            // sweep cares about.
-            max_segment_records: 8,
-            index_stride: 2,
-            // The floor of the permitted range: chunking granularity is
-            // orthogonal to what this sweep exercises.
-            chunk_size: 64 * 1024,
-        },
-    )
-    .unwrap();
-    for sequence in 0..30 {
-        set.append_group(
-            &[range_record(sequence)],
-            Durability::Fsync,
-            Uuid::from_u128(1000 + sequence as u128),
+    fill_rolled_range(
+        SegmentSet::create_v2_in(
+            env,
+            Path::new(ROOT),
+            vtop_log::SegmentDescriptorV2 {
+                segment_id: Uuid::from_u128(1),
+                topic: "events.v1".to_owned(),
+                topic_epoch: 7,
+                lineage: RangeLineage::root(Uuid::from_u128(100)),
+                base_offset: 0,
+                segment_generation: 3,
+                creation_node_id: Uuid::from_u128(500),
+                creation_fencing_epoch: 5,
+            },
+            vtop_log::SegmentConfigV2 {
+                max_record_bytes: 256,
+                max_group_bytes: 1024,
+                max_segment_bytes: 4096,
+                // Rolls by COUNT rather than bytes: v2 frames carry proof
+                // overhead, and a byte bound tuned for v1 would make the roll
+                // pattern differ between the two sweeps for no reason the
+                // sweep cares about.
+                max_segment_records: 8,
+                index_stride: 2,
+                // The floor of the permitted range: chunking granularity is
+                // orthogonal to what this sweep exercises.
+                chunk_size: 64 * 1024,
+            },
         )
-        .unwrap();
-    }
-    assert!(
-        set.sealed().len() >= 2,
-        "the v2 workload must roll at least twice"
-    );
-    set
+        .unwrap(),
+    )
 }
 
 /// Cross-segment truncation sweep: crash before every storage operation of a
