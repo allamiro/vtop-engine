@@ -797,7 +797,56 @@ impl LocalBroker {
     }
 
     /// Enable adaptive cross-session group commit for produce durability.
+    ///
+    /// On a replicated range the group's WORST CASE is judged against the
+    /// replica plane (#453, review): a group of individually admissible
+    /// requests is replicated as one batch frame, and a config that could
+    /// seal a group the plane cannot frame would lose quorum after the
+    /// leader append — the failure the per-request check exists to prevent.
+    /// The defaults (1 MiB, 1,024 records) sit eight times under the frame;
+    /// a config that does not is refused here by name.
     pub fn with_group_commit(mut self, config: GroupCommitConfig) -> BrokerResult<Self> {
+        if self.replicas.is_some() {
+            let limits = crate::replication::REPLICA_LIMITS;
+            let frame = u64::from(limits.max_frame_bytes);
+            let header = vtop_protocol::HEADER_LEN as u64;
+            let per_request = vtop_protocol::replica_append_frame_size(&self.range, &[])
+                .map_err(|problem| BrokerError::InvalidConfig(problem.to_string()))?
+                as u64
+                - header;
+            // How many requests one group can hold: the record threshold seals
+            // at max_records (one record per request at the least), the queue
+            // at max_pending_requests. ONE request never batches — the driver
+            // sends it as a single append, already judged per request — so
+            // only a config that can seal a multi-request group is judged
+            // here (review).
+            let requests = (config.max_records.min(config.max_pending_requests)) as u64;
+            if requests > 1 {
+                // The record bytes a group can reach: whichever bound is met
+                // first (review) — the byte and record thresholds together, or
+                // `requests` admissible requests each carrying the most one
+                // frame allows. A threshold set high to disable itself does
+                // not count against a config the other threshold keeps safe.
+                let single_payload_max = frame.saturating_sub(header + per_request);
+                let by_thresholds = config
+                    .max_bytes
+                    .saturating_add((config.max_records as u64).saturating_mul(16));
+                let by_requests = requests.saturating_mul(single_payload_max);
+                let worst = header
+                    .saturating_add(4)
+                    .saturating_add(requests.saturating_mul(per_request))
+                    .saturating_add(by_thresholds.min(by_requests));
+                if worst > frame {
+                    return Err(BrokerError::InvalidConfig(format!(
+                        "group commit could seal a group of up to {worst} bytes on the wire \
+                         (max_bytes {} + {} records + {requests} requests), more than the \
+                         replica plane frames per append ({frame}); lower max_bytes or \
+                         max_records so a sealed group always fits one replica frame",
+                        config.max_bytes, config.max_records
+                    )));
+                }
+            }
+        }
         self.group_commit = Some(Arc::new(
             GroupCommitCoordinator::new(config).map_err(BrokerError::InvalidConfig)?,
         ));
@@ -1883,6 +1932,22 @@ impl LocalBroker {
                 "brokers with a configured replica set accept only Quorum durability produce requests",
             ));
         }
+        // What the replica plane can frame (#453): a follower refuses a frame
+        // over the plane's limits at decode — from the leader's side that was
+        // a quorum that never arrived, retried by every client as if it might
+        // — while the leader's own session limits admit more than the plane
+        // carries. Judged HERE, before the append, with a code no client
+        // retries and the limit in the message.
+        if self.replicas.is_some() {
+            if let Some(reason) = replica_frame_refusal(&request.range, &request.records) {
+                return Some(error(
+                    request_id,
+                    stream_id,
+                    ErrorCode::InvalidRequest,
+                    &reason,
+                ));
+            }
+        }
         None
     }
 
@@ -2265,6 +2330,44 @@ fn map_metadata_error(error: &MetadataError) -> (ErrorCode, String) {
         MetadataError::InvalidTransition(detail) => (ErrorCode::WrongLineage, detail.clone()),
         MetadataError::Limit(detail) => (ErrorCode::InvalidRequest, detail.clone()),
     }
+}
+
+/// Why the replica plane could not frame these records as one append, if it
+/// could not (#453): more records than `REPLICA_LIMITS.max_records`, or a
+/// frame larger than `REPLICA_LIMITS.max_frame_bytes` — sized byte-exactly
+/// by the protocol's own arithmetic (review), so exactly the frames the wire
+/// would refuse to encode are refused here, and none the wire would carry.
+/// `None` when one append carries them.
+pub(crate) fn replica_frame_refusal(
+    range: &RangeIdentity,
+    records: &[ProduceRecord],
+) -> Option<String> {
+    let limits = crate::replication::REPLICA_LIMITS;
+    if records.len() > limits.max_records as usize {
+        return Some(format!(
+            "produce carries {} records; the replica plane frames at most {} per append and a \
+             follower refuses more at decode — send fewer per request (a stock Kafka client's \
+             default batch is 10,000)",
+            records.len(),
+            limits.max_records
+        ));
+    }
+    let frame = match vtop_protocol::replica_append_frame_size(range, records) {
+        Ok(frame) => frame,
+        Err(problem) => {
+            return Some(format!(
+                "produce cannot be framed for the replica plane: {problem}"
+            ))
+        }
+    };
+    if frame > limits.max_frame_bytes as usize {
+        return Some(format!(
+            "produce would be a {frame}-byte replica frame; the replica plane frames at most {} \
+             bytes per append — send fewer or smaller records per request",
+            limits.max_frame_bytes
+        ));
+    }
+    None
 }
 
 fn error(request_id: u64, stream_id: u64, code: ErrorCode, message: &str) -> WireFrame {

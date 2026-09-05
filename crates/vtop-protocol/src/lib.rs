@@ -733,6 +733,55 @@ pub fn encode_frame(frame: &WireFrame, limits: ProtocolLimits) -> Result<Vec<u8>
     Ok(encoded)
 }
 
+/// The payload a `ReplicaAppendRequest` of `records` under `range` encodes
+/// to, byte-exact: the encoder's own arithmetic, factored out so admission
+/// judges the frame the wire will see and cannot drift from it (#453).
+fn replica_append_payload_size(
+    range: &RangeIdentity,
+    records: &[ProduceRecord],
+) -> Result<usize, ProtocolError> {
+    fn add(total: &mut usize, value: usize) -> Result<(), ProtocolError> {
+        *total = total
+            .checked_add(value)
+            .ok_or_else(|| ProtocolError::Limit("payload length overflow".to_owned()))?;
+        Ok(())
+    }
+    fn bytes_size(value: &[u8]) -> Result<usize, ProtocolError> {
+        let _ = u32::try_from(value.len())
+            .map_err(|_| ProtocolError::Limit("byte string exceeds u32".to_owned()))?;
+        4_usize
+            .checked_add(value.len())
+            .ok_or_else(|| ProtocolError::Limit("byte string length overflow".to_owned()))
+    }
+    validate_topic(&range.topic)?;
+    let mut size = bytes_size(range.topic.as_bytes())?
+        .checked_add(8 + 16 + 8)
+        .ok_or_else(|| ProtocolError::Limit("range length overflow".to_owned()))?;
+    // fencing_epoch, leader_node_id, expected_base_offset, producer_id,
+    // producer_epoch, first_sequence, record count.
+    add(&mut size, 8 + 16 + 8 + 16 + 8 + 8 + 4)?;
+    for record in records {
+        add(&mut size, 8)?; // timestamp
+        add(&mut size, bytes_size(&record.key)?)?;
+        add(&mut size, bytes_size(&record.value)?)?;
+    }
+    Ok(size)
+}
+
+/// The frame a `ReplicaAppendRequest` of `records` under `range` would be on
+/// the wire, byte-exact, header included (#453): what a leader must judge
+/// against a replica plane's `max_frame_bytes` BEFORE appending, so a request
+/// the plane could never carry is refused by name instead of failing a
+/// quorum forever. The record-count bound is judged separately by the caller.
+pub fn replica_append_frame_size(
+    range: &RangeIdentity,
+    records: &[ProduceRecord],
+) -> Result<usize, ProtocolError> {
+    HEADER_LEN
+        .checked_add(replica_append_payload_size(range, records)?)
+        .ok_or_else(|| ProtocolError::Limit("frame length overflow".to_owned()))
+}
+
 fn encoded_payload_size(message: &Message, limits: ProtocolLimits) -> Result<usize, ProtocolError> {
     fn add(total: &mut usize, value: usize) -> Result<(), ProtocolError> {
         *total = total
@@ -832,13 +881,7 @@ fn encoded_payload_size(message: &Message, limits: ProtocolLimits) -> Result<usi
                     ));
                 }
                 record_count(value.records.len(), limits)?;
-                let mut size = range_size(&value.range)? + 8 + 16 + 8 + 16 + 8 + 8 + 4;
-                for record in &value.records {
-                    add(&mut size, 8)?;
-                    add(&mut size, bytes_size(&record.key)?)?;
-                    add(&mut size, bytes_size(&record.value)?)?;
-                }
-                size
+                replica_append_payload_size(&value.range, &value.records)?
             }
             Message::ReplicaAppendResponse(_) => 8,
             Message::CommittedHwmUpdate(value) => range_size(&value.range)? + 8 + 8,
@@ -2026,6 +2069,52 @@ impl<'a> Decoder<'a> {
 
 #[cfg(test)]
 mod tests {
+    /// The admission sizer and the encoder agree to the byte (#453): a
+    /// leader refusing on the sizer refuses exactly the frames the wire
+    /// would refuse to encode.
+    #[test]
+    fn the_replica_append_sizer_matches_the_encoder_to_the_byte() {
+        let range = super::RangeIdentity {
+            topic: "sized.v1".to_owned(),
+            topic_epoch: 3,
+            range_id: uuid::Uuid::from_u128(0x51),
+            range_generation: 1,
+        };
+        for (count, key, value) in [(1, 0, 0), (7, 3, 100), (4096, 16, 1_900)] {
+            let records: Vec<super::ProduceRecord> = (0..count)
+                .map(|i| super::ProduceRecord {
+                    timestamp_millis: i as i64,
+                    key: vec![b'k'; key],
+                    value: vec![b'v'; value],
+                })
+                .collect();
+            let frame = super::WireFrame {
+                request_id: 9,
+                stream_id: 0,
+                message: super::Message::ReplicaAppendRequest(super::ReplicaAppendRequest {
+                    range: range.clone(),
+                    fencing_epoch: 4,
+                    leader_node_id: uuid::Uuid::from_u128(0x52),
+                    expected_base_offset: 77,
+                    producer_id: uuid::Uuid::from_u128(0x53),
+                    producer_epoch: 2,
+                    first_sequence: 5,
+                    records: records.clone(),
+                }),
+            };
+            let limits = super::ProtocolLimits {
+                max_frame_bytes: super::ABSOLUTE_MAX_FRAME_BYTES,
+                max_records: super::ABSOLUTE_MAX_RECORDS,
+            };
+            let encoded = super::encode_frame(&frame, limits).unwrap();
+            assert_eq!(
+                super::replica_append_frame_size(&range, &records).unwrap(),
+                encoded.len(),
+                "{count} records, key {key}, value {value}"
+            );
+        }
+    }
+
     use super::*;
 
     fn limits() -> ProtocolLimits {

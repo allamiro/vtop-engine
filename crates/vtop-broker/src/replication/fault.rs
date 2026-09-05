@@ -565,6 +565,216 @@ mod tests {
         }
     }
 
+    /// The leader refuses what the replica plane cannot frame BEFORE the
+    /// append (#453), with a code no client retries and the limit in the
+    /// message — instead of appending locally and reporting a quorum that
+    /// never arrives while every follower drops the frame at decode.
+    #[test]
+    fn an_append_the_replica_plane_cannot_frame_is_refused_by_the_leader_before_the_append() {
+        use vtop_protocol::{Durability, ErrorCode, Message, ProduceRequest, Role, WireFrame};
+        let meta = MetaFencingEpoch::new(EPOCH);
+        let d0 = tempfile::tempdir().unwrap();
+        let d1 = tempfile::tempdir().unwrap();
+        let dl = tempfile::tempdir().unwrap();
+        let f0 = follower(&d0, 1, Uuid::from_u128(0xA2), &meta);
+        let f1 = follower(&d1, 2, Uuid::from_u128(0xA3), &meta);
+        let replicas: Arc<dyn crate::replication::ReplicaSet> =
+            Arc::new(InProcessReplicaSet::new(vec![f0.clone(), f1.clone()]));
+        let range = range();
+        let leader = crate::LocalBroker::with_replication(
+            open_segment(&dl, 3, &range),
+            ProducerEpochJournal::open(dl.path().join("epochs")).unwrap(),
+            range.clone(),
+            EPOCH,
+            meta.clone(),
+            Uuid::from_u128(0xA1),
+            Some(ClusterCommittedOffset::new(0)),
+            Some(replicas),
+        )
+        .unwrap();
+        let produce_records = |first_sequence: u64, records: Vec<ProduceRecord>| WireFrame {
+            request_id: 1,
+            stream_id: 0,
+            message: Message::ProduceRequest(ProduceRequest {
+                range: range.clone(),
+                fencing_epoch: EPOCH,
+                producer_id: Uuid::from_u128(0xB1),
+                producer_epoch: 1,
+                first_sequence,
+                durability: Durability::Quorum,
+                records,
+            }),
+        };
+        let produce = |first_sequence: u64, count: usize| {
+            produce_records(
+                first_sequence,
+                (0..count)
+                    .map(|i| ProduceRecord {
+                        timestamp_millis: 1,
+                        key: Vec::new(),
+                        value: format!("v{i}").into_bytes(),
+                    })
+                    .collect(),
+            )
+        };
+        let too_many = vtop_protocol::DEFAULT_MAX_RECORDS as usize + 1;
+        let reply = leader.handle(Role::Producer, produce(0, too_many));
+        match reply.message {
+            Message::Error(refusal) => {
+                assert_eq!(refusal.code, ErrorCode::InvalidRequest);
+                assert!(!refusal.retryable, "a client must not retry this as it is");
+                assert!(
+                    refusal.message.contains(&too_many.to_string())
+                        && refusal.message.contains("4096"),
+                    "{}",
+                    refusal.message
+                );
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert_eq!(
+            leader.local_offsets().1,
+            0,
+            "nothing appended on the leader"
+        );
+        assert_eq!(f0.local_committed_offset(), 0, "nothing reached follower 0");
+        assert_eq!(f1.local_committed_offset(), 0, "nothing reached follower 1");
+        // Under the cap the same producer appends with a quorum.
+        let reply = leader.handle(Role::Producer, produce(0, 8));
+        assert!(
+            matches!(reply.message, Message::ProduceResponse(_)),
+            "{:?}",
+            reply.message
+        );
+        assert_eq!(leader.local_offsets().1, 8);
+        // Bytes are judged by the exact frame the wire would see (review):
+        // the largest request that encodes under the plane's cap is admitted,
+        // and one byte per record more is refused.
+        let max = vtop_protocol::DEFAULT_MAX_FRAME_BYTES as usize;
+        let sized = |count: usize, value: usize| -> Vec<ProduceRecord> {
+            (0..count)
+                .map(|_| ProduceRecord {
+                    timestamp_millis: 1,
+                    key: Vec::new(),
+                    value: vec![0_u8; value],
+                })
+                .collect()
+        };
+        let one = vtop_protocol::replica_append_frame_size(&range, &sized(1, 0)).unwrap();
+        let per_record =
+            vtop_protocol::replica_append_frame_size(&range, &sized(2, 0)).unwrap() - one;
+        // 4,096 records: the value size that lands the frame on the cap.
+        let value = (max - one - 4_095 * per_record) / 4_096;
+        let exact = sized(4_096, value);
+        let frame = vtop_protocol::replica_append_frame_size(&range, &exact).unwrap();
+        assert!(
+            frame <= max && frame + 4_096 > max,
+            "frame {frame} sits within one byte per record of {max}"
+        );
+        assert!(
+            crate::replica_frame_refusal(&range, &exact).is_none(),
+            "a frame the wire encodes ({frame} bytes) is admitted, whatever an estimate would say"
+        );
+        let over = sized(4_096, value + 1);
+        let refusal =
+            crate::replica_frame_refusal(&range, &over).expect("4,096 more bytes is over the cap");
+        assert!(
+            refusal.contains("replica frame") && refusal.contains(&max.to_string()),
+            "{refusal}"
+        );
+        // And through the broker (review): refused before the append, with
+        // the leader and both followers where they were.
+        let reply = leader.handle(Role::Producer, produce_records(8, over));
+        match reply.message {
+            Message::Error(refusal) => {
+                assert_eq!(refusal.code, ErrorCode::InvalidRequest);
+                assert!(!refusal.retryable);
+                assert!(
+                    refusal.message.contains("replica frame"),
+                    "{}",
+                    refusal.message
+                );
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert_eq!(
+            leader.local_offsets().1,
+            8,
+            "the over-byte produce appended nothing"
+        );
+        assert_eq!(f0.local_committed_offset(), 8);
+        assert_eq!(f1.local_committed_offset(), 8);
+    }
+
+    /// A group-commit config that could seal a group the replica plane cannot
+    /// frame is refused when the broker is replicated (review): a group of
+    /// admissible requests replicates as ONE batch frame, and one over the
+    /// plane's frame would lose quorum after the leader append.
+    #[test]
+    fn a_group_commit_config_the_plane_cannot_frame_is_refused_on_a_replicated_broker() {
+        use crate::group_commit::GroupCommitConfig;
+        let meta = MetaFencingEpoch::new(EPOCH);
+        let d0 = tempfile::tempdir().unwrap();
+        let f0 = follower(&d0, 1, Uuid::from_u128(0xA2), &meta);
+        let build = |dir: &TempDir, replicated: bool| {
+            let replicas: Option<Arc<dyn crate::replication::ReplicaSet>> =
+                replicated.then(|| Arc::new(InProcessReplicaSet::new(vec![f0.clone()])) as Arc<_>);
+            crate::LocalBroker::with_replication(
+                open_segment(dir, 9, &range()),
+                ProducerEpochJournal::open(dir.path().join("epochs")).unwrap(),
+                range(),
+                EPOCH,
+                meta.clone(),
+                Uuid::from_u128(0xA1),
+                Some(ClusterCommittedOffset::new(0)),
+                replicas,
+            )
+            .unwrap()
+        };
+        let over = GroupCommitConfig {
+            max_bytes: u64::from(vtop_protocol::DEFAULT_MAX_FRAME_BYTES),
+            ..GroupCommitConfig::default()
+        };
+        let d1 = tempfile::tempdir().unwrap();
+        let refused = build(&d1, true)
+            .with_group_commit(over.clone())
+            .err()
+            .expect("refused");
+        assert!(
+            refused.to_string().contains("replica plane frames"),
+            "{refused}"
+        );
+        // A group that can only ever hold ONE request is the per-request
+        // check's business (review): the driver never batches one, and a
+        // threshold set high to disable itself must not fail a config the
+        // other threshold keeps safe.
+        let d4 = tempfile::tempdir().unwrap();
+        assert!(build(&d4, true)
+            .with_group_commit(GroupCommitConfig {
+                max_pending_requests: 1,
+                max_records: 4_096,
+                max_bytes: u64::from(vtop_protocol::DEFAULT_MAX_FRAME_BYTES),
+                ..GroupCommitConfig::default()
+            })
+            .is_ok());
+        let d5 = tempfile::tempdir().unwrap();
+        assert!(build(&d5, true)
+            .with_group_commit(GroupCommitConfig {
+                max_records: 1,
+                max_bytes: u64::MAX,
+                ..GroupCommitConfig::default()
+            })
+            .is_ok());
+        // The defaults sit well under the frame, and a standalone broker
+        // replicates nothing, so neither is judged against the plane.
+        let d2 = tempfile::tempdir().unwrap();
+        assert!(build(&d2, true)
+            .with_group_commit(GroupCommitConfig::default())
+            .is_ok());
+        let d3 = tempfile::tempdir().unwrap();
+        assert!(build(&d3, false).with_group_commit(over).is_ok());
+    }
+
     #[test]
     fn drop_prevents_follower_ack() {
         let meta = MetaFencingEpoch::new(EPOCH);
