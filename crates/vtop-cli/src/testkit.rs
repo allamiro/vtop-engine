@@ -149,6 +149,7 @@ pub fn pipeline<'a>(
 ) -> Pipeline<'a> {
     Pipeline {
         throttles: Arc::default(),
+        attempts: Arc::default(),
         store,
         backend,
         config,

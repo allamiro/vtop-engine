@@ -688,8 +688,9 @@ impl VtopConfig {
         {
             return Err(VtopError::Config(format!(
                 "batching.adaptive_width.min_width must be between 1 and \
-                 batching.max_concurrent_batches ({}): a floor of zero would flush nothing, and \
-                 one above the ceiling is not a floor",
+                 batching.max_concurrent_batches ({}): it is the floor the width controller \
+                 backs off to, checked whether or not the controller is enabled — a config is \
+                 valid whole, not knob by knob",
                 self.batching.max_concurrent_batches
             )));
         }

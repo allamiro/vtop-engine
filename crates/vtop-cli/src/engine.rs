@@ -130,6 +130,9 @@ pub struct Pipeline<'a> {
     /// the engine reads it before and after a cycle to learn whether the
     /// cycle was throttled, which is what the width controller consumes.
     pub throttles: Arc<AtomicU64>,
+    /// Uploads ISSUED, whatever became of them (#102): the width controller
+    /// judges only cycles that reached the store.
+    pub attempts: Arc<AtomicU64>,
     /// Per-bucket provisioning cells for `ensure_bucket` when
     /// `upload.create_bucket` is set. Owned by [`Engine`] and shared into
     /// every pipeline, like `versioned_buckets`, so provisioning runs once
@@ -490,6 +493,7 @@ impl<'a> Pipeline<'a> {
             .map(|h| ObjectChecksum::new(algo.as_str(), h));
 
         let t = Instant::now();
+        self.attempts.fetch_add(1, Ordering::Relaxed);
         if let Err(e) = self
             .backend
             .put_object(&compressed.path, &object_uri, object_ck)
@@ -615,10 +619,24 @@ impl<'a> Pipeline<'a> {
             fail!(format!("manifest authentication verification failed: {e}"));
         }
         // 2) the stored object matches size + checksum,
+        // A throttled verification is the store asking for less traffic too
+        // (review): counted like an upload, so the cycle's verdict sees it.
         let obj_v = self
             .backend
             .verify_object(&object_uri, compressed.size_bytes, object_ck)
-            .await?;
+            .await
+            .inspect_err(|e| {
+                note_upload_throttle(
+                    e,
+                    "object_verify",
+                    [
+                        tenant.as_str(),
+                        source.source_type.as_str(),
+                        format.extension(),
+                    ],
+                    &self.throttles,
+                )
+            })?;
         if !obj_v.passed {
             if let Some(mx) = telemetry::metrics() {
                 mx.verification_failures_total
@@ -635,7 +653,19 @@ impl<'a> Pipeline<'a> {
         let man_v = self
             .backend
             .verify_object(&manifest_uri, manifest_size, manifest_ck)
-            .await?;
+            .await
+            .inspect_err(|e| {
+                note_upload_throttle(
+                    e,
+                    "manifest_verify",
+                    [
+                        tenant.as_str(),
+                        source.source_type.as_str(),
+                        format.extension(),
+                    ],
+                    &self.throttles,
+                )
+            })?;
         if !man_v.passed {
             if let Some(mx) = telemetry::metrics() {
                 mx.verification_failures_total
@@ -1003,7 +1033,7 @@ impl WidthController {
         self.current = if throttled {
             (self.current / 2).max(self.floor)
         } else {
-            (self.current + 1).min(self.ceiling)
+            self.current.saturating_add(1).min(self.ceiling)
         };
         self.current
     }
@@ -1024,6 +1054,8 @@ pub struct Engine {
     versioned_buckets: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Throttles counted across the process, shared into every pipeline (#102).
     throttles: Arc<AtomicU64>,
+    /// Uploads issued across every pipeline, see `Pipeline::attempts`.
+    attempts: Arc<AtomicU64>,
     /// The width controller (#102); consulted only when
     /// `batching.adaptive_width.enabled`.
     width: WidthController,
@@ -1268,6 +1300,7 @@ impl Engine {
             manifest_mac_key,
             versioned_buckets: Arc::default(),
             throttles: Arc::default(),
+            attempts: Arc::default(),
             width,
             provisioned_buckets: Arc::default(),
             pending: HashMap::new(),
@@ -1294,6 +1327,7 @@ impl Engine {
             manifest_mac_key: self.manifest_mac_key.clone(),
             versioned_buckets: Arc::clone(&self.versioned_buckets),
             throttles: Arc::clone(&self.throttles),
+            attempts: Arc::clone(&self.attempts),
             provisioned_buckets: Arc::clone(&self.provisioned_buckets),
         }
     }
@@ -1616,9 +1650,10 @@ impl Engine {
             mx.upload_width.set(limit as i64);
         }
         let throttles_before = self.throttles.load(Ordering::Relaxed);
-        // A cycle with nothing to upload probes nothing (review): idle
-        // polling after a throttle must not walk the width back up.
-        let attempted = !work.is_empty();
+        // A cycle that ISSUED no upload probes nothing (review): idle polling
+        // after a throttle must not walk the width back up, and neither may a
+        // cycle whose batches all failed before reaching the store.
+        let attempts_before = self.attempts.load(Ordering::Relaxed);
         let pipeline = self.pipeline();
         // buffer_unordered keeps `limit` verifies in flight and yields each as
         // it finishes, so a slow upload never holds up the ones behind it.
@@ -1643,7 +1678,9 @@ impl Engine {
 
         // The cycle's verdict for the width controller (#102): any throttle
         // in it halves the next width; none grows it by one.
-        if self.config.batching.adaptive_width.enabled && attempted {
+        if self.config.batching.adaptive_width.enabled
+            && self.attempts.load(Ordering::Relaxed) > attempts_before
+        {
             let throttled = self.throttles.load(Ordering::Relaxed) > throttles_before;
             let before = self.width.width();
             let after = self.width.observe_cycle(throttled);
@@ -2630,6 +2667,9 @@ mod tests {
             vec![2, 3, 4, 5, 6, 7, 8, 8, 8],
             "one per clean cycle, then the ceiling"
         );
+        // A ceiling at the top of the type (review): climbing must saturate.
+        let mut unbounded = WidthController::new(usize::MAX, 1);
+        assert_eq!(unbounded.observe_cycle(false), usize::MAX);
 
         let mut floored = WidthController::new(8, 3);
         assert_eq!(floored.observe_cycle(true), 4);
