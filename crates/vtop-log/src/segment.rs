@@ -1193,6 +1193,16 @@ impl SegmentReader {
         self.header.format_version()
     }
 
+    /// Content bytes this sealed segment holds, format-independent (#429):
+    /// the accounting a truncation or retention pass reports must not care
+    /// which manifest recorded it.
+    pub fn content_bytes(&self) -> u64 {
+        match &self.manifest {
+            AnyManifest::V1(manifest) => manifest.content_bytes,
+            AnyManifest::V2(manifest) => manifest.content_bytes,
+        }
+    }
+
     /// This segment's identity, format-independent.
     ///
     /// Transfer requests name sealed segments by id rather than by offset or

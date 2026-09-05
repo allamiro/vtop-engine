@@ -1264,19 +1264,6 @@ impl SegmentSet {
     /// durable: the next open finishes the truncation instead of reopening
     /// the wreckage.
     fn truncate_across_segments(&mut self, offset: u64) -> VtopLogResult<crate::TruncateOutcome> {
-        // The marker records a v1 segment identity. A v2 range would need the
-        // v2 descriptor fields carried too; until the format does, refuse
-        // loudly rather than have recovery rebuild a tail with the wrong
-        // identity.
-        if self.tail().descriptor_v2().is_some()
-            || self.sealed.iter().any(|r| r.descriptor_v2().is_some())
-        {
-            return Err(LogError::InvalidConfig(
-                "cannot truncate a v2 range across segments: the truncation intent marker \
-                 records a v1 segment identity"
-                    .to_owned(),
-            ));
-        }
         let Some(cut_index) = self
             .sealed
             .iter()
@@ -1314,31 +1301,62 @@ impl SegmentSet {
             ProducerSnapshot::default()
         };
 
-        let mut replacement = self.tail().v1_descriptor_view();
-        replacement.segment_id = Uuid::from_u128(self.env.rng.next_u128());
-        replacement.base_offset = offset;
+        // The replacement takes the TAIL's format (#429): it is the segment
+        // appends continue into, and a v2 tail must come back as a v2
+        // segment with its generation, creation node and creation epoch
+        // carried unchanged — the same fields a rolled successor inherits —
+        // or the rebuilt tail would carry a different identity than the one
+        // it replaced. Only the segment id and base offset are new, exactly
+        // as on a roll.
+        let replacement_id = Uuid::from_u128(self.env.rng.next_u128());
+        let replacement = if let Some(descriptor) = self.tail().descriptor_v2() {
+            let mut descriptor = descriptor.clone();
+            descriptor.segment_id = replacement_id;
+            descriptor.base_offset = offset;
+            crate::truncate_intent::ReplacementTail::V2 {
+                descriptor,
+                config: self
+                    .tail()
+                    .config_v2()
+                    .expect("a v2 tail carries a v2 config"),
+            }
+        } else {
+            let mut descriptor = self.tail().v1_descriptor_view();
+            descriptor.segment_id = replacement_id;
+            descriptor.base_offset = offset;
+            crate::truncate_intent::ReplacementTail::V1 {
+                descriptor,
+                config: self.tail().config(),
+            }
+        };
         let mut doomed: Vec<DoomedSegment> = self.sealed[cut_index..]
             .iter()
             .map(|reader| DoomedSegment {
-                segment_id: reader.manifest().descriptor.segment_id,
+                // The format-agnostic accessor (#429): `manifest()` is
+                // v1-only and panics on a v2 reader, and the doomed list
+                // only needs identity and stem.
+                segment_id: reader.segment_id(),
                 base_offset: reader.base_offset(),
             })
             .collect();
         doomed.push(DoomedSegment {
-            segment_id: self.tail().v1_descriptor_view().segment_id,
+            segment_id: self
+                .tail()
+                .descriptor_v2()
+                .map(|descriptor| descriptor.segment_id)
+                .unwrap_or_else(|| self.tail().v1_descriptor_view().segment_id),
             base_offset: self.tail().base_offset(),
         });
         let intent = TruncateIntent {
             target_offset: offset,
             replacement,
-            config: self.tail().config(),
             doomed,
             inherited,
         };
         let records_removed = self.next_offset() - offset;
         let bytes_removed = self.sealed[cut_index..]
             .iter()
-            .map(|reader| reader.manifest().content_bytes)
+            .map(|reader| reader.content_bytes())
             .sum::<u64>()
             + self.tail().content_bytes();
 
@@ -1537,12 +1555,27 @@ fn finish_truncation(env: &Env, directory: &Path, intent: &TruncateIntent) -> Vt
         )?;
     }
     let replacement_path = directory.join(format!("{stem}.active"));
-    drop(ActiveSegment::create_in(
-        env,
-        &replacement_path,
-        intent.replacement.clone(),
-        intent.config,
-    )?);
+    match &intent.replacement {
+        crate::truncate_intent::ReplacementTail::V1 { descriptor, config } => {
+            drop(ActiveSegment::create_in(
+                env,
+                &replacement_path,
+                descriptor.clone(),
+                *config,
+            )?);
+        }
+        // The marker carried the v2 identity whole (#429), so the rebuild is
+        // as byte-deterministic as v1's: same descriptor, same config, same
+        // chunk size, on every run of recovery.
+        crate::truncate_intent::ReplacementTail::V2 { descriptor, config } => {
+            drop(ActiveSegment::create_v2_in(
+                env,
+                &replacement_path,
+                descriptor.clone(),
+                *config,
+            )?);
+        }
+    }
 
     let marker = directory.join(TRUNCATE_INTENT_FILE);
     env.storage
@@ -2029,11 +2062,103 @@ mod tests {
         replacement.base_offset = target;
         TruncateIntent {
             target_offset: target,
-            replacement,
-            config: config(),
+            replacement: crate::truncate_intent::ReplacementTail::V1 {
+                descriptor: replacement,
+                config: config(),
+            },
             doomed,
             inherited,
         }
+    }
+
+    /// A v2 range truncates across segments with its identity intact (#429):
+    /// the replacement carries the tail's segment generation, creation node
+    /// and creation epoch unchanged — the same fields a rolled successor
+    /// inherits — under a fresh segment id at the cut. Before the intent
+    /// marker could carry these fields, this exact call was refused; the
+    /// refusal's job is now done by carrying them.
+    #[test]
+    fn a_v2_range_truncates_across_segments_with_its_identity_intact() {
+        let directory = tempdir().unwrap();
+        let producer = Uuid::from_u128(43);
+        let mut set = SegmentSet::create_v2_in(
+            &Env::real(),
+            directory.path(),
+            crate::SegmentDescriptorV2 {
+                segment_id: Uuid::from_u128(7),
+                topic: "events.v1".to_owned(),
+                topic_epoch: 7,
+                lineage: RangeLineage::root(Uuid::from_u128(100)),
+                base_offset: 0,
+                segment_generation: 4,
+                creation_node_id: Uuid::from_u128(0xA1),
+                creation_fencing_epoch: 9,
+            },
+            crate::SegmentConfigV2 {
+                max_record_bytes: 256,
+                max_group_bytes: 1024,
+                max_segment_bytes: 4096,
+                max_segment_records: 8,
+                index_stride: 2,
+                chunk_size: 64 * 1024,
+            },
+        )
+        .unwrap();
+        for sequence in 0..40 {
+            set.append_group(
+                &[record(producer, sequence)],
+                Durability::Fsync,
+                Uuid::from_u128(12_000 + sequence as u128),
+            )
+            .unwrap();
+        }
+        assert!(set.sealed().len() >= 2, "need at least two sealed segments");
+        let cut = set.sealed()[1].base_offset();
+        let old_tail_id = set.active().descriptor_v2().unwrap().segment_id;
+
+        let outcome = set.truncate_to(cut).unwrap();
+        assert_eq!(outcome.next_offset, cut);
+        assert!(
+            !directory.path().join(TRUNCATE_INTENT_FILE).exists(),
+            "the marker must be cleared once the truncation completes"
+        );
+        let rebuilt = set
+            .active()
+            .descriptor_v2()
+            .expect("a v2 range must come back as a v2 segment, not fall to v1")
+            .clone();
+        assert_eq!(rebuilt.base_offset, cut);
+        assert_ne!(
+            rebuilt.segment_id, old_tail_id,
+            "the replacement is a new segment, exactly as on a roll"
+        );
+        assert_eq!(
+            (
+                rebuilt.segment_generation,
+                rebuilt.creation_node_id,
+                rebuilt.creation_fencing_epoch,
+            ),
+            (4, Uuid::from_u128(0xA1), 9),
+            "the identity fields ride the marker unchanged — a rebuilt tail with a \
+             different identity than the one it replaced is the failure the old \
+             refusal existed to prevent"
+        );
+        // The producer continues over the retained prefix: the inherited
+        // frontier rode the marker, v2 exactly as v1.
+        set.append_group(
+            &[record(producer, cut)],
+            Durability::Fsync,
+            Uuid::from_u128(90_000),
+        )
+        .unwrap();
+        assert_eq!(set.next_offset(), cut + 1);
+
+        // And the completed layout reopens clean.
+        drop(set);
+        let reopened = SegmentSet::open_in(&Env::real(), directory.path())
+            .unwrap()
+            .expect("the truncated v2 range must reopen");
+        assert_eq!(reopened.next_offset(), cut + 1);
     }
 
     /// A cut at a sealed segment boundary removes whole segments and replaces
@@ -2153,12 +2278,17 @@ mod tests {
             )
             .unwrap();
         }
+        let crate::truncate_intent::ReplacementTail::V1 { descriptor, config } =
+            intent.replacement.clone()
+        else {
+            unreachable!("the staged fixture is v1");
+        };
         drop(
             ActiveSegment::create_in(
                 &Env::real(),
                 directory.path().join(format!("{stem}.active")),
-                intent.replacement.clone(),
-                intent.config,
+                descriptor,
+                config,
             )
             .unwrap(),
         );
@@ -2219,12 +2349,17 @@ mod tests {
             )
             .unwrap();
         }
+        let crate::truncate_intent::ReplacementTail::V1 { descriptor, config } =
+            intent.replacement.clone()
+        else {
+            unreachable!("the staged fixture is v1");
+        };
         drop(
             ActiveSegment::create_in(
                 &Env::real(),
                 directory.path().join(format!("{stem}.active")),
-                intent.replacement.clone(),
-                intent.config,
+                descriptor,
+                config,
             )
             .unwrap(),
         );
@@ -2244,7 +2379,7 @@ mod tests {
         // than minting a new segment per attempt.
         assert_eq!(
             set.active().descriptor().segment_id,
-            intent.replacement.segment_id
+            intent.replacement.segment_id()
         );
         set.append_group(
             &[record(producer, cut)],
@@ -2710,8 +2845,10 @@ mod tests {
         replacement.base_offset = cut;
         let intent = TruncateIntent {
             target_offset: cut,
-            replacement,
-            config: config(),
+            replacement: crate::truncate_intent::ReplacementTail::V1 {
+                descriptor: replacement,
+                config: config(),
+            },
             doomed: vec![DoomedSegment {
                 segment_id: doomed.segment_id(),
                 base_offset: doomed.base_offset(),
