@@ -456,7 +456,19 @@ impl<'a> Pipeline<'a> {
                 std::sync::Arc::clone(registry.entry(bucket.clone()).or_default())
             };
             if let Err(e) = cell
-                .get_or_try_init(|| async { self.backend.ensure_bucket(&bucket).await })
+                .get_or_try_init(|| async {
+                    note_store_request(
+                        self.backend.ensure_bucket(&bucket).await,
+                        "ensure_bucket",
+                        [
+                            tenant.as_str(),
+                            source.source_type.as_str(),
+                            format.extension(),
+                        ],
+                        &self.attempts,
+                        &self.throttles,
+                    )
+                })
                 .await
             {
                 fail!(format!("ensure_bucket {bucket} failed: {e}"));
@@ -476,7 +488,17 @@ impl<'a> Pipeline<'a> {
             }
             let checked = self.versioned_buckets.lock().unwrap().contains(&bucket);
             if !checked {
-                if let Err(e) = self.backend.verify_bucket_versioning(&bucket).await {
+                if let Err(e) = note_store_request(
+                    self.backend.verify_bucket_versioning(&bucket).await,
+                    "bucket_versioning",
+                    [
+                        tenant.as_str(),
+                        source.source_type.as_str(),
+                        format.extension(),
+                    ],
+                    &self.attempts,
+                    &self.throttles,
+                ) {
                     fail!(format!("bucket versioning preflight failed: {e}"));
                 }
                 self.versioned_buckets
@@ -569,6 +591,7 @@ impl<'a> Pipeline<'a> {
 
         // ---- OBJECT_UPLOADED -> MANIFEST_UPLOADED -----------------------
         let t = Instant::now();
+        self.attempts.fetch_add(1, Ordering::Relaxed);
         let stored_manifest = match self
             .backend
             .put_manifest(&manifest_path, &manifest_uri, manifest_ck)
@@ -621,6 +644,7 @@ impl<'a> Pipeline<'a> {
         // 2) the stored object matches size + checksum,
         // A throttled verification is the store asking for less traffic too
         // (review): counted like an upload, so the cycle's verdict sees it.
+        self.attempts.fetch_add(1, Ordering::Relaxed);
         let obj_v = self
             .backend
             .verify_object(&object_uri, compressed.size_bytes, object_ck)
@@ -650,6 +674,7 @@ impl<'a> Pipeline<'a> {
             fail!(format!("object verification failed: {}", obj_v.message));
         }
         // 3) the stored manifest matches size + checksum.
+        self.attempts.fetch_add(1, Ordering::Relaxed);
         let man_v = self
             .backend
             .verify_object(&manifest_uri, manifest_size, manifest_ck)
@@ -687,18 +712,28 @@ impl<'a> Pipeline<'a> {
             // When storage assigned a version, authenticate the bytes of that
             // exact immutable version — the same bytes recovery will pin to —
             // instead of whatever currently sits at the key.
-            let stored_read = match stored_manifest.version_id.as_deref() {
-                Some(version) => {
-                    self.backend
-                        .get_manifest_pinned(&manifest_uri, version, MAX_MANIFEST_BYTES)
-                        .await
-                }
-                None => {
-                    self.backend
-                        .get_object_bounded(&manifest_uri, MAX_MANIFEST_BYTES)
-                        .await
-                }
-            };
+            let stored_read = note_store_request(
+                match stored_manifest.version_id.as_deref() {
+                    Some(version) => {
+                        self.backend
+                            .get_manifest_pinned(&manifest_uri, version, MAX_MANIFEST_BYTES)
+                            .await
+                    }
+                    None => {
+                        self.backend
+                            .get_object_bounded(&manifest_uri, MAX_MANIFEST_BYTES)
+                            .await
+                    }
+                },
+                "manifest_readback",
+                [
+                    tenant.as_str(),
+                    source.source_type.as_str(),
+                    format.extension(),
+                ],
+                &self.attempts,
+                &self.throttles,
+            );
             let stored_bytes = match stored_read {
                 Ok(bytes) => bytes,
                 Err(e) => fail!(format!("stored manifest download failed: {e}")),
@@ -983,6 +1018,24 @@ impl PendingBuffer {
 /// fails and replays either way; what changes is what an operator sees. A
 /// store asking for less is a signal a same-rate retry only worsens, and
 /// until #102's controller consumes it, the counter is how it is seen.
+/// Every store request feeds the cycle's verdict (review): it is an attempt,
+/// and a throttle on it is a throttle — a preflight before the first upload
+/// and a read-back after the last one included, since the store asks for less
+/// traffic on any of them.
+fn note_store_request<T>(
+    result: Result<T, VtopError>,
+    stage: &str,
+    labels: [&str; 3],
+    attempts: &AtomicU64,
+    throttles: &AtomicU64,
+) -> Result<T, VtopError> {
+    attempts.fetch_add(1, Ordering::Relaxed);
+    if let Err(error) = &result {
+        note_upload_throttle(error, stage, labels, throttles);
+    }
+    result
+}
+
 fn note_upload_throttle(error: &VtopError, stage: &str, labels: [&str; 3], throttles: &AtomicU64) {
     if !error.is_upload_throttle() {
         return;
@@ -2653,6 +2706,40 @@ mod tests {
     /// The width controller alone (#102): halves on a throttle, never below
     /// the floor; grows by one on a clean cycle, never above the ceiling;
     /// and recovers all the way back once the store goes quiet.
+    #[test]
+    fn a_store_request_is_an_attempt_and_a_throttled_one_is_a_throttle() {
+        let attempts = AtomicU64::new(0);
+        let throttles = AtomicU64::new(0);
+        let labels = ["t", "file", "csv"];
+        assert!(note_store_request(Ok(()), "ensure_bucket", labels, &attempts, &throttles).is_ok());
+        assert!(note_store_request::<()>(
+            Err(VtopError::UploadThrottled("slow down".into())),
+            "bucket_versioning",
+            labels,
+            &attempts,
+            &throttles
+        )
+        .is_err());
+        assert!(note_store_request::<()>(
+            Err(VtopError::Config("not a throttle".into())),
+            "manifest_readback",
+            labels,
+            &attempts,
+            &throttles
+        )
+        .is_err());
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            3,
+            "every request is an attempt"
+        );
+        assert_eq!(
+            throttles.load(Ordering::Relaxed),
+            1,
+            "only the throttled one is a throttle"
+        );
+    }
+
     #[test]
     fn the_width_controller_halves_on_throttle_and_climbs_back_to_the_ceiling() {
         let mut width = WidthController::new(8, 1);
