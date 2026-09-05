@@ -399,19 +399,38 @@ pub fn addr_from_env() -> Option<SocketAddr> {
 /// Never returns an error: a telemetry problem must not stop the process.
 pub async fn maybe_start_from_env(source: Arc<dyn MetricsSource>) -> Option<SocketAddr> {
     let addr = addr_from_env()?;
-    let tls = match tls_from_env() {
-        Ok(tls) => tls,
+    let tls = tls_from_env_or_disabled()?;
+    start_lenient(addr, source, tls).await
+}
+
+/// The TLS preflight for the env form (review): validated BEFORE a caller
+/// builds anything it would otherwise pay for — the engine initializes its
+/// registry only once both the address and the TLS half are usable, since a
+/// registry nobody can scrape is hot-path cost with no observer. Refused,
+/// not downgraded: a misconfigured pair disables the endpoint rather than
+/// serving it plaintext.
+pub fn tls_from_env_or_disabled() -> Option<Option<TlsSettings>> {
+    match tls_from_env() {
+        Ok(tls) => Some(tls),
         Err(reason) => {
-            // Refused, not downgraded: the endpoint stays OFF rather than
-            // coming up plaintext when TLS was asked for and misconfigured.
             tracing::error!(
                 %reason,
                 "metrics endpoint TLS misconfigured; the endpoint is disabled rather than \
                  served plaintext"
             );
-            return None;
+            None
         }
-    };
+    }
+}
+
+/// Start with settings the caller already validated, never failing the
+/// process: the env form's second half, for a caller that ran the
+/// preflights itself.
+pub async fn start_lenient(
+    addr: SocketAddr,
+    source: Arc<dyn MetricsSource>,
+    tls: Option<TlsSettings>,
+) -> Option<SocketAddr> {
     let started = match tls {
         Some(settings) => start_tls(addr, source, settings).await,
         None => start(addr, source).await,

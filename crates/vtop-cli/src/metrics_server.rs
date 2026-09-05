@@ -57,10 +57,13 @@ pub async fn maybe_start() -> Option<SocketAddr> {
     //
     // Shared with the starter rather than re-parsed here, so the accepted
     // formats and the error message cannot drift between the two checks.
-    vtop_observe::addr_from_env()?;
+    let addr = vtop_observe::addr_from_env()?;
+    // And the TLS half (review): a misconfigured pair disables the endpoint,
+    // which must be known before the registry exists for the same reason.
+    let tls = vtop_observe::tls_from_env_or_disabled()?;
     if let Err(e) = telemetry::init() {
         tracing::error!(error = %e, "metrics registry failed to initialize; endpoint disabled");
         return None;
     }
-    vtop_observe::maybe_start_from_env(Arc::new(EngineMetrics)).await
+    vtop_observe::start_lenient(addr, Arc::new(EngineMetrics), tls).await
 }
