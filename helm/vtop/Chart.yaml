@@ -7,15 +7,19 @@ description: >-
   plane. TLS material is never defaulted — you must supply your own Secrets.
 type: application
 # Chart version (the packaging), independent of the application version below.
+# 0.4.0: the transport knobs land — transport.<plane> per plane with
+# acknowledgePlaintext as the named choice, observability.tls for the observe
+# endpoint, conditional Secret mounts and HTTPS probes (#294) — a
+# values-contract change, hence the minor bump; carries appVersion 0.5.0.
 # 0.3.0: deployment.mode lands (colocated default, byte-identical render;
 # separated refuses until slice 2) and cluster.nodeUuids moves to
 # data.nodeUuids (#287) — a values-contract change, hence the minor bump.
 # 0.2.1: no template or values change — the bump carries appVersion 0.4.0.
 # 0.2.0: `replicated` renders symmetric candidates and data.leaderOrdinal is
 # retired (#284) — a values-contract change, hence the minor bump.
-version: 0.3.0
+version: 0.4.0
 # Must track the workspace version in Cargo.toml; the GHCR image tags follow it.
-appVersion: "0.4.0"
+appVersion: "0.5.0"
 kubeVersion: ">=1.25.0-0"
 home: https://github.com/allamiro/vtop-engine
 sources:
