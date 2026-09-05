@@ -1020,31 +1020,22 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
                 .read_range_lease(topic_uuid, range_uuid)
                 .await
                 .map_err(|error| error.to_string())?;
-            let mut transitions = Vec::new();
-            let mut next_from = from_epoch;
-            let mut read_at_applied_index = 0;
-            let mut found = true;
-            loop {
-                let page = client
-                    .read_range_transitions(topic_uuid, range_uuid, next_from, limit)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                if !page.found {
-                    found = false;
-                    break;
-                }
-                read_at_applied_index = page.read_at_applied_index;
-                let Some(last) = page.transitions.last().map(|view| view.epoch_to) else {
-                    break;
-                };
-                transitions.extend(page.transitions);
-                if last == u64::MAX {
-                    break;
-                }
-                next_from = last + 1;
-            }
+            let client_ref = &client;
+            let read = read_chain_consistently(
+                move |next_from, limit| async move {
+                    client_ref
+                        .read_range_transitions(topic_uuid, range_uuid, next_from, limit)
+                        .await
+                        .map_err(|error| error.to_string())
+                },
+                from_epoch,
+                limit,
+            )
+            .await?;
             note_redirects(&client);
-            if !found || !lease.found {
+            let found = read.is_some() && lease.found;
+            let (transitions, read_at_applied_index) = read.unwrap_or_default();
+            if !found {
                 if json {
                     println!("{}", serde_json::json!({ "found": false }));
                 } else {
@@ -2216,6 +2207,65 @@ fn outcome_text(view: &AdminTransitionView, record: &TransitionAudit) -> String 
     }
 }
 
+/// Read a range's whole chain, page after page, and accept only pages that
+/// describe ONE applied state (review): a chain read across several applied
+/// indices may hold a record from before a transition next to one from after
+/// it, and an audit of that is an audit of nothing. Pages carrying the same
+/// index are one read; otherwise the chain is read again and accepted only
+/// when two passes agree — after three disagreeing passes the chain is
+/// moving faster than it can be read, and the audit says so instead of
+/// presenting the last pass as a snapshot.
+///
+/// `Ok(None)` is a range that does not exist.
+async fn read_chain_consistently<F, Fut>(
+    mut fetch: F,
+    from_epoch: u64,
+    limit: u16,
+) -> Result<Option<(Vec<AdminTransitionView>, u64)>, String>
+where
+    F: FnMut(u64, u16) -> Fut,
+    Fut: std::future::Future<
+        Output = Result<vtop_meta::transport::wire::AdminReadRangeTransitionsResponse, String>,
+    >,
+{
+    const PASSES: usize = 3;
+    let mut previous: Option<Vec<AdminTransitionView>> = None;
+    let mut span = (0, 0);
+    for _ in 0..PASSES {
+        let mut chain = Vec::new();
+        let mut next_from = from_epoch;
+        let mut first_index = None;
+        let mut last_index;
+        loop {
+            let page = fetch(next_from, limit).await?;
+            if !page.found {
+                return Ok(None);
+            }
+            first_index.get_or_insert(page.read_at_applied_index);
+            last_index = page.read_at_applied_index;
+            let Some(last) = page.transitions.last().map(|view| view.epoch_to) else {
+                break;
+            };
+            chain.extend(page.transitions);
+            if last == u64::MAX {
+                break;
+            }
+            next_from = last + 1;
+        }
+        let first_index = first_index.unwrap_or(last_index);
+        span = (first_index, last_index);
+        if first_index == last_index || previous.as_ref() == Some(&chain) {
+            return Ok(Some((chain, last_index)));
+        }
+        previous = Some(chain);
+    }
+    Err(format!(
+        "the transition chain changed while it was being read: {PASSES} passes disagreed, the \
+         last spanning applied index {}..{}; re-run the audit",
+        span.0, span.1
+    ))
+}
+
 fn transition_line(view: &AdminTransitionView, record: &TransitionAudit) -> String {
     format!(
         "epoch {}->{} holder {}->{} grant={} granted_at_ms={} apply_index={} link={} outcome={} mac={}",
@@ -2311,6 +2361,101 @@ fn mac_key_from_env(name: &str) -> Result<[u8; 32], String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The chain is accepted only as ONE applied state (review): pages that
+    /// straddle a transition are read again, two agreeing passes are the
+    /// read, and three disagreeing passes are a refusal, not a snapshot.
+    #[tokio::test]
+    async fn a_chain_read_across_applied_states_is_accepted_only_when_two_passes_agree() {
+        use std::cell::RefCell;
+        use std::collections::VecDeque;
+        use vtop_meta::transport::wire::AdminReadRangeTransitionsResponse as Page;
+        use vtop_meta::PromotionRefusal;
+        let holder = Uuid::from_u128(0xa);
+        let view = |epoch_to: u64, outcome: TransitionOutcome| AdminTransitionView {
+            epoch_from: epoch_to - 1,
+            epoch_to,
+            holder_from: None,
+            holder_to: holder,
+            grant: GrantKind::Election,
+            granted_at_ms: 1_000 * epoch_to as i64,
+            granted_apply_index: 10 * epoch_to,
+            outcome,
+            mac: None,
+        };
+        let page = |transitions: Vec<AdminTransitionView>, index: u64| Page {
+            found: true,
+            transitions,
+            read_at_applied_index: index,
+        };
+        let reported = |at: i64| TransitionOutcome::Reported {
+            outcome: PromotionOutcome::Refused {
+                reason: PromotionRefusal::QuorumUnavailable,
+            },
+            reported_at_ms: at,
+            reported_apply_index: 22,
+        };
+        // Pass 1 straddles a transition: epoch 2 is pending on its first
+        // page and the index moves under its second. Pass 2 is one state.
+        let script = RefCell::new(VecDeque::from(vec![
+            page(
+                vec![view(1, reported(1)), view(2, TransitionOutcome::Pending)],
+                10,
+            ),
+            page(vec![view(3, TransitionOutcome::Pending)], 12),
+            page(vec![], 12),
+            page(vec![view(1, reported(1)), view(2, reported(2))], 13),
+            page(vec![view(3, TransitionOutcome::Pending)], 13),
+            page(vec![], 13),
+        ]));
+        let asked = RefCell::new(Vec::new());
+        let fetch = |from: u64, limit: u16| {
+            asked.borrow_mut().push((from, limit));
+            std::future::ready(Ok(script.borrow_mut().pop_front().expect("scripted page")))
+        };
+        let (chain, index) = read_chain_consistently(fetch, 1, 2).await.unwrap().unwrap();
+        assert_eq!(index, 13, "the agreeing pass's index");
+        assert_eq!(chain.len(), 3);
+        assert!(
+            matches!(chain[1].outcome, TransitionOutcome::Reported { .. }),
+            "the second pass's record, not the first's"
+        );
+        assert_eq!(
+            *asked.borrow(),
+            vec![(1, 2), (3, 2), (4, 2), (1, 2), (3, 2), (4, 2)],
+            "paged from the last epoch seen, twice"
+        );
+
+        // Three passes that never agree: a refusal naming the span, not the
+        // last pass dressed as a snapshot.
+        let mut moving = VecDeque::new();
+        for pass in 0..3_i64 {
+            moving.push_back(page(vec![view(1, reported(pass))], 20 + pass as u64 * 2));
+            moving.push_back(page(vec![], 21 + pass as u64 * 2));
+        }
+        let script = RefCell::new(moving);
+        let fetch = |_: u64, _: u16| {
+            std::future::ready(Ok(script.borrow_mut().pop_front().expect("scripted page")))
+        };
+        let refused = read_chain_consistently(fetch, 1, 2).await.unwrap_err();
+        assert!(
+            refused.contains("re-run the audit") && refused.contains("24..25"),
+            "{refused}"
+        );
+
+        // A range that does not exist is `None`, on the first page.
+        let fetch = |_: u64, _: u16| {
+            std::future::ready(Ok(Page {
+                found: false,
+                transitions: Vec::new(),
+                read_at_applied_index: 0,
+            }))
+        };
+        assert!(read_chain_consistently(fetch, 1, 2)
+            .await
+            .unwrap()
+            .is_none());
+    }
 
     #[test]
     fn parse_node_state_accepts_canonical_names() {
