@@ -362,7 +362,14 @@ pub fn is_throttle_status(status: u16) -> bool {
 ///   Requests` / `503 Service Unavailable` status line as any of them may
 ///   relay it from a proxy.
 pub fn looks_throttled(text: &str) -> bool {
-    text.lines().any(line_relays_throttle)
+    // The LAST non-empty line only (review): it is the tool's verdict, and
+    // an earlier line — a retry it reported and recovered from, say — is
+    // not. This is also the line the error message carries.
+    text.lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .is_some_and(line_relays_throttle)
 }
 
 fn line_relays_throttle(line: &str) -> bool {
@@ -390,8 +397,19 @@ fn line_relays_throttle(line: &str) -> bool {
             }
         }
     }
-    // A status line with its reason phrase, as a proxy or mc relays it.
-    if line.contains("429 Too Many Requests") || line.contains("503 Service Unavailable") {
+    // A status line with its reason phrase, as a proxy relays it: the line
+    // IS the status, optionally behind an `HTTP/1.1 ` or `HTTP ` prefix —
+    // not a phrase found somewhere inside a line (review), where an object
+    // key could put it.
+    let status_line = line
+        .trim()
+        .trim_start_matches("HTTP/1.1 ")
+        .trim_start_matches("HTTP/1.0 ")
+        .trim_start_matches("HTTP/2 ")
+        .trim_start_matches("HTTP ");
+    if status_line.starts_with("429 Too Many Requests")
+        || status_line.starts_with("503 Service Unavailable")
+    {
         return true;
     }
     // S3's message for every throttle, which mc relays without the code.
@@ -623,6 +641,7 @@ mod throttle_tests {
             "An error occurred (Throttling) when calling the PutObject operation",
             "upload failed: s3://bucket/key\nAn error occurred (RequestLimitExceeded) when calling the PutObject operation",
             "HTTP 429 Too Many Requests",
+            "HTTP/1.1 503 Service Unavailable",
             "503 Service Unavailable",
         ] {
             assert!(looks_throttled(relayed), "{relayed}");
@@ -636,6 +655,8 @@ mod throttle_tests {
             "ERROR: S3 error: 403 (AccessDenied)",
             "mc: <ERROR> Unable to validate source `x`: file does not exist",
             "connection reset by peer",
+            // An earlier line's throttle is not the verdict (review).
+            "An error occurred (SlowDown) when calling the PutObject operation; retrying\nAn error occurred (AccessDenied) when calling the PutObject operation",
             // A key that happens to be named after a code is not a code (review).
             "An error occurred (AccessDenied) when calling the PutObject operation: s3://bucket/SlowDown/Throttling.log",
             "upload failed: s3://bucket/TooManyRequests/file to s3://bucket/503 Service/Unavailable",

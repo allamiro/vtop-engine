@@ -510,17 +510,21 @@ impl UploadBackend for S3NativeBackend {
                 Ok(())
             }
             Err(e) => {
-                let se = e.into_service_error();
-                let msg = se.to_string().to_lowercase();
-                if msg.contains("alreadyexists")
-                    || msg.contains("already exists")
-                    || msg.contains("alreadyownedbyyou")
-                    || msg.contains("already owned")
-                    || msg.contains("bucketalreadyownedbyyou")
-                {
+                // Idempotence first, on the service error's own words; then
+                // the same classification as every other request (review),
+                // so a throttled CreateBucket is a throttle, not a mystery.
+                let already_owned = matches!(&e, SdkError::ServiceError(context) if {
+                    let msg = context.err().to_string().to_lowercase();
+                    msg.contains("alreadyexists")
+                        || msg.contains("already exists")
+                        || msg.contains("alreadyownedbyyou")
+                        || msg.contains("already owned")
+                        || msg.contains("bucketalreadyownedbyyou")
+                });
+                if already_owned {
                     Ok(())
                 } else {
-                    Err(VtopError::Upload(format!("create_bucket {bucket}: {se}")))
+                    Err(sdk_failure("create_bucket", bucket, e))
                 }
             }
         }
