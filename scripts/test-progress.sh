@@ -83,6 +83,7 @@ bar() { # <done> <total> <label>
 # ---------------------------------------------------------------------------
 cargo_args=(); bin_args=(); metadata_args=(); packages=(); excludes=(); config_overrides=()
 past_sep=0; expect_value=""; workspace_flag=0; target_selected=0; doc_only=0; no_run=0; target_args=0
+target_selectors=(); pending_selector=""
 TARGET_ARG=""; MANIFEST_PATH=""
 for arg in "$@"; do
   if (( past_sep )); then
@@ -95,6 +96,9 @@ for arg in "$@"; do
   fi
   if [[ -n "$expect_value" ]]; then
     cargo_args+=("$arg")
+    if [[ -n "${pending_selector:-}" ]]; then
+      target_selectors+=("${pending_selector}=${arg}"); pending_selector=""
+    fi
     case "$expect_value" in
       -p|--package) packages+=("$arg") ;;
       --exclude) excludes+=("$arg") ;;
@@ -153,14 +157,14 @@ for arg in "$@"; do
       no_run=1 ;;
     --lib|--bins|--tests|--examples|--benches|--all-targets|\
     --test=*|--bin=*|--example=*|--bench=*)
-      cargo_args+=("$arg"); target_selected=1 ;;
+      cargo_args+=("$arg"); target_selected=1; target_selectors+=("$arg") ;;
     -*)
       cargo_args+=("$arg") ;;
     *)
       bin_args+=("$arg") ;;
   esac
   case "$arg" in
-    --test|--bin|--example|--bench) target_selected=1 ;;
+    --test|--bin|--example|--bench) target_selected=1; pending_selector="$arg" ;;
   esac
 done
 [[ -z "$expect_value" ]] || die "option $expect_value is missing its value"
@@ -294,7 +298,11 @@ with open(sys.argv[2]) as handle:
 workspace_flag = sys.argv[3] == "1"
 manifest_path = sys.argv[4]
 count = int(sys.argv[5])
-selected, excluded = sys.argv[6:6 + count], sys.argv[6 + count:]
+selected = sys.argv[6:6 + count]
+excluded_count = int(sys.argv[6 + count])
+excluded = sys.argv[7 + count:7 + count + excluded_count]
+# Whatever follows the selection is the mode's own arguments.
+extra = sys.argv[7 + count + excluded_count:]
 by_id = {package["id"]: package for package in meta["packages"]}
 members = meta["workspace_members"]
 default_members = meta.get("workspace_default_members") or members
@@ -363,21 +371,72 @@ if mode == "libs":
     # cargo, so it must not be counted as one here. A proc-macro crate IS
     # a library for this purpose: cargo runs its doctests too, under a
     # target kind that names neither lib nor rlib.
+    # An explicit `--doc` (the `all` flag) runs the unit even for a library
+    # with `doctest = false` (review), so the flag is honoured only when the
+    # doctests ride along with a default run.
+    every = extra[:1] == ["all"]
     print(sum(1 for pid in roots if any(
         any(kind in target["kind"] for kind in ("lib", "rlib", "proc-macro"))
-        and target.get("doctest", True)
+        and (every or target.get("doctest", True))
         for target in by_id[pid]["targets"])))
     sys.exit(0)
 if mode == "harnessless":
+    # `cargo metadata` does not carry the `harness` field (review), so it is
+    # read from each root's manifest: a `[lib]`, `[[bin]]`, `[[test]]`,
+    # `[[bench]]` or `[[example]]` table with `harness = false`, matched to
+    # the metadata target of the same kind and name for its source path.
+    import tomllib
+    kinds = {"lib": ("lib",), "bin": ("bin",), "test": ("test",), "bench": ("bench",), "example": ("example",)}
     for pid in roots:
         package = by_id[pid]
         root = os.path.dirname(package["manifest_path"])
-        for target in package["targets"]:
-            if target.get("harness", True):
+        try:
+            with open(package["manifest_path"], "rb") as handle:
+                manifest = tomllib.load(handle)
+        except (OSError, tomllib.TOMLDecodeError):
+            continue
+        for table, want in kinds.items():
+            entries = manifest.get(table)
+            if entries is None:
                 continue
-            if not any(kind in target["kind"] for kind in ("test", "lib", "rlib", "bin", "bench", "example")):
+            if isinstance(entries, dict):
+                entries = [entries]
+            for entry in entries:
+                if entry.get("harness", True):
+                    continue
+                name = entry.get("name") or package["name"].replace("-", "_")
+                for target in package["targets"]:
+                    if target["name"] == name and any(kind in target["kind"] for kind in want + ("rlib",)):
+                        print(os.path.relpath(target["src_path"], root))
+    sys.exit(0)
+if mode == "roots-for-targets":
+    # Which selected roots a target selector reaches (review): `--lib` builds
+    # only packages with a library, `--test NAME` only the package that has
+    # that test, and so on; a package the selectors cannot reach is not in
+    # the graph cargo compiles.
+    selectors = extra
+    def reached(package):
+        for selector in selectors:
+            if selector == "--all-targets":
+                return True
+            flag, _, name = selector.partition("=")
+            kinds = {"--lib": ("lib", "rlib", "proc-macro"), "--bins": ("bin",), "--bin": ("bin",),
+                     "--tests": ("test", "lib", "rlib", "bin"), "--test": ("test",),
+                     "--examples": ("example",), "--example": ("example",),
+                     "--benches": ("bench",), "--bench": ("bench",)}.get(flag)
+            if not kinds:
                 continue
-            print(os.path.relpath(target["src_path"], root))
+            for target in package["targets"]:
+                if any(kind in target["kind"] for kind in kinds) and (not name or target["name"] == name):
+                    return True
+        return False
+    for pid in roots:
+        if reached(by_id[pid]):
+            print(pid)
+    sys.exit(0)
+if mode == "roots":
+    for pid in roots:
+        print(pid)
     sys.exit(0)
 sys.exit("unknown mode " + mode)
 PY
@@ -395,9 +454,11 @@ for line in open(sys.argv[1]):
         seen.add(exe)
 print(len(seen))
 PY
-closure() { # <mode> — the closure helper over the resolved metadata
-  python3 "$WORK/closure.py" "$1" "$WORK/metadata.json" "$workspace_flag" "$MANIFEST_PATH" \
-    "${#packages[@]}" ${packages[@]+"${packages[@]}"} ${excludes[@]+"${excludes[@]}"}
+closure() { # <mode> [extra args...] — the closure helper over the resolved metadata
+  local mode="$1"; shift
+  python3 "$WORK/closure.py" "$mode" "$WORK/metadata.json" "$workspace_flag" "$MANIFEST_PATH" \
+    "${#packages[@]}" ${packages[@]+"${packages[@]}"} \
+    "${#excludes[@]}" ${excludes[@]+"${excludes[@]}"} "$@"
 }
 
 cargo metadata --format-version 1 --filter-platform "$TRIPLE" \
@@ -418,6 +479,15 @@ else
   for package in ${packages[@]+"${packages[@]}"}; do
     selection+=(-p "$package")
   done
+fi
+if (( target_selected )); then
+  # A target selector reaches only the packages that have such a target
+  # (review): `--lib` in a workspace with a binary-only member compiles the
+  # library's graph alone. The selection becomes exactly those roots.
+  reached="$(closure roots-for-targets ${target_selectors[@]+"${target_selectors[@]}"})" || exit 2
+  [[ -n "$reached" ]] || die "no selected package has a target the selectors name (${target_selectors[*]})"
+  selection=()
+  while IFS= read -r root; do selection+=(-p "$root"); done <<< "$reached"
 fi
 TOTAL_PACKAGES="$(cargo tree ${selection[@]+"${selection[@]}"} \
     ${metadata_args[@]+"${metadata_args[@]}"} \
@@ -525,7 +595,9 @@ fi
 # Doctest units: one per selected package with a library target, unless a
 # target selector (which skips doctests under cargo) was given.
 DOC_UNITS=0
-if (( ! target_selected )); then
+if (( doc_only )); then
+  DOC_UNITS="$(closure libs all)" || exit 2
+elif (( ! target_selected )); then
   DOC_UNITS="$(closure libs)" || exit 2
 fi
 TOTAL_UNITS=$(( TOTAL_BINS + DOC_UNITS ))
@@ -616,6 +688,19 @@ if [[ "$RUN_RC" -ne 0 ]]; then
     show { print }
     /^test result: / { show = 0 }'
   diagnostics "$WORK/run.log"
+  # A custom harness writes its explanation where libtest would have put a
+  # `failures:` section — anywhere between its `Running` line and the next
+  # status line — so that whole stretch is replayed for each one (review).
+  if [[ -n "$HARNESSLESS" ]]; then
+    plain_log "$WORK/run.log" | awk -v set="$HARNESSLESS" '
+      BEGIN { n = split(set, names, "\n"); for (i = 1; i <= n; i++) if (names[i] != "") custom[names[i]] = 1 }
+      /^[[:space:]]+(Running|Doc-tests) / {
+        unit = $0
+        sub(/^[[:space:]]+(Running|Doc-tests) (unittests )?/, "", unit); sub(/ \(.*\)$/, "", unit)
+        show = (unit in custom); if (show) print $0; next
+      }
+      show { print }'
+  fi
   printf '\n%s%d passed, %d failed%s\n' "$RED" "$passed" "$failed" "$RESET"
   exit "$RUN_RC"
 fi
