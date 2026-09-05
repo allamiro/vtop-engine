@@ -482,6 +482,10 @@ async fn accept_loop(
                 };
                 let source = Arc::clone(&source);
                 let acceptor = acceptor.clone();
+                // ONE deadline from accept (review): the handshake's shorter
+                // limit sits inside it, so a TLS peer cannot hold a permit
+                // for a handshake budget and then a whole connection's.
+                let deadline = tokio::time::Instant::now() + CONNECTION_DEADLINE;
                 tokio::spawn(async move {
                     match acceptor {
                         // The transport is the one configured, never
@@ -494,7 +498,7 @@ async fn accept_loop(
                             )
                             .await
                             {
-                                Ok(Ok(tls)) => serve_io(tls, source, peer).await,
+                                Ok(Ok(tls)) => serve_io(tls, source, peer, deadline).await,
                                 Ok(Err(error)) => {
                                     tracing::debug!(%peer, %error, "metrics TLS handshake failed; closed")
                                 }
@@ -503,7 +507,7 @@ async fn accept_loop(
                                 }
                             }
                         }
-                        None => serve_io(stream, source, peer).await,
+                        None => serve_io(stream, source, peer, deadline).await,
                     }
                     drop(permit);
                 });
@@ -531,8 +535,12 @@ async fn accept_loop(
 }
 
 /// One connection, over whichever stream the configured transport produced.
-async fn serve_io<IO>(io: IO, source: Arc<dyn MetricsSource>, peer: SocketAddr)
-where
+async fn serve_io<IO>(
+    io: IO,
+    source: Arc<dyn MetricsSource>,
+    peer: SocketAddr,
+    deadline: tokio::time::Instant,
+) where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let service = service_fn(move |req| {
@@ -552,7 +560,7 @@ where
         // rather than holding it for the full connection deadline.
         .header_read_timeout(HEADER_READ_TIMEOUT)
         .serve_connection(TokioIo::new(io), service);
-    match tokio::time::timeout(CONNECTION_DEADLINE, conn).await {
+    match tokio::time::timeout_at(deadline, conn).await {
         Err(_) => {
             tracing::debug!(%peer, "metrics connection hit deadline; closed")
         }
