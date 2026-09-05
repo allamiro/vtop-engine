@@ -51,6 +51,14 @@ def _effective_endpoint(scenario) -> str:
     return os.environ.get("VTOP_S3_ENDPOINT_URL", "") or scenario.get("endpoint_url", "")
 
 
+def _shaped_by_the_bundled_proxy(scenario) -> bool:
+    """True only for a scenario shaped through the bundled `minio` proxy
+    (review): the lab credential fallback follows that proxy's name, and
+    lib/shaping.py refuses a proxy wearing it that forwards anywhere else."""
+    return bool(scenario.get("shaping_api_url")) and str(
+        scenario.get("shaping_proxy", "minio") or "minio") == "minio"
+
+
 def _is_lab_endpoint(endpoint: str, shaped: bool = False) -> bool:
     # The compose stack publishes MinIO on the loopback interface at the
     # FIXED host port 9000 (docker-compose.benchmark.yml pins it; only the
@@ -240,7 +248,7 @@ def _backend_env(scenario) -> dict[str, str]:
     # credentials (already in the environment) winning over the fallbacks.
     if scenario.get("backend") == "minio" or (
             scenario.get("backend") == "s3_native" and endpoint
-            and _is_lab_endpoint(endpoint, shaped=bool(scenario.get("shaping_api_url")))):
+            and _is_lab_endpoint(endpoint, shaped=_shaped_by_the_bundled_proxy(scenario))):
         # The benchmark compose lets an operator override the SERVER's
         # credentials via MINIO_ROOT_USER / MINIO_ROOT_PASSWORD (issue #81).
         # The client must follow the same variables THROUGH THE SAME

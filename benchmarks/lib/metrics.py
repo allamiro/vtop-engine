@@ -24,6 +24,9 @@ CSV_HEADERS: dict[str, list[str]] = {
         "p50_latency_ms", "p95_latency_ms", "p99_latency_ms", "cpu_avg_percent",
         "cpu_max_percent", "memory_avg_mb", "memory_max_mb", "disk_read_mb",
         "disk_write_mb", "network_tx_mb", "network_rx_mb", "error_count",
+        # The pipe the run was measured through (#403); empty when unshaped.
+        "shaping_proxy", "shaping_bandwidth_kbps", "shaping_latency_ms",
+        "shaping_jitter_ms", "shaping_scope",
     ],
     "batch_metrics.csv": [
         "run_id", "batch_id", "scenario_name", "batch_start_time", "batch_end_time",
@@ -131,6 +134,18 @@ def _md_cell(v) -> str:
     )
 
 
+def _shaping_cell(s: dict) -> str:
+    """The pipe a shaped run was measured through, or 'none': a p95 in the
+    human view is never read without it (review)."""
+    shape = s.get("shaping")
+    if not shape:
+        return "none (unshaped)"
+    return _md_cell(
+        f"{shape.get('proxy')}: {shape.get('bandwidth_kbps') or 'unlimited'} KB/s "
+        f"{shape.get('scope', 'per_connection').replace('_', ' ')}, "
+        f"{shape.get('latency_ms')} ms RTT ±{shape.get('jitter_ms')} ms")
+
+
 def _summary_md(s: dict) -> str:
     def g(k):
         return _md_cell(s.get(k, ""))
@@ -171,6 +186,7 @@ def _summary_md(s: dict) -> str:
         f"| CPU avg / max | {g('cpu_avg_percent')}% / {g('cpu_max_percent')}% |",
         f"| Memory avg / max | {g('memory_avg_mb')} / {g('memory_max_mb')} MB |",
         f"| Upload backend | {g('backend')} |",
+        f"| Shaped pipe (#403) | {_shaping_cell(s)} |",
         "",
         "## Bottleneck observations",
         "",

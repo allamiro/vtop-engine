@@ -152,16 +152,19 @@ aggregate is the shape times the uploads in flight — scenario 13 keeps
 `shaping_jitter_ms` — and points `endpoint_url` at the proxy on `:9100`. The
 runner installs the toxics for exactly the measured block and removes them on
 every way out of it, so a following unshaped run never inherits the pipe; the
-shape is recorded in `summary.json` under `shaping`, so a p95 is never read
-without the link it was measured through.
+shape is recorded in `summary.json` under `shaping`, as flat `shaping_*`
+columns in `metrics.csv` and the matrix comparison, and as a row in
+`summary.md`, so a p95 is never read without the link it was measured through.
+Toxics are named per run (`vtop_<token>_…`); a proxy already carrying any
+toxic — another run's or a hand-made one — refuses the run rather than stack.
 
 What the run answers, and where to read it:
 
 | question | reads on |
 |----------|----------|
-| does a thin pipe grow the **deficit** or the **queues**? | `backlog_metrics.csv` should climb while `inflight_batches` and memory stay bounded — the #98 hypothesis-1 shape, now reachable on purpose |
-| is the wait attributed honestly? | `object_upload_ms` p95 carries the pipe; `total_ms` grows by the same, not more |
-| what does the controller see? | the raw signal #102's width controller consumes — `object_upload_ms` against the pipe and `upload_throttled_total` when the store pushes back. The controller itself lives in the engine process, and this harness runs one `process-once` per cycle, so its width resets every cycle: observing the back-off needs a long-lived `vtopctl run` against the same shaped stack, which is where the #102 measurement belongs |
+| does a thin pipe grow the **deficit** rather than the process? | `backlog_metrics.csv` should climb while `memory_max_mb` in `metrics.csv` stays bounded — the #98 hypothesis-1 shape, now reachable on purpose. (The engine's own queue gauges, `inflight_batches` and `upload_throttled_total`, are not scraped by this harness; read them off the engine's `/metrics` if you run it with `VTOP_METRICS_ADDR`.) |
+| is the wait attributed honestly? | `object_upload_ms` p95 in `stage_metrics.csv` carries the pipe; `total_ms` grows by the same, not more |
+| what does the controller see? | the raw signal #102's width controller consumes — `object_upload_ms` against the pipe. The controller itself lives in the engine process, and this harness runs one `process-once` per cycle, so its width resets every cycle: observing the back-off (and the throttle counter it reacts to) needs a long-lived `vtopctl run` against the same shaped stack with its `/metrics` scraped, which is where the #102 measurement belongs |
 | what is the control? | the runner unshapes the pipe on every way out, so a following unshaped run of scenario 12 is the comparison — same seeder, same store, no pipe |
 
 ## 8. Clean benchmark data

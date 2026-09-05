@@ -464,6 +464,8 @@ def main() -> int:
         # The pipe the numbers were measured through, or None (#403): a p95
         # is never read without it.
         "shaping": shape.describe() if shape else None,
+        # And flat, for the CSV, the summary table and the matrix (review).
+        **(shape.flat_columns() if shape else {}),
     }
     # CPU/mem summary from the system-metrics samples written during the run.
     summary.update(_sys_summary(writer.dir))

@@ -9,7 +9,7 @@ import pytest
 from lib.engine import _is_lab_endpoint
 from lib.scenario import Scenario, load_scenario
 from lib.shaping import (
-    TOXIC_NAMES,
+    TOXIC_KINDS,
     Shape,
     ShapingError,
     apply,
@@ -34,7 +34,9 @@ class ScriptedClient:
         self.calls.append((method, path, body))
         default = {"GET": 200, "POST": 201, "DELETE": 204}[method]
         status = self.statuses.get((method, path), default)
-        payload = {"name": "minio", "listen": "[::]:9100"} if method == "GET" else None
+        payload = (
+            {"name": "minio", "listen": "[::]:9100", "upstream": "minio:9000", "toxics": []}
+            if method == "GET" else None)
         return status, payload
 
 
@@ -52,10 +54,16 @@ def test_the_shape_is_read_from_flat_keys_and_the_api_url_is_normalized():
     shape = Shape.from_scenario(scenario(
         shaping_api_url="http://127.0.0.1:8474/", shaping_proxy="minio",
         shaping_bandwidth_kbps=1250, shaping_latency_ms=100, shaping_jitter_ms=20))
-    assert shape == Shape("http://127.0.0.1:8474", "minio", 1250, 100, 20)
+    assert (shape.api_url, shape.proxy, shape.bandwidth_kbps, shape.latency_ms, shape.jitter_ms) == (
+        "http://127.0.0.1:8474", "minio", 1250, 100, 20)
+    assert len(shape.run_token) == 8, "a token per run"
     assert shape.describe() == {"proxy": "minio", "bandwidth_kbps": 1250,
                                 "latency_ms": 100, "jitter_ms": 20,
-                                "scope": "per_connection"}
+                                "scope": "per_connection", "run_token": shape.run_token}
+    assert shape.flat_columns() == {"shaping_proxy": "minio", "shaping_bandwidth_kbps": 1250,
+                                    "shaping_latency_ms": 100, "shaping_jitter_ms": 20,
+                                    "shaping_scope": "per_connection"}
+    assert shape.toxic_names() == [f"vtop_{shape.run_token}_{k}" for k in TOXIC_KINDS]
 
 
 def test_a_shaped_run_with_no_shape_is_refused():
@@ -81,7 +89,7 @@ class ResettingRemovalClient(ScriptedClient):
     def request(self, method, path, body=None):
         applied = any(m == "POST" for m, _, _ in self.calls)
         self.calls.append((method, path, body))
-        if method == "DELETE" and applied and path.endswith("vtop_bandwidth_up"):
+        if method == "DELETE" and applied and path.endswith("_bandwidth_up"):
             raise ShapingError("toxiproxy at http://x is not answering (connection reset)")
         return {"GET": 200, "POST": 201, "DELETE": 204}[method], None
 
@@ -90,7 +98,7 @@ def test_cleanup_tries_every_toxic_past_a_transport_error():
     client = ResettingRemovalClient()
     sc = scenario(shaping_api_url="http://127.0.0.1:8474", shaping_bandwidth_kbps=1250,
                   shaping_latency_ms=100)
-    with pytest.raises(ShapingError, match="vtop_bandwidth_up \\(toxiproxy"):
+    with pytest.raises(ShapingError, match="_bandwidth_up \\(toxiproxy"):
         with shaped(sc, client_factory=lambda url: client, log=lambda _: None):
             pass
     tail = [p for m, p, _ in client.calls[-4:] if m == "DELETE"]
@@ -110,7 +118,7 @@ def test_bad_knobs_are_refused_by_name():
 def test_bandwidth_shapes_both_directions_and_latency_splits_the_round_trip():
     shape = Shape("http://x", "minio", 1250, 101, 21)
     toxics = shape.toxics()
-    assert [t["name"] for t in toxics] == list(TOXIC_NAMES)
+    assert [t["name"] for t in toxics] == shape.toxic_names()
     up, down, lat_up, lat_down = toxics
     assert (up["type"], up["stream"], up["attributes"]) == ("bandwidth", "upstream", {"rate": 1250})
     assert (down["stream"], down["attributes"]) == ("downstream", {"rate": 1250})
@@ -123,9 +131,9 @@ def test_bandwidth_shapes_both_directions_and_latency_splits_the_round_trip():
 
 def test_latency_only_and_bandwidth_only_shapes_carry_only_their_toxics():
     assert [t["name"] for t in Shape("http://x", "minio", 0, 100, 0).toxics()] == [
-        "vtop_latency_up", "vtop_latency_down"]
+        "vtop_run_latency_up", "vtop_run_latency_down"]
     assert [t["name"] for t in Shape("http://x", "minio", 500, 0, 0).toxics()] == [
-        "vtop_bandwidth_up", "vtop_bandwidth_down"]
+        "vtop_run_bandwidth_up", "vtop_run_bandwidth_down"]
 
 
 # --------------------------------------------------------------------------
@@ -133,17 +141,43 @@ def test_latency_only_and_bandwidth_only_shapes_carry_only_their_toxics():
 # --------------------------------------------------------------------------
 
 
-def test_apply_checks_the_proxy_replaces_our_toxics_and_installs_the_shape():
+def test_apply_checks_the_proxy_and_installs_this_runs_toxics():
     client = ScriptedClient()
-    shape = Shape("http://127.0.0.1:8474", "minio", 1250, 100, 20)
+    shape = Shape("http://127.0.0.1:8474", "minio", 1250, 100, 20, "cafe0001")
     apply(shape, client)
     methods = [(m, p) for m, p, _ in client.calls]
     assert methods[0] == ("GET", "/proxies/minio")
-    # Ours are removed first, by name, so an interrupted run's leftovers are
-    # replaced rather than stacked.
-    assert methods[1:5] == [("DELETE", f"/proxies/minio/toxics/{n}") for n in TOXIC_NAMES]
-    assert methods[5:] == [("POST", "/proxies/minio/toxics")] * 4
-    assert [b["name"] for _, _, b in client.calls[5:]] == list(TOXIC_NAMES)
+    assert methods[1:] == [("POST", "/proxies/minio/toxics")] * 4
+    assert [b["name"] for _, _, b in client.calls[1:]] == shape.toxic_names()
+    assert all(n.startswith("vtop_cafe0001_") for n in shape.toxic_names())
+
+
+def test_a_proxy_already_shaped_by_another_run_is_refused_not_replaced():
+    class Occupied(ScriptedClient):
+        def request(self, method, path, body=None):
+            status, payload = super().request(method, path, body)
+            if method == "GET":
+                payload = dict(payload, toxics=[{"name": "vtop_deadbeef_latency_up", "enabled": True}])
+            return status, payload
+
+    client = Occupied()
+    with pytest.raises(ShapingError, match="another shaped run"):
+        apply(Shape("http://x", "minio", 1250, 0, 0), client)
+    assert not any(m == "DELETE" for m, _, _ in client.calls), "another run's toxics are never deleted"
+
+
+def test_the_bundled_proxy_name_must_front_the_bundled_store():
+    class Elsewhere(ScriptedClient):
+        def request(self, method, path, body=None):
+            status, payload = super().request(method, path, body)
+            if method == "GET":
+                payload = dict(payload, upstream="store.example:9000")
+            return status, payload
+
+    with pytest.raises(ShapingError, match="not the bundled MinIO"):
+        apply(Shape("http://x", "minio", 1250, 0, 0), Elsewhere())
+    # Another name may forward anywhere; it just gets no lab credentials.
+    apply(Shape("http://x", "other", 1250, 0, 0), Elsewhere())
 
 
 def test_a_foreign_toxic_on_the_proxy_is_refused_by_name():
@@ -151,23 +185,11 @@ def test_a_foreign_toxic_on_the_proxy_is_refused_by_name():
         def request(self, method, path, body=None):
             status, payload = super().request(method, path, body)
             if method == "GET":
-                payload = dict(payload, toxics=[
-                    {"name": "vtop_latency_up", "enabled": True},   # ours: replaced, not refused
-                    {"name": "someones_slow_close", "enabled": True},
-                ])
+                payload = dict(payload, toxics=[{"name": "someones_slow_close", "enabled": True}])
             return status, payload
 
     with pytest.raises(ShapingError, match="someones_slow_close"):
         apply(Shape("http://x", "minio", 1250, 0, 0), Occupied())
-
-    class OnlyOurs(ScriptedClient):
-        def request(self, method, path, body=None):
-            status, payload = super().request(method, path, body)
-            if method == "GET":
-                payload = dict(payload, toxics=[{"name": "vtop_bandwidth_up", "enabled": True}])
-            return status, payload
-
-    apply(Shape("http://x", "minio", 1250, 0, 0), OnlyOurs())
 
 
 def test_a_missing_proxy_names_the_file_that_registers_it():
@@ -196,11 +218,12 @@ class HalfRefusingClient(ScriptedClient):
 
 def test_half_a_shape_is_rolled_back_before_the_failure_is_reported():
     client = HalfRefusingClient()
+    shape = Shape("http://x", "minio", 1250, 100, 0)
     with pytest.raises(ShapingError, match="removed again"):
-        apply(Shape("http://x", "minio", 1250, 100, 0), client)
-    # After the refused POST: every toxic of ours deleted again.
+        apply(shape, client)
+    # After the refused POST: every toxic of this run deleted again.
     tail = [(m, p) for m, p, _ in client.calls[-4:]]
-    assert tail == [("DELETE", f"/proxies/minio/toxics/{n}") for n in TOXIC_NAMES]
+    assert tail == [("DELETE", f"/proxies/minio/toxics/{n}") for n in shape.toxic_names()]
 
 
 class FailingRemovalClient(ScriptedClient):
@@ -210,7 +233,7 @@ class FailingRemovalClient(ScriptedClient):
     def request(self, method, path, body=None):
         applied = any(m == "POST" for m, _, _ in self.calls)
         self.calls.append((method, path, body))
-        if method == "DELETE" and applied and path.endswith("vtop_latency_up"):
+        if method == "DELETE" and applied and path.endswith("_latency_up"):
             return 500, None
         return {"GET": 200, "POST": 201, "DELETE": 204}[method], None
 
@@ -218,12 +241,12 @@ class FailingRemovalClient(ScriptedClient):
 def test_a_removal_that_fails_is_reported_not_announced_as_removed():
     client = FailingRemovalClient()
     sc = scenario(shaping_api_url="http://127.0.0.1:8474", shaping_latency_ms=100)
-    with pytest.raises(ShapingError, match="vtop_latency_up \\(HTTP 500\\)"):
+    with pytest.raises(ShapingError, match="_latency_up \\(HTTP 500\\)"):
         with shaped(sc, client_factory=lambda url: client, log=lambda _: None):
             pass
     # Every name was still tried before the report.
     deletes = [p for m, p, _ in client.calls if m == "DELETE"]
-    assert len(deletes) >= 2 * len(TOXIC_NAMES), "cleared before apply and again on exit"
+    assert len(deletes) == len(TOXIC_KINDS), "every name tried on exit"
 
 
 def test_an_endpoint_that_is_not_the_proxys_listener_is_refused():
@@ -268,7 +291,7 @@ def test_the_shape_is_removed_on_every_exit():
         assert shape.bandwidth_kbps == 1250
         applied = len(client.calls)
     removed = client.calls[applied:]
-    assert removed == [("DELETE", f"/proxies/minio/toxics/{n}", None) for n in TOXIC_NAMES]
+    assert removed == [("DELETE", f"/proxies/minio/toxics/{n}", None) for n in shape.toxic_names()]
     assert any("shaping minio" in line for line in lines)
     assert any("removed" in line for line in lines)
 
@@ -276,10 +299,10 @@ def test_the_shape_is_removed_on_every_exit():
     # inherit a constraint it never asked for.
     client = ScriptedClient()
     with pytest.raises(RuntimeError, match="boom"):
-        with shaped(sc, client_factory=lambda url: client, log=lambda _: None):
+        with shaped(sc, client_factory=lambda url: client, log=lambda _: None) as shape:
+            names = shape.toxic_names()
             raise RuntimeError("boom")
-    assert client.calls[-4:] == [("DELETE", f"/proxies/minio/toxics/{n}", None)
-                                 for n in TOXIC_NAMES]
+    assert client.calls[-4:] == [("DELETE", f"/proxies/minio/toxics/{n}", None) for n in names]
 
 
 def test_an_unshaped_scenario_touches_nothing():
@@ -299,7 +322,8 @@ def test_the_shaped_soak_scenario_carries_its_shape(tmp_path):
     path = __import__("os").path.join(here, "..", "scenarios", "13-backpressure-soak-shaped.yaml")
     sc = load_scenario(path)
     shape = Shape.from_scenario(sc)
-    assert shape == Shape("http://127.0.0.1:8474", "minio", 1250, 100, 20)
+    assert (shape.api_url, shape.proxy, shape.bandwidth_kbps, shape.latency_ms, shape.jitter_ms) == (
+        "http://127.0.0.1:8474", "minio", 1250, 100, 20)
     assert sc.endpoint_url == "http://localhost:9100", "the engine talks to the proxy"
     assert sc.backend == "s3_native" and sc.seed_concurrently is True
     assert sc.max_concurrent_batches == 1, "one connection is the pipe"
@@ -315,7 +339,17 @@ def test_a_flat_scenario_file_parses_the_shaping_keys_without_pyyaml(tmp_path):
         shaping_latency_ms: 80
     """), encoding="utf-8")
     sc = load_scenario(str(p))
-    assert Shape.from_scenario(sc) == Shape("http://127.0.0.1:8474", "minio", 640, 80, 0)
+    shape = Shape.from_scenario(sc)
+    assert (shape.api_url, shape.proxy, shape.bandwidth_kbps, shape.latency_ms, shape.jitter_ms) == (
+        "http://127.0.0.1:8474", "minio", 640, 80, 0)
+
+
+def test_the_lab_credentials_follow_the_bundled_proxy_only():
+    from lib.engine import _shaped_by_the_bundled_proxy
+    assert _shaped_by_the_bundled_proxy(scenario(shaping_api_url="http://x"))
+    assert _shaped_by_the_bundled_proxy(scenario(shaping_api_url="http://x", shaping_proxy="minio"))
+    assert not _shaped_by_the_bundled_proxy(scenario(shaping_api_url="http://x", shaping_proxy="other"))
+    assert not _shaped_by_the_bundled_proxy(scenario())
 
 
 def test_the_shaped_proxy_port_is_the_lab_only_when_shaped():

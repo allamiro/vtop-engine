@@ -37,14 +37,20 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
-# Ours, by name, so a stale toxic from an interrupted run is replaced rather
-# than stacked, and nothing an operator added by hand is ever touched.
-TOXIC_NAMES = (
-    "vtop_bandwidth_up",
-    "vtop_bandwidth_down",
-    "vtop_latency_up",
-    "vtop_latency_down",
-)
+# Every toxic this harness installs is named `vtop_<run token>_<kind>`: the
+# prefix marks it as ours, the token marks it as THIS run's (review). A proxy
+# carrying any `vtop_` toxic when a run starts is refused — it is another
+# run's, or an interrupted run's leftover — and never deleted or stacked on:
+# one run cannot tell a live neighbour from a stale one, and guessing either
+# way corrupts a measurement. Nothing an operator added by hand is touched
+# either; it is refused by name.
+TOXIC_PREFIX = "vtop_"
+TOXIC_KINDS = ("bandwidth_up", "bandwidth_down", "latency_up", "latency_down")
+
+
+def new_run_token() -> str:
+    import os
+    return os.urandom(4).hex()
 
 REQUEST_TIMEOUT_SECONDS = 5.0
 
@@ -83,6 +89,14 @@ class Shape:
     bandwidth_kbps: int
     latency_ms: int
     jitter_ms: int
+    run_token: str = "run"
+
+    def toxic_names(self) -> list[str]:
+        """This run's toxic names, in application order."""
+        return [f"{TOXIC_PREFIX}{self.run_token}_{kind}" for kind in TOXIC_KINDS]
+
+    def toxic_name(self, kind: str) -> str:
+        return f"{TOXIC_PREFIX}{self.run_token}_{kind}"
 
     @classmethod
     def from_scenario(cls, scenario) -> Shape | None:
@@ -108,7 +122,7 @@ class Shape:
         if jitter and not latency:
             raise ValueError("shaping_jitter_ms needs a shaping_latency_ms to spread")
         proxy = str(scenario.get("shaping_proxy", "minio") or "minio").strip()
-        return cls(api.rstrip("/"), proxy, bandwidth, latency, jitter)
+        return cls(api.rstrip("/"), proxy, bandwidth, latency, jitter, new_run_token())
 
     def toxics(self) -> list[dict[str, Any]]:
         """The toxics, in the order they are applied.
@@ -120,19 +134,18 @@ class Shape:
         """
         out: list[dict[str, Any]] = []
         if self.bandwidth_kbps:
-            for name, stream in (("vtop_bandwidth_up", "upstream"),
-                                 ("vtop_bandwidth_down", "downstream")):
-                out.append({"name": name, "type": "bandwidth", "stream": stream,
-                            "toxicity": 1.0,
+            for kind, stream in (("bandwidth_up", "upstream"), ("bandwidth_down", "downstream")):
+                out.append({"name": self.toxic_name(kind), "type": "bandwidth",
+                            "stream": stream, "toxicity": 1.0,
                             "attributes": {"rate": self.bandwidth_kbps}})
         if self.latency_ms:
             down, odd = divmod(self.latency_ms, 2)
             jitter_down, jitter_odd = divmod(self.jitter_ms, 2)
-            out.append({"name": "vtop_latency_up", "type": "latency",
+            out.append({"name": self.toxic_name("latency_up"), "type": "latency",
                         "stream": "upstream", "toxicity": 1.0,
                         "attributes": {"latency": down + odd,
                                        "jitter": jitter_down + jitter_odd}})
-            out.append({"name": "vtop_latency_down", "type": "latency",
+            out.append({"name": self.toxic_name("latency_down"), "type": "latency",
                         "stream": "downstream", "toxicity": 1.0,
                         "attributes": {"latency": down, "jitter": jitter_down}})
         return out
@@ -144,7 +157,25 @@ class Shape:
         is this times the connections in flight."""
         return {"proxy": self.proxy, "bandwidth_kbps": self.bandwidth_kbps,
                 "latency_ms": self.latency_ms, "jitter_ms": self.jitter_ms,
-                "scope": "per_connection"}
+                "scope": "per_connection", "run_token": self.run_token}
+
+    def flat_columns(self) -> dict[str, Any]:
+        """The shape as flat `shaping_*` columns for metrics.csv, the summary
+        table and the matrix comparison (review): a p95 in any view carries
+        the pipe it was measured through."""
+        return {"shaping_proxy": self.proxy, "shaping_bandwidth_kbps": self.bandwidth_kbps,
+                "shaping_latency_ms": self.latency_ms, "shaping_jitter_ms": self.jitter_ms,
+                "shaping_scope": "per_connection"}
+
+
+SHAPING_COLUMNS = ("shaping_proxy", "shaping_bandwidth_kbps", "shaping_latency_ms",
+                   "shaping_jitter_ms", "shaping_scope")
+
+# The bundled stack's proxy: this name, forwarding to the compose MinIO. The
+# lab credential fallback is tied to it (review) — a custom proxy under any
+# other name, or this name forwarding elsewhere, is somebody else's store.
+BUNDLED_PROXY = "minio"
+BUNDLED_UPSTREAM = "minio:9000"
 
 
 class ToxiproxyClient:
@@ -205,16 +236,33 @@ def apply(shape: Shape, client: ToxiproxyClient, endpoint: str | None = None) ->
             "from benchmarks/toxiproxy.json at startup")
     if status != 200:
         raise ShapingError(f"toxiproxy answered HTTP {status} for proxy {shape.proxy!r}")
-    # A toxic that is not ours (review) would stack with the shape and go
-    # unrecorded: refused by name, never measured through.
-    foreign = sorted(
+    # Any toxic already on the proxy refuses the run (review): another run's
+    # (live, or an interrupted one's leftover — one run cannot tell which) or
+    # somebody's hand-made one. Either would shape the run on top of the
+    # scenario's shape while the summary said otherwise; nothing is deleted
+    # or stacked on.
+    present = sorted(
         str(t.get("name")) for t in ((proxy or {}).get("toxics") or [])
-        if isinstance(t, dict) and t.get("name") not in TOXIC_NAMES and t.get("enabled", True))
-    if foreign:
+        if isinstance(t, dict) and t.get("enabled", True))
+    if present:
+        ours = [name for name in present if name.startswith(TOXIC_PREFIX)]
+        theirs = [name for name in present if not name.startswith(TOXIC_PREFIX)]
+        detail = []
+        if ours:
+            detail.append(f"{ours} from another shaped run (live, or interrupted before it "
+                          "cleaned up)")
+        if theirs:
+            detail.append(f"{theirs} not this harness's")
         raise ShapingError(
-            f"proxy {shape.proxy!r} already carries toxic(s) {foreign} that are not this "
-            "harness's: they would shape the run on top of the scenario's shape and the "
-            "summary would not say so — remove them, or run without this proxy")
+            f"proxy {shape.proxy!r} already carries toxic(s): {'; '.join(detail)}. They would "
+            "shape this run on top of its own shape and the summary would not say so. Wait for "
+            "the other run, or remove them: DELETE {api}/proxies/{proxy}/toxics/<name>, or "
+            "restart the shaped stack".replace("{api}", shape.api_url).replace("{proxy}", shape.proxy))
+    if shape.proxy == BUNDLED_PROXY and (proxy or {}).get("upstream") != BUNDLED_UPSTREAM:
+        raise ShapingError(
+            f"proxy {BUNDLED_PROXY!r} forwards to {(proxy or {}).get('upstream')!r}, not the "
+            f"bundled MinIO ({BUNDLED_UPSTREAM}): the name carries the lab's credentials, so a "
+            "proxy wearing it must front the lab's store")
     if endpoint is not None:
         listener = _listener_port((proxy or {}).get("listen"))
         wanted = _port_of(endpoint)
@@ -222,7 +270,6 @@ def apply(shape: Shape, client: ToxiproxyClient, endpoint: str | None = None) ->
             raise ShapingError(
                 f"the engine's endpoint {endpoint!r} does not reach proxy {shape.proxy!r}, "
                 f"which listens on port {listener}: the run would go around the shape")
-    clear(shape, client)
     for toxic in shape.toxics():
         try:
             status, _ = client.request("POST", f"/proxies/{shape.proxy}/toxics", toxic)
@@ -240,11 +287,11 @@ def apply(shape: Shape, client: ToxiproxyClient, endpoint: str | None = None) ->
 
 
 def clear(shape: Shape, client: ToxiproxyClient) -> None:
-    """Remove our toxics, by name. Absent ones are fine; a removal that FAILS
-    is reported after every name was tried, because a toxic left behind
-    shapes the next run without saying so."""
+    """Remove THIS run's toxics, by name — never another run's. Absent ones
+    are fine; a removal that FAILS is reported after every name was tried,
+    because a toxic left behind shapes the next run without saying so."""
     stayed = []
-    for name in TOXIC_NAMES:
+    for name in shape.toxic_names():
         # Every name is tried whatever the previous one did (review): a
         # reset on one removal must not leave the others installed.
         try:
