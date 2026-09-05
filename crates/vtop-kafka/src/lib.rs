@@ -11,15 +11,27 @@
 //!   [`records`]   RecordBatch v2, the container Produce carries in and Fetch out
 //!   [`messages`]  request framing, API identity, and the version gate
 //!
-//! Landed so far: the layers that need no broker to be correct, and none to be
-//! tested. The bridge seam and the listener follow — deliberately after these,
-//! because everything above them is a translation, and a translation built on
-//! an unverified codec is a bug store.
+//!   [`api`]       the five phase-1 APIs, request and response, every served version
+//!   [`bridge`]    the seam: what a backend must answer, and an in-memory one
+//!   [`gateway`]   the listener: frames in, the bridge behind, refusals by name
+//!
+//! The codec layers landed first, and the bridge and listener after them —
+//! deliberately, because everything above the codecs is a translation, and a
+//! translation built on an unverified codec is a bug store. What the listener
+//! serves is exactly what the engine can honestly back today; everything else
+//! is a refusal with the code a client's retry policy can act on, and a
+//! reason on the log. The native backend over `LocalBroker` implements
+//! [`bridge::Bridge`] where brokers are wired.
 
+pub mod api;
+pub mod bridge;
+pub mod gateway;
 pub mod messages;
 pub mod records;
 pub mod wire;
 
+pub use bridge::{Appended, Bridge, Fetched, MemoryBridge};
+pub use gateway::{Gateway, GatewayConfig};
 pub use messages::{ApiKey, ErrorCode, HeaderVerdict, RequestHeader};
 pub use records::{Record, RecordBatch};
 pub use wire::{Decoder, Encoder, WireError};
