@@ -101,6 +101,145 @@ pub struct ObservabilityConfig {
     pub listen: Option<String>,
 }
 
+/// How one plane's listener — and this node's dials on the same plane — is
+/// secured (#294). A plane is ONE transport in both directions.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum PlaneTransport {
+    /// TLS 1.3, mutual. The default, and the only transport a deployment
+    /// method selects.
+    #[default]
+    Tls,
+    /// No TLS, loopback only: the listener refuses to bind anywhere else,
+    /// because on a plaintext plane whoever reaches the port is whoever
+    /// they say they are.
+    Plaintext,
+    /// No TLS on any interface, acknowledged by name — for a trusted
+    /// segment or a sidecar mesh that supplies what this plane gives up.
+    PlaintextOnAnyInterface,
+}
+
+impl PlaneTransport {
+    pub fn is_tls(self) -> bool {
+        matches!(self, Self::Tls)
+    }
+}
+
+/// How this node dials a plane another node serves (#294): the server's
+/// exposure is the server's business, so there are only two answers.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClientTransport {
+    #[default]
+    Tls,
+    Plaintext,
+}
+
+impl ClientTransport {
+    pub fn is_tls(self) -> bool {
+        matches!(self, Self::Tls)
+    }
+}
+
+/// The TLS paths a `tls` plane needs, or the refusal that names the plane
+/// and the knob when they are absent (#294). Asked only on the `tls` arm,
+/// so a plaintext plane never needs paths it would not use.
+fn tls_paths_for<'a>(
+    paths: Option<&'a TlsPaths>,
+    plane: &str,
+    knob: &str,
+    field: &str,
+) -> Result<&'a TlsPaths, String> {
+    paths.ok_or_else(|| {
+        format!(
+            "the {plane} plane is `{knob}: tls` (the default) but `{field}` is not set: give it \
+             the certificate paths, or set `{knob}: plaintext` to serve it without TLS on \
+             loopback"
+        )
+    })
+}
+
+/// Refuse, before anything binds, a `plaintext` plane on a listener that is
+/// not a loopback address (#294). The library refuses the same thing at bind
+/// time, but a leader's replica-status listener serves from a detached task
+/// whose refusal would arrive as a warning after readiness was already
+/// announced (review) — so every plane is judged here first, at startup,
+/// where a refusal stops the node. A hostname is left to the bind: only a
+/// literal address can be judged without resolving it.
+pub fn check_plaintext_exposure(
+    transport: PlaneTransport,
+    listen: &str,
+    plane: &str,
+    knob: &str,
+) -> Result<(), String> {
+    if transport != PlaneTransport::Plaintext {
+        return Ok(());
+    }
+    let Ok(address) = listen.parse::<std::net::SocketAddr>() else {
+        return Ok(());
+    };
+    if address.ip().is_loopback() {
+        return Ok(());
+    }
+    Err(format!(
+        "`{knob}: plaintext` serves the {plane} plane without TLS on a loopback address only, \
+         but its listener is {listen}: bind it to 127.0.0.1, enable TLS, or set `{knob}: \
+         plaintext-on-any-interface` if the exposure is genuinely intended"
+    ))
+}
+
+/// The same judgement on the address a listener actually BOUND (#294,
+/// review): a hostname the literal check had to leave alone resolves here,
+/// and a listener that serves from a detached task — the leader's
+/// replica-status server — is judged before readiness is announced rather
+/// than by a warning after it.
+pub fn check_plaintext_bound(
+    transport: PlaneTransport,
+    bound: std::net::SocketAddr,
+    plane: &str,
+    knob: &str,
+) -> Result<(), String> {
+    check_plaintext_exposure(transport, &bound.to_string(), plane, knob)
+}
+
+/// A role that PROMOTES cannot serve a plaintext replica plane (#294,
+/// review): promotion fences the other replicas over that plane, and a
+/// plaintext replica endpoint refuses every fence — there is no peer
+/// identity to authorize one — so the range could never be taken. That is
+/// every candidate, and a leader whose epoch metadata decides (a `lease`)
+/// with followers to fence; a static leader, a follower, and a standalone
+/// promote nothing. Refused at startup, by name, rather than discovered as
+/// an election that never ends or a lease held by a node that never serves.
+pub fn refuse_plaintext_promotion(
+    role: DataRole,
+    leased: bool,
+    replicated: bool,
+    transport: PlaneTransport,
+) -> Result<(), String> {
+    if transport.is_tls() {
+        return Ok(());
+    }
+    let promotes = match role {
+        DataRole::Candidate => true,
+        DataRole::Leader => leased && replicated,
+        _ => false,
+    };
+    if promotes {
+        return Err(format!(
+            "`role: {role:?}` with {} requires `replica_transport: tls`: promotion fences the \
+             other replicas over the replica plane, and a plaintext replica endpoint refuses \
+             every fence (it has no peer identity to authorize one), so the range could never \
+             be taken. Use a static leader with followers, or TLS, for a plaintext lab",
+            if role == DataRole::Candidate {
+                "a plaintext replica plane"
+            } else {
+                "a lease and followers on a plaintext replica plane"
+            }
+        ));
+    }
+    Ok(())
+}
+
 /// A metadata Raft node process.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -117,7 +256,20 @@ pub struct MetaNodeConfig {
     /// entry is ignored.
     #[serde(default)]
     pub peers: Vec<MetaPeerConfig>,
-    pub tls: TlsPaths,
+    /// Transport of the Raft peer plane (#294): `tls` (the default), or
+    /// `plaintext` / `plaintext-on-any-interface`. One transport in both
+    /// directions — this node's listener and its dials to every peer — so
+    /// every member of the group must agree.
+    #[serde(default)]
+    pub peer_transport: PlaneTransport,
+    /// Transport of the admin plane (#294). A plaintext admin plane refuses
+    /// an enforcing `admin_authorization`: there is no CN to match.
+    #[serde(default)]
+    pub admin_transport: PlaneTransport,
+    /// Required while any plane is `tls`; may be omitted only when both
+    /// planes are plaintext.
+    #[serde(default)]
+    pub tls: Option<TlsPaths>,
     #[serde(default)]
     pub timers: MetaTimersConfig,
     /// Who may submit which admin commands (#238).
@@ -271,7 +423,18 @@ pub struct DataNodeConfig {
     #[serde(default)]
     pub peers: Vec<FollowerPeerConfig>,
     /// Identity on the replication plane (CN = node_uuid).
-    pub replica_tls: TlsPaths,
+    /// Transport of the replica plane (#294): listener and dials alike, so
+    /// every member of the range must agree.
+    #[serde(default)]
+    pub replica_transport: PlaneTransport,
+    /// Transport of the native produce/fetch plane (#294). Under plaintext a
+    /// session is admitted on the declared principal alone — anything that
+    /// can reach the port and knows `principal_id` may produce and consume.
+    #[serde(default)]
+    pub native_transport: PlaneTransport,
+    /// Required while `replica_transport` is `tls`.
+    #[serde(default)]
+    pub replica_tls: Option<TlsPaths>,
     /// Leader/standalone: identity + client trust on the produce/fetch plane.
     pub native_tls: Option<TlsPaths>,
     /// Leader/standalone: the one client principal the authorizer accepts.
@@ -422,7 +585,14 @@ pub struct LeaseConfig {
     /// node id", and the live-chaos harness wired the metadata node's own
     /// certificate here to match — which is exactly the confusion the policy
     /// now rejects.
-    pub tls: TlsPaths,
+    /// How this node dials the metadata admin plane (#294): `tls` (the
+    /// default) or `plaintext`, matching the metadata tier's
+    /// `admin_transport`.
+    #[serde(default)]
+    pub transport: ClientTransport,
+    /// Required while `transport` is `tls`.
+    #[serde(default)]
+    pub tls: Option<TlsPaths>,
     #[serde(default = "default_lease_duration_ms")]
     pub lease_duration_ms: u64,
     #[serde(default = "default_renew_interval_ms")]
@@ -461,6 +631,44 @@ pub struct LeaseAdminPeer {
     /// and wrong when certificates are per-pod — so it is per-peer here.
     #[serde(default)]
     pub server_name: String,
+    /// This peer's admin transport (#294), when it differs from
+    /// `lease.transport`: a metadata tier migrated one node at a time is
+    /// mixed for the duration, and the leader may be on either side of it.
+    /// Unset inherits the lease's.
+    #[serde(default)]
+    pub transport: Option<ClientTransport>,
+}
+
+impl LeaseAdminPeer {
+    /// The transport this peer is dialed with, given the lease's own.
+    pub fn transport_or(&self, default: ClientTransport) -> ClientTransport {
+        self.transport.unwrap_or(default)
+    }
+}
+
+/// The refusal when `lease.transport` is plaintext but a redirect peer is
+/// dialed with TLS and `lease.tls` is absent: it names the peers, since the
+/// lease's own setting is not what asked for the material.
+pub fn lease_tls_missing_for_peers(peers: &[LeaseAdminPeer]) -> String {
+    let peers: Vec<String> = peers
+        .iter()
+        .filter(|peer| peer.transport_or(ClientTransport::Plaintext).is_tls())
+        .map(|peer| peer.node_id.to_string())
+        .collect();
+    format!(
+        "`lease.tls` is required: `lease.transport` is plaintext, but admin peer(s) {} are dialed \
+         with `transport: tls`; give the certificate paths, or set those peers to plaintext",
+        peers.join(", ")
+    )
+}
+
+/// Whether dialing the admin plane needs TLS material at all (#294): when the
+/// lease's own transport is TLS, or any redirect peer's is.
+pub fn lease_needs_tls(transport: ClientTransport, peers: &[LeaseAdminPeer]) -> bool {
+    transport.is_tls()
+        || peers
+            .iter()
+            .any(|peer| peer.transport_or(transport).is_tls())
 }
 
 fn default_lease_duration_ms() -> u64 {
@@ -477,6 +685,325 @@ pub fn load<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|error| format!("read {}: {error}", path.display()))?;
     serde_yaml::from_str(&text).map_err(|error| format!("parse {}: {error}", path.display()))
+}
+
+impl MetaNodeConfig {
+    /// The TLS paths for a `tls` plane, by the plane's name (#294).
+    pub fn tls_for(&self, plane: &str) -> Result<&TlsPaths, String> {
+        tls_paths_for(
+            self.tls.as_ref(),
+            plane,
+            &format!("{plane}_transport"),
+            "tls",
+        )
+    }
+}
+
+impl DataNodeConfig {
+    /// The replica plane's TLS paths (#294); asked only when it is a `tls`
+    /// plane.
+    pub fn replica_tls_paths(&self) -> Result<&TlsPaths, String> {
+        tls_paths_for(
+            self.replica_tls.as_ref(),
+            "replica",
+            "replica_transport",
+            "replica_tls",
+        )
+    }
+
+    /// The native plane's TLS paths (#294); `role` names who is asking,
+    /// since only a leader or candidate serves it.
+    pub fn native_tls_paths(&self, role: &str) -> Result<&TlsPaths, String> {
+        self.native_tls.as_ref().ok_or_else(|| {
+            format!(
+                "{role} requires native_tls while `native_transport: tls` (the default); set \
+                 the paths, or `native_transport: plaintext` for a loopback lab"
+            )
+        })
+    }
+}
+
+impl LeaseConfig {
+    /// TLS material is needed when ANY candidate is dialed with it (review).
+    pub fn needs_tls(&self) -> bool {
+        lease_needs_tls(self.transport, &self.admin_peers)
+    }
+
+    /// The paths for dialing the admin plane under TLS (#294).
+    pub fn tls_paths(&self) -> Result<&TlsPaths, String> {
+        if self.transport.is_tls() {
+            return tls_paths_for(
+                self.tls.as_ref(),
+                "lease admin",
+                "lease.transport",
+                "lease.tls",
+            );
+        }
+        // The lease itself is plaintext; a redirect peer is not (review): the
+        // refusal names that peer, not a setting the lease already has.
+        self.tls
+            .as_ref()
+            .ok_or_else(|| lease_tls_missing_for_peers(&self.admin_peers))
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+
+    /// #294 (review): a redirect peer may be on the other side of a rolling
+    /// transport migration, and the lease client keeps TLS material as long
+    /// as any peer needs it.
+    /// The refusal blames the peer, not the lease (review).
+    #[test]
+    fn a_missing_lease_tls_is_blamed_on_the_peer_that_needs_it() {
+        let peer = |transport| LeaseAdminPeer {
+            node_id: 2,
+            endpoint: "127.0.0.1:9201".to_owned(),
+            server_name: String::new(),
+            transport,
+        };
+        let refusal = lease_tls_missing_for_peers(&[peer(None), peer(Some(ClientTransport::Tls))]);
+        assert!(
+            refusal.contains("admin peer(s) 2")
+                && refusal.contains("`lease.transport` is plaintext"),
+            "{refusal}"
+        );
+    }
+
+    #[test]
+    fn a_lease_peer_may_name_its_own_transport_and_material_is_kept_while_any_needs_it() {
+        let peer = |transport| LeaseAdminPeer {
+            node_id: 2,
+            endpoint: "127.0.0.1:9201".to_owned(),
+            server_name: String::new(),
+            transport,
+        };
+        assert_eq!(
+            peer(None).transport_or(ClientTransport::Plaintext),
+            ClientTransport::Plaintext
+        );
+        assert_eq!(
+            peer(Some(ClientTransport::Tls)).transport_or(ClientTransport::Plaintext),
+            ClientTransport::Tls
+        );
+        assert!(!lease_needs_tls(ClientTransport::Plaintext, &[peer(None)]));
+        assert!(lease_needs_tls(
+            ClientTransport::Plaintext,
+            &[peer(Some(ClientTransport::Tls))]
+        ));
+        assert!(lease_needs_tls(
+            ClientTransport::Tls,
+            &[peer(Some(ClientTransport::Plaintext))]
+        ));
+    }
+
+    /// The default is TLS on every plane, spelled or not; the knobs take
+    /// kebab-case; a `tls` plane without paths is refused by name.
+    #[test]
+    fn plane_transports_default_to_tls_and_refuse_a_tls_plane_without_paths() {
+        let config: MetaNodeConfig = serde_yaml::from_str(
+            r#"
+node_id: 1
+cluster_id: 11111111-2222-3333-4444-555555555555
+data_dir: /tmp/x
+peer_listen: 127.0.0.1:9100
+admin_listen: 127.0.0.1:9200
+tls: { ca: ca.pem, cert: c.pem, key: k.pem }
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.peer_transport, PlaneTransport::Tls);
+        assert_eq!(config.admin_transport, PlaneTransport::Tls);
+        assert!(config.tls_for("peer").is_ok());
+
+        let plaintext: MetaNodeConfig = serde_yaml::from_str(
+            r#"
+node_id: 1
+cluster_id: 11111111-2222-3333-4444-555555555555
+data_dir: /tmp/x
+peer_listen: 127.0.0.1:9100
+admin_listen: 0.0.0.0:9200
+peer_transport: plaintext
+admin_transport: plaintext-on-any-interface
+"#,
+        )
+        .unwrap();
+        assert_eq!(plaintext.peer_transport, PlaneTransport::Plaintext);
+        assert_eq!(
+            plaintext.admin_transport,
+            PlaneTransport::PlaintextOnAnyInterface
+        );
+        assert!(plaintext.tls.is_none(), "no plane needs paths");
+
+        let half: MetaNodeConfig = serde_yaml::from_str(
+            r#"
+node_id: 1
+cluster_id: 11111111-2222-3333-4444-555555555555
+data_dir: /tmp/x
+peer_listen: 127.0.0.1:9100
+admin_listen: 127.0.0.1:9200
+peer_transport: plaintext
+"#,
+        )
+        .unwrap();
+        let refusal = half
+            .tls_for("admin")
+            .expect_err("a tls plane without paths is a configuration error");
+        assert!(
+            refusal.contains("admin plane") && refusal.contains("admin_transport"),
+            "{refusal}"
+        );
+    }
+
+    /// A plaintext plane off loopback is refused at startup, naming the knob
+    /// and the ways out; loopback, TLS, an acknowledged exposure, and a
+    /// hostname the bind will judge all pass.
+    #[test]
+    fn a_plaintext_plane_off_loopback_is_refused_before_anything_binds() {
+        use PlaneTransport::*;
+        assert!(check_plaintext_exposure(
+            Plaintext,
+            "127.0.0.1:9300",
+            "replica",
+            "replica_transport"
+        )
+        .is_ok());
+        assert!(
+            check_plaintext_exposure(Plaintext, "[::1]:9300", "replica", "replica_transport")
+                .is_ok()
+        );
+        assert!(
+            check_plaintext_exposure(Tls, "0.0.0.0:9300", "replica", "replica_transport").is_ok()
+        );
+        assert!(check_plaintext_exposure(
+            PlaintextOnAnyInterface,
+            "0.0.0.0:9300",
+            "replica",
+            "replica_transport"
+        )
+        .is_ok());
+        assert!(
+            check_plaintext_exposure(
+                Plaintext,
+                "vtop-0.vtop-headless:9300",
+                "replica",
+                "replica_transport"
+            )
+            .is_ok(),
+            "a name is judged by the bind, which still refuses"
+        );
+        let refusal =
+            check_plaintext_exposure(Plaintext, "0.0.0.0:9300", "replica", "replica_transport")
+                .expect_err("an unspecified address is not loopback");
+        assert!(
+            refusal.contains("replica_transport")
+                && refusal.contains("0.0.0.0:9300")
+                && refusal.contains("plaintext-on-any-interface"),
+            "{refusal}"
+        );
+    }
+
+    /// A bound address is judged like a literal one, and a candidate on a
+    /// plaintext replica plane is refused by name.
+    #[test]
+    fn a_bound_address_is_judged_and_a_plaintext_candidate_is_refused() {
+        let loopback: std::net::SocketAddr = "127.0.0.1:9300".parse().unwrap();
+        let exposed: std::net::SocketAddr = "0.0.0.0:9300".parse().unwrap();
+        assert!(check_plaintext_bound(
+            PlaneTransport::Plaintext,
+            loopback,
+            "replica",
+            "replica_transport"
+        )
+        .is_ok());
+        assert!(check_plaintext_bound(
+            PlaneTransport::Plaintext,
+            exposed,
+            "replica",
+            "replica_transport"
+        )
+        .unwrap_err()
+        .contains("0.0.0.0:9300"));
+        use PlaneTransport::{Plaintext, PlaintextOnAnyInterface, Tls};
+        assert!(refuse_plaintext_promotion(DataRole::Candidate, true, true, Tls).is_ok());
+        assert!(refuse_plaintext_promotion(DataRole::Follower, true, true, Plaintext).is_ok());
+        assert!(
+            refuse_plaintext_promotion(DataRole::Candidate, false, false, Plaintext)
+                .unwrap_err()
+                .contains("fence")
+        );
+        assert!(refuse_plaintext_promotion(
+            DataRole::Candidate,
+            false,
+            false,
+            PlaintextOnAnyInterface
+        )
+        .is_err());
+        // A leased, replicated leader promotes too (review); a static one or
+        // a leased standalone does not.
+        assert!(
+            refuse_plaintext_promotion(DataRole::Leader, true, true, Plaintext)
+                .unwrap_err()
+                .contains("lease and followers")
+        );
+        assert!(refuse_plaintext_promotion(DataRole::Leader, false, true, Plaintext).is_ok());
+        assert!(refuse_plaintext_promotion(DataRole::Leader, true, false, Plaintext).is_ok());
+    }
+
+    /// The lease client's dial is its own knob, and a data node's two planes
+    /// are independent of each other and of it.
+    #[test]
+    fn data_and_lease_transports_are_independent_knobs() {
+        let lease: LeaseConfig = serde_yaml::from_str(
+            r#"
+admin_endpoint: 127.0.0.1:9200
+server_name: meta
+topic_uuid: aaaaaaaa-0000-0000-0000-0000000000f1
+transport: plaintext
+"#,
+        )
+        .unwrap();
+        assert_eq!(lease.transport, ClientTransport::Plaintext);
+        let lease_tls: LeaseConfig = serde_yaml::from_str(
+            r#"
+admin_endpoint: 127.0.0.1:9200
+server_name: meta
+topic_uuid: aaaaaaaa-0000-0000-0000-0000000000f1
+"#,
+        )
+        .unwrap();
+        assert!(lease_tls
+            .tls_paths()
+            .expect_err("tls by default, and no paths")
+            .contains("lease.tls"));
+
+        let data: DataNodeConfig = serde_yaml::from_str(
+            r#"
+role: follower
+node_uuid: aaaaaaaa-0000-0000-0000-0000000000a1
+cluster_id: 11111111-2222-3333-4444-555555555555
+data_dir: /tmp/x
+fencing_epoch: 0
+range: { topic: t, topic_epoch: 1, range_id: aaaaaaaa-0000-0000-0000-0000000000c1, range_generation: 0 }
+segment_id: aaaaaaaa-0000-0000-0000-0000000000d1
+replica_listen: 127.0.0.1:9300
+replica_transport: plaintext
+native_transport: plaintext-on-any-interface
+"#,
+        )
+        .unwrap();
+        assert_eq!(data.replica_transport, PlaneTransport::Plaintext);
+        assert_eq!(
+            data.native_transport,
+            PlaneTransport::PlaintextOnAnyInterface
+        );
+        assert!(data.replica_tls.is_none() && data.native_tls.is_none());
+        assert!(data
+            .native_tls_paths("leader")
+            .expect_err("asked as if it were a tls plane")
+            .contains("native_transport"));
+    }
 }
 
 #[cfg(test)]

@@ -175,17 +175,26 @@ struct ReplicaConfig {
 #[serde(deny_unknown_fields)]
 struct NodeClientConfig {
     range: RangeConfig,
-    ca_cert: PathBuf,
-    /// Operator certificate for the replication plane.
-    ///
-    /// Its CN **must be a UUID**. That is not this command's rule: the replica
-    /// listener identifies every peer by a UUID CN before dispatching a frame,
-    /// so a certificate with a human-readable CN is refused at the transport
-    /// before the status request is ever read. Issue the operator certificate
-    /// from the same CA with a UUID subject.
-    client_cert: PathBuf,
-    client_key: PathBuf,
+    /// How the replica plane is dialed (#294): `tls` (the default) or
+    /// `plaintext`, matching the range's `replica_transport`. Under
+    /// plaintext the PEM paths are not needed and no identity is presented.
+    #[serde(default)]
+    transport: StatusTransport,
+    #[serde(default)]
+    ca_cert: Option<PathBuf>,
+    #[serde(default)]
+    client_cert: Option<PathBuf>,
+    #[serde(default)]
+    client_key: Option<PathBuf>,
     replicas: Vec<ReplicaConfig>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum StatusTransport {
+    #[default]
+    Tls,
+    Plaintext,
 }
 
 /// One replica's answer, or why it did not give one.
@@ -222,10 +231,37 @@ fn load_config(path: &Path) -> Result<NodeClientConfig, String> {
 
 /// Build the client fresh per replica: `ReplicaTlsMaterial` is consumed when a
 /// connector is built, and a status command is not on any hot path.
+/// The PEM paths a `tls` config must carry (#294): refused by name when
+/// absent, and refused outright under `plaintext` for a verb that needs an
+/// identity — sealed-segment transfers are refused by a plaintext replica
+/// plane anyway, so there is nothing such a config could do with them.
+fn tls_paths<'a>(
+    config: &'a NodeClientConfig,
+    verb: &str,
+) -> Result<(&'a PathBuf, &'a PathBuf, &'a PathBuf), String> {
+    if config.transport == StatusTransport::Plaintext {
+        return Err(format!(
+            "{verb} needs the leader identity, which only a certificate carries: a plaintext \
+             replica plane refuses it, so this config (`transport: plaintext`) cannot run it"
+        ));
+    }
+    match (&config.client_cert, &config.client_key, &config.ca_cert) {
+        (Some(cert), Some(key), Some(ca)) => Ok((cert, key, ca)),
+        _ => Err(
+            "the node config is `transport: tls` (the default) but ca_cert, client_cert \
+                  and client_key are not all set: give the PEM paths, or set `transport: \
+                  plaintext` for a range whose replica_transport is plaintext"
+                .to_owned(),
+        ),
+    }
+}
+
 fn client(config: &NodeClientConfig, timeout: Duration) -> Result<ReplicaStatusClient, String> {
-    let material =
-        TlsMaterial::from_pem_files(&config.client_cert, &config.client_key, &config.ca_cert)
-            .map_err(|error| error.to_string())?;
+    if config.transport == StatusTransport::Plaintext {
+        return Ok(ReplicaStatusClient::plaintext().with_timeout(timeout));
+    }
+    let (cert, key, ca) = tls_paths(config, "status")?;
+    let material = TlsMaterial::from_pem_files(cert, key, ca).map_err(|error| error.to_string())?;
     ReplicaStatusClient::new(ReplicaTlsMaterial {
         certificate_chain: material.certificate_chain,
         private_key: material.private_key,
@@ -968,14 +1004,18 @@ async fn repair(
     std::fs::write(&marker, b"vtop repair destination\n")
         .map_err(|error| format!("mark {} as repair-owned: {error}", into.display()))?;
 
-    let material =
-        TlsMaterial::from_pem_files(&config.client_cert, &config.client_key, &config.ca_cert)
-            .map_err(|error| error.to_string())?;
+    let material = {
+        let (cert, key, ca) = tls_paths(config, "a sealed-segment transfer")?;
+        TlsMaterial::from_pem_files(cert, key, ca)
+    }
+    .map_err(|error| error.to_string())?;
     // Loaded twice because building a connector CONSUMES the material, and the
     // gap check below needs its own client.
-    let status_material =
-        TlsMaterial::from_pem_files(&config.client_cert, &config.client_key, &config.ca_cert)
-            .map_err(|error| error.to_string())?;
+    let status_material = {
+        let (cert, key, ca) = tls_paths(config, "a sealed-segment transfer")?;
+        TlsMaterial::from_pem_files(cert, key, ca)
+    }
+    .map_err(|error| error.to_string())?;
     let client = SegmentTransferClient::new(ReplicaTlsMaterial {
         certificate_chain: material.certificate_chain,
         private_key: material.private_key,
@@ -1343,9 +1383,10 @@ mod tests {
                 range_id: Uuid::from_u128(7),
                 range_generation: 0,
             },
-            ca_cert: PathBuf::from("ca.pem"),
-            client_cert: PathBuf::from("client.pem"),
-            client_key: PathBuf::from("client.key"),
+            transport: StatusTransport::default(),
+            ca_cert: Some(PathBuf::from("ca.pem")),
+            client_cert: Some(PathBuf::from("client.pem")),
+            client_key: Some(PathBuf::from("client.key")),
             replicas: Vec::new(),
         }
     }

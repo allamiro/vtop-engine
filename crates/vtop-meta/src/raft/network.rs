@@ -259,8 +259,11 @@ impl PeerDirectory {
 /// Factory that builds one [`TlsRaftNetwork`] client per target.
 pub struct TlsRaftNetworkFactory {
     directory: PeerDirectory,
-    /// Template material; each client clones trust roots + presents this identity.
-    material: Arc<TlsMaterialOwned>,
+    /// Template material; each client clones trust roots + presents this
+    /// identity. `None` is a PLAINTEXT peer plane (#294): clients dial
+    /// without TLS, and the peer server on every member must be plaintext
+    /// too — a plane is one transport in both directions.
+    material: Option<Arc<TlsMaterialOwned>>,
     source: NodeId,
 }
 
@@ -290,10 +293,10 @@ impl TlsMaterialOwned {
 }
 
 impl TlsRaftNetworkFactory {
-    pub fn new(source: NodeId, directory: PeerDirectory, material: TlsMaterial) -> Self {
+    pub fn new(source: NodeId, directory: PeerDirectory, material: Option<TlsMaterial>) -> Self {
         Self {
             directory,
-            material: Arc::new(TlsMaterialOwned::from_material(material)),
+            material: material.map(|material| Arc::new(TlsMaterialOwned::from_material(material))),
             source,
         }
     }
@@ -305,7 +308,7 @@ impl RaftNetworkFactory<MetaRaftTypeConfig> for TlsRaftNetworkFactory {
     async fn new_client(&mut self, target: NodeId, _node: &EmptyNode) -> Self::Network {
         TlsRaftNetwork {
             directory: self.directory.clone(),
-            material: Arc::clone(&self.material),
+            material: self.material.clone(),
             source: self.source,
             target,
         }
@@ -314,7 +317,7 @@ impl RaftNetworkFactory<MetaRaftTypeConfig> for TlsRaftNetworkFactory {
 
 pub struct TlsRaftNetwork {
     directory: PeerDirectory,
-    material: Arc<TlsMaterialOwned>,
+    material: Option<Arc<TlsMaterialOwned>>,
     source: NodeId,
     target: NodeId,
 }
@@ -393,12 +396,15 @@ impl TlsRaftNetwork {
             .directory
             .get(self.target)
             .ok_or_else(|| self.unreachable("no peer address in directory"))?;
-        let client = PeerClient::new(
-            self.material.to_material(),
-            endpoint.server_name.clone(),
-            MetaNodeId(self.target),
-        )
-        .map_err(|error| self.unreachable(error))?;
+        let client = match &self.material {
+            Some(material) => PeerClient::new(
+                material.to_material(),
+                endpoint.server_name.clone(),
+                MetaNodeId(self.target),
+            )
+            .map_err(|error| self.unreachable(error))?,
+            None => PeerClient::plaintext(endpoint.server_name.clone(), MetaNodeId(self.target)),
+        };
         Ok((client, endpoint.addr))
     }
 }

@@ -2,6 +2,7 @@
 //! RPCs and the admin endpoint over mTLS TCP.
 
 use crate::config::MetaNodeConfig;
+use crate::config::{check_plaintext_bound, check_plaintext_exposure, PlaneTransport};
 use crate::observe::{MetaRaftCollector, NodeObservability};
 use crate::tls;
 use std::sync::Arc;
@@ -88,6 +89,18 @@ pub async fn serve(
         }
     }
 
+    // EVERY tls plane's material before Raft starts (review): a certificate
+    // the admin plane cannot read must fail the process before it campaigns,
+    // not after it has sent peer RPCs it can never expose an admin endpoint
+    // for.
+    let peer_material = match config.peer_transport {
+        PlaneTransport::Tls => Some(tls::meta_material(config.tls_for("peer")?)?),
+        PlaneTransport::Plaintext | PlaneTransport::PlaintextOnAnyInterface => None,
+    };
+    let admin_material = match config.admin_transport {
+        PlaneTransport::Tls => Some(tls::meta_material(config.tls_for("admin")?)?),
+        PlaneTransport::Plaintext | PlaneTransport::PlaintextOnAnyInterface => None,
+    };
     let env = Env::real();
     let node = start_meta_node(
         &env,
@@ -95,7 +108,9 @@ pub async fn serve(
         config.cluster_id,
         config.node_id,
         directory,
-        tls::meta_material(&config.tls)?,
+        // The peer plane's material, or none for a plaintext plane (#294):
+        // the Raft network dials every peer the way this node listens.
+        peer_material,
         MetaNodeTimers {
             election_timeout_min_ms: config.timers.election_timeout_min_ms,
             election_timeout_max_ms: config.timers.election_timeout_max_ms,
@@ -122,19 +137,60 @@ pub async fn serve(
         tracing::info!("leadership-transition statements are signed (key from {name})");
     }
 
+    // Both planes judged before either binds (#294, review): a refusal is a
+    // startup error, never a warning behind an already-announced readiness.
+    check_plaintext_exposure(
+        config.peer_transport,
+        &config.peer_listen,
+        "peer",
+        "peer_transport",
+    )?;
+    check_plaintext_exposure(
+        config.admin_transport,
+        &config.admin_listen,
+        "admin",
+        "admin_transport",
+    )?;
     let peer_listener = TcpListener::bind(&config.peer_listen)
         .await
         .map_err(|error| format!("bind {}: {error}", config.peer_listen))?;
     let admin_listener = TcpListener::bind(&config.admin_listen)
         .await
         .map_err(|error| format!("bind {}: {error}", config.admin_listen))?;
+    // The addresses actually bound, judged before either plane serves: a
+    // hostname resolved here where the literal check could not see it.
+    check_plaintext_bound(
+        config.peer_transport,
+        peer_listener
+            .local_addr()
+            .map_err(|error| error.to_string())?,
+        "peer",
+        "peer_transport",
+    )?;
+    check_plaintext_bound(
+        config.admin_transport,
+        admin_listener
+            .local_addr()
+            .map_err(|error| error.to_string())?,
+        "admin",
+        "admin_transport",
+    )?;
 
-    let peer_server = PeerServer::new(
-        tls::meta_material(&config.tls)?,
-        MetaNodeId(config.node_id),
-        Arc::clone(&node.peer_handler) as Arc<dyn PeerRpcHandler>,
-    )
-    .map_err(|error| error.to_string())?;
+    let peer_handler = Arc::clone(&node.peer_handler) as Arc<dyn PeerRpcHandler>;
+    let peer_server = match config.peer_transport {
+        PlaneTransport::Tls => PeerServer::new(
+            tls::meta_material(config.tls_for("peer")?)?,
+            MetaNodeId(config.node_id),
+            peer_handler,
+        )
+        .map_err(|error| error.to_string())?,
+        PlaneTransport::Plaintext => {
+            PeerServer::plaintext(MetaNodeId(config.node_id), peer_handler)
+        }
+        PlaneTransport::PlaintextOnAnyInterface => {
+            PeerServer::plaintext_on_any_interface(MetaNodeId(config.node_id), peer_handler)
+        }
+    };
     // An absent policy keeps the pre-#238 behaviour — any CA-signed client may
     // do anything — so it warns rather than passing silently. The warning names
     // the concrete exposure, not just the missing key: an operator who reads
@@ -142,21 +198,43 @@ pub async fn serve(
     let authorizer = match &config.admin_authorization {
         Some(policy) => policy.authorizer(),
         None => {
-            eprintln!(
-                "warning: admin endpoint {} is authenticated but NOT authorized: any client \
-                 holding a certificate signed by this CA — including every data node — may \
-                 change cluster membership and grant range leases. Set `admin_authorization` \
-                 to restrict cluster-scoped commands to named operator CNs.",
-                config.admin_listen
-            );
+            match config.admin_transport {
+                PlaneTransport::Tls => eprintln!(
+                    "warning: admin endpoint {} is authenticated but NOT authorized: any client \
+                     holding a certificate signed by this CA — including every data node — may \
+                     change cluster membership and grant range leases. Set `admin_authorization` \
+                     to restrict cluster-scoped commands to named operator CNs.",
+                    config.admin_listen
+                ),
+                // Not "authenticated but": nothing here is authenticated, and
+                // the warning must say who that admits (review).
+                PlaneTransport::Plaintext | PlaneTransport::PlaintextOnAnyInterface => eprintln!(
+                    "warning: admin endpoint {} is PLAINTEXT and UNAUTHENTICATED: it carries no \
+                     certificate, so anything that can reach it may run `meta init`, change \
+                     cluster membership and grant range leases, and `admin_authorization` cannot \
+                     apply (there is no CN to match). Keep it on loopback or a segment you trust.",
+                    config.admin_listen
+                ),
+            }
             AdminAuthorizer::permissive()
         }
     };
-    let admin_server = AdminServer::with_authorization(
-        tls::meta_material(&config.tls)?,
-        Arc::clone(&node.consensus) as Arc<dyn AdminHandler>,
-        authorizer,
-    )
+    let admin_handler = Arc::clone(&node.consensus) as Arc<dyn AdminHandler>;
+    // A plaintext admin plane refuses an enforcing policy at construction:
+    // there is no CN to match, and the library says so in its own words.
+    let admin_server = match config.admin_transport {
+        PlaneTransport::Tls => AdminServer::with_authorization(
+            admin_material.ok_or_else(|| {
+                "admin_transport is tls but its material was not resolved".to_owned()
+            })?,
+            admin_handler,
+            authorizer,
+        ),
+        PlaneTransport::Plaintext => AdminServer::plaintext(admin_handler, authorizer),
+        PlaneTransport::PlaintextOnAnyInterface => {
+            AdminServer::plaintext_on_any_interface(admin_handler, authorizer)
+        }
+    }
     .map_err(|error| error.to_string())?;
 
     // The operational surface comes up before the ready marker so a scraper or

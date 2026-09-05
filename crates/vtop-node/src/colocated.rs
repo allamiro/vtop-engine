@@ -51,6 +51,15 @@ pub struct ColocatedNodeConfig {
 
 impl ColocatedNodeConfig {
     fn validate(&self) -> Result<(), String> {
+        // A data role this config can never serve is refused before either
+        // role binds a port (review): the standalone entry judges it in
+        // `data_node::run`, and co-location enters `serve` directly.
+        crate::config::refuse_plaintext_promotion(
+            self.data.role,
+            self.data.lease.is_some(),
+            !self.data.followers.is_empty(),
+            self.data.replica_transport,
+        )?;
         // Fail loudly rather than picking a winner. A config that names three
         // listen addresses and gets one is a config whose author has a wrong
         // model of the process. PRESENCE of the block is what is rejected —
