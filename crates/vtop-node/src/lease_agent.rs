@@ -1284,8 +1284,8 @@ enum StoodDownVerdict {
     NotLatched,
 }
 
-fn stood_down_verdict(stood_down: Option<u64>, decision: &LeaseDecision) -> StoodDownVerdict {
-    if stood_down.is_none() {
+fn stood_down_verdict(latched: bool, decision: &LeaseDecision) -> StoodDownVerdict {
+    if !latched {
         return StoodDownVerdict::NotLatched;
     }
     match *decision {
@@ -1388,9 +1388,12 @@ pub struct LeaseAgent {
     /// campaign hold-off cannot help, because it only guards `Acquire`.
     /// While latched, a round that finds this node named at ANY epoch
     /// retries the hand-back instead of renewing — a delayed acquisition
-    /// commit can surface above the latch (review) — and only an answer
-    /// that stops naming this node clears it. See [`stood_down_verdict`].
-    stood_down_epoch: Option<u64>,
+    /// commit can surface an epoch the stand-down never saw (review,
+    /// twice: first above the epoch it latched, then after a
+    /// reconciliation that found nothing, which is why this is a fact and
+    /// not an epoch) — and only an answer that stops naming this node
+    /// clears it. See [`stood_down_verdict`].
+    stood_down_latched: bool,
     /// A persistent handle on the same gate, kept so a range that goes
     /// missing AFTER the gate opened can revoke readiness — the consumable
     /// `ready` above only governs the first open (review).
@@ -1494,7 +1497,7 @@ impl LeaseAgent {
             state: LeaseState::NotHeld,
             ready: None,
             stand_down: None,
-            stood_down_epoch: None,
+            stood_down_latched: false,
             gate: None,
             gate_degraded: false,
             range_missing: false,
@@ -1583,8 +1586,7 @@ impl LeaseAgent {
                 // failure races the grant, and the next read would renew
                 // the unservable epoch back to life. `release()` already
                 // reconciles: whatever epoch metadata attributes to this
-                // node is the epoch it hands back, recorded or not, and
-                // the latch takes ITS answer rather than local memory.
+                // node is the epoch it hands back, recorded or not.
                 let held = match self.state {
                     LeaseState::Held { fencing_epoch } => Some(fencing_epoch),
                     _ => None,
@@ -1603,11 +1605,11 @@ impl LeaseAgent {
                 // own two calls need. Abandoning loses nothing: the
                 // exit-path release re-reconciles against metadata and
                 // proposes with whatever epoch it finds.
-                let handed_back = if release_closed {
-                    self.release().await
+                if release_closed {
+                    self.release().await;
                 } else {
                     tokio::select! {
-                        released = self.release() => released,
+                        () = self.release() => {}
                         changed = release.changed() => {
                             if changed.is_err() {
                                 release_closed = true;
@@ -1617,21 +1619,22 @@ impl LeaseAgent {
                             // takes over. A closed watch or a spurious
                             // wake finishes the hand-back here.
                             if !*release.borrow() {
-                                self.release().await
-                            } else {
-                                None
+                                self.release().await;
                             }
                         }
                     }
-                };
-                // Latched until metadata stops naming this node for it
-                // (review, #410): the release above is best-effort, and a
-                // refused hand-back must not become next round's renewal —
-                // see the field. The epoch is the one the release targeted
-                // (metadata's attribution); local memory is the fall-back
-                // for the abandoned-release shape, where the exit release
-                // re-reconciles anyway.
-                self.stood_down_epoch = handed_back.or(held);
+                }
+                // LATCHED UNCONDITIONALLY (review, third round) — not on
+                // what the release found. The abandoned acquisition can
+                // commit AFTER the reconciliation read, so "metadata
+                // attributed nothing to us" is an answer the delayed
+                // commit can invalidate a moment later — with the latch
+                // dropped, that grant would arrive as an ordinary Renew
+                // and re-promote the failed build. The latch is the fact
+                // that this node stood down; which epoch metadata names is
+                // re-read every round it stands, and only an answer that
+                // names nobody-us clears it.
+                self.stood_down_latched = true;
                 if let Some(fencing_epoch) = held {
                     self.publish_lost(fencing_epoch);
                 }
@@ -1808,14 +1811,7 @@ impl LeaseAgent {
     /// orderly stop. Best-effort by design: a refusal means the lease was
     /// already lost or taken, and blocking exit on metadata would trade a
     /// prompt failover for a hung shutdown, the exact inversion of the goal.
-    /// Returns the epoch the hand-back targeted — metadata's attribution,
-    /// or the recorded fall-back when the read failed — whether or not the
-    /// proposal landed, and `None` when there was nothing to release. The
-    /// stand-down path latches on it (review, #439): a wake can cancel a
-    /// round after an acquisition committed but before local state caught
-    /// up, so "what this process recorded" is exactly the wrong thing to
-    /// latch on.
-    async fn release(&mut self) -> Option<u64> {
+    async fn release(&mut self) {
         // What THIS PROCESS recorded is not what metadata decided (review,
         // twice over): the abandoned round can die after metadata committed
         // an acquisition and before `self.state` caught up (NotHeld with a
@@ -1875,12 +1871,12 @@ impl LeaseAgent {
                 if let Some(epoch) = recorded {
                     self.publish_lost(epoch);
                 }
-                return None;
+                return;
             }
             // The read failed: propose with what the agent recorded, the
             // pre-reconciliation behavior — best effort either way.
             (Some(recorded), None) => recorded,
-            (None, None) => return None,
+            (None, None) => return,
         };
         let was_published = recorded.is_some();
         let proposal = self
@@ -1918,7 +1914,6 @@ impl LeaseAgent {
         if was_published {
             self.publish_lost(fencing_epoch);
         }
-        Some(fencing_epoch)
     }
 
     /// Every admin round trip is bounded by this. A blackholed endpoint (as
@@ -1961,7 +1956,7 @@ impl LeaseAgent {
             )
             .await?;
         let decision = decide(&view, self.node_uuid, now_ms());
-        match stood_down_verdict(self.stood_down_epoch, &decision) {
+        match stood_down_verdict(self.stood_down_latched, &decision) {
             StoodDownVerdict::RetryHandBack { fencing_epoch } => {
                 tracing::warn!(
                     range = %self.range_uuid,
@@ -1969,16 +1964,10 @@ impl LeaseAgent {
                     "metadata still names this node while it stands down; retrying \
                      the hand-back instead of renewing"
                 );
-                // Re-latched on what metadata NAMED, which can sit above
-                // the original latch (review, second round): the abandoned
-                // acquisition's delayed commit surfaces here, and the
-                // hand-back below targets metadata's attribution either
-                // way.
-                self.stood_down_epoch = Some(fencing_epoch);
                 self.release().await;
                 return Ok(self.config.poll_interval);
             }
-            StoodDownVerdict::Cleared => self.stood_down_epoch = None,
+            StoodDownVerdict::Cleared => self.stood_down_latched = false,
             StoodDownVerdict::NotLatched => {}
         }
         match decision {
@@ -2390,13 +2379,13 @@ mod tests {
     #[test]
     fn a_stood_down_epoch_is_handed_back_again_not_renewed() {
         assert_eq!(
-            stood_down_verdict(Some(4), &LeaseDecision::Renew { fencing_epoch: 4 }),
+            stood_down_verdict(true, &LeaseDecision::Renew { fencing_epoch: 4 }),
             StoodDownVerdict::RetryHandBack { fencing_epoch: 4 },
             "a refused hand-back must not become the next round's renewal"
         );
         assert_eq!(
             stood_down_verdict(
-                Some(4),
+                true,
                 &LeaseDecision::HeldAdministratively { fencing_epoch: 4 }
             ),
             StoodDownVerdict::RetryHandBack { fencing_epoch: 4 },
@@ -2412,7 +2401,7 @@ mod tests {
         // back runs through Acquire, which clears the latch a round
         // earlier because nobody holds the range.
         assert_eq!(
-            stood_down_verdict(Some(4), &LeaseDecision::Renew { fencing_epoch: 6 }),
+            stood_down_verdict(true, &LeaseDecision::Renew { fencing_epoch: 6 }),
             StoodDownVerdict::RetryHandBack { fencing_epoch: 6 },
             "a delayed acquisition commit surfaces ABOVE the latch, and it is still \
              the failed build's grant to hand back, not a renewal to serve"
@@ -2429,14 +2418,14 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                stood_down_verdict(Some(4), &decision),
+                stood_down_verdict(true, &decision),
                 StoodDownVerdict::Cleared,
                 "{name} means metadata no longer names this node, and holding the \
                  latch past that would refuse legitimate holds"
             );
         }
         assert_eq!(
-            stood_down_verdict(None, &LeaseDecision::Renew { fencing_epoch: 4 }),
+            stood_down_verdict(false, &LeaseDecision::Renew { fencing_epoch: 4 }),
             StoodDownVerdict::NotLatched
         );
     }
