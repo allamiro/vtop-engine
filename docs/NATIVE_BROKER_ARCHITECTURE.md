@@ -34,6 +34,10 @@ becomes the foundation for these broker-level invariants:
    reassignment, range split, and range merge.
 7. Corruption is detectable from immutable segment bytes and authenticated
    evidence without trusting mutable broker metadata.
+8. A published high-water mark never regresses: a new leader raises it only
+   through an entry of its own fencing epoch that a quorum durably holds,
+   never by counting what earlier epochs left on other replicas (Raft
+   §5.4.2, #240).
 
 This ADR defines the target and the review boundaries. It does not claim that
 the first storage slice already implements clustering or proof-carrying

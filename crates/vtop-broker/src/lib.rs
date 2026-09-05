@@ -631,6 +631,14 @@ pub struct LocalBroker {
     /// Quorum-committed high-water mark. When set, fetch never exposes above it
     /// and `Durability::Quorum` produce waits for it to cover the append.
     cluster_committed: Option<ClusterCommittedOffset>,
+    /// Set while a promotion has established a boundary it has not yet
+    /// proven through this epoch's marker (#240, §5.4.2). Fetch refuses
+    /// while it is set: the cell holds the durable floor, which is a mark a
+    /// quorum once proved but may sit below what the previous leader had
+    /// already published, and a consumer that read the higher mark must not
+    /// watch it move backwards. Produce is admitted — it is what commits the
+    /// marker prefix implicitly when it lands first.
+    boundary_pending: AtomicBool,
     /// Sealed-prefix retention bound in bytes; 0 = retention disabled (#290).
     /// Atomic so operators can set it after construction without a lock, and
     /// the produce path can read it inside the state-lock critical section.
@@ -763,6 +771,7 @@ impl LocalBroker {
             segment_format,
             retention_max_total_bytes: std::sync::atomic::AtomicU64::new(0),
             cluster_committed,
+            boundary_pending: AtomicBool::new(false),
             replicas,
             node_id,
             group_checkpoints: None,
@@ -1252,6 +1261,19 @@ impl LocalBroker {
         self.cluster_committed.as_ref()
     }
 
+    /// Whether a promotion's boundary is established but not yet proven by
+    /// this epoch's quorum-acked marker; fetch refuses while it is.
+    pub fn boundary_pending(&self) -> bool {
+        self.boundary_pending.load(Ordering::SeqCst)
+    }
+
+    /// Raise or clear the boundary-pending gate. Raised by the promotion
+    /// that pends a marker, cleared by the marker's publication or by the
+    /// demotion or suspension that retires it.
+    pub fn set_boundary_pending(&self, pending: bool) {
+        self.boundary_pending.store(pending, Ordering::SeqCst);
+    }
+
     /// The range this broker leads.
     pub fn range(&self) -> &RangeIdentity {
         &self.range
@@ -1477,6 +1499,21 @@ impl LocalBroker {
                     self.check_range(&meta, &request.range, request.fencing_epoch)
                 {
                     return error(request_id, stream_id, code, message);
+                }
+                // A boundary this epoch has not proven is not served (#240,
+                // §5.4.2): the cell holds the durable floor, and a consumer
+                // that read the previous leader's higher mark must never
+                // watch the mark move backwards. Retryable, as the quorum
+                // shortfall it waits on is — the same code a produce gets
+                // when its own quorum does not arrive.
+                if self.boundary_pending() {
+                    return error(
+                        request_id,
+                        stream_id,
+                        ErrorCode::Overloaded,
+                        "promotion boundary not yet proven: this epoch's marker awaits a \
+                         quorum; retry",
+                    );
                 }
                 let mut state = self
                     .state

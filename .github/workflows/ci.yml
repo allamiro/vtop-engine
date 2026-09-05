@@ -594,6 +594,10 @@ jobs:
             -f helm/vtop/ci/default-values.yaml \
             --set replicaCount=4 \
             --set 'data.nodeUuids={aaaaaaaa-0000-0000-0000-0000000000a1,aaaaaaaa-0000-0000-0000-0000000000a2,aaaaaaaa-0000-0000-0000-0000000000a3,aaaaaaaa-0000-0000-0000-0000000000a4}'
+          # The #240 format knob: a value the binary would refuse must be
+          # refused at render time, with the two it accepts named.
+          refuses_because 'data.segmentFormat must be "v1" or "v2"' \
+            -f helm/vtop/ci/default-values.yaml --set data.segmentFormat=v3
           # The #287 slice-2 guards on the SEPARATED shape: the tier sizes
           # are required, the voter count stays odd, the identity list is
           # indexed by data-tier ordinal, and an explicit admin endpoint
@@ -775,6 +779,13 @@ jobs:
               abort "candidate #{ordinal} has no lease block" unless configs[ordinal]["data"]["lease"]
               epoch = configs[ordinal]["data"].fetch("fencing_epoch")
               abort "candidate #{ordinal} fencing_epoch is #{epoch}, must be 0" unless epoch == 0
+              # The happy path of the format knob (#240): the replicated CI
+              # values choose v2 so the failover in the smoke test publishes
+              # through the marker, and a render that silently dropped the
+              # key would revert the whole path to v1 while deploying
+              # cleanly. (No apostrophes in this block; see above.)
+              format = configs[ordinal]["data"].fetch("segment_format", nil)
+              abort "candidate #{ordinal} segment_format is #{format.inspect}, must be v2" unless format == "v2"
             end
 
             # One range, not a mixture. A stray standalone pod would serve its

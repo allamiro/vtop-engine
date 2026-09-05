@@ -557,6 +557,12 @@ data:
   cluster_id: {{ $clusterId }}
   data_dir: /var/lib/vtop/data
   fencing_epoch: {{ int $v.data.fencingEpoch }}
+  {{- if $v.data.segmentFormat }}
+  {{- if not (has $v.data.segmentFormat (list "v1" "v2")) }}
+  {{- fail (printf "\n\ndata.segmentFormat must be \"v1\" or \"v2\" (got %q): it is the on-disk format a NEW range is created in, and the binary refuses anything else." $v.data.segmentFormat) }}
+  {{- end }}
+  segment_format: {{ $v.data.segmentFormat }}
+  {{- end }}
   range:
     topic: {{ required "\n\ndata.range.topic is required: the wire-level topic name this range serves." $v.data.range.topic | quote }}
     topic_epoch: {{ int $v.data.range.topicEpoch }}

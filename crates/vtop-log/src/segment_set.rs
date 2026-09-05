@@ -752,6 +752,24 @@ impl SegmentSet {
         })
     }
 
+    /// Create a range's first segment in the proof-carrying v2 format.
+    pub fn create_v2_in(
+        env: &Env,
+        directory: impl AsRef<Path>,
+        descriptor: crate::SegmentDescriptorV2,
+        config: crate::SegmentConfigV2,
+    ) -> VtopLogResult<Self> {
+        let directory = directory.as_ref().to_path_buf();
+        let path = directory.join(format!("{}.active", segment_stem(descriptor.base_offset)));
+        let active = ActiveSegment::create_v2_in(env, &path, descriptor, config)?;
+        Ok(Self {
+            env: env.clone(),
+            directory,
+            sealed: Vec::new(),
+            active: Some(active),
+        })
+    }
+
     /// Append a group, minting the successor's identity from this set's own
     /// environment if the append forces a roll.
     ///

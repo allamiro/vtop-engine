@@ -944,23 +944,52 @@ log "quorum produce accepted $R_EXPECTED records on candidate $holder_ordinal"
 # returns while the third replica is still catching up, so this is POLLED
 # with a deadline rather than asserted once (an immediate assertion tests
 # the timing, not the replication, and flakes).
-await_all_committed() { # <expected>
-  local expected="$1" ordinal offset mport
+#
+# A BOUNDED band plus convergence, not exact equality (#240): every promotion
+# appends one boundary marker of its epoch to the log — a record the consumer
+# never sees but every replica durably holds — and how many elections a run
+# holds is not deterministic. What IS known is the current lease epoch: epochs
+# are minted from 1 and a marker exists only for an epoch that was promoted,
+# so the surplus over the records produced is at most that epoch (review: a
+# floor alone would admit a deterministic leader-side duplication that every
+# replica converged on). So the offset lies in [records, records + epoch],
+# and every replica reports the SAME offset: the band says nothing was lost
+# and nothing beyond the markers was invented, the agreement says
+# replication reached every replica.
+await_all_committed() { # <expected-records> <lease-epoch>
+  local expected="$1" epoch="$2" ordinal offset
+  local ceiling=$((expected + epoch))
+  local -a mports=() offsets=()
   for ordinal in 0 1 2; do
-    alloc_port; mport="$r_port"
-    forward_ns "$REPLICATED_NS" "${REL}-${ordinal}" "$mport" 9500
-    offset=""
-    for _ in $(seq 1 45); do
-      offset="$(committed_offset "$mport")"
-      [ "${offset:-0}" = "$expected" ] && break
-      sleep 2
-    done
-    [ "${offset:-0}" = "$expected" ] \
-      || fail "pod $ordinal has durably applied '${offset:-0}' of $expected records after 90s; replication is not reaching it"
-    log "pod $ordinal has durably applied all $expected records"
+    alloc_port; mports[ordinal]="$r_port"
+    forward_ns "$REPLICATED_NS" "${REL}-${ordinal}" "${mports[ordinal]}" 9500
   done
+  local settled=0
+  for _ in $(seq 1 45); do
+    settled=1
+    for ordinal in 0 1 2; do
+      offset="$(committed_offset "${mports[ordinal]}")"
+      offsets[ordinal]="${offset:-0}"
+      [ "${offsets[ordinal]}" -ge "$expected" ] || settled=0
+      [ "${offsets[ordinal]}" -le "$ceiling" ] || settled=0
+    done
+    if [ "$settled" = 1 ]; then
+      [ "${offsets[0]}" = "${offsets[1]}" ] && [ "${offsets[1]}" = "${offsets[2]}" ] || settled=0
+    fi
+    [ "$settled" = 1 ] && break
+    sleep 2
+  done
+  for ordinal in 0 1 2; do
+    [ "${offsets[ordinal]}" -ge "$expected" ] \
+      || fail "pod $ordinal has durably applied '${offsets[ordinal]}' of at least $expected records after 90s; replication is not reaching it"
+    [ "${offsets[ordinal]}" -le "$ceiling" ] \
+      || fail "pod $ordinal reports offset ${offsets[ordinal]}, above the $expected records plus at most $epoch boundary marker(s) the lease epoch permits: something was applied that nobody produced"
+  done
+  [ "$settled" = 1 ] \
+    || fail "the replicas never converged after 90s: offsets ${offsets[0]}/${offsets[1]}/${offsets[2]} (expected $expected records plus at most $epoch boundary marker(s))"
+  log "every pod has durably applied all $expected records (offset ${offsets[0]}, within the $epoch marker(s) the lease epoch permits) and the three agree"
 }
-await_all_committed "$R_EXPECTED"
+await_all_committed "$R_EXPECTED" "$EPOCH"
 log "replication verified in Kubernetes: quorum durability works and every replica holds the data"
 
 # THE FAILOVER THE TOPOLOGY EXISTS FOR (#284). Delete the holder's pod —
@@ -1139,7 +1168,7 @@ log "post-failover peer DNS settled"
 # Every replica — INCLUDING the recreated pod — converges on the full total:
 # the 60 pre-delete records survived the failover, the 30 post-failover
 # records replicated, and the returned pod caught up from whatever it missed.
-await_all_committed "$R_TOTAL"
+await_all_committed "$R_TOTAL" "$NEW_EPOCH"
 log "failover verified in Kubernetes: the range moved (or recovered) without a re-render, produce resumed, and all $R_TOTAL records are on every replica"
 
 log "PASS"

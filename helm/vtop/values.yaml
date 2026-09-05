@@ -191,6 +191,15 @@ data:
   # must be 0 (enforced at render time): candidates start knowing nothing and
   # learn every epoch from grants, so a floor at the first grant refuses it.
   fencingEpoch: 1
+  # The on-disk format a NEW range is created in: "v1" or "v2". Empty keeps
+  # the binary's default (v1), so an existing install renders exactly as it
+  # did. Creation-time only — an existing range keeps the format its data
+  # already has. v2 is the proof-carrying format, and the one a replicated
+  # range wants: the promotion boundary marker (#240) — the record a new
+  # leader must quorum-ack before publishing its high-water mark — can only
+  # be carried by a v2 frame, so a v1 replicated range keeps the pre-marker
+  # publication path.
+  segmentFormat: ""
   # Identity of the range each node serves. REQUIRED (no defaults — these are
   # protocol-visible identities, verified end to end).
   range:
