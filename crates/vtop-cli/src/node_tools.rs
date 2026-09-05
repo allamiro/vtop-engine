@@ -235,6 +235,30 @@ fn client(config: &NodeClientConfig, timeout: Duration) -> Result<ReplicaStatusC
     .map_err(|error| error.to_string())
 }
 
+/// Each replica's epoch vector (#240) for the transitions audit's cross-check:
+/// which fencing epoch wrote each stretch of its log, or why it could not be
+/// asked. Same config as `node status`, one fresh client per replica.
+pub(crate) async fn epoch_vectors(
+    path: &Path,
+    timeout: Duration,
+) -> Result<Vec<crate::meta_tools::ReplicaEpochVector>, String> {
+    let config = load_config(path)?;
+    let range = config.range.identity();
+    let mut vectors = Vec::with_capacity(config.replicas.len());
+    for replica in &config.replicas {
+        let endpoint = resolve_endpoint(&replica.addr).map_err(|error| error.to_string());
+        let outcome = match (client(&config, timeout), endpoint) {
+            (Ok(client), Ok(addr)) => client
+                .epoch_history(addr, &replica.server_name, replica.node_uuid, &range)
+                .await
+                .map_err(|error| error.to_string()),
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        };
+        vectors.push((replica.node_uuid, replica.addr.clone(), outcome));
+    }
+    Ok(vectors)
+}
+
 async fn collect(
     config: &NodeClientConfig,
     timeout: Duration,
