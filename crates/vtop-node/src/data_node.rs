@@ -1031,7 +1031,12 @@ async fn run_leader(
         }
         match lease.try_snapshot() {
             None => {
-                if last_ready.load(std::sync::atomic::Ordering::Relaxed) {
+                // The gate again, beside the cached verdict (review): a
+                // marker raised between the read above and here would
+                // otherwise ride out on a "ready" decided before it.
+                if last_ready.load(std::sync::atomic::Ordering::Relaxed)
+                    && !probe_broker.boundary_pending()
+                {
                     vtop_observe::Readiness::Ready
                 } else {
                     vtop_observe::Readiness::not_ready(
@@ -1471,7 +1476,10 @@ async fn run_candidate(
                         }
                     }
                     None => {
-                        if probe_last_probe.load(std::sync::atomic::Ordering::Relaxed) {
+                        // The gate again, beside the cached verdict (review).
+                        if probe_last_probe.load(std::sync::atomic::Ordering::Relaxed)
+                            && !broker.boundary_pending()
+                        {
                             vtop_observe::Readiness::Ready
                         } else {
                             vtop_observe::Readiness::not_ready(

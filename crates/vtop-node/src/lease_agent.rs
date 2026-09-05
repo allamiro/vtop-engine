@@ -339,6 +339,14 @@ impl QuorumProbe for ReplicaPlaneProbe {
     }
 }
 
+/// What one successful marker publication proved: the epoch whose marker
+/// is now quorum-acked, and the high-water mark it published (review).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublishedMarker {
+    pub epoch: u64,
+    pub committed: u64,
+}
+
 /// Publishes into a live broker.
 ///
 /// On a replicated v2 range the probed boundary is NOT published here (#240,
@@ -434,11 +442,23 @@ impl BrokerLeasePublisher {
         }
     }
 
-    /// One attempt at the pending marker: `Ok(Some(mark))` published it,
-    /// `Ok(None)` found nothing pending, `Err` names why it stays pending.
-    /// Synchronous and blocking (an fsync plus a replication round trip), so
-    /// the driver runs it on the blocking pool.
+    /// One attempt at the pending marker, answering only the mark: the
+    /// tests' shorthand over [`Self::publish_pending_boundary`].
+    #[cfg(test)]
     pub fn try_publish_pending_boundary(&self) -> Result<Option<u64>, String> {
+        self.publish_pending_boundary()
+            .map(|published| published.map(|published| published.committed))
+    }
+
+    /// One attempt at the pending marker: `Ok(Some(published))` names the
+    /// epoch whose marker went out and the mark it published, `Ok(None)`
+    /// found nothing pending, `Err` names why it stays pending. The pending
+    /// epoch is read INSIDE this call, so a re-grant between a caller's own
+    /// read and this one publishes the newer marker — and a caller that
+    /// reports the epoch must report the one answered here, not the one it
+    /// captured (review). Synchronous and blocking (an fsync plus a
+    /// replication round trip), so the driver runs it on the blocking pool.
+    pub fn publish_pending_boundary(&self) -> Result<Option<PublishedMarker>, String> {
         let Some(epoch) = self.pending_marker_epoch() else {
             return Ok(None);
         };
@@ -456,7 +476,10 @@ impl BrokerLeasePublisher {
                     // Proven: the mark is published, and fetch may serve it.
                     self.broker.set_boundary_pending(false);
                 }
-                Ok(Some(mark))
+                Ok(Some(PublishedMarker {
+                    epoch,
+                    committed: mark,
+                }))
             }
             Err(error) => Err(error.to_string()),
         }
@@ -498,20 +521,27 @@ impl BrokerLeasePublisher {
             };
             let publisher = Arc::clone(&self);
             let outcome =
-                tokio::task::spawn_blocking(move || publisher.try_publish_pending_boundary()).await;
+                tokio::task::spawn_blocking(move || publisher.publish_pending_boundary()).await;
             match outcome {
-                Ok(Ok(Some(committed))) => {
+                Ok(Ok(Some(PublishedMarker {
+                    epoch: published,
+                    committed,
+                }))) => {
                     attempts = 0;
+                    // THE EPOCH THAT WENT OUT, not the one read above
+                    // (review): a re-grant between the two publishes the
+                    // newer marker, and the harness waits for that one by
+                    // number.
                     tracing::info!(
                         range = %self.broker.range().range_id,
-                        fencing_epoch = epoch,
+                        fencing_epoch = published,
                         committed_high_watermark = committed,
                         "boundary marker quorum-acked; the high-water mark is published"
                     );
                     // The harness-readable line, beside the structured one:
                     // scenarios assert this exact event.
                     println!(
-                        "boundary_marker_published epoch={epoch} committed={committed} range={}",
+                        "boundary_marker_published epoch={published} committed={committed} range={}",
                         self.broker.range().range_id
                     );
                     use std::io::Write;
