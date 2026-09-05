@@ -12,9 +12,10 @@
 //! dedup survives snapshot/restore identically on every replica.
 
 use crate::command::{
-    MetadataCommand, MetadataError, MetadataResponse, NodeState, RangeAssignment,
-    VerificationMethod, MAX_ASSIGNED_RANGES, MAX_NODE_ADDR_BYTES, MAX_TIER_BACKEND_ID_BYTES,
-    MAX_TIER_OBJECT_URI_BYTES, MAX_TIER_VERSION_ID_BYTES,
+    decode_promotion_outcome, encode_promotion_outcome, MetadataCommand, MetadataError,
+    MetadataResponse, NodeState, PromotionOutcome, RangeAssignment, VerificationMethod,
+    MAX_ASSIGNED_RANGES, MAX_NODE_ADDR_BYTES, MAX_TIER_BACKEND_ID_BYTES, MAX_TIER_OBJECT_URI_BYTES,
+    MAX_TIER_VERSION_ID_BYTES, MAX_TRANSITION_QUORUM,
 };
 use crate::keys::{validate_group_name, validate_topic_name, MetaKey};
 use crate::placement::{
@@ -59,6 +60,7 @@ const VALUE_TAG_REBALANCE_INTENT: u8 = 15;
 const VALUE_TAG_RANGE_V2: u8 = 16;
 const VALUE_TAG_SEGMENT_TIER_COPY: u8 = 17;
 const VALUE_TAG_TOPIC_RETENTION_POLICY: u8 = 18;
+const VALUE_TAG_RANGE_TRANSITION: u8 = 19;
 
 /// A registered broker/controller node.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -332,6 +334,108 @@ pub struct TopicRetentionPolicyRecord {
 }
 
 /// A typed record value stored under an encoded [`MetaKey`].
+/// How an epoch came to be minted (#240 item 5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrantKind {
+    /// [`MetadataCommand::AcquireRangeLease`]: a candidate won the election.
+    Election,
+    /// [`MetadataCommand::GrantRangeLease`]: an operator named the holder.
+    Administrative,
+}
+
+/// What the holder reported about its grant, if anything yet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TransitionOutcome {
+    /// Minted, never reported on. An epoch that was granted and never
+    /// served under looks exactly like this — deliberately visible rather
+    /// than absent, so a gap in the chain can only ever mean a missing
+    /// record, never a legitimate silence.
+    Pending,
+    Reported {
+        outcome: PromotionOutcome,
+        reported_at_ms: i64,
+        reported_apply_index: u64,
+    },
+}
+
+/// One epoch transition of a range (#240 item 5): minted by the state
+/// machine at the moment the epoch is, so the chain of a range's records is
+/// gapless by construction — every grant has one, whether or not anyone
+/// ever served under it. The evidence the promotion computed (the fenced
+/// quorum, the boundary adopted, the §5.4.1 vote) arrives afterwards from
+/// the holder and is kept here rather than logged and lost.
+///
+/// What it asserts is checkable afterwards by anyone holding the record and
+/// the replicas: `epoch_to > epoch_from` and the chain has no gaps; the
+/// boundary is at or below what a majority in the quorum reported; the vote
+/// recomputes from the quorum. What it does NOT claim, stated plainly: it
+/// prevents nothing, it does not attest the outgoing holder's final state
+/// (`holder_from` is who metadata believed held the range, usually dead by
+/// then), and an unfenced replica's offset never appears in it.
+///
+/// The canonical encoding — [`MetaValue::encode`] — is the signing input
+/// for the transition statement; a MAC over these bytes is computed where
+/// the record is served, not inside `apply`, because the replicated state
+/// machine must stay deterministic without a secret every voter shares.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RangeTransitionRecord {
+    pub epoch_from: u64,
+    pub epoch_to: u64,
+    /// Who metadata believed held the range when the epoch was minted;
+    /// `None` when nobody did.
+    pub holder_from: Option<Uuid>,
+    pub holder_to: Uuid,
+    pub grant: GrantKind,
+    /// The granting command's `issued_at_ms` — data in the replicated log,
+    /// never a local clock.
+    pub granted_at_ms: i64,
+    pub granted_apply_index: u64,
+    pub outcome: TransitionOutcome,
+}
+
+impl RangeTransitionRecord {
+    /// The record's canonical encoding — the same bytes the snapshot
+    /// carries — which is the signing input for the transition statement.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, CodecError> {
+        MetaValue::RangeTransition(self.clone()).encode()
+    }
+
+    /// The bytes the transition statement's MAC is computed over: the
+    /// record's KEY — topic, range, and the epoch it establishes — followed
+    /// by its canonical value bytes. The key is part of the statement
+    /// because a MAC over the value alone would vouch for "this transition
+    /// happened" without saying WHERE: a signed record lifted from one
+    /// range's chain would verify when presented as another range's, and
+    /// a reader checking an archived chain offline has nothing but the
+    /// MAC to tell it the record belongs to the chain it is checking.
+    pub fn signing_input(&self, topic_uuid: Uuid, range_uuid: Uuid) -> Result<Vec<u8>, CodecError> {
+        let mut input = MetaKey::RangeTransition {
+            topic_uuid,
+            range_uuid,
+            fencing_epoch: self.epoch_to,
+        }
+        .encode();
+        input.extend_from_slice(&self.canonical_bytes()?);
+        Ok(input)
+    }
+
+    /// The transition statement's MAC (#240 item 5): a keyed BLAKE3 hash
+    /// over [`Self::signing_input`], computed where the record is SERVED —
+    /// never inside `apply`, which must stay deterministic across voters
+    /// whose keys may differ. A reader holding the key, the record, and
+    /// the range identity it was read for verifies it without the cluster;
+    /// a reader holding none of these has only the cluster's word, which
+    /// is what the MAC exists to improve on.
+    pub fn mac(
+        &self,
+        key: &[u8; 32],
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+    ) -> Result<[u8; 32], CodecError> {
+        Ok(*blake3::keyed_hash(key, &self.signing_input(topic_uuid, range_uuid)?).as_bytes())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MetaValue {
     Node(NodeRecord),
@@ -349,6 +453,7 @@ pub enum MetaValue {
     RebalanceIntent(RebalanceIntentRecord),
     TierCopy(TierCopyRecord),
     TopicRetentionPolicy(TopicRetentionPolicyRecord),
+    RangeTransition(RangeTransitionRecord),
 }
 
 impl MetaValue {
@@ -574,6 +679,41 @@ impl MetaValue {
                         MAX_TIER_VERSION_ID_BYTES,
                         "tier object version id",
                     )?;
+                }
+            }
+            MetaValue::RangeTransition(transition) => {
+                put_u8(&mut out, VALUE_TAG_RANGE_TRANSITION);
+                put_u64(&mut out, transition.epoch_from);
+                put_u64(&mut out, transition.epoch_to);
+                match transition.holder_from {
+                    None => put_u8(&mut out, 0),
+                    Some(holder) => {
+                        put_u8(&mut out, 1);
+                        put_uuid(&mut out, holder);
+                    }
+                }
+                put_uuid(&mut out, transition.holder_to);
+                put_u8(
+                    &mut out,
+                    match transition.grant {
+                        GrantKind::Election => 1,
+                        GrantKind::Administrative => 2,
+                    },
+                );
+                put_i64(&mut out, transition.granted_at_ms);
+                put_u64(&mut out, transition.granted_apply_index);
+                match &transition.outcome {
+                    TransitionOutcome::Pending => put_u8(&mut out, 0),
+                    TransitionOutcome::Reported {
+                        outcome,
+                        reported_at_ms,
+                        reported_apply_index,
+                    } => {
+                        put_u8(&mut out, 1);
+                        encode_promotion_outcome(&mut out, outcome)?;
+                        put_i64(&mut out, *reported_at_ms);
+                        put_u64(&mut out, *reported_apply_index);
+                    }
                 }
             }
             MetaValue::TopicRetentionPolicy(policy) => {
@@ -846,6 +986,37 @@ impl MetaValue {
                     fencing_epoch,
                 })
             }
+            VALUE_TAG_RANGE_TRANSITION => MetaValue::RangeTransition(RangeTransitionRecord {
+                epoch_from: reader.u64("transition epoch from")?,
+                epoch_to: reader.u64("transition epoch to")?,
+                holder_from: if reader.flag("transition holder-from presence")? {
+                    Some(reader.uuid("transition holder from")?)
+                } else {
+                    None
+                },
+                holder_to: reader.uuid("transition holder to")?,
+                grant: match reader.u8("transition grant kind")? {
+                    1 => GrantKind::Election,
+                    2 => GrantKind::Administrative,
+                    other => {
+                        return Err(CodecError::UnknownTag {
+                            what: "transition grant kind",
+                            tag: u32::from(other),
+                        })
+                    }
+                },
+                granted_at_ms: reader.i64("transition granted at")?,
+                granted_apply_index: reader.u64("transition granted apply index")?,
+                outcome: if reader.flag("transition outcome presence")? {
+                    TransitionOutcome::Reported {
+                        outcome: decode_promotion_outcome(&mut reader)?,
+                        reported_at_ms: reader.i64("transition reported at")?,
+                        reported_apply_index: reader.u64("transition reported apply index")?,
+                    }
+                } else {
+                    TransitionOutcome::Pending
+                },
+            }),
             VALUE_TAG_TOPIC_RETENTION_POLICY => {
                 MetaValue::TopicRetentionPolicy(TopicRetentionPolicyRecord {
                     generation: reader.u64("retention policy generation")?,
@@ -944,17 +1115,34 @@ impl MetaStateMachine {
                 ..
             } => self.create_topic(name, *topic_uuid, *root_range_uuid),
             MetadataCommand::GrantRangeLease {
+                env,
                 topic_uuid,
                 range_uuid,
                 holder_node_uuid,
                 expected_range_generation,
-                ..
             } => self.grant_range_lease(
                 apply_index,
+                env.issued_at_ms,
                 *topic_uuid,
                 *range_uuid,
                 *holder_node_uuid,
                 *expected_range_generation,
+            ),
+            MetadataCommand::ReportPromotionOutcome {
+                env,
+                topic_uuid,
+                range_uuid,
+                holder_node_uuid,
+                fencing_epoch,
+                outcome,
+            } => self.report_promotion_outcome(
+                apply_index,
+                env.issued_at_ms,
+                *topic_uuid,
+                *range_uuid,
+                *holder_node_uuid,
+                *fencing_epoch,
+                outcome,
             ),
             MetadataCommand::AcquireRangeLease {
                 env,
@@ -1484,6 +1672,7 @@ impl MetaStateMachine {
     fn grant_range_lease(
         &mut self,
         apply_index: u64,
+        now_ms: i64,
         topic_uuid: Uuid,
         range_uuid: Uuid,
         holder_node_uuid: Uuid,
@@ -1523,6 +1712,8 @@ impl MetaStateMachine {
         let Some(fencing_epoch) = range.fencing_epoch.checked_add(1) else {
             return reject(MetadataError::limit("fencing epoch space is exhausted"));
         };
+        let epoch_from = range.fencing_epoch;
+        let holder_from = range.lease.as_ref().map(|lease| lease.holder_node_uuid);
         range.fencing_epoch = fencing_epoch;
         range.lease = Some(LeaseRecord {
             holder_node_uuid,
@@ -1534,7 +1725,134 @@ impl MetaStateMachine {
             expires_at_ms: None,
         });
         range.generation += 1;
+        self.mint_transition(
+            topic_uuid,
+            range_uuid,
+            RangeTransitionRecord {
+                epoch_from,
+                epoch_to: fencing_epoch,
+                holder_from,
+                holder_to: holder_node_uuid,
+                grant: GrantKind::Administrative,
+                granted_at_ms: now_ms,
+                granted_apply_index: apply_index,
+                outcome: TransitionOutcome::Pending,
+            },
+        );
         MetadataResponse::LeaseGranted { fencing_epoch }
+    }
+
+    /// Record the transition an epoch mint IS (#240 item 5), in the same
+    /// apply as the mint, so the chain can never have a legitimate gap: a
+    /// missing record means a missing record.
+    fn mint_transition(
+        &mut self,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        transition: RangeTransitionRecord,
+    ) {
+        let key = MetaKey::RangeTransition {
+            topic_uuid,
+            range_uuid,
+            fencing_epoch: transition.epoch_to,
+        }
+        .encode();
+        self.records
+            .insert(key, MetaValue::RangeTransition(transition));
+    }
+
+    /// The holder of an epoch reports what its promotion established or why
+    /// it stood aside (#240 item 5).
+    ///
+    /// Argument list mirrors the command's fields, as every other apply
+    /// method here does.
+    #[allow(clippy::too_many_arguments)]
+    fn report_promotion_outcome(
+        &mut self,
+        apply_index: u64,
+        now_ms: i64,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        holder_node_uuid: Uuid,
+        fencing_epoch: u64,
+        outcome: &PromotionOutcome,
+    ) -> MetadataResponse {
+        if let PromotionOutcome::Established { quorum, .. } = outcome {
+            if quorum.len() > MAX_TRANSITION_QUORUM {
+                return reject(MetadataError::limit(format!(
+                    "a promotion report may carry at most {MAX_TRANSITION_QUORUM} quorum answers"
+                )));
+            }
+        }
+        let key = MetaKey::RangeTransition {
+            topic_uuid,
+            range_uuid,
+            fencing_epoch,
+        }
+        .encode();
+        let Some(MetaValue::RangeTransition(transition)) = self.records.get_mut(&key) else {
+            return reject(MetadataError::NotFound);
+        };
+        // Only the node the epoch was granted to has evidence about it; a
+        // report from anyone else is at best confusion and at worst a
+        // forgery, and either way not this record's to keep.
+        if transition.holder_to != holder_node_uuid {
+            return reject(MetadataError::invalid_transition(format!(
+                "epoch {fencing_epoch} was granted to {}, not {holder_node_uuid}",
+                transition.holder_to
+            )));
+        }
+        // An established transition is final: what a quorum proved cannot
+        // be rewritten by a later report. A refusal may be superseded — a
+        // quorum miss is retryable, and the retry that succeeds at the same
+        // epoch is exactly the report that should stand.
+        if let TransitionOutcome::Reported {
+            outcome: PromotionOutcome::Established { .. },
+            ..
+        } = &transition.outcome
+        {
+            return reject(MetadataError::invalid_transition(format!(
+                "epoch {fencing_epoch} is already recorded as established; an established \
+                 transition is final"
+            )));
+        }
+        transition.outcome = TransitionOutcome::Reported {
+            outcome: outcome.clone(),
+            reported_at_ms: now_ms,
+            reported_apply_index: apply_index,
+        };
+        MetadataResponse::TransitionRecorded { fencing_epoch }
+    }
+
+    /// A range's transition chain from `from_epoch` upward, at most `limit`
+    /// records, in epoch order (#240 item 5).
+    pub fn range_transitions(
+        &self,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        from_epoch: u64,
+        limit: usize,
+    ) -> Vec<RangeTransitionRecord> {
+        let start = MetaKey::RangeTransition {
+            topic_uuid,
+            range_uuid,
+            fencing_epoch: from_epoch,
+        }
+        .encode();
+        let end = MetaKey::RangeTransition {
+            topic_uuid,
+            range_uuid,
+            fencing_epoch: u64::MAX,
+        }
+        .encode();
+        self.records
+            .range(start..=end)
+            .take(limit)
+            .filter_map(|(_, value)| match value {
+                MetaValue::RangeTransition(transition) => Some(transition.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Election path (#223): take the lease unless someone else still holds a
@@ -1627,6 +1945,8 @@ impl MetaStateMachine {
         let Some(fencing_epoch) = range.fencing_epoch.checked_add(1) else {
             return reject(MetadataError::limit("fencing epoch space is exhausted"));
         };
+        let epoch_from = range.fencing_epoch;
+        let holder_from = range.lease.as_ref().map(|lease| lease.holder_node_uuid);
         range.fencing_epoch = fencing_epoch;
         range.lease = Some(LeaseRecord {
             holder_node_uuid,
@@ -1635,6 +1955,20 @@ impl MetaStateMachine {
             expires_at_ms: Some(expires_at_ms),
         });
         range.generation += 1;
+        self.mint_transition(
+            topic_uuid,
+            range_uuid,
+            RangeTransitionRecord {
+                epoch_from,
+                epoch_to: fencing_epoch,
+                holder_from,
+                holder_to: holder_node_uuid,
+                grant: GrantKind::Election,
+                granted_at_ms: now_ms,
+                granted_apply_index: apply_index,
+                outcome: TransitionOutcome::Pending,
+            },
+        );
         MetadataResponse::LeaseGranted { fencing_epoch }
     }
 
@@ -3850,6 +4184,24 @@ impl MetaStateMachine {
                     reason: "value type does not match its key category",
                 });
             }
+            // A transition's invariants are part of its canonical form
+            // (review): the key names the epoch it minted, and a mint only
+            // ever moves the epoch forward. A snapshot that disagrees with
+            // either was not written by this state machine.
+            if let (
+                MetaKey::RangeTransition { fencing_epoch, .. },
+                MetaValue::RangeTransition(transition),
+            ) = (&typed_key, &value)
+            {
+                if transition.epoch_to != *fencing_epoch
+                    || transition.epoch_to <= transition.epoch_from
+                {
+                    return Err(CodecError::InvalidValue {
+                        what: "snapshot record",
+                        reason: "transition epochs disagree with the key or do not advance",
+                    });
+                }
+            }
             previous_key = Some(key.clone());
             records.insert(key, value);
         }
@@ -3920,6 +4272,10 @@ fn key_matches_value(key: &MetaKey, value: &MetaValue) -> bool {
             | (
                 MetaKey::TopicRetentionPolicy { .. },
                 MetaValue::TopicRetentionPolicy(_)
+            )
+            | (
+                MetaKey::RangeTransition { .. },
+                MetaValue::RangeTransition(_)
             )
     )
 }
@@ -4163,6 +4519,422 @@ mod tests {
                 lease_duration_ms: duration_ms,
             },
         )
+    }
+
+    fn transitions_of(
+        machine: &MetaStateMachine,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+    ) -> Vec<RangeTransitionRecord> {
+        machine.range_transitions(topic_uuid, range_uuid, 0, 64)
+    }
+
+    fn established(
+        boundary: u64,
+        quorum: &[(u128, u64)],
+        votes: u32,
+        required: u32,
+    ) -> PromotionOutcome {
+        PromotionOutcome::Established {
+            boundary_offset: Some(boundary),
+            sealed_prefix_end: None,
+            quorum: quorum
+                .iter()
+                .map(|(node, offset)| crate::command::QuorumAnswer {
+                    node_uuid: Uuid::from_u128(*node),
+                    offset: *offset,
+                })
+                .collect(),
+            votes,
+            required,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn report(
+        machine: &mut MetaStateMachine,
+        index: u64,
+        request: u128,
+        now_ms: i64,
+        holder: Uuid,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        fencing_epoch: u64,
+        outcome: PromotionOutcome,
+    ) -> MetadataResponse {
+        machine.apply(
+            index,
+            &MetadataCommand::ReportPromotionOutcome {
+                env: envelope_at(request, now_ms),
+                topic_uuid,
+                range_uuid,
+                holder_node_uuid: holder,
+                fencing_epoch,
+                outcome,
+            },
+        )
+    }
+
+    /// Every mint records its transition, in the same apply (#240 item 5):
+    /// an election from nobody, an election that displaces a lapsed holder,
+    /// and an administrative grant each leave a record, the chain links
+    /// epoch to epoch with no gap, and a fresh record is visibly PENDING —
+    /// the honest shape of an epoch nobody has served under yet.
+    #[test]
+    fn every_grant_mints_a_transition_and_the_chain_is_gapless() {
+        let (mut machine, first, topic_uuid, range_uuid) = leaseable_range(10);
+        let second = Uuid::from_u128(11);
+        machine.apply(
+            3,
+            &MetadataCommand::RegisterNode {
+                env: envelope(3),
+                node_uuid: second,
+                addr: "n2:9200".to_owned(),
+                expected_generation: None,
+            },
+        );
+        let generation = range_of(&machine, topic_uuid, range_uuid).generation;
+        assert!(matches!(
+            acquire(
+                &mut machine,
+                4,
+                4,
+                1_000,
+                first,
+                topic_uuid,
+                range_uuid,
+                generation,
+                5_000
+            ),
+            MetadataResponse::LeaseGranted { fencing_epoch: 1 }
+        ));
+        // Lapsed, then taken by the other node.
+        let generation = range_of(&machine, topic_uuid, range_uuid).generation;
+        assert!(matches!(
+            acquire(
+                &mut machine,
+                5,
+                5,
+                7_000,
+                second,
+                topic_uuid,
+                range_uuid,
+                generation,
+                5_000
+            ),
+            MetadataResponse::LeaseGranted { fencing_epoch: 2 }
+        ));
+        // An operator hands it back to the first node, permanently.
+        let generation = range_of(&machine, topic_uuid, range_uuid).generation;
+        assert!(matches!(
+            machine.apply(
+                6,
+                &MetadataCommand::GrantRangeLease {
+                    env: envelope_at(6, 9_000),
+                    topic_uuid,
+                    range_uuid,
+                    holder_node_uuid: first,
+                    expected_range_generation: generation,
+                },
+            ),
+            MetadataResponse::LeaseGranted { fencing_epoch: 3 }
+        ));
+
+        let chain = transitions_of(&machine, topic_uuid, range_uuid);
+        assert_eq!(chain.len(), 3, "one record per mint, no more and no fewer");
+        assert_eq!(
+            chain[0],
+            RangeTransitionRecord {
+                epoch_from: 0,
+                epoch_to: 1,
+                holder_from: None,
+                holder_to: first,
+                grant: GrantKind::Election,
+                granted_at_ms: 1_000,
+                granted_apply_index: 4,
+                outcome: TransitionOutcome::Pending,
+            }
+        );
+        assert_eq!(chain[1].epoch_from, 1);
+        assert_eq!(chain[1].epoch_to, 2);
+        assert_eq!(chain[1].holder_from, Some(first));
+        assert_eq!(chain[1].holder_to, second);
+        assert_eq!(chain[1].grant, GrantKind::Election);
+        assert_eq!(chain[2].epoch_from, 2);
+        assert_eq!(chain[2].epoch_to, 3);
+        assert_eq!(chain[2].holder_from, Some(second));
+        assert_eq!(chain[2].holder_to, first);
+        assert_eq!(chain[2].grant, GrantKind::Administrative);
+        assert_eq!(chain[2].granted_at_ms, 9_000);
+        for pair in chain.windows(2) {
+            assert_eq!(
+                pair[0].epoch_to, pair[1].epoch_from,
+                "each record begins where the previous one ended: no gap, ever"
+            );
+        }
+        // The read is a key range in epoch order, and `from_epoch` cuts it.
+        assert_eq!(
+            machine
+                .range_transitions(topic_uuid, range_uuid, 2, 64)
+                .len(),
+            2
+        );
+        assert_eq!(
+            machine
+                .range_transitions(topic_uuid, range_uuid, 0, 1)
+                .len(),
+            1
+        );
+        assert!(machine
+            .range_transitions(Uuid::from_u128(99), range_uuid, 0, 64)
+            .is_empty());
+    }
+
+    /// The holder's report fills in the outcome (#240 item 5): the fenced
+    /// quorum, the adopted boundary and the vote are kept as data a checker
+    /// can recompute from rather than trust. Only the holder may report; a
+    /// refusal may be superseded by the retry that succeeds; an established
+    /// transition is final; and an epoch never minted has no record to
+    /// fill.
+    #[test]
+    fn a_promotion_report_fills_the_holders_record_and_an_established_one_is_final() {
+        let (mut machine, holder, topic_uuid, range_uuid) = leaseable_range(10);
+        let generation = range_of(&machine, topic_uuid, range_uuid).generation;
+        acquire(
+            &mut machine,
+            3,
+            3,
+            1_000,
+            holder,
+            topic_uuid,
+            range_uuid,
+            generation,
+            5_000,
+        );
+        let rival = Uuid::from_u128(11);
+
+        // Somebody else's report on this epoch is refused by name.
+        assert!(matches!(
+            report(
+                &mut machine,
+                4,
+                4,
+                1_100,
+                rival,
+                topic_uuid,
+                range_uuid,
+                1,
+                established(0, &[], 0, 0)
+            ),
+            MetadataResponse::Rejected(MetadataError::InvalidTransition(_))
+        ));
+        // An epoch never minted has nothing to fill.
+        assert!(matches!(
+            report(
+                &mut machine,
+                5,
+                5,
+                1_100,
+                holder,
+                topic_uuid,
+                range_uuid,
+                7,
+                established(0, &[], 0, 0)
+            ),
+            MetadataResponse::Rejected(MetadataError::NotFound)
+        ));
+        // A quorum miss, reported honestly...
+        assert!(matches!(
+            report(
+                &mut machine,
+                6,
+                6,
+                1_200,
+                holder,
+                topic_uuid,
+                range_uuid,
+                1,
+                PromotionOutcome::Refused {
+                    reason: crate::command::PromotionRefusal::QuorumUnavailable
+                },
+            ),
+            MetadataResponse::TransitionRecorded { fencing_epoch: 1 }
+        ));
+        // ...may be superseded by the retry that succeeds at the same epoch.
+        let evidence = established(401, &[(10, 401), (11, 400), (12, 350)], 3, 2);
+        assert!(matches!(
+            report(
+                &mut machine,
+                7,
+                7,
+                1_500,
+                holder,
+                topic_uuid,
+                range_uuid,
+                1,
+                evidence.clone()
+            ),
+            MetadataResponse::TransitionRecorded { fencing_epoch: 1 }
+        ));
+        let chain = transitions_of(&machine, topic_uuid, range_uuid);
+        assert_eq!(
+            chain[0].outcome,
+            TransitionOutcome::Reported {
+                outcome: evidence,
+                reported_at_ms: 1_500,
+                reported_apply_index: 7,
+            }
+        );
+        // Established is final: a later report cannot rewrite what was proven.
+        assert!(matches!(
+            report(
+                &mut machine,
+                8,
+                8,
+                1_600,
+                holder,
+                topic_uuid,
+                range_uuid,
+                1,
+                established(0, &[], 0, 0)
+            ),
+            MetadataResponse::Rejected(MetadataError::InvalidTransition(_))
+        ));
+        // The quorum list is bounded in apply as well as on the wire.
+        let oversized = established(
+            0,
+            &(0..MAX_TRANSITION_QUORUM as u128 + 1)
+                .map(|node| (node, 0))
+                .collect::<Vec<_>>(),
+            0,
+            0,
+        );
+        let generation = range_of(&machine, topic_uuid, range_uuid).generation;
+        acquire(
+            &mut machine,
+            9,
+            9,
+            9_000,
+            holder,
+            topic_uuid,
+            range_uuid,
+            generation,
+            5_000,
+        );
+        assert!(matches!(
+            report(
+                &mut machine,
+                10,
+                10,
+                9_100,
+                holder,
+                topic_uuid,
+                range_uuid,
+                2,
+                oversized
+            ),
+            MetadataResponse::Rejected(MetadataError::Limit(_))
+        ));
+    }
+
+    /// A snapshot whose transition record disagrees with its key, or whose
+    /// epochs do not advance, is refused (review): the invariants are part
+    /// of the canonical form, not a courtesy of the writer.
+    #[test]
+    fn a_snapshot_transition_that_breaks_its_invariants_is_refused() {
+        let (mut machine, holder, topic_uuid, range_uuid) = leaseable_range(10);
+        let generation = range_of(&machine, topic_uuid, range_uuid).generation;
+        acquire(
+            &mut machine,
+            3,
+            3,
+            1_000,
+            holder,
+            topic_uuid,
+            range_uuid,
+            generation,
+            5_000,
+        );
+        let encoded = machine.encode_snapshot().unwrap();
+        let key = MetaKey::RangeTransition {
+            topic_uuid,
+            range_uuid,
+            fencing_epoch: 1,
+        }
+        .encode();
+        let key_at = encoded
+            .windows(key.len())
+            .position(|window| window == key.as_slice())
+            .expect("the transition key is in the snapshot");
+        // key, then u32 value length, then the value: tag, epoch_from,
+        // epoch_to.
+        let value_at = key_at + key.len() + 4;
+        assert_eq!(encoded[value_at], VALUE_TAG_RANGE_TRANSITION);
+        let mut not_advancing = encoded.clone();
+        not_advancing[value_at + 1..value_at + 9].copy_from_slice(&1_u64.to_be_bytes());
+        assert!(
+            MetaStateMachine::decode_snapshot(&not_advancing).is_err(),
+            "epoch_from == epoch_to is not a transition"
+        );
+        let mut disagreeing = encoded.clone();
+        disagreeing[value_at + 9..value_at + 17].copy_from_slice(&2_u64.to_be_bytes());
+        assert!(
+            MetaStateMachine::decode_snapshot(&disagreeing).is_err(),
+            "a value whose epoch_to is not the key's epoch was not written by this machine"
+        );
+        assert!(MetaStateMachine::decode_snapshot(&encoded).is_ok());
+    }
+
+    /// The record survives a snapshot byte-exactly in both outcomes, and its
+    /// value tag agrees with its key category (#240 item 5).
+    #[test]
+    fn transition_records_round_trip_through_snapshots() {
+        let (mut machine, holder, topic_uuid, range_uuid) = leaseable_range(10);
+        let generation = range_of(&machine, topic_uuid, range_uuid).generation;
+        acquire(
+            &mut machine,
+            3,
+            3,
+            1_000,
+            holder,
+            topic_uuid,
+            range_uuid,
+            generation,
+            5_000,
+        );
+        let generation = range_of(&machine, topic_uuid, range_uuid).generation;
+        acquire(
+            &mut machine,
+            4,
+            4,
+            7_000,
+            holder,
+            topic_uuid,
+            range_uuid,
+            generation,
+            5_000,
+        );
+        report(
+            &mut machine,
+            5,
+            5,
+            7_100,
+            holder,
+            topic_uuid,
+            range_uuid,
+            2,
+            established(401, &[(10, 401), (11, 400)], 2, 2),
+        );
+        let encoded = machine.encode_snapshot().unwrap();
+        let decoded = MetaStateMachine::decode_snapshot(&encoded).unwrap();
+        assert_eq!(decoded.encode_snapshot().unwrap(), encoded);
+        assert_eq!(
+            transitions_of(&decoded, topic_uuid, range_uuid),
+            transitions_of(&machine, topic_uuid, range_uuid)
+        );
+        let value =
+            MetaValue::RangeTransition(transitions_of(&machine, topic_uuid, range_uuid)[1].clone());
+        assert_eq!(MetaValue::decode(&value.encode().unwrap()).unwrap(), value);
     }
 
     /// The core liveness property: a leader that stops renewing loses the

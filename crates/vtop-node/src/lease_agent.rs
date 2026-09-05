@@ -87,6 +87,11 @@ pub trait QuorumProbe: Send + Sync {
     async fn probe(&self, fencing_epoch: u64) -> Vec<crate::promotion::ReplicaProbe>;
     /// The CONFIGURED replica-set size, not the number that answered.
     fn replication_factor(&self) -> usize;
+    /// The candidate's own sealed-prefix end at promotion, for the
+    /// transition record (#240 item 5); `None` when unknown.
+    fn sealed_prefix_end(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Probes over the replication plane, one RPC per follower.
@@ -110,6 +115,11 @@ pub trait QuorumProbe: Send + Sync {
 pub trait CandidateLocalView: Send + Sync {
     fn local_committed_offset(&self) -> u64;
     fn epoch_starts(&self) -> Vec<vtop_broker::fencing_epochs::EpochStart>;
+    /// Where this replica's sealed prefix ends (#306), for the transition
+    /// record (#240 item 5); `None` when the view cannot say.
+    fn sealed_prefix_end(&self) -> Option<u64> {
+        None
+    }
 }
 
 impl CandidateLocalView for LocalBroker {
@@ -121,6 +131,12 @@ impl CandidateLocalView for LocalBroker {
     fn epoch_starts(&self) -> Vec<vtop_broker::fencing_epochs::EpochStart> {
         self.epoch_starts()
     }
+
+    fn sealed_prefix_end(&self) -> Option<u64> {
+        self.sealed_segment_handles()
+            .last()
+            .map(|handle| handle.next_offset)
+    }
 }
 
 impl CandidateLocalView for vtop_broker::replication::InProcessFollower {
@@ -130,6 +146,13 @@ impl CandidateLocalView for vtop_broker::replication::InProcessFollower {
 
     fn epoch_starts(&self) -> Vec<vtop_broker::fencing_epochs::EpochStart> {
         self.epoch_starts()
+    }
+
+    fn sealed_prefix_end(&self) -> Option<u64> {
+        // The candidate's view during its probe IS the follower it was
+        // (review): the sealed prefix it reports is the one it holds now,
+        // not the broker's after the build.
+        self.sealed_prefix_end()
     }
 }
 
@@ -336,6 +359,10 @@ impl QuorumProbe for ReplicaPlaneProbe {
     fn replication_factor(&self) -> usize {
         // The leader plus its configured followers.
         self.followers.len() + 1
+    }
+
+    fn sealed_prefix_end(&self) -> Option<u64> {
+        self.view.sealed_prefix_end()
     }
 }
 
@@ -792,6 +819,15 @@ enum Promoted {
 struct Promoter {
     /// Set by the quorum-miss arm; read and cleared by the caller (#375).
     quorum_miss: bool,
+    /// This node's own view, for the evidence a STANDALONE promotion can
+    /// still report (review): a range with no replica set has no probe to
+    /// carry its view, but its sealed prefix is as knowable as anyone's.
+    local_view: Option<Arc<dyn CandidateLocalView>>,
+    /// What the last verification established or why it refused, kept for
+    /// the agent to report to metadata (#240 item 5) — the evidence the
+    /// promotion computes and used to discard. Taken by the caller; a
+    /// verification that was skipped (epoch already verified) leaves none.
+    evidence: Option<vtop_meta::PromotionOutcome>,
     publisher: Arc<dyn LeasePublisher>,
     probe: Option<Arc<dyn QuorumProbe>>,
     /// The epoch whose boundary has already been verified.
@@ -843,6 +879,32 @@ impl Promoter {
                             replicas = answered.len(),
                             "verified promotion: committed boundary established by quorum"
                         );
+                        // The evidence, kept rather than discarded (#240
+                        // item 5): the fenced quorum as it answered, and the
+                        // §5.4.1 vote recomputed the way `establish` counts
+                        // it — fenced replicas at or below the candidate's
+                        // own offset — so a checker can recompute it from
+                        // the quorum rather than trust it.
+                        let candidate_offset = answered
+                            .get(&self.node_uuid)
+                            .copied()
+                            .unwrap_or(committed_offset);
+                        self.evidence = Some(vtop_meta::PromotionOutcome::Established {
+                            boundary_offset: Some(committed_offset),
+                            sealed_prefix_end: probe.sealed_prefix_end(),
+                            quorum: answered
+                                .iter()
+                                .map(|(node_uuid, offset)| vtop_meta::QuorumAnswer {
+                                    node_uuid: *node_uuid,
+                                    offset: *offset,
+                                })
+                                .collect(),
+                            votes: answered
+                                .values()
+                                .filter(|offset| **offset <= candidate_offset)
+                                .count() as u32,
+                            required: crate::promotion::majority(probe.replication_factor()) as u32,
+                        });
                         Some(committed_offset)
                     }
                     crate::promotion::Promotion::QuorumUnavailable { answered, required } => {
@@ -868,6 +930,9 @@ impl Promoter {
                         // permanently refuses, wedging the range under its own
                         // live lease.
                         self.quorum_miss = true;
+                        self.evidence = Some(vtop_meta::PromotionOutcome::Refused {
+                            reason: vtop_meta::PromotionRefusal::QuorumUnavailable,
+                        });
                         self.suspended(fencing_epoch);
                         return false;
                     }
@@ -888,6 +953,9 @@ impl Promoter {
                         // and a stale follower answer can transiently place
                         // the boundary above this node's own disk.
                         self.stand_aside = true;
+                        self.evidence = Some(vtop_meta::PromotionOutcome::Refused {
+                            reason: vtop_meta::PromotionRefusal::LeaderBehind,
+                        });
                         self.suspended(fencing_epoch);
                         return false;
                     }
@@ -914,12 +982,31 @@ impl Promoter {
                         // right fix is a different candidate, and suspending
                         // leaves the epoch grantable to it.
                         self.stand_aside = true;
+                        self.evidence = Some(vtop_meta::PromotionOutcome::Refused {
+                            reason: vtop_meta::PromotionRefusal::CandidateBehindVoters,
+                        });
                         self.suspended(fencing_epoch);
                         return false;
                     }
                 }
             }
         };
+        if self.probe.is_none() {
+            // A standalone promotion has no quorum and no proven boundary:
+            // the node's own log is the boundary. Recorded as served with
+            // nothing to recompute, rather than left Pending as if nobody
+            // had promoted.
+            self.evidence = Some(vtop_meta::PromotionOutcome::Established {
+                boundary_offset: None,
+                sealed_prefix_end: self
+                    .local_view
+                    .as_ref()
+                    .and_then(|view| view.sealed_prefix_end()),
+                quorum: Vec::new(),
+                votes: 0,
+                required: 0,
+            });
+        }
         self.publisher.promote(fencing_epoch, committed_offset);
         self.verified_epoch = Some(fencing_epoch);
         tracing::info!(range = %self.range_uuid, fencing_epoch, "range lease held");
@@ -957,6 +1044,12 @@ impl Promoter {
     /// it, because one verdict funds one hold-off.
     fn take_stand_aside(&mut self) -> bool {
         std::mem::take(&mut self.stand_aside)
+    }
+
+    /// The last verification's evidence, if a verification ran; reading
+    /// clears it, because one verification funds one report.
+    fn take_evidence(&mut self) -> Option<vtop_meta::PromotionOutcome> {
+        self.evidence.take()
     }
 }
 
@@ -1110,7 +1203,7 @@ pub fn decide(
 
 /// Drives one range's lease against the metadata group.
 pub struct LeaseAgent {
-    admin: AdminClient,
+    admin: Arc<AdminClient>,
     config: LeaseAgentConfig,
     node_uuid: Uuid,
     topic_uuid: Uuid,
@@ -1216,13 +1309,15 @@ impl LeaseAgent {
     ) -> Result<Self, String> {
         config.validate()?;
         Ok(Self {
-            admin,
+            admin: Arc::new(admin),
             config,
             node_uuid,
             topic_uuid,
             range_uuid,
             promoter: Promoter {
                 quorum_miss: false,
+                local_view: None,
+                evidence: None,
                 publisher,
                 probe,
                 verified_epoch: None,
@@ -1241,6 +1336,14 @@ impl LeaseAgent {
             campaign_hold_off_rounds: 0,
             quorum_miss_hold: None,
         })
+    }
+
+    /// This node's own view, so a STANDALONE promotion's transition record
+    /// still carries the sealed prefix the node knows (#240 item 5). A
+    /// replicated range's probe carries its view already.
+    pub fn with_local_view(mut self, view: Arc<dyn CandidateLocalView>) -> Self {
+        self.promoter.local_view = Some(view);
+        self
     }
 
     /// Share the flag a supervisor sets when it cannot serve an epoch it was
@@ -1833,7 +1936,9 @@ impl LeaseAgent {
     }
 
     async fn publish_held(&mut self, fencing_epoch: u64, held_until_ms: Option<i64>) -> Promoted {
-        if !self.promoter.ensure(fencing_epoch).await {
+        let held = self.promoter.ensure(fencing_epoch).await;
+        self.report_outcome(fencing_epoch);
+        if !held {
             let quorum_miss = self.promoter.take_quorum_miss();
             if self.promoter.take_stand_aside() {
                 // Two lease lifetimes of poll rounds: enough for the replica
@@ -1853,6 +1958,90 @@ impl LeaseAgent {
         self.state = LeaseState::Held { fencing_epoch };
         self.held_until_ms = held_until_ms;
         Promoted::Yes
+    }
+
+    /// Report what the verification established, or why it refused, so the
+    /// transition record metadata minted at grant time stops being Pending
+    /// (#240 item 5). Best effort, and OFF the renewal path (review): the
+    /// report runs as its own task with its own short deadline and its own
+    /// retries, so a slow or blackholed metadata leader can neither delay
+    /// the renewal that keeps the lease alive nor be told about the
+    /// promotion only once. A report that never lands is logged and the
+    /// epoch's record stays visibly Pending — the honest shape of "nobody
+    /// told metadata what happened", and one a chain reader can see.
+    fn report_outcome(&mut self, fencing_epoch: u64) {
+        let Some(outcome) = self.promoter.take_evidence() else {
+            return;
+        };
+        let admin = Arc::clone(&self.admin);
+        let (topic_uuid, range_uuid, node_uuid) =
+            (self.topic_uuid, self.range_uuid, self.node_uuid);
+        // Each ATTEMPT is bounded well inside one renew interval; the task as
+        // a whole may outlive several renewals (five attempts plus backoff
+        // is up to ~13s at the default cadence), and that is fine precisely
+        // because it is detached — no renewal ever waits on it (review).
+        let attempt_deadline = (self.config.renew_interval / 4)
+            .clamp(Duration::from_millis(200), Duration::from_secs(2));
+        tokio::spawn(async move {
+            let command = MetadataCommand::ReportPromotionOutcome {
+                env: envelope(),
+                topic_uuid,
+                range_uuid,
+                holder_node_uuid: node_uuid,
+                fencing_epoch,
+                outcome,
+            };
+            let mut backoff = Duration::from_millis(500);
+            for attempt in 1..=5_u32 {
+                match tokio::time::timeout(attempt_deadline, admin.propose(command.clone())).await {
+                    Ok(Ok(response)) => match response.response {
+                        MetadataResponse::TransitionRecorded { .. } => {
+                            tracing::info!(
+                                range = %range_uuid,
+                                fencing_epoch,
+                                attempt,
+                                "promotion outcome recorded against the epoch's transition"
+                            );
+                            return;
+                        }
+                        // A refusal is metadata's verdict, not a delivery
+                        // failure: the record is already established, the
+                        // epoch was granted to someone else, or the epoch
+                        // was never minted. Retrying cannot change it.
+                        other => {
+                            tracing::warn!(
+                                range = %range_uuid,
+                                fencing_epoch,
+                                ?other,
+                                "metadata refused the promotion report; the transition stays as it was"
+                            );
+                            return;
+                        }
+                    },
+                    Ok(Err(error)) => tracing::warn!(
+                        range = %range_uuid,
+                        fencing_epoch,
+                        attempt,
+                        %error,
+                        "promotion report not delivered; retrying"
+                    ),
+                    Err(_) => tracing::warn!(
+                        range = %range_uuid,
+                        fencing_epoch,
+                        attempt,
+                        deadline = ?attempt_deadline,
+                        "promotion report timed out; retrying"
+                    ),
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(5));
+            }
+            tracing::warn!(
+                range = %range_uuid,
+                fencing_epoch,
+                "promotion report abandoned after five attempts; the transition stays Pending"
+            );
+        });
     }
 
     /// Hold a quorum-missed epoch still for as long as the budget allows.
@@ -2530,6 +2719,100 @@ mod tests {
         }
     }
 
+    /// A verification leaves the evidence the transition record keeps
+    /// (#240 item 5): the fenced quorum as it answered, the vote recomputed
+    /// the way `establish` counts it, the refusal named by its reason — and
+    /// a skipped re-verification leaves nothing, so nothing is reported
+    /// twice.
+    #[tokio::test]
+    async fn a_verification_leaves_the_evidence_the_transition_record_keeps() {
+        let recorder = Arc::new(Recorder::default());
+        let probe = fixed(vec![at(1, Some(90)), at(2, Some(80)), at(3, Some(95))], 3);
+        let mut verifier = promoter(recorder.clone(), Some(probe));
+        assert!(verifier.ensure(5).await);
+        let Some(vtop_meta::PromotionOutcome::Established {
+            boundary_offset,
+            quorum,
+            votes,
+            required,
+            ..
+        }) = verifier.take_evidence()
+        else {
+            panic!("an established promotion leaves Established evidence");
+        };
+        assert_eq!(
+            boundary_offset,
+            Some(90),
+            "the k-th largest of three is the floor"
+        );
+        assert_eq!(
+            quorum.len(),
+            3,
+            "every fenced answer is kept, not only the voters"
+        );
+        assert_eq!(
+            votes, 2,
+            "nodes 1 and 2 are at or below the candidate's 90; node 3 is not"
+        );
+        assert_eq!(required, 2);
+        assert!(
+            verifier.take_evidence().is_none(),
+            "one verification funds one report"
+        );
+        assert!(verifier.ensure(5).await, "already verified");
+        assert!(
+            verifier.take_evidence().is_none(),
+            "a skipped re-verification computes nothing and reports nothing"
+        );
+
+        let probe = fixed(vec![at(1, Some(90)), at(2, None), at(3, None)], 3);
+        let mut verifier = promoter(recorder.clone(), Some(probe));
+        assert!(!verifier.ensure(6).await);
+        assert_eq!(
+            verifier.take_evidence(),
+            Some(vtop_meta::PromotionOutcome::Refused {
+                reason: vtop_meta::PromotionRefusal::QuorumUnavailable
+            })
+        );
+
+        let mut standalone = promoter(recorder, None);
+        assert!(standalone.ensure(7).await);
+        assert_eq!(
+            standalone.take_evidence(),
+            Some(vtop_meta::PromotionOutcome::Established {
+                boundary_offset: None,
+                sealed_prefix_end: None,
+                quorum: Vec::new(),
+                votes: 0,
+                required: 0,
+            }),
+            "a standalone promotion is established with nothing to recompute, not left Pending"
+        );
+        // Given its own view, a standalone promotion still reports the
+        // sealed prefix it holds (review).
+        struct SealedAt(u64);
+        impl CandidateLocalView for SealedAt {
+            fn local_committed_offset(&self) -> u64 {
+                self.0
+            }
+            fn epoch_starts(&self) -> Vec<vtop_broker::fencing_epochs::EpochStart> {
+                Vec::new()
+            }
+            fn sealed_prefix_end(&self) -> Option<u64> {
+                Some(self.0)
+            }
+        }
+        standalone.local_view = Some(Arc::new(SealedAt(300)));
+        assert!(standalone.ensure(8).await);
+        assert!(matches!(
+            standalone.take_evidence(),
+            Some(vtop_meta::PromotionOutcome::Established {
+                sealed_prefix_end: Some(300),
+                ..
+            })
+        ));
+    }
+
     fn test_broker(dir: &std::path::Path, epoch: u64) -> LocalBroker {
         let range = vtop_protocol::RangeIdentity {
             topic: "telemetry".into(),
@@ -2565,6 +2848,8 @@ mod tests {
     ) -> Promoter {
         Promoter {
             quorum_miss: false,
+            local_view: None,
+            evidence: None,
             publisher,
             probe,
             verified_epoch: None,

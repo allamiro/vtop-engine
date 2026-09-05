@@ -70,9 +70,48 @@ const GOLDEN_SNAPSHOT_FILE_HEX: &str = concat!(
 
 /// v1 state-machine snapshot payload containing the stage-8b retention
 /// records: a tier-copy evidence record and a topic retention policy, plus
-/// the node/topic/range/segment records and dedup FIFO that produced them.
-/// Pins the new value tags (17, 18) byte-exactly.
+/// the node/topic/range/segment records and dedup FIFO that produced them —
+/// and, since the grant at index 3 now mints one (#240 item 5), the range
+/// transition record (value tag 19) that grant left. Pins tags 17, 18 and
+/// 19 byte-exactly.
 const GOLDEN_RETENTION_PAYLOAD_HEX: &str = concat!(
+    "000100000008001300000211111111222243338444555555555555000000190c00076e31",
+    "3a39323030010000000000000000000000000064000b00000361756469742e7631000000",
+    "1903ffeeddccbbaa9988776655443322110000000000000000010013000004ffeeddccbb",
+    "aa998877665544332211000000001b02000861756469742e763100000000000000010000",
+    "0000000000000023000005ffeeddccbbaa998877665544332211000f1e2d3c4b5a697887",
+    "96a5b4c3d2e1f00000003b04000000000000000200000000000000000000000000000000",
+    "010111111111222243338444555555555555000000000000000100000000000000030033",
+    "000006ffeeddccbbaa998877665544332211000f1e2d3c4b5a69788796a5b4c3d2e1f0aa",
+    "aaaaaabbbb4ccc8dddeeeeeeeeeeee000000420500000000000000010000000000000000",
+    "0000000000000080abababababababababababababababababababababababababababab",
+    "abababab0200000000000000010033000010ffeeddccbbaa998877665544332211000f1e",
+    "2d3c4b5a69788796a5b4c3d2e1f0aaaaaaaabbbb4ccc8dddeeeeeeeeeeee000000db1100",
+    "000000000000000000000000000001ababababababababababababababababababababab",
+    "ababababababababababab0000000000001000000973332d6e6174697665002973333a2f",
+    "2f746965722f6e61746976652f61756469742e76312f7365676d656e742e7365676d656e",
+    "7401002033734c346b71434a6f3035714f574268427170664f464164543464524a567656",
+    "5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d01111111",
+    "112222433384445555555555550000000000000006000000000000000200000000000000",
+    "010013000011ffeeddccbbaa998877665544332211000000000a12000000000000000000",
+    "002b000012ffeeddccbbaa998877665544332211000f1e2d3c4b5a69788796a5b4c3d2e1",
+    "f00000000000000001000000341300000000000000000000000000000001001111111122",
+    "224333844455555555555502010203040506070800000000000000030000000007000000",
+    "000000000000009300000000010000000a00010000000000000000000000000000000000",
+    "009300000000020000002a0002ffeeddccbbaa9988776655443322110000000000000000",
+    "010f1e2d3c4b5a69788796a5b4c3d2e1f000000000000000000000930000000003000000",
+    "0a00030000000000000001000000000000000000009300000000040000000a0001000000",
+    "0000000002000000000000000000009300000000050000000a0001000000000000000100",
+    "0000000000000000009300000000060000000a0001000000000000000000000000000000",
+    "0000009300000000070000000a00010000000000000000",
+);
+
+/// The same fixture's payload as the version BEFORE transition records
+/// existed (the pinned bytes of the previous golden vector): a snapshot an
+/// older node wrote, which the current node must still decode and re-encode
+/// as a fixed point — one record short of what the fixture produces today,
+/// because the grant left no transition then.
+const GOLDEN_RETENTION_PAYLOAD_HEX_BEFORE_TRANSITIONS: &str = concat!(
     "000100000007001300000211111111222243338444555555555555000000190c00076e31",
     "3a39323030010000000000000000000000000064000b00000361756469742e7631000000",
     "1903ffeeddccbbaa9988776655443322110000000000000000010013000004ffeeddccbb",
@@ -444,10 +483,33 @@ fn v1_snapshot_payload_with_retention_records_matches_golden_vector() {
     assert_eq!(to_hex(&payload), GOLDEN_RETENTION_PAYLOAD_HEX);
 
     // The pinned bytes decode back to the identical machine (fixed point),
-    // and the two new value tags are actually present in the vector.
+    // and the new value tags are actually present in the vector.
     let decoded = MetaStateMachine::decode_snapshot(&payload).unwrap();
     assert_eq!(decoded.encode_snapshot().unwrap(), payload);
     assert_eq!(decoded, retention_machine());
+    let topic = Uuid::parse_str("ffeeddcc-bbaa-9988-7766-554433221100").unwrap();
+    let range = Uuid::parse_str("0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0").unwrap();
+    let transitions = decoded.range_transitions(topic, range, 0, 8);
+    assert_eq!(
+        transitions.len(),
+        1,
+        "the grant at index 3 minted exactly one transition record (#240 item 5)"
+    );
+    assert_eq!(transitions[0].epoch_to, 1);
+    assert!(matches!(
+        transitions[0].outcome,
+        vtop_meta::TransitionOutcome::Pending
+    ));
+
+    // A snapshot written BEFORE transition records existed still decodes,
+    // is still a fixed point, and differs from today's fixture by exactly
+    // the record the grant now leaves — an older node's snapshot opens
+    // under the current binary with nothing invented.
+    let before = from_hex(GOLDEN_RETENTION_PAYLOAD_HEX_BEFORE_TRANSITIONS);
+    let older = MetaStateMachine::decode_snapshot(&before).unwrap();
+    assert_eq!(older.encode_snapshot().unwrap(), before);
+    assert_eq!(older.record_count() + 1, decoded.record_count());
+    assert!(older.range_transitions(topic, range, 0, 8).is_empty());
 
     // An unknown verification-method tag inside the tier record must refuse
     // to decode, never default. The method byte immediately follows the

@@ -34,7 +34,25 @@
       "properties": {
         "mode": {
           "enum": ["colocated", "separated"],
-          "description": "colocated (default) renders the single co-located StatefulSet; separated is #287 slice 2 and refuses at render time until the two-tier rendering exists."
+          "description": "colocated (default) renders the single co-located StatefulSet; separated renders a metadata tier and a data tier as two StatefulSets sized by deployment.meta/data.replicaCount (#287)."
+        },
+        "meta": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "replicaCount": { "$ref": "#/$defs/nonNegInt" },
+            "resources": { "type": "object" },
+            "affinity": { "type": "object" }
+          }
+        },
+        "data": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "replicaCount": { "$ref": "#/$defs/nonNegInt" },
+            "resources": { "type": "object" },
+            "affinity": { "type": "object" }
+          }
         }
       }
     },

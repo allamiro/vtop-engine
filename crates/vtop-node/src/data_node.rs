@@ -955,7 +955,10 @@ async fn run_leader(
             config.range.range_id,
             Arc::clone(&publisher) as Arc<dyn crate::lease_agent::LeasePublisher>,
             promotion_probe,
-        )?;
+        )?
+        // The standalone case has no probe to carry this node's view, and
+        // its transition record still wants the sealed prefix (#240 item 5).
+        .with_local_view(Arc::clone(&broker) as Arc<dyn crate::lease_agent::CandidateLocalView>);
         agent_task = Some(tokio::spawn(agent.run(release_lease_rx)));
         // The boundary is published through this epoch's marker, not by the
         // promotion itself (#240, §5.4.2): the driver appends and proves it,
@@ -2599,6 +2602,14 @@ impl crate::lease_agent::CandidateLocalView for SwitchingLocalView {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
             .map_or_else(Vec::new, |view| view.epoch_starts())
+    }
+
+    fn sealed_prefix_end(&self) -> Option<u64> {
+        self.delegate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(|view| view.sealed_prefix_end())
     }
 }
 

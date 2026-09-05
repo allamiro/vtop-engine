@@ -12,7 +12,7 @@ pub(crate) const CHECKSUM_LEN: usize = 32;
 pub(crate) const FRAME_PREFIX_LEN: usize = 12;
 pub(crate) const RECORD_FIXED_BODY_LEN: usize =
     RECORD_FRAME_OVERHEAD_BYTES as usize - FRAME_PREFIX_LEN;
-const MAX_HEADER_BYTES: u32 = 1024 * 1024;
+pub(crate) const MAX_HEADER_BYTES: u32 = 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SegmentHeader {

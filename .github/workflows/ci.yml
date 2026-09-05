@@ -498,7 +498,9 @@ jobs:
           echo "appVersion $chart matches the workspace"
 
       - name: helm lint
-        run: helm lint helm/vtop -f helm/vtop/ci/default-values.yaml
+        run: |
+          helm lint helm/vtop -f helm/vtop/ci/default-values.yaml
+          helm lint helm/vtop -f helm/vtop/ci/separated-values.yaml
 
       - name: Render the documented happy path
         run: |
@@ -592,12 +594,86 @@ jobs:
             -f helm/vtop/ci/default-values.yaml \
             --set replicaCount=4 \
             --set 'data.nodeUuids={aaaaaaaa-0000-0000-0000-0000000000a1,aaaaaaaa-0000-0000-0000-0000000000a2,aaaaaaaa-0000-0000-0000-0000000000a3,aaaaaaaa-0000-0000-0000-0000000000a4}'
-          refuses "deployment.mode=colocated (separated is slice 2)" \
-            -f helm/vtop/ci/default-values.yaml --set deployment.mode=separated
           # The #240 format knob: a value the binary would refuse must be
           # refused at render time, with the two it accepts named.
           refuses_because 'data.segmentFormat must be "v1" or "v2"' \
             -f helm/vtop/ci/default-values.yaml --set data.segmentFormat=v3
+          # The #287 slice-2 guards on the SEPARATED shape: the tier sizes
+          # are required, the voter count stays odd, the identity list is
+          # indexed by data-tier ordinal, and an explicit admin endpoint
+          # needs the name its certificate carries.
+          refuses_because "deployment.meta.replicaCount is unset" \
+            -f helm/vtop/ci/separated-values.yaml --set deployment.meta.replicaCount=0
+          refuses_because "deployment.data.replicaCount is unset" \
+            -f helm/vtop/ci/separated-values.yaml --set deployment.data.replicaCount=0
+          refuses_because "deployment.meta.replicaCount 4 is even" \
+            -f helm/vtop/ci/separated-values.yaml --set deployment.meta.replicaCount=4
+          refuses_because "data.nodeUuids has 3 entries but deployment.data.replicaCount is 2" \
+            -f helm/vtop/ci/separated-values.yaml --set deployment.data.replicaCount=2
+          refuses_because "set data.lease.serverName" \
+            -f helm/vtop/ci/separated-values.yaml --set data.lease.adminEndpoint=meta.example:9200
+
+      # The SEPARATED shape (#287 slice 2): two tiers, each pod's config the
+      # ROLE config its command deserializes, the data tier's lease pointed
+      # at the metadata tier by its pods' own names. Parsed, not grepped, for
+      # the reason the replicated check below records.
+      - name: The separated deployment renders two tiers that can find each other
+        run: |
+          set -euo pipefail
+          helm template vtop helm/vtop -f helm/vtop/ci/separated-values.yaml > /tmp/separated.yaml
+          ruby -ryaml -e '
+            docs = YAML.load_stream(File.read("/tmp/separated.yaml")).compact
+            sets = docs.select { |d| d["kind"] == "StatefulSet" }.map { |d| d["metadata"]["name"] }.sort
+            abort "expected two StatefulSets, got #{sets}" unless sets == %w[vtop-data vtop-meta]
+            budgets = docs.select { |d| d["kind"] == "PodDisruptionBudget" }.map { |d| d["metadata"]["name"] }.sort
+            abort "expected one budget per tier, got #{budgets}" unless budgets == %w[vtop-data vtop-meta]
+            headless = docs.select { |d| d["kind"] == "Service" && d["spec"]["clusterIP"] == "None" }.map { |d| d["metadata"]["name"] }.sort
+            abort "expected one headless Service per tier, got #{headless}" unless headless == %w[vtop-data-headless vtop-meta-headless]
+            cm = docs.find { |d| d["kind"] == "ConfigMap" } or abort "no ConfigMap"
+            files = cm["data"].keys.sort
+            abort "expected meta-0..2 and data-0..2, got #{files}" \
+              unless files == %w[data-0.yaml data-1.yaml data-2.yaml meta-0.yaml meta-1.yaml meta-2.yaml]
+            metas = (0..2).map { |i| YAML.safe_load(cm["data"]["meta-#{i}.yaml"]) }
+            datas = (0..2).map { |i| YAML.safe_load(cm["data"]["data-#{i}.yaml"]) }
+
+            # Role configs, not the co-located wrapper: no meta:/data: nesting,
+            # and each carries its own observability endpoint.
+            metas.each_with_index do |m, i|
+              abort "meta-#{i} is nested like a co-located config" if m.key?("meta") || m.key?("data")
+              abort "meta-#{i} node_id is #{m["node_id"]}, want #{i + 1}" unless m["node_id"] == i + 1
+              abort "meta-#{i} has no observability endpoint" unless m["observability"]
+              peers = m.fetch("peers").map { |p| p.fetch("addr") }
+              want = (0..2).map { |j| "vtop-meta-#{j}.vtop-meta-headless.default.svc.cluster.local:9100" }
+              abort "meta-#{i} peers #{peers} are not the metadata tier #{want}" unless peers == want
+            end
+            uuids = %w[aaaaaaaa-0000-0000-0000-0000000000a1 aaaaaaaa-0000-0000-0000-0000000000a2 aaaaaaaa-0000-0000-0000-0000000000a3]
+            datas.each_with_index do |d, i|
+              abort "data-#{i} is nested like a co-located config" if d.key?("meta") || d.key?("data")
+              abort "data-#{i} role is #{d["role"]}, want candidate" unless d["role"] == "candidate"
+              abort "data-#{i} node_uuid is #{d["node_uuid"]}, want #{uuids[i]}" unless d["node_uuid"] == uuids[i]
+              abort "data-#{i} has no observability endpoint" unless d["observability"]
+              peers = d.fetch("peers").map { |p| p.fetch("addr") }
+              want = (0..2).map { |j| "vtop-data-#{j}.vtop-data-headless.default.svc.cluster.local:9300" }
+              abort "data-#{i} peers #{peers} are not the data tier #{want}" unless peers == want
+              # Addresses are what the replica plane dials; identities are
+              # what quorum arithmetic counts (review). The peer list must
+              # carry every data identity exactly once.
+              peer_ids = d.fetch("peers").map { |p| p.fetch("node_uuid") }
+              abort "data-#{i} peer identities #{peer_ids} are not the data tier #{uuids}" unless peer_ids == uuids
+              lease = d.fetch("lease")
+              # The lease reaches the METADATA tier, at a pod name the
+              # certificate can be verified against — never the co-located
+              # loopback default and never a Service name.
+              abort "data-#{i} lease endpoint #{lease["admin_endpoint"]} is not the metadata tier" \
+                unless lease["admin_endpoint"] == "vtop-meta-0.vtop-meta-headless.default.svc.cluster.local:9200"
+              abort "data-#{i} lease server_name does not match its endpoint" \
+                unless lease["server_name"] == "vtop-meta-0.vtop-meta-headless.default.svc.cluster.local"
+              admin = lease.fetch("admin_peers").map { |p| p.fetch("endpoint") }
+              want_admin = (0..2).map { |j| "vtop-meta-#{j}.vtop-meta-headless.default.svc.cluster.local:9200" }
+              abort "data-#{i} admin_peers #{admin} are not every metadata pod" unless admin == want_admin
+            end
+            puts "separated deployment parses: three voters, three leased candidates, each tier addressed by its own names"
+          '
 
       # The REPLICATED shape, which until now nothing rendered at all — not
       # here, and not in the live smoke test either. It is the only topology

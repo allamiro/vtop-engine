@@ -38,8 +38,17 @@ pub struct ClientConfig {
     pub producer_epoch: u64,
     pub fencing_epoch: u64,
     pub range: RangeConfig,
+    /// rustls server name the data node's certificate carries. Unused, and
+    /// may be empty, when `tls` is absent.
+    #[serde(default)]
     pub server_name: String,
-    pub tls: TlsPaths,
+    /// Absent means a PLAINTEXT native session (#294): no certificate on
+    /// either side, the declared principal is the whole of the evidence,
+    /// and the node admits it only if its authorizer accepts unverified
+    /// principals. Meant for a loopback lab; a node refuses to serve
+    /// plaintext on anything else unless told so by name.
+    #[serde(default)]
+    pub tls: Option<TlsPaths>,
 }
 
 impl ClientConfig {
@@ -48,19 +57,33 @@ impl ClientConfig {
     }
 }
 
-type Session = tokio_rustls::client::TlsStream<TcpStream>;
+type Session = vtop_meta::transport::MaybeTls<TcpStream>;
 
 async fn connect(config: &ClientConfig, addr: &str, role: Role) -> Result<Session, String> {
-    let connector = TlsConnector::from(tls::client_config(&config.tls)?);
     let socket = TcpStream::connect(addr)
         .await
         .map_err(|error| format!("connect {addr}: {error}"))?;
-    let name = rustls::pki_types::ServerName::try_from(config.server_name.clone())
-        .map_err(|error| error.to_string())?;
-    let mut stream = connector
-        .connect(name, socket)
-        .await
-        .map_err(|error| format!("tls {addr}: {error}"))?;
+    let mut stream = match &config.tls {
+        Some(paths) => {
+            let connector = TlsConnector::from(tls::client_config(paths)?);
+            let name = rustls::pki_types::ServerName::try_from(config.server_name.clone())
+                .map_err(|error| error.to_string())?;
+            Session::Tls(Box::new(
+                connector
+                    .connect(name, socket)
+                    .await
+                    .map_err(|error| format!("tls {addr}: {error}"))?
+                    .into(),
+            ))
+        }
+        None => {
+            eprintln!(
+                "warning: native session to {addr} is PLAINTEXT: no certificate on either side; \
+                 the principal is declared, not proven"
+            );
+            Session::Plain(socket)
+        }
+    };
     write_frame(
         &mut stream,
         &WireFrame {

@@ -172,12 +172,28 @@ NET="${NET:-vtop-engine_storage-net}"
 # variable at all — a blank-but-set export masks .env for compose, so it
 # must mask it here too (the ${VAR:-default} at the use site then maps blank
 # to the lab default on both sides).
-env_default() { # <key> — the value filed in ./.env, one quote layer stripped
+env_default() { # <key> — the value filed in ./.env, read by Compose's rules
   local value
   value="$(sed -n "s/^$1=//p" .env | tail -1)"
   case "$value" in
-    \"*\") value="${value#\"}"; value="${value%\"}" ;;
-    \'*\') value="${value#\'}"; value="${value%\'}" ;;
+    \"*)
+      # A quoted value ends at its CLOSING quote; an inline comment after
+      # it is not part of the credential (review — matching on a quote PAIR
+      # left the quotes inside the value whenever a comment followed). An
+      # unterminated quote stays exactly as written.
+      value="$(printf '%s' "$value" | sed -E 's/^"([^"]*)".*/\1/')"
+      ;;
+    \'*)
+      value="$(printf '%s' "$value" | sed -E "s/^'([^']*)'.*/\1/")"
+      ;;
+    *)
+      # Compose's dotenv rule for UNQUOTED values: an inline comment starts
+      # at the first whitespace-preceded '#', and trailing whitespace goes.
+      # These are the credentials the MinIO container was interpolated
+      # with, so a parser that keeps 'secret # local MinIO' hands the
+      # client a password the server never saw — and it reads as auth.
+      value="$(printf '%s' "$value" | sed -E 's/[[:space:]]+#.*$//; s/[[:space:]]+$//')"
+      ;;
   esac
   printf '%s' "$value"
 }

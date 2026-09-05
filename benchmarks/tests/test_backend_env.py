@@ -62,6 +62,68 @@ def test_a_dotenv_file_supplies_the_override_the_shell_did_not(
     )
 
 
+def test_an_inline_comment_is_not_part_of_the_password(
+        tmp_path, monkeypatch):
+    # Compose strips a whitespace-preceded '#' from an UNQUOTED value, so
+    # the server was started with 'benchmarksecret' — a client parser that
+    # keeps ' # local MinIO' authenticates with a password the server never
+    # saw, and the failure reads as an auth bug in the scenario. A QUOTED
+    # value keeps its '#', and a '#' glued to the value (no whitespace
+    # before it) is content, not a comment — both per Compose's own rules.
+    from lib import engine
+    monkeypatch.setattr(engine, "_ENV_FILE", str(tmp_path / ".env"))
+    (tmp_path / ".env").write_text(
+        "MINIO_ROOT_USER=\"user # not a comment\" # a real comment\n"
+        "MINIO_ROOT_PASSWORD=benchmarksecret # local MinIO\n",
+        encoding="utf-8")
+    for var in ("MINIO_ROOT_USER", "MINIO_ROOT_PASSWORD",
+                "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    env = _backend_env(minio_scenario())
+    assert env["AWS_SECRET_ACCESS_KEY"] == "benchmarksecret", (
+        "the inline comment belongs to the file, not the password"
+    )
+    assert env["AWS_ACCESS_KEY_ID"] == "user # not a comment", (
+        "a quoted value keeps its '#' and ends at its closing quote — the "
+        "comment after the quote goes, and so do the quotes themselves"
+    )
+
+
+def test_an_explicitly_empty_filed_value_does_not_crash_the_parser(
+        tmp_path, monkeypatch):
+    # 'KEY=' files the empty string. The quote check used substring
+    # membership ('' in '"\'' is True), so the empty value indexed past its
+    # own end and the parser crashed instead of letting the documented
+    # blank-value fallback apply (review).
+    from lib import engine
+    monkeypatch.setattr(engine, "_ENV_FILE", str(tmp_path / ".env"))
+    (tmp_path / ".env").write_text(
+        "MINIO_ROOT_USER=\nMINIO_ROOT_PASSWORD=\n", encoding="utf-8")
+    for var in ("MINIO_ROOT_USER", "MINIO_ROOT_PASSWORD",
+                "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    env = _backend_env(minio_scenario())
+    assert env["AWS_ACCESS_KEY_ID"] == "minioadmin", (
+        "an explicitly blank filed credential falls back to the lab default"
+    )
+
+
+def test_a_hash_glued_to_the_value_is_content(tmp_path, monkeypatch):
+    from lib import engine
+    monkeypatch.setattr(engine, "_ENV_FILE", str(tmp_path / ".env"))
+    (tmp_path / ".env").write_text(
+        "MINIO_ROOT_USER=minioadmin\nMINIO_ROOT_PASSWORD=#secret\n",
+        encoding="utf-8")
+    for var in ("MINIO_ROOT_USER", "MINIO_ROOT_PASSWORD",
+                "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    env = _backend_env(minio_scenario())
+    assert env["AWS_SECRET_ACCESS_KEY"] == "#secret", (
+        "compose requires whitespace before an inline comment; a glued '#' "
+        "is the value"
+    )
+
+
 def test_the_shell_wins_over_the_dotenv_file(tmp_path, monkeypatch):
     # The same precedence compose applies: an exported variable overrides
     # the filed one.

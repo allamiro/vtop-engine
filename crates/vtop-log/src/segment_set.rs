@@ -3590,17 +3590,347 @@ mod tests {
         );
     }
 
+    /// TORN means provably short, not merely undecodable (#410): a
+    /// FULL-LENGTH successor header whose checksum fails is damage to a
+    /// file that once existed complete, and the decoder hands back the
+    /// same `Corrupt` it uses for a mid-write cut. Deleting damage
+    /// destroys the evidence quarantine exists to preserve, so the flip
+    /// must refuse the open and leave the file where it lies.
+    #[test]
+    fn a_damaged_full_length_successor_header_is_quarantined_not_deleted() {
+        let directory = tempdir().unwrap();
+        // Stage through the REAL roll so the successor is byte-exact, then
+        // delete only the boundary and flip ONE byte inside the header
+        // JSON — the file keeps its full length, only its checksum lies.
+        let producer = Uuid::from_u128(77);
+        let mut staged =
+            SegmentSet::create_in(&Env::real(), directory.path(), descriptor(), config()).unwrap();
+        for sequence in 0..3 {
+            staged
+                .append_group(
+                    &[record(producer, sequence)],
+                    Durability::Fsync,
+                    Uuid::from_u128(8000 + sequence as u128),
+                )
+                .unwrap();
+        }
+        staged.roll(Uuid::from_u128(0xBADF00D)).unwrap();
+        drop(staged);
+        std::fs::remove_file(directory.path().join(format!("{}.commit", segment_stem(3)))).unwrap();
+        let flipped_path = directory.path().join(format!("{}.active", segment_stem(3)));
+        let mut bytes = std::fs::read(&flipped_path).unwrap();
+        bytes[20] ^= 0xFF;
+        std::fs::write(&flipped_path, &bytes).unwrap();
+
+        let refused = SegmentSet::open_in(&Env::real(), directory.path())
+            .map(|_| ())
+            .expect_err("a damaged successor header must keep the directory refused");
+        assert!(
+            !matches!(refused, LogError::TailSealedWithoutSuccessor { .. }),
+            "a full-length file must not have been classified as torn and deleted: {refused}"
+        );
+        assert!(
+            flipped_path.exists(),
+            "the damaged header is evidence; quarantine preserves it, deletion would not"
+        );
+    }
+
+    /// Shortness alone is not provenance (#410, review round three): a
+    /// complete header from ANOTHER range — a shorter topic makes it
+    /// measure below this range's torn floor — damaged and restored under
+    /// the roll-window name must quarantine, not sweep. What a torn write
+    /// has and a foreign header lacks is prefix-consistency with the
+    /// expected successor, checked in layers: an honestly-encoded short
+    /// foreign header claims a JSON length no real successor of this range
+    /// could have (this test's case), and one whose length field is also
+    /// damaged into range diverges byte-wise at its topic inside the
+    /// deterministic descriptor region. Either way the classification
+    /// refuses to call it torn.
+    #[test]
+    fn a_short_damaged_foreign_header_is_quarantined_not_deleted() {
+        let directory = tempdir().unwrap();
+        strand_after_seal(directory.path(), false);
+        let foreign_path = directory.path().join(format!("{}.active", segment_stem(3)));
+        let mut foreign = descriptor();
+        foreign.topic = "x".to_owned();
+        foreign.segment_id = Uuid::from_u128(0xF5);
+        foreign.base_offset = 3;
+        // The foreign header must land STRICTLY BELOW the torn floor to
+        // exercise the prefix-consistency path this test pins (review: the
+        // default config's wider digits exactly cancelled the topic's
+        // savings, so the floor check quarantined it before the prefix
+        // logic ever ran). The narrowest config makes the shortened topic
+        // the only length difference — decisively below the floor.
+        let narrowest = SegmentConfig {
+            max_record_bytes: 1,
+            max_group_bytes: 1,
+            max_segment_bytes: 1,
+            max_segment_records: 1,
+            index_stride: 1,
+        };
+        let mut bytes =
+            crate::codec::encode_header(&crate::codec::SegmentHeader::new(foreign, narrowest))
+                .unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        std::fs::write(&foreign_path, bytes).unwrap();
+
+        let refused = SegmentSet::open_in(&Env::real(), directory.path())
+            .map(|_| ())
+            .expect_err("a foreign artifact must keep the directory refused");
+        assert!(
+            !matches!(refused, LogError::TailSealedWithoutSuccessor { .. }),
+            "short is not torn: the foreign header must not have been swept: {refused}"
+        );
+        assert!(
+            foreign_path.exists(),
+            "the foreign artifact is an operator's evidence; quarantine preserves it"
+        );
+    }
+
+    /// A cut inside the length field is still boundable (#410, review
+    /// round eight): the byte present is the high-order byte of a
+    /// big-endian length, and `0xff` names a length above the codec
+    /// ceiling whatever the three missing bytes were. A file of magic
+    /// plus that byte is not a prefix of any real header, so it quarantines
+    /// as a foreign artifact — where the earlier classification, skipping
+    /// the length check until all four bytes were present, deleted it.
+    #[test]
+    fn a_length_prefix_no_header_could_carry_is_quarantined_not_deleted() {
+        let directory = tempdir().unwrap();
+        strand_after_seal(directory.path(), false);
+        let artifact_path = directory.path().join(format!("{}.active", segment_stem(3)));
+        std::fs::write(&artifact_path, b"VTOPSEG1\xff").unwrap();
+
+        let refused = SegmentSet::open_in(&Env::real(), directory.path())
+            .map(|_| ())
+            .expect_err("an impossible length prefix must keep the directory refused");
+        assert!(
+            !matches!(refused, LogError::TailSealedWithoutSuccessor { .. }),
+            "a length no header could carry is not torn, and must not be swept: {refused}"
+        );
+        assert!(
+            artifact_path.exists(),
+            "the artifact is evidence; quarantine preserves it, deletion would not"
+        );
+    }
+
+    /// An open digit run bounds the value it was cut from (#410, review
+    /// round eight): a record limit whose observed digits already exceed
+    /// the 64 MiB ceiling cannot be completed into any config the codec
+    /// writes, so the cut is quarantined — while the identical cut at a
+    /// value that IS a valid limit is still recognised as torn and swept.
+    /// The pair is what makes the pin discriminating rather than merely
+    /// stricter.
+    #[test]
+    fn an_open_config_run_past_its_ceiling_is_quarantined_not_deleted() {
+        let cut_after_record_limit = |max_record_bytes: u32| {
+            let mut successor = descriptor();
+            successor.segment_id = Uuid::from_u128(0xF6);
+            successor.base_offset = 3;
+            // The group and segment limits ride the record limit (review,
+            // round ten): a fixture keeping config()'s 512-byte group
+            // beside a seven-digit record limit encodes a config no
+            // validator accepts, and its length claim then holds no valid
+            // completion — the claim check would rightly quarantine it for
+            // a reason this test is not about.
+            let bytes = crate::codec::encode_header(&crate::codec::SegmentHeader::new(
+                successor,
+                SegmentConfig {
+                    max_record_bytes,
+                    max_group_bytes: u64::from(max_record_bytes)
+                        + crate::types::RECORD_FRAME_OVERHEAD_BYTES,
+                    max_segment_bytes: u64::from(max_record_bytes)
+                        + crate::types::RECORD_FRAME_OVERHEAD_BYTES,
+                    ..config()
+                },
+            ))
+            .unwrap();
+            let needle = format!("\"max_record_bytes\":{max_record_bytes}");
+            let at = bytes
+                .windows(needle.len())
+                .position(|window| window == needle.as_bytes())
+                .expect("the record limit is encoded in the header JSON");
+            bytes[..at + needle.len()].to_vec()
+        };
+
+        let quarantined = tempdir().unwrap();
+        strand_after_seal(quarantined.path(), false);
+        let artifact_path = quarantined
+            .path()
+            .join(format!("{}.active", segment_stem(3)));
+        std::fs::write(&artifact_path, cut_after_record_limit(70_000_000)).unwrap();
+        let refused = SegmentSet::open_in(&Env::real(), quarantined.path())
+            .map(|_| ())
+            .expect_err("a limit past its ceiling must keep the directory refused");
+        assert!(
+            !matches!(refused, LogError::TailSealedWithoutSuccessor { .. }),
+            "no continuation of 70000000 is a valid record limit; the cut is not torn: {refused}"
+        );
+        assert!(artifact_path.exists(), "the artifact is evidence and stays");
+
+        let swept = tempdir().unwrap();
+        strand_after_seal(swept.path(), false);
+        let torn_path = swept.path().join(format!("{}.active", segment_stem(3)));
+        std::fs::write(&torn_path, cut_after_record_limit(7_000_000)).unwrap();
+        let refused = SegmentSet::open_in(&Env::real(), swept.path())
+            .map(|_| ())
+            .expect_err("a prefix without a usable tail must still refuse to open");
+        assert!(
+            matches!(refused, LogError::TailSealedWithoutSuccessor { .. }),
+            "the same cut at a valid limit is a torn write and must be swept: {refused}"
+        );
+        assert!(
+            !torn_path.exists(),
+            "a torn write of this range's own header is discarded"
+        );
+    }
+
+    /// The claim and the config must agree (#410, review rounds eight and
+    /// nine): a real minimal successor header, re-labelled with the
+    /// narrowest template's length (two bytes short of its own config) and
+    /// cut after its JSON, matched every earlier check byte for byte and
+    /// was deleted as torn. Under the true length the identical bytes ARE a
+    /// torn write and are swept; under the false one they are a header no
+    /// encoder produced, and quarantine.
+    #[test]
+    fn a_length_claim_that_cannot_describe_the_config_is_quarantined_not_deleted() {
+        let minimal_cut = |relabel: bool| {
+            let mut successor = descriptor();
+            successor.segment_id = Uuid::from_u128(0xF7);
+            successor.base_offset = 3;
+            let bytes = crate::codec::encode_header(&crate::codec::SegmentHeader::new(
+                successor,
+                SegmentConfig {
+                    max_record_bytes: 1,
+                    max_group_bytes: 1 + crate::types::RECORD_FRAME_OVERHEAD_BYTES,
+                    max_segment_bytes: 1 + crate::types::RECORD_FRAME_OVERHEAD_BYTES,
+                    max_segment_records: 1,
+                    index_stride: 1,
+                },
+            ))
+            .unwrap();
+            let json_len = u32::from_be_bytes(bytes[8..12].try_into().unwrap()) as usize;
+            let mut cut = bytes[..12 + json_len].to_vec();
+            if relabel {
+                cut[8..12].copy_from_slice(&((json_len - 2) as u32).to_be_bytes());
+            }
+            cut
+        };
+
+        let quarantined = tempdir().unwrap();
+        strand_after_seal(quarantined.path(), false);
+        let artifact_path = quarantined
+            .path()
+            .join(format!("{}.active", segment_stem(3)));
+        std::fs::write(&artifact_path, minimal_cut(true)).unwrap();
+        let refused = SegmentSet::open_in(&Env::real(), quarantined.path())
+            .map(|_| ())
+            .expect_err("a claim that cannot describe its config must keep the directory refused");
+        assert!(
+            !matches!(refused, LogError::TailSealedWithoutSuccessor { .. }),
+            "the re-labelled header is not torn and must not be swept: {refused}"
+        );
+        assert!(artifact_path.exists(), "the artifact is evidence and stays");
+
+        let swept = tempdir().unwrap();
+        strand_after_seal(swept.path(), false);
+        let torn_path = swept.path().join(format!("{}.active", segment_stem(3)));
+        std::fs::write(&torn_path, minimal_cut(false)).unwrap();
+        let refused = SegmentSet::open_in(&Env::real(), swept.path())
+            .map(|_| ())
+            .expect_err("a prefix without a usable tail must still refuse to open");
+        assert!(
+            matches!(refused, LogError::TailSealedWithoutSuccessor { .. }),
+            "the same bytes under their true length are a torn write and are swept: {refused}"
+        );
+        assert!(!torn_path.exists());
+    }
+
+    /// A cut inside the checksum leaves bytes the completed header makes
+    /// checkable (#410, review round nine): the true prefix of the hash is
+    /// a torn write and is swept; one damaged byte among them is a header
+    /// that once existed whole, and quarantines.
+    #[test]
+    fn a_damaged_partial_checksum_is_quarantined_not_deleted() {
+        let cut_in_checksum = |damage: bool| {
+            let mut successor = descriptor();
+            successor.segment_id = Uuid::from_u128(0xF8);
+            successor.base_offset = 3;
+            let bytes = crate::codec::encode_header(&crate::codec::SegmentHeader::new(
+                successor,
+                SegmentConfig {
+                    max_record_bytes: 1,
+                    max_group_bytes: 1 + crate::types::RECORD_FRAME_OVERHEAD_BYTES,
+                    max_segment_bytes: 1 + crate::types::RECORD_FRAME_OVERHEAD_BYTES,
+                    max_segment_records: 1,
+                    index_stride: 1,
+                },
+            ))
+            .unwrap();
+            let json_len = u32::from_be_bytes(bytes[8..12].try_into().unwrap()) as usize;
+            let mut cut = bytes[..12 + json_len + 4].to_vec();
+            if damage {
+                cut[12 + json_len + 3] ^= 0xFF;
+            }
+            cut
+        };
+
+        let quarantined = tempdir().unwrap();
+        strand_after_seal(quarantined.path(), false);
+        let artifact_path = quarantined
+            .path()
+            .join(format!("{}.active", segment_stem(3)));
+        std::fs::write(&artifact_path, cut_in_checksum(true)).unwrap();
+        let refused = SegmentSet::open_in(&Env::real(), quarantined.path())
+            .map(|_| ())
+            .expect_err("a damaged checksum must keep the directory refused");
+        assert!(
+            !matches!(refused, LogError::TailSealedWithoutSuccessor { .. }),
+            "a checksum byte the header cannot have produced is damage, and must not be swept: {refused}"
+        );
+        assert!(artifact_path.exists(), "the artifact is evidence and stays");
+
+        let swept = tempdir().unwrap();
+        strand_after_seal(swept.path(), false);
+        let torn_path = swept.path().join(format!("{}.active", segment_stem(3)));
+        std::fs::write(&torn_path, cut_in_checksum(false)).unwrap();
+        let refused = SegmentSet::open_in(&Env::real(), swept.path())
+            .map(|_| ())
+            .expect_err("a prefix without a usable tail must still refuse to open");
+        assert!(
+            matches!(refused, LogError::TailSealedWithoutSuccessor { .. }),
+            "a true prefix of the checksum is a torn write and is swept: {refused}"
+        );
+        assert!(!torn_path.exists());
+    }
+
     /// The roll's FIRST window: a crash mid-write of the successor's own
     /// header. The commit sidecar's absence proves creation never finished,
     /// so the torn file has never held a record and is discarded — the
     /// layout becomes sealed-only, whose recovery is adoption.
+    ///
+    /// The fixture is a genuine PREFIX of the real header bytes (#410): a
+    /// torn write can only ever leave a prefix, so the file carries its
+    /// true length claim and provably falls short of it. Garbage after the
+    /// magic — the fixture this replaced — is not something a torn write
+    /// of this binary's header can produce, and the classification now
+    /// quarantines it instead.
     #[test]
     fn a_torn_successor_header_is_discarded_and_the_range_recovers() {
         let directory = tempdir().unwrap();
         strand_after_seal(directory.path(), true);
+        let torn = {
+            let mut successor = descriptor();
+            successor.segment_id = Uuid::from_u128(0xF3);
+            successor.base_offset = 3;
+            crate::codec::encode_header(&crate::codec::SegmentHeader::new(successor, config()))
+                .unwrap()[..40]
+                .to_vec()
+        };
         std::fs::write(
             directory.path().join(format!("{}.active", segment_stem(3))),
-            b"VTOPSEG1 but torn mid-wr",
+            torn,
         )
         .unwrap();
 
@@ -3805,7 +4135,18 @@ mod tests {
         let directory = tempdir().unwrap();
         strand_after_seal(directory.path(), false);
         let torn_path = directory.path().join(format!("{}.active", segment_stem(3)));
-        std::fs::write(&torn_path, b"VTOPSEG1 but torn mid-wr").unwrap();
+        // The same genuine-prefix fixture as the discard test (#410): what
+        // keeps this pair quarantined must be the sidecar beside it, not an
+        // artifact of the torn file failing classification on its own.
+        let torn = {
+            let mut successor = descriptor();
+            successor.segment_id = Uuid::from_u128(0xF4);
+            successor.base_offset = 3;
+            crate::codec::encode_header(&crate::codec::SegmentHeader::new(successor, config()))
+                .unwrap()[..40]
+                .to_vec()
+        };
+        std::fs::write(&torn_path, torn).unwrap();
         let sidecar_path = directory
             .path()
             .join(format!("{}.producers", segment_stem(3)));

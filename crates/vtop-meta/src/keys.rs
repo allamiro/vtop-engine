@@ -9,7 +9,7 @@
 //! The `/meta/0/...` display form exists for admin tooling and debug output
 //! only; it is never parsed and never stored.
 
-use crate::wire::{put_u16, put_u8, put_uuid, CodecError, Reader};
+use crate::wire::{put_u16, put_u64, put_u8, put_uuid, CodecError, Reader};
 use std::cmp::Ordering;
 use std::fmt;
 use uuid::Uuid;
@@ -40,6 +40,7 @@ const CATEGORY_SEGMENT_REPLACEMENT_PROOF: u8 = 14;
 const CATEGORY_SEGMENT_REBALANCE_INTENT: u8 = 15;
 const CATEGORY_SEGMENT_TIER_COPY: u8 = 16;
 const CATEGORY_TOPIC_RETENTION_POLICY: u8 = 17;
+const CATEGORY_RANGE_TRANSITION: u8 = 18;
 
 /// Consumer-group names reuse the topic-name bound so group identity stays
 /// allocation-bounded on the wire and in snapshots.
@@ -136,6 +137,15 @@ pub enum MetaKey {
     TopicRetentionPolicy {
         topic_uuid: Uuid,
     },
+    /// One epoch transition of a range (#240 item 5), keyed by the epoch it
+    /// minted. The epoch is the last component and big-endian, so the
+    /// records of a range scan in transition order — the chain is a key
+    /// range, not a search.
+    RangeTransition {
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        fencing_epoch: u64,
+    },
 }
 
 /// Validate a topic name against the shared 249-byte semantics.
@@ -182,6 +192,7 @@ impl MetaKey {
             MetaKey::SegmentRebalanceIntent { .. } => CATEGORY_SEGMENT_REBALANCE_INTENT,
             MetaKey::SegmentTierCopy { .. } => CATEGORY_SEGMENT_TIER_COPY,
             MetaKey::TopicRetentionPolicy { .. } => CATEGORY_TOPIC_RETENTION_POLICY,
+            MetaKey::RangeTransition { .. } => CATEGORY_RANGE_TRANSITION,
         }
     }
 
@@ -270,6 +281,15 @@ impl MetaKey {
                 put_uuid(&mut out, *segment_uuid);
             }
             MetaKey::TopicRetentionPolicy { topic_uuid } => put_uuid(&mut out, *topic_uuid),
+            MetaKey::RangeTransition {
+                topic_uuid,
+                range_uuid,
+                fencing_epoch,
+            } => {
+                put_uuid(&mut out, *topic_uuid);
+                put_uuid(&mut out, *range_uuid);
+                put_u64(&mut out, *fencing_epoch);
+            }
         }
         out
     }
@@ -366,6 +386,11 @@ impl MetaKey {
                 topic_uuid: reader.uuid("topic uuid")?,
                 range_uuid: reader.uuid("range uuid")?,
                 segment_uuid: reader.uuid("segment uuid")?,
+            },
+            CATEGORY_RANGE_TRANSITION => MetaKey::RangeTransition {
+                topic_uuid: reader.uuid("topic uuid")?,
+                range_uuid: reader.uuid("range uuid")?,
+                fencing_epoch: reader.u64("fencing epoch")?,
             },
             CATEGORY_TOPIC_RETENTION_POLICY => MetaKey::TopicRetentionPolicy {
                 topic_uuid: reader.uuid("topic uuid")?,
@@ -466,6 +491,14 @@ impl fmt::Display for MetaKey {
             MetaKey::TopicRetentionPolicy { topic_uuid } => {
                 write!(formatter, "/meta/0/topic-retention-policy/{topic_uuid}")
             }
+            MetaKey::RangeTransition {
+                topic_uuid,
+                range_uuid,
+                fencing_epoch,
+            } => write!(
+                formatter,
+                "/meta/0/range-transition/{topic_uuid}/{range_uuid}/{fencing_epoch}"
+            ),
         }
     }
 }
@@ -539,7 +572,38 @@ mod tests {
             MetaKey::TopicRetentionPolicy {
                 topic_uuid: Uuid::from_u128(2),
             },
+            MetaKey::RangeTransition {
+                topic_uuid: Uuid::from_u128(2),
+                range_uuid: Uuid::from_u128(3),
+                fencing_epoch: 7,
+            },
         ]
+    }
+
+    /// A range's transitions sort by epoch under one prefix (#240 item 5):
+    /// that is what lets the chain be read as a key range, in order.
+    #[test]
+    fn range_transitions_sort_by_epoch_under_their_range() {
+        let at = |fencing_epoch: u64| MetaKey::RangeTransition {
+            topic_uuid: Uuid::from_u128(2),
+            range_uuid: Uuid::from_u128(3),
+            fencing_epoch,
+        };
+        assert!(at(1) < at(2));
+        assert!(
+            at(255) < at(256),
+            "big-endian: the width of the number never reorders it"
+        );
+        assert!(at(u64::MAX - 1) < at(u64::MAX));
+        let other_range = MetaKey::RangeTransition {
+            topic_uuid: Uuid::from_u128(2),
+            range_uuid: Uuid::from_u128(4),
+            fencing_epoch: 0,
+        };
+        assert!(
+            at(u64::MAX) < other_range,
+            "every epoch of one range precedes the next range"
+        );
     }
 
     #[test]
@@ -664,6 +728,16 @@ mod tests {
             }
             .to_string(),
             "/meta/0/topic-retention-policy/00000000-0000-0000-0000-000000000002"
+        );
+        assert_eq!(
+            MetaKey::RangeTransition {
+                topic_uuid: Uuid::from_u128(2),
+                range_uuid: Uuid::from_u128(3),
+                fencing_epoch: 7,
+            }
+            .to_string(),
+            "/meta/0/range-transition/00000000-0000-0000-0000-000000000002\
+             /00000000-0000-0000-0000-000000000003/7"
         );
     }
 }

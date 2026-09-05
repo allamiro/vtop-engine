@@ -1,0 +1,383 @@
+{{- if eq (include "vtop.deploymentMode" .) "separated" }}
+{{- /* SEPARATED MODE (#287): two StatefulSets, sized independently.
+
+       The metadata tier is a Raft quorum and wants to stay small and odd;
+       the data tier grows with the data. Co-location cannot grow one without
+       growing the other — a fourth data node would be a fourth voter, which
+       buys no fault tolerance and costs a round trip on every commit — so
+       under this mode each tier is its own workload, its own headless
+       Service, its own PVC, and its own half of the TLS contract:
+       tls.metaSecretName's node-<i>.pem is meta pod <i> (CN = i+1) and
+       tls.dataSecretName's node-<i>.pem is data pod <i> (CN =
+       data.nodeUuids[i]). The container command is the ROLE command —
+       `vtop-node meta` or `vtop-node data` — not the co-located wrapper. */}}
+{{- $metaCount := int (include "vtop.metaReplicaCount" .) }}
+{{- $dataCount := int (include "vtop.dataReplicaCount" .) }}
+{{- /* Per-tier overrides; an empty override inherits the chart-wide value. */}}
+{{- $metaResources := .Values.resources }}
+{{- with .Values.deployment.meta.resources }}{{ $metaResources = . }}{{ end }}
+{{- $dataResources := .Values.resources }}
+{{- with .Values.deployment.data.resources }}{{ $dataResources = . }}{{ end }}
+{{- $metaAffinity := .Values.affinity }}
+{{- with .Values.deployment.meta.affinity }}{{ $metaAffinity = . }}{{ end }}
+{{- $dataAffinity := .Values.affinity }}
+{{- with .Values.deployment.data.affinity }}{{ $dataAffinity = . }}{{ end }}
+{{- /* Each tier hashes ONLY its own config files (review): one ConfigMap
+       carries both tiers, and hashing the whole of it would roll the
+       metadata quorum for a data-only change. */}}
+{{- $metaConfig := "" }}
+{{- range $i := until $metaCount }}{{ $metaConfig = printf "%s%s" $metaConfig (include "vtop.metaTierConfig" (dict "root" $ "ordinal" $i)) }}{{ end }}
+{{- $dataConfig := "" }}
+{{- range $i := until $dataCount }}{{ $dataConfig = printf "%s%s" $dataConfig (include "vtop.dataTierConfig" (dict "root" $ "ordinal" $i)) }}{{ end }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "vtop.tierName" (dict "root" . "tier" "meta") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vtop.labels" . | nindent 4 }}
+    vtop.allamiro.io/tier: meta
+spec:
+  replicas: {{ $metaCount }}
+  serviceName: {{ include "vtop.tierHeadlessServiceName" (dict "root" . "tier" "meta") }}
+  # Parallel: quorum members should come up together; serializing quorum
+  # bringup only slows recovery for no safety gain.
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "vtop.tierSelectorLabels" (dict "root" . "tier" "meta") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "vtop.tierSelectorLabels" (dict "root" . "tier" "meta") | nindent 8 }}
+        {{- with (omit .Values.podLabels "app.kubernetes.io/name" "app.kubernetes.io/instance" "vtop.allamiro.io/tier") }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # A META config edit changes this hash and rolls this tier only.
+        checksum/config: {{ $metaConfig | sha256sum }}
+        {{- if .Values.metrics.prometheusAnnotations }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.ports.observability | quote }}
+        prometheus.io/path: /metrics
+        {{- end }}
+        {{- with (omit .Values.podAnnotations "checksum/config" "prometheus.io/scrape" "prometheus.io/port" "prometheus.io/path") }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "vtop.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ int .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if $metaAffinity }}
+      affinity:
+        {{- toYaml $metaAffinity | nindent 8 }}
+      {{- else }}
+      # Prefer spreading VOTERS across nodes; two on one node turn a node
+      # failure into a quorum loss. Set deployment.meta.affinity (or the
+      # chart-wide .Values.affinity) to a required rule for production.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "vtop.tierSelectorLabels" (dict "root" . "tier" "meta") | nindent 20 }}
+      {{- end }}
+      containers:
+        - name: vtop-meta
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # Ordinal-derived identity, as in the co-located shape: the pod's
+          # hostname ends in its ordinal, which selects meta-<ordinal>.yaml
+          # and fixes the Raft node id (ordinal+1) and the TLS leaf.
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              ordinal="${HOSTNAME##*-}"
+              exec {{ .Values.image.binary }} meta --config "/etc/vtop/config/meta-${ordinal}.yaml"
+          env:
+            {{- if .Values.logFormat }}
+            - name: VTOP_LOG_FORMAT
+              value: {{ .Values.logFormat | quote }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: meta-peer
+              containerPort: {{ .Values.ports.metaPeer }}
+            - name: meta-admin
+              containerPort: {{ .Values.ports.metaAdmin }}
+            - name: obs
+              containerPort: {{ .Values.ports.observability }}
+          {{- if .Values.probes.startup.enabled }}
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: obs
+            periodSeconds: {{ int .Values.probes.startup.periodSeconds }}
+            failureThreshold: {{ int .Values.probes.startup.failureThreshold }}
+            timeoutSeconds: {{ int .Values.probes.startup.timeoutSeconds }}
+          {{- end }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: obs
+            periodSeconds: {{ int .Values.probes.readiness.periodSeconds }}
+            failureThreshold: {{ int .Values.probes.readiness.failureThreshold }}
+            timeoutSeconds: {{ int .Values.probes.readiness.timeoutSeconds }}
+            successThreshold: {{ int .Values.probes.readiness.successThreshold }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: obs
+            periodSeconds: {{ int .Values.probes.liveness.periodSeconds }}
+            failureThreshold: {{ int .Values.probes.liveness.failureThreshold }}
+            timeoutSeconds: {{ int .Values.probes.liveness.timeoutSeconds }}
+          resources:
+            {{- toYaml $metaResources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/vtop/config
+              readOnly: true
+            - name: tls-meta
+              mountPath: /etc/vtop/tls/meta
+              readOnly: true
+            - name: meta
+              mountPath: /var/lib/vtop/meta
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "vtop.fullname" . }}
+        - name: tls-meta
+          secret:
+            secretName: {{ include "vtop.metaSecretName" . | quote }}
+            defaultMode: 0440
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: meta
+        labels:
+          {{- include "vtop.tierSelectorLabels" (dict "root" . "tier" "meta") | nindent 10 }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.meta.accessModes | nindent 10 }}
+        {{- with .Values.persistence.meta.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.meta.size }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "vtop.tierName" (dict "root" . "tier" "data") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vtop.labels" . | nindent 4 }}
+    vtop.allamiro.io/tier: data
+spec:
+  replicas: {{ $dataCount }}
+  serviceName: {{ include "vtop.tierHeadlessServiceName" (dict "root" . "tier" "data") }}
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "vtop.tierSelectorLabels" (dict "root" . "tier" "data") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "vtop.tierSelectorLabels" (dict "root" . "tier" "data") | nindent 8 }}
+        {{- with (omit .Values.podLabels "app.kubernetes.io/name" "app.kubernetes.io/instance" "vtop.allamiro.io/tier") }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # A DATA config edit changes this hash and rolls this tier only.
+        checksum/config: {{ $dataConfig | sha256sum }}
+        {{- if .Values.metrics.prometheusAnnotations }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.ports.observability | quote }}
+        prometheus.io/path: /metrics
+        {{- end }}
+        {{- with (omit .Values.podAnnotations "checksum/config" "prometheus.io/scrape" "prometheus.io/port" "prometheus.io/path") }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "vtop.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      # The drain budget for the #280 shutdown: listeners close, the range
+      # lease is released so failover starts at once, the final commit
+      # boundary is written. SIGKILL after it remains safe.
+      terminationGracePeriodSeconds: {{ int .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if $dataAffinity }}
+      affinity:
+        {{- toYaml $dataAffinity | nindent 8 }}
+      {{- else }}
+      # Prefer spreading REPLICAS across nodes: a replicated range with two
+      # replicas on one node loses its quorum with that node. Set
+      # deployment.data.affinity (or the chart-wide .Values.affinity) to a
+      # required rule for production.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "vtop.tierSelectorLabels" (dict "root" . "tier" "data") | nindent 20 }}
+      {{- end }}
+      containers:
+        - name: vtop-data
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # Ordinal-derived identity: data-<ordinal>.yaml fixes the broker
+          # UUID (data.nodeUuids[ordinal]) and the TLS leaf.
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              ordinal="${HOSTNAME##*-}"
+              exec {{ .Values.image.binary }} data --config "/etc/vtop/config/data-${ordinal}.yaml"
+          env:
+            {{- if .Values.logFormat }}
+            - name: VTOP_LOG_FORMAT
+              value: {{ .Values.logFormat | quote }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: replica
+              containerPort: {{ .Values.ports.replica }}
+            - name: native
+              containerPort: {{ .Values.ports.native }}
+            - name: obs
+              containerPort: {{ .Values.ports.observability }}
+          {{- if .Values.probes.startup.enabled }}
+          # The startup budget is what protects a node re-opening large
+          # ranges from being killed mid-recovery.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: obs
+            periodSeconds: {{ int .Values.probes.startup.periodSeconds }}
+            failureThreshold: {{ int .Values.probes.startup.failureThreshold }}
+            timeoutSeconds: {{ int .Values.probes.startup.timeoutSeconds }}
+          {{- end }}
+          # /readyz is a LEVEL with a reason: a fenced leaseholder going
+          # unready is the system working — read the 503 body, do not loosen
+          # the probe.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: obs
+            periodSeconds: {{ int .Values.probes.readiness.periodSeconds }}
+            failureThreshold: {{ int .Values.probes.readiness.failureThreshold }}
+            timeoutSeconds: {{ int .Values.probes.readiness.timeoutSeconds }}
+            successThreshold: {{ int .Values.probes.readiness.successThreshold }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: obs
+            periodSeconds: {{ int .Values.probes.liveness.periodSeconds }}
+            failureThreshold: {{ int .Values.probes.liveness.failureThreshold }}
+            timeoutSeconds: {{ int .Values.probes.liveness.timeoutSeconds }}
+          resources:
+            {{- toYaml $dataResources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/vtop/config
+              readOnly: true
+            - name: tls-data
+              mountPath: /etc/vtop/tls/data
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/vtop/data
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "vtop.fullname" . }}
+        - name: tls-data
+          secret:
+            secretName: {{ include "vtop.dataSecretName" . | quote }}
+            defaultMode: 0440
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "vtop.tierSelectorLabels" (dict "root" . "tier" "data") | nindent 10 }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.data.accessModes | nindent 10 }}
+        {{- with .Values.persistence.data.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.data.size }}
+{{- end }}

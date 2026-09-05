@@ -11,9 +11,11 @@
 # top-level `observability` block; per-role blocks are rejected by design.
 # This chart only ever emits the accepted shape.
 
-# Number of co-located nodes. Three is the smallest metadata Raft group that
-# survives one failure; even counts add fault-tolerance nothing (a 4-voter
-# quorum is 3, same tolerance as 3 voters) so prefer 3 or 5.
+# Number of co-located nodes (deployment.mode colocated). Three is the
+# smallest metadata Raft group that survives one failure; even counts add
+# fault-tolerance nothing (a 4-voter quorum is 3, same tolerance as 3 voters)
+# so prefer 3 or 5. NOT read under deployment.mode separated, which sizes its
+# two tiers under `deployment`.
 replicaCount: 3
 
 image:
@@ -58,11 +60,34 @@ clusterDomain: cluster.local
 # ---------------------------------------------------------------------------
 deployment:
   # colocated: every pod hosts a metadata voter AND a data replica in one
-  #   process — the only shape this chart has ever rendered, and the default.
-  # separated: a metadata tier and a data tier as two StatefulSets, sized
-  #   independently. NOT RENDERED YET (#287 slice 2); the chart refuses it
-  #   rather than silently rendering the co-located shape.
+  #   process — the only shape this chart ever rendered, and the default.
+  #   Sized by `replicaCount`; both tiers are the same size by construction.
+  # separated: a metadata tier and a data tier as TWO StatefulSets, sized
+  #   independently below — the split KRaft made for the same reason: a Raft
+  #   quorum wants to stay small and odd, a data plane grows with the data,
+  #   and co-location cannot grow one without growing the other.
   mode: colocated
+  # Tier sizes, read ONLY under `separated` (colocated reads `replicaCount`).
+  # Both are REQUIRED there — sizing the tiers independently is the point of
+  # the mode, so the chart refuses to guess either.
+  meta:
+    # Metadata voters: small and ODD (even counts are refused — a fourth voter
+    # adds a round trip and no fault tolerance). Pods <fullname>-meta-<i>,
+    # meta node id i+1, leaves node-<i>.pem in tls.metaSecretName.
+    replicaCount: 0
+    # Per-tier overrides; empty inherits the chart-wide `resources` and
+    # `affinity` below. A tier-scoped anti-affinity belongs here: the
+    # chart-wide rule would make data pods avoid META pods rather than
+    # each other.
+    resources: {}
+    affinity: {}
+  data:
+    # Data replicas, sized by the data. Pods <fullname>-data-<i>, identity
+    # data.nodeUuids[i], leaves node-<i>.pem in tls.dataSecretName. Under
+    # data.topology "replicated" this is the replica set of the ONE range.
+    replicaCount: 0
+    resources: {}
+    affinity: {}
 
 cluster:
   # UUID shared by every node in the cluster. REQUIRED.
@@ -148,8 +173,9 @@ meta:
 # (#240), and finally candidate mode (#284) — so automatic FAILOVER, the last
 # thing this block called unbacked, is now backed too: the role follows the
 # metadata lease inside the binary and a dead holder is replaced in place.
-# What the chart still does not do is separate the metadata and data planes
-# into their own workloads (#287); every pod runs both.
+# Whether the metadata and data planes share a pod is `deployment.mode`
+# (#287): colocated runs both in every pod; separated renders each as its
+# own tier, and this block then describes the DATA tier.
 # ---------------------------------------------------------------------------
 data:
   # One broker UUID per data replica, indexed by pod ordinal: nodeUuids[0] is
@@ -232,7 +258,11 @@ data:
     enabled: false
     # Any metadata admin endpoint. The default is this same process's local
     # admin listener — legitimate under co-location: the data plane reaches
-    # metadata over the network path even when it is the same process.
+    # metadata over the network path even when it is the same process. Under
+    # deployment.mode separated the default is replaced by the metadata
+    # tier's first pod (its own FQDN, so the certificate has a name to
+    # verify); any other value is honoured as written, with `serverName`
+    # then required to match it.
     adminEndpoint: "127.0.0.1:9200"
     # Server name for the admin endpoint's certificate. Empty uses
     # tls.serverName, falling back to the pod's own headless FQDN.
