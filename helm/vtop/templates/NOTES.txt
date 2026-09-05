@@ -23,6 +23,16 @@ vtop {{ .Chart.AppVersion }} — SEPARATED tiers (#287): {{ $metaCount }} metada
      vtopctl meta init --members {{ join "," $ids }} --config admin.yaml
      vtopctl meta status --config admin.yaml
 
+{{- if eq (toString .Values.transport.admin) "plaintext" }}
+   The admin plane is PLAINTEXT (transport.admin): admin.yaml carries no
+   certificate, and dials the way the plane listens —
+
+     endpoint: localhost:{{ .Values.ports.metaAdmin }}
+     transport: plaintext
+
+   There is no operator identity on this plane: every peer that reaches the
+   port is an operator. Keep it behind networkPolicy.clientFrom.
+{{- else }}
    admin.yaml must carry BOTH of these — the name is the one that pod's
    certificate carries, which is tls.serverName when you set one:
 
@@ -31,6 +41,7 @@ vtop {{ .Chart.AppVersion }} — SEPARATED tiers (#287): {{ $metaCount }} metada
 
    plus ca_cert/client_cert/client_key for your operator credentials.
    `server_name` defaults to "localhost", which will NOT match — set it.
+{{- end }}
 
    Metadata node ids are meta-tier ordinal+1: {{ $metaSet }}-0 is node 1.
 {{- if .Values.meta.adminAuthorization.enabled }}
@@ -58,8 +69,8 @@ vtop {{ .Chart.AppVersion }} — SEPARATED tiers (#287): {{ $metaCount }} metada
    headless FQDN on port {{ .Values.ports.native }}.
 {{- end }}
 
-6. Metrics: Prometheus text on http://<pod>:{{ .Values.ports.observability }}/metrics on every pod of
-   both tiers. The endpoint is UNAUTHENTICATED (#78)
+6. Metrics: Prometheus text on {{ if .Values.observability.tls.secretName }}https{{ else }}http{{ end }}://<pod>:{{ .Values.ports.observability }}/metrics on every pod of
+   both tiers.{{ if .Values.observability.tls.secretName }} The endpoint serves TLS (observability.tls): scrape with your CA, or -k in a lab.{{ end }} The endpoint is UNAUTHENTICATED (#78)
    {{- if .Values.networkPolicy.enabled }} — NetworkPolicy is enabled and restricts it.{{ else }} — consider networkPolicy.enabled=true to restrict it in-cluster.{{ end }}
 {{- else -}}
 {{- $ids := list -}}
@@ -75,7 +86,11 @@ vtop {{ .Chart.AppVersion }} — {{ int .Values.replicaCount }} co-located node(
    co-located node it is the CONJUNCTION of both roles. Read the reason:
 
      kubectl -n {{ $ns }} port-forward pod/{{ $fullname }}-0 {{ .Values.ports.observability }}:{{ .Values.ports.observability }} &
+{{- if .Values.observability.tls.secretName }}
+     curl -s --cacert <your CA> https://127.0.0.1:{{ .Values.ports.observability }}/readyz   # or -k in a lab; the endpoint serves TLS (observability.tls)
+{{- else }}
      curl -s http://127.0.0.1:{{ .Values.ports.observability }}/readyz
+{{- end }}
 
    Fresh pods report Ready before a Raft leader exists — that is by design
    (requiring leadership would deadlock bootstrap, which arrives over the
@@ -91,6 +106,16 @@ vtop {{ .Chart.AppVersion }} — {{ int .Values.replicaCount }} co-located node(
      vtopctl meta init --members {{ join "," $ids }} --config admin.yaml
      vtopctl meta status --config admin.yaml
 
+{{- if eq (toString .Values.transport.admin) "plaintext" }}
+   The admin plane is PLAINTEXT (transport.admin): admin.yaml carries no
+   certificate, and dials the way the plane listens —
+
+     endpoint: localhost:{{ .Values.ports.metaAdmin }}
+     transport: plaintext
+
+   There is no operator identity on this plane: every peer that reaches the
+   port is an operator. Keep it behind networkPolicy.clientFrom.
+{{- else }}
    Forward a SPECIFIC POD, not the Service. Each pod presents a certificate
    whose SAN is that pod's own headless FQDN, so a load-balanced endpoint
    gives the client no name it can verify and TLS fails before vtopctl sends
@@ -101,6 +126,7 @@ vtop {{ .Chart.AppVersion }} — {{ int .Values.replicaCount }} co-located node(
 
    plus ca_cert/client_cert/client_key for your operator credentials.
    `server_name` defaults to "localhost", which will NOT match — set it.
+{{- end }}
 
    Node ids are pod ordinal+1: {{ $fullname }}-0 is meta node 1, and so on.
 {{- if .Values.meta.adminAuthorization.enabled }}
@@ -109,7 +135,7 @@ vtop {{ .Chart.AppVersion }} — {{ int .Values.replicaCount }} co-located node(
    cluster-scoped commands: {{ .Values.meta.adminAuthorization.operatorCommonNames | toJson }}
 {{- end }}
 
-4. Metrics: Prometheus text on http://<pod>:{{ .Values.ports.observability }}/metrics
+4. Metrics: Prometheus text on {{ if .Values.observability.tls.secretName }}https{{ else }}http{{ end }}://<pod>:{{ .Values.ports.observability }}/metrics{{ if .Values.observability.tls.secretName }} (TLS: scrape with your CA, or -k in a lab){{ end }}
    {{- if .Values.metrics.serviceMonitor.enabled }} (ServiceMonitor installed).{{ else }}{{ if .Values.metrics.prometheusAnnotations }} (pods carry prometheus.io/* scrape annotations).{{ end }}{{ end }}
    The endpoint is UNAUTHENTICATED (#78)
    {{- if .Values.networkPolicy.enabled }} — NetworkPolicy is enabled and restricts it.{{ else }} — consider networkPolicy.enabled=true to restrict it in-cluster.{{ end }}
