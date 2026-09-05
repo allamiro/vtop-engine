@@ -306,6 +306,8 @@ certificates also carry that Service's DNS name as a shared SAN.
 | `meta.timers.heartbeatIntervalMs` | `60` | |
 | `meta.adminAuthorization.enabled` | `false` | `false` = block absent: authenticate-only, node warns at startup. `true` + empty list = **nobody** may run cluster-scoped commands (enforced as written). |
 | `meta.adminAuthorization.operatorCommonNames` | `[]` | Certificate CNs allowed cluster-scoped admin commands. |
+| `meta.transitionMacKey.secretName` | `""` | Secret holding the 32-byte hex key that signs leadership-transition statements (#240). Injected as `VTOP_TRANSITION_MAC_KEY` into every metadata process and named to its config; empty means unsigned. A named Secret missing at startup is a hard error. |
+| `meta.transitionMacKey.secretKey` | `key` | The key within that Secret. |
 | `data.topology` | `standalone` | `standalone` = one independent range per pod; `replicated` = one range, every pod a candidate, role from the lease (section above). |
 | `data.leaderOrdinal` | — **retired** | Setting it fails the render in every topology; the role lives in the binary now. |
 | `data.fencingEpoch` | `1` | Static epoch; only a floor when the lease drives leadership. **Must be `0` under `replicated`** (grants are minted from 1). |

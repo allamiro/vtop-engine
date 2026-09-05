@@ -271,10 +271,33 @@ MetaNodeConfig `vtop-node meta` deserializes, with its own observability
 endpoint — the standalone command owns one, unlike the co-located wrapper.
 Peers are the metadata tier's own pods. Expects (dict "root" $ "ordinal" <int>).
 */}}
+{{/*
+The transition MAC key reference must be whole (#240 item 5): a Secret name
+without a key within it renders an env var Kubernetes cannot resolve, and
+the pod would sit in CreateContainerConfigError saying so less clearly.
+*/}}
+{{- define "vtop.transitionMacKeyGuard" -}}
+{{- if and .Values.meta.transitionMacKey.secretName (not .Values.meta.transitionMacKey.secretKey) -}}
+{{- fail "\n\nmeta.transitionMacKey.secretName is set but meta.transitionMacKey.secretKey is empty: name the key within the Secret that holds the 32-byte hex MAC key." -}}
+{{- end -}}
+{{- /* The Secret-backed entry must be the only VTOP_TRANSITION_MAC_KEY: a
+       later extraEnv entry of the same name would win inside the container,
+       and the metadata process would sign with a key the chart never
+       named (review). */ -}}
+{{- if .Values.meta.transitionMacKey.secretName -}}
+{{- range .Values.extraEnv -}}
+{{- if eq (toString .name) "VTOP_TRANSITION_MAC_KEY" -}}
+{{- fail "\n\nextraEnv sets VTOP_TRANSITION_MAC_KEY while meta.transitionMacKey.secretName is set: the chart injects that variable from the Secret, and a second entry would override it. Remove it from extraEnv, or unset meta.transitionMacKey.secretName to leave transitions unsigned — the config field that makes the node read the variable is rendered only from the Secret reference." -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
 {{- define "vtop.metaTierConfig" -}}
 {{- $root := .root -}}
 {{- $i := int .ordinal -}}
 {{- $v := $root.Values -}}
+{{- include "vtop.transitionMacKeyGuard" $root -}}
 {{- $metaCount := int (include "vtop.metaReplicaCount" $root) -}}
 {{- $clusterId := required "\n\ncluster.id is required: the cluster UUID shared by every node. The chart does not default identities — they must match the certificates you minted." $v.cluster.id -}}
 # Metadata-tier config for pod {{ include "vtop.tierName" (dict "root" $root "tier" "meta") }}-{{ $i }}.
@@ -307,6 +330,10 @@ timers:
 # meta.adminAuthorization asked for.
 admin_authorization:
   operator_common_names: {{ toJson $v.meta.adminAuthorization.operatorCommonNames }}
+{{- end }}
+{{- if $v.meta.transitionMacKey.secretName }}
+# The key itself is in the environment, from meta.transitionMacKey (#240).
+transition_mac_key_env: VTOP_TRANSITION_MAC_KEY
 {{- end }}
 # This process's own endpoint. Unauthenticated (#78): keep it off public
 # networks (see networkPolicy).
@@ -455,6 +482,7 @@ so this template never emits them. Expects (dict "root" $ "ordinal" <int>).
 {{- $root := .root -}}
 {{- $i := int .ordinal -}}
 {{- $v := $root.Values -}}
+{{- include "vtop.transitionMacKeyGuard" $root -}}
 {{- $clusterId := required "\n\ncluster.id is required: the cluster UUID shared by every node. The chart does not default identities — they must match the certificates you minted." $v.cluster.id -}}
 {{- $nodeUuid := "" -}}
 {{- if gt (len $v.data.nodeUuids) $i -}}
@@ -502,6 +530,9 @@ meta:
   # meta.adminAuthorization asked for.
   admin_authorization:
     operator_common_names: {{ toJson $v.meta.adminAuthorization.operatorCommonNames }}
+{{- end }}
+{{- if $v.meta.transitionMacKey.secretName }}
+  transition_mac_key_env: VTOP_TRANSITION_MAC_KEY
 {{- end }}
 data:
   {{- /* TOPOLOGY. The binary supports candidate/leader/follower/standalone,
