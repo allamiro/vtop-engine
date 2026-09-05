@@ -321,10 +321,11 @@ impl UploadBackend for S3NativeBackend {
             .send()
             .await
             .map_err(|e| {
-                VtopError::Upload(format!(
-                    "get_object {object_uri} (version {version_id}): {}",
-                    e.into_service_error()
-                ))
+                sdk_failure(
+                    "get_object",
+                    &format!("{object_uri} (version {version_id})"),
+                    e,
+                )
             })?;
         if out
             .content_length()
