@@ -162,6 +162,9 @@ jobs:
             # part of the contract they enforce.
             helm:
               - 'helm/**'
+              # The smoke script IS the kind job's test (#416): a change to it
+              # that did not run it would be judged by shellcheck alone.
+              - 'scripts/k8s-smoke.sh'
               - '.github/workflows/ci.yml'
               # The chart's appVersion has to track the workspace version, and
               # the workspace version can only change HERE. Without this the

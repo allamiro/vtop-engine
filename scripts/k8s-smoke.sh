@@ -239,6 +239,62 @@ ${unaddressed:+ targets with no podIP — not scheduled/started, or the query fa
 ${unprobed:+ probes that never completed — the exec/API path, not a DNS verdict:${unprobed};}"
 }
 
+dump_pod_evidence() { # <namespace> <pod...> — what a timed-out wait saw (#416)
+  local ns="$1"; shift
+  echo "--- pods in $ns"
+  timeout 20 kubectl -n "$ns" get pods -o wide 2>&1 | head -20 || true
+  local pod
+  for pod in "$@"; do
+    echo "--- describe $pod"
+    timeout 20 kubectl -n "$ns" describe pod "$pod" 2>&1 | tail -40 || true
+    echo "--- last log lines of $pod"
+    timeout 30 kubectl -n "$ns" logs "$pod" --tail=60 --request-timeout=20s --limit-bytes=100000 2>&1 || true
+  done
+  echo "--- kube-dns"
+  timeout 15 kubectl -n kube-system get pods -l k8s-app=kube-dns -o wide 2>&1 || true
+}
+
+await_pod_running() { # <namespace> <pod> <seconds> [old-uid] — a NEW pod, Running, judged on the clock
+  # Not the pod that was deleted (its uid) and not one on its way out (a
+  # terminating pod still reports Running), on a WALL-CLOCK budget: the bound
+  # of each query is what remains, and the pause between queries is taken
+  # only when it fits (review). A query the API server did not answer is told
+  # apart from a pod that is not there, so the timeout blames what it saw.
+  local ns="$1" pod="$2" budget="$3" old_uid="${4:-}"
+  local deadline=$((SECONDS + budget)) answered=0 remaining bound seen="" rc errf
+  local uid="" phase="" deleting=""
+  errf="$(mktemp)"
+  while :; do
+    remaining=$((deadline - SECONDS))
+    [ "$remaining" -gt 0 ] || break
+    bound=$(( remaining < 15 ? remaining : 15 ))
+    seen="$(timeout "$bound" kubectl -n "$ns" get pod "$pod" \
+      -o jsonpath='{.metadata.uid}{"|"}{.status.phase}{"|"}{.metadata.deletionTimestamp}' 2>"$errf")"; rc=$?
+    if [ "$rc" -eq 0 ]; then
+      answered=1
+      IFS='|' read -r uid phase deleting <<< "$seen"
+      if [ "$phase" = "Running" ] && [ -z "$deleting" ] && [ "$uid" != "$old_uid" ]; then
+        rm -f "$errf"; return 0
+      fi
+    elif grep -qi 'not found' "$errf"; then
+      answered=1; uid=""; phase="absent"; deleting=""
+    fi
+    remaining=$((deadline - SECONDS))
+    [ "$remaining" -ge 3 ] || break
+    sleep 3
+  done
+  rm -f "$errf"
+  if [ "$answered" -eq 1 ]; then
+    local why="phase '${phase:-absent}'"
+    [ -n "$deleting" ] && why="$why, terminating"
+    [ -n "$old_uid" ] && [ "$uid" = "$old_uid" ] && why="$why, still the deleted pod's uid"
+    echo "pod $pod is not a new Running pod after ${budget}s: $why" >&2
+  else
+    echo "the API server did not answer one query about pod $pod in ${budget}s" >&2
+  fi
+  return 1
+}
+
 # ---------------------------------------------------------------------------
 # Identities. The chart refuses to render without them by design (#81), so a
 # smoke test has to mint a real CA and per-ordinal leaves with the CNs and SANs
@@ -409,10 +465,19 @@ log "pod 1 is empty, confirming per-pod independent ranges"
 # deliberately the SIGKILL path, NOT the orderly SIGTERM drain #280 added:
 # durability must never depend on the clean path being taken.
 log "force-deleting ${REL}-0 and checking the records survive"
+killed_uid="$(kubectl -n "$NS" get pod "${REL}-0" -o jsonpath='{.metadata.uid}' 2>/dev/null || true)"
 kubectl -n "$NS" delete pod "${REL}-0" --grace-period=0 --force >/dev/null 2>&1
 sleep 5
+# The recreated pod's readiness depends on its peers resolving its new name
+# and it resolving theirs (#416): gate DNS again once the pod is back, and
+# only then judge readiness, on a fresh budget. A wait that times out says
+# what it saw.
+await_pod_running "$NS" "${REL}-0" 120 "$killed_uid" \
+  || { dump_pod_evidence "$NS" "${REL}-0"; fail "the killed pod did not come back as a new Running pod within 120s"; }
+log "gating on headless DNS again: the recreated pod must resolve its peers, and they it (#416)"
+await_peer_dns "$NS"
 kubectl -n "$NS" wait --for=condition=ready "pod/${REL}-0" --timeout=180s >/dev/null \
-  || fail "pod did not come back Ready after being killed"
+  || { dump_pod_evidence "$NS" "${REL}-0"; fail "pod did not come back Ready within 180s of DNS settling after being killed"; }
 
 forward "${REL}-0" 19502 9500
 survived="$(committed_offset 19502)"
@@ -1059,6 +1124,7 @@ log "replication verified in Kubernetes: quorum durability works and every repli
 # election's outcome; whichever it is, produce must resume against it and
 # every previously acknowledged record must still be there.
 log "deleting the holder's pod (candidate $holder_ordinal) to force a failover"
+holder_uid="$(kubectl -n "$R_NS" get pod "$(data_pod "$holder_ordinal")" -o jsonpath='{.metadata.uid}' 2>/dev/null || true)"
 kubectl -n "$R_NS" delete pod "$(data_pod "$holder_ordinal")" >/dev/null
 
 # The recreated pod races the survivors for the vacated lease, and it CAN
@@ -1070,8 +1136,19 @@ kubectl -n "$R_NS" delete pod "$(data_pod "$holder_ordinal")" >/dev/null
 # Same capture-then-test as above: the `||` on a read fed by a here-string
 # guards nothing.
 moved="$(await_holder "$EPOCH")" || moved=""
-[ -n "$moved" ] || fail "no grant above epoch $EPOCH within 180s of deleting the holder: the range \
+[ -n "$moved" ] || {
+  # evidence for a grant that never came (#416): the lease as metadata
+  # shows it, every data and metadata pod's last lines, and kube-dns — the
+  # election is not gated on DNS, because the deleted holder's name cannot
+  # resolve until it is back and the survivors must elect without it.
+  echo "--- lease view (holder epoch): $(lease_state 20 2>/dev/null || true)"
+  pods=()
+  for o in 0 1 2; do pods+=("$(data_pod "$o")"); done
+  for o in 0 1 2; do pods+=("$(meta_pod "$o")"); done
+  dump_pod_evidence "$R_NS" "${pods[@]}"
+  fail "no grant above epoch $EPOCH within 180s of deleting the holder: the range \
 did not move, so either the lease never came free or no candidate could take it"
+}
 read -r NEW_HOLDER NEW_EPOCH <<< "$moved"
 new_ordinal="$(ordinal_of "$NEW_HOLDER")"
 if [ "$NEW_HOLDER" = "$HOLDER" ]; then
@@ -1198,6 +1275,14 @@ fi
 # right either way; the difference is ATTRIBUTION. Blaming the recreated pod
 # after four minutes in which the API server never answered accuses a
 # component nobody observed doing anything.
+# The recreated pod first has to exist and run; then the data tier's DNS is
+# gated again — its new name for its peers, theirs for it — and only then is
+# readiness judged, on the full budget (#416).
+deleted_pod="$(data_pod "$holder_ordinal")"
+await_pod_running "$R_NS" "$deleted_pod" 120 "$holder_uid" \
+  || { dump_pod_evidence "$R_NS" "$deleted_pod"; fail "the deleted holder's pod did not come back as a new Running pod within 120s"; }
+log "gating the data tier on DNS again: the recreated pod must resolve its peers, and they it (#416)"
+await_peer_dns "$R_NS" "$DATA_POD" "$DATA_HEADLESS"
 returned=""
 answered=0
 ready=""
@@ -1209,10 +1294,15 @@ for _ in $(seq 1 80); do
   sleep 3
 done
 [ -n "$returned" ] || {
-  kubectl -n "$R_NS" get pods || true
+  not_ready=()
+  while IFS= read -r name; do [ -n "$name" ] && not_ready+=("$name"); done < <(
+    timeout 20 kubectl -n "$R_NS" get pods -l "app.kubernetes.io/instance=${REL}" \
+      -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' 2>/dev/null \
+      | grep -v '|True$' | cut -d'|' -f1 || true)
+  dump_pod_evidence "$R_NS" "${not_ready[@]}"
   if [ "$answered" -eq 1 ]; then
     fail "the deleted pod never came back: only ${ready:-0} of $R_PODS pods are Ready and \
-un-terminating after 240s"
+un-terminating 240s after DNS settled"
   else
     fail "could not read pod readiness for 240s: the API server never answered, so \
 nothing is known about the recreated pod"
