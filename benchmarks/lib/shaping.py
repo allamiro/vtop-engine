@@ -58,8 +58,17 @@ class ShapingError(RuntimeError):
 
 
 def _non_negative_int(value: Any, key: str) -> int:
+    """An integer, exactly (review): `int()` would quietly turn 1.9 into 1
+    and True into 1, and the run would then apply and record a shape the
+    scenario never asked for."""
+    if isinstance(value, bool):
+        raise ValueError(f"{key} must be an integer, got {value!r}")
+    if isinstance(value, float):
+        if not value.is_integer():
+            raise ValueError(f"{key} must be an integer, got {value!r}")
+        value = int(value)
     try:
-        out = int(value)
+        out = int(str(value).strip())
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{key} must be an integer, got {value!r}") from exc
     if out < 0:
@@ -226,7 +235,13 @@ def clear(shape: Shape, client: ToxiproxyClient) -> None:
     shapes the next run without saying so."""
     stayed = []
     for name in TOXIC_NAMES:
-        status, _ = client.request("DELETE", f"/proxies/{shape.proxy}/toxics/{name}")
+        # Every name is tried whatever the previous one did (review): a
+        # reset on one removal must not leave the others installed.
+        try:
+            status, _ = client.request("DELETE", f"/proxies/{shape.proxy}/toxics/{name}")
+        except ShapingError as exc:
+            stayed.append(f"{name} ({exc})")
+            continue
         if status not in (200, 204, 404):
             stayed.append(f"{name} (HTTP {status})")
     if stayed:

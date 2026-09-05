@@ -63,6 +63,40 @@ def test_a_shaped_run_with_no_shape_is_refused():
         Shape.from_scenario(scenario(shaping_api_url="http://127.0.0.1:8474"))
 
 
+def test_a_shape_knob_is_an_integer_or_refused():
+    base = dict(shaping_api_url="http://x", shaping_bandwidth_kbps=10)
+    with pytest.raises(ValueError, match="shaping_latency_ms must be an integer, got 1.9"):
+        Shape.from_scenario(scenario(**base, shaping_latency_ms=1.9))
+    with pytest.raises(ValueError, match="shaping_latency_ms must be an integer, got True"):
+        Shape.from_scenario(scenario(**base, shaping_latency_ms=True))
+    with pytest.raises(ValueError, match="shaping_latency_ms must be an integer"):
+        Shape.from_scenario(scenario(**base, shaping_latency_ms="2.0"))
+    assert Shape.from_scenario(scenario(**base, shaping_latency_ms=100.0)).latency_ms == 100
+    assert Shape.from_scenario(scenario(**base, shaping_latency_ms="100")).latency_ms == 100
+
+
+class ResettingRemovalClient(ScriptedClient):
+    """Loses the connection on the first removal after the shape is applied."""
+
+    def request(self, method, path, body=None):
+        applied = any(m == "POST" for m, _, _ in self.calls)
+        self.calls.append((method, path, body))
+        if method == "DELETE" and applied and path.endswith("vtop_bandwidth_up"):
+            raise ShapingError("toxiproxy at http://x is not answering (connection reset)")
+        return {"GET": 200, "POST": 201, "DELETE": 204}[method], None
+
+
+def test_cleanup_tries_every_toxic_past_a_transport_error():
+    client = ResettingRemovalClient()
+    sc = scenario(shaping_api_url="http://127.0.0.1:8474", shaping_bandwidth_kbps=1250,
+                  shaping_latency_ms=100)
+    with pytest.raises(ShapingError, match="vtop_bandwidth_up \\(toxiproxy"):
+        with shaped(sc, client_factory=lambda url: client, log=lambda _: None):
+            pass
+    tail = [p for m, p, _ in client.calls[-4:] if m == "DELETE"]
+    assert len(tail) == 4, "the other three were still attempted"
+
+
 def test_bad_knobs_are_refused_by_name():
     with pytest.raises(ValueError, match="shaping_bandwidth_kbps"):
         Shape.from_scenario(scenario(shaping_api_url="http://x", shaping_bandwidth_kbps=-1))
