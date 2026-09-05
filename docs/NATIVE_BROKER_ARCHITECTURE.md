@@ -447,6 +447,17 @@ Cutover records a barrier offset for each parent and the ordered child mapping.
 Parent ranges remain readable until all durable consumer cursors and retention
 rules permit retirement.
 
+A cursor may stand UNPINNED (#457, #468): a nil segment id, bound to the topic
+epoch and the range's lineage generation, its record offset the position. This
+is how a Kafka consumer group's committed offset lives on the plane — a
+gateway commits what its consumers tell it before any segment holding that
+offset has sealed, and whichever node serves the range next reads it back
+through the same linearizable admin read (`vtopctl meta group-cursor`). Within
+its lineage a head cursor moves either way, a rewind being the group's own
+decision, and the CAS on its checkpoint generation fences a stale writer; it
+does not cross a lineage change on its own. A pinned cursor — the recovery
+protocol's, committed with a segment's proof — keeps the forward rule.
+
 ## 8. Consensus, fencing, and replication
 
 `openraft` is isolated behind a VTOP-owned interface conceptually equivalent

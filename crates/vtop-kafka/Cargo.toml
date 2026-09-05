@@ -10,13 +10,18 @@ description = "Kafka wire-compatibility gateway over the native VTOP broker (#22
 # The native backend over `LocalBroker` (#225): on by default, since the
 # gateway is built to sit on the engine; a lab wanting only the in-memory
 # backend and the codecs can opt out.
-default = ["native"]
+default = ["native", "metadata"]
 native = ["dep:vtop-broker", "dep:vtop-protocol"]
+# Committed offsets as cursors on the metadata plane (#457 slice 2b): the
+# store a node's gateway gets under a lease. On by default for the same
+# reason; a lab without a metadata plane can opt out.
+metadata = ["dep:vtop-meta"]
 
 [dependencies]
 thiserror = { workspace = true }
 vtop-broker = { workspace = true, optional = true }
 vtop-protocol = { workspace = true, optional = true }
+vtop-meta = { workspace = true, optional = true }
 tokio = { version = "1", default-features = false, features = ["io-util", "net", "rt", "sync", "time", "macros"] }
 async-trait = { workspace = true }
 tracing = { workspace = true }

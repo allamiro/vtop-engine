@@ -33,6 +33,7 @@ use crate::api_groups::{
 };
 use crate::bridge::{Bridge, Fetched, Sequenced};
 use crate::groups::{Coordinator, GroupConfig, JoinRequest, Joined, SyncStanding};
+use crate::lease::{LeaseState, LeaseView};
 use crate::messages::{
     frame, write_response_header, ApiKey, ErrorCode, HeaderVerdict, RequestHeader,
 };
@@ -251,6 +252,10 @@ pub struct Gateway {
     groups: Arc<Coordinator>,
     /// Where committed offsets live; `None` refuses commits by name.
     offsets: Option<Arc<dyn OffsetStore>>,
+    /// Whether this node still holds the range (review). `None` where nothing
+    /// can take the range away — an embedder with no lease at all — and the
+    /// gateway speaks for it unconditionally, as it did before this existed.
+    lease: Option<Arc<dyn LeaseView>>,
     /// Each group's commits in turn (review): a commit is judged under its
     /// generation and then written, and a slow write must not let a later
     /// commit — a newer generation's, after the member lapsed — be judged,
@@ -282,6 +287,41 @@ impl Gateway {
         self
     }
 
+    /// The lease behind everything this gateway says about the range
+    /// (review): once it is gone, the gateway stops claiming to lead the
+    /// partition and to coordinate its groups, so a stock client refreshes
+    /// its metadata and finds the node that holds it now. Without this, a
+    /// fenced listener that stays reachable would keep answering
+    /// FindCoordinator with itself and a consumer would retry there for good.
+    pub fn with_lease(mut self, lease: Arc<dyn LeaseView>) -> Self {
+        self.lease = Some(lease);
+        self
+    }
+
+    /// Whether this gateway still speaks for its range. `Unknown` is not
+    /// evidence of a handoff — a busy broker view is not a lost lease — so it
+    /// keeps serving and the commit path answers retryably.
+    fn speaks_for_the_range(&self) -> bool {
+        !matches!(
+            self.lease.as_ref().map(|lease| lease.lease()),
+            Some(LeaseState::Gone)
+        )
+    }
+
+    /// The refusal a fenced gateway gives the group protocol: retriable, and
+    /// the client's next FindCoordinator (here or at another broker) is what
+    /// finds the holder.
+    fn fenced(&self, api: &str) -> Option<ErrorCode> {
+        (!self.speaks_for_the_range()).then(|| {
+            tracing::warn!(
+                api,
+                "kafka {api} refused: this node no longer holds the range's lease, so it does not \
+                 coordinate its groups; the client finds the holder"
+            );
+            ErrorCode::CoordinatorNotAvailable
+        })
+    }
+
     pub fn new(bridge: Arc<dyn Bridge>, config: GatewayConfig) -> Self {
         if config.groups.min_session_timeout <= config.max_fetch_wait.max(config.max_offset_wait) {
             // Said once, at construction (review): a session may be shorter
@@ -305,6 +345,7 @@ impl Gateway {
             producer_order: Arc::new(std::sync::Mutex::new(HashMap::new())),
             groups: Arc::new(Coordinator::new(group_config)),
             offsets: None,
+            lease: None,
             commit_order: Arc::new(std::sync::Mutex::new(HashMap::new())),
             jobs: Arc::new(Jobs::default()),
             offsetless_refusals: std::sync::atomic::AtomicU64::new(0),
@@ -686,11 +727,12 @@ impl Gateway {
             ApiKey::Heartbeat => match consumed(decode_heartbeat(&mut d, version), &d, "Heartbeat")
             {
                 Ok(request) => {
-                    let error = self
-                        .groups
-                        .heartbeat(&request.group_id, request.generation_id, &request.member_id)
-                        .err()
-                        .unwrap_or(ErrorCode::None);
+                    let error = self.fenced("Heartbeat").unwrap_or_else(|| {
+                        self.groups
+                            .heartbeat(&request.group_id, request.generation_id, &request.member_id)
+                            .err()
+                            .unwrap_or(ErrorCode::None)
+                    });
                     encode_error_only(&mut out, version, error);
                     Ok(None)
                 }
@@ -699,11 +741,12 @@ impl Gateway {
             ApiKey::LeaveGroup => {
                 match consumed(decode_leave_group(&mut d, version), &d, "LeaveGroup") {
                     Ok(request) => {
-                        let error = self
-                            .groups
-                            .leave(&request.group_id, &request.member_id)
-                            .err()
-                            .unwrap_or(ErrorCode::None);
+                        let error = self.fenced("LeaveGroup").unwrap_or_else(|| {
+                            self.groups
+                                .leave(&request.group_id, &request.member_id)
+                                .err()
+                                .unwrap_or(ErrorCode::None)
+                        });
                         encode_error_only(&mut out, version, error);
                         Ok(None)
                     }
@@ -779,9 +822,18 @@ impl Gateway {
                 }
             },
         };
+        // A fenced gateway leads nothing (review): the partition is answered
+        // `NOT_LEADER_OR_FOLLOWER` with no leader, which is the code every
+        // stock client answers by refreshing its metadata elsewhere.
+        let leads = self.speaks_for_the_range();
         let mut topics = Vec::with_capacity(names.len());
         for name in names {
             topics.push(match self.bounds(&name).await {
+                Ok(_) if !leads => MetadataTopic {
+                    error: ErrorCode::NotLeaderOrFollower,
+                    name,
+                    leader: None,
+                },
                 Ok(_) => MetadataTopic {
                     error: ErrorCode::None,
                     name,
@@ -871,6 +923,15 @@ impl Gateway {
                 "an empty group id names no group",
             );
         }
+        // Only while the lease is this node's (review): a fenced listener
+        // that named itself would hold a consumer at a node that cannot take
+        // its commits.
+        if let Some(error) = self.fenced("FindCoordinator") {
+            return refused(
+                error,
+                "this node no longer holds the range's lease; ask another broker for the coordinator",
+            );
+        }
         FindCoordinatorResponse {
             error: ErrorCode::None,
             error_message: None,
@@ -887,6 +948,16 @@ impl Gateway {
         version: i16,
         client_id: Option<&str>,
     ) -> JoinGroupResponse {
+        if let Some(error) = self.fenced("JoinGroup") {
+            return JoinGroupResponse {
+                error,
+                generation_id: -1,
+                protocol_name: String::new(),
+                leader: String::new(),
+                member_id: request.member_id,
+                members: Vec::new(),
+            };
+        }
         let millis = |ms: i32| Duration::from_millis(u64::try_from(ms).unwrap_or(0));
         let member_id_sent = request.member_id.clone();
         let joined = self
@@ -933,6 +1004,12 @@ impl Gateway {
     /// SyncGroup: the leader's assignments are the client-side assignor's,
     /// run through this gateway's topic map before any member sees them.
     async fn sync_group(&self, request: SyncGroupRequest) -> SyncGroupResponse {
+        if let Some(error) = self.fenced("SyncGroup") {
+            return SyncGroupResponse {
+                error,
+                assignment: Vec::new(),
+            };
+        }
         // Membership, generation, state and leadership first (review): a
         // stale member's retry hears the coordinator's own code, not a
         // verdict on assignments it is not entitled to make. Only the leader
@@ -4160,6 +4237,115 @@ mod tests {
             before,
             "no enumeration for a member not entitled to assign"
         );
+    }
+
+    /// A fenced gateway stops claiming the range (review): it no longer names
+    /// itself the coordinator, no longer leads the partition in its Metadata,
+    /// and refuses the group protocol as unavailable — so a stock client
+    /// refreshes and finds the node that holds the lease now, rather than
+    /// retrying for good at a listener that can take nothing. A view that is
+    /// merely busy is not a handoff: the gateway keeps serving.
+    #[tokio::test]
+    async fn a_fenced_gateway_stops_claiming_the_range() {
+        struct View(std::sync::Mutex<crate::lease::LeaseState>);
+        impl crate::lease::LeaseView for View {
+            fn lease(&self) -> crate::lease::LeaseState {
+                *self.0.lock().unwrap()
+            }
+        }
+        let view = Arc::new(View(std::sync::Mutex::new(crate::lease::LeaseState::Held(
+            3,
+        ))));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let gateway = Gateway::new(
+            Arc::new(MemoryBridge::with_topics(["events"])),
+            GatewayConfig {
+                advertised_port: addr.port() as i32,
+                groups: GroupConfig {
+                    initial_rebalance_delay: Duration::from_millis(50),
+                    ..GroupConfig::default()
+                },
+                ..GatewayConfig::default()
+            },
+        )
+        .with_lease(Arc::clone(&view) as Arc<dyn crate::lease::LeaseView>);
+        tokio::spawn(gateway.serve(listener, rx));
+        // Metadata v4: topics, then two booleans the version carries.
+        let named = || {
+            let mut e = Encoder::new();
+            e.array_len(1);
+            e.string("events");
+            e.bool(true);
+            e.into_vec()
+        };
+        let topic_error = |reply: &[u8]| {
+            let mut d = Decoder::new(reply);
+            d.i32("throttle").unwrap();
+            d.array_len("brokers").unwrap();
+            d.i32("node").unwrap();
+            d.string("host").unwrap();
+            d.i32("port").unwrap();
+            d.nullable_string("rack").unwrap();
+            d.nullable_string("cluster").unwrap();
+            d.i32("controller").unwrap();
+            d.array_len("topics").unwrap();
+            d.i16("topic error").unwrap()
+        };
+        // Holding: it is the coordinator and it leads the partition.
+        let reply = call(addr, 10, 1, 1, &find_coordinator_body(1, "g", 0))
+            .await
+            .unwrap();
+        assert_eq!(read_find_coordinator(&reply, 1).0, 0);
+        let reply = call(addr, 3, 4, 2, &named()).await.unwrap();
+        assert_eq!(topic_error(&reply), 0, "holding: it leads the partition");
+        // Fenced: it claims nothing.
+        *view.0.lock().unwrap() = crate::lease::LeaseState::Gone;
+        let reply = call(addr, 10, 1, 3, &find_coordinator_body(1, "g", 0))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_find_coordinator(&reply, 1).0,
+            ErrorCode::CoordinatorNotAvailable.as_i16()
+        );
+        let reply = call(
+            addr,
+            11,
+            2,
+            4,
+            &join_body(2, "g", "", &[("range", b"m".as_slice())]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_join(&reply, 2).error,
+            ErrorCode::CoordinatorNotAvailable.as_i16()
+        );
+        let reply = call(addr, 12, 1, 5, &heartbeat_body(1, "g", 1, "m"))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_error_only(&reply, 1),
+            ErrorCode::CoordinatorNotAvailable.as_i16()
+        );
+        let reply = call(addr, 13, 1, 6, &leave_body("g", "m")).await.unwrap();
+        assert_eq!(
+            read_error_only(&reply, 1),
+            ErrorCode::CoordinatorNotAvailable.as_i16()
+        );
+        let reply = call(addr, 3, 4, 7, &named()).await.unwrap();
+        assert_eq!(
+            topic_error(&reply),
+            ErrorCode::NotLeaderOrFollower.as_i16(),
+            "a fenced gateway leads nothing"
+        );
+        // Busy is not a handoff.
+        *view.0.lock().unwrap() = crate::lease::LeaseState::Unknown;
+        let reply = call(addr, 10, 1, 8, &find_coordinator_body(1, "g", 0))
+            .await
+            .unwrap();
+        assert_eq!(read_find_coordinator(&reply, 1).0, 0);
     }
 
     /// A named fetch is the store's answer whatever the gateway serves

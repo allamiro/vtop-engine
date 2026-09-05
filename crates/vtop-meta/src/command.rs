@@ -88,6 +88,20 @@ const COMMAND_KIND_CANCEL_RETENTION: u16 = 27;
 const COMMAND_KIND_ACQUIRE_RANGE_LEASE: u16 = 28;
 const COMMAND_KIND_RENEW_RANGE_LEASE: u16 = 29;
 const COMMAND_KIND_REPORT_PROMOTION_OUTCOME: u16 = 30;
+const COMMAND_KIND_COMMIT_GROUP_CURSOR_FENCED: u16 = 31;
+const COMMAND_KIND_ENSURE_GROUP_MEMBER_FOR_RANGE: u16 = 32;
+
+/// Why a fenced cursor commit is refused (#457 slice 2b): the commit did not
+/// come from the range's current leaseholder at its current fencing epoch. A
+/// constant, so a gateway can tell this refusal from any other
+/// `InvalidTransition` without parsing prose.
+pub const NOT_LEASEHOLDER: &str =
+    "the commit is not the range's leaseholder's at the current fencing epoch";
+
+/// Why a cursor commit is refused when the member no longer holds the range
+/// (#457 slice 2b): a constant, so a gateway can tell "stand again" from a
+/// position the plane will not take.
+pub const NOT_ASSIGNED: &str = "member is not assigned the cursor topic/range";
 
 const RESPONSE_KIND_ACK: u16 = 1;
 const RESPONSE_KIND_TOPIC_CREATED: u16 = 2;
@@ -193,6 +207,14 @@ impl VerificationMethod {
 pub struct RangeAssignment {
     pub topic_uuid: Uuid,
     pub range_uuid: Uuid,
+}
+
+/// The UUID a Kafka-named consumer group has on this plane (#457 slice 2b):
+/// a gateway names a group by the name its clients use, the plane by UUID,
+/// and one derives the other under the cluster id — so every node of the
+/// cluster, and an operator's tool, agree on it without a lookup.
+pub fn derived_group_uuid(cluster_id: Uuid, name: &str) -> Uuid {
+    Uuid::new_v5(&cluster_id, name.as_bytes())
 }
 
 /// Bound on the fenced-quorum answers a promotion report may carry: the
@@ -525,6 +547,54 @@ pub enum MetadataCommand {
         group_uuid: Uuid,
         member_uuid: Uuid,
     },
+    /// The membership a range's gateway needs, in one fenced step (#457 slice
+    /// 2b): the group exists, this member is in it, and it holds this range.
+    /// Idempotent and deterministic — the state machine sees what stands and
+    /// makes the rest so, with no compare-and-set for the caller to lose a
+    /// race on. Node-scoped and fenced by the lease, like the commit it
+    /// precedes: a node that does not hold the range may not take a group's
+    /// membership on it, and a data node's own certificate is enough to
+    /// submit it (the create/join/assign trio it replaces is cluster-scoped,
+    /// an operator's).
+    EnsureGroupMemberForRange {
+        env: CommandEnvelope,
+        /// The group's Kafka name, as the gateway derives its UUID from.
+        name: String,
+        group_uuid: Uuid,
+        member_uuid: Uuid,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        holder_node_uuid: Uuid,
+        fencing_epoch: u64,
+    },
+    /// `CommitGroupCursor` from a range's leaseholder (#457 slice 2b): the
+    /// same commit, fenced by the lease. The plane takes it only from the
+    /// range's current holder at its current fencing epoch — the gate
+    /// `RegisterSealedSegment` has — so a leader whose lease was stolen while
+    /// its Kafka listener stayed reachable cannot move a group's position
+    /// after its successor has. A new kind rather than new fields on the old
+    /// one: entries already in a log keep their shape, and a plane that
+    /// predates it refuses the kind it does not know.
+    CommitGroupCursorFenced {
+        env: CommandEnvelope,
+        group_uuid: Uuid,
+        member_uuid: Uuid,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        topic_epoch: u64,
+        range_generation: u64,
+        segment_uuid: Uuid,
+        segment_generation: u64,
+        segment_root: [u8; 32],
+        record_offset: u64,
+        record_index: u64,
+        lineage_transition_id: Option<Uuid>,
+        expected_checkpoint_generation: Option<u64>,
+        /// The node committing, which must hold the range's lease...
+        holder_node_uuid: Uuid,
+        /// ...at this fencing epoch, the one the plane granted it.
+        fencing_epoch: u64,
+    },
     /// Remove a member whose last heartbeat apply-index is strictly older than
     /// `stale_before_apply_index`. Durable cursors are retained.
     ExpireStaleMember {
@@ -715,6 +785,8 @@ impl MetadataCommand {
             | MetadataCommand::LeaveConsumerGroup { env, .. }
             | MetadataCommand::AssignMemberRanges { env, .. }
             | MetadataCommand::CommitGroupCursor { env, .. }
+            | MetadataCommand::CommitGroupCursorFenced { env, .. }
+            | MetadataCommand::EnsureGroupMemberForRange { env, .. }
             | MetadataCommand::HeartbeatMember { env, .. }
             | MetadataCommand::ExpireStaleMember { env, .. }
             | MetadataCommand::SetNodePlacementAttrs { env, .. }
@@ -976,6 +1048,62 @@ impl MetadataCommand {
                 put_u64(&mut out, *record_index);
                 encode_optional_uuid(&mut out, *lineage_transition_id);
                 encode_optional_u64(&mut out, *expected_checkpoint_generation);
+            }
+            MetadataCommand::EnsureGroupMemberForRange {
+                env,
+                name,
+                group_uuid,
+                member_uuid,
+                topic_uuid,
+                range_uuid,
+                holder_node_uuid,
+                fencing_epoch,
+            } => {
+                put_u16(&mut out, COMMAND_KIND_ENSURE_GROUP_MEMBER_FOR_RANGE);
+                encode_envelope(&mut out, env);
+                put_bounded_str(&mut out, name, MAX_GROUP_NAME_BYTES, "group name")?;
+                put_uuid(&mut out, *group_uuid);
+                put_uuid(&mut out, *member_uuid);
+                put_uuid(&mut out, *topic_uuid);
+                put_uuid(&mut out, *range_uuid);
+                put_uuid(&mut out, *holder_node_uuid);
+                put_u64(&mut out, *fencing_epoch);
+            }
+            MetadataCommand::CommitGroupCursorFenced {
+                env,
+                group_uuid,
+                member_uuid,
+                topic_uuid,
+                range_uuid,
+                topic_epoch,
+                range_generation,
+                segment_uuid,
+                segment_generation,
+                segment_root,
+                record_offset,
+                record_index,
+                lineage_transition_id,
+                expected_checkpoint_generation,
+                holder_node_uuid,
+                fencing_epoch,
+            } => {
+                put_u16(&mut out, COMMAND_KIND_COMMIT_GROUP_CURSOR_FENCED);
+                encode_envelope(&mut out, env);
+                put_uuid(&mut out, *group_uuid);
+                put_uuid(&mut out, *member_uuid);
+                put_uuid(&mut out, *topic_uuid);
+                put_uuid(&mut out, *range_uuid);
+                put_u64(&mut out, *topic_epoch);
+                put_u64(&mut out, *range_generation);
+                put_uuid(&mut out, *segment_uuid);
+                put_u64(&mut out, *segment_generation);
+                put_bytes32(&mut out, segment_root);
+                put_u64(&mut out, *record_offset);
+                put_u64(&mut out, *record_index);
+                encode_optional_uuid(&mut out, *lineage_transition_id);
+                encode_optional_u64(&mut out, *expected_checkpoint_generation);
+                put_uuid(&mut out, *holder_node_uuid);
+                put_u64(&mut out, *fencing_epoch);
             }
             MetadataCommand::HeartbeatMember {
                 env,
@@ -1425,6 +1553,49 @@ impl MetadataCommand {
                     "expected checkpoint generation",
                 )?,
             }),
+            COMMAND_KIND_ENSURE_GROUP_MEMBER_FOR_RANGE => {
+                let env = decode_envelope(reader)?;
+                let name = reader.bounded_str(MAX_GROUP_NAME_BYTES, "group name")?;
+                if name.is_empty() {
+                    return Err(CodecError::InvalidValue {
+                        what: "group name",
+                        reason: "must not be empty",
+                    });
+                }
+                Ok(MetadataCommand::EnsureGroupMemberForRange {
+                    env,
+                    name: name.to_owned(),
+                    group_uuid: reader.uuid("group uuid")?,
+                    member_uuid: reader.uuid("member uuid")?,
+                    topic_uuid: reader.uuid("topic uuid")?,
+                    range_uuid: reader.uuid("range uuid")?,
+                    holder_node_uuid: reader.uuid("holder node uuid")?,
+                    fencing_epoch: reader.u64("fencing epoch")?,
+                })
+            }
+            COMMAND_KIND_COMMIT_GROUP_CURSOR_FENCED => {
+                Ok(MetadataCommand::CommitGroupCursorFenced {
+                    env: decode_envelope(reader)?,
+                    group_uuid: reader.uuid("group uuid")?,
+                    member_uuid: reader.uuid("member uuid")?,
+                    topic_uuid: reader.uuid("topic uuid")?,
+                    range_uuid: reader.uuid("range uuid")?,
+                    topic_epoch: reader.u64("topic epoch")?,
+                    range_generation: reader.u64("range generation")?,
+                    segment_uuid: reader.uuid("segment uuid")?,
+                    segment_generation: reader.u64("segment generation")?,
+                    segment_root: reader.bytes32("segment root")?,
+                    record_offset: reader.u64("record offset")?,
+                    record_index: reader.u64("record index")?,
+                    lineage_transition_id: decode_optional_uuid(reader, "lineage transition id")?,
+                    expected_checkpoint_generation: decode_optional_u64(
+                        reader,
+                        "expected checkpoint generation",
+                    )?,
+                    holder_node_uuid: reader.uuid("holder node uuid")?,
+                    fencing_epoch: reader.u64("fencing epoch")?,
+                })
+            }
             COMMAND_KIND_HEARTBEAT_MEMBER => Ok(MetadataCommand::HeartbeatMember {
                 env: decode_envelope(reader)?,
                 group_uuid: reader.uuid("group uuid")?,
