@@ -341,7 +341,11 @@ def named(spec, package):
         if "@" in fragment:
             spec_name, wanted = fragment.split("@", 1)
             return spec_name == name and version_matches(wanted, package["version"])
-        return version_matches(fragment, package["version"])
+        # A bare fragment is a version if it looks like one, else a name
+        # (review): `#0.1` and `#a` are both accepted by cargo.
+        if fragment[:1].isdigit():
+            return version_matches(fragment, package["version"])
+        return fragment == name
     if spec == name:
         return True
     for separator in ("@", ":"):
@@ -458,7 +462,7 @@ if mode == "roots-for-targets":
                     "--lib": is_lib,
                     "--bins": "bin" in kind,
                     "--bin": "bin" in kind and target["name"] == name,
-                    "--tests": "test" in kind or target.get("test", True) and (is_lib or "bin" in kind),
+                    "--tests": target.get("test", True) and ("test" in kind or is_lib or "bin" in kind),
                     "--test": "test" in kind and target["name"] == name,
                     "--examples": "example" in kind,
                     "--example": "example" in kind and target["name"] == name,
@@ -680,6 +684,10 @@ ran=0; passed=0; failed=0; current="cargo test"
 stream=0
 case " ${bin_args[*]+"${bin_args[*]}"} " in
   *" --nocapture "*|*" --no-capture "*|*" --show-output "*|*" --list "*|*" --help "*|*" -h "*) stream=1 ;;
+esac
+# Cargo's own verbose output is output asked for as well (review).
+case " ${cargo_args[*]+"${cargo_args[*]}"} " in
+  *" -v "*|*" -vv "*|*" --verbose "*) stream=1 ;;
 esac
 # libtest also uncaptures on RUST_TEST_NOCAPTURE (review): output asked for
 # through the environment is output asked for.
