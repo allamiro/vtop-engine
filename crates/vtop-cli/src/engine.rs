@@ -2473,6 +2473,41 @@ mod tests {
             0,
             "the manifest was never attempted"
         );
+
+        // The manifest stage has its own accounting, so it needs its own
+        // throttle (review): the object put lands, the manifest put is
+        // refused, and only `manifest_upload` moves. Same test function on
+        // purpose — the registry is process-wide, and two tests reading
+        // deltas of the same counter in parallel would race each other.
+        let input = dir.path().join("in-manifest.log");
+        std::fs::write(&input, "another line\n").unwrap();
+        let mut cfg = file_config(
+            dir.path().join("work-manifest").to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        cfg.batching.max_batch_age_seconds = 3_600;
+        let mut engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        engine.backend = Arc::new(vtop_upload::MockBackend::new().with_throttled_manifest_puts(1));
+        let object_before = throttled_so_far("object_upload");
+        let manifest_before = throttled_so_far("manifest_upload");
+        let outcomes = engine.run_source(SourceType::File, true).await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].final_state, BatchState::Failed);
+        assert!(!outcomes[0].committed);
+        assert_eq!(
+            throttled_so_far("object_upload") - object_before,
+            0,
+            "the object put landed"
+        );
+        assert_eq!(
+            throttled_so_far("manifest_upload") - manifest_before,
+            1,
+            "the manifest stage counts its own throttle"
+        );
     }
 
     /// #102 (review on #391): with `create_bucket` set, provisioning ran
