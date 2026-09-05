@@ -612,6 +612,9 @@ jobs:
             -f helm/vtop/ci/separated-values.yaml --set deployment.data.replicaCount=2
           refuses_because "set data.lease.serverName" \
             -f helm/vtop/ci/separated-values.yaml --set data.lease.adminEndpoint=meta.example:9200
+          # The transition MAC key reference must be whole (#240 item 5).
+          refuses_because "meta.transitionMacKey.secretKey is empty" \
+            -f helm/vtop/ci/default-values.yaml --set meta.transitionMacKey.secretName=vtop-transition-key --set meta.transitionMacKey.secretKey=""
 
       # The SEPARATED shape (#287 slice 2): two tiers, each pod's config the
       # ROLE config its command deserializes, the data tier's lease pointed
@@ -679,6 +682,46 @@ jobs:
       # here, and not in the live smoke test either. It is the only topology
       # that exercises replication, fencing and promotion, so it was the one
       # shape that mattered most and was covered least.
+      # The transition MAC key (#240 item 5) is a metadata-process secret:
+      # named to every metadata config, injected into every metadata
+      # container, and handed to no data process in either shape.
+      - name: The transition MAC key reaches every metadata process and no data process
+        run: |
+          set -euo pipefail
+          helm template vtop helm/vtop -f helm/vtop/ci/default-values.yaml \
+            --set meta.transitionMacKey.secretName=vtop-transition-key > /tmp/keyed.yaml
+          helm template vtop helm/vtop -f helm/vtop/ci/separated-values.yaml \
+            --set meta.transitionMacKey.secretName=vtop-transition-key > /tmp/keyed-separated.yaml
+          ruby -ryaml -e '
+            def env_of(container)
+              (container["env"] || []).map { |e| [e["name"], e.dig("valueFrom", "secretKeyRef")] }.to_h
+            end
+            want = { "name" => "vtop-transition-key", "key" => "key" }
+            docs = YAML.load_stream(File.read("/tmp/keyed.yaml")).compact
+            cm = docs.find { |d| d["kind"] == "ConfigMap" } or abort "no ConfigMap"
+            (0..2).each do |i|
+              node = YAML.safe_load(cm["data"]["node-#{i}.yaml"])
+              abort "node-#{i} meta config does not name the key env" unless node["meta"]["transition_mac_key_env"] == "VTOP_TRANSITION_MAC_KEY"
+            end
+            sts = docs.find { |d| d["kind"] == "StatefulSet" } or abort "no StatefulSet"
+            ref = env_of(sts["spec"]["template"]["spec"]["containers"][0])["VTOP_TRANSITION_MAC_KEY"]
+            abort "co-located container lacks the secretKeyRef, got #{ref.inspect}" unless ref == want
+
+            docs = YAML.load_stream(File.read("/tmp/keyed-separated.yaml")).compact
+            cm = docs.find { |d| d["kind"] == "ConfigMap" } or abort "no ConfigMap"
+            (0..2).each do |i|
+              meta = YAML.safe_load(cm["data"]["meta-#{i}.yaml"])
+              abort "meta-#{i} does not name the key env" unless meta["transition_mac_key_env"] == "VTOP_TRANSITION_MAC_KEY"
+              data = YAML.safe_load(cm["data"]["data-#{i}.yaml"])
+              abort "data-#{i} carries a metadata-only field" if data.key?("transition_mac_key_env")
+            end
+            sets = docs.select { |d| d["kind"] == "StatefulSet" }.map { |d| [d["metadata"]["name"], d] }.to_h
+            meta_ref = env_of(sets.fetch("vtop-meta")["spec"]["template"]["spec"]["containers"][0])["VTOP_TRANSITION_MAC_KEY"]
+            abort "meta tier lacks the secretKeyRef, got #{meta_ref.inspect}" unless meta_ref == want
+            data_env = env_of(sets.fetch("vtop-data")["spec"]["template"]["spec"]["containers"][0])
+            abort "data tier was handed the metadata key" if data_env.key?("VTOP_TRANSITION_MAC_KEY")
+            puts "the transition MAC key reaches every metadata process and no data process"
+          '
       - name: The replicated topology renders the shape it claims
         run: |
           set -euo pipefail
