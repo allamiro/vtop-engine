@@ -10,7 +10,8 @@
 //! of the same directory), not failover.
 
 use crate::config::{
-    check_plaintext_bound, check_plaintext_exposure, refuse_plaintext_promotion, PlaneTransport,
+    check_plaintext_bound, check_plaintext_exposure, refuse_kafka_gateway_misuse,
+    refuse_plaintext_promotion, PlaneTransport,
 };
 use crate::config::{DataNodeConfig, DataRole};
 use crate::observe::{
@@ -648,6 +649,7 @@ pub async fn run(
         !config.followers.is_empty(),
         config.replica_transport,
     )?;
+    refuse_kafka_gateway_misuse(config.role, config.kafka.as_ref())?;
     let endpoint = config.observability.take().unwrap_or_default();
     let metrics_addr = observability.serve(&endpoint).await?;
     serve(config, &observability, metrics_addr, shutdown).await
@@ -1012,6 +1014,20 @@ async fn run_leader(
         }
         None => None,
     };
+    // The Kafka gateway's listener (#225), bound here for the same reason:
+    // a port that cannot be bound must refuse startup before this node could
+    // hold a lease it would never serve. The gateway itself is built once
+    // the broker exists, below.
+    let kafka_listener = match config.kafka.as_ref() {
+        Some(kafka) => {
+            let listener = TcpListener::bind(&kafka.listen)
+                .await
+                .map_err(|error| format!("bind kafka {}: {error}", kafka.listen))?;
+            let bound = listener.local_addr().map_err(|error| error.to_string())?;
+            Some((listener, bound))
+        }
+        None => None,
+    };
     let principal = config
         .principal_id
         .ok_or("leader/standalone requires principal_id")?;
@@ -1358,10 +1374,64 @@ async fn run_leader(
         None => None,
     };
 
+    // The Kafka gateway (#225): the native bridge over THIS broker, appending
+    // as the configured principal at the durability the range can honour,
+    // served on the listener bound above and stopped by the node's shutdown.
+    let kafka_addr = match config.kafka.as_ref().zip(kafka_listener) {
+        Some((kafka, (kafka_listener, bound))) => {
+            let bridge = vtop_kafka::NativeBridge::new(
+                Arc::clone(&broker),
+                vtop_kafka::NativeBridgeConfig {
+                    topic: kafka
+                        .topic
+                        .clone()
+                        .unwrap_or_else(|| config.range.topic.clone()),
+                    producer_id: principal,
+                    durability: if replicated {
+                        vtop_protocol::Durability::Quorum
+                    } else {
+                        vtop_protocol::Durability::LocalFsync
+                    },
+                    fetch_max_records: MAX_RECORDS,
+                },
+            );
+            let gateway = vtop_kafka::Gateway::new(
+                Arc::new(bridge),
+                vtop_kafka::GatewayConfig {
+                    advertised_host: kafka
+                        .advertised_host
+                        .clone()
+                        .unwrap_or_else(|| bound.ip().to_string()),
+                    advertised_port: kafka
+                        .advertised_port
+                        .map(i32::from)
+                        .unwrap_or_else(|| i32::from(bound.port())),
+                    node_id: kafka.node_id,
+                    cluster_id: Some(config.cluster_id.to_string()),
+                    max_fetch_wait: Duration::from_millis(kafka.max_fetch_wait_ms),
+                    ..vtop_kafka::GatewayConfig::default()
+                },
+            );
+            let kafka_shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                if let Err(error) = gateway.serve(kafka_listener, kafka_shutdown).await {
+                    tracing::warn!(%error, "kafka gateway exited");
+                }
+            });
+            eprintln!(
+                "warning: kafka gateway on {bound} speaks Kafka's protocol, which carries no vtop \
+                 identity: every peer that reaches it produces and fetches as principal {principal} \
+                 (#225 phase 1)"
+            );
+            Some(bound)
+        }
+        None => None,
+    };
+
     let shutdown_rx = oneshot_on_shutdown(shutdown.clone());
     observability.gate.mark_ready();
     println!(
-        "data_node_ready role={} node={} native={listen}{}{}",
+        "data_node_ready role={} node={} native={listen}{}{}{}",
         if replicated { "leader" } else { "standalone" },
         config.node_uuid,
         status_addr
@@ -1369,6 +1439,9 @@ async fn run_leader(
             .unwrap_or_default(),
         metrics_addr
             .map(|addr| format!(" metrics={addr}"))
+            .unwrap_or_default(),
+        kafka_addr
+            .map(|addr| format!(" kafka={addr}"))
             .unwrap_or_default()
     );
     use std::io::Write;
