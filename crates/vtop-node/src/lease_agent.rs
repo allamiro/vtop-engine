@@ -510,6 +510,18 @@ impl BrokerLeasePublisher {
     /// (review): the flag is taken before spawning and released by the
     /// attempt itself on every exit path, so short renew intervals cannot
     /// stack blocking retry budgets.
+    ///
+    /// A forced offer the flag swallows is recoverable or moot, never
+    /// lost (review). The draining older-epoch attempt either got fenced —
+    /// the tail gap stands, and every renewal re-offers it under the
+    /// CURRENT epoch — or it completed a legitimate quorum on the marker
+    /// it had already appended, and the watermark it advanced covers the
+    /// whole tail: nothing unpublished exists for the new epoch to prove.
+    /// An epoch is not owed a marker for its own sake — the epoch's
+    /// journal entry landed at adoption, reads serve at a quorum-proven
+    /// watermark, and the first produce carries its own-epoch quorum. The
+    /// marker exists to publish an inherited tail, and a published tail
+    /// needs no second proof.
     fn offer_marker(&self, fencing_epoch: u64, forced: bool) {
         let unpublished_tail = || {
             self.broker

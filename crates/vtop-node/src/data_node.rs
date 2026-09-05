@@ -2541,6 +2541,14 @@ impl crate::lease_agent::LeasePublisher for LeadingDemoteAdapter {
         );
     }
 
+    fn renewed(&self, fencing_epoch: u64) {
+        // Forwarded, not inherited (review): the default is a no-op, and
+        // swallowing the tick here would sever the only path that re-offers
+        // an exhausted boundary marker for a dynamically promoted candidate
+        // — the broker publisher this adapter exists to wrap.
+        crate::lease_agent::LeasePublisher::renewed(self.inner.as_ref(), fencing_epoch);
+    }
+
     fn demote(&self, _rival_epoch: u64) {
         crate::lease_agent::LeasePublisher::demote(
             self.inner.as_ref(),
@@ -2648,6 +2656,25 @@ impl crate::lease_agent::LeasePublisher for CandidateLeasePublisher {
             fencing_epoch,
             committed_offset,
         });
+    }
+
+    fn renewed(&self, fencing_epoch: u64) {
+        // Forwarded to the installed target like `suspend` (review): the
+        // tick reaches the broker publisher only through this chain, and
+        // inheriting the no-op default would leave a candidate leader's
+        // exhausted marker unrecoverable for the rest of the epoch. Before
+        // a completion installs the target there is no broker to tick —
+        // and nothing lost: the completion's own `promote` carries the
+        // forced offer. A read lock suffices; the tick mutates nothing
+        // this publisher owns.
+        if let Some(target) = self
+            .target
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            target.renewed(fencing_epoch);
+        }
     }
 
     fn demote(&self, fencing_epoch: u64) {
@@ -3149,6 +3176,52 @@ mod tests {
                 Some(41)
             ),
             "the latest recorded grant completes"
+        );
+    }
+
+    /// The per-renewal tick reaches the broker through the candidate's
+    /// dispatch chain (review): both `CandidateLeasePublisher` and the
+    /// `LeadingDemoteAdapter` it installs must FORWARD `renewed`, not
+    /// inherit the trait's no-op default — a candidate leader whose
+    /// boundary marker exhausted its budget against unreachable followers
+    /// has no other path that ever re-offers it.
+    #[test]
+    fn candidate_publisher_forwards_renewals_to_the_installed_target() {
+        use crate::lease_agent::LeasePublisher;
+        #[derive(Default)]
+        struct Target {
+            renewed: std::sync::Mutex<Vec<u64>>,
+        }
+        impl LeasePublisher for Target {
+            fn promote(&self, _fencing_epoch: u64, _committed_offset: Option<u64>) {}
+            fn renewed(&self, fencing_epoch: u64) {
+                self.renewed.lock().unwrap().push(fencing_epoch);
+            }
+            fn demote(&self, _fencing_epoch: u64) {}
+            fn suspend(&self, _fencing_epoch: u64) {}
+        }
+        let (verdict_tx, _verdict_rx) = tokio::sync::watch::channel(RoleVerdict::Undecided);
+        let publisher = CandidateLeasePublisher {
+            target: std::sync::RwLock::new(None),
+            verdicts: verdict_tx,
+            finished_through: std::sync::atomic::AtomicU64::new(0),
+            recorded_through: std::sync::atomic::AtomicU64::new(0),
+        };
+        // Before a completion installs a target there is no broker to tick,
+        // and dropping the tick is correct: the completion's own promote
+        // carries the forced marker offer.
+        publisher.renewed(7);
+
+        let target = std::sync::Arc::new(Target::default());
+        publisher.set_target(Some(
+            std::sync::Arc::clone(&target) as std::sync::Arc<dyn LeasePublisher>
+        ));
+        publisher.renewed(8);
+        assert_eq!(
+            *target.renewed.lock().unwrap(),
+            vec![8],
+            "a renewal after completion must reach the installed publisher, or an \
+             exhausted marker is never re-offered on a candidate leader"
         );
     }
 
