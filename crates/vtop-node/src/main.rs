@@ -277,11 +277,7 @@ async fn run(cli: Cli) -> Result<i32, String> {
             server_name,
         } => {
             let config = client::ClientConfig::load(&client_config)?;
-            let tls = config.tls.as_ref().ok_or(
-                "replica-status needs `tls` in the client config: the replica plane is \
-                 queried with the leader identity, which only a certificate carries",
-            )?;
-            client::replica_status(tls, &server_name, &addr, &config.range).await
+            client::replica_status(config.replica_tls()?, &server_name, &addr, &config.range).await
         }
     }
 }

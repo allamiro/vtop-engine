@@ -49,6 +49,60 @@ pub struct ClientConfig {
     /// plaintext on anything else unless told so by name.
     #[serde(default)]
     pub tls: Option<TlsPaths>,
+    /// How `replica-status` dials the replica plane (#294): unset follows
+    /// `tls` (present means TLS with the identity it names, absent means
+    /// plaintext), `plaintext` overrides it — for a range whose native
+    /// plane is TLS but whose replica plane is not, which the node's two
+    /// knobs allow, so one client config can serve both verbs.
+    #[serde(default)]
+    pub replica_transport: Option<DialTransport>,
+    /// How produce/verify dial the native plane (#294): unset follows `tls`
+    /// the same way, `plaintext` overrides it — for the inverse combination,
+    /// a plaintext native plane behind a TLS replica plane, where the `tls`
+    /// block is there for `replica-status` and must not pick the native
+    /// transport on its way past.
+    #[serde(default)]
+    pub native_transport: Option<DialTransport>,
+}
+
+#[derive(Clone, Copy, Debug, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DialTransport {
+    Tls,
+    Plaintext,
+}
+
+impl ClientConfig {
+    /// The TLS paths to dial the replica plane with, or `None` for plaintext.
+    pub fn replica_tls(&self) -> Result<Option<&TlsPaths>, String> {
+        dial_tls(
+            self.replica_transport,
+            self.tls.as_ref(),
+            "replica_transport",
+        )
+    }
+
+    /// The TLS paths to dial the native plane with, or `None` for plaintext.
+    pub fn native_tls(&self) -> Result<Option<&TlsPaths>, String> {
+        dial_tls(self.native_transport, self.tls.as_ref(), "native_transport")
+    }
+}
+
+/// One plane's dial decision (#294): the selector when set, the `tls` block's
+/// presence when not — and `tls` without a block is refused by the knob's
+/// name rather than dialed plaintext by accident.
+fn dial_tls<'a>(
+    selector: Option<DialTransport>,
+    tls: Option<&'a TlsPaths>,
+    knob: &str,
+) -> Result<Option<&'a TlsPaths>, String> {
+    match selector {
+        Some(DialTransport::Plaintext) => Ok(None),
+        Some(DialTransport::Tls) => tls
+            .map(Some)
+            .ok_or_else(|| format!("{knob} is tls but the client config has no `tls` block")),
+        None => Ok(tls),
+    }
 }
 
 impl ClientConfig {
@@ -63,7 +117,7 @@ async fn connect(config: &ClientConfig, addr: &str, role: Role) -> Result<Sessio
     let socket = TcpStream::connect(addr)
         .await
         .map_err(|error| format!("connect {addr}: {error}"))?;
-    let mut stream = match &config.tls {
+    let mut stream = match config.native_tls()? {
         Some(paths) => {
             let connector = TlsConnector::from(tls::client_config(paths)?);
             let name = rustls::pki_types::ServerName::try_from(config.server_name.clone())
@@ -453,21 +507,32 @@ pub async fn verify(config: &ClientConfig, args: VerifyArgs) -> Result<i32, Stri
 /// Query a follower's replication status (local committed offset / next
 /// offset) over the replica plane, authenticating with the leader identity.
 pub async fn replica_status(
-    tls_paths: &TlsPaths,
+    tls_paths: Option<&TlsPaths>,
     server_name: &str,
     addr: &str,
     range: &RangeConfig,
 ) -> Result<i32, String> {
-    let connector = TlsConnector::from(tls::client_config(tls_paths)?);
     let socket = TcpStream::connect(addr)
         .await
         .map_err(|error| format!("connect {addr}: {error}"))?;
-    let name = rustls::pki_types::ServerName::try_from(server_name.to_owned())
-        .map_err(|error| error.to_string())?;
-    let mut stream = connector
-        .connect(name, socket)
-        .await
-        .map_err(|error| format!("tls {addr}: {error}"))?;
+    // Dialed the way the replica plane is served (#294): with the leader
+    // identity under TLS, or plaintext with none — the status verb is one a
+    // plaintext replica plane still answers.
+    let mut stream = match tls_paths {
+        Some(paths) => {
+            let connector = TlsConnector::from(tls::client_config(paths)?);
+            let name = rustls::pki_types::ServerName::try_from(server_name.to_owned())
+                .map_err(|error| error.to_string())?;
+            Session::Tls(Box::new(
+                connector
+                    .connect(name, socket)
+                    .await
+                    .map_err(|error| format!("tls {addr}: {error}"))?
+                    .into(),
+            ))
+        }
+        None => Session::Plain(socket),
+    };
     write_frame(
         &mut stream,
         &WireFrame {
@@ -497,5 +562,45 @@ pub async fn replica_status(
             Err(format!("status rejected: {code:?} {message}"))
         }
         other => Err(format!("unexpected status reply: {other:?}")),
+    }
+}
+
+#[cfg(test)]
+mod dial_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// #294: the two planes are dialed by their own knobs; the `tls` block's
+    /// presence is only the default each falls back to.
+    #[test]
+    fn each_plane_is_dialed_by_its_own_selector_and_falls_back_to_the_block() {
+        let paths = TlsPaths {
+            ca: PathBuf::from("ca.pem"),
+            cert: PathBuf::from("cert.pem"),
+            key: PathBuf::from("key.pem"),
+        };
+        assert!(dial_tls(None, Some(&paths), "native_transport")
+            .unwrap()
+            .is_some());
+        assert!(dial_tls(None, None, "native_transport").unwrap().is_none());
+        // The inverse combination: a TLS block for the replica plane that must
+        // not pick TLS for a plaintext native plane.
+        assert!(dial_tls(
+            Some(DialTransport::Plaintext),
+            Some(&paths),
+            "native_transport"
+        )
+        .unwrap()
+        .is_none());
+        assert!(
+            dial_tls(Some(DialTransport::Tls), Some(&paths), "replica_transport")
+                .unwrap()
+                .is_some()
+        );
+        let refused = dial_tls(Some(DialTransport::Tls), None, "replica_transport").unwrap_err();
+        assert!(
+            refused.contains("replica_transport") && refused.contains("`tls`"),
+            "{refused}"
+        );
     }
 }

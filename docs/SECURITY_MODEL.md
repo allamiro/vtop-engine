@@ -88,18 +88,22 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are used as normat
 
 ### Native broker transport
 
-- The native broker transport is restricted to TLS 1.3 and requires a client
-  certificate chained to the configured client roots. The transport gained
-  plaintext modes in #294 slices 3 and 4 (the replica plane, then the native
-  produce/fetch plane), but no node config key, `vtopctl` flag or Helm value
-  reaches either, so the restriction holds for every deployable
-  configuration; #294 is where selecting it would be decided. A plaintext
-  replica plane refuses the verbs whose authorization depends on a client
-  certificate; a plaintext native plane admits a session only if the
-  deployment's `SessionAuthorizer` accepts the declared principal without a
-  certificate in so many words (`authorize_unverified`, refusing by default),
-  and both refuse at bind time to serve on a non-loopback address unless
-  constructed with the exposure acknowledged by name.
+- The native broker transport is TLS 1.3 with a client certificate chained
+  to the configured client roots BY DEFAULT, on every plane. Each plane's
+  transport is a node config knob (#294 slice 5): `peer_transport` and
+  `admin_transport` on a metadata node, `replica_transport` and
+  `native_transport` on a data node, `lease.transport` for a data node's
+  dial of the admin plane — `tls` unless spelled otherwise, `plaintext` to
+  serve without TLS on a loopback address only (the listener refuses to bind
+  anywhere else), or `plaintext-on-any-interface` to acknowledge the
+  exposure by name. No `vtopctl` flag or Helm value sets them, so every
+  chart-rendered configuration is still TLS. A plaintext replica plane
+  refuses the verbs whose authorization depends on a client certificate; a
+  plaintext native plane admits a session on the declared principal alone
+  (the node's authorizer accepts the configured `principal_id` unverified —
+  anything that can reach the port and knows that UUID may produce and
+  consume); a plaintext admin plane refuses an enforcing
+  `admin_authorization`, since there is no CN to match.
 - Certificate validity alone does not grant a role. The embedding deployment
   **MUST** supply a `SessionAuthorizer` that binds the peer certificate chain,
   declared principal ID, and requested producer/consumer role. Produce requests
@@ -321,7 +325,7 @@ the ignore list and the build re-audited.
 | Manifest authentication | Optional | Keyed BLAKE3 MAC; required when configured. |
 | Chain of custody (object ↔ source markers) | Yes | Manifest binds object hash to covered markers. |
 | Replay safety / no premature commit | Yes | Enforced in state machine, state store, and pipeline. |
-| Transport confidentiality | Yes (native broker) / Configurable (Kafka, S3, PostgreSQL) | Every deployable configuration of the native broker is TLS 1.3 mTLS: the transport gained plaintext modes in #294 slices 3 and 4 (replica and native planes), but no node config key, `vtopctl` flag or Helm value reaches them, so plaintext is not selectable by any deployment method today. A plaintext replica plane also refuses the verbs whose authorization depends on a client certificate, and a plaintext native plane admits only principals the authorizer accepts unverified by name. Kafka/S3/PostgreSQL confidentiality is configured on those clients, not implemented in core. |
+| Transport confidentiality | Configurable (native broker: TLS 1.3 mTLS on every plane whose transport knob is left at its default; a plane switched to plaintext has none) / Configurable (Kafka, S3, PostgreSQL) | The native broker is TLS 1.3 mTLS on every plane whose transport is left at its default. Five node config knobs choose (#294 slice 5). Four are listeners — `peer_transport`, `admin_transport`, `replica_transport`, `native_transport` — each `tls` unless set to `plaintext` (loopback only) or `plaintext-on-any-interface` (spelled out deliberately); the fifth, `lease.transport`, is a dial with `tls` or `plaintext` only, and its loopback bound comes from the admin listener it dials, not from the dial. A plane on any plaintext setting has no transport confidentiality, so a security review of a hand-written node config reads all five. No `vtopctl` flag or Helm value sets them, so chart-rendered deployments are TLS throughout. A plaintext replica plane refuses the verbs whose authorization depends on a client certificate, and a plaintext native plane admits the configured principal on its declaration alone. Kafka/S3/PostgreSQL confidentiality is configured on those clients, not implemented in core. |
 | PostgreSQL transport authentication | Yes for remote hosts | Non-loopback connections require `sslmode=verify-full`; loopback/socket plaintext is limited to local operation. |
 | Backend-limited verification disclosure | Yes | Size-only mode is labeled and rejected by default. |
 | Data-at-rest encryption | Not by VTOP | Delegated to storage layer (SSE/bucket default). |
@@ -350,7 +354,7 @@ the ignore list and the build re-audited.
 | Object Lock retention on versioned manifest buckets | **SHOULD** |
 | Object lock / immutability | **SHOULD** (later) |
 | Secret redaction in logs | **MUST** |
-| Native broker transport restricted to TLS 1.3 with client certificates | **MUST** (no deployment method can select the plaintext transport; see §2) |
+| Native broker transport restricted to TLS 1.3 with client certificates | **MUST** by default; a node config knob selects plaintext per plane, loopback-only unless acknowledged by name (§2) |
 | Native broker sessions authorized by an explicit `SessionAuthorizer` | **MUST** |
 | Native clients validate the broker certificate and expected server identity | **MUST** (deployed clients; the loopback lab client may omit `tls` and connect plaintext, see §2) |
 | Native produce bound to the authenticated principal (`producer_id == principal_id`) | **MUST** |
@@ -388,7 +392,7 @@ flagged and collected below the tables.
 
 | Family | Stack | Function | Class |
 |---|---|---|---|
-| Cluster-plane TLS (admin, Raft peer, replica, native client; each plane also has a library-level plaintext mode no deployment method selects, §2) | rustls 0.23, **ring pinned at every construction site**, TLS 1.3 only, mutual; CN identity via `x509-parser` after chain validation on the admin, Raft-peer and replica planes — the native-client plane never parses the subject (Q3 below) | peer authentication, confidentiality; authorization input where the CN is read (CN is a Raft **safety** input on the peer plane) — native sessions match the declared hello principal against config, not the certificate | security function |
+| Cluster-plane TLS (admin, Raft peer, replica, native client; each plane's transport is a node config knob defaulting to TLS; plaintext is selectable per plane, loopback-only unless named, and confidentiality holds only on the planes left at `tls`, §2) | rustls 0.23, **ring pinned at every construction site**, TLS 1.3 only, mutual; CN identity via `x509-parser` after chain validation on the admin, Raft-peer and replica planes — the native-client plane never parses the subject (Q3 below) | peer authentication, confidentiality; authorization input where the CN is read (CN is a Raft **safety** input on the peer plane) — native sessions match the declared hello principal against config, not the certificate | security function |
 | Kafka source transport | librdkafka (vendored C, cmake) + **system OpenSSL** (`ssl`) + **system Cyrus SASL** (`sasl`) | broker TLS + SASL auth; plaintext unless configured (SHOULD-level, §2); missing password env is a hard startup error, never a silent downgrade | security function |
 | S3 upload transport + signing | AWS SDK: hyper 1 + hyper-rustls + rustls 0.23 with the SDK's **aws-lc-rs** provider, system roots; SigV4 HMAC-SHA-256 (SigV4a/P-256 available, never explicitly invoked) | endpoint TLS (scheme floor via `verify_tls`; cert verification not disableable) and per-request authentication | security function |
 | Postgres state store (`--features postgres`) | sqlx with `tls-rustls-ring-webpki` (the one place the workspace picks the stack); SCRAM-SHA-256 auth with ChaCha CSPRNG nonces — but the **server** chooses the method: sqlx also answers legacy `md5` (and cleartext) password requests, with no client-side way to refuse | verify-full floor for remote hosts (§2, MUST); database authentication | security function |

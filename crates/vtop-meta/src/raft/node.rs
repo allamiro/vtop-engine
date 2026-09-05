@@ -60,7 +60,7 @@ pub async fn start_meta_node(
     cluster_id: Uuid,
     node_id: u64,
     directory: PeerDirectory,
-    material: TlsMaterial,
+    material: Option<TlsMaterial>,
     timers: MetaNodeTimers,
 ) -> Result<MetaNode, String> {
     let store = MetaRaftStore::open(env, data_dir, cluster_id, MetaStorageConfig::default())

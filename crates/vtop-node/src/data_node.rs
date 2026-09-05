@@ -9,6 +9,9 @@
 //! leader validates durability and recovery (acked records survive a restart
 //! of the same directory), not failover.
 
+use crate::config::{
+    check_plaintext_bound, check_plaintext_exposure, refuse_plaintext_promotion, PlaneTransport,
+};
 use crate::config::{DataNodeConfig, DataRole};
 use crate::observe::{
     BrokerCollector, FollowerCollector, NodeObservability, SegmentRecoveryCollector,
@@ -79,7 +82,7 @@ fn lease_admin_client(
         // TLS remains the only mode this path builds. Slice 1 of #294 makes the
         // admin transport CAPABLE of plaintext; wiring a node's lease client to
         // choose it belongs with the config surface, not here.
-        plaintext: false,
+        plaintext: !lease.transport.is_tls(),
     }];
     // THE PEERS MAY NOT EXIST YET; THIS NODE'S OWN ENDPOINT MUST (#367). The
     // configured endpoint above stays strict — a node that cannot resolve the
@@ -102,11 +105,18 @@ fn lease_admin_client(
             } else {
                 peer.server_name.clone()
             },
-            plaintext: false,
+            plaintext: !peer.transport_or(lease.transport).is_tls(),
         });
     }
-    vtop_meta::AdminClient::with_candidates(tls::meta_material(&lease.tls)?, candidates)
-        .map_err(|error| error.to_string())
+    // Dialed the way each candidate listens (#294): TLS material is carried
+    // when ANY of them needs it (review) — a tier migrated one node at a time
+    // is mixed for the duration, and the leader may be on either side.
+    if lease.needs_tls() {
+        vtop_meta::AdminClient::with_candidates(tls::meta_material(lease.tls_paths()?)?, candidates)
+    } else {
+        vtop_meta::AdminClient::plaintext(candidates)
+    }
+    .map_err(|error| error.to_string())
 }
 
 /// Open the range through the startup catalog on every restart; create its
@@ -469,6 +479,146 @@ impl SessionAuthorizer for PrincipalAuthorizer {
     fn authorize(&self, _peer_chain_der: &[Vec<u8>], principal_id: Uuid, role: Role) -> bool {
         principal_id == self.principal && matches!(role, Role::Producer | Role::Consumer)
     }
+
+    /// On a plaintext native plane (#294) the rule is the same — the
+    /// configured principal, as a producer or consumer — and the evidence
+    /// is only the declaration. That is the mode's stated cost: the plane
+    /// is served only where `native_transport` allowed it to bind.
+    fn authorize_unverified(&self, principal_id: Uuid, role: Role) -> bool {
+        principal_id == self.principal && matches!(role, Role::Producer | Role::Consumer)
+    }
+}
+
+/// The replica plane's server for this node's transport (#294): TLS with
+/// this node's identity, or plaintext with the exposure the config named.
+fn replica_server(
+    config: &DataNodeConfig,
+    handler: Arc<dyn ReplicaPeerHandler>,
+) -> Result<ReplicaPeerServer, String> {
+    Ok(match config.replica_transport {
+        PlaneTransport::Tls => ReplicaPeerServer::new(
+            tls::replica_material(config.replica_tls_paths()?)?,
+            config.node_uuid,
+            handler,
+        )
+        .map_err(|error| error.to_string())?,
+        PlaneTransport::Plaintext => ReplicaPeerServer::plaintext(config.node_uuid, handler),
+        PlaneTransport::PlaintextOnAnyInterface => {
+            ReplicaPeerServer::plaintext_on_any_interface(config.node_uuid, handler)
+        }
+    })
+}
+
+/// A replica-status client dialing the replica plane the way this node
+/// serves it (#294): one plane, one transport.
+fn replica_status_client(
+    config: &DataNodeConfig,
+) -> Result<vtop_broker::replication::ReplicaStatusClient, String> {
+    if config.replica_transport.is_tls() {
+        vtop_broker::replication::ReplicaStatusClient::new(tls::replica_material(
+            config.replica_tls_paths()?,
+        )?)
+        .map_err(|error| error.to_string())
+    } else {
+        Ok(vtop_broker::replication::ReplicaStatusClient::plaintext())
+    }
+}
+
+/// The leader's replica set, dialing followers the way the plane is served
+/// (#294).
+fn start_replica_set(
+    config: &DataNodeConfig,
+    follower_configs: Vec<NetworkFollowerConfig>,
+) -> Result<NetworkedReplicaSet, String> {
+    let handle = tokio::runtime::Handle::current();
+    if config.replica_transport.is_tls() {
+        NetworkedReplicaSet::start_on_handle_with_memory(
+            handle,
+            follower_configs,
+            tls::replica_material(config.replica_tls_paths()?)?,
+            FlowControlConfig::default(),
+            None,
+        )
+    } else {
+        NetworkedReplicaSet::start_plaintext_on_handle(
+            handle,
+            follower_configs,
+            FlowControlConfig::default(),
+            None,
+        )
+    }
+    .map_err(|error| error.to_string())
+}
+
+/// The native plane's TLS material, resolved EARLY (review): a leader
+/// reads it before it spawns the lease agent, so a missing or unreadable
+/// certificate is a startup error and never a holder that acquired a lease
+/// it cannot serve. `None` for a plaintext plane.
+fn native_material(
+    config: &DataNodeConfig,
+    role: &str,
+) -> Result<Option<vtop_broker::ServerTlsMaterial>, String> {
+    if config.native_transport.is_tls() {
+        Ok(Some(tls::server_material(config.native_tls_paths(role)?)?))
+    } else {
+        Ok(None)
+    }
+}
+
+/// The native plane's server for this node's transport (#294), over one
+/// broker, from material [`native_material`] resolved earlier.
+fn native_server(
+    config: &DataNodeConfig,
+    material: Option<vtop_broker::ServerTlsMaterial>,
+    broker: Arc<LocalBroker>,
+    principal: Uuid,
+    server_config: ServerConfig,
+) -> Result<NativeServer, String> {
+    let authorizer = Arc::new(PrincipalAuthorizer { principal });
+    match config.native_transport {
+        PlaneTransport::Tls => NativeServer::new(
+            broker,
+            material.ok_or_else(|| {
+                "native_transport is tls but its material was not resolved".to_owned()
+            })?,
+            authorizer,
+            server_config,
+        ),
+        PlaneTransport::Plaintext => NativeServer::plaintext(broker, authorizer, server_config),
+        PlaneTransport::PlaintextOnAnyInterface => {
+            NativeServer::plaintext_on_any_interface(broker, authorizer, server_config)
+        }
+    }
+    .map_err(|error| error.to_string())
+}
+
+/// [`native_server`] over a broker slot, for a candidate whose broker is
+/// rebuilt at each role transition.
+fn native_server_over_slot(
+    config: &DataNodeConfig,
+    material: Option<vtop_broker::ServerTlsMaterial>,
+    slot: Arc<vtop_broker::BrokerSlot>,
+    principal: Uuid,
+    server_config: ServerConfig,
+) -> Result<NativeServer, String> {
+    let authorizer = Arc::new(PrincipalAuthorizer { principal });
+    match config.native_transport {
+        PlaneTransport::Tls => NativeServer::over_slot(
+            slot,
+            material.ok_or_else(|| {
+                "native_transport is tls but its material was not resolved".to_owned()
+            })?,
+            authorizer,
+            server_config,
+        ),
+        PlaneTransport::Plaintext => {
+            NativeServer::over_slot_plaintext(slot, authorizer, server_config)
+        }
+        PlaneTransport::PlaintextOnAnyInterface => {
+            NativeServer::over_slot_plaintext_on_any_interface(slot, authorizer, server_config)
+        }
+    }
+    .map_err(|error| error.to_string())
 }
 
 /// Run a data node that owns its own observability endpoint.
@@ -486,6 +636,17 @@ pub async fn run(
             DataRole::Candidate => "data-candidate",
         },
         &config.node_uuid.to_string(),
+    )?;
+    // A role this config can never serve is refused before a single port
+    // is bound (lab): judged only on the leader path, the refusal came
+    // after the observability bind, and a port already taken — the live
+    // leader's, in a lab that stands a leased twin next to it — spoke
+    // first and hid the real verdict.
+    refuse_plaintext_promotion(
+        config.role,
+        config.lease.is_some(),
+        !config.followers.is_empty(),
+        config.replica_transport,
     )?;
     let endpoint = config.observability.take().unwrap_or_default();
     let metrics_addr = observability.serve(&endpoint).await?;
@@ -647,6 +808,12 @@ async fn run_follower(
         .replica_listen
         .as_ref()
         .ok_or("follower requires replica_listen")?;
+    check_plaintext_exposure(
+        config.replica_transport,
+        listen,
+        "replica",
+        "replica_transport",
+    )?;
     // Captured before the range moves into the follower; the watcher needs the
     // same range id the follower was constructed for, not a second reading of
     // the config.
@@ -727,15 +894,20 @@ async fn run_follower(
         watcher_task = Some(tokio::spawn(watcher.run(shutdown.clone())));
     }
 
-    let server = ReplicaPeerServer::new(
-        tls::replica_material(&config.replica_tls)?,
-        config.node_uuid,
+    let server = replica_server(
+        &config,
         Arc::clone(&follower) as Arc<dyn ReplicaPeerHandler>,
     )
     .map_err(|error| error.to_string())?;
     let listener = TcpListener::bind(listen)
         .await
         .map_err(|error| format!("bind {listen}: {error}"))?;
+    check_plaintext_bound(
+        config.replica_transport,
+        listener.local_addr().map_err(|error| error.to_string())?,
+        "replica",
+        "replica_transport",
+    )?;
     observability.gate.mark_ready();
     println!(
         "data_node_ready role=follower node={} replica={listen}{}",
@@ -785,10 +957,61 @@ async fn run_leader(
         .native_listen
         .as_ref()
         .ok_or("leader/standalone requires native_listen")?;
-    let native_tls = config
-        .native_tls
-        .as_ref()
-        .ok_or("leader/standalone requires native_tls")?;
+    check_plaintext_exposure(
+        config.native_transport,
+        listen,
+        "native",
+        "native_transport",
+    )?;
+    // A leased leader with followers promotes over the replica plane the
+    // way a candidate does (review), and cannot do so in plaintext.
+    refuse_plaintext_promotion(
+        config.role,
+        config.lease.is_some(),
+        !config.followers.is_empty(),
+        config.replica_transport,
+    )?;
+    // The native listener BOUND and judged here, before the lease agent
+    // exists (review): a hostname that resolves off loopback is refused
+    // before this node could acquire a lease it would never serve.
+    let listener = TcpListener::bind(listen)
+        .await
+        .map_err(|error| format!("bind {listen}: {error}"))?;
+    check_plaintext_bound(
+        config.native_transport,
+        listener.local_addr().map_err(|error| error.to_string())?,
+        "native",
+        "native_transport",
+    )?;
+    let native_material = native_material(&config, "leader/standalone")?;
+    // Judged HERE, not by the bind (review): the status listener below
+    // serves from a detached task, and a refusal there would be a warning
+    // after readiness was announced.
+    // Bound and judged HERE as well (review), before the lease agent exists:
+    // a status listener whose hostname resolves off loopback must refuse
+    // startup before this node could acquire a lease it would never serve —
+    // the same reason the native listener above is bound early.
+    let status_listener = match config.replica_listen.as_ref() {
+        Some(status_listen) => {
+            check_plaintext_exposure(
+                config.replica_transport,
+                status_listen,
+                "replica",
+                "replica_transport",
+            )?;
+            let listener = TcpListener::bind(status_listen)
+                .await
+                .map_err(|error| format!("bind {status_listen}: {error}"))?;
+            check_plaintext_bound(
+                config.replica_transport,
+                listener.local_addr().map_err(|error| error.to_string())?,
+                "replica",
+                "replica_transport",
+            )?;
+            Some(listener)
+        }
+        None => None,
+    };
     let principal = config
         .principal_id
         .ok_or("leader/standalone requires principal_id")?;
@@ -819,16 +1042,7 @@ async fn run_leader(
             .iter()
             .map(|f| f.node_id)
             .collect::<Vec<Uuid>>();
-        let replica_set = Arc::new(
-            NetworkedReplicaSet::start_on_handle_with_memory(
-                tokio::runtime::Handle::current(),
-                follower_configs,
-                tls::replica_material(&config.replica_tls)?,
-                FlowControlConfig::default(),
-                None,
-            )
-            .map_err(|error| error.to_string())?,
-        );
+        let replica_set = Arc::new(start_replica_set(&config, follower_configs)?);
         // Wait for follower streams so the first quorum produce does not race
         // the dials; proceed anyway after the deadline (a scenario may start
         // a leader against a deliberately dead follower).
@@ -863,6 +1077,32 @@ async fn run_leader(
     };
 
     let broker = Arc::new(broker);
+    // The status server BUILT here (review), before the lease agent exists:
+    // its constructor resolves the replica plane's TLS material, and a
+    // certificate that plane cannot read must fail the process before this
+    // node could acquire a lease it would never serve — the listener was
+    // already bound early for the same reason; now the server is too.
+    let status_server = match status_listener {
+        Some(listener) => Some((
+            listener,
+            replica_server(
+                &config,
+                Arc::new(LeaderStatusReplica {
+                    broker: Arc::clone(&broker),
+                    node_id: config.node_uuid,
+                    transfer: LeaderSegmentTransferHandler::new(Arc::clone(&broker)),
+                    transfer_allowed: config
+                        .followers
+                        .iter()
+                        .map(|follower| follower.node_uuid)
+                        .chain(config.transfer_peers.iter().copied())
+                        .collect(),
+                }) as Arc<dyn ReplicaPeerHandler>,
+            )
+            .map_err(|error| error.to_string())?,
+        )),
+        None => None,
+    };
     // Same epoch history a follower keeps (#240). A leader needs its own: the
     // range's history is the union of what each replica recorded, and a leader
     // that could not say which epoch wrote its tail is exactly the replica a
@@ -899,10 +1139,7 @@ async fn run_leader(
         Some(Arc::new(crate::lease_agent::ReplicaPlaneProbe::new(
             Arc::clone(&broker) as Arc<dyn crate::lease_agent::CandidateLocalView>,
             config.node_uuid,
-            vtop_broker::replication::ReplicaStatusClient::new(tls::replica_material(
-                &config.replica_tls,
-            )?)
-            .map_err(|error| error.to_string())?,
+            replica_status_client(&config)?,
             endpoints,
             broker.range().clone(),
         )))
@@ -1079,10 +1316,11 @@ async fn run_leader(
         }
     }));
 
-    let server = NativeServer::new(
+    let server = native_server(
+        &config,
+        native_material,
         Arc::clone(&broker),
-        tls::server_material(native_tls)?,
-        Arc::new(PrincipalAuthorizer { principal }),
+        principal,
         ServerConfig {
             cluster_id: config.cluster_id,
             node_id: config.node_uuid,
@@ -1097,8 +1335,7 @@ async fn run_leader(
             handshake_timeout: Duration::from_secs(5),
             idle_timeout: Duration::from_secs(300),
         },
-    )
-    .map_err(|error| error.to_string())?;
+    )?;
     // Taken before `serve`, which consumes the server.
     observability.register(Box::new(ServerCollector::new(Arc::clone(
         server.metrics(),
@@ -1108,27 +1345,8 @@ async fn run_leader(
     // RPC, so `vtopctl node status` can measure follower lag against the
     // leader's own boundary rather than against the furthest-ahead follower.
     // Status only: see LeaderStatusReplica.
-    let status_addr = match config.replica_listen.as_ref() {
-        Some(status_listen) => {
-            let status_server = ReplicaPeerServer::new(
-                tls::replica_material(&config.replica_tls)?,
-                config.node_uuid,
-                Arc::new(LeaderStatusReplica {
-                    broker: Arc::clone(&broker),
-                    node_id: config.node_uuid,
-                    transfer: LeaderSegmentTransferHandler::new(Arc::clone(&broker)),
-                    transfer_allowed: config
-                        .followers
-                        .iter()
-                        .map(|follower| follower.node_uuid)
-                        .chain(config.transfer_peers.iter().copied())
-                        .collect(),
-                }) as Arc<dyn ReplicaPeerHandler>,
-            )
-            .map_err(|error| error.to_string())?;
-            let status_listener = TcpListener::bind(status_listen)
-                .await
-                .map_err(|error| format!("bind {status_listen}: {error}"))?;
+    let status_addr = match config.replica_listen.as_ref().zip(status_server) {
+        Some((status_listen, (status_listener, status_server))) => {
             let status_shutdown = oneshot_on_shutdown(shutdown.clone());
             tokio::spawn(async move {
                 if let Err(error) = status_server.serve(status_listener, status_shutdown).await {
@@ -1140,9 +1358,6 @@ async fn run_leader(
         None => None,
     };
 
-    let listener = TcpListener::bind(listen)
-        .await
-        .map_err(|error| format!("bind {listen}: {error}"))?;
     let shutdown_rx = oneshot_on_shutdown(shutdown.clone());
     observability.gate.mark_ready();
     println!(
@@ -1273,10 +1488,13 @@ async fn run_candidate(
         .native_listen
         .as_ref()
         .ok_or("candidate requires native_listen: any member may become the leader")?;
-    let native_tls = config
-        .native_tls
-        .as_ref()
-        .ok_or("candidate requires native_tls")?;
+    check_plaintext_exposure(
+        config.native_transport,
+        native_listen,
+        "native",
+        "native_transport",
+    )?;
+    let native_material = native_material(&config, "candidate")?;
     let principal = config
         .principal_id
         .ok_or("candidate requires principal_id")?;
@@ -1284,6 +1502,18 @@ async fn run_candidate(
         .replica_listen
         .as_ref()
         .ok_or("candidate requires replica_listen: any member may become a follower")?;
+    check_plaintext_exposure(
+        config.replica_transport,
+        replica_listen,
+        "replica",
+        "replica_transport",
+    )?;
+    refuse_plaintext_promotion(
+        config.role,
+        config.lease.is_some(),
+        true,
+        config.replica_transport,
+    )?;
     let roll = SegmentRoll {
         max_bytes: config.max_segment_bytes,
         max_records: config.max_segment_records,
@@ -1293,15 +1523,22 @@ async fn run_candidate(
 
     // --- both planes, bound once --------------------------------------------
     let switching = Arc::new(SwitchingReplicaHandler::new(config.node_uuid));
-    let replica_server = ReplicaPeerServer::new(
-        tls::replica_material(&config.replica_tls)?,
-        config.node_uuid,
+    let replica_server = replica_server(
+        &config,
         Arc::clone(&switching) as Arc<dyn ReplicaPeerHandler>,
     )
     .map_err(|error| error.to_string())?;
     let replica_listener = TcpListener::bind(replica_listen)
         .await
         .map_err(|error| format!("bind {replica_listen}: {error}"))?;
+    check_plaintext_bound(
+        config.replica_transport,
+        replica_listener
+            .local_addr()
+            .map_err(|error| error.to_string())?,
+        "replica",
+        "replica_transport",
+    )?;
     let replica_shutdown = oneshot_on_shutdown(shutdown.clone());
     // HELD, not detached (review): a listener that dies while this node
     // holds the lease leaves a ready leader with a dead endpoint. The
@@ -1315,10 +1552,11 @@ async fn run_candidate(
     });
 
     let slot = Arc::new(vtop_broker::BrokerSlot::empty());
-    let native_server = vtop_broker::NativeServer::over_slot(
+    let native_server = native_server_over_slot(
+        &config,
+        native_material,
         Arc::clone(&slot),
-        tls::server_material(native_tls)?,
-        Arc::new(PrincipalAuthorizer { principal }),
+        principal,
         ServerConfig {
             cluster_id: config.cluster_id,
             node_id: config.node_uuid,
@@ -1331,14 +1569,21 @@ async fn run_candidate(
             handshake_timeout: Duration::from_secs(5),
             idle_timeout: Duration::from_secs(300),
         },
-    )
-    .map_err(|error| error.to_string())?;
+    )?;
     observability.register(Box::new(ServerCollector::new(Arc::clone(
         native_server.metrics(),
     ))?))?;
     let native_listener = TcpListener::bind(native_listen)
         .await
         .map_err(|error| format!("bind {native_listen}: {error}"))?;
+    check_plaintext_bound(
+        config.native_transport,
+        native_listener
+            .local_addr()
+            .map_err(|error| error.to_string())?,
+        "native",
+        "native_transport",
+    )?;
     let native_shutdown = oneshot_on_shutdown(shutdown.clone());
     let mut native_task = tokio::spawn(async move {
         native_server
@@ -1375,10 +1620,7 @@ async fn run_candidate(
     let probe = crate::lease_agent::ReplicaPlaneProbe::new(
         Arc::clone(&view) as Arc<dyn crate::lease_agent::CandidateLocalView>,
         config.node_uuid,
-        vtop_broker::replication::ReplicaStatusClient::new(tls::replica_material(
-            &config.replica_tls,
-        )?)
-        .map_err(|error| error.to_string())?,
+        replica_status_client(&config)?,
         endpoints,
         range.clone(),
     );
@@ -2299,16 +2541,7 @@ async fn build_leader_phase(
         })
         .collect::<Result<Vec<_>, String>>()?;
     let follower_ids: Vec<Uuid> = follower_configs.iter().map(|f| f.node_id).collect();
-    let replicas = Arc::new(
-        NetworkedReplicaSet::start_on_handle_with_memory(
-            tokio::runtime::Handle::current(),
-            follower_configs,
-            tls::replica_material(&config.replica_tls)?,
-            FlowControlConfig::default(),
-            None,
-        )
-        .map_err(|error| error.to_string())?,
-    );
+    let replicas = Arc::new(start_replica_set(config, follower_configs)?);
     // Wait for follower streams so the first quorum produce does not race
     // the dials — the same courtesy run_leader extends, and equally bounded.
     // This runs in the SUPERVISOR, not the agent loop, so renewals continue

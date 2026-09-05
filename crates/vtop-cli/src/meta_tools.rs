@@ -622,6 +622,14 @@ pub struct MetaCommonArgs {
     pub config: PathBuf,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum AdminTransport {
+    #[default]
+    Tls,
+    Plaintext,
+}
+
 #[derive(Debug, Deserialize)]
 struct MetaAdminConfig {
     /// `host:port` of the admin mTLS listener to ask FIRST.
@@ -629,9 +637,17 @@ struct MetaAdminConfig {
     /// rustls server name (usually matches a SAN on the server cert).
     #[serde(default = "default_server_name")]
     server_name: String,
-    ca_cert: PathBuf,
-    client_cert: PathBuf,
-    client_key: PathBuf,
+    /// How the endpoint is dialed (#294): `tls` (the default) or `plaintext`,
+    /// matching the metadata node's `admin_transport`. Under plaintext the
+    /// PEM paths are not needed and no identity is presented.
+    #[serde(default)]
+    transport: AdminTransport,
+    #[serde(default)]
+    ca_cert: Option<PathBuf>,
+    #[serde(default)]
+    client_cert: Option<PathBuf>,
+    #[serde(default)]
+    client_key: Option<PathBuf>,
     /// Every other metadata node this command may be redirected to (#292).
     ///
     /// Reads and writes on this plane must reach the RAFT LEADER, and a
@@ -660,6 +676,28 @@ struct MetaAdminPeer {
     /// SAN and wrong with per-node certificates — so it is per peer here.
     #[serde(default)]
     server_name: String,
+    /// This peer's admin transport (#294), when it differs from the config's:
+    /// a metadata tier migrated one node at a time is mixed for the duration,
+    /// and a redirect may lead to either side. Unset inherits `transport`.
+    #[serde(default)]
+    transport: Option<AdminTransport>,
+}
+
+/// Whether a candidate is dialed plaintext: its own transport, else the
+/// config's.
+fn admin_dial_plaintext(peer: Option<&AdminTransport>, default: &AdminTransport) -> bool {
+    peer.unwrap_or(default) == &AdminTransport::Plaintext
+}
+
+/// Whether PEM material is needed at all: when the config's transport is TLS,
+/// or any peer's is (review) — the leader may be on either side of a rolling
+/// migration.
+fn admin_needs_tls<'a>(
+    default: &AdminTransport,
+    peers: impl Iterator<Item = Option<&'a AdminTransport>>,
+) -> bool {
+    let mut peers = peers;
+    default == &AdminTransport::Tls || peers.any(|peer| peer == Some(&AdminTransport::Tls))
 }
 
 fn default_server_name() -> String {
@@ -713,9 +751,30 @@ fn note_redirects(client: &AdminClient) {
 }
 
 fn connect(config: &MetaAdminConfig) -> Result<AdminClient, String> {
-    let material =
-        TlsMaterial::from_pem_files(&config.client_cert, &config.client_key, &config.ca_cert)
-            .map_err(|error| error.to_string())?;
+    // Dialed the way the metadata node listens (#294): under TLS with the
+    // operator's identity, or plaintext with none — the node's own choice,
+    // matched here rather than guessed.
+    let needs_tls = admin_needs_tls(
+        &config.transport,
+        config.peers.iter().map(|peer| peer.transport.as_ref()),
+    );
+    let material = if !needs_tls {
+        None
+    } else {
+        let (Some(cert), Some(key), Some(ca)) =
+            (&config.client_cert, &config.client_key, &config.ca_cert)
+        else {
+            return Err(
+                "TLS material is needed — the admin config is `transport: tls` (the default), \
+                 or a peer is — but ca_cert, client_cert and client_key are not all set: give \
+                 the PEM paths, or set `transport: plaintext` on the config and change any peer \
+                 with `transport: tls` to `transport: plaintext`"
+                    .to_owned(),
+            );
+        };
+        Some(TlsMaterial::from_pem_files(cert, key, ca).map_err(|error| error.to_string())?)
+    };
+    let plaintext = admin_dial_plaintext(None, &config.transport);
     // The configured endpoint first — it is what the operator named, and under
     // co-location it is usually the closest node — then everywhere a redirect
     // could point.
@@ -730,7 +789,7 @@ fn connect(config: &MetaAdminConfig) -> Result<AdminClient, String> {
             .err()
             .map(|_| config.endpoint.clone()),
         server_name: config.server_name.clone(),
-        plaintext: false,
+        plaintext,
     }];
     for peer in &config.peers {
         candidates.push(AdminCandidate {
@@ -746,10 +805,14 @@ fn connect(config: &MetaAdminConfig) -> Result<AdminClient, String> {
             } else {
                 peer.server_name.clone()
             },
-            plaintext: false,
+            plaintext: admin_dial_plaintext(peer.transport.as_ref(), &config.transport),
         });
     }
-    AdminClient::with_candidates(material, candidates).map_err(|error| error.to_string())
+    match material {
+        Some(material) => AdminClient::with_candidates(material, candidates),
+        None => AdminClient::plaintext(candidates),
+    }
+    .map_err(|error| error.to_string())
 }
 
 /// Dispatch `vtopctl meta` and return a process exit code.
@@ -2457,6 +2520,22 @@ mod tests {
             .is_none());
     }
 
+    /// #294 (review): a redirect peer may sit on the other side of a rolling
+    /// transport migration; each is dialed its own way, and material is kept
+    /// while any needs it.
+    #[test]
+    fn admin_dial_follows_each_peer_and_material_is_kept_while_any_peer_needs_it() {
+        let tls = AdminTransport::Tls;
+        let plain = AdminTransport::Plaintext;
+        assert!(admin_dial_plaintext(None, &plain));
+        assert!(!admin_dial_plaintext(None, &tls));
+        assert!(!admin_dial_plaintext(Some(&tls), &plain));
+        assert!(admin_dial_plaintext(Some(&plain), &tls));
+        assert!(!admin_needs_tls(&plain, [None, Some(&plain)].into_iter()));
+        assert!(admin_needs_tls(&plain, [None, Some(&tls)].into_iter()));
+        assert!(admin_needs_tls(&tls, [Some(&plain)].into_iter()));
+    }
+
     #[test]
     fn parse_node_state_accepts_canonical_names() {
         assert_eq!(parse_node_state("active").unwrap(), NodeState::Active);
@@ -2475,6 +2554,25 @@ client_key: /tmp/client.key
         let config: MetaAdminConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.endpoint, "127.0.0.1:9701");
         assert_eq!(config.server_name, "localhost");
+        assert_eq!(config.transport, AdminTransport::Tls);
+
+        // A plaintext admin plane (#294) needs no PEM paths; a tls one
+        // without them is refused at connect time, naming the knob.
+        let plain: MetaAdminConfig = serde_yaml::from_str(
+            r#"
+endpoint: "127.0.0.1:9701"
+transport: plaintext
+"#,
+        )
+        .unwrap();
+        assert_eq!(plain.transport, AdminTransport::Plaintext);
+        assert!(plain.ca_cert.is_none());
+        let bare: MetaAdminConfig = serde_yaml::from_str(r#"endpoint: "127.0.0.1:9701""#).unwrap();
+        let refusal = match connect(&bare) {
+            Err(refusal) => refusal,
+            Ok(_) => panic!("tls without paths must be refused"),
+        };
+        assert!(refusal.contains("transport: plaintext"), "{refusal}");
     }
 
     /// A node UUID that differs per index, so a test that means "two nodes"
