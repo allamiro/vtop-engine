@@ -33,6 +33,7 @@ IMAGE_TAG="${IMAGE_TAG:-local}"
 DOMAIN="${CLUSTER_DOMAIN:-cluster.local}"
 NEIGHBOUR_NS="${NS}-neighbour"
 REPLICATED_NS="${NS}-replicated"
+SEPARATED_NS="${NS}-separated"
 WORK="$(mktemp -d)"
 CERTS="$WORK/certs"
 HEADLESS="${REL}-headless"
@@ -60,6 +61,8 @@ cleanup() {
     kubectl delete namespace "$NEIGHBOUR_NS" --wait=false >/dev/null 2>&1 || true
     helm uninstall "$REL" -n "$REPLICATED_NS" >/dev/null 2>&1 || true
     kubectl delete namespace "$REPLICATED_NS" --wait=false >/dev/null 2>&1 || true
+    helm uninstall "$REL" -n "$SEPARATED_NS" >/dev/null 2>&1 || true
+    kubectl delete namespace "$SEPARATED_NS" --wait=false >/dev/null 2>&1 || true
   fi
   rm -rf "$WORK"
 }
@@ -155,8 +158,12 @@ whether the StatefulSet created anything is unknown"
 # job's own ceiling, so the diagnostics below would never print. The
 # deadline keeps the worst case inside the budget the surrounding readiness
 # waits already set.
-await_peer_dns() { # namespace
+await_peer_dns() { # namespace [pod-prefix] [headless-service]
+  # The prefix and headless name are the co-located ones unless told
+  # otherwise: the separated shape (#287) gates each tier's own DNS.
   peer_ns="$1"
+  peer_prefix="${2:-${REL}-}"
+  peer_headless="${3:-$HEADLESS}"
   unresolved=""
   unprobed=""
   unaddressed=""
@@ -178,31 +185,31 @@ await_peer_dns() { # namespace
       # most of a round. Past the deadline the round stops where it stands
       # — at most one bounded probe late.
       [ "$SECONDS" -lt "$gate_deadline" ] || { round_complete=0; break; }
-      want="$(timeout 15 kubectl -n "$peer_ns" get pod "${REL}-${name}" \
+      want="$(timeout 15 kubectl -n "$peer_ns" get pod "${peer_prefix}${name}" \
         -o jsonpath='{.status.podIP}' 2>/dev/null || true)"
       if [ -z "$want" ]; then
-        unaddressed="$unaddressed ${REL}-${name}"
+        unaddressed="$unaddressed ${peer_prefix}${name}"
         continue
       fi
-      peer_fqdn="${REL}-${name}.${HEADLESS}.${peer_ns}.svc.${DOMAIN}"
+      peer_fqdn="${peer_prefix}${name}.${peer_headless}.${peer_ns}.svc.${DOMAIN}"
       for probe in 0 1 2; do
         [ "$probe" = "$name" ] && continue
         [ "$SECONDS" -lt "$gate_deadline" ] || { round_complete=0; break; }
-        answer="$(timeout 15 kubectl -n "$peer_ns" exec "${REL}-${probe}" -- \
+        answer="$(timeout 15 kubectl -n "$peer_ns" exec "${peer_prefix}${probe}" -- \
           sh -c "timeout 10 getent hosts ${peer_fqdn} || echo miss:\$?" 2>/dev/null || true)"
         case "$answer" in
           "")
-            unprobed="$unprobed ${REL}-${probe}->${REL}-${name}"
+            unprobed="$unprobed ${peer_prefix}${probe}->${peer_prefix}${name}"
             ;;
           miss:*)
             # miss:2 is name-not-found; miss:124 is the remote lookup's own
             # timeout — a hung resolver, still a DNS verdict.
-            unresolved="$unresolved ${REL}-${probe}->${REL}-${name}(${answer})"
+            unresolved="$unresolved ${peer_prefix}${probe}->${peer_prefix}${name}(${answer})"
             ;;
           *)
             got="${answer%%[[:space:]]*}"
             [ "$got" = "$want" ] \
-              || unresolved="$unresolved ${REL}-${probe}->${REL}-${name}(stale:${got}!=${want})"
+              || unresolved="$unresolved ${peer_prefix}${probe}->${peer_prefix}${name}(stale:${got}!=${want})"
             ;;
         esac
       done
@@ -520,6 +527,49 @@ done
 log "node capacity reclaimed"
 
 # ---------------------------------------------------------------------------
+# THE REPLICATED TOPOLOGY, run TWICE (#287 slice 3): first as the co-located
+# shape (one StatefulSet, each pod a metadata voter AND a data candidate),
+# then as the SEPARATED shape (a metadata tier and a data tier as two
+# StatefulSets). The assertions are the same because the claims are the same;
+# what differs is which pod carries which plane, and the naming helpers below
+# are the only place that knows. Rendering the separated shape is not
+# evidence it works — the lesson of #281, restated for #287.
+# ---------------------------------------------------------------------------
+meta_pod()  { printf '%s%s' "$META_POD" "$1"; }   # metadata voter <ordinal>
+data_pod()  { printf '%s%s' "$DATA_POD" "$1"; }   # data candidate <ordinal>
+meta_fqdn() { printf '%s.%s.%s.svc.%s' "$(meta_pod "$1")" "$META_HEADLESS" "$R_NS" "$DOMAIN"; }
+data_fqdn() { printf '%s.%s.%s.svc.%s' "$(data_pod "$1")" "$DATA_HEADLESS" "$R_NS" "$DOMAIN"; }
+shape_pods() { # every pod of the shape, one per line
+  local o
+  for o in 0 1 2; do meta_pod "$o"; echo; done
+  if [ "$META_POD" != "$DATA_POD" ]; then
+    for o in 0 1 2; do data_pod "$o"; echo; done
+  fi
+}
+await_shape_dns() { # each tier's peers must resolve each other (#416)
+  await_peer_dns "$R_NS" "$DATA_POD" "$DATA_HEADLESS"
+  if [ "$META_POD" != "$DATA_POD" ]; then
+    await_peer_dns "$R_NS" "$META_POD" "$META_HEADLESS"
+  fi
+}
+await_capacity_reclaimed() { # <what comes next> — the same wait the standalone release does
+  local remaining="unknown" pods
+  for _ in $(seq 1 60); do
+    if pods="$(kubectl get pods -A -l "app.kubernetes.io/instance=${REL}" --no-headers 2>/dev/null)"; then
+      remaining="$(printf '%s' "$pods" | grep -c . || true)"
+      [ "$remaining" = "0" ] && break
+    else
+      remaining="unknown"
+    fi
+    sleep 2
+  done
+  [ "$remaining" = "0" ] \
+    || fail "capacity was not reclaimed after 120s: $remaining pod(s) still present (\"unknown\" means the cluster stopped answering). Installing $1 now would leave a pod Pending on a node that has no room for it."
+  log "node capacity reclaimed"
+}
+
+run_replicated_shape() {
+# ---------------------------------------------------------------------------
 # THE REPLICATED TOPOLOGY.
 #
 # Everything above runs the STANDALONE default, where three replicas are three
@@ -536,21 +586,22 @@ log "node capacity reclaimed"
 # above, because that is what proves the topology took effect rather than
 # merely being accepted: quorum durability succeeds where it was refused, and
 # a follower nobody produced to holds the records instead of staying empty.
-log "installing the REPLICATED topology into $REPLICATED_NS"
-kubectl create namespace "$REPLICATED_NS" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+log "installing the REPLICATED topology (${SHAPE} shape, ${R_VALUES}) into $R_NS"
+kubectl create namespace "$R_NS" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
+# Per-tier leaves: in the co-located shape a pod carries both, so the two
+# FQDNs coincide; in the separated shape each tier's pod has its own.
 i=0
 for uuid in "$UUID_0" "$UUID_1" "$UUID_2"; do
-  fqdn="${REL}-${i}.${HEADLESS}.${REPLICATED_NS}.svc.${DOMAIN}"
-  mkcert "$((i+1))" "$fqdn" "r-meta-node-${i}"
-  mkcert "$uuid" "$fqdn" "r-data-node-${i}"
+  mkcert "$((i+1))" "$(meta_fqdn "$i")" "r-meta-node-${i}"
+  mkcert "$uuid" "$(data_fqdn "$i")" "r-data-node-${i}"
   i=$((i+1))
 done
 mkcert "operator" "operator" "r-operator"
-mkcert "$PRINCIPAL" "${REL}-0.${HEADLESS}.${REPLICATED_NS}.svc.${DOMAIN}" "r-client"
+mkcert "$PRINCIPAL" "$(data_fqdn 0)" "r-client"
 
 for plane in meta data; do
-  kubectl -n "$REPLICATED_NS" create secret generic "${REL}-${plane}-tls" \
+  kubectl -n "$R_NS" create secret generic "${REL}-${plane}-tls" \
     --from-file=ca.pem="$CERTS/ca.pem" \
     --from-file=node-0.pem="$CERTS/r-${plane}-node-0.pem" --from-file=node-0-key.pem="$CERTS/r-${plane}-node-0-key.pem" \
     --from-file=node-1.pem="$CERTS/r-${plane}-node-1.pem" --from-file=node-1-key.pem="$CERTS/r-${plane}-node-1-key.pem" \
@@ -558,8 +609,8 @@ for plane in meta data; do
     --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 done
 
-helm upgrade --install "$REL" helm/vtop -n "$REPLICATED_NS" \
-  -f helm/vtop/ci/replicated-values.yaml \
+helm upgrade --install "$REL" helm/vtop -n "$R_NS" \
+  -f "helm/vtop/ci/${R_VALUES}" \
   --set "tls.metaSecretName=${REL}-meta-tls" \
   --set "tls.dataSecretName=${REL}-data-tls" \
   --set "image.repository=${IMAGE_REPO}" \
@@ -581,12 +632,12 @@ helm upgrade --install "$REL" helm/vtop -n "$REPLICATED_NS" \
 # and no metadata at all.
 log "waiting for pod 0's metadata process to be up, then bootstrapping the group"
 for _ in $(seq 1 60); do
-  phase="$(kubectl -n "$REPLICATED_NS" get "pod/${REL}-0" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+  phase="$(kubectl -n "$R_NS" get "pod/$(meta_pod 0)" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
   [ "$phase" = "Running" ] && break
   sleep 3
 done
 [ "${phase:-}" = "Running" ] \
-  || { kubectl -n "$REPLICATED_NS" get pods; fail "replicated pod 0 never reached Running (phase='${phase:-none}')"; }
+  || { kubectl -n "$R_NS" get pods; fail "metadata pod 0 ($(meta_pod 0)) never reached Running (phase='${phase:-none}')"; }
 
 # The forward is re-established on EVERY attempt, which the standalone path
 # does not need to do. Two things are moving here that are settled there: the
@@ -610,7 +661,7 @@ done
 # to prevent, and did it silently: two forwards on one port means `curl -sf` hits
 # the wrong listener, fails, and `set -e` aborts the script with no message at
 # all. Caught by running the test rather than by reading it.
-r_port=19700
+r_port="$R_PORT_BASE"
 alloc_port() {
   r_port=$((r_port + 1))
 }
@@ -637,20 +688,20 @@ for _ in $(seq 1 90); do
   r_port=$((r_port + 1))
   cat > "$WORK/r-admin.yaml" <<EOF
 endpoint: localhost:${r_port}
-server_name: ${REL}-0.${HEADLESS}.${REPLICATED_NS}.svc.${DOMAIN}
+server_name: $(meta_fqdn 0)
 ca_cert: $CERTS/ca.pem
 client_cert: $CERTS/r-operator.pem
 client_key: $CERTS/r-operator-key.pem
 EOF
-  forward_ns "$REPLICATED_NS" "${REL}-0" "$r_port" 9200
+  forward_ns "$R_NS" "$(meta_pod 0)" "$r_port" 9200
   if vtopctl meta init --members 1,2,3 --config "$WORK/r-admin.yaml" >/dev/null 2>&1; then
     r_init="yes"; break
   fi
 done
 [ -n "$r_init" ] || {
   vtopctl meta init --members 1,2,3 --config "$WORK/r-admin.yaml" || true
-  kubectl -n "$REPLICATED_NS" get pods || true
-  kubectl -n "$REPLICATED_NS" logs "${REL}-0" --tail=20 || true
+  kubectl -n "$R_NS" get pods || true
+  kubectl -n "$R_NS" logs "$(meta_pod 0)" --tail=20 || true
   fail "meta init never succeeded in the replicated namespace"
 }
 
@@ -661,7 +712,7 @@ peer_ports=()
 for ordinal in 0 1 2; do
   alloc_port
   peer_ports+=("$r_port")
-  forward_ns "$REPLICATED_NS" "${REL}-${ordinal}" "$r_port" 9200
+  forward_ns "$R_NS" "$(meta_pod "$ordinal")" "$r_port" 9200
 done
 
 # Find WHICH pod leads, and then deliberately aim everything at one that does
@@ -678,7 +729,7 @@ for _ in $(seq 1 30); do
   for ordinal in 0 1 2; do
     cat > "$WORK/probe-${ordinal}.yaml" <<EOF
 endpoint: localhost:${peer_ports[$ordinal]}
-server_name: ${REL}-${ordinal}.${HEADLESS}.${REPLICATED_NS}.svc.${DOMAIN}
+server_name: $(meta_fqdn "$ordinal")
 ca_cert: $CERTS/ca.pem
 client_cert: $CERTS/r-operator.pem
 client_key: $CERTS/r-operator-key.pem
@@ -731,7 +782,7 @@ log "metadata leader is pod $leader_ordinal; aiming every admin write at pod $fo
 {
   cat <<EOF
 endpoint: localhost:${peer_ports[$follower_ordinal]}
-server_name: ${REL}-${follower_ordinal}.${HEADLESS}.${REPLICATED_NS}.svc.${DOMAIN}
+server_name: $(meta_fqdn "$follower_ordinal")
 ca_cert: $CERTS/ca.pem
 client_cert: $CERTS/r-operator.pem
 client_key: $CERTS/r-operator-key.pem
@@ -741,7 +792,7 @@ EOF
     cat <<EOF
   - node_id: $((ordinal + 1))
     endpoint: localhost:${peer_ports[$ordinal]}
-    server_name: ${REL}-${ordinal}.${HEADLESS}.${REPLICATED_NS}.svc.${DOMAIN}
+    server_name: $(meta_fqdn "$ordinal")
 EOF
   done
 } > "$WORK/r-admin-multi.yaml"
@@ -777,7 +828,7 @@ meta_admin "created the topic and its root range in metadata" \
 ordinal=0
 for uuid in "$UUID_0" "$UUID_1" "$UUID_2"; do
   meta_admin "registered data node $uuid" \
-    meta register-node --node-uuid "$uuid" --addr "${REL}-${ordinal}.${HEADLESS}.${REPLICATED_NS}.svc.${DOMAIN}:9300"
+    meta register-node --node-uuid "$uuid" --addr "$(data_fqdn "$ordinal"):9300"
   ordinal=$((ordinal + 1))
 done
 
@@ -791,15 +842,15 @@ or vtopctl is not following redirects"
 log "observed $redirects_seen leader redirect(s): admin writes reached the leader from a follower endpoint"
 
 log "waiting for the whole replicated range to become Ready"
-await_pods_exist "$REPLICATED_NS" 3
-kubectl -n "$REPLICATED_NS" wait --for=condition=ready pod -l "app.kubernetes.io/instance=${REL}" \
+await_pods_exist "$R_NS" "$R_PODS"
+kubectl -n "$R_NS" wait --for=condition=ready pod -l "app.kubernetes.io/instance=${REL}" \
   --timeout=240s >/dev/null || {
-    kubectl -n "$REPLICATED_NS" get pods
-    for o in 0 1 2; do echo "--- ${REL}-$o ---"; kubectl -n "$REPLICATED_NS" logs "${REL}-$o" --tail=30 || true; done
+    kubectl -n "$R_NS" get pods
+    for pod in $(shape_pods); do echo "--- $pod ---"; kubectl -n "$R_NS" logs "$pod" --tail=30 || true; done
     fail "the replicated range never became Ready"
   }
 log "gating on the replicated range's headless DNS (#416)"
-await_peer_dns "$REPLICATED_NS"
+await_shape_dns
 log "replicated peer DNS settled"
 
 # WHICH POD HOLDS THE RANGE IS AN ELECTION'S OUTCOME, NOT A RENDERED FACT.
@@ -911,9 +962,10 @@ r_produce() { # <ordinal> <fencing-epoch> <producer-epoch> <records>
   # loop above records. Torn down because this call sits in a retry loop:
   # sixty abandoned port-forwards would be sixty kubectl processes and sixty
   # API streams held open for the length of the wait.
-  forward_ns "$REPLICATED_NS" "${REL}-${ordinal}" "$pport" 9400
+  forward_ns "$R_NS" "$(data_pod "$ordinal")" "$pport" 9400
   local fwd="${FORWARDS##* }"
-  local fqdn="${REL}-${ordinal}.${HEADLESS}.${REPLICATED_NS}.svc.${DOMAIN}"
+  local fqdn
+  fqdn="$(data_fqdn "$ordinal")"
   sed "s|^server_name: .*|server_name: \"${fqdn}\"|; s|cert: $CERTS/client.pem|cert: $CERTS/r-client.pem|; s|key: $CERTS/client-key.pem|key: $CERTS/r-client-key.pem|; s/^producer_epoch: .*/producer_epoch: ${producer}/; s/^fencing_epoch: .*/fencing_epoch: ${fencing}/" \
     "$WORK/client.yaml" > "$WORK/r-client.yaml"
   # BOUNDED, so the retry deadline outside means what it says: the client
@@ -948,7 +1000,7 @@ await_all_committed() { # <expected>
   local expected="$1" ordinal offset mport
   for ordinal in 0 1 2; do
     alloc_port; mport="$r_port"
-    forward_ns "$REPLICATED_NS" "${REL}-${ordinal}" "$mport" 9500
+    forward_ns "$R_NS" "$(data_pod "$ordinal")" "$mport" 9500
     offset=""
     for _ in $(seq 1 45); do
       offset="$(committed_offset "$mport")"
@@ -970,7 +1022,7 @@ log "replication verified in Kubernetes: quorum durability works and every repli
 # election's outcome; whichever it is, produce must resume against it and
 # every previously acknowledged record must still be there.
 log "deleting the holder's pod (candidate $holder_ordinal) to force a failover"
-kubectl -n "$REPLICATED_NS" delete pod "${REL}-${holder_ordinal}" >/dev/null
+kubectl -n "$R_NS" delete pod "$(data_pod "$holder_ordinal")" >/dev/null
 
 # The recreated pod races the survivors for the vacated lease, and it CAN
 # legitimately win — StatefulSets restart fast, and a recovered holder
@@ -1011,7 +1063,7 @@ R_TOTAL=$((R_EXPECTED + 30))
 # asked" — the same attribution rule `await_pods_exist` states above.
 ready_members() {
   local pods
-  pods="$(kubectl -n "$REPLICATED_NS" get pods -l "app.kubernetes.io/instance=${REL}" \
+  pods="$(kubectl -n "$R_NS" get pods -l "app.kubernetes.io/instance=${REL}" \
     -o jsonpath='{range .items[*]}{.metadata.deletionTimestamp}{"|"}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' \
     2>/dev/null)" || return 1
   printf '%s' "$pods" | grep -c '^|True$' || true
@@ -1033,7 +1085,7 @@ while :; do
   members_at_write="$(ready_members || true)"
   r_produce "$new_ordinal" "$NEW_EPOCH" 2 30 && break
   [ "$SECONDS" -lt "$produce_deadline" ] || {
-    kubectl -n "$REPLICATED_NS" get pods || true
+    kubectl -n "$R_NS" get pods || true
     # THE ENGINE'S OWN ACCOUNT, not just the client's error. This failure has
     # now been diagnosed twice from the outside and misattributed twice, both
     # times because the only evidence was `tls handshake eof` — which says the
@@ -1043,12 +1095,12 @@ while :; do
     # costs nothing on a passing run and is the difference between a diagnosis
     # and a guess on a failing one.
     for o in 0 1 2; do
-      echo "--- ${REL}-$o (last 120 lines) ---"
-      kubectl -n "$REPLICATED_NS" logs "${REL}-$o" --tail=120 2>&1 \
+      echo "--- $(data_pod "$o") (last 120 lines) ---"
+      kubectl -n "$R_NS" logs "$(data_pod "$o")" --tail=120 2>&1 \
         | grep -iE 'promot|quorum|lease|epoch|fenc|stand|slot|listener|panic|error' \
-        || kubectl -n "$REPLICATED_NS" logs "${REL}-$o" --tail=40 2>&1 || true
-      echo "--- ${REL}-$o previous container, if it restarted ---"
-      kubectl -n "$REPLICATED_NS" logs "${REL}-$o" --previous --tail=60 2>&1 | tail -20 || true
+        || kubectl -n "$R_NS" logs "$(data_pod "$o")" --tail=40 2>&1 || true
+      echo "--- $(data_pod "$o") previous container, if it restarted ---"
+      kubectl -n "$R_NS" logs "$(data_pod "$o")" --previous --tail=60 2>&1 | tail -20 || true
     done
     echo "--- lease as metadata sees it ---"
     lease_state || true
@@ -1074,24 +1126,20 @@ epoch $NEW_EPOCH — retargeting"
   fi
   sleep 3
 done
-case "${members_at_write:-0}" in
-  1 | 2)
-    log "produce resumed at epoch $NEW_EPOCH; the attempt that landed began with only \
-${members_at_write} of 3 members Ready — the range served through the outage on a bare quorum"
-    ;;
-  3)
-    log "produce resumed at epoch $NEW_EPOCH; the replacement was already back when the \
+if [ "${members_at_write:-x}" -ge 1 ] 2>/dev/null && [ "$members_at_write" -lt "$R_PODS" ]; then
+  log "produce resumed at epoch $NEW_EPOCH; the attempt that landed began with only \
+${members_at_write} of $R_PODS pods Ready — the range served through the outage on a bare quorum"
+elif [ "${members_at_write:-x}" -eq "$R_PODS" ] 2>/dev/null; then
+  log "produce resumed at epoch $NEW_EPOCH; the replacement was already back when the \
 winning attempt began, so this run did not exercise the degraded-quorum path (a fast restart, \
 not a failure)"
-    ;;
-  *)
-    # Zero Ready members cannot be true of a cluster that just accepted a
-    # quorum write, so this is the readiness QUERY having failed. Say that,
-    # rather than reporting a member count nobody measured.
-    log "produce resumed at epoch $NEW_EPOCH; how many members were Ready at the time is \
+else
+  # Zero Ready members cannot be true of a cluster that just accepted a
+  # quorum write, so this is the readiness QUERY having failed. Say that,
+  # rather than reporting a member count nobody measured.
+  log "produce resumed at epoch $NEW_EPOCH; how many pods were Ready at the time is \
 unknown (the readiness query did not answer)"
-    ;;
-esac
+fi
 
 # NOW the returning pod must rejoin, because the convergence assertion below
 # is about it: with only two pods up, "a majority acked" and "everyone acked"
@@ -1112,28 +1160,28 @@ ready=""
 for _ in $(seq 1 80); do
   if ready="$(ready_members)"; then
     answered=1
-    [ "${ready:-0}" -eq 3 ] && { returned="yes"; break; }
+    [ "${ready:-0}" -eq "$R_PODS" ] && { returned="yes"; break; }
   fi
   sleep 3
 done
 [ -n "$returned" ] || {
-  kubectl -n "$REPLICATED_NS" get pods || true
+  kubectl -n "$R_NS" get pods || true
   if [ "$answered" -eq 1 ]; then
-    fail "the deleted pod never came back: only ${ready:-0} of 3 pods are Ready and \
+    fail "the deleted pod never came back: only ${ready:-0} of $R_PODS pods are Ready and \
 un-terminating after 240s"
   else
     fail "could not read pod readiness for 240s: the API server never answered, so \
 nothing is known about the recreated pod"
   fi
 }
-log "the deleted pod rejoined; all three replicas are Ready again"
+log "the deleted pod rejoined; all $R_PODS pods are Ready again"
 
 # The second gate is the one occurrence three taught: the recreated pod was
 # Ready, but its peers could not resolve its NEW record, so replication to it
 # stalled and the convergence check below blamed the replica. Readiness and
 # resolvability move independently across a pod recreation — gate on both.
 log "gating on post-failover headless DNS: peers must resolve the recreated pod (#416)"
-await_peer_dns "$REPLICATED_NS"
+await_shape_dns
 log "post-failover peer DNS settled"
 
 # Every replica — INCLUDING the recreated pod — converges on the full total:
@@ -1141,5 +1189,38 @@ log "post-failover peer DNS settled"
 # records replicated, and the returned pod caught up from whatever it missed.
 await_all_committed "$R_TOTAL"
 log "failover verified in Kubernetes: the range moved (or recovered) without a re-render, produce resumed, and all $R_TOTAL records are on every replica"
+
+}
+
+SHAPE=colocated
+R_NS="$REPLICATED_NS"
+R_VALUES=replicated-values.yaml
+META_POD="${REL}-"
+DATA_POD="${REL}-"
+META_HEADLESS="$HEADLESS"
+DATA_HEADLESS="$HEADLESS"
+R_PODS=3
+R_PORT_BASE=19700
+run_replicated_shape
+
+log "releasing the co-located replicated namespace before the separated shape"
+helm uninstall "$REL" -n "$REPLICATED_NS" >/dev/null 2>&1 || true
+kubectl delete namespace "$REPLICATED_NS" --wait=true --timeout=180s >/dev/null 2>&1 || true
+await_capacity_reclaimed "the separated shape"
+
+# The SEPARATED shape (#287): three metadata voters in one StatefulSet, three
+# data candidates in another, the lease crossing between them. Six pods, two
+# headless Services, and a fresh port range so nothing collides with the
+# forwards the first pass left behind.
+SHAPE=separated
+R_NS="$SEPARATED_NS"
+R_VALUES=separated-values.yaml
+META_POD="${REL}-meta-"
+DATA_POD="${REL}-data-"
+META_HEADLESS="${REL}-meta-headless"
+DATA_HEADLESS="${REL}-data-headless"
+R_PODS=6
+R_PORT_BASE=21700
+run_replicated_shape
 
 log "PASS"
