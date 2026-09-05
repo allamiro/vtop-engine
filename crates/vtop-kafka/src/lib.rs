@@ -25,19 +25,24 @@
 //! [`bridge::Bridge`] where brokers are wired.
 
 pub mod api;
+pub mod api_groups;
 pub mod bridge;
 pub mod gateway;
+pub mod groups;
 pub mod messages;
 #[cfg(feature = "native")]
 pub mod native;
+pub mod offsets;
 pub mod records;
 mod turnstile;
 pub mod wire;
 
 pub use bridge::{Appended, Bridge, Fetched, MemoryBridge, Sequenced};
 pub use gateway::{Gateway, GatewayConfig};
+pub use groups::{Coordinator, GroupConfig};
 pub use messages::{ApiKey, ErrorCode, HeaderVerdict, RequestHeader};
 #[cfg(feature = "native")]
 pub use native::{EpochsExhausted, NativeBridge, NativeBridgeConfig};
+pub use offsets::{Committed, MemoryOffsetStore, OffsetStore};
 pub use records::{Record, RecordBatch};
 pub use wire::{Decoder, Encoder, WireError};
