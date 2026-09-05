@@ -495,13 +495,18 @@ impl SourceAdapter for FileSource {
         // sources costs data. The asymmetry decides it.
         //
         // Aliases — a symlink beside its target, or two hard links — are not a
-        // spelling question and are not handled here (#378). They ask whether
-        // two directory entries for one inode are one source or two, which has
-        // a defensible answer either way, and the answer has to be paired with
-        // a cursor identity that survives `delete_after_commit` removing one
-        // of the aliases. `canonicalize` looks like it settles this and does
-        // not: it merges symlinks, cannot see hard links at all, and leaves
-        // the deletion of an alias silently re-reading the survivor from zero.
+        // spelling question, and the RULING (#378) is that they are two
+        // sources: each entry is archived under its own name, so the file's
+        // records are archived twice, and discovery says so (below). No merge
+        // and no knob, because a merge needs a cursor identity that survives
+        // one alias being removed, and there is no safe one: keyed by the
+        // surviving spelling, `delete_after_commit` removes it and the next
+        // discovery re-reads the target from zero (#376 re-entered); keyed by
+        // the inode, a freed inode reused by a NEW file inherits the old
+        // cursor and that file's opening records are never read. A duplicate
+        // costs storage; a merge risks data. `canonicalize` looks like it
+        // settles this and does not: it merges symlinks, cannot see hard
+        // links at all, and has exactly the first failure above.
         let mut seen = std::collections::HashSet::<std::path::PathBuf>::new();
         // Surviving spellings with their (device, inode), for the alias
         // warning below (#378).
@@ -534,14 +539,12 @@ impl SourceAdapter for FileSource {
                 });
             }
         }
-        // Two surviving entries for ONE inode are archived as two sources.
-        // Whether they SHOULD be one is #378's open question, deliberately
-        // unanswered here — but doing it silently is the wrong way to do it,
-        // whichever answer wins. Warned once per alias-group COMPOSITION per
-        // process (#388): the duplication is either intended or a config
-        // surprise, and both deserve exactly one line, not one per cycle —
-        // until the group changes, when the line that named it no longer
-        // says what to go look at.
+        // Two surviving entries for ONE inode are archived as two sources,
+        // by ruling (#378, above) — and never silently. Warned once per
+        // alias-group COMPOSITION per process (#388): the duplication is
+        // either intended or a config surprise, and both deserve exactly one
+        // line, not one per cycle — until the group changes, when the line
+        // that named it no longer says what to go look at.
         let to_warn = {
             let mut warned = self.warned_aliases.lock().expect("alias map lock poisoned");
             alias_groups_to_warn(&mut warned, alias_groups(&identities), &identities)
@@ -549,8 +552,10 @@ impl SourceAdapter for FileSource {
         for group in to_warn {
             tracing::warn!(
                 paths = ?group,
-                "two directory entries name one file; each is archived as \
-                 its own source, so its records are archived twice (#378)"
+                "two directory entries name one file; each is archived as its own source, so \
+                 its records are archived twice — by ruling (#378), since no cursor identity \
+                 survives an alias being removed. Narrow the patterns to one spelling if one \
+                 source is meant"
             );
         }
         Ok(out)
@@ -992,18 +997,21 @@ mod tests {
         );
     }
 
-    /// A symlink and its target are still TWO sources, and `..` still does not
-    /// merge — both on purpose (#376, followed up by #378).
+    /// A symlink and its target are TWO sources, and `..` does not merge —
+    /// both on purpose (#376), and the first now by ruling (#378).
     ///
     /// This pins a deliberate non-behaviour, which is worth a test precisely
     /// because it looks like an oversight. Deduplicating by inode would merge
     /// them, and `canonicalize` makes it a one-liner — but it is not a
     /// spelling question, it is "are two directory entries for one inode one
-    /// source or two", and the answer has to be paired with a cursor identity
-    /// that survives `delete_after_commit` removing one of the aliases. With
-    /// the symlink deduplicated and deleted, the next discovery surfaces the
-    /// target under a different `source_name`, finds no cursor, and re-reads
-    /// the file from zero — #376 re-entered through its own fix.
+    /// source or two", and a merge needs a cursor identity that survives
+    /// `delete_after_commit` removing one of the aliases. There is no safe
+    /// one: with the symlink deduplicated and deleted, the next discovery
+    /// surfaces the target under a different `source_name`, finds no cursor,
+    /// and re-reads the file from zero (#376 re-entered through its own fix);
+    /// keyed by inode instead, a freed inode reused by a new file inherits
+    /// the old cursor and skips that file's opening records. So: two sources,
+    /// named once by the alias warning, and no knob.
     ///
     /// `..` is left for the same reason from the other side: `a/link/../b` is
     /// not `a/b` when `link` is a symlink, so collapsing it lexically could
@@ -1034,8 +1042,8 @@ mod tests {
         assert_eq!(
             symlinked.len(),
             2,
-            "a symlink and its target are two directory entries and stay two sources \
-             until #378 decides otherwise WITH a cursor identity to match: {symlinked:?}"
+            "a symlink and its target are two directory entries and two sources by ruling \
+             (#378): no cursor identity survives an alias being removed: {symlinked:?}"
         );
 
         let traversed: Vec<String> = FileSource::new(
@@ -1061,9 +1069,9 @@ mod tests {
         );
     }
 
-    /// The alias DETECTION for #378: while the merge question stays open,
-    /// two directory entries for one inode must at least be named, because
-    /// silent double-archiving is wrong under either eventual answer.
+    /// The alias DETECTION for #378: two directory entries for one inode are
+    /// two sources by ruling, and they must be named, because silent
+    /// double-archiving is the wrong way to do even the right thing.
     #[test]
     fn two_entries_for_one_inode_are_grouped_and_distinct_files_are_not() {
         let dir = tempfile::tempdir().unwrap();
