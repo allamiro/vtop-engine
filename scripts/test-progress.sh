@@ -361,8 +361,9 @@ if selected:
             sys.exit("package " + spec + " is not a member of this workspace")
         matched.extend(matches)
     # `--workspace -p a` selects the WORKSPACE under cargo: the -p is
-    # checked for existence and otherwise ignored, so it is here too.
-    roots = list(members) if workspace_flag else matched
+    # checked for existence and otherwise ignored, so it is here too. A
+    # package named twice (`-p a -p 'a*'`) is one root (review).
+    roots = list(members) if workspace_flag else list(dict.fromkeys(matched))
 else:
     roots = list(members if workspace_flag else default_members)
 roots = [pid for pid in roots if not any(named(spec, by_id[pid]) for spec in excluded)]
@@ -392,7 +393,6 @@ if mode == "harnessless":
     kinds = {"lib": ("lib", "rlib", "proc-macro"), "bin": ("bin",), "test": ("test",), "bench": ("bench",), "example": ("example",)}
     for pid in roots:
         package = by_id[pid]
-        root = os.path.dirname(package["manifest_path"])
         try:
             with open(package["manifest_path"], "rb") as handle:
                 manifest = tomllib.load(handle)
@@ -423,6 +423,23 @@ if mode == "roots-for-targets":
     # the graph cargo compiles.
     selectors = extra
     LIB = ("lib", "rlib", "proc-macro")
+    def bench_eligible(package, target):
+        # `bench = true` is the default for libraries and binaries and is not
+        # in metadata (review); the manifest is read for a `bench = false`.
+        import tomllib
+        try:
+            with open(package["manifest_path"], "rb") as handle:
+                manifest = tomllib.load(handle)
+        except (OSError, tomllib.TOMLDecodeError):
+            return True
+        tables = [manifest.get("lib")] if any(k in target["kind"] for k in LIB) else manifest.get("bin") or []
+        for entry in tables:
+            if not entry:
+                continue
+            name = entry.get("name") or package["name"].replace("-", "_")
+            if name == target["name"] and not entry.get("bench", True):
+                return False
+        return True
     def reached(package):
         for selector in selectors:
             if selector == "--all-targets":
@@ -431,12 +448,12 @@ if mode == "roots-for-targets":
             for target in package["targets"]:
                 kind = target["kind"]
                 is_lib = any(k in kind for k in LIB)
-                # The plural selectors follow cargo's ELIGIBILITY flags where
-                # metadata carries them (review): `--tests` is every target
-                # with `test = true` plus the integration tests, whatever its
-                # kind; `--benches` would be `bench = true`, which metadata
-                # does not expose, so it falls back to kind. The named
-                # selectors are explicit and ignore the flags, as cargo does.
+                # The plural selectors follow cargo's ELIGIBILITY flags: `--tests`
+                # is every target with `test = true` (in metadata) plus the
+                # integration tests, whatever its kind; `--benches` every
+                # target with `bench = true`, read from the manifest since
+                # metadata does not carry it. The named selectors are explicit
+                # and ignore the flags, as cargo does.
                 hit = {
                     "--lib": is_lib,
                     "--bins": "bin" in kind,
@@ -445,7 +462,7 @@ if mode == "roots-for-targets":
                     "--test": "test" in kind and target["name"] == name,
                     "--examples": "example" in kind,
                     "--example": "example" in kind and target["name"] == name,
-                    "--benches": "bench" in kind or is_lib or "bin" in kind,
+                    "--benches": "bench" in kind or (is_lib or "bin" in kind) and bench_eligible(package, target),
                     "--bench": "bench" in kind and target["name"] == name,
                 }.get(flag, False)
                 if hit:
@@ -705,7 +722,7 @@ while :; do
   # Each status line as the executable it names (a doctest unit names
   # none, and is never a custom harness).
   statuses="$(plain_log "$WORK/run.log" | grep -E '^[[:space:]]+(Running|Doc-tests) ' \
-    | sed -E 's/^.*\(([^()]*)\)$/\1/; s|^.*/||; /^[[:space:]]+Doc-tests /d')"
+    | sed -E 's/^.*\(([^()]*)\)[[:space:]]*$/\1/; s|^.*/||; /^[[:space:]]+Doc-tests /d')"
   if [[ -n "$HARNESSLESS" && -n "$statuses" ]]; then
     custom_started="$(printf '%s\n' "$statuses" | grep -cxF -f <(printf '%s\n' "$HARNESSLESS") || true)"
     last_custom=0
