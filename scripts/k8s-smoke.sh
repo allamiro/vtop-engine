@@ -939,14 +939,25 @@ lease_state() { # [per-attempt-bound] — echoes "<holder> <epoch>", empty when 
   # wedged forward would spend the whole produce window in a single call
   # and the loop's deadline could never fire. A caller near its own
   # deadline passes the smaller bound it can still afford (review).
-  local bound="${1:-10}"
+  local bound="${1:-10}" code=0
+  : > "$WORK/lease-read.err"
+  # Why the read failed is kept, not thrown away (#469): a wait that ends
+  # with nothing must be able to say whether the plane had no grant or the
+  # read never got an answer — the two look identical in an empty string,
+  # and one of them is a test bug while the other is a product bug.
   timeout --kill-after=1 "$bound" \
     vtopctl --json meta range-lease --config "$WORK/r-admin-multi.yaml" \
-    --topic-uuid "$TOPIC_UUID" --range-uuid "$RANGE_ID" 2>/dev/null \
-    | python3 -c '
+    --topic-uuid "$TOPIC_UUID" --range-uuid "$RANGE_ID" \
+    > "$WORK/lease-read.json" 2> "$WORK/lease-read.err" || code=$?
+  # The EXIT STATUS is what says the read did not land, not the presence of
+  # stderr (review): a successful read through a follower writes a redirect
+  # note there, and treating that as failure would call a landed read lost.
+  echo "$code" > "$WORK/lease-read.code"
+  [ "$code" = 0 ] || echo "vtopctl meta range-lease exited $code" >> "$WORK/lease-read.err"
+  python3 -c '
 import json, sys
 try:
-    d = json.load(sys.stdin)
+    d = json.load(open(sys.argv[1]))
 except Exception:
     sys.exit(1)
 lease = d.get("lease") or {}
@@ -954,7 +965,27 @@ holder = lease.get("holder_node_uuid") or ""
 epoch = lease.get("fencing_epoch")
 if holder and epoch is not None:
     print(holder, epoch)
-' 2>/dev/null || true
+' "$WORK/lease-read.json" 2>/dev/null || true
+}
+
+# What the last lease read had to say for itself (#469): its stderr, and the
+# metadata plane's own view of who leads and how far it has applied. Printed
+# where a wait for a grant ends empty, so the next reader of a CI log can
+# tell a plane that never granted from a read that never landed.
+lease_read_evidence() {
+  echo "--- the wait's last lease read stderr: \
+$(tail -3 "$WORK/lease-wait.err" 2>/dev/null | tr '\n' ' ')"
+  echo "--- the wait's last lease read stdout: \
+$(tail -c 400 "$WORK/lease-wait.json" 2>/dev/null | tr '\n' ' ')"
+  echo "--- the wait's last lease read exit: $(cat "$WORK/lease-wait.code" 2>/dev/null || echo unknown)"
+  # A probe that fails is itself evidence, and must not end the dump it
+  # belongs to (review): `set -e` would abort here on the very failure this
+  # path exists to explain, taking the pod evidence and the message with it.
+  local status="" code=0
+  status="$(timeout --kill-after=1 20 vtopctl --json meta status \
+    --config "$WORK/r-admin-multi.yaml" 2>&1 | tail -c 600 | tr '\n' ' ')" || code=$?
+  [ "$code" = 0 ] || status="$status (meta status exited $code)"
+  echo "--- metadata plane status: $status"
 }
 
 ordinal_of() { # <node-uuid> -> pod ordinal
@@ -1141,13 +1172,29 @@ moved="$(await_holder "$EPOCH")" || moved=""
   # shows it, every data and metadata pod's last lines, and kube-dns — the
   # election is not gated on DNS, because the deleted holder's name cannot
   # resolve until it is back and the survivors must elect without it.
-  echo "--- lease view (holder epoch): $(lease_state 20 2>/dev/null || true)"
+  # The wait's own evidence, kept before anything else reads the lease
+  # (review): the diagnostic probe below overwrites these files, and printing
+  # them afterwards would attribute the failure to the probe rather than to
+  # the wait that actually gave up.
+  for artefact in json err code; do
+    cp "$WORK/lease-read.$artefact" "$WORK/lease-wait.$artefact" 2>/dev/null || true
+  done
+  echo "--- a later probe's lease view (holder epoch): $(lease_state 20 2>/dev/null || true)"
+  lease_read_evidence
   pods=()
   for o in 0 1 2; do pods+=("$(data_pod "$o")"); done
   for o in 0 1 2; do pods+=("$(meta_pod "$o")"); done
   dump_pod_evidence "$R_NS" "${pods[@]}"
-  fail "no grant above epoch $EPOCH within 180s of deleting the holder: the range \
-did not move, so either the lease never came free or no candidate could take it"
+  # Which of the two it was, said plainly (#469): a read that never landed is
+  # not evidence that the range stayed put, and the two used to share one
+  # message.
+  if [ "$(cat "$WORK/lease-wait.code" 2>/dev/null || echo 0)" != 0 ]; then
+    fail "no grant above epoch $EPOCH within 180s of deleting the holder, and the last lease \
+read did not land: the range may well have moved — see the read's error above"
+  fi
+  fail "no grant above epoch $EPOCH within 180s of deleting the holder: the lease read answered, \
+and the plane still holds no grant above that epoch, so either the lease never came free or no \
+candidate could take it"
 }
 read -r NEW_HOLDER NEW_EPOCH <<< "$moved"
 new_ordinal="$(ordinal_of "$NEW_HOLDER")"

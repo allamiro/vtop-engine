@@ -49,3 +49,17 @@ resources:
   requests:
     cpu: 100m
     memory: 256Mi
+
+# Raft timers for CI (#469). A kind cluster on a shared runner is not a
+# datacenter LAN: with the chart's defaults (60 ms heartbeats, 300-600 ms
+# elections) a loaded runner misses replication deadlines for minutes at a
+# time, and a linearizable admin read — which needs the leader to confirm a
+# quorum — is refused for as long as that lasts. The smoke then cannot tell
+# "the range did not move" from "the read never landed". Widened here and
+# only here: a real deployment keeps the chart's defaults, which are sized
+# for a network, not for a CI runner sharing a core with a compiler.
+meta:
+  timers:
+    electionTimeoutMinMs: 1500
+    electionTimeoutMaxMs: 3000
+    heartbeatIntervalMs: 250
