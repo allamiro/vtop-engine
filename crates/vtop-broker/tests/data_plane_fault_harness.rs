@@ -666,10 +666,10 @@ fn a_bandwidth_starved_follower_lags_by_its_budget_and_recovers() {
         c.ctx()
     );
 
-    // Time alone releases the queue at the pipe's rate: three ticks, one
-    // record; six more, the last — budget never accrues past the burst.
-    c.replica_set.advance_tick(3);
-    assert_eq!(c.followers[0].local_committed_offset(), 4, "{}", c.ctx());
+    // Time alone releases the queue at the pipe's rate — and the same
+    // amount of time releases the same bytes however it is chunked
+    // (review): six ticks asked for at once carry both held records, one at
+    // tick three and one at tick six, exactly as six single ticks would.
     c.replica_set.advance_tick(6);
     assert_eq!(c.followers[0].local_committed_offset(), 5, "{}", c.ctx());
     assert_eq!(
@@ -678,23 +678,29 @@ fn a_bandwidth_starved_follower_lags_by_its_budget_and_recovers() {
         "{}",
         c.ctx()
     );
-
-    // Opening the pipe (clearing the fault, then draining) delivers what
-    // it still held, and the range converges without anyone restarting.
+    // Idle ticks never accrue past the burst: a full bucket carries one
+    // record at once, then the pipe's rate applies again.
+    c.replica_set.advance_tick(30);
     c.produce(5)
+        .unwrap_or_else(|e| panic!("{}: {e:?}", c.ctx()));
+    assert_eq!(c.followers[0].local_committed_offset(), 6, "{}", c.ctx());
+    c.produce(6)
         .unwrap_or_else(|e| panic!("{}: {e:?}", c.ctx()));
     assert_eq!(
         c.followers[0].local_committed_offset(),
-        5,
-        "{}: held again",
+        6,
+        "{}: thirty idle ticks bought one record, not ten",
         c.ctx()
     );
+
+    // Opening the pipe (clearing the fault, then draining) delivers what
+    // it still held, and the range converges without anyone restarting.
     c.replica_set.clear_follower_fault(0);
     c.replica_set.drain_all();
-    assert_eq!(c.followers[0].local_committed_offset(), 6, "{}", c.ctx());
-    assert_eq!(c.followers[1].local_committed_offset(), 6, "{}", c.ctx());
-    assert_eq!(c.cluster_committed.get(), 6, "{}", c.ctx());
-    c.produce(6)
+    assert_eq!(c.followers[0].local_committed_offset(), 7, "{}", c.ctx());
+    assert_eq!(c.followers[1].local_committed_offset(), 7, "{}", c.ctx());
+    assert_eq!(c.cluster_committed.get(), 7, "{}", c.ctx());
+    c.produce(7)
         .unwrap_or_else(|e| panic!("{}: {e:?}", c.ctx()));
     c.assert_invariants();
 }

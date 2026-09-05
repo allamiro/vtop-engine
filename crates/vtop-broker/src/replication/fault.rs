@@ -199,10 +199,18 @@ impl FaultInjectingReplicaSet {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.tick = state.tick.saturating_add(ticks);
-        Self::refill(&mut state, ticks);
-        let tick = state.tick;
-        Self::drain_due(&self.inner, &mut state, tick);
+        // TICK BY TICK (review): a bucket refills and releases as each tick
+        // passes, so what crosses a pipe in nine ticks is the same whether
+        // they are asked for at once or one at a time. Refilling once for
+        // the whole span and draining once after would cap the refill at
+        // the burst and release a single append where the pipe carried
+        // three.
+        for _ in 0..ticks {
+            state.tick = state.tick.saturating_add(1);
+            Self::refill(&mut state, 1);
+            let tick = state.tick;
+            Self::drain_due(&self.inner, &mut state, tick);
+        }
     }
 
     /// Refill every follower's bucket for `ticks` elapsed, capped at the
