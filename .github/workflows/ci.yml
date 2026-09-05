@@ -451,7 +451,7 @@ jobs:
           echo "=== node capacity and allocation ==="
           kubectl describe node | sed -n '/Allocated resources/,/^Events/p' || true
           kubectl get pods -A -o wide || true
-          for ns in vtop-ci vtop-ci-neighbour vtop-ci-replicated; do
+          for ns in vtop-ci vtop-ci-neighbour vtop-ci-replicated vtop-ci-separated; do
             echo "=== $ns ==="
             kubectl -n "$ns" get pods -o wide || true
             # Pending pods have no logs and no events of their own worth
