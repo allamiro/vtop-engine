@@ -1292,6 +1292,75 @@ impl MetaStateMachine {
                 lineage_transition_id: *lineage_transition_id,
                 expected_checkpoint_generation: *expected_checkpoint_generation,
             }),
+            MetadataCommand::EnsureGroupMemberForRange {
+                name,
+                group_uuid,
+                member_uuid,
+                topic_uuid,
+                range_uuid,
+                holder_node_uuid,
+                fencing_epoch,
+                ..
+            } => {
+                if let Some(refusal) = self.not_the_leaseholder(
+                    *topic_uuid,
+                    *range_uuid,
+                    *holder_node_uuid,
+                    *fencing_epoch,
+                ) {
+                    return refusal;
+                }
+                self.ensure_group_member_for_range(
+                    apply_index,
+                    name,
+                    *group_uuid,
+                    *member_uuid,
+                    *topic_uuid,
+                    *range_uuid,
+                )
+            }
+            MetadataCommand::CommitGroupCursorFenced {
+                group_uuid,
+                member_uuid,
+                topic_uuid,
+                range_uuid,
+                topic_epoch,
+                range_generation,
+                segment_uuid,
+                segment_generation,
+                segment_root,
+                record_offset,
+                record_index,
+                lineage_transition_id,
+                expected_checkpoint_generation,
+                holder_node_uuid,
+                fencing_epoch,
+                ..
+            } => {
+                if let Some(refusal) = self.not_the_leaseholder(
+                    *topic_uuid,
+                    *range_uuid,
+                    *holder_node_uuid,
+                    *fencing_epoch,
+                ) {
+                    return refusal;
+                }
+                self.commit_group_cursor(CommitCursorArgs {
+                    group_uuid: *group_uuid,
+                    member_uuid: *member_uuid,
+                    topic_uuid: *topic_uuid,
+                    range_uuid: *range_uuid,
+                    topic_epoch: *topic_epoch,
+                    range_generation: *range_generation,
+                    segment_uuid: *segment_uuid,
+                    segment_generation: *segment_generation,
+                    segment_root: *segment_root,
+                    record_offset: *record_offset,
+                    record_index: *record_index,
+                    lineage_transition_id: *lineage_transition_id,
+                    expected_checkpoint_generation: *expected_checkpoint_generation,
+                })
+            }
             MetadataCommand::HeartbeatMember {
                 group_uuid,
                 member_uuid,
@@ -2492,6 +2561,180 @@ impl MetaStateMachine {
         }
     }
 
+    /// The lease gate (#457 slice 2b), as `RegisterSealedSegment` has it: the
+    /// range must be held, by this node, at this epoch. `Some(refusal)` when
+    /// it is not — a leader whose lease moved on, stolen or lapsed and
+    /// re-granted, whatever CAS token it learned.
+    fn not_the_leaseholder(
+        &self,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+        holder_node_uuid: Uuid,
+        fencing_epoch: u64,
+    ) -> Option<MetadataResponse> {
+        let range_key = MetaKey::Range {
+            topic_uuid,
+            range_uuid,
+        }
+        .encode();
+        let Some(MetaValue::Range(range)) = self.records.get(&range_key) else {
+            return Some(reject(MetadataError::NotFound));
+        };
+        let held = matches!(
+            range.lease.as_ref(),
+            Some(lease)
+                if lease.holder_node_uuid == holder_node_uuid
+                    && lease.fencing_epoch == fencing_epoch
+        );
+        (!held).then(|| {
+            reject(MetadataError::invalid_transition(
+                crate::command::NOT_LEASEHOLDER,
+            ))
+        })
+    }
+
+    /// The membership a range's gateway needs, made so in one step (#457
+    /// slice 2b): the group exists under its name, this member is in it, and
+    /// it holds this range. Every part is idempotent — what already stands is
+    /// left alone — so a gateway needs no compare-and-set of its own and a
+    /// retry after a lost answer changes nothing. The group's generation
+    /// moves only when the membership actually changed, so a stock consumer's
+    /// reconnect does not churn it.
+    fn ensure_group_member_for_range(
+        &mut self,
+        apply_index: u64,
+        name: &str,
+        group_uuid: Uuid,
+        member_uuid: Uuid,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+    ) -> MetadataResponse {
+        if validate_group_name(name).is_err() {
+            return reject(MetadataError::limit(format!(
+                "group name must be 1..={} bytes, got {}",
+                crate::keys::MAX_GROUP_NAME_BYTES,
+                name.len()
+            )));
+        }
+        let range_key = MetaKey::Range {
+            topic_uuid,
+            range_uuid,
+        }
+        .encode();
+        if !matches!(self.records.get(&range_key), Some(MetaValue::Range(_))) {
+            return reject(MetadataError::NotFound);
+        }
+        let group_key = MetaKey::Group { group_uuid }.encode();
+        let name_key = MetaKey::GroupByName {
+            name: name.to_owned(),
+        }
+        .encode();
+        // The name is the group's identity to a client (review): if it names
+        // another group, this is not the group the caller thinks it is.
+        if let Some(MetaValue::GroupName(record)) = self.records.get(&name_key) {
+            if record.group_uuid != group_uuid {
+                return reject(MetadataError::AlreadyExists);
+            }
+        }
+        if !matches!(self.records.get(&group_key), Some(MetaValue::Group(_))) {
+            self.records.insert(
+                name_key,
+                MetaValue::GroupName(GroupNameRecord { group_uuid }),
+            );
+            self.records.insert(
+                group_key.clone(),
+                MetaValue::Group(ConsumerGroupRecord {
+                    name: name.to_owned(),
+                    generation: 0,
+                }),
+            );
+        }
+        // Exclusive ownership, as `AssignMemberRanges` has it: a range belongs
+        // to at most one live member of the group.
+        for (key_bytes, value) in &self.records {
+            let Ok(MetaKey::GroupMember {
+                group_uuid: other_group,
+                member_uuid: other_member,
+            }) = MetaKey::decode(key_bytes)
+            else {
+                continue;
+            };
+            if other_group != group_uuid || other_member == member_uuid {
+                continue;
+            }
+            let MetaValue::GroupMember(other) = value else {
+                continue;
+            };
+            if other
+                .assigned
+                .iter()
+                .any(|held| held.topic_uuid == topic_uuid && held.range_uuid == range_uuid)
+            {
+                return reject(MetadataError::invalid_transition(
+                    "range is already assigned to another group member",
+                ));
+            }
+        }
+        let member_key = MetaKey::GroupMember {
+            group_uuid,
+            member_uuid,
+        }
+        .encode();
+        let assignment = RangeAssignment {
+            topic_uuid,
+            range_uuid,
+        };
+        let changed = match self.records.get_mut(&member_key) {
+            Some(MetaValue::GroupMember(member)) => {
+                member.last_heartbeat_apply_index = apply_index;
+                let holds = member
+                    .assigned
+                    .iter()
+                    .any(|held| held.topic_uuid == topic_uuid && held.range_uuid == range_uuid);
+                if holds {
+                    false
+                } else {
+                    if member.assigned.len() >= MAX_ASSIGNED_RANGES {
+                        return reject(MetadataError::limit(format!(
+                            "assigned ranges must be <= {MAX_ASSIGNED_RANGES}"
+                        )));
+                    }
+                    let Some(next) = member.generation.checked_add(1) else {
+                        return reject(MetadataError::limit(
+                            "member generation space is exhausted",
+                        ));
+                    };
+                    member.assigned.push(assignment);
+                    member.generation = next;
+                    true
+                }
+            }
+            _ => {
+                self.records.insert(
+                    member_key,
+                    MetaValue::GroupMember(GroupMemberRecord {
+                        generation: 0,
+                        last_heartbeat_apply_index: apply_index,
+                        assigned: vec![assignment],
+                    }),
+                );
+                true
+            }
+        };
+        let Some(MetaValue::Group(group)) = self.records.get_mut(&group_key) else {
+            unreachable!("the group record was made or found above");
+        };
+        if changed {
+            let Some(next) = group.generation.checked_add(1) else {
+                return reject(MetadataError::limit("group generation space is exhausted"));
+            };
+            group.generation = next;
+        }
+        MetadataResponse::Ack {
+            generation: group.generation,
+        }
+    }
+
     fn commit_group_cursor(&mut self, args: CommitCursorArgs) -> MetadataResponse {
         let group_key = MetaKey::Group {
             group_uuid: args.group_uuid,
@@ -2513,7 +2756,7 @@ impl MetaStateMachine {
         });
         if !owns_range {
             return reject(MetadataError::invalid_transition(
-                "member is not assigned the cursor topic/range",
+                crate::command::NOT_ASSIGNED,
             ));
         }
 
@@ -2575,10 +2818,11 @@ impl MetaStateMachine {
         // from ever being confused — and its record offset is the position,
         // the way a Kafka gateway commits what its consumers tell it before
         // any segment holding that offset has sealed and been registered. It
-        // carries no segment generation, root or index, and it moves forward
-        // or not at all, as every cursor does. A pinned cursor still needs its
+        // carries no segment generation, root or index, and within its
+        // lineage it moves either way — a rewind is the group's decision, and
+        // the CAS below fences a stale writer. A pinned cursor still needs its
         // segment registered, generation and root matching, and the offset
-        // inside it.
+        // inside it, and keeps the forward rule.
         if args.segment_uuid.is_nil() {
             // A segment registered under nil before nil was reserved (review)
             // is named, not silently read as unpinned: it can be pinned by
@@ -2694,8 +2938,18 @@ impl MetaStateMachine {
                 // only backward is refused. The segment-identity rule below,
                 // which asks for a strictly higher offset across identities,
                 // is for two SEGMENTS.
+                // A head cursor moves either way within its lineage (#457
+                // slice 2b): a rewind is the group's own decision — Kafka's
+                // consumer may seek and commit where it seeks — and what
+                // fences a stale writer is the CAS on the checkpoint
+                // generation, not the offset. A pinned cursor keeps the
+                // forward rule: it is the recovery protocol's, committed with
+                // a segment's proof.
+                let both_unpinned = args.segment_uuid.is_nil() && existing.segment_uuid.is_nil();
                 let pin_change = args.segment_uuid.is_nil() != existing.segment_uuid.is_nil();
-                if pin_change {
+                if both_unpinned {
+                    // Judged above: no segment field on an unpinned cursor.
+                } else if pin_change {
                     if args.record_offset < existing.record_offset {
                         return reject(MetadataError::invalid_transition(
                             "cursor moved backward across a pin change",
@@ -4778,12 +5032,13 @@ mod tests {
 
     /// A gateway commits what its consumers tell it before the segment holding
     /// that offset seals (#457 slice 2b): an unpinned cursor — nil segment —
-    /// is bound to the topic epoch and the lineage generation, moves forward
-    /// or not at all under the checkpoint CAS, refuses a lineage it was not
+    /// is bound to the topic epoch and the lineage generation, moves either
+    /// way within its lineage (a rewind is a position too) under the
+    /// checkpoint CAS, refuses a lineage it was not
     /// committed under and any segment field it cannot carry; a pinned commit
     /// still needs its segment registered; a reader finds the record.
     #[test]
-    fn an_unpinned_cursor_is_bound_to_the_lineage_and_moves_forward_only() {
+    fn an_unpinned_cursor_is_bound_to_the_lineage_and_fenced_by_its_cas() {
         let (mut machine, _node, topic_uuid, range_uuid) = leaseable_range(10);
         let (group_uuid, member_uuid) = (Uuid::from_u128(0x50), Uuid::from_u128(0x51));
         assert!(matches!(
@@ -4872,20 +5127,26 @@ mod tests {
             ),
             "equal is forward-or-equal"
         );
+        // A rewind (#457 slice 2b): a head cursor moves either way within
+        // its lineage — the group's own decision, as Kafka's consumer may
+        // seek and commit where it seeks; what fences a stale writer is the
+        // CAS, not the offset.
         assert!(
             matches!(
                 machine.apply(26, &commit(26, 5, Some(2), lineage, 0)),
-                MetadataResponse::Rejected(_)
+                MetadataResponse::CursorCommitted {
+                    checkpoint_generation: 3
+                }
             ),
-            "backward"
+            "a rewind is a position too"
         );
         assert!(matches!(
-            machine.apply(27, &commit(27, 30, Some(2), lineage + 1, 0)),
+            machine.apply(27, &commit(27, 30, Some(3), lineage + 1, 0)),
             MetadataResponse::Rejected(MetadataError::LineageMismatch { .. })
         ));
         assert!(
             matches!(
-                machine.apply(28, &commit(28, 30, Some(2), lineage, 3)),
+                machine.apply(28, &commit(28, 30, Some(3), lineage, 3)),
                 MetadataResponse::Rejected(_)
             ),
             "no segment fields on an unpinned cursor"
@@ -4904,7 +5165,7 @@ mod tests {
             record_offset: 30,
             record_index: 0,
             lineage_transition_id: None,
-            expected_checkpoint_generation: Some(2),
+            expected_checkpoint_generation: Some(3),
         };
         assert!(
             matches!(
@@ -4926,7 +5187,7 @@ mod tests {
                 record.checkpoint_generation,
                 record.segment_uuid
             ),
-            (20, 2, Uuid::nil())
+            (5, 3, Uuid::nil())
         );
         // Nil is reserved: no segment registers under it.
         let range_generation = range_of(&machine, topic_uuid, range_uuid).generation;
@@ -5003,25 +5264,25 @@ mod tests {
         };
         assert!(
             matches!(
-                machine.apply(33, &pin_at(33, 20, 2)),
+                machine.apply(33, &pin_at(33, 5, 3)),
                 MetadataResponse::CursorCommitted {
-                    checkpoint_generation: 3
+                    checkpoint_generation: 4
                 }
             ),
             "pinned where it stands"
         );
         assert!(
             matches!(
-                machine.apply(34, &commit(34, 20, Some(3), lineage, 0)),
+                machine.apply(34, &commit(34, 5, Some(4), lineage, 0)),
                 MetadataResponse::CursorCommitted {
-                    checkpoint_generation: 4
+                    checkpoint_generation: 5
                 }
             ),
             "unpinned again where it stands"
         );
         assert!(
             matches!(
-                machine.apply(35, &pin_at(35, 19, 4)),
+                machine.apply(35, &pin_at(35, 4, 5)),
                 MetadataResponse::Rejected(MetadataError::InvalidTransition(reason))
                     if reason.contains("backward across a pin change")
             ),
@@ -5038,7 +5299,7 @@ mod tests {
             range.lineage_generation += 1;
         }
         assert!(matches!(
-            machine.apply(36, &commit(36, 40, Some(4), lineage + 1, 0)),
+            machine.apply(36, &commit(36, 40, Some(5), lineage + 1, 0)),
             MetadataResponse::Rejected(_)
         ));
         // A pre-lineage snapshot's cursor carries the range's old CAS token as
@@ -5229,6 +5490,364 @@ mod tests {
             MetadataResponse::Rejected(MetadataError::InvalidTransition(reason))
                 if reason.contains("lineage change")
         ));
+    }
+
+    /// The membership a gateway needs is made in one fenced step (#457 slice
+    /// 2b): the group appears under its name, the member joins holding the
+    /// range, a repeat changes nothing (and does not churn the generation), a
+    /// name already naming another group is refused, a range another member
+    /// holds is refused, and a node that does not hold the lease may not ask
+    /// at all.
+    #[test]
+    fn membership_for_a_range_is_made_in_one_fenced_step() {
+        let (mut machine, node_a, topic_uuid, range_uuid) = leaseable_range(10);
+        let node_b = Uuid::from_u128(11);
+        assert!(matches!(
+            machine.apply(
+                3,
+                &MetadataCommand::RegisterNode {
+                    env: envelope(3),
+                    node_uuid: node_b,
+                    addr: "n2:9200".to_owned(),
+                    expected_generation: None,
+                }
+            ),
+            MetadataResponse::Ack { .. }
+        ));
+        let group_uuid = Uuid::from_u128(0x80);
+        let member_uuid = Uuid::from_u128(0x81);
+        let ensure =
+            |env: u128, name: &str, group: Uuid, member: Uuid, holder: Uuid, epoch: u64| {
+                MetadataCommand::EnsureGroupMemberForRange {
+                    env: envelope(env),
+                    name: name.to_owned(),
+                    group_uuid: group,
+                    member_uuid: member,
+                    topic_uuid,
+                    range_uuid,
+                    holder_node_uuid: holder,
+                    fencing_epoch: epoch,
+                }
+            };
+        assert!(
+            matches!(
+                machine.apply(10, &ensure(10, "g", group_uuid, member_uuid, node_a, 1)),
+                MetadataResponse::Rejected(MetadataError::InvalidTransition(reason))
+                    if reason == crate::command::NOT_LEASEHOLDER
+            ),
+            "no lease held yet"
+        );
+        let generation = range_of(&machine, topic_uuid, range_uuid).generation;
+        let MetadataResponse::LeaseGranted { fencing_epoch } = acquire(
+            &mut machine,
+            11,
+            11,
+            1_000,
+            node_a,
+            topic_uuid,
+            range_uuid,
+            generation,
+            60_000,
+        ) else {
+            panic!("a lease for node a");
+        };
+        let MetadataResponse::Ack { generation: first } = machine.apply(
+            12,
+            &ensure(12, "g", group_uuid, member_uuid, node_a, fencing_epoch),
+        ) else {
+            panic!("the membership is made");
+        };
+        let Some(MetaValue::GroupMember(member)) = machine.record(&MetaKey::GroupMember {
+            group_uuid,
+            member_uuid,
+        }) else {
+            panic!("the member is there");
+        };
+        assert_eq!(
+            member.assigned,
+            vec![RangeAssignment {
+                topic_uuid,
+                range_uuid
+            }]
+        );
+        let Some(MetaValue::Group(group)) = machine.record(&MetaKey::Group { group_uuid }) else {
+            panic!("the group is there");
+        };
+        assert_eq!(group.name, "g");
+        // Again: nothing changes, and the generation does not churn.
+        let MetadataResponse::Ack { generation: again } = machine.apply(
+            13,
+            &ensure(13, "g", group_uuid, member_uuid, node_a, fencing_epoch),
+        ) else {
+            panic!("a repeat is taken")
+        };
+        assert_eq!(
+            again, first,
+            "an unchanged membership does not move the generation"
+        );
+        // The name belongs to that group now.
+        assert!(matches!(
+            machine.apply(
+                14,
+                &ensure(
+                    14,
+                    "g",
+                    Uuid::from_u128(0x82),
+                    member_uuid,
+                    node_a,
+                    fencing_epoch
+                )
+            ),
+            MetadataResponse::Rejected(MetadataError::AlreadyExists)
+        ));
+        // Another member of the same group cannot hold the same range.
+        assert!(matches!(
+            machine.apply(
+                15,
+                &ensure(
+                    15,
+                    "g",
+                    group_uuid,
+                    Uuid::from_u128(0x83),
+                    node_a,
+                    fencing_epoch
+                )
+            ),
+            MetadataResponse::Rejected(MetadataError::InvalidTransition(_))
+        ));
+        // The lease moves: the old holder may not ask any more, the new one may.
+        assert!(matches!(
+            machine.apply(
+                16,
+                &MetadataCommand::ReleaseRangeLease {
+                    env: envelope(16),
+                    topic_uuid,
+                    range_uuid,
+                    expected_fencing_epoch: fencing_epoch,
+                }
+            ),
+            MetadataResponse::Ack { .. }
+        ));
+        let generation = range_of(&machine, topic_uuid, range_uuid).generation;
+        let MetadataResponse::LeaseGranted {
+            fencing_epoch: next_epoch,
+        } = acquire(
+            &mut machine,
+            17,
+            17,
+            2_000,
+            node_b,
+            topic_uuid,
+            range_uuid,
+            generation,
+            60_000,
+        )
+        else {
+            panic!("a lease for node b");
+        };
+        assert!(
+            matches!(
+                machine.apply(18, &ensure(18, "g", group_uuid, member_uuid, node_a, fencing_epoch)),
+                MetadataResponse::Rejected(MetadataError::InvalidTransition(reason))
+                    if reason == crate::command::NOT_LEASEHOLDER
+            ),
+            "the old holder"
+        );
+        assert!(matches!(
+            machine.apply(
+                19,
+                &ensure(19, "g", group_uuid, member_uuid, node_b, next_epoch)
+            ),
+            MetadataResponse::Ack { .. }
+        ));
+        // A range the plane does not know.
+        assert!(matches!(
+            machine.apply(
+                20,
+                &MetadataCommand::EnsureGroupMemberForRange {
+                    env: envelope(20),
+                    name: "g".to_owned(),
+                    group_uuid,
+                    member_uuid,
+                    topic_uuid,
+                    range_uuid: Uuid::from_u128(0x99),
+                    holder_node_uuid: node_b,
+                    fencing_epoch: next_epoch,
+                }
+            ),
+            MetadataResponse::Rejected(MetadataError::NotFound)
+        ));
+    }
+
+    /// A fenced cursor commit needs the range's current leaseholder at its
+    /// current epoch (#457 slice 2b): the holder's own goes through; a stale
+    /// epoch, another node, or a released lease is refused by name; the next
+    /// holder's goes through at its epoch, and the old holder's not.
+    #[test]
+    fn a_fenced_cursor_commit_needs_the_current_leaseholder() {
+        let (mut machine, node_a, topic_uuid, range_uuid) = leaseable_range(10);
+        let node_b = Uuid::from_u128(11);
+        assert!(matches!(
+            machine.apply(
+                3,
+                &MetadataCommand::RegisterNode {
+                    env: envelope(3),
+                    node_uuid: node_b,
+                    addr: "n2:9200".to_owned(),
+                    expected_generation: None,
+                }
+            ),
+            MetadataResponse::Ack { .. }
+        ));
+        let (group_uuid, member_uuid) = (Uuid::from_u128(0x70), Uuid::from_u128(0x71));
+        assert!(matches!(
+            machine.apply(
+                20,
+                &MetadataCommand::CreateConsumerGroup {
+                    env: envelope(20),
+                    name: "fenced".to_owned(),
+                    group_uuid,
+                }
+            ),
+            MetadataResponse::GroupCreated { .. }
+        ));
+        assert!(matches!(
+            machine.apply(
+                21,
+                &MetadataCommand::JoinConsumerGroup {
+                    env: envelope(21),
+                    group_uuid,
+                    member_uuid,
+                    expected_group_generation: 0,
+                }
+            ),
+            MetadataResponse::MemberJoined { .. }
+        ));
+        assert!(matches!(
+            machine.apply(
+                22,
+                &MetadataCommand::AssignMemberRanges {
+                    env: envelope(22),
+                    group_uuid,
+                    member_uuid,
+                    ranges: vec![RangeAssignment {
+                        topic_uuid,
+                        range_uuid,
+                    }],
+                    expected_member_generation: 0,
+                }
+            ),
+            MetadataResponse::Ack { .. }
+        ));
+        let Some(MetaValue::Topic(topic)) = machine.record(&MetaKey::Topic { topic_uuid }) else {
+            panic!("the topic is there");
+        };
+        let topic_epoch = topic.topic_epoch;
+        let lineage = range_of(&machine, topic_uuid, range_uuid).lineage_generation;
+        let fenced =
+            |env: u128, offset: u64, expected: Option<u64>, holder: Uuid, fencing_epoch: u64| {
+                MetadataCommand::CommitGroupCursorFenced {
+                    env: envelope(env),
+                    group_uuid,
+                    member_uuid,
+                    topic_uuid,
+                    range_uuid,
+                    topic_epoch,
+                    range_generation: lineage,
+                    segment_uuid: Uuid::nil(),
+                    segment_generation: 0,
+                    segment_root: [0; 32],
+                    record_offset: offset,
+                    record_index: 0,
+                    lineage_transition_id: None,
+                    expected_checkpoint_generation: expected,
+                    holder_node_uuid: holder,
+                    fencing_epoch,
+                }
+            };
+        let not_holder = |answer: MetadataResponse| {
+            matches!(
+                answer,
+                MetadataResponse::Rejected(MetadataError::InvalidTransition(reason))
+                    if reason == crate::command::NOT_LEASEHOLDER
+            )
+        };
+        assert!(
+            not_holder(machine.apply(30, &fenced(30, 10, None, node_a, 1))),
+            "no lease held yet"
+        );
+        let generation = range_of(&machine, topic_uuid, range_uuid).generation;
+        let MetadataResponse::LeaseGranted { fencing_epoch } = acquire(
+            &mut machine,
+            31,
+            31,
+            1_000,
+            node_a,
+            topic_uuid,
+            range_uuid,
+            generation,
+            60_000,
+        ) else {
+            panic!("a lease for node a");
+        };
+        assert!(matches!(
+            machine.apply(32, &fenced(32, 10, None, node_a, fencing_epoch)),
+            MetadataResponse::CursorCommitted {
+                checkpoint_generation: 0
+            }
+        ));
+        assert!(
+            not_holder(machine.apply(33, &fenced(33, 11, Some(0), node_a, fencing_epoch + 1))),
+            "a stale or future epoch"
+        );
+        assert!(
+            not_holder(machine.apply(34, &fenced(34, 11, Some(0), node_b, fencing_epoch))),
+            "another node at the right epoch"
+        );
+        assert!(matches!(
+            machine.apply(
+                35,
+                &MetadataCommand::ReleaseRangeLease {
+                    env: envelope(35),
+                    topic_uuid,
+                    range_uuid,
+                    expected_fencing_epoch: fencing_epoch,
+                }
+            ),
+            MetadataResponse::Ack { .. }
+        ));
+        assert!(
+            not_holder(machine.apply(36, &fenced(36, 11, Some(0), node_a, fencing_epoch))),
+            "released: nobody holds it"
+        );
+        let generation = range_of(&machine, topic_uuid, range_uuid).generation;
+        let MetadataResponse::LeaseGranted {
+            fencing_epoch: next_epoch,
+        } = acquire(
+            &mut machine,
+            37,
+            37,
+            2_000,
+            node_b,
+            topic_uuid,
+            range_uuid,
+            generation,
+            60_000,
+        )
+        else {
+            panic!("a lease for node b");
+        };
+        assert!(next_epoch > fencing_epoch);
+        assert!(matches!(
+            machine.apply(38, &fenced(38, 11, Some(0), node_b, next_epoch)),
+            MetadataResponse::CursorCommitted {
+                checkpoint_generation: 1
+            }
+        ));
+        assert!(
+            not_holder(machine.apply(39, &fenced(39, 12, Some(1), node_a, fencing_epoch))),
+            "the old holder at its old epoch, whatever CAS token it learned"
+        );
     }
 
     /// The holder's report fills in the outcome (#240 item 5): the fenced

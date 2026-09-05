@@ -1201,7 +1201,7 @@ jobs:
 
       # Scenario 17 drives the Kafka gateway with a stock client: kafkacat is
       # librdkafka, the library under every non-JVM Kafka client (#225).
-      - name: Install a stock Kafka client for scenarios 17 to 19
+      - name: Install a stock Kafka client for scenarios 17 to 20
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq kafkacat

@@ -68,6 +68,27 @@ pub fn seal_active(path: &Path) -> Result<(), String> {
 /// Both matter: a client with only the first cannot follow a redirect at all,
 /// and a client that ignored the first would stop preferring the local
 /// endpoint under co-location, where it is genuinely the cheapest hop.
+/// The range's lease as the broker holds it, for the Kafka gateway's offset
+/// store (#457 slice 2b): the fencing epoch while the lease is active, none
+/// otherwise — one snapshot where the broker can give one, so an epoch from
+/// before a grant is never paired with a lease bit from after it.
+struct BrokerLeaseView(Arc<vtop_broker::LocalBroker>);
+
+impl vtop_kafka::metadata_offsets::LeaseView for BrokerLeaseView {
+    fn lease(&self) -> vtop_kafka::metadata_offsets::LeaseState {
+        use vtop_kafka::metadata_offsets::LeaseState;
+        // Never waits on the broker's lock (review): a produce holds it
+        // through its fsync, and an offset commit that blocked there would
+        // park a runtime worker past its own ceiling. A view that cannot
+        // answer now says so, and the commit is retryable.
+        match self.0.meta_fencing_epoch().try_snapshot() {
+            Some((epoch, true)) => LeaseState::Held(epoch),
+            Some((_, false)) => LeaseState::Gone,
+            None => LeaseState::Unknown,
+        }
+    }
+}
+
 fn lease_admin_client(
     lease: &crate::config::LeaseConfig,
 ) -> Result<vtop_meta::AdminClient, String> {
@@ -1413,13 +1434,14 @@ async fn run_leader(
             // as the principal with ordinary epochs. Judged above, before
             // the lease agent started.
             let kafka_producer = kafka_producer.expect("judged with the config above");
+            let served_topic = kafka
+                .topic
+                .clone()
+                .unwrap_or_else(|| config.range.topic.clone());
             let bridge = vtop_kafka::NativeBridge::new(
                 Arc::clone(&broker),
                 vtop_kafka::NativeBridgeConfig {
-                    topic: kafka
-                        .topic
-                        .clone()
-                        .unwrap_or_else(|| config.range.topic.clone()),
+                    topic: served_topic.clone(),
                     producer_id: kafka_producer,
                     durability: if replicated {
                         vtop_protocol::Durability::Quorum
@@ -1470,6 +1492,38 @@ async fn run_leader(
                 + gateway_config.max_offset_wait
                 + Duration::from_secs(1);
             let gateway = vtop_kafka::Gateway::new(Arc::new(bridge), gateway_config);
+            // Committed offsets live on the metadata plane when this node
+            // holds its range under a lease (#457 slice 2b): a group's
+            // position becomes an unpinned cursor bound to the topic epoch
+            // and the range's lineage, read back by whichever node serves the
+            // range next. Standalone, there is no plane to keep it, and the
+            // gateway refuses commits by name rather than remembering what
+            // it would forget.
+            let gateway = match config.lease.as_ref() {
+                Some(lease) => gateway
+                    .with_lease(Arc::new(BrokerLeaseView(Arc::clone(&broker)))
+                        as Arc<dyn vtop_kafka::LeaseView>)
+                    .with_offsets(Arc::new(
+                        vtop_kafka::metadata_offsets::MetadataOffsetStore::new(
+                            Arc::new(lease_admin_client(lease)?)
+                                as Arc<dyn vtop_kafka::metadata_offsets::CursorPlane>,
+                            // Fenced by the lease the broker holds the range at
+                            // (review): a commit carries it, and a node whose
+                            // lease is gone takes none.
+                            Arc::new(BrokerLeaseView(Arc::clone(&broker)))
+                                as Arc<dyn vtop_kafka::metadata_offsets::LeaseView>,
+                            vtop_kafka::metadata_offsets::RangeIdentity {
+                                cluster_id: config.cluster_id,
+                                topic: served_topic,
+                                topic_uuid: lease.topic_uuid,
+                                range_uuid: config.range.range_id,
+                                topic_epoch: config.range.topic_epoch,
+                                holder_node_uuid: config.node_uuid,
+                            },
+                        ),
+                    )),
+                None => gateway,
+            };
             let kafka_shutdown = shutdown.clone();
             // Kept, to be joined before the range is handed back (review):
             // `serve` returns only once every session has answered its

@@ -124,6 +124,19 @@ pub fn classify(command: &MetadataCommand) -> (CommandClass, Option<Uuid>) {
         // identity that may fill it in is the one it was granted to.
         | MetadataCommand::ReportPromotionOutcome {
             holder_node_uuid, ..
+        }
+        // A range's gateway keeps its groups' committed offsets on the plane
+        // (#457 slice 2b), under the identity the node already has: both
+        // commands carry the holder they claim to be and are refused by the
+        // state machine unless that node holds the range at that epoch, so
+        // the authorization and the fence name the same node. The
+        // create/join/assign trio they replace stays cluster-scoped: it
+        // carries no holder to bind an identity to.
+        | MetadataCommand::EnsureGroupMemberForRange {
+            holder_node_uuid, ..
+        }
+        | MetadataCommand::CommitGroupCursorFenced {
+            holder_node_uuid, ..
         } => (CommandClass::NodeScoped, Some(*holder_node_uuid)),
         _ => (CommandClass::ClusterScoped, None),
     }
@@ -496,6 +509,60 @@ mod tests {
             AdminIdentity::Named("anyone".to_owned()),
         ] {
             assert_eq!(authz.authorize_read(&identity), Ok(()));
+        }
+    }
+
+    /// A range's gateway submits its groups' offset commands under its own
+    /// node certificate (#457 slice 2b): both are node-scoped and bound to
+    /// the holder they name, so another node's certificate cannot submit
+    /// them, and an operator still may.
+    #[test]
+    fn a_gateways_own_offset_commands_are_node_scoped() {
+        let authz = authorizer(&["operator"]);
+        let ensure = MetadataCommand::EnsureGroupMemberForRange {
+            env: envelope(),
+            name: "g".to_owned(),
+            group_uuid: Uuid::from_u128(0x50),
+            member_uuid: Uuid::from_u128(0x51),
+            topic_uuid: Uuid::from_u128(20),
+            range_uuid: Uuid::from_u128(21),
+            holder_node_uuid: NODE_A,
+            fencing_epoch: 3,
+        };
+        let commit = MetadataCommand::CommitGroupCursorFenced {
+            env: envelope(),
+            group_uuid: Uuid::from_u128(0x50),
+            member_uuid: Uuid::from_u128(0x51),
+            topic_uuid: Uuid::from_u128(20),
+            range_uuid: Uuid::from_u128(21),
+            topic_epoch: 1,
+            range_generation: 0,
+            segment_uuid: Uuid::nil(),
+            segment_generation: 0,
+            segment_root: [0; 32],
+            record_offset: 10,
+            record_index: 0,
+            lineage_transition_id: None,
+            expected_checkpoint_generation: None,
+            holder_node_uuid: NODE_A,
+            fencing_epoch: 3,
+        };
+        for command in [&ensure, &commit] {
+            let (class, holder) = classify(command);
+            assert_eq!(class, CommandClass::NodeScoped);
+            assert_eq!(holder, Some(NODE_A));
+            assert_eq!(
+                authz.authorize_command(&AdminIdentity::Node(NODE_A), command),
+                Ok(())
+            );
+            assert!(matches!(
+                authz.authorize_command(&AdminIdentity::Node(NODE_B), command),
+                Err(Refusal::WrongHolder { .. })
+            ));
+            assert_eq!(
+                authz.authorize_command(&AdminIdentity::Named("operator".to_owned()), command),
+                Ok(())
+            );
         }
     }
 

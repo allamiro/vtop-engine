@@ -85,6 +85,37 @@ pub enum MetaCommand {
         #[arg(long)]
         range_uuid: Uuid,
     },
+    /// What a consumer group last committed on a range (#457 slice 2b),
+    /// through the same linearizable fence as every admin read: the cursor —
+    /// unpinned at the head (nil segment) or pinned to a sealed segment — the
+    /// topic epoch and lineage generation it is bound to, its checkpoint
+    /// generation, the member that committed it, and the applied index the
+    /// read was served at. The group is named by UUID, or by the Kafka name
+    /// its clients use together with the cluster id the gateway derives the
+    /// UUID under.
+    GroupCursor {
+        #[command(flatten)]
+        common: MetaCommonArgs,
+        #[arg(long)]
+        topic_uuid: Uuid,
+        #[arg(long)]
+        range_uuid: Uuid,
+        /// The group's UUID on the plane.
+        #[arg(
+            long,
+            conflicts_with = "group_name",
+            required_unless_present = "group_name"
+        )]
+        group_uuid: Option<Uuid>,
+        /// The group's Kafka name; its UUID is derived under --cluster-id.
+        #[arg(long, requires = "cluster_id")]
+        group_name: Option<String>,
+        /// The cluster id the gateway derives group UUIDs under. Names a
+        /// group only together with --group-name, never beside --group-uuid,
+        /// which needs no derivation (review).
+        #[arg(long, requires = "group_name", conflicts_with = "group_uuid")]
+        cluster_id: Option<Uuid>,
+    },
     /// The range's leadership-transition chain (#240 item 5), audited: each
     /// link's epoch continuity, each established promotion's vote recomputed
     /// from the quorum it recorded, and — given --mac-key-env — each
@@ -1067,6 +1098,94 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
                             .map(|ms| ms.to_string())
                             .unwrap_or_else(|| "never".to_owned()),
                     ),
+                }
+            }
+            Ok(())
+        }
+        MetaCommand::GroupCursor {
+            common,
+            topic_uuid,
+            range_uuid,
+            group_uuid,
+            group_name,
+            cluster_id,
+        } => {
+            let group_uuid = match (group_uuid, group_name, cluster_id) {
+                (Some(uuid), _, _) => uuid,
+                (None, Some(name), Some(cluster_id)) => {
+                    vtop_meta::command::derived_group_uuid(cluster_id, &name)
+                }
+                _ => {
+                    return Err(
+                        "name the group: --group-uuid, or --group-name with --cluster-id"
+                            .to_owned(),
+                    )
+                }
+            };
+            let config = load_admin_config(&common.config)?;
+            let client = connect(&config)?;
+            let view = client
+                .read_group_cursor(group_uuid, topic_uuid, range_uuid)
+                .await
+                .map_err(|error| error.to_string())?;
+            note_redirects(&client);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "group_uuid": group_uuid,
+                        "group_found": view.group_found,
+                        "read_at_applied_index": view.read_at_applied_index,
+                        "cursor": view.cursor.as_ref().map(|cursor| serde_json::json!({
+                            "record_offset": cursor.record_offset,
+                            "record_index": cursor.record_index,
+                            "pinned": !cursor.segment_uuid.is_nil(),
+                            "segment_uuid": cursor.segment_uuid,
+                            "segment_generation": cursor.segment_generation,
+                            "segment_root": hex_lower(&cursor.segment_root),
+                            "topic_epoch": cursor.topic_epoch,
+                            "range_generation": cursor.range_generation,
+                            "lineage_transition_id": cursor.lineage_transition_id,
+                            "checkpoint_generation": cursor.checkpoint_generation,
+                            "committed_by_member": cursor.committed_by_member,
+                        })),
+                    }))
+                    .map_err(|error| error.to_string())?
+                );
+            } else if !view.group_found {
+                println!("group {group_uuid} not found");
+            } else {
+                match view.cursor {
+                    None => println!(
+                        "group {group_uuid} has committed nothing on this range read_at_applied_index={}",
+                        view.read_at_applied_index
+                    ),
+                    Some(cursor) => {
+                        let pin = if cursor.segment_uuid.is_nil() {
+                            "unpinned".to_owned()
+                        } else {
+                            format!(
+                                "segment={} segment_generation={} segment_root={}",
+                                cursor.segment_uuid,
+                                cursor.segment_generation,
+                                hex_lower(&cursor.segment_root)
+                            )
+                        };
+                        println!(
+                            "group {group_uuid} cursor offset={} index={} {pin} topic_epoch={} lineage={} checkpoint_generation={} committed_by={} transition={} read_at_applied_index={}",
+                            cursor.record_offset,
+                            cursor.record_index,
+                            cursor.topic_epoch,
+                            cursor.range_generation,
+                            cursor.checkpoint_generation,
+                            cursor.committed_by_member,
+                            cursor
+                                .lineage_transition_id
+                                .map(|id| id.to_string())
+                                .unwrap_or_else(|| "none".to_owned()),
+                            view.read_at_applied_index,
+                        );
+                    }
                 }
             }
             Ok(())
@@ -3209,6 +3328,68 @@ transport: plaintext
                 .expect_err("a blank domain leaves RF > 1 refused for the same reason as before");
         }
         check_failure_domain("rack-a").expect("a real domain is the accepted case");
+    }
+
+    /// #457 slice 2b: `group-cursor` names the group one way — by UUID, or
+    /// by the Kafka name under the cluster id the gateway derives it from. A
+    /// name without the cluster id, both ways at once, or neither, is refused
+    /// at parse time; the derivation is the plane's own.
+    #[test]
+    fn group_cursor_names_the_group_one_way() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct Harness {
+            #[command(subcommand)]
+            command: MetaCommand,
+        }
+
+        let (topic, range, group, cluster) = (
+            node(1).to_string(),
+            node(2).to_string(),
+            node(3).to_string(),
+            node(4).to_string(),
+        );
+        let base = [
+            "vtopctl",
+            "group-cursor",
+            "--config",
+            "/nonexistent/meta.yaml",
+            "--topic-uuid",
+            topic.as_str(),
+            "--range-uuid",
+            range.as_str(),
+        ];
+        let parse = |extra: &[&str]| {
+            Harness::try_parse_from(base.iter().copied().chain(extra.iter().copied()))
+        };
+        assert!(parse(&["--group-uuid", &group]).is_ok());
+        assert!(
+            parse(&["--group-uuid", &group, "--cluster-id", &cluster]).is_err(),
+            "a uuid needs no derivation, so the cluster id would be ignored"
+        );
+        assert!(parse(&["--group-name", "g", "--cluster-id", &cluster]).is_ok());
+        assert!(
+            parse(&["--group-name", "g"]).is_err(),
+            "a name needs the cluster id"
+        );
+        assert!(
+            parse(&[
+                "--group-uuid",
+                &group,
+                "--group-name",
+                "g",
+                "--cluster-id",
+                &cluster
+            ])
+            .is_err(),
+            "one way, not both"
+        );
+        assert!(parse(&[]).is_err(), "some way");
+        assert_eq!(
+            vtop_meta::command::derived_group_uuid(node(4), "g"),
+            Uuid::new_v5(&node(4), b"g")
+        );
     }
 
     /// The four replacement-flow commands parse, and the arguments they need in

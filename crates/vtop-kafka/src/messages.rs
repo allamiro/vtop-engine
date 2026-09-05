@@ -223,6 +223,9 @@ pub enum ErrorCode {
     OffsetMetadataTooLarge = 12,
     /// The gateway cannot hold another group right now; a client retries.
     CoordinatorNotAvailable = 15,
+    /// This node does not hold the range now — its lease moved on — so it
+    /// takes no commit for the group; the client finds its coordinator again.
+    NotCoordinator = 16,
     /// A member speaking for a generation the group has left behind.
     IllegalGeneration = 22,
     /// Members that cannot agree on a protocol, or an assignment that names
