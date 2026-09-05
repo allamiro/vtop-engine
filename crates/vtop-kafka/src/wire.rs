@@ -378,6 +378,11 @@ fn compact_len(len: usize, what: &str) -> u32 {
         .unwrap_or_else(|| panic!("{what} cannot carry {len} bytes: the compact length is a u32"))
 }
 
+/// The most bytes a Kafka STRING or NULLABLE_STRING field carries: its
+/// length is an i16 (review). Every string the gateway puts on the wire from
+/// a source it did not decode — a store's rows — is held to it first.
+pub const MAX_STRING_BYTES: usize = i16::MAX as usize;
+
 /// A growable response buffer.
 ///
 /// Encoding cannot fail: everything written is already a well-typed Rust value,
@@ -489,7 +494,7 @@ impl Encoder {
     /// place of a loud stop (review).
     pub fn string(&mut self, v: &str) {
         assert!(
-            v.len() <= i16::MAX as usize,
+            v.len() <= MAX_STRING_BYTES,
             "a STRING field cannot carry {} bytes: the wire length is an i16",
             v.len()
         );
