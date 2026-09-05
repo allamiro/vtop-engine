@@ -30,6 +30,28 @@ pub struct FollowerNetworkFault {
     /// Buffer up to this many due appends, then release them in reverse order.
     /// `0` disables reordering.
     pub reorder_window: usize,
+    /// A thin pipe toward this follower (#403): appends are released as a
+    /// token bucket refilled by this many record bytes (key plus value)
+    /// per logical tick, in order — a rate, not a loss, so every queue
+    /// behind it becomes a growth question the harness can ask. Zero is
+    /// unlimited. Committed-HWM updates are not metered: they are a few
+    /// bytes that a real link carries beside the appends it starves.
+    pub bytes_per_tick: u64,
+    /// The bucket's capacity; zero means one tick's worth. A bucket that is
+    /// FULL releases the append at the head whatever its size, so a batch
+    /// larger than the burst crosses a starved link eventually rather than
+    /// never — the link is slow, not closed.
+    pub burst_bytes: u64,
+}
+
+impl FollowerNetworkFault {
+    fn burst(&self) -> u64 {
+        if self.burst_bytes == 0 {
+            self.bytes_per_tick
+        } else {
+            self.burst_bytes
+        }
+    }
 }
 
 /// Snapshot of pending network deliveries (for assertions / debugging).
@@ -39,6 +61,9 @@ pub struct PendingDeliveryStats {
     pub delayed_appends: usize,
     pub reorder_buffered: usize,
     pub delayed_hwm: usize,
+    /// Record bytes waiting behind delay or a thin pipe (#403): the size of
+    /// the retransmission the leader would owe, which the pins bound.
+    pub delayed_bytes: u64,
 }
 
 /// Full network fault plan keyed by follower index (0-based).
@@ -62,6 +87,17 @@ struct FollowerNetState {
     delayed_appends: VecDeque<PendingAppend>,
     reorder_buf: VecDeque<Vec<ReplicaAppendRequest>>,
     delayed_hwm: VecDeque<PendingHwm>,
+    /// The token bucket's current fill, in record bytes (#403).
+    budget: u64,
+}
+
+/// The bytes a link carries for these appends: every record's key and value.
+fn append_bytes(requests: &[ReplicaAppendRequest]) -> u64 {
+    requests
+        .iter()
+        .flat_map(|request| request.records.iter())
+        .map(|record| (record.key.len() + record.value.len()) as u64)
+        .sum()
 }
 
 struct FaultState {
@@ -86,6 +122,7 @@ impl FaultInjectingReplicaSet {
                 delayed_appends: VecDeque::new(),
                 reorder_buf: VecDeque::new(),
                 delayed_hwm: VecDeque::new(),
+                budget: 0,
             })
             .collect();
         Self {
@@ -130,6 +167,9 @@ impl FaultInjectingReplicaSet {
             .followers
             .get_mut(follower_index)
             .unwrap_or_else(|| panic!("follower_index {follower_index} out of range"));
+        // A newly set pipe starts with a full bucket: the first append after
+        // the fault crosses at once, and starvation shows from the second.
+        slot.budget = fault.burst();
         slot.fault = fault;
     }
 
@@ -144,6 +184,7 @@ impl FaultInjectingReplicaSet {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         for (index, fault) in plan.followers.iter().enumerate() {
             if let Some(slot) = state.followers.get_mut(index) {
+                slot.budget = fault.burst();
                 slot.fault = fault.clone();
             }
         }
@@ -158,9 +199,66 @@ impl FaultInjectingReplicaSet {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.tick = state.tick.saturating_add(ticks);
-        let tick = state.tick;
-        Self::drain_due(&self.inner, &mut state, tick);
+        // EVENT BY EVENT (review, twice): a bucket refills and releases as
+        // the ticks pass, so what crosses a pipe in nine ticks is the same
+        // whether they are asked for at once or one at a time — refilling
+        // once for the whole span would cap at the burst and release one
+        // append where the pipe carried three. But a billion idle ticks are
+        // not a billion scans: the clock jumps straight to the next tick at
+        // which anything can happen (a delayed delivery coming due, or a
+        // held append's bytes accruing), refills for exactly that span, and
+        // drains there; an idle span is one jump.
+        let target = state.tick.saturating_add(ticks);
+        while state.tick < target {
+            let next = Self::next_event_tick(&state).unwrap_or(target).min(target);
+            let step = next.saturating_sub(state.tick).max(1);
+            state.tick = state.tick.saturating_add(step);
+            Self::refill(&mut state, step);
+            let tick = state.tick;
+            Self::drain_due(&self.inner, &mut state, tick);
+        }
+    }
+
+    /// The next tick, after the current one, at which some follower's
+    /// queue can move: a delayed append or HWM update coming due, or a
+    /// budget-held append accruing the bytes it waits for. `None` when
+    /// nothing is waiting on the clock.
+    fn next_event_tick(state: &FaultState) -> Option<u64> {
+        let now = state.tick;
+        let mut next: Option<u64> = None;
+        let mut consider = |tick: u64| {
+            if tick > now {
+                next = Some(next.map_or(tick, |best| best.min(tick)));
+            }
+        };
+        for slot in &state.followers {
+            if let Some(front) = slot.delayed_appends.front() {
+                if front.deliver_at > now {
+                    consider(front.deliver_at);
+                } else if slot.fault.bytes_per_tick > 0 {
+                    let needed = append_bytes(&front.requests).min(slot.fault.burst());
+                    let short = needed.saturating_sub(slot.budget);
+                    let ticks = short.div_ceil(slot.fault.bytes_per_tick).max(1);
+                    consider(now.saturating_add(ticks));
+                }
+            }
+            if let Some(front) = slot.delayed_hwm.front() {
+                consider(front.deliver_at.max(now + 1));
+            }
+        }
+        next
+    }
+
+    /// Refill every follower's bucket for `ticks` elapsed, capped at the
+    /// burst (#403): budget does not accrue past what the pipe can hold.
+    fn refill(state: &mut FaultState, ticks: u64) {
+        for slot in &mut state.followers {
+            if slot.fault.bytes_per_tick == 0 {
+                continue;
+            }
+            let accrued = slot.fault.bytes_per_tick.saturating_mul(ticks);
+            slot.budget = slot.budget.saturating_add(accrued).min(slot.fault.burst());
+        }
     }
 
     /// Deliver every buffered RPC immediately (heal / catch-up helper).
@@ -177,9 +275,15 @@ impl FaultInjectingReplicaSet {
             for pending in &mut slot.delayed_hwm {
                 pending.deliver_at = 0;
             }
+            // "Deliver everything now" opens the pipe as well as the clock;
+            // the bucket is left full for whatever the fault still holds.
+            slot.budget = u64::MAX;
         }
         let tick = state.tick;
         Self::drain_due(&self.inner, &mut state, tick);
+        for slot in &mut state.followers {
+            slot.budget = slot.fault.burst();
+        }
         // Flush any incomplete reorder windows.
         for (index, slot) in state.followers.iter_mut().enumerate() {
             while let Some(requests) = slot.reorder_buf.pop_back() {
@@ -202,6 +306,12 @@ impl FaultInjectingReplicaSet {
                 .sum(),
             reorder_buffered: state.followers.iter().map(|f| f.reorder_buf.len()).sum(),
             delayed_hwm: state.followers.iter().map(|f| f.delayed_hwm.len()).sum(),
+            delayed_bytes: state
+                .followers
+                .iter()
+                .flat_map(|f| f.delayed_appends.iter())
+                .map(|pending| append_bytes(&pending.requests))
+                .sum(),
         }
     }
 
@@ -210,6 +320,16 @@ impl FaultInjectingReplicaSet {
             while let Some(front) = slot.delayed_appends.front() {
                 if front.deliver_at > tick {
                     break;
+                }
+                // The pipe (#403): an append due by the clock still waits for
+                // its bytes, in order — head-of-line, as a link is. A full
+                // bucket releases the head whatever its size.
+                if slot.fault.bytes_per_tick > 0 {
+                    let cost = append_bytes(&front.requests);
+                    if slot.budget < cost && slot.budget < slot.fault.burst() {
+                        break;
+                    }
+                    slot.budget = slot.budget.saturating_sub(cost);
                 }
                 let pending = slot.delayed_appends.pop_front().expect("front existed");
                 Self::accept_due_append(inner, index, slot, pending.requests);
@@ -334,6 +454,7 @@ impl ReplicaSet for FaultInjectingReplicaSet {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         // One logical tick per fan-out attempt keeps delivery deterministic.
         state.tick = state.tick.saturating_add(1);
+        Self::refill(&mut state, 1);
         Self::enqueue_appends(&mut state, requests);
         let tick = state.tick;
         Self::drain_due(&self.inner, &mut state, tick);
