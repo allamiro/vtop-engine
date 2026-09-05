@@ -218,6 +218,9 @@ pub enum PromotionRefusal {
     /// Fewer than a majority of the fenced replicas were at or below the
     /// candidate's own offset (Raft §5.4.1).
     CandidateBehindVoters,
+    /// The quorum's boundary fell below a watermark an earlier promotion of
+    /// the range published (#449).
+    BelowPublished,
 }
 
 impl PromotionRefusal {
@@ -226,6 +229,7 @@ impl PromotionRefusal {
             PromotionRefusal::QuorumUnavailable => 1,
             PromotionRefusal::LeaderBehind => 2,
             PromotionRefusal::CandidateBehindVoters => 3,
+            PromotionRefusal::BelowPublished => 4,
         }
     }
 
@@ -234,6 +238,7 @@ impl PromotionRefusal {
             1 => Ok(PromotionRefusal::QuorumUnavailable),
             2 => Ok(PromotionRefusal::LeaderBehind),
             3 => Ok(PromotionRefusal::CandidateBehindVoters),
+            4 => Ok(PromotionRefusal::BelowPublished),
             other => Err(CodecError::UnknownTag {
                 what: "promotion refusal",
                 tag: u32::from(other),
