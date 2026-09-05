@@ -1270,40 +1270,58 @@ pub fn decide(
 /// because it only guards `Acquire`. While the latch stands, a round that
 /// finds this node named AT ANY EPOCH retries the hand-back — the
 /// abandoned acquisition's delayed commit can surface above the latch —
-/// and only an answer that stops naming this node — a rival, a lapse, a
-/// successful release — clears it; the legitimate path back runs through
-/// `Acquire`, which is exactly such an answer.
+/// and an EMPTY read is not proof it never will (review, fourth round):
+/// a proposal the server decoded can commit after any number of reads
+/// that showed no lease, so emptiness holds the latch through the
+/// campaign hold-off window rather than clearing it. What does clear it:
+/// the hold-off running out with metadata still naming nobody (the
+/// realistic commit window is long spent), a rival's live grant, or the
+/// range vanishing — the latter two because the zombie proposal applies
+/// against that state and is refused by it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum StoodDownVerdict {
     /// Metadata still names this node — at ANY epoch — while the latch
     /// stands: hand that epoch back instead of renewing it.
     RetryHandBack { fencing_epoch: u64 },
-    /// Metadata stopped naming this node; the latch is spent.
+    /// Metadata names nobody, but the abandoned proposal could still
+    /// commit: keep the latch and let the hold-off tick — the Acquire arm
+    /// stands aside this round either way.
+    HoldingThrough,
+    /// Metadata's answer refutes the stood-down grant (or the hold-off
+    /// window outlived any realistic delayed commit); the latch is spent.
     Cleared,
     /// No latch stands.
     NotLatched,
 }
 
-fn stood_down_verdict(latched: bool, decision: &LeaseDecision) -> StoodDownVerdict {
+fn stood_down_verdict(
+    latched: bool,
+    hold_off_active: bool,
+    decision: &LeaseDecision,
+) -> StoodDownVerdict {
     if !latched {
         return StoodDownVerdict::NotLatched;
     }
     match *decision {
-        // ANY self-owned epoch, not just the one latched (review, second
-        // round). The stand-down can abandon a round whose acquisition
-        // commits AFTER the release read metadata — the delayed-commit
-        // window the release race documents — so metadata can name this
-        // node at an epoch ABOVE the latch. That is not "a fresh grant
-        // after the hold-off": a legitimate re-grant only ever arrives
-        // through the Acquire arm, which clears this latch a round
-        // earlier when metadata reports nobody holding. A self-owned
-        // epoch surfacing while the latch stands is the abandoned
-        // acquisition, and renewing it would re-promote the failed build
-        // past the hold-off that only guards Acquire.
+        // ANY self-owned epoch, not just one remembered (review, second
+        // round): the delayed commit mints whatever epoch it mints, and a
+        // legitimate re-grant only ever arrives through the Acquire arm —
+        // which cannot run while this latch stands.
         LeaseDecision::Renew { fencing_epoch }
         | LeaseDecision::HeldAdministratively { fencing_epoch } => {
             StoodDownVerdict::RetryHandBack { fencing_epoch }
         }
+        // Nobody holds the range. NOT proof the abandoned proposal died
+        // (review, fourth round) — it can commit after this read — so the
+        // latch rides out the hold-off, which the fall-through Acquire arm
+        // is spending on standing aside anyway. Once the hold-off is gone,
+        // an empty answer has held for the whole window and the latch
+        // yields to the campaign.
+        LeaseDecision::Acquire { .. } if hold_off_active => StoodDownVerdict::HoldingThrough,
+        // A rival's live grant or a deleted range refutes the zombie at
+        // its own apply — a proposal against a live lease or a missing
+        // range is refused by the state machine — and a spent hold-off
+        // over an empty range is the window outliving the commit.
         _ => StoodDownVerdict::Cleared,
     }
 }
@@ -1956,7 +1974,11 @@ impl LeaseAgent {
             )
             .await?;
         let decision = decide(&view, self.node_uuid, now_ms());
-        match stood_down_verdict(self.stood_down_latched, &decision) {
+        match stood_down_verdict(
+            self.stood_down_latched,
+            self.campaign_hold_off_rounds > 0,
+            &decision,
+        ) {
             StoodDownVerdict::RetryHandBack { fencing_epoch } => {
                 tracing::warn!(
                     range = %self.range_uuid,
@@ -1967,6 +1989,9 @@ impl LeaseAgent {
                 self.release().await;
                 return Ok(self.config.poll_interval);
             }
+            // The latch stays; the Acquire arm below spends a hold-off
+            // round standing aside, which is the wait this verdict wants.
+            StoodDownVerdict::HoldingThrough => {}
             StoodDownVerdict::Cleared => self.stood_down_latched = false,
             StoodDownVerdict::NotLatched => {}
         }
@@ -2379,12 +2404,13 @@ mod tests {
     #[test]
     fn a_stood_down_epoch_is_handed_back_again_not_renewed() {
         assert_eq!(
-            stood_down_verdict(true, &LeaseDecision::Renew { fencing_epoch: 4 }),
+            stood_down_verdict(true, true, &LeaseDecision::Renew { fencing_epoch: 4 }),
             StoodDownVerdict::RetryHandBack { fencing_epoch: 4 },
             "a refused hand-back must not become the next round's renewal"
         );
         assert_eq!(
             stood_down_verdict(
+                true,
                 true,
                 &LeaseDecision::HeldAdministratively { fencing_epoch: 4 }
             ),
@@ -2392,40 +2418,55 @@ mod tests {
             "an administrative lease cannot lapse, so retrying the hand-back is the \
              only way it ever leaves this node"
         );
-        // A SELF-OWNED EPOCH ABOVE THE LATCH IS THE ABANDONED ACQUISITION,
-        // not a fresh grant (review, second round): the stand-down can
-        // cancel a round whose AcquireRangeLease commits after the release
-        // read metadata, so the higher epoch surfaces exactly while the
-        // latch stands — and clearing on it would renew the failed build
-        // past a hold-off that only guards Acquire. The legitimate path
-        // back runs through Acquire, which clears the latch a round
-        // earlier because nobody holds the range.
+        // A SELF-OWNED EPOCH THE STAND-DOWN NEVER SAW is the abandoned
+        // acquisition, not a fresh grant (review, second round): a
+        // legitimate re-grant only ever arrives through the Acquire arm,
+        // which cannot run while the latch stands.
         assert_eq!(
-            stood_down_verdict(true, &LeaseDecision::Renew { fencing_epoch: 6 }),
+            stood_down_verdict(true, true, &LeaseDecision::Renew { fencing_epoch: 6 }),
             StoodDownVerdict::RetryHandBack { fencing_epoch: 6 },
-            "a delayed acquisition commit surfaces ABOVE the latch, and it is still \
-             the failed build's grant to hand back, not a renewal to serve"
+            "a delayed acquisition commit surfaces at an epoch the latch never saw, \
+             and it is still the failed build's grant to hand back"
         );
-        // Metadata stopped naming this node, in every shape it can: each
-        // clears the latch.
-        for (name, decision) in [
-            ("a rival's grant", LeaseDecision::Wait { fencing_epoch: 5 }),
-            (
-                "our own lapse",
-                LeaseDecision::Acquire {
-                    expected_range_generation: 7,
-                },
-            ),
-        ] {
-            assert_eq!(
-                stood_down_verdict(true, &decision),
-                StoodDownVerdict::Cleared,
-                "{name} means metadata no longer names this node, and holding the \
-                 latch past that would refuse legitimate holds"
-            );
-        }
+        // AN EMPTY READ IS NOT PROOF (review, fourth round): the abandoned
+        // proposal was decoded by the server and can commit after any
+        // number of reads that showed no lease, so emptiness holds the
+        // latch while the hold-off ticks.
         assert_eq!(
-            stood_down_verdict(false, &LeaseDecision::Renew { fencing_epoch: 4 }),
+            stood_down_verdict(
+                true,
+                true,
+                &LeaseDecision::Acquire {
+                    expected_range_generation: 7,
+                }
+            ),
+            StoodDownVerdict::HoldingThrough,
+            "one empty read cannot clear the latch: the cancelled acquisition can \
+             still commit, and an unlatched agent would serve it as an ordinary Renew"
+        );
+        // What DOES clear it: an answer the zombie proposal is refused
+        // against at its own apply, or the hold-off outliving any
+        // realistic commit.
+        assert_eq!(
+            stood_down_verdict(true, true, &LeaseDecision::Wait { fencing_epoch: 5 }),
+            StoodDownVerdict::Cleared,
+            "a rival's live grant refuses the zombie proposal at apply time, so the \
+             latch has nothing left to guard"
+        );
+        assert_eq!(
+            stood_down_verdict(
+                true,
+                false,
+                &LeaseDecision::Acquire {
+                    expected_range_generation: 7,
+                }
+            ),
+            StoodDownVerdict::Cleared,
+            "an empty answer that held for the whole hold-off window has outlived \
+             any realistic delayed commit; holding longer would wedge the campaign"
+        );
+        assert_eq!(
+            stood_down_verdict(false, true, &LeaseDecision::Renew { fencing_epoch: 4 }),
             StoodDownVerdict::NotLatched
         );
     }
