@@ -10,12 +10,14 @@ use super::tls::{server_name, TlsMaterial};
 use super::wire::{
     read_frame, write_frame, AdminAddLearnerRequest, AdminChangeMembershipRequest, AdminError,
     AdminInitRequest, AdminMembershipResponse, AdminProposeRequest, AdminProposeResponse,
-    AdminReadRangeLeaseRequest, AdminReadRangeLeaseResponse, AdminReadRangeTransitionsRequest,
+    AdminReadGroupCursorRequest, AdminReadGroupCursorResponse, AdminReadRangeLeaseRequest,
+    AdminReadRangeLeaseResponse, AdminReadRangeTransitionsRequest,
     AdminReadRangeTransitionsResponse, AdminReadSegmentPlacementRequest,
     AdminReadSegmentPlacementResponse, AdminStatusRequest, AdminStatusResponse, NotLeaderHint,
     TransportError, TransportResult, VtpmFrame, KIND_ADMIN_ADD_LEARNER_REQ,
     KIND_ADMIN_CHANGE_MEMBERSHIP_REQ, KIND_ADMIN_ERROR, KIND_ADMIN_INIT_REQ,
     KIND_ADMIN_MEMBERSHIP_RESP, KIND_ADMIN_PROPOSE_REQ, KIND_ADMIN_PROPOSE_RESP,
+    KIND_ADMIN_READ_GROUP_CURSOR_REQ, KIND_ADMIN_READ_GROUP_CURSOR_RESP,
     KIND_ADMIN_READ_RANGE_LEASE_REQ, KIND_ADMIN_READ_RANGE_LEASE_RESP,
     KIND_ADMIN_READ_RANGE_TRANSITIONS_REQ, KIND_ADMIN_READ_RANGE_TRANSITIONS_RESP,
     KIND_ADMIN_READ_SEGMENT_PLACEMENT_REQ, KIND_ADMIN_READ_SEGMENT_PLACEMENT_RESP,
@@ -69,6 +71,17 @@ pub trait AdminHandler: Send + Sync {
     ) -> TransportResult<AdminReadRangeTransitionsResponse> {
         Err(TransportError::Protocol(
             "this admin handler does not serve transition reads".to_owned(),
+        ))
+    }
+    /// Linearizable read of a group's committed cursor on a range (#457 slice
+    /// 2b): what a Kafka gateway answers OffsetFetch with. Defaulted to a
+    /// refusal, as the transition read is.
+    async fn read_group_cursor(
+        &self,
+        _request: AdminReadGroupCursorRequest,
+    ) -> TransportResult<AdminReadGroupCursorResponse> {
+        Err(TransportError::Protocol(
+            "this admin handler does not serve group cursor reads".to_owned(),
         ))
     }
 }
@@ -363,6 +376,17 @@ async fn dispatch_admin(
             let response = handler.read_range_transitions(request).await?;
             Ok(VtpmFrame {
                 kind: KIND_ADMIN_READ_RANGE_TRANSITIONS_RESP,
+                payload: response.encode()?,
+            })
+        }
+        KIND_ADMIN_READ_GROUP_CURSOR_REQ => {
+            let request = AdminReadGroupCursorRequest::decode(&frame.payload)?;
+            // A read, like the others: what a group committed is evidence
+            // anybody entitled to look at the cluster may check.
+            authorize(authorizer.authorize_read(identity))?;
+            let response = handler.read_group_cursor(request).await?;
+            Ok(VtpmFrame {
+                kind: KIND_ADMIN_READ_GROUP_CURSOR_RESP,
                 payload: response.encode()?,
             })
         }
@@ -731,6 +755,37 @@ impl AdminClient {
         match frame.kind {
             KIND_ADMIN_READ_RANGE_TRANSITIONS_RESP => {
                 Ok(AdminReadRangeTransitionsResponse::decode(&frame.payload)?)
+            }
+            KIND_ADMIN_ERROR => {
+                let error = AdminError::decode(&frame.payload)?;
+                Err(TransportError::Protocol(error.message))
+            }
+            other => Err(TransportError::UnexpectedKind(other)),
+        }
+    }
+
+    /// Linearizable read of what `group_uuid` committed on `range_uuid`
+    /// (#457 slice 2b).
+    pub async fn read_group_cursor(
+        &self,
+        group_uuid: uuid::Uuid,
+        topic_uuid: uuid::Uuid,
+        range_uuid: uuid::Uuid,
+    ) -> TransportResult<AdminReadGroupCursorResponse> {
+        let frame = self
+            .round_trip(VtpmFrame {
+                kind: KIND_ADMIN_READ_GROUP_CURSOR_REQ,
+                payload: AdminReadGroupCursorRequest {
+                    group_uuid,
+                    topic_uuid,
+                    range_uuid,
+                }
+                .encode(),
+            })
+            .await?;
+        match frame.kind {
+            KIND_ADMIN_READ_GROUP_CURSOR_RESP => {
+                Ok(AdminReadGroupCursorResponse::decode(&frame.payload)?)
             }
             KIND_ADMIN_ERROR => {
                 let error = AdminError::decode(&frame.payload)?;

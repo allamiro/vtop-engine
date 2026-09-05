@@ -43,8 +43,9 @@ pub use tls::{
 };
 pub use wire::{
     read_frame, write_frame, AdminAddLearnerRequest, AdminChangeMembershipRequest, AdminError,
-    AdminInitRequest, AdminLeaseView, AdminMembershipResponse, AdminProposeRequest,
-    AdminProposeResponse, AdminReadRangeLeaseRequest, AdminReadRangeLeaseResponse,
+    AdminGroupCursorView, AdminInitRequest, AdminLeaseView, AdminMembershipResponse,
+    AdminProposeRequest, AdminProposeResponse, AdminReadGroupCursorRequest,
+    AdminReadGroupCursorResponse, AdminReadRangeLeaseRequest, AdminReadRangeLeaseResponse,
     AdminReadRangeTransitionsRequest, AdminReadRangeTransitionsResponse,
     AdminReadSegmentPlacementRequest, AdminReadSegmentPlacementResponse, AdminRebalanceIntentView,
     AdminSegmentView, AdminStatusRequest, AdminStatusResponse, AdminTransitionView,
@@ -52,7 +53,8 @@ pub use wire::{
     PeerVoteRequest, PeerVoteResponse, TransportError, TransportResult, VtpmFrame, WireLogId,
     KIND_ADMIN_ADD_LEARNER_REQ, KIND_ADMIN_CHANGE_MEMBERSHIP_REQ, KIND_ADMIN_ERROR,
     KIND_ADMIN_INIT_REQ, KIND_ADMIN_MEMBERSHIP_RESP, KIND_ADMIN_PROPOSE_REQ,
-    KIND_ADMIN_PROPOSE_RESP, KIND_ADMIN_READ_RANGE_LEASE_REQ, KIND_ADMIN_READ_RANGE_LEASE_RESP,
+    KIND_ADMIN_PROPOSE_RESP, KIND_ADMIN_READ_GROUP_CURSOR_REQ, KIND_ADMIN_READ_GROUP_CURSOR_RESP,
+    KIND_ADMIN_READ_RANGE_LEASE_REQ, KIND_ADMIN_READ_RANGE_LEASE_RESP,
     KIND_ADMIN_READ_RANGE_TRANSITIONS_REQ, KIND_ADMIN_READ_RANGE_TRANSITIONS_RESP,
     KIND_ADMIN_READ_SEGMENT_PLACEMENT_REQ, KIND_ADMIN_READ_SEGMENT_PLACEMENT_RESP,
     KIND_ADMIN_STATUS_REQ, KIND_ADMIN_STATUS_RESP, KIND_APPEND_REQ, KIND_APPEND_RESP,
