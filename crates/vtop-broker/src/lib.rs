@@ -1331,6 +1331,18 @@ impl LocalBroker {
     /// append. Metrics collection must use [`Self::try_local_offsets`] instead:
     /// a scrape that blocks takes the observability endpoint down with a
     /// stalling disk.
+    /// The earliest offset still held: the log's base after retention has
+    /// reclaimed what it reclaimed. What a consumer's `log_start_offset` is
+    /// (#225), and the floor below which a read is refused as retained.
+    /// Queues behind an append the way [`Self::local_offsets`] does.
+    pub fn earliest_offset(&self) -> u64 {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.segment.base_offset()
+    }
+
     pub fn local_offsets(&self) -> (u64, u64) {
         let state = self
             .state

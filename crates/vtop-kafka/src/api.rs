@@ -11,6 +11,42 @@
 use crate::messages::{ApiKey, ErrorCode};
 use crate::wire::{Decoder, Encoder, WireError};
 
+/// The most topics one request may name, and the most partitions per topic
+/// (review): phase 1 serves one partition per topic and a handful of topics,
+/// and a client declaring more than this is not a client this gateway can
+/// serve. Checked BEFORE anything is allocated for the count.
+pub const MAX_TOPICS: usize = 1024;
+pub const MAX_PARTITIONS: usize = 1024;
+
+/// The longest error message written to the wire: a STRING is an `i16`
+/// length, and a message that quoted a maximal transactional id would not
+/// fit. Clipped at a UTF-8 boundary, never split mid-character.
+pub const MAX_ERROR_MESSAGE_BYTES: usize = 1024;
+
+fn bounded(d: &mut Decoder<'_>, field: &'static str, limit: usize) -> Result<usize, WireError> {
+    let declared = d.array_len(field)?.unwrap_or(0);
+    if declared > limit {
+        return Err(WireError::TooMany {
+            field,
+            declared,
+            limit,
+        });
+    }
+    Ok(declared)
+}
+
+/// `message` cut to at most `max` bytes on a character boundary.
+pub fn clip(message: &str, max: usize) -> &str {
+    if message.len() <= max {
+        return message;
+    }
+    let mut end = max;
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    &message[..end]
+}
+
 // ------------------------------------------------------------------ ApiVersions
 
 /// The response: which api keys this gateway serves, at which versions.
@@ -47,8 +83,15 @@ pub struct MetadataRequest {
 pub fn decode_metadata(d: &mut Decoder<'_>, version: i16) -> Result<MetadataRequest, WireError> {
     let topics = match d.array_len("metadata.topics")? {
         None => None,
+        Some(n) if n > MAX_TOPICS => {
+            return Err(WireError::TooMany {
+                field: "metadata.topics",
+                declared: n,
+                limit: MAX_TOPICS,
+            })
+        }
         Some(n) => {
-            let mut names = Vec::with_capacity(n.min(1024));
+            let mut names = Vec::with_capacity(n);
             for _ in 0..n {
                 names.push(d.string("metadata.topics.name")?.to_owned());
             }
@@ -177,12 +220,12 @@ pub fn decode_produce(d: &mut Decoder<'_>, _version: i16) -> Result<ProduceReque
         .map(str::to_owned);
     let acks = d.i16("produce.acks")?;
     let timeout_ms = d.i32("produce.timeoutMs")?;
-    let topic_count = d.array_len("produce.topicData")?.unwrap_or(0);
-    let mut topics = Vec::with_capacity(topic_count.min(1024));
+    let topic_count = bounded(d, "produce.topicData", MAX_TOPICS)?;
+    let mut topics = Vec::with_capacity(topic_count);
     for _ in 0..topic_count {
         let name = d.string("produce.topicData.name")?.to_owned();
-        let partition_count = d.array_len("produce.partitionData")?.unwrap_or(0);
-        let mut partitions = Vec::with_capacity(partition_count.min(1024));
+        let partition_count = bounded(d, "produce.partitionData", MAX_PARTITIONS)?;
+        let mut partitions = Vec::with_capacity(partition_count);
         for _ in 0..partition_count {
             let index = d.i32("produce.partitionData.index")?;
             let records = d
@@ -235,7 +278,11 @@ pub fn encode_produce(out: &mut Encoder, version: i16, topics: &[ProduceTopicRes
             }
             if version >= 8 {
                 out.array_len(0); // record_errors: the whole batch is refused, not one record
-                out.nullable_string(p.error_message.as_deref());
+                out.nullable_string(
+                    p.error_message
+                        .as_deref()
+                        .map(|message| clip(message, MAX_ERROR_MESSAGE_BYTES)),
+                );
             }
         }
     }
@@ -282,12 +329,12 @@ pub fn decode_fetch(d: &mut Decoder<'_>, version: i16) -> Result<FetchRequest, W
     } else {
         -1
     };
-    let topic_count = d.array_len("fetch.topics")?.unwrap_or(0);
-    let mut topics = Vec::with_capacity(topic_count.min(1024));
+    let topic_count = bounded(d, "fetch.topics", MAX_TOPICS)?;
+    let mut topics = Vec::with_capacity(topic_count);
     for _ in 0..topic_count {
         let name = d.string("fetch.topics.topic")?.to_owned();
-        let partition_count = d.array_len("fetch.topics.partitions")?.unwrap_or(0);
-        let mut partitions = Vec::with_capacity(partition_count.min(1024));
+        let partition_count = bounded(d, "fetch.topics.partitions", MAX_PARTITIONS)?;
+        let mut partitions = Vec::with_capacity(partition_count);
         for _ in 0..partition_count {
             let index = d.i32("fetch.partitions.partition")?;
             if version >= 9 {
@@ -307,12 +354,10 @@ pub fn decode_fetch(d: &mut Decoder<'_>, version: i16) -> Result<FetchRequest, W
         topics.push(FetchTopic { name, partitions });
     }
     if version >= 7 {
-        let forgotten = d.array_len("fetch.forgottenTopicsData")?.unwrap_or(0);
+        let forgotten = bounded(d, "fetch.forgottenTopicsData", MAX_TOPICS)?;
         for _ in 0..forgotten {
             d.string("fetch.forgottenTopicsData.topic")?;
-            let n = d
-                .array_len("fetch.forgottenTopicsData.partitions")?
-                .unwrap_or(0);
+            let n = bounded(d, "fetch.forgottenTopicsData.partitions", MAX_PARTITIONS)?;
             for _ in 0..n {
                 d.i32("fetch.forgottenTopicsData.partitions")?;
             }
@@ -408,12 +453,12 @@ pub fn decode_list_offsets(
     } else {
         0
     };
-    let topic_count = d.array_len("listOffsets.topics")?.unwrap_or(0);
-    let mut topics = Vec::with_capacity(topic_count.min(1024));
+    let topic_count = bounded(d, "listOffsets.topics", MAX_TOPICS)?;
+    let mut topics = Vec::with_capacity(topic_count);
     for _ in 0..topic_count {
         let name = d.string("listOffsets.topics.name")?.to_owned();
-        let partition_count = d.array_len("listOffsets.topics.partitions")?.unwrap_or(0);
-        let mut partitions = Vec::with_capacity(partition_count.min(1024));
+        let partition_count = bounded(d, "listOffsets.topics.partitions", MAX_PARTITIONS)?;
+        let mut partitions = Vec::with_capacity(partition_count);
         for _ in 0..partition_count {
             let index = d.i32("listOffsets.partitions.partitionIndex")?;
             if version >= 4 {
@@ -710,6 +755,87 @@ mod tests {
             d.i64("timestamp").unwrap();
             assert_eq!(d.i64("offset").unwrap(), 42);
         }
+    }
+
+    /// A count above the ceiling is refused before anything is allocated
+    /// for it (review), on every array a request carries.
+    #[test]
+    fn an_array_above_the_ceiling_is_refused_before_it_is_read() {
+        // Enough bytes behind the count that the decoder's own byte check
+        // does not fire first: the count is the thing under test.
+        let mut e = Encoder::new();
+        e.array_len(MAX_TOPICS + 1);
+        e.raw(&vec![0_u8; 2 * (MAX_TOPICS + 1)]);
+        let bytes = e.into_vec();
+        assert!(matches!(
+            decode_metadata(&mut Decoder::new(&bytes), 1),
+            Err(WireError::TooMany { field: "metadata.topics", declared, .. }) if declared == MAX_TOPICS + 1
+        ));
+        let mut e = Encoder::new();
+        e.nullable_string(None);
+        e.i16(-1);
+        e.i32(0);
+        e.array_len(1);
+        e.string("events");
+        e.array_len(MAX_PARTITIONS + 1);
+        e.raw(&vec![0_u8; 8 * (MAX_PARTITIONS + 1)]);
+        let bytes = e.into_vec();
+        assert!(matches!(
+            decode_produce(&mut Decoder::new(&bytes), 3),
+            Err(WireError::TooMany {
+                field: "produce.partitionData",
+                ..
+            })
+        ));
+        let mut e = Encoder::new();
+        e.i32(-1);
+        e.array_len(MAX_TOPICS + 1);
+        e.raw(&vec![0_u8; 2 * (MAX_TOPICS + 1)]);
+        let bytes = e.into_vec();
+        assert!(matches!(
+            decode_list_offsets(&mut Decoder::new(&bytes), 1),
+            Err(WireError::TooMany {
+                field: "listOffsets.topics",
+                ..
+            })
+        ));
+    }
+
+    /// A message longer than the wire allows is clipped on a character
+    /// boundary, never split (review).
+    #[test]
+    fn an_error_message_is_clipped_on_a_character_boundary() {
+        let long = "é".repeat(2_000); // two bytes each
+        let clipped = clip(&long, MAX_ERROR_MESSAGE_BYTES);
+        assert_eq!(clipped.len(), MAX_ERROR_MESSAGE_BYTES);
+        assert!(clipped.chars().all(|c| c == 'é'));
+        let odd = format!("a{}", "é".repeat(600));
+        let clipped = clip(&odd, MAX_ERROR_MESSAGE_BYTES);
+        assert_eq!(
+            clipped.len(),
+            MAX_ERROR_MESSAGE_BYTES - 1,
+            "one byte short, not mid-character"
+        );
+        assert_eq!(clip("short", MAX_ERROR_MESSAGE_BYTES), "short");
+        // And the v8 writer applies it: a maximal transactional id in the
+        // reason still encodes.
+        let mut out = Encoder::new();
+        encode_produce(
+            &mut out,
+            8,
+            &[ProduceTopicResponse {
+                name: "events".to_owned(),
+                partitions: vec![ProducePartitionResponse {
+                    index: 0,
+                    error: ErrorCode::UnsupportedForMessageFormat,
+                    base_offset: -1,
+                    log_append_time_ms: -1,
+                    log_start_offset: -1,
+                    error_message: Some("x".repeat(40_000)),
+                }],
+            }],
+        );
+        assert!(out.len() < 2_000);
     }
 
     #[test]

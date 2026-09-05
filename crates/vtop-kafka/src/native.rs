@@ -28,31 +28,96 @@ use vtop_protocol::{
 /// How the bridge appends: the identity it appends as, and the durability the
 /// range can honour (the broker refuses `Quorum` on a standalone range and
 /// `LocalFsync` on a replicated one, so the node that wires this says which).
+///
+/// There is no producer epoch here on purpose: the bridge MINTS one when it
+/// is built (see [`NativeBridge::new`]), because a sequence space is a
+/// property of one live bridge and a recreated one must not inherit a
+/// frontier it did not see.
 #[derive(Debug, Clone)]
 pub struct NativeBridgeConfig {
     pub topic: String,
     pub producer_id: Uuid,
-    pub producer_epoch: u64,
     pub durability: Durability,
     /// The most records one fetch asks the broker for.
     pub fetch_max_records: u32,
 }
 
+/// The sequence space of one live bridge: the next sequence to reserve, and
+/// the lock that ORDERS reservations against appends (review). Two sessions
+/// reserving adjacent sequences and reaching the broker in the other order
+/// would trip its contiguity check, and a reservation the broker refused
+/// would leave a hole every later append trips over — so a reservation is
+/// taken and spent under one lock, and stands only once the broker accepted
+/// it.
+struct SequenceSpace {
+    next: u64,
+}
+
 pub struct NativeBridge {
     broker: Arc<LocalBroker>,
     config: NativeBridgeConfig,
-    next_sequence: AtomicU64,
+    producer_epoch: u64,
+    sequences: std::sync::Mutex<SequenceSpace>,
     request_id: AtomicU64,
 }
 
+/// One epoch per bridge built, strictly increasing within a process and
+/// across restarts on any sane clock: microseconds since the epoch, bumped
+/// past the previous mint when two bridges are built in the same instant.
+fn mint_producer_epoch() -> u64 {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(1);
+    let mut previous = LAST.load(Ordering::SeqCst);
+    loop {
+        let candidate = now.max(previous + 1);
+        match LAST.compare_exchange(previous, candidate, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return candidate,
+            Err(seen) => previous = seen,
+        }
+    }
+}
+
 impl NativeBridge {
+    /// Build over `broker`, minting a fresh producer epoch: a recreated
+    /// bridge does not know where the previous one's sequences ended, and
+    /// the broker keeps per-epoch sequence state, so a new epoch — sequences
+    /// from zero, as a restarted Kafka producer's own — is the honest start.
+    /// The old epoch's state stays behind it, as it should.
     pub fn new(broker: Arc<LocalBroker>, config: NativeBridgeConfig) -> Self {
+        Self::with_producer_epoch(broker, config, mint_producer_epoch())
+    }
+
+    /// Build with a chosen epoch. For a caller that allocates epochs itself
+    /// (or a test that needs two bridges to share one); an epoch the broker
+    /// has already seen sequences for must be resumed by that caller.
+    pub fn with_producer_epoch(
+        broker: Arc<LocalBroker>,
+        config: NativeBridgeConfig,
+        producer_epoch: u64,
+    ) -> Self {
         Self {
             broker,
             config,
-            next_sequence: AtomicU64::new(0),
+            producer_epoch,
+            sequences: std::sync::Mutex::new(SequenceSpace { next: 0 }),
             request_id: AtomicU64::new(1),
         }
+    }
+
+    /// The producer epoch this bridge appends under.
+    pub fn producer_epoch(&self) -> u64 {
+        self.producer_epoch
+    }
+
+    /// The next sequence this bridge would reserve.
+    pub fn next_sequence(&self) -> u64 {
+        self.sequences
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .next
     }
 
     fn frame(&self, message: Message) -> WireFrame {
@@ -94,14 +159,17 @@ impl Bridge for NativeBridge {
         vec![self.config.topic.clone()]
     }
 
-    fn produce(&self, topic: &str, batch: &RecordBatch) -> Result<Appended, ErrorCode> {
+    fn produce(&self, topic: &str, batches: &[RecordBatch]) -> Result<Appended, ErrorCode> {
         self.known(topic)?;
-        if batch.records.is_empty() {
+        if batches.is_empty() || batches.iter().any(|batch| batch.records.is_empty()) {
             return Err(ErrorCode::InvalidRecord);
         }
-        let records: Vec<ProduceRecord> = batch
-            .records
+        // The whole set is ONE native append (review): the broker takes a
+        // request's records atomically, so a set is acknowledged whole or
+        // refused whole, never half durable for a client to retry into.
+        let records: Vec<ProduceRecord> = batches
             .iter()
+            .flat_map(|batch| batch.records.iter())
             .map(|record| ProduceRecord {
                 timestamp_millis: record.timestamp_millis,
                 // The native record has no null: a Kafka null key or value
@@ -111,15 +179,21 @@ impl Bridge for NativeBridge {
             })
             .collect();
         let count = records.len() as u64;
-        // The sequence space is the bridge's, contiguous by construction:
-        // reserved here, and the reservation stands whatever the broker
-        // says, so a refused append never leaves a hole the next one trips.
-        let first_sequence = self.next_sequence.fetch_add(count, Ordering::SeqCst);
+        // Reserved and spent under ONE lock (review): the broker requires
+        // contiguous sequences in arrival order, so no other produce may
+        // reach it between this reservation and this append — and the
+        // reservation stands only once the broker took it, so a refused
+        // append leaves no hole for the next one to trip over.
+        let mut sequences = self
+            .sequences
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let first_sequence = sequences.next;
         let request = ProduceRequest {
             range: self.broker.range().clone(),
             fencing_epoch: self.broker.held_fencing_epoch(),
             producer_id: self.config.producer_id,
-            producer_epoch: self.config.producer_epoch,
+            producer_epoch: self.producer_epoch,
             first_sequence,
             durability: self.config.durability,
             records,
@@ -134,6 +208,7 @@ impl Bridge for NativeBridge {
                     .first()
                     .map(|outcome| outcome.offset as i64)
                     .ok_or(ErrorCode::InvalidRecord)?;
+                sequences.next = first_sequence + count;
                 Ok(Appended {
                     base_offset,
                     log_append_time_ms: -1,
@@ -190,7 +265,9 @@ impl Bridge for NativeBridge {
                 Ok(Fetched {
                     records: encoded,
                     high_watermark,
-                    log_start_offset: 0,
+                    // The floor retention left (review), not zero: a
+                    // consumer below it must learn where the log now starts.
+                    log_start_offset: self.broker.earliest_offset() as i64,
                 })
             }
             Message::Error(error) => {
@@ -204,15 +281,20 @@ impl Bridge for NativeBridge {
         }
     }
 
-    fn high_watermark(&self, topic: &str) -> Result<i64, ErrorCode> {
+    fn bounds(&self, topic: &str) -> Result<(i64, i64), ErrorCode> {
         self.known(topic)?;
-        // Asked of the broker the way a consumer would: the smallest fetch it
-        // accepts (it refuses one for no records) carries the watermark, and
-        // there is no separate accessor to drift from it.
+        // The watermark asked from the log's END (review), never from offset
+        // zero: once retention has reclaimed the prefix, a fetch from zero
+        // is refused as retained, and the watermark would vanish with it. A
+        // fetch at the next offset carries the committed high watermark and
+        // no records, and the broker accepts it. The floor is the broker's
+        // own. `local_offsets` queues behind an append the way a request
+        // handler may.
+        let (_, next_offset) = self.broker.local_offsets();
         let request = FetchRequest {
             range: self.broker.range().clone(),
             fencing_epoch: self.broker.held_fencing_epoch(),
-            start_offset: 0,
+            start_offset: next_offset,
             max_bytes: 1,
             max_records: 1,
         };
@@ -221,7 +303,10 @@ impl Bridge for NativeBridge {
             .handle(Role::Consumer, self.frame(Message::FetchRequest(request)))
             .message
         {
-            Message::FetchResponse(response) => Ok(response.committed_high_watermark as i64),
+            Message::FetchResponse(response) => Ok((
+                self.broker.earliest_offset() as i64,
+                response.committed_high_watermark as i64,
+            )),
             Message::Error(error) => Err(kafka_code(error.code)),
             _ => Err(ErrorCode::InvalidRecord),
         }
@@ -268,17 +353,87 @@ mod tests {
         (dir, broker)
     }
 
+    fn config(durability: Durability) -> NativeBridgeConfig {
+        NativeBridgeConfig {
+            topic: "events".to_owned(),
+            producer_id: Uuid::from_u128(0xabc),
+            durability,
+            fetch_max_records: 1024,
+        }
+    }
+
     fn bridge(broker: Arc<LocalBroker>) -> NativeBridge {
-        NativeBridge::new(
-            broker,
-            NativeBridgeConfig {
-                topic: "events".to_owned(),
-                producer_id: Uuid::from_u128(0xabc),
-                producer_epoch: 1,
-                durability: Durability::LocalFsync,
-                fetch_max_records: 1024,
-            },
-        )
+        NativeBridge::new(broker, config(Durability::LocalFsync))
+    }
+
+    /// A refused append leaves no hole (review): the reservation stands only
+    /// once the broker took it, so the next produce under the same epoch
+    /// starts where the broker expects.
+    #[test]
+    fn a_refused_append_does_not_spend_a_sequence() {
+        let (_dir, broker) = broker();
+        // Quorum on a standalone range is refused by the broker before any
+        // append: the one refusal a fixture can produce on demand.
+        let refused =
+            NativeBridge::with_producer_epoch(Arc::clone(&broker), config(Durability::Quorum), 77);
+        assert!(refused.produce("events", &[batch(&[("a", None)])]).is_err());
+        assert_eq!(
+            refused.next_sequence(),
+            0,
+            "nothing reserved for a refused append"
+        );
+        // The same epoch, from a bridge that appends: the broker still
+        // expects sequence 0, and gets it.
+        let accepted = NativeBridge::with_producer_epoch(
+            Arc::clone(&broker),
+            config(Durability::LocalFsync),
+            77,
+        );
+        assert_eq!(
+            accepted
+                .produce("events", &[batch(&[("a", None), ("b", None)])])
+                .unwrap()
+                .base_offset,
+            0
+        );
+        assert_eq!(accepted.next_sequence(), 2);
+        assert_eq!(
+            accepted
+                .produce("events", &[batch(&[("c", None)])])
+                .unwrap()
+                .base_offset,
+            2
+        );
+    }
+
+    /// A recreated bridge mints its own epoch (review): sequences from zero
+    /// under a new epoch, the way a restarted producer's are, so the old
+    /// frontier is never guessed at.
+    #[test]
+    fn a_recreated_bridge_starts_a_new_producer_epoch() {
+        let (_dir, broker) = broker();
+        let first = bridge(Arc::clone(&broker));
+        first
+            .produce("events", &[batch(&[("a", None), ("b", None)])])
+            .unwrap();
+        let second = bridge(Arc::clone(&broker));
+        assert!(
+            second.producer_epoch() > first.producer_epoch(),
+            "strictly later"
+        );
+        assert_eq!(second.next_sequence(), 0);
+        assert_eq!(
+            second
+                .produce("events", &[batch(&[("c", None)])])
+                .unwrap()
+                .base_offset,
+            2
+        );
+        assert_eq!(second.high_watermark("events").unwrap(), 3);
+        let mut epochs: Vec<u64> = (0..64).map(|_| mint_producer_epoch()).collect();
+        let sorted = epochs.clone();
+        epochs.dedup();
+        assert_eq!(epochs, sorted, "minted epochs are strictly increasing");
     }
 
     fn batch(values: &[(&str, Option<&str>)]) -> RecordBatch {
@@ -307,18 +462,19 @@ mod tests {
         let bridge = bridge(broker);
         assert_eq!(bridge.topics(), vec!["events".to_owned()]);
         let first = bridge
-            .produce("events", &batch(&[("a", Some("k1")), ("b", None)]))
+            .produce("events", &[batch(&[("a", Some("k1")), ("b", None)])])
             .unwrap();
         assert_eq!(first.base_offset, 0);
-        let second = bridge.produce("events", &batch(&[("c", None)])).unwrap();
+        let second = bridge.produce("events", &[batch(&[("c", None)])]).unwrap();
         assert_eq!(
             second.base_offset, 2,
             "the native log assigns contiguous offsets"
         );
         assert_eq!(bridge.high_watermark("events").unwrap(), 3);
+        assert_eq!(bridge.bounds("events").unwrap(), (0, 3));
 
         let fetched = bridge.fetch("events", 0, 1 << 20).unwrap();
-        assert_eq!(fetched.high_watermark, 3);
+        assert_eq!((fetched.high_watermark, fetched.log_start_offset), (3, 0));
         let decoded = RecordBatch::decode(&fetched.records).unwrap();
         assert_eq!(decoded.base_offset, 0);
         let values: Vec<&[u8]> = decoded
@@ -349,12 +505,40 @@ mod tests {
         );
     }
 
+    /// A two-batch set is one native append (review): contiguous, one
+    /// acknowledgement, and the sequence space advances by the whole set.
+    #[test]
+    fn a_produce_set_is_one_native_append() {
+        let (_dir, broker) = broker();
+        let bridge = bridge(broker);
+        let appended = bridge
+            .produce(
+                "events",
+                &[batch(&[("a", None), ("b", None)]), batch(&[("c", None)])],
+            )
+            .unwrap();
+        assert_eq!(appended.base_offset, 0);
+        assert_eq!(bridge.next_sequence(), 3);
+        assert_eq!(bridge.bounds("events").unwrap(), (0, 3));
+        let mut empty = batch(&[("d", None)]);
+        empty.records.clear();
+        assert_eq!(
+            bridge
+                .produce("events", &[batch(&[("d", None)]), empty])
+                .unwrap_err(),
+            ErrorCode::InvalidRecord
+        );
+        assert_eq!(bridge.bounds("events").unwrap(), (0, 3), "nothing landed");
+    }
+
     #[test]
     fn the_bridge_serves_its_own_topic_only() {
         let (_dir, broker) = broker();
         let bridge = bridge(broker);
         assert_eq!(
-            bridge.produce("other", &batch(&[("a", None)])).unwrap_err(),
+            bridge
+                .produce("other", &[batch(&[("a", None)])])
+                .unwrap_err(),
             ErrorCode::UnknownTopicOrPartition
         );
         assert_eq!(

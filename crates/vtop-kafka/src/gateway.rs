@@ -44,6 +44,12 @@ pub struct GatewayConfig {
     /// is emulated here by polling, and this caps it.
     pub max_fetch_wait: Duration,
     pub fetch_poll_interval: Duration,
+    /// The longest a produce is waited for, whatever the client's
+    /// `timeout_ms`: the append itself cannot be cancelled (a real backend
+    /// fsyncs), so past this the client is told `REQUEST_TIMED_OUT` while the
+    /// append runs on — and a retry may then duplicate, which is the
+    /// single-writer limitation the native bridge documents.
+    pub max_produce_wait: Duration,
 }
 
 impl Default for GatewayConfig {
@@ -56,6 +62,7 @@ impl Default for GatewayConfig {
             max_frame_bytes: 32 * 1024 * 1024,
             max_fetch_wait: Duration::from_secs(5),
             fetch_poll_interval: Duration::from_millis(50),
+            max_produce_wait: Duration::from_secs(30),
         }
     }
 }
@@ -86,6 +93,12 @@ impl Gateway {
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> std::io::Result<()> {
         let gateway = Arc::new(self);
+        // A receiver already reading `true` never changes again (review):
+        // judged before the first accept, not after a change that will not
+        // come.
+        if *shutdown.borrow() {
+            return Ok(());
+        }
         let mut watching = true;
         loop {
             tokio::select! {
@@ -172,12 +185,14 @@ impl Gateway {
                 encode_api_versions(&mut out, version, ErrorCode::None);
                 Ok(None)
             }
-            ApiKey::Metadata => decode_metadata(&mut d, version).map(|request| {
-                let response = self.metadata(request);
-                encode_metadata(&mut out, version, &response);
-                None
-            }),
-            ApiKey::Produce => match decode_produce(&mut d, version) {
+            ApiKey::Metadata => {
+                consumed(decode_metadata(&mut d, version), &d, "Metadata").map(|request| {
+                    let response = self.metadata(request);
+                    encode_metadata(&mut out, version, &response);
+                    None
+                })
+            }
+            ApiKey::Produce => match consumed(decode_produce(&mut d, version), &d, "Produce") {
                 Ok(request) => match self.produce(request).await {
                     Ok(topics) => {
                         encode_produce(&mut out, version, &topics);
@@ -187,7 +202,7 @@ impl Gateway {
                 },
                 Err(error) => Err(error),
             },
-            ApiKey::Fetch => match decode_fetch(&mut d, version) {
+            ApiKey::Fetch => match consumed(decode_fetch(&mut d, version), &d, "Fetch") {
                 Ok(request) => {
                     let topics = self.fetch(request).await;
                     encode_fetch(&mut out, version, &topics);
@@ -195,11 +210,13 @@ impl Gateway {
                 }
                 Err(error) => Err(error),
             },
-            ApiKey::ListOffsets => decode_list_offsets(&mut d, version).map(|request| {
-                let topics = self.list_offsets(request);
-                encode_list_offsets(&mut out, version, &topics);
-                None
-            }),
+            ApiKey::ListOffsets => {
+                consumed(decode_list_offsets(&mut d, version), &d, "ListOffsets").map(|request| {
+                    let topics = self.list_offsets(request);
+                    encode_list_offsets(&mut out, version, &topics);
+                    None
+                })
+            }
         };
         match served {
             Ok(None) => Answer::Reply(out.into_vec()),
@@ -277,6 +294,7 @@ impl Gateway {
                             &topic.name,
                             partition.index,
                             partition.records.as_deref(),
+                            request.timeout_ms,
                         )
                         .await
                     }
@@ -322,6 +340,7 @@ impl Gateway {
         topic: &str,
         partition: i32,
         records: Option<&[u8]>,
+        timeout_ms: i32,
     ) -> Result<crate::bridge::Appended, (ErrorCode, String)> {
         if partition != 0 {
             return Err((
@@ -349,6 +368,14 @@ impl Gateway {
             ));
         }
         for (which, batch) in batches.iter().enumerate() {
+            if batch.records.is_empty() {
+                // An empty batch has nothing to acknowledge (review): refused,
+                // so no backend can answer it with an offset it never took.
+                return Err((
+                    ErrorCode::InvalidRecord,
+                    format!("batch {which} carries no records"),
+                ));
+            }
             if let Some(index) = batch.records.iter().position(|r| !r.headers.is_empty()) {
                 // Refused rather than dropped: a record's headers have
                 // nowhere to go in the native log today, and losing them
@@ -366,24 +393,31 @@ impl Gateway {
         let bridge = Arc::clone(&self.bridge);
         let topic = topic.to_owned();
         // The bridge is synchronous and a real one fsyncs: off the runtime's
-        // threads, the way the broker's own session loop does it. Appended in
-        // order; the first batch's base offset is the partition's answer.
-        tokio::task::spawn_blocking(move || {
-            let mut first = None;
-            for batch in &batches {
-                let appended = bridge.produce(&topic, batch)?;
-                first.get_or_insert(appended);
+        // threads, the way the broker's own session loop does it. The SET is
+        // one append (review) — whole or not at all — and the wait for it
+        // is bounded by the client's `timeout_ms` under the gateway's cap:
+        // the append cannot be cancelled, so past the bound the client is
+        // told it timed out while the append runs on.
+        let wait =
+            Duration::from_millis(timeout_ms.max(1) as u64).min(self.config.max_produce_wait);
+        let append = tokio::task::spawn_blocking(move || bridge.produce(&topic, &batches));
+        match tokio::time::timeout(wait, append).await {
+            Ok(Ok(Ok(appended))) => Ok(appended),
+            Ok(Ok(Err(code))) => {
+                Err((code, format!("the bridge refused the append with {code:?}")))
             }
-            Ok::<_, ErrorCode>(first.expect("at least one batch"))
-        })
-        .await
-        .map_err(|join| {
-            (
+            Ok(Err(join)) => Err((
                 ErrorCode::RequestTimedOut,
                 format!("produce task failed: {join}"),
-            )
-        })?
-        .map_err(|code| (code, format!("the bridge refused the append with {code:?}")))
+            )),
+            Err(_) => Err((
+                ErrorCode::RequestTimedOut,
+                format!(
+                    "the append did not finish within {wait:?}; it runs on, and a retry may \
+                     duplicate what it appends (#225 single-writer limitation)"
+                ),
+            )),
+        }
     }
 
     async fn fetch(&self, request: FetchRequest) -> Vec<FetchTopicResponse> {
@@ -409,13 +443,21 @@ impl Gateway {
                     let outcome = if partition.index != 0 {
                         Err(ErrorCode::UnknownTopicOrPartition)
                     } else if remaining == 0 {
+                        // No budget left: the watermarks without records —
+                        // but an offset outside the log is still refused
+                        // (review), not masked as an empty success.
                         let bridge = Arc::clone(&self.bridge);
                         let name = topic.name.clone();
+                        let offset = partition.fetch_offset;
                         tokio::task::spawn_blocking(move || {
-                            bridge.high_watermark(&name).map(|high_watermark| Fetched {
+                            let (log_start_offset, high_watermark) = bridge.bounds(&name)?;
+                            if offset < log_start_offset || offset > high_watermark {
+                                return Err(ErrorCode::OffsetOutOfRange);
+                            }
+                            Ok(Fetched {
                                 records: Vec::new(),
                                 high_watermark,
-                                log_start_offset: 0,
+                                log_start_offset,
                             })
                         })
                         .await
@@ -523,6 +565,19 @@ impl Gateway {
             })
             .collect()
     }
+}
+
+/// A decoded body must be the WHOLE body (review): trailing bytes are a
+/// schema this gateway does not know — an extension, or a misframed request
+/// — and accepting them silently would serve a request it did not read.
+fn consumed<T>(
+    decoded: Result<T, crate::wire::WireError>,
+    d: &Decoder<'_>,
+    api: &'static str,
+) -> Result<T, crate::wire::WireError> {
+    let request = decoded?;
+    d.expect_consumed(api)?;
+    Ok(request)
 }
 
 /// Every batch in a RECORDS field, each decoded and judged, in order.
@@ -1022,6 +1077,40 @@ mod tests {
             .all(|p| p.2.len() == one.len()));
     }
 
+    /// An empty batch is refused (review): no backend answers it with an
+    /// offset it never took.
+    #[tokio::test]
+    async fn an_empty_batch_is_refused() {
+        let (addr, _stop) = start(Arc::new(MemoryBridge::with_topics(["events"]))).await;
+        let empty = RecordBatch::encode(0, -1, -1, -1, &[]);
+        let reply = call(addr, 0, 8, 1, &produce_body("events", 0, -1, None, &empty))
+            .await
+            .unwrap();
+        let (error, _, message) = read_produce(&reply, 8);
+        assert_eq!(error, ErrorCode::InvalidRecord.as_i16());
+        assert!(message.unwrap().contains("no records"));
+    }
+
+    /// With the budget spent, an offset outside the log is still refused
+    /// (review), not answered as an empty success.
+    #[tokio::test]
+    async fn a_spent_budget_does_not_mask_an_offset_out_of_range() {
+        let bridge = Arc::new(MemoryBridge::with_topics(["a", "b"]));
+        let (addr, _stop) = start(bridge).await;
+        let one = batch_bytes(&["0123456789"], false);
+        call(addr, 0, 3, 1, &produce_body("a", 0, -1, None, &one))
+            .await
+            .unwrap();
+        call(addr, 0, 3, 2, &produce_body("b", 0, -1, None, &one))
+            .await
+            .unwrap();
+        let body = fetch_body_sized(4, &[("a", 0, 0), ("b", 0, 9)], 0, 1, one.len() as i32);
+        let reply = call(addr, 1, 4, 3, &body).await.unwrap();
+        let parts = read_fetch_all(&reply, 4);
+        assert_eq!(parts[0].0, 0);
+        assert_eq!(parts[1].0, ErrorCode::OffsetOutOfRange.as_i16());
+    }
+
     /// `min_bytes` gates the poll (review): above what exists it holds to
     /// the deadline and answers with what there is; zero answers at once.
     #[tokio::test]
@@ -1241,6 +1330,38 @@ mod tests {
         socket.write_all(&(i32::MAX).to_be_bytes()).await.unwrap();
         let mut probe = [0_u8; 1];
         assert!(matches!(socket.read(&mut probe).await, Ok(0) | Err(_)));
+    }
+
+    /// Trailing bytes after a served body close the connection (review): a
+    /// schema this gateway does not know is not served by accident.
+    #[tokio::test]
+    async fn a_body_with_trailing_bytes_is_refused() {
+        let (addr, _stop) = start(Arc::new(MemoryBridge::with_topics(["events"]))).await;
+        let mut body = Encoder::new();
+        body.i32(-1); // every topic
+        body.i8(7); // not Metadata v1's schema
+        assert!(call(addr, 3, 1, 1, body.as_slice()).await.is_none());
+        // The same body without the tail is served.
+        let mut body = Encoder::new();
+        body.i32(-1);
+        assert!(call(addr, 3, 1, 2, body.as_slice()).await.is_some());
+    }
+
+    /// A shutdown already signalled stops the listener before its first
+    /// accept (review).
+    #[tokio::test]
+    async fn a_shutdown_signalled_before_serve_stops_it_at_once() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (tx, rx) = tokio::sync::watch::channel(true);
+        let gateway = Gateway::new(
+            Arc::new(MemoryBridge::with_topics(["events"])),
+            GatewayConfig::default(),
+        );
+        tokio::time::timeout(Duration::from_secs(2), gateway.serve(listener, rx))
+            .await
+            .expect("returns without waiting for a change")
+            .unwrap();
+        drop(tx);
     }
 
     #[tokio::test]
