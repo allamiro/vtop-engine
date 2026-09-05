@@ -143,6 +143,11 @@ impl NativeBridge {
 /// partition's leader any more; a storage or overload refusal is a timeout
 /// the client retries; a sequence conflict or a malformed request is a bad
 /// record the client must not retry blindly.
+/// How many invisible stretches one fetch follows before answering empty:
+/// markers are rare, so one is the case; the bound keeps a pathological log
+/// from turning one fetch into a scan.
+const MAX_INVISIBLE_HOPS: usize = 64;
+
 fn kafka_code(code: NativeCode) -> ErrorCode {
     match code {
         NativeCode::Fenced | NativeCode::WrongRange | NativeCode::WrongLineage => {
@@ -256,22 +261,53 @@ impl Bridge for NativeBridge {
     fn fetch(&self, topic: &str, offset: i64, max_bytes: usize) -> Result<Fetched, ErrorCode> {
         self.known(topic)?;
         let start_offset = u64::try_from(offset).map_err(|_| ErrorCode::OffsetOutOfRange)?;
-        let request = FetchRequest {
-            range: self.broker.range().clone(),
-            fencing_epoch: self.broker.held_fencing_epoch(),
-            start_offset,
-            max_bytes: u32::try_from(max_bytes).unwrap_or(u32::MAX),
-            max_records: self.config.fetch_max_records,
-        };
-        let reply = self
-            .broker
-            .handle(Role::Consumer, self.frame(Message::FetchRequest(request)));
-        match reply.message {
-            Message::FetchResponse(response) => {
-                let high_watermark = response.committed_high_watermark as i64;
-                if start_offset > response.committed_high_watermark {
-                    return Err(ErrorCode::OffsetOutOfRange);
+        let mut from = start_offset;
+        let mut hops = 0;
+        let response = loop {
+            let request = FetchRequest {
+                range: self.broker.range().clone(),
+                fencing_epoch: self.broker.held_fencing_epoch(),
+                start_offset: from,
+                max_bytes: u32::try_from(max_bytes).unwrap_or(u32::MAX),
+                max_records: self.config.fetch_max_records,
+            };
+            let reply = self
+                .broker
+                .handle(Role::Consumer, self.frame(Message::FetchRequest(request)));
+            match reply.message {
+                Message::FetchResponse(response) => {
+                    if start_offset > response.committed_high_watermark {
+                        return Err(ErrorCode::OffsetOutOfRange);
+                    }
+                    // A stretch with nothing visible but a moved cursor — a
+                    // promotion marker the broker filters from consumer output
+                    // (review): follow the cursor. A Kafka client has no
+                    // cursor of its own to move; handed an empty set at this
+                    // offset it would ask for it forever.
+                    if response.records.is_empty()
+                        && response.next_offset > from
+                        && response.next_offset < response.committed_high_watermark
+                        && hops < MAX_INVISIBLE_HOPS
+                    {
+                        from = response.next_offset;
+                        hops += 1;
+                        continue;
+                    }
+                    break response;
                 }
+                Message::Error(error) => {
+                    tracing::warn!(code = ?error.code, message = %error.message, "native fetch refused");
+                    return Err(kafka_code(error.code));
+                }
+                other => {
+                    tracing::warn!(?other, "native fetch answered with an unexpected message");
+                    return Err(ErrorCode::InvalidRecord);
+                }
+            }
+        };
+        let high_watermark = response.committed_high_watermark as i64;
+        {
+            {
                 let records: Vec<Record> = response
                     .records
                     .iter()
@@ -298,14 +334,6 @@ impl Bridge for NativeBridge {
                     log_start_offset: self.broker.earliest_offset() as i64,
                 })
             }
-            Message::Error(error) => {
-                tracing::warn!(code = ?error.code, message = %error.message, "native fetch refused");
-                Err(kafka_code(error.code))
-            }
-            other => {
-                tracing::warn!(?other, "native fetch answered with an unexpected message");
-                Err(ErrorCode::InvalidRecord)
-            }
         }
     }
 
@@ -327,10 +355,17 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use vtop_broker::ProducerEpochJournal;
-    use vtop_log::{ActiveSegment, KeyRange, RangeLineage, SegmentConfig, SegmentDescriptor};
+    use vtop_log::{
+        ActiveSegment, KeyRange, LogRecord, RangeLineage, SegmentConfig, SegmentDescriptor,
+    };
     use vtop_protocol::RangeIdentity;
 
     fn broker() -> (TempDir, Arc<LocalBroker>) {
+        broker_over(Vec::new())
+    }
+
+    /// A broker opened over a log that already holds `records`, committed.
+    fn broker_over(records: Vec<LogRecord>) -> (TempDir, Arc<LocalBroker>) {
         let dir = tempfile::tempdir().unwrap();
         let range_id = Uuid::from_u128(10);
         let range = RangeIdentity {
@@ -351,12 +386,20 @@ mod tests {
             },
             base_offset: 0,
         };
-        let segment = ActiveSegment::create(
+        let mut segment = ActiveSegment::create(
             dir.path().join("events.active"),
             descriptor,
             SegmentConfig::default(),
         )
         .unwrap();
+        for record in records {
+            segment
+                .append(record, vtop_log::Durability::Buffered)
+                .unwrap();
+        }
+        if segment.next_offset() > 0 {
+            segment.commit().unwrap();
+        }
         let epochs = ProducerEpochJournal::open(dir.path().join("events.epochs")).unwrap();
         let broker = Arc::new(LocalBroker::new(segment, epochs, range, 7).unwrap());
         (dir, broker)
@@ -513,6 +556,53 @@ mod tests {
             bridge.fetch("events", 4, 1 << 20).unwrap_err(),
             ErrorCode::OffsetOutOfRange
         );
+    }
+
+    /// A promotion marker the broker filters from consumer output is not a
+    /// place a Kafka consumer can be parked (review): the fetch follows the
+    /// cursor past it to the next visible record. The marker is written
+    /// into the log directly — a standalone broker publishes none — under
+    /// the reserved producer the consumer path filters on.
+    #[test]
+    fn a_fetch_follows_the_cursor_past_a_filtered_marker() {
+        let record = |producer_id: Uuid, sequence: u64, value: &str| LogRecord {
+            producer_id,
+            producer_epoch: 0,
+            sequence,
+            timestamp_millis: 0,
+            attributes: 0,
+            key: Vec::new(),
+            value: value.as_bytes().to_vec(),
+        };
+        let writer = Uuid::from_u128(0xabc);
+        let (_dir, broker) = broker_over(vec![
+            record(writer, 0, "a"),
+            record(
+                vtop_broker::PROMOTION_MARKER_PRODUCER,
+                0,
+                "promotion-boundary",
+            ),
+            record(writer, 1, "b"),
+        ]);
+        let bridge = bridge(Arc::clone(&broker));
+        assert_eq!(bridge.bounds("events").unwrap(), (0, 3));
+        // From the marker's offset, with a budget that admits nothing past
+        // the marker itself: the record after it, not an empty set.
+        let fetched = bridge.fetch("events", 1, 1).unwrap();
+        let decoded = RecordBatch::decode(&fetched.records).unwrap();
+        assert_eq!(decoded.base_offset, 2, "the record after the marker");
+        assert_eq!(decoded.records[0].value.as_deref(), Some(b"b".as_slice()));
+        // From the start: both visible records, the marker absent.
+        let all =
+            RecordBatch::decode(&bridge.fetch("events", 0, 1 << 20).unwrap().records).unwrap();
+        assert_eq!(all.records.len(), 2);
+        assert_eq!(all.base_offset + all.records[1].offset, 2);
+        // At the watermark: nothing, and no error.
+        assert!(bridge
+            .fetch("events", 3, 1 << 20)
+            .unwrap()
+            .records
+            .is_empty());
     }
 
     /// The shapes the native log cannot hold are refused, not bent (review):

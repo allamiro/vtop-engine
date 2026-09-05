@@ -111,7 +111,7 @@ pub struct ObservabilityConfig {
 }
 
 /// The Kafka gateway on a data node (#225).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KafkaGatewayConfig {
     /// `host:port` the Kafka listener binds. Loopback unless `any_interface`.
@@ -136,6 +136,40 @@ pub struct KafkaGatewayConfig {
     /// The longest a fetch waits for data, whatever the client asked.
     #[serde(default = "default_kafka_max_fetch_wait_ms")]
     pub max_fetch_wait_ms: u64,
+    /// The producer identity the gateway appends under. Default: a UUID
+    /// derived from the principal (v5 in the principal's namespace), never
+    /// the principal itself — a native client appending as the principal
+    /// shares the producer-epoch journal with whoever else uses that UUID,
+    /// and the gateway's minted epoch would fence it (review).
+    #[serde(default)]
+    pub producer_id: Option<Uuid>,
+}
+
+/// The identity the gateway appends under: the configured one, or one
+/// derived from the principal. Never the principal (review): the journal
+/// keys producer epochs by UUID, and the gateway mints a wall-clock epoch at
+/// every start, so a native client appending as the same UUID with ordinary
+/// epochs would be refused as fenced the moment Kafka was enabled.
+pub fn kafka_producer_id(principal: Uuid, kafka: &KafkaGatewayConfig) -> Result<Uuid, String> {
+    match kafka.producer_id {
+        Some(id) if id == principal => Err(format!(
+            "`kafka.producer_id` is the node's principal ({principal}): the gateway must append \
+             under an identity of its own, or its producer epoch fences every native client \
+             appending as the principal. Leave it unset to derive one"
+        )),
+        Some(id) => Ok(id),
+        None => Ok(Uuid::new_v5(&principal, b"vtop-kafka-gateway")),
+    }
+}
+
+/// `true` for a listen address that names every interface: Metadata must
+/// then be told what to advertise, because `0.0.0.0` on a client's own host
+/// is the client, not this node.
+fn listens_on_every_interface(listen: &str) -> bool {
+    listen
+        .rsplit_once(':')
+        .map(|(host, _)| host.trim_matches(['[', ']']))
+        .is_some_and(|host| host == "0.0.0.0" || host == "::" || host.is_empty())
 }
 
 fn default_kafka_node_id() -> i32 {
@@ -161,6 +195,14 @@ pub fn refuse_kafka_gateway_misuse(
             "`kafka` is configured on a {role:?} node: the gateway is served by a leader or \
              standalone only — it holds one broker, and a candidate's changes with the lease \
              (#225)"
+        ));
+    }
+    if listens_on_every_interface(&kafka.listen) && kafka.advertised_host.is_none() {
+        return Err(format!(
+            "`kafka.listen: {}` binds every interface and no `kafka.advertised_host` is set: \
+             Metadata would tell clients to connect to the unspecified address, which on their \
+             own host is themselves. Set `kafka.advertised_host` to what clients dial (review)",
+            kafka.listen
         ));
     }
     if !kafka.any_interface {
@@ -887,6 +929,7 @@ mod transport_tests {
             topic: None,
             node_id: 1,
             max_fetch_wait_ms: 5_000,
+            producer_id: None,
         };
         assert!(refuse_kafka_gateway_misuse(DataRole::Leader, None).is_ok());
         assert!(refuse_kafka_gateway_misuse(
@@ -908,12 +951,65 @@ mod transport_tests {
         let refused =
             refuse_kafka_gateway_misuse(DataRole::Standalone, Some(&kafka("0.0.0.0:9092", false)))
                 .unwrap_err();
+        assert!(refused.contains("advertised_host"), "{refused}");
+        let refused =
+            refuse_kafka_gateway_misuse(DataRole::Standalone, Some(&kafka("10.0.0.5:9092", false)))
+                .unwrap_err();
         assert!(refused.contains("any_interface"), "{refused}");
-        assert!(refuse_kafka_gateway_misuse(
-            DataRole::Standalone,
-            Some(&kafka("0.0.0.0:9092", true))
-        )
-        .is_ok());
+        // Every interface, named, and told what to advertise: served.
+        let mut wildcard = kafka("[::]:9092", true);
+        assert!(
+            refuse_kafka_gateway_misuse(DataRole::Leader, Some(&wildcard))
+                .unwrap_err()
+                .contains("advertised_host")
+        );
+        wildcard.advertised_host = Some("broker.example".to_owned());
+        assert!(refuse_kafka_gateway_misuse(DataRole::Leader, Some(&wildcard)).is_ok());
+    }
+
+    /// The gateway's producer identity is never the principal (review): the
+    /// journal keys epochs by UUID, and the gateway's minted epoch would
+    /// fence every native client appending as the principal.
+    #[test]
+    fn the_kafka_producer_id_is_derived_from_the_principal_and_never_equal_to_it() {
+        let principal = Uuid::from_u128(0x1234);
+        let kafka = KafkaGatewayConfig {
+            listen: "127.0.0.1:9092".to_owned(),
+            any_interface: false,
+            advertised_host: None,
+            advertised_port: None,
+            topic: None,
+            node_id: 1,
+            max_fetch_wait_ms: 5_000,
+            producer_id: None,
+        };
+        let derived = kafka_producer_id(principal, &kafka).unwrap();
+        assert_ne!(derived, principal);
+        assert_eq!(
+            derived,
+            kafka_producer_id(principal, &kafka).unwrap(),
+            "stable across restarts"
+        );
+        assert_ne!(
+            derived,
+            kafka_producer_id(Uuid::from_u128(0x5678), &kafka).unwrap(),
+            "one per principal"
+        );
+        let own = KafkaGatewayConfig {
+            producer_id: Some(Uuid::from_u128(0x9999)),
+            ..kafka.clone()
+        };
+        assert_eq!(
+            kafka_producer_id(principal, &own).unwrap(),
+            Uuid::from_u128(0x9999)
+        );
+        let same = KafkaGatewayConfig {
+            producer_id: Some(principal),
+            ..kafka
+        };
+        assert!(kafka_producer_id(principal, &same)
+            .unwrap_err()
+            .contains("principal"));
     }
 
     /// #294 (review): a redirect peer may be on the other side of a rolling

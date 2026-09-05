@@ -74,7 +74,7 @@ blake3 = "1"
 openraft = { version = "=0.9.25", features = ["single-term-leader", "storage-v2", "loosen-follower-log-revert"] }
 hex = "0.4"
 base64 = "0.23"
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 flate2 = "1"
 zstd = "0.13"

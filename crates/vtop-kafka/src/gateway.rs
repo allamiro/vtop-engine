@@ -62,6 +62,11 @@ pub struct GatewayConfig {
     /// warning, so what a peer can hold here is bounded by
     /// `max_sessions * max_frame_bytes` and not by how many sockets it opens.
     pub max_sessions: usize,
+    /// How long `serve` waits, after the accept loop stops, for every
+    /// session to finish the request it is in and close (review): an
+    /// embedder that hands its range back after `serve` returns knows no
+    /// append is still in flight through the gateway.
+    pub drain_timeout: Duration,
 }
 
 impl Default for GatewayConfig {
@@ -78,12 +83,26 @@ impl Default for GatewayConfig {
             frame_read_timeout: Duration::from_secs(30),
             idle_timeout: Duration::from_secs(600),
             max_sessions: 256,
+            drain_timeout: Duration::from_secs(5),
         }
     }
 }
 
 /// A frame's buffer starts this large and grows with the bytes received.
 const INITIAL_FRAME_CAPACITY: usize = 64 * 1024;
+
+/// Resolves when `shutdown` reads `true`; never on a dropped sender, which
+/// is not a signal (see `serve`).
+async fn shutdown_signalled(shutdown: &mut tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        if shutdown.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
 
 /// A bridge call awaited only until `ceiling` (review). The call itself
 /// cannot be cancelled — a real backend may be behind an fsync or a held
@@ -146,7 +165,7 @@ impl Gateway {
             tokio::select! {
                 changed = shutdown.changed(), if watching => {
                     match changed {
-                        Ok(()) if *shutdown.borrow() => return Ok(()),
+                        Ok(()) if *shutdown.borrow() => break,
                         Ok(()) => {}
                         Err(_) => watching = false,
                     }
@@ -176,21 +195,53 @@ impl Gateway {
                         }
                     };
                     let gateway = Arc::clone(&gateway);
+                    let session_shutdown = shutdown.clone();
                     tokio::spawn(async move {
                         let _slot = permit;
-                        if let Err(error) = gateway.session(socket).await {
+                        if let Err(error) = gateway.session(socket, session_shutdown).await {
                             tracing::debug!(%peer, %error, "kafka session ended");
                         }
                     });
                 }
             }
         }
+        // The drain (review): every session sees the same signal between
+        // frames and closes — one mid-request answers it first — and their
+        // slots come back. Holding every slot is holding proof that no
+        // request is in flight; past `drain_timeout` the embedder is told,
+        // and proceeds on its own judgement.
+        let slots = u32::try_from(gateway.config.max_sessions.max(1)).unwrap_or(u32::MAX);
+        if tokio::time::timeout(
+            gateway.config.drain_timeout,
+            gateway.sessions.acquire_many(slots),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!(
+                open = slots - u32::try_from(gateway.sessions.available_permits()).unwrap_or(0),
+                "kafka gateway stopped with sessions still open past the drain timeout"
+            );
+        }
+        Ok(())
     }
 
-    async fn session(self: Arc<Self>, mut socket: TcpStream) -> std::io::Result<()> {
+    async fn session(
+        self: Arc<Self>,
+        mut socket: TcpStream,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> std::io::Result<()> {
         loop {
-            let len = match tokio::time::timeout(self.config.idle_timeout, socket.read_i32()).await
-            {
+            // Between frames is where shutdown is heard (review): a request
+            // already read is answered before the connection closes.
+            let read = tokio::select! {
+                read = tokio::time::timeout(self.config.idle_timeout, socket.read_i32()) => read,
+                _ = shutdown_signalled(&mut shutdown) => {
+                    tracing::debug!("kafka session closed on shutdown");
+                    return Ok(());
+                }
+            };
+            let len = match read {
                 Err(_) => {
                     tracing::debug!("kafka session idle past the limit; connection closed");
                     return Ok(());
@@ -873,6 +924,59 @@ mod tests {
                 .is_some(),
             "the slot the first session freed serves the third"
         );
+    }
+
+    /// Shutdown drains (review): a request in flight is answered, an idle
+    /// session is closed, and `serve` returns only after both.
+    #[tokio::test]
+    async fn shutdown_answers_the_request_in_flight_closes_idle_sessions_and_then_returns() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop, rx) = tokio::sync::watch::channel(false);
+        let gateway = Gateway::new(
+            Arc::new(MemoryBridge::with_topics(["events"])),
+            GatewayConfig {
+                advertised_port: addr.port() as i32,
+                max_fetch_wait: Duration::from_secs(2),
+                fetch_poll_interval: Duration::from_millis(10),
+                ..GatewayConfig::default()
+            },
+        );
+        let serving = tokio::spawn(gateway.serve(listener, rx));
+
+        let mut idle = TcpStream::connect(addr).await.unwrap();
+        assert!(exchange(&mut idle, &request(18, 0, 1, &[])).await.is_some());
+        let mut busy = TcpStream::connect(addr).await.unwrap();
+        // A long poll at the watermark: in flight when the signal comes.
+        busy.write_all(&request(1, 4, 2, &fetch_body(4, "events", 0, 0, 600)))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        stop.send(true).unwrap();
+
+        let started = std::time::Instant::now();
+        let len = busy
+            .read_i32()
+            .await
+            .expect("the in-flight fetch is answered");
+        let mut reply = vec![0_u8; len as usize];
+        busy.read_exact(&mut reply).await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(1_000),
+            "answered when its own poll ends, not held past it: {:?}",
+            started.elapsed()
+        );
+        let mut rest = Vec::new();
+        assert_eq!(
+            idle.read_to_end(&mut rest).await.unwrap(),
+            0,
+            "the idle session is closed"
+        );
+        tokio::time::timeout(Duration::from_secs(3), serving)
+            .await
+            .expect("serve returns once the sessions are gone")
+            .unwrap()
+            .unwrap();
     }
 
     /// A bridge stuck past the fetch ceiling answers `REQUEST_TIMED_OUT` at
