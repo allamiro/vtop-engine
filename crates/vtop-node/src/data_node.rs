@@ -2620,13 +2620,25 @@ impl crate::lease_agent::CandidateLocalView for SwitchingLocalView {
     }
 
     fn fence_for_probe(&self, fencing_epoch: u64) -> Result<(), String> {
-        // No delegate is no log AND no writer: the probe's vote is the
-        // empty replica's honest zero, and there is nothing to stop.
+        // NO DELEGATE IS NO VOTE (review, #439). An empty slot is not an
+        // empty log: the supervisor clears the old role before installing
+        // the next one, so a probe landing in that window would read zero
+        // over a directory that holds real records — and "nothing can
+        // append right now" does not make zero the committed offset. The
+        // refusal makes the probe abstain; the window is one role flip
+        // wide, and the next round re-probes an installed view.
         self.delegate
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
-            .map_or(Ok(()), |view| view.fence_for_probe(fencing_epoch))
+            .map_or(
+                Err(
+                    "no role is installed to fence; a vote here would be a zero read \
+                     over a log mid-handoff"
+                        .to_owned(),
+                ),
+                |view| view.fence_for_probe(fencing_epoch),
+            )
     }
 }
 
@@ -3378,6 +3390,22 @@ mod tests {
         assert!(
             problem.contains("InvalidArtifact") && problem.contains("stray.active"),
             "the refusal must name the reason and the path: {problem}"
+        );
+    }
+
+    /// An empty view slot abstains from the promotion probe rather than
+    /// voting zero (review, #439): the supervisor clears the old role
+    /// before installing the next one, and a probe landing in that window
+    /// would count an empty slot as an empty log over a directory that
+    /// holds real records.
+    #[test]
+    fn a_cleared_view_slot_abstains_from_the_probe_instead_of_voting_zero() {
+        use crate::lease_agent::CandidateLocalView;
+        let view = SwitchingLocalView::empty();
+        assert!(
+            view.fence_for_probe(5).is_err(),
+            "a probe across a role flip must abstain; a zero vote from a cleared slot \
+             can drag the established boundary below records the directory holds"
         );
     }
 

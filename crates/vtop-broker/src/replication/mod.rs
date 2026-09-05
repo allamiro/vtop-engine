@@ -629,6 +629,43 @@ impl InProcessFollower {
     ///
     /// **An epoch below the one already held.** Fencing moves forward only;
     /// otherwise a stale leader could un-fence a replica it had already lost.
+    /// Fence this replica from its OWN process (#410): stop the log at
+    /// `epoch` so the promotion probe can count an offset nothing is still
+    /// moving.
+    ///
+    /// Not [`Self::fence`], deliberately, on both of that method's guards.
+    /// The not-yet-observed-grant refusal protects against a peer's bare
+    /// claim over the wire; this epoch is no claim — it is this process's
+    /// own authenticated read of its grant, and the shared metadata view
+    /// only learns it after the promotion the probe serves. And no
+    /// reconciliation: the caller IS this replica, and a log has nothing
+    /// to reconcile against itself.
+    ///
+    /// THE META LOCK IS THE APPEND'S CRITICAL SECTION (review). Both
+    /// append paths hold it from their fencing check through the applied
+    /// records, so taking it here waits out any append already past its
+    /// check and blocks the next one until the epoch has risen — after
+    /// which the check itself refuses. Without it, adoption is a bare
+    /// atomic maximum that an in-flight append can straddle: checked at
+    /// the old epoch, applied after the "stopped" offset was read.
+    ///
+    /// Fencing moves forward only, exactly as the wire fence rules: an
+    /// epoch below the one already held means the grant this probe acts
+    /// on has been superseded, and the refusal is the caller's cue to
+    /// abstain rather than vouch for a boundary metadata has moved past.
+    pub fn fence_locally(&self, epoch: u64) -> Result<(), (ErrorCode, String)> {
+        let _meta = self.meta_fencing_epoch.lock();
+        let held = self.held_fencing_epoch();
+        if epoch < held {
+            return Err((
+                ErrorCode::Fenced,
+                format!("local fence at epoch {epoch} is below this replica's held epoch {held}"),
+            ));
+        }
+        self.adopt_fencing_epoch(epoch);
+        Ok(())
+    }
+
     pub fn fence(
         &self,
         epoch: u64,

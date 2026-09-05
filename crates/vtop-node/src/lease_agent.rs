@@ -168,27 +168,15 @@ impl CandidateLocalView for vtop_broker::replication::InProcessFollower {
     }
 
     fn fence_for_probe(&self, fencing_epoch: u64) -> Result<(), String> {
-        // The lease watcher's own dialect, not the wire fence. The wire
-        // fence refuses epochs its metadata view has not observed — sound
-        // against a peer's bare claim over the network, but this epoch is
-        // no claim: it is this process's own authenticated read of the
-        // grant, the very fact that made it the candidate, and the shared
-        // view only learns it AFTER the probe (promote publishes it).
-        // Adoption is the fence: durable-first, monotonic, and once held
-        // rises, `check_follower_fencing` refuses every append that names
-        // any other epoch — the deposed leader's stream included.
-        self.adopt_fencing_epoch(fencing_epoch);
-        let held = self.held_fencing_epoch();
-        if held > fencing_epoch {
-            // A newer epoch already stopped this log: the grant the probe
-            // is acting on has been superseded, and an offset counted here
-            // would vouch for a boundary metadata has moved past.
-            return Err(format!(
-                "this replica is already fenced at epoch {held}, above the probe's \
-                 grant {fencing_epoch}"
-            ));
-        }
-        Ok(())
+        // Under the append paths' own critical section (review, #439):
+        // bare adoption is an atomic maximum an in-flight append can
+        // straddle — checked at the old epoch, applied after the
+        // "stopped" offset was read. `fence_locally` owns the trust
+        // argument (this epoch is the process's own authenticated read of
+        // its grant, not a peer's claim) and the serialization; a refusal
+        // means the grant was superseded, and the probe abstains.
+        self.fence_locally(fencing_epoch)
+            .map_err(|(code, reason)| format!("{code:?}: {reason}"))
     }
 }
 
@@ -1569,45 +1557,65 @@ impl LeaseAgent {
             // same hold-off an eligibility refusal takes: hand it back AND sit
             // out, long enough for somebody else to win uncontested.
             if self.stand_down.as_ref().is_some_and(|signal| signal.take()) {
-                if let LeaseState::Held { fencing_epoch } = self.state {
-                    // Latched until metadata stops naming this node for it
-                    // (review, #410): the release below is best-effort, and
-                    // a refused hand-back must not become next round's
-                    // renewal — see the field.
-                    self.stood_down_epoch = Some(fencing_epoch);
-                    tracing::warn!(
-                        range = %self.range_uuid,
-                        fencing_epoch,
-                        "standing down: this node was granted an epoch it could not serve, \
-                         so the lease goes back and this node sits out the next rounds"
-                    );
-                    // Raced against the release signal exactly as the round
-                    // is (review): this release can spend two bounded
-                    // deadlines, and a shutdown arriving inside it used to
-                    // wait them out before the loop head could break —
-                    // leaving the FINAL release less drain budget than its
-                    // own two calls need. Abandoning loses nothing: the
-                    // exit-path release re-reconciles against metadata and
-                    // proposes with whatever epoch it finds.
-                    if release_closed {
-                        self.release().await;
-                    } else {
-                        tokio::select! {
-                            () = self.release() => {}
-                            changed = release.changed() => {
-                                if changed.is_err() {
-                                    release_closed = true;
-                                }
-                                // Only an actual `true` abandons — the loop
-                                // head breaks on it and the exit release
-                                // takes over. A closed watch or a spurious
-                                // wake finishes the hand-back here.
-                                if !*release.borrow() {
-                                    self.release().await;
-                                }
+                // NOT GATED ON `LeaseState::Held` (review, #439). The wake
+                // that delivers this order can cancel the round that was
+                // publishing the grant — AFTER metadata committed the
+                // acquisition, BEFORE `self.state` caught up — so a
+                // stand-down that only released what it recorded would skip
+                // both the hand-back and the latch exactly when the build
+                // failure races the grant, and the next read would renew
+                // the unservable epoch back to life. `release()` already
+                // reconciles: whatever epoch metadata attributes to this
+                // node is the epoch it hands back, recorded or not, and
+                // the latch takes ITS answer rather than local memory.
+                let held = match self.state {
+                    LeaseState::Held { fencing_epoch } => Some(fencing_epoch),
+                    _ => None,
+                };
+                tracing::warn!(
+                    range = %self.range_uuid,
+                    recorded_epoch = held,
+                    "standing down: this node was granted an epoch it could not serve, \
+                     so the lease goes back and this node sits out the next rounds"
+                );
+                // Raced against the release signal exactly as the round
+                // is (review): this release can spend two bounded
+                // deadlines, and a shutdown arriving inside it used to
+                // wait them out before the loop head could break —
+                // leaving the FINAL release less drain budget than its
+                // own two calls need. Abandoning loses nothing: the
+                // exit-path release re-reconciles against metadata and
+                // proposes with whatever epoch it finds.
+                let handed_back = if release_closed {
+                    self.release().await
+                } else {
+                    tokio::select! {
+                        released = self.release() => released,
+                        changed = release.changed() => {
+                            if changed.is_err() {
+                                release_closed = true;
+                            }
+                            // Only an actual `true` abandons — the loop
+                            // head breaks on it and the exit release
+                            // takes over. A closed watch or a spurious
+                            // wake finishes the hand-back here.
+                            if !*release.borrow() {
+                                self.release().await
+                            } else {
+                                None
                             }
                         }
                     }
+                };
+                // Latched until metadata stops naming this node for it
+                // (review, #410): the release above is best-effort, and a
+                // refused hand-back must not become next round's renewal —
+                // see the field. The epoch is the one the release targeted
+                // (metadata's attribution); local memory is the fall-back
+                // for the abandoned-release shape, where the exit release
+                // re-reconciles anyway.
+                self.stood_down_epoch = handed_back.or(held);
+                if let Some(fencing_epoch) = held {
                     self.publish_lost(fencing_epoch);
                 }
                 self.state = LeaseState::NotHeld;
@@ -1783,7 +1791,14 @@ impl LeaseAgent {
     /// orderly stop. Best-effort by design: a refusal means the lease was
     /// already lost or taken, and blocking exit on metadata would trade a
     /// prompt failover for a hung shutdown, the exact inversion of the goal.
-    async fn release(&mut self) {
+    /// Returns the epoch the hand-back targeted — metadata's attribution,
+    /// or the recorded fall-back when the read failed — whether or not the
+    /// proposal landed, and `None` when there was nothing to release. The
+    /// stand-down path latches on it (review, #439): a wake can cancel a
+    /// round after an acquisition committed but before local state caught
+    /// up, so "what this process recorded" is exactly the wrong thing to
+    /// latch on.
+    async fn release(&mut self) -> Option<u64> {
         // What THIS PROCESS recorded is not what metadata decided (review,
         // twice over): the abandoned round can die after metadata committed
         // an acquisition and before `self.state` caught up (NotHeld with a
@@ -1843,12 +1858,12 @@ impl LeaseAgent {
                 if let Some(epoch) = recorded {
                     self.publish_lost(epoch);
                 }
-                return;
+                return None;
             }
             // The read failed: propose with what the agent recorded, the
             // pre-reconciliation behavior — best effort either way.
             (Some(recorded), None) => recorded,
-            (None, None) => return,
+            (None, None) => return None,
         };
         let was_published = recorded.is_some();
         let proposal = self
@@ -1886,6 +1901,7 @@ impl LeaseAgent {
         if was_published {
             self.publish_lost(fencing_epoch);
         }
+        Some(fencing_epoch)
     }
 
     /// Every admin round trip is bounded by this. A blackholed endpoint (as
