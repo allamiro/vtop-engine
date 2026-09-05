@@ -54,6 +54,12 @@ die() { printf 'test-progress: %s\n' "$*" >&2; exit 2; }
 for tool in cargo rustc python3 awk; do
   command -v "$tool" >/dev/null 2>&1 || die "$tool is required and was not found on PATH"
 done
+# Python 3.11 or newer: `tomllib` reads cargo's config for the build target
+# and each root's manifest for `harness = false`, and an older python3 would
+# pass the check above and fail later with a traceback that names neither
+# the version nor the way around it.
+python3 -c 'import tomllib' 2>/dev/null \
+  || die "Python 3.11 or newer is required (tomllib); python3 here is $(python3 -V 2>&1)"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -255,12 +261,6 @@ PY
 if [[ -n "$TARGET_ARG" ]]; then
   TRIPLE="$TARGET_ARG"
 else
-  # tomllib arrived in Python 3.11; an older python3 passes the tool check
-  # above and fails inside the lookup with a traceback that names neither
-  # the version nor the way around it.
-  python3 -c 'import tomllib' 2>/dev/null \
-    || die "reading cargo's config for build.target needs Python 3.11 or newer (tomllib); \
-python3 here is $(python3 -V 2>&1). Upgrade, or pass --target to skip the lookup"
   TRIPLE="$(build_target)" || die "could not settle the build target"
 fi
 TRIPLE="${TRIPLE:-$HOST}"
