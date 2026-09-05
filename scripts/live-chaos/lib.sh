@@ -152,7 +152,7 @@ preflight_settings() {
   # so the ceiling leaves that headroom — the same reasoning as the metrics
   # bases below.
   require_integer_in_range CHAOS_NATIVE_PORT "$NATIVE_PORT" 1024 65522
-  require_integer_in_range CHAOS_KAFKA_BASE_PORT "$KAFKA_BASE_PORT" 1024 65533
+  require_integer_in_range CHAOS_KAFKA_BASE_PORT "$KAFKA_BASE_PORT" 1024 65534
   # Ceilings are the highest port each family actually derives: metadata ids
   # run 1..5 so the top base is 65535-5, and data indices run 0..3 — index 3 is
   # the replacement replica (#242) — so the top base is 65535-3. A tighter bound
@@ -1430,7 +1430,10 @@ start_colocated_node() {
 # above performs.
 
 candidate_native_addr() { echo "$DATA_HOST:$((NATIVE_PORT + 10 + $1))"; }
-kafka_addr() { echo "$DATA_HOST:$((KAFKA_BASE_PORT + $1))"; }
+# Loopback by name, not $DATA_HOST (review): the Kafka listener is bound and
+# dialled on 127.0.0.1 by both scenarios (the gateway admits whoever reaches
+# it), so the collision scan must judge the port on the host that will use it.
+kafka_addr() { echo "127.0.0.1:$((KAFKA_BASE_PORT + $1))"; }
 kafka_port() { echo "$((KAFKA_BASE_PORT + $1))"; }
 
 candidate_identity() { # <n: 1|2|3> — echoes "<uuid> <cert-basename>"

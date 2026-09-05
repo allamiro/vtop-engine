@@ -27,13 +27,16 @@ init_workdir
 # collisions in preflight and moved with CHAOS_KAFKA_BASE_PORT.
 KAFKA_PORT="$(kafka_port 1)"
 RECORDS="${CHAOS_KAFKA_RECORDS:-20000}"
-ACK_FLOOR="${CHAOS_KAFKA_ACK_FLOOR:-$((RECORDS / 4))}"
+require_integer_in_range CHAOS_KAFKA_RECORDS "$RECORDS" 2 10000000
+# The floor the kill waits for and the pacing both scale to the run (review):
+# a twelve-record smoke run must pass the same validation a 20,000-record
+# run does.
+ACK_FLOOR="${CHAOS_KAFKA_ACK_FLOOR:-$(( RECORDS / 4 > 0 ? RECORDS / 4 : 1 ))}"
 # The producer is paced — a pause every PACE_EVERY records — so the stream
 # lasts seconds instead of the one second librdkafka needs for 20,000 small
 # records, and the follower kill lands INSIDE it.
-PACE_EVERY="${CHAOS_KAFKA_PACE_EVERY:-500}"
+PACE_EVERY="${CHAOS_KAFKA_PACE_EVERY:-$(( RECORDS < 500 ? RECORDS : 500 ))}"
 PACE_SLEEP="${CHAOS_KAFKA_PACE_SLEEP:-0.2}"
-require_integer_in_range CHAOS_KAFKA_RECORDS "$RECORDS" 2 10000000
 require_integer_in_range CHAOS_KAFKA_ACK_FLOOR "$ACK_FLOOR" 1 "$RECORDS"
 require_integer_in_range CHAOS_KAFKA_PACE_EVERY "$PACE_EVERY" 1 "$RECORDS"
 [[ -n "${TOPIC:-}" ]] || fail "lib.sh did not set TOPIC"
@@ -89,11 +92,18 @@ kafka_watermark() {
 # Wait for real progress, then kill a follower while the producer is still
 # streaming — and prove it was.
 deadline=$((SECONDS + PROGRESS_TIMEOUT_SECONDS))
-until [[ "$(kafka_watermark)" =~ ^[0-9]+$ && "$(kafka_watermark)" -ge "$ACK_FLOOR" ]]; do
-  [[ $SECONDS -lt $deadline ]] || fail "the producer made no progress to $ACK_FLOOR: $(tail -3 "$WORKDIR/logs/kcat-produce.log")"
+reached=0
+while (( SECONDS < deadline )); do
+  mark="$(kafka_watermark)"
+  if [[ "$mark" =~ ^[0-9]+$ && "$mark" -ge "$ACK_FLOOR" ]]; then
+    reached=1
+    break
+  fi
   kill -0 "$PRODUCER" 2>/dev/null || fail "the producer ended before reaching the floor: $(tail -3 "$WORKDIR/logs/kcat-produce.log")"
-  sleep 0.1
+  # No sleep past the deadline (review): only while a poll still fits.
+  (( deadline - SECONDS > 1 )) && sleep 0.1
 done
+[[ $reached -eq 1 ]] || fail "the producer made no progress to $ACK_FLOOR within ${PROGRESS_TIMEOUT_SECONDS}s: $(tail -3 "$WORKDIR/logs/kcat-produce.log")"
 kill -0 "$PRODUCER" 2>/dev/null \
   || fail "the producer finished before the kill could land inside its stream; slow it with CHAOS_KAFKA_PACE_SLEEP"
 log "watermark past $ACK_FLOOR with the producer still streaming"
