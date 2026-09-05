@@ -40,15 +40,26 @@ pub trait Bridge: Send + Sync + 'static {
     /// Every topic this backend serves, for a Metadata request naming none.
     fn topics(&self) -> Vec<String>;
 
-    /// Append one decoded batch; the backend assigns its base offset.
-    fn produce(&self, topic: &str, batch: &RecordBatch) -> Result<Appended, ErrorCode>;
+    /// Append a set of decoded batches, ALL OR NOTHING (review): a produce
+    /// set is one acknowledgement, and a set half appended would be durable
+    /// data the client retries into duplicates. The backend assigns the base
+    /// offset; every batch carries at least one record (the listener judges
+    /// that), and offsets run contiguously across the set.
+    fn produce(&self, topic: &str, batches: &[RecordBatch]) -> Result<Appended, ErrorCode>;
 
     /// Batches from `offset` on, up to about `max_bytes` — always at least
     /// the first batch, so a client's buffer never starves on a big one.
     fn fetch(&self, topic: &str, offset: i64, max_bytes: usize) -> Result<Fetched, ErrorCode>;
 
+    /// `(log_start_offset, high_watermark)`: the earliest offset still held
+    /// and the next to be assigned. What ListOffsets LATEST answers, and the
+    /// range a fetch offset must fall in to be served rather than refused.
+    fn bounds(&self, topic: &str) -> Result<(i64, i64), ErrorCode>;
+
     /// The next offset to be assigned, which is what ListOffsets LATEST is.
-    fn high_watermark(&self, topic: &str) -> Result<i64, ErrorCode>;
+    fn high_watermark(&self, topic: &str) -> Result<i64, ErrorCode> {
+        self.bounds(topic).map(|(_, high_watermark)| high_watermark)
+    }
 }
 
 struct StoredBatch {
@@ -102,7 +113,12 @@ impl Bridge for MemoryBridge {
         names
     }
 
-    fn produce(&self, topic: &str, batch: &RecordBatch) -> Result<Appended, ErrorCode> {
+    fn produce(&self, topic: &str, batches: &[RecordBatch]) -> Result<Appended, ErrorCode> {
+        if batches.is_empty() || batches.iter().any(|batch| batch.records.is_empty()) {
+            // Nothing to acknowledge: an empty set, or an empty batch in it,
+            // is refused rather than answered with an offset it never took.
+            return Err(ErrorCode::InvalidRecord);
+        }
         let mut logs = self
             .logs
             .lock()
@@ -110,35 +126,39 @@ impl Bridge for MemoryBridge {
         let log = logs
             .get_mut(topic)
             .ok_or(ErrorCode::UnknownTopicOrPartition)?;
-        let base_offset = log.next_offset;
-        // Re-based onto the offsets THIS log assigns: the producer's own base
-        // offset is meaningless here, and a fetch must hand back batches
-        // whose offsets are the ones it advertised.
-        let records: Vec<Record> = batch
-            .records
-            .iter()
-            .enumerate()
-            .map(|(i, record)| Record {
-                offset: base_offset + i as i64,
-                ..record.clone()
-            })
-            .collect();
-        let bytes = RecordBatch::encode(
-            base_offset,
-            batch.producer_id,
-            batch.producer_epoch,
-            batch.base_sequence,
-            &records,
-        );
-        let count = records.len() as i64;
-        log.batches.push(StoredBatch {
-            base_offset,
-            last_offset: base_offset + count.max(1) - 1,
-            bytes,
-        });
-        log.next_offset = base_offset + count;
+        // Under ONE lock, so the set lands whole and contiguous.
+        let set_base = log.next_offset;
+        for batch in batches {
+            let base_offset = log.next_offset;
+            // Re-based onto the offsets THIS log assigns: the producer's own
+            // base offset is meaningless here, and a fetch must hand back
+            // batches whose offsets are the ones it advertised.
+            let records: Vec<Record> = batch
+                .records
+                .iter()
+                .enumerate()
+                .map(|(i, record)| Record {
+                    offset: base_offset + i as i64,
+                    ..record.clone()
+                })
+                .collect();
+            let bytes = RecordBatch::encode(
+                base_offset,
+                batch.producer_id,
+                batch.producer_epoch,
+                batch.base_sequence,
+                &records,
+            );
+            let count = records.len() as i64;
+            log.batches.push(StoredBatch {
+                base_offset,
+                last_offset: base_offset + count - 1,
+                bytes,
+            });
+            log.next_offset = base_offset + count;
+        }
         Ok(Appended {
-            base_offset,
+            base_offset: set_base,
             log_append_time_ms: -1,
         })
     }
@@ -170,13 +190,18 @@ impl Bridge for MemoryBridge {
         })
     }
 
-    fn high_watermark(&self, topic: &str) -> Result<i64, ErrorCode> {
+    fn bounds(&self, topic: &str) -> Result<(i64, i64), ErrorCode> {
         let logs = self
             .logs
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         logs.get(topic)
-            .map(|log| log.next_offset)
+            .map(|log| {
+                (
+                    log.batches.first().map_or(0, |b| b.base_offset),
+                    log.next_offset,
+                )
+            })
             .ok_or(ErrorCode::UnknownTopicOrPartition)
     }
 }
@@ -210,14 +235,14 @@ mod tests {
         let bridge = MemoryBridge::with_topics(["events"]);
         assert_eq!(
             bridge
-                .produce("events", &batch(&["a", "b"]))
+                .produce("events", &[batch(&["a", "b"])])
                 .unwrap()
                 .base_offset,
             0
         );
         assert_eq!(
             bridge
-                .produce("events", &batch(&["c"]))
+                .produce("events", &[batch(&["c"])])
                 .unwrap()
                 .base_offset,
             2
@@ -258,8 +283,8 @@ mod tests {
     #[test]
     fn a_fetch_never_starves_on_a_batch_bigger_than_its_budget() {
         let bridge = MemoryBridge::with_topics(["events"]);
-        bridge.produce("events", &batch(&["0123456789"])).unwrap();
-        bridge.produce("events", &batch(&["x"])).unwrap();
+        bridge.produce("events", &[batch(&["0123456789"])]).unwrap();
+        bridge.produce("events", &[batch(&["x"])]).unwrap();
         let fetched = bridge.fetch("events", 0, 1).unwrap();
         // The first batch alone, whole, despite a one-byte budget.
         assert_eq!(
@@ -278,12 +303,41 @@ mod tests {
         assert!(bridge.fetch("events", 0, 1 << 20).unwrap().records.len() > first_len);
     }
 
+    /// A set lands whole (review): two batches in one produce are contiguous
+    /// and acknowledged once, and an empty batch anywhere refuses the set.
+    #[test]
+    fn a_produce_set_lands_whole_or_not_at_all() {
+        let bridge = MemoryBridge::with_topics(["events"]);
+        let appended = bridge
+            .produce("events", &[batch(&["a", "b"]), batch(&["c"])])
+            .unwrap();
+        assert_eq!(appended.base_offset, 0);
+        assert_eq!(bridge.bounds("events").unwrap(), (0, 3));
+        let mut empty = batch(&["d"]);
+        empty.records.clear();
+        assert_eq!(
+            bridge
+                .produce("events", &[batch(&["d"]), empty])
+                .unwrap_err(),
+            ErrorCode::InvalidRecord
+        );
+        assert_eq!(
+            bridge.bounds("events").unwrap(),
+            (0, 3),
+            "nothing of the refused set landed"
+        );
+        assert_eq!(
+            bridge.produce("events", &[]).unwrap_err(),
+            ErrorCode::InvalidRecord
+        );
+    }
+
     #[test]
     fn an_unknown_topic_is_unknown_everywhere() {
         let bridge = MemoryBridge::with_topics(["events"]);
         assert_eq!(bridge.topics(), vec!["events".to_owned()]);
         assert_eq!(
-            bridge.produce("nope", &batch(&["a"])).unwrap_err(),
+            bridge.produce("nope", &[batch(&["a"])]).unwrap_err(),
             ErrorCode::UnknownTopicOrPartition
         );
         assert_eq!(
