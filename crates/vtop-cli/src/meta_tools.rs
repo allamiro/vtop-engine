@@ -1019,8 +1019,13 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
                 }
                 return Ok(());
             }
-            let audit =
-                audit_transitions(&response.transitions, key.as_ref(), topic_uuid, range_uuid)?;
+            let audit = audit_transitions(
+                &response.transitions,
+                key.as_ref(),
+                topic_uuid,
+                range_uuid,
+                from_epoch,
+            )?;
             if json {
                 println!(
                     "{}",
@@ -1967,19 +1972,22 @@ pub fn audit_transitions(
     key: Option<&[u8; 32]>,
     topic_uuid: Uuid,
     range_uuid: Uuid,
+    from_epoch: u64,
 ) -> Result<ChainAudit, String> {
     let mut audit = ChainAudit::default();
-    let mut previous: Option<&AdminTransitionView> = None;
+    // Every epoch is minted as exactly the previous one plus one, by both
+    // grant paths — so the chain from `from_epoch` upward must present
+    // EVERY epoch in turn (review): a record that jumps, or a first record
+    // above the epoch asked for, is a missing record, not a legitimate
+    // silence. Continuity is on the epoch, not the holder: a released lease
+    // is followed by a grant from nobody, legitimately.
+    let mut expected_to = from_epoch;
     for view in views {
-        // Continuity is on the EPOCH: a grant's `epoch_from` is the epoch
-        // the range was at when it was minted, which is the previous
-        // record's `epoch_to`. The holder is not part of the link — a
-        // released lease is followed by a grant from nobody, legitimately.
-        let link_ok = view.epoch_to > view.epoch_from
-            && previous.is_none_or(|before| before.epoch_to == view.epoch_from);
+        let link_ok = view.epoch_to == expected_to && view.epoch_from + 1 == view.epoch_to;
         if !link_ok {
             audit.broken_links += 1;
         }
+        expected_to = view.epoch_to + 1;
         let vote = match &view.outcome {
             TransitionOutcome::Reported {
                 outcome:
@@ -1992,19 +2000,29 @@ pub fn audit_transitions(
                     },
                 ..
             } => {
+                // ONE answer per replica (review): the promoter built its
+                // evidence from a map keyed by node, and neither the report
+                // validation nor the wire enforce uniqueness, so a quorum
+                // naming the holder twice must not count it twice.
+                let mut answers = std::collections::BTreeMap::new();
+                let mut duplicated = false;
+                for answer in quorum {
+                    if answers.insert(answer.node_uuid, answer.offset).is_some() {
+                        duplicated = true;
+                    }
+                }
                 // The holder's own offset, as the promoter used it: its
                 // answer in the quorum, else the boundary it established.
-                let candidate_offset = quorum
-                    .iter()
-                    .find(|answer| answer.node_uuid == view.holder_to)
-                    .map(|answer| answer.offset)
+                let candidate_offset = answers
+                    .get(&view.holder_to)
+                    .copied()
                     .or(*boundary_offset)
                     .unwrap_or(0);
-                let recomputed = quorum
-                    .iter()
-                    .filter(|answer| answer.offset <= candidate_offset)
+                let recomputed = answers
+                    .values()
+                    .filter(|offset| **offset <= candidate_offset)
                     .count() as u32;
-                let ok = recomputed == *votes && *votes >= *required;
+                let ok = !duplicated && recomputed == *votes && *votes >= *required;
                 if !ok {
                     audit.vote_disagreements += 1;
                 }
@@ -2038,7 +2056,6 @@ pub fn audit_transitions(
             MacVerdict::Unverified => audit.unverified += 1,
         }
         audit.records.push(TransitionAudit { link_ok, vote, mac });
-        previous = Some(view);
     }
     Ok(audit)
 }
@@ -2570,7 +2587,7 @@ client_key: /tmp/client.key
             view.mac = Some(view.record().mac(&key, topic, range).unwrap());
         }
 
-        let audit = audit_transitions(&views, Some(&key), topic, range).unwrap();
+        let audit = audit_transitions(&views, Some(&key), topic, range, 1).unwrap();
         assert!(audit.verdict().is_ok(), "{audit:?}");
         assert_eq!(audit.verified, 3);
         assert!(audit.records.iter().all(|record| record.link_ok));
@@ -2585,14 +2602,14 @@ client_key: /tmp/client.key
         assert!(audit.records[1].vote.is_none() && audit.records[2].vote.is_none());
 
         let relabelled =
-            audit_transitions(&views, Some(&key), topic, Uuid::from_u128(0x72)).unwrap();
+            audit_transitions(&views, Some(&key), topic, Uuid::from_u128(0x72), 1).unwrap();
         assert_eq!(
             relabelled.mismatches, 3,
             "another range's chain is not this one's"
         );
         assert!(relabelled.verdict().unwrap_err().contains("MAC mismatch"));
 
-        let unchecked = audit_transitions(&views, None, topic, range).unwrap();
+        let unchecked = audit_transitions(&views, None, topic, range, 1).unwrap();
         assert_eq!(
             (unchecked.unverified, unchecked.verified),
             (3, 0),
@@ -2606,10 +2623,49 @@ client_key: /tmp/client.key
         let mut gapped = views.clone();
         gapped[2].epoch_from = 5;
         gapped[2].mac = Some(gapped[2].record().mac(&key, topic, range).unwrap());
-        let gap = audit_transitions(&gapped, Some(&key), topic, range).unwrap();
+        let gap = audit_transitions(&gapped, Some(&key), topic, range, 1).unwrap();
         assert_eq!(gap.broken_links, 1);
         assert!(!gap.records[2].link_ok && gap.records[1].link_ok);
         assert!(gap.verdict().unwrap_err().contains("broken link"));
+
+        // A record that jumps an epoch is a missing record, and so is a
+        // first record above the epoch asked for (review).
+        let mut jumped = views.clone();
+        jumped[2].epoch_from = 3;
+        jumped[2].epoch_to = 4;
+        jumped[2].mac = Some(jumped[2].record().mac(&key, topic, range).unwrap());
+        let jump = audit_transitions(&jumped, Some(&key), topic, range, 1).unwrap();
+        assert_eq!(jump.broken_links, 1, "epoch 3 is missing between 2 and 4");
+        let headless = audit_transitions(&views[1..], Some(&key), topic, range, 1).unwrap();
+        assert!(
+            !headless.records[0].link_ok && headless.records[1].link_ok,
+            "asked from epoch 1, the chain must begin at epoch 1"
+        );
+        let mid = audit_transitions(&views[1..], Some(&key), topic, range, 2).unwrap();
+        assert!(
+            mid.verdict().is_ok(),
+            "asked from epoch 2, it may begin there"
+        );
+
+        // A quorum naming one replica twice counts it once (review).
+        let mut doubled = views.clone();
+        if let TransitionOutcome::Reported {
+            outcome: PromotionOutcome::Established { quorum, .. },
+            ..
+        } = &mut doubled[0].outcome
+        {
+            quorum.retain(|answer| answer.node_uuid == holder_a);
+            let again = quorum[0];
+            quorum.push(again);
+        }
+        doubled[0].mac = Some(doubled[0].record().mac(&key, topic, range).unwrap());
+        let dup = audit_transitions(&doubled, Some(&key), topic, range, 1).unwrap();
+        let vote = dup.records[0].vote.as_ref().unwrap();
+        assert_eq!(
+            (vote.recomputed, vote.ok),
+            (1, false),
+            "the holder twice is one replica"
+        );
 
         let mut overstated = views.clone();
         if let TransitionOutcome::Reported {
@@ -2620,7 +2676,7 @@ client_key: /tmp/client.key
             *votes = 3;
         }
         overstated[0].mac = Some(overstated[0].record().mac(&key, topic, range).unwrap());
-        let vote = audit_transitions(&overstated, Some(&key), topic, range).unwrap();
+        let vote = audit_transitions(&overstated, Some(&key), topic, range, 1).unwrap();
         assert_eq!(
             vote.vote_disagreements, 1,
             "three votes are claimed; the quorum shows two at or below the holder"
@@ -2629,7 +2685,7 @@ client_key: /tmp/client.key
 
         let mut unsigned = views.clone();
         unsigned[1].mac = None;
-        let some = audit_transitions(&unsigned, Some(&key), topic, range).unwrap();
+        let some = audit_transitions(&unsigned, Some(&key), topic, range, 1).unwrap();
         assert_eq!((some.verified, some.unsigned), (2, 1));
         assert!(
             some.verdict().is_ok(),
