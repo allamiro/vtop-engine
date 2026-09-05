@@ -79,6 +79,7 @@ GET /readyz    readiness
 | `vtop_inflight_batches` | gauge | Accumulated but not sealed |
 | `vtop_source_read_errors_total` | counter | An unhealthy source, which is otherwise invisible |
 | `vtop_upload_throttled_total{stage}` | counter | The store asking for less concurrency, not more retries (#102) |
+| `vtop_upload_width` | gauge | Uploads in flight this cycle: the configured width, or the adaptive controller's (#102) |
 
 ### Design decisions worth knowing
 

@@ -675,6 +675,8 @@ path needed by the distributed options is already implemented (§6.3).
 | `engine.work_dir` / `log_level` | scratch dir; verbosity |
 | `engine.ledger_retention_days` / `ledger_prune_batch` | committed-row retention (§6.6; SQLite engine-side only) |
 | `batching.max_records` / `max_bytes` / `max_batch_age_seconds` | seal thresholds |
+| `batching.max_concurrent_batches` | uploads kept in flight per cycle (default 8); the ceiling when the adaptive width is on |
+| `batching.adaptive_width.enabled` / `min_width` | AIMD upload width (#102): a cycle the store throttled halves the next cycle's width, a clean cycle grows it by one, never below `min_width` (default 1) nor above the ceiling. Off by default; `vtop_upload_width` shows the width in use |
 | `compression.type` / `level` | `gzip` \| `zstd` \| `none` |
 | `checksum.algorithm` | `sha256` \| `blake3` \| disabled |
 | `manifest_mac_key_env` | optional env-var name for the 32-byte hex manifest MAC key; the secret is not serialized |
