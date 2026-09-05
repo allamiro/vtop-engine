@@ -114,7 +114,11 @@ FAILED_CELLS=""
 CSV="$OUT_DIR/topic_sweep.csv"
 echo "topics,records_produced,observe_seconds,kafka_cycles,records_read,avg_read_phase_ms,avg_empty_wait_pct,objects_archived" > "$CSV"
 
-kafka() { docker compose exec -T kafka /opt/kafka/bin/"$@"; }
+kafka() { # <tool> <args...>: a Kafka CLI tool inside the broker container
+  local tool="$1"
+  shift
+  docker compose exec -T kafka "/opt/kafka/bin/$tool" "$@"
+}
 
 # Run kafka-init to completion before any cell, so its seed topics exist when
 # the first purge happens rather than arriving after it.
@@ -155,9 +159,25 @@ purge_foreign_topics() { # $1 = the prefix this cell owns, empty for "none"
     if [ -n "$own" ] && case "$topic" in "${own}-"*) true ;; *) false ;; esac; then
       continue
     fi
+    # `</dev/null`: `docker compose exec` reads the loop's stdin otherwise
+    # and swallows the rest of the listing, so only the first topic was
+    # ever deleted and the stray check below failed every cell.
     kafka kafka-topics.sh --bootstrap-server localhost:9092 --delete \
-      --topic "$topic" >/dev/null 2>&1 || true
+      --topic "$topic" >/dev/null 2>&1 </dev/null || true
   done <<< "$listing"
+  # Deletion is asynchronous on the broker: `--delete` returns once the
+  # request is accepted, and the topic stays in the listing until the
+  # controller has removed it — long enough, on a fresh KRaft broker, for the
+  # stray check below to read the seed topics as survivors and fail a cell
+  # that was clean a second later. Wait for the listing to agree, bounded.
+  local deadline=$(( SECONDS + 60 )) remaining
+  while :; do
+    remaining="$(kafka kafka-topics.sh --bootstrap-server localhost:9092 --list 2>/dev/null \
+      | grep -v '^__' | { if [ -n "$own" ]; then grep -cv "^${own}-"; else grep -c .; fi; } || true)"
+    [ "${remaining:-0}" -eq 0 ] && break
+    [ "$SECONDS" -lt "$deadline" ] || break
+    sleep 1
+  done
 }
 
 cleanup() {
@@ -203,6 +223,20 @@ kafka kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1 \
 # are present for the first purge rather than arriving after it.
 seed_kafka_init
 
+# The group coordinator is not ready the moment the broker answers a topic
+# listing: the first consumer to join creates __consumer_offsets, and an
+# engine started before that skips its first pass on NotCoordinator — which
+# the first cell then reports as a failed source and withholds its row. A
+# throwaway consumer on a seed topic warms it; the listing says when it is.
+log "warming the group coordinator"
+kafka kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic cef_events \
+  --group topic-sweep-warm --from-beginning --timeout-ms 8000 >/dev/null 2>&1 </dev/null || true
+for _ in $(seq 1 30); do
+  kafka kafka-topics.sh --bootstrap-server localhost:9092 --list 2>/dev/null | grep -q '^__consumer_offsets$' && break
+  sleep 1
+done
+kafka kafka-topics.sh --bootstrap-server localhost:9092 --list 2>/dev/null | grep -q '^__consumer_offsets$' \
+  || fail "the group coordinator never came up (__consumer_offsets absent); the first cell would skip its first pass"
 for count in "${COUNTS[@]}"; do
   log "=== $count topic(s), $TOTAL_RECORDS records spread across them ==="
 
