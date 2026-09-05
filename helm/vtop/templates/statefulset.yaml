@@ -120,6 +120,14 @@ spec:
             - name: VTOP_LOG_FORMAT
               value: {{ .Values.logFormat | quote }}
             {{- end }}
+            {{- if .Values.meta.transitionMacKey.secretName }}
+            # The transition MAC key (#240 item 5), for the metadata process.
+            - name: VTOP_TRANSITION_MAC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.meta.transitionMacKey.secretName | quote }}
+                  key: {{ .Values.meta.transitionMacKey.secretKey | quote }}
+            {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

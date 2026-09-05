@@ -158,6 +158,17 @@ meta:
     enabled: false
     # Certificate Common Names permitted to run cluster-scoped admin commands.
     operatorCommonNames: []
+  # Signed leadership-transition statements (#240 item 5). When secretName
+  # is set, every metadata pod reads the 32-byte hex key from that Secret —
+  # injected as VTOP_TRANSITION_MAC_KEY and named to the config as
+  # transition_mac_key_env — and serves each transition record with a MAC a
+  # reader can verify offline against the range identity it was read for.
+  # Absent means unsigned. A named Secret that is missing at startup is a
+  # hard error in the binary, never a silent downgrade to unsigned.
+  transitionMacKey:
+    secretName: ""
+    # The key within the Secret holding the 64 hex characters.
+    secretKey: key
 
 # ---------------------------------------------------------------------------
 # Data role (`data:` block of the rendered config).

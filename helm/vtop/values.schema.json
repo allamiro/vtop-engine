@@ -119,6 +119,15 @@
               "items": { "type": "string", "minLength": 1 }
             }
           }
+        },
+        "transitionMacKey": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Secret holding the 32-byte hex key that signs leadership-transition statements (#240 item 5); empty secretName means unsigned.",
+          "properties": {
+            "secretName": { "type": "string" },
+            "secretKey": { "type": "string" }
+          }
         }
       }
     },
