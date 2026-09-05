@@ -1616,6 +1616,9 @@ impl Engine {
             mx.upload_width.set(limit as i64);
         }
         let throttles_before = self.throttles.load(Ordering::Relaxed);
+        // A cycle with nothing to upload probes nothing (review): idle
+        // polling after a throttle must not walk the width back up.
+        let attempted = !work.is_empty();
         let pipeline = self.pipeline();
         // buffer_unordered keeps `limit` verifies in flight and yields each as
         // it finishes, so a slow upload never holds up the ones behind it.
@@ -1640,7 +1643,7 @@ impl Engine {
 
         // The cycle's verdict for the width controller (#102): any throttle
         // in it halves the next width; none grows it by one.
-        if self.config.batching.adaptive_width.enabled {
+        if self.config.batching.adaptive_width.enabled && attempted {
             let throttled = self.throttles.load(Ordering::Relaxed) > throttles_before;
             let before = self.width.width();
             let after = self.width.observe_cycle(throttled);
@@ -2685,6 +2688,14 @@ mod tests {
         let outcomes = engine.run_source(SourceType::File, true).await.unwrap();
         assert_eq!(outcomes[0].final_state, BatchState::Failed);
         assert_eq!(engine.upload_width(), 2, "halved after a throttled cycle");
+        // An idle cycle probes nothing and moves nothing (review).
+        let idle = engine.run_source(SourceType::File, true).await.unwrap();
+        assert!(idle.is_empty(), "nothing to flush");
+        assert_eq!(
+            engine.upload_width(),
+            2,
+            "idle polling must not walk the width back up"
+        );
         // Clean cycles climb back one at a time, and stop at the ceiling.
         for (n, want) in [(2, 3), (3, 4), (4, 4)] {
             append(n);
