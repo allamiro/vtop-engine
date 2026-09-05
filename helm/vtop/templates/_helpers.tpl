@@ -280,6 +280,17 @@ the pod would sit in CreateContainerConfigError saying so less clearly.
 {{- if and .Values.meta.transitionMacKey.secretName (not .Values.meta.transitionMacKey.secretKey) -}}
 {{- fail "\n\nmeta.transitionMacKey.secretName is set but meta.transitionMacKey.secretKey is empty: name the key within the Secret that holds the 32-byte hex MAC key." -}}
 {{- end -}}
+{{- /* The Secret-backed entry must be the only VTOP_TRANSITION_MAC_KEY: a
+       later extraEnv entry of the same name would win inside the container,
+       and the metadata process would sign with a key the chart never
+       named (review). */ -}}
+{{- if .Values.meta.transitionMacKey.secretName -}}
+{{- range .Values.extraEnv -}}
+{{- if eq (toString .name) "VTOP_TRANSITION_MAC_KEY" -}}
+{{- fail "\n\nextraEnv sets VTOP_TRANSITION_MAC_KEY while meta.transitionMacKey.secretName is set: the chart injects that variable from the Secret, and a second entry would override it. Remove it from extraEnv, or unset meta.transitionMacKey.secretName to supply the key yourself." -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 {{- end }}
 
 {{- define "vtop.metaTierConfig" -}}

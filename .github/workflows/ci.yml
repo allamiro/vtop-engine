@@ -615,6 +615,9 @@ jobs:
           # The transition MAC key reference must be whole (#240 item 5).
           refuses_because "meta.transitionMacKey.secretKey is empty" \
             -f helm/vtop/ci/default-values.yaml --set meta.transitionMacKey.secretName=vtop-transition-key --set meta.transitionMacKey.secretKey=""
+          refuses_because "extraEnv sets VTOP_TRANSITION_MAC_KEY" \
+            -f helm/vtop/ci/default-values.yaml --set meta.transitionMacKey.secretName=vtop-transition-key \
+            --set 'extraEnv[0].name=VTOP_TRANSITION_MAC_KEY' --set 'extraEnv[0].value=deadbeef'
 
       # The SEPARATED shape (#287 slice 2): two tiers, each pod's config the
       # ROLE config its command deserializes, the data tier's lease pointed
