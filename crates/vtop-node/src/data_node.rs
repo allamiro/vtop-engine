@@ -1050,6 +1050,13 @@ async fn run_leader(
     let principal = config
         .principal_id
         .ok_or("leader/standalone requires principal_id")?;
+    // The gateway's identity judged HERE (review), before the lease agent
+    // exists: a refusal is a startup error with nothing acquired yet, never
+    // an exit that leaves a lease for its deadline to reclaim.
+    let kafka_producer = match config.kafka.as_ref() {
+        Some(kafka) => Some(kafka_producer_id(principal, kafka)?),
+        None => None,
+    };
 
     // Kept beside the broker: the collector needs the concrete replica set for
     // per-follower lag, which the `dyn ReplicaSet` the broker holds does not
@@ -1403,8 +1410,9 @@ async fn run_leader(
             // An identity of the gateway's own (review), never the
             // principal: the journal keys producer epochs by UUID, and the
             // gateway's minted epoch would fence a native client appending
-            // as the principal with ordinary epochs.
-            let kafka_producer = kafka_producer_id(principal, kafka)?;
+            // as the principal with ordinary epochs. Judged above, before
+            // the lease agent started.
+            let kafka_producer = kafka_producer.expect("judged with the config above");
             let bridge = vtop_kafka::NativeBridge::new(
                 Arc::clone(&broker),
                 vtop_kafka::NativeBridgeConfig {
@@ -1495,7 +1503,15 @@ async fn run_leader(
             },
         },
     };
-    served.map_err(|error| format!("native server exited: {error}"))?;
+    if let Err(error) = served {
+        // The native server failing takes the gateway with it (review): its
+        // accept loop is aborted before the error returns, so no Kafka
+        // session is admitted to a node that is on its way out.
+        if let Some(task) = kafka_task.take() {
+            task.abort();
+        }
+        return Err(format!("native server exited: {error}"));
+    }
     // Orderly stop (#280). The native listener is closed and sessions are
     // drained; the lease agent — racing on the same signal — releases the
     // range so failover need not wait out the lease deadline, and the final

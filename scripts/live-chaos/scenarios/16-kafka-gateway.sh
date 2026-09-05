@@ -50,8 +50,15 @@ kafka_exchange() {
     escaped+="\\x${body_hex:i:2}"
   done
   printf '%b' "$escaped" >&3
+  # A connection closed before four length bytes arrive is the gateway's
+  # refusal (review): returns 2 when the gateway closed, with nothing
+  # printed, instead of feeding an empty string to the arithmetic.
   local reply_len_hex reply_len
   reply_len_hex="$(head -c 4 <&3 | od -An -tx1 | tr -d ' \n')"
+  if [[ ${#reply_len_hex} -ne 8 ]]; then
+    exec 3>&-
+    return 2
+  fi
   reply_len=$((16#$reply_len_hex))
   head -c "$reply_len" <&3 | od -An -tx1 | tr -d ' \n'
   exec 3>&-
@@ -77,7 +84,12 @@ log "Metadata v1 names the range topic '$TOPIC' behind the gateway"
 
 # A version this gateway does not serve is refused, not mis-parsed: Produce
 # v2 closes the connection.
-if REPLY="$(kafka_exchange "000000020000000900056368616f73" 2>/dev/null)" && [[ -n "$REPLY" ]]; then
+set +e
+REPLY="$(kafka_exchange "000000020000000900056368616f73")"
+CLOSED=$?
+set -e
+[[ $CLOSED -eq 2 && -z "$REPLY" ]] || CLOSED=0
+if [[ $CLOSED -ne 2 ]]; then
   fail "Produce v2 (below the served range) was answered rather than refused: $REPLY"
 fi
 log "a version outside the served range is refused by closing the connection"

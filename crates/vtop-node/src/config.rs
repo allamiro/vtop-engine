@@ -197,6 +197,27 @@ pub fn refuse_kafka_gateway_misuse(
              (#225)"
         ));
     }
+    // An advertised endpoint clients cannot dial is refused before the bind
+    // (review): a blank host or port zero in Metadata is a client that
+    // bootstraps and then connects to nothing.
+    if kafka
+        .advertised_host
+        .as_deref()
+        .is_some_and(|host| host.trim().is_empty())
+    {
+        return Err(
+            "`kafka.advertised_host` is blank: set it to what clients dial, or leave it \
+                    unset to advertise the bound address"
+                .to_owned(),
+        );
+    }
+    if kafka.advertised_port == Some(0) {
+        return Err(
+            "`kafka.advertised_port: 0` is not a port clients can dial: set the port they \
+                    reach, or leave it unset to advertise the bound one"
+                .to_owned(),
+        );
+    }
     if listens_on_every_interface(&kafka.listen) && kafka.advertised_host.is_none() {
         return Err(format!(
             "`kafka.listen: {}` binds every interface and no `kafka.advertised_host` is set: \
@@ -965,6 +986,17 @@ mod transport_tests {
         );
         wildcard.advertised_host = Some("broker.example".to_owned());
         assert!(refuse_kafka_gateway_misuse(DataRole::Leader, Some(&wildcard)).is_ok());
+        // An endpoint nobody can dial is refused by name (review).
+        let mut blank = kafka("127.0.0.1:9092", false);
+        blank.advertised_host = Some("  ".to_owned());
+        assert!(refuse_kafka_gateway_misuse(DataRole::Leader, Some(&blank))
+            .unwrap_err()
+            .contains("blank"));
+        let mut zero = kafka("127.0.0.1:9092", false);
+        zero.advertised_port = Some(0);
+        assert!(refuse_kafka_gateway_misuse(DataRole::Leader, Some(&zero))
+            .unwrap_err()
+            .contains("advertised_port: 0"));
     }
 
     /// The gateway's producer identity is never the principal (review): the
