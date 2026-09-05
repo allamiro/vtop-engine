@@ -14,9 +14,14 @@ design):
 
     shaping_api_url: http://127.0.0.1:8474   # "" = unshaped, the default
     shaping_proxy: minio                     # registered from toxiproxy.json
-    shaping_bandwidth_kbps: 1250             # KB/s each way; 0 = unlimited
+    shaping_bandwidth_kbps: 1250             # KB/s each way PER CONNECTION; 0 = unlimited
     shaping_latency_ms: 100                  # round trip, split across directions
     shaping_jitter_ms: 20                    # spread on that round trip
+
+The bandwidth toxic is PER CONNECTION (toxiproxy limits each connection it
+proxies), so the aggregate pipe is the shape times the connections in flight.
+A scenario that wants a fixed pipe keeps one upload in flight
+(`max_concurrent_batches: 1`); scenario 13 does. The recorded shape says so.
 
 Nothing here imports the engine: it drives toxiproxy's HTTP API with the
 standard library, the way the rest of the harness drives the binary.
@@ -30,6 +35,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 # Ours, by name, so a stale toxic from an interrupted run is replaced rather
 # than stacked, and nothing an operator added by hand is ever touched.
@@ -124,9 +130,12 @@ class Shape:
 
     def describe(self) -> dict[str, Any]:
         """What the summary records: the shape, so a number is never read
-        without the pipe it was measured through."""
+        without the pipe it was measured through — and its scope, because
+        toxiproxy's bandwidth toxic limits each CONNECTION, so the aggregate
+        is this times the connections in flight."""
         return {"proxy": self.proxy, "bandwidth_kbps": self.bandwidth_kbps,
-                "latency_ms": self.latency_ms, "jitter_ms": self.jitter_ms}
+                "latency_ms": self.latency_ms, "jitter_ms": self.jitter_ms,
+                "scope": "per_connection"}
 
 
 class ToxiproxyClient:
@@ -157,15 +166,43 @@ class ToxiproxyClient:
                 "--profile shaped up -d") from exc
 
 
-def apply(shape: Shape, client: ToxiproxyClient) -> None:
-    """Install the shape on its proxy, replacing any toxic of ours already there."""
-    status, _ = client.request("GET", f"/proxies/{shape.proxy}")
+def _port_of(endpoint: str) -> int | None:
+    try:
+        return urlsplit(endpoint).port
+    except ValueError:
+        return None
+
+
+def _listener_port(listen: Any) -> int | None:
+    # toxiproxy reports "[::]:9100" or "0.0.0.0:9100"; the port is what the
+    # engine's endpoint must name.
+    if not isinstance(listen, str) or ":" not in listen:
+        return None
+    try:
+        return int(listen.rsplit(":", 1)[1])
+    except ValueError:
+        return None
+
+
+def apply(shape: Shape, client: ToxiproxyClient, endpoint: str | None = None) -> None:
+    """Install the shape on its proxy, replacing any toxic of ours already
+    there. With `endpoint`, the engine's effective endpoint must name the
+    proxy's own listener port: a scenario declaring the store's direct port
+    would otherwise bypass every toxic while the summary recorded a shape."""
+    status, proxy = client.request("GET", f"/proxies/{shape.proxy}")
     if status == 404:
         raise ShapingError(
             f"toxiproxy has no proxy {shape.proxy!r}: the shaped stack registers it "
             "from benchmarks/toxiproxy.json at startup")
     if status != 200:
         raise ShapingError(f"toxiproxy answered HTTP {status} for proxy {shape.proxy!r}")
+    if endpoint is not None:
+        listener = _listener_port((proxy or {}).get("listen"))
+        wanted = _port_of(endpoint)
+        if listener is None or wanted != listener:
+            raise ShapingError(
+                f"the engine's endpoint {endpoint!r} does not reach proxy {shape.proxy!r}, "
+                f"which listens on port {listener}: the run would go around the shape")
     clear(shape, client)
     for toxic in shape.toxics():
         try:
@@ -214,7 +251,8 @@ def require_endpoint_through_proxy(scenario, effective_endpoint: str) -> None:
 
 @contextmanager
 def shaped(scenario, client_factory: Callable[[str], ToxiproxyClient] = ToxiproxyClient,
-           log: Callable[[str], None] = print) -> Iterator[Shape | None]:
+           log: Callable[[str], None] = print,
+           endpoint: str | None = None) -> Iterator[Shape | None]:
     """Shape the pipe for the duration of the block, and unshape it after.
 
     The removal runs on every exit — a failed run, a keyboard interrupt — so
@@ -225,7 +263,7 @@ def shaped(scenario, client_factory: Callable[[str], ToxiproxyClient] = Toxiprox
         yield None
         return
     client = client_factory(shape.api_url)
-    apply(shape, client)
+    apply(shape, client, endpoint)
     log(f"[bench] shaping {shape.proxy}: {shape.bandwidth_kbps or 'unlimited'} KB/s each way, "
         f"{shape.latency_ms} ms round trip ±{shape.jitter_ms} ms")
     try:

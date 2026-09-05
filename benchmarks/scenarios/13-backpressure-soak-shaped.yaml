@@ -33,6 +33,12 @@ shaping_jitter_ms: 20
 batch_max_records: 50
 batch_max_bytes: 1048576
 batch_max_age_seconds: 5
+# ONE upload at a time (review): toxiproxy's bandwidth toxic limits each
+# CONNECTION, so at a wider setting the aggregate is the shape times the
+# connections in flight. One batch in flight is one connection, and then the
+# per-connection number IS the pipe. Widen it only to measure per-connection
+# shaping, and read the numbers as such.
+max_concurrent_batches: 1
 backlog_multiplier: 1.5
 seed_concurrently: true
 seed_interval_seconds: 1.0

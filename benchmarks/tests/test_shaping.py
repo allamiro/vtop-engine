@@ -33,7 +33,9 @@ class ScriptedClient:
     def request(self, method, path, body=None):
         self.calls.append((method, path, body))
         default = {"GET": 200, "POST": 201, "DELETE": 204}[method]
-        return self.statuses.get((method, path), default), None
+        status = self.statuses.get((method, path), default)
+        payload = {"name": "minio", "listen": "[::]:9100"} if method == "GET" else None
+        return status, payload
 
 
 # --------------------------------------------------------------------------
@@ -52,7 +54,8 @@ def test_the_shape_is_read_from_flat_keys_and_the_api_url_is_normalized():
         shaping_bandwidth_kbps=1250, shaping_latency_ms=100, shaping_jitter_ms=20))
     assert shape == Shape("http://127.0.0.1:8474", "minio", 1250, 100, 20)
     assert shape.describe() == {"proxy": "minio", "bandwidth_kbps": 1250,
-                                "latency_ms": 100, "jitter_ms": 20}
+                                "latency_ms": 100, "jitter_ms": 20,
+                                "scope": "per_connection"}
 
 
 def test_a_shaped_run_with_no_shape_is_refused():
@@ -165,6 +168,18 @@ def test_a_removal_that_fails_is_reported_not_announced_as_removed():
     assert len(deletes) >= 2 * len(TOXIC_NAMES), "cleared before apply and again on exit"
 
 
+def test_an_endpoint_that_is_not_the_proxys_listener_is_refused():
+    client = ScriptedClient()
+    shape = Shape("http://x", "minio", 1250, 0, 0)
+    apply(shape, client, endpoint="http://localhost:9100")
+    with pytest.raises(ShapingError, match="listens on port 9100"):
+        apply(shape, client, endpoint="http://localhost:9000")
+
+
+def test_the_recorded_shape_says_it_is_per_connection():
+    assert Shape("http://x", "minio", 1250, 100, 20).describe()["scope"] == "per_connection"
+
+
 def test_an_endpoint_override_that_bypasses_the_proxy_is_refused():
     sc = scenario(shaping_api_url="http://127.0.0.1:8474", shaping_bandwidth_kbps=10,
                   endpoint_url="http://localhost:9100")
@@ -215,6 +230,7 @@ def test_the_shaped_soak_scenario_carries_its_shape(tmp_path):
     assert shape == Shape("http://127.0.0.1:8474", "minio", 1250, 100, 20)
     assert sc.endpoint_url == "http://localhost:9100", "the engine talks to the proxy"
     assert sc.backend == "s3_native" and sc.seed_concurrently is True
+    assert sc.max_concurrent_batches == 1, "one connection is the pipe"
 
 
 def test_a_flat_scenario_file_parses_the_shaping_keys_without_pyyaml(tmp_path):
@@ -230,9 +246,12 @@ def test_a_flat_scenario_file_parses_the_shaping_keys_without_pyyaml(tmp_path):
     assert Shape.from_scenario(sc) == Shape("http://127.0.0.1:8474", "minio", 640, 80, 0)
 
 
-def test_the_shaped_proxy_port_is_still_the_lab():
+def test_the_shaped_proxy_port_is_the_lab_only_when_shaped():
     # The proxy fronts the same lab MinIO, so its loopback port keeps the lab
-    # credential fallbacks; anything else is still somebody else's store.
-    assert _is_lab_endpoint("http://localhost:9100")
+    # credential fallbacks — for a shaped scenario. Unshaped, 9100 is
+    # somebody else's service and gets no keys.
+    assert _is_lab_endpoint("http://localhost:9100", shaped=True)
+    assert not _is_lab_endpoint("http://localhost:9100")
     assert _is_lab_endpoint("http://127.0.0.1:9000")
-    assert not _is_lab_endpoint("http://localhost:4566")
+    assert _is_lab_endpoint("http://127.0.0.1:9000", shaped=True)
+    assert not _is_lab_endpoint("http://localhost:4566", shaped=True)

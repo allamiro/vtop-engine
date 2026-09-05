@@ -51,7 +51,7 @@ def _effective_endpoint(scenario) -> str:
     return os.environ.get("VTOP_S3_ENDPOINT_URL", "") or scenario.get("endpoint_url", "")
 
 
-def _is_lab_endpoint(endpoint: str) -> bool:
+def _is_lab_endpoint(endpoint: str, shaped: bool = False) -> bool:
     # The compose stack publishes MinIO on the loopback interface at the
     # FIXED host port 9000 (docker-compose.benchmark.yml pins it; only the
     # bind address is overridable), and that one endpoint is the only one
@@ -69,10 +69,13 @@ def _is_lab_endpoint(endpoint: str) -> bool:
         port = parts.port
     except ValueError:
         return False
-    # 9100 is the same lab MinIO behind the shaped stack's toxiproxy (#403):
-    # the pipe changes, the store and its lab credentials do not.
+    # 9100 is the same lab MinIO behind the shaped stack's toxiproxy (#403)
+    # — but only for a SHAPED scenario: the pipe changes, the store and its
+    # lab credentials do not. An unshaped scenario aimed at 9100 is somebody
+    # else's service, and must not be handed the lab's keys (review).
+    lab_ports = (9000, 9100) if shaped else (9000,)
     return (parts.hostname in ("localhost", "127.0.0.1", "::1")
-            and port in (9000, 9100))
+            and port in lab_ports)
 
 
 def write_engine_config(scenario, work_dir: str, state_db: str,
@@ -237,7 +240,7 @@ def _backend_env(scenario) -> dict[str, str]:
     # credentials (already in the environment) winning over the fallbacks.
     if scenario.get("backend") == "minio" or (
             scenario.get("backend") == "s3_native" and endpoint
-            and _is_lab_endpoint(endpoint)):
+            and _is_lab_endpoint(endpoint, shaped=bool(scenario.get("shaping_api_url")))):
         # The benchmark compose lets an operator override the SERVER's
         # credentials via MINIO_ROOT_USER / MINIO_ROOT_PASSWORD (issue #81).
         # The client must follow the same variables THROUGH THE SAME

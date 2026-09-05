@@ -137,7 +137,7 @@ def main() -> int:
     # The pipe is shaped for exactly the block the measurements come from,
     # and unshaped on every way out of it (#403).
     with SystemMonitor(emit_sys, interval=float(sc.get("sys_sample_interval", 1.0))), \
-            shaping.shaped(sc):
+            shaping.shaped(sc, endpoint=engine.effective_endpoint(sc)):
         # initial seed
         # A --seed-dir the caller supplied may already hold input. Those bytes
         # reach `bytes_archived`, so they must reach `bytes_seeded` too or the

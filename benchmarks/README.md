@@ -144,7 +144,10 @@ docker compose -f benchmarks/docker-compose.benchmark.yml --profile shaped down
 ```
 
 The scenario names the shape with flat keys — `shaping_api_url` (empty means
-unshaped), `shaping_proxy`, `shaping_bandwidth_kbps` (KB/s, each direction),
+unshaped), `shaping_proxy`, `shaping_bandwidth_kbps` (KB/s, each direction,
+**per connection**: toxiproxy limits each connection it proxies, so the
+aggregate is the shape times the uploads in flight — scenario 13 keeps
+`max_concurrent_batches: 1`, which makes one connection the pipe),
 `shaping_latency_ms` (round trip, split across the directions) and
 `shaping_jitter_ms` — and points `endpoint_url` at the proxy on `:9100`. The
 runner installs the toxics for exactly the measured block and removes them on
