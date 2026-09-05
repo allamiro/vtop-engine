@@ -374,13 +374,27 @@ const MARKER_RETRY_PAUSE: Duration = Duration::from_millis(2);
 /// design, and either way the first own-epoch produce quorum still proves
 /// the prefix — §5.4.2 is satisfied by whichever own-epoch entry lands
 /// first.
-fn publish_boundary_marker_until_settled(broker: Arc<LocalBroker>, fencing_epoch: u64) {
+fn publish_boundary_marker_until_settled(
+    broker: Arc<LocalBroker>,
+    in_flight: Arc<std::sync::atomic::AtomicBool>,
+    fencing_epoch: u64,
+) {
     if broker.cluster_committed().is_none() {
         // The standalone boundary is the node's own log; the §5.4.2 hazard
         // is vacuous there and the marker would only be refused by name.
+        in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
         return;
     }
     let attempts = move || {
+        // Every exit clears the in-flight flag, or the re-fire path could
+        // never offer the marker again (review).
+        struct Clear(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let _clear = Clear(in_flight);
         for attempt in 0..=MARKER_RETRY_ATTEMPTS {
             match broker.publish_boundary_marker(fencing_epoch) {
                 Ok(published) => {
@@ -448,6 +462,12 @@ fn publish_boundary_marker_until_settled(broker: Arc<LocalBroker>, fencing_epoch
 /// Publishes into a live broker.
 pub struct BrokerLeasePublisher {
     broker: Arc<LocalBroker>,
+    /// One marker task at a time (review): a renewal seeing the
+    /// unpublished tail while a previous attempt still sleeps through its
+    /// budget must not stack another ten seconds of blocking work — short
+    /// renewal intervals would otherwise fill the blocking pool with
+    /// duplicate marker fan-outs.
+    marker_in_flight: Arc<std::sync::atomic::AtomicBool>,
     /// The newest epoch this publisher has fired the boundary marker for
     /// (#240 slice 3). Keyed HERE, not on the broker's held epoch: a
     /// static-epoch leader is constructed already holding its granted
@@ -461,6 +481,7 @@ impl BrokerLeasePublisher {
     pub fn new(broker: Arc<LocalBroker>) -> Self {
         Self {
             broker,
+            marker_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             marker_published_for: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -531,8 +552,16 @@ impl LeasePublisher for BrokerLeasePublisher {
                 .cluster_committed()
                 .zip(self.broker.try_local_offsets())
                 .is_some_and(|(cell, (committed, _))| cell.get() < committed);
-        if newly_adopted_epoch || unpublished_tail {
-            publish_boundary_marker_until_settled(Arc::clone(&self.broker), fencing_epoch);
+        if (newly_adopted_epoch || unpublished_tail)
+            && !self
+                .marker_in_flight
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            publish_boundary_marker_until_settled(
+                Arc::clone(&self.broker),
+                Arc::clone(&self.marker_in_flight),
+                fencing_epoch,
+            );
         }
     }
 
