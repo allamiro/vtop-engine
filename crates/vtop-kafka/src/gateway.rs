@@ -185,13 +185,14 @@ impl Gateway {
                 encode_api_versions(&mut out, version, ErrorCode::None);
                 Ok(None)
             }
-            ApiKey::Metadata => {
-                consumed(decode_metadata(&mut d, version), &d, "Metadata").map(|request| {
-                    let response = self.metadata(request);
+            ApiKey::Metadata => match consumed(decode_metadata(&mut d, version), &d, "Metadata") {
+                Ok(request) => {
+                    let response = self.metadata(request).await;
                     encode_metadata(&mut out, version, &response);
-                    None
-                })
-            }
+                    Ok(None)
+                }
+                Err(error) => Err(error),
+            },
             ApiKey::Produce => match consumed(decode_produce(&mut d, version), &d, "Produce") {
                 Ok(request) => match self.produce(request).await {
                     Ok(topics) => {
@@ -211,11 +212,14 @@ impl Gateway {
                 Err(error) => Err(error),
             },
             ApiKey::ListOffsets => {
-                consumed(decode_list_offsets(&mut d, version), &d, "ListOffsets").map(|request| {
-                    let topics = self.list_offsets(request);
-                    encode_list_offsets(&mut out, version, &topics);
-                    None
-                })
+                match consumed(decode_list_offsets(&mut d, version), &d, "ListOffsets") {
+                    Ok(request) => {
+                        let topics = self.list_offsets(request).await;
+                        encode_list_offsets(&mut out, version, &topics);
+                        Ok(None)
+                    }
+                    Err(error) => Err(error),
+                }
             }
         };
         match served {
@@ -229,33 +233,46 @@ impl Gateway {
         }
     }
 
-    fn has_topic(&self, name: &str) -> bool {
-        self.bridge.high_watermark(name).is_ok()
+    /// Off the runtime's threads (review): a real bridge answers from the
+    /// broker, behind the lock an append holds across its fsync, and a
+    /// Metadata storm must not park every worker behind it.
+    async fn bounds(&self, name: &str) -> Result<(i64, i64), ErrorCode> {
+        let bridge = Arc::clone(&self.bridge);
+        let name = name.to_owned();
+        tokio::task::spawn_blocking(move || bridge.bounds(&name))
+            .await
+            .unwrap_or(Err(ErrorCode::RequestTimedOut))
     }
 
-    fn metadata(&self, request: MetadataRequest) -> MetadataResponse {
-        let names = request.topics.unwrap_or_else(|| self.bridge.topics());
-        let topics = names
-            .into_iter()
-            .map(|name| {
-                if self.has_topic(&name) {
-                    MetadataTopic {
-                        error: ErrorCode::None,
-                        name,
-                        leader: Some(self.config.node_id),
-                    }
-                } else {
-                    // Never created here, whatever `allow_auto_topic_creation`
-                    // said: a topic is a range the metadata plane granted, not
-                    // a name a producer typed.
-                    MetadataTopic {
-                        error: ErrorCode::UnknownTopicOrPartition,
-                        name,
-                        leader: None,
-                    }
+    async fn metadata(&self, request: MetadataRequest) -> MetadataResponse {
+        let names = match request.topics {
+            Some(names) => names,
+            None => {
+                let bridge = Arc::clone(&self.bridge);
+                tokio::task::spawn_blocking(move || bridge.topics())
+                    .await
+                    .unwrap_or_default()
+            }
+        };
+        let mut topics = Vec::with_capacity(names.len());
+        for name in names {
+            topics.push(if self.bounds(&name).await.is_ok() {
+                MetadataTopic {
+                    error: ErrorCode::None,
+                    name,
+                    leader: Some(self.config.node_id),
                 }
-            })
-            .collect();
+            } else {
+                // Never created here, whatever `allow_auto_topic_creation`
+                // said: a topic is a range the metadata plane granted, not
+                // a name a producer typed.
+                MetadataTopic {
+                    error: ErrorCode::UnknownTopicOrPartition,
+                    name,
+                    leader: None,
+                }
+            });
+        }
         MetadataResponse {
             brokers: vec![MetadataBroker {
                 node_id: self.config.node_id,
@@ -283,6 +300,12 @@ impl Gateway {
         let refused_whole = request.transactional_id.as_ref().map(|id| {
             format!("transactional produce (transactional_id {id:?}) is out of scope (#225)")
         });
+        // ONE deadline for the request (review): the client's `timeout_ms`
+        // under the gateway's cap, shared by every partition — the appends
+        // run one after another, and N of them must not take N budgets.
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_millis(request.timeout_ms.max(1) as u64)
+                .min(self.config.max_produce_wait);
         let mut topics = Vec::with_capacity(request.topics.len());
         for topic in request.topics {
             let mut partitions = Vec::with_capacity(topic.partitions.len());
@@ -294,7 +317,7 @@ impl Gateway {
                             &topic.name,
                             partition.index,
                             partition.records.as_deref(),
-                            request.timeout_ms,
+                            deadline,
                         )
                         .await
                     }
@@ -305,7 +328,7 @@ impl Gateway {
                         error: ErrorCode::None,
                         base_offset: appended.base_offset,
                         log_append_time_ms: appended.log_append_time_ms,
-                        log_start_offset: 0,
+                        log_start_offset: appended.log_start_offset,
                         error_message: None,
                     },
                     Err((error, reason)) => {
@@ -340,7 +363,7 @@ impl Gateway {
         topic: &str,
         partition: i32,
         records: Option<&[u8]>,
-        timeout_ms: i32,
+        deadline: tokio::time::Instant,
     ) -> Result<crate::bridge::Appended, (ErrorCode, String)> {
         if partition != 0 {
             return Err((
@@ -398,10 +421,14 @@ impl Gateway {
         // is bounded by the client's `timeout_ms` under the gateway's cap:
         // the append cannot be cancelled, so past the bound the client is
         // told it timed out while the append runs on.
-        let wait =
-            Duration::from_millis(timeout_ms.max(1) as u64).min(self.config.max_produce_wait);
+        if tokio::time::Instant::now() >= deadline {
+            return Err((
+                ErrorCode::RequestTimedOut,
+                "the request's deadline passed before this partition was reached".to_owned(),
+            ));
+        }
         let append = tokio::task::spawn_blocking(move || bridge.produce(&topic, &batches));
-        match tokio::time::timeout(wait, append).await {
+        match tokio::time::timeout_at(deadline, append).await {
             Ok(Ok(Ok(appended))) => Ok(appended),
             Ok(Ok(Err(code))) => {
                 Err((code, format!("the bridge refused the append with {code:?}")))
@@ -412,10 +439,9 @@ impl Gateway {
             )),
             Err(_) => Err((
                 ErrorCode::RequestTimedOut,
-                format!(
-                    "the append did not finish within {wait:?}; it runs on, and a retry may \
+                "the append did not finish by the request's deadline; it runs on, and a retry may \
                      duplicate what it appends (#225 single-writer limitation)"
-                ),
+                    .to_owned(),
             )),
         }
     }
@@ -523,47 +549,42 @@ impl Gateway {
         }
     }
 
-    fn list_offsets(&self, request: ListOffsetsRequest) -> Vec<ListOffsetsTopicResponse> {
-        request
-            .topics
-            .into_iter()
-            .map(|topic| {
-                let partitions = topic
-                    .partitions
-                    .into_iter()
-                    .map(|partition| {
-                        let (error, offset) = if partition.index != 0 {
-                            (ErrorCode::UnknownTopicOrPartition, -1)
-                        } else if partition.timestamp == TIMESTAMP_LATEST {
-                            match self.bridge.high_watermark(&topic.name) {
-                                Ok(offset) => (ErrorCode::None, offset),
-                                Err(error) => (error, -1),
-                            }
-                        } else {
-                            // EARLIEST has no exact accessor and by-timestamp
-                            // no index behind it: refused by name, not
-                            // answered with a scan.
-                            tracing::warn!(
-                                topic = %topic.name,
-                                timestamp = partition.timestamp,
-                                "kafka ListOffsets refused: only LATEST (-1) is served in phase 1 (#225)"
-                            );
-                            (ErrorCode::UnsupportedVersion, -1)
-                        };
-                        ListOffsetsPartitionResponse {
-                            index: partition.index,
-                            error,
-                            timestamp: partition.timestamp,
-                            offset,
-                        }
-                    })
-                    .collect();
-                ListOffsetsTopicResponse {
-                    name: topic.name,
-                    partitions,
-                }
-            })
-            .collect()
+    async fn list_offsets(&self, request: ListOffsetsRequest) -> Vec<ListOffsetsTopicResponse> {
+        let mut topics = Vec::with_capacity(request.topics.len());
+        for topic in request.topics {
+            let mut partitions = Vec::with_capacity(topic.partitions.len());
+            for partition in topic.partitions {
+                let (error, offset) = if partition.index != 0 {
+                    (ErrorCode::UnknownTopicOrPartition, -1)
+                } else if partition.timestamp == TIMESTAMP_LATEST {
+                    match self.bounds(&topic.name).await {
+                        Ok((_, high_watermark)) => (ErrorCode::None, high_watermark),
+                        Err(error) => (error, -1),
+                    }
+                } else {
+                    // EARLIEST has no exact accessor and by-timestamp no
+                    // index behind it: refused by name, not answered with a
+                    // scan.
+                    tracing::warn!(
+                        topic = %topic.name,
+                        timestamp = partition.timestamp,
+                        "kafka ListOffsets refused: only LATEST (-1) is served in phase 1 (#225)"
+                    );
+                    (ErrorCode::UnsupportedVersion, -1)
+                };
+                partitions.push(ListOffsetsPartitionResponse {
+                    index: partition.index,
+                    error,
+                    timestamp: partition.timestamp,
+                    offset,
+                });
+            }
+            topics.push(ListOffsetsTopicResponse {
+                name: topic.name,
+                partitions,
+            });
+        }
+        topics
     }
 }
 
@@ -1075,6 +1096,72 @@ mod tests {
         assert!(read_fetch_all(&reply, 4)
             .iter()
             .all(|p| p.2.len() == one.len()));
+    }
+
+    /// One deadline for the whole request (review): two slow partitions do
+    /// not take two budgets.
+    #[tokio::test]
+    async fn a_produce_request_has_one_deadline_across_its_partitions() {
+        struct Slow(MemoryBridge);
+        impl Bridge for Slow {
+            fn topics(&self) -> Vec<String> {
+                self.0.topics()
+            }
+            fn produce(
+                &self,
+                topic: &str,
+                batches: &[RecordBatch],
+            ) -> Result<crate::bridge::Appended, ErrorCode> {
+                std::thread::sleep(Duration::from_millis(300));
+                self.0.produce(topic, batches)
+            }
+            fn fetch(
+                &self,
+                topic: &str,
+                offset: i64,
+                max_bytes: usize,
+            ) -> Result<Fetched, ErrorCode> {
+                self.0.fetch(topic, offset, max_bytes)
+            }
+            fn bounds(&self, topic: &str) -> Result<(i64, i64), ErrorCode> {
+                self.0.bounds(topic)
+            }
+        }
+        let (addr, _stop) = start(Arc::new(Slow(MemoryBridge::with_topics(["a", "b"])))).await;
+        let one = batch_bytes(&["x"], false);
+        let mut body = Encoder::new();
+        body.nullable_string(None);
+        body.i16(-1);
+        body.i32(200); // timeout_ms
+        body.array_len(2);
+        for topic in ["a", "b"] {
+            body.string(topic);
+            body.array_len(1);
+            body.i32(0);
+            body.nullable_bytes(Some(&one));
+        }
+        let started = std::time::Instant::now();
+        let reply = call(addr, 0, 8, 1, body.as_slice()).await.unwrap();
+        let held = started.elapsed();
+        assert!(
+            held < Duration::from_millis(500),
+            "one budget, not one per partition: {held:?}"
+        );
+        let mut d = Decoder::new(&reply);
+        assert_eq!(d.array_len("topics").unwrap(), Some(2));
+        let mut codes = Vec::new();
+        for _ in 0..2 {
+            d.string("topic").unwrap();
+            d.array_len("partitions").unwrap();
+            d.i32("index").unwrap();
+            codes.push(d.i16("error").unwrap());
+            d.i64("base").unwrap();
+            d.i64("append_time").unwrap();
+            d.i64("log_start").unwrap();
+            d.array_len("record_errors").unwrap();
+            d.nullable_string("message").unwrap();
+        }
+        assert_eq!(codes, vec![ErrorCode::RequestTimedOut.as_i16(); 2]);
     }
 
     /// An empty batch is refused (review): no backend answers it with an

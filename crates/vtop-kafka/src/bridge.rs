@@ -24,6 +24,9 @@ pub struct Appended {
     /// `-1` when the backend keeps the producer's timestamps (create time),
     /// which is what every phase-1 backend does.
     pub log_append_time_ms: i64,
+    /// The earliest offset still held after the append (review): what the
+    /// produce response advertises, from the backend's own floor.
+    pub log_start_offset: i64,
 }
 
 /// What a fetch found: zero or more encoded v2 batches, back to back, as
@@ -126,10 +129,15 @@ impl Bridge for MemoryBridge {
         let log = logs
             .get_mut(topic)
             .ok_or(ErrorCode::UnknownTopicOrPartition)?;
-        // Under ONE lock, so the set lands whole and contiguous.
+        // Under ONE lock, so the set lands whole and contiguous — and STAGED
+        // first (review): every batch is encoded before any is committed, so
+        // a batch the encoder refuses leaves the log untouched rather than
+        // half a set behind it.
         let set_base = log.next_offset;
+        let mut next_offset = log.next_offset;
+        let mut staged = Vec::with_capacity(batches.len());
         for batch in batches {
-            let base_offset = log.next_offset;
+            let base_offset = next_offset;
             // Re-based onto the offsets THIS log assigns: the producer's own
             // base offset is meaningless here, and a fetch must hand back
             // batches whose offsets are the ones it advertised.
@@ -150,16 +158,19 @@ impl Bridge for MemoryBridge {
                 &records,
             );
             let count = records.len() as i64;
-            log.batches.push(StoredBatch {
+            staged.push(StoredBatch {
                 base_offset,
                 last_offset: base_offset + count - 1,
                 bytes,
             });
-            log.next_offset = base_offset + count;
+            next_offset = base_offset + count;
         }
+        log.batches.extend(staged);
+        log.next_offset = next_offset;
         Ok(Appended {
             base_offset: set_base,
             log_append_time_ms: -1,
+            log_start_offset: log.batches.first().map_or(0, |b| b.base_offset),
         })
     }
 
