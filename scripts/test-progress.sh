@@ -331,10 +331,13 @@ def named(spec, package):
     # qualified pkgid (`path+file:///x#0.1.0`, `file:///x#name@0.1.0`);
     # match the forms a person types (review).
     name = package["name"]
-    if "#" in spec:
-        source, fragment = spec.rsplit("#", 1)
+    if "#" in spec or "://" in spec:
+        # A qualified spec: a source URL, with or without a fragment (review).
+        source, _, fragment = spec.partition("#")
         if source_of(source).rstrip("/") != source_of(package["id"]).rstrip("/"):
             return False
+        if not fragment:
+            return True
         if "@" in fragment:
             spec_name, wanted = fragment.split("@", 1)
             return spec_name == name and version_matches(wanted, package["version"])
@@ -386,7 +389,7 @@ if mode == "harnessless":
     # `[[bench]]` or `[[example]]` table with `harness = false`, matched to
     # the metadata target of the same kind and name for its source path.
     import tomllib
-    kinds = {"lib": ("lib",), "bin": ("bin",), "test": ("test",), "bench": ("bench",), "example": ("example",)}
+    kinds = {"lib": ("lib", "rlib", "proc-macro"), "bin": ("bin",), "test": ("test",), "bench": ("bench",), "example": ("example",)}
     for pid in roots:
         package = by_id[pid]
         root = os.path.dirname(package["manifest_path"])
@@ -406,8 +409,12 @@ if mode == "harnessless":
                     continue
                 name = entry.get("name") or package["name"].replace("-", "_")
                 for target in package["targets"]:
-                    if target["name"] == name and any(kind in target["kind"] for kind in want + ("rlib",)):
-                        print(os.path.relpath(target["src_path"], root))
+                    if target["name"] == name and any(kind in target["kind"] for kind in want):
+                        # ABSOLUTE, so two members with a `tests/shared.rs`
+                        # each stay two targets (review); the executable that
+                        # cargo names in its `Running` line is looked up from
+                        # this path in the build's own artifact stream.
+                        print(target["src_path"])
     sys.exit(0)
 if mode == "roots-for-targets":
     # Which selected roots a target selector reaches (review): `--lib` builds
@@ -415,19 +422,33 @@ if mode == "roots-for-targets":
     # that test, and so on; a package the selectors cannot reach is not in
     # the graph cargo compiles.
     selectors = extra
+    LIB = ("lib", "rlib", "proc-macro")
     def reached(package):
         for selector in selectors:
             if selector == "--all-targets":
                 return True
             flag, _, name = selector.partition("=")
-            kinds = {"--lib": ("lib", "rlib", "proc-macro"), "--bins": ("bin",), "--bin": ("bin",),
-                     "--tests": ("test", "lib", "rlib", "bin"), "--test": ("test",),
-                     "--examples": ("example",), "--example": ("example",),
-                     "--benches": ("bench",), "--bench": ("bench",)}.get(flag)
-            if not kinds:
-                continue
             for target in package["targets"]:
-                if any(kind in target["kind"] for kind in kinds) and (not name or target["name"] == name):
+                kind = target["kind"]
+                is_lib = any(k in kind for k in LIB)
+                # The plural selectors follow cargo's ELIGIBILITY flags where
+                # metadata carries them (review): `--tests` is every target
+                # with `test = true` plus the integration tests, whatever its
+                # kind; `--benches` would be `bench = true`, which metadata
+                # does not expose, so it falls back to kind. The named
+                # selectors are explicit and ignore the flags, as cargo does.
+                hit = {
+                    "--lib": is_lib,
+                    "--bins": "bin" in kind,
+                    "--bin": "bin" in kind and target["name"] == name,
+                    "--tests": "test" in kind or target.get("test", True) and (is_lib or "bin" in kind),
+                    "--test": "test" in kind and target["name"] == name,
+                    "--examples": "example" in kind,
+                    "--example": "example" in kind and target["name"] == name,
+                    "--benches": "bench" in kind or is_lib or "bin" in kind,
+                    "--bench": "bench" in kind and target["name"] == name,
+                }.get(flag, False)
+                if hit:
                     return True
         return False
     for pid in roots:
@@ -604,8 +625,27 @@ TOTAL_UNITS=$(( TOTAL_BINS + DOC_UNITS ))
 # Targets built with `harness = false` (review): cargo runs them like any
 # other test executable, but a custom harness owes libtest nothing, so no
 # `test result:` line closes them. Such a unit is counted finished when a
-# later status line follows it, or when cargo has exited.
-HARNESSLESS="$(closure harnessless)" || exit 2
+# later status line follows it, or when cargo has exited. They are known by
+# the EXECUTABLE cargo names in its `Running` line — mapped from the
+# target's source path through the build's own artifact stream — so two
+# members with a `tests/shared.rs` each are told apart (review).
+HARNESSLESS_SOURCES="$(closure harnessless)" || exit 2
+HARNESSLESS=""
+if [[ -n "$HARNESSLESS_SOURCES" && -f "$WORK/build.json" ]]; then
+  HARNESSLESS="$(python3 - "$WORK/build.json" <<'PY' "$HARNESSLESS_SOURCES"
+import json, os, sys
+sources = set(sys.argv[2].split("\n"))
+for line in open(sys.argv[1]):
+    try:
+        msg = json.loads(line)
+    except ValueError:
+        continue
+    exe = msg.get("executable")
+    if exe and msg.get("profile", {}).get("test") and msg.get("target", {}).get("src_path") in sources:
+        print(os.path.basename(exe))
+PY
+)"
+fi
 if (( ! doc_only && TOTAL_UNITS == 0 )); then
   # Nothing runnable AND no doctest target is not a passing suite: say so
   # and refuse to claim success. Zero binaries ALONE is not fatal — a library
@@ -623,6 +663,12 @@ ran=0; passed=0; failed=0; current="cargo test"
 stream=0
 case " ${bin_args[*]+"${bin_args[*]}"} " in
   *" --nocapture "*|*" --no-capture "*|*" --show-output "*|*" --list "*|*" --help "*|*" -h "*) stream=1 ;;
+esac
+# libtest also uncaptures on RUST_TEST_NOCAPTURE (review): output asked for
+# through the environment is output asked for.
+case "${RUST_TEST_NOCAPTURE:-}" in
+  ""|0) ;;
+  *) stream=1 ;;
 esac
 if (( stream )); then
   cargo test ${cargo_args[@]+"${cargo_args[@]}"} --no-fail-fast -- ${bin_args[@]+"${bin_args[@]}"} 2>&1 \
@@ -656,8 +702,10 @@ while :; do
   # once cargo is gone.
   ran="$(plain_log "$WORK/run.log" | grep -cE '^test result: ' || true)"
   ran="${ran:-0}"
+  # Each status line as the executable it names (a doctest unit names
+  # none, and is never a custom harness).
   statuses="$(plain_log "$WORK/run.log" | grep -E '^[[:space:]]+(Running|Doc-tests) ' \
-    | sed -E 's/^[[:space:]]+(Running|Doc-tests) (unittests )?//; s/ \(.*\)$//')"
+    | sed -E 's/^.*\(([^()]*)\)$/\1/; s|^.*/||; /^[[:space:]]+Doc-tests /d')"
   if [[ -n "$HARNESSLESS" && -n "$statuses" ]]; then
     custom_started="$(printf '%s\n' "$statuses" | grep -cxF -f <(printf '%s\n' "$HARNESSLESS") || true)"
     last_custom=0
@@ -696,7 +744,7 @@ if [[ "$RUN_RC" -ne 0 ]]; then
       BEGIN { n = split(set, names, "\n"); for (i = 1; i <= n; i++) if (names[i] != "") custom[names[i]] = 1 }
       /^[[:space:]]+(Running|Doc-tests) / {
         unit = $0
-        sub(/^[[:space:]]+(Running|Doc-tests) (unittests )?/, "", unit); sub(/ \(.*\)$/, "", unit)
+        sub(/^.*\(/, "", unit); sub(/\)$/, "", unit); sub(/^.*\//, "", unit)
         show = (unit in custom); if (show) print $0; next
       }
       show { print }'
