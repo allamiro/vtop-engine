@@ -27,7 +27,7 @@ CFG="$WORKDIR/data-standalone-kafka.yaml"
   # no vtop identity, so the listener admits whoever reaches it.
   echo "kafka: { listen: \"127.0.0.1:$KAFKA_PORT\" }"
 } | install_config "$CFG"
-TOPIC="$TOPIC"
+[[ -n "${TOPIC:-}" ]] || fail "lib.sh did not set TOPIC"
 
 PID="$(start_node "data-standalone-kafka" "data_node_ready" data --config "$CFG")"
 grep -q "kafka=127.0.0.1:$KAFKA_PORT" "$WORKDIR/logs/data-standalone-kafka.log" \
@@ -42,8 +42,14 @@ kafka_exchange() {
   local body_hex="$1"
   local len=$(( ${#body_hex} / 2 ))
   exec 3<>"/dev/tcp/127.0.0.1/$KAFKA_PORT"
-  printf "$(printf '\\x%02x\\x%02x\\x%02x\\x%02x' $(( (len >> 24) & 255 )) $(( (len >> 16) & 255 )) $(( (len >> 8) & 255 )) $(( len & 255 )))" >&3
-  printf "$(sed 's/../\\x&/g' <<<"$body_hex")" >&3
+  # Bytes as %b data, never as a format string: the length as four escapes,
+  # then every hex pair of the body as one.
+  local escaped i
+  escaped="$(printf '\\x%02x\\x%02x\\x%02x\\x%02x' $(( (len >> 24) & 255 )) $(( (len >> 16) & 255 )) $(( (len >> 8) & 255 )) $(( len & 255 )))"
+  for (( i = 0; i < ${#body_hex}; i += 2 )); do
+    escaped+="\\x${body_hex:i:2}"
+  done
+  printf '%b' "$escaped" >&3
   local reply_len_hex reply_len
   reply_len_hex="$(head -c 4 <&3 | od -An -tx1 | tr -d ' \n')"
   reply_len=$((16#$reply_len_hex))
