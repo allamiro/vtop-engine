@@ -337,44 +337,53 @@ impl Gateway {
                 "no records in the produce".to_owned(),
             ));
         };
-        let batch = RecordBatch::decode(records).map_err(|error| {
-            let code = match &error {
-                BatchError::Compressed { .. } => ErrorCode::UnsupportedCompressionType,
-                BatchError::Transactional | BatchError::Control => {
-                    ErrorCode::UnsupportedForMessageFormat
-                }
-                BatchError::CrcMismatch { .. } => ErrorCode::CorruptMessage,
-                BatchError::UnsupportedMagic { .. } => ErrorCode::UnsupportedForMessageFormat,
-                _ => ErrorCode::InvalidRecord,
-            };
-            (code, error.to_string())
-        })?;
-        if let Some(index) = batch.records.iter().position(|r| !r.headers.is_empty()) {
-            // Refused rather than dropped: a record's headers have nowhere to
-            // go in the native log today, and losing them silently is not a
-            // translation.
+        // EVERY batch the field carries (review): a RECORDS field may hold
+        // several back to back, and the decoder stops at the first one's
+        // declared length by design. All are decoded and judged before any
+        // is appended, so a refusal appends nothing.
+        let batches = split_batches(records)?;
+        if batches.is_empty() {
             return Err((
                 ErrorCode::InvalidRecord,
-                format!(
-                    "record {index} carries {} header(s), and the native log has nowhere to keep \
-                     them (#225): headers are refused rather than dropped",
-                    batch.records[index].headers.len()
-                ),
+                "no batches in the produce".to_owned(),
             ));
+        }
+        for (which, batch) in batches.iter().enumerate() {
+            if let Some(index) = batch.records.iter().position(|r| !r.headers.is_empty()) {
+                // Refused rather than dropped: a record's headers have
+                // nowhere to go in the native log today, and losing them
+                // silently is not a translation.
+                return Err((
+                    ErrorCode::InvalidRecord,
+                    format!(
+                        "batch {which} record {index} carries {} header(s), and the native log has \
+                         nowhere to keep them (#225): headers are refused rather than dropped",
+                        batch.records[index].headers.len()
+                    ),
+                ));
+            }
         }
         let bridge = Arc::clone(&self.bridge);
         let topic = topic.to_owned();
         // The bridge is synchronous and a real one fsyncs: off the runtime's
-        // threads, the way the broker's own session loop does it.
-        tokio::task::spawn_blocking(move || bridge.produce(&topic, &batch))
-            .await
-            .map_err(|join| {
-                (
-                    ErrorCode::RequestTimedOut,
-                    format!("produce task failed: {join}"),
-                )
-            })?
-            .map_err(|code| (code, format!("the bridge refused the append with {code:?}")))
+        // threads, the way the broker's own session loop does it. Appended in
+        // order; the first batch's base offset is the partition's answer.
+        tokio::task::spawn_blocking(move || {
+            let mut first = None;
+            for batch in &batches {
+                let appended = bridge.produce(&topic, batch)?;
+                first.get_or_insert(appended);
+            }
+            Ok::<_, ErrorCode>(first.expect("at least one batch"))
+        })
+        .await
+        .map_err(|join| {
+            (
+                ErrorCode::RequestTimedOut,
+                format!("produce task failed: {join}"),
+            )
+        })?
+        .map_err(|code| (code, format!("the bridge refused the append with {code:?}")))
     }
 
     async fn fetch(&self, request: FetchRequest) -> Vec<FetchTopicResponse> {
@@ -384,20 +393,40 @@ impl Gateway {
         let wait = Duration::from_millis(request.max_wait_ms.max(0) as u64)
             .min(self.config.max_fetch_wait);
         let deadline = tokio::time::Instant::now() + wait;
+        let min_bytes = usize::try_from(request.min_bytes.max(0)).unwrap_or(usize::MAX);
         loop {
             let mut topics = Vec::with_capacity(request.topics.len());
-            let mut any_data = false;
+            // ONE budget for the whole response (review), not one per
+            // partition: the first partition with data keeps its
+            // at-least-one-batch guarantee, and once the budget is spent the
+            // rest report their watermarks without asking for records.
+            let mut remaining = usize::try_from(request.max_bytes.max(1)).unwrap_or(usize::MAX);
+            let mut total = 0_usize;
+            let mut any_error = false;
             for topic in &request.topics {
                 let mut partitions = Vec::with_capacity(topic.partitions.len());
                 for partition in &topic.partitions {
                     let outcome = if partition.index != 0 {
                         Err(ErrorCode::UnknownTopicOrPartition)
+                    } else if remaining == 0 {
+                        let bridge = Arc::clone(&self.bridge);
+                        let name = topic.name.clone();
+                        tokio::task::spawn_blocking(move || {
+                            bridge.high_watermark(&name).map(|high_watermark| Fetched {
+                                records: Vec::new(),
+                                high_watermark,
+                                log_start_offset: 0,
+                            })
+                        })
+                        .await
+                        .unwrap_or(Err(ErrorCode::RequestTimedOut))
                     } else {
                         let bridge = Arc::clone(&self.bridge);
                         let name = topic.name.clone();
-                        let (offset, max_bytes) = (partition.fetch_offset, partition.max_bytes);
-                        let budget =
-                            usize::try_from(max_bytes.min(request.max_bytes).max(1)).unwrap_or(1);
+                        let offset = partition.fetch_offset;
+                        let budget = usize::try_from(partition.max_bytes.max(1))
+                            .unwrap_or(usize::MAX)
+                            .min(remaining);
                         tokio::task::spawn_blocking(move || bridge.fetch(&name, offset, budget))
                             .await
                             .unwrap_or(Err(ErrorCode::RequestTimedOut))
@@ -408,7 +437,8 @@ impl Gateway {
                             high_watermark,
                             log_start_offset,
                         }) => {
-                            any_data |= !records.is_empty();
+                            total += records.len();
+                            remaining = remaining.saturating_sub(records.len());
                             FetchPartitionResponse {
                                 index: partition.index,
                                 error: ErrorCode::None,
@@ -418,7 +448,7 @@ impl Gateway {
                             }
                         }
                         Err(error) => {
-                            any_data = true; // an error is an answer; do not wait on it
+                            any_error = true; // an error is an answer; do not wait on it
                             FetchPartitionResponse {
                                 index: partition.index,
                                 error,
@@ -436,8 +466,10 @@ impl Gateway {
             }
             // The long poll, emulated (#225 surface map): the broker answers
             // "nothing yet" at once, so waiting for `max_wait_ms` happens
-            // here, by asking again until there is data or the wait is up.
-            if any_data || tokio::time::Instant::now() >= deadline {
+            // here, by asking again until `min_bytes` is met (review) — zero
+            // returns at once — or the wait is up, when whatever is there is
+            // the answer.
+            if any_error || total >= min_bytes || tokio::time::Instant::now() >= deadline {
                 return topics;
             }
             tokio::time::sleep(
@@ -491,6 +523,49 @@ impl Gateway {
             })
             .collect()
     }
+}
+
+/// Every batch in a RECORDS field, each decoded and judged, in order.
+fn split_batches(mut bytes: &[u8]) -> Result<Vec<RecordBatch>, (ErrorCode, String)> {
+    let mut batches = Vec::new();
+    while !bytes.is_empty() {
+        if bytes.len() < 12 {
+            return Err((
+                ErrorCode::InvalidRecord,
+                format!("{} trailing byte(s) after the last batch", bytes.len()),
+            ));
+        }
+        let declared = i32::from_be_bytes(bytes[8..12].try_into().expect("four bytes"));
+        let len = usize::try_from(declared)
+            .ok()
+            .and_then(|n| n.checked_add(12))
+            .filter(|n| *n <= bytes.len())
+            .ok_or_else(|| {
+                (
+                    ErrorCode::InvalidRecord,
+                    format!(
+                        "batch {} declares {declared} byte(s) but {} remain",
+                        batches.len(),
+                        bytes.len() - 12
+                    ),
+                )
+            })?;
+        let batch = RecordBatch::decode(&bytes[..len]).map_err(|error| {
+            let code = match &error {
+                BatchError::Compressed { .. } => ErrorCode::UnsupportedCompressionType,
+                BatchError::Transactional | BatchError::Control => {
+                    ErrorCode::UnsupportedForMessageFormat
+                }
+                BatchError::CrcMismatch { .. } => ErrorCode::CorruptMessage,
+                BatchError::UnsupportedMagic { .. } => ErrorCode::UnsupportedForMessageFormat,
+                _ => ErrorCode::InvalidRecord,
+            };
+            (code, format!("batch {}: {error}", batches.len()))
+        })?;
+        batches.push(batch);
+        bytes = &bytes[len..];
+    }
+    Ok(batches)
 }
 
 #[cfg(test)]
@@ -620,28 +695,46 @@ mod tests {
         offset: i64,
         max_wait_ms: i32,
     ) -> Vec<u8> {
+        fetch_body_sized(
+            version,
+            &[(topic, partition, offset)],
+            max_wait_ms,
+            1,
+            1 << 20,
+        )
+    }
+
+    fn fetch_body_sized(
+        version: i16,
+        partitions: &[(&str, i32, i64)],
+        max_wait_ms: i32,
+        min_bytes: i32,
+        max_bytes: i32,
+    ) -> Vec<u8> {
         let mut e = Encoder::new();
         e.i32(-1);
         e.i32(max_wait_ms);
-        e.i32(1);
-        e.i32(1 << 20);
+        e.i32(min_bytes);
+        e.i32(max_bytes);
         e.i8(1); // read_committed: served as the watermark, honestly
         if version >= 7 {
             e.i32(0);
             e.i32(-1);
         }
-        e.array_len(1);
-        e.string(topic);
-        e.array_len(1);
-        e.i32(partition);
-        if version >= 9 {
-            e.i32(-1);
+        e.array_len(partitions.len());
+        for (topic, partition, offset) in partitions {
+            e.string(topic);
+            e.array_len(1);
+            e.i32(*partition);
+            if version >= 9 {
+                e.i32(-1);
+            }
+            e.i64(*offset);
+            if version >= 5 {
+                e.i64(0);
+            }
+            e.i32(1 << 20);
         }
-        e.i64(offset);
-        if version >= 5 {
-            e.i64(0);
-        }
-        e.i32(1 << 16);
         if version >= 7 {
             e.array_len(0);
         }
@@ -653,28 +746,39 @@ mod tests {
 
     /// (error, high watermark, records bytes) of the first partition.
     fn read_fetch(reply: &[u8], version: i16) -> (i16, i64, Vec<u8>) {
+        read_fetch_all(reply, version).remove(0)
+    }
+
+    /// (error, high watermark, records bytes) of every partition, in order.
+    fn read_fetch_all(reply: &[u8], version: i16) -> Vec<(i16, i64, Vec<u8>)> {
         let mut d = Decoder::new(reply);
         d.i32("throttle").unwrap();
         if version >= 7 {
             d.i16("error").unwrap();
             d.i32("session").unwrap();
         }
-        d.array_len("topics").unwrap();
-        d.string("topic").unwrap();
-        d.array_len("partitions").unwrap();
-        d.i32("index").unwrap();
-        let error = d.i16("error").unwrap();
-        let hwm = d.i64("hwm").unwrap();
-        d.i64("lso").unwrap();
-        if version >= 5 {
-            d.i64("log_start").unwrap();
+        let mut out = Vec::new();
+        let topics = d.array_len("topics").unwrap().unwrap();
+        for _ in 0..topics {
+            d.string("topic").unwrap();
+            let partitions = d.array_len("partitions").unwrap().unwrap();
+            for _ in 0..partitions {
+                d.i32("index").unwrap();
+                let error = d.i16("error").unwrap();
+                let hwm = d.i64("hwm").unwrap();
+                d.i64("lso").unwrap();
+                if version >= 5 {
+                    d.i64("log_start").unwrap();
+                }
+                d.array_len("aborted").unwrap();
+                if version >= 11 {
+                    d.i32("preferred").unwrap();
+                }
+                let records = d.nullable_bytes("records").unwrap().unwrap_or(&[]).to_vec();
+                out.push((error, hwm, records));
+            }
         }
-        d.array_len("aborted").unwrap();
-        if version >= 11 {
-            d.i32("preferred").unwrap();
-        }
-        let records = d.nullable_bytes("records").unwrap().unwrap_or(&[]).to_vec();
-        (error, hwm, records)
+        out
     }
 
     fn decode_all(mut bytes: &[u8]) -> Vec<RecordBatch> {
@@ -845,6 +949,109 @@ mod tests {
             d.i64("timestamp").unwrap();
             assert_eq!(d.i64("offset").unwrap(), 3, "LATEST is the next offset");
         }
+    }
+
+    /// A RECORDS field holding two batches appends both (review): the
+    /// decoder's stop at the first declared length is not the set's end.
+    #[tokio::test]
+    async fn every_batch_in_a_produce_set_is_appended_in_order() {
+        let (addr, _stop) = start(Arc::new(MemoryBridge::with_topics(["events"]))).await;
+        let mut set = batch_bytes(&["a", "b"], false);
+        set.extend_from_slice(&batch_bytes(&["c"], false));
+        let reply = call(addr, 0, 3, 1, &produce_body("events", 0, -1, None, &set))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_produce(&reply, 3),
+            (0, 0, None),
+            "the first batch's base offset"
+        );
+        let reply = call(addr, 1, 4, 2, &fetch_body(4, "events", 0, 0, 0))
+            .await
+            .unwrap();
+        let (_, hwm, records) = read_fetch(&reply, 4);
+        assert_eq!(hwm, 3);
+        let batches = decode_all(&records);
+        assert_eq!((batches.len(), batches[1].base_offset), (2, 2));
+
+        // A bad batch anywhere in the set appends nothing.
+        let mut set = batch_bytes(&["d"], false);
+        set.extend_from_slice(&batch_bytes(&["e"], true));
+        let reply = call(addr, 0, 8, 3, &produce_body("events", 0, -1, None, &set))
+            .await
+            .unwrap();
+        let (error, _, message) = read_produce(&reply, 8);
+        assert_eq!(error, ErrorCode::InvalidRecord.as_i16());
+        assert!(message.unwrap().starts_with("batch 1 record 0"));
+        let reply = call(addr, 1, 4, 4, &fetch_body(4, "events", 0, 0, 0))
+            .await
+            .unwrap();
+        assert_eq!(read_fetch(&reply, 4).1, 3, "nothing appended");
+    }
+
+    /// One byte budget per response (review): the second partition gets
+    /// what the first left, and reports its watermark when nothing is left.
+    #[tokio::test]
+    async fn the_fetch_budget_is_spent_once_across_partitions() {
+        let bridge = Arc::new(MemoryBridge::with_topics(["a", "b"]));
+        let (addr, _stop) = start(bridge).await;
+        let one = batch_bytes(&["0123456789"], false);
+        call(addr, 0, 3, 1, &produce_body("a", 0, -1, None, &one))
+            .await
+            .unwrap();
+        call(addr, 0, 3, 2, &produce_body("b", 0, -1, None, &one))
+            .await
+            .unwrap();
+        let body = fetch_body_sized(4, &[("a", 0, 0), ("b", 0, 0)], 0, 1, one.len() as i32);
+        let reply = call(addr, 1, 4, 3, &body).await.unwrap();
+        let parts = read_fetch_all(&reply, 4);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(
+            (parts[0].0, parts[0].1, parts[0].2.len()),
+            (0, 1, one.len())
+        );
+        assert_eq!(
+            (parts[1].0, parts[1].1, parts[1].2.len()),
+            (0, 1, 0),
+            "budget spent: watermark only"
+        );
+        let body = fetch_body_sized(4, &[("a", 0, 0), ("b", 0, 0)], 0, 1, 2 * one.len() as i32);
+        let reply = call(addr, 1, 4, 4, &body).await.unwrap();
+        assert!(read_fetch_all(&reply, 4)
+            .iter()
+            .all(|p| p.2.len() == one.len()));
+    }
+
+    /// `min_bytes` gates the poll (review): above what exists it holds to
+    /// the deadline and answers with what there is; zero answers at once.
+    #[tokio::test]
+    async fn min_bytes_holds_the_poll_and_zero_does_not() {
+        let (addr, _stop) = start(Arc::new(MemoryBridge::with_topics(["events"]))).await;
+        call(
+            addr,
+            0,
+            3,
+            1,
+            &produce_body("events", 0, -1, None, &batch_bytes(&["a"], false)),
+        )
+        .await
+        .unwrap();
+        let started = std::time::Instant::now();
+        let body = fetch_body_sized(4, &[("events", 0, 0)], 200, 1 << 20, 1 << 20);
+        let reply = call(addr, 1, 4, 2, &body).await.unwrap();
+        assert!(
+            !read_fetch(&reply, 4).2.is_empty(),
+            "what there is, at the deadline"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        let started = std::time::Instant::now();
+        let body = fetch_body_sized(4, &[("events", 0, 1)], 2_000, 0, 1 << 20);
+        let reply = call(addr, 1, 4, 3, &body).await.unwrap();
+        assert!(read_fetch(&reply, 4).2.is_empty());
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "min_bytes 0 returns at once"
+        );
     }
 
     #[tokio::test]
