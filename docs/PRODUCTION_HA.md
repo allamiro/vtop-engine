@@ -679,7 +679,7 @@ path needed by the distributed options is already implemented (§6.3).
 | `checksum.algorithm` | `sha256` \| `blake3` \| disabled |
 | `manifest_mac_key_env` | optional env-var name for the 32-byte hex manifest MAC key; the secret is not serialized |
 | `sources.kafka.*` | brokers, group, include/exclude, `enable_auto_commit:false` |
-| `sources.file.*` | paths, `delete_after_commit`, `whole_file` |
+| `sources.file.*` | paths, `delete_after_commit`, `whole_file`. Two directory entries naming one file — a symlink beside its target, two hard links — are **two sources** by ruling (#378): each is archived under its own name, so the file's records are archived twice, and discovery warns once per alias group naming every spelling. Narrow the patterns to one spelling if one source is meant. There is no merge and no knob, because a merge needs a cursor identity that survives an alias being removed and none is safe: keyed by the surviving spelling, `delete_after_commit` removes it and the target is re-read from zero; keyed by inode, a freed inode reused by a new file inherits the old cursor and that file's opening records are skipped. A duplicate costs storage; a merge risks data. |
 | `sources.syslog_spool.*` | spool paths |
 | `upload.backend` | `s3_native` \| `s3cmd` \| `awscli` \| `minio` \| `localfs` \| `mock` |
 | `upload.bucket` | bucket (supports `telemetry-{format}`) |
