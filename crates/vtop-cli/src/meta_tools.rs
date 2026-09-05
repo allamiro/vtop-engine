@@ -1033,6 +1033,7 @@ async fn run_inner(command: MetaCommand, json: bool) -> Result<(), String> {
                     crate::node_tools::epoch_vectors(
                         path,
                         std::time::Duration::from_millis(replica_timeout_ms),
+                        range_uuid,
                     )
                     .await?,
                 ),
