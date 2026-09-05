@@ -601,6 +601,104 @@ fn delayed_follower_fsync_is_independent_of_network() {
     c.assert_invariants();
 }
 
+/// A thin pipe toward one follower (#403): the follower falls behind by
+/// exactly what the budget permits and no further, the leader keeps
+/// committing on the majority that is not starved, the bytes waiting behind
+/// the pipe are bounded by what was produced, and when the pipe opens the
+/// follower catches up without a restart. Record cost here is key plus
+/// value: `k` + `vN` = 3 bytes for a single-digit N.
+#[test]
+fn a_bandwidth_starved_follower_lags_by_its_budget_and_recovers() {
+    let mut c = boot_cluster(SEED ^ 0x40);
+    c.produce(0)
+        .unwrap_or_else(|e| panic!("{}: {e:?}", c.ctx()));
+    assert_eq!(c.followers[0].local_committed_offset(), 1, "{}", c.ctx());
+
+    // One byte per tick, three bytes of burst: a 3-byte record crosses every
+    // third tick. Each produce is one tick.
+    c.replica_set.set_follower_fault(
+        0,
+        FollowerNetworkFault {
+            bytes_per_tick: 1,
+            burst_bytes: 3,
+            ..FollowerNetworkFault::default()
+        },
+    );
+    // The bucket starts full: sequence 1 crosses at once and empties it.
+    c.produce(1)
+        .unwrap_or_else(|e| panic!("{}: {e:?}", c.ctx()));
+    assert_eq!(c.followers[0].local_committed_offset(), 2, "{}", c.ctx());
+    assert_eq!(
+        c.replica_set.pending_stats().delayed_bytes,
+        0,
+        "{}",
+        c.ctx()
+    );
+    // Sequences 2 and 3 wait behind the pipe (budget 1, then 2, of the 3
+    // each needs); the leader still commits on follower 1 and itself.
+    c.produce(2)
+        .unwrap_or_else(|e| panic!("{}: {e:?}", c.ctx()));
+    c.produce(3)
+        .unwrap_or_else(|e| panic!("{}: {e:?}", c.ctx()));
+    assert_eq!(c.followers[0].local_committed_offset(), 2, "{}", c.ctx());
+    assert_eq!(c.followers[1].local_committed_offset(), 4, "{}", c.ctx());
+    assert_eq!(
+        c.cluster_committed.get(),
+        4,
+        "{}: the unstarved majority commits",
+        c.ctx()
+    );
+    assert_eq!(
+        c.replica_set.pending_stats().delayed_bytes,
+        6,
+        "{}: exactly the two held records wait behind the pipe",
+        c.ctx()
+    );
+    // The fourth produce refills the bucket to 3: sequence 2 crosses,
+    // sequences 3 and 4 wait — one record per three ticks, as budgeted.
+    c.produce(4)
+        .unwrap_or_else(|e| panic!("{}: {e:?}", c.ctx()));
+    assert_eq!(c.followers[0].local_committed_offset(), 3, "{}", c.ctx());
+    assert_eq!(
+        c.replica_set.pending_stats().delayed_bytes,
+        6,
+        "{}",
+        c.ctx()
+    );
+
+    // Time alone releases the queue at the pipe's rate: three ticks, one
+    // record; six more, the last — budget never accrues past the burst.
+    c.replica_set.advance_tick(3);
+    assert_eq!(c.followers[0].local_committed_offset(), 4, "{}", c.ctx());
+    c.replica_set.advance_tick(6);
+    assert_eq!(c.followers[0].local_committed_offset(), 5, "{}", c.ctx());
+    assert_eq!(
+        c.replica_set.pending_stats().delayed_bytes,
+        0,
+        "{}",
+        c.ctx()
+    );
+
+    // Opening the pipe (clearing the fault, then draining) delivers what
+    // it still held, and the range converges without anyone restarting.
+    c.produce(5)
+        .unwrap_or_else(|e| panic!("{}: {e:?}", c.ctx()));
+    assert_eq!(
+        c.followers[0].local_committed_offset(),
+        5,
+        "{}: held again",
+        c.ctx()
+    );
+    c.replica_set.clear_follower_fault(0);
+    c.replica_set.drain_all();
+    assert_eq!(c.followers[0].local_committed_offset(), 6, "{}", c.ctx());
+    assert_eq!(c.followers[1].local_committed_offset(), 6, "{}", c.ctx());
+    assert_eq!(c.cluster_committed.get(), 6, "{}", c.ctx());
+    c.produce(6)
+        .unwrap_or_else(|e| panic!("{}: {e:?}", c.ctx()));
+    c.assert_invariants();
+}
+
 #[test]
 fn network_loss_dup_reorder_delay_and_catch_up() {
     let mut c = boot_cluster(SEED ^ 0x20);
