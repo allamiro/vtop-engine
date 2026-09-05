@@ -234,44 +234,38 @@ fn sdk_failure<E>(operation: &str, target: &str, error: SdkError<E, HttpResponse
 where
     E: std::error::Error + ProvideErrorMetadata + Send + Sync + 'static,
 {
-    match error {
-        SdkError::ServiceError(context) => {
-            let status = context.raw().status().as_u16();
-            let code = context.err().code().map(str::to_owned);
-            let detail = format!(
-                "{operation} {target}: {} (http {status}{})",
-                context.err(),
-                code.as_deref()
-                    .map(|code| format!(", {code}"))
-                    .unwrap_or_default()
-            );
-            if crate::base::is_throttle_status(status)
-                || code.as_deref().is_some_and(crate::base::is_throttle_code)
-            {
-                VtopError::UploadThrottled(detail)
-            } else {
-                VtopError::Upload(detail)
-            }
-        }
-        // A 429/503 whose body the SDK could not parse as an S3 error — a
-        // proxy's HTML, an empty body — arrives as a response error with the
-        // raw status still attached (review). It is the same throttle.
-        SdkError::ResponseError(context) => {
-            let status = context.raw().status().as_u16();
-            let detail = format!(
-                "{operation} {target}: unparseable response (http {status}): {}",
-                DisplayErrorContext(context.err())
-            );
-            if crate::base::is_throttle_status(status) {
-                VtopError::UploadThrottled(detail)
-            } else {
-                VtopError::Upload(detail)
-            }
-        }
-        other => VtopError::Upload(format!(
-            "{operation} {target}: {}",
-            DisplayErrorContext(&other)
-        )),
+    // The wire facts, from whichever variant kept them: a service error has
+    // a status and usually a code; a response the SDK could not parse as an
+    // S3 error document — a proxy's HTML, an empty body — still has its
+    // status (review), and a 429/503 there is the same throttle.
+    let (status, code) = match &error {
+        SdkError::ServiceError(context) => (
+            Some(context.raw().status().as_u16()),
+            context.err().code().map(str::to_owned),
+        ),
+        SdkError::ResponseError(context) => (Some(context.raw().status().as_u16()), None),
+        _ => (None, None),
+    };
+    let detail = match (&error, status) {
+        (SdkError::ServiceError(context), Some(status)) => format!(
+            "{operation} {target}: {} (http {status}{})",
+            context.err(),
+            code.as_deref()
+                .map(|code| format!(", {code}"))
+                .unwrap_or_default()
+        ),
+        (_, Some(status)) => format!(
+            "{operation} {target}: unparseable response (http {status}): {}",
+            DisplayErrorContext(&error)
+        ),
+        _ => format!("{operation} {target}: {}", DisplayErrorContext(&error)),
+    };
+    let throttled = status.is_some_and(crate::base::is_throttle_status)
+        || code.as_deref().is_some_and(crate::base::is_throttle_code);
+    if throttled {
+        VtopError::UploadThrottled(detail)
+    } else {
+        VtopError::Upload(detail)
     }
 }
 
