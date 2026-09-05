@@ -287,7 +287,7 @@ the pod would sit in CreateContainerConfigError saying so less clearly.
 {{- if .Values.meta.transitionMacKey.secretName -}}
 {{- range .Values.extraEnv -}}
 {{- if eq (toString .name) "VTOP_TRANSITION_MAC_KEY" -}}
-{{- fail "\n\nextraEnv sets VTOP_TRANSITION_MAC_KEY while meta.transitionMacKey.secretName is set: the chart injects that variable from the Secret, and a second entry would override it. Remove it from extraEnv, or unset meta.transitionMacKey.secretName to supply the key yourself." -}}
+{{- fail "\n\nextraEnv sets VTOP_TRANSITION_MAC_KEY while meta.transitionMacKey.secretName is set: the chart injects that variable from the Secret, and a second entry would override it. Remove it from extraEnv, or unset meta.transitionMacKey.secretName to leave transitions unsigned — the config field that makes the node read the variable is rendered only from the Secret reference." -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
