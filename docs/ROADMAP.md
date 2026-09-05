@@ -271,15 +271,125 @@ conformance gap the engine has never claimed to close.
   hard dependency of some planes rather than a configured capability
   (#294).
 
-## v0.5.0 and beyond
+## v0.5.0 — compatibility, and the numbers behind the claims
 
-The theme is **compatibility**: the Kafka wire-protocol gateway over the
-native broker (#225), whose phase 1 — wire codec, RecordBatch v2, the
-version gate — is reviewed and ready. Around it: TLS as a configured
-capability across every deployment method (#294), a chart that separates
-metadata from data (#287), the FIPS story (#296), the adaptive source and
-target I/O arc (#100 #101 #102) with the measurements that gate it
-(#98 #130), the #240 remainder, and the inode-alias question (#378).
+The theme is **speaking a protocol the ecosystem already speaks, without
+giving up what the native plane proves**. Every item shipped as bounded
+slices behind bot review; the ones that were measurements rather than
+behavior were run, posted with their caveats, and closed on what the numbers
+said.
+
+- **The Kafka wire-compatibility gateway, phase 1 (#225).** `vtop-kafka`
+  speaks ApiVersions, Metadata, Produce, Fetch and ListOffsets (LATEST and
+  EARLIEST) over a `Bridge` seam whose native backend appends onto
+  `LocalBroker` under a minted producer epoch and one sequence space (#350
+  laid the wire codec; #447 the listener, the bridge and the native
+  backend). A leader or standalone serves it beside its native plane from a
+  `kafka:` block (#452): the producer identity is derived from the
+  principal and never equal to it, the gateway drains and is joined before
+  the lease is released, a listener failure ends the node, and a stock
+  client's default 10,000-record batch is appended in as many native
+  appends as the replica plane can frame. The acceptance is live-chaos
+  scenario 17 (#455): librdkafka produces 20,000 keyed records with
+  `acks=all` through the gateway on a leader with two followers as one
+  stream, a follower is SIGKILLed while that stream is provably mid-flight,
+  the same process finishes clean, the same client reads everything back
+  byte-exact, and the sealed segments verify. It runs in CI on every push.
+- **TLS as a configured capability (#294).** Every plane's transport is a
+  knob — `tls`, `plaintext`, `plaintext_on_any_interface` — with TLS the
+  default and plaintext a choice the config makes you name (#436, #432); a
+  plaintext plane off loopback, a plaintext admin plane promoted into a
+  leased cluster, and an admin policy the transport cannot enforce are
+  refused by name; a peer speaking the other transport is refused as
+  cross-mode rather than as a bare handshake failure; the observability
+  endpoint serves TLS, mutual when a client CA is given (#443); scenario 15
+  boots a whole cluster on loopback without a certificate (#445); and the
+  chart carries the knobs with `acknowledgePlaintext` as the named choice
+  (#450).
+- **A chart with two tiers (#287).** `deployment.mode: separated` renders a
+  metadata tier and a data tier that scale apart (#390, #431), and the kind
+  smoke runs its replicated pass twice, co-located and then separated
+  (#434).
+- **The failover recovery protocol, completed (#240).** The acknowledged
+  floor survives restarts (#402); verify names records by position (#415);
+  the boundary marker exists, publishes on proof and hides from consumers
+  (#417, #428); every grant leaves a signed transition record the holder
+  fills in (#430, #437 for the chart's key); and `vtopctl meta transitions`
+  audits a range's leadership chain against the identity asked for, each
+  replica's epoch vector held to it (#438 and its follow-up). The one item
+  that is a design decision rather than a slice is #449.
+- **The adaptive upload side (#102).** A throttle is told apart from every
+  other upload failure (#433) and the upload width follows the store's
+  throttles by AIMD (#441, `batching.adaptive_width`, off by default). The
+  latency term stayed out on purpose: the throttle signal is unambiguous
+  and the latency one is not.
+- **Two directory entries for one inode are two sources (#378).** Ruled, not
+  knobbed: no cursor identity survives one alias being removed safely, so
+  there is no merge; a grown alias group warns again, naming what changed
+  (#398).
+- **Bandwidth-shaped runs (#403).** A thin pipe is a fault the harness can
+  inject — the broker's appends released by a token bucket (#440) — and the
+  benchmark lab shapes the upload plane through toxiproxy (#446): the proxy
+  is claimed atomically, the toxics are named per run, and the shape rides
+  every result view so a p95 is never read without the pipe it was
+  measured through.
+
+### What the measurements said
+
+Both measurement issues ran on a busy laptop under Docker Desktop, not the
+quiet machine they asked for; the **shapes** below are stable across cells
+and the **absolute numbers** are not quotable.
+
+- **The sweep grid (#130)**: 112 cells, zero failures. zstd:1 and zstd:3
+  dominate on throughput per CPU at the same ratio band as gzip:6, which
+  costs 2–4× the CPU; gzip:9 and zstd:9 buy almost no ratio; and throughput
+  is flat across codecs, which points the next lever at the pipeline's
+  serialisation rather than the codec. The topic-count dimension runs 1, 8,
+  28 and 100 topics: the read phase is the poll window at every count (253
+  to 255 ms), so topic count costs about one percent at 100 — the
+  pre-#96 "N topics cost N poll waits" hypothesis is falsified. Getting
+  that row took three harness fixes (#456).
+- **The sustained-backpressure soak (#98)**: five minutes at 200k rec/s
+  against an engine reading ≈6k. Buffers stayed bounded (the gauge counts
+  open per-partition buffers, not a queue), RSS plateaued near 125 MB, the
+  ledger's committed history is pruned (114 KB after 147 batches; the WAL
+  is checkpointed), `commits_total ≤ verified_total` held at every sample,
+  and retention loss is **counted and warned**, not silent:
+  `vtop_retention_lost_records_total` recorded 27,582,996 records when the
+  broker's retention outran the engine. What is missing is the alert on
+  that counter (#454). 1M rec/s remains undemonstrated on this hardware for
+  a lab-host reason: Docker Desktop's embedded DNS fails under that load.
+
+### Known limitations in v0.5.0
+
+- The gateway is **phase 1**: no consumer groups, no idempotent producers
+  (InitProducerId is refused by name, so a retry after a timeout can
+  duplicate), no transactions; one partition per range; a set larger than
+  one native append is appended in order and a failure between appends
+  leaves the prefix durable. Phase 2 is #457, phase 3 is #458.
+- **The replica plane refuses an oversized frame silently** (#453): a
+  follower drops an append above `DEFAULT_MAX_RECORDS` at decode and the
+  leader reports a quorum that never arrives. The gateway splits around it;
+  the plane should refuse by name.
+- **A published high-water mark may still regress across a leader change**
+  (#449): two majority-sized answer sets need share only one member, and
+  nothing yet holds a promotion's published watermark to the previous one.
+- **Retention loss is counted but not on a dashboard** (#454).
+- **The kind smoke flakes on cluster DNS under a loaded runner** (#416):
+  one-shot deadlines meeting a slow runner, passing on rerun.
+- **The benchmark numbers carry the busy-laptop caveat** stated above; a
+  quiet-machine run would tighten them, not change their shape.
+
+## v0.6.0 and beyond
+
+The theme is **the gateway's second phase and the evidence gaps the first
+one exposed**: consumer groups and idempotent producers over lineage-bound
+cursors (#457), then per-topic virtualization with verifiable offset
+translation (#458); the replica plane refusing what it cannot frame (#453);
+the published watermark that never regresses (#449); the retention-loss
+alert (#454); a kind suite that waits on conditions rather than deadlines
+(#416). Behind those: the FIPS story (#296) and the adaptive source side
+(#100, #101) whose target side shipped here.
 
 ---
 
