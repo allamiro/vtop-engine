@@ -552,6 +552,14 @@ await_shape_dns() { # each tier's peers must resolve each other (#416)
     await_peer_dns "$R_NS" "$META_POD" "$META_HEADLESS"
   fi
 }
+bounded_logs() { # <pod> <tail> [kubectl logs flags...] — one bounded fetch (review)
+  # Bounded on every axis a hung API path can stretch: the client wait, the
+  # server-side request, and the response size — so a failure report is
+  # reached rather than waited for.
+  local pod="$1" tail="$2"; shift 2
+  timeout 30 kubectl -n "$R_NS" logs "$pod" --tail="$tail" --request-timeout=20s \
+    --limit-bytes=200000 "$@" 2>&1 || true
+}
 await_capacity_reclaimed() { # <what comes next> — the same wait the standalone release does
   local remaining="unknown" pods
   for _ in $(seq 1 60); do
@@ -701,7 +709,7 @@ done
 [ -n "$r_init" ] || {
   vtopctl meta init --members 1,2,3 --config "$WORK/r-admin.yaml" || true
   kubectl -n "$R_NS" get pods || true
-  kubectl -n "$R_NS" logs "$(meta_pod 0)" --tail=20 || true
+  bounded_logs "$(meta_pod 0)" 20
   fail "meta init never succeeded in the replicated namespace"
 }
 
@@ -846,7 +854,7 @@ await_pods_exist "$R_NS" "$R_PODS"
 kubectl -n "$R_NS" wait --for=condition=ready pod -l "app.kubernetes.io/instance=${REL}" \
   --timeout=240s >/dev/null || {
     kubectl -n "$R_NS" get pods
-    for pod in $(shape_pods); do echo "--- $pod ---"; kubectl -n "$R_NS" logs "$pod" --tail=30 || true; done
+    for pod in $(shape_pods); do echo "--- $pod ---"; bounded_logs "$pod" 30; done
     fail "the replicated range never became Ready"
   }
 log "gating on the replicated range's headless DNS (#416)"
@@ -1061,9 +1069,9 @@ R_TOTAL=$((R_EXPECTED + 30))
 # Ready, un-terminating members. Echoes the count; FAILS when the API server
 # did not answer, so a caller can tell "nobody is Ready" from "nobody was
 # asked" — the same attribution rule `await_pods_exist` states above.
-ready_members() {
-  local pods
-  pods="$(kubectl -n "$R_NS" get pods -l "app.kubernetes.io/instance=${REL}" \
+ready_members() { # [label selector] — Ready, un-terminating pods; the release's by default
+  local pods selector="${1:-app.kubernetes.io/instance=${REL}}"
+  pods="$(kubectl -n "$R_NS" get pods -l "$selector" \
     -o jsonpath='{range .items[*]}{.metadata.deletionTimestamp}{"|"}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' \
     2>/dev/null)" || return 1
   printf '%s' "$pods" | grep -c '^|True$' || true
@@ -1082,7 +1090,10 @@ while :; do
   # and the write, which would have reported a bare quorum that no write ever
   # ran on. What survives the loop is the reading taken at the start of the
   # attempt that actually landed.
-  members_at_write="$(ready_members || true)"
+  # The DATA tier's members (review): in the separated shape the metadata
+  # voters are pods too, and a count that included them would report a
+  # six-pod figure as the state of a three-replica quorum.
+  members_at_write="$(ready_members "$DATA_SELECTOR" || true)"
   r_produce "$new_ordinal" "$NEW_EPOCH" 2 30 && break
   [ "$SECONDS" -lt "$produce_deadline" ] || {
     kubectl -n "$R_NS" get pods || true
@@ -1096,11 +1107,15 @@ while :; do
     # and a guess on a failing one.
     for o in 0 1 2; do
       echo "--- $(data_pod "$o") (last 120 lines) ---"
-      kubectl -n "$R_NS" logs "$(data_pod "$o")" --tail=120 2>&1 \
+      # ONE bounded fetch per container, filtered from the copy (review):
+      # an unbounded `kubectl logs` against a wedged API path is how a
+      # failure report never arrives.
+      view="$(bounded_logs "$(data_pod "$o")" 120)"
+      printf '%s\n' "$view" \
         | grep -iE 'promot|quorum|lease|epoch|fenc|stand|slot|listener|panic|error' \
-        || kubectl -n "$R_NS" logs "$(data_pod "$o")" --tail=40 2>&1 || true
+        || printf '%s\n' "$view" | tail -40
       echo "--- $(data_pod "$o") previous container, if it restarted ---"
-      kubectl -n "$R_NS" logs "$(data_pod "$o")" --previous --tail=60 2>&1 | tail -20 || true
+      bounded_logs "$(data_pod "$o")" 60 --previous | tail -20
     done
     echo "--- lease as metadata sees it ---"
     lease_state || true
@@ -1126,10 +1141,10 @@ epoch $NEW_EPOCH — retargeting"
   fi
   sleep 3
 done
-if [ "${members_at_write:-x}" -ge 1 ] 2>/dev/null && [ "$members_at_write" -lt "$R_PODS" ]; then
+if [ "${members_at_write:-x}" -ge 1 ] 2>/dev/null && [ "$members_at_write" -lt "$R_DATA_PODS" ]; then
   log "produce resumed at epoch $NEW_EPOCH; the attempt that landed began with only \
-${members_at_write} of $R_PODS pods Ready — the range served through the outage on a bare quorum"
-elif [ "${members_at_write:-x}" -eq "$R_PODS" ] 2>/dev/null; then
+${members_at_write} of $R_DATA_PODS data replicas Ready — the range served through the outage on a bare quorum"
+elif [ "${members_at_write:-x}" -eq "$R_DATA_PODS" ] 2>/dev/null; then
   log "produce resumed at epoch $NEW_EPOCH; the replacement was already back when the \
 winning attempt began, so this run did not exercise the degraded-quorum path (a fast restart, \
 not a failure)"
@@ -1200,6 +1215,8 @@ DATA_POD="${REL}-"
 META_HEADLESS="$HEADLESS"
 DATA_HEADLESS="$HEADLESS"
 R_PODS=3
+R_DATA_PODS=3
+DATA_SELECTOR="app.kubernetes.io/instance=${REL}"
 R_PORT_BASE=19700
 run_replicated_shape
 
@@ -1220,6 +1237,8 @@ DATA_POD="${REL}-data-"
 META_HEADLESS="${REL}-meta-headless"
 DATA_HEADLESS="${REL}-data-headless"
 R_PODS=6
+R_DATA_PODS=3
+DATA_SELECTOR="app.kubernetes.io/instance=${REL},vtop.allamiro.io/tier=data"
 R_PORT_BASE=21700
 run_replicated_shape
 
