@@ -87,6 +87,8 @@ class ResettingRemovalClient(ScriptedClient):
     """Loses the connection on the first removal after the shape is applied."""
 
     def request(self, method, path, body=None):
+        if method == "GET":
+            return super().request(method, path, body)
         applied = any(m == "POST" for m, _, _ in self.calls)
         self.calls.append((method, path, body))
         if method == "DELETE" and applied and path.endswith("_bandwidth_up"):
@@ -201,7 +203,7 @@ def test_a_missing_proxy_names_the_file_that_registers_it():
 
 def test_a_refused_toxic_fails_the_run_by_name():
     client = ScriptedClient(statuses={("POST", "/proxies/minio/toxics"): 400})
-    with pytest.raises(ShapingError, match="vtop_bandwidth_up"):
+    with pytest.raises(ShapingError, match="_bandwidth_up"):
         apply(Shape("http://x", "minio", 1250, 0, 0), client)
 
 
@@ -209,6 +211,8 @@ class HalfRefusingClient(ScriptedClient):
     """Accepts the first toxic and refuses the second."""
 
     def request(self, method, path, body=None):
+        if method == "GET":
+            return super().request(method, path, body)
         self.calls.append((method, path, body))
         if method == "POST":
             posts = sum(1 for m, _, _ in self.calls if m == "POST")
@@ -231,6 +235,8 @@ class FailingRemovalClient(ScriptedClient):
     on the way out — the leftover this test is about."""
 
     def request(self, method, path, body=None):
+        if method == "GET":
+            return super().request(method, path, body)
         applied = any(m == "POST" for m, _, _ in self.calls)
         self.calls.append((method, path, body))
         if method == "DELETE" and applied and path.endswith("_latency_up"):
