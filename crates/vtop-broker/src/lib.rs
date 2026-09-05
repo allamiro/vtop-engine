@@ -1354,6 +1354,19 @@ impl LocalBroker {
     /// cluster commit is known. Read under one lock, so retention rolling
     /// segments between two reads cannot pair a floor with a watermark it
     /// never shared a log with.
+    /// The producer epoch the journal holds for `producer_id`, if any (#225):
+    /// what a bridge must mint ABOVE. The journal replicates with the log,
+    /// so on a replica promoted after a failover it holds the former
+    /// leader's epoch — and a clock behind that leader's would otherwise
+    /// mint below it and be fenced until the clock caught up.
+    pub fn producer_epoch_of(&self, producer_id: Uuid) -> Option<u64> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.producer_epochs.current(producer_id)
+    }
+
     pub fn retained_bounds(&self) -> (u64, u64) {
         let state = self
             .state

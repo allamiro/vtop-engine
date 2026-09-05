@@ -80,16 +80,23 @@ pub struct NativeBridge {
 
 /// One epoch per bridge built, strictly increasing within a process and
 /// across restarts on any sane clock: microseconds since the epoch, bumped
-/// past the previous mint when two bridges are built in the same instant.
-fn mint_producer_epoch() -> u64 {
+/// past the previous mint when two bridges are built in the same instant —
+/// and held ABOVE an epoch the journal already holds for this producer
+/// (review): the journal replicates with the log, so a replica
+/// promoted after a failover carries the former leader's epoch, and a clock
+/// behind that leader's would otherwise mint below it — every append fenced
+/// until the clock caught up. Durable state orders the mint; the clock only
+/// keeps two bridges in one process apart.
+fn mint_producer_epoch_above(journal: Option<u64>) -> u64 {
     static LAST: AtomicU64 = AtomicU64::new(0);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_micros() as u64)
-        .unwrap_or(1);
+        .unwrap_or(1)
+        .max(journal.map_or(0, |held| held.saturating_add(1)));
     let mut previous = LAST.load(Ordering::SeqCst);
     loop {
-        let candidate = now.max(previous + 1);
+        let candidate = now.max(previous.saturating_add(1));
         match LAST.compare_exchange(previous, candidate, Ordering::SeqCst, Ordering::SeqCst) {
             Ok(_) => return candidate,
             Err(seen) => previous = seen,
@@ -104,7 +111,8 @@ impl NativeBridge {
     /// from zero, as a restarted Kafka producer's own — is the honest start.
     /// The old epoch's state stays behind it, as it should.
     pub fn new(broker: Arc<LocalBroker>, config: NativeBridgeConfig) -> Self {
-        Self::with_producer_epoch(broker, config, mint_producer_epoch())
+        let held = broker.producer_epoch_of(config.producer_id);
+        Self::with_producer_epoch(broker, config, mint_producer_epoch_above(held))
     }
 
     /// Build with a chosen epoch. For a caller that allocates epochs itself
@@ -634,10 +642,43 @@ mod tests {
             2
         );
         assert_eq!(second.high_watermark("events").unwrap(), 3);
-        let epochs: Vec<u64> = (0..64).map(|_| mint_producer_epoch()).collect();
+        let epochs: Vec<u64> = (0..64).map(|_| mint_producer_epoch_above(None)).collect();
         assert!(
             epochs.windows(2).all(|pair| pair[0] < pair[1]),
             "minted epochs are strictly increasing: {epochs:?}"
+        );
+    }
+
+    /// A journal that already holds a higher epoch for the bridge's producer
+    /// — a replica promoted after a failover, its clock behind the former
+    /// leader's — orders the mint (review): the new bridge appends, it is
+    /// not fenced until the clock catches up.
+    #[test]
+    fn a_bridge_mints_above_the_epoch_the_journal_holds() {
+        let (_dir, broker) = broker();
+        let far_ahead = 1 << 62; // an epoch no clock reaches
+        let former = NativeBridge::with_producer_epoch(
+            Arc::clone(&broker),
+            config(Durability::LocalFsync),
+            far_ahead,
+        );
+        former.produce("events", &[batch(&[("a", None)])]).unwrap();
+        assert_eq!(
+            broker.producer_epoch_of(Uuid::from_u128(0xabc)),
+            Some(far_ahead)
+        );
+        let promoted = bridge(Arc::clone(&broker));
+        assert!(
+            promoted.producer_epoch() > far_ahead,
+            "above the journal, not the clock"
+        );
+        assert_eq!(
+            promoted
+                .produce("events", &[batch(&[("b", None)])])
+                .unwrap()
+                .base_offset,
+            1,
+            "appends instead of being fenced"
         );
     }
 
