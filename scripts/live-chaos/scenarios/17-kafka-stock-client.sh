@@ -27,15 +27,17 @@ init_workdir
 # collisions in preflight and moved with CHAOS_KAFKA_BASE_PORT.
 KAFKA_PORT="$(kafka_port 1)"
 RECORDS="${CHAOS_KAFKA_RECORDS:-20000}"
-require_integer_in_range CHAOS_KAFKA_RECORDS "$RECORDS" 2 10000000
-# The floor the kill waits for and the pacing both scale to the run (review):
-# a twelve-record smoke run must pass the same validation a 20,000-record
-# run does.
-ACK_FLOOR="${CHAOS_KAFKA_ACK_FLOOR:-$(( RECORDS / 4 > 0 ? RECORDS / 4 : 1 ))}"
-# The producer is paced — a pause every PACE_EVERY records — so the stream
-# lasts seconds instead of the one second librdkafka needs for 20,000 small
-# records, and the follower kill lands INSIDE it.
-PACE_EVERY="${CHAOS_KAFKA_PACE_EVERY:-$(( RECORDS < 500 ? RECORDS : 500 ))}"
+# At least 5,000 (review): kcat reads its input in blocks, so a run smaller
+# than a block is produced as one burst whatever the feeder's pacing, and
+# the follower kill has no stream to land in. A twelve-record smoke run is
+# refused here by name rather than failing at the kill.
+require_integer_in_range CHAOS_KAFKA_RECORDS "$RECORDS" 5000 10000000
+# The floor the kill waits for, and the pacing, both scale to the run.
+ACK_FLOOR="${CHAOS_KAFKA_ACK_FLOOR:-$(( RECORDS / 4 ))}"
+# The producer is paced — a pause every PACE_EVERY records, one fortieth of
+# the run — so the stream lasts seconds instead of the one second librdkafka
+# needs for 20,000 small records, and the follower kill lands INSIDE it.
+PACE_EVERY="${CHAOS_KAFKA_PACE_EVERY:-$(( RECORDS / 40 ))}"
 PACE_SLEEP="${CHAOS_KAFKA_PACE_SLEEP:-0.2}"
 require_integer_in_range CHAOS_KAFKA_ACK_FLOOR "$ACK_FLOOR" 1 "$RECORDS"
 require_integer_in_range CHAOS_KAFKA_PACE_EVERY "$PACE_EVERY" 1 "$RECORDS"
