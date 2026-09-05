@@ -282,7 +282,10 @@ TRIPLE="${TRIPLE:-$HOST}"
 # is worse than one that never used the construct.
 cat > "$WORK/closure.py" <<'PY'
 # The selected roots over cargo's metadata: `libs` prints how many of them
-# have a library target with doctests on (the doctest units cargo will run).
+# have a library target with doctests on (the doctest units cargo will run);
+# `harnessless` prints the source path, as cargo's `Running` line spells it,
+# of every selected target built with `harness = false` — an executable that
+# runs under cargo test but owes libtest no `test result:` line.
 # The package COUNT is cargo tree's, not this graph's — see the phase-1 note.
 import fnmatch, json, os, sys
 mode = sys.argv[1]
@@ -364,6 +367,17 @@ if mode == "libs":
         any(kind in target["kind"] for kind in ("lib", "rlib", "proc-macro"))
         and target.get("doctest", True)
         for target in by_id[pid]["targets"])))
+    sys.exit(0)
+if mode == "harnessless":
+    for pid in roots:
+        package = by_id[pid]
+        root = os.path.dirname(package["manifest_path"])
+        for target in package["targets"]:
+            if target.get("harness", True):
+                continue
+            if not any(kind in target["kind"] for kind in ("test", "lib", "rlib", "bin", "bench", "example")):
+                continue
+            print(os.path.relpath(target["src_path"], root))
     sys.exit(0)
 sys.exit("unknown mode " + mode)
 PY
@@ -515,6 +529,11 @@ if (( ! target_selected )); then
   DOC_UNITS="$(closure libs)" || exit 2
 fi
 TOTAL_UNITS=$(( TOTAL_BINS + DOC_UNITS ))
+# Targets built with `harness = false` (review): cargo runs them like any
+# other test executable, but a custom harness owes libtest nothing, so no
+# `test result:` line closes them. Such a unit is counted finished when a
+# later status line follows it, or when cargo has exited.
+HARNESSLESS="$(closure harnessless)" || exit 2
 if (( ! doc_only && TOTAL_UNITS == 0 )); then
   # Nothing runnable AND no doctest target is not a passing suite: say so
   # and refuse to claim success. Zero binaries ALONE is not fatal — a library
@@ -560,9 +579,19 @@ while :; do
   # label that kept its indentation would be the only symptom.
   # FINISHED units, not started ones (review): `Running` precedes a binary,
   # `test result:` closes it (and closes each doctest unit), so a single
-  # slow binary reads as in progress rather than complete.
+  # slow binary reads as in progress rather than complete. A harness-less
+  # unit has no closing line; it counts once something runs after it, or
+  # once cargo is gone.
   ran="$(plain_log "$WORK/run.log" | grep -cE '^test result: ' || true)"
   ran="${ran:-0}"
+  statuses="$(plain_log "$WORK/run.log" | grep -E '^[[:space:]]+(Running|Doc-tests) ' \
+    | sed -E 's/^[[:space:]]+(Running|Doc-tests) (unittests )?//; s/ \(.*\)$//')"
+  if [[ -n "$HARNESSLESS" && -n "$statuses" ]]; then
+    custom_started="$(printf '%s\n' "$statuses" | grep -cxF -f <(printf '%s\n' "$HARNESSLESS") || true)"
+    last_custom=0
+    printf '%s\n' "$HARNESSLESS" | grep -qxF -- "$(printf '%s\n' "$statuses" | tail -1)" && last_custom=1
+    ran=$(( ran + ${custom_started:-0} - (alive ? last_custom : 0) ))
+  fi
   current="$(plain_log "$WORK/run.log" | grep -E '^[[:space:]]+(Running|Doc-tests) ' | tail -1 \
     | sed -E 's/^[[:space:]]+//; s/ \(.*\)$//')"
   passed="$(sum_counts passed "$WORK/run.log")"
