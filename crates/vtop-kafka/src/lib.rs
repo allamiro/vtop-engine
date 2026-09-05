@@ -14,6 +14,7 @@
 //!   [`api`]       the five phase-1 APIs, request and response, every served version
 //!   [`bridge`]    the seam: what a backend must answer, and an in-memory one
 //!   [`gateway`]   the listener: frames in, the bridge behind, refusals by name
+//!   [`native`]    the backend over `LocalBroker` (feature `native`, on by default)
 //!
 //! The codec layers landed first, and the bridge and listener after them —
 //! deliberately, because everything above the codecs is a translation, and a
@@ -27,11 +28,15 @@ pub mod api;
 pub mod bridge;
 pub mod gateway;
 pub mod messages;
+#[cfg(feature = "native")]
+pub mod native;
 pub mod records;
 pub mod wire;
 
 pub use bridge::{Appended, Bridge, Fetched, MemoryBridge};
 pub use gateway::{Gateway, GatewayConfig};
 pub use messages::{ApiKey, ErrorCode, HeaderVerdict, RequestHeader};
+#[cfg(feature = "native")]
+pub use native::{NativeBridge, NativeBridgeConfig};
 pub use records::{Record, RecordBatch};
 pub use wire::{Decoder, Encoder, WireError};

@@ -4047,10 +4047,14 @@ dependencies = [
 name = "vtop-kafka"
 version = "0.4.0"
 dependencies = [
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
  "uuid",
+ "vtop-broker",
+ "vtop-log",
+ "vtop-protocol",
 ]
 
 [[package]]
