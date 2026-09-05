@@ -498,7 +498,10 @@ pub enum MetadataCommand {
     },
     /// Durably commit a lineage-aware cursor. `expected_checkpoint_generation`
     /// is `None` for the first commit (cursor must be absent) and `Some(g)` for
-    /// a CAS advance against an existing checkpoint.
+    /// a CAS advance against an existing checkpoint. A nil `segment_uuid` (with
+    /// zero generation, root and index) is an UNPINNED cursor (#457 slice 2b):
+    /// bound to the topic epoch and lineage generation, the record offset its
+    /// position, no segment named — a Kafka gateway's commit at the head.
     CommitGroupCursor {
         env: CommandEnvelope,
         group_uuid: Uuid,

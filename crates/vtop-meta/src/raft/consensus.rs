@@ -16,7 +16,8 @@ use crate::raft::type_config::{MetaRaftTypeConfig, NodeId};
 use crate::state::MetaValue;
 use crate::transport::admin::AdminHandler;
 use crate::transport::wire::{
-    AdminLeaseView, AdminReadRangeLeaseResponse, AdminReadRangeTransitionsResponse,
+    AdminGroupCursorView, AdminLeaseView, AdminReadGroupCursorResponse,
+    AdminReadRangeLeaseResponse, AdminReadRangeTransitionsResponse,
     AdminReadSegmentPlacementResponse, AdminRebalanceIntentView, AdminSegmentView,
     AdminTransitionView, MAX_TRANSITIONS_PER_READ,
 };
@@ -355,6 +356,63 @@ impl AdminReadRangeTransitions for OpenraftConsensus {
     }
 }
 
+/// Linearizable read of a group's committed cursor on a range (#457 slice
+/// 2b), its own trait for the same reason the lease and transition reads
+/// are.
+#[async_trait]
+pub trait AdminReadGroupCursor: Send + Sync {
+    async fn read_group_cursor(
+        &self,
+        group_uuid: Uuid,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+    ) -> ConsensusResult<AdminReadGroupCursorResponse>;
+}
+
+#[async_trait]
+impl AdminReadGroupCursor for OpenraftConsensus {
+    async fn read_group_cursor(
+        &self,
+        group_uuid: Uuid,
+        topic_uuid: Uuid,
+        range_uuid: Uuid,
+    ) -> ConsensusResult<AdminReadGroupCursorResponse> {
+        let Some(store) = self.store.as_ref() else {
+            return Err(ConsensusError::Message(
+                "this node was built without applied state and cannot serve reads".to_owned(),
+            ));
+        };
+        // Fence FIRST, as every admin read does: a committed offset served
+        // from a lagging copy could be behind what the group was told it
+        // committed, and a consumer resuming there would replay.
+        self.raft
+            .ensure_linearizable()
+            .await
+            .map_err(classify_read_error)?;
+        store.with_storage(|storage| {
+            let read_at_applied_index = storage.last_applied();
+            let state = storage.state();
+            let group_found = matches!(
+                state.record(&MetaKey::Group { group_uuid }),
+                Some(MetaValue::Group(_))
+            );
+            let cursor = match state.record(&MetaKey::GroupCursor {
+                group_uuid,
+                topic_uuid,
+                range_uuid,
+            }) {
+                Some(MetaValue::GroupCursor(record)) => Some(AdminGroupCursorView::from(record)),
+                _ => None,
+            };
+            Ok(AdminReadGroupCursorResponse {
+                group_found,
+                cursor,
+                read_at_applied_index,
+            })
+        })
+    }
+}
+
 /// Linearizable range-lease read, kept as its own trait so the consensus
 /// façade stays the narrow propose/status interface it was.
 #[async_trait]
@@ -686,6 +744,20 @@ impl AdminHandler for OpenraftConsensus {
             request.range_uuid,
             request.from_epoch,
             request.limit,
+        )
+        .await
+        .map_err(to_transport_error)
+    }
+
+    async fn read_group_cursor(
+        &self,
+        request: crate::transport::wire::AdminReadGroupCursorRequest,
+    ) -> TransportResult<AdminReadGroupCursorResponse> {
+        AdminReadGroupCursor::read_group_cursor(
+            self,
+            request.group_uuid,
+            request.topic_uuid,
+            request.range_uuid,
         )
         .await
         .map_err(to_transport_error)

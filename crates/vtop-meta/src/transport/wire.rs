@@ -82,6 +82,10 @@ pub const KIND_ADMIN_READ_SEGMENT_PLACEMENT_REQ: u16 = 21;
 pub const KIND_ADMIN_READ_SEGMENT_PLACEMENT_RESP: u16 = 22;
 pub const KIND_ADMIN_READ_RANGE_TRANSITIONS_REQ: u16 = 23;
 pub const KIND_ADMIN_READ_RANGE_TRANSITIONS_RESP: u16 = 24;
+// What a consumer group committed on a range (#457 slice 2b): the read a
+// Kafka gateway answers OffsetFetch with, linearizable like every admin read.
+pub const KIND_ADMIN_READ_GROUP_CURSOR_REQ: u16 = 25;
+pub const KIND_ADMIN_READ_GROUP_CURSOR_RESP: u16 = 26;
 
 /// The most transition records one read returns; a longer chain is paged
 /// with `from_epoch`.
@@ -1000,6 +1004,171 @@ impl AdminReadRangeTransitionsResponse {
         let response = Self {
             found,
             transitions,
+            read_at_applied_index: reader.u64("read at applied index")?,
+        };
+        reader.finish()?;
+        Ok(response)
+    }
+}
+
+/// Which group's cursor to read, on which range (#457 slice 2b).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdminReadGroupCursorRequest {
+    pub group_uuid: Uuid,
+    pub topic_uuid: Uuid,
+    pub range_uuid: Uuid,
+}
+
+impl AdminReadGroupCursorRequest {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_uuid(&mut out, self.group_uuid);
+        put_uuid(&mut out, self.topic_uuid);
+        put_uuid(&mut out, self.range_uuid);
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut reader = Reader::new(bytes);
+        let request = Self {
+            group_uuid: reader.uuid("group uuid")?,
+            topic_uuid: reader.uuid("topic uuid")?,
+            range_uuid: reader.uuid("range uuid")?,
+        };
+        reader.finish()?;
+        Ok(request)
+    }
+}
+
+/// A group's committed cursor as the admin wire carries it: the state
+/// machine's [`crate::state::CursorCheckpointRecord`], field for field. A nil
+/// `segment_uuid` is an unpinned cursor — see the record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdminGroupCursorView {
+    pub topic_epoch: u64,
+    pub range_generation: u64,
+    pub segment_uuid: Uuid,
+    pub segment_generation: u64,
+    pub segment_root: [u8; 32],
+    pub record_offset: u64,
+    pub record_index: u64,
+    pub lineage_transition_id: Option<Uuid>,
+    pub checkpoint_generation: u64,
+    pub committed_by_member: Uuid,
+}
+
+impl From<&crate::state::CursorCheckpointRecord> for AdminGroupCursorView {
+    fn from(record: &crate::state::CursorCheckpointRecord) -> Self {
+        Self {
+            topic_epoch: record.topic_epoch,
+            range_generation: record.range_generation,
+            segment_uuid: record.segment_uuid,
+            segment_generation: record.segment_generation,
+            segment_root: record.segment_root,
+            record_offset: record.record_offset,
+            record_index: record.record_index,
+            lineage_transition_id: record.lineage_transition_id,
+            checkpoint_generation: record.checkpoint_generation,
+            committed_by_member: record.committed_by_member,
+        }
+    }
+}
+
+impl AdminGroupCursorView {
+    fn encode_into(&self, out: &mut Vec<u8>) {
+        put_u64(out, self.topic_epoch);
+        put_u64(out, self.range_generation);
+        put_uuid(out, self.segment_uuid);
+        put_u64(out, self.segment_generation);
+        put_bytes32(out, &self.segment_root);
+        put_u64(out, self.record_offset);
+        put_u64(out, self.record_index);
+        match self.lineage_transition_id {
+            None => put_u8(out, 0),
+            Some(id) => {
+                put_u8(out, 1);
+                put_uuid(out, id);
+            }
+        }
+        put_u64(out, self.checkpoint_generation);
+        put_uuid(out, self.committed_by_member);
+    }
+
+    fn decode_from(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
+        let topic_epoch = reader.u64("cursor topic epoch")?;
+        let range_generation = reader.u64("cursor range generation")?;
+        let segment_uuid = reader.uuid("cursor segment uuid")?;
+        let segment_generation = reader.u64("cursor segment generation")?;
+        let segment_root = reader.bytes32("cursor segment root")?;
+        let record_offset = reader.u64("cursor record offset")?;
+        let record_index = reader.u64("cursor record index")?;
+        let lineage_transition_id = match reader.u8("cursor lineage transition flag")? {
+            0 => None,
+            1 => Some(reader.uuid("cursor lineage transition id")?),
+            _ => {
+                return Err(CodecError::InvalidValue {
+                    what: "cursor lineage transition flag",
+                    reason: "must be 0 or 1",
+                })
+            }
+        };
+        let checkpoint_generation = reader.u64("cursor checkpoint generation")?;
+        let committed_by_member = reader.uuid("cursor committed by member")?;
+        Ok(Self {
+            topic_epoch,
+            range_generation,
+            segment_uuid,
+            segment_generation,
+            segment_root,
+            record_offset,
+            record_index,
+            lineage_transition_id,
+            checkpoint_generation,
+            committed_by_member,
+        })
+    }
+}
+
+/// What a group has committed on a range: whether the group exists at all,
+/// the cursor if any, and the applied index the read was served at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdminReadGroupCursorResponse {
+    pub group_found: bool,
+    pub cursor: Option<AdminGroupCursorView>,
+    pub read_at_applied_index: u64,
+}
+
+impl AdminReadGroupCursorResponse {
+    pub fn encode(&self) -> Result<Vec<u8>, CodecError> {
+        let mut out = Vec::new();
+        put_u8(&mut out, u8::from(self.group_found));
+        match &self.cursor {
+            None => put_u8(&mut out, 0),
+            Some(cursor) => {
+                put_u8(&mut out, 1);
+                cursor.encode_into(&mut out);
+            }
+        }
+        put_u64(&mut out, self.read_at_applied_index);
+        Ok(out)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut reader = Reader::new(bytes);
+        let group_found = reader.flag("group found")?;
+        let cursor = match reader.u8("cursor flag")? {
+            0 => None,
+            1 => Some(AdminGroupCursorView::decode_from(&mut reader)?),
+            _ => {
+                return Err(CodecError::InvalidValue {
+                    what: "cursor flag",
+                    reason: "must be 0 or 1",
+                })
+            }
+        };
+        let response = Self {
+            group_found,
+            cursor,
             read_at_applied_index: reader.u64("read at applied index")?,
         };
         reader.finish()?;
@@ -2034,6 +2203,75 @@ mod tests {
             oversized.encode(),
             Err(CodecError::BoundExceeded { .. })
         ));
+    }
+
+    /// The group cursor read (#457 slice 2b) round-trips its request and its
+    /// response — with no cursor, with an unpinned one, with a pinned one
+    /// carrying a lineage transition id — and refuses a presence flag that
+    /// is neither 0 nor 1.
+    #[test]
+    fn group_cursor_read_round_trips() {
+        let request = AdminReadGroupCursorRequest {
+            group_uuid: Uuid::from_u128(0x50),
+            topic_uuid: Uuid::from_u128(20),
+            range_uuid: Uuid::from_u128(21),
+        };
+        assert_eq!(
+            AdminReadGroupCursorRequest::decode(&request.encode()).unwrap(),
+            request
+        );
+        let none = AdminReadGroupCursorResponse {
+            group_found: true,
+            cursor: None,
+            read_at_applied_index: 9,
+        };
+        assert_eq!(
+            AdminReadGroupCursorResponse::decode(&none.encode().unwrap()).unwrap(),
+            none
+        );
+        let unpinned = AdminReadGroupCursorResponse {
+            group_found: true,
+            cursor: Some(AdminGroupCursorView {
+                topic_epoch: 1,
+                range_generation: 0,
+                segment_uuid: Uuid::nil(),
+                segment_generation: 0,
+                segment_root: [0; 32],
+                record_offset: 4_242,
+                record_index: 0,
+                lineage_transition_id: None,
+                checkpoint_generation: 7,
+                committed_by_member: Uuid::from_u128(0x51),
+            }),
+            read_at_applied_index: 10,
+        };
+        assert_eq!(
+            AdminReadGroupCursorResponse::decode(&unpinned.encode().unwrap()).unwrap(),
+            unpinned
+        );
+        let pinned = AdminReadGroupCursorResponse {
+            group_found: true,
+            cursor: Some(AdminGroupCursorView {
+                topic_epoch: 2,
+                range_generation: 3,
+                segment_uuid: Uuid::from_u128(0x30),
+                segment_generation: 1,
+                segment_root: [0xAB; 32],
+                record_offset: 99,
+                record_index: 3,
+                lineage_transition_id: Some(Uuid::from_u128(0x77)),
+                checkpoint_generation: 12,
+                committed_by_member: Uuid::from_u128(0x52),
+            }),
+            read_at_applied_index: 11,
+        };
+        assert_eq!(
+            AdminReadGroupCursorResponse::decode(&pinned.encode().unwrap()).unwrap(),
+            pinned
+        );
+        let mut bad = none.encode().unwrap();
+        bad[1] = 2;
+        assert!(AdminReadGroupCursorResponse::decode(&bad).is_err());
     }
 
     #[test]

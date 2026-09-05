@@ -225,7 +225,14 @@ pub struct GroupMemberRecord {
     pub assigned: Vec<RangeAssignment>,
 }
 
-/// Lineage-aware durable cursor checkpoint for one group/topic/range.
+/// Lineage-aware durable cursor checkpoint for one group/topic/range. A nil
+/// `segment_uuid` is an UNPINNED cursor (#457 slice 2b): bound to the topic
+/// epoch and the range's lineage generation, its record offset the position,
+/// no segment named — what a Kafka gateway commits at the head, before the
+/// segment holding that offset has sealed. Cursors protect their group's
+/// unread data from retention and authorize nothing; the bound on how far
+/// ahead an unpinned cursor may be committed belongs where the head is known,
+/// at the gateway, which refuses a commit past its watermark.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CursorCheckpointRecord {
     pub topic_epoch: u64,
@@ -2128,6 +2135,15 @@ impl MetaStateMachine {
         sealed_by_epoch: u64,
         expected_range_generation: u64,
     ) -> MetadataResponse {
+        // The nil segment id is reserved (#457 slice 2b, review): it marks an
+        // UNPINNED cursor in CommitGroupCursor, so no segment may register
+        // under it — a registered nil segment could never be pinned, and a
+        // commit naming it would be read as unpinned.
+        if segment_uuid.is_nil() {
+            return reject(MetadataError::invalid_transition(
+                "the nil segment id is reserved for unpinned cursors; a segment cannot register under it",
+            ));
+        }
         let segment_key = MetaKey::Segment {
             topic_uuid,
             range_uuid,
@@ -2552,33 +2568,69 @@ impl MetaStateMachine {
         }
         let committed_range_generation = range.lineage_generation;
 
-        let segment_key = MetaKey::Segment {
-            topic_uuid: args.topic_uuid,
-            range_uuid: args.range_uuid,
-            segment_uuid: args.segment_uuid,
+        // An UNPINNED cursor (#457 slice 2b): a nil segment id says the cursor
+        // names no segment. It is bound to the topic epoch and the range's
+        // lineage generation — the identity that keeps "the same integer
+        // means a different record after a recreation or a range evolution"
+        // from ever being confused — and its record offset is the position,
+        // the way a Kafka gateway commits what its consumers tell it before
+        // any segment holding that offset has sealed and been registered. It
+        // carries no segment generation, root or index, and it moves forward
+        // or not at all, as every cursor does. A pinned cursor still needs its
+        // segment registered, generation and root matching, and the offset
+        // inside it.
+        if args.segment_uuid.is_nil() {
+            // A segment registered under nil before nil was reserved (review)
+            // is named, not silently read as unpinned: it can be pinned by
+            // nobody, and this says so.
+            let nil_segment_key = MetaKey::Segment {
+                topic_uuid: args.topic_uuid,
+                range_uuid: args.range_uuid,
+                segment_uuid: Uuid::nil(),
+            }
+            .encode();
+            if self.records.contains_key(&nil_segment_key) {
+                return reject(MetadataError::invalid_transition(
+                    "a segment registered under the reserved nil id cannot be pinned; nil marks an unpinned cursor",
+                ));
+            }
+            if args.segment_generation != 0
+                || args.segment_root != [0; 32]
+                || args.record_index != 0
+            {
+                return reject(MetadataError::invalid_transition(
+                    "an unpinned cursor (nil segment) carries no segment generation, root or record index",
+                ));
+            }
+        } else {
+            let segment_key = MetaKey::Segment {
+                topic_uuid: args.topic_uuid,
+                range_uuid: args.range_uuid,
+                segment_uuid: args.segment_uuid,
+            }
+            .encode();
+            let Some(MetaValue::Segment(segment)) = self.records.get(&segment_key) else {
+                return reject(MetadataError::NotFound);
+            };
+            if segment.segment_generation != args.segment_generation {
+                return reject(MetadataError::GenerationMismatch {
+                    expected: args.segment_generation,
+                    actual: segment.segment_generation,
+                });
+            }
+            if segment.content_root != args.segment_root {
+                return reject(MetadataError::invalid_transition(
+                    "segment root does not match the registered segment",
+                ));
+            }
+            if args.record_offset < segment.base_offset || args.record_offset > segment.next_offset
+            {
+                return reject(MetadataError::invalid_transition(format!(
+                    "record offset {} is outside sealed segment [{}, {}]",
+                    args.record_offset, segment.base_offset, segment.next_offset
+                )));
+            }
         }
-        .encode();
-        let Some(MetaValue::Segment(segment)) = self.records.get(&segment_key) else {
-            return reject(MetadataError::NotFound);
-        };
-        if segment.segment_generation != args.segment_generation {
-            return reject(MetadataError::GenerationMismatch {
-                expected: args.segment_generation,
-                actual: segment.segment_generation,
-            });
-        }
-        if segment.content_root != args.segment_root {
-            return reject(MetadataError::invalid_transition(
-                "segment root does not match the registered segment",
-            ));
-        }
-        if args.record_offset < segment.base_offset || args.record_offset > segment.next_offset {
-            return reject(MetadataError::invalid_transition(format!(
-                "record offset {} is outside sealed segment [{}, {}]",
-                args.record_offset, segment.base_offset, segment.next_offset
-            )));
-        }
-
         match (existing_cursor, args.expected_checkpoint_generation) {
             (None, None) => {
                 self.records.insert(
@@ -2615,7 +2667,41 @@ impl MetaStateMachine {
                         actual: existing.topic_epoch,
                     });
                 }
-                if let Err(error) = cursor_is_forward_or_equal(&existing, &args) {
+                // An unpinned cursor does not cross a lineage change on its
+                // own (review): the same integer is a different position on
+                // the other side of a split or merge, and the transition rule
+                // that carries a cursor across is not served yet. The one
+                // mismatch that is NOT a lineage change is the pre-lineage
+                // snapshot's CAS token, accepted once above (review): a group
+                // upgrading from it commits its head offset unpinned, and the
+                // record normalizes to lineage zero as a pinned one would. The
+                // guard holds whichever side is unpinned (review): a pinned
+                // commit in a new lineage over a stored unpinned cursor would
+                // otherwise cross on the segment-identity rule alone.
+                if (args.segment_uuid.is_nil() || existing.segment_uuid.is_nil())
+                    && !legacy_cursor_generation
+                    && existing.range_generation != committed_range_generation
+                {
+                    return reject(MetadataError::invalid_transition(
+                        "an unpinned cursor does not advance across a lineage change; the transition rule that carries it is not served yet",
+                    ));
+                }
+                // A pin change — unpinned to pinned once the segment holding
+                // the offset seals, pinned to unpinned, the legacy
+                // normalization among them — within one lineage and epoch
+                // (review): both offsets are positions in the same lineage,
+                // so the same offset is the same position and is accepted;
+                // only backward is refused. The segment-identity rule below,
+                // which asks for a strictly higher offset across identities,
+                // is for two SEGMENTS.
+                let pin_change = args.segment_uuid.is_nil() != existing.segment_uuid.is_nil();
+                if pin_change {
+                    if args.record_offset < existing.record_offset {
+                        return reject(MetadataError::invalid_transition(
+                            "cursor moved backward across a pin change",
+                        ));
+                    }
+                } else if let Err(error) = cursor_is_forward_or_equal(&existing, &args) {
                     return reject(error);
                 }
                 let Some(next_generation) = existing.checkpoint_generation.checked_add(1) else {
@@ -4688,6 +4774,461 @@ mod tests {
         assert!(machine
             .range_transitions(Uuid::from_u128(99), range_uuid, 0, 64)
             .is_empty());
+    }
+
+    /// A gateway commits what its consumers tell it before the segment holding
+    /// that offset seals (#457 slice 2b): an unpinned cursor — nil segment —
+    /// is bound to the topic epoch and the lineage generation, moves forward
+    /// or not at all under the checkpoint CAS, refuses a lineage it was not
+    /// committed under and any segment field it cannot carry; a pinned commit
+    /// still needs its segment registered; a reader finds the record.
+    #[test]
+    fn an_unpinned_cursor_is_bound_to_the_lineage_and_moves_forward_only() {
+        let (mut machine, _node, topic_uuid, range_uuid) = leaseable_range(10);
+        let (group_uuid, member_uuid) = (Uuid::from_u128(0x50), Uuid::from_u128(0x51));
+        assert!(matches!(
+            machine.apply(
+                20,
+                &MetadataCommand::CreateConsumerGroup {
+                    env: envelope(20),
+                    name: "g".to_owned(),
+                    group_uuid,
+                }
+            ),
+            MetadataResponse::GroupCreated { .. }
+        ));
+        assert!(matches!(
+            machine.apply(
+                21,
+                &MetadataCommand::JoinConsumerGroup {
+                    env: envelope(21),
+                    group_uuid,
+                    member_uuid,
+                    expected_group_generation: 0,
+                }
+            ),
+            MetadataResponse::MemberJoined { .. }
+        ));
+        assert!(matches!(
+            machine.apply(
+                22,
+                &MetadataCommand::AssignMemberRanges {
+                    env: envelope(22),
+                    group_uuid,
+                    member_uuid,
+                    ranges: vec![RangeAssignment {
+                        topic_uuid,
+                        range_uuid,
+                    }],
+                    expected_member_generation: 0,
+                }
+            ),
+            MetadataResponse::Ack { .. }
+        ));
+        let lineage = range_of(&machine, topic_uuid, range_uuid).lineage_generation;
+        let Some(MetaValue::Topic(topic)) = machine.record(&MetaKey::Topic { topic_uuid }) else {
+            panic!("the topic is there");
+        };
+        let topic_epoch = topic.topic_epoch;
+        let commit =
+            |env: u128,
+             offset: u64,
+             expected: Option<u64>,
+             range_generation: u64,
+             segment_generation: u64| MetadataCommand::CommitGroupCursor {
+                env: envelope(env),
+                group_uuid,
+                member_uuid,
+                topic_uuid,
+                range_uuid,
+                topic_epoch,
+                range_generation,
+                segment_uuid: Uuid::nil(),
+                segment_generation,
+                segment_root: [0; 32],
+                record_offset: offset,
+                record_index: 0,
+                lineage_transition_id: None,
+                expected_checkpoint_generation: expected,
+            };
+        assert!(matches!(
+            machine.apply(23, &commit(23, 10, None, lineage, 0)),
+            MetadataResponse::CursorCommitted {
+                checkpoint_generation: 0
+            }
+        ));
+        assert!(matches!(
+            machine.apply(24, &commit(24, 20, Some(0), lineage, 0)),
+            MetadataResponse::CursorCommitted {
+                checkpoint_generation: 1
+            }
+        ));
+        assert!(
+            matches!(
+                machine.apply(25, &commit(25, 20, Some(1), lineage, 0)),
+                MetadataResponse::CursorCommitted {
+                    checkpoint_generation: 2
+                }
+            ),
+            "equal is forward-or-equal"
+        );
+        assert!(
+            matches!(
+                machine.apply(26, &commit(26, 5, Some(2), lineage, 0)),
+                MetadataResponse::Rejected(_)
+            ),
+            "backward"
+        );
+        assert!(matches!(
+            machine.apply(27, &commit(27, 30, Some(2), lineage + 1, 0)),
+            MetadataResponse::Rejected(MetadataError::LineageMismatch { .. })
+        ));
+        assert!(
+            matches!(
+                machine.apply(28, &commit(28, 30, Some(2), lineage, 3)),
+                MetadataResponse::Rejected(_)
+            ),
+            "no segment fields on an unpinned cursor"
+        );
+        let pinned = MetadataCommand::CommitGroupCursor {
+            env: envelope(29),
+            group_uuid,
+            member_uuid,
+            topic_uuid,
+            range_uuid,
+            topic_epoch,
+            range_generation: lineage,
+            segment_uuid: Uuid::from_u128(0x99),
+            segment_generation: 0,
+            segment_root: [7; 32],
+            record_offset: 30,
+            record_index: 0,
+            lineage_transition_id: None,
+            expected_checkpoint_generation: Some(2),
+        };
+        assert!(
+            matches!(
+                machine.apply(29, &pinned),
+                MetadataResponse::Rejected(MetadataError::NotFound)
+            ),
+            "a pinned commit still needs its segment registered"
+        );
+        let Some(MetaValue::GroupCursor(record)) = machine.record(&MetaKey::GroupCursor {
+            group_uuid,
+            topic_uuid,
+            range_uuid,
+        }) else {
+            panic!("the cursor is there");
+        };
+        assert_eq!(
+            (
+                record.record_offset,
+                record.checkpoint_generation,
+                record.segment_uuid
+            ),
+            (20, 2, Uuid::nil())
+        );
+        // Nil is reserved: no segment registers under it.
+        let range_generation = range_of(&machine, topic_uuid, range_uuid).generation;
+        assert!(matches!(
+            machine.apply(
+                30,
+                &MetadataCommand::RegisterSealedSegment {
+                    env: envelope(30),
+                    topic_uuid,
+                    range_uuid,
+                    segment_uuid: Uuid::nil(),
+                    segment_generation: 0,
+                    base_offset: 0,
+                    next_offset: 100,
+                    content_root: [1; 32],
+                    sealed_by_epoch: 1,
+                    expected_range_generation: range_generation,
+                }
+            ),
+            MetadataResponse::Rejected(_)
+        ));
+        // The segment holding the offset seals (a leaseholder's act): the
+        // cursor is pinned to it WHERE IT STANDS, and unpinned again there — a
+        // pin change at the same offset is the same position (review); only
+        // backward across the change is refused.
+        let generation = range_of(&machine, topic_uuid, range_uuid).generation;
+        let MetadataResponse::LeaseGranted { fencing_epoch } = acquire(
+            &mut machine,
+            31,
+            31,
+            1_000,
+            _node,
+            topic_uuid,
+            range_uuid,
+            generation,
+            60_000,
+        ) else {
+            panic!("a lease to seal under");
+        };
+        let range_generation = range_of(&machine, topic_uuid, range_uuid).generation;
+        assert!(matches!(
+            machine.apply(
+                32,
+                &MetadataCommand::RegisterSealedSegment {
+                    env: envelope(32),
+                    topic_uuid,
+                    range_uuid,
+                    segment_uuid: Uuid::from_u128(0x88),
+                    segment_generation: 0,
+                    base_offset: 0,
+                    next_offset: 100,
+                    content_root: [8; 32],
+                    sealed_by_epoch: fencing_epoch,
+                    expected_range_generation: range_generation,
+                }
+            ),
+            MetadataResponse::Ack { .. }
+        ));
+        let pin_at = |env: u128, offset: u64, expected: u64| MetadataCommand::CommitGroupCursor {
+            env: envelope(env),
+            group_uuid,
+            member_uuid,
+            topic_uuid,
+            range_uuid,
+            topic_epoch,
+            range_generation: lineage,
+            segment_uuid: Uuid::from_u128(0x88),
+            segment_generation: 0,
+            segment_root: [8; 32],
+            record_offset: offset,
+            record_index: 0,
+            lineage_transition_id: None,
+            expected_checkpoint_generation: Some(expected),
+        };
+        assert!(
+            matches!(
+                machine.apply(33, &pin_at(33, 20, 2)),
+                MetadataResponse::CursorCommitted {
+                    checkpoint_generation: 3
+                }
+            ),
+            "pinned where it stands"
+        );
+        assert!(
+            matches!(
+                machine.apply(34, &commit(34, 20, Some(3), lineage, 0)),
+                MetadataResponse::CursorCommitted {
+                    checkpoint_generation: 4
+                }
+            ),
+            "unpinned again where it stands"
+        );
+        assert!(
+            matches!(
+                machine.apply(35, &pin_at(35, 19, 4)),
+                MetadataResponse::Rejected(MetadataError::InvalidTransition(reason))
+                    if reason.contains("backward across a pin change")
+            ),
+            "backward across the change"
+        );
+        // The range's lineage moves on (as a split or merge would move it):
+        // the unpinned cursor does not follow on its own.
+        let range_key = MetaKey::Range {
+            topic_uuid,
+            range_uuid,
+        }
+        .encode();
+        if let Some(MetaValue::Range(range)) = machine.records.get_mut(&range_key) {
+            range.lineage_generation += 1;
+        }
+        assert!(matches!(
+            machine.apply(36, &commit(36, 40, Some(4), lineage + 1, 0)),
+            MetadataResponse::Rejected(_)
+        ));
+        // A pre-lineage snapshot's cursor carries the range's old CAS token as
+        // its range generation; the one-time normalization accepts an unpinned
+        // head commit too, and stores lineage zero.
+        let (legacy_group, legacy_member) = (Uuid::from_u128(0x60), Uuid::from_u128(0x61));
+        assert!(matches!(
+            machine.apply(
+                40,
+                &MetadataCommand::CreateConsumerGroup {
+                    env: envelope(40),
+                    name: "legacy".to_owned(),
+                    group_uuid: legacy_group,
+                }
+            ),
+            MetadataResponse::GroupCreated { .. }
+        ));
+        assert!(matches!(
+            machine.apply(
+                41,
+                &MetadataCommand::JoinConsumerGroup {
+                    env: envelope(41),
+                    group_uuid: legacy_group,
+                    member_uuid: legacy_member,
+                    expected_group_generation: 0,
+                }
+            ),
+            MetadataResponse::MemberJoined { .. }
+        ));
+        assert!(matches!(
+            machine.apply(
+                42,
+                &MetadataCommand::AssignMemberRanges {
+                    env: envelope(42),
+                    group_uuid: legacy_group,
+                    member_uuid: legacy_member,
+                    ranges: vec![RangeAssignment {
+                        topic_uuid,
+                        range_uuid,
+                    }],
+                    expected_member_generation: 0,
+                }
+            ),
+            MetadataResponse::Ack { .. }
+        ));
+        // The range back at lineage zero, as a pre-lineage snapshot has it.
+        if let Some(MetaValue::Range(range)) = machine.records.get_mut(&range_key) {
+            range.lineage_generation = 0;
+        }
+        let stale_cas_token = 5;
+        machine.records.insert(
+            MetaKey::GroupCursor {
+                group_uuid: legacy_group,
+                topic_uuid,
+                range_uuid,
+            }
+            .encode(),
+            MetaValue::GroupCursor(CursorCheckpointRecord {
+                topic_epoch,
+                range_generation: stale_cas_token,
+                segment_uuid: Uuid::from_u128(0x99),
+                segment_generation: 0,
+                segment_root: [7; 32],
+                record_offset: 10,
+                record_index: 0,
+                lineage_transition_id: None,
+                checkpoint_generation: 0,
+                committed_by_member: legacy_member,
+            }),
+        );
+        assert!(
+            matches!(
+                machine.apply(
+                    43,
+                    &MetadataCommand::CommitGroupCursor {
+                        env: envelope(43),
+                        group_uuid: legacy_group,
+                        member_uuid: legacy_member,
+                        topic_uuid,
+                        range_uuid,
+                        topic_epoch,
+                        range_generation: stale_cas_token,
+                        segment_uuid: Uuid::nil(),
+                        segment_generation: 0,
+                        segment_root: [0; 32],
+                        record_offset: 10,
+                        record_index: 0,
+                        lineage_transition_id: None,
+                        expected_checkpoint_generation: Some(0),
+                    }
+                ),
+                MetadataResponse::CursorCommitted {
+                    checkpoint_generation: 1
+                }
+            ),
+            "unpinned where it stood: the same offset is accepted"
+        );
+        assert!(matches!(
+            machine.apply(
+                44,
+                &MetadataCommand::CommitGroupCursor {
+                    env: envelope(44),
+                    group_uuid: legacy_group,
+                    member_uuid: legacy_member,
+                    topic_uuid,
+                    range_uuid,
+                    topic_epoch,
+                    range_generation: 0,
+                    segment_uuid: Uuid::nil(),
+                    segment_generation: 0,
+                    segment_root: [0; 32],
+                    record_offset: 20,
+                    record_index: 0,
+                    lineage_transition_id: None,
+                    expected_checkpoint_generation: Some(1),
+                }
+            ),
+            MetadataResponse::CursorCommitted {
+                checkpoint_generation: 2
+            }
+        ));
+        let Some(MetaValue::GroupCursor(normalized)) = machine.record(&MetaKey::GroupCursor {
+            group_uuid: legacy_group,
+            topic_uuid,
+            range_uuid,
+        }) else {
+            panic!("the legacy cursor is there")
+        };
+        assert_eq!(
+            (
+                normalized.range_generation,
+                normalized.record_offset,
+                normalized.segment_uuid
+            ),
+            (0, 20, Uuid::nil()),
+            "normalized to lineage zero, unpinned, advanced"
+        );
+        assert_eq!(normalized.checkpoint_generation, 2);
+        // The stored cursor is unpinned and the range's lineage moves on: a
+        // PINNED commit in the new lineage does not cross either (review).
+        if let Some(MetaValue::Range(range)) = machine.records.get_mut(&range_key) {
+            range.lineage_generation += 1;
+        }
+        let moved_lineage = range_of(&machine, topic_uuid, range_uuid).lineage_generation;
+        // Sealing is a leaseholder's act: the lease taken above still stands.
+        let range_generation = range_of(&machine, topic_uuid, range_uuid).generation;
+        assert!(matches!(
+            machine.apply(
+                50,
+                &MetadataCommand::RegisterSealedSegment {
+                    env: envelope(50),
+                    topic_uuid,
+                    range_uuid,
+                    segment_uuid: Uuid::from_u128(0x77),
+                    segment_generation: 0,
+                    base_offset: 0,
+                    next_offset: 100,
+                    content_root: [9; 32],
+                    sealed_by_epoch: fencing_epoch,
+                    expected_range_generation: range_generation,
+                }
+            ),
+            MetadataResponse::Ack { .. }
+        ));
+        assert!(matches!(
+            machine.apply(
+                51,
+                &MetadataCommand::CommitGroupCursor {
+                    env: envelope(51),
+                    group_uuid: legacy_group,
+                    member_uuid: legacy_member,
+                    topic_uuid,
+                    range_uuid,
+                    topic_epoch,
+                    range_generation: moved_lineage,
+                    segment_uuid: Uuid::from_u128(0x77),
+                    segment_generation: 0,
+                    segment_root: [9; 32],
+                    record_offset: 50,
+                    record_index: 0,
+                    lineage_transition_id: None,
+                    // The cursor stands at checkpoint generation 2 (review):
+                    // the CAS token is current, so what refuses the commit is
+                    // the guard's own refusal, not a stale CAS token.
+                    expected_checkpoint_generation: Some(2),
+                }
+            ),
+            MetadataResponse::Rejected(MetadataError::InvalidTransition(reason))
+                if reason.contains("lineage change")
+        ));
     }
 
     /// The holder's report fills in the outcome (#240 item 5): the fenced
