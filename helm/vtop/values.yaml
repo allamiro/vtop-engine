@@ -100,11 +100,13 @@ cluster:
   # migration explanation.
 
 # ---------------------------------------------------------------------------
-# TLS — REQUIRED, never defaulted.
+# TLS — REQUIRED for every plane left at tls (the default), never defaulted.
 #
 # This chart ships NO credentials of any kind and refuses to render without
-# your Secret names (a lab compose once shipped default credentials — issue
-# #81 — and this chart exists on the other side of that lesson). Mint your own
+# your Secret names for any plane that is tls (a lab compose once shipped
+# default credentials — issue #81 — and this chart exists on the other side
+# of that lesson). Which planes are tls is `transport` below; with every
+# plane plaintext, no Secret is needed and none is mounted. Mint your own
 # CA and per-node leaves; scripts/live-chaos/gen-certs.sh in the repo shows
 # the exact shape (ECDSA P-256, serverAuth+clientAuth, CN rules below).
 #
@@ -164,7 +166,10 @@ transport:
 # writes `client_ca` into a hand-written config and switches to exec probes.
 # With TLS set, the probes use scheme HTTPS (unverified, as kubelet does),
 # the scrape annotations say https, and the ServiceMonitor scrapes https
-# with metrics.serviceMonitor.tlsConfig.
+# with metrics.serviceMonitor.tlsConfig. The node reads the material at
+# START: a rotated Secret takes effect on the next restart, so rotate with
+# `kubectl rollout restart` (or a Secret-watching restarter) before the old
+# certificate expires — the chart cannot hash a Secret it does not own.
 # ---------------------------------------------------------------------------
 observability:
   tls:
@@ -431,7 +436,9 @@ networkPolicy:
   metricsFrom: []
   # Peers allowed to reach the admin + native client planes. Empty means NO
   # external clients (cluster-internal traffic between vtop pods is always
-  # allowed; both planes still require mTLS regardless).
+  # allowed). On a plane left at tls, mTLS still authenticates every client
+  # behind this policy; on a plane set to plaintext (transport.admin /
+  # transport.native) this policy is the ONLY gate.
   clientFrom: []
   # Where DNS egress is allowed. The peer list is FQDNs, so name resolution is
   # a hard dependency — but a rule with no destination admits port 53 to
@@ -453,8 +460,12 @@ networkPolicy:
   extraEgress: []
 
 metrics:
-  # Well-known scrape annotations on the pods (prometheus.io/scrape|port|path).
-  # Harmless where unused; many stacks honor them out of the box.
+  # Well-known scrape annotations on the pods (prometheus.io/scrape|port|path,
+  # and scheme https under observability.tls). Harmless where unused; many
+  # stacks honor them out of the box. With observability.tls and a private
+  # CA, an annotation-driven scraper verifies against nothing it knows: give
+  # it the CA (or skip verification in a lab), or turn these off and use the
+  # ServiceMonitor with its tlsConfig.
   prometheusAnnotations: true
   # Prometheus Operator ServiceMonitor. Requires the CRD: the template fails
   # with a clear message when monitoring.coreos.com/v1 is absent rather than

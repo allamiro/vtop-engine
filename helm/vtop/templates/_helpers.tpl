@@ -137,6 +137,9 @@ chart says so at render time instead.
 {{- fail (printf "\n\ntransport.%s is plaintext but transport.acknowledgePlaintext is false. A plaintext plane in a cluster has no peer authentication and no confidentiality on the wire; the chart renders it only when that is said twice. Set transport.acknowledgePlaintext: true, or leave the plane at tls." $plane) -}}
 {{- end -}}
 {{- end -}}
+{{- if and (eq (toString $t.replica) "plaintext") (eq (toString .Values.data.topology) "replicated") -}}
+{{- fail "\n\ntransport.replica is plaintext but data.topology is replicated: a replicated range is rendered as candidates, and the node refuses a candidate on a plaintext replica plane — promotion needs fencing, which is refused there. Use topology standalone, or serve the replica plane with tls." -}}
+{{- end -}}
 {{- if and (eq (toString $t.admin) "plaintext") .Values.meta.adminAuthorization.enabled -}}
 {{- fail "\n\ntransport.admin is plaintext but meta.adminAuthorization.enabled is true: without a client certificate there is no caller identity to enforce the policy against, and the node refuses that config before Raft starts. Disable the policy, or serve the admin plane with tls." -}}
 {{- end -}}
@@ -466,9 +469,10 @@ segment_id: {{ required "\n\ndata.segmentId is required: the segment UUID (proto
 native_listen: "0.0.0.0:{{ $v.ports.native }}"
 replica_listen: "0.0.0.0:{{ $v.ports.replica }}"
 {{- if eq (toString $v.transport.replica) "plaintext" }}
-# The replica plane without TLS (#294), acknowledged in values: replication
-# is served, but fencing and promotion are refused there, so this range
-# replicates and does not fail over. The node says so at every start.
+# The replica plane without TLS (#294), acknowledged in values. Fencing and
+# promotion are refused there, so only a STANDALONE range serves it — a
+# replicated topology is refused at render, since its candidates would be
+# refused by the node. The node says so at every start.
 replica_transport: plaintext-on-any-interface
 {{- else }}
 replica_tls:
@@ -510,7 +514,9 @@ principal_id: {{ required "\n\ndata.principalId is required: the UUID of the one
 {{- end -}}
 {{- $endpoint = printf "%s:%d" (include "vtop.tierPodFqdn" $metaZero) (int $v.ports.metaAdmin) -}}
 {{- $serverName = include "vtop.tierServerName" $metaZero -}}
-{{- else if not $serverName -}}
+{{- else if and (not $serverName) (ne (toString $v.transport.admin) "plaintext") -}}
+{{- /* Under a plaintext admin dial there is no certificate to name (#294),
+       so a custom endpoint needs no serverName. */ -}}
 {{- fail (printf "\n\ndata.lease.adminEndpoint is %q under separated mode: set data.lease.serverName to the name that endpoint's certificate carries (or leave adminEndpoint at its default to address the metadata tier's first pod)." $endpoint) -}}
 {{- end }}
 # Metadata-driven leadership (#223). The credential is this node's OWN
@@ -705,9 +711,10 @@ data:
   # measure lag against this replica's boundary. Write paths refuse.
   replica_listen: "0.0.0.0:{{ $v.ports.replica }}"
 {{- if eq (toString $v.transport.replica) "plaintext" }}
-  # The replica plane without TLS (#294), acknowledged in values: fencing
-  # and promotion are refused there, so this range replicates and does not
-  # fail over. The node says so at every start.
+  # The replica plane without TLS (#294), acknowledged in values. Fencing
+  # and promotion are refused there, so only a STANDALONE range serves it —
+  # a replicated topology is refused at render, since its candidates would
+  # be refused by the node. The node says so at every start.
   replica_transport: plaintext-on-any-interface
 {{- else }}
   replica_tls:

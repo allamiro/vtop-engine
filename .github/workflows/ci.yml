@@ -526,16 +526,35 @@ jobs:
           if grep -q 'tls-meta\|tls-data' /tmp/plaintext.yaml; then
             echo "::error::plaintext render still mounts a TLS Secret"; exit 1
           fi
-          grep -q 'transport: plaintext' /tmp/plaintext.yaml || true
+          # The lease dials the admin plane, and the plaintext values enable
+          # it: the dial must be plaintext too, or the data pod would try a
+          # TLS handshake against a plaintext admin listener.
+          # Anchored to the lease's own line: the listener knobs carry the same
+          # substring, and matching them would be the no-op this replaces.
+          grep -qE '^\s*transport: plaintext$' /tmp/plaintext.yaml \
+            || { echo "::error::plaintext render does not dial the admin plane plaintext"; exit 1; }
           echo "plaintext shape renders as spelled out, with no Secret"
-          # Observability TLS: the Secret mounted, the probes on HTTPS, the
-          # config carrying the paths.
-          helm template vtop helm/vtop -f helm/vtop/ci/default-values.yaml \
-            --set observability.tls.secretName=vtop-observe-tls > /tmp/observe.yaml
-          grep -q 'scheme: HTTPS' /tmp/observe.yaml || { echo "::error::observability TLS did not switch the probes to HTTPS"; exit 1; }
-          grep -q 'cert: /etc/vtop/tls/observe/cert.pem' /tmp/observe.yaml || { echo "::error::observability TLS not in the rendered config"; exit 1; }
-          grep -q 'prometheus.io/scheme: https' /tmp/observe.yaml || { echo "::error::observability TLS not in the scrape annotations"; exit 1; }
-          echo "observability TLS renders end to end"
+          # Observability TLS, on BOTH shapes: the Secret mounted and named,
+          # every probe on HTTPS, the config carrying the paths, the
+          # annotation saying https.
+          observe_render() {
+            local values="$1" probes="$2" out="$3"
+            helm template vtop helm/vtop -f "$values" \
+              --set observability.tls.secretName=vtop-observe-tls > "$out"
+            test "$(grep -c 'scheme: HTTPS' "$out")" -ge "$probes" \
+              || { echo "::error::$values: observability TLS did not switch every probe to HTTPS"; exit 1; }
+            grep -q 'cert: /etc/vtop/tls/observe/cert.pem' "$out" \
+              || { echo "::error::$values: observability TLS not in the rendered config"; exit 1; }
+            grep -q 'mountPath: /etc/vtop/tls/observe' "$out" \
+              || { echo "::error::$values: the observability Secret is not mounted"; exit 1; }
+            grep -q 'secretName: "vtop-observe-tls"' "$out" \
+              || { echo "::error::$values: the observability Secret is not referenced"; exit 1; }
+            grep -q 'prometheus.io/scheme: https' "$out" \
+              || { echo "::error::$values: observability TLS not in the scrape annotations"; exit 1; }
+          }
+          observe_render helm/vtop/ci/default-values.yaml 3 /tmp/observe.yaml
+          observe_render helm/vtop/ci/separated-values.yaml 6 /tmp/observe-separated.yaml
+          echo "observability TLS renders end to end on both shapes"
 
       - name: Render the documented happy path
         run: |
@@ -646,6 +665,10 @@ jobs:
             -f helm/vtop/ci/default-values.yaml --set transport.peer=mtls
           refuses_because "transport.admin is plaintext but meta.adminAuthorization.enabled is true" \
             -f helm/vtop/ci/plaintext-values.yaml --set meta.adminAuthorization.enabled=true
+          # A replicated range is candidates, and the node refuses a candidate
+          # on a plaintext replica plane; the chart refuses first.
+          refuses_because "transport.replica is plaintext but data.topology is replicated" \
+            -f helm/vtop/ci/plaintext-values.yaml --set data.topology=replicated
           refuses_because "deployment.meta.replicaCount is unset" \
             -f helm/vtop/ci/separated-values.yaml --set deployment.meta.replicaCount=0
           refuses_because "deployment.data.replicaCount is unset" \

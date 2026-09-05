@@ -195,10 +195,12 @@ typed twice, never inherited from one line.
 What each plaintext plane costs, in the node's own words: the Raft sender is
 self-asserted (`peer`); every reachable peer may change membership and grant
 leases, and `meta.adminAuthorization` cannot apply, so the chart refuses the
-combination (`admin`); fencing and promotion are refused, so the range
-**replicates but does not fail over** (`replica`); the configured principal
-is admitted on its declaration alone (`native`). The lease dials the admin
-plane and follows `transport.admin`.
+combination (`admin`); fencing and promotion are refused, so only a
+**standalone** range serves it — a replicated topology is refused at render,
+because its candidates would be refused by the node (`replica`); the
+configured principal is admitted on its declaration alone (`native`). The
+lease dials the admin plane and follows `transport.admin`; under a plaintext
+admin dial a custom `data.lease.adminEndpoint` needs no certificate name.
 
 A Secret is required only for the planes left at `tls`: with every plane
 plaintext the chart renders without `tls.metaSecretName` or
@@ -216,6 +218,17 @@ or `insecureSkipVerify` for a lab). The mutual form — a client CA, only a
 scraper the CA vouches for served — is not rendered by the chart: kubelet
 httpGet probes cannot present a certificate. A deployment that wants it writes
 `observability.tls.client_ca` into a hand-written config and uses exec probes.
+
+Two things to know operating it. The node reads the certificate and key at
+**start** and has no hot reload yet, so a rotated Secret takes effect on the
+next restart: rotate with `kubectl rollout restart statefulset/<name>` (or a
+Secret-watching restarter) before the old certificate expires — the chart
+cannot add a checksum annotation for a Secret it does not own. And an
+annotation-driven scraper (`metrics.prometheusAnnotations`) that follows
+`prometheus.io/scheme: https` verifies the certificate against nothing it
+knows when the CA is private: give it the CA (or skip verification in a lab),
+or turn the annotations off and use the ServiceMonitor, whose `tlsConfig` is
+where the CA reference goes.
 
 ## First start: expect one or two restarts
 

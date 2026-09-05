@@ -19,6 +19,11 @@ data:
     rangeId: aaaaaaaa-0000-0000-0000-0000000000c1
   segmentId: aaaaaaaa-0000-0000-0000-0000000000d1
   principalId: aaaaaaaa-0000-0000-0000-0000000000ce
+  # The lease is what dials the admin plane, so the render carries the
+  # plaintext dial the CI step asserts (review).
+  lease:
+    enabled: true
+    topicUuid: aaaaaaaa-0000-0000-0000-0000000000f1
 resources:
   requests:
     cpu: 100m
