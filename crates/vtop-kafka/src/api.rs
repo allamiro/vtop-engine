@@ -158,9 +158,19 @@ pub struct MetadataBroker {
 pub struct MetadataTopic {
     pub error: ErrorCode,
     pub name: String,
-    /// Partition zero's leader, when the topic exists: phase 1 has one
-    /// partition per topic and this gateway leads it.
-    pub leader: Option<i32>,
+    /// The topic's partitions and who leads each (#457 slice 3). Empty when
+    /// the topic carries an error: a client is told the topic's state, not a
+    /// leader it cannot use.
+    pub partitions: Vec<MetadataPartition>,
+}
+
+/// One partition of a topic, and the broker that leads it. A range is a
+/// partition here: the node holding that range's lease is its leader, and a
+/// client sends that partition's produces and fetches there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetadataPartition {
+    pub index: i32,
+    pub leader: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -197,22 +207,24 @@ pub fn encode_metadata(out: &mut Encoder, version: i16, r: &MetadataResponse) {
         if version >= 1 {
             out.bool(false); // is_internal
         }
-        match topic.leader {
-            None => out.array_len(0),
-            Some(leader) => {
-                out.array_len(1);
-                out.i16(ErrorCode::None.as_i16());
-                out.i32(0); // partition_index
-                out.i32(leader);
-                if version >= 7 {
-                    out.i32(0); // leader_epoch
-                }
-                out.array_len(1);
-                out.i32(leader); // replica_nodes
-                out.array_len(1);
-                out.i32(leader); // isr_nodes
-                if version >= 5 {
-                    out.array_len(0); // offline_replicas
+        match &topic.partitions {
+            partitions if partitions.is_empty() => out.array_len(0),
+            partitions => {
+                out.array_len(partitions.len());
+                for partition in partitions {
+                    out.i16(ErrorCode::None.as_i16());
+                    out.i32(partition.index);
+                    out.i32(partition.leader);
+                    if version >= 7 {
+                        out.i32(0); // leader_epoch
+                    }
+                    out.array_len(1);
+                    out.i32(partition.leader); // replica_nodes
+                    out.array_len(1);
+                    out.i32(partition.leader); // isr_nodes
+                    if version >= 5 {
+                        out.array_len(0); // offline_replicas
+                    }
                 }
             }
         }
@@ -573,12 +585,15 @@ mod tests {
                 MetadataTopic {
                     error: ErrorCode::None,
                     name: "events".to_owned(),
-                    leader: Some(1),
+                    partitions: vec![MetadataPartition {
+                        index: 0,
+                        leader: 1,
+                    }],
                 },
                 MetadataTopic {
                     error: ErrorCode::UnknownTopicOrPartition,
                     name: "nope".to_owned(),
-                    leader: None,
+                    partitions: Vec::new(),
                 },
             ],
         };

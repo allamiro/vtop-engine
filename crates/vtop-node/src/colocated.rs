@@ -61,6 +61,15 @@ impl ColocatedNodeConfig {
             self.data.replica_transport,
         )?;
         crate::config::refuse_kafka_gateway_misuse(self.data.role, self.data.kafka.as_ref())?;
+        // And the partition topology, before either role binds (review). This
+        // check lives in `data_node::run` for the standalone entry and in
+        // `serve` for direct callers, but `run` below binds the shared
+        // observability endpoint BEFORE `serve` is ever polled: without it, a
+        // co-located node with an unroutable topology fails late and leaves
+        // the metrics port held.
+        if let Some(kafka) = self.data.kafka.as_ref() {
+            crate::config::kafka_partitions(kafka)?;
+        }
         // Fail loudly rather than picking a winner. A config that names three
         // listen addresses and gets one is a config whose author has a wrong
         // model of the process. PRESENCE of the block is what is rejected —
@@ -204,6 +213,50 @@ observability:
         assert!(
             error.contains("ONE observability endpoint"),
             "the error must say what to do instead: {error}"
+        );
+    }
+
+    /// A topology no client could route is refused by the co-located entry
+    /// too. `run` binds the shared observability endpoint before `serve` is
+    /// polled, so a check that lived only in `serve` would fail late and
+    /// leave the metrics port held.
+    #[test]
+    fn a_bad_partition_topology_is_refused_before_either_role_binds() {
+        let yaml = r#"
+meta:
+  node_id: 1
+  cluster_id: 00000000-0000-0000-0000-0000000000c0
+  data_dir: /tmp/meta
+  peer_listen: "127.0.0.1:9101"
+  admin_listen: "127.0.0.1:9201"
+  tls: { ca: ca.pem, cert: c.pem, key: k.pem }
+data:
+  role: standalone
+  node_uuid: 00000000-0000-0000-0000-0000000000a1
+  cluster_id: 00000000-0000-0000-0000-0000000000c0
+  data_dir: /tmp/data
+  fencing_epoch: 1
+  range: { topic: t, topic_epoch: 1, range_id: 00000000-0000-0000-0000-0000000000c1, range_generation: 0 }
+  segment_id: 00000000-0000-0000-0000-0000000000d1
+  native_listen: "127.0.0.1:9400"
+  replica_tls: { ca: ca.pem, cert: c.pem, key: k.pem }
+  native_tls: { ca: ca.pem, cert: c.pem, key: k.pem }
+  principal_id: 00000000-0000-0000-0000-0000000000e1
+  kafka:
+    listen: "127.0.0.1:9092"
+    node_id: 1
+    partition: 0
+    partitions:
+      - { partition: 0, node_id: 1, host: a, port: 9092 }
+      - { partition: 1, node_id: 1, host: a, port: 9092 }
+observability:
+  listen: "127.0.0.1:9500"
+"#;
+        let config: ColocatedNodeConfig = serde_yaml::from_str(yaml).unwrap();
+        let error = config.validate().unwrap_err();
+        assert!(
+            error.contains("one gateway serves one range"),
+            "the co-located entry must judge the topology too: {error}"
         );
     }
 

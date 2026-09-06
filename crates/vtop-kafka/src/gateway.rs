@@ -57,6 +57,17 @@ pub struct GatewayConfig {
     /// The broker id this gateway answers as; the leader of every partition.
     pub node_id: i32,
     pub cluster_id: Option<String>,
+    /// The partition this gateway leads (#457 slice 3). A range is a Kafka
+    /// partition: this gateway serves exactly one, and every produce, fetch
+    /// or commit for another is refused by name so the client goes to the
+    /// broker that does lead it. Zero, and the only partition, unless a
+    /// topology says otherwise.
+    pub partition: i32,
+    /// Every partition of the topic and the broker leading it, this one
+    /// included (#457 slice 3). EMPTY means the shape every deployment has
+    /// today: one partition, this gateway's, and Metadata says so — the
+    /// behaviour is unchanged for anyone who never sets this.
+    pub partitions: Vec<PartitionLeader>,
     /// A request frame above this is a closed connection, not an allocation.
     pub max_frame_bytes: usize,
     /// The longest a fetch waits for data, whatever the client asked: the
@@ -108,6 +119,8 @@ impl Default for GatewayConfig {
             advertised_host: "127.0.0.1".to_owned(),
             advertised_port: 9092,
             node_id: 1,
+            partition: 0,
+            partitions: Vec::new(),
             cluster_id: Some("vtop".to_owned()),
             max_frame_bytes: 32 * 1024 * 1024,
             max_fetch_wait: Duration::from_secs(5),
@@ -228,6 +241,17 @@ async fn until<T>(
     }
 }
 
+/// A partition of the served topic and the broker that leads it (#457 slice
+/// 3): what Metadata tells a client so it sends each partition's traffic to
+/// the node holding that range's lease.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionLeader {
+    pub index: i32,
+    pub node_id: i32,
+    pub host: String,
+    pub port: i32,
+}
+
 /// What a request produced: a framed reply, or a closed connection with the
 /// reason on the log — the protocol's own form of a refusal it cannot answer.
 enum Answer {
@@ -296,6 +320,73 @@ impl Gateway {
     pub fn with_lease(mut self, lease: Arc<dyn LeaseView>) -> Self {
         self.lease = Some(lease);
         self
+    }
+
+    /// The partitions this gateway advertises: the topology it was given, or
+    /// itself as the only partition when it was given none.
+    fn partition_map(&self) -> Vec<PartitionLeader> {
+        if self.config.partitions.is_empty() {
+            return vec![PartitionLeader {
+                index: self.config.partition,
+                node_id: self.config.node_id,
+                host: self.config.advertised_host.clone(),
+                port: self.config.advertised_port,
+            }];
+        }
+        self.config.partitions.clone()
+    }
+
+    /// `not_ours`, but for a topic that may not exist (review). The
+    /// topology describes the partitions of the topics this gateway SERVES,
+    /// so a partition index appearing in it says nothing about a name nobody
+    /// has: answering `NOT_LEADER_OR_FOLLOWER` there sends the client to
+    /// another broker, which has the same topology and makes the same
+    /// mistake, and the client loops. The enumeration is fetched at most once
+    /// per request and reused. A failed enumeration is not evidence a topic
+    /// is absent, so the topology answers then, as it did before.
+    async fn not_ours_for(
+        &self,
+        topic: &str,
+        partition: i32,
+        served: &mut Option<Result<Vec<String>, ErrorCode>>,
+        deadline: tokio::time::Instant,
+    ) -> ErrorCode {
+        if served.is_none() {
+            *served = Some(self.served_topics(deadline).await);
+        }
+        if matches!(served, Some(Ok(names)) if !names.iter().any(|name| name == topic)) {
+            return ErrorCode::UnknownTopicOrPartition;
+        }
+        self.not_ours(partition)
+    }
+
+    /// Whether this gateway leads a partition — the only one it may serve.
+    fn leads(&self, partition: i32) -> bool {
+        partition == self.config.partition
+    }
+
+    /// What to answer for a partition this gateway does not lead: the
+    /// topology's own answer. A partition another broker leads is
+    /// `NOT_LEADER_OR_FOLLOWER`, which a client answers by refreshing its
+    /// metadata and going there; a partition no broker leads is not a
+    /// partition of this topic at all.
+    fn not_ours(&self, partition: i32) -> ErrorCode {
+        // By reference (review): one request may name 4 096 partitions, and
+        // cloning the topology — every host string in it — for each of them
+        // turns a bounded request into quadratic work.
+        let known = if self.config.partitions.is_empty() {
+            partition == self.config.partition
+        } else {
+            self.config
+                .partitions
+                .iter()
+                .any(|peer| peer.index == partition)
+        };
+        if known {
+            ErrorCode::NotLeaderOrFollower
+        } else {
+            ErrorCode::UnknownTopicOrPartition
+        }
     }
 
     /// Whether this gateway still speaks for its range. `Unknown` is not
@@ -822,6 +913,21 @@ impl Gateway {
                 }
             },
         };
+        // One entry per topic NAMED, however often it is named (review). A
+        // client may put the same name in 1 024 times, and each occurrence
+        // would materialise the whole topology behind it — 256 brokers is
+        // the widest validation accepts — turning one small unauthenticated
+        // request into a multi-megabyte answer. Kafka's own broker answers
+        // from a map for the same reason. First-occurrence order is kept, so
+        // a well-formed request is unchanged.
+        let names = {
+            let mut seen = std::collections::HashSet::new();
+            let deduplicated: Vec<String> = names
+                .into_iter()
+                .filter(|name| seen.insert(name.clone()))
+                .collect();
+            deduplicated
+        };
         // A fenced gateway leads nothing (review): the partition is answered
         // `NOT_LEADER_OR_FOLLOWER` with no leader, which is the code every
         // stock client answers by refreshing its metadata elsewhere.
@@ -832,12 +938,19 @@ impl Gateway {
                 Ok(_) if !leads => MetadataTopic {
                     error: ErrorCode::NotLeaderOrFollower,
                     name,
-                    leader: None,
+                    partitions: Vec::new(),
                 },
                 Ok(_) => MetadataTopic {
                     error: ErrorCode::None,
                     name,
-                    leader: Some(self.config.node_id),
+                    partitions: self
+                        .partition_map()
+                        .into_iter()
+                        .map(|partition| crate::api::MetadataPartition {
+                            index: partition.index,
+                            leader: partition.node_id,
+                        })
+                        .collect(),
                 },
                 // Never created here, whatever `allow_auto_topic_creation`
                 // said: a topic is a range the metadata plane granted, not
@@ -845,7 +958,7 @@ impl Gateway {
                 Err(ErrorCode::UnknownTopicOrPartition) => MetadataTopic {
                     error: ErrorCode::UnknownTopicOrPartition,
                     name,
-                    leader: None,
+                    partitions: Vec::new(),
                 },
                 // A topic the bridge knows but cannot vouch for right now
                 // (review) — fenced, overloaded, storage trouble — keeps its
@@ -854,16 +967,33 @@ impl Gateway {
                 Err(error) => MetadataTopic {
                     error,
                     name,
-                    leader: None,
+                    partitions: Vec::new(),
                 },
             });
         }
         Ok(MetadataResponse {
-            brokers: vec![MetadataBroker {
-                node_id: self.config.node_id,
-                host: self.config.advertised_host.clone(),
-                port: self.config.advertised_port,
-            }],
+            // Every broker the topology names (#457 slice 3), so a client can
+            // reach the partition it wants. Itself alone where no topology
+            // was given.
+            // Deduplicated in linear time (review): a topology may name
+            // 4 096 partitions and this is an unauthenticated path, so
+            // scanning the growing list once per partition would be eight
+            // million comparisons a request. The node refuses a topology
+            // that reuses a broker id, so in a validated deployment nothing
+            // is ever dropped here; a library caller that builds its own
+            // config still gets the first entry for an id, as before.
+            brokers: {
+                let mut seen = std::collections::HashSet::new();
+                self.partition_map()
+                    .into_iter()
+                    .filter(|partition| seen.insert(partition.node_id))
+                    .map(|partition| MetadataBroker {
+                        node_id: partition.node_id,
+                        host: partition.host,
+                        port: partition.port,
+                    })
+                    .collect()
+            },
             cluster_id: self.config.cluster_id.clone(),
             controller_id: self.config.node_id,
             topics,
@@ -1141,12 +1271,13 @@ impl Gateway {
         for (member, topics) in decoded {
             for (topic, partitions) in topics {
                 for partition in partitions {
-                    if partition != 0 || !served.contains(&topic) {
+                    if !self.leads(partition) || !served.contains(&topic) {
                         return Err((
                             ErrorCode::InconsistentGroupProtocol,
                             member.clone(),
                             format!(
-                                "partition {partition} of {topic:?}: this gateway serves partition 0 of {served:?}"
+                                "partition {partition} of {topic:?}: this gateway serves partition {} of {served:?}",
+                                self.config.partition
                             ),
                         ));
                     }
@@ -1270,8 +1401,8 @@ impl Gateway {
         // deterministic refusal never turns into a bridge error, and a commit
         // that cannot succeed costs no bridge work.
         let by_name = |p: &crate::api_groups::OffsetCommitPartition| -> Option<ErrorCode> {
-            if p.partition != 0 {
-                Some(ErrorCode::UnknownTopicOrPartition)
+            if !self.leads(p.partition) {
+                Some(self.not_ours(p.partition))
             } else if p.offset < 0 {
                 // -1 is the wire's "nothing committed"; a position below zero
                 // is not one a consumer resumes from (review).
@@ -1307,9 +1438,20 @@ impl Gateway {
                 })
                 .collect::<Vec<_>>()
         };
-        let needs_bridge = verdicts
-            .iter()
-            .any(|decided| decided.iter().any(Option::is_none));
+        // A redirect needs the bridge too (review): `NOT_LEADER_OR_FOLLOWER`
+        // for a partition of a topic that does not exist would send the
+        // client to a broker with the same topology, which would say the
+        // same thing. So the enumeration is fetched whenever one was decided
+        // by name, not only when something was left undecided.
+        let redirected = verdicts.iter().any(|decided| {
+            decided
+                .iter()
+                .any(|verdict| verdict == &Some(ErrorCode::NotLeaderOrFollower))
+        });
+        let needs_bridge = redirected
+            || verdicts
+                .iter()
+                .any(|decided| decided.iter().any(Option::is_none));
         if !needs_bridge {
             return (answered(&verdicts, ErrorCode::None), outstanding);
         }
@@ -1326,6 +1468,20 @@ impl Gateway {
                 return (answered(&verdicts, error), outstanding);
             }
         };
+        // A redirect stands only for a topic that exists (review). The
+        // topology names the partitions of the topics this gateway serves,
+        // so for a name nobody has it says nothing, and sending the client
+        // to another broker would only have it answer the same way.
+        for (topic, decided) in request.topics.iter().zip(verdicts.iter_mut()) {
+            if served.contains(&topic.name) {
+                continue;
+            }
+            for verdict in decided.iter_mut() {
+                if verdict == &Some(ErrorCode::NotLeaderOrFollower) {
+                    *verdict = Some(ErrorCode::UnknownTopicOrPartition);
+                }
+            }
+        }
         // The watermark of every topic still to judge (review, #468): a
         // committed offset is the next one to consume, so it may reach the
         // watermark and no further — a position past what exists would be a
@@ -1645,6 +1801,8 @@ impl Gateway {
             + Duration::from_millis(request.timeout_ms.max(1) as u64)
                 .min(self.config.max_produce_wait);
         let mut topics = Vec::with_capacity(request.topics.len());
+        // Once for the request, and only if a redirect is ever considered.
+        let mut served = None;
         for topic in request.topics {
             let mut partitions = Vec::with_capacity(topic.partitions.len());
             for partition in topic.partitions {
@@ -1656,6 +1814,7 @@ impl Gateway {
                             partition.index,
                             partition.records.as_deref(),
                             deadline,
+                            &mut served,
                         )
                         .await
                     }
@@ -1702,12 +1861,14 @@ impl Gateway {
         partition: i32,
         records: Option<&[u8]>,
         deadline: tokio::time::Instant,
+        served: &mut Option<Result<Vec<String>, ErrorCode>>,
     ) -> Result<crate::bridge::Appended, (ErrorCode, String)> {
-        if partition != 0 {
+        if !self.leads(partition) {
             return Err((
-                ErrorCode::UnknownTopicOrPartition,
+                self.not_ours_for(topic, partition, served, deadline).await,
                 format!(
-                    "partition {partition}: phase 1 serves one partition per topic, partition 0"
+                    "partition {partition}: this gateway leads partition {}",
+                    self.config.partition
                 ),
             ));
         }
@@ -1843,6 +2004,9 @@ impl Gateway {
         // ceiling instead of holding the response open.
         let ceiling = tokio::time::Instant::now() + self.config.max_fetch_wait;
         let min_bytes = usize::try_from(request.min_bytes.max(0)).unwrap_or(usize::MAX);
+        // Enumerated at most once for the whole fetch, long poll included:
+        // a redirect decision must not cost a bridge call per turn.
+        let mut served = None;
         loop {
             let mut topics = Vec::with_capacity(request.topics.len());
             // ONE budget for the whole response (review), not one per
@@ -1855,8 +2019,13 @@ impl Gateway {
             for topic in &request.topics {
                 let mut partitions = Vec::with_capacity(topic.partitions.len());
                 for partition in &topic.partitions {
-                    let outcome = if partition.index != 0 {
-                        Err(ErrorCode::UnknownTopicOrPartition)
+                    let outcome = if !self.leads(partition.index) {
+                        // Another broker's partition, or none of this topic's
+                        // (#457 slice 3): the topology answers, not a guess —
+                        // and only for a topic that exists.
+                        Err(self
+                            .not_ours_for(&topic.name, partition.index, &mut served, ceiling)
+                            .await)
                     } else if remaining == 0 {
                         // No budget left: the watermarks without records —
                         // but an offset outside the log is still refused
@@ -1944,12 +2113,20 @@ impl Gateway {
     }
 
     async fn list_offsets(&self, request: ListOffsetsRequest) -> Vec<ListOffsetsTopicResponse> {
+        // One ceiling for the request, and one topic enumeration under it,
+        // fetched only if a redirect is ever considered.
+        let ceiling = tokio::time::Instant::now() + self.config.max_fetch_wait;
+        let mut served = None;
         let mut topics = Vec::with_capacity(request.topics.len());
         for topic in request.topics {
             let mut partitions = Vec::with_capacity(topic.partitions.len());
             for partition in topic.partitions {
-                let (error, offset) = if partition.index != 0 {
-                    (ErrorCode::UnknownTopicOrPartition, -1)
+                let (error, offset) = if !self.leads(partition.index) {
+                    (
+                        self.not_ours_for(&topic.name, partition.index, &mut served, ceiling)
+                            .await,
+                        -1,
+                    )
                 } else if partition.timestamp == TIMESTAMP_LATEST
                     || partition.timestamp == TIMESTAMP_EARLIEST
                 {
@@ -4236,6 +4413,233 @@ mod tests {
             bridge.1.load(std::sync::atomic::Ordering::SeqCst),
             before,
             "no enumeration for a member not entitled to assign"
+        );
+    }
+
+    /// A gateway serves only the partition it leads (#457 slice 3), and its
+    /// Metadata names every broker of the topology so a client can reach the
+    /// others. A partition another broker leads is `NOT_LEADER_OR_FOLLOWER`,
+    /// which a stock client answers by refreshing and going there; a
+    /// partition no broker leads is not this topic's at all. With no
+    /// topology configured nothing changes: one partition, this gateway's.
+    #[tokio::test]
+    async fn a_gateway_serves_only_the_partition_it_leads() {
+        let topology = vec![
+            PartitionLeader {
+                index: 0,
+                node_id: 7,
+                host: "other.example".to_owned(),
+                port: 9092,
+            },
+            PartitionLeader {
+                index: 1,
+                node_id: 9,
+                host: "127.0.0.1".to_owned(),
+                port: 0,
+            },
+        ];
+        let (addr, _stop) = start_with(Arc::new(MemoryBridge::with_topics(["events"])), |c| {
+            c.node_id = 9;
+            c.partition = 1;
+            c.partitions = topology.clone();
+        })
+        .await;
+        // Metadata: both brokers, both partitions, each with its own leader.
+        let mut body = Encoder::new();
+        body.array_len(1);
+        body.string("events");
+        body.bool(true);
+        let reply = call(addr, 3, 4, 1, body.as_slice()).await.unwrap();
+        let mut d = Decoder::new(&reply);
+        d.i32("throttle").unwrap();
+        assert_eq!(d.array_len("brokers").unwrap(), Some(2));
+        let mut brokers = Vec::new();
+        for _ in 0..2 {
+            let node = d.i32("node").unwrap();
+            let host = d.string("host").unwrap().to_owned();
+            let port = d.i32("port").unwrap();
+            d.nullable_string("rack").unwrap();
+            brokers.push((node, host, port));
+        }
+        assert_eq!(brokers[0].0, 7);
+        assert_eq!(brokers[0].1, "other.example");
+        assert_eq!(brokers[1].0, 9);
+        d.nullable_string("cluster").unwrap();
+        d.i32("controller").unwrap();
+        assert_eq!(d.array_len("topics").unwrap(), Some(1));
+        assert_eq!(d.i16("topic error").unwrap(), 0);
+        assert_eq!(d.string("topic name").unwrap(), "events");
+        d.bool("internal").unwrap();
+        assert_eq!(d.array_len("partitions").unwrap(), Some(2));
+        let mut leaders = Vec::new();
+        for _ in 0..2 {
+            assert_eq!(d.i16("partition error").unwrap(), 0);
+            let index = d.i32("partition index").unwrap();
+            let leader = d.i32("leader").unwrap();
+            d.array_len("replicas").unwrap();
+            d.i32("replica").unwrap();
+            d.array_len("isr").unwrap();
+            d.i32("isr node").unwrap();
+            // offline_replicas is v5+; this reads v4.
+            leaders.push((index, leader));
+        }
+        assert_eq!(
+            leaders,
+            vec![(0, 7), (1, 9)],
+            "each partition names its own leader"
+        );
+        // Produce: ours is served, another broker's is redirected, and one
+        // nobody leads is not this topic's.
+        let reply = call(
+            addr,
+            0,
+            8,
+            2,
+            &produce_body("events", 1, -1, None, &batch_bytes(&["a"], false)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_produce(&reply, 8).0,
+            0,
+            "the partition this gateway leads"
+        );
+        let reply = call(
+            addr,
+            0,
+            8,
+            3,
+            &produce_body("events", 0, -1, None, &batch_bytes(&["a"], false)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_produce(&reply, 8).0,
+            ErrorCode::NotLeaderOrFollower.as_i16(),
+            "another broker's partition"
+        );
+        let reply = call(
+            addr,
+            0,
+            8,
+            4,
+            &produce_body("events", 5, -1, None, &batch_bytes(&["a"], false)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_produce(&reply, 8).0,
+            ErrorCode::UnknownTopicOrPartition.as_i16(),
+            "no broker leads partition 5"
+        );
+        // Fetch and ListOffsets answer the same way.
+        let reply = call(addr, 1, 4, 5, &fetch_body(4, "events", 0, 0, 1_048_576))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_fetch(&reply, 4).0,
+            ErrorCode::NotLeaderOrFollower.as_i16()
+        );
+        let reply = call(addr, 1, 4, 6, &fetch_body(4, "events", 1, 0, 1_048_576))
+            .await
+            .unwrap();
+        assert_eq!(read_fetch(&reply, 4).0, 0);
+        // And with no topology at all, the shape every deployment has today.
+        let (plain, _stop2) = start(Arc::new(MemoryBridge::with_topics(["events"]))).await;
+        let reply = call(
+            plain,
+            0,
+            8,
+            7,
+            &produce_body("events", 0, -1, None, &batch_bytes(&["a"], false)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_produce(&reply, 8).0, 0, "partition 0 unchanged");
+    }
+
+    /// The topology names the partitions of the topics this gateway SERVES,
+    /// so it says nothing about a name nobody has (review). Answering
+    /// `NOT_LEADER_OR_FOLLOWER` for partition 0 of a topic that does not
+    /// exist would send the client to a broker holding the same topology,
+    /// which would answer the same way, and the client would loop. And a
+    /// client that names one topic many times is answered once for it: each
+    /// occurrence would otherwise expand the whole topology behind it.
+    #[tokio::test]
+    async fn a_partition_of_a_topic_nobody_has_is_unknown_not_elsewhere() {
+        let topology = vec![
+            PartitionLeader {
+                index: 0,
+                node_id: 7,
+                host: "other.example".to_owned(),
+                port: 9092,
+            },
+            PartitionLeader {
+                index: 1,
+                node_id: 9,
+                host: "127.0.0.1".to_owned(),
+                port: 0,
+            },
+        ];
+        let (addr, _stop) = start_with(Arc::new(MemoryBridge::with_topics(["events"])), |c| {
+            c.node_id = 9;
+            c.partition = 1;
+            c.partitions = topology.clone();
+        })
+        .await;
+        let unknown = ErrorCode::UnknownTopicOrPartition.as_i16();
+        // Produce, fetch and list offsets: partition 0 IS in the topology,
+        // and `absent` is not.
+        let reply = call(
+            addr,
+            0,
+            8,
+            1,
+            &produce_body("absent", 0, -1, None, &batch_bytes(&["a"], false)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_produce(&reply, 8).0,
+            unknown,
+            "a topic nobody has is not another broker's"
+        );
+        let reply = call(addr, 1, 4, 2, &fetch_body(4, "absent", 0, 0, 1_048_576))
+            .await
+            .unwrap();
+        assert_eq!(read_fetch(&reply, 4).0, unknown);
+        // The existing topic still redirects, so the narrowing did not
+        // swallow the routing this slice is for.
+        let reply = call(addr, 1, 4, 3, &fetch_body(4, "events", 0, 0, 1_048_576))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_fetch(&reply, 4).0,
+            ErrorCode::NotLeaderOrFollower.as_i16()
+        );
+        // Metadata: one entry for a name given four times.
+        let mut body = Encoder::new();
+        body.array_len(4);
+        for _ in 0..4 {
+            body.string("events");
+        }
+        body.bool(true);
+        let reply = call(addr, 3, 4, 4, body.as_slice()).await.unwrap();
+        let mut d = Decoder::new(&reply);
+        d.i32("throttle").unwrap();
+        assert_eq!(d.array_len("brokers").unwrap(), Some(2));
+        for _ in 0..2 {
+            d.i32("node").unwrap();
+            d.string("host").unwrap();
+            d.i32("port").unwrap();
+            d.nullable_string("rack").unwrap();
+        }
+        d.nullable_string("cluster").unwrap();
+        d.i32("controller").unwrap();
+        assert_eq!(
+            d.array_len("topics").unwrap(),
+            Some(1),
+            "one answer per topic named, however often it is named"
         );
     }
 
