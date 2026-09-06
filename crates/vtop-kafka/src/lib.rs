@@ -56,7 +56,7 @@ pub use lease::{LeaseState, LeaseView};
 pub use messages::{ApiKey, ErrorCode, HeaderVerdict, RequestHeader};
 #[cfg(feature = "native")]
 pub use native::{EpochsExhausted, NativeBridge, NativeBridgeConfig};
-pub use offsets::{Committed, MemoryOffsetStore, OffsetStore};
+pub use offsets::{Committed, MemoryOffsetStore, OffsetStore, OverlayOffsetStore};
 pub use records::{Record, RecordBatch};
 pub use remote::{RemoteBridge, RemoteConfig};
 pub use topics::{TopicBinding, TopicMap};

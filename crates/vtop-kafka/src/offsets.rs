@@ -11,8 +11,8 @@
 //! and a position below zero is not one a consumer can resume from.
 
 use crate::messages::ErrorCode;
-use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 /// A committed position and the metadata the client attached to it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,6 +139,84 @@ impl OffsetStore for MemoryOffsetStore {
     }
 }
 
+/// Topics the metadata-plane store does not name (a `backend: kafka` catalog
+/// route) still accept OffsetCommit in this process. Those rows are not a
+/// lineage-bound cursor: this node has no range for that log.
+pub struct OverlayOffsetStore {
+    inner: Arc<dyn OffsetStore>,
+    extra_topics: HashSet<String>,
+    extra: MemoryOffsetStore,
+}
+
+impl OverlayOffsetStore {
+    pub fn wrapping(
+        inner: Arc<dyn OffsetStore>,
+        extra_topics: Vec<String>,
+    ) -> Arc<dyn OffsetStore> {
+        if extra_topics.is_empty() {
+            return inner;
+        }
+        Arc::new(Self {
+            inner,
+            extra_topics: extra_topics.into_iter().collect(),
+            extra: MemoryOffsetStore::default(),
+        })
+    }
+
+    fn is_extra(&self, topic: &str) -> bool {
+        self.extra_topics.contains(topic)
+    }
+}
+
+#[async_trait::async_trait]
+impl OffsetStore for OverlayOffsetStore {
+    async fn commit(
+        &self,
+        group: &str,
+        topic: &str,
+        partition: i32,
+        committed: Committed,
+    ) -> Result<(), ErrorCode> {
+        if self.is_extra(topic) {
+            self.extra.commit(group, topic, partition, committed).await
+        } else {
+            self.inner.commit(group, topic, partition, committed).await
+        }
+    }
+
+    async fn fetch(
+        &self,
+        group: &str,
+        topic: &str,
+        partition: i32,
+    ) -> Result<Option<Committed>, ErrorCode> {
+        if self.is_extra(topic) {
+            self.extra.fetch(group, topic, partition).await
+        } else {
+            self.inner.fetch(group, topic, partition).await
+        }
+    }
+
+    async fn committed(
+        &self,
+        group: &str,
+        at_most: usize,
+    ) -> Result<Vec<(String, i32, Committed)>, ErrorCode> {
+        let cap = at_most.saturating_add(1);
+        let mut rows = self.inner.committed(group, at_most).await?;
+        if rows.len() >= cap {
+            return Ok(rows);
+        }
+        let extra = self
+            .extra
+            .committed(group, cap.saturating_sub(rows.len()).saturating_sub(1))
+            .await?;
+        rows.extend(extra);
+        rows.truncate(cap);
+        Ok(rows)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,5 +299,35 @@ mod tests {
         assert_eq!(store.committed("g", 10).await.unwrap().len(), 4);
         assert_eq!(store.committed("h", 10).await.unwrap().len(), 1);
         assert!(store.committed("none", 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn overlay_keeps_extra_topics_off_the_inner_store() {
+        let inner = Arc::new(MemoryOffsetStore::default());
+        let store = OverlayOffsetStore::wrapping(
+            Arc::clone(&inner) as Arc<dyn OffsetStore>,
+            vec!["legacy".to_owned()],
+        );
+        store
+            .commit(
+                "g",
+                "legacy",
+                0,
+                Committed {
+                    offset: 9,
+                    metadata: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            inner.fetch("g", "legacy", 0).await.unwrap(),
+            None,
+            "a kafka-only name is not this range's cursor"
+        );
+        assert_eq!(
+            store.fetch("g", "legacy", 0).await.unwrap().unwrap().offset,
+            9
+        );
     }
 }

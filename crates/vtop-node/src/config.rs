@@ -436,6 +436,7 @@ pub fn kafka_topics(kafka: &KafkaGatewayConfig) -> Result<(), String> {
     }
     let mut seen = BTreeSet::new();
     let mut native_backed = Vec::new();
+    let mut remote_logs = BTreeSet::new();
     for route in &kafka.topics {
         if route.name.is_empty() {
             return Err(
@@ -466,6 +467,20 @@ pub fn kafka_topics(kafka: &KafkaGatewayConfig) -> Result<(), String> {
                 }
                 for broker in &route.brokers {
                     kafka_bootstrap_broker(broker, &route.name)?;
+                }
+                let remote_topic = route
+                    .remote_topic
+                    .clone()
+                    .unwrap_or_else(|| route.name.clone());
+                let mut brokers = route.brokers.clone();
+                brokers.sort();
+                if !remote_logs.insert((brokers, remote_topic.clone())) {
+                    return Err(format!(
+                        "`kafka.topics` gives {:?} the same remote log as another route \
+                         ({remote_topic}): two Kafka names would share one producer-sequence \
+                         space on that cluster",
+                        route.name
+                    ));
                 }
             }
             other => {
@@ -754,6 +769,11 @@ fn kafka_bootstrap_broker(broker: &str, topic: &str) -> Result<(), String> {
         let Some((host, port)) = rest.split_once("]:") else {
             return Err(format!("{what} {broker:?} that is not [host]:port"));
         };
+        if host.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err(format!(
+                "{what} {broker:?}: [host]:port is for an IPv6 literal, not {host:?}"
+            ));
+        }
         (host, port)
     } else {
         let Some((host, port)) = broker.rsplit_once(':') else {
@@ -2385,6 +2405,40 @@ mod transport_tests {
         assert!(kafka_topics(&bad_port)
             .unwrap_err()
             .contains("not a number"));
+        let bracketed_dns = KafkaGatewayConfig {
+            topics: vec![KafkaTopicRoute {
+                name: "legacy".to_owned(),
+                backend: "kafka".to_owned(),
+                brokers: vec!["[localhost]:9092".to_owned()],
+                ..KafkaTopicRoute::default()
+            }],
+            ..base.clone()
+        };
+        assert!(kafka_topics(&bracketed_dns)
+            .unwrap_err()
+            .contains("IPv6 literal"));
+        let two_remotes = KafkaGatewayConfig {
+            topics: vec![
+                KafkaTopicRoute {
+                    name: "legacy".to_owned(),
+                    backend: "kafka".to_owned(),
+                    brokers: vec!["127.0.0.1:9092".to_owned()],
+                    remote_topic: Some("shared".to_owned()),
+                    ..KafkaTopicRoute::default()
+                },
+                KafkaTopicRoute {
+                    name: "copy".to_owned(),
+                    backend: "kafka".to_owned(),
+                    brokers: vec!["127.0.0.1:9092".to_owned()],
+                    remote_topic: Some("shared".to_owned()),
+                    ..KafkaTopicRoute::default()
+                },
+            ],
+            ..base.clone()
+        };
+        assert!(kafka_topics(&two_remotes)
+            .unwrap_err()
+            .contains("same remote log"));
         let receipts_on_kafka = KafkaGatewayConfig {
             topics: vec![KafkaTopicRoute {
                 name: "legacy".to_owned(),

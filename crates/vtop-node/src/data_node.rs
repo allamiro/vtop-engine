@@ -1638,61 +1638,73 @@ async fn run_leader(
                     .with_lease(Arc::new(BrokerLeaseView(Arc::clone(&broker)))
                         as Arc<dyn vtop_kafka::LeaseView>)
                     .with_offsets(vtop_kafka::CutoverStore::wrapping(
-                        Arc::new(
-                            vtop_kafka::metadata_offsets::MetadataOffsetStore::new(
-                                Arc::new(lease_admin_client(lease)?)
-                                    as Arc<dyn vtop_kafka::metadata_offsets::CursorPlane>,
-                                Arc::new(BrokerLeaseView(Arc::clone(&broker)))
-                                    as Arc<dyn vtop_kafka::metadata_offsets::LeaseView>,
-                                vtop_kafka::metadata_offsets::RangeIdentity {
-                                    cluster_id: config.cluster_id,
-                                    topic: served_topic.clone(),
-                                    topic_uuid: lease.topic_uuid,
-                                    range_uuid: config.range.range_id,
-                                    topic_epoch: config.range.topic_epoch,
-                                    holder_node_uuid: config.node_uuid,
-                                    partition: kafka.partition,
-                                },
-                            )
-                            .with_peers(
-                                kafka
-                                    .partitions
-                                    .iter()
-                                    .filter(|peer| peer.partition != kafka.partition)
-                                    .filter_map(|peer| {
-                                        match (peer.topic_uuid, peer.range_uuid, peer.topic_epoch) {
-                                            (
-                                                Some(topic_uuid),
-                                                Some(range_uuid),
-                                                Some(topic_epoch),
-                                            ) => {
-                                                Some(vtop_kafka::metadata_offsets::PartitionRange {
-                                                    topic: served_topic.clone(),
-                                                    partition: peer.partition,
-                                                    topic_uuid,
-                                                    range_uuid,
-                                                    topic_epoch,
-                                                })
+                        vtop_kafka::OverlayOffsetStore::wrapping(
+                            Arc::new(
+                                vtop_kafka::metadata_offsets::MetadataOffsetStore::new(
+                                    Arc::new(lease_admin_client(lease)?)
+                                        as Arc<dyn vtop_kafka::metadata_offsets::CursorPlane>,
+                                    Arc::new(BrokerLeaseView(Arc::clone(&broker)))
+                                        as Arc<dyn vtop_kafka::metadata_offsets::LeaseView>,
+                                    vtop_kafka::metadata_offsets::RangeIdentity {
+                                        cluster_id: config.cluster_id,
+                                        topic: served_topic.clone(),
+                                        topic_uuid: lease.topic_uuid,
+                                        range_uuid: config.range.range_id,
+                                        topic_epoch: config.range.topic_epoch,
+                                        holder_node_uuid: config.node_uuid,
+                                        partition: kafka.partition,
+                                    },
+                                )
+                                .with_peers(
+                                    kafka
+                                        .partitions
+                                        .iter()
+                                        .filter(|peer| peer.partition != kafka.partition)
+                                        .filter_map(|peer| {
+                                            match (
+                                                peer.topic_uuid,
+                                                peer.range_uuid,
+                                                peer.topic_epoch,
+                                            ) {
+                                                (
+                                                    Some(topic_uuid),
+                                                    Some(range_uuid),
+                                                    Some(topic_epoch),
+                                                ) => Some(
+                                                    vtop_kafka::metadata_offsets::PartitionRange {
+                                                        topic: served_topic.clone(),
+                                                        partition: peer.partition,
+                                                        topic_uuid,
+                                                        range_uuid,
+                                                        topic_epoch,
+                                                    },
+                                                ),
+                                                _ => None,
                                             }
-                                            _ => None,
-                                        }
-                                    })
-                                    .collect(),
-                            )
-                            .with_topic_aliases(
-                                kafka
-                                    .topics
-                                    .iter()
-                                    .filter(|route| {
-                                        matches!(
-                                            route.backend.as_str(),
-                                            "native" | "dual" | "shadow"
-                                        )
-                                    })
-                                    .map(|route| route.name.clone())
-                                    .collect(),
-                            ),
-                        ) as Arc<dyn vtop_kafka::OffsetStore>,
+                                        })
+                                        .collect(),
+                                )
+                                .with_topic_aliases(
+                                    kafka
+                                        .topics
+                                        .iter()
+                                        .filter(|route| {
+                                            matches!(
+                                                route.backend.as_str(),
+                                                "native" | "dual" | "shadow"
+                                            )
+                                        })
+                                        .map(|route| route.name.clone())
+                                        .collect(),
+                                ),
+                            ) as Arc<dyn vtop_kafka::OffsetStore>,
+                            kafka
+                                .topics
+                                .iter()
+                                .filter(|route| route.backend == "kafka")
+                                .map(|route| route.name.clone())
+                                .collect(),
+                        ),
                         cutovers,
                     )),
                 None => gateway,

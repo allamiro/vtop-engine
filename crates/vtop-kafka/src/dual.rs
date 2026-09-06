@@ -43,6 +43,10 @@ pub struct Receipt {
     pub shadow_offset: Option<i64>,
     pub records: i64,
     pub sha256: [u8; 32],
+    /// Set on [`ReceiptKind::NativeCursor`]: the group whose cursor is native.
+    pub group: Option<String>,
+    /// Set on [`ReceiptKind::NativeCursor`].
+    pub partition: Option<i32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +59,9 @@ pub enum ReceiptKind {
     ShadowMatch,
     /// A shadow-read saw different bytes; the client was told.
     ShadowMismatch,
+    /// After cutover, this group's cursor is native numbering and must not
+    /// be translated again.
+    NativeCursor,
 }
 
 impl ReceiptKind {
@@ -64,6 +71,7 @@ impl ReceiptKind {
             Self::PrimaryOnly => "primary_only",
             Self::ShadowMatch => "shadow_match",
             Self::ShadowMismatch => "shadow_mismatch",
+            Self::NativeCursor => "native_cursor",
         }
     }
 
@@ -73,6 +81,7 @@ impl ReceiptKind {
             "primary_only" => Some(Self::PrimaryOnly),
             "shadow_match" => Some(Self::ShadowMatch),
             "shadow_mismatch" => Some(Self::ShadowMismatch),
+            "native_cursor" => Some(Self::NativeCursor),
             _ => None,
         }
     }
@@ -250,6 +259,11 @@ fn parse_receipt(line: &str) -> Result<Receipt, String> {
         shadow_offset,
         records,
         sha256,
+        group: json_field(line, "group").ok().filter(|s| s != "null"),
+        partition: json_field(line, "partition")
+            .ok()
+            .filter(|s| s != "null")
+            .and_then(|s| s.parse().ok()),
     })
 }
 
@@ -259,8 +273,7 @@ fn json_field(line: &str, key: &str) -> Result<String, String> {
         .split_once(&needle)
         .map(|(_, rest)| rest.trim_start())
         .ok_or_else(|| format!("missing {key}"))?;
-    if rest.starts_with('"') {
-        let inner = &rest[1..];
+    if let Some(inner) = rest.strip_prefix('"') {
         let mut out = String::new();
         let mut chars = inner.chars();
         while let Some(c) = chars.next() {
@@ -324,14 +337,22 @@ fn receipt_json(row: &Receipt) -> String {
         Some(offset) => offset.to_string(),
         None => "null".to_owned(),
     };
-    format!(
+    let mut json = format!(
         "{{\"topic\":{},\"kind\":{},\"primary_offset\":{},\"shadow_offset\":{shadow},\"records\":{},\"sha256\":{}}}",
         json_escape(&row.topic),
         json_escape(row.kind.as_str()),
         row.primary_offset,
         row.records,
         json_escape(&hex_encode(&row.sha256)),
-    )
+    );
+    if let (Some(group), Some(partition)) = (&row.group, row.partition) {
+        json.pop();
+        json.push_str(&format!(
+            ",\"group\":{},\"partition\":{partition}}}",
+            json_escape(group)
+        ));
+    }
+    json
 }
 
 fn json_escape(s: &str) -> String {
@@ -449,6 +470,8 @@ impl Bridge for DualBridge {
                     shadow_offset: Some(shadow.base_offset),
                     records,
                     sha256: hash,
+                    group: None,
+                    partition: None,
                 })?;
                 Ok(primary)
             }
@@ -467,6 +490,8 @@ impl Bridge for DualBridge {
                     shadow_offset: None,
                     records,
                     sha256: hash,
+                    group: None,
+                    partition: None,
                 })?;
                 Err(ErrorCode::KafkaStorageError)
             }
@@ -514,6 +539,8 @@ impl Bridge for DualBridge {
                         shadow_offset: Some(shadow_offset),
                         records: 0,
                         sha256: hash,
+                        group: None,
+                        partition: None,
                     })?;
                     Ok(primary)
                 } else {
@@ -532,6 +559,8 @@ impl Bridge for DualBridge {
                         shadow_offset: Some(shadow_offset),
                         records: 0,
                         sha256: hash,
+                        group: None,
+                        partition: None,
                     })?;
                     Err(ErrorCode::CorruptMessage)
                 }
@@ -559,24 +588,23 @@ fn payload_bytes_equal(a: &[u8], b: &[u8]) -> bool {
     record_payloads(a) == record_payloads(b)
 }
 
-fn record_payloads(
-    encoded: &[u8],
-) -> Vec<(
-    i64,
-    Option<Vec<u8>>,
-    Option<Vec<u8>>,
-    Vec<(String, Option<Vec<u8>>)>,
-)> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ComparedRecord {
+    timestamp_millis: i64,
+    key: Option<Vec<u8>>,
+    value: Option<Vec<u8>>,
+    headers: Vec<(String, Option<Vec<u8>>)>,
+}
+
+fn record_payloads(encoded: &[u8]) -> Vec<ComparedRecord> {
     decode_batches(encoded)
         .into_iter()
         .flat_map(|batch| batch.records)
-        .map(|record| {
-            (
-                record.timestamp_millis,
-                record.key,
-                record.value,
-                record.headers,
-            )
+        .map(|record| ComparedRecord {
+            timestamp_millis: record.timestamp_millis,
+            key: record.key,
+            value: record.value,
+            headers: record.headers,
         })
         .collect()
 }
@@ -619,8 +647,11 @@ pub struct CutoverStore {
     /// `(group, topic, partition)` committed or migrated after wrapping:
     /// those offsets are already native and must not run through
     /// `to_primary` again, even when they numerically overlap a historical
-    /// shadow range.
+    /// shadow range. Reloaded from `NativeCursor` receipts on restart.
     native: Mutex<HashSet<(String, String, i32)>>,
+    /// Commits and fetch-migrations take turns so a translation write-back
+    /// cannot rewind a concurrent native commit.
+    order: tokio::sync::Mutex<()>,
 }
 
 impl CutoverStore {
@@ -629,6 +660,7 @@ impl CutoverStore {
             inner,
             by_topic: Mutex::new(HashMap::new()),
             native: Mutex::new(HashSet::new()),
+            order: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -651,6 +683,13 @@ impl CutoverStore {
         }
         let store = Self::new(inner);
         for (topic, receipts) in topics {
+            for row in receipts.rows() {
+                if row.kind == ReceiptKind::NativeCursor {
+                    if let (Some(group), Some(partition)) = (row.group, row.partition) {
+                        store.remember_native(&group, &topic, partition);
+                    }
+                }
+            }
             store.cut_over(&topic, receipts);
         }
         Arc::new(store)
@@ -667,11 +706,44 @@ impl CutoverStore {
         }
     }
 
-    fn mark_native(&self, group: &str, topic: &str, partition: i32) {
+    fn remember_native(&self, group: &str, topic: &str, partition: i32) -> bool {
         self.native
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert((group.to_owned(), topic.to_owned(), partition));
+            .insert((group.to_owned(), topic.to_owned(), partition))
+    }
+
+    fn mark_native(&self, group: &str, topic: &str, partition: i32) {
+        if !self.remember_native(group, topic, partition) {
+            return;
+        }
+        let log = {
+            let by_topic = self
+                .by_topic
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            by_topic.get(topic).map(Arc::clone)
+        };
+        if let Some(log) = log {
+            if let Err(error) = log.record(Receipt {
+                topic: topic.to_owned(),
+                kind: ReceiptKind::NativeCursor,
+                primary_offset: 0,
+                shadow_offset: None,
+                records: 0,
+                sha256: [0; 32],
+                group: Some(group.to_owned()),
+                partition: Some(partition),
+            }) {
+                tracing::error!(
+                    group,
+                    topic,
+                    partition,
+                    code = error.as_i16(),
+                    "kafka cutover: the native-cursor marker could not be appended; a restart may re-translate this group"
+                );
+            }
+        }
     }
 
     fn is_native(&self, group: &str, topic: &str, partition: i32) -> bool {
@@ -691,6 +763,7 @@ impl OffsetStore for CutoverStore {
         partition: i32,
         committed: Committed,
     ) -> Result<(), ErrorCode> {
+        let _order = self.order.lock().await;
         self.inner
             .commit(group, topic, partition, committed)
             .await?;
@@ -707,6 +780,7 @@ impl OffsetStore for CutoverStore {
         topic: &str,
         partition: i32,
     ) -> Result<Option<Committed>, ErrorCode> {
+        let _order = self.order.lock().await;
         let Some(mut committed) = self.inner.fetch(group, topic, partition).await? else {
             return Ok(None);
         };
@@ -734,6 +808,7 @@ impl OffsetStore for CutoverStore {
         group: &str,
         at_most: usize,
     ) -> Result<Vec<(String, i32, Committed)>, ErrorCode> {
+        let _order = self.order.lock().await;
         let mut rows = self.inner.committed(group, at_most).await?;
         for (topic, partition, committed) in rows.iter_mut() {
             if self.is_native(group, topic, *partition) {
@@ -1008,6 +1083,8 @@ mod tests {
             shadow_offset: Some(9),
             records: 2,
             sha256: [0xab; 32],
+            group: None,
+            partition: None,
         };
         let line = receipt_json(&row);
         let parsed = load_receipts_jsonl(&format!("{line}\n")).unwrap();
@@ -1020,6 +1097,8 @@ mod tests {
             shadow_offset: Some(1),
             records: 1,
             sha256: [0; 32],
+            group: None,
+            partition: None,
         };
         let line = receipt_json(&tabbed);
         assert_eq!(load_receipts_jsonl(&line).unwrap(), vec![tabbed]);
@@ -1038,6 +1117,8 @@ mod tests {
                 shadow_offset: Some(4),
                 records: 2,
                 sha256: [1; 32],
+                group: None,
+                partition: None,
             })
             .unwrap();
         drop(first);
@@ -1230,6 +1311,8 @@ mod tests {
             shadow_offset: Some(0),
             records: 1,
             sha256: [0; 32],
+            group: None,
+            partition: None,
         })
         .unwrap();
         std::fs::remove_file(&path).unwrap();
@@ -1242,6 +1325,8 @@ mod tests {
                 shadow_offset: Some(1),
                 records: 1,
                 sha256: [1; 32],
+                group: None,
+                partition: None,
             }),
             Err(ErrorCode::KafkaStorageError)
         );
@@ -1249,6 +1334,53 @@ mod tests {
             log.rows().len(),
             1,
             "memory stays at the last durable row when the file refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_native_cursor_marker_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let receipts = ReceiptLog::create(&path).unwrap();
+        receipts
+            .record(Receipt {
+                topic: "events".to_owned(),
+                kind: ReceiptKind::DualWrite,
+                primary_offset: 0,
+                shadow_offset: Some(1),
+                records: 2,
+                sha256: [2; 32],
+                group: None,
+                partition: None,
+            })
+            .unwrap();
+        let inner = Arc::new(MemoryOffsetStore::default());
+        let store = CutoverStore::wrapping(
+            Arc::clone(&inner) as Arc<dyn OffsetStore>,
+            vec![("events".to_owned(), Arc::clone(&receipts))],
+        );
+        store
+            .commit(
+                "g",
+                "events",
+                0,
+                Committed {
+                    offset: 1,
+                    metadata: None,
+                },
+            )
+            .await
+            .unwrap();
+        drop(store);
+        let reopened = ReceiptLog::create(&path).unwrap();
+        let again = CutoverStore::wrapping(
+            inner as Arc<dyn OffsetStore>,
+            vec![("events".to_owned(), reopened)],
+        );
+        assert_eq!(
+            again.fetch("g", "events", 0).await.unwrap().unwrap().offset,
+            1,
+            "the native commit is not translated again after restart"
         );
     }
 

@@ -37,6 +37,19 @@ pub struct RemoteConfig {
     pub timeout: Duration,
 }
 
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ReplayKey {
+    topic: String,
+    producer_id: i64,
+    producer_epoch: i16,
+}
+
+struct ReplaySet {
+    first_sequence: i32,
+    fingerprint: u64,
+    appended: Appended,
+}
+
 /// A [`Bridge`] over an external Kafka cluster.
 pub struct RemoteBridge {
     config: RemoteConfig,
@@ -46,7 +59,7 @@ pub struct RemoteBridge {
     /// on the shadow. Keyed by topic as well as producer identity: one
     /// RemoteBridge may serve several names, and a retry on B must not
     /// ack A's offset. Five sets, matching the memory backend's window.
-    recent: Mutex<HashMap<(String, i64, i16), VecDeque<(i32, u64, Appended)>>>,
+    recent: Mutex<HashMap<ReplayKey, VecDeque<ReplaySet>>>,
 }
 
 impl RemoteBridge {
@@ -125,7 +138,10 @@ impl RemoteBridge {
     }
 
     fn host_port(host: &str, port: i32) -> String {
-        if host.contains(':') && !host.starts_with('[') {
+        if host.starts_with('[') || host.ends_with(']') {
+            return String::new();
+        }
+        if host.contains(':') {
             format!("[{host}]:{port}")
         } else {
             format!("{host}:{port}")
@@ -220,7 +236,14 @@ impl RemoteBridge {
     }
 
     fn socket_addr(host: &str, port: i32) -> Option<SocketAddr> {
-        Self::host_port(host, port)
+        if host.starts_with('[') || host.ends_with(']') {
+            return None;
+        }
+        let encoded = Self::host_port(host, port);
+        if encoded.is_empty() {
+            return None;
+        }
+        encoded
             .to_socket_addrs()
             .ok()
             .and_then(|mut addrs| addrs.next())
@@ -229,11 +252,14 @@ impl RemoteBridge {
     fn encode_batches(batches: &[RecordBatch]) -> Vec<u8> {
         let mut out = Vec::new();
         for batch in batches {
+            // The remote cluster did not mint this gateway's producer ids.
+            // Forwarding them is UNKNOWN_PRODUCER_ID there; local sequenced
+            // retries are remembered in `recent` instead.
             out.extend(RecordBatch::encode(
                 batch.base_offset,
-                batch.producer_id,
-                batch.producer_epoch,
-                batch.base_sequence,
+                -1,
+                -1,
+                -1,
                 &batch.records,
             ));
         }
@@ -284,19 +310,19 @@ impl RemoteBridge {
             .recent
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(window) = recent.get(&(
-            topic.to_owned(),
-            sequenced.producer_id,
-            sequenced.producer_epoch,
-        )) else {
+        let Some(window) = recent.get(&ReplayKey {
+            topic: topic.to_owned(),
+            producer_id: sequenced.producer_id,
+            producer_epoch: sequenced.producer_epoch,
+        }) else {
             return Ok(None);
         };
         match window
             .iter()
             .rev()
-            .find(|(first, _, _)| *first == sequenced.first_sequence)
+            .find(|set| set.first_sequence == sequenced.first_sequence)
         {
-            Some((_, seen, appended)) if *seen == fingerprint => Ok(Some(appended.clone())),
+            Some(set) if set.fingerprint == fingerprint => Ok(Some(set.appended.clone())),
             Some(_) => Err(ErrorCode::InvalidRecord),
             None => Ok(None),
         }
@@ -308,16 +334,20 @@ impl RemoteBridge {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let window = recent
-            .entry((
-                topic.to_owned(),
-                sequenced.producer_id,
-                sequenced.producer_epoch,
-            ))
+            .entry(ReplayKey {
+                topic: topic.to_owned(),
+                producer_id: sequenced.producer_id,
+                producer_epoch: sequenced.producer_epoch,
+            })
             .or_default();
         if window.len() == 5 {
             window.pop_front();
         }
-        window.push_back((sequenced.first_sequence, fingerprint, appended));
+        window.push_back(ReplaySet {
+            first_sequence: sequenced.first_sequence,
+            fingerprint,
+            appended,
+        });
     }
 }
 
@@ -599,7 +629,10 @@ mod tests {
             RemoteBridge::host_port("2001:db8::1", 9092),
             "[2001:db8::1]:9092"
         );
-        assert_eq!(RemoteBridge::host_port("[::1]", 9092), "[::1]:9092");
+        assert!(
+            RemoteBridge::host_port("[::1]", 9092).is_empty(),
+            "Metadata carries host without URL-authority brackets"
+        );
         assert_eq!(RemoteBridge::host_port("127.0.0.1", 9092), "127.0.0.1:9092");
     }
 }
