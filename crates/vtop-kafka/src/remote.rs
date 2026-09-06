@@ -21,7 +21,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How the client reaches the cluster and which names it advertises.
 #[derive(Debug, Clone)]
@@ -59,6 +59,11 @@ struct InflightSet {
 struct RemoteIdentity {
     producer_id: i64,
     producer_epoch: i16,
+    /// Local `first_sequence` at the moment this remote id was minted.
+    /// Kafka requires a new producer id to start at sequence 0, so a
+    /// gateway restart that mints a replacement still forwards the client's
+    /// already-advanced sequence as `first_sequence - local_base`.
+    local_base: i32,
 }
 
 struct ProducerBook {
@@ -88,8 +93,15 @@ impl SendError {
 fn produce_reply_error(raw: i16) -> SendError {
     match raw {
         7 | 19 => SendError::Ambiguous(ErrorCode::from_i16(raw)),
+        // UNKNOWN_PRODUCER_ID (54) / INVALID_PRODUCER_EPOCH (47): the
+        // leader rejected the batch; a retry may mint a replacement id.
+        47 | 54 => SendError::Unsent(ErrorCode::InvalidProducerEpoch),
         other => SendError::Unsent(ErrorCode::from_i16(other)),
     }
+}
+
+fn producer_identity_stale(code: ErrorCode) -> bool {
+    matches!(code, ErrorCode::InvalidProducerEpoch)
 }
 
 /// A [`Bridge`] over an external Kafka cluster.
@@ -136,7 +148,7 @@ impl RemoteBridge {
         version: i16,
         body: &[u8],
     ) -> Result<Vec<u8>, ErrorCode> {
-        self.rpc_tracked(addr, key, version, body)
+        self.rpc_tracked(addr, key, version, body, self.config.timeout)
             .map_err(SendError::code)
     }
 
@@ -146,7 +158,11 @@ impl RemoteBridge {
         key: i16,
         version: i16,
         body: &[u8],
+        timeout: Duration,
     ) -> Result<Vec<u8>, SendError> {
+        if timeout.is_zero() {
+            return Err(SendError::Unsent(ErrorCode::RequestTimedOut));
+        }
         let mut header = Encoder::new();
         header.i16(key);
         header.i16(version);
@@ -154,16 +170,15 @@ impl RemoteBridge {
         header.nullable_string(Some("vtop-remote"));
         header.raw(body);
         let framed = frame(header.as_slice());
-        let mut stream =
-            TcpStream::connect_timeout(&addr, self.config.timeout).map_err(|error| {
-                tracing::warn!(%addr, %error, "kafka remote: bootstrap connect failed");
-                SendError::Unsent(ErrorCode::BrokerNotAvailable)
-            })?;
+        let mut stream = TcpStream::connect_timeout(&addr, timeout).map_err(|error| {
+            tracing::warn!(%addr, %error, "kafka remote: bootstrap connect failed");
+            SendError::Unsent(ErrorCode::BrokerNotAvailable)
+        })?;
         stream
-            .set_read_timeout(Some(self.config.timeout))
+            .set_read_timeout(Some(timeout))
             .map_err(|_| SendError::Unsent(ErrorCode::BrokerNotAvailable))?;
         stream
-            .set_write_timeout(Some(self.config.timeout))
+            .set_write_timeout(Some(timeout))
             .map_err(|_| SendError::Unsent(ErrorCode::BrokerNotAvailable))?;
         stream
             .write_all(&framed)
@@ -210,11 +225,16 @@ impl RemoteBridge {
     ) -> Result<Vec<u8>, ErrorCode> {
         let mut last = ErrorCode::BrokerNotAvailable;
         let mut tried = false;
+        let deadline = Instant::now() + self.config.timeout;
         for addr in addrs {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(ErrorCode::RequestTimedOut);
+            }
             tried = true;
-            match self.rpc(addr, key, version, body) {
+            match self.rpc_tracked(addr, key, version, body, remaining) {
                 Ok(reply) => return Ok(reply),
-                Err(error) => last = error,
+                Err(error) => last = error.code(),
             }
         }
         if !tried {
@@ -349,7 +369,7 @@ impl RemoteBridge {
         body.array_len(1);
         body.i32(0);
         body.nullable_bytes(Some(&records));
-        let reply = self.rpc_tracked(leader, 0, 5, body.as_slice())?;
+        let reply = self.rpc_tracked(leader, 0, 5, body.as_slice(), self.config.timeout)?;
         let mut d = Decoder::new(&reply);
         d.array_len("topics")
             .map_err(|_| SendError::Ambiguous(ErrorCode::CorruptMessage))?;
@@ -488,7 +508,7 @@ impl RemoteBridge {
         }
     }
 
-    fn init_remote_producer(&self) -> Result<RemoteIdentity, ErrorCode> {
+    fn init_remote_producer(&self) -> Result<(i64, i16), ErrorCode> {
         let mut body = Encoder::new();
         body.nullable_string(None);
         body.i32(60_000);
@@ -508,10 +528,7 @@ impl RemoteBridge {
         if producer_id < 0 {
             return Err(ErrorCode::KafkaStorageError);
         }
-        Ok(RemoteIdentity {
-            producer_id,
-            producer_epoch,
-        })
+        Ok((producer_id, producer_epoch))
     }
 
     fn ensure_remote_id(
@@ -526,9 +543,24 @@ impl RemoteBridge {
                 return Ok(*id);
             }
         }
-        let minted = self.init_remote_producer()?;
+        let (producer_id, producer_epoch) = self.init_remote_producer()?;
+        let minted = RemoteIdentity {
+            producer_id,
+            producer_epoch,
+            local_base: sequenced.first_sequence,
+        };
         let mut book = self.lock_book();
         Ok(*book.remote_ids.entry(key).or_insert(minted))
+    }
+
+    fn forget_remote_id(&self, topic: &str, sequenced: Sequenced) {
+        self.lock_book()
+            .remote_ids
+            .remove(&Self::replay_key(topic, sequenced));
+    }
+
+    fn remote_sequence(remote: RemoteIdentity, first_sequence: i32) -> i32 {
+        first_sequence.wrapping_sub(remote.local_base)
     }
 }
 
@@ -548,28 +580,48 @@ impl Bridge for RemoteBridge {
         }
         if let Some(identity) = sequenced {
             let fingerprint = crate::bridge::set_fingerprint(batches);
-            let remote = self.ensure_remote_id(topic, identity)?;
-            {
-                let mut book = self.lock_book();
-                if let Some(previous) = Self::replay_in(&book, topic, identity, fingerprint)? {
-                    return Ok(previous);
-                }
-                Self::inflight_in(&book, topic, identity, fingerprint)?;
-                Self::mark_inflight_in(&mut book, topic, identity, fingerprint);
-            }
-            match self.produce_once(topic, batches, Some((remote, identity.first_sequence))) {
-                Ok(appended) => {
+            let mut retried_identity = false;
+            loop {
+                let remote = self.ensure_remote_id(topic, identity)?;
+                {
                     let mut book = self.lock_book();
-                    Self::clear_inflight_in(&mut book, topic, identity);
-                    Self::remember_in(&mut book, topic, identity, fingerprint, appended.clone());
-                    Ok(appended)
+                    if let Some(previous) = Self::replay_in(&book, topic, identity, fingerprint)? {
+                        return Ok(previous);
+                    }
+                    Self::inflight_in(&book, topic, identity, fingerprint)?;
+                    Self::mark_inflight_in(&mut book, topic, identity, fingerprint);
                 }
-                Err(SendError::Unsent(code)) => {
-                    let mut book = self.lock_book();
-                    Self::clear_inflight_in(&mut book, topic, identity);
-                    Err(code)
+                let remote_seq = Self::remote_sequence(remote, identity.first_sequence);
+                match self.produce_once(topic, batches, Some((remote, remote_seq))) {
+                    Ok(appended) => {
+                        let mut book = self.lock_book();
+                        Self::clear_inflight_in(&mut book, topic, identity);
+                        Self::remember_in(
+                            &mut book,
+                            topic,
+                            identity,
+                            fingerprint,
+                            appended.clone(),
+                        );
+                        return Ok(appended);
+                    }
+                    Err(SendError::Unsent(code))
+                        if producer_identity_stale(code) && !retried_identity =>
+                    {
+                        {
+                            let mut book = self.lock_book();
+                            Self::clear_inflight_in(&mut book, topic, identity);
+                        }
+                        self.forget_remote_id(topic, identity);
+                        retried_identity = true;
+                    }
+                    Err(SendError::Unsent(code)) => {
+                        let mut book = self.lock_book();
+                        Self::clear_inflight_in(&mut book, topic, identity);
+                        return Err(code);
+                    }
+                    Err(SendError::Ambiguous(code)) => return Err(code),
                 }
-                Err(SendError::Ambiguous(code)) => Err(code),
             }
         } else {
             self.produce_once(topic, batches, None)
@@ -856,6 +908,32 @@ mod tests {
             produce_reply_error(ErrorCode::UnknownTopicOrPartition.as_i16()),
             SendError::Unsent(_)
         ));
+        assert!(matches!(
+            produce_reply_error(54),
+            SendError::Unsent(ErrorCode::InvalidProducerEpoch)
+        ));
+        assert_eq!(
+            RemoteBridge::remote_sequence(
+                RemoteIdentity {
+                    producer_id: 1,
+                    producer_epoch: 0,
+                    local_base: 50,
+                },
+                50
+            ),
+            0
+        );
+        assert_eq!(
+            RemoteBridge::remote_sequence(
+                RemoteIdentity {
+                    producer_id: 1,
+                    producer_epoch: 0,
+                    local_base: 50,
+                },
+                51
+            ),
+            1
+        );
     }
 
     #[test]

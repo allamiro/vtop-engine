@@ -1071,7 +1071,11 @@ impl Gateway {
                                 .into_iter()
                                 .map(|partition| crate::api::MetadataPartition {
                                     index: partition.index,
-                                    leader: partition.node_id,
+                                    leader: if partition.index == self.config.partition {
+                                        -1
+                                    } else {
+                                        partition.node_id
+                                    },
                                     error: if partition.index == self.config.partition {
                                         ErrorCode::NotLeaderOrFollower
                                     } else {
@@ -5062,16 +5066,16 @@ mod tests {
         for _ in 0..2 {
             let error = d.i16("p error").unwrap();
             let index = d.i32("index").unwrap();
-            d.i32("leader").unwrap();
+            let leader = d.i32("leader").unwrap();
             d.array_len("replicas").unwrap();
             d.i32("replica").unwrap();
             d.array_len("isr").unwrap();
             d.i32("isr").unwrap();
-            errors.push((index, error));
+            errors.push((index, error, leader));
         }
         assert_eq!(
             errors,
-            vec![(0, 0), (1, ErrorCode::NotLeaderOrFollower.as_i16()),]
+            vec![(0, 0, 7), (1, ErrorCode::NotLeaderOrFollower.as_i16(), -1),]
         );
     }
 

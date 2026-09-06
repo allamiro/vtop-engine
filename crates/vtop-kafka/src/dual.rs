@@ -20,7 +20,7 @@ use crate::records::RecordBatch;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 /// Where a dual topic's reads are served from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,7 +108,16 @@ impl ReceiptLog {
     }
 
     pub fn create(path: impl AsRef<Path>) -> std::io::Result<Arc<Self>> {
-        let path = path.as_ref().to_path_buf();
+        let path = absolute_receipt_path(path.as_ref());
+        // One writer per path (review): two routes sharing a JSONL must
+        // take turns on the same mutex, or concurrent writeln! calls
+        // interleave bytes and the next restart cannot parse the file.
+        let mut logs = interned_receipt_logs()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(existing) = logs.get(&path).and_then(|weak| weak.upgrade()) {
+            return Ok(existing);
+        }
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)?;
@@ -129,10 +138,12 @@ impl ReceiptLog {
         } else {
             Vec::new()
         };
-        Ok(Arc::new(Self {
+        let log = Arc::new(Self {
             rows: Mutex::new(rows),
-            path: Some(path),
-        }))
+            path: Some(path.clone()),
+        });
+        logs.insert(path, Arc::downgrade(&log));
+        Ok(log)
     }
 
     /// Append the row. A durable log that cannot be written is an error:
@@ -220,6 +231,21 @@ impl ReceiptLog {
             .map(|row| receipt_json(&row))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+}
+
+fn interned_receipt_logs() -> &'static Mutex<HashMap<PathBuf, Weak<ReceiptLog>>> {
+    static LOGS: OnceLock<Mutex<HashMap<PathBuf, Weak<ReceiptLog>>>> = OnceLock::new();
+    LOGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn absolute_receipt_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
     }
 }
 
@@ -347,8 +373,10 @@ fn json_optional_i32(line: &str, key: &str) -> Result<Option<i32>, String> {
         return Ok(None);
     };
     let rest = rest.trim_start();
-    if rest.strip_prefix("null").is_some() {
-        return Ok(None);
+    if let Some(after) = rest.strip_prefix("null") {
+        if after.is_empty() || matches!(after.chars().next(), Some(',' | '}' | ' ' | '\t')) {
+            return Ok(None);
+        }
     }
     if rest.starts_with('"') {
         return Err(format!("{key} is not a JSON integer"));
@@ -1569,6 +1597,18 @@ mod tests {
         .unwrap_err()
         .contains("group or partition"));
         assert!(json_optional_quoted(r#"{"group":1}"#, "group").is_err());
+    }
+
+    #[test]
+    fn two_creates_of_the_same_path_share_the_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let a = ReceiptLog::create(&path).unwrap();
+        let b = ReceiptLog::create(&path).unwrap();
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "concurrent dual/cutover routes must not append the same file through two mutexes"
+        );
     }
 
     #[tokio::test]
