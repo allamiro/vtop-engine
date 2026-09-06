@@ -95,6 +95,11 @@ pub struct RangeIdentity {
     pub topic_epoch: u64,
     /// This node, as the plane knows the range's leaseholder.
     pub holder_node_uuid: Uuid,
+    /// The Kafka partition this range is served as (#457 slice 3). A gateway
+    /// leading partition 2 commits and fetches for partition 2, and the store
+    /// answers for that partition alone — zero on a single-partition topic,
+    /// which is every deployment that names no topology.
+    pub partition: i32,
 }
 
 /// How many times a CAS is retried with the plane's actual before the store
@@ -329,7 +334,7 @@ impl MetadataOffsetStore {
     }
 
     fn is_this_range(&self, topic: &str, partition: i32) -> bool {
-        partition == 0 && topic == self.range.topic
+        partition == self.range.partition && topic == self.range.topic
     }
 }
 
@@ -610,9 +615,9 @@ impl OffsetStore for MetadataOffsetStore {
         // One range, one partition: the group's rows here are one or none,
         // within any bound a caller could ask for.
         Ok(self
-            .fetch(group, &self.range.topic, 0)
+            .fetch(group, &self.range.topic, self.range.partition)
             .await?
-            .map(|committed| vec![(self.range.topic.clone(), 0, committed)])
+            .map(|committed| vec![(self.range.topic.clone(), self.range.partition, committed)])
             .unwrap_or_default())
     }
 }
@@ -771,6 +776,7 @@ mod tests {
             range_uuid: RANGE_UUID,
             topic_epoch: 1,
             holder_node_uuid,
+            partition: 0,
         }
     }
 
