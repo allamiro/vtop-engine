@@ -79,7 +79,7 @@ grep -q "kafka=127.0.0.1:$P0_PORT" "$WORKDIR/logs/data-kafka-p0.log" \
   || fail "partition 0's ready line does not name its kafka listener"
 grep -q "kafka=127.0.0.1:$P1_PORT" "$WORKDIR/logs/data-kafka-p1.log" \
   || fail "partition 1's ready line does not name its kafka listener"
-log "two standalone gateways up: partition 0 on 127.0.0.1:$P0_PORT, partition 1 on 127.0.0.1:$P1_PORT"
+log "two standalone gateways up: partition 0 on 127.0.0.1:$P0_PORT (pid $P0_PID), partition 1 on 127.0.0.1:$P1_PORT (pid $P1_PID)"
 
 BOOT="127.0.0.1:$P0_PORT,127.0.0.1:$P1_PORT"
 INPUT0="$WORKDIR/kafka-p0.txt"

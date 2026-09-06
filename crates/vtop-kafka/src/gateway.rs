@@ -413,22 +413,25 @@ impl Gateway {
 
     /// The broker that coordinates `group` (#457 slice 4b): the leader of
     /// the partition `coordinator_partition_index` selects, from the same
-    /// topology Metadata advertises. Sorted by index so two gateways given
-    /// the same peers in different order still agree.
+    /// topology Metadata advertises. Looked up by index, not by cloning the
+    /// topology — FindCoordinator and every group request take this path,
+    /// and a host string copied for each of them is work nobody asked for.
     fn elected_coordinator(&self, group: &str) -> PartitionLeader {
-        let mut map = self.partition_map();
-        map.sort_by_key(|peer| peer.index);
-        let slot = coordinator_partition_index(group, map.len());
-        map.into_iter()
-            .nth(slot)
-            .expect("partition_map always names at least this gateway")
-    }
-
-    /// Whether this gateway is `group`'s coordinator. The group protocol
-    /// and OffsetCommit/OffsetFetch go here and nowhere else; a gateway
-    /// that is not this group's answers `NOT_COORDINATOR`.
-    fn coordinates(&self, group: &str) -> bool {
-        self.elected_coordinator(group).node_id == self.config.node_id
+        if self.config.partitions.is_empty() {
+            return PartitionLeader {
+                index: self.config.partition,
+                node_id: self.config.node_id,
+                host: self.config.advertised_host.clone(),
+                port: self.config.advertised_port,
+            };
+        }
+        let slot = coordinator_partition_index(group, self.config.partitions.len()) as i32;
+        self.config
+            .partitions
+            .iter()
+            .find(|peer| peer.index == slot)
+            .cloned()
+            .expect("kafka_partitions names every index from 0")
     }
 
     /// The refusal a group-protocol request gets when this gateway is not
@@ -437,12 +440,13 @@ impl Gateway {
     /// the right broker; `COORDINATOR_NOT_AVAILABLE` is how it waits out a
     /// handoff of this one.
     fn not_this_groups_coordinator(&self, api: &str, group: &str) -> Option<ErrorCode> {
-        if !self.coordinates(group) {
+        let coordinator = self.elected_coordinator(group);
+        if coordinator.node_id != self.config.node_id {
             tracing::warn!(
                 api,
                 group,
                 this = self.config.node_id,
-                coordinator = self.elected_coordinator(group).node_id,
+                coordinator = coordinator.node_id,
                 "kafka {api} refused: this gateway is not the group's coordinator; the client \
                  finds the one the topology elects"
             );
@@ -4969,6 +4973,39 @@ mod tests {
             coordinator_partition_index("g", 2),
             "stable"
         );
+    }
+
+    /// The election is by partition INDEX, not by the order the operator
+    /// wrote the topology: two gateways given the same peers reversed still
+    /// name the same coordinator, which is how a group does not split.
+    #[tokio::test]
+    async fn coordinator_election_does_not_follow_the_topology_order() {
+        let (addr, _stop) = start_groups_tuned(
+            Arc::new(MemoryBridge::with_topics(["events"])),
+            None,
+            |c| {
+                c.node_id = 9;
+                c.partition = 1;
+                let mut peers = two_partition_topology(c.advertised_port);
+                peers.reverse();
+                c.partitions = peers;
+            },
+        )
+        .await;
+        let reply = call(addr, 10, 1, 1, &find_coordinator_body(1, "g", 0))
+            .await
+            .unwrap();
+        let (error, node, _, _) = read_find_coordinator(&reply, 1);
+        assert_eq!(
+            (error, node),
+            (0, 9),
+            "\"g\" elects partition 1 however the peers are listed"
+        );
+        let reply = call(addr, 10, 1, 2, &find_coordinator_body(1, "b", 0))
+            .await
+            .unwrap();
+        let (error, node, host, port) = read_find_coordinator(&reply, 1);
+        assert_eq!((error, node, host.as_str(), port), (0, 7, "other.example", 9092));
     }
 
     fn two_partition_topology(this_port: i32) -> Vec<PartitionLeader> {
