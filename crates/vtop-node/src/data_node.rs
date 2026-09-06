@@ -671,6 +671,14 @@ pub async fn run(
         config.replica_transport,
     )?;
     refuse_kafka_gateway_misuse(config.role, config.kafka.as_ref())?;
+    // Before the observability listener, not after it (review): `serve`
+    // validates too, for callers that enter there, but by then this function
+    // has spawned a detached accept loop and returning an error would leave
+    // the metrics port held — and a port already taken would speak first and
+    // hide this verdict, the way the promotion refusal once did.
+    if let Some(kafka) = config.kafka.as_ref() {
+        crate::config::kafka_partitions(kafka)?;
+    }
     let endpoint = config.observability.take().unwrap_or_default();
     let metrics_addr = observability.serve(&endpoint).await?;
     serve(config, &observability, metrics_addr, shutdown).await
@@ -712,6 +720,13 @@ pub async fn serve(
     metrics_addr: Option<std::net::SocketAddr>,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), String> {
+    // A topology that points a client at the wrong broker is worse than none
+    // (#457 slice 3): judged HERE, where every entry point passes — the
+    // colocated role calls this directly and would otherwise bind and
+    // advertise an invalid one (review).
+    if let Some(kafka) = config.kafka.as_ref() {
+        crate::config::kafka_partitions(kafka)?;
+    }
     std::fs::create_dir_all(&config.data_dir)
         .map_err(|error| format!("create {}: {error}", config.data_dir.display()))?;
     let range = config.range.identity();
@@ -1057,10 +1072,11 @@ async fn run_leader(
                     kafka.listen
                 ));
             }
-            if bound.ip().is_unspecified() && kafka.advertised_host.is_none() {
+            if bound.ip().is_unspecified() && !kafka.advertises_a_host(kafka.partition) {
                 return Err(format!(
-                    "`kafka.listen: {}` bound every interface at {bound} and no \
-                     `kafka.advertised_host` is set: set it to what clients dial",
+                    "`kafka.listen: {}` bound every interface at {bound} and nothing says what \
+                     to advertise: set `kafka.advertised_host` to what clients dial, or name \
+                     this node's host in `kafka.partitions`",
                     kafka.listen
                 ));
             }
@@ -1468,16 +1484,27 @@ async fn run_leader(
                 },
             )
             .map_err(|error| format!("kafka gateway: {error}"))?;
+            // One place decides what clients are told to dial, and the
+            // topology wins there (review): FindCoordinator answers from this
+            // field, and on a wildcard listener the bound address is
+            // `0.0.0.0`, which on the client's own machine is the client.
+            let (advertised_host, advertised_port) =
+                crate::config::kafka_advertised_endpoint(kafka, bound);
             let gateway_config = vtop_kafka::GatewayConfig {
-                advertised_host: kafka
-                    .advertised_host
-                    .clone()
-                    .unwrap_or_else(|| bound.ip().to_string()),
-                advertised_port: kafka
-                    .advertised_port
-                    .map(i32::from)
-                    .unwrap_or_else(|| i32::from(bound.port())),
+                advertised_host,
+                advertised_port,
                 node_id: kafka.node_id,
+                partition: kafka.partition,
+                partitions: kafka
+                    .partitions
+                    .iter()
+                    .map(|peer| vtop_kafka::PartitionLeader {
+                        index: peer.partition,
+                        node_id: peer.node_id,
+                        host: peer.host.clone(),
+                        port: i32::from(peer.port),
+                    })
+                    .collect(),
                 cluster_id: Some(config.cluster_id.to_string()),
                 max_fetch_wait: Duration::from_millis(kafka.max_fetch_wait_ms),
                 ..vtop_kafka::GatewayConfig::default()
@@ -1519,6 +1546,7 @@ async fn run_leader(
                                 range_uuid: config.range.range_id,
                                 topic_epoch: config.range.topic_epoch,
                                 holder_node_uuid: config.node_uuid,
+                                partition: kafka.partition,
                             },
                         ),
                     )),

@@ -41,7 +41,7 @@ mod turnstile;
 pub mod wire;
 
 pub use bridge::{Appended, Bridge, Fetched, MemoryBridge, Sequenced};
-pub use gateway::{Gateway, GatewayConfig};
+pub use gateway::{Gateway, GatewayConfig, PartitionLeader};
 pub use groups::{Coordinator, GroupConfig};
 pub use lease::{LeaseState, LeaseView};
 pub use messages::{ApiKey, ErrorCode, HeaderVerdict, RequestHeader};

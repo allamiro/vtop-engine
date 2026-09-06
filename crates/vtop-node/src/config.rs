@@ -6,6 +6,7 @@
 
 use serde::Deserialize;
 use std::collections::BTreeSet;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 use vtop_meta::transport::AdminAuthorizer;
@@ -130,9 +131,25 @@ pub struct KafkaGatewayConfig {
     /// The Kafka topic name; the range's wire topic unless set.
     #[serde(default)]
     pub topic: Option<String>,
-    /// The broker id Metadata reports; the leader of the one partition.
+    /// The broker id Metadata reports; the leader of the partition this node
+    /// serves.
     #[serde(default = "default_kafka_node_id")]
     pub node_id: i32,
+    /// Which Kafka partition this node's range is (#457 slice 3). Zero, and
+    /// the only one, unless `partitions` names a topology.
+    #[serde(default)]
+    pub partition: i32,
+    /// Every partition of the topic and the broker leading it, this node
+    /// included. EMPTY is the shape every deployment has today: one
+    /// partition, this node's, and Metadata says so.
+    ///
+    /// A Kafka partition is an independent log, which is what a range is:
+    /// each entry names another node's range serving the same Kafka topic
+    /// name under its own partition index. The gateway refuses every
+    /// partition but its own by name, so a client goes to the broker that
+    /// leads it.
+    #[serde(default)]
+    pub partitions: Vec<KafkaPartitionPeer>,
     /// The longest a fetch waits for data, whatever the client asked.
     #[serde(default = "default_kafka_max_fetch_wait_ms")]
     pub max_fetch_wait_ms: u64,
@@ -145,11 +162,222 @@ pub struct KafkaGatewayConfig {
     pub producer_id: Option<Uuid>,
 }
 
+/// One partition of the Kafka topic and the broker that leads it (#457
+/// slice 3).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KafkaPartitionPeer {
+    /// The Kafka partition index this broker leads.
+    pub partition: i32,
+    /// The broker id it reports as, matching that node's `kafka.node_id`.
+    pub node_id: i32,
+    /// What clients dial for it: its advertised host and port.
+    pub host: String,
+    pub port: u16,
+}
+
 /// The identity the gateway appends under: the configured one, or one
 /// derived from the principal. Never the principal (review): the journal
 /// keys producer epochs by UUID, and the gateway mints a wall-clock epoch at
 /// every start, so a native client appending as the same UUID with ordinary
 /// epochs would be refused as fenced the moment Kafka was enabled.
+/// The partition topology a gateway may serve (#457 slice 3), or a refusal
+/// naming what is wrong with it. An empty list is the single-partition shape
+/// and always fine; a list must name every partition from zero once, and must
+/// name THIS node's partition as this node's broker id — a topology that
+/// points a client at the wrong broker is worse than none, because the client
+/// believes it.
+impl KafkaGatewayConfig {
+    /// Whether Metadata has a host to give clients for this node's partition
+    /// (review). A non-empty topology is AUTHORITATIVE — the gateway reads
+    /// its own entry there and never looks at `advertised_host` — so a
+    /// deployment that binds every interface and names its host in the
+    /// topology has said what to advertise, and must not be made to say it
+    /// twice under a key that will be ignored. With no topology, the override
+    /// is the only answer there is.
+    pub fn advertises_a_host(&self, partition: i32) -> bool {
+        match self
+            .partitions
+            .iter()
+            .find(|peer| peer.partition == partition)
+        {
+            Some(mine) => !names_no_host(&mine.host),
+            None => self
+                .advertised_host
+                .as_deref()
+                .is_some_and(|host| !names_no_host(host)),
+        }
+    }
+}
+
+pub fn kafka_partitions(kafka: &KafkaGatewayConfig) -> Result<(), String> {
+    if kafka.partitions.is_empty() {
+        if kafka.partition != 0 {
+            return Err(format!(
+                "`kafka.partition: {}` names a partition with no `kafka.partitions` topology to \
+                 place it in: a gateway that is not partition 0 must say where the others are",
+                kafka.partition
+            ));
+        }
+        return Ok(());
+    }
+    let mut indexes: Vec<i32> = kafka.partitions.iter().map(|p| p.partition).collect();
+    indexes.sort_unstable();
+    let expected: Vec<i32> = (0..kafka.partitions.len() as i32).collect();
+    if indexes != expected {
+        return Err(format!(
+            "`kafka.partitions` must name every partition from 0 to {} exactly once, got {indexes:?}",
+            kafka.partitions.len() - 1
+        ));
+    }
+    // Every peer a client is told to dial is judged the way this node's own
+    // advertised endpoint is (review): a blank host, port zero or a negative
+    // broker id in Metadata is a client that bootstraps and then connects to
+    // nothing, and these values are served verbatim.
+    for peer in &kafka.partitions {
+        // A wildcard host is a blank one wearing a costume, and a padded
+        // host is one that only looks dialable here (review): the topology
+        // is copied into Metadata verbatim.
+        refuse_undialable_host(
+            &peer.host,
+            &format!(
+                "`kafka.partitions` gives partition {} a host that",
+                peer.partition
+            ),
+        )?;
+        if peer.port == 0 {
+            return Err(format!(
+                "`kafka.partitions` gives partition {} port 0: set it to the port clients dial",
+                peer.partition
+            ));
+        }
+        if !(0..=255).contains(&peer.node_id) {
+            // The same bound this node's own id has (review): a producer
+            // identity encodes the broker id in one byte, so a topology
+            // naming 256 points a partition at a broker that cannot start
+            // with the configuration that would serve it.
+            return Err(format!(
+                "`kafka.partitions` gives partition {} the broker id {}: a broker id is 0 to 255, \
+                 the range a node can run with",
+                peer.partition, peer.node_id
+            ));
+        }
+    }
+    // One partition per broker id (review). In Kafka at large a broker leads
+    // many partitions, and this rule is not that: it is what THIS gateway can
+    // honour. One gateway serves one range, so a topology naming one broker
+    // for two partitions advertises a leader that answers
+    // `NOT_LEADER_OR_FOLLOWER` for one of them — and the client's metadata
+    // refresh points it straight back to the same place. An unroutable
+    // partition is worse than a refused config, so it is refused here. When a
+    // gateway can serve several ranges, this rule relaxes to "one broker id is
+    // one endpoint" and no further.
+    for (i, peer) in kafka.partitions.iter().enumerate() {
+        if let Some(other) = kafka.partitions[i + 1..]
+            .iter()
+            .find(|seen| seen.node_id == peer.node_id)
+        {
+            return Err(format!(
+                "`kafka.partitions` gives broker {} both partition {} and partition {}: one \
+                 gateway serves one range, so the second would have no server. Give each \
+                 partition its own broker",
+                peer.node_id, peer.partition, other.partition
+            ));
+        }
+    }
+    // And one listener at one endpoint (review). The broker-id rule above
+    // catches the same topology written one way; this catches it written the
+    // other. Compared by what the host MEANS, not how it is spelled
+    // (review): DNS is case-insensitive and one IP address has many
+    // spellings, so `broker.example` and `BROKER.EXAMPLE`, or `::1` and
+    // `0:0:0:0:0:0:0:1`, are one host each and a byte comparison would let
+    // both pairs through as two. Two ids at one `host:port`
+    // are two names for the process listening there, which serves one range
+    // — so the second partition gets
+    // `NOT_LEADER_OR_FOLLOWER` and the client's refresh sends it back to the
+    // address it just came from. Distinct ids do not make a second server.
+    for (i, peer) in kafka.partitions.iter().enumerate() {
+        if let Some(other) = kafka.partitions[i + 1..].iter().find(|seen| {
+            seen.port == peer.port && canonical_host(&seen.host) == canonical_host(&peer.host)
+        }) {
+            return Err(format!(
+                "`kafka.partitions` puts partition {} and partition {} both at {}:{}: one                  listener is there and it serves one range, so the second would have no server.                  Give each partition its own endpoint",
+                peer.partition, other.partition, peer.host, peer.port
+            ));
+        }
+    }
+    let Some(mine) = kafka
+        .partitions
+        .iter()
+        .find(|p| p.partition == kafka.partition)
+    else {
+        return Err(format!(
+            "`kafka.partitions` does not name this node's partition ({})",
+            kafka.partition
+        ));
+    };
+    // One answer to "what do clients dial for this node" (review). The
+    // topology is authoritative — Metadata serves it verbatim and the
+    // coordinator answers from it — so an `advertised_host` or
+    // `advertised_port` that disagrees is a second answer that will never be
+    // used. An author who wrote both and meant them believes something about
+    // this process that is not true, and silently picking the winner would
+    // hide that instead of correcting it.
+    if let Some(host) = kafka.advertised_host.as_deref() {
+        if canonical_host(host) != canonical_host(&mine.host) {
+            return Err(format!(
+                "`kafka.advertised_host: {host}` disagrees with what `kafka.partitions` gives \
+                 partition {}: `{}`. The topology is what clients are told, so set one or the \
+                 other, not both",
+                kafka.partition, mine.host
+            ));
+        }
+    }
+    if let Some(port) = kafka.advertised_port {
+        if port != mine.port {
+            return Err(format!(
+                "`kafka.advertised_port: {port}` disagrees with what `kafka.partitions` gives \
+                 partition {}: {}. The topology is what clients are told, so set one or the \
+                 other, not both",
+                kafka.partition, mine.port
+            ));
+        }
+    }
+    if mine.node_id != kafka.node_id {
+        return Err(format!(
+            "`kafka.partitions` gives partition {} the broker id {}, but this node's \
+             `kafka.node_id` is {}: a client told the wrong broker leads a partition believes it",
+            kafka.partition, mine.node_id, kafka.node_id
+        ));
+    }
+    Ok(())
+}
+
+/// What this node tells clients to dial, in one place (review). The
+/// topology first: Metadata serves it verbatim, so a gateway whose own
+/// endpoint came from anywhere else would answer FindCoordinator with an
+/// address Metadata never named — the bound `0.0.0.0` of a wildcard
+/// listener, which on the client's own machine is the client. Then the
+/// override, then the bound address, which is right on loopback and is why
+/// a wildcard bind must say something. `kafka_partitions` refuses a topology
+/// that disagrees with the override, so the order here settles nothing that
+/// was ever in dispute.
+pub fn kafka_advertised_endpoint(kafka: &KafkaGatewayConfig, bound: SocketAddr) -> (String, i32) {
+    let mine = kafka
+        .partitions
+        .iter()
+        .find(|peer| peer.partition == kafka.partition);
+    let host = mine
+        .map(|peer| peer.host.clone())
+        .or_else(|| kafka.advertised_host.clone())
+        .unwrap_or_else(|| bound.ip().to_string());
+    let port = mine
+        .map(|peer| i32::from(peer.port))
+        .or_else(|| kafka.advertised_port.map(i32::from))
+        .unwrap_or_else(|| i32::from(bound.port()));
+    (host, port)
+}
+
 pub fn kafka_producer_id(principal: Uuid, kafka: &KafkaGatewayConfig) -> Result<Uuid, String> {
     match kafka.producer_id {
         Some(id) if id == principal => Err(format!(
@@ -165,11 +393,159 @@ pub fn kafka_producer_id(principal: Uuid, kafka: &KafkaGatewayConfig) -> Result<
 /// `true` for a listen address that names every interface: Metadata must
 /// then be told what to advertise, because `0.0.0.0` on a client's own host
 /// is the client, not this node.
+/// A host that names no particular host: blank, or the unspecified address
+/// however it is spelled. Parsed rather than matched against a list of
+/// spellings (review), because `::`, `::0`, `0:0:0:0:0:0:0:0` and
+/// `0.0.0.0` are the same address and a client can dial none of them.
+fn names_no_host(host: &str) -> bool {
+    let host = host.trim();
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(host);
+    bare.is_empty()
+        || bare
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_unspecified())
+}
+
+/// One spelling of a host, for deciding whether two entries name the same
+/// endpoint (review). An IP literal is parsed and printed back, so `::1`,
+/// `0:0:0:0:0:0:0:1` and `[::1]` are one host, and a v4-mapped v6 literal is
+/// the v4 address it maps to — the same listener either way. Anything else
+/// is a DNS name, which is case-insensitive.
+///
+/// This is a COMPARISON KEY and never what is served: clients receive the
+/// string the operator wrote, which is why `refuse_undialable_host` insists
+/// that string be dialable as written.
+fn canonical_host(host: &str) -> String {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(host);
+    match bare.parse::<IpAddr>() {
+        Ok(IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4).to_string(),
+            None => IpAddr::V6(v6).to_string(),
+        },
+        Ok(ip) => ip.to_string(),
+        // A trailing dot is the DNS root label made explicit (review):
+        // `broker.example.` is the fully qualified spelling of
+        // `broker.example`, and a resolver treats them as one name. Exactly
+        // one is stripped — a second dot is not a valid name and stays
+        // different, so a typo is not silently folded into a real host.
+        Err(_) => bare.strip_suffix('.').unwrap_or(bare).to_ascii_lowercase(),
+    }
+}
+
+/// A name a resolver could accept, judged by SHAPE rather than by the one
+/// defect that was noticed most recently (review). Whitespace, an empty
+/// label, a label over 63 bytes, a name over 253, a leading or trailing
+/// hyphen, a non-ASCII byte: each of these has the same consequence — the
+/// string is copied into Metadata and the client cannot resolve it — so
+/// they are refused as one class instead of one at a time.
+///
+/// Underscores are ALLOWED, though a strict reading of RFC 1123 forbids
+/// them: Compose service names and some internal zones use them, they
+/// resolve in practice, and refusing them here would reject working
+/// deployments to enforce a rule nothing else in the path enforces. A
+/// non-ASCII name is refused with the remedy, since a resolver wants the
+/// punycode form and only the operator can produce it.
+fn refuse_unresolvable_name(host: &str, what: &str) -> Result<(), String> {
+    let name = host.strip_suffix('.').unwrap_or(host);
+    if name.len() > 253 {
+        return Err(format!(
+            "{what} is {} bytes long: a domain name is at most 253",
+            name.len()
+        ));
+    }
+    if !name.is_ascii() {
+        return Err(format!(
+            "{what} is `{host}`, which is not ASCII: give the punycode form (`xn--…`), which is \
+             what a resolver is asked for"
+        ));
+    }
+    for label in name.split('.') {
+        if label.is_empty() {
+            return Err(format!(
+                "{what} is `{host}`, which has an empty label: `a..b` names nothing"
+            ));
+        }
+        if label.len() > 63 {
+            return Err(format!(
+                "{what} is `{host}`, whose label `{label}` is {} bytes: a label is at most 63",
+                label.len()
+            ));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(format!(
+                "{what} is `{host}`, whose label `{label}` starts or ends with a hyphen, which a \
+                 name may not"
+            ));
+        }
+        if !label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err(format!(
+                "{what} is `{host}`, whose label `{label}` has a character a host name may not \
+                 carry: letters, digits, hyphen and underscore"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A host that will be COPIED INTO Metadata, judged once (review). The
+/// topology and the advertised override are both served verbatim, so the
+/// string an operator wrote has to be the string a client can use — not one
+/// that happens to validate after trimming and then goes out with its
+/// whitespace intact. Refused rather than normalised: an operator who wrote
+/// a stray space should see it, not have it quietly repaired here and
+/// nowhere else.
+fn refuse_undialable_host(host: &str, what: &str) -> Result<(), String> {
+    // Anywhere in it, not only around it (review): `broker example` is no
+    // more resolvable than ` broker.example `, and both are copied into
+    // Metadata exactly as written.
+    if host.chars().any(char::is_whitespace) {
+        return Err(format!(
+            "{what} is `{host}`, which contains whitespace: it is served to clients exactly as \
+             written, so write the host they dial"
+        ));
+    }
+    // Brackets belong to a URL authority, where they separate a v6 address
+    // from its port (review). Metadata carries host and port in separate
+    // fields, so a bracketed host is copied into the address a client builds
+    // and resolves to nothing — for either family, which is why both are
+    // refused rather than only the v4 spelling.
+    if host.starts_with('[') || host.ends_with(']') {
+        return Err(format!(
+            "{what} is `{host}`: brackets separate an address from a port in a URL, and Metadata \
+             carries the port in its own field. Write the address without them"
+        ));
+    }
+    if names_no_host(host) {
+        return Err(format!(
+            "{what} is `{host}`, which names no host a client can dial: set it to the address \
+             clients reach that broker at"
+        ));
+    }
+    // An IP literal has already been judged by parsing it; anything else is
+    // a name, and is held to what a name may look like.
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(host);
+    if bare.parse::<IpAddr>().is_err() {
+        refuse_unresolvable_name(host, what)?;
+    }
+    Ok(())
+}
+
 fn listens_on_every_interface(listen: &str) -> bool {
     listen
         .rsplit_once(':')
-        .map(|(host, _)| host.trim_matches(['[', ']']))
-        .is_some_and(|host| host == "0.0.0.0" || host == "::" || host.is_empty())
+        .is_some_and(|(host, _)| names_no_host(host))
 }
 
 fn default_kafka_node_id() -> i32 {
@@ -200,16 +576,11 @@ pub fn refuse_kafka_gateway_misuse(
     // An advertised endpoint clients cannot dial is refused before the bind
     // (review): a blank host or port zero in Metadata is a client that
     // bootstraps and then connects to nothing.
-    if kafka
-        .advertised_host
-        .as_deref()
-        .is_some_and(|host| host.trim().is_empty())
-    {
-        return Err(
-            "`kafka.advertised_host` is blank: set it to what clients dial, or leave it \
-                    unset to advertise the bound address"
-                .to_owned(),
-        );
+    if let Some(host) = kafka.advertised_host.as_deref() {
+        // The same judgement the topology's hosts get: this string is served
+        // to clients verbatim too, and leaving it unset is the way to say
+        // "advertise the bound address".
+        refuse_undialable_host(host, "`kafka.advertised_host`")?;
     }
     if kafka.node_id < 0 {
         return Err(format!(
@@ -237,11 +608,12 @@ pub fn refuse_kafka_gateway_misuse(
                 .to_owned(),
         );
     }
-    if listens_on_every_interface(&kafka.listen) && kafka.advertised_host.is_none() {
+    if listens_on_every_interface(&kafka.listen) && !kafka.advertises_a_host(kafka.partition) {
         return Err(format!(
-            "`kafka.listen: {}` binds every interface and no `kafka.advertised_host` is set: \
+            "`kafka.listen: {}` binds every interface and nothing says what to advertise: \
              Metadata would tell clients to connect to the unspecified address, which on their \
-             own host is themselves. Set `kafka.advertised_host` to what clients dial (review)",
+             own host is themselves. Set `kafka.advertised_host` to what clients dial, or name \
+             this node's host in `kafka.partitions` (review)",
             kafka.listen
         ));
     }
@@ -968,6 +1340,8 @@ mod transport_tests {
             advertised_port: None,
             topic: None,
             node_id: 1,
+            partition: 0,
+            partitions: Vec::new(),
             max_fetch_wait_ms: 5_000,
             producer_id: None,
         };
@@ -1007,10 +1381,16 @@ mod transport_tests {
         assert!(refuse_kafka_gateway_misuse(DataRole::Leader, Some(&wildcard)).is_ok());
         // An endpoint nobody can dial is refused by name (review).
         let mut blank = kafka("127.0.0.1:9092", false);
-        blank.advertised_host = Some("  ".to_owned());
+        blank.advertised_host = Some(String::new());
         assert!(refuse_kafka_gateway_misuse(DataRole::Leader, Some(&blank))
             .unwrap_err()
-            .contains("blank"));
+            .contains("names no host"));
+        // And one that only looks dialable until it is served verbatim.
+        let mut padded = kafka("127.0.0.1:9092", false);
+        padded.advertised_host = Some(" broker.example ".to_owned());
+        assert!(refuse_kafka_gateway_misuse(DataRole::Leader, Some(&padded))
+            .unwrap_err()
+            .contains("whitespace"));
         let mut negative = kafka("127.0.0.1:9092", false);
         negative.node_id = -1;
         assert!(
@@ -1036,6 +1416,417 @@ mod transport_tests {
     /// The gateway's producer identity is never the principal (review): the
     /// journal keys epochs by UUID, and the gateway's minted epoch would
     /// fence every native client appending as the principal.
+    /// A partition topology must place this node correctly or not exist at
+    /// all (#457 slice 3): a client told the wrong broker leads a partition
+    /// believes it, so the config is judged before the listener binds.
+    #[test]
+    fn a_partition_topology_must_place_this_node() {
+        let base = KafkaGatewayConfig {
+            listen: "127.0.0.1:9092".to_owned(),
+            any_interface: false,
+            advertised_host: None,
+            advertised_port: None,
+            topic: None,
+            node_id: 9,
+            partition: 0,
+            partitions: Vec::new(),
+            max_fetch_wait_ms: 5_000,
+            producer_id: None,
+        };
+        // Each peer at its own endpoint: two brokers are two servers, and a
+        // topology that says otherwise is refused below on its own.
+        let peer = |partition: i32, node_id: i32| KafkaPartitionPeer {
+            partition,
+            node_id,
+            host: format!("h{node_id}"),
+            port: 9092,
+        };
+        // No topology: the shape every deployment has today.
+        assert!(kafka_partitions(&base).is_ok());
+        // A partition without a topology to place it in.
+        let orphan = KafkaGatewayConfig {
+            partition: 1,
+            ..base.clone()
+        };
+        assert!(kafka_partitions(&orphan).is_err());
+        // A well-formed two-partition topology naming this node.
+        let good = KafkaGatewayConfig {
+            partition: 1,
+            partitions: vec![peer(0, 7), peer(1, 9)],
+            ..base.clone()
+        };
+        assert!(kafka_partitions(&good).is_ok());
+        // A gap in the indexes.
+        let gap = KafkaGatewayConfig {
+            partition: 0,
+            partitions: vec![peer(0, 9), peer(2, 7)],
+            ..base.clone()
+        };
+        assert!(kafka_partitions(&gap).is_err());
+        // A topology that forgets this node's own partition.
+        let absent = KafkaGatewayConfig {
+            partition: 1,
+            partitions: vec![peer(0, 7)],
+            ..base.clone()
+        };
+        assert!(kafka_partitions(&absent).is_err());
+        // A topology that gives this node's partition to another broker.
+        let stolen = KafkaGatewayConfig {
+            partition: 0,
+            partitions: vec![peer(0, 7), peer(1, 9)],
+            ..base.clone()
+        };
+        assert!(kafka_partitions(&stolen).is_err());
+        // One broker for two partitions: refused while a gateway serves one
+        // range, because the second partition would have no server and a
+        // client's metadata refresh would point back at the same place.
+        let shared = KafkaGatewayConfig {
+            partition: 0,
+            partitions: vec![peer(0, 9), peer(1, 9)],
+            ..base.clone()
+        };
+        assert!(kafka_partitions(&shared).is_err());
+        // And what the gateway is actually built with: the topology, which
+        // is what Metadata already told the client, not the wildcard address
+        // the listener bound.
+        let wildcard_bound: SocketAddr = "0.0.0.0:9092".parse().unwrap();
+        let placed = KafkaGatewayConfig {
+            listen: "0.0.0.0:9092".to_owned(),
+            any_interface: true,
+            partition: 1,
+            partitions: vec![peer(0, 7), peer(1, 9)],
+            ..base.clone()
+        };
+        assert_eq!(
+            kafka_advertised_endpoint(&placed, wildcard_bound),
+            ("h9".to_owned(), 9_092),
+            "FindCoordinator must not answer the address the listener bound"
+        );
+        let overridden = KafkaGatewayConfig {
+            advertised_host: Some("edge.example".to_owned()),
+            advertised_port: Some(19_092),
+            ..base.clone()
+        };
+        assert_eq!(
+            kafka_advertised_endpoint(&overridden, wildcard_bound),
+            ("edge.example".to_owned(), 19_092)
+        );
+        let loopback: SocketAddr = "127.0.0.1:9092".parse().unwrap();
+        assert_eq!(
+            kafka_advertised_endpoint(&base, loopback),
+            ("127.0.0.1".to_owned(), 9_092),
+            "with neither, the bound address, which is right on loopback"
+        );
+        // A host that names no host: what a listen address looks like, and
+        // what a client resolves to itself.
+        for wildcard_host in [
+            "0.0.0.0",
+            "::",
+            "[::]",
+            "::0",
+            "0:0:0:0:0:0:0:0",
+            "  ",
+            " h9 ",
+            "h 9",
+        ] {
+            let unspecified = KafkaGatewayConfig {
+                partition: 0,
+                partitions: vec![
+                    KafkaPartitionPeer {
+                        partition: 0,
+                        node_id: 9,
+                        host: wildcard_host.to_owned(),
+                        port: 9092,
+                    },
+                    peer(1, 7),
+                ],
+                ..base.clone()
+            };
+            assert!(
+                kafka_partitions(&unspecified).is_err(),
+                "`{wildcard_host}` is not an address a client can dial"
+            );
+        }
+        // DNS is case-insensitive, so one host spelled two ways is one host,
+        // and the second partition would have no server.
+        let cased = KafkaGatewayConfig {
+            partition: 0,
+            partitions: vec![
+                KafkaPartitionPeer {
+                    partition: 0,
+                    node_id: 9,
+                    host: "broker.example".to_owned(),
+                    port: 9092,
+                },
+                KafkaPartitionPeer {
+                    partition: 1,
+                    node_id: 7,
+                    host: "BROKER.EXAMPLE".to_owned(),
+                    port: 9092,
+                },
+            ],
+            ..base.clone()
+        };
+        assert!(kafka_partitions(&cased).is_err());
+        // One address, many spellings: still one listener, and still one
+        // partition with no server behind it.
+        for (a, b) in [
+            ("::1", "0:0:0:0:0:0:0:1"),
+            ("127.0.0.1", "::ffff:127.0.0.1"),
+            ("broker.example", "BROKER.EXAMPLE"),
+            ("broker.example", "broker.example."),
+            ("broker.example.", "BROKER.EXAMPLE"),
+        ] {
+            let spelled = KafkaGatewayConfig {
+                partition: 0,
+                partitions: vec![
+                    KafkaPartitionPeer {
+                        partition: 0,
+                        node_id: 9,
+                        host: a.to_owned(),
+                        port: 9092,
+                    },
+                    KafkaPartitionPeer {
+                        partition: 1,
+                        node_id: 7,
+                        host: b.to_owned(),
+                        port: 9092,
+                    },
+                ],
+                ..base.clone()
+            };
+            assert!(
+                kafka_partitions(&spelled).is_err(),
+                "`{a}` and `{b}` are one endpoint"
+            );
+        }
+        // Different addresses stay different, however they are written.
+        let distinct = KafkaGatewayConfig {
+            partition: 0,
+            partitions: vec![
+                KafkaPartitionPeer {
+                    partition: 0,
+                    node_id: 9,
+                    host: "::1".to_owned(),
+                    port: 9092,
+                },
+                KafkaPartitionPeer {
+                    partition: 1,
+                    node_id: 7,
+                    host: "::2".to_owned(),
+                    port: 9092,
+                },
+            ],
+            ..base.clone()
+        };
+        assert!(kafka_partitions(&distinct).is_ok());
+        // A name is judged by shape, so the whole class goes at once rather
+        // than one spelling at a time.
+        let long_label = "a".repeat(64);
+        let long_name = vec!["b".repeat(60); 5].join(".");
+        for bad_name in [
+            "-broker.example",
+            "broker-.example",
+            "broker..example",
+            "broker.exa mple",
+            "broker.exam*ple",
+            "[::1]",
+            "[127.0.0.1]",
+            "brøker.example",
+            long_label.as_str(),
+            long_name.as_str(),
+        ] {
+            let named = KafkaGatewayConfig {
+                partition: 0,
+                partitions: vec![
+                    KafkaPartitionPeer {
+                        partition: 0,
+                        node_id: 9,
+                        host: bad_name.to_owned(),
+                        port: 9092,
+                    },
+                    peer(1, 7),
+                ],
+                ..base.clone()
+            };
+            assert!(
+                kafka_partitions(&named).is_err(),
+                "`{bad_name}` is not a name a resolver would take"
+            );
+        }
+        // And the shapes real deployments use are not collateral damage.
+        for good_name in [
+            "broker.example",
+            "broker.example.",
+            "vtop-0.vtop-headless.default.svc.cluster.local",
+            "vtop_broker",
+            "localhost",
+            "127.0.0.1",
+            "::1",
+        ] {
+            let named = KafkaGatewayConfig {
+                partition: 0,
+                partitions: vec![
+                    KafkaPartitionPeer {
+                        partition: 0,
+                        node_id: 9,
+                        host: good_name.to_owned(),
+                        port: 9092,
+                    },
+                    peer(1, 7),
+                ],
+                ..base.clone()
+            };
+            assert!(
+                kafka_partitions(&named).is_ok(),
+                "`{good_name}` is a host a client dials today"
+            );
+        }
+        // The override is served verbatim too, and gets the same judgement.
+        for bad_override in [
+            "",
+            " ",
+            "0.0.0.0",
+            "::",
+            " edge.example ",
+            "edge example",
+            "edge\texample",
+        ] {
+            let padded = KafkaGatewayConfig {
+                advertised_host: Some(bad_override.to_owned()),
+                ..base.clone()
+            };
+            assert!(
+                refuse_kafka_gateway_misuse(DataRole::Leader, Some(&padded)).is_err(),
+                "`{bad_override}` is not a host a client can dial"
+            );
+        }
+        // One answer to what clients dial: an override that disagrees with
+        // the topology is a second answer that would never be used.
+        let contradicts_host = KafkaGatewayConfig {
+            advertised_host: Some("elsewhere".to_owned()),
+            partition: 1,
+            partitions: vec![peer(0, 7), peer(1, 9)],
+            ..base.clone()
+        };
+        assert!(kafka_partitions(&contradicts_host).is_err());
+        let contradicts_port = KafkaGatewayConfig {
+            advertised_port: Some(19_092),
+            partition: 1,
+            partitions: vec![peer(0, 7), peer(1, 9)],
+            ..base.clone()
+        };
+        assert!(kafka_partitions(&contradicts_port).is_err());
+        // Saying the same thing twice is not a contradiction.
+        let agrees = KafkaGatewayConfig {
+            advertised_host: Some("h9".to_owned()),
+            advertised_port: Some(9_092),
+            partition: 1,
+            partitions: vec![peer(0, 7), peer(1, 9)],
+            ..base.clone()
+        };
+        assert!(kafka_partitions(&agrees).is_ok());
+        // Two ids at one endpoint: the same topology written the other way,
+        // and the same partition with no server. Distinct ids do not make a
+        // second listener.
+        let one_listener = KafkaGatewayConfig {
+            partition: 0,
+            partitions: vec![
+                KafkaPartitionPeer {
+                    partition: 0,
+                    node_id: 9,
+                    host: "h".to_owned(),
+                    port: 9092,
+                },
+                KafkaPartitionPeer {
+                    partition: 1,
+                    node_id: 7,
+                    host: "h".to_owned(),
+                    port: 9092,
+                },
+            ],
+            ..base.clone()
+        };
+        let error = kafka_partitions(&one_listener).unwrap_err();
+        assert!(
+            error.contains("both at h:9092"),
+            "the refusal must name the endpoint they share: {error}"
+        );
+        // The same host on a different port is a different listener, and fine.
+        let two_ports = KafkaGatewayConfig {
+            partition: 0,
+            partitions: vec![
+                KafkaPartitionPeer {
+                    partition: 0,
+                    node_id: 9,
+                    host: "h".to_owned(),
+                    port: 9092,
+                },
+                KafkaPartitionPeer {
+                    partition: 1,
+                    node_id: 7,
+                    host: "h".to_owned(),
+                    port: 9093,
+                },
+            ],
+            ..base.clone()
+        };
+        assert!(kafka_partitions(&two_ports).is_ok());
+        // A topology that names this node's host IS what gets advertised, so
+        // a wildcard bind needs no second answer under a key never read.
+        let wildcard = KafkaGatewayConfig {
+            listen: "0.0.0.0:9092".to_owned(),
+            any_interface: true,
+            partition: 1,
+            partitions: vec![peer(0, 7), peer(1, 9)],
+            ..base.clone()
+        };
+        assert!(wildcard.advertises_a_host(wildcard.partition));
+        assert!(refuse_kafka_gateway_misuse(DataRole::Leader, Some(&wildcard)).is_ok());
+        // With no topology, the override is still the only answer there is.
+        let bare = KafkaGatewayConfig {
+            listen: "0.0.0.0:9092".to_owned(),
+            any_interface: true,
+            ..base.clone()
+        };
+        assert!(!bare.advertises_a_host(bare.partition));
+        assert!(refuse_kafka_gateway_misuse(DataRole::Leader, Some(&bare)).is_err());
+        // Endpoints a client cannot dial, and ids a node cannot run with.
+        for bad in [
+            KafkaPartitionPeer {
+                partition: 1,
+                node_id: 7,
+                host: "  ".to_owned(),
+                port: 9092,
+            },
+            KafkaPartitionPeer {
+                partition: 1,
+                node_id: 7,
+                host: "h".to_owned(),
+                port: 0,
+            },
+            KafkaPartitionPeer {
+                partition: 1,
+                node_id: 256,
+                host: "h".to_owned(),
+                port: 9092,
+            },
+            KafkaPartitionPeer {
+                partition: 1,
+                node_id: -1,
+                host: "h".to_owned(),
+                port: 9092,
+            },
+        ] {
+            let config = KafkaGatewayConfig {
+                partition: 0,
+                partitions: vec![peer(0, 9), bad],
+                ..base.clone()
+            };
+            assert!(kafka_partitions(&config).is_err());
+        }
+    }
+
     #[test]
     fn the_kafka_producer_id_is_derived_from_the_principal_and_never_equal_to_it() {
         let principal = Uuid::from_u128(0x1234);
@@ -1046,6 +1837,8 @@ mod transport_tests {
             advertised_port: None,
             topic: None,
             node_id: 1,
+            partition: 0,
+            partitions: Vec::new(),
             max_fetch_wait_ms: 5_000,
             producer_id: None,
         };

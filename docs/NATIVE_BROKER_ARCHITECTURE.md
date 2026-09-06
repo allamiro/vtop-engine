@@ -447,6 +447,19 @@ Cutover records a barrier offset for each parent and the ordered child mapping.
 Parent ranges remain readable until all durable consumer cursors and retention
 rules permit retirement.
 
+A Kafka partition is an independent log, which is what a range is, so the
+gateway presents one partition per range (#457): a node's `kafka.partition`
+says which index its range is, and `kafka.partitions` names every partition of
+that Kafka topic with the broker leading it. Metadata then answers with every
+broker and every partition, and each gateway serves only its own — a produce,
+fetch or commit for another partition is `NOT_LEADER_OR_FOLLOWER`, which a
+stock client answers by refreshing its metadata and going to the broker that
+leads it, and one for a partition no broker leads is not that topic's at all.
+With no topology configured nothing changes: one partition, this gateway's.
+A partition's ranges are not key-space shards of one topic — that is the
+lineage model of #473 — so each partition keeps its own full-keyspace root
+range and its own valid segment descriptors.
+
 A cursor may stand UNPINNED (#457, #468): a nil segment id, bound to the topic
 epoch and the range's lineage generation, its record offset the position. This
 is how a Kafka consumer group's committed offset lives on the plane — a
