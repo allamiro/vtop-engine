@@ -50,6 +50,27 @@ struct ReplaySet {
     appended: Appended,
 }
 
+struct InflightSet {
+    first_sequence: i32,
+    fingerprint: u64,
+}
+
+/// Whether the Produce bytes can have reached the broker.
+enum SendError {
+    /// Connect or local setup failed; a retry may send.
+    Unsent(ErrorCode),
+    /// The request may already have been appended; a retry must not send again.
+    Ambiguous(ErrorCode),
+}
+
+impl SendError {
+    fn code(self) -> ErrorCode {
+        match self {
+            Self::Unsent(code) | Self::Ambiguous(code) => code,
+        }
+    }
+}
+
 /// A [`Bridge`] over an external Kafka cluster.
 pub struct RemoteBridge {
     config: RemoteConfig,
@@ -60,6 +81,10 @@ pub struct RemoteBridge {
     /// RemoteBridge may serve several names, and a retry on B must not
     /// ack A's offset. Five sets, matching the memory backend's window.
     recent: Mutex<HashMap<ReplayKey, VecDeque<ReplaySet>>>,
+    /// Sequenced produces whose request left this process without a
+    /// response: the next retry of those bytes must not encode another
+    /// non-idempotent Produce.
+    inflight: Mutex<HashMap<ReplayKey, VecDeque<InflightSet>>>,
 }
 
 impl RemoteBridge {
@@ -84,6 +109,7 @@ impl RemoteBridge {
         Ok(Self {
             config,
             recent: Mutex::new(HashMap::new()),
+            inflight: Mutex::new(HashMap::new()),
         })
     }
 
@@ -94,6 +120,17 @@ impl RemoteBridge {
         version: i16,
         body: &[u8],
     ) -> Result<Vec<u8>, ErrorCode> {
+        self.rpc_tracked(addr, key, version, body)
+            .map_err(SendError::code)
+    }
+
+    fn rpc_tracked(
+        &self,
+        addr: SocketAddr,
+        key: i16,
+        version: i16,
+        body: &[u8],
+    ) -> Result<Vec<u8>, SendError> {
         let mut header = Encoder::new();
         header.i16(key);
         header.i16(version);
@@ -104,35 +141,35 @@ impl RemoteBridge {
         let mut stream =
             TcpStream::connect_timeout(&addr, self.config.timeout).map_err(|error| {
                 tracing::warn!(%addr, %error, "kafka remote: bootstrap connect failed");
-                ErrorCode::BrokerNotAvailable
+                SendError::Unsent(ErrorCode::BrokerNotAvailable)
             })?;
         stream
             .set_read_timeout(Some(self.config.timeout))
-            .map_err(|_| ErrorCode::BrokerNotAvailable)?;
+            .map_err(|_| SendError::Unsent(ErrorCode::BrokerNotAvailable))?;
         stream
             .set_write_timeout(Some(self.config.timeout))
-            .map_err(|_| ErrorCode::BrokerNotAvailable)?;
+            .map_err(|_| SendError::Unsent(ErrorCode::BrokerNotAvailable))?;
         stream
             .write_all(&framed)
-            .map_err(|_| ErrorCode::BrokerNotAvailable)?;
+            .map_err(|_| SendError::Ambiguous(ErrorCode::BrokerNotAvailable))?;
         let mut len_buf = [0_u8; 4];
         stream
             .read_exact(&mut len_buf)
-            .map_err(|_| ErrorCode::BrokerNotAvailable)?;
+            .map_err(|_| SendError::Ambiguous(ErrorCode::BrokerNotAvailable))?;
         let len = i32::from_be_bytes(len_buf);
         if len < 4 || len as usize > 32 * 1024 * 1024 {
-            return Err(ErrorCode::CorruptMessage);
+            return Err(SendError::Ambiguous(ErrorCode::CorruptMessage));
         }
         let mut body = vec![0_u8; len as usize];
         stream
             .read_exact(&mut body)
-            .map_err(|_| ErrorCode::BrokerNotAvailable)?;
+            .map_err(|_| SendError::Ambiguous(ErrorCode::BrokerNotAvailable))?;
         let mut d = Decoder::new(&body);
         let correlation = d
             .i32("correlation")
-            .map_err(|_| ErrorCode::CorruptMessage)?;
+            .map_err(|_| SendError::Ambiguous(ErrorCode::CorruptMessage))?;
         if correlation != 1 {
-            return Err(ErrorCode::CorruptMessage);
+            return Err(SendError::Ambiguous(ErrorCode::CorruptMessage));
         }
         Ok(body[4..].to_vec())
     }
@@ -266,8 +303,8 @@ impl RemoteBridge {
         out
     }
 
-    fn produce_once(&self, topic: &str, batches: &[RecordBatch]) -> Result<Appended, ErrorCode> {
-        let leader = self.leader_of(topic)?;
+    fn produce_once(&self, topic: &str, batches: &[RecordBatch]) -> Result<Appended, SendError> {
+        let leader = self.leader_of(topic).map_err(SendError::Unsent)?;
         let records = Self::encode_batches(batches);
         let mut body = Encoder::new();
         body.nullable_string(None);
@@ -278,21 +315,32 @@ impl RemoteBridge {
         body.array_len(1);
         body.i32(0);
         body.nullable_bytes(Some(&records));
-        let reply = self.rpc(leader, 0, 5, body.as_slice())?;
+        let reply = self.rpc_tracked(leader, 0, 5, body.as_slice())?;
         let mut d = Decoder::new(&reply);
         d.array_len("topics")
-            .map_err(|_| ErrorCode::CorruptMessage)?;
-        d.string("topic").map_err(|_| ErrorCode::CorruptMessage)?;
+            .map_err(|_| SendError::Ambiguous(ErrorCode::CorruptMessage))?;
+        d.string("topic")
+            .map_err(|_| SendError::Ambiguous(ErrorCode::CorruptMessage))?;
         d.array_len("partitions")
-            .map_err(|_| ErrorCode::CorruptMessage)?;
-        d.i32("index").map_err(|_| ErrorCode::CorruptMessage)?;
-        let error = d.i16("error").map_err(|_| ErrorCode::CorruptMessage)?;
+            .map_err(|_| SendError::Ambiguous(ErrorCode::CorruptMessage))?;
+        d.i32("index")
+            .map_err(|_| SendError::Ambiguous(ErrorCode::CorruptMessage))?;
+        let error = d
+            .i16("error")
+            .map_err(|_| SendError::Ambiguous(ErrorCode::CorruptMessage))?;
         if error != 0 {
-            return Err(ErrorCode::from_i16(error));
+            // The broker answered; it did not append. A retry may send.
+            return Err(SendError::Unsent(ErrorCode::from_i16(error)));
         }
-        let base_offset = d.i64("base").map_err(|_| ErrorCode::CorruptMessage)?;
-        let log_append_time_ms = d.i64("append").map_err(|_| ErrorCode::CorruptMessage)?;
-        let log_start_offset = d.i64("start").map_err(|_| ErrorCode::CorruptMessage)?;
+        let base_offset = d
+            .i64("base")
+            .map_err(|_| SendError::Ambiguous(ErrorCode::CorruptMessage))?;
+        let log_append_time_ms = d
+            .i64("append")
+            .map_err(|_| SendError::Ambiguous(ErrorCode::CorruptMessage))?;
+        let log_start_offset = d
+            .i64("start")
+            .map_err(|_| SendError::Ambiguous(ErrorCode::CorruptMessage))?;
         Ok(Appended {
             base_offset,
             log_append_time_ms,
@@ -349,6 +397,70 @@ impl RemoteBridge {
             appended,
         });
     }
+
+    fn replay_key(topic: &str, sequenced: Sequenced) -> ReplayKey {
+        ReplayKey {
+            topic: topic.to_owned(),
+            producer_id: sequenced.producer_id,
+            producer_epoch: sequenced.producer_epoch,
+        }
+    }
+
+    fn inflight_of(
+        &self,
+        topic: &str,
+        sequenced: Sequenced,
+        fingerprint: u64,
+    ) -> Result<bool, ErrorCode> {
+        let inflight = self
+            .inflight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(window) = inflight.get(&Self::replay_key(topic, sequenced)) else {
+            return Ok(false);
+        };
+        match window
+            .iter()
+            .rev()
+            .find(|set| set.first_sequence == sequenced.first_sequence)
+        {
+            Some(set) if set.fingerprint == fingerprint => Ok(true),
+            Some(_) => Err(ErrorCode::InvalidRecord),
+            None => Ok(false),
+        }
+    }
+
+    fn mark_inflight(&self, topic: &str, sequenced: Sequenced, fingerprint: u64) {
+        let mut inflight = self
+            .inflight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let window = inflight
+            .entry(Self::replay_key(topic, sequenced))
+            .or_default();
+        if window.len() == 5 {
+            window.pop_front();
+        }
+        window.push_back(InflightSet {
+            first_sequence: sequenced.first_sequence,
+            fingerprint,
+        });
+    }
+
+    fn clear_inflight(&self, topic: &str, sequenced: Sequenced) {
+        let mut inflight = self
+            .inflight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = Self::replay_key(topic, sequenced);
+        let Some(window) = inflight.get_mut(&key) else {
+            return;
+        };
+        window.retain(|set| set.first_sequence != sequenced.first_sequence);
+        if window.is_empty() {
+            inflight.remove(&key);
+        }
+    }
 }
 
 impl Bridge for RemoteBridge {
@@ -370,11 +482,28 @@ impl Bridge for RemoteBridge {
             if let Some(previous) = self.replay(topic, identity, fingerprint)? {
                 return Ok(previous);
             }
-            let appended = self.produce_once(topic, batches)?;
-            self.remember(topic, identity, fingerprint, appended.clone());
-            return Ok(appended);
+            if self.inflight_of(topic, identity, fingerprint)? {
+                // The previous attempt may already have appended on the
+                // remote cluster. Encoding another non-idempotent Produce
+                // would duplicate it.
+                return Err(ErrorCode::RequestTimedOut);
+            }
+            self.mark_inflight(topic, identity, fingerprint);
+            match self.produce_once(topic, batches) {
+                Ok(appended) => {
+                    self.clear_inflight(topic, identity);
+                    self.remember(topic, identity, fingerprint, appended.clone());
+                    Ok(appended)
+                }
+                Err(SendError::Unsent(code)) => {
+                    self.clear_inflight(topic, identity);
+                    Err(code)
+                }
+                Err(SendError::Ambiguous(code)) => Err(code),
+            }
+        } else {
+            self.produce_once(topic, batches).map_err(SendError::code)
         }
-        self.produce_once(topic, batches)
     }
 
     fn fetch(&self, topic: &str, offset: i64, max_bytes: usize) -> Result<Fetched, ErrorCode> {
@@ -612,6 +741,27 @@ mod tests {
             Err(ErrorCode::InvalidRecord),
             "the same sequence with other bytes is not a retry"
         );
+        let timed_out = {
+            let remote = Arc::clone(&remote);
+            tokio::task::spawn_blocking(move || {
+                let sequenced = Sequenced {
+                    producer_id: 9,
+                    producer_epoch: 0,
+                    first_sequence: 1,
+                };
+                let batches = [batch(&["d"])];
+                let fingerprint = crate::bridge::set_fingerprint(&batches);
+                remote.mark_inflight("events", sequenced, fingerprint);
+                remote.produce("events", &batches, Some(sequenced))
+            })
+            .await
+            .unwrap()
+        };
+        assert_eq!(
+            timed_out,
+            Err(ErrorCode::RequestTimedOut),
+            "an in-flight sequenced produce is not encoded again"
+        );
         let bounds = {
             let remote = Arc::clone(&remote);
             tokio::task::spawn_blocking(move || remote.bounds("events"))
@@ -619,7 +769,11 @@ mod tests {
                 .unwrap()
                 .unwrap()
         };
-        assert_eq!(bounds, (0, 3), "the sequenced retry appended nothing");
+        assert_eq!(
+            bounds,
+            (0, 3),
+            "the sequenced retry and the in-flight set appended nothing"
+        );
         let _ = tx.send(true);
     }
 

@@ -140,26 +140,33 @@ impl OffsetStore for MemoryOffsetStore {
 }
 
 /// Topics the metadata-plane store does not name (a `backend: kafka` catalog
-/// route) still accept OffsetCommit in this process. Those rows are not a
-/// lineage-bound cursor: this node has no range for that log.
+/// route) have no range cursor on this node. Commits for those names are
+/// refused rather than remembered in this process: a successful OffsetCommit
+/// that lived only here would vanish on restart or coordinator move.
 pub struct OverlayOffsetStore {
     inner: Arc<dyn OffsetStore>,
     extra_topics: HashSet<String>,
-    extra: MemoryOffsetStore,
 }
 
 impl OverlayOffsetStore {
+    /// `owned` names keep their inner (durable) cursor. Remaining `extra`
+    /// names are kafka-only: OffsetCommit is `UNKNOWN_TOPIC_OR_PARTITION`.
     pub fn wrapping(
         inner: Arc<dyn OffsetStore>,
         extra_topics: Vec<String>,
+        owned: impl IntoIterator<Item = String>,
     ) -> Arc<dyn OffsetStore> {
+        let owned: HashSet<String> = owned.into_iter().collect();
+        let extra_topics: HashSet<String> = extra_topics
+            .into_iter()
+            .filter(|name| !owned.contains(name))
+            .collect();
         if extra_topics.is_empty() {
             return inner;
         }
         Arc::new(Self {
             inner,
-            extra_topics: extra_topics.into_iter().collect(),
-            extra: MemoryOffsetStore::default(),
+            extra_topics,
         })
     }
 
@@ -178,7 +185,11 @@ impl OffsetStore for OverlayOffsetStore {
         committed: Committed,
     ) -> Result<(), ErrorCode> {
         if self.is_extra(topic) {
-            self.extra.commit(group, topic, partition, committed).await
+            tracing::error!(
+                topic,
+                "kafka-only catalog name has no range cursor; OffsetCommit is refused rather than remembered in this process"
+            );
+            Err(ErrorCode::UnknownTopicOrPartition)
         } else {
             self.inner.commit(group, topic, partition, committed).await
         }
@@ -191,7 +202,7 @@ impl OffsetStore for OverlayOffsetStore {
         partition: i32,
     ) -> Result<Option<Committed>, ErrorCode> {
         if self.is_extra(topic) {
-            self.extra.fetch(group, topic, partition).await
+            Err(ErrorCode::UnknownTopicOrPartition)
         } else {
             self.inner.fetch(group, topic, partition).await
         }
@@ -202,18 +213,7 @@ impl OffsetStore for OverlayOffsetStore {
         group: &str,
         at_most: usize,
     ) -> Result<Vec<(String, i32, Committed)>, ErrorCode> {
-        let cap = at_most.saturating_add(1);
-        let mut rows = self.inner.committed(group, at_most).await?;
-        if rows.len() >= cap {
-            return Ok(rows);
-        }
-        let extra = self
-            .extra
-            .committed(group, cap.saturating_sub(rows.len()).saturating_sub(1))
-            .await?;
-        rows.extend(extra);
-        rows.truncate(cap);
-        Ok(rows)
+        self.inner.committed(group, at_most).await
     }
 }
 
@@ -307,27 +307,54 @@ mod tests {
         let store = OverlayOffsetStore::wrapping(
             Arc::clone(&inner) as Arc<dyn OffsetStore>,
             vec!["legacy".to_owned()],
+            Vec::new(),
+        );
+        assert_eq!(
+            store
+                .commit(
+                    "g",
+                    "legacy",
+                    0,
+                    Committed {
+                        offset: 9,
+                        metadata: None,
+                    },
+                )
+                .await,
+            Err(ErrorCode::UnknownTopicOrPartition),
+            "a kafka-only name is refused rather than remembered here"
+        );
+        assert_eq!(
+            inner.fetch("g", "legacy", 0).await.unwrap(),
+            None,
+            "a kafka-only name is not this range's cursor"
+        );
+    }
+
+    #[tokio::test]
+    async fn overlay_does_not_steal_names_the_inner_store_owns() {
+        let inner = Arc::new(MemoryOffsetStore::default());
+        let store = OverlayOffsetStore::wrapping(
+            Arc::clone(&inner) as Arc<dyn OffsetStore>,
+            vec!["events".to_owned()],
+            vec!["events".to_owned()],
         );
         store
             .commit(
                 "g",
-                "legacy",
+                "events",
                 0,
                 Committed {
-                    offset: 9,
+                    offset: 4,
                     metadata: None,
                 },
             )
             .await
             .unwrap();
         assert_eq!(
-            inner.fetch("g", "legacy", 0).await.unwrap(),
-            None,
-            "a kafka-only name is not this range's cursor"
-        );
-        assert_eq!(
-            store.fetch("g", "legacy", 0).await.unwrap().unwrap().offset,
-            9
+            inner.fetch("g", "events", 0).await.unwrap().unwrap().offset,
+            4,
+            "an owned name keeps the durable inner cursor"
         );
     }
 }

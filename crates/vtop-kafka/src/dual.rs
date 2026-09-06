@@ -259,7 +259,7 @@ fn parse_receipt(line: &str) -> Result<Receipt, String> {
         shadow_offset,
         records,
         sha256,
-        group: json_field(line, "group").ok().filter(|s| s != "null"),
+        group: json_optional_quoted(line, "group")?,
         partition: json_field(line, "partition")
             .ok()
             .filter(|s| s != "null")
@@ -311,6 +311,21 @@ fn json_field(line: &str, key: &str) -> Result<String, String> {
             .find([',', '}'])
             .ok_or_else(|| format!("truncated {key}"))?;
         Ok(rest[..end].trim().to_owned())
+    }
+}
+
+/// A quoted JSON string, or `None` when the field is absent or JSON null.
+/// A group literally named `null` is `"null"` in the file, not the token.
+fn json_optional_quoted(line: &str, key: &str) -> Result<Option<String>, String> {
+    let needle = format!("\"{key}\":");
+    let Some((_, rest)) = line.split_once(&needle) else {
+        return Ok(None);
+    };
+    let rest = rest.trim_start();
+    if rest.starts_with('"') {
+        Ok(Some(json_field(line, key)?))
+    } else {
+        Ok(None)
     }
 }
 
@@ -531,38 +546,52 @@ impl Bridge for DualBridge {
                         ErrorCode::KafkaStorageError
                     })?;
                 let hash = records_hash(&primary.records);
-                if payload_bytes_equal(&primary.records, &shadow.records) {
-                    self.receipts.record(Receipt {
-                        topic: self.kafka_topic.clone(),
-                        kind: ReceiptKind::ShadowMatch,
-                        primary_offset: offset,
-                        shadow_offset: Some(shadow_offset),
-                        records: 0,
-                        sha256: hash,
-                        group: None,
-                        partition: None,
-                    })?;
-                    Ok(primary)
-                } else {
-                    tracing::error!(
-                        topic,
-                        offset,
-                        shadow_offset,
-                        primary_bytes = primary.records.len(),
-                        shadow_bytes = shadow.records.len(),
-                        "kafka shadow-read: the two backends served different bytes"
-                    );
-                    self.receipts.record(Receipt {
-                        topic: self.kafka_topic.clone(),
-                        kind: ReceiptKind::ShadowMismatch,
-                        primary_offset: offset,
-                        shadow_offset: Some(shadow_offset),
-                        records: 0,
-                        sha256: hash,
-                        group: None,
-                        partition: None,
-                    })?;
-                    Err(ErrorCode::CorruptMessage)
+                match payload_bytes_equal(&primary.records, &shadow.records) {
+                    Ok(true) => {
+                        self.receipts.record(Receipt {
+                            topic: self.kafka_topic.clone(),
+                            kind: ReceiptKind::ShadowMatch,
+                            primary_offset: offset,
+                            shadow_offset: Some(shadow_offset),
+                            records: 0,
+                            sha256: hash,
+                            group: None,
+                            partition: None,
+                        })?;
+                        Ok(primary)
+                    }
+                    Ok(false) => {
+                        tracing::error!(
+                            topic,
+                            offset,
+                            shadow_offset,
+                            primary_bytes = primary.records.len(),
+                            shadow_bytes = shadow.records.len(),
+                            "kafka shadow-read: the two backends served different bytes"
+                        );
+                        self.receipts.record(Receipt {
+                            topic: self.kafka_topic.clone(),
+                            kind: ReceiptKind::ShadowMismatch,
+                            primary_offset: offset,
+                            shadow_offset: Some(shadow_offset),
+                            records: 0,
+                            sha256: hash,
+                            group: None,
+                            partition: None,
+                        })?;
+                        Err(ErrorCode::CorruptMessage)
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            topic,
+                            offset,
+                            shadow_offset,
+                            code = error.as_i16(),
+                            "kafka shadow-read: a backend returned a truncated or invalid batch; \
+                             the primary is not served as a match"
+                        );
+                        Err(ErrorCode::KafkaStorageError)
+                    }
                 }
             }
         }
@@ -584,8 +613,8 @@ impl Bridge for DualBridge {
 /// base offsets, and a byte-exact compare of the Fetch payload would then
 /// always mismatch. Keys, timestamps and headers are compared too — a
 /// matching value with a rewritten key is still a divergence.
-fn payload_bytes_equal(a: &[u8], b: &[u8]) -> bool {
-    record_payloads(a) == record_payloads(b)
+fn payload_bytes_equal(a: &[u8], b: &[u8]) -> Result<bool, ErrorCode> {
+    Ok(record_payloads(a)? == record_payloads(b)?)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -596,8 +625,8 @@ struct ComparedRecord {
     headers: Vec<(String, Option<Vec<u8>>)>,
 }
 
-fn record_payloads(encoded: &[u8]) -> Vec<ComparedRecord> {
-    decode_batches(encoded)
+fn record_payloads(encoded: &[u8]) -> Result<Vec<ComparedRecord>, ErrorCode> {
+    Ok(decode_batches(encoded)?
         .into_iter()
         .flat_map(|batch| batch.records)
         .map(|record| ComparedRecord {
@@ -606,32 +635,38 @@ fn record_payloads(encoded: &[u8]) -> Vec<ComparedRecord> {
             value: record.value,
             headers: record.headers,
         })
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]
 fn record_values(encoded: &[u8]) -> Vec<Vec<u8>> {
     decode_batches(encoded)
+        .unwrap_or_default()
         .into_iter()
         .flat_map(|batch| batch.records)
         .map(|record| record.value.unwrap_or_default())
         .collect()
 }
 
-fn decode_batches(mut encoded: &[u8]) -> Vec<RecordBatch> {
+fn decode_batches(mut encoded: &[u8]) -> Result<Vec<RecordBatch>, ErrorCode> {
     let mut out = Vec::new();
-    while encoded.len() >= 12 {
-        let len = i32::from_be_bytes(encoded[8..12].try_into().unwrap()) as usize + 12;
+    while !encoded.is_empty() {
+        if encoded.len() < 12 {
+            return Err(ErrorCode::CorruptMessage);
+        }
+        let batch_length = i32::from_be_bytes(encoded[8..12].try_into().unwrap());
+        let len = usize::try_from(batch_length)
+            .ok()
+            .and_then(|n| n.checked_add(12))
+            .ok_or(ErrorCode::CorruptMessage)?;
         if len > encoded.len() {
-            break;
+            return Err(ErrorCode::CorruptMessage);
         }
-        match RecordBatch::decode(&encoded[..len]) {
-            Ok(batch) => out.push(batch),
-            Err(_) => break,
-        }
+        let batch = RecordBatch::decode(&encoded[..len]).map_err(|_| ErrorCode::CorruptMessage)?;
+        out.push(batch);
         encoded = &encoded[len..];
     }
-    out
+    Ok(out)
 }
 
 /// After a cutover, OffsetFetch answers the native (primary) offset a
@@ -649,6 +684,10 @@ pub struct CutoverStore {
     /// `to_primary` again, even when they numerically overlap a historical
     /// shadow range. Reloaded from `NativeCursor` receipts on restart.
     native: Mutex<HashSet<(String, String, i32)>>,
+    /// Native keys whose durable marker has not yet landed in the receipt
+    /// file. A later commit or fetch retries the append rather than
+    /// treating an in-memory-only mark as done.
+    dirty: Mutex<HashSet<(String, String, i32)>>,
     /// Commits and fetch-migrations take turns so a translation write-back
     /// cannot rewind a concurrent native commit.
     order: tokio::sync::Mutex<()>,
@@ -660,6 +699,7 @@ impl CutoverStore {
             inner,
             by_topic: Mutex::new(HashMap::new()),
             native: Mutex::new(HashSet::new()),
+            dirty: Mutex::new(HashSet::new()),
             order: tokio::sync::Mutex::new(()),
         }
     }
@@ -684,7 +724,7 @@ impl CutoverStore {
         let store = Self::new(inner);
         for (topic, receipts) in topics {
             for row in receipts.rows() {
-                if row.kind == ReceiptKind::NativeCursor {
+                if row.kind == ReceiptKind::NativeCursor && row.topic == topic {
                     if let (Some(group), Some(partition)) = (row.group, row.partition) {
                         store.remember_native(&group, &topic, partition);
                     }
@@ -713,10 +753,28 @@ impl CutoverStore {
             .insert((group.to_owned(), topic.to_owned(), partition))
     }
 
-    fn mark_native(&self, group: &str, topic: &str, partition: i32) {
-        if !self.remember_native(group, topic, partition) {
-            return;
-        }
+    fn mark_dirty(&self, group: &str, topic: &str, partition: i32) {
+        self.dirty
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert((group.to_owned(), topic.to_owned(), partition));
+    }
+
+    fn clear_dirty(&self, group: &str, topic: &str, partition: i32) {
+        self.dirty
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&(group.to_owned(), topic.to_owned(), partition));
+    }
+
+    fn is_dirty(&self, group: &str, topic: &str, partition: i32) -> bool {
+        self.dirty
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&(group.to_owned(), topic.to_owned(), partition))
+    }
+
+    fn persist_native(&self, group: &str, topic: &str, partition: i32) -> Result<(), ErrorCode> {
         let log = {
             let by_topic = self
                 .by_topic
@@ -724,8 +782,8 @@ impl CutoverStore {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             by_topic.get(topic).map(Arc::clone)
         };
-        if let Some(log) = log {
-            if let Err(error) = log.record(Receipt {
+        match log {
+            Some(log) => log.record(Receipt {
                 topic: topic.to_owned(),
                 kind: ReceiptKind::NativeCursor,
                 primary_offset: 0,
@@ -734,16 +792,40 @@ impl CutoverStore {
                 sha256: [0; 32],
                 group: Some(group.to_owned()),
                 partition: Some(partition),
-            }) {
+            }),
+            None => Ok(()),
+        }
+    }
+
+    fn mark_native(&self, group: &str, topic: &str, partition: i32) -> Result<(), ErrorCode> {
+        let first = self.remember_native(group, topic, partition);
+        if !first && !self.is_dirty(group, topic, partition) {
+            return Ok(());
+        }
+        self.mark_dirty(group, topic, partition);
+        match self.persist_native(group, topic, partition) {
+            Ok(()) => {
+                self.clear_dirty(group, topic, partition);
+                Ok(())
+            }
+            Err(error) => {
                 tracing::error!(
                     group,
                     topic,
                     partition,
                     code = error.as_i16(),
-                    "kafka cutover: the native-cursor marker could not be appended; a restart may re-translate this group"
+                    "kafka cutover: the native-cursor marker could not be appended; the commit is not acknowledged"
                 );
+                Err(error)
             }
         }
+    }
+
+    fn flush_native(&self, group: &str, topic: &str, partition: i32) -> Result<(), ErrorCode> {
+        if !self.is_dirty(group, topic, partition) {
+            return Ok(());
+        }
+        self.mark_native(group, topic, partition)
     }
 
     fn is_native(&self, group: &str, topic: &str, partition: i32) -> bool {
@@ -769,8 +851,9 @@ impl OffsetStore for CutoverStore {
             .await?;
         // After cutover, Fetch served native offsets, so this commit is
         // native numbering. Remember that so a later fetch does not treat
-        // it as a leftover shadow cursor.
-        self.mark_native(group, topic, partition);
+        // it as a leftover shadow cursor. The marker must land in the
+        // receipt file before the client is told the commit held.
+        self.mark_native(group, topic, partition)?;
         Ok(())
     }
 
@@ -785,6 +868,7 @@ impl OffsetStore for CutoverStore {
             return Ok(None);
         };
         if self.is_native(group, topic, partition) {
+            self.flush_native(group, topic, partition)?;
             return Ok(Some(committed));
         }
         let translated = self.translate(topic, committed.offset);
@@ -796,7 +880,7 @@ impl OffsetStore for CutoverStore {
             self.inner
                 .commit(group, topic, partition, migrated.clone())
                 .await?;
-            self.mark_native(group, topic, partition);
+            self.mark_native(group, topic, partition)?;
             return Ok(Some(migrated));
         }
         committed.offset = translated;
@@ -812,6 +896,7 @@ impl OffsetStore for CutoverStore {
         let mut rows = self.inner.committed(group, at_most).await?;
         for (topic, partition, committed) in rows.iter_mut() {
             if self.is_native(group, topic, *partition) {
+                self.flush_native(group, topic, *partition)?;
                 continue;
             }
             let translated = self.translate(topic, committed.offset);
@@ -823,7 +908,7 @@ impl OffsetStore for CutoverStore {
                 self.inner
                     .commit(group, topic, *partition, migrated.clone())
                     .await?;
-                self.mark_native(group, topic, *partition);
+                self.mark_native(group, topic, *partition)?;
                 *committed = migrated;
             }
         }
@@ -1389,5 +1474,130 @@ mod tests {
         let inner: Arc<dyn OffsetStore> = Arc::new(MemoryOffsetStore::default());
         let wrapped = CutoverStore::wrapping(Arc::clone(&inner), Vec::new());
         assert!(Arc::ptr_eq(&inner, &wrapped));
+    }
+
+    #[test]
+    fn a_truncated_batch_tail_is_not_a_shadow_match() {
+        let encoded = RecordBatch::encode(0, -1, -1, -1, &batch(&["a"]).records);
+        let mut padded = encoded.clone();
+        padded.extend_from_slice(&[0u8; 12]);
+        assert!(
+            payload_bytes_equal(&encoded, &padded).is_err(),
+            "leftover bytes after a valid prefix are not equality"
+        );
+        assert!(payload_bytes_equal(&encoded, &encoded).unwrap());
+    }
+
+    #[test]
+    fn a_group_named_null_survives_receipt_round_trip() {
+        let json = receipt_json(&Receipt {
+            topic: "events".to_owned(),
+            kind: ReceiptKind::NativeCursor,
+            primary_offset: 0,
+            shadow_offset: None,
+            records: 0,
+            sha256: [0; 32],
+            group: Some("null".to_owned()),
+            partition: Some(0),
+        });
+        let parsed = parse_receipt(&json).unwrap();
+        assert_eq!(parsed.group.as_deref(), Some("null"));
+        assert_eq!(parsed.partition, Some(0));
+    }
+
+    #[tokio::test]
+    async fn a_native_cursor_marker_is_scoped_to_its_topic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let receipts = ReceiptLog::create(&path).unwrap();
+        receipts
+            .record(Receipt {
+                topic: "events".to_owned(),
+                kind: ReceiptKind::NativeCursor,
+                primary_offset: 0,
+                shadow_offset: None,
+                records: 0,
+                sha256: [0; 32],
+                group: Some("g".to_owned()),
+                partition: Some(0),
+            })
+            .unwrap();
+        receipts
+            .record(Receipt {
+                topic: "other".to_owned(),
+                kind: ReceiptKind::DualWrite,
+                primary_offset: 0,
+                shadow_offset: Some(1),
+                records: 2,
+                sha256: [3; 32],
+                group: None,
+                partition: None,
+            })
+            .unwrap();
+        let inner = Arc::new(MemoryOffsetStore::default());
+        inner
+            .commit(
+                "g",
+                "other",
+                0,
+                Committed {
+                    offset: 1,
+                    metadata: None,
+                },
+            )
+            .await
+            .unwrap();
+        let store = CutoverStore::wrapping(
+            inner as Arc<dyn OffsetStore>,
+            vec![
+                ("events".to_owned(), Arc::clone(&receipts)),
+                ("other".to_owned(), receipts),
+            ],
+        );
+        assert_eq!(
+            store.fetch("g", "other", 0).await.unwrap().unwrap().offset,
+            0,
+            "a native marker for events does not skip translation on other"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_native_cursor_that_cannot_be_appended_fails_the_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let receipts = ReceiptLog::create(&path).unwrap();
+        receipts
+            .record(Receipt {
+                topic: "events".to_owned(),
+                kind: ReceiptKind::DualWrite,
+                primary_offset: 0,
+                shadow_offset: Some(1),
+                records: 2,
+                sha256: [2; 32],
+                group: None,
+                partition: None,
+            })
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let inner = Arc::new(MemoryOffsetStore::default());
+        let store = CutoverStore::wrapping(
+            Arc::clone(&inner) as Arc<dyn OffsetStore>,
+            vec![("events".to_owned(), receipts)],
+        );
+        assert_eq!(
+            store
+                .commit(
+                    "g",
+                    "events",
+                    0,
+                    Committed {
+                        offset: 1,
+                        metadata: None,
+                    },
+                )
+                .await,
+            Err(ErrorCode::KafkaStorageError)
+        );
     }
 }

@@ -1632,7 +1632,9 @@ async fn run_leader(
             // gateway refuses commits by name rather than remembering what
             // it would forget. A cutover topic wraps that store so
             // OffsetFetch answers the native offset a previously committed
-            // Kafka offset became (#458).
+            // Kafka offset became (#458). A `backend: kafka` catalog name
+            // has no range here: OverlayOffsetStore refuses its commits
+            // rather than remembering a cursor this process would forget.
             let gateway = match config.lease.as_ref() {
                 Some(lease) => gateway
                     .with_lease(Arc::new(BrokerLeaseView(Arc::clone(&broker)))
@@ -1704,6 +1706,18 @@ async fn run_leader(
                                 .filter(|route| route.backend == "kafka")
                                 .map(|route| route.name.clone())
                                 .collect(),
+                            std::iter::once(served_topic.clone()).chain(
+                                kafka
+                                    .topics
+                                    .iter()
+                                    .filter(|route| {
+                                        matches!(
+                                            route.backend.as_str(),
+                                            "native" | "dual" | "shadow"
+                                        )
+                                    })
+                                    .map(|route| route.name.clone()),
+                            ),
                         ),
                         cutovers,
                     )),

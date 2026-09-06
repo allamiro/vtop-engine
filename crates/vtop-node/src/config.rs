@@ -474,6 +474,7 @@ pub fn kafka_topics(kafka: &KafkaGatewayConfig) -> Result<(), String> {
                     .unwrap_or_else(|| route.name.clone());
                 let mut brokers = route.brokers.clone();
                 brokers.sort();
+                brokers.dedup();
                 if !remote_logs.insert((brokers, remote_topic.clone())) {
                     return Err(format!(
                         "`kafka.topics` gives {:?} the same remote log as another route \
@@ -2437,6 +2438,28 @@ mod transport_tests {
             ..base.clone()
         };
         assert!(kafka_topics(&two_remotes)
+            .unwrap_err()
+            .contains("same remote log"));
+        let two_remotes_dup_brokers = KafkaGatewayConfig {
+            topics: vec![
+                KafkaTopicRoute {
+                    name: "legacy".to_owned(),
+                    backend: "kafka".to_owned(),
+                    brokers: vec!["127.0.0.1:9092".to_owned(), "127.0.0.1:9092".to_owned()],
+                    remote_topic: Some("shared".to_owned()),
+                    ..KafkaTopicRoute::default()
+                },
+                KafkaTopicRoute {
+                    name: "copy".to_owned(),
+                    backend: "kafka".to_owned(),
+                    brokers: vec!["127.0.0.1:9092".to_owned()],
+                    remote_topic: Some("shared".to_owned()),
+                    ..KafkaTopicRoute::default()
+                },
+            ],
+            ..base.clone()
+        };
+        assert!(kafka_topics(&two_remotes_dup_brokers)
             .unwrap_err()
             .contains("same remote log"));
         let receipts_on_kafka = KafkaGatewayConfig {
