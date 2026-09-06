@@ -154,8 +154,8 @@ preflight_settings() {
   # so the ceiling leaves that headroom — the same reasoning as the metrics
   # bases below.
   require_integer_in_range CHAOS_NATIVE_PORT "$NATIVE_PORT" 1024 65522
-  # Six listeners (kafka-0..5), so the base may be at most 65529 (review).
-  require_integer_in_range CHAOS_KAFKA_BASE_PORT "$KAFKA_BASE_PORT" 1024 65529
+  # Six listeners (kafka-0..5), so the base may be at most 65530 (review).
+  require_integer_in_range CHAOS_KAFKA_BASE_PORT "$KAFKA_BASE_PORT" 1024 65530
   # Ceilings are the highest port each family actually derives: metadata ids
   # run 1..5 so the top base is 65535-5, and data indices run 0..3 — index 3 is
   # the replacement replica (#242) — so the top base is 65535-3. A tighter bound

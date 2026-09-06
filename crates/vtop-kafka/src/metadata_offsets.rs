@@ -156,6 +156,9 @@ pub struct MetadataOffsetStore {
     range: RangeIdentity,
     /// Other partitions this coordinator stores cursors on (#457 slice 4c).
     peers: Vec<PartitionRange>,
+    /// Kafka names this range is served as besides `range.topic` (#458): a
+    /// catalog name that is not the native log's name still commits here.
+    aliases: Vec<String>,
     groups: Mutex<HashMap<String, GroupState>>,
     /// The metadata warning is given once per store, not per commit.
     metadata_dropped_said: AtomicBool,
@@ -172,6 +175,7 @@ impl MetadataOffsetStore {
             lease,
             range,
             peers: Vec::new(),
+            aliases: Vec::new(),
             groups: Mutex::new(HashMap::new()),
             metadata_dropped_said: AtomicBool::new(false),
         }
@@ -183,6 +187,14 @@ impl MetadataOffsetStore {
     /// by name, not a guess at its UUID.
     pub fn with_peers(mut self, peers: Vec<PartitionRange>) -> Self {
         self.peers = peers;
+        self
+    }
+
+    /// Kafka catalog names that map onto this native range. Empty means
+    /// only `range.topic` is accepted, which is every deployment that never
+    /// sets `kafka.topics`.
+    pub fn with_topic_aliases(mut self, aliases: Vec<String>) -> Self {
+        self.aliases = aliases;
         self
     }
 
@@ -210,7 +222,11 @@ impl MetadataOffsetStore {
         }
         self.peers
             .iter()
-            .find(|peer| peer.topic == topic && peer.partition == partition)
+            .find(|peer| {
+                peer.partition == partition
+                    && (peer.topic == topic
+                        || (peer.topic == self.range.topic && self.names_topic(topic)))
+            })
             .map(|peer| CursorTarget {
                 topic_uuid: peer.topic_uuid,
                 range_uuid: peer.range_uuid,
@@ -324,7 +340,7 @@ impl MetadataOffsetStore {
                 // retries, and the plane's record says whose.
                 tracing::warn!(
                     group,
-                    range = %self.range.range_uuid,
+                    range = %target.range_uuid,
                     reason,
                     "kafka offsets: the range is held by another member on the plane; commits wait for it"
                 );
@@ -333,7 +349,7 @@ impl MetadataOffsetStore {
             MetadataResponse::Rejected(MetadataError::NotFound) => {
                 tracing::warn!(
                     group,
-                    range = %self.range.range_uuid,
+                    range = %target.range_uuid,
                     "kafka offsets: the plane does not know this range; a commit cannot be a cursor on it"
                 );
                 Err(ErrorCode::UnknownTopicOrPartition)
@@ -353,15 +369,28 @@ impl MetadataOffsetStore {
                 );
                 Err(ErrorCode::InvalidGroupId)
             }
-            other => Err(self.unexpected("EnsureGroupMemberForRange", group, other)),
+            other => {
+                let step = if target.coordinated {
+                    "EnsureGroupMemberCoordinated"
+                } else {
+                    "EnsureGroupMemberForRange"
+                };
+                Err(self.unexpected(step, group, target.range_uuid, other))
+            }
         }
     }
 
-    fn unexpected(&self, step: &str, group: &str, answer: MetadataResponse) -> ErrorCode {
+    fn unexpected(
+        &self,
+        step: &str,
+        group: &str,
+        range: Uuid,
+        answer: MetadataResponse,
+    ) -> ErrorCode {
         tracing::warn!(
             step,
             group,
-            range = %self.range.range_uuid,
+            range = %range,
             ?answer,
             "kafka offsets: the plane answered with what this step has no rule for; the client retries"
         );
@@ -425,7 +454,26 @@ impl MetadataOffsetStore {
     }
 
     fn is_this_range(&self, topic: &str, partition: i32) -> bool {
-        partition == self.range.partition && topic == self.range.topic
+        partition == self.range.partition && self.names_topic(topic)
+    }
+
+    fn names_topic(&self, topic: &str) -> bool {
+        topic == self.range.topic || self.aliases.iter().any(|name| name == topic)
+    }
+
+    fn advertised_topic(&self) -> &str {
+        self.aliases
+            .first()
+            .map(String::as_str)
+            .unwrap_or(self.range.topic.as_str())
+    }
+
+    fn listing_name(&self, stored: &str) -> String {
+        if stored == self.range.topic {
+            self.advertised_topic().to_owned()
+        } else {
+            stored.to_owned()
+        }
     }
 }
 
@@ -681,7 +729,12 @@ impl OffsetStore for MetadataOffsetStore {
                 }
                 other => {
                     self.remember_range(group, target.range_uuid, state);
-                    return Err(self.unexpected("CommitGroupCursor", group, other));
+                    return Err(self.unexpected(
+                        "CommitGroupCursor",
+                        group,
+                        target.range_uuid,
+                        other,
+                    ));
                 }
             }
         }
@@ -736,20 +789,27 @@ impl OffsetStore for MetadataOffsetStore {
         // (#457 slice 4c): a coordinator answers every partition it can
         // store. Stops one over the caller's bound, as MemoryOffsetStore
         // does, so the listener can say the group has committed more.
+        // Each peer is read through `fetch` so a listing sees the same
+        // cursor a named OffsetFetch would, and so the per-peer checkpoint
+        // cache is warm for the next commit.
         let cap = at_most.saturating_add(1);
         let mut rows = Vec::new();
         if let Some(committed) = self
             .fetch(group, &self.range.topic, self.range.partition)
             .await?
         {
-            rows.push((self.range.topic.clone(), self.range.partition, committed));
+            rows.push((
+                self.advertised_topic().to_owned(),
+                self.range.partition,
+                committed,
+            ));
         }
         for peer in &self.peers {
             if rows.len() >= cap {
                 break;
             }
             if let Some(committed) = self.fetch(group, &peer.topic, peer.partition).await? {
-                rows.push((peer.topic.clone(), peer.partition, committed));
+                rows.push((self.listing_name(&peer.topic), peer.partition, committed));
             }
         }
         Ok(rows)
@@ -931,6 +991,25 @@ mod tests {
             offset,
             metadata: None,
         }
+    }
+
+    #[tokio::test]
+    async fn a_catalog_alias_commits_on_this_range() {
+        let plane = Arc::new(MemoryPlane::with_range());
+        let epoch = plane.grant(NODE_A);
+        let store = MetadataOffsetStore::new(
+            Arc::clone(&plane) as Arc<dyn CursorPlane>,
+            FixedLease::holding(epoch),
+            identity(),
+        )
+        .with_topic_aliases(vec!["events.v1".to_owned()]);
+        store.commit("g", "events.v1", 0, at(4)).await.unwrap();
+        assert_eq!(store.fetch("g", "events.v1", 0).await, Ok(Some(at(4))));
+        assert_eq!(
+            store.committed("g", 8).await.unwrap()[0].0,
+            "events.v1",
+            "the listing names the catalog, not only the native log"
+        );
     }
 
     /// Commits become unpinned cursors on the plane and fetches read them:

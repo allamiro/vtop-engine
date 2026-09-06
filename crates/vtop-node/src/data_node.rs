@@ -1678,6 +1678,19 @@ async fn run_leader(
                                         }
                                     })
                                     .collect(),
+                            )
+                            .with_topic_aliases(
+                                kafka
+                                    .topics
+                                    .iter()
+                                    .filter(|route| {
+                                        matches!(
+                                            route.backend.as_str(),
+                                            "native" | "dual" | "shadow"
+                                        )
+                                    })
+                                    .map(|route| route.name.clone())
+                                    .collect(),
                             ),
                         ) as Arc<dyn vtop_kafka::OffsetStore>,
                         cutovers,

@@ -113,11 +113,13 @@ timeout "$((10#$PROGRESS_TIMEOUT_SECONDS * 3))" "$KCAT" -G "$GROUP" -b "$BOOT" \
   -X session.timeout.ms=10000 \
   -e -K: -f '%k:%s\n' ${KCAT_DEBUG[@]+"${KCAT_DEBUG[@]}"} "$TOPIC" > "$OUT0" 2> "$LOG0" &
 C0=$!
+echo "$C0" >> "$WORKDIR/pids"
 timeout "$((10#$PROGRESS_TIMEOUT_SECONDS * 3))" "$KCAT" -G "$GROUP" -b "$BOOT" \
   -X auto.offset.reset=earliest -X enable.auto.commit=true -X auto.commit.interval.ms=500 \
   -X session.timeout.ms=10000 \
   -e -K: -f '%k:%s\n' ${KCAT_DEBUG[@]+"${KCAT_DEBUG[@]}"} "$TOPIC" > "$OUT1" 2> "$LOG1" &
 C1=$!
+echo "$C1" >> "$WORKDIR/pids"
 wait "$C0"
 E0=$?
 wait "$C1"

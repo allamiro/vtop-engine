@@ -43,8 +43,10 @@ pub struct RemoteBridge {
     /// Idempotent retries this client already sent (#458): the remote
     /// cluster does not share this gateway's producer ids, so a sequenced
     /// retry that the primary already acknowledged must not produce again
-    /// on the shadow. Five sets, matching the memory backend's window.
-    recent: Mutex<HashMap<(i64, i16), VecDeque<(i32, Appended)>>>,
+    /// on the shadow. Keyed by topic as well as producer identity: one
+    /// RemoteBridge may serve several names, and a retry on B must not
+    /// ack A's offset. Five sets, matching the memory backend's window.
+    recent: Mutex<HashMap<(String, i64, i16), VecDeque<(i32, u64, Appended)>>>,
 }
 
 impl RemoteBridge {
@@ -122,23 +124,51 @@ impl RemoteBridge {
         Ok(body[4..].to_vec())
     }
 
-    fn first_bootstrap(&self) -> Result<SocketAddr, ErrorCode> {
-        for broker in &self.config.bootstrap {
-            if let Ok(mut addrs) = broker.to_socket_addrs() {
-                if let Some(addr) = addrs.next() {
-                    return Ok(addr);
-                }
+    fn host_port(host: &str, port: i32) -> String {
+        if host.contains(':') && !host.starts_with('[') {
+            format!("[{host}]:{port}")
+        } else {
+            format!("{host}:{port}")
+        }
+    }
+
+    fn rpc_any(
+        &self,
+        addrs: impl IntoIterator<Item = SocketAddr>,
+        key: i16,
+        version: i16,
+        body: &[u8],
+    ) -> Result<Vec<u8>, ErrorCode> {
+        let mut last = ErrorCode::BrokerNotAvailable;
+        let mut tried = false;
+        for addr in addrs {
+            tried = true;
+            match self.rpc(addr, key, version, body) {
+                Ok(reply) => return Ok(reply),
+                Err(error) => last = error,
             }
         }
-        Err(ErrorCode::BrokerNotAvailable)
+        if !tried {
+            return Err(ErrorCode::BrokerNotAvailable);
+        }
+        Err(last)
+    }
+
+    fn bootstrap_addrs(&self) -> Vec<SocketAddr> {
+        let mut addrs = Vec::new();
+        for broker in &self.config.bootstrap {
+            if let Ok(resolved) = broker.to_socket_addrs() {
+                addrs.extend(resolved);
+            }
+        }
+        addrs
     }
 
     fn leader_of(&self, topic: &str) -> Result<SocketAddr, ErrorCode> {
-        let bootstrap = self.first_bootstrap()?;
         let mut body = Encoder::new();
         body.array_len(1);
         body.string(topic);
-        let reply = self.rpc(bootstrap, 3, 1, body.as_slice())?;
+        let reply = self.rpc_any(self.bootstrap_addrs(), 3, 1, body.as_slice())?;
         let mut d = Decoder::new(&reply);
         let brokers = d
             .array_len("brokers")
@@ -186,11 +216,14 @@ impl RemoteBridge {
             .into_iter()
             .find(|(node, _, _)| *node == leader)
             .ok_or(ErrorCode::NotLeaderOrFollower)?;
-        format!("{host}:{port}")
+        Self::socket_addr(&host, port).ok_or(ErrorCode::BrokerNotAvailable)
+    }
+
+    fn socket_addr(host: &str, port: i32) -> Option<SocketAddr> {
+        Self::host_port(host, port)
             .to_socket_addrs()
             .ok()
             .and_then(|mut addrs| addrs.next())
-            .ok_or(ErrorCode::BrokerNotAvailable)
     }
 
     fn encode_batches(batches: &[RecordBatch]) -> Vec<u8> {
@@ -241,32 +274,50 @@ impl RemoteBridge {
         })
     }
 
-    fn replay(&self, sequenced: Sequenced) -> Option<Appended> {
-        self.recent
+    fn replay(
+        &self,
+        topic: &str,
+        sequenced: Sequenced,
+        fingerprint: u64,
+    ) -> Result<Option<Appended>, ErrorCode> {
+        let recent = self
+            .recent
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&(sequenced.producer_id, sequenced.producer_epoch))
-            .and_then(|window| {
-                window
-                    .iter()
-                    .rev()
-                    .find(|(first, _)| *first == sequenced.first_sequence)
-                    .map(|(_, appended)| appended.clone())
-            })
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(window) = recent.get(&(
+            topic.to_owned(),
+            sequenced.producer_id,
+            sequenced.producer_epoch,
+        )) else {
+            return Ok(None);
+        };
+        match window
+            .iter()
+            .rev()
+            .find(|(first, _, _)| *first == sequenced.first_sequence)
+        {
+            Some((_, seen, appended)) if *seen == fingerprint => Ok(Some(appended.clone())),
+            Some(_) => Err(ErrorCode::InvalidRecord),
+            None => Ok(None),
+        }
     }
 
-    fn remember(&self, sequenced: Sequenced, appended: Appended) {
+    fn remember(&self, topic: &str, sequenced: Sequenced, fingerprint: u64, appended: Appended) {
         let mut recent = self
             .recent
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let window = recent
-            .entry((sequenced.producer_id, sequenced.producer_epoch))
+            .entry((
+                topic.to_owned(),
+                sequenced.producer_id,
+                sequenced.producer_epoch,
+            ))
             .or_default();
         if window.len() == 5 {
             window.pop_front();
         }
-        window.push_back((sequenced.first_sequence, appended));
+        window.push_back((sequenced.first_sequence, fingerprint, appended));
     }
 }
 
@@ -285,11 +336,12 @@ impl Bridge for RemoteBridge {
             return Err(ErrorCode::UnknownTopicOrPartition);
         }
         if let Some(identity) = sequenced {
-            if let Some(previous) = self.replay(identity) {
+            let fingerprint = crate::bridge::set_fingerprint(batches);
+            if let Some(previous) = self.replay(topic, identity, fingerprint)? {
                 return Ok(previous);
             }
             let appended = self.produce_once(topic, batches)?;
-            self.remember(identity, appended.clone());
+            self.remember(topic, identity, fingerprint, appended.clone());
             return Ok(appended);
         }
         self.produce_once(topic, batches)
@@ -329,8 +381,16 @@ impl Bridge for RemoteBridge {
         let high_watermark = d.i64("hwm").map_err(|_| ErrorCode::CorruptMessage)?;
         d.i64("lso").map_err(|_| ErrorCode::CorruptMessage)?;
         let log_start_offset = d.i64("start").map_err(|_| ErrorCode::CorruptMessage)?;
-        d.array_len("aborted")
-            .map_err(|_| ErrorCode::CorruptMessage)?;
+        let aborted = d
+            .array_len("aborted")
+            .map_err(|_| ErrorCode::CorruptMessage)?
+            .unwrap_or(0);
+        for _ in 0..aborted {
+            d.i64("aborted_producer")
+                .map_err(|_| ErrorCode::CorruptMessage)?;
+            d.i64("aborted_first_offset")
+                .map_err(|_| ErrorCode::CorruptMessage)?;
+        }
         let records = d
             .nullable_bytes("records")
             .map_err(|_| ErrorCode::CorruptMessage)?
@@ -509,6 +569,19 @@ mod tests {
             .unwrap()
         };
         assert_eq!(first.base_offset, retry.base_offset);
+        let mismatch = {
+            let remote = Arc::clone(&remote);
+            tokio::task::spawn_blocking(move || {
+                remote.produce("events", &[batch(&["NO"])], Some(sequenced))
+            })
+            .await
+            .unwrap()
+        };
+        assert_eq!(
+            mismatch,
+            Err(ErrorCode::InvalidRecord),
+            "the same sequence with other bytes is not a retry"
+        );
         let bounds = {
             let remote = Arc::clone(&remote);
             tokio::task::spawn_blocking(move || remote.bounds("events"))
@@ -518,5 +591,15 @@ mod tests {
         };
         assert_eq!(bounds, (0, 3), "the sequenced retry appended nothing");
         let _ = tx.send(true);
+    }
+
+    #[test]
+    fn an_ipv6_leader_host_is_bracketed_before_it_is_dialed() {
+        assert_eq!(
+            RemoteBridge::host_port("2001:db8::1", 9092),
+            "[2001:db8::1]:9092"
+        );
+        assert_eq!(RemoteBridge::host_port("[::1]", 9092), "[::1]:9092");
+        assert_eq!(RemoteBridge::host_port("127.0.0.1", 9092), "127.0.0.1:9092");
     }
 }

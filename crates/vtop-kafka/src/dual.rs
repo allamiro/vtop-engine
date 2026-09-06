@@ -18,7 +18,7 @@ use crate::messages::ErrorCode;
 use crate::offsets::{Committed, OffsetStore};
 use crate::records::RecordBatch;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -78,6 +78,11 @@ impl ReceiptKind {
     }
 }
 
+/// Inclusive of the exclusive end: Kafka commits the next offset to consume.
+fn receipt_covers(start: i64, records: i64, offset: i64) -> bool {
+    offset >= start && offset <= start.saturating_add(records)
+}
+
 /// The log of translations and comparisons (#458 slice 4). Memory always;
 /// a path, when set, appends JSONL an operator prints with `vtopctl receipt`.
 pub struct ReceiptLog {
@@ -121,7 +126,10 @@ impl ReceiptLog {
         }))
     }
 
-    pub fn record(&self, receipt: Receipt) {
+    /// Append the row. A durable log that cannot be written is an error:
+    /// DualBridge must not ack a write whose translation would vanish on
+    /// restart.
+    pub fn record(&self, receipt: Receipt) -> Result<(), ErrorCode> {
         if let Some(path) = &self.path {
             if let Err(error) = std::fs::OpenOptions::new()
                 .create(true)
@@ -129,20 +137,23 @@ impl ReceiptLog {
                 .open(path)
                 .and_then(|mut file| {
                     use std::io::Write;
-                    writeln!(file, "{}", receipt_json(&receipt))
+                    writeln!(file, "{}", receipt_json(&receipt))?;
+                    file.sync_all()
                 })
             {
                 tracing::error!(
                     path = %path.display(),
                     error = %error,
-                    "kafka receipt: the JSONL file could not be appended; the in-memory log still holds the row"
+                    "kafka receipt: the JSONL file could not be appended; the write is not acknowledged"
                 );
+                return Err(ErrorCode::KafkaStorageError);
             }
         }
         self.rows
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(receipt);
+        Ok(())
     }
 
     pub fn rows(&self) -> Vec<Receipt> {
@@ -153,6 +164,9 @@ impl ReceiptLog {
     }
 
     /// The primary offset a shadow offset became, if a dual-write covered it.
+    /// The exclusive end (`start + records`) is included: Kafka commits the
+    /// next offset to consume, so a consumer that finished the receipt
+    /// commits that cursor, not one inside the batch.
     pub fn to_primary(&self, topic: &str, shadow_offset: i64) -> Option<i64> {
         self.rows
             .lock()
@@ -162,9 +176,9 @@ impl ReceiptLog {
             .find(|row| {
                 row.topic == topic
                     && row.kind == ReceiptKind::DualWrite
-                    && row.shadow_offset.is_some_and(|start| {
-                        shadow_offset >= start && shadow_offset < start + row.records
-                    })
+                    && row
+                        .shadow_offset
+                        .is_some_and(|start| receipt_covers(start, row.records, shadow_offset))
             })
             .map(|row| {
                 let delta = shadow_offset - row.shadow_offset.unwrap();
@@ -182,8 +196,7 @@ impl ReceiptLog {
             .find(|row| {
                 row.topic == topic
                     && row.kind == ReceiptKind::DualWrite
-                    && primary_offset >= row.primary_offset
-                    && primary_offset < row.primary_offset + row.records
+                    && receipt_covers(row.primary_offset, row.records, primary_offset)
             })
             .and_then(|row| {
                 let delta = primary_offset - row.primary_offset;
@@ -257,6 +270,22 @@ fn json_field(line: &str, key: &str) -> Result<String, String> {
                     Some('"') => out.push('"'),
                     Some('\\') => out.push('\\'),
                     Some('n') => out.push('\n'),
+                    Some('t') => out.push('\t'),
+                    Some('r') => out.push('\r'),
+                    Some('b') => out.push('\u{8}'),
+                    Some('f') => out.push('\u{c}'),
+                    Some('u') => {
+                        let hex: String = chars.by_ref().take(4).collect();
+                        if hex.len() != 4 {
+                            return Err(format!("truncated \\u escape for {key}"));
+                        }
+                        let code = u32::from_str_radix(&hex, 16)
+                            .map_err(|_| format!("bad \\u escape for {key}"))?;
+                        out.push(
+                            char::from_u32(code)
+                                .ok_or_else(|| format!("bad \\u escape for {key}"))?,
+                        );
+                    }
                     Some(other) => out.push(other),
                     None => break,
                 },
@@ -356,6 +385,9 @@ pub struct DualBridge {
     shadow_topic: String,
     read: DualRead,
     receipts: Arc<ReceiptLog>,
+    /// Primary-then-shadow is one produce: concurrent callers must not
+    /// interleave the two appends, or a receipt would pair the wrong offsets.
+    write: Mutex<()>,
 }
 
 impl DualBridge {
@@ -376,6 +408,7 @@ impl DualBridge {
             shadow_topic,
             read,
             receipts,
+            write: Mutex::new(()),
         }
     }
 
@@ -398,6 +431,10 @@ impl Bridge for DualBridge {
         if topic != self.kafka_topic {
             return Err(ErrorCode::UnknownTopicOrPartition);
         }
+        let _write = self
+            .write
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let hash = payload_hash(batches);
         let records: i64 = batches.iter().map(|b| b.records.len() as i64).sum();
         let primary = self
@@ -412,7 +449,7 @@ impl Bridge for DualBridge {
                     shadow_offset: Some(shadow.base_offset),
                     records,
                     sha256: hash,
-                });
+                })?;
                 Ok(primary)
             }
             Err(error) => {
@@ -430,7 +467,7 @@ impl Bridge for DualBridge {
                     shadow_offset: None,
                     records,
                     sha256: hash,
-                });
+                })?;
                 Err(ErrorCode::KafkaStorageError)
             }
         }
@@ -477,7 +514,7 @@ impl Bridge for DualBridge {
                         shadow_offset: Some(shadow_offset),
                         records: 0,
                         sha256: hash,
-                    });
+                    })?;
                     Ok(primary)
                 } else {
                     tracing::error!(
@@ -495,7 +532,7 @@ impl Bridge for DualBridge {
                         shadow_offset: Some(shadow_offset),
                         records: 0,
                         sha256: hash,
-                    });
+                    })?;
                     Err(ErrorCode::CorruptMessage)
                 }
             }
@@ -516,11 +553,35 @@ impl Bridge for DualBridge {
 /// Encoded batches compared by the records they carry, not the offsets the
 /// backends stamped: a dual-write of the same produce lands at different
 /// base offsets, and a byte-exact compare of the Fetch payload would then
-/// always mismatch.
+/// always mismatch. Keys, timestamps and headers are compared too — a
+/// matching value with a rewritten key is still a divergence.
 fn payload_bytes_equal(a: &[u8], b: &[u8]) -> bool {
-    record_values(a) == record_values(b)
+    record_payloads(a) == record_payloads(b)
 }
 
+fn record_payloads(
+    encoded: &[u8],
+) -> Vec<(
+    i64,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Vec<(String, Option<Vec<u8>>)>,
+)> {
+    decode_batches(encoded)
+        .into_iter()
+        .flat_map(|batch| batch.records)
+        .map(|record| {
+            (
+                record.timestamp_millis,
+                record.key,
+                record.value,
+                record.headers,
+            )
+        })
+        .collect()
+}
+
+#[cfg(test)]
 fn record_values(encoded: &[u8]) -> Vec<Vec<u8>> {
     decode_batches(encoded)
         .into_iter()
@@ -546,14 +607,20 @@ fn decode_batches(mut encoded: &[u8]) -> Vec<RecordBatch> {
 }
 
 /// After a cutover, OffsetFetch answers the native (primary) offset a
-/// previously committed shadow offset became. Commits themselves still
-/// store what the client sent — the offset the gateway advertised while
-/// the shadow was the read side.
+/// previously committed shadow offset became. Commits that arrive after
+/// wrapping are native — Fetch already advertised native numbering — so
+/// they are stored as-is and never translated again. A fetch of a cursor
+/// that has not been rewritten still goes through the receipt.
 pub struct CutoverStore {
     inner: Arc<dyn OffsetStore>,
     /// Topics whose committed offsets were recorded against the shadow
     /// numbering, and the receipt log that translates them.
     by_topic: Mutex<HashMap<String, Arc<ReceiptLog>>>,
+    /// `(group, topic, partition)` committed or migrated after wrapping:
+    /// those offsets are already native and must not run through
+    /// `to_primary` again, even when they numerically overlap a historical
+    /// shadow range.
+    native: Mutex<HashSet<(String, String, i32)>>,
 }
 
 impl CutoverStore {
@@ -561,6 +628,7 @@ impl CutoverStore {
         Self {
             inner,
             by_topic: Mutex::new(HashMap::new()),
+            native: Mutex::new(HashSet::new()),
         }
     }
 
@@ -598,6 +666,20 @@ impl CutoverStore {
             None => offset,
         }
     }
+
+    fn mark_native(&self, group: &str, topic: &str, partition: i32) {
+        self.native
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert((group.to_owned(), topic.to_owned(), partition));
+    }
+
+    fn is_native(&self, group: &str, topic: &str, partition: i32) -> bool {
+        self.native
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&(group.to_owned(), topic.to_owned(), partition))
+    }
 }
 
 #[async_trait::async_trait]
@@ -609,7 +691,14 @@ impl OffsetStore for CutoverStore {
         partition: i32,
         committed: Committed,
     ) -> Result<(), ErrorCode> {
-        self.inner.commit(group, topic, partition, committed).await
+        self.inner
+            .commit(group, topic, partition, committed)
+            .await?;
+        // After cutover, Fetch served native offsets, so this commit is
+        // native numbering. Remember that so a later fetch does not treat
+        // it as a leftover shadow cursor.
+        self.mark_native(group, topic, partition);
+        Ok(())
     }
 
     async fn fetch(
@@ -621,7 +710,22 @@ impl OffsetStore for CutoverStore {
         let Some(mut committed) = self.inner.fetch(group, topic, partition).await? else {
             return Ok(None);
         };
-        committed.offset = self.translate(topic, committed.offset);
+        if self.is_native(group, topic, partition) {
+            return Ok(Some(committed));
+        }
+        let translated = self.translate(topic, committed.offset);
+        if translated != committed.offset {
+            let migrated = Committed {
+                offset: translated,
+                metadata: committed.metadata.clone(),
+            };
+            self.inner
+                .commit(group, topic, partition, migrated.clone())
+                .await?;
+            self.mark_native(group, topic, partition);
+            return Ok(Some(migrated));
+        }
+        committed.offset = translated;
         Ok(Some(committed))
     }
 
@@ -631,8 +735,22 @@ impl OffsetStore for CutoverStore {
         at_most: usize,
     ) -> Result<Vec<(String, i32, Committed)>, ErrorCode> {
         let mut rows = self.inner.committed(group, at_most).await?;
-        for (topic, _, committed) in rows.iter_mut() {
-            committed.offset = self.translate(topic, committed.offset);
+        for (topic, partition, committed) in rows.iter_mut() {
+            if self.is_native(group, topic, *partition) {
+                continue;
+            }
+            let translated = self.translate(topic, committed.offset);
+            if translated != committed.offset {
+                let migrated = Committed {
+                    offset: translated,
+                    metadata: committed.metadata.clone(),
+                };
+                self.inner
+                    .commit(group, topic, *partition, migrated.clone())
+                    .await?;
+                self.mark_native(group, topic, *partition);
+                *committed = migrated;
+            }
         }
         Ok(rows)
     }
@@ -862,6 +980,23 @@ mod tests {
             "after cutover the consumer resumes at the native offset"
         );
         assert_eq!(store.committed("g", 8).await.unwrap()[0].2.offset, 0);
+        store
+            .commit(
+                "g",
+                "events",
+                0,
+                Committed {
+                    offset: 1,
+                    metadata: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.fetch("g", "events", 0).await.unwrap().unwrap().offset,
+            1,
+            "a native commit after cutover is not translated again even if it overlaps a shadow range"
+        );
     }
 
     #[test]
@@ -878,6 +1013,16 @@ mod tests {
         let parsed = load_receipts_jsonl(&format!("{line}\n")).unwrap();
         assert_eq!(parsed, vec![row]);
         assert!(load_receipts_jsonl("{\"topic\":\"x\"}").is_err());
+        let tabbed = Receipt {
+            topic: "ev\tents".to_owned(),
+            kind: ReceiptKind::DualWrite,
+            primary_offset: 0,
+            shadow_offset: Some(1),
+            records: 1,
+            sha256: [0; 32],
+        };
+        let line = receipt_json(&tabbed);
+        assert_eq!(load_receipts_jsonl(&line).unwrap(), vec![tabbed]);
     }
 
     #[test]
@@ -885,17 +1030,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("receipts.jsonl");
         let first = ReceiptLog::create(&path).unwrap();
-        first.record(Receipt {
-            topic: "events".to_owned(),
-            kind: ReceiptKind::DualWrite,
-            primary_offset: 0,
-            shadow_offset: Some(4),
-            records: 2,
-            sha256: [1; 32],
-        });
+        first
+            .record(Receipt {
+                topic: "events".to_owned(),
+                kind: ReceiptKind::DualWrite,
+                primary_offset: 0,
+                shadow_offset: Some(4),
+                records: 2,
+                sha256: [1; 32],
+            })
+            .unwrap();
         drop(first);
         let reopened = ReceiptLog::create(&path).unwrap();
         assert_eq!(reopened.to_primary("events", 5), Some(1));
+        assert_eq!(
+            reopened.to_primary("events", 6),
+            Some(2),
+            "the exclusive end is the next offset Kafka commits"
+        );
         assert_eq!(reopened.rows().len(), 1);
         let corrupt = dir.path().join("bad.jsonl");
         std::fs::write(&corrupt, "not-json\n").unwrap();
@@ -1025,6 +1177,79 @@ mod tests {
             .rows()
             .iter()
             .any(|row| row.kind == ReceiptKind::DualWrite));
+    }
+
+    #[test]
+    fn compare_names_a_mismatch_when_only_the_key_differs() {
+        let primary = Arc::new(MemoryBridge::with_topics(["native"]));
+        let shadow = Arc::new(MemoryBridge::with_topics(["kafka"]));
+        let dual = DualBridge::new(
+            "events".to_owned(),
+            Arc::clone(&primary) as Arc<dyn Bridge>,
+            "native".to_owned(),
+            Arc::clone(&shadow) as Arc<dyn Bridge>,
+            "kafka".to_owned(),
+            DualRead::Compare,
+            ReceiptLog::memory(),
+        );
+        primary.produce("native", &[batch(&["a"])], None).unwrap();
+        shadow
+            .produce("kafka", &[batch_keyed("other", "a")], None)
+            .unwrap();
+        assert_eq!(
+            dual.fetch("events", 0, 1 << 20),
+            Err(ErrorCode::CorruptMessage)
+        );
+    }
+
+    fn batch_keyed(key: &str, value: &str) -> RecordBatch {
+        RecordBatch {
+            base_offset: 0,
+            producer_id: -1,
+            producer_epoch: -1,
+            base_sequence: -1,
+            records: vec![Record {
+                offset: 0,
+                timestamp_millis: 1,
+                key: Some(key.as_bytes().to_vec()),
+                value: Some(value.as_bytes().to_vec()),
+                headers: Vec::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn a_durable_receipt_that_cannot_be_appended_is_storage_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let log = ReceiptLog::create(&path).unwrap();
+        log.record(Receipt {
+            topic: "events".to_owned(),
+            kind: ReceiptKind::DualWrite,
+            primary_offset: 0,
+            shadow_offset: Some(0),
+            records: 1,
+            sha256: [0; 32],
+        })
+        .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(
+            log.record(Receipt {
+                topic: "events".to_owned(),
+                kind: ReceiptKind::DualWrite,
+                primary_offset: 1,
+                shadow_offset: Some(1),
+                records: 1,
+                sha256: [1; 32],
+            }),
+            Err(ErrorCode::KafkaStorageError)
+        );
+        assert_eq!(
+            log.rows().len(),
+            1,
+            "memory stays at the last durable row when the file refused"
+        );
     }
 
     #[test]

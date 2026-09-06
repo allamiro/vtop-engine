@@ -416,14 +416,14 @@ impl Gateway {
     /// topology Metadata advertises. Looked up by index, not by cloning the
     /// topology — FindCoordinator and every group request take this path,
     /// and a host string copied for each of them is work nobody asked for.
-    fn elected_coordinator(&self, group: &str) -> PartitionLeader {
+    fn elected_coordinator(&self, group: &str) -> Option<PartitionLeader> {
         if self.config.partitions.is_empty() {
-            return PartitionLeader {
+            return Some(PartitionLeader {
                 index: self.config.partition,
                 node_id: self.config.node_id,
                 host: self.config.advertised_host.clone(),
                 port: self.config.advertised_port,
-            };
+            });
         }
         let slot = coordinator_partition_index(group, self.config.partitions.len()) as i32;
         self.config
@@ -431,7 +431,6 @@ impl Gateway {
             .iter()
             .find(|peer| peer.index == slot)
             .cloned()
-            .expect("kafka_partitions names every index from 0")
     }
 
     /// The refusal a group-protocol request gets when this gateway is not
@@ -440,7 +439,16 @@ impl Gateway {
     /// the right broker; `COORDINATOR_NOT_AVAILABLE` is how it waits out a
     /// handoff of this one.
     fn not_this_groups_coordinator(&self, api: &str, group: &str) -> Option<ErrorCode> {
-        let coordinator = self.elected_coordinator(group);
+        let Some(coordinator) = self.elected_coordinator(group) else {
+            tracing::warn!(
+                api,
+                group,
+                this = self.config.node_id,
+                "kafka {api} refused: the topology does not name the elected partition index; the \
+                 client retries"
+            );
+            return Some(ErrorCode::CoordinatorNotAvailable);
+        };
         if coordinator.node_id != self.config.node_id {
             tracing::warn!(
                 api,
@@ -1165,7 +1173,12 @@ impl Gateway {
                 "an empty group id names no group",
             );
         }
-        let elected = self.elected_coordinator(&request.key);
+        let Some(elected) = self.elected_coordinator(&request.key) else {
+            return refused(
+                ErrorCode::CoordinatorNotAvailable,
+                "the topology does not name the elected partition; retry FindCoordinator",
+            );
+        };
         if elected.node_id == self.config.node_id {
             if let Some(error) = self.fenced("FindCoordinator") {
                 return refused(
@@ -5006,6 +5019,39 @@ mod tests {
             (error, node, host.as_str(), port),
             (0, 7, "other.example", 9092)
         );
+    }
+
+    #[tokio::test]
+    async fn a_gap_in_the_topology_is_coordinator_not_available_not_a_panic() {
+        let group = (0..64)
+            .map(|i| format!("g{i}"))
+            .find(|g| coordinator_partition_index(g, 2) == 1)
+            .expect("some group elects slot 1");
+        let (addr, _stop) =
+            start_groups_tuned(Arc::new(MemoryBridge::with_topics(["events"])), None, |c| {
+                c.node_id = 9;
+                c.partition = 0;
+                c.partitions = vec![
+                    PartitionLeader {
+                        index: 0,
+                        node_id: 9,
+                        host: "127.0.0.1".to_owned(),
+                        port: c.advertised_port,
+                    },
+                    PartitionLeader {
+                        index: 2,
+                        node_id: 7,
+                        host: "other.example".to_owned(),
+                        port: 9092,
+                    },
+                ];
+            })
+            .await;
+        let reply = call(addr, 10, 1, 1, &find_coordinator_body(1, &group, 0))
+            .await
+            .unwrap();
+        let (error, _, _, _) = read_find_coordinator(&reply, 1);
+        assert_eq!(error, ErrorCode::CoordinatorNotAvailable.as_i16());
     }
 
     fn two_partition_topology(this_port: i32) -> Vec<PartitionLeader> {

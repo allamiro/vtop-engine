@@ -38,8 +38,9 @@ enum TopicMapKind {
     /// `UNKNOWN_TOPIC_OR_PARTITION` is what a client sees, as it did before.
     Single(Arc<dyn Bridge>),
     /// Named routes: Metadata is the catalog, a name not in it is unknown
-    /// before any backend is asked, and two routes may share a backend
-    /// (two virtual names of one native log) or not.
+    /// before any backend is asked. Two routes may share a backend process
+    /// only when they name different backend logs; two Kafka names of one
+    /// log would share one producer-sequence space.
     Routed {
         order: Vec<String>,
         by_name: HashMap<String, Binding>,
@@ -80,7 +81,7 @@ impl TopicMap {
             );
         }
         let mut order = Vec::with_capacity(entries.len());
-        let mut by_name = HashMap::with_capacity(entries.len());
+        let mut by_name: HashMap<String, Binding> = HashMap::with_capacity(entries.len());
         for entry in entries {
             if entry.name.is_empty() {
                 return Err(
@@ -98,6 +99,17 @@ impl TopicMap {
             if by_name.contains_key(&entry.name) {
                 return Err(format!(
                     "kafka topic map names {:?} twice: one name is one backend",
+                    entry.name
+                ));
+            }
+            if let Some((other, _)) = by_name.iter().find(|(_, binding)| {
+                Arc::ptr_eq(&binding.backend, &entry.backend)
+                    && binding.backend_topic == entry.backend_topic
+            }) {
+                return Err(format!(
+                    "kafka topic map gives {other:?} and {:?} the same backend log: idempotent \
+                     producers keep a sequence space per Kafka name, and this backend has one; \
+                     give each name its own log, or wait until sequences are namespaced",
                     entry.name
                 ));
             }
@@ -243,12 +255,27 @@ mod tests {
             },
             TopicBinding {
                 name: "events".to_owned(),
-                backend: backend,
+                backend: Arc::clone(&backend),
                 backend_topic: "other".to_owned(),
             },
         ])
         .err()
         .expect("duplicate")
         .contains("twice"));
+        assert!(TopicMap::routed(vec![
+            TopicBinding {
+                name: "events".to_owned(),
+                backend: Arc::clone(&backend),
+                backend_topic: "events".to_owned(),
+            },
+            TopicBinding {
+                name: "alias".to_owned(),
+                backend: Arc::clone(&backend),
+                backend_topic: "events".to_owned(),
+            },
+        ])
+        .err()
+        .expect("shared log")
+        .contains("same backend log"));
     }
 }

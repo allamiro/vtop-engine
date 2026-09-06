@@ -218,11 +218,6 @@ pub struct KafkaTopicRoute {
     pub cutover: bool,
 }
 
-/// The identity the gateway appends under: the configured one, or one
-/// derived from the principal. Never the principal (review): the journal
-/// keys producer epochs by UUID, and the gateway mints a wall-clock epoch at
-/// every start, so a native client appending as the same UUID with ordinary
-/// epochs would be refused as fenced the moment Kafka was enabled.
 /// The partition topology a gateway may serve (#457 slice 3), or a refusal
 /// naming what is wrong with it. An empty list is the single-partition shape
 /// and always fine; a list must name every partition from zero once, and must
@@ -440,6 +435,7 @@ pub fn kafka_topics(kafka: &KafkaGatewayConfig) -> Result<(), String> {
         return Ok(());
     }
     let mut seen = BTreeSet::new();
+    let mut native_backed = Vec::new();
     for route in &kafka.topics {
         if route.name.is_empty() {
             return Err(
@@ -454,8 +450,13 @@ pub fn kafka_topics(kafka: &KafkaGatewayConfig) -> Result<(), String> {
             ));
         }
         match route.backend.as_str() {
-            "native" => {}
+            "native" => {
+                native_backed.push(route.name.clone());
+            }
             "kafka" | "dual" | "shadow" => {
+                if matches!(route.backend.as_str(), "dual" | "shadow") {
+                    native_backed.push(route.name.clone());
+                }
                 if route.brokers.is_empty() {
                     return Err(format!(
                         "`kafka.topics` gives {:?} backend {:?} with no brokers: set the \
@@ -464,12 +465,7 @@ pub fn kafka_topics(kafka: &KafkaGatewayConfig) -> Result<(), String> {
                     ));
                 }
                 for broker in &route.brokers {
-                    if broker.is_empty() || !broker.contains(':') {
-                        return Err(format!(
-                            "`kafka.topics` gives {:?} a broker {broker:?} that is not host:port",
-                            route.name
-                        ));
-                    }
+                    kafka_bootstrap_broker(broker, &route.name)?;
                 }
             }
             other => {
@@ -520,10 +516,19 @@ pub fn kafka_topics(kafka: &KafkaGatewayConfig) -> Result<(), String> {
                     ));
                 }
             }
-            if route.read.as_deref() == Some("kafka") {
+            if matches!(route.read.as_deref(), Some("kafka") | Some("compare")) {
                 return Err(format!(
-                    "`kafka.topics` gives {:?} cutover while read is kafka: OffsetFetch would \
-                     answer native offsets while Fetch still serves the shadow numbering",
+                    "`kafka.topics` gives {:?} cutover while read is {}: OffsetFetch would \
+                     translate a native committed offset as a shadow offset. Cutover is native \
+                     numbering; set read: native",
+                    route.name,
+                    route.read.as_deref().unwrap()
+                ));
+            }
+            if route.backend == "shadow" && route.read.as_deref() != Some("native") {
+                return Err(format!(
+                    "`kafka.topics` gives {:?} cutover on backend shadow without read: native: \
+                     shadow reads default to compare, which is not native numbering",
                     route.name
                 ));
             }
@@ -534,6 +539,14 @@ pub fn kafka_topics(kafka: &KafkaGatewayConfig) -> Result<(), String> {
                 route.name, route.backend
             ));
         }
+    }
+    if native_backed.len() > 1 {
+        return Err(format!(
+            "`kafka.topics` gives {:?} and {:?} this node's one log: idempotent producers keep a \
+             sequence space per Kafka name, and this range has one. Give the second name a kafka \
+             backend, or wait until sequences are namespaced",
+            native_backed[0], native_backed[1]
+        ));
     }
     Ok(())
 }
@@ -563,6 +576,11 @@ pub fn kafka_advertised_endpoint(kafka: &KafkaGatewayConfig, bound: SocketAddr) 
     (host, port)
 }
 
+/// The identity the gateway appends under: the configured one, or one
+/// derived from the principal. Never the principal (review): the journal
+/// keys producer epochs by UUID, and the gateway mints a wall-clock epoch at
+/// every start, so a native client appending as the same UUID with ordinary
+/// epochs would be refused as fenced the moment Kafka was enabled.
 pub fn kafka_producer_id(principal: Uuid, kafka: &KafkaGatewayConfig) -> Result<Uuid, String> {
     match kafka.producer_id {
         Some(id) if id == principal => Err(format!(
@@ -724,6 +742,42 @@ fn refuse_undialable_host(host: &str, what: &str) -> Result<(), String> {
     if bare.parse::<IpAddr>().is_err() {
         refuse_unresolvable_name(host, what)?;
     }
+    Ok(())
+}
+
+/// A bootstrap `host:port` (or `[host]:port` for IPv6) a remote route dials.
+/// Syntax is judged here so a typo is a refused config, not a produce that
+/// discovers `BROKER_NOT_AVAILABLE`.
+fn kafka_bootstrap_broker(broker: &str, topic: &str) -> Result<(), String> {
+    let what = format!("`kafka.topics` gives {topic:?} a broker");
+    let (host, port) = if let Some(rest) = broker.strip_prefix('[') {
+        let Some((host, port)) = rest.split_once("]:") else {
+            return Err(format!("{what} {broker:?} that is not [host]:port"));
+        };
+        (host, port)
+    } else {
+        let Some((host, port)) = broker.rsplit_once(':') else {
+            return Err(format!("{what} {broker:?} that is not host:port"));
+        };
+        if host.is_empty() {
+            return Err(format!("{what} {broker:?} that is not host:port"));
+        }
+        if host.contains(':') {
+            return Err(format!(
+                "{what} {broker:?} that is not host:port: write an IPv6 address as [host]:port"
+            ));
+        }
+        (host, port)
+    };
+    let parsed: u16 = port
+        .parse()
+        .map_err(|_| format!("{what} {broker:?} whose port is not a number in 1..=65535"))?;
+    if parsed == 0 {
+        return Err(format!(
+            "{what} {broker:?} with port 0: set the port clients dial"
+        ));
+    }
+    refuse_undialable_host(host, &format!("{what} {broker:?} whose host"))?;
     Ok(())
 }
 
@@ -2288,6 +2342,49 @@ mod transport_tests {
         assert!(kafka_topics(&cutover_while_shadow)
             .unwrap_err()
             .contains("read is kafka"));
+        let cutover_while_compare = KafkaGatewayConfig {
+            topics: vec![KafkaTopicRoute {
+                name: "events".to_owned(),
+                backend: "dual".to_owned(),
+                brokers: vec!["127.0.0.1:9092".to_owned()],
+                read: Some("compare".to_owned()),
+                receipts: Some("/tmp/events.jsonl".to_owned()),
+                cutover: true,
+                ..KafkaTopicRoute::default()
+            }],
+            ..base.clone()
+        };
+        assert!(kafka_topics(&cutover_while_compare)
+            .unwrap_err()
+            .contains("read is compare"));
+        let two_natives = KafkaGatewayConfig {
+            topics: vec![
+                KafkaTopicRoute {
+                    name: "events".to_owned(),
+                    backend: "native".to_owned(),
+                    ..KafkaTopicRoute::default()
+                },
+                KafkaTopicRoute {
+                    name: "alias".to_owned(),
+                    backend: "native".to_owned(),
+                    ..KafkaTopicRoute::default()
+                },
+            ],
+            ..base.clone()
+        };
+        assert!(kafka_topics(&two_natives).unwrap_err().contains("one log"));
+        let bad_port = KafkaGatewayConfig {
+            topics: vec![KafkaTopicRoute {
+                name: "legacy".to_owned(),
+                backend: "kafka".to_owned(),
+                brokers: vec!["host:bad".to_owned()],
+                ..KafkaTopicRoute::default()
+            }],
+            ..base.clone()
+        };
+        assert!(kafka_topics(&bad_port)
+            .unwrap_err()
+            .contains("not a number"));
         let receipts_on_kafka = KafkaGatewayConfig {
             topics: vec![KafkaTopicRoute {
                 name: "legacy".to_owned(),
