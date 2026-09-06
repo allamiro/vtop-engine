@@ -564,6 +564,19 @@ pub fn kafka_topics(kafka: &KafkaGatewayConfig) -> Result<(), String> {
             native_backed[0], native_backed[1]
         ));
     }
+    if let Some(served) = kafka.topic.as_deref() {
+        if kafka
+            .topics
+            .iter()
+            .any(|route| route.backend == "kafka" && route.name == served)
+        {
+            return Err(format!(
+                "`kafka.topics` gives {served:?} backend kafka, which is also kafka.topic: that \
+                 name is this node's range cursor. Use a native/dual/shadow route for it, or pick \
+                 another Kafka name for the remote log"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -2462,6 +2475,19 @@ mod transport_tests {
         assert!(kafka_topics(&two_remotes_dup_brokers)
             .unwrap_err()
             .contains("same remote log"));
+        let kafka_only_is_served = KafkaGatewayConfig {
+            topic: Some("legacy".to_owned()),
+            topics: vec![KafkaTopicRoute {
+                name: "legacy".to_owned(),
+                backend: "kafka".to_owned(),
+                brokers: vec!["127.0.0.1:9092".to_owned()],
+                ..KafkaTopicRoute::default()
+            }],
+            ..base.clone()
+        };
+        assert!(kafka_topics(&kafka_only_is_served)
+            .unwrap_err()
+            .contains("kafka.topic"));
         let receipts_on_kafka = KafkaGatewayConfig {
             topics: vec![KafkaTopicRoute {
                 name: "legacy".to_owned(),

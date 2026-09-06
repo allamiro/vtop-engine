@@ -357,4 +357,30 @@ mod tests {
             "an owned name keeps the durable inner cursor"
         );
     }
+
+    #[tokio::test]
+    async fn overlay_refuses_a_kafka_only_name_even_when_it_matches_the_range() {
+        let inner = Arc::new(MemoryOffsetStore::default());
+        let store = OverlayOffsetStore::wrapping(
+            Arc::clone(&inner) as Arc<dyn OffsetStore>,
+            vec!["events".to_owned()],
+            Vec::new(),
+        );
+        assert_eq!(
+            store
+                .commit(
+                    "g",
+                    "events",
+                    0,
+                    Committed {
+                        offset: 1,
+                        metadata: None,
+                    },
+                )
+                .await,
+            Err(ErrorCode::UnknownTopicOrPartition),
+            "served_topic is not owned unless a native/dual/shadow route names it"
+        );
+        assert!(inner.fetch("g", "events", 0).await.unwrap().is_none());
+    }
 }

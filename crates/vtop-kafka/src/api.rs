@@ -171,6 +171,7 @@ pub struct MetadataTopic {
 pub struct MetadataPartition {
     pub index: i32,
     pub leader: i32,
+    pub error: ErrorCode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,7 +213,7 @@ pub fn encode_metadata(out: &mut Encoder, version: i16, r: &MetadataResponse) {
             partitions => {
                 out.array_len(partitions.len());
                 for partition in partitions {
-                    out.i16(ErrorCode::None.as_i16());
+                    out.i16(partition.error.as_i16());
                     out.i32(partition.index);
                     out.i32(partition.leader);
                     if version >= 7 {
@@ -588,6 +589,7 @@ mod tests {
                     partitions: vec![MetadataPartition {
                         index: 0,
                         leader: 1,
+                        error: ErrorCode::None,
                     }],
                 },
                 MetadataTopic {

@@ -55,11 +55,24 @@ struct InflightSet {
     fingerprint: u64,
 }
 
+#[derive(Clone, Copy)]
+struct RemoteIdentity {
+    producer_id: i64,
+    producer_epoch: i16,
+}
+
+struct ProducerBook {
+    recent: HashMap<ReplayKey, VecDeque<ReplaySet>>,
+    inflight: HashMap<ReplayKey, VecDeque<InflightSet>>,
+    remote_ids: HashMap<ReplayKey, RemoteIdentity>,
+}
+
 /// Whether the Produce bytes can have reached the broker.
 enum SendError {
     /// Connect or local setup failed; a retry may send.
     Unsent(ErrorCode),
-    /// The request may already have been appended; a retry must not send again.
+    /// The request may already have been appended; a retry must not send again
+    /// as a new non-idempotent Produce.
     Ambiguous(ErrorCode),
 }
 
@@ -71,20 +84,20 @@ impl SendError {
     }
 }
 
+/// Kafka produce errors that do not prove the leader rejected the append.
+fn produce_reply_error(raw: i16) -> SendError {
+    match raw {
+        7 | 19 => SendError::Ambiguous(ErrorCode::from_i16(raw)),
+        other => SendError::Unsent(ErrorCode::from_i16(other)),
+    }
+}
+
 /// A [`Bridge`] over an external Kafka cluster.
 pub struct RemoteBridge {
     config: RemoteConfig,
-    /// Idempotent retries this client already sent (#458): the remote
-    /// cluster does not share this gateway's producer ids, so a sequenced
-    /// retry that the primary already acknowledged must not produce again
-    /// on the shadow. Keyed by topic as well as producer identity: one
-    /// RemoteBridge may serve several names, and a retry on B must not
-    /// ack A's offset. Five sets, matching the memory backend's window.
-    recent: Mutex<HashMap<ReplayKey, VecDeque<ReplaySet>>>,
-    /// Sequenced produces whose request left this process without a
-    /// response: the next retry of those bytes must not encode another
-    /// non-idempotent Produce.
-    inflight: Mutex<HashMap<ReplayKey, VecDeque<InflightSet>>>,
+    /// Sequenced produce bookkeeping, one mutex: check-and-mark of in-flight
+    /// sets is atomic with replay, and unresolved sets are never evicted.
+    book: Mutex<ProducerBook>,
 }
 
 impl RemoteBridge {
@@ -108,8 +121,11 @@ impl RemoteBridge {
         }
         Ok(Self {
             config,
-            recent: Mutex::new(HashMap::new()),
-            inflight: Mutex::new(HashMap::new()),
+            book: Mutex::new(ProducerBook {
+                recent: HashMap::new(),
+                inflight: HashMap::new(),
+                remote_ids: HashMap::new(),
+            }),
         })
     }
 
@@ -286,26 +302,44 @@ impl RemoteBridge {
             .and_then(|mut addrs| addrs.next())
     }
 
-    fn encode_batches(batches: &[RecordBatch]) -> Vec<u8> {
+    fn encode_batches(batches: &[RecordBatch], identity: Option<(RemoteIdentity, i32)>) -> Vec<u8> {
         let mut out = Vec::new();
-        for batch in batches {
-            // The remote cluster did not mint this gateway's producer ids.
-            // Forwarding them is UNKNOWN_PRODUCER_ID there; local sequenced
-            // retries are remembered in `recent` instead.
-            out.extend(RecordBatch::encode(
-                batch.base_offset,
-                -1,
-                -1,
-                -1,
-                &batch.records,
-            ));
+        match identity {
+            None => {
+                for batch in batches {
+                    out.extend(RecordBatch::encode(
+                        batch.base_offset,
+                        -1,
+                        -1,
+                        -1,
+                        &batch.records,
+                    ));
+                }
+            }
+            Some((remote, mut sequence)) => {
+                for batch in batches {
+                    out.extend(RecordBatch::encode(
+                        batch.base_offset,
+                        remote.producer_id,
+                        remote.producer_epoch,
+                        sequence,
+                        &batch.records,
+                    ));
+                    sequence = sequence.saturating_add(batch.records.len() as i32);
+                }
+            }
         }
         out
     }
 
-    fn produce_once(&self, topic: &str, batches: &[RecordBatch]) -> Result<Appended, SendError> {
+    fn produce_once(
+        &self,
+        topic: &str,
+        batches: &[RecordBatch],
+        identity: Option<(RemoteIdentity, i32)>,
+    ) -> Result<Appended, SendError> {
         let leader = self.leader_of(topic).map_err(SendError::Unsent)?;
-        let records = Self::encode_batches(batches);
+        let records = Self::encode_batches(batches, identity);
         let mut body = Encoder::new();
         body.nullable_string(None);
         body.i16(-1); // acks=all
@@ -329,8 +363,7 @@ impl RemoteBridge {
             .i16("error")
             .map_err(|_| SendError::Ambiguous(ErrorCode::CorruptMessage))?;
         if error != 0 {
-            // The broker answered; it did not append. A retry may send.
-            return Err(SendError::Unsent(ErrorCode::from_i16(error)));
+            return Err(produce_reply_error(error));
         }
         let base_offset = d
             .i64("base")
@@ -348,21 +381,27 @@ impl RemoteBridge {
         })
     }
 
-    fn replay(
-        &self,
+    fn lock_book(&self) -> std::sync::MutexGuard<'_, ProducerBook> {
+        self.book
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn replay_key(topic: &str, sequenced: Sequenced) -> ReplayKey {
+        ReplayKey {
+            topic: topic.to_owned(),
+            producer_id: sequenced.producer_id,
+            producer_epoch: sequenced.producer_epoch,
+        }
+    }
+
+    fn replay_in(
+        book: &ProducerBook,
         topic: &str,
         sequenced: Sequenced,
         fingerprint: u64,
     ) -> Result<Option<Appended>, ErrorCode> {
-        let recent = self
-            .recent
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(window) = recent.get(&ReplayKey {
-            topic: topic.to_owned(),
-            producer_id: sequenced.producer_id,
-            producer_epoch: sequenced.producer_epoch,
-        }) else {
+        let Some(window) = book.recent.get(&Self::replay_key(topic, sequenced)) else {
             return Ok(None);
         };
         match window
@@ -376,47 +415,13 @@ impl RemoteBridge {
         }
     }
 
-    fn remember(&self, topic: &str, sequenced: Sequenced, fingerprint: u64, appended: Appended) {
-        let mut recent = self
-            .recent
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let window = recent
-            .entry(ReplayKey {
-                topic: topic.to_owned(),
-                producer_id: sequenced.producer_id,
-                producer_epoch: sequenced.producer_epoch,
-            })
-            .or_default();
-        if window.len() == 5 {
-            window.pop_front();
-        }
-        window.push_back(ReplaySet {
-            first_sequence: sequenced.first_sequence,
-            fingerprint,
-            appended,
-        });
-    }
-
-    fn replay_key(topic: &str, sequenced: Sequenced) -> ReplayKey {
-        ReplayKey {
-            topic: topic.to_owned(),
-            producer_id: sequenced.producer_id,
-            producer_epoch: sequenced.producer_epoch,
-        }
-    }
-
-    fn inflight_of(
-        &self,
+    fn inflight_in(
+        book: &ProducerBook,
         topic: &str,
         sequenced: Sequenced,
         fingerprint: u64,
     ) -> Result<bool, ErrorCode> {
-        let inflight = self
-            .inflight
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(window) = inflight.get(&Self::replay_key(topic, sequenced)) else {
+        let Some(window) = book.inflight.get(&Self::replay_key(topic, sequenced)) else {
             return Ok(false);
         };
         match window
@@ -430,16 +435,20 @@ impl RemoteBridge {
         }
     }
 
-    fn mark_inflight(&self, topic: &str, sequenced: Sequenced, fingerprint: u64) {
-        let mut inflight = self
+    fn mark_inflight_in(
+        book: &mut ProducerBook,
+        topic: &str,
+        sequenced: Sequenced,
+        fingerprint: u64,
+    ) {
+        let window = book
             .inflight
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let window = inflight
             .entry(Self::replay_key(topic, sequenced))
             .or_default();
-        if window.len() == 5 {
-            window.pop_front();
+        if window.iter().any(|set| {
+            set.first_sequence == sequenced.first_sequence && set.fingerprint == fingerprint
+        }) {
+            return;
         }
         window.push_back(InflightSet {
             first_sequence: sequenced.first_sequence,
@@ -447,19 +456,79 @@ impl RemoteBridge {
         });
     }
 
-    fn clear_inflight(&self, topic: &str, sequenced: Sequenced) {
-        let mut inflight = self
-            .inflight
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fn remember_in(
+        book: &mut ProducerBook,
+        topic: &str,
+        sequenced: Sequenced,
+        fingerprint: u64,
+        appended: Appended,
+    ) {
+        let window = book
+            .recent
+            .entry(Self::replay_key(topic, sequenced))
+            .or_default();
+        if window.len() == 5 {
+            window.pop_front();
+        }
+        window.push_back(ReplaySet {
+            first_sequence: sequenced.first_sequence,
+            fingerprint,
+            appended,
+        });
+    }
+
+    fn clear_inflight_in(book: &mut ProducerBook, topic: &str, sequenced: Sequenced) {
         let key = Self::replay_key(topic, sequenced);
-        let Some(window) = inflight.get_mut(&key) else {
+        let Some(window) = book.inflight.get_mut(&key) else {
             return;
         };
         window.retain(|set| set.first_sequence != sequenced.first_sequence);
         if window.is_empty() {
-            inflight.remove(&key);
+            book.inflight.remove(&key);
         }
+    }
+
+    fn init_remote_producer(&self) -> Result<RemoteIdentity, ErrorCode> {
+        let mut body = Encoder::new();
+        body.nullable_string(None);
+        body.i32(60_000);
+        let reply = self.rpc_any(self.bootstrap_addrs(), 22, 1, body.as_slice())?;
+        let mut d = Decoder::new(&reply);
+        d.i32("throttle").map_err(|_| ErrorCode::CorruptMessage)?;
+        let error = d.i16("error").map_err(|_| ErrorCode::CorruptMessage)?;
+        if error != 0 {
+            return Err(ErrorCode::from_i16(error));
+        }
+        let producer_id = d
+            .i64("producer_id")
+            .map_err(|_| ErrorCode::CorruptMessage)?;
+        let producer_epoch = d
+            .i16("producer_epoch")
+            .map_err(|_| ErrorCode::CorruptMessage)?;
+        if producer_id < 0 {
+            return Err(ErrorCode::KafkaStorageError);
+        }
+        Ok(RemoteIdentity {
+            producer_id,
+            producer_epoch,
+        })
+    }
+
+    fn ensure_remote_id(
+        &self,
+        topic: &str,
+        sequenced: Sequenced,
+    ) -> Result<RemoteIdentity, ErrorCode> {
+        let key = Self::replay_key(topic, sequenced);
+        {
+            let book = self.lock_book();
+            if let Some(id) = book.remote_ids.get(&key) {
+                return Ok(*id);
+            }
+        }
+        let minted = self.init_remote_producer()?;
+        let mut book = self.lock_book();
+        Ok(*book.remote_ids.entry(key).or_insert(minted))
     }
 }
 
@@ -479,30 +548,32 @@ impl Bridge for RemoteBridge {
         }
         if let Some(identity) = sequenced {
             let fingerprint = crate::bridge::set_fingerprint(batches);
-            if let Some(previous) = self.replay(topic, identity, fingerprint)? {
-                return Ok(previous);
+            let remote = self.ensure_remote_id(topic, identity)?;
+            {
+                let mut book = self.lock_book();
+                if let Some(previous) = Self::replay_in(&book, topic, identity, fingerprint)? {
+                    return Ok(previous);
+                }
+                Self::inflight_in(&book, topic, identity, fingerprint)?;
+                Self::mark_inflight_in(&mut book, topic, identity, fingerprint);
             }
-            if self.inflight_of(topic, identity, fingerprint)? {
-                // The previous attempt may already have appended on the
-                // remote cluster. Encoding another non-idempotent Produce
-                // would duplicate it.
-                return Err(ErrorCode::RequestTimedOut);
-            }
-            self.mark_inflight(topic, identity, fingerprint);
-            match self.produce_once(topic, batches) {
+            match self.produce_once(topic, batches, Some((remote, identity.first_sequence))) {
                 Ok(appended) => {
-                    self.clear_inflight(topic, identity);
-                    self.remember(topic, identity, fingerprint, appended.clone());
+                    let mut book = self.lock_book();
+                    Self::clear_inflight_in(&mut book, topic, identity);
+                    Self::remember_in(&mut book, topic, identity, fingerprint, appended.clone());
                     Ok(appended)
                 }
                 Err(SendError::Unsent(code)) => {
-                    self.clear_inflight(topic, identity);
+                    let mut book = self.lock_book();
+                    Self::clear_inflight_in(&mut book, topic, identity);
                     Err(code)
                 }
                 Err(SendError::Ambiguous(code)) => Err(code),
             }
         } else {
-            self.produce_once(topic, batches).map_err(SendError::code)
+            self.produce_once(topic, batches, None)
+                .map_err(SendError::code)
         }
     }
 
@@ -741,27 +812,24 @@ mod tests {
             Err(ErrorCode::InvalidRecord),
             "the same sequence with other bytes is not a retry"
         );
-        let timed_out = {
+        let next = {
             let remote = Arc::clone(&remote);
             tokio::task::spawn_blocking(move || {
-                let sequenced = Sequenced {
-                    producer_id: 9,
-                    producer_epoch: 0,
-                    first_sequence: 1,
-                };
-                let batches = [batch(&["d"])];
-                let fingerprint = crate::bridge::set_fingerprint(&batches);
-                remote.mark_inflight("events", sequenced, fingerprint);
-                remote.produce("events", &batches, Some(sequenced))
+                remote.produce(
+                    "events",
+                    &[batch(&["d"])],
+                    Some(Sequenced {
+                        producer_id: 9,
+                        producer_epoch: 0,
+                        first_sequence: 1,
+                    }),
+                )
             })
             .await
             .unwrap()
+            .unwrap()
         };
-        assert_eq!(
-            timed_out,
-            Err(ErrorCode::RequestTimedOut),
-            "an in-flight sequenced produce is not encoded again"
-        );
+        assert_eq!(next.base_offset, 3);
         let bounds = {
             let remote = Arc::clone(&remote);
             tokio::task::spawn_blocking(move || remote.bounds("events"))
@@ -771,10 +839,23 @@ mod tests {
         };
         assert_eq!(
             bounds,
-            (0, 3),
-            "the sequenced retry and the in-flight set appended nothing"
+            (0, 4),
+            "the sequenced retry appended nothing; sequence 1 landed once"
         );
         let _ = tx.send(true);
+    }
+
+    #[test]
+    fn a_produce_timeout_after_the_leader_answered_is_ambiguous() {
+        assert!(matches!(
+            produce_reply_error(ErrorCode::RequestTimedOut.as_i16()),
+            SendError::Ambiguous(_)
+        ));
+        assert!(matches!(produce_reply_error(19), SendError::Ambiguous(_)));
+        assert!(matches!(
+            produce_reply_error(ErrorCode::UnknownTopicOrPartition.as_i16()),
+            SendError::Unsent(_)
+        ));
     }
 
     #[test]

@@ -1706,18 +1706,13 @@ async fn run_leader(
                                 .filter(|route| route.backend == "kafka")
                                 .map(|route| route.name.clone())
                                 .collect(),
-                            std::iter::once(served_topic.clone()).chain(
-                                kafka
-                                    .topics
-                                    .iter()
-                                    .filter(|route| {
-                                        matches!(
-                                            route.backend.as_str(),
-                                            "native" | "dual" | "shadow"
-                                        )
-                                    })
-                                    .map(|route| route.name.clone()),
-                            ),
+                            kafka
+                                .topics
+                                .iter()
+                                .filter(|route| {
+                                    matches!(route.backend.as_str(), "native" | "dual" | "shadow")
+                                })
+                                .map(|route| route.name.clone()),
                         ),
                         cutovers,
                     )),

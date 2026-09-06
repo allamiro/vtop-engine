@@ -237,6 +237,10 @@ pub fn load_receipts_jsonl(text: &str) -> Result<Vec<Receipt>, String> {
 }
 
 fn parse_receipt(line: &str) -> Result<Receipt, String> {
+    let line = line.trim();
+    if !line.ends_with('}') {
+        return Err("truncated JSON object".to_owned());
+    }
     let topic = json_field(line, "topic")?;
     let kind = ReceiptKind::parse(&json_field(line, "kind")?)
         .ok_or_else(|| format!("unknown kind in {line}"))?;
@@ -252,6 +256,11 @@ fn parse_receipt(line: &str) -> Result<Receipt, String> {
     let records = json_i64(line, "records")?;
     let sha = json_field(line, "sha256")?;
     let sha256 = parse_sha256(&sha)?;
+    let group = json_optional_quoted(line, "group")?;
+    let partition = json_optional_i32(line, "partition")?;
+    if kind == ReceiptKind::NativeCursor && (group.is_none() || partition.is_none()) {
+        return Err("native_cursor missing group or partition".to_owned());
+    }
     Ok(Receipt {
         topic,
         kind,
@@ -259,11 +268,8 @@ fn parse_receipt(line: &str) -> Result<Receipt, String> {
         shadow_offset,
         records,
         sha256,
-        group: json_optional_quoted(line, "group")?,
-        partition: json_field(line, "partition")
-            .ok()
-            .filter(|s| s != "null")
-            .and_then(|s| s.parse().ok()),
+        group,
+        partition,
     })
 }
 
@@ -316,6 +322,7 @@ fn json_field(line: &str, key: &str) -> Result<String, String> {
 
 /// A quoted JSON string, or `None` when the field is absent or JSON null.
 /// A group literally named `null` is `"null"` in the file, not the token.
+/// Any other present value is corrupt.
 fn json_optional_quoted(line: &str, key: &str) -> Result<Option<String>, String> {
     let needle = format!("\"{key}\":");
     let Some((_, rest)) = line.split_once(&needle) else {
@@ -324,9 +331,32 @@ fn json_optional_quoted(line: &str, key: &str) -> Result<Option<String>, String>
     let rest = rest.trim_start();
     if rest.starts_with('"') {
         Ok(Some(json_field(line, key)?))
+    } else if let Some(after) = rest.strip_prefix("null") {
+        if after.is_empty() || matches!(after.chars().next(), Some(',' | '}' | ' ' | '\t')) {
+            return Ok(None);
+        }
+        Err(format!("{key} is not a JSON string or null"))
     } else {
-        Ok(None)
+        Err(format!("{key} is not a JSON string or null"))
     }
+}
+
+fn json_optional_i32(line: &str, key: &str) -> Result<Option<i32>, String> {
+    let needle = format!("\"{key}\":");
+    let Some((_, rest)) = line.split_once(&needle) else {
+        return Ok(None);
+    };
+    let rest = rest.trim_start();
+    if rest.strip_prefix("null").is_some() {
+        return Ok(None);
+    }
+    if rest.starts_with('"') {
+        return Err(format!("{key} is not a JSON integer"));
+    }
+    json_field(line, key)?
+        .parse()
+        .map(Some)
+        .map_err(|_| format!("{key} is not a JSON integer"))
 }
 
 fn json_i64(line: &str, key: &str) -> Result<i64, String> {
@@ -684,10 +714,9 @@ pub struct CutoverStore {
     /// `to_primary` again, even when they numerically overlap a historical
     /// shadow range. Reloaded from `NativeCursor` receipts on restart.
     native: Mutex<HashSet<(String, String, i32)>>,
-    /// Native keys whose durable marker has not yet landed in the receipt
-    /// file. A later commit or fetch retries the append rather than
-    /// treating an in-memory-only mark as done.
-    dirty: Mutex<HashSet<(String, String, i32)>>,
+    /// NativeCursor rows loaded from disk whose inner commit may not have
+    /// landed: wrapping completes them before the first fetch.
+    pending: Mutex<HashMap<(String, String, i32), i64>>,
     /// Commits and fetch-migrations take turns so a translation write-back
     /// cannot rewind a concurrent native commit.
     order: tokio::sync::Mutex<()>,
@@ -699,7 +728,7 @@ impl CutoverStore {
             inner,
             by_topic: Mutex::new(HashMap::new()),
             native: Mutex::new(HashSet::new()),
-            dirty: Mutex::new(HashSet::new()),
+            pending: Mutex::new(HashMap::new()),
             order: tokio::sync::Mutex::new(()),
         }
     }
@@ -725,9 +754,15 @@ impl CutoverStore {
         for (topic, receipts) in topics {
             for row in receipts.rows() {
                 if row.kind == ReceiptKind::NativeCursor && row.topic == topic {
-                    if let (Some(group), Some(partition)) = (row.group, row.partition) {
-                        store.remember_native(&group, &topic, partition);
-                    }
+                    let (Some(group), Some(partition)) = (row.group, row.partition) else {
+                        continue;
+                    };
+                    store.remember_native(&group, &topic, partition);
+                    store
+                        .pending
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert((group, topic.clone(), partition), row.primary_offset);
                 }
             }
             store.cut_over(&topic, receipts);
@@ -753,28 +788,13 @@ impl CutoverStore {
             .insert((group.to_owned(), topic.to_owned(), partition))
     }
 
-    fn mark_dirty(&self, group: &str, topic: &str, partition: i32) {
-        self.dirty
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert((group.to_owned(), topic.to_owned(), partition));
-    }
-
-    fn clear_dirty(&self, group: &str, topic: &str, partition: i32) {
-        self.dirty
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&(group.to_owned(), topic.to_owned(), partition));
-    }
-
-    fn is_dirty(&self, group: &str, topic: &str, partition: i32) -> bool {
-        self.dirty
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains(&(group.to_owned(), topic.to_owned(), partition))
-    }
-
-    fn persist_native(&self, group: &str, topic: &str, partition: i32) -> Result<(), ErrorCode> {
+    fn persist_native(
+        &self,
+        group: &str,
+        topic: &str,
+        partition: i32,
+        offset: i64,
+    ) -> Result<(), ErrorCode> {
         let log = {
             let by_topic = self
                 .by_topic
@@ -786,7 +806,7 @@ impl CutoverStore {
             Some(log) => log.record(Receipt {
                 topic: topic.to_owned(),
                 kind: ReceiptKind::NativeCursor,
-                primary_offset: 0,
+                primary_offset: offset,
                 shadow_offset: None,
                 records: 0,
                 sha256: [0; 32],
@@ -797,35 +817,63 @@ impl CutoverStore {
         }
     }
 
-    fn mark_native(&self, group: &str, topic: &str, partition: i32) -> Result<(), ErrorCode> {
-        let first = self.remember_native(group, topic, partition);
-        if !first && !self.is_dirty(group, topic, partition) {
-            return Ok(());
-        }
-        self.mark_dirty(group, topic, partition);
-        match self.persist_native(group, topic, partition) {
-            Ok(()) => {
-                self.clear_dirty(group, topic, partition);
-                Ok(())
-            }
-            Err(error) => {
-                tracing::error!(
-                    group,
-                    topic,
-                    partition,
-                    code = error.as_i16(),
-                    "kafka cutover: the native-cursor marker could not be appended; the commit is not acknowledged"
-                );
-                Err(error)
-            }
-        }
+    fn mark_native(
+        &self,
+        group: &str,
+        topic: &str,
+        partition: i32,
+        offset: i64,
+    ) -> Result<(), ErrorCode> {
+        self.persist_native(group, topic, partition, offset)?;
+        self.remember_native(group, topic, partition);
+        // Keep the offset pending until inner.commit lands so a crash or a
+        // failed inner write is completed from this marker, not left as a
+        // native-looking cursor at the previous position.
+        self.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert((group.to_owned(), topic.to_owned(), partition), offset);
+        Ok(())
     }
 
-    fn flush_native(&self, group: &str, topic: &str, partition: i32) -> Result<(), ErrorCode> {
-        if !self.is_dirty(group, topic, partition) {
+    fn clear_pending(&self, group: &str, topic: &str, partition: i32) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&(group.to_owned(), topic.to_owned(), partition));
+    }
+
+    async fn finish_pending(
+        &self,
+        group: &str,
+        topic: &str,
+        partition: i32,
+    ) -> Result<(), ErrorCode> {
+        let offset = {
+            let pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            pending
+                .get(&(group.to_owned(), topic.to_owned(), partition))
+                .copied()
+        };
+        let Some(offset) = offset else {
             return Ok(());
-        }
-        self.mark_native(group, topic, partition)
+        };
+        self.inner
+            .commit(
+                group,
+                topic,
+                partition,
+                Committed {
+                    offset,
+                    metadata: None,
+                },
+            )
+            .await?;
+        self.clear_pending(group, topic, partition);
+        Ok(())
     }
 
     fn is_native(&self, group: &str, topic: &str, partition: i32) -> bool {
@@ -846,14 +894,13 @@ impl OffsetStore for CutoverStore {
         committed: Committed,
     ) -> Result<(), ErrorCode> {
         let _order = self.order.lock().await;
+        // Marker first: a crash after this and before inner.commit is
+        // completed from the NativeCursor row on the next wrapping.
+        self.mark_native(group, topic, partition, committed.offset)?;
         self.inner
             .commit(group, topic, partition, committed)
             .await?;
-        // After cutover, Fetch served native offsets, so this commit is
-        // native numbering. Remember that so a later fetch does not treat
-        // it as a leftover shadow cursor. The marker must land in the
-        // receipt file before the client is told the commit held.
-        self.mark_native(group, topic, partition)?;
+        self.clear_pending(group, topic, partition);
         Ok(())
     }
 
@@ -864,11 +911,11 @@ impl OffsetStore for CutoverStore {
         partition: i32,
     ) -> Result<Option<Committed>, ErrorCode> {
         let _order = self.order.lock().await;
+        self.finish_pending(group, topic, partition).await?;
         let Some(mut committed) = self.inner.fetch(group, topic, partition).await? else {
             return Ok(None);
         };
         if self.is_native(group, topic, partition) {
-            self.flush_native(group, topic, partition)?;
             return Ok(Some(committed));
         }
         let translated = self.translate(topic, committed.offset);
@@ -877,10 +924,11 @@ impl OffsetStore for CutoverStore {
                 offset: translated,
                 metadata: committed.metadata.clone(),
             };
+            self.mark_native(group, topic, partition, translated)?;
             self.inner
                 .commit(group, topic, partition, migrated.clone())
                 .await?;
-            self.mark_native(group, topic, partition)?;
+            self.clear_pending(group, topic, partition);
             return Ok(Some(migrated));
         }
         committed.offset = translated;
@@ -895,8 +943,11 @@ impl OffsetStore for CutoverStore {
         let _order = self.order.lock().await;
         let mut rows = self.inner.committed(group, at_most).await?;
         for (topic, partition, committed) in rows.iter_mut() {
+            self.finish_pending(group, topic, *partition).await?;
             if self.is_native(group, topic, *partition) {
-                self.flush_native(group, topic, *partition)?;
+                if let Some(latest) = self.inner.fetch(group, topic, *partition).await? {
+                    *committed = latest;
+                }
                 continue;
             }
             let translated = self.translate(topic, committed.offset);
@@ -905,10 +956,11 @@ impl OffsetStore for CutoverStore {
                     offset: translated,
                     metadata: committed.metadata.clone(),
                 };
+                self.mark_native(group, topic, *partition, translated)?;
                 self.inner
                     .commit(group, topic, *partition, migrated.clone())
                     .await?;
-                self.mark_native(group, topic, *partition)?;
+                self.clear_pending(group, topic, *partition);
                 *committed = migrated;
             }
         }
@@ -1503,6 +1555,61 @@ mod tests {
         let parsed = parse_receipt(&json).unwrap();
         assert_eq!(parsed.group.as_deref(), Some("null"));
         assert_eq!(parsed.partition, Some(0));
+    }
+
+    #[test]
+    fn a_truncated_native_cursor_is_corrupt() {
+        assert!(parse_receipt(
+            r#"{"topic":"events","kind":"native_cursor","primary_offset":5,"shadow_offset":null,"records":0,"sha256":"0000000000000000000000000000000000000000000000000000000000000000""#
+        )
+        .is_err());
+        assert!(parse_receipt(
+            r#"{"topic":"events","kind":"native_cursor","primary_offset":5,"shadow_offset":null,"records":0,"sha256":"0000000000000000000000000000000000000000000000000000000000000000"}"#
+        )
+        .unwrap_err()
+        .contains("group or partition"));
+        assert!(json_optional_quoted(r#"{"group":1}"#, "group").is_err());
+    }
+
+    #[tokio::test]
+    async fn a_native_cursor_row_completes_an_interrupted_inner_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipts.jsonl");
+        let receipts = ReceiptLog::create(&path).unwrap();
+        receipts
+            .record(Receipt {
+                topic: "events".to_owned(),
+                kind: ReceiptKind::NativeCursor,
+                primary_offset: 5,
+                shadow_offset: None,
+                records: 0,
+                sha256: [0; 32],
+                group: Some("g".to_owned()),
+                partition: Some(0),
+            })
+            .unwrap();
+        let inner = Arc::new(MemoryOffsetStore::default());
+        inner
+            .commit(
+                "g",
+                "events",
+                0,
+                Committed {
+                    offset: 1,
+                    metadata: None,
+                },
+            )
+            .await
+            .unwrap();
+        let store = CutoverStore::wrapping(
+            inner as Arc<dyn OffsetStore>,
+            vec![("events".to_owned(), receipts)],
+        );
+        assert_eq!(
+            store.fetch("g", "events", 0).await.unwrap().unwrap().offset,
+            5,
+            "the receipt offset is applied when inner lagged the marker"
+        );
     }
 
     #[tokio::test]

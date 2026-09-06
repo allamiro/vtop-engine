@@ -1045,18 +1045,43 @@ impl Gateway {
                 .collect();
             deduplicated
         };
-        // A fenced gateway leads nothing (review): the partition is answered
-        // `NOT_LEADER_OR_FOLLOWER` with no leader, which is the code every
-        // stock client answers by refreshing its metadata elsewhere.
+        // A fenced gateway leads nothing (review): its own partition is
+        // answered `NOT_LEADER_OR_FOLLOWER`. A single-partition topic carries
+        // that at the topic, which is the code every stock client answers by
+        // refreshing its metadata elsewhere. A multi-partition topology still
+        // names the healthy peers, so a client bootstrapped only here can
+        // find them.
         let leads = self.speaks_for_the_range();
         let mut topics = Vec::with_capacity(names.len());
         for name in names {
             topics.push(match self.bounds(&name, ceiling).await {
-                Ok(_) if !leads => MetadataTopic {
-                    error: ErrorCode::NotLeaderOrFollower,
-                    name,
-                    partitions: Vec::new(),
-                },
+                Ok(_) if !leads => {
+                    let map = self.partition_map();
+                    if map.len() <= 1 {
+                        MetadataTopic {
+                            error: ErrorCode::NotLeaderOrFollower,
+                            name,
+                            partitions: Vec::new(),
+                        }
+                    } else {
+                        MetadataTopic {
+                            error: ErrorCode::None,
+                            name,
+                            partitions: map
+                                .into_iter()
+                                .map(|partition| crate::api::MetadataPartition {
+                                    index: partition.index,
+                                    leader: partition.node_id,
+                                    error: if partition.index == self.config.partition {
+                                        ErrorCode::NotLeaderOrFollower
+                                    } else {
+                                        ErrorCode::None
+                                    },
+                                })
+                                .collect(),
+                        }
+                    }
+                }
                 Ok(_) => MetadataTopic {
                     error: ErrorCode::None,
                     name,
@@ -1066,6 +1091,7 @@ impl Gateway {
                         .map(|partition| crate::api::MetadataPartition {
                             index: partition.index,
                             leader: partition.node_id,
+                            error: ErrorCode::None,
                         })
                         .collect(),
                 },
@@ -4971,6 +4997,82 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(read_find_coordinator(&reply, 1).0, 0);
+    }
+
+    #[tokio::test]
+    async fn metadata_keeps_peer_partitions_when_this_lease_is_gone() {
+        struct View(std::sync::Mutex<crate::lease::LeaseState>);
+        impl crate::lease::LeaseView for View {
+            fn lease(&self) -> crate::lease::LeaseState {
+                *self.0.lock().unwrap()
+            }
+        }
+        let view = Arc::new(View(std::sync::Mutex::new(crate::lease::LeaseState::Gone)));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let gateway = Gateway::new(
+            Arc::new(MemoryBridge::with_topics(["events"])),
+            GatewayConfig {
+                advertised_host: "127.0.0.1".to_owned(),
+                advertised_port: addr.port() as i32,
+                node_id: 9,
+                partition: 1,
+                partitions: vec![
+                    PartitionLeader {
+                        index: 0,
+                        node_id: 7,
+                        host: "other.example".to_owned(),
+                        port: 9092,
+                    },
+                    PartitionLeader {
+                        index: 1,
+                        node_id: 9,
+                        host: "127.0.0.1".to_owned(),
+                        port: addr.port() as i32,
+                    },
+                ],
+                ..GatewayConfig::default()
+            },
+        )
+        .with_lease(view as Arc<dyn crate::lease::LeaseView>);
+        tokio::spawn(gateway.serve(listener, rx));
+        let mut body = Encoder::new();
+        body.array_len(1);
+        body.string("events");
+        body.bool(true);
+        let reply = call(addr, 3, 4, 1, body.as_slice()).await.unwrap();
+        let mut d = Decoder::new(&reply);
+        d.i32("throttle").unwrap();
+        d.array_len("brokers").unwrap();
+        for _ in 0..2 {
+            d.i32("node").unwrap();
+            d.string("host").unwrap();
+            d.i32("port").unwrap();
+            d.nullable_string("rack").unwrap();
+        }
+        d.nullable_string("cluster").unwrap();
+        d.i32("controller").unwrap();
+        d.array_len("topics").unwrap();
+        assert_eq!(d.i16("topic error").unwrap(), 0, "the topic still exists");
+        assert_eq!(d.string("name").unwrap(), "events");
+        d.bool("internal").unwrap();
+        assert_eq!(d.array_len("partitions").unwrap(), Some(2));
+        let mut errors = Vec::new();
+        for _ in 0..2 {
+            let error = d.i16("p error").unwrap();
+            let index = d.i32("index").unwrap();
+            d.i32("leader").unwrap();
+            d.array_len("replicas").unwrap();
+            d.i32("replica").unwrap();
+            d.array_len("isr").unwrap();
+            d.i32("isr").unwrap();
+            errors.push((index, error));
+        }
+        assert_eq!(
+            errors,
+            vec![(0, 0), (1, ErrorCode::NotLeaderOrFollower.as_i16()),]
+        );
     }
 
     /// Java `String.hashCode` of ASCII "g" is 103; Kafka's abs then mod 2
