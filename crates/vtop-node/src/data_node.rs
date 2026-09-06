@@ -141,6 +141,98 @@ fn lease_admin_client(
     .map_err(|error| error.to_string())
 }
 
+/// The catalog Metadata advertises (#458): each Kafka name to the backend
+/// that answers it, and the receipt logs a cutover OffsetFetch must read.
+/// Today's empty `kafka.topics` never reaches here.
+struct BuiltKafkaTopics {
+    map: vtop_kafka::TopicMap,
+    cutovers: Vec<(String, Arc<vtop_kafka::ReceiptLog>)>,
+}
+
+fn kafka_topic_map(
+    native: Arc<dyn vtop_kafka::Bridge>,
+    native_topic: &str,
+    kafka: &crate::config::KafkaGatewayConfig,
+) -> Result<BuiltKafkaTopics, String> {
+    let mut bindings = Vec::with_capacity(kafka.topics.len());
+    let mut cutovers = Vec::new();
+    for route in &kafka.topics {
+        let remote_topic = route
+            .remote_topic
+            .clone()
+            .unwrap_or_else(|| route.name.clone());
+        let remote = || -> Result<Arc<dyn vtop_kafka::Bridge>, String> {
+            Ok(
+                Arc::new(vtop_kafka::RemoteBridge::new(vtop_kafka::RemoteConfig {
+                    bootstrap: route.brokers.clone(),
+                    topics: vec![remote_topic.clone()],
+                    timeout: Duration::from_secs(10),
+                })?) as Arc<dyn vtop_kafka::Bridge>,
+            )
+        };
+        let receipts = |route: &crate::config::KafkaTopicRoute| -> Result<Arc<vtop_kafka::ReceiptLog>, String> {
+            match route.receipts.as_deref() {
+                Some(path) => vtop_kafka::ReceiptLog::create(path)
+                    .map_err(|error| format!("kafka receipts {path}: {error}")),
+                None => Ok(vtop_kafka::ReceiptLog::memory()),
+            }
+        };
+        let binding = match route.backend.as_str() {
+            "native" => {
+                if route.cutover {
+                    cutovers.push((route.name.clone(), receipts(route)?));
+                }
+                vtop_kafka::TopicBinding {
+                    name: route.name.clone(),
+                    backend: Arc::clone(&native),
+                    backend_topic: native_topic.to_owned(),
+                }
+            }
+            "kafka" => vtop_kafka::TopicBinding {
+                name: route.name.clone(),
+                backend: remote()?,
+                backend_topic: remote_topic,
+            },
+            "dual" | "shadow" => {
+                let read = match (route.backend.as_str(), route.read.as_deref()) {
+                    ("shadow", None) | (_, Some("compare")) => vtop_kafka::DualRead::Compare,
+                    (_, Some("kafka")) => vtop_kafka::DualRead::Shadow,
+                    _ => vtop_kafka::DualRead::Primary,
+                };
+                let log = receipts(route)?;
+                if route.cutover {
+                    cutovers.push((route.name.clone(), Arc::clone(&log)));
+                }
+                let dual = vtop_kafka::DualBridge::new(
+                    route.name.clone(),
+                    Arc::clone(&native),
+                    native_topic.to_owned(),
+                    remote()?,
+                    remote_topic,
+                    read,
+                    log,
+                );
+                vtop_kafka::TopicBinding {
+                    name: route.name.clone(),
+                    backend: Arc::new(dual),
+                    backend_topic: route.name.clone(),
+                }
+            }
+            other => {
+                return Err(format!(
+                    "kafka topic {:?}: backend {other:?} is not native, kafka, dual or shadow",
+                    route.name
+                ));
+            }
+        };
+        bindings.push(binding);
+    }
+    Ok(BuiltKafkaTopics {
+        map: vtop_kafka::TopicMap::routed(bindings)?,
+        cutovers,
+    })
+}
+
 /// Open the range through the startup catalog on every restart; create its
 /// first segment on first start.
 ///
@@ -671,6 +763,15 @@ pub async fn run(
         config.replica_transport,
     )?;
     refuse_kafka_gateway_misuse(config.role, config.kafka.as_ref())?;
+    // Before the observability listener, not after it (review): `serve`
+    // validates too, for callers that enter there, but by then this function
+    // has spawned a detached accept loop and returning an error would leave
+    // the metrics port held — and a port already taken would speak first and
+    // hide this verdict, the way the promotion refusal once did.
+    if let Some(kafka) = config.kafka.as_ref() {
+        crate::config::kafka_partitions(kafka)?;
+        crate::config::kafka_topics(kafka)?;
+    }
     let endpoint = config.observability.take().unwrap_or_default();
     let metrics_addr = observability.serve(&endpoint).await?;
     serve(config, &observability, metrics_addr, shutdown).await
@@ -712,6 +813,14 @@ pub async fn serve(
     metrics_addr: Option<std::net::SocketAddr>,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), String> {
+    // A topology that points a client at the wrong broker is worse than none
+    // (#457 slice 3): judged HERE, where every entry point passes — the
+    // colocated role calls this directly and would otherwise bind and
+    // advertise an invalid one (review).
+    if let Some(kafka) = config.kafka.as_ref() {
+        crate::config::kafka_partitions(kafka)?;
+        crate::config::kafka_topics(kafka)?;
+    }
     std::fs::create_dir_all(&config.data_dir)
         .map_err(|error| format!("create {}: {error}", config.data_dir.display()))?;
     let range = config.range.identity();
@@ -1057,10 +1166,11 @@ async fn run_leader(
                     kafka.listen
                 ));
             }
-            if bound.ip().is_unspecified() && kafka.advertised_host.is_none() {
+            if bound.ip().is_unspecified() && !kafka.advertises_a_host(kafka.partition) {
                 return Err(format!(
-                    "`kafka.listen: {}` bound every interface at {bound} and no \
-                     `kafka.advertised_host` is set: set it to what clients dial",
+                    "`kafka.listen: {}` bound every interface at {bound} and nothing says what \
+                     to advertise: set `kafka.advertised_host` to what clients dial, or name \
+                     this node's host in `kafka.partitions`",
                     kafka.listen
                 ));
             }
@@ -1438,46 +1548,59 @@ async fn run_leader(
                 .topic
                 .clone()
                 .unwrap_or_else(|| config.range.topic.clone());
-            let bridge = vtop_kafka::NativeBridge::new(
-                Arc::clone(&broker),
-                vtop_kafka::NativeBridgeConfig {
-                    topic: served_topic.clone(),
-                    producer_id: kafka_producer,
-                    durability: if replicated {
-                        vtop_protocol::Durability::Quorum
-                    } else {
-                        vtop_protocol::Durability::LocalFsync
+            let native: Arc<dyn vtop_kafka::Bridge> = Arc::new(
+                vtop_kafka::NativeBridge::new(
+                    Arc::clone(&broker),
+                    vtop_kafka::NativeBridgeConfig {
+                        topic: served_topic.clone(),
+                        producer_id: kafka_producer,
+                        durability: if replicated {
+                            vtop_protocol::Durability::Quorum
+                        } else {
+                            vtop_protocol::Durability::LocalFsync
+                        },
+                        fetch_max_records: MAX_RECORDS,
+                        // What one append may carry (review): on a replicated
+                        // range, what the replica plane frames — a follower
+                        // refuses a larger frame, and from here that looks like a
+                        // quorum that never arrives (#453); standalone, the
+                        // node's own session limits, so a stock client's default
+                        // batch is one append and all-or-nothing.
+                        max_append_records: if replicated {
+                            vtop_protocol::DEFAULT_MAX_RECORDS as usize
+                        } else {
+                            MAX_RECORDS as usize
+                        },
+                        max_append_bytes: if replicated {
+                            (vtop_protocol::DEFAULT_MAX_FRAME_BYTES / 2) as usize
+                        } else {
+                            (MAX_FRAME_BYTES / 2) as usize
+                        },
                     },
-                    fetch_max_records: MAX_RECORDS,
-                    // What one append may carry (review): on a replicated
-                    // range, what the replica plane frames — a follower
-                    // refuses a larger frame, and from here that looks like a
-                    // quorum that never arrives (#453); standalone, the
-                    // node's own session limits, so a stock client's default
-                    // batch is one append and all-or-nothing.
-                    max_append_records: if replicated {
-                        vtop_protocol::DEFAULT_MAX_RECORDS as usize
-                    } else {
-                        MAX_RECORDS as usize
-                    },
-                    max_append_bytes: if replicated {
-                        (vtop_protocol::DEFAULT_MAX_FRAME_BYTES / 2) as usize
-                    } else {
-                        (MAX_FRAME_BYTES / 2) as usize
-                    },
-                },
-            )
-            .map_err(|error| format!("kafka gateway: {error}"))?;
+                )
+                .map_err(|error| format!("kafka gateway: {error}"))?,
+            );
+            // One place decides what clients are told to dial, and the
+            // topology wins there (review): FindCoordinator answers from this
+            // field, and on a wildcard listener the bound address is
+            // `0.0.0.0`, which on the client's own machine is the client.
+            let (advertised_host, advertised_port) =
+                crate::config::kafka_advertised_endpoint(kafka, bound);
             let gateway_config = vtop_kafka::GatewayConfig {
-                advertised_host: kafka
-                    .advertised_host
-                    .clone()
-                    .unwrap_or_else(|| bound.ip().to_string()),
-                advertised_port: kafka
-                    .advertised_port
-                    .map(i32::from)
-                    .unwrap_or_else(|| i32::from(bound.port())),
+                advertised_host,
+                advertised_port,
                 node_id: kafka.node_id,
+                partition: kafka.partition,
+                partitions: kafka
+                    .partitions
+                    .iter()
+                    .map(|peer| vtop_kafka::PartitionLeader {
+                        index: peer.partition,
+                        node_id: peer.node_id,
+                        host: peer.host.clone(),
+                        port: i32::from(peer.port),
+                    })
+                    .collect(),
                 cluster_id: Some(config.cluster_id.to_string()),
                 max_fetch_wait: Duration::from_millis(kafka.max_fetch_wait_ms),
                 ..vtop_kafka::GatewayConfig::default()
@@ -1491,36 +1614,107 @@ async fn run_leader(
                 + gateway_config.max_fetch_wait
                 + gateway_config.max_offset_wait
                 + Duration::from_secs(1);
-            let gateway = vtop_kafka::Gateway::new(Arc::new(bridge), gateway_config);
+            let gateway = if kafka.topics.is_empty() {
+                (vtop_kafka::Gateway::new(native, gateway_config), Vec::new())
+            } else {
+                let built = kafka_topic_map(native, &served_topic, kafka)?;
+                (
+                    vtop_kafka::Gateway::from_topics(built.map, gateway_config),
+                    built.cutovers,
+                )
+            };
+            let (gateway, cutovers) = gateway;
             // Committed offsets live on the metadata plane when this node
             // holds its range under a lease (#457 slice 2b): a group's
             // position becomes an unpinned cursor bound to the topic epoch
             // and the range's lineage, read back by whichever node serves the
             // range next. Standalone, there is no plane to keep it, and the
             // gateway refuses commits by name rather than remembering what
-            // it would forget.
+            // it would forget. A cutover topic wraps that store so
+            // OffsetFetch answers the native offset a previously committed
+            // Kafka offset became (#458). A `backend: kafka` catalog name
+            // has no range here: OverlayOffsetStore refuses its commits
+            // rather than remembering a cursor this process would forget.
             let gateway = match config.lease.as_ref() {
                 Some(lease) => gateway
                     .with_lease(Arc::new(BrokerLeaseView(Arc::clone(&broker)))
                         as Arc<dyn vtop_kafka::LeaseView>)
-                    .with_offsets(Arc::new(
-                        vtop_kafka::metadata_offsets::MetadataOffsetStore::new(
-                            Arc::new(lease_admin_client(lease)?)
-                                as Arc<dyn vtop_kafka::metadata_offsets::CursorPlane>,
-                            // Fenced by the lease the broker holds the range at
-                            // (review): a commit carries it, and a node whose
-                            // lease is gone takes none.
-                            Arc::new(BrokerLeaseView(Arc::clone(&broker)))
-                                as Arc<dyn vtop_kafka::metadata_offsets::LeaseView>,
-                            vtop_kafka::metadata_offsets::RangeIdentity {
-                                cluster_id: config.cluster_id,
-                                topic: served_topic,
-                                topic_uuid: lease.topic_uuid,
-                                range_uuid: config.range.range_id,
-                                topic_epoch: config.range.topic_epoch,
-                                holder_node_uuid: config.node_uuid,
-                            },
+                    .with_offsets(vtop_kafka::CutoverStore::wrapping(
+                        vtop_kafka::OverlayOffsetStore::wrapping(
+                            Arc::new(
+                                vtop_kafka::metadata_offsets::MetadataOffsetStore::new(
+                                    Arc::new(lease_admin_client(lease)?)
+                                        as Arc<dyn vtop_kafka::metadata_offsets::CursorPlane>,
+                                    Arc::new(BrokerLeaseView(Arc::clone(&broker)))
+                                        as Arc<dyn vtop_kafka::metadata_offsets::LeaseView>,
+                                    vtop_kafka::metadata_offsets::RangeIdentity {
+                                        cluster_id: config.cluster_id,
+                                        topic: served_topic.clone(),
+                                        topic_uuid: lease.topic_uuid,
+                                        range_uuid: config.range.range_id,
+                                        topic_epoch: config.range.topic_epoch,
+                                        holder_node_uuid: config.node_uuid,
+                                        partition: kafka.partition,
+                                    },
+                                )
+                                .with_peers(
+                                    kafka
+                                        .partitions
+                                        .iter()
+                                        .filter(|peer| peer.partition != kafka.partition)
+                                        .filter_map(|peer| {
+                                            match (
+                                                peer.topic_uuid,
+                                                peer.range_uuid,
+                                                peer.topic_epoch,
+                                            ) {
+                                                (
+                                                    Some(topic_uuid),
+                                                    Some(range_uuid),
+                                                    Some(topic_epoch),
+                                                ) => Some(
+                                                    vtop_kafka::metadata_offsets::PartitionRange {
+                                                        topic: served_topic.clone(),
+                                                        partition: peer.partition,
+                                                        topic_uuid,
+                                                        range_uuid,
+                                                        topic_epoch,
+                                                    },
+                                                ),
+                                                _ => None,
+                                            }
+                                        })
+                                        .collect(),
+                                )
+                                .with_topic_aliases(
+                                    kafka
+                                        .topics
+                                        .iter()
+                                        .filter(|route| {
+                                            matches!(
+                                                route.backend.as_str(),
+                                                "native" | "dual" | "shadow"
+                                            )
+                                        })
+                                        .map(|route| route.name.clone())
+                                        .collect(),
+                                ),
+                            ) as Arc<dyn vtop_kafka::OffsetStore>,
+                            kafka
+                                .topics
+                                .iter()
+                                .filter(|route| route.backend == "kafka")
+                                .map(|route| route.name.clone())
+                                .collect(),
+                            kafka
+                                .topics
+                                .iter()
+                                .filter(|route| {
+                                    matches!(route.backend.as_str(), "native" | "dual" | "shadow")
+                                })
+                                .map(|route| route.name.clone()),
                         ),
+                        cutovers,
                     )),
                 None => gateway,
             };

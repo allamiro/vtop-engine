@@ -95,6 +95,23 @@ pub struct RangeIdentity {
     pub topic_epoch: u64,
     /// This node, as the plane knows the range's leaseholder.
     pub holder_node_uuid: Uuid,
+    /// The Kafka partition this range is served as (#457 slice 3). A gateway
+    /// leading partition 2 commits and fetches for partition 2, and the store
+    /// answers for that partition alone — zero on a single-partition topic,
+    /// which is every deployment that names no topology.
+    pub partition: i32,
+}
+
+/// A partition this coordinator can store a cursor on besides its own
+/// (#457 slice 4c): a range another node leads, whose identity the topology
+/// named. The fence on a commit for it is still THIS node's lease.
+#[derive(Debug, Clone)]
+pub struct PartitionRange {
+    pub topic: String,
+    pub partition: i32,
+    pub topic_uuid: Uuid,
+    pub range_uuid: Uuid,
+    pub topic_epoch: u64,
 }
 
 /// How many times a CAS is retried with the plane's actual before the store
@@ -103,10 +120,10 @@ pub struct RangeIdentity {
 /// from holding the request past its deadline.
 const CAS_ATTEMPTS: usize = 4;
 
-/// What the store remembers of a group: the plane's identities for it and
-/// the last CAS tokens it saw. A guess, corrected by every answer.
+/// What the store remembers of a group on one range: the plane's identities
+/// for it and the last CAS tokens it saw. A guess, corrected by every answer.
 #[derive(Debug, Clone, Default)]
-struct GroupState {
+struct RangeCursorState {
     /// The membership ladder — group, member, assignment — has been walked
     /// and stood; a `NotFound` from the plane unsets it.
     member_stands: bool,
@@ -116,10 +133,32 @@ struct GroupState {
     lineage: u64,
 }
 
+/// What the store remembers of a group: one cursor state per range the
+/// coordinator has committed on, this node's included.
+#[derive(Debug, Clone, Default)]
+struct GroupState {
+    ranges: HashMap<Uuid, RangeCursorState>,
+}
+
+/// Where a commit or a fetch lands: this node's range, or a peer's.
+struct CursorTarget {
+    topic_uuid: Uuid,
+    range_uuid: Uuid,
+    topic_epoch: u64,
+    /// `true` when the fence is this node's own range lease on a range it
+    /// does not lead (#457 slice 4c).
+    coordinated: bool,
+}
+
 pub struct MetadataOffsetStore {
     plane: Arc<dyn CursorPlane>,
     lease: Arc<dyn LeaseView>,
     range: RangeIdentity,
+    /// Other partitions this coordinator stores cursors on (#457 slice 4c).
+    peers: Vec<PartitionRange>,
+    /// Kafka names this range is served as besides `range.topic` (#458): a
+    /// catalog name that is not the native log's name still commits here.
+    aliases: Vec<String>,
     groups: Mutex<HashMap<String, GroupState>>,
     /// The metadata warning is given once per store, not per commit.
     metadata_dropped_said: AtomicBool,
@@ -135,35 +174,85 @@ impl MetadataOffsetStore {
             plane,
             lease,
             range,
+            peers: Vec::new(),
+            aliases: Vec::new(),
             groups: Mutex::new(HashMap::new()),
             metadata_dropped_said: AtomicBool::new(false),
         }
+    }
+
+    /// The partitions this coordinator stores besides its own (#457 slice
+    /// 4c). A topology that named no range identity for a peer is simply
+    /// absent here: a commit for that partition is `UNKNOWN_TOPIC_OR_PARTITION`
+    /// by name, not a guess at its UUID.
+    pub fn with_peers(mut self, peers: Vec<PartitionRange>) -> Self {
+        self.peers = peers;
+        self
+    }
+
+    /// Kafka catalog names that map onto this native range. Empty means
+    /// only `range.topic` is accepted, which is every deployment that never
+    /// sets `kafka.topics`.
+    pub fn with_topic_aliases(mut self, aliases: Vec<String>) -> Self {
+        self.aliases = aliases;
+        self
     }
 
     fn group_uuid(&self, group: &str) -> Uuid {
         derived_group_uuid(self.range.cluster_id, group)
     }
 
-    /// The gateway serving this range, as the plane's member of the group:
-    /// one per group per range, whichever node holds the lease.
-    fn member_uuid(&self, group_uuid: Uuid) -> Uuid {
-        Uuid::new_v5(&group_uuid, self.range.range_uuid.as_bytes())
+    /// The gateway serving `range_uuid`, as the plane's member of the group:
+    /// one per group per range, whichever node holds that range's lease —
+    /// or, for a coordinated commit, whichever coordinator first stood the
+    /// member against it. Derived from the TARGET range so a later leader of
+    /// that partition names the same member.
+    fn member_uuid_for(&self, group_uuid: Uuid, range_uuid: Uuid) -> Uuid {
+        Uuid::new_v5(&group_uuid, range_uuid.as_bytes())
     }
 
-    fn state(&self, group: &str) -> GroupState {
+    fn cursor_target(&self, topic: &str, partition: i32) -> Option<CursorTarget> {
+        if self.is_this_range(topic, partition) {
+            return Some(CursorTarget {
+                topic_uuid: self.range.topic_uuid,
+                range_uuid: self.range.range_uuid,
+                topic_epoch: self.range.topic_epoch,
+                coordinated: false,
+            });
+        }
+        self.peers
+            .iter()
+            .find(|peer| {
+                peer.partition == partition
+                    && (peer.topic == topic
+                        || (peer.topic == self.range.topic && self.names_topic(topic)))
+            })
+            .map(|peer| CursorTarget {
+                topic_uuid: peer.topic_uuid,
+                range_uuid: peer.range_uuid,
+                topic_epoch: peer.topic_epoch,
+                coordinated: true,
+            })
+    }
+
+    fn range_state(&self, group: &str, range_uuid: Uuid) -> RangeCursorState {
         self.groups
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(group)
+            .and_then(|state| state.ranges.get(&range_uuid))
             .cloned()
             .unwrap_or_default()
     }
 
-    fn remember(&self, group: &str, state: GroupState) {
+    fn remember_range(&self, group: &str, range_uuid: Uuid, range: RangeCursorState) {
         self.groups
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(group.to_owned(), state);
+            .entry(group.to_owned())
+            .or_default()
+            .ranges
+            .insert(range_uuid, range);
     }
 
     fn envelope() -> CommandEnvelope {
@@ -190,31 +279,46 @@ impl MetadataOffsetStore {
             })
     }
 
-    /// The membership this gateway needs, in one fenced step (#457 slice 2b):
-    /// the plane makes the group, the member and the range assignment stand,
-    /// idempotently and deterministically — no compare-and-set for the store
-    /// to lose a race on, and one round trip rather than three. Node-scoped,
-    /// so a data node's own certificate carries it where admin authorization
-    /// is on. Walked once per group per store, and again when the plane says
-    /// what stood is gone.
+    /// The membership this gateway needs, in one fenced step (#457 slice 2b,
+    /// slice 4c): the plane makes the group, the member and the range
+    /// assignment stand. On this node's own range the fence is that range's
+    /// lease; on a partition it does not lead the fence is the lease it
+    /// DOES hold. Walked once per group per range per store, and again when
+    /// the plane says what stood is gone.
     async fn ensure_member(
         &self,
         group: &str,
         group_uuid: Uuid,
         fencing_epoch: u64,
+        target: &CursorTarget,
     ) -> Result<(), ErrorCode> {
-        let answer = self
-            .propose(MetadataCommand::EnsureGroupMemberForRange {
+        let member_uuid = self.member_uuid_for(group_uuid, target.range_uuid);
+        let command = if target.coordinated {
+            MetadataCommand::EnsureGroupMemberCoordinated {
                 env: Self::envelope(),
                 name: group.to_owned(),
                 group_uuid,
-                member_uuid: self.member_uuid(group_uuid),
-                topic_uuid: self.range.topic_uuid,
-                range_uuid: self.range.range_uuid,
+                member_uuid,
+                topic_uuid: target.topic_uuid,
+                range_uuid: target.range_uuid,
+                coordinator_topic_uuid: self.range.topic_uuid,
+                coordinator_range_uuid: self.range.range_uuid,
                 holder_node_uuid: self.range.holder_node_uuid,
                 fencing_epoch,
-            })
-            .await?;
+            }
+        } else {
+            MetadataCommand::EnsureGroupMemberForRange {
+                env: Self::envelope(),
+                name: group.to_owned(),
+                group_uuid,
+                member_uuid,
+                topic_uuid: target.topic_uuid,
+                range_uuid: target.range_uuid,
+                holder_node_uuid: self.range.holder_node_uuid,
+                fencing_epoch,
+            }
+        };
+        let answer = self.propose(command).await?;
         match answer {
             MetadataResponse::Ack { .. } => Ok(()),
             MetadataResponse::Rejected(MetadataError::InvalidTransition(reason))
@@ -236,7 +340,7 @@ impl MetadataOffsetStore {
                 // retries, and the plane's record says whose.
                 tracing::warn!(
                     group,
-                    range = %self.range.range_uuid,
+                    range = %target.range_uuid,
                     reason,
                     "kafka offsets: the range is held by another member on the plane; commits wait for it"
                 );
@@ -245,7 +349,7 @@ impl MetadataOffsetStore {
             MetadataResponse::Rejected(MetadataError::NotFound) => {
                 tracing::warn!(
                     group,
-                    range = %self.range.range_uuid,
+                    range = %target.range_uuid,
                     "kafka offsets: the plane does not know this range; a commit cannot be a cursor on it"
                 );
                 Err(ErrorCode::UnknownTopicOrPartition)
@@ -265,15 +369,28 @@ impl MetadataOffsetStore {
                 );
                 Err(ErrorCode::InvalidGroupId)
             }
-            other => Err(self.unexpected("EnsureGroupMemberForRange", group, other)),
+            other => {
+                let step = if target.coordinated {
+                    "EnsureGroupMemberCoordinated"
+                } else {
+                    "EnsureGroupMemberForRange"
+                };
+                Err(self.unexpected(step, group, target.range_uuid, other))
+            }
         }
     }
 
-    fn unexpected(&self, step: &str, group: &str, answer: MetadataResponse) -> ErrorCode {
+    fn unexpected(
+        &self,
+        step: &str,
+        group: &str,
+        range: Uuid,
+        answer: MetadataResponse,
+    ) -> ErrorCode {
         tracing::warn!(
             step,
             group,
-            range = %self.range.range_uuid,
+            range = %range,
             ?answer,
             "kafka offsets: the plane answered with what this step has no rule for; the client retries"
         );
@@ -291,18 +408,22 @@ impl MetadataOffsetStore {
         ErrorCode::CoordinatorNotAvailable
     }
 
-    /// The group's cursor on this range under THIS topic epoch: a cursor of
+    /// The group's cursor on `target` under THAT topic epoch: a cursor of
     /// another epoch is a recreated topic's, naming a position in a topic
     /// that is gone.
-    async fn read(&self, group_uuid: Uuid) -> Result<Option<AdminGroupCursorView>, ErrorCode> {
-        let cursor = self.read_any(group_uuid).await?;
+    async fn read(
+        &self,
+        group_uuid: Uuid,
+        target: &CursorTarget,
+    ) -> Result<Option<AdminGroupCursorView>, ErrorCode> {
+        let cursor = self.read_any(group_uuid, target).await?;
         Ok(cursor.filter(|cursor| {
-            let current = cursor.topic_epoch == self.range.topic_epoch;
+            let current = cursor.topic_epoch == target.topic_epoch;
             if !current {
                 tracing::debug!(
                     %group_uuid,
                     cursor_epoch = cursor.topic_epoch,
-                    topic_epoch = self.range.topic_epoch,
+                    topic_epoch = target.topic_epoch,
                     "kafka offsets: a cursor of another topic epoch is not a position here"
                 );
             }
@@ -312,14 +433,18 @@ impl MetadataOffsetStore {
 
     /// A cursor read, as the wire answers it: whatever the group has on this
     /// range, whichever topic epoch it belongs to.
-    async fn read_any(&self, group_uuid: Uuid) -> Result<Option<AdminGroupCursorView>, ErrorCode> {
+    async fn read_any(
+        &self,
+        group_uuid: Uuid,
+        target: &CursorTarget,
+    ) -> Result<Option<AdminGroupCursorView>, ErrorCode> {
         let view = self
             .plane
-            .read_group_cursor(group_uuid, self.range.topic_uuid, self.range.range_uuid)
+            .read_group_cursor(group_uuid, target.topic_uuid, target.range_uuid)
             .await
             .map_err(|PlaneError(error)| {
                 tracing::warn!(
-                    range = %self.range.range_uuid,
+                    range = %target.range_uuid,
                     error,
                     "kafka offsets: the metadata plane did not answer a read; the client retries"
                 );
@@ -329,7 +454,26 @@ impl MetadataOffsetStore {
     }
 
     fn is_this_range(&self, topic: &str, partition: i32) -> bool {
-        partition == 0 && topic == self.range.topic
+        partition == self.range.partition && self.names_topic(topic)
+    }
+
+    fn names_topic(&self, topic: &str) -> bool {
+        topic == self.range.topic || self.aliases.iter().any(|name| name == topic)
+    }
+
+    fn advertised_topic(&self) -> &str {
+        self.aliases
+            .first()
+            .map(String::as_str)
+            .unwrap_or(self.range.topic.as_str())
+    }
+
+    fn listing_name(&self, stored: &str) -> String {
+        if stored == self.range.topic {
+            self.advertised_topic().to_owned()
+        } else {
+            stored.to_owned()
+        }
     }
 }
 
@@ -344,9 +488,9 @@ impl OffsetStore for MetadataOffsetStore {
     ) -> Result<(), ErrorCode> {
         // The commit path's lines, held here too (review): the listener
         // judges them first, the store for any other caller.
-        if !self.is_this_range(topic, partition) {
+        let Some(target) = self.cursor_target(topic, partition) else {
             return Err(ErrorCode::UnknownTopicOrPartition);
-        }
+        };
         if committed.offset < 0 {
             return Err(ErrorCode::OffsetOutOfRange);
         }
@@ -393,33 +537,57 @@ impl OffsetStore for MetadataOffsetStore {
             }
         };
         let group_uuid = self.group_uuid(group);
-        let member_uuid = self.member_uuid(group_uuid);
-        let mut state = self.state(group);
+        let member_uuid = self.member_uuid_for(group_uuid, target.range_uuid);
+        let mut state = self.range_state(group, target.range_uuid);
         if !state.member_stands {
-            self.ensure_member(group, group_uuid, fencing_epoch).await?;
+            self.ensure_member(group, group_uuid, fencing_epoch, &target)
+                .await?;
             state.member_stands = true;
-            self.remember(group, state.clone());
+            self.remember_range(group, target.range_uuid, state.clone());
         }
         let mut re_stood = false;
         for _ in 0..CAS_ATTEMPTS {
             let answer = self
-                .propose(MetadataCommand::CommitGroupCursorFenced {
-                    env: Self::envelope(),
-                    group_uuid,
-                    member_uuid,
-                    topic_uuid: self.range.topic_uuid,
-                    range_uuid: self.range.range_uuid,
-                    topic_epoch: self.range.topic_epoch,
-                    range_generation: state.lineage,
-                    segment_uuid: Uuid::nil(),
-                    segment_generation: 0,
-                    segment_root: [0; 32],
-                    record_offset: committed.offset as u64,
-                    record_index: 0,
-                    lineage_transition_id: None,
-                    expected_checkpoint_generation: state.checkpoint,
-                    holder_node_uuid: self.range.holder_node_uuid,
-                    fencing_epoch,
+                .propose(if target.coordinated {
+                    MetadataCommand::CommitGroupCursorCoordinated {
+                        env: Self::envelope(),
+                        group_uuid,
+                        member_uuid,
+                        topic_uuid: target.topic_uuid,
+                        range_uuid: target.range_uuid,
+                        coordinator_topic_uuid: self.range.topic_uuid,
+                        coordinator_range_uuid: self.range.range_uuid,
+                        topic_epoch: target.topic_epoch,
+                        range_generation: state.lineage,
+                        segment_uuid: Uuid::nil(),
+                        segment_generation: 0,
+                        segment_root: [0; 32],
+                        record_offset: committed.offset as u64,
+                        record_index: 0,
+                        lineage_transition_id: None,
+                        expected_checkpoint_generation: state.checkpoint,
+                        holder_node_uuid: self.range.holder_node_uuid,
+                        fencing_epoch,
+                    }
+                } else {
+                    MetadataCommand::CommitGroupCursorFenced {
+                        env: Self::envelope(),
+                        group_uuid,
+                        member_uuid,
+                        topic_uuid: target.topic_uuid,
+                        range_uuid: target.range_uuid,
+                        topic_epoch: target.topic_epoch,
+                        range_generation: state.lineage,
+                        segment_uuid: Uuid::nil(),
+                        segment_generation: 0,
+                        segment_root: [0; 32],
+                        record_offset: committed.offset as u64,
+                        record_index: 0,
+                        lineage_transition_id: None,
+                        expected_checkpoint_generation: state.checkpoint,
+                        holder_node_uuid: self.range.holder_node_uuid,
+                        fencing_epoch,
+                    }
                 })
                 .await?;
             match answer {
@@ -427,7 +595,7 @@ impl OffsetStore for MetadataOffsetStore {
                     checkpoint_generation,
                 } => {
                     state.checkpoint = Some(checkpoint_generation);
-                    self.remember(group, state);
+                    self.remember_range(group, target.range_uuid, state);
                     return Ok(());
                 }
                 MetadataResponse::Rejected(MetadataError::LineageMismatch { actual, .. }) => {
@@ -448,25 +616,25 @@ impl OffsetStore for MetadataOffsetStore {
                     // a cursor of another topic epoch is what the plane is
                     // refusing here, and filtering it out would leave the
                     // guess unchanged and the commit looping to no purpose.
-                    match self.read_any(group_uuid).await? {
-                        Some(cursor) if cursor.topic_epoch == self.range.topic_epoch => {
+                    match self.read_any(group_uuid, &target).await? {
+                        Some(cursor) if cursor.topic_epoch == target.topic_epoch => {
                             state.checkpoint = Some(cursor.checkpoint_generation);
                         }
                         Some(cursor) => {
                             tracing::warn!(
                                 group,
                                 cursor_epoch = cursor.topic_epoch,
-                                topic_epoch = self.range.topic_epoch,
+                                topic_epoch = target.topic_epoch,
                                 "kafka offsets: the group's cursor on this range belongs to another \
                                  topic epoch; this topic was recreated under it"
                             );
-                            self.remember(group, state);
+                            self.remember_range(group, target.range_uuid, state);
                             return Err(ErrorCode::UnknownTopicOrPartition);
                         }
                         None => {
                             // It stood a moment ago and does not now: the
                             // client retries and the next attempt sees it.
-                            self.remember(group, state);
+                            self.remember_range(group, target.range_uuid, state);
                             return Err(ErrorCode::CoordinatorNotAvailable);
                         }
                     }
@@ -478,7 +646,8 @@ impl OffsetStore for MetadataOffsetStore {
                     // moved it, or a rebalance on the plane did (review): the
                     // membership is stood again, not the position refused.
                     state.member_stands = false;
-                    self.ensure_member(group, group_uuid, fencing_epoch).await?;
+                    self.ensure_member(group, group_uuid, fencing_epoch, &target)
+                        .await?;
                     state.member_stands = true;
                     re_stood = true;
                 }
@@ -487,18 +656,19 @@ impl OffsetStore for MetadataOffsetStore {
                 {
                     tracing::warn!(
                         group,
-                        range = %self.range.range_uuid,
+                        range = %target.range_uuid,
                         "kafka offsets: the member does not hold this range on the plane; the client \
                          finds its coordinator again"
                     );
-                    self.remember(group, state);
+                    self.remember_range(group, target.range_uuid, state);
                     return Err(ErrorCode::CoordinatorNotAvailable);
                 }
                 MetadataResponse::Rejected(MetadataError::NotFound) if !re_stood => {
                     // The group or the member is gone from the plane since it
                     // was stood — make it stand once more.
                     state.member_stands = false;
-                    self.ensure_member(group, group_uuid, fencing_epoch).await?;
+                    self.ensure_member(group, group_uuid, fencing_epoch, &target)
+                        .await?;
                     state.member_stands = true;
                     re_stood = true;
                 }
@@ -508,21 +678,21 @@ impl OffsetStore for MetadataOffsetStore {
                     // committed offset cannot become one there.
                     tracing::warn!(
                         group,
-                        range = %self.range.range_uuid,
+                        range = %target.range_uuid,
                         "kafka offsets: the metadata plane refuses an unpinned cursor; it predates head \
                          cursors, and commits are refused by name until it is upgraded"
                     );
-                    self.remember(group, state);
+                    self.remember_range(group, target.range_uuid, state);
                     return Err(ErrorCode::UnsupportedForMessageFormat);
                 }
                 MetadataResponse::Rejected(MetadataError::EpochMismatch { .. }) => {
                     tracing::warn!(
                         group,
-                        topic_epoch = self.range.topic_epoch,
+                        topic_epoch = target.topic_epoch,
                         "kafka offsets: the plane's cursor is bound to another topic epoch; this topic was \
                          recreated under it"
                     );
-                    self.remember(group, state);
+                    self.remember_range(group, target.range_uuid, state);
                     return Err(ErrorCode::UnknownTopicOrPartition);
                 }
                 MetadataResponse::Rejected(MetadataError::InvalidTransition(reason))
@@ -537,7 +707,7 @@ impl OffsetStore for MetadataOffsetStore {
                         "kafka offsets: the plane does not hold this node as the range's leaseholder at \
                          this epoch; the commit is refused and the client finds its coordinator again"
                     );
-                    self.remember(group, state);
+                    self.remember_range(group, target.range_uuid, state);
                     return Err(ErrorCode::NotCoordinator);
                 }
                 MetadataResponse::Rejected(MetadataError::InvalidTransition(reason)) => {
@@ -549,21 +719,26 @@ impl OffsetStore for MetadataOffsetStore {
                         reason,
                         "kafka offsets: the plane refuses the position"
                     );
-                    self.remember(group, state);
+                    self.remember_range(group, target.range_uuid, state);
                     return Err(ErrorCode::OffsetOutOfRange);
                 }
                 MetadataResponse::Rejected(MetadataError::Limit(reason)) => {
                     tracing::warn!(group, reason, "kafka offsets: the plane refuses the commit");
-                    self.remember(group, state);
+                    self.remember_range(group, target.range_uuid, state);
                     return Err(ErrorCode::InvalidRequest);
                 }
                 other => {
-                    self.remember(group, state);
-                    return Err(self.unexpected("CommitGroupCursor", group, other));
+                    self.remember_range(group, target.range_uuid, state);
+                    return Err(self.unexpected(
+                        "CommitGroupCursor",
+                        group,
+                        target.range_uuid,
+                        other,
+                    ));
                 }
             }
         }
-        self.remember(group, state);
+        self.remember_range(group, target.range_uuid, state);
         Err(self.kept_moving("CommitGroupCursor", group))
     }
 
@@ -573,18 +748,21 @@ impl OffsetStore for MetadataOffsetStore {
         topic: &str,
         partition: i32,
     ) -> Result<Option<Committed>, ErrorCode> {
-        if !self.is_this_range(topic, partition) || vtop_meta::validate_group_name(group).is_err() {
+        let Some(target) = self.cursor_target(topic, partition) else {
+            return Ok(None);
+        };
+        if vtop_meta::validate_group_name(group).is_err() {
             return Ok(None);
         }
         let group_uuid = self.group_uuid(group);
-        let Some(cursor) = self.read(group_uuid).await? else {
+        let Some(cursor) = self.read(group_uuid, &target).await? else {
             return Ok(None);
         };
         // What the plane confirmed is what the next commit's CAS names.
-        let mut state = self.state(group);
+        let mut state = self.range_state(group, target.range_uuid);
         state.checkpoint = Some(cursor.checkpoint_generation);
         state.lineage = cursor.range_generation;
-        self.remember(group, state);
+        self.remember_range(group, target.range_uuid, state);
         // A position the wire cannot carry is not one to answer with
         // (review): a Kafka offset is an i64, and a silent clamp would read
         // as a legitimate position at the ceiling.
@@ -605,15 +783,36 @@ impl OffsetStore for MetadataOffsetStore {
     async fn committed(
         &self,
         group: &str,
-        _at_most: usize,
+        at_most: usize,
     ) -> Result<Vec<(String, i32, Committed)>, ErrorCode> {
-        // One range, one partition: the group's rows here are one or none,
-        // within any bound a caller could ask for.
-        Ok(self
-            .fetch(group, &self.range.topic, 0)
+        // This node's partition first, then each peer the topology named
+        // (#457 slice 4c): a coordinator answers every partition it can
+        // store. Stops one over the caller's bound, as MemoryOffsetStore
+        // does, so the listener can say the group has committed more.
+        // Each peer is read through `fetch` so a listing sees the same
+        // cursor a named OffsetFetch would, and so the per-peer checkpoint
+        // cache is warm for the next commit.
+        let cap = at_most.saturating_add(1);
+        let mut rows = Vec::new();
+        if let Some(committed) = self
+            .fetch(group, &self.range.topic, self.range.partition)
             .await?
-            .map(|committed| vec![(self.range.topic.clone(), 0, committed)])
-            .unwrap_or_default())
+        {
+            rows.push((
+                self.advertised_topic().to_owned(),
+                self.range.partition,
+                committed,
+            ));
+        }
+        for peer in &self.peers {
+            if rows.len() >= cap {
+                break;
+            }
+            if let Some(committed) = self.fetch(group, &peer.topic, peer.partition).await? {
+                rows.push((self.listing_name(&peer.topic), peer.partition, committed));
+            }
+        }
+        Ok(rows)
     }
 }
 
@@ -626,6 +825,8 @@ mod tests {
 
     const TOPIC_UUID: Uuid = Uuid::from_u128(0x20);
     const RANGE_UUID: Uuid = Uuid::from_u128(0x21);
+    const PEER_TOPIC: Uuid = Uuid::from_u128(0x22);
+    const PEER_RANGE: Uuid = Uuid::from_u128(0x23);
     const CLUSTER_ID: Uuid = Uuid::from_u128(0x99);
     const NODE_A: Uuid = Uuid::from_u128(0x10);
     const NODE_B: Uuid = Uuid::from_u128(0x11);
@@ -674,6 +875,16 @@ mod tests {
                 root_range_uuid: RANGE_UUID,
             });
             plane
+        }
+
+        fn with_peer_topic(self) -> Self {
+            self.apply(MetadataCommand::CreateTopic {
+                env: MetadataOffsetStore::envelope(),
+                name: "events.v1.p1".to_owned(),
+                topic_uuid: PEER_TOPIC,
+                root_range_uuid: PEER_RANGE,
+            });
+            self
         }
 
         /// The range's lease goes to `holder`; the epoch the plane minted.
@@ -771,6 +982,7 @@ mod tests {
             range_uuid: RANGE_UUID,
             topic_epoch: 1,
             holder_node_uuid,
+            partition: 0,
         }
     }
 
@@ -779,6 +991,25 @@ mod tests {
             offset,
             metadata: None,
         }
+    }
+
+    #[tokio::test]
+    async fn a_catalog_alias_commits_on_this_range() {
+        let plane = Arc::new(MemoryPlane::with_range());
+        let epoch = plane.grant(NODE_A);
+        let store = MetadataOffsetStore::new(
+            Arc::clone(&plane) as Arc<dyn CursorPlane>,
+            FixedLease::holding(epoch),
+            identity(),
+        )
+        .with_topic_aliases(vec!["events.v1".to_owned()]);
+        store.commit("g", "events.v1", 0, at(4)).await.unwrap();
+        assert_eq!(store.fetch("g", "events.v1", 0).await, Ok(Some(at(4))));
+        assert_eq!(
+            store.committed("g", 8).await.unwrap()[0].0,
+            "events.v1",
+            "the listing names the catalog, not only the native log"
+        );
     }
 
     /// Commits become unpinned cursors on the plane and fetches read them:
@@ -1202,5 +1433,67 @@ mod tests {
             identity(),
         );
         assert_eq!(store.fetch("g", "events", 0).await, Ok(None));
+    }
+
+    fn peer() -> PartitionRange {
+        PartitionRange {
+            topic: "events".to_owned(),
+            partition: 1,
+            topic_uuid: PEER_TOPIC,
+            range_uuid: PEER_RANGE,
+            topic_epoch: 1,
+        }
+    }
+
+    /// A coordinator commits a cursor on a partition it does not lead
+    /// (#457 slice 4c), fenced by the lease it does hold; losing that lease
+    /// refuses the next commit on the foreign partition too.
+    #[tokio::test]
+    async fn a_coordinator_commits_on_a_partition_it_does_not_lead() {
+        let plane = Arc::new(MemoryPlane::with_range().with_peer_topic());
+        let epoch = plane.grant(NODE_A);
+        let lease = FixedLease::holding(epoch);
+        let store = MetadataOffsetStore::new(
+            Arc::clone(&plane) as Arc<dyn CursorPlane>,
+            Arc::clone(&lease) as Arc<dyn LeaseView>,
+            identity(),
+        )
+        .with_peers(vec![peer()]);
+        assert_eq!(
+            store.commit("g", "events", 1, at(9)).await,
+            Ok(()),
+            "the coordinator stores a cursor on a range it does not lead"
+        );
+        assert_eq!(store.fetch("g", "events", 1).await, Ok(Some(at(9))));
+        assert_eq!(
+            store.fetch("g", "events", 0).await,
+            Ok(None),
+            "the coordinator's own partition was not written"
+        );
+        let rows = store.committed("g", 8).await.unwrap();
+        assert_eq!(rows, vec![("events".to_owned(), 1, at(9))]);
+        plane.release(epoch);
+        lease.set(LeaseState::Gone);
+        assert_eq!(
+            store.commit("g", "events", 1, at(10)).await,
+            Err(ErrorCode::NotCoordinator),
+            "losing the coordinator's own lease refuses every partition"
+        );
+    }
+
+    /// A partition the topology did not identify is unknown, not guessed.
+    #[tokio::test]
+    async fn a_peer_without_identity_is_unknown() {
+        let plane = Arc::new(MemoryPlane::with_range());
+        let epoch = plane.grant(NODE_A);
+        let store = MetadataOffsetStore::new(
+            Arc::clone(&plane) as Arc<dyn CursorPlane>,
+            FixedLease::holding(epoch),
+            identity(),
+        );
+        assert_eq!(
+            store.commit("g", "events", 1, at(1)).await,
+            Err(ErrorCode::UnknownTopicOrPartition)
+        );
     }
 }

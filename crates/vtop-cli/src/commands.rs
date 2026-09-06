@@ -93,6 +93,14 @@ pub enum Command {
         #[arg(long, default_value_t = 500, value_parser = clap::value_parser!(u32).range(1..))]
         limit: u32,
     },
+    /// Print a dual-write / shadow-read receipt file (#458). One JSON object
+    /// per line, as the gateway wrote it: which native offset a Kafka offset
+    /// became, and the hash of the records both backends served.
+    Receipt {
+        /// JSONL written by the gateway when a topic is `dual` or `shadow`.
+        #[arg(long)]
+        file: PathBuf,
+    },
     /// Offline verification tools for sealed native segments. Unlike every
     /// other subcommand these take no --config: an independent verifier must
     /// run from the sealed artifacts and explicit pins alone.
@@ -167,10 +175,49 @@ fn load(config: &Path) -> Result<(VtopConfig, StreamsConfig), VtopError> {
     Ok((cfg, streams))
 }
 
+fn print_receipts(file: &Path, json: bool) -> i32 {
+    let text = match std::fs::read_to_string(file) {
+        Ok(text) => text,
+        Err(error) => {
+            eprintln!("read {}: {error}", file.display());
+            return 1;
+        }
+    };
+    let mut any = false;
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(value) => {
+                any = true;
+                if json {
+                    println!("{value}");
+                } else {
+                    println!("{}", serde_json::to_string_pretty(&value).unwrap());
+                }
+            }
+            Err(error) => {
+                eprintln!("receipt line {}: {error}", i + 1);
+                return 1;
+            }
+        }
+    }
+    if !any {
+        eprintln!("{} contains no receipt rows", file.display());
+        return 1;
+    }
+    0
+}
+
 /// Dispatch a parsed CLI invocation. Returns a process exit code.
 pub async fn dispatch(cli: Cli) -> i32 {
     // Segment tools are synchronous, config-free, and use their own exit-code
     // contract (see segment_tools), so they bypass the engine dispatch path.
+    if let Command::Receipt { file } = &cli.command {
+        return print_receipts(file, cli.json);
+    }
     if let Command::Segment { command } = &cli.command {
         return crate::segment_tools::run(command, cli.json);
     }
@@ -447,6 +494,7 @@ async fn run_command(cli: &Cli) -> Result<(), VtopError> {
             }
             Ok(())
         }
+        Command::Receipt { .. } => unreachable!("dispatched before run_command"),
         Command::Segment { .. } => unreachable!("dispatched before run_command"),
         Command::Meta { .. } => unreachable!("dispatched before run_command"),
         Command::Node { .. } => unreachable!("dispatched before run_command"),
@@ -674,5 +722,30 @@ mod tests {
             Command::PruneLedger { limit, .. } => assert_eq!(limit, 500),
             other => panic!("parsed wrong command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn receipt_parses_and_prints_jsonl_and_rejects_a_bad_line() {
+        let cli = Cli::try_parse_from(["vtopctl", "receipt", "--file", "r.jsonl"]).unwrap();
+        match cli.command {
+            Command::Receipt { file } => assert_eq!(file, std::path::PathBuf::from("r.jsonl")),
+            other => panic!("parsed wrong command: {other:?}"),
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r.jsonl");
+        std::fs::write(
+            &path,
+            "{\"topic\":\"events\",\"kind\":\"dual_write\",\"primary_offset\":0,\"shadow_offset\":4,\"records\":2,\"sha256\":\"ab\"}\n",
+        )
+        .unwrap();
+        assert_eq!(print_receipts(&path, true), 0);
+        std::fs::write(&path, "not-json\n").unwrap();
+        assert_eq!(print_receipts(&path, true), 1);
+        std::fs::write(&path, "\n").unwrap();
+        assert_eq!(print_receipts(&path, true), 1);
+        assert_eq!(
+            print_receipts(std::path::Path::new("/no/such/receipt.jsonl"), true),
+            1
+        );
     }
 }

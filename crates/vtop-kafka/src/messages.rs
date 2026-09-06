@@ -200,12 +200,19 @@ pub enum ErrorCode {
     UnknownTopicOrPartition = 3,
     NotLeaderOrFollower = 6,
     RequestTimedOut = 7,
+    /// The external cluster (or this node's Kafka listener) could not be
+    /// reached (#458): a produce or fetch is not an empty success.
+    BrokerNotAvailable = 8,
     MessageTooLarge = 10,
     /// The gateway understood the request and will not serve it — used for the
     /// capabilities phase 1 deliberately does not have, never for a transient
     /// condition a client should retry.
     UnsupportedVersion = 35,
     InvalidRecord = 87,
+    /// A dual-write whose shadow refused after the primary appended, or a
+    /// shadow-read that could not be compared (#458): the client must not
+    /// treat a one-sided write as durable.
+    KafkaStorageError = 56,
     UnsupportedCompressionType = 76,
     /// Transactions and anything else out of scope.
     UnsupportedForMessageFormat = 43,
@@ -252,6 +259,43 @@ pub enum ErrorCode {
 impl ErrorCode {
     pub fn as_i16(self) -> i16 {
         self as i16
+    }
+
+    /// A code the other broker sent, as this crate names it. An unknown
+    /// code is storage trouble, not a guess at a retry policy we do not
+    /// serve.
+    pub fn from_i16(code: i16) -> Self {
+        match code {
+            0 => Self::None,
+            1 => Self::OffsetOutOfRange,
+            2 => Self::CorruptMessage,
+            3 => Self::UnknownTopicOrPartition,
+            6 => Self::NotLeaderOrFollower,
+            7 => Self::RequestTimedOut,
+            8 => Self::BrokerNotAvailable,
+            10 => Self::MessageTooLarge,
+            12 => Self::OffsetMetadataTooLarge,
+            15 => Self::CoordinatorNotAvailable,
+            16 => Self::NotCoordinator,
+            22 => Self::IllegalGeneration,
+            23 => Self::InconsistentGroupProtocol,
+            24 => Self::InvalidGroupId,
+            25 => Self::UnknownMemberId,
+            26 => Self::InvalidSessionTimeout,
+            27 => Self::RebalanceInProgress,
+            35 => Self::UnsupportedVersion,
+            42 => Self::InvalidRequest,
+            43 => Self::UnsupportedForMessageFormat,
+            45 => Self::OutOfOrderSequenceNumber,
+            46 => Self::DuplicateSequenceNumber,
+            47 => Self::InvalidProducerEpoch,
+            56 => Self::KafkaStorageError,
+            76 => Self::UnsupportedCompressionType,
+            79 => Self::MemberIdRequired,
+            84 => Self::GroupMaxSizeReached,
+            87 => Self::InvalidRecord,
+            _ => Self::KafkaStorageError,
+        }
     }
 }
 
