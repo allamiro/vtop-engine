@@ -458,6 +458,24 @@ decision, and the CAS on its checkpoint generation fences a stale writer; it
 does not cross a lineage change on its own. A pinned cursor — the recovery
 protocol's, committed with a segment's proof — keeps the forward rule.
 
+A cursor commit is fenced by a lease, and for a group that spans partitions
+that lease is the COORDINATOR's, not the target range's (#457). A Kafka
+consumer group covers every partition of a topic and one broker coordinates
+it; a partition is a range under a topic of its own here, so the coordinator
+stores offsets for ranges it does not lead and whose lease it can never hold.
+The commit therefore names two ranges: the one the cursor lands on, and the
+one the committer leads. The plane takes it only from that range's current
+holder at its current epoch.
+
+What this buys is the property the lease was giving us all along: a
+coordinator is deposed exactly by losing its own lease, and from that instant
+every commit it sends is refused, on every partition, however reachable its
+listener still is. What it deliberately does not do is judge which range ought
+to coordinate which group — the plane cannot see a Kafka topology, so that
+rule lives in the gateway — and the compare-and-set on the checkpoint
+generation is what keeps two writers from silently losing each other's update.
+A single-partition deployment sends the plain fenced commit and is unaffected.
+
 ## 8. Consensus, fencing, and replication
 
 `openraft` is isolated behind a VTOP-owned interface conceptually equivalent

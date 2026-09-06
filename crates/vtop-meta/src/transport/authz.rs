@@ -137,6 +137,18 @@ pub fn classify(command: &MetadataCommand) -> (CommandClass, Option<Uuid>) {
         }
         | MetadataCommand::CommitGroupCursorFenced {
             holder_node_uuid, ..
+        }
+        // A coordinator's pair (#457 slice 4) is the same bargain on a
+        // different lease: the holder it names is the node whose certificate
+        // may submit it, and the state machine refuses it unless that node
+        // holds the COORDINATOR range at that epoch. The range the cursor
+        // lands on is not the one being authorized, and does not need to be:
+        // no certificate is bound to a range, only to a node.
+        | MetadataCommand::EnsureGroupMemberCoordinated {
+            holder_node_uuid, ..
+        }
+        | MetadataCommand::CommitGroupCursorCoordinated {
+            holder_node_uuid, ..
         } => (CommandClass::NodeScoped, Some(*holder_node_uuid)),
         _ => (CommandClass::ClusterScoped, None),
     }
@@ -547,7 +559,43 @@ mod tests {
             holder_node_uuid: NODE_A,
             fencing_epoch: 3,
         };
-        for command in [&ensure, &commit] {
+        // The coordinator's pair names a range under another topic, and the
+        // holder it is bound to is still the node, not the range: a
+        // certificate authorizes who submits, the state machine judges what
+        // lease they hold.
+        let ensure_coordinated = MetadataCommand::EnsureGroupMemberCoordinated {
+            env: envelope(),
+            name: "g".to_owned(),
+            group_uuid: Uuid::from_u128(0x50),
+            member_uuid: Uuid::from_u128(0x51),
+            topic_uuid: Uuid::from_u128(22),
+            range_uuid: Uuid::from_u128(23),
+            coordinator_topic_uuid: Uuid::from_u128(20),
+            coordinator_range_uuid: Uuid::from_u128(21),
+            holder_node_uuid: NODE_A,
+            fencing_epoch: 3,
+        };
+        let commit_coordinated = MetadataCommand::CommitGroupCursorCoordinated {
+            env: envelope(),
+            group_uuid: Uuid::from_u128(0x50),
+            member_uuid: Uuid::from_u128(0x51),
+            topic_uuid: Uuid::from_u128(22),
+            range_uuid: Uuid::from_u128(23),
+            coordinator_topic_uuid: Uuid::from_u128(20),
+            coordinator_range_uuid: Uuid::from_u128(21),
+            topic_epoch: 1,
+            range_generation: 0,
+            segment_uuid: Uuid::nil(),
+            segment_generation: 0,
+            segment_root: [0; 32],
+            record_offset: 10,
+            record_index: 0,
+            lineage_transition_id: None,
+            expected_checkpoint_generation: None,
+            holder_node_uuid: NODE_A,
+            fencing_epoch: 3,
+        };
+        for command in [&ensure, &commit, &ensure_coordinated, &commit_coordinated] {
             let (class, holder) = classify(command);
             assert_eq!(class, CommandClass::NodeScoped);
             assert_eq!(holder, Some(NODE_A));

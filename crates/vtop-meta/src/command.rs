@@ -90,6 +90,8 @@ const COMMAND_KIND_RENEW_RANGE_LEASE: u16 = 29;
 const COMMAND_KIND_REPORT_PROMOTION_OUTCOME: u16 = 30;
 const COMMAND_KIND_COMMIT_GROUP_CURSOR_FENCED: u16 = 31;
 const COMMAND_KIND_ENSURE_GROUP_MEMBER_FOR_RANGE: u16 = 32;
+const COMMAND_KIND_COMMIT_GROUP_CURSOR_COORDINATED: u16 = 33;
+const COMMAND_KIND_ENSURE_GROUP_MEMBER_COORDINATED: u16 = 34;
 
 /// Why a fenced cursor commit is refused (#457 slice 2b): the commit did not
 /// come from the range's current leaseholder at its current fencing epoch. A
@@ -595,6 +597,67 @@ pub enum MetadataCommand {
         /// ...at this fencing epoch, the one the plane granted it.
         fencing_epoch: u64,
     },
+    /// `CommitGroupCursorFenced` from the group's COORDINATOR (#457 slice 4):
+    /// the same commit, on a range the committer does not lead, fenced by the
+    /// one it does.
+    ///
+    /// A Kafka consumer group spans every partition of a topic and ONE broker
+    /// coordinates it. A Kafka partition is a vtop range of its own — today a
+    /// whole topic of its own — so the coordinator must store the offset of a
+    /// range another node leads, whose lease it will never hold. Fencing that
+    /// commit on the target range's lease would make it impossible; fencing
+    /// it on nothing would let any reachable gateway move any group's
+    /// position. So the fence moves to the range the committer DOES lead, the
+    /// one that makes it the coordinator at all.
+    ///
+    /// That is the whole property, and it is the one that matters: a
+    /// coordinator is deposed exactly by losing its own lease, and from that
+    /// moment every commit it sends is refused, whichever partition it names.
+    /// What it does not prove is which range ought to coordinate which group
+    /// — the plane cannot see a Kafka topology, so it cannot judge that — and
+    /// the compare-and-set on `expected_checkpoint_generation` is what keeps
+    /// two writers from silently losing each other's update.
+    CommitGroupCursorCoordinated {
+        env: CommandEnvelope,
+        group_uuid: Uuid,
+        member_uuid: Uuid,
+        topic_uuid: Uuid,
+        /// The range the cursor is ON: the partition being committed.
+        range_uuid: Uuid,
+        /// The range the committer LEADS: what its lease fences.
+        coordinator_topic_uuid: Uuid,
+        coordinator_range_uuid: Uuid,
+        topic_epoch: u64,
+        range_generation: u64,
+        segment_uuid: Uuid,
+        segment_generation: u64,
+        segment_root: [u8; 32],
+        record_offset: u64,
+        record_index: u64,
+        lineage_transition_id: Option<Uuid>,
+        expected_checkpoint_generation: Option<u64>,
+        /// The node committing, which must hold `coordinator_range_uuid`...
+        holder_node_uuid: Uuid,
+        /// ...at this fencing epoch, the one the plane granted it.
+        fencing_epoch: u64,
+    },
+    /// `EnsureGroupMemberForRange` from the group's coordinator (#457 slice
+    /// 4), fenced the same way: the membership a coordinator needs before it
+    /// can commit a cursor on a range it does not lead.
+    EnsureGroupMemberCoordinated {
+        env: CommandEnvelope,
+        name: String,
+        group_uuid: Uuid,
+        member_uuid: Uuid,
+        topic_uuid: Uuid,
+        /// The range the member is assigned: the partition it consumes.
+        range_uuid: Uuid,
+        /// The range the coordinator leads: what its lease fences.
+        coordinator_topic_uuid: Uuid,
+        coordinator_range_uuid: Uuid,
+        holder_node_uuid: Uuid,
+        fencing_epoch: u64,
+    },
     /// Remove a member whose last heartbeat apply-index is strictly older than
     /// `stale_before_apply_index`. Durable cursors are retained.
     ExpireStaleMember {
@@ -787,6 +850,8 @@ impl MetadataCommand {
             | MetadataCommand::CommitGroupCursor { env, .. }
             | MetadataCommand::CommitGroupCursorFenced { env, .. }
             | MetadataCommand::EnsureGroupMemberForRange { env, .. }
+            | MetadataCommand::CommitGroupCursorCoordinated { env, .. }
+            | MetadataCommand::EnsureGroupMemberCoordinated { env, .. }
             | MetadataCommand::HeartbeatMember { env, .. }
             | MetadataCommand::ExpireStaleMember { env, .. }
             | MetadataCommand::SetNodePlacementAttrs { env, .. }
@@ -1102,6 +1167,70 @@ impl MetadataCommand {
                 put_u64(&mut out, *record_index);
                 encode_optional_uuid(&mut out, *lineage_transition_id);
                 encode_optional_u64(&mut out, *expected_checkpoint_generation);
+                put_uuid(&mut out, *holder_node_uuid);
+                put_u64(&mut out, *fencing_epoch);
+            }
+            MetadataCommand::CommitGroupCursorCoordinated {
+                env,
+                group_uuid,
+                member_uuid,
+                topic_uuid,
+                range_uuid,
+                coordinator_topic_uuid,
+                coordinator_range_uuid,
+                topic_epoch,
+                range_generation,
+                segment_uuid,
+                segment_generation,
+                segment_root,
+                record_offset,
+                record_index,
+                lineage_transition_id,
+                expected_checkpoint_generation,
+                holder_node_uuid,
+                fencing_epoch,
+            } => {
+                put_u16(&mut out, COMMAND_KIND_COMMIT_GROUP_CURSOR_COORDINATED);
+                encode_envelope(&mut out, env);
+                put_uuid(&mut out, *group_uuid);
+                put_uuid(&mut out, *member_uuid);
+                put_uuid(&mut out, *topic_uuid);
+                put_uuid(&mut out, *range_uuid);
+                put_uuid(&mut out, *coordinator_topic_uuid);
+                put_uuid(&mut out, *coordinator_range_uuid);
+                put_u64(&mut out, *topic_epoch);
+                put_u64(&mut out, *range_generation);
+                put_uuid(&mut out, *segment_uuid);
+                put_u64(&mut out, *segment_generation);
+                put_bytes32(&mut out, segment_root);
+                put_u64(&mut out, *record_offset);
+                put_u64(&mut out, *record_index);
+                encode_optional_uuid(&mut out, *lineage_transition_id);
+                encode_optional_u64(&mut out, *expected_checkpoint_generation);
+                put_uuid(&mut out, *holder_node_uuid);
+                put_u64(&mut out, *fencing_epoch);
+            }
+            MetadataCommand::EnsureGroupMemberCoordinated {
+                env,
+                name,
+                group_uuid,
+                member_uuid,
+                topic_uuid,
+                range_uuid,
+                coordinator_topic_uuid,
+                coordinator_range_uuid,
+                holder_node_uuid,
+                fencing_epoch,
+            } => {
+                put_u16(&mut out, COMMAND_KIND_ENSURE_GROUP_MEMBER_COORDINATED);
+                encode_envelope(&mut out, env);
+                put_bounded_str(&mut out, name, MAX_GROUP_NAME_BYTES, "group name")?;
+                put_uuid(&mut out, *group_uuid);
+                put_uuid(&mut out, *member_uuid);
+                put_uuid(&mut out, *topic_uuid);
+                put_uuid(&mut out, *range_uuid);
+                put_uuid(&mut out, *coordinator_topic_uuid);
+                put_uuid(&mut out, *coordinator_range_uuid);
                 put_uuid(&mut out, *holder_node_uuid);
                 put_u64(&mut out, *fencing_epoch);
             }
@@ -1592,6 +1721,53 @@ impl MetadataCommand {
                         reader,
                         "expected checkpoint generation",
                     )?,
+                    holder_node_uuid: reader.uuid("holder node uuid")?,
+                    fencing_epoch: reader.u64("fencing epoch")?,
+                })
+            }
+            COMMAND_KIND_COMMIT_GROUP_CURSOR_COORDINATED => {
+                Ok(MetadataCommand::CommitGroupCursorCoordinated {
+                    env: decode_envelope(reader)?,
+                    group_uuid: reader.uuid("group uuid")?,
+                    member_uuid: reader.uuid("member uuid")?,
+                    topic_uuid: reader.uuid("topic uuid")?,
+                    range_uuid: reader.uuid("range uuid")?,
+                    coordinator_topic_uuid: reader.uuid("coordinator topic uuid")?,
+                    coordinator_range_uuid: reader.uuid("coordinator range uuid")?,
+                    topic_epoch: reader.u64("topic epoch")?,
+                    range_generation: reader.u64("range generation")?,
+                    segment_uuid: reader.uuid("segment uuid")?,
+                    segment_generation: reader.u64("segment generation")?,
+                    segment_root: reader.bytes32("segment root")?,
+                    record_offset: reader.u64("record offset")?,
+                    record_index: reader.u64("record index")?,
+                    lineage_transition_id: decode_optional_uuid(reader, "lineage transition id")?,
+                    expected_checkpoint_generation: decode_optional_u64(
+                        reader,
+                        "expected checkpoint generation",
+                    )?,
+                    holder_node_uuid: reader.uuid("holder node uuid")?,
+                    fencing_epoch: reader.u64("fencing epoch")?,
+                })
+            }
+            COMMAND_KIND_ENSURE_GROUP_MEMBER_COORDINATED => {
+                let env = decode_envelope(reader)?;
+                let name = reader.bounded_str(MAX_GROUP_NAME_BYTES, "group name")?;
+                if name.is_empty() {
+                    return Err(CodecError::InvalidValue {
+                        what: "group name",
+                        reason: "must not be empty",
+                    });
+                }
+                Ok(MetadataCommand::EnsureGroupMemberCoordinated {
+                    env,
+                    name: name.to_owned(),
+                    group_uuid: reader.uuid("group uuid")?,
+                    member_uuid: reader.uuid("member uuid")?,
+                    topic_uuid: reader.uuid("topic uuid")?,
+                    range_uuid: reader.uuid("range uuid")?,
+                    coordinator_topic_uuid: reader.uuid("coordinator topic uuid")?,
+                    coordinator_range_uuid: reader.uuid("coordinator range uuid")?,
                     holder_node_uuid: reader.uuid("holder node uuid")?,
                     fencing_epoch: reader.u64("fencing epoch")?,
                 })
@@ -2525,6 +2701,73 @@ mod tests {
                 outcome: PromotionOutcome::Refused {
                     reason: PromotionRefusal::LeaderBehind,
                 },
+            },
+            // The four group commands a gateway sends (#457). They were not
+            // in this list when they landed, so the round-trip, the
+            // trailing-byte and the truncation cases never saw them; they are
+            // here now, and the coordinated pair carries a coordinator range
+            // deliberately unlike the range the cursor lands on, so a field
+            // dropped or transposed on the wire cannot round-trip by
+            // accident.
+            MetadataCommand::EnsureGroupMemberForRange {
+                env: envelope(35),
+                name: "audit.consumers".to_owned(),
+                group_uuid: Uuid::from_u128(50),
+                member_uuid: Uuid::from_u128(51),
+                topic_uuid: Uuid::from_u128(20),
+                range_uuid: Uuid::from_u128(21),
+                holder_node_uuid: Uuid::from_u128(10),
+                fencing_epoch: 5,
+            },
+            MetadataCommand::CommitGroupCursorFenced {
+                env: envelope(36),
+                group_uuid: Uuid::from_u128(50),
+                member_uuid: Uuid::from_u128(51),
+                topic_uuid: Uuid::from_u128(20),
+                range_uuid: Uuid::from_u128(21),
+                topic_epoch: 2,
+                range_generation: 0,
+                segment_uuid: Uuid::nil(),
+                segment_generation: 0,
+                segment_root: [0; 32],
+                record_offset: 4_096,
+                record_index: 0,
+                lineage_transition_id: None,
+                expected_checkpoint_generation: Some(7),
+                holder_node_uuid: Uuid::from_u128(10),
+                fencing_epoch: 5,
+            },
+            MetadataCommand::EnsureGroupMemberCoordinated {
+                env: envelope(37),
+                name: "audit.consumers".to_owned(),
+                group_uuid: Uuid::from_u128(50),
+                member_uuid: Uuid::from_u128(51),
+                topic_uuid: Uuid::from_u128(22),
+                range_uuid: Uuid::from_u128(23),
+                coordinator_topic_uuid: Uuid::from_u128(20),
+                coordinator_range_uuid: Uuid::from_u128(21),
+                holder_node_uuid: Uuid::from_u128(10),
+                fencing_epoch: 5,
+            },
+            MetadataCommand::CommitGroupCursorCoordinated {
+                env: envelope(38),
+                group_uuid: Uuid::from_u128(50),
+                member_uuid: Uuid::from_u128(51),
+                topic_uuid: Uuid::from_u128(22),
+                range_uuid: Uuid::from_u128(23),
+                coordinator_topic_uuid: Uuid::from_u128(20),
+                coordinator_range_uuid: Uuid::from_u128(21),
+                topic_epoch: 3,
+                range_generation: 1,
+                segment_uuid: Uuid::from_u128(30),
+                segment_generation: 2,
+                segment_root: [7; 32],
+                record_offset: 8_192,
+                record_index: 12,
+                lineage_transition_id: Some(Uuid::from_u128(60)),
+                expected_checkpoint_generation: None,
+                holder_node_uuid: Uuid::from_u128(10),
+                fencing_epoch: 5,
             },
         ]
     }
