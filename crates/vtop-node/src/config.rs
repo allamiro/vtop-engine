@@ -160,11 +160,16 @@ pub struct KafkaGatewayConfig {
     /// and the gateway's minted epoch would fence it (review).
     #[serde(default)]
     pub producer_id: Option<Uuid>,
+    /// Per-topic backends (#458). Empty is today's shape: one native topic
+    /// (`topic`, or the range's wire name). A non-empty list is the catalog
+    /// Metadata advertises, and a name in no row is unknown by name.
+    #[serde(default)]
+    pub topics: Vec<KafkaTopicRoute>,
 }
 
 /// One partition of the Kafka topic and the broker that leads it (#457
 /// slice 3).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct KafkaPartitionPeer {
     /// The Kafka partition index this broker leads.
@@ -174,6 +179,43 @@ pub struct KafkaPartitionPeer {
     /// What clients dial for it: its advertised host and port.
     pub host: String,
     pub port: u16,
+    /// The vtop range this partition is, when this node coordinates a group
+    /// that commits it (#457 slice 4c). All three together, or none: a
+    /// coordinator that does not know the range cannot store a cursor on it.
+    #[serde(default)]
+    pub topic_uuid: Option<Uuid>,
+    #[serde(default)]
+    pub range_uuid: Option<Uuid>,
+    #[serde(default)]
+    pub topic_epoch: Option<u64>,
+}
+
+/// One Kafka topic name and the backend that answers it (#458).
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct KafkaTopicRoute {
+    /// The name a Kafka client produces and consumes.
+    pub name: String,
+    /// `native`, `kafka`, `dual`, or `shadow`.
+    pub backend: String,
+    /// Bootstrap brokers for an external cluster (`kafka`, `dual`, `shadow`).
+    #[serde(default)]
+    pub brokers: Vec<String>,
+    /// The topic name on that cluster, if different from `name`.
+    #[serde(default)]
+    pub remote_topic: Option<String>,
+    /// Where dual/shadow reads are served: `native`, `kafka`, or `compare`.
+    #[serde(default)]
+    pub read: Option<String>,
+    /// JSONL path for dual-write / shadow-read receipts. Memory only if unset.
+    #[serde(default)]
+    pub receipts: Option<String>,
+    /// Translate OffsetFetch from the shadow numbering onto native, using
+    /// `receipts` (#458). Set when this topic's read side has switched to
+    /// native after a dual-write, so a consumer that committed Kafka
+    /// offsets resumes without replay or loss. Requires `receipts`.
+    #[serde(default)]
+    pub cutover: bool,
 }
 
 /// The identity the gateway appends under: the configured one, or one
@@ -306,6 +348,42 @@ pub fn kafka_partitions(kafka: &KafkaGatewayConfig) -> Result<(), String> {
             ));
         }
     }
+    for peer in &kafka.partitions {
+        match (peer.topic_uuid, peer.range_uuid, peer.topic_epoch) {
+            (None, None, None) => {}
+            (Some(topic_uuid), Some(range_uuid), Some(_)) => {
+                if topic_uuid.is_nil() || range_uuid.is_nil() {
+                    return Err(format!(
+                        "`kafka.partitions` gives partition {} a nil topic or range uuid: a \
+                         coordinator cannot store a cursor on a range that does not exist",
+                        peer.partition
+                    ));
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "`kafka.partitions` gives partition {} a partial range identity: set \
+                     topic_uuid, range_uuid and topic_epoch together, or none of them",
+                    peer.partition
+                ));
+            }
+        }
+    }
+    for (i, peer) in kafka.partitions.iter().enumerate() {
+        let Some(range_uuid) = peer.range_uuid else {
+            continue;
+        };
+        if let Some(other) = kafka.partitions[i + 1..]
+            .iter()
+            .find(|seen| seen.range_uuid == Some(range_uuid))
+        {
+            return Err(format!(
+                "`kafka.partitions` gives partition {} and partition {} the same range {}: a \
+                 Kafka partition is a range of its own",
+                peer.partition, other.partition, range_uuid
+            ));
+        }
+    }
     let Some(mine) = kafka
         .partitions
         .iter()
@@ -349,6 +427,113 @@ pub fn kafka_partitions(kafka: &KafkaGatewayConfig) -> Result<(), String> {
              `kafka.node_id` is {}: a client told the wrong broker leads a partition believes it",
             kafka.partition, mine.node_id, kafka.node_id
         ));
+    }
+    Ok(())
+}
+
+/// The topic map a gateway may serve (#458), or a refusal naming what is
+/// wrong with it. An empty list is today's single native topic and always
+/// fine; a list must name each topic once, with a backend, and an external
+/// backend must name the brokers it dials.
+pub fn kafka_topics(kafka: &KafkaGatewayConfig) -> Result<(), String> {
+    if kafka.topics.is_empty() {
+        return Ok(());
+    }
+    let mut seen = BTreeSet::new();
+    for route in &kafka.topics {
+        if route.name.is_empty() {
+            return Err(
+                "`kafka.topics` names a topic with no name: every route needs a Kafka name"
+                    .to_owned(),
+            );
+        }
+        if !seen.insert(route.name.clone()) {
+            return Err(format!(
+                "`kafka.topics` names {:?} twice: one name is one backend",
+                route.name
+            ));
+        }
+        match route.backend.as_str() {
+            "native" => {}
+            "kafka" | "dual" | "shadow" => {
+                if route.brokers.is_empty() {
+                    return Err(format!(
+                        "`kafka.topics` gives {:?} backend {:?} with no brokers: set the \
+                         cluster this route dials",
+                        route.name, route.backend
+                    ));
+                }
+                for broker in &route.brokers {
+                    if broker.is_empty() || !broker.contains(':') {
+                        return Err(format!(
+                            "`kafka.topics` gives {:?} a broker {broker:?} that is not host:port",
+                            route.name
+                        ));
+                    }
+                }
+            }
+            other => {
+                return Err(format!(
+                    "`kafka.topics` gives {:?} backend {other:?}: use native, kafka, dual or shadow",
+                    route.name
+                ));
+            }
+        }
+        if let Some(read) = route.read.as_deref() {
+            if !matches!(read, "native" | "kafka" | "compare") {
+                return Err(format!(
+                    "`kafka.topics` gives {:?} read {read:?}: use native, kafka or compare",
+                    route.name
+                ));
+            }
+            if route.backend == "native" || route.backend == "kafka" {
+                return Err(format!(
+                    "`kafka.topics` gives {:?} a read side, but backend {:?} has only one side",
+                    route.name, route.backend
+                ));
+            }
+        }
+        if route.backend == "native"
+            && (route.brokers.iter().any(|b| !b.is_empty()) || route.remote_topic.is_some())
+        {
+            return Err(format!(
+                "`kafka.topics` gives {:?} backend native with brokers or a remote topic: a \
+                 native route is this node's range",
+                route.name
+            ));
+        }
+        if route.cutover {
+            if route.receipts.as_deref().is_none_or(str::is_empty) {
+                return Err(format!(
+                    "`kafka.topics` gives {:?} cutover with no receipts: OffsetFetch cannot \
+                     translate a committed Kafka offset without the dual-write log",
+                    route.name
+                ));
+            }
+            match route.backend.as_str() {
+                "native" | "dual" | "shadow" => {}
+                other => {
+                    return Err(format!(
+                        "`kafka.topics` gives {:?} cutover on backend {other:?}: cutover is \
+                         native after a dual-write, or dual/shadow still serving native reads",
+                        route.name
+                    ));
+                }
+            }
+            if route.read.as_deref() == Some("kafka") {
+                return Err(format!(
+                    "`kafka.topics` gives {:?} cutover while read is kafka: OffsetFetch would \
+                     answer native offsets while Fetch still serves the shadow numbering",
+                    route.name
+                ));
+            }
+        } else if route.receipts.is_some() && matches!(route.backend.as_str(), "native" | "kafka") {
+            return Err(format!(
+                "`kafka.topics` gives {:?} receipts on backend {:?}: receipts belong on dual \
+                 or shadow, or on native with cutover after the switch",
+                route.name, route.backend
+            ));
+        }
     }
     Ok(())
 }
@@ -1344,6 +1529,7 @@ mod transport_tests {
             partitions: Vec::new(),
             max_fetch_wait_ms: 5_000,
             producer_id: None,
+            topics: Vec::new(),
         };
         assert!(refuse_kafka_gateway_misuse(DataRole::Leader, None).is_ok());
         assert!(refuse_kafka_gateway_misuse(
@@ -1432,6 +1618,7 @@ mod transport_tests {
             partitions: Vec::new(),
             max_fetch_wait_ms: 5_000,
             producer_id: None,
+            topics: Vec::new(),
         };
         // Each peer at its own endpoint: two brokers are two servers, and a
         // topology that says otherwise is refused below on its own.
@@ -1440,6 +1627,9 @@ mod transport_tests {
             node_id,
             host: format!("h{node_id}"),
             port: 9092,
+            topic_uuid: None,
+            range_uuid: None,
+            topic_epoch: None,
         };
         // No topology: the shape every deployment has today.
         assert!(kafka_partitions(&base).is_ok());
@@ -1537,6 +1727,9 @@ mod transport_tests {
                         node_id: 9,
                         host: wildcard_host.to_owned(),
                         port: 9092,
+                        topic_uuid: None,
+                        range_uuid: None,
+                        topic_epoch: None,
                     },
                     peer(1, 7),
                 ],
@@ -1557,12 +1750,18 @@ mod transport_tests {
                     node_id: 9,
                     host: "broker.example".to_owned(),
                     port: 9092,
+                    topic_uuid: None,
+                    range_uuid: None,
+                    topic_epoch: None,
                 },
                 KafkaPartitionPeer {
                     partition: 1,
                     node_id: 7,
                     host: "BROKER.EXAMPLE".to_owned(),
                     port: 9092,
+                    topic_uuid: None,
+                    range_uuid: None,
+                    topic_epoch: None,
                 },
             ],
             ..base.clone()
@@ -1585,12 +1784,18 @@ mod transport_tests {
                         node_id: 9,
                         host: a.to_owned(),
                         port: 9092,
+                        topic_uuid: None,
+                        range_uuid: None,
+                        topic_epoch: None,
                     },
                     KafkaPartitionPeer {
                         partition: 1,
                         node_id: 7,
                         host: b.to_owned(),
                         port: 9092,
+                        topic_uuid: None,
+                        range_uuid: None,
+                        topic_epoch: None,
                     },
                 ],
                 ..base.clone()
@@ -1609,12 +1814,18 @@ mod transport_tests {
                     node_id: 9,
                     host: "::1".to_owned(),
                     port: 9092,
+                    topic_uuid: None,
+                    range_uuid: None,
+                    topic_epoch: None,
                 },
                 KafkaPartitionPeer {
                     partition: 1,
                     node_id: 7,
                     host: "::2".to_owned(),
                     port: 9092,
+                    topic_uuid: None,
+                    range_uuid: None,
+                    topic_epoch: None,
                 },
             ],
             ..base.clone()
@@ -1644,6 +1855,9 @@ mod transport_tests {
                         node_id: 9,
                         host: bad_name.to_owned(),
                         port: 9092,
+                        topic_uuid: None,
+                        range_uuid: None,
+                        topic_epoch: None,
                     },
                     peer(1, 7),
                 ],
@@ -1672,6 +1886,9 @@ mod transport_tests {
                         node_id: 9,
                         host: good_name.to_owned(),
                         port: 9092,
+                        topic_uuid: None,
+                        range_uuid: None,
+                        topic_epoch: None,
                     },
                     peer(1, 7),
                 ],
@@ -1737,12 +1954,18 @@ mod transport_tests {
                     node_id: 9,
                     host: "h".to_owned(),
                     port: 9092,
+                    topic_uuid: None,
+                    range_uuid: None,
+                    topic_epoch: None,
                 },
                 KafkaPartitionPeer {
                     partition: 1,
                     node_id: 7,
                     host: "h".to_owned(),
                     port: 9092,
+                    topic_uuid: None,
+                    range_uuid: None,
+                    topic_epoch: None,
                 },
             ],
             ..base.clone()
@@ -1761,12 +1984,18 @@ mod transport_tests {
                     node_id: 9,
                     host: "h".to_owned(),
                     port: 9092,
+                    topic_uuid: None,
+                    range_uuid: None,
+                    topic_epoch: None,
                 },
                 KafkaPartitionPeer {
                     partition: 1,
                     node_id: 7,
                     host: "h".to_owned(),
                     port: 9093,
+                    topic_uuid: None,
+                    range_uuid: None,
+                    topic_epoch: None,
                 },
             ],
             ..base.clone()
@@ -1798,24 +2027,36 @@ mod transport_tests {
                 node_id: 7,
                 host: "  ".to_owned(),
                 port: 9092,
+                topic_uuid: None,
+                range_uuid: None,
+                topic_epoch: None,
             },
             KafkaPartitionPeer {
                 partition: 1,
                 node_id: 7,
                 host: "h".to_owned(),
                 port: 0,
+                topic_uuid: None,
+                range_uuid: None,
+                topic_epoch: None,
             },
             KafkaPartitionPeer {
                 partition: 1,
                 node_id: 256,
                 host: "h".to_owned(),
                 port: 9092,
+                topic_uuid: None,
+                range_uuid: None,
+                topic_epoch: None,
             },
             KafkaPartitionPeer {
                 partition: 1,
                 node_id: -1,
                 host: "h".to_owned(),
                 port: 9092,
+                topic_uuid: None,
+                range_uuid: None,
+                topic_epoch: None,
             },
         ] {
             let config = KafkaGatewayConfig {
@@ -1825,6 +2066,253 @@ mod transport_tests {
             };
             assert!(kafka_partitions(&config).is_err());
         }
+        // A range identity is all three fields, or none.
+        let incomplete = KafkaGatewayConfig {
+            partition: 0,
+            partitions: vec![peer(0, 9), {
+                let mut p = peer(1, 7);
+                p.topic_uuid = Some(Uuid::from_u128(1));
+                p
+            }],
+            ..base.clone()
+        };
+        assert!(kafka_partitions(&incomplete)
+            .unwrap_err()
+            .contains("partial range identity"));
+        let identified = KafkaGatewayConfig {
+            partition: 0,
+            partitions: vec![
+                {
+                    let mut p = peer(0, 9);
+                    p.topic_uuid = Some(Uuid::from_u128(1));
+                    p.range_uuid = Some(Uuid::from_u128(2));
+                    p.topic_epoch = Some(1);
+                    p
+                },
+                {
+                    let mut p = peer(1, 7);
+                    p.topic_uuid = Some(Uuid::from_u128(3));
+                    p.range_uuid = Some(Uuid::from_u128(4));
+                    p.topic_epoch = Some(1);
+                    p
+                },
+            ],
+            ..base.clone()
+        };
+        assert!(kafka_partitions(&identified).is_ok());
+        let duplicated = KafkaGatewayConfig {
+            partition: 0,
+            partitions: vec![
+                {
+                    let mut p = peer(0, 9);
+                    p.topic_uuid = Some(Uuid::from_u128(1));
+                    p.range_uuid = Some(Uuid::from_u128(2));
+                    p.topic_epoch = Some(1);
+                    p
+                },
+                {
+                    let mut p = peer(1, 7);
+                    p.topic_uuid = Some(Uuid::from_u128(3));
+                    p.range_uuid = Some(Uuid::from_u128(2));
+                    p.topic_epoch = Some(1);
+                    p
+                },
+            ],
+            ..base.clone()
+        };
+        assert!(kafka_partitions(&duplicated)
+            .unwrap_err()
+            .contains("same range"));
+        let nil_uuid = KafkaGatewayConfig {
+            partition: 0,
+            partitions: vec![
+                {
+                    let mut p = peer(0, 9);
+                    p.topic_uuid = Some(Uuid::nil());
+                    p.range_uuid = Some(Uuid::from_u128(2));
+                    p.topic_epoch = Some(1);
+                    p
+                },
+                peer(1, 7),
+            ],
+            ..base.clone()
+        };
+        assert!(kafka_partitions(&nil_uuid)
+            .unwrap_err()
+            .contains("nil topic or range"));
+    }
+
+    #[test]
+    fn a_topic_map_must_name_each_topic_once_with_a_backend() {
+        let base = KafkaGatewayConfig {
+            listen: "127.0.0.1:9092".to_owned(),
+            any_interface: false,
+            advertised_host: None,
+            advertised_port: None,
+            topic: None,
+            node_id: 1,
+            partition: 0,
+            partitions: Vec::new(),
+            max_fetch_wait_ms: 5_000,
+            producer_id: None,
+            topics: Vec::new(),
+        };
+        assert!(kafka_topics(&base).is_ok());
+        let native = KafkaGatewayConfig {
+            topics: vec![KafkaTopicRoute {
+                name: "events".to_owned(),
+                backend: "native".to_owned(),
+                ..KafkaTopicRoute::default()
+            }],
+            ..base.clone()
+        };
+        assert!(kafka_topics(&native).is_ok());
+        let duplicate = KafkaGatewayConfig {
+            topics: vec![
+                KafkaTopicRoute {
+                    name: "events".to_owned(),
+                    backend: "native".to_owned(),
+                    ..KafkaTopicRoute::default()
+                },
+                KafkaTopicRoute {
+                    name: "events".to_owned(),
+                    backend: "kafka".to_owned(),
+                    brokers: vec!["127.0.0.1:9092".to_owned()],
+                    ..KafkaTopicRoute::default()
+                },
+            ],
+            ..base.clone()
+        };
+        assert!(kafka_topics(&duplicate).unwrap_err().contains("twice"));
+        let blank = KafkaGatewayConfig {
+            topics: vec![KafkaTopicRoute {
+                name: String::new(),
+                backend: "native".to_owned(),
+                ..KafkaTopicRoute::default()
+            }],
+            ..base.clone()
+        };
+        assert!(kafka_topics(&blank).unwrap_err().contains("no name"));
+        let no_brokers = KafkaGatewayConfig {
+            topics: vec![KafkaTopicRoute {
+                name: "legacy".to_owned(),
+                backend: "kafka".to_owned(),
+                ..KafkaTopicRoute::default()
+            }],
+            ..base.clone()
+        };
+        assert!(kafka_topics(&no_brokers)
+            .unwrap_err()
+            .contains("no brokers"));
+        let unknown = KafkaGatewayConfig {
+            topics: vec![KafkaTopicRoute {
+                name: "events".to_owned(),
+                backend: "s3".to_owned(),
+                ..KafkaTopicRoute::default()
+            }],
+            ..base.clone()
+        };
+        assert!(kafka_topics(&unknown)
+            .unwrap_err()
+            .contains("native, kafka, dual or shadow"));
+        let native_brokers = KafkaGatewayConfig {
+            topics: vec![KafkaTopicRoute {
+                name: "events".to_owned(),
+                backend: "native".to_owned(),
+                brokers: vec!["127.0.0.1:9092".to_owned()],
+                ..KafkaTopicRoute::default()
+            }],
+            ..base.clone()
+        };
+        assert!(kafka_topics(&native_brokers)
+            .unwrap_err()
+            .contains("brokers or a remote topic"));
+        let native_read = KafkaGatewayConfig {
+            topics: vec![KafkaTopicRoute {
+                name: "events".to_owned(),
+                backend: "native".to_owned(),
+                read: Some("compare".to_owned()),
+                ..KafkaTopicRoute::default()
+            }],
+            ..base.clone()
+        };
+        assert!(kafka_topics(&native_read)
+            .unwrap_err()
+            .contains("only one side"));
+        let dual = KafkaGatewayConfig {
+            topics: vec![KafkaTopicRoute {
+                name: "events".to_owned(),
+                backend: "dual".to_owned(),
+                brokers: vec!["127.0.0.1:9092".to_owned()],
+                read: Some("compare".to_owned()),
+                ..KafkaTopicRoute::default()
+            }],
+            ..base.clone()
+        };
+        assert!(kafka_topics(&dual).is_ok());
+        let cutover_no_receipts = KafkaGatewayConfig {
+            topics: vec![KafkaTopicRoute {
+                name: "events".to_owned(),
+                backend: "native".to_owned(),
+                cutover: true,
+                ..KafkaTopicRoute::default()
+            }],
+            ..base.clone()
+        };
+        assert!(kafka_topics(&cutover_no_receipts)
+            .unwrap_err()
+            .contains("no receipts"));
+        let cutover_ok = KafkaGatewayConfig {
+            topics: vec![KafkaTopicRoute {
+                name: "events".to_owned(),
+                backend: "native".to_owned(),
+                receipts: Some("/tmp/events.jsonl".to_owned()),
+                cutover: true,
+                ..KafkaTopicRoute::default()
+            }],
+            ..base.clone()
+        };
+        assert!(kafka_topics(&cutover_ok).is_ok());
+        let cutover_while_shadow = KafkaGatewayConfig {
+            topics: vec![KafkaTopicRoute {
+                name: "events".to_owned(),
+                backend: "dual".to_owned(),
+                brokers: vec!["127.0.0.1:9092".to_owned()],
+                read: Some("kafka".to_owned()),
+                receipts: Some("/tmp/events.jsonl".to_owned()),
+                cutover: true,
+                ..KafkaTopicRoute::default()
+            }],
+            ..base.clone()
+        };
+        assert!(kafka_topics(&cutover_while_shadow)
+            .unwrap_err()
+            .contains("read is kafka"));
+        let receipts_on_kafka = KafkaGatewayConfig {
+            topics: vec![KafkaTopicRoute {
+                name: "legacy".to_owned(),
+                backend: "kafka".to_owned(),
+                brokers: vec!["127.0.0.1:9092".to_owned()],
+                receipts: Some("/tmp/events.jsonl".to_owned()),
+                ..KafkaTopicRoute::default()
+            }],
+            ..base.clone()
+        };
+        assert!(kafka_topics(&receipts_on_kafka)
+            .unwrap_err()
+            .contains("receipts belong"));
+        let blank_broker = KafkaGatewayConfig {
+            topics: vec![KafkaTopicRoute {
+                name: "legacy".to_owned(),
+                backend: "kafka".to_owned(),
+                brokers: vec!["noport".to_owned()],
+                ..KafkaTopicRoute::default()
+            }],
+            ..base
+        };
+        assert!(kafka_topics(&blank_broker)
+            .unwrap_err()
+            .contains("host:port"));
     }
 
     #[test]
@@ -1841,6 +2329,7 @@ mod transport_tests {
             partitions: Vec::new(),
             max_fetch_wait_ms: 5_000,
             producer_id: None,
+            topics: Vec::new(),
         };
         let derived = kafka_producer_id(principal, &kafka).unwrap();
         assert_ne!(derived, principal);

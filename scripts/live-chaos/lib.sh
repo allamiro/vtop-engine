@@ -65,7 +65,8 @@ REPLICA_BASE_PORT="${CHAOS_REPLICA_BASE_PORT:-9300}"
 NATIVE_PORT="${CHAOS_NATIVE_PORT:-9400}"
 # The Kafka gateway listeners (#225): kafka-0 for the standalone of scenario
 # 16, kafka-1 for the leader of scenario 17, kafka-2 for the leader of
-# scenario 18, kafka-3 for the leader of scenario 19. Above the candidate natives
+# scenario 18, kafka-3 for the leader of scenarios 19 and 20, kafka-4 and
+# kafka-5 for the two partitions of scenario 21. Above the candidate natives
 # (NATIVE_PORT + 11..13) so the default layout has no overlap.
 KAFKA_BASE_PORT="${CHAOS_KAFKA_BASE_PORT:-$((NATIVE_PORT + 20))}"
 # Observability endpoints (#224). Every node gets one so scenarios can gate on
@@ -153,8 +154,8 @@ preflight_settings() {
   # so the ceiling leaves that headroom — the same reasoning as the metrics
   # bases below.
   require_integer_in_range CHAOS_NATIVE_PORT "$NATIVE_PORT" 1024 65522
-  # Four listeners (kafka-0..3), so the base may be at most 65532 (review).
-  require_integer_in_range CHAOS_KAFKA_BASE_PORT "$KAFKA_BASE_PORT" 1024 65532
+  # Six listeners (kafka-0..5), so the base may be at most 65529 (review).
+  require_integer_in_range CHAOS_KAFKA_BASE_PORT "$KAFKA_BASE_PORT" 1024 65529
   # Ceilings are the highest port each family actually derives: metadata ids
   # run 1..5 so the top base is 65535-5, and data indices run 0..3 — index 3 is
   # the replacement replica (#242) — so the top base is 65535-3. A tighter bound
@@ -186,7 +187,9 @@ preflight_settings() {
   done
   labels+=("native")
   endpoints+=("$(native_addr)")
-  for id in 0 1 2 3; do
+  labels+=("native-p1")
+  endpoints+=("$DATA_HOST:$((NATIVE_PORT + 2))")
+  for id in 0 1 2 3 4 5; do
     labels+=("kafka-$id")
     endpoints+=("$(kafka_addr "$id")")
   done

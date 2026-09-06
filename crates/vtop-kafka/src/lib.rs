@@ -13,7 +13,10 @@
 //!
 //!   [`api`]       the five phase-1 APIs, request and response, every served version
 //!   [`bridge`]    the seam: what a backend must answer, and an in-memory one
-//!   [`gateway`]   the listener: frames in, the bridge behind, refusals by name
+//!   [`topics`]    per-topic virtualization: which backend answers a Kafka name
+//!   [`dual`]      dual-write / shadow-read, and the receipt that proves it
+//!   [`remote`]    an external Kafka cluster as a Bridge, over these codecs
+//!   [`gateway`]   the listener: frames in, the map behind, refusals by name
 //!   [`native`]    the backend over `LocalBroker` (feature `native`, on by default)
 //!
 //! The codec layers landed first, and the bridge and listener after them —
@@ -27,6 +30,7 @@
 pub mod api;
 pub mod api_groups;
 pub mod bridge;
+pub mod dual;
 pub mod gateway;
 pub mod groups;
 pub mod lease;
@@ -37,11 +41,16 @@ pub mod metadata_offsets;
 pub mod native;
 pub mod offsets;
 pub mod records;
+pub mod remote;
+pub mod topics;
 mod turnstile;
 pub mod wire;
 
 pub use bridge::{Appended, Bridge, Fetched, MemoryBridge, Sequenced};
-pub use gateway::{Gateway, GatewayConfig, PartitionLeader};
+pub use dual::{
+    load_receipts_jsonl, CutoverStore, DualBridge, DualRead, Receipt, ReceiptKind, ReceiptLog,
+};
+pub use gateway::{coordinator_partition_index, Gateway, GatewayConfig, PartitionLeader};
 pub use groups::{Coordinator, GroupConfig};
 pub use lease::{LeaseState, LeaseView};
 pub use messages::{ApiKey, ErrorCode, HeaderVerdict, RequestHeader};
@@ -49,4 +58,6 @@ pub use messages::{ApiKey, ErrorCode, HeaderVerdict, RequestHeader};
 pub use native::{EpochsExhausted, NativeBridge, NativeBridgeConfig};
 pub use offsets::{Committed, MemoryOffsetStore, OffsetStore};
 pub use records::{Record, RecordBatch};
+pub use remote::{RemoteBridge, RemoteConfig};
+pub use topics::{TopicBinding, TopicMap};
 pub use wire::{Decoder, Encoder, WireError};

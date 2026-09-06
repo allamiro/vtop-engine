@@ -69,6 +69,7 @@ impl ColocatedNodeConfig {
         // the metrics port held.
         if let Some(kafka) = self.data.kafka.as_ref() {
             crate::config::kafka_partitions(kafka)?;
+            crate::config::kafka_topics(kafka)?;
         }
         // Fail loudly rather than picking a winner. A config that names three
         // listen addresses and gets one is a config whose author has a wrong

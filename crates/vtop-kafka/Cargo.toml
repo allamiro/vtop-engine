@@ -25,6 +25,7 @@ vtop-meta = { workspace = true, optional = true }
 tokio = { version = "1", default-features = false, features = ["io-util", "net", "rt", "sync", "time", "macros"] }
 async-trait = { workspace = true }
 tracing = { workspace = true }
+sha2 = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]

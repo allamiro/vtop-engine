@@ -39,6 +39,7 @@ use crate::messages::{
 };
 use crate::offsets::{Committed, OffsetStore};
 use crate::records::{BatchError, RecordBatch};
+use crate::topics::{Resolved, TopicMap};
 use crate::turnstile::Turnstile;
 use crate::wire::{Decoder, Encoder};
 use std::collections::HashMap;
@@ -59,8 +60,10 @@ pub struct GatewayConfig {
     pub cluster_id: Option<String>,
     /// The partition this gateway leads (#457 slice 3). A range is a Kafka
     /// partition: this gateway serves exactly one, and every produce, fetch
-    /// or commit for another is refused by name so the client goes to the
-    /// broker that does lead it. Zero, and the only partition, unless a
+    /// or list-offsets for another is refused by name so the client goes to
+    /// the broker that does lead it. Offset commits for a group this gateway
+    /// coordinates are a different path (#457 slice 4b): they cover every
+    /// partition of the topic. Zero, and the only partition, unless a
     /// topology says otherwise.
     pub partition: i32,
     /// Every partition of the topic and the broker leading it, this one
@@ -243,13 +246,38 @@ async fn until<T>(
 
 /// A partition of the served topic and the broker that leads it (#457 slice
 /// 3): what Metadata tells a client so it sends each partition's traffic to
-/// the node holding that range's lease.
+/// the node holding that range's lease. The group's coordinator is chosen
+/// from this same list (#457 slice 4b), so every gateway with the topology
+/// names the same broker for a group.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartitionLeader {
     pub index: i32,
     pub node_id: i32,
     pub host: String,
     pub port: i32,
+}
+
+/// Which partition's leader coordinates `group` (#457 slice 4b).
+///
+/// Java `String.hashCode` over UTF-16, then Kafka's `Utils.abs` (MIN_VALUE
+/// maps to 0), then modulo the partition count. Every gateway given the same
+/// topology computes the same answer, so a group does not split across
+/// brokers. A single-partition deployment has one slot and every group lands
+/// on it, which is today's behaviour.
+pub fn coordinator_partition_index(group: &str, partitions: usize) -> usize {
+    if partitions == 0 {
+        return 0;
+    }
+    let mut hash: i32 = 0;
+    for unit in group.encode_utf16() {
+        hash = hash.wrapping_mul(31).wrapping_add(i32::from(unit));
+    }
+    let abs = if hash == i32::MIN {
+        0
+    } else {
+        hash.unsigned_abs() as usize
+    };
+    abs % partitions
 }
 
 /// What a request produced: a framed reply, or a closed connection with the
@@ -292,7 +320,9 @@ pub struct Gateway {
     /// Commits refused for want of a store, for a warning that does not
     /// repeat itself per request.
     offsetless_refusals: std::sync::atomic::AtomicU64,
-    bridge: Arc<dyn Bridge>,
+    /// Which backend answers each Kafka topic (#458): one bridge for every
+    /// name unless a topic map was given.
+    topics: TopicMap,
     config: GatewayConfig,
     sessions: Arc<tokio::sync::Semaphore>,
     refused_sessions: std::sync::atomic::AtomicU64,
@@ -360,9 +390,65 @@ impl Gateway {
         self.not_ours(partition)
     }
 
-    /// Whether this gateway leads a partition — the only one it may serve.
+    /// Whether this gateway leads a partition — the only one it may produce,
+    /// fetch or list offsets for. Offset commits for a group it coordinates
+    /// are not this question (#457 slice 4b).
     fn leads(&self, partition: i32) -> bool {
         partition == self.config.partition
+    }
+
+    /// Whether `partition` is one this topology names — this node's, or
+    /// another broker's. A coordinator accepts commits and assignments for
+    /// every such partition; one nobody named is not this topic's at all.
+    fn known_partition(&self, partition: i32) -> bool {
+        if self.config.partitions.is_empty() {
+            partition == self.config.partition
+        } else {
+            self.config
+                .partitions
+                .iter()
+                .any(|peer| peer.index == partition)
+        }
+    }
+
+    /// The broker that coordinates `group` (#457 slice 4b): the leader of
+    /// the partition `coordinator_partition_index` selects, from the same
+    /// topology Metadata advertises. Sorted by index so two gateways given
+    /// the same peers in different order still agree.
+    fn elected_coordinator(&self, group: &str) -> PartitionLeader {
+        let mut map = self.partition_map();
+        map.sort_by_key(|peer| peer.index);
+        let slot = coordinator_partition_index(group, map.len());
+        map.into_iter()
+            .nth(slot)
+            .expect("partition_map always names at least this gateway")
+    }
+
+    /// Whether this gateway is `group`'s coordinator. The group protocol
+    /// and OffsetCommit/OffsetFetch go here and nowhere else; a gateway
+    /// that is not this group's answers `NOT_COORDINATOR`.
+    fn coordinates(&self, group: &str) -> bool {
+        self.elected_coordinator(group).node_id == self.config.node_id
+    }
+
+    /// The refusal a group-protocol request gets when this gateway is not
+    /// that group's coordinator, or is the coordinator but no longer holds
+    /// the lease that made it one. `NOT_COORDINATOR` is how a client finds
+    /// the right broker; `COORDINATOR_NOT_AVAILABLE` is how it waits out a
+    /// handoff of this one.
+    fn not_this_groups_coordinator(&self, api: &str, group: &str) -> Option<ErrorCode> {
+        if !self.coordinates(group) {
+            tracing::warn!(
+                api,
+                group,
+                this = self.config.node_id,
+                coordinator = self.elected_coordinator(group).node_id,
+                "kafka {api} refused: this gateway is not the group's coordinator; the client \
+                 finds the one the topology elects"
+            );
+            return Some(ErrorCode::NotCoordinator);
+        }
+        self.fenced(api)
     }
 
     /// What to answer for a partition this gateway does not lead: the
@@ -374,15 +460,7 @@ impl Gateway {
         // By reference (review): one request may name 4 096 partitions, and
         // cloning the topology — every host string in it — for each of them
         // turns a bounded request into quadratic work.
-        let known = if self.config.partitions.is_empty() {
-            partition == self.config.partition
-        } else {
-            self.config
-                .partitions
-                .iter()
-                .any(|peer| peer.index == partition)
-        };
-        if known {
+        if self.known_partition(partition) {
             ErrorCode::NotLeaderOrFollower
         } else {
             ErrorCode::UnknownTopicOrPartition
@@ -414,6 +492,13 @@ impl Gateway {
     }
 
     pub fn new(bridge: Arc<dyn Bridge>, config: GatewayConfig) -> Self {
+        Self::from_topics(TopicMap::single(bridge), config)
+    }
+
+    /// Serve the given topic map (#458): Metadata is the catalog, and every
+    /// produce, fetch, list-offsets, commit and fetch of offsets is routed
+    /// through it.
+    pub fn from_topics(topics: TopicMap, config: GatewayConfig) -> Self {
         if config.groups.min_session_timeout <= config.max_fetch_wait.max(config.max_offset_wait) {
             // Said once, at construction (review): a session may be shorter
             // than one long poll or one commit, and a heartbeat queued behind
@@ -429,7 +514,7 @@ impl Gateway {
         let group_config = config.groups.clone();
         let sessions = Arc::new(tokio::sync::Semaphore::new(config.max_sessions.max(1)));
         Self {
-            bridge,
+            topics,
             config,
             sessions,
             refused_sessions: std::sync::atomic::AtomicU64::new(0),
@@ -442,6 +527,13 @@ impl Gateway {
             offsetless_refusals: std::sync::atomic::AtomicU64::new(0),
             closed: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// The backend that answers `topic`, and the name to use on it.
+    fn resolve(&self, topic: &str) -> Result<Resolved, ErrorCode> {
+        self.topics
+            .resolve(topic)
+            .ok_or(ErrorCode::UnknownTopicOrPartition)
     }
 
     /// Serve until `shutdown` reads `true`. A dropped sender is not a signal
@@ -818,12 +910,18 @@ impl Gateway {
             ApiKey::Heartbeat => match consumed(decode_heartbeat(&mut d, version), &d, "Heartbeat")
             {
                 Ok(request) => {
-                    let error = self.fenced("Heartbeat").unwrap_or_else(|| {
-                        self.groups
-                            .heartbeat(&request.group_id, request.generation_id, &request.member_id)
-                            .err()
-                            .unwrap_or(ErrorCode::None)
-                    });
+                    let error = self
+                        .not_this_groups_coordinator("Heartbeat", &request.group_id)
+                        .unwrap_or_else(|| {
+                            self.groups
+                                .heartbeat(
+                                    &request.group_id,
+                                    request.generation_id,
+                                    &request.member_id,
+                                )
+                                .err()
+                                .unwrap_or(ErrorCode::None)
+                        });
                     encode_error_only(&mut out, version, error);
                     Ok(None)
                 }
@@ -832,12 +930,14 @@ impl Gateway {
             ApiKey::LeaveGroup => {
                 match consumed(decode_leave_group(&mut d, version), &d, "LeaveGroup") {
                     Ok(request) => {
-                        let error = self.fenced("LeaveGroup").unwrap_or_else(|| {
-                            self.groups
-                                .leave(&request.group_id, &request.member_id)
-                                .err()
-                                .unwrap_or(ErrorCode::None)
-                        });
+                        let error = self
+                            .not_this_groups_coordinator("LeaveGroup", &request.group_id)
+                            .unwrap_or_else(|| {
+                                self.groups
+                                    .leave(&request.group_id, &request.member_id)
+                                    .err()
+                                    .unwrap_or(ErrorCode::None)
+                            });
                         encode_error_only(&mut out, version, error);
                         Ok(None)
                     }
@@ -878,13 +978,20 @@ impl Gateway {
 
     /// Off the runtime's threads (review): a real bridge answers from the
     /// broker, behind the lock an append holds across its fsync, and a
-    /// Metadata storm must not park every worker behind it.
-    async fn bounds(&self, name: &str) -> Result<(i64, i64), ErrorCode> {
-        let bridge = Arc::clone(&self.bridge);
-        let name = name.to_owned();
+    /// Metadata storm must not park every worker behind it. The caller's
+    /// deadline is the ceiling (#457 review): a ListOffsets or Metadata that
+    /// already spent time enumerating topics must not start a fresh
+    /// `max_fetch_wait` per partition.
+    async fn bounds(
+        &self,
+        name: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<(i64, i64), ErrorCode> {
+        let resolved = self.resolve(name)?;
         until(
-            tokio::time::Instant::now() + self.config.max_fetch_wait,
-            self.jobs.blocking(move || bridge.bounds(&name)),
+            deadline,
+            self.jobs
+                .blocking(move || resolved.backend.bounds(&resolved.backend_topic)),
         )
         .await
     }
@@ -893,6 +1000,7 @@ impl Gateway {
     /// for a code when the bridge does not enumerate its topics in time
     /// (audit) — an empty list would read as "no topics", which is not known.
     async fn metadata(&self, request: MetadataRequest) -> Result<MetadataResponse, String> {
+        let ceiling = tokio::time::Instant::now() + self.config.max_fetch_wait;
         let names = match request.topics {
             Some(names) => names,
             // Under the same ceiling as the bounds lookups below (review): a
@@ -900,10 +1008,7 @@ impl Gateway {
             // naming them all. Not done in time: the connection closes
             // (audit), the protocol's form of a refusal it cannot answer, and
             // the client's next metadata refresh asks again.
-            None => match self
-                .served_topics(tokio::time::Instant::now() + self.config.max_fetch_wait)
-                .await
-            {
+            None => match self.served_topics(ceiling).await {
                 Ok(names) => names,
                 Err(error) => {
                     return Err(format!(
@@ -934,7 +1039,7 @@ impl Gateway {
         let leads = self.speaks_for_the_range();
         let mut topics = Vec::with_capacity(names.len());
         for name in names {
-            topics.push(match self.bounds(&name).await {
+            topics.push(match self.bounds(&name, ceiling).await {
                 Ok(_) if !leads => MetadataTopic {
                     error: ErrorCode::NotLeaderOrFollower,
                     name,
@@ -1016,17 +1121,20 @@ impl Gateway {
         if tokio::time::Instant::now() >= deadline {
             return Err(ErrorCode::RequestTimedOut);
         }
-        let bridge = Arc::clone(&self.bridge);
-        tokio::time::timeout_at(deadline, self.jobs.blocking(move || bridge.topics()))
+        let map = self.topics.clone();
+        tokio::time::timeout_at(deadline, self.jobs.blocking(move || map.names()))
             .await
             .map(|joined| joined.map_err(|_| ErrorCode::RequestTimedOut))
             .unwrap_or(Err(ErrorCode::RequestTimedOut))
     }
 
-    /// FindCoordinator (#457 slice 2): this gateway is the coordinator of
-    /// every group it serves — one range, one partition, one leader — so the
-    /// answer is itself, for any group. A transaction key is out of scope, by
-    /// name; an empty key names no group.
+    /// FindCoordinator (#457 slice 4b): the broker the topology elects for
+    /// this group, the same answer from every gateway that has the topology.
+    /// This gateway names itself only when it is that broker and still holds
+    /// the lease; a fenced coordinator does not send clients to a node that
+    /// cannot take their commits. A gateway that is not the group's still
+    /// answers with the elected broker — that is how a client finds it. A
+    /// transaction key is out of scope, by name; an empty key names no group.
     fn find_coordinator(&self, request: FindCoordinatorRequest) -> FindCoordinatorResponse {
         let refused = |error: ErrorCode, message: &str| FindCoordinatorResponse {
             error,
@@ -1053,21 +1161,21 @@ impl Gateway {
                 "an empty group id names no group",
             );
         }
-        // Only while the lease is this node's (review): a fenced listener
-        // that named itself would hold a consumer at a node that cannot take
-        // its commits.
-        if let Some(error) = self.fenced("FindCoordinator") {
-            return refused(
-                error,
-                "this node no longer holds the range's lease; ask another broker for the coordinator",
-            );
+        let elected = self.elected_coordinator(&request.key);
+        if elected.node_id == self.config.node_id {
+            if let Some(error) = self.fenced("FindCoordinator") {
+                return refused(
+                    error,
+                    "this node no longer holds the range's lease; ask another broker for the coordinator",
+                );
+            }
         }
         FindCoordinatorResponse {
             error: ErrorCode::None,
             error_message: None,
-            node_id: self.config.node_id,
-            host: self.config.advertised_host.clone(),
-            port: self.config.advertised_port,
+            node_id: elected.node_id,
+            host: elected.host,
+            port: elected.port,
         }
     }
 
@@ -1078,7 +1186,7 @@ impl Gateway {
         version: i16,
         client_id: Option<&str>,
     ) -> JoinGroupResponse {
-        if let Some(error) = self.fenced("JoinGroup") {
+        if let Some(error) = self.not_this_groups_coordinator("JoinGroup", &request.group_id) {
             return JoinGroupResponse {
                 error,
                 generation_id: -1,
@@ -1134,7 +1242,7 @@ impl Gateway {
     /// SyncGroup: the leader's assignments are the client-side assignor's,
     /// run through this gateway's topic map before any member sees them.
     async fn sync_group(&self, request: SyncGroupRequest) -> SyncGroupResponse {
-        if let Some(error) = self.fenced("SyncGroup") {
+        if let Some(error) = self.not_this_groups_coordinator("SyncGroup", &request.group_id) {
             return SyncGroupResponse {
                 error,
                 assignment: Vec::new(),
@@ -1213,7 +1321,9 @@ impl Gateway {
     }
 
     /// Every partition a consumer-protocol assignment names must be one this
-    /// gateway serves: partition 0 of a topic behind the bridge — every
+    /// group's coordinator can place: a partition of the topology, of a topic
+    /// behind the bridge (#457 slice 4b) — the assignment covers every
+    /// partition of the topic, not only the one this node leads. Every
     /// assignment judged against ONE enumeration of the topics (review), made
     /// only when an assignment names anything, so a SyncGroup of a thousand
     /// assignments is one bridge call, not a thousand. An assignment that
@@ -1271,13 +1381,13 @@ impl Gateway {
         for (member, topics) in decoded {
             for (topic, partitions) in topics {
                 for partition in partitions {
-                    if !self.leads(partition) || !served.contains(&topic) {
+                    if !self.known_partition(partition) || !served.contains(&topic) {
                         return Err((
                             ErrorCode::InconsistentGroupProtocol,
                             member.clone(),
                             format!(
-                                "partition {partition} of {topic:?}: this gateway serves partition {} of {served:?}",
-                                self.config.partition
+                                "partition {partition} of {topic:?}: this coordinator places \
+                                 partitions of {served:?} named by the topology"
                             ),
                         ));
                     }
@@ -1363,6 +1473,9 @@ impl Gateway {
         Vec<tokio::task::JoinHandle<Result<(), ErrorCode>>>,
     ) {
         let mut outstanding = Vec::new();
+        if let Some(error) = self.not_this_groups_coordinator("OffsetCommit", &request.group_id) {
+            return (every_partition(request, error), outstanding);
+        }
         // Membership first (review): a stale generation or an unknown member
         // is answered as such whatever the bridge does next — a client acts
         // on that code, rejoining or correcting its identity, and a bridge
@@ -1401,8 +1514,8 @@ impl Gateway {
         // deterministic refusal never turns into a bridge error, and a commit
         // that cannot succeed costs no bridge work.
         let by_name = |p: &crate::api_groups::OffsetCommitPartition| -> Option<ErrorCode> {
-            if !self.leads(p.partition) {
-                Some(self.not_ours(p.partition))
+            if !self.known_partition(p.partition) {
+                Some(ErrorCode::UnknownTopicOrPartition)
             } else if p.offset < 0 {
                 // -1 is the wire's "nothing committed"; a position below zero
                 // is not one a consumer resumes from (review).
@@ -1439,10 +1552,10 @@ impl Gateway {
                 .collect::<Vec<_>>()
         };
         // A redirect needs the bridge too (review): `NOT_LEADER_OR_FOLLOWER`
-        // for a partition of a topic that does not exist would send the
-        // client to a broker with the same topology, which would say the
-        // same thing. So the enumeration is fetched whenever one was decided
-        // by name, not only when something was left undecided.
+        // no longer applies to OffsetCommit — the coordinator stores every
+        // partition of the group — so this flag is kept for a code a name
+        // check cannot produce here, and the enumeration still runs whenever
+        // something was left undecided.
         let redirected = verdicts.iter().any(|decided| {
             decided
                 .iter()
@@ -1482,21 +1595,21 @@ impl Gateway {
                 }
             }
         }
-        // The watermark of every topic still to judge (review, #468): a
+        // The watermark of partitions this gateway LEADS (review, #468): a
         // committed offset is the next one to consume, so it may reach the
-        // watermark and no further — a position past what exists would be a
-        // cursor metadata cannot bound, and a group lying itself out of
-        // retention's protection. The head is known HERE, at the bridge, and
-        // nowhere else. Each lookup waits on the request deadline (review): a
-        // bridge blocked on its storage or its lock is not a wait the cap
-        // leaves unbounded, and a watermark not given in time is a commit not
-        // taken. A topic decided whole by name, or not served, is not looked
-        // up.
+        // watermark and no further. The head of a partition another broker
+        // leads is not known here — the coordinator's bridge is the wrong
+        // log — and the plane's lineage CAS is what bounds that commit
+        // (#457 slice 4c). Each lookup waits on the request deadline. A
+        // topic decided whole by name, or not served, is not looked up.
         let mut watermarks: HashMap<String, Result<i64, ErrorCode>> = HashMap::new();
         for (topic, decided) in request.topics.iter().zip(&verdicts) {
-            if decided.iter().all(Option::is_some)
-                || !served.contains(&topic.name)
-                || watermarks.contains_key(&topic.name)
+            let needs_ours = topic
+                .partitions
+                .iter()
+                .zip(decided.iter())
+                .any(|(p, v)| v.is_none() && self.leads(p.partition));
+            if !needs_ours || !served.contains(&topic.name) || watermarks.contains_key(&topic.name)
             {
                 continue;
             }
@@ -1507,15 +1620,18 @@ impl Gateway {
             let watermark = if tokio::time::Instant::now() >= deadline {
                 Err(ErrorCode::RequestTimedOut)
             } else {
-                let bridge = Arc::clone(&self.bridge);
-                let name = topic.name.clone();
-                tokio::time::timeout_at(
-                    deadline,
-                    self.jobs.blocking(move || bridge.high_watermark(&name)),
-                )
-                .await
-                .map(|joined| joined.unwrap_or(Err(ErrorCode::RequestTimedOut)))
-                .unwrap_or(Err(ErrorCode::RequestTimedOut))
+                match self.resolve(&topic.name) {
+                    Err(error) => Err(error),
+                    Ok(resolved) => tokio::time::timeout_at(
+                        deadline,
+                        self.jobs.blocking(move || {
+                            resolved.backend.high_watermark(&resolved.backend_topic)
+                        }),
+                    )
+                    .await
+                    .map(|joined| joined.unwrap_or(Err(ErrorCode::RequestTimedOut)))
+                    .unwrap_or(Err(ErrorCode::RequestTimedOut)),
+                }
             };
             watermarks.insert(topic.name.clone(), watermark);
         }
@@ -1527,6 +1643,10 @@ impl Gateway {
                 let refused = verdict.or_else(|| {
                     if !served.contains(&topic.name) {
                         Some(ErrorCode::UnknownTopicOrPartition)
+                    } else if !self.leads(p.partition) {
+                        // Another broker's partition: the coordinator stores
+                        // it without a local watermark (#457 slice 4c).
+                        None
                     } else if let Some(Err(error)) = watermark {
                         // A watermark the bridge refused, or did not give
                         // before the deadline: its code, not a guess.
@@ -1595,6 +1715,12 @@ impl Gateway {
                     request.topics.unwrap_or_default(),
                     ErrorCode::InvalidGroupId,
                 ),
+            };
+        }
+        if let Some(error) = self.not_this_groups_coordinator("OffsetFetch", &request.group_id) {
+            return OffsetFetchResponse {
+                error,
+                topics: every_asked(request.topics.unwrap_or_default(), error),
             };
         }
         // Named topics, or — a null list at v2+ — every partition the group
@@ -1916,8 +2042,13 @@ impl Gateway {
         // it (#457): one producer, contiguous sequences, or a refusal that
         // appends nothing.
         let sequenced = sequenced_identity(&batches)?;
-        let bridge = Arc::clone(&self.bridge);
-        let topic = topic.to_owned();
+        let kafka_topic = topic.to_owned();
+        let resolved = self.resolve(topic).map_err(|error| {
+            (
+                error,
+                format!("topic {kafka_topic:?} is not in this gateway's topic map"),
+            )
+        })?;
         // The bridge is synchronous and a real one fsyncs: off the runtime's
         // threads, the way the broker's own session loop does it. The SET is
         // one append (review) — whole or not at all — and the wait for it
@@ -1941,7 +2072,7 @@ impl Gateway {
         // queue running beside the first.
         let ordered = sequenced.map(|sequenced| {
             let key: ProducerKey = (
-                topic.clone(),
+                kafka_topic.clone(),
                 sequenced.producer_id,
                 sequenced.producer_epoch,
             );
@@ -1959,7 +2090,9 @@ impl Gateway {
             let turn = ordered
                 .as_ref()
                 .map(|(_, turnstile, ticket)| turnstile.wait_turn(*ticket));
-            let outcome = bridge.produce(&topic, &batches, sequenced);
+            let outcome = resolved
+                .backend
+                .produce(&resolved.backend_topic, &batches, sequenced);
             drop(turn);
             if let Some((key, turnstile, _)) = ordered {
                 // Under the map lock, so a set arriving now either finds the
@@ -2030,37 +2163,49 @@ impl Gateway {
                         // No budget left: the watermarks without records —
                         // but an offset outside the log is still refused
                         // (review), not masked as an empty success.
-                        let bridge = Arc::clone(&self.bridge);
-                        let name = topic.name.clone();
-                        let offset = partition.fetch_offset;
-                        until(
-                            ceiling,
-                            self.jobs.blocking(move || {
-                                let (log_start_offset, high_watermark) = bridge.bounds(&name)?;
-                                if offset < log_start_offset || offset > high_watermark {
-                                    return Err(ErrorCode::OffsetOutOfRange);
-                                }
-                                Ok(Fetched {
-                                    records: Vec::new(),
-                                    high_watermark,
-                                    log_start_offset,
-                                })
-                            }),
-                        )
-                        .await
+                        match self.resolve(&topic.name) {
+                            Err(error) => Err(error),
+                            Ok(resolved) => {
+                                let offset = partition.fetch_offset;
+                                until(
+                                    ceiling,
+                                    self.jobs.blocking(move || {
+                                        let (log_start_offset, high_watermark) =
+                                            resolved.backend.bounds(&resolved.backend_topic)?;
+                                        if offset < log_start_offset || offset > high_watermark {
+                                            return Err(ErrorCode::OffsetOutOfRange);
+                                        }
+                                        Ok(Fetched {
+                                            records: Vec::new(),
+                                            high_watermark,
+                                            log_start_offset,
+                                        })
+                                    }),
+                                )
+                                .await
+                            }
+                        }
                     } else {
-                        let bridge = Arc::clone(&self.bridge);
-                        let name = topic.name.clone();
-                        let offset = partition.fetch_offset;
-                        let budget = usize::try_from(partition.max_bytes.max(1))
-                            .unwrap_or(usize::MAX)
-                            .min(remaining);
-                        until(
-                            ceiling,
-                            self.jobs
-                                .blocking(move || bridge.fetch(&name, offset, budget)),
-                        )
-                        .await
+                        match self.resolve(&topic.name) {
+                            Err(error) => Err(error),
+                            Ok(resolved) => {
+                                let offset = partition.fetch_offset;
+                                let budget = usize::try_from(partition.max_bytes.max(1))
+                                    .unwrap_or(usize::MAX)
+                                    .min(remaining);
+                                until(
+                                    ceiling,
+                                    self.jobs.blocking(move || {
+                                        resolved.backend.fetch(
+                                            &resolved.backend_topic,
+                                            offset,
+                                            budget,
+                                        )
+                                    }),
+                                )
+                                .await
+                            }
+                        }
                     };
                     partitions.push(match outcome {
                         Ok(Fetched {
@@ -2133,7 +2278,7 @@ impl Gateway {
                     // LATEST is the watermark, EARLIEST the retained floor:
                     // both are one snapshot of the bridge's bounds, and
                     // `-o beginning` on a stock client is the latter.
-                    match self.bounds(&topic.name).await {
+                    match self.bounds(&topic.name, ceiling).await {
                         Ok((log_start, high_watermark)) => (
                             ErrorCode::None,
                             if partition.timestamp == TIMESTAMP_LATEST {
@@ -2485,6 +2630,65 @@ mod tests {
         let gateway = Gateway::new(bridge, config);
         tokio::spawn(gateway.serve(listener, rx));
         (addr, tx)
+    }
+
+    /// Two backends, two Kafka names (#458): Metadata is the catalog, a
+    /// produce of each name lands on its own log, and a name in neither is
+    /// unknown by name.
+    #[tokio::test]
+    async fn a_topic_map_routes_each_name_and_refuses_one_in_neither() {
+        let events = Arc::new(MemoryBridge::with_topics(["events.v1"]));
+        let audit = Arc::new(MemoryBridge::with_topics(["audit.log"]));
+        let map = crate::topics::TopicMap::routed(vec![
+            crate::topics::TopicBinding {
+                name: "events".to_owned(),
+                backend: Arc::clone(&events) as Arc<dyn Bridge>,
+                backend_topic: "events.v1".to_owned(),
+            },
+            crate::topics::TopicBinding {
+                name: "audit".to_owned(),
+                backend: Arc::clone(&audit) as Arc<dyn Bridge>,
+                backend_topic: "audit.log".to_owned(),
+            },
+        ])
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let gateway = Gateway::from_topics(
+            map,
+            GatewayConfig {
+                advertised_port: addr.port() as i32,
+                max_fetch_wait: Duration::from_millis(500),
+                ..GatewayConfig::default()
+            },
+        );
+        tokio::spawn(gateway.serve(listener, rx));
+        let reply = call(
+            addr,
+            0,
+            3,
+            2,
+            &produce_body("events", 0, -1, None, &batch_bytes(&["a"], false)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_produce(&reply, 3).0, 0);
+        assert_eq!(events.bounds("events.v1").unwrap(), (0, 1));
+        assert_eq!(audit.bounds("audit.log").unwrap(), (0, 0));
+        let reply = call(
+            addr,
+            0,
+            3,
+            3,
+            &produce_body("nope", 0, -1, None, &batch_bytes(&["x"], false)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_produce(&reply, 3).0,
+            ErrorCode::UnknownTopicOrPartition.as_i16()
+        );
     }
 
     /// A bridge whose FIRST append takes `pause` — a backend behind a slow
@@ -4752,7 +4956,205 @@ mod tests {
         assert_eq!(read_find_coordinator(&reply, 1).0, 0);
     }
 
-    /// A named fetch is the store's answer whatever the gateway serves
+    /// Java `String.hashCode` of ASCII "g" is 103; Kafka's abs then mod 2
+    /// elects partition 1. A single slot always elects 0, which is today's
+    /// one-partition coordinator.
+    #[test]
+    fn coordinator_election_is_stable_and_java_compatible_for_ascii() {
+        assert_eq!(coordinator_partition_index("g", 1), 0);
+        assert_eq!(coordinator_partition_index("g", 2), 1);
+        assert_eq!(coordinator_partition_index("b", 2), 0);
+        assert_eq!(
+            coordinator_partition_index("g", 2),
+            coordinator_partition_index("g", 2),
+            "stable"
+        );
+    }
+
+    fn two_partition_topology(this_port: i32) -> Vec<PartitionLeader> {
+        vec![
+            PartitionLeader {
+                index: 0,
+                node_id: 7,
+                host: "other.example".to_owned(),
+                port: 9092,
+            },
+            PartitionLeader {
+                index: 1,
+                node_id: 9,
+                host: "127.0.0.1".to_owned(),
+                port: this_port,
+            },
+        ]
+    }
+
+    /// One coordinator per group, chosen the same way from the topology
+    /// (#457 slice 4b): FindCoordinator names the elected broker even when
+    /// it is not this gateway; a gateway that is not the group's answers
+    /// `NOT_COORDINATOR` on the group protocol, which is how a client finds
+    /// the right one; a SyncGroup covering every partition of the topic is
+    /// accepted, not only the one this node leads; and the coordinator
+    /// stores a commit for a partition it does not lead.
+    #[tokio::test]
+    async fn one_coordinator_per_group_covers_every_partition() {
+        let store = Arc::new(crate::offsets::MemoryOffsetStore::default());
+        let (addr, _stop) = start_groups_tuned(
+            Arc::new(MemoryBridge::with_topics(["events"])),
+            Some(Arc::clone(&store) as Arc<dyn OffsetStore>),
+            |c| {
+                c.node_id = 9;
+                c.partition = 1;
+                c.partitions = two_partition_topology(c.advertised_port);
+            },
+        )
+        .await;
+        // "g" elects partition 1 — this gateway. "b" elects partition 0.
+        let reply = call(addr, 10, 1, 1, &find_coordinator_body(1, "g", 0))
+            .await
+            .unwrap();
+        let (error, node, host, port) = read_find_coordinator(&reply, 1);
+        assert_eq!((error, node, port), (0, 9, i32::from(addr.port())));
+        assert_eq!(host, "127.0.0.1");
+        let reply = call(addr, 10, 1, 2, &find_coordinator_body(1, "b", 0))
+            .await
+            .unwrap();
+        let (error, node, host, port) = read_find_coordinator(&reply, 1);
+        assert_eq!(
+            (error, node, host.as_str(), port),
+            (0, 7, "other.example", 9092)
+        );
+        let reply = call(
+            addr,
+            11,
+            2,
+            3,
+            &join_body(2, "b", "", &[("range", b"m".as_slice())]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_join(&reply, 2).error,
+            ErrorCode::NotCoordinator.as_i16(),
+            "a group this topology elects elsewhere is not coordinated here"
+        );
+        let reply = call(addr, 12, 1, 4, &heartbeat_body(1, "b", 1, "m"))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_error_only(&reply, 1),
+            ErrorCode::NotCoordinator.as_i16()
+        );
+        let reply = call(
+            addr,
+            8,
+            7,
+            5,
+            &offset_commit_body(7, "b", -1, "", "events", 0, 1, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_offset_commit(&reply, 7),
+            vec![(0, ErrorCode::NotCoordinator.as_i16())]
+        );
+        let reply = call(
+            addr,
+            9,
+            3,
+            51,
+            &offset_fetch_body(3, "b", Some(&[("events", &[0][..])])),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_offset_fetch(&reply, 3).0,
+            ErrorCode::NotCoordinator.as_i16()
+        );
+        let reply = call(addr, 13, 0, 52, &leave_body("b", "m")).await.unwrap();
+        assert_eq!(
+            read_error_only(&reply, 0),
+            ErrorCode::NotCoordinator.as_i16()
+        );
+
+        // One member of "g": the leader's assignor covers both partitions,
+        // not only the one this node leads.
+        let protocols: &[(&str, &[u8])] = &[("range", b"sub-events")];
+        let reply = call(addr, 11, 2, 6, &join_body(2, "g", "", protocols))
+            .await
+            .unwrap();
+        let joined = read_join(&reply, 2);
+        assert_eq!(joined.error, 0);
+        let assignment = consumer_assignment("events", &[0, 1]);
+        let reply = call(
+            addr,
+            14,
+            1,
+            8,
+            &sync_body(
+                1,
+                "g",
+                joined.generation,
+                &joined.member_id,
+                &[(joined.member_id.as_str(), assignment.as_slice())],
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_sync(&reply, 1).0,
+            0,
+            "an assignment covering every partition of the topic is this coordinator's to place"
+        );
+
+        // A commit for partition 0 — which this gateway does not lead — is
+        // stored here, because this gateway coordinates the group.
+        let reply = call(
+            addr,
+            8,
+            7,
+            9,
+            &offset_commit_body(
+                7,
+                "g",
+                joined.generation,
+                &joined.member_id,
+                "events",
+                0,
+                11,
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_offset_commit(&reply, 7), vec![(0, 0)]);
+        let reply = call(
+            addr,
+            8,
+            7,
+            10,
+            &offset_commit_body(
+                7,
+                "g",
+                joined.generation,
+                &joined.member_id,
+                "events",
+                1,
+                0,
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_offset_commit(&reply, 7), vec![(1, 0)]);
+        assert_eq!(
+            store.fetch("g", "events", 0).await.unwrap().unwrap().offset,
+            11
+        );
+        assert_eq!(
+            store.fetch("g", "events", 1).await.unwrap().unwrap().offset,
+            0
+        );
+    }
     /// (review): an offset committed for a topic this gateway no longer
     /// serves is still what the group committed, and a client naming its
     /// assignment resumes by it.
