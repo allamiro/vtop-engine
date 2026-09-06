@@ -4980,18 +4980,15 @@ mod tests {
     /// name the same coordinator, which is how a group does not split.
     #[tokio::test]
     async fn coordinator_election_does_not_follow_the_topology_order() {
-        let (addr, _stop) = start_groups_tuned(
-            Arc::new(MemoryBridge::with_topics(["events"])),
-            None,
-            |c| {
+        let (addr, _stop) =
+            start_groups_tuned(Arc::new(MemoryBridge::with_topics(["events"])), None, |c| {
                 c.node_id = 9;
                 c.partition = 1;
                 let mut peers = two_partition_topology(c.advertised_port);
                 peers.reverse();
                 c.partitions = peers;
-            },
-        )
-        .await;
+            })
+            .await;
         let reply = call(addr, 10, 1, 1, &find_coordinator_body(1, "g", 0))
             .await
             .unwrap();
@@ -5005,7 +5002,10 @@ mod tests {
             .await
             .unwrap();
         let (error, node, host, port) = read_find_coordinator(&reply, 1);
-        assert_eq!((error, node, host.as_str(), port), (0, 7, "other.example", 9092));
+        assert_eq!(
+            (error, node, host.as_str(), port),
+            (0, 7, "other.example", 9092)
+        );
     }
 
     fn two_partition_topology(this_port: i32) -> Vec<PartitionLeader> {
