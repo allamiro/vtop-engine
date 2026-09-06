@@ -1361,6 +1361,92 @@ impl MetaStateMachine {
                     expected_checkpoint_generation: *expected_checkpoint_generation,
                 })
             }
+            MetadataCommand::EnsureGroupMemberCoordinated {
+                name,
+                group_uuid,
+                member_uuid,
+                topic_uuid,
+                range_uuid,
+                coordinator_topic_uuid,
+                coordinator_range_uuid,
+                holder_node_uuid,
+                fencing_epoch,
+                ..
+            } => {
+                // The lease the coordinator DOES hold (#457 slice 4). It
+                // leads `coordinator_range_uuid` under its own
+                // `coordinator_topic_uuid`, and is registering a member
+                // against `range_uuid`, a partition it never leads. The pair
+                // is carried whole because a Kafka partition is a range under
+                // a topic of its own: the coordinator's lease is not found
+                // under the topic the cursor lands on.
+                if let Some(refusal) = self.not_the_leaseholder(
+                    *coordinator_topic_uuid,
+                    *coordinator_range_uuid,
+                    *holder_node_uuid,
+                    *fencing_epoch,
+                ) {
+                    return refusal;
+                }
+                self.ensure_group_member_for_range(
+                    apply_index,
+                    name,
+                    *group_uuid,
+                    *member_uuid,
+                    *topic_uuid,
+                    *range_uuid,
+                )
+            }
+            MetadataCommand::CommitGroupCursorCoordinated {
+                group_uuid,
+                member_uuid,
+                topic_uuid,
+                range_uuid,
+                coordinator_topic_uuid,
+                coordinator_range_uuid,
+                topic_epoch,
+                range_generation,
+                segment_uuid,
+                segment_generation,
+                segment_root,
+                record_offset,
+                record_index,
+                lineage_transition_id,
+                expected_checkpoint_generation,
+                holder_node_uuid,
+                fencing_epoch,
+                ..
+            } => {
+                if let Some(refusal) = self.not_the_leaseholder(
+                    *coordinator_topic_uuid,
+                    *coordinator_range_uuid,
+                    *holder_node_uuid,
+                    *fencing_epoch,
+                ) {
+                    return refusal;
+                }
+                // Everything past the fence is the ordinary commit: the
+                // cursor is still bound to the TARGET range's lineage and
+                // still moves under the same compare-and-set, so a
+                // coordinator holding a stale view of a partition it does not
+                // lead is refused by the lineage, exactly as its leader would
+                // have been.
+                self.commit_group_cursor(CommitCursorArgs {
+                    group_uuid: *group_uuid,
+                    member_uuid: *member_uuid,
+                    topic_uuid: *topic_uuid,
+                    range_uuid: *range_uuid,
+                    topic_epoch: *topic_epoch,
+                    range_generation: *range_generation,
+                    segment_uuid: *segment_uuid,
+                    segment_generation: *segment_generation,
+                    segment_root: *segment_root,
+                    record_offset: *record_offset,
+                    record_index: *record_index,
+                    lineage_transition_id: *lineage_transition_id,
+                    expected_checkpoint_generation: *expected_checkpoint_generation,
+                })
+            }
             MetadataCommand::HeartbeatMember {
                 group_uuid,
                 member_uuid,
@@ -5677,6 +5763,184 @@ mod tests {
             ),
             MetadataResponse::Rejected(MetadataError::NotFound)
         ));
+    }
+
+    /// A Kafka group spans every partition and one broker coordinates it, so
+    /// the coordinator commits offsets for partitions it does not lead (#457
+    /// slice 4). A Kafka partition is a range under a topic of its own here,
+    /// so "does not lead" means a different topic entirely — and the fence
+    /// moves to the range the coordinator DOES lead. What that buys: the
+    /// moment the coordinator loses its own lease it stops being able to move
+    /// any group's position, on any partition, which is exactly when it stops
+    /// being the coordinator.
+    #[test]
+    fn a_coordinator_commits_on_a_range_it_does_not_lead() {
+        let (mut machine, node_a, mine_topic, mine_range) = leaseable_range(10);
+        let node_b = Uuid::from_u128(11);
+        let (their_topic, their_range) = (Uuid::from_u128(22), Uuid::from_u128(23));
+        assert!(matches!(
+            machine.apply(
+                3,
+                &MetadataCommand::RegisterNode {
+                    env: envelope(3),
+                    node_uuid: node_b,
+                    addr: "n2:9200".to_owned(),
+                    expected_generation: None,
+                }
+            ),
+            MetadataResponse::Ack { .. }
+        ));
+        assert!(matches!(
+            machine.apply(
+                4,
+                &MetadataCommand::CreateTopic {
+                    env: envelope(4),
+                    name: "events.v1.p1".to_owned(),
+                    topic_uuid: their_topic,
+                    root_range_uuid: their_range,
+                }
+            ),
+            MetadataResponse::TopicCreated { .. }
+        ));
+        let (group_uuid, member_uuid) = (Uuid::from_u128(0x80), Uuid::from_u128(0x81));
+        let generation = range_of(&machine, mine_topic, mine_range).generation;
+        let MetadataResponse::LeaseGranted { fencing_epoch } = acquire(
+            &mut machine,
+            5,
+            5,
+            1_000,
+            node_a,
+            mine_topic,
+            mine_range,
+            generation,
+            60_000,
+        ) else {
+            panic!("a lease on the range this node leads");
+        };
+        let ensure =
+            |env: u128, holder: Uuid, epoch: u64| MetadataCommand::EnsureGroupMemberCoordinated {
+                env: envelope(env),
+                name: "coordinated".to_owned(),
+                group_uuid,
+                member_uuid,
+                topic_uuid: their_topic,
+                range_uuid: their_range,
+                coordinator_topic_uuid: mine_topic,
+                coordinator_range_uuid: mine_range,
+                holder_node_uuid: holder,
+                fencing_epoch: epoch,
+            };
+        let not_holder = |answer: MetadataResponse| {
+            matches!(
+                answer,
+                MetadataResponse::Rejected(MetadataError::InvalidTransition(reason))
+                    if reason == crate::command::NOT_LEASEHOLDER
+            )
+        };
+        assert!(
+            not_holder(machine.apply(6, &ensure(6, node_b, fencing_epoch))),
+            "a node that holds no lease coordinates nothing"
+        );
+        assert!(matches!(
+            machine.apply(7, &ensure(7, node_a, fencing_epoch)),
+            MetadataResponse::Ack { .. }
+        ));
+        let their_epoch = match machine.record(&MetaKey::Topic {
+            topic_uuid: their_topic,
+        }) {
+            Some(MetaValue::Topic(topic)) => topic.topic_epoch,
+            other => panic!("expected the other partition's topic, got {other:?}"),
+        };
+        let lineage = range_of(&machine, their_topic, their_range).lineage_generation;
+        let commit =
+            |env: u128,
+             offset: u64,
+             expected: Option<u64>,
+             range_generation: u64,
+             holder: Uuid,
+             epoch: u64| MetadataCommand::CommitGroupCursorCoordinated {
+                env: envelope(env),
+                group_uuid,
+                member_uuid,
+                topic_uuid: their_topic,
+                range_uuid: their_range,
+                coordinator_topic_uuid: mine_topic,
+                coordinator_range_uuid: mine_range,
+                topic_epoch: their_epoch,
+                range_generation,
+                segment_uuid: Uuid::nil(),
+                segment_generation: 0,
+                segment_root: [0; 32],
+                record_offset: offset,
+                record_index: 0,
+                lineage_transition_id: None,
+                expected_checkpoint_generation: expected,
+                holder_node_uuid: holder,
+                fencing_epoch: epoch,
+            };
+        assert!(matches!(
+            machine.apply(8, &commit(8, 10, None, lineage, node_a, fencing_epoch)),
+            MetadataResponse::CursorCommitted {
+                checkpoint_generation: 0
+            }
+        ));
+        assert!(
+            not_holder(machine.apply(
+                9,
+                &commit(9, 11, Some(0), lineage, node_a, fencing_epoch + 1)
+            )),
+            "an epoch this node was never granted"
+        );
+        assert!(
+            not_holder(machine.apply(10, &commit(10, 11, Some(0), lineage, node_b, fencing_epoch))),
+            "another node at this node's epoch"
+        );
+        // The target range's lineage still binds the cursor. A coordinator
+        // reading a stale view of a partition it does not lead is refused by
+        // the same rule its leader would have been.
+        assert!(matches!(
+            machine.apply(
+                11,
+                &commit(11, 11, Some(0), lineage + 1, node_a, fencing_epoch)
+            ),
+            MetadataResponse::Rejected(MetadataError::LineageMismatch { .. })
+        ));
+        // Deposed: the lease that made it the coordinator is gone, so every
+        // commit it sends is refused — on a partition whose own leader never
+        // changed.
+        assert!(matches!(
+            machine.apply(
+                12,
+                &MetadataCommand::ReleaseRangeLease {
+                    env: envelope(12),
+                    topic_uuid: mine_topic,
+                    range_uuid: mine_range,
+                    expected_fencing_epoch: fencing_epoch,
+                }
+            ),
+            MetadataResponse::Ack { .. }
+        ));
+        assert!(
+            not_holder(machine.apply(13, &commit(13, 11, Some(0), lineage, node_a, fencing_epoch))),
+            "a coordinator that lost its own lease moves nobody's position"
+        );
+        assert!(
+            not_holder(machine.apply(14, &ensure(14, node_a, fencing_epoch))),
+            "and registers no more members either"
+        );
+        let cursor = match machine.record(&MetaKey::GroupCursor {
+            group_uuid,
+            topic_uuid: their_topic,
+            range_uuid: their_range,
+        }) {
+            Some(MetaValue::GroupCursor(cursor)) => cursor.clone(),
+            other => panic!("expected the committed cursor, got {other:?}"),
+        };
+        assert_eq!(
+            (cursor.record_offset, cursor.checkpoint_generation),
+            (10, 0),
+            "the position that stands is the one commit that was fenced by a lease actually held"
+        );
     }
 
     /// A fenced cursor commit needs the range's current leaseholder at its
