@@ -150,6 +150,13 @@ impl ReceiptLog {
     /// DualBridge must not ack a write whose translation would vanish on
     /// restart.
     pub fn record(&self, receipt: Receipt) -> Result<(), ErrorCode> {
+        // One lock covers the durable append and the in-memory row so two
+        // interned callers cannot interleave writeln! bytes or diverge
+        // file order from vector order.
+        let mut rows = self
+            .rows
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(path) = &self.path {
             if let Err(error) = std::fs::OpenOptions::new()
                 .create(true)
@@ -169,10 +176,7 @@ impl ReceiptLog {
                 return Err(ErrorCode::KafkaStorageError);
             }
         }
-        self.rows
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(receipt);
+        rows.push(receipt);
         Ok(())
     }
 
