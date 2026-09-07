@@ -235,7 +235,7 @@ services:
   #   docker compose -f docker-compose.yml -f docker-compose.observability.yml \
   #       up --force-recreate grafana-seed
   grafana-seed:
-    image: curlimages/curl:8.21.0
+    image: curlimages/curl:8.22.0
     container_name: vtop-grafana-seed
     security_opt:
       - no-new-privileges:true
