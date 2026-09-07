@@ -447,6 +447,22 @@ Cutover records a barrier offset for each parent and the ordered child mapping.
 Parent ranges remain readable until all durable consumer cursors and retention
 rules permit retirement.
 
+A Kafka partition is an independent log, which is what a range is, so the
+gateway presents one partition per range (#457): a node's `kafka.partition`
+says which index its range is, and `kafka.partitions` names every partition of
+that Kafka topic with the broker leading it. Metadata then answers with every
+broker and every partition, and each gateway serves only its own — a produce
+or fetch for another partition is `NOT_LEADER_OR_FOLLOWER`, which a
+stock client answers by refreshing its metadata and going to the broker that
+leads it, and one for a partition no broker leads is not that topic's at all.
+Offset commits are the coordinator's: the broker the topology elects for the
+group stores every partition of the topic, including those it does not lead,
+and a gateway that is not that broker answers `NOT_COORDINATOR`.
+With no topology configured nothing changes: one partition, this gateway's.
+A partition's ranges are not key-space shards of one topic — that is the
+lineage model of #473 — so each partition keeps its own full-keyspace root
+range and its own valid segment descriptors.
+
 A cursor may stand UNPINNED (#457, #468): a nil segment id, bound to the topic
 epoch and the range's lineage generation, its record offset the position. This
 is how a Kafka consumer group's committed offset lives on the plane — a
@@ -475,6 +491,15 @@ to coordinate which group — the plane cannot see a Kafka topology, so that
 rule lives in the gateway — and the compare-and-set on the checkpoint
 generation is what keeps two writers from silently losing each other's update.
 A single-partition deployment sends the plain fenced commit and is unaffected.
+
+A Kafka topic name is not always this node's range (#458). `kafka.topics`
+maps each name to a backend: native storage, an external cluster spoken with
+the same codecs, or a dual-write / shadow-read pair. Metadata is that catalog;
+a name in no backend is `UNKNOWN_TOPIC_OR_PARTITION` by name. Dual-write
+appends both sides and records a receipt (`vtopctl receipt --file`) of which
+native offset a Kafka offset became and a hash of the records; a shadow-read
+serves the native copy and a mismatch is `CORRUPT_MESSAGE`, never a silent
+divergence. Today's config without `kafka.topics` is one native topic.
 
 ## 8. Consensus, fencing, and replication
 

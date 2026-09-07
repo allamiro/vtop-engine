@@ -118,7 +118,7 @@ struct ProducerWindow {
 
 /// What a remembered set's records were: their timestamps, keys, values and
 /// headers, hashed. The memory bridge is a test double, so a 64-bit hash is enough.
-fn set_fingerprint(batches: &[RecordBatch]) -> u64 {
+pub(crate) fn set_fingerprint(batches: &[RecordBatch]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for batch in batches {

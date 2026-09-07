@@ -1,17 +1,18 @@
-//! Consumer groups on one gateway (#457, slice 2): the classic group
+//! Consumer groups on one gateway (#457, slice 2 and 4b): the classic group
 //! protocol's coordinator, in memory.
 //!
-//! This gateway is the coordinator of every group it serves — one range,
-//! one partition, one leader — so a group's whole life is here: members
-//! join, the coordinator holds each join until every member of the round is
-//! in (or the round's deadline passes), the round completes with a new
-//! generation, a leader and a protocol, the leader's SyncGroup hands out the
-//! assignment the CLIENT-SIDE assignor computed, heartbeats keep a member
-//! alive, and a leave or a missed session ends it. Membership is ephemeral
-//! by design: a coordinator that restarts has empty groups and every member
-//! rejoins, as it would with a Kafka broker that moved the group. What must
-//! outlive the coordinator — committed offsets — is the offset store's
-//! business, not this module's.
+//! This gateway is the coordinator of the groups the topology elects onto it
+//! — one coordinator per group, the same answer from every gateway given the
+//! same partition list. A group's whole life is here: members join, the
+//! coordinator holds each join until every member of the round is in (or the
+//! round's deadline passes), the round completes with a new generation, a
+//! leader and a protocol, the leader's SyncGroup hands out the assignment
+//! the CLIENT-SIDE assignor computed (covering every partition of the topic),
+//! heartbeats keep a member alive, and a leave or a missed session ends it.
+//! Membership is ephemeral by design: a coordinator that restarts has empty
+//! groups and every member rejoins, as it would with a Kafka broker that
+//! moved the group. What must outlive the coordinator — committed offsets —
+//! is the offset store's business, not this module's.
 //!
 //! Every code a client acts on is the protocol's own: `UNKNOWN_MEMBER_ID`
 //! when a member is not one, `ILLEGAL_GENERATION` when its generation is
