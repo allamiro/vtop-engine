@@ -380,16 +380,61 @@ and the **absolute numbers** are not quotable.
 - **The benchmark numbers carry the busy-laptop caveat** stated above; a
   quiet-machine run would tighten them, not change their shape.
 
-## v0.6.0 and beyond
+## v0.6.0 — the gateway's second phase, and the evidence gaps the first one exposed
 
-The theme is **the gateway's second phase and the evidence gaps the first
-one exposed**: consumer groups and idempotent producers over lineage-bound
-cursors (#457), then per-topic virtualization with verifiable offset
-translation (#458); the replica plane refusing what it cannot frame (#453);
-the published watermark that never regresses (#449); the retention-loss
-alert (#454); a kind suite that waits on conditions rather than deadlines
-(#416). Behind those: the FIPS story (#296) and the adaptive source side
-(#100, #101) whose target side shipped here.
+The theme is **a stock Kafka client can join a group, produce idempotently,
+and migrate a topic with a receipt that survives restart**, without giving
+up what the native plane already proved. The evidence-gap items that
+landed on `main` after v0.5.0 ride this tag too.
+
+- **Consumer groups and idempotent producers (#457).** InitProducerId mints
+  an id; a retried batch appends once. A topology-elected coordinator
+  (Java `String.hashCode` then Kafka's abs, by partition index, not peer
+  order) covers every partition and stores commits on ranges it does not
+  lead, fenced by the lease it does hold. Each gateway serves exactly the
+  partition it leads and advertises the rest, so a produce or fetch for
+  another is refused by name. Live-chaos scenario 21: two kcat members,
+  one partition each, byte-exact reads.
+- **Per-topic virtualization with verifiable receipts (#458).** `kafka.topics`
+  binds each Kafka name to native storage, an external cluster, or a
+  dual-write / shadow-read pair. A dual-write lands on the primary first;
+  a shadow failure is `KAFKA_STORAGE_ERROR`, never an ack for a one-sided
+  write. Shadow-reads compare key, timestamp, headers and value.
+  Cutover translates committed offsets through a JSONL receipt that
+  survives restart; `vtopctl receipt` prints it. Kafka-only catalog names
+  refuse OffsetCommit rather than a process-local cursor.
+- **An append the replica plane cannot frame is refused at the leader
+  (#453)**, before the append, instead of a quorum that never arrives.
+- **A published high-water mark never regresses across a leader change
+  (#449):** a promotion's boundary is held to a watermark the range
+  already published.
+- **Retention loss is on the dashboard and alerts (#454).**
+- **The kind suite waits on conditions rather than one-shot deadlines
+  (#416)**, and a lease-read error is named rather than swallowed (#469).
+- **A node that voted for the loser still records the elected leader's
+  committed vote (#465)**, so hard-state cannot wedge the metadata plane.
+
+### Known limitations in v0.6.0
+
+- **One gateway still serves one range.** Duplicate `node_id` is refused
+  even when endpoints agree. Multi-partition-per-broker is range-split —
+  #473 / v0.7.0.
+- **Transactions are out of scope.** InitProducerId with a transactional
+  id is refused by name.
+- **RemoteBridge virtualizes one log per Kafka name** and always speaks
+  remote partition 0. Another partition is refused at this gateway.
+- **A sequenced remote produce the client never saw acked can still
+  duplicate across a gateway restart**: remote producer identity is
+  process-local. In-process retries are rebased and reminted.
+- **The benchmark numbers still carry the busy-laptop caveat** from
+  v0.5.0; a quiet-machine run would tighten them, not change their shape.
+
+## v0.7.0 and beyond
+
+The theme is **splitting a range the formats already expect**: one broker
+leading several Kafka partitions (#473), then whatever of FIPS (#296) and
+the adaptive source side (#100, #101) still sits behind a design, not a
+slice.
 
 ---
 
