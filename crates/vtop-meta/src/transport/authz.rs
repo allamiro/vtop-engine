@@ -149,6 +149,14 @@ pub fn classify(command: &MetadataCommand) -> (CommandClass, Option<Uuid>) {
         }
         | MetadataCommand::CommitGroupCursorCoordinated {
             holder_node_uuid, ..
+        }
+        // A split is the parent leaseholder's move and nobody else's (#473):
+        // the barrier offset is a claim about that node's own log, and the
+        // state machine refuses the command unless the named holder holds
+        // the parent at the named epoch — authorization and fence name the
+        // same node, exactly as the sealed-segment register does.
+        | MetadataCommand::SplitRange {
+            holder_node_uuid, ..
         } => (CommandClass::NodeScoped, Some(*holder_node_uuid)),
         _ => (CommandClass::ClusterScoped, None),
     }

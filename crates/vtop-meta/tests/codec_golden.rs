@@ -18,6 +18,46 @@ use vtop_meta::{
 const ROOT: &str = "/meta";
 const SEED: u64 = 0x5eed_0093;
 
+/// The pinned SplitRange command (#473): request ...ee02, barrier 0x280,
+/// CAS 1, holder bbbbbbbb…31 at epoch 1.
+const GOLDEN_SPLIT_COMMAND_HEX: &str = concat!(
+    "002300112233445566778899aabbccddee020102030405060708ffeeddccbbaa99887766",
+    "5544332211000f1e2d3c4b5a69788796a5b4c3d2e1f0aaaaaaaa00000000000000000000",
+    "0041aaaaaaaa000000000000000000000042cccccccc0000000000000000000000770000",
+    "0000000002800000000000000001bbbbbbbb000000000000000000000031000000000000",
+    "0001",
+);
+/// The snapshot payload after the pinned split: the sealed parent under
+/// the v3 range tag, both children with parents on record, and the
+/// lineage-transition record, exactly as the production snapshot writes
+/// them.
+const GOLDEN_SPLIT_STATE_PAYLOAD_HEX: &str = concat!(
+    "0001000000080013000002bbbbbbbb000000000000000000000031000000190c00076e31",
+    "3a39323030010000000000000000000000000064000b00000361756469742e7631000000",
+    "1903ffeeddccbbaa9988776655443322110000000000000000010013000004ffeeddccbb",
+    "aa998877665544332211000000001b02000861756469742e763100000000000000010000",
+    "0000000000000023000005ffeeddccbbaa998877665544332211000f1e2d3c4b5a697887",
+    "96a5b4c3d2e1f00000005d14000000000000000200000000000000000000000000000000",
+    "01000000000000000000010000000000000280cccccccc00000000000000000000007701",
+    "bbbbbbbb0000000000000000000000310000000000000001000000000000000300230000",
+    "05ffeeddccbbaa99887766554433221100aaaaaaaa000000000000000000000041000000",
+    "351400000000000000000000000000000000010000000000000000000000000000000101",
+    "0f1e2d3c4b5a69788796a5b4c3d2e1f000000023000005ffeeddccbbaa99887766554433",
+    "221100aaaaaaaa0000000000000000000000420000003514000000000000000080000000",
+    "000000000100000000000000000000000000000001010f1e2d3c4b5a69788796a5b4c3d2",
+    "e1f00000002b000012ffeeddccbbaa998877665544332211000f1e2d3c4b5a69788796a5",
+    "b4c3d2e1f0000000000000000100000034130000000000000000000000000000000100bb",
+    "bbbbbb000000000000000000000031020000000000000000000000000000000300002300",
+    "0013ffeeddccbbaa99887766554433221100cccccccc0000000000000000000000770000",
+    "0049150f1e2d3c4b5a69788796a5b4c3d2e1f00000000000000280aaaaaaaa0000000000",
+    "00000000000041aaaaaaaa00000000000000000000004200000000000000010102030405",
+    "0607080000000400112233445566778899aabbccddeeff0000002a0002ffeeddccbbaa99",
+    "88776655443322110000000000000000010f1e2d3c4b5a69788796a5b4c3d2e1f0001122",
+    "33445566778899aabbccddee030000000a00010000000000000000001122334455667788",
+    "99aabbccddee010000000a0003000000000000000100112233445566778899aabbccddee",
+    "020000000a00010000000000000002",
+);
+
 /// v1 hard state: term 3, vote for node 7 committed, generation 1.
 const GOLDEN_HARD_STATE_HEX: &str = concat!(
     "56544f504d48533100010000000000000003010000000000000007010000000000000001",
@@ -180,6 +220,83 @@ fn golden_command() -> MetadataCommand {
         topic_uuid: Uuid::parse_str("ffeeddcc-bbaa-9988-7766-554433221100").unwrap(),
         root_range_uuid: Uuid::parse_str("0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0").unwrap(),
     }
+}
+
+/// The pinned SplitRange command (#473 slice 1): every field a distinct
+/// byte pattern, so a swapped pair cannot cancel out in the vector.
+fn golden_split_command() -> MetadataCommand {
+    MetadataCommand::SplitRange {
+        env: CommandEnvelope {
+            // A request id of its OWN: the dedup FIFO replays a reused id
+            // with the first command answer, which is exactly what it is
+            // for and exactly not what a golden vector wants.
+            request_id: Uuid::parse_str("00112233-4455-6677-8899-aabbccddee02").unwrap(),
+            issued_at_ms: 0x0102_0304_0506_0708,
+        },
+        topic_uuid: Uuid::parse_str("ffeeddcc-bbaa-9988-7766-554433221100").unwrap(),
+        parent_range_uuid: Uuid::parse_str("0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0").unwrap(),
+        left_range_uuid: Uuid::parse_str("aaaaaaaa-0000-0000-0000-000000000041").unwrap(),
+        right_range_uuid: Uuid::parse_str("aaaaaaaa-0000-0000-0000-000000000042").unwrap(),
+        transition_id: Uuid::parse_str("cccccccc-0000-0000-0000-000000000077").unwrap(),
+        barrier_offset: 0x0000_0000_0000_0280,
+        expected_range_generation: 0x0000_0000_0000_0001,
+        holder_node_uuid: Uuid::parse_str("bbbbbbbb-0000-0000-0000-000000000031").unwrap(),
+        fencing_epoch: 0x0000_0000_0000_0001,
+    }
+}
+
+#[test]
+fn split_range_command_matches_golden_vector() {
+    let encoded = golden_split_command().encode().unwrap();
+    assert_eq!(to_hex(&encoded), GOLDEN_SPLIT_COMMAND_HEX);
+    assert_eq!(
+        MetadataCommand::decode(&encoded).unwrap(),
+        golden_split_command(),
+        "the pinned bytes must decode back to the pinned command"
+    );
+}
+
+/// The snapshot payload after a split (#473): pins the v3 range tag with
+/// parents and seal, the children, and the lineage-transition record as the
+/// production snapshot path writes them. A replica snapshotted by this build
+/// and restored by a later one reads exactly these bytes.
+#[test]
+fn split_state_snapshot_matches_golden_vector() {
+    let mut machine = MetaStateMachine::new();
+    machine.apply(1, &golden_command());
+    machine.apply(
+        2,
+        &MetadataCommand::RegisterNode {
+            env: CommandEnvelope {
+                request_id: Uuid::parse_str("00112233-4455-6677-8899-aabbccddee03").unwrap(),
+                issued_at_ms: 0,
+            },
+            node_uuid: Uuid::parse_str("bbbbbbbb-0000-0000-0000-000000000031").unwrap(),
+            addr: "n1:9200".to_owned(),
+            expected_generation: None,
+        },
+    );
+    machine.apply(
+        3,
+        &MetadataCommand::GrantRangeLease {
+            env: CommandEnvelope {
+                request_id: Uuid::parse_str("00112233-4455-6677-8899-aabbccddee01").unwrap(),
+                issued_at_ms: 0,
+            },
+            topic_uuid: Uuid::parse_str("ffeeddcc-bbaa-9988-7766-554433221100").unwrap(),
+            range_uuid: Uuid::parse_str("0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0").unwrap(),
+            holder_node_uuid: Uuid::parse_str("bbbbbbbb-0000-0000-0000-000000000031").unwrap(),
+            expected_range_generation: 0,
+        },
+    );
+    let split = machine.apply(4, &golden_split_command());
+    assert!(
+        matches!(split, vtop_meta::MetadataResponse::Ack { .. }),
+        "the golden split must land or the vector pins a refusal: {split:?}"
+    );
+    let payload = machine.encode_snapshot().unwrap();
+    assert_eq!(to_hex(&payload), GOLDEN_SPLIT_STATE_PAYLOAD_HEX);
+    MetaStateMachine::decode_snapshot(&payload).unwrap();
 }
 
 fn golden_entry() -> MetaLogEntry {

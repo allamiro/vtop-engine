@@ -41,6 +41,7 @@ const CATEGORY_SEGMENT_REBALANCE_INTENT: u8 = 15;
 const CATEGORY_SEGMENT_TIER_COPY: u8 = 16;
 const CATEGORY_TOPIC_RETENTION_POLICY: u8 = 17;
 const CATEGORY_RANGE_TRANSITION: u8 = 18;
+const CATEGORY_LINEAGE_TRANSITION: u8 = 19;
 
 /// Consumer-group names reuse the topic-name bound so group identity stays
 /// allocation-bounded on the wire and in snapshots.
@@ -146,6 +147,15 @@ pub enum MetaKey {
         range_uuid: Uuid,
         fencing_epoch: u64,
     },
+    /// One lineage transition of a topic's key space (#473): the durable
+    /// record of a split — parent, barrier, ordered children — keyed by the
+    /// transition id the split named. Topic-scoped rather than range-scoped
+    /// because the object it describes spans three ranges, and the cursor
+    /// carry (#468's rule) looks it up by the id a cursor carries.
+    LineageTransition {
+        topic_uuid: Uuid,
+        transition_id: Uuid,
+    },
 }
 
 /// Validate a topic name against the shared 249-byte semantics.
@@ -193,6 +203,7 @@ impl MetaKey {
             MetaKey::SegmentTierCopy { .. } => CATEGORY_SEGMENT_TIER_COPY,
             MetaKey::TopicRetentionPolicy { .. } => CATEGORY_TOPIC_RETENTION_POLICY,
             MetaKey::RangeTransition { .. } => CATEGORY_RANGE_TRANSITION,
+            MetaKey::LineageTransition { .. } => CATEGORY_LINEAGE_TRANSITION,
         }
     }
 
@@ -289,6 +300,13 @@ impl MetaKey {
                 put_uuid(&mut out, *topic_uuid);
                 put_uuid(&mut out, *range_uuid);
                 put_u64(&mut out, *fencing_epoch);
+            }
+            MetaKey::LineageTransition {
+                topic_uuid,
+                transition_id,
+            } => {
+                put_uuid(&mut out, *topic_uuid);
+                put_uuid(&mut out, *transition_id);
             }
         }
         out
@@ -392,6 +410,10 @@ impl MetaKey {
                 range_uuid: reader.uuid("range uuid")?,
                 fencing_epoch: reader.u64("fencing epoch")?,
             },
+            CATEGORY_LINEAGE_TRANSITION => MetaKey::LineageTransition {
+                topic_uuid: reader.uuid("topic uuid")?,
+                transition_id: reader.uuid("transition id")?,
+            },
             CATEGORY_TOPIC_RETENTION_POLICY => MetaKey::TopicRetentionPolicy {
                 topic_uuid: reader.uuid("topic uuid")?,
             },
@@ -491,6 +513,13 @@ impl fmt::Display for MetaKey {
             MetaKey::TopicRetentionPolicy { topic_uuid } => {
                 write!(formatter, "/meta/0/topic-retention-policy/{topic_uuid}")
             }
+            MetaKey::LineageTransition {
+                topic_uuid,
+                transition_id,
+            } => write!(
+                formatter,
+                "/meta/0/lineage-transition/{topic_uuid}/{transition_id}"
+            ),
             MetaKey::RangeTransition {
                 topic_uuid,
                 range_uuid,
@@ -527,6 +556,10 @@ mod tests {
                 topic_uuid: Uuid::from_u128(2),
                 range_uuid: Uuid::from_u128(3),
                 segment_uuid: Uuid::from_u128(4),
+            },
+            MetaKey::LineageTransition {
+                topic_uuid: Uuid::from_u128(2),
+                transition_id: Uuid::from_u128(0x77),
             },
             MetaKey::Key {
                 key_uuid: Uuid::from_u128(5),
