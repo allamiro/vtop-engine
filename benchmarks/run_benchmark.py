@@ -77,6 +77,17 @@ def main() -> int:
     os.makedirs(results_root, exist_ok=True)
 
     sc = load_scenario(args.scenario)
+    # The launch mode is judged with the same before-it-costs-anything
+    # timing as the shape (#476): a typo'd runner_mode must refuse here,
+    # not fall back to host and record a run as something it was not.
+    try:
+        mode = engine.runner_mode(sc)
+    except ValueError as bad:
+        print(f"[bench] {bad}", file=sys.stderr)
+        return 2
+    if mode == "container":
+        print("[bench] runner_mode=container: the engine runs inside the "
+              "compose stack (profile `containerized` must be up)")
     # The shape is judged HERE, before a seed byte exists (#403): a bad knob
     # fails the run before it costs anything, and a shaped scenario never
     # runs unshaped under its own name.
@@ -102,7 +113,13 @@ def main() -> int:
     # `--seed-dir "$UNSET_VAR"`) falls through to mkdtemp, and must therefore be
     # owned by us - otherwise we would create a directory and then leak it.
     seed_dir_is_ours = not args.seed_dir
-    seed_dir = args.seed_dir or tempfile.mkdtemp(prefix=f"vtop-seed-{sc.name}-")
+    # ABSOLUTE from the start (review): a relative --seed-dir means one
+    # thing against the runner's cwd and another against the container's,
+    # and the generated config carries whichever spelling it was given.
+    if args.seed_dir:
+        seed_dir = os.path.abspath(args.seed_dir)
+    else:
+        seed_dir = tempfile.mkdtemp(prefix=f"vtop-seed-{sc.name}-")
     work_dir = tempfile.mkdtemp(prefix="vtop-work-")
     state_db = os.path.join(tempfile.mkdtemp(prefix="vtop-state-"), "state.db")
     input_glob = os.path.join(seed_dir, "*")
@@ -110,6 +127,48 @@ def main() -> int:
     config_path = os.path.join(os.path.dirname(state_db), "_engine.yaml")
     engine.write_engine_config(sc, work_dir, state_db, input_glob, config_path,
                                key_prefix=run_id)
+
+    def _cleanup_owned_scratch():
+        # Every early-refusal path removes the run's OWNED scratch the same
+        # way (review): the caller-supplied seed dir is never deleted, the
+        # writer's dir stays as the record of the refused run, and work +
+        # state + an owned seed dir go. One helper so a new refusal cannot
+        # forget one of the three.
+        writer.close()
+        if should_remove_seed_dir(seed_dir_is_ours, args.keep_seed):
+            shutil.rmtree(seed_dir, ignore_errors=True)
+        shutil.rmtree(work_dir, ignore_errors=True)
+        shutil.rmtree(os.path.dirname(state_db), ignore_errors=True)
+
+    if mode == "container":
+        # The command backends need external CLI tools (mc, aws, s3cmd)
+        # the hardened bench image does not carry (review): refuse them up
+        # front with the in-process alternative named, rather than failing
+        # every cycle on a missing binary.
+        if sc.get("backend") in ("minio", "awscli", "s3cmd"):
+            print(
+                f"[bench] runner_mode=container cannot use backend "
+                f"{sc.get('backend')!r}: it shells out to a CLI tool the "
+                "engine container does not carry. Use s3_native (in-process "
+                "S3) or localfs for container runs.",
+                file=sys.stderr)
+            _cleanup_owned_scratch()
+            return 2
+        # Refused HERE, before a seed byte exists — the same
+        # before-it-costs-anything timing as the shape and mode checks: a
+        # mis-mounted run root otherwise soaks for the full duration
+        # counting buried errors (#476, found live). The seed directory is
+        # created first (review): a caller-supplied --seed-dir that does
+        # not exist yet is the generator's to make, not the preflight's to
+        # refuse. And a refusal cleans up what this run already made
+        # (review): the writer's directory stays as the record of the
+        # refused run, but the owned scratch does not leak.
+        os.makedirs(seed_dir, exist_ok=True)
+        problem = engine.preflight_container(config_path, seed_dir, binary, scenario=sc)
+        if problem is not None:
+            print(f"[bench] {problem}", file=sys.stderr)
+            _cleanup_owned_scratch()
+            return 2
 
     start = time.time()
     start_iso = iso_now()
@@ -137,7 +196,23 @@ def main() -> int:
 
     # The pipe is shaped for exactly the block the measurements come from,
     # and unshaped on every way out of it (#403).
-    with SystemMonitor(emit_sys, interval=float(sc.get("sys_sample_interval", 1.0))), \
+    # Resource accounting names the SAME subject in both modes (review):
+    # container mode reads the engine container's own accounting, and host
+    # mode is scoped to just the engine's process subtree rather than the
+    # whole runner tree — the generator and the concurrent seeder are the
+    # harness, not the measured program, and counting them made host and
+    # container cpu/memory incomparable. The subtree filter names the
+    # engine binary; a sample that cannot find it reads 0 rather than the
+    # harness's load.
+    # RESOLVED before its basename (review): psutil reads the executable
+    # through Process.exe(), which follows a VTOPCTL_BIN symlink to its
+    # target, so matching on the link's own basename would exclude every
+    # engine process and report zero. realpath makes both sides name the
+    # resolved file.
+    engine_proc_name = os.path.basename(os.path.realpath(binary))
+    with SystemMonitor(emit_sys, interval=float(sc.get("sys_sample_interval", 1.0)),
+                       container="vtop-bench-engine" if mode == "container" else None,
+                       proc_name=None if mode == "container" else engine_proc_name), \
             shaping.shaped(sc, endpoint=engine.effective_endpoint(sc), shape=shape):
         # initial seed
         # A --seed-dir the caller supplied may already hold input. Those bytes
@@ -183,6 +258,7 @@ def main() -> int:
             if interval <= 0:
                 print("[bench] seed_interval_seconds must be > 0 when seeding "
                       f"concurrently; got {interval}", file=sys.stderr)
+                _cleanup_owned_scratch()
                 return 2
             # Whole-file formats are refused for the same reason a partially
             # written file is not a record: the seeder writes to the final path,
@@ -193,6 +269,7 @@ def main() -> int:
                 print("[bench] seed_concurrently cannot be used with whole-file "
                       "input: the engine may commit a partially written file",
                       file=sys.stderr)
+                _cleanup_owned_scratch()
                 return 2
 
             def _seed_loop():
@@ -473,6 +550,11 @@ def main() -> int:
         "shaping": shape.describe() if shape else None,
         # And flat, for the CSV, the summary table and the matrix (review).
         **(shape.flat_columns() if shape else {}),
+        # Which way the sender ran (#476), on every run including host-mode
+        # ones: a container's veth and its bridge hop are part of the
+        # measurement, and a number read without knowing the namespace is a
+        # number compared against the wrong baseline.
+        "runner_mode": engine.runner_mode(sc),
     }
     # CPU/mem summary from the system-metrics samples written during the run.
     summary.update(_sys_summary(writer.dir))

@@ -58,6 +58,87 @@ python3 benchmarks/run_benchmark.py benchmarks/scenarios/01-small-jsonl-gzip.yam
 
 Results land in `benchmarks/results/<run_id>/` (unique per run).
 
+### Where the sender runs: `runner_mode` (#476)
+
+Every scenario carries a `runner_mode` — `host` (the default, and the
+behaviour of every bundled scenario: `target/release/vtopctl` as a host
+process) or `container`, which execs the **same host-built binary**,
+mounted read-only, inside the compose stack's `vtop-engine` service:
+
+```bash
+cargo build --release --bin vtopctl   # the binary is bind-mounted read-only
+docker compose -f benchmarks/docker-compose.benchmark.yml --profile containerized up -d
+python3 benchmarks/run_benchmark.py my-containerized-scenario.yaml   # runner_mode: container
+```
+
+Build the binary **before** `compose up`: the `vtop-engine` service
+bind-mounts `target/release/vtopctl` read-only, and the mount is declared
+with `create_host_path: false` so Compose refuses to start (rather than
+silently mounting an empty directory in its place) if the binary is not
+there yet. A prior host-mode run also leaves it built.
+
+Container mode exists so something can later sit in the sender's L3 path
+(#477's middlebox): `tc` shapes only the interfaces of the namespace it
+runs in, and a host process reaching a published loopback port has no such
+interface. The mode is recorded as a `runner_mode` column in
+`metrics.csv`, `matrix.csv` and `summary.json` on **every** run, host mode
+included — a container's veth and bridge hop are part of the measurement,
+and a number must never be read without knowing which namespace produced
+it.
+
+Two constraints, stated rather than discovered:
+
+- **Shaped containerized runs are Linux-only.** On macOS (and any Docker
+  Desktop platform) the sender's traffic crosses a host-to-VM hop that sits
+  outside `tc`, so the profile the engine experiences is not the profile a
+  middlebox installs. Unshaped container runs work anywhere; numbers from
+  them still carry the virtualization tax of that platform.
+- **Container-mode credentials are environment credentials.** The keys,
+  session token and SDK endpoint overrides cross the boundary by name;
+  the PROFILE chain (`AWS_PROFILE`, `~/.aws/*`) does not — the hardened
+  container mounts no home directory, deliberately. Export keys (or use
+  the lab fallbacks) for container runs; profile-based identity is
+  host-mode-only until someone decides mounting credentials into the lab
+  container is worth it.
+- **Resource metrics are INTERVAL-sampled** (`sys_sample_interval`,
+  default 1 s): a host-mode engine subprocess that starts and exits
+  between two samples — a fast one-shot mock scenario — can be missed
+  entirely, reading near-zero cpu/memory. The numbers are meaningful for
+  the sustained scenarios metrics exist for (the soaks run the engine
+  continuously); for a one-shot drain, lower the interval or read the
+  batch-stage timings instead.
+- **Container-mode cpu/memory come from the container's own accounting**
+  (`docker stats`), because the engine there is no descendant of the
+  runner; thread and open-file counts are unavailable through that
+  surface and read 0. Host-wide disk/network counters are unchanged.
+- **Run directories must live under the mounted run root** (default
+  `/tmp`, overridable with `VTOP_BENCH_RUN_ROOT` — export `TMPDIR` to
+  match): the generated config names absolute paths, and the container
+  mounts the run root at the same path so the config means the same thing
+  in both namespaces.
+
+**The committed host↔container pair** (scenario 12's knobs at
+`duration_seconds: 60` — shortened from 300 under disk pressure; same
+seeder, same store, both modes on the same machine back-to-back):
+run ids `bp12-60s-host-20260908T093607Z-a6x5gf` and
+`bp12-60s-container-20260908T093747Z-twlcfm` (local artifacts —
+`results/` is never committed, so the numbers and conditions HERE are the
+canonical record), Linux 5.14 (RHEL 9),
+local MinIO via loopback (host) / compose bridge (container), 2026-09-08.
+Host: 156.4 files/s, upload p95 29ms, 0 errors. Container: 121.0 files/s,
+upload p95 17ms, 18 of ~40 cycle invocations returned nonzero with no
+outcomes (their stderr is not yet surfaced — #499 tracks that gap).
+
+That is a 23% throughput gap, which is LARGER than the 10% bar — so per
+that bar, treat container-mode numbers as measurements of the mode until
+this is explained and closed. What the pair already shows: the gap is not
+the data path — the container's upload p95 is LOWER — but the per-cycle
+launch, where host mode spawns a process and container mode runs
+`docker compose exec` (~100–200ms each) against cycles that are
+themselves short. A longer-duration soak amortizes it; so would a
+resident in-container cycle runner, which is #477-adjacent work. Compare
+container runs to container runs until then.
+
 ## 4. Run the full matrix
 
 ```bash
