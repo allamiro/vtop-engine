@@ -1346,9 +1346,9 @@ jobs:
           retention-days: 7
 
   # The MSRV is a tested promise, not a number in a file: this builds on exactly
-  # the declared toolchain. The floor is set by sqlx 0.9 (rust-version 1.94.0),
-  # which raised the aws-sdk crates' previous 1.91.1 floor; lowering it means
-  # pinning sqlx back to 0.8.
+  # the declared toolchain. The floor is set by aws-smithy-types 1.6.3
+  # (rust-version 1.94.1), which raised the 1.94.0 floor sqlx 0.9 set;
+  # lowering it means pinning aws-smithy-types back below 1.6.3.
   msrv:
     name: msrv (build on declared rust-version)
     needs: changes
