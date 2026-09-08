@@ -64,6 +64,23 @@ def should_remove_seed_dir(seed_dir_is_ours: bool, keep_seed: bool) -> bool:
     return seed_dir_is_ours and not keep_seed
 
 
+def measured_nothing(success: int, failed: int, errors: int,
+                     files_seeded: int = 0) -> bool:
+    """Whether a run's engine produced no batch at all from real input (#499).
+
+    Extracted so the refuse-loudly decision can be tested without driving a
+    real engine. A run where nothing committed and nothing failed-at-verify
+    measured nothing when EITHER the engine exited nonzero (config error) OR
+    input was actually seeded yet no batch came out — the latter covers the
+    case where every seeded file fails the adapter read, which the engine logs
+    and skips while still exiting 0, so a nonzero subprocess exit cannot be
+    required (review). Returning success in either case would file a non-run as
+    a fast, all-zeros success (exactly how scenario 07 hid at HEAD). A genuinely
+    empty run — no input seeded and no error — is NOT this case and must pass.
+    """
+    return success == 0 and failed == 0 and (errors > 0 or files_seeded > 0)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("scenario")
@@ -178,6 +195,11 @@ def main() -> int:
     out_bytes = 0
     in_bytes = 0
     success = failed = replayed = errors = 0
+    # The first no-outcome cycle's stderr, kept so a run that measured nothing
+    # can surface WHY in the results dir instead of leaving an all-zeros summary
+    # with the reason on a discarded stderr (#499).
+    engine_stderr = ""
+    no_outcome_cycles = 0
     comp_ratios = []
     files_seen = 0
     # Seeded bytes, tracked alongside the archived ones so the backlog is a
@@ -296,8 +318,17 @@ def main() -> int:
             print(f"[bench] seeding concurrently: {per_round} files every {interval}s")
         while True:
             rc, outcomes, stderr = engine.process_once(binary, config_path, sc)
-            if rc != 0 and not outcomes:
-                errors += 1
+            if not outcomes:
+                if rc != 0:
+                    errors += 1
+                # Keep the FIRST no-outcome cycle's stderr, keyed on the cycle
+                # COUNT rather than on the buffer being empty (review): a first
+                # empty-stderr cycle must still be the one preserved, and a
+                # cycle that exited 0 after every seeded file failed to read
+                # (logged and skipped) carries its diagnostic here too (#499).
+                no_outcome_cycles += 1
+                if no_outcome_cycles == 1:
+                    engine_stderr = stderr
             produced = 0
             cycle_success = 0
             cycle_fail = 0
@@ -572,6 +603,25 @@ def main() -> int:
     writer.write_summary(summary)
     writer.close()
 
+    # A run whose engine produced no batch from real input measured NOTHING
+    # (#499): a config error (nonzero exit) OR every seeded file failing the
+    # adapter read (logged, skipped, exit 0). Returning 0 with an all-zeros
+    # summary files a non-run as a fast success — exactly how scenario 07 hid
+    # at HEAD.
+    refuse = measured_nothing(success, failed, errors, files_seen)
+
+    # Surface the engine's own diagnostics in the results dir whenever there is
+    # a diagnostic to surface or a refusal to explain (#499): the reason a run
+    # went nowhere used to live only on a stderr the runner discarded, leaving
+    # nothing on disk but a zero row. The file is written even for an empty
+    # diagnostic so the refusal message below never points at a log that is not
+    # there (review); an empty file honestly records that the engine said
+    # nothing.
+    stderr_log = os.path.join(writer.dir, "engine-stderr.log")
+    if refuse or errors > 0:
+        with open(stderr_log, "w", encoding="utf-8") as fh:
+            fh.write(engine_stderr)
+
     if should_remove_seed_dir(seed_dir_is_ours, args.keep_seed):
         shutil.rmtree(seed_dir, ignore_errors=True)
     elif not seed_dir_is_ours:
@@ -584,6 +634,12 @@ def main() -> int:
 
     print(f"[bench] done: {success} ok, {failed} failed, {replayed} replayed in {duration_s}s")
     print(f"[bench] summary: {os.path.join(writer.dir, 'summary.md')}")
+
+    if refuse:
+        print(f"[bench] REFUSED: the engine produced no batch from "
+              f"{files_seen} seeded file(s) ({errors} error(s)); nothing was "
+              f"measured. Engine stderr: {stderr_log}", file=sys.stderr)
+        return 4
     return 0
 
 

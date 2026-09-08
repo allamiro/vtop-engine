@@ -11,7 +11,7 @@ import textwrap
 
 import pytest
 
-from lib.scenario import _coerce, _fallback_parse, load_scenario, reseed_count
+from lib.scenario import _coerce, _fallback_parse, _strip_inline_comment, load_scenario, reseed_count
 
 
 def write(tmp_path, text, name="s.yaml"):
@@ -115,6 +115,93 @@ def test_fallback_parse_keeps_literal_block_lines_on_their_own_lines():
     assert parsed["after"] == 1
 
 
+def test_fallback_parse_reads_a_block_sequence():
+    # Without PyYAML a YAML-list value must still reach the config as a list, or
+    # a command_env_allowlist would vanish and an env-authenticated command
+    # backend would lose its credentials (#499).
+    parsed = _fallback_parse(
+        "command_env_allowlist:\n"
+        "  - AWS_ACCESS_KEY_ID\n"
+        "  - AWS_SECRET_ACCESS_KEY\n"
+        "backend: awscli\n"
+    )
+    assert parsed["command_env_allowlist"] == [
+        "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
+    assert parsed["backend"] == "awscli", (
+        "the key after a sequence must still parse"
+    )
+
+
+def test_fallback_parse_sequence_strips_quotes_and_skips_interior_blanks():
+    parsed = _fallback_parse(
+        'k:\n  - "A"\n\n  - \'B\'\nnext: 5\n')
+    assert parsed["k"] == ["A", "B"]
+    assert parsed["next"] == 5
+
+
+def test_fallback_parse_empty_value_without_a_sequence_stays_empty():
+    # A bare "key:" with no list underneath is still the empty string, not a
+    # spurious list — the sequence branch must not fire on ordinary empties.
+    parsed = _fallback_parse("endpoint_url:\nname: x\n")
+    assert parsed["endpoint_url"] == ""
+    assert parsed["name"] == "x"
+
+
+def test_fallback_parse_sequence_skips_a_comment_between_items():
+    # A YAML comment between items must not terminate the sequence and drop the
+    # remaining entries (#499).
+    parsed = _fallback_parse(
+        "command_env_allowlist:\n"
+        "  - AWS_ACCESS_KEY_ID\n"
+        "  # the secret follows\n"
+        "  - AWS_SECRET_ACCESS_KEY\n"
+        "backend: awscli\n"
+    )
+    assert parsed["command_env_allowlist"] == [
+        "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
+    assert parsed["backend"] == "awscli"
+
+
+def test_fallback_parse_sequence_key_may_carry_an_inline_comment():
+    # "key: # note" is still an empty scalar introducing a sequence; the inline
+    # comment must not leave the value non-empty and skip the sequence branch.
+    parsed = _fallback_parse(
+        "command_env_allowlist: # credentials\n"
+        "  - AWS_ACCESS_KEY_ID\n"
+        "  - AWS_SECRET_ACCESS_KEY\n"
+        "next: 3\n"
+    )
+    assert parsed["command_env_allowlist"] == [
+        "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
+    assert parsed["next"] == 3
+
+
+def test_fallback_parse_keeps_a_hash_inside_a_token():
+    # A "#" that is not a comment (an issue reference, a URL fragment) stays in
+    # the value: comment-stripping keys on a preceding space, not any "#".
+    assert _strip_inline_comment("issue#98") == "issue#98"
+    assert _strip_inline_comment("value # note") == "value "
+
+
+def test_fallback_parse_keeps_a_hash_inside_a_quoted_value():
+    # A "#" inside a quoted region is content, not a comment: quote state is
+    # tracked before a comment can start, so a quoted sequence item survives.
+    assert _strip_inline_comment('"foo # bar"') == '"foo # bar"'
+    assert _strip_inline_comment("'foo # bar'") == "'foo # bar'"
+    parsed = _fallback_parse('k:\n  - "foo # bar"\n  - B\n')
+    assert parsed["k"] == ["foo # bar", "B"]
+
+
+def test_a_quote_mid_scalar_is_literal_not_a_delimiter():
+    # An apostrophe inside a PLAIN scalar (John's) must not open a quoted
+    # region and swallow a following comment: a quote opens a scalar only as
+    # its first non-whitespace character.
+    assert _strip_inline_comment("John's # note") == "John's "
+    assert _strip_inline_comment('  "quoted"') == '  "quoted"'
+    parsed = _fallback_parse("k:\n  - John's\n  - B\n")
+    assert parsed["k"] == ["John's", "B"]
+
+
 @pytest.mark.parametrize(
     "raw,expected",
     [
@@ -127,6 +214,42 @@ def test_fallback_parse_keeps_literal_block_lines_on_their_own_lines():
 )
 def test_coerce_types(raw, expected):
     assert _coerce(raw) == expected
+
+
+def test_coerce_reads_a_flow_sequence():
+    # Inline "[a, b]" must become a list, matching PyYAML, so a flow-style
+    # command_env_allowlist does not arrive as a bracketed string that splits
+    # into unusable "[AWS_..." / "...]" names (#499).
+    assert _coerce("[AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY]") == [
+        "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
+    assert _coerce("[]") == []
+    # a comma inside a quoted item does not split it
+    assert _coerce('["a,b", c]') == ["a,b", "c"]
+    # an apostrophe inside a PLAIN item is literal, not a quote delimiter, so it
+    # does not swallow the comma and the items after it
+    assert _coerce("[John's, B]") == ["John's", "B"]
+    assert _coerce("[a, don't, c]") == ["a", "don't", "c"]
+    # a doubled '' inside a single-quoted item is an escaped literal quote and
+    # stays in the region, so an interior comma does not split it, and _coerce
+    # unescapes it to a single quote (matching YAML)
+    assert _coerce("['a''b,c', B]") == ["a'b,c", "B"]
+    assert _coerce("'it''s'") == "it's"
+
+
+def test_a_hash_inside_a_doubled_quote_region_is_content():
+    # A doubled '' escape must keep a following '#' inside the quoted region
+    # rather than closing it and treating the '#' as a comment.
+    assert _strip_inline_comment("'a''b # c'") == "'a''b # c'"
+
+
+def test_fallback_parse_reads_a_flow_style_allowlist():
+    parsed = _fallback_parse(
+        "command_env_allowlist: [AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY]\n"
+        "backend: awscli\n"
+    )
+    assert parsed["command_env_allowlist"] == [
+        "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
+    assert parsed["backend"] == "awscli"
 
 
 # --------------------------------------------------------------------------

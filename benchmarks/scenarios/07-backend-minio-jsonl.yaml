@@ -1,12 +1,27 @@
 name: backend-minio-jsonl
-description: Real upload path to MinIO (requires benchmarks/docker-compose.benchmark.yml up).
+description: >-
+  Real one-shot upload path to MinIO over the shipped s3_native backend
+  (#499): the in-process S3 client the engine actually ships, the same
+  backend scenario 12 soaks, so a plain drain-once run measures what ships
+  and runs identically in host and container modes. The mc-based `minio`
+  command backend it used to name failed config validation on every cycle
+  (upload.command_binary must be an explicit absolute path) and is not
+  carried by the container image; s3_native needs no external CLI. Requires
+  benchmarks/docker-compose.benchmark.yml up.
 volume: 200
 file_size: small
 format: jsonl
 compression: gzip
 checksum: sha256
-backend: minio
-bucket: "telemetry-{format}"
+backend: s3_native
+# A LITERAL bucket the compose init service provisions (docker-compose.
+# benchmark.yml): the runner does not substitute "{format}", so a templated
+# name would target a bucket that never exists and every upload would fail
+# with NoSuchBucket. jsonl is this scenario's format.
+bucket: "telemetry-jsonl"
+# No create_bucket opt-in: telemetry-jsonl is among the buckets the compose
+# init service provisions, so each cold-cache cycle carries no CreateBucket
+# into the measurement (matches scenario 12).
 endpoint_url: http://localhost:9000
 batch_max_records: 10000
 batch_max_bytes: 104857600

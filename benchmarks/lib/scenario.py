@@ -101,10 +101,70 @@ class Scenario:
         return self.values.get(key, default)
 
 
+def _split_flow_items(s: str) -> list[str]:
+    """Split a flow-sequence body on its TOP-LEVEL commas, honouring quotes so
+    a comma inside ``"a,b"`` does not split the item. Kept minimal (no nested
+    collections): the only flow collections the scenarios use are flat lists of
+    env-var names."""
+    items: list[str] = []
+    buf: list[str] = []
+    quote = ""
+    escaped = False
+    skip = False  # the paired char of a doubled '' escape, already consumed
+    for idx, ch in enumerate(s):
+        if skip:
+            buf.append(ch)
+            skip = False
+            continue
+        if quote == '"':
+            buf.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                quote = ""
+        elif quote == "'":
+            buf.append(ch)
+            if ch == "'":
+                # A doubled '' is an escaped literal quote inside a YAML
+                # single-quoted scalar and stays in the region; a lone ' closes
+                # it. Without this a comma after the '' would wrongly split.
+                if idx + 1 < len(s) and s[idx + 1] == "'":
+                    skip = True
+                else:
+                    quote = ""
+        elif ch in ("'", '"') and not "".join(buf).strip():
+            # A quote opens a quoted item only as the item's first
+            # non-whitespace character (review): an apostrophe inside a plain
+            # item like ``John's`` is literal and must not swallow the comma
+            # and the items after it.
+            quote = ch
+            buf.append(ch)
+        elif ch == ",":
+            items.append("".join(buf).strip())
+            buf = []
+        else:
+            buf.append(ch)
+    tail = "".join(buf).strip()
+    if tail or items:
+        items.append(tail)
+    return [it for it in items if it != ""]
+
+
 def _coerce(value: str) -> Any:
     v = value.strip()
-    if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+    # Flow-style sequence: "[a, b, c]" -> a list, matching PyYAML so the
+    # fallback loader agrees with it. A command_env_allowlist written inline
+    # would otherwise arrive as the whole bracketed string and split into
+    # "[AWS_..." / "...]" names the engine cannot resolve (review).
+    if len(v) >= 2 and v[0] == "[" and v[-1] == "]":
+        return [_coerce(item) for item in _split_flow_items(v[1:-1])]
+    if v.startswith('"') and v.endswith('"'):
         return v[1:-1]
+    if v.startswith("'") and v.endswith("'"):
+        # YAML single-quoted scalars escape a literal quote by doubling it.
+        return v[1:-1].replace("''", "'")
     low = v.lower()
     if low in ("true", "false"):
         return low == "true"
@@ -124,6 +184,50 @@ def _coerce(value: str) -> Any:
 # line-at-a-time parser stored the literal ">-" and dropped the prose — while
 # the module promised it could read every bundled scenario.
 _BLOCK_INDICATORS = (">", ">-", ">+", "|", "|-", "|+")
+
+
+def _strip_inline_comment(s: str) -> str:
+    """Drop a YAML inline comment: a ``#`` at the start of the value or one
+    preceded by whitespace begins a comment; a ``#`` inside a token (a URL
+    fragment, an issue reference like ``#98``) is literal — and a ``#`` inside a
+    quoted value (``"foo # bar"``) is content, so quote state is tracked before
+    a comment can start."""
+    prev_ws = True  # the start of the value counts as preceded by whitespace
+    quote = ""
+    escaped = False
+    skip = False     # the paired char of a doubled '' escape, already consumed
+    started = False  # a non-whitespace char has been seen
+    for idx, ch in enumerate(s):
+        if skip:
+            skip = False
+        elif quote == '"':
+            # Double quotes honour backslash escaping in YAML.
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                quote = ""
+        elif quote == "'":
+            # A doubled '' is an escaped literal quote and stays in the region;
+            # a lone ' closes it — so a '#' after the '' is still content.
+            if ch == "'":
+                if idx + 1 < len(s) and s[idx + 1] == "'":
+                    skip = True
+                else:
+                    quote = ""
+        elif ch in ("'", '"') and not started:
+            # A quote opens a quoted scalar only as the value's FIRST
+            # non-whitespace character (review): an apostrophe inside a plain
+            # scalar like ``John's # note`` is literal, not a quote delimiter,
+            # so a following comment must still be stripped.
+            quote = ch
+        elif ch == "#" and prev_ws:
+            return s[:idx]
+        if ch not in " \t":
+            started = True
+        prev_ws = ch in " \t"
+    return s
 
 
 def _fallback_parse(text: str) -> dict[str, Any]:
@@ -161,6 +265,37 @@ def _fallback_parse(text: str) -> dict[str, Any]:
                 # `i` already rests on the terminating line, so flat parsing
                 # resumes there and keys after the block still parse.
                 continue
+            # A block SEQUENCE: "key:" with no inline value (a trailing comment
+            # like "key: # note" still counts as empty), followed by
+            # more-indented "- item" lines (review). Without this the fallback
+            # parser recorded the key as "" and dropped every item, so a
+            # command_env_allowlist written as a YAML list silently vanished
+            # when PyYAML was absent — and an env-authenticated command backend
+            # then lost the credentials CommandPolicy restores from that field.
+            if _strip_inline_comment(val_part).strip() == "":
+                key_indent = len(raw) - len(raw.lstrip())
+                seq: list[Any] = []
+                j = i
+                while j < len(lines):
+                    nxt = lines[j]
+                    stripped = nxt.lstrip()
+                    if not nxt.strip() or stripped.startswith("#"):
+                        # A blank line OR a comment-only line inside the
+                        # sequence is skipped, not a terminator: YAML allows
+                        # both between items.
+                        j += 1
+                        continue
+                    nxt_indent = len(nxt) - len(nxt.lstrip())
+                    if nxt_indent > key_indent and stripped.startswith("- "):
+                        item = _strip_inline_comment(stripped[2:]).strip()
+                        seq.append(_coerce(item) if item else "")
+                        j += 1
+                    else:
+                        break
+                if seq:
+                    out[key_part.strip()] = seq
+                    i = j
+                    continue
         line = raw.split("#", 1)[0].rstrip()
         if not line.strip():
             continue
