@@ -61,6 +61,10 @@ const VALUE_TAG_RANGE_V2: u8 = 16;
 const VALUE_TAG_SEGMENT_TIER_COPY: u8 = 17;
 const VALUE_TAG_TOPIC_RETENTION_POLICY: u8 = 18;
 const VALUE_TAG_RANGE_TRANSITION: u8 = 19;
+/// A range that carries lineage state (#473): parents, a seal, or both.
+/// Records without either keep encoding as the legacy tags byte-for-byte.
+const VALUE_TAG_RANGE_V3: u8 = 20;
+const VALUE_TAG_LINEAGE_TRANSITION: u8 = 21;
 
 /// A registered broker/controller node.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -143,9 +147,30 @@ pub struct RangeRecord {
     /// Lineage version of the key interval itself. Bumps only on an actual
     /// lineage transition (split/merge); unrelated metadata updates that
     /// advance `generation` leave it untouched, so cursor lineage checks
-    /// survive CAS churn. No transition exists yet, so it stays 0 today.
+    /// survive CAS churn. A split (#473) mints children at the parent's
+    /// version plus one; the parent keeps its own — its interval did not
+    /// change, it was retired.
     pub lineage_generation: u64,
+    /// The range(s) this one was split (one) or merged (two) from (#473).
+    /// Empty for a root. The format rule is vtop_log::RangeLineage's: a
+    /// generation-zero lineage is the parentless full keyspace.
+    pub parents: Vec<Uuid>,
+    /// Set once this range has been split (#473): its offset space is
+    /// sealed at the barrier and its key interval carried by the children
+    /// the transition record names. A sealed range stays readable — and
+    /// leasable, for serving those reads — until retention and cursors
+    /// permit retirement; what it refuses is a second split and any sealed
+    /// segment reaching above the barrier.
+    pub sealed_at: Option<SealedParent>,
     pub lease: Option<LeaseRecord>,
+}
+
+/// Where a split sealed its parent (#473): the barrier offset the
+/// leaseholder named, and the transition that consumed the range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SealedParent {
+    pub barrier_offset: u64,
+    pub transition_id: Uuid,
 }
 
 /// Verification lifecycle of a sealed segment.
@@ -385,6 +410,25 @@ pub enum TransitionOutcome {
 /// the record is served, not inside `apply`, because the replicated state
 /// machine must stay deterministic without a secret every voter shares.
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LineageTransitionRecord {
+    /// The range whose key interval the children now carry.
+    pub parent_range_uuid: Uuid,
+    /// The parent leader's committed tail at seal time: where the parent's
+    /// readable history ends and the cursor carry's mapping begins.
+    pub barrier_offset: u64,
+    /// The ordered children: left carries the parent's prefix with the new
+    /// bit clear, right with it set — vtop_log::KeyRange::children's order,
+    /// which is the format's, not this record's, to define.
+    pub left_range_uuid: Uuid,
+    pub right_range_uuid: Uuid,
+    /// The fencing epoch the split was fenced by.
+    pub sealed_by_epoch: u64,
+    /// The splitting command's `issued_at_ms` — data in the replicated
+    /// log, never a local clock.
+    pub issued_at_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RangeTransitionRecord {
     pub epoch_from: u64,
     pub epoch_to: u64,
@@ -461,6 +505,7 @@ pub enum MetaValue {
     TierCopy(TierCopyRecord),
     TopicRetentionPolicy(TopicRetentionPolicyRecord),
     RangeTransition(RangeTransitionRecord),
+    LineageTransition(LineageTransitionRecord),
 }
 
 impl MetaValue {
@@ -500,8 +545,13 @@ impl MetaValue {
                 // A range that has never seen a lineage transition encodes as
                 // the legacy tag byte-for-byte, so pinned snapshot vectors and
                 // mixed-version replicas stay stable; the v2 tag appears only
-                // once a transition actually bumps `lineage_generation`.
-                if range.lineage_generation == 0 {
+                // once a transition actually bumps `lineage_generation`, and
+                // the v3 tag (#473) only once a range carries parents or a
+                // seal — a child, or a split parent.
+                let lineage_bearing = !range.parents.is_empty() || range.sealed_at.is_some();
+                if lineage_bearing {
+                    put_u8(&mut out, VALUE_TAG_RANGE_V3);
+                } else if range.lineage_generation == 0 {
                     put_u8(&mut out, VALUE_TAG_RANGE);
                 } else {
                     put_u8(&mut out, VALUE_TAG_RANGE_V2);
@@ -510,7 +560,24 @@ impl MetaValue {
                 put_u64(&mut out, range.key_prefix);
                 put_u8(&mut out, range.key_prefix_bits);
                 put_u64(&mut out, range.fencing_epoch);
-                if range.lineage_generation != 0 {
+                if lineage_bearing {
+                    // v3 writes the lineage generation unconditionally — a
+                    // split parent legitimately sits at zero — where v2's
+                    // presence-by-tag rule forbids the zero.
+                    put_u64(&mut out, range.lineage_generation);
+                    put_u8(&mut out, range.parents.len() as u8);
+                    for parent in &range.parents {
+                        put_uuid(&mut out, *parent);
+                    }
+                    match &range.sealed_at {
+                        None => put_u8(&mut out, 0),
+                        Some(sealed) => {
+                            put_u8(&mut out, 1);
+                            put_u64(&mut out, sealed.barrier_offset);
+                            put_uuid(&mut out, sealed.transition_id);
+                        }
+                    }
+                } else if range.lineage_generation != 0 {
                     put_u64(&mut out, range.lineage_generation);
                 }
                 // Presence byte 1 is the pre-#223 lease and is still emitted
@@ -688,6 +755,15 @@ impl MetaValue {
                     )?;
                 }
             }
+            MetaValue::LineageTransition(transition) => {
+                put_u8(&mut out, VALUE_TAG_LINEAGE_TRANSITION);
+                put_uuid(&mut out, transition.parent_range_uuid);
+                put_u64(&mut out, transition.barrier_offset);
+                put_uuid(&mut out, transition.left_range_uuid);
+                put_uuid(&mut out, transition.right_range_uuid);
+                put_u64(&mut out, transition.sealed_by_epoch);
+                put_i64(&mut out, transition.issued_at_ms);
+            }
             MetaValue::RangeTransition(transition) => {
                 put_u8(&mut out, VALUE_TAG_RANGE_TRANSITION);
                 put_u64(&mut out, transition.epoch_from);
@@ -762,7 +838,7 @@ impl MetaValue {
                 topic_uuid: reader.uuid("topic uuid")?,
                 latest_epoch: reader.u64("latest topic epoch")?,
             }),
-            VALUE_TAG_RANGE | VALUE_TAG_RANGE_V2 => {
+            VALUE_TAG_RANGE | VALUE_TAG_RANGE_V2 | VALUE_TAG_RANGE_V3 => {
                 let generation = reader.u64("range generation")?;
                 let key_prefix = reader.u64("key prefix")?;
                 let key_prefix_bits = reader.u8("key prefix bits")?;
@@ -771,9 +847,11 @@ impl MetaValue {
                 // lineage version is the initial one. The v2 tag exists only
                 // for transitioned ranges; a zero there is non-canonical (it
                 // would re-encode as the legacy tag) and must be rejected.
-                let lineage_generation = if tag == VALUE_TAG_RANGE_V2 {
+                // v3 (#473) writes it unconditionally — a split parent
+                // legitimately sits at zero, made canonical by its seal.
+                let lineage_generation = if tag == VALUE_TAG_RANGE_V2 || tag == VALUE_TAG_RANGE_V3 {
                     let lineage_generation = reader.u64("lineage generation")?;
-                    if lineage_generation == 0 {
+                    if lineage_generation == 0 && tag == VALUE_TAG_RANGE_V2 {
                         return Err(CodecError::InvalidValue {
                             what: "range lineage generation",
                             reason: "v2 range records must carry a nonzero lineage generation",
@@ -782,6 +860,46 @@ impl MetaValue {
                     lineage_generation
                 } else {
                     0
+                };
+                let (parents, sealed_at) = if tag == VALUE_TAG_RANGE_V3 {
+                    let parent_count = reader.u8("parent count")?;
+                    // The format rule (vtop_log::RangeLineage): one split
+                    // parent or two merge parents; zero of either belongs
+                    // to the legacy tags, and more is no record this build
+                    // wrote.
+                    if parent_count > 2 {
+                        return Err(CodecError::InvalidValue {
+                            what: "range parents",
+                            reason: "a range has at most two parents (a merge)",
+                        });
+                    }
+                    let mut parents = Vec::with_capacity(parent_count as usize);
+                    for _ in 0..parent_count {
+                        parents.push(reader.uuid("parent range uuid")?);
+                    }
+                    let sealed_at = match reader.u8("seal presence")? {
+                        0 => None,
+                        1 => Some(SealedParent {
+                            barrier_offset: reader.u64("barrier offset")?,
+                            transition_id: reader.uuid("transition id")?,
+                        }),
+                        _ => {
+                            return Err(CodecError::InvalidValue {
+                                what: "range seal presence",
+                                reason: "seal presence must be 0 or 1",
+                            })
+                        }
+                    };
+                    if parents.is_empty() && sealed_at.is_none() {
+                        return Err(CodecError::InvalidValue {
+                            what: "range lineage state",
+                            reason: "v3 range records must carry parents or a seal; \
+                                     without either the record re-encodes as a legacy tag",
+                        });
+                    }
+                    (parents, sealed_at)
+                } else {
+                    (Vec::new(), None)
                 };
                 // 0 = no lease, 1 = lease with no deadline (the pre-#223
                 // encoding, still emitted for administrative grants), 2 =
@@ -812,9 +930,19 @@ impl MetaValue {
                     key_prefix_bits,
                     fencing_epoch,
                     lineage_generation,
+                    parents,
+                    sealed_at,
                     lease,
                 })
             }
+            VALUE_TAG_LINEAGE_TRANSITION => MetaValue::LineageTransition(LineageTransitionRecord {
+                parent_range_uuid: reader.uuid("parent range uuid")?,
+                barrier_offset: reader.u64("barrier offset")?,
+                left_range_uuid: reader.uuid("left range uuid")?,
+                right_range_uuid: reader.uuid("right range uuid")?,
+                sealed_by_epoch: reader.u64("sealed-by epoch")?,
+                issued_at_ms: reader.i64("issued-at ms")?,
+            }),
             VALUE_TAG_SEGMENT => MetaValue::Segment(SegmentRecord {
                 segment_generation: reader.u64("segment generation")?,
                 base_offset: reader.u64("base offset")?,
@@ -1188,6 +1316,29 @@ impl MetaStateMachine {
                 expected_fencing_epoch,
                 ..
             } => self.release_range_lease(*topic_uuid, *range_uuid, *expected_fencing_epoch),
+            MetadataCommand::SplitRange {
+                env,
+                topic_uuid,
+                parent_range_uuid,
+                left_range_uuid,
+                right_range_uuid,
+                transition_id,
+                barrier_offset,
+                expected_range_generation,
+                holder_node_uuid,
+                fencing_epoch,
+            } => self.split_range(SplitRangeArgs {
+                issued_at_ms: env.issued_at_ms,
+                topic_uuid: *topic_uuid,
+                parent_range_uuid: *parent_range_uuid,
+                left_range_uuid: *left_range_uuid,
+                right_range_uuid: *right_range_uuid,
+                transition_id: *transition_id,
+                barrier_offset: *barrier_offset,
+                expected_range_generation: *expected_range_generation,
+                holder_node_uuid: *holder_node_uuid,
+                fencing_epoch: *fencing_epoch,
+            }),
             MetadataCommand::RegisterSealedSegment {
                 topic_uuid,
                 range_uuid,
@@ -1821,6 +1972,8 @@ impl MetaStateMachine {
                 key_prefix_bits: 0,
                 fencing_epoch: 0,
                 lineage_generation: 0,
+                parents: Vec::new(),
+                sealed_at: None,
                 lease: None,
             }),
         );
@@ -2341,6 +2494,21 @@ impl MetaStateMachine {
                 "segment offsets regress: next {next_offset} < base {base_offset}"
             )));
         }
+        // A SEALED PARENT PUBLISHES NOTHING PAST ITS BARRIER (#473, review —
+        // the design said so and the first cut forgot it): the barrier is
+        // where the transition declared the parent's history ends, and a
+        // segment reaching past it would hold durable records the cursor
+        // carry will never walk. Ending exactly AT the barrier is the
+        // legitimate final segment.
+        if let Some(sealed) = &range.sealed_at {
+            if next_offset > sealed.barrier_offset {
+                return reject(MetadataError::invalid_transition(format!(
+                    "range is sealed at barrier {}: a segment ending at {next_offset} \
+                     would publish past the lineage transition",
+                    sealed.barrier_offset
+                )));
+            }
+        }
         if self.records.contains_key(&segment_key) {
             return reject(MetadataError::AlreadyExists);
         }
@@ -2651,6 +2819,255 @@ impl MetaStateMachine {
     /// range must be held, by this node, at this epoch. `Some(refusal)` when
     /// it is not — a leader whose lease moved on, stolen or lapsed and
     /// re-granted, whatever CAS token it learned.
+    /// Split a range at a barrier (#473 slice 1): seal the parent, create
+    /// the two children that halve its key interval, and mint the lineage
+    /// transition record the cursor carry will check.
+    ///
+    /// Every refusal precedes every mutation, so a refused split leaves the
+    /// keyspace untouched — the same all-or-nothing shape as every other
+    /// apply, made trivial here by doing all the reads first.
+    fn split_range(&mut self, args: SplitRangeArgs) -> MetadataResponse {
+        let SplitRangeArgs {
+            issued_at_ms,
+            topic_uuid,
+            parent_range_uuid,
+            left_range_uuid,
+            right_range_uuid,
+            transition_id,
+            barrier_offset,
+            expected_range_generation,
+            holder_node_uuid,
+            fencing_epoch,
+        } = args;
+        // Nil ids are reserved everywhere on this plane; a nil child or
+        // transition would collide with the unpinned-cursor conventions.
+        if left_range_uuid.is_nil() || right_range_uuid.is_nil() || transition_id.is_nil() {
+            return reject(MetadataError::invalid_transition(
+                "split names a nil id; child and transition ids must be real",
+            ));
+        }
+        if left_range_uuid == right_range_uuid
+            || left_range_uuid == parent_range_uuid
+            || right_range_uuid == parent_range_uuid
+        {
+            return reject(MetadataError::invalid_transition(
+                "split ids must be three distinct ranges: a parent and two children",
+            ));
+        }
+        let parent_key = MetaKey::Range {
+            topic_uuid,
+            range_uuid: parent_range_uuid,
+        }
+        .encode();
+        let Some(MetaValue::Range(parent)) = self.records.get(&parent_key) else {
+            return reject(MetadataError::NotFound);
+        };
+        // IDEMPOTENT REPLAY FIRST (review bar for every retryable command):
+        // the same transition id finding the seal it wrote is a lost answer
+        // being re-asked, and must Ack without touching anything — before
+        // the CAS check, because the original apply bumped the generation
+        // the retry still names.
+        if let Some(sealed) = &parent.sealed_at {
+            if sealed.transition_id == transition_id {
+                // A replay must BE a replay (review): the same id with
+                // different children or a different barrier is not a lost
+                // answer being re-asked, it is a second, different split
+                // wearing the first one's name — and an Ack would tell the
+                // caller ITS values took effect while the durable record
+                // holds the originals.
+                let transition_key = MetaKey::LineageTransition {
+                    topic_uuid,
+                    transition_id,
+                }
+                .encode();
+                let Some(MetaValue::LineageTransition(recorded)) =
+                    self.records.get(&transition_key)
+                else {
+                    unreachable!("a seal always writes its transition in the same apply");
+                };
+                if recorded.left_range_uuid != left_range_uuid
+                    || recorded.right_range_uuid != right_range_uuid
+                    || recorded.barrier_offset != barrier_offset
+                {
+                    return reject(MetadataError::invalid_transition(format!(
+                        "transition {transition_id} is recorded with different \
+                         children or barrier; a replay must match what it replays"
+                    )));
+                }
+                return MetadataResponse::Ack {
+                    generation: parent.generation,
+                };
+            }
+            return reject(MetadataError::invalid_transition(format!(
+                "range is already split under transition {}; its key interval has moved on",
+                sealed.transition_id
+            )));
+        }
+        // The lease fence, exactly as RegisterSealedSegment has it: the
+        // barrier offset is a claim about the parent leader's own log, and
+        // only the holder of the current epoch may make it.
+        if let Some(refusal) = self.not_the_leaseholder(
+            topic_uuid,
+            parent_range_uuid,
+            holder_node_uuid,
+            fencing_epoch,
+        ) {
+            return refusal;
+        }
+        let Some(MetaValue::Range(parent)) = self.records.get(&parent_key) else {
+            unreachable!("parent was present above and apply is single-threaded");
+        };
+        if parent.generation != expected_range_generation {
+            return reject(MetadataError::GenerationMismatch {
+                expected: expected_range_generation,
+                actual: parent.generation,
+            });
+        }
+        // A BARRIER BELOW REGISTERED COVERAGE STRANDS RECORDS PAST THE SEAL
+        // (review): the seal gate refuses future registrations above the
+        // barrier, but a barrier named below what is ALREADY registered
+        // would leave durable segments past the transition's declared end —
+        // the same records, stranded from the other direction.
+        let segments_start = MetaKey::Segment {
+            topic_uuid,
+            range_uuid: parent_range_uuid,
+            segment_uuid: Uuid::nil(),
+        }
+        .encode();
+        let segments_end = MetaKey::Segment {
+            topic_uuid,
+            range_uuid: parent_range_uuid,
+            segment_uuid: Uuid::from_u128(u128::MAX),
+        }
+        .encode();
+        let registered_end = self
+            .records
+            .range(segments_start..=segments_end)
+            .filter_map(|(_, value)| match value {
+                MetaValue::Segment(segment) => Some(segment.next_offset),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        if barrier_offset < registered_end {
+            return reject(MetadataError::invalid_transition(format!(
+                "barrier {barrier_offset} sits below already-registered segment \
+                 coverage ending at {registered_end}; the split would strand \
+                 durable records past the seal"
+            )));
+        }
+        // AND BELOW NO DURABLE CURSOR (review): an unpinned head commit
+        // deliberately accepts arbitrary offsets, so a group can stand
+        // committed past every registered segment — and a barrier under
+        // such a checkpoint would retire history the group's durable
+        // position still names, before the carry (slice 2) has anything to
+        // map it onto. A full scan of the cursor category, deliberately:
+        // cursor keys lead with the group, not the range, and a split is
+        // an operator-grade event that can afford one pass over the
+        // records rather than a second index maintained forever.
+        let mut cursor_end = 0_u64;
+        for (key, value) in &self.records {
+            let MetaValue::GroupCursor(cursor) = value else {
+                continue;
+            };
+            let Ok(MetaKey::GroupCursor {
+                topic_uuid: cursor_topic,
+                range_uuid: cursor_range,
+                ..
+            }) = MetaKey::decode(key)
+            else {
+                continue;
+            };
+            if cursor_topic == topic_uuid && cursor_range == parent_range_uuid {
+                cursor_end = cursor_end.max(cursor.record_offset);
+            }
+        }
+        if barrier_offset < cursor_end {
+            return reject(MetadataError::invalid_transition(format!(
+                "barrier {barrier_offset} sits below a group's durable cursor at \
+                 {cursor_end}; the split would retire history a committed \
+                 position still names"
+            )));
+        }
+        // The FORMAT owns the halving rule: vtop_log::KeyRange::children is
+        // what descriptors validate against, so the plane derives the
+        // children from the same code rather than restating the arithmetic.
+        let parent_interval = vtop_log::KeyRange {
+            prefix: parent.key_prefix,
+            prefix_bits: parent.key_prefix_bits,
+        };
+        let (left_interval, right_interval) = match parent_interval.children() {
+            Ok(children) => children,
+            Err(error) => {
+                return reject(MetadataError::invalid_transition(format!(
+                    "the parent's key interval cannot split: {error}"
+                )));
+            }
+        };
+        let child_lineage_generation = parent.lineage_generation + 1;
+        let parent_generation = parent.generation + 1;
+        let left_key = MetaKey::Range {
+            topic_uuid,
+            range_uuid: left_range_uuid,
+        }
+        .encode();
+        let right_key = MetaKey::Range {
+            topic_uuid,
+            range_uuid: right_range_uuid,
+        }
+        .encode();
+        let transition_key = MetaKey::LineageTransition {
+            topic_uuid,
+            transition_id,
+        }
+        .encode();
+        if self.records.contains_key(&left_key)
+            || self.records.contains_key(&right_key)
+            || self.records.contains_key(&transition_key)
+        {
+            return reject(MetadataError::AlreadyExists);
+        }
+        // Every read is done; from here the split happens whole.
+        let Some(MetaValue::Range(parent)) = self.records.get_mut(&parent_key) else {
+            unreachable!("parent was present above and apply is single-threaded");
+        };
+        parent.generation = parent_generation;
+        parent.sealed_at = Some(SealedParent {
+            barrier_offset,
+            transition_id,
+        });
+        let child = |interval: vtop_log::KeyRange| {
+            // Children elect leaders through the existing acquisition path:
+            // epoch zero, no lease, a fresh CAS history of their own.
+            MetaValue::Range(RangeRecord {
+                generation: 0,
+                key_prefix: interval.prefix,
+                key_prefix_bits: interval.prefix_bits,
+                fencing_epoch: 0,
+                lineage_generation: child_lineage_generation,
+                parents: vec![parent_range_uuid],
+                sealed_at: None,
+                lease: None,
+            })
+        };
+        self.records.insert(left_key, child(left_interval));
+        self.records.insert(right_key, child(right_interval));
+        self.records.insert(
+            transition_key,
+            MetaValue::LineageTransition(LineageTransitionRecord {
+                parent_range_uuid,
+                barrier_offset,
+                left_range_uuid,
+                right_range_uuid,
+                sealed_by_epoch: fencing_epoch,
+                issued_at_ms,
+            }),
+        );
+        MetadataResponse::Ack {
+            generation: parent_generation,
+        }
+    }
+
     fn not_the_leaseholder(
         &self,
         topic_uuid: Uuid,
@@ -4694,6 +5111,10 @@ fn key_matches_value(key: &MetaKey, value: &MetaValue) -> bool {
                 MetaKey::SegmentRebalanceIntent { .. },
                 MetaValue::RebalanceIntent(_)
             )
+            | (
+                MetaKey::LineageTransition { .. },
+                MetaValue::LineageTransition(_)
+            )
             | (MetaKey::SegmentTierCopy { .. }, MetaValue::TierCopy(_))
             | (
                 MetaKey::TopicRetentionPolicy { .. },
@@ -4704,6 +5125,22 @@ fn key_matches_value(key: &MetaKey, value: &MetaValue) -> bool {
                 MetaValue::RangeTransition(_)
             )
     )
+}
+
+/// `SplitRange`'s fields, bundled so the apply arm stays a projection
+/// (#473) — the same shape CommitCursorArgs takes for the same clippy
+/// reason: a dozen positional arguments is how two u64s swap silently.
+struct SplitRangeArgs {
+    issued_at_ms: i64,
+    topic_uuid: Uuid,
+    parent_range_uuid: Uuid,
+    left_range_uuid: Uuid,
+    right_range_uuid: Uuid,
+    transition_id: Uuid,
+    barrier_offset: u64,
+    expected_range_generation: u64,
+    holder_node_uuid: Uuid,
+    fencing_epoch: u64,
 }
 
 struct CommitCursorArgs {
@@ -4909,6 +5346,651 @@ mod tests {
             },
         );
         (machine, node_uuid, topic_uuid, range_uuid)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn split(
+        machine: &mut MetaStateMachine,
+        index: u64,
+        request: u128,
+        topic_uuid: Uuid,
+        parent: Uuid,
+        left: u128,
+        right: u128,
+        transition: u128,
+        barrier_offset: u64,
+        expected_range_generation: u64,
+        holder: Uuid,
+        fencing_epoch: u64,
+    ) -> MetadataResponse {
+        machine.apply(
+            index,
+            &MetadataCommand::SplitRange {
+                env: envelope(request),
+                topic_uuid,
+                parent_range_uuid: parent,
+                left_range_uuid: Uuid::from_u128(left),
+                right_range_uuid: Uuid::from_u128(right),
+                transition_id: Uuid::from_u128(transition),
+                barrier_offset,
+                expected_range_generation,
+                holder_node_uuid: holder,
+                fencing_epoch,
+            },
+        )
+    }
+
+    /// The split, whole (#473 slice 1): the parent is sealed at the barrier
+    /// under the transition id, its CAS generation moves, and two children
+    /// halve its interval at the next lineage generation with the parent on
+    /// record — while the parent keeps its own lineage generation, because
+    /// its interval did not change, it was retired.
+    #[test]
+    fn a_split_seals_the_parent_and_mints_two_children_halving_its_interval() {
+        let (mut machine, node, topic, parent) = leaseable_range(30);
+        acquire(&mut machine, 3, 3, 1_000, node, topic, parent, 0, 10_000);
+        let before = range_of(&machine, topic, parent);
+        let response = split(
+            &mut machine,
+            4,
+            4,
+            topic,
+            parent,
+            0x41,
+            0x42,
+            0x77,
+            640,
+            before.generation,
+            node,
+            before.fencing_epoch,
+        );
+        let MetadataResponse::Ack { generation } = response else {
+            panic!("a well-formed split from the holder must land: {response:?}");
+        };
+        let sealed = range_of(&machine, topic, parent);
+        assert_eq!(generation, sealed.generation);
+        assert_eq!(
+            sealed.sealed_at,
+            Some(SealedParent {
+                barrier_offset: 640,
+                transition_id: Uuid::from_u128(0x77),
+            }),
+            "the seal is the durable fact every later refusal hangs off"
+        );
+        assert_eq!(
+            sealed.lineage_generation, 0,
+            "the parent keeps its lineage generation: its interval was retired, not changed"
+        );
+        let left = range_of(&machine, topic, Uuid::from_u128(0x41));
+        let right = range_of(&machine, topic, Uuid::from_u128(0x42));
+        assert_eq!(
+            (left.key_prefix, left.key_prefix_bits),
+            (0, 1),
+            "the left child carries the parent prefix with the new bit clear"
+        );
+        assert_eq!(
+            (right.key_prefix, right.key_prefix_bits),
+            (1_u64 << 63, 1),
+            "the right child carries the new bit set — vtop_log::KeyRange::children order"
+        );
+        for (name, child) in [("left", &left), ("right", &right)] {
+            assert_eq!(child.lineage_generation, 1, "{name}");
+            assert_eq!(child.parents, vec![parent], "{name}");
+            assert_eq!(
+                child.generation, 0,
+                "{name}: a child starts its own CAS history"
+            );
+            assert!(
+                child.lease.is_none(),
+                "{name}: children elect through acquisition"
+            );
+            assert!(child.sealed_at.is_none(), "{name}");
+        }
+        let transition_key = MetaKey::LineageTransition {
+            topic_uuid: topic,
+            transition_id: Uuid::from_u128(0x77),
+        };
+        let Some(MetaValue::LineageTransition(record)) = machine.record(&transition_key) else {
+            panic!("the transition record is what the cursor carry checks; it must exist");
+        };
+        assert_eq!(record.parent_range_uuid, parent);
+        assert_eq!(record.barrier_offset, 640);
+        assert_eq!(record.left_range_uuid, Uuid::from_u128(0x41));
+        assert_eq!(record.right_range_uuid, Uuid::from_u128(0x42));
+        assert_eq!(record.sealed_by_epoch, sealed.fencing_epoch);
+    }
+
+    /// A retry that lost its answer re-asks with the SAME transition id and
+    /// must Ack without touching anything — before the CAS check, because
+    /// the original apply bumped the generation the retry still names.
+    #[test]
+    fn a_replayed_split_acks_idempotently_without_touching_anything() {
+        let (mut machine, node, topic, parent) = leaseable_range(30);
+        acquire(&mut machine, 3, 3, 1_000, node, topic, parent, 0, 10_000);
+        let generation = range_of(&machine, topic, parent).generation;
+        let epoch = range_of(&machine, topic, parent).fencing_epoch;
+        split(
+            &mut machine,
+            4,
+            4,
+            topic,
+            parent,
+            0x41,
+            0x42,
+            0x77,
+            640,
+            generation,
+            node,
+            epoch,
+        );
+        let sealed = range_of(&machine, topic, parent);
+        let replay = split(
+            &mut machine,
+            5,
+            5,
+            topic,
+            parent,
+            0x41,
+            0x42,
+            0x77,
+            640,
+            generation,
+            node,
+            epoch,
+        );
+        assert_eq!(
+            replay,
+            MetadataResponse::Ack { generation: sealed.generation },
+            "the stale CAS token the retry carries must not matter: the seal it wrote is the answer"
+        );
+        assert_eq!(
+            range_of(&machine, topic, parent),
+            sealed,
+            "replay mutates nothing"
+        );
+    }
+
+    /// The seal is final: a second split under a NEW transition id is refused
+    /// by the standing one, and reusing a spent transition id elsewhere is a
+    /// collision, not a replay.
+    #[test]
+    fn a_sealed_parent_refuses_a_second_split_and_a_spent_transition_id_cannot_be_reused() {
+        let (mut machine, node, topic, parent) = leaseable_range(30);
+        acquire(&mut machine, 3, 3, 1_000, node, topic, parent, 0, 10_000);
+        let generation = range_of(&machine, topic, parent).generation;
+        let epoch = range_of(&machine, topic, parent).fencing_epoch;
+        split(
+            &mut machine,
+            4,
+            4,
+            topic,
+            parent,
+            0x41,
+            0x42,
+            0x77,
+            640,
+            generation,
+            node,
+            epoch,
+        );
+        let sealed_generation = range_of(&machine, topic, parent).generation;
+        let again = split(
+            &mut machine,
+            5,
+            5,
+            topic,
+            parent,
+            0x51,
+            0x52,
+            0x88,
+            700,
+            sealed_generation,
+            node,
+            epoch,
+        );
+        assert!(
+            matches!(
+                again,
+                MetadataResponse::Rejected(MetadataError::InvalidTransition { .. })
+            ),
+            "a second split would fork the keyspace: {again:?}"
+        );
+        // The left child can split further — but not under the parent id
+        // it already spent.
+        let left = Uuid::from_u128(0x41);
+        acquire(&mut machine, 6, 6, 1_000, node, topic, left, 0, 10_000);
+        let child_generation = range_of(&machine, topic, left).generation;
+        let child_epoch = range_of(&machine, topic, left).fencing_epoch;
+        let reuse = split(
+            &mut machine,
+            7,
+            7,
+            topic,
+            left,
+            0x61,
+            0x62,
+            0x77,
+            40,
+            child_generation,
+            node,
+            child_epoch,
+        );
+        assert!(
+            matches!(
+                reuse,
+                MetadataResponse::Rejected(MetadataError::AlreadyExists)
+            ),
+            "a transition id names ONE transition forever: {reuse:?}"
+        );
+        let deeper = split(
+            &mut machine,
+            8,
+            8,
+            topic,
+            left,
+            0x61,
+            0x62,
+            0x99,
+            40,
+            child_generation,
+            node,
+            child_epoch,
+        );
+        assert!(matches!(deeper, MetadataResponse::Ack { .. }), "{deeper:?}");
+        let grandchild = range_of(&machine, topic, Uuid::from_u128(0x62));
+        assert_eq!(
+            (
+                grandchild.key_prefix,
+                grandchild.key_prefix_bits,
+                grandchild.lineage_generation
+            ),
+            (1_u64 << 62, 2, 2),
+            "a child splits again at the next lineage generation, one bit deeper"
+        );
+    }
+
+    /// A sealed parent publishes nothing past its barrier (review — the
+    /// design said so and the first cut forgot it): the barrier is where
+    /// the transition declared the parent's history ends, and a segment
+    /// reaching past it would hold durable records the cursor carry will
+    /// never walk. Ending exactly AT the barrier is the legitimate final
+    /// segment, and still lands.
+    #[test]
+    fn a_sealed_parent_refuses_a_segment_reaching_past_its_barrier() {
+        let (mut machine, node, topic, parent) = leaseable_range(30);
+        acquire(&mut machine, 3, 3, 1_000, node, topic, parent, 0, 10_000);
+        let generation = range_of(&machine, topic, parent).generation;
+        let epoch = range_of(&machine, topic, parent).fencing_epoch;
+        split(
+            &mut machine,
+            4,
+            4,
+            topic,
+            parent,
+            0x41,
+            0x42,
+            0x77,
+            640,
+            generation,
+            node,
+            epoch,
+        );
+        let sealed_generation = range_of(&machine, topic, parent).generation;
+        let register = |machine: &mut MetaStateMachine, index, segment: u128, next_offset, gen| {
+            machine.apply(
+                index,
+                &MetadataCommand::RegisterSealedSegment {
+                    env: envelope(index as u128 + 100),
+                    topic_uuid: topic,
+                    range_uuid: parent,
+                    segment_uuid: Uuid::from_u128(segment),
+                    segment_generation: 0,
+                    base_offset: 0,
+                    next_offset,
+                    content_root: [7; 32],
+                    sealed_by_epoch: epoch,
+                    expected_range_generation: gen,
+                },
+            )
+        };
+        let past = register(&mut machine, 5, 0x91, 641, sealed_generation);
+        assert!(
+            matches!(
+                past,
+                MetadataResponse::Rejected(MetadataError::InvalidTransition { .. })
+            ),
+            "a segment ending past the barrier publishes past the transition: {past:?}"
+        );
+        let at = register(&mut machine, 6, 0x92, 640, sealed_generation);
+        assert!(
+            matches!(at, MetadataResponse::Ack { .. }),
+            "the final segment legitimately ends exactly at the barrier: {at:?}"
+        );
+    }
+
+    /// The seal guards both directions (review): registration past the
+    /// barrier is refused after the split, and a split whose barrier sits
+    /// below coverage already registered is refused before it — the same
+    /// stranded records, approached from either side.
+    #[test]
+    fn a_barrier_below_registered_coverage_is_refused() {
+        let (mut machine, node, topic, parent) = leaseable_range(30);
+        acquire(&mut machine, 3, 3, 1_000, node, topic, parent, 0, 10_000);
+        let generation = range_of(&machine, topic, parent).generation;
+        let epoch = range_of(&machine, topic, parent).fencing_epoch;
+        let registered = machine.apply(
+            4,
+            &MetadataCommand::RegisterSealedSegment {
+                env: envelope(104),
+                topic_uuid: topic,
+                range_uuid: parent,
+                segment_uuid: Uuid::from_u128(0x91),
+                segment_generation: 0,
+                base_offset: 0,
+                next_offset: 10,
+                content_root: [7; 32],
+                sealed_by_epoch: epoch,
+                expected_range_generation: generation,
+            },
+        );
+        assert!(
+            matches!(registered, MetadataResponse::Ack { .. }),
+            "{registered:?}"
+        );
+        let generation = range_of(&machine, topic, parent).generation;
+        let below = split(
+            &mut machine,
+            5,
+            5,
+            topic,
+            parent,
+            0x41,
+            0x42,
+            0x77,
+            5,
+            generation,
+            node,
+            epoch,
+        );
+        assert!(
+            matches!(
+                below,
+                MetadataResponse::Rejected(MetadataError::InvalidTransition { .. })
+            ),
+            "a barrier below registered coverage strands durable records: {below:?}"
+        );
+        let at = split(
+            &mut machine,
+            6,
+            6,
+            topic,
+            parent,
+            0x41,
+            0x42,
+            0x77,
+            10,
+            generation,
+            node,
+            epoch,
+        );
+        assert!(
+            matches!(at, MetadataResponse::Ack { .. }),
+            "a barrier at the registered end seals cleanly: {at:?}"
+        );
+    }
+
+    /// The seal also respects durable cursors (review): an unpinned head
+    /// commit accepts arbitrary offsets, so a group can stand committed
+    /// past every registered segment — and a barrier under that checkpoint
+    /// would retire history the position still names.
+    #[test]
+    fn a_barrier_below_a_durable_group_cursor_is_refused() {
+        let (mut machine, node, topic, parent) = leaseable_range(30);
+        acquire(&mut machine, 3, 3, 1_000, node, topic, parent, 0, 10_000);
+        let (group_uuid, member_uuid) = (Uuid::from_u128(0x50), Uuid::from_u128(0x51));
+        machine.apply(
+            20,
+            &MetadataCommand::CreateConsumerGroup {
+                env: envelope(20),
+                name: "g".to_owned(),
+                group_uuid,
+            },
+        );
+        machine.apply(
+            21,
+            &MetadataCommand::JoinConsumerGroup {
+                env: envelope(21),
+                group_uuid,
+                member_uuid,
+                expected_group_generation: 0,
+            },
+        );
+        machine.apply(
+            22,
+            &MetadataCommand::AssignMemberRanges {
+                env: envelope(22),
+                group_uuid,
+                member_uuid,
+                ranges: vec![RangeAssignment {
+                    topic_uuid: topic,
+                    range_uuid: parent,
+                }],
+                expected_member_generation: 0,
+            },
+        );
+        let Some(MetaValue::Topic(record)) = machine.record(&MetaKey::Topic { topic_uuid: topic })
+        else {
+            panic!("the topic is there");
+        };
+        let topic_epoch = record.topic_epoch;
+        let committed = machine.apply(
+            23,
+            &MetadataCommand::CommitGroupCursor {
+                env: envelope(23),
+                group_uuid,
+                member_uuid,
+                topic_uuid: topic,
+                range_uuid: parent,
+                topic_epoch,
+                range_generation: 0,
+                segment_uuid: Uuid::nil(),
+                segment_generation: 0,
+                segment_root: [0; 32],
+                record_offset: 20,
+                record_index: 0,
+                lineage_transition_id: None,
+                expected_checkpoint_generation: None,
+            },
+        );
+        assert!(
+            matches!(committed, MetadataResponse::CursorCommitted { .. }),
+            "{committed:?}"
+        );
+        let generation = range_of(&machine, topic, parent).generation;
+        let epoch = range_of(&machine, topic, parent).fencing_epoch;
+        let below = split(
+            &mut machine,
+            24,
+            24,
+            topic,
+            parent,
+            0x41,
+            0x42,
+            0x77,
+            19,
+            generation,
+            node,
+            epoch,
+        );
+        assert!(
+            matches!(
+                below,
+                MetadataResponse::Rejected(MetadataError::InvalidTransition { .. })
+            ),
+            "a barrier under a committed position retires history it still names: {below:?}"
+        );
+        let at = split(
+            &mut machine,
+            25,
+            25,
+            topic,
+            parent,
+            0x41,
+            0x42,
+            0x77,
+            20,
+            generation,
+            node,
+            epoch,
+        );
+        assert!(
+            matches!(at, MetadataResponse::Ack { .. }),
+            "a barrier at the committed position seals cleanly: {at:?}"
+        );
+    }
+
+    /// The fence and the CAS, refused in the same shapes RegisterSealedSegment
+    /// refuses them: a non-holder, a stale epoch, and a stale generation each
+    /// leave the keyspace untouched.
+    #[test]
+    fn a_split_is_fenced_by_the_lease_and_cas_like_a_sealed_segment_register() {
+        let (mut machine, node, topic, parent) = leaseable_range(30);
+        acquire(&mut machine, 3, 3, 1_000, node, topic, parent, 0, 10_000);
+        let generation = range_of(&machine, topic, parent).generation;
+        let epoch = range_of(&machine, topic, parent).fencing_epoch;
+        let rival = Uuid::from_u128(31);
+        let wrong_holder = split(
+            &mut machine,
+            4,
+            4,
+            topic,
+            parent,
+            0x41,
+            0x42,
+            0x77,
+            640,
+            generation,
+            rival,
+            epoch,
+        );
+        assert!(
+            matches!(
+                wrong_holder,
+                MetadataResponse::Rejected(MetadataError::InvalidTransition { .. })
+            ),
+            "{wrong_holder:?}"
+        );
+        let wrong_epoch = split(
+            &mut machine,
+            5,
+            5,
+            topic,
+            parent,
+            0x41,
+            0x42,
+            0x77,
+            640,
+            generation,
+            node,
+            epoch + 1,
+        );
+        assert!(
+            matches!(
+                wrong_epoch,
+                MetadataResponse::Rejected(MetadataError::InvalidTransition { .. })
+            ),
+            "{wrong_epoch:?}"
+        );
+        let stale_cas = split(
+            &mut machine,
+            6,
+            6,
+            topic,
+            parent,
+            0x41,
+            0x42,
+            0x77,
+            640,
+            generation + 7,
+            node,
+            epoch,
+        );
+        assert!(
+            matches!(
+                stale_cas,
+                MetadataResponse::Rejected(MetadataError::GenerationMismatch { .. })
+            ),
+            "{stale_cas:?}"
+        );
+        assert!(
+            range_of(&machine, topic, parent).sealed_at.is_none(),
+            "every refusal above must leave the keyspace untouched"
+        );
+        let nil = machine.apply(
+            7,
+            &MetadataCommand::SplitRange {
+                env: envelope(7),
+                topic_uuid: topic,
+                parent_range_uuid: parent,
+                left_range_uuid: Uuid::nil(),
+                right_range_uuid: Uuid::from_u128(0x42),
+                transition_id: Uuid::from_u128(0x77),
+                barrier_offset: 640,
+                expected_range_generation: generation,
+                holder_node_uuid: node,
+                fencing_epoch: epoch,
+            },
+        );
+        assert!(
+            matches!(
+                nil,
+                MetadataResponse::Rejected(MetadataError::InvalidTransition { .. })
+            ),
+            "nil ids are reserved everywhere on this plane: {nil:?}"
+        );
+    }
+
+    /// The lineage-bearing shapes round-trip: a child (parents, no seal), a
+    /// sealed parent (seal, lineage generation zero — canonical only under
+    /// v3), and the transition record itself. Recovery rebuilds the keyspace
+    /// from these bytes alone.
+    #[test]
+    fn lineage_bearing_records_round_trip() {
+        let child = MetaValue::Range(RangeRecord {
+            generation: 3,
+            key_prefix: 1 << 63,
+            key_prefix_bits: 1,
+            fencing_epoch: 9,
+            lineage_generation: 1,
+            parents: vec![Uuid::from_u128(21)],
+            sealed_at: None,
+            lease: None,
+        });
+        let sealed = MetaValue::Range(RangeRecord {
+            generation: 5,
+            key_prefix: 0,
+            key_prefix_bits: 0,
+            fencing_epoch: 4,
+            lineage_generation: 0,
+            parents: Vec::new(),
+            sealed_at: Some(SealedParent {
+                barrier_offset: 640,
+                transition_id: Uuid::from_u128(0x77),
+            }),
+            lease: None,
+        });
+        let transition = MetaValue::LineageTransition(LineageTransitionRecord {
+            parent_range_uuid: Uuid::from_u128(21),
+            barrier_offset: 640,
+            left_range_uuid: Uuid::from_u128(0x41),
+            right_range_uuid: Uuid::from_u128(0x42),
+            sealed_by_epoch: 4,
+            issued_at_ms: 1_000,
+        });
+        for value in [child, sealed, transition] {
+            let decoded = MetaValue::decode(&value.encode().unwrap()).unwrap();
+            assert_eq!(decoded, value);
+        }
     }
 
     fn range_of(machine: &MetaStateMachine, topic_uuid: Uuid, range_uuid: Uuid) -> RangeRecord {
@@ -6839,6 +7921,8 @@ mod tests {
             key_prefix_bits: 0,
             fencing_epoch: 2,
             lineage_generation: 0,
+            parents: Vec::new(),
+            sealed_at: None,
             lease: Some(LeaseRecord {
                 holder_node_uuid: Uuid::from_u128(10),
                 fencing_epoch: 2,
@@ -6855,6 +7939,8 @@ mod tests {
         assert_eq!(MetaValue::decode(&encoded).unwrap(), without);
 
         let with = MetaValue::Range(RangeRecord {
+            parents: Vec::new(),
+            sealed_at: None,
             lease: Some(LeaseRecord {
                 holder_node_uuid: Uuid::from_u128(10),
                 fencing_epoch: 2,
@@ -7017,6 +8103,8 @@ mod tests {
             key_prefix_bits: 0,
             fencing_epoch: 3,
             lineage_generation: 0,
+            parents: Vec::new(),
+            sealed_at: None,
             lease: None,
         });
         let encoded = untransitioned.encode().unwrap();
@@ -7030,6 +8118,8 @@ mod tests {
             key_prefix_bits: 0,
             fencing_epoch: 3,
             lineage_generation: 4,
+            parents: Vec::new(),
+            sealed_at: None,
             lease: None,
         });
         let encoded = transitioned.encode().unwrap();

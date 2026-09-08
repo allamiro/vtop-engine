@@ -92,6 +92,7 @@ const COMMAND_KIND_COMMIT_GROUP_CURSOR_FENCED: u16 = 31;
 const COMMAND_KIND_ENSURE_GROUP_MEMBER_FOR_RANGE: u16 = 32;
 const COMMAND_KIND_COMMIT_GROUP_CURSOR_COORDINATED: u16 = 33;
 const COMMAND_KIND_ENSURE_GROUP_MEMBER_COORDINATED: u16 = 34;
+const COMMAND_KIND_SPLIT_RANGE: u16 = 35;
 
 /// Why a fenced cursor commit is refused (#457 slice 2b): the commit did not
 /// come from the range's current leaseholder at its current fencing epoch. A
@@ -470,6 +471,36 @@ pub enum MetadataCommand {
         fencing_epoch: u64,
         outcome: PromotionOutcome,
     },
+    /// Split a range at a barrier: seal the parent's offset space at the
+    /// committed tail its leaseholder names, and create two children that
+    /// halve its key interval (#473 slice 1). Fenced exactly as
+    /// [`MetadataCommand::RegisterSealedSegment`] is — the plane takes it
+    /// only from the parent's current leaseholder at its current epoch,
+    /// CAS'd on the parent's record generation — because the barrier offset
+    /// is a claim about the log, and the lease fence is what makes that
+    /// claim exactly-one-writer.
+    ///
+    /// `transition_id` names the lineage transition durably: a replay with
+    /// the SAME id is an idempotent Ack, a second split with a different id
+    /// is refused by name. The transition record it mints is the object the
+    /// cursor carry (#468's rule, slice 2) checks.
+    SplitRange {
+        env: CommandEnvelope,
+        topic_uuid: Uuid,
+        parent_range_uuid: Uuid,
+        left_range_uuid: Uuid,
+        right_range_uuid: Uuid,
+        transition_id: Uuid,
+        /// The parent leader's committed tail at seal time. Children start
+        /// their own logs; this is where the parent's readable history ends
+        /// and the mapping the cursor carry consumes begins.
+        barrier_offset: u64,
+        expected_range_generation: u64,
+        /// The node splitting, which must hold the parent's lease...
+        holder_node_uuid: Uuid,
+        /// ...at this fencing epoch, the one the plane granted it.
+        fencing_epoch: u64,
+    },
     RegisterSealedSegment {
         env: CommandEnvelope,
         topic_uuid: Uuid,
@@ -840,6 +871,7 @@ impl MetadataCommand {
             | MetadataCommand::RenewRangeLease { env, .. }
             | MetadataCommand::ReportPromotionOutcome { env, .. }
             | MetadataCommand::ReleaseRangeLease { env, .. }
+            | MetadataCommand::SplitRange { env, .. }
             | MetadataCommand::RegisterSealedSegment { env, .. }
             | MetadataCommand::MarkSegmentVerified { env, .. }
             | MetadataCommand::PutKeyRecord { env, .. }
@@ -981,6 +1013,30 @@ impl MetadataCommand {
                 put_uuid(&mut out, *holder_node_uuid);
                 put_u64(&mut out, *fencing_epoch);
                 encode_promotion_outcome(&mut out, outcome)?;
+            }
+            MetadataCommand::SplitRange {
+                env,
+                topic_uuid,
+                parent_range_uuid,
+                left_range_uuid,
+                right_range_uuid,
+                transition_id,
+                barrier_offset,
+                expected_range_generation,
+                holder_node_uuid,
+                fencing_epoch,
+            } => {
+                put_u16(&mut out, COMMAND_KIND_SPLIT_RANGE);
+                encode_envelope(&mut out, env);
+                put_uuid(&mut out, *topic_uuid);
+                put_uuid(&mut out, *parent_range_uuid);
+                put_uuid(&mut out, *left_range_uuid);
+                put_uuid(&mut out, *right_range_uuid);
+                put_uuid(&mut out, *transition_id);
+                put_u64(&mut out, *barrier_offset);
+                put_u64(&mut out, *expected_range_generation);
+                put_uuid(&mut out, *holder_node_uuid);
+                put_u64(&mut out, *fencing_epoch);
             }
             MetadataCommand::RegisterSealedSegment {
                 env,
@@ -1602,6 +1658,18 @@ impl MetadataCommand {
                 topic_uuid: reader.uuid("topic uuid")?,
                 range_uuid: reader.uuid("range uuid")?,
                 expected_fencing_epoch: reader.u64("expected fencing epoch")?,
+            }),
+            COMMAND_KIND_SPLIT_RANGE => Ok(MetadataCommand::SplitRange {
+                env: decode_envelope(reader)?,
+                topic_uuid: reader.uuid("topic uuid")?,
+                parent_range_uuid: reader.uuid("parent range uuid")?,
+                left_range_uuid: reader.uuid("left range uuid")?,
+                right_range_uuid: reader.uuid("right range uuid")?,
+                transition_id: reader.uuid("transition id")?,
+                barrier_offset: reader.u64("barrier offset")?,
+                expected_range_generation: reader.u64("expected range generation")?,
+                holder_node_uuid: reader.uuid("holder node uuid")?,
+                fencing_epoch: reader.u64("fencing epoch")?,
             }),
             COMMAND_KIND_REGISTER_SEALED_SEGMENT => Ok(MetadataCommand::RegisterSealedSegment {
                 env: decode_envelope(reader)?,
@@ -2424,6 +2492,18 @@ mod tests {
                 name: "events.v1".to_owned(),
                 topic_uuid: Uuid::from_u128(20),
                 root_range_uuid: Uuid::from_u128(21),
+            },
+            MetadataCommand::SplitRange {
+                env: envelope(45),
+                topic_uuid: Uuid::from_u128(20),
+                parent_range_uuid: Uuid::from_u128(21),
+                left_range_uuid: Uuid::from_u128(0x41),
+                right_range_uuid: Uuid::from_u128(0x42),
+                transition_id: Uuid::from_u128(0x77),
+                barrier_offset: 640,
+                expected_range_generation: 3,
+                holder_node_uuid: Uuid::from_u128(10),
+                fencing_epoch: 9,
             },
             MetadataCommand::GrantRangeLease {
                 env: envelope(5),
