@@ -447,6 +447,35 @@ def write_engine_config(scenario, work_dir: str, state_db: str,
     if backend == "localfs":
         root = scenario.get("local_path", "") or os.path.join(os.path.dirname(state_db), "objects")
         lines.append(f'  local_path: "{root}"')
+    # Command-based backends (awscli/s3cmd/minio) shell out to a CLI, and the
+    # engine refuses a non-absolute command_binary — PATH lookup is forbidden
+    # (vtop-core config.rs). write_engine_config never wrote a command_* block,
+    # so ANY command backend failed config validation on every cycle (#499);
+    # pass a scenario-supplied absolute path (and optional alias/profile)
+    # through so such a backend can be configured at all.
+    if backend in ("awscli", "s3cmd", "minio"):
+        command_binary = scenario.get("command_binary", "")
+        if command_binary:
+            lines.append(f'  command_binary: "{command_binary}"')
+        profile = scenario.get("profile", "")
+        if profile:
+            lines.append(f'  profile: "{profile}"')
+        # The engine CLEARS the child environment and restores only the names
+        # in command_env_allowlist (CommandPolicy::command_with_environment,
+        # vtop-upload/src/command.rs). A command backend that authenticates
+        # through env vars (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, ...) fails
+        # auth unless its allowlist is serialized too, so a dropped allowlist
+        # left the newly configurable backend unusable (#499). Accept a YAML
+        # list or a comma/space-separated string.
+        allow = scenario.get("command_env_allowlist", "")
+        if isinstance(allow, (list, tuple)):
+            names = [str(n).strip() for n in allow if str(n).strip()]
+        else:
+            names = [n for n in str(allow).replace(",", " ").split() if n]
+        if names:
+            lines.append("  command_env_allowlist:")
+            for name in names:
+                lines.append(f'    - "{name}"')
     if endpoint:
         # The config the CONTAINERIZED engine reads must name the store as
         # that engine reaches it (#476): loopback inside the container is

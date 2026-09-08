@@ -113,3 +113,78 @@ def test_each_run_namespaces_its_objects_under_its_run_id(tmp_path):
 def test_the_prefix_defaults_to_empty(tmp_path):
     text = write(tmp_path, {})
     assert '  prefix: ""' in text
+
+
+# --------------------------------------------------------------------------
+# Command-backend binary (#499)
+# --------------------------------------------------------------------------
+
+
+def test_a_command_backend_writes_its_explicit_binary(tmp_path):
+    # awscli/s3cmd/minio are command backends: the engine refuses a
+    # command_binary that is not an absolute path, and write_engine_config used
+    # to emit no command_* block at all — so every such scenario failed config
+    # validation on every cycle. A scenario-supplied absolute path must land.
+    text = write(tmp_path, {"backend": "minio",
+                            "command_binary": "/usr/local/bin/mc"})
+    assert '  command_binary: "/usr/local/bin/mc"' in text, (
+        "a command backend must be able to name its absolute binary, or it "
+        "cannot pass config validation at all (#499)"
+    )
+
+
+def test_each_command_backend_carries_its_binary(tmp_path):
+    for backend, path in (("awscli", "/usr/bin/aws"),
+                          ("s3cmd", "/usr/bin/s3cmd"),
+                          ("minio", "/usr/local/bin/mc")):
+        text = write(tmp_path, {"backend": backend, "command_binary": path})
+        assert f'  command_binary: "{path}"' in text, backend
+
+
+def test_a_command_profile_is_written_when_given(tmp_path):
+    text = write(tmp_path, {"backend": "awscli",
+                            "command_binary": "/usr/bin/aws",
+                            "profile": "bench"})
+    assert '  profile: "bench"' in text
+
+
+def test_an_s3_native_backend_gets_no_command_binary(tmp_path):
+    # The in-process backend takes no external binary: a stray command_binary
+    # line would be a config key the native path does not consume.
+    text = write(tmp_path, {"backend": "s3_native",
+                            "endpoint_url": "http://localhost:9000",
+                            "command_binary": "/usr/local/bin/mc"})
+    assert "command_binary" not in text, (
+        "s3_native runs in-process; it must not be handed a command binary"
+    )
+
+
+def test_a_command_env_allowlist_list_is_serialized(tmp_path):
+    # The engine clears the child env and restores only these names, so an
+    # env-authenticating backend (AWS CLI) fails auth if the allowlist is
+    # dropped. A YAML list must reach the config as a YAML sequence.
+    text = write(tmp_path, {"backend": "awscli",
+                            "command_binary": "/usr/bin/aws",
+                            "command_env_allowlist": ["AWS_ACCESS_KEY_ID",
+                                                      "AWS_SECRET_ACCESS_KEY"]})
+    assert "  command_env_allowlist:" in text
+    assert '    - "AWS_ACCESS_KEY_ID"' in text
+    assert '    - "AWS_SECRET_ACCESS_KEY"' in text
+
+
+def test_a_command_env_allowlist_string_is_split(tmp_path):
+    # A value that skipped the loader arrives as a string; a comma/space list
+    # must serialize the same way as a YAML list.
+    text = write(tmp_path, {"backend": "awscli",
+                            "command_binary": "/usr/bin/aws",
+                            "command_env_allowlist": "AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY"})
+    assert '    - "AWS_ACCESS_KEY_ID"' in text
+    assert '    - "AWS_SECRET_ACCESS_KEY"' in text
+
+
+def test_no_allowlist_emits_no_block(tmp_path):
+    text = write(tmp_path, {"backend": "awscli",
+                            "command_binary": "/usr/bin/aws"})
+    assert "command_env_allowlist" not in text, (
+        "absent must stay absent so the engine keeps its empty-allowlist default"
+    )
