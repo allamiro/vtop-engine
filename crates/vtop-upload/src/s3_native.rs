@@ -105,6 +105,11 @@ fn validate_endpoint_scheme(endpoint_url: Option<&str>, verify_tls: bool) -> Res
 }
 
 impl S3NativeBackend {
+    /// S3's hard minimum for a non-final multipart part (#482).
+    pub const fn part_size_floor() -> u64 {
+        5 * 1024 * 1024
+    }
+
     /// Build the backend from config, resolving credentials via the standard
     /// AWS credential chain (env vars, profile, instance metadata).
     pub async fn new(cfg: &S3NativeConfig) -> Result<Self, VtopError> {
@@ -207,6 +212,7 @@ impl S3NativeBackend {
         &self,
         object_uri: &str,
         algo: ChecksumAlgorithm,
+        max_bytes: u64,
     ) -> Result<(String, u64), VtopError> {
         let (bucket, key) = parse_s3_uri(object_uri)?;
         let out = self
@@ -217,7 +223,13 @@ impl S3NativeBackend {
             .send()
             .await
             .map_err(|e| sdk_failure("get_object", object_uri, e))?;
-        digest_reader(algo, out.body.into_async_read())
+        // BOUNDED (review): a same-size adversary is caught by the digest,
+        // but an OVERSIZED replacement must not be hashed whole — read at
+        // most max_bytes (the caller passes expected_size + 1), exactly as
+        // verify_reader_content does, so a huge object cannot be pulled
+        // down before it is rejected on size.
+        use tokio::io::AsyncReadExt;
+        digest_reader(algo, out.body.into_async_read().take(max_bytes))
             .await?
             .ok_or_else(|| VtopError::Upload("cannot hash with disabled checksum mode".into()))
     }
@@ -463,19 +475,46 @@ impl UploadBackend for S3NativeBackend {
         };
 
         match algo {
-            ChecksumAlgorithm::Sha256 => match head.checksum_sha256 {
-                Some(stored) if stored.eq_ignore_ascii_case(expected.hex) => Ok(
-                    VerificationResult::passed("S3 service-computed SHA-256 verified"),
-                ),
-                Some(_) => Ok(VerificationResult::failed(
-                    "S3 service-computed SHA-256 mismatch",
-                )),
-                None => Ok(VerificationResult::limited(
-                    "object size matches; S3 returned no service-computed SHA-256",
-                )),
-            },
+            ChecksumAlgorithm::Sha256 => {
+                let judged = crate::base::judge_service_sha256(
+                    head.checksum_sha256.as_deref(),
+                    expected.hex,
+                );
+                if !judged.backend_limited {
+                    return Ok(judged);
+                }
+                // NO SERVICE CHECKSUM IS NOT NO EVIDENCE (#482): S3 returns
+                // no whole-object SHA-256 for a multipart upload — only a
+                // composite the head decoding rejects — and the limited
+                // answer here used to fail every above-threshold batch
+                // under require_strong_verification. The stored body is
+                // still there to hash: one bounded read-back, the same
+                // strong evidence the BLAKE3 arm has always used, at the
+                // cost of a GET the measurement half of #482 publishes.
+                // Which path ran stays observable in the message.
+                let (actual, bytes_read) = self
+                    .digest_stored_body(object_uri, algo, expected_size.saturating_add(1))
+                    .await?;
+                if bytes_read != expected_size {
+                    return Ok(VerificationResult::failed(format!(
+                        "size mismatch: expected {expected_size}, read {bytes_read} stored bytes"
+                    )));
+                }
+                if actual.eq_ignore_ascii_case(expected.hex) {
+                    Ok(VerificationResult::passed(
+                        "stored content SHA-256 verified by read-back (no service \
+                         whole-object checksum; multipart or unchecked upload)",
+                    ))
+                } else {
+                    Ok(VerificationResult::failed(
+                        "stored content SHA-256 mismatch on read-back",
+                    ))
+                }
+            }
             ChecksumAlgorithm::Blake3 => {
-                let (actual, bytes_read) = self.digest_stored_body(object_uri, algo).await?;
+                let (actual, bytes_read) = self
+                    .digest_stored_body(object_uri, algo, expected_size.saturating_add(1))
+                    .await?;
                 if bytes_read != expected_size {
                     return Ok(VerificationResult::failed(format!(
                         "size mismatch: expected {expected_size}, read {bytes_read} stored bytes"
@@ -539,6 +578,10 @@ impl UploadBackend for S3NativeBackend {
     }
     fn supports_multipart(&self) -> bool {
         true
+    }
+
+    fn min_part_size_bytes(&self) -> u64 {
+        Self::part_size_floor()
     }
 
     async fn create_multipart_upload(

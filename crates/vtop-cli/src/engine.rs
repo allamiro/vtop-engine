@@ -35,6 +35,7 @@ use vtop_core::telemetry;
 use vtop_core::types::{ChecksumAlgorithm, ProgressMarker, SourceType};
 use vtop_core::work_dir::cleanup_work_dir;
 use vtop_state::{connect_state_store, BatchPatch, BatchRecord, StateStore};
+use vtop_upload::multipart::{self, MultipartFence, MultipartUploadConfig};
 use vtop_upload::{ObjectChecksum, UploadBackend};
 
 /// How long a batch claim stays exclusive without renewal (#93). Batches
@@ -514,11 +515,54 @@ impl<'a> Pipeline<'a> {
             .as_deref()
             .map(|h| ObjectChecksum::new(algo.as_str(), h));
 
+        // ONE PUT, OR RESUMABLE MULTIPART above the threshold (#482). The
+        // retransmission unit for a single put is the whole batch — a lost
+        // object near the end of a 100 MB batch costs the whole 100 MB
+        // again through mark_failed -> replay. Multipart makes the part the
+        // unit, using machinery the repository already owns; the config is
+        // built ONE way for both this path and `vtopctl tier`, so part
+        // sizes and fencing cannot drift.
+        //
+        // The fence is derived from the batch id and the content digest,
+        // NOT a lease this path does not have. What it protects: a session
+        // resumed for THIS object identity carries THIS content — the
+        // resume refuses if the local bytes or their digest changed, so a
+        // re-derived batch (a new digest) never adopts a stale session. It
+        // does NOT fence against a concurrent writer to the same object
+        // key; the telemetry path has one writer per batch id by
+        // construction (the run's own key prefix), which is the property
+        // that stands in for the lease `tier` holds.
+        let mp_cfg = MultipartUploadConfig::from_upload(&self.config.upload, work_dir.clone());
         let t = Instant::now();
-        if let Err(e) = note_store_request(
+        let multipart_used = mp_cfg.should_multipart(self.backend.as_ref(), compressed.size_bytes);
+        let upload_result = if multipart_used {
+            let fence = MultipartFence {
+                // No segment lineage on the telemetry path; the identity is
+                // the batch and its bytes.
+                expected_segment_generation: 0,
+                fencing_epoch: 0,
+                content_digest_hex: object_checksum.clone().unwrap_or_default(),
+                content_digest_algorithm: algo.as_str().to_owned(),
+                byte_length: compressed.size_bytes,
+            };
+            multipart::upload_resumable(
+                self.backend.as_ref(),
+                &mp_cfg,
+                &compressed.path,
+                &object_uri,
+                object_ck,
+                fence,
+            )
+            .await
+            .map(|_| ())
+        } else {
             self.backend
                 .put_object(&compressed.path, &object_uri, object_ck)
-                .await,
+                .await
+                .map(|_| ())
+        };
+        if let Err(e) = note_store_request(
+            upload_result,
             "object_upload",
             [
                 tenant.as_str(),
@@ -528,9 +572,41 @@ impl<'a> Pipeline<'a> {
             &self.attempts,
             &self.throttles,
         ) {
+            // NO ORPHANED SESSION (#482): a failed multipart leaves a
+            // *.multipart.json and a live upload id, and mark_failed
+            // re-derives the batch — a re-derivation with the same bytes
+            // resumes it (the point of the session), but a re-derivation
+            // with DIFFERENT bytes mints a new digest and a new session
+            // filename, orphaning this one by construction. Abort it here
+            // so the abandoned upload id is released now rather than
+            // waiting out the abandon window. Best-effort: the failure is
+            // already decided, and a failed abort must not mask it.
+            if multipart_used {
+                let fence = MultipartFence {
+                    expected_segment_generation: 0,
+                    fencing_epoch: 0,
+                    content_digest_hex: object_checksum.clone().unwrap_or_default(),
+                    content_digest_algorithm: algo.as_str().to_owned(),
+                    byte_length: compressed.size_bytes,
+                };
+                if let Err(abort_err) =
+                    multipart::abort_session(self.backend.as_ref(), &work_dir, &object_uri, &fence)
+                        .await
+                {
+                    tracing::warn!(
+                        batch_id,
+                        error = %abort_err,
+                        "could not abort the failed multipart session; the abandon \
+                         sweep will reclaim it"
+                    );
+                }
+            }
             fail!(format!("object upload failed: {e}"));
         }
         metrics.object_upload_ms = t.elapsed().as_millis() as u64;
+        if multipart_used {
+            tracing::info!(batch_id, uri = %object_uri, "object_uploaded via multipart");
+        }
         let obj_patch = BatchPatch {
             object_uri: Some(object_uri.clone()),
             object_sha256: Some(object_checksum.clone().unwrap_or_default()),
@@ -1248,6 +1324,20 @@ impl Engine {
         }
         let mut engine = Self::new_with_state_store(config, streams, state_store).await?;
         engine._instance_locks = locks;
+        // Reclaim multipart sessions no source will replay (#482, review):
+        // a crash mid-upload leaves a *.multipart.json and a live upload id
+        // that the inline abort could not reach. The abandonment sweep is
+        // the only thing that frees them, and the engine is its only
+        // production caller — so it runs once at exclusive startup, under
+        // the instance lock, best-effort. Sessions younger than the abandon
+        // window are left for an in-flight run.
+        let mp_cfg = multipart::MultipartUploadConfig::from_upload(
+            &engine.config.upload,
+            std::path::PathBuf::from(&engine.config.engine.work_dir),
+        );
+        if let Err(e) = multipart::cleanup_abandoned(engine.backend.as_ref(), &mp_cfg).await {
+            tracing::warn!(error = %e, "multipart abandonment sweep failed at startup");
+        }
         Ok(engine)
     }
 

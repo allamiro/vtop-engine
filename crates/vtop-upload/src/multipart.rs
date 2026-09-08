@@ -21,7 +21,7 @@ use tokio::sync::Semaphore;
 use vtop_core::errors::VtopError;
 
 /// Tunables for one resumable upload run.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MultipartUploadConfig {
     pub part_size_bytes: u64,
     pub threshold_bytes: u64,
@@ -43,7 +43,16 @@ impl MultipartUploadConfig {
     }
 
     pub fn should_multipart(&self, backend: &dyn UploadBackend, size: u64) -> bool {
-        backend.supports_multipart() && size >= self.threshold_bytes && size > 0
+        // The configured part size must clear the backend's floor (#482,
+        // review): S3 rejects a non-final part below 5 MiB, so a too-small
+        // part size routed to multipart fails every non-final part. This is
+        // the ONE decision both callers share, so the floor lives here —
+        // neither the engine nor `vtopctl tier` can select a doomed
+        // multipart independently.
+        backend.supports_multipart()
+            && size >= self.threshold_bytes
+            && size > 0
+            && self.part_size_bytes >= backend.min_part_size_bytes()
     }
 }
 
@@ -534,10 +543,28 @@ pub async fn cleanup_abandoned(
         if age < cfg.abandon_after_secs {
             continue;
         }
+        // The session file is the ONLY record of the remote upload id
+        // (#482, review): deleting it after a FAILED abort orphans the
+        // remote parts with nothing left to retry the abort against. So a
+        // still-in-progress session is deleted only once its abort
+        // succeeds; a failed abort leaves the session for the next sweep,
+        // and a transient endpoint error self-heals when the store
+        // recovers. A session already Completed has no live upload to
+        // abort and is always removed.
         if session.phase == MultipartSessionPhase::InProgress {
-            let _ = backend
+            if let Err(e) = backend
                 .abort_multipart_upload(&session.object_uri, &session.upload_id)
-                .await;
+                .await
+            {
+                tracing::warn!(
+                    object = %session.object_uri,
+                    upload_id = %session.upload_id,
+                    error = %e,
+                    "abandoned multipart abort failed; keeping the session for the \
+                     next sweep so the remote upload is not orphaned"
+                );
+                continue;
+            }
         }
         delete_session(&path)?;
         cleaned += 1;
@@ -598,6 +625,117 @@ mod tests {
             abandon_after_secs: 60,
             state_dir: dir.to_path_buf(),
         }
+    }
+
+    /// #482, THE test the fix must turn green — asserted as the DESIRED end
+    /// state, failing today by the exact six-link chain the issue walks:
+    /// the engine's default checksum is SHA-256; multipart creation never
+    /// requests a whole-object checksum; S3 (here, the S3-semantics mock,
+    /// judging through the SAME shared function as the real backend)
+    /// returns no whole-object SHA-256 for a multipart completion; the
+    /// SHA-256 arm therefore reads LIMITED; and require_strong_verification
+    /// — the default — fails the batch. An above-threshold object uploaded
+    /// through the multipart path under the default configuration must
+    /// verify NON-limited, or the engine cannot be given this path.
+    #[tokio::test]
+    async fn a_multipart_object_under_default_sha256_verifies_strongly() {
+        let data = vec![5_u8; 10_000];
+        let sha256 = vtop_core::checksum::sha256_bytes(&data);
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&data).unwrap();
+        f.flush().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let backend = MockBackend::new().with_s3_checksum_semantics();
+        let uri = "s3://bucket/batch.jsonl.gz";
+        upload_resumable(
+            &backend,
+            &cfg(state.path(), 3_000),
+            f.path(),
+            uri,
+            Some(ObjectChecksum::new("sha256", &sha256)),
+            MultipartFence {
+                expected_segment_generation: 0,
+                fencing_epoch: 0,
+                content_digest_hex: sha256.clone(),
+                content_digest_algorithm: "sha256".to_owned(),
+                byte_length: data.len() as u64,
+            },
+        )
+        .await
+        .unwrap();
+        let res = backend
+            .verify_object(
+                uri,
+                data.len() as u64,
+                Some(ObjectChecksum::new("sha256", &sha256)),
+            )
+            .await
+            .unwrap();
+        assert!(
+            res.passed && !res.backend_limited,
+            "a multipart object under the DEFAULT config must verify strongly, \
+             or wiring multipart into the engine fails every batch above the \
+             threshold: {res:?}"
+        );
+    }
+
+    /// The backend minimum gates should_multipart (#482, review): S3
+    /// rejects a non-final part below 5 MiB, so a sub-floor part size must
+    /// not select multipart regardless of threshold and object size. The
+    /// s3_native floor is a named constant so the number cannot drift.
+    #[test]
+    fn should_multipart_refuses_a_part_size_below_the_backend_floor() {
+        assert_eq!(
+            crate::s3_native::S3NativeBackend::part_size_floor(),
+            5 * 1024 * 1024
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = MultipartUploadConfig {
+            part_size_bytes: 3_000,
+            threshold_bytes: 3_000,
+            max_parallelism: 2,
+            abandon_after_secs: 60,
+            state_dir: dir.path().to_path_buf(),
+        };
+        assert!(
+            cfg.should_multipart(&MockBackend::new(), 10_000),
+            "a backend with no floor accepts the small part size"
+        );
+        assert!(
+            !cfg.should_multipart(
+                &MockBackend::new().with_min_part_size(5 * 1024 * 1024),
+                10_000
+            ),
+            "a 3 KB part size must not multipart to a 5 MiB-floor backend"
+        );
+    }
+
+    /// The S3-semantics mock's own faithfulness pin: a SINGLE put under the
+    /// same semantics verifies strongly through the service SHA-256 — the
+    /// path production takes today — so the failing multipart test above is
+    /// isolating the multipart hole, not a broken mock.
+    #[tokio::test]
+    async fn a_single_put_under_s3_semantics_verifies_strongly_via_the_service_sha256() {
+        let data = vec![5_u8; 1_000];
+        let sha256 = vtop_core::checksum::sha256_bytes(&data);
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&data).unwrap();
+        f.flush().unwrap();
+        let backend = MockBackend::new().with_s3_checksum_semantics();
+        let uri = "s3://bucket/small.jsonl.gz";
+        backend
+            .put_object(f.path(), uri, Some(ObjectChecksum::new("sha256", &sha256)))
+            .await
+            .unwrap();
+        let res = backend
+            .verify_object(
+                uri,
+                data.len() as u64,
+                Some(ObjectChecksum::new("sha256", &sha256)),
+            )
+            .await
+            .unwrap();
+        assert!(res.passed && !res.backend_limited, "{res:?}");
     }
 
     #[tokio::test]
@@ -816,5 +954,45 @@ mod tests {
         assert_eq!(cleaned, 1);
         assert!(!path.exists());
         assert_eq!(backend.pending_multipart_count(), 0);
+    }
+
+    /// A failed abort keeps the session (#482, review): the session file is
+    /// the only record of the remote upload id, so deleting it after the
+    /// abort failed would orphan the remote parts with nothing left to
+    /// retry against. The next sweep tries again once the store recovers.
+    #[tokio::test]
+    async fn a_failed_abort_keeps_the_session_for_the_next_sweep() {
+        let data = vec![3_u8; 3_000];
+        let (file, digest) = tmp_file(&data);
+        let state = tempfile::tempdir().unwrap();
+        let backend = MockBackend::new()
+            .with_multipart_fail_after_parts(Arc::new(AtomicUsize::new(1)))
+            .with_failing_abort();
+        let uri = "s3://bucket/abandon.segment";
+        let f = fence(&digest, data.len() as u64, 1);
+        let mut cfg = cfg(state.path(), 1_000);
+        let _ = upload_resumable(
+            &backend,
+            &cfg,
+            file.path(),
+            uri,
+            Some(ObjectChecksum::new("blake3", &digest)),
+            f.clone(),
+        )
+        .await
+        .expect_err("interrupt");
+        let path = session_path(state.path(), uri, &f);
+        let mut session = load_session(&path).unwrap();
+        session.updated_at_unix_secs = 1;
+        save_session(&path, &session).unwrap();
+        cfg.abandon_after_secs = 10;
+
+        let cleaned = cleanup_abandoned(&backend, &cfg).await.unwrap();
+        assert_eq!(cleaned, 0, "a failed abort cleans nothing");
+        assert!(path.exists(), "the session survives for the next sweep");
+        assert!(
+            backend.pending_multipart_count() >= 1,
+            "the remote upload is still tracked, not orphaned"
+        );
     }
 }

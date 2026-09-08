@@ -21,6 +21,11 @@ struct Stored {
     size: u64,
     /// Engine-provided object checksum (None when checksums are disabled).
     checksum: Option<String>,
+    /// What the SERVICE computed, under s3_checksum_semantics: a real
+    /// SHA-256 for a single PUT, `None` for a multipart completion (S3's
+    /// composite does not decode as one). Distinct from `checksum`, which
+    /// is uploader-provided metadata and never evidence.
+    service_sha256: Option<String>,
     /// Full content, so `get_object`-based verification is testable.
     data: Vec<u8>,
     /// Prevent the corrupt-on-verify fault from toggling the same byte back to
@@ -74,6 +79,21 @@ pub struct MockBackend {
     /// shared budget could never reach the manifest stage.
     throttled_object_puts: AtomicUsize,
     throttled_manifest_puts: AtomicUsize,
+    /// S3-FAITHFUL checksum semantics (#482): a single PUT records a
+    /// service-computed SHA-256; a multipart completion records NONE —
+    /// mirroring the composite value b64_to_hex_sha256 rejects — and
+    /// `verify_object` judges the SHA-256 arm through the SAME shared
+    /// function the real backend uses, so the mock that reproduces the
+    /// composite-checksum gap cannot drift from the code whose gap it
+    /// reproduces. Off by default: every existing test keeps the mock's
+    /// hash-the-stored-bytes verification.
+    s3_checksum_semantics: bool,
+    /// A configurable non-final-part floor (#482), so should_multipart's
+    /// backend-minimum gate is testable without a live S3. Zero by default.
+    min_part_size: u64,
+    /// When true, abort_multipart_upload fails — so the sweep's
+    /// keep-session-on-failed-abort path is testable (#482).
+    fail_abort: bool,
 }
 
 impl Default for MockBackend {
@@ -83,6 +103,21 @@ impl Default for MockBackend {
 }
 
 impl MockBackend {
+    pub fn with_s3_checksum_semantics(mut self) -> Self {
+        self.s3_checksum_semantics = true;
+        self
+    }
+
+    pub fn with_min_part_size(mut self, bytes: u64) -> Self {
+        self.min_part_size = bytes;
+        self
+    }
+
+    pub fn with_failing_abort(mut self) -> Self {
+        self.fail_abort = true;
+        self
+    }
+
     pub fn new() -> Self {
         Self {
             objects: Mutex::new(HashMap::new()),
@@ -92,6 +127,9 @@ impl MockBackend {
             fail_verification: false,
             backend_limited: false,
             corrupt_on_verify: false,
+            s3_checksum_semantics: false,
+            min_part_size: 0,
+            fail_abort: false,
             multipart_fail_after_parts: Arc::new(AtomicUsize::new(usize::MAX)),
             multipart_parts_uploaded: Arc::new(AtomicUsize::new(0)),
             bucket_ensures: AtomicUsize::new(0),
@@ -186,6 +224,14 @@ impl MockBackend {
             if let Some(b) = s.data.first_mut() {
                 *b ^= 0xff;
                 s.corrupted = true;
+                // A corrupted body must recompute its service digest (or the
+                // s3-semantics verify would accept the STALE service SHA-256
+                // without reading the tampered bytes, review). Recompute so
+                // the mock stays a faithful adversary: S3 would return the
+                // digest of what it now stores.
+                if s.service_sha256.is_some() {
+                    s.service_sha256 = Some(vtop_core::checksum::sha256_bytes(&s.data));
+                }
             }
         }
     }
@@ -197,7 +243,13 @@ impl MockBackend {
         checksum: Option<&str>,
     ) -> Result<String, VtopError> {
         let data = tokio::fs::read(local_path).await?;
-        self.store_bytes(uri, data, checksum)
+        // Under S3 semantics a single PUT gets a service-computed SHA-256,
+        // exactly as the real backend receives one for a whole-object
+        // upload it sent the checksum with (#482).
+        let service = self
+            .s3_checksum_semantics
+            .then(|| vtop_core::checksum::sha256_bytes(&data));
+        self.store_bytes(uri, data, checksum, service)
     }
 
     fn store_bytes(
@@ -205,10 +257,12 @@ impl MockBackend {
         uri: &str,
         data: Vec<u8>,
         checksum: Option<&str>,
+        service_sha256: Option<String>,
     ) -> Result<String, VtopError> {
         let stored = Stored {
             size: data.len() as u64,
             checksum: checksum.map(|s| s.to_string()),
+            service_sha256,
             data: data.clone(),
             corrupted: false,
         };
@@ -331,9 +385,14 @@ impl UploadBackend for MockBackend {
             uri: object_uri.to_string(),
             size_bytes: Some(s.size),
             etag: s.checksum.clone(),
-            // The stored checksum is uploader-provided test metadata. Strong
-            // verification below hashes `data` instead.
-            checksum_sha256: None,
+            // Under S3 semantics the head carries what the SERVICE computed
+            // (#482); otherwise the stored checksum stays uploader-provided
+            // test metadata and strong verification hashes `data` instead.
+            checksum_sha256: if self.s3_checksum_semantics {
+                s.service_sha256.clone()
+            } else {
+                None
+            },
         })
     }
 
@@ -356,10 +415,63 @@ impl UploadBackend for MockBackend {
             if let Some(first) = stored.data.first_mut() {
                 *first ^= 0xff;
                 stored.corrupted = true;
+                if stored.service_sha256.is_some() {
+                    stored.service_sha256 = Some(vtop_core::checksum::sha256_bytes(&stored.data));
+                }
             }
         }
         if stored.data.len() as u64 != expected_size {
             return Ok(VerificationResult::failed("mock: size mismatch"));
+        }
+        // S3-FAITHFUL arms (#482): the SHA-256 judgment goes through the
+        // SAME shared function the real backend uses, so a service value of
+        // None — a multipart completion — reads limited here exactly as it
+        // does against S3. BLAKE3 hashes the stored body, which is the real
+        // read-back's semantics.
+        if self.s3_checksum_semantics {
+            let Some(expected) = expected else {
+                return Ok(VerificationResult::limited(
+                    "object present and size matches (checksums disabled)",
+                ));
+            };
+            return Ok(match expected.algorithm.to_ascii_lowercase().as_str() {
+                "sha256" => {
+                    let judged = crate::base::judge_service_sha256(
+                        stored.service_sha256.as_deref(),
+                        expected.hex,
+                    );
+                    if !judged.backend_limited {
+                        judged
+                    } else {
+                        // The read-back fallback, as the real backend does
+                        // it (#482): no service checksum means hash the
+                        // stored body, never settle for limited.
+                        let actual = vtop_core::checksum::sha256_bytes(&stored.data);
+                        if actual.eq_ignore_ascii_case(expected.hex) {
+                            VerificationResult::passed(
+                                "stored content SHA-256 verified by read-back (no \
+                                 service whole-object checksum; multipart or \
+                                 unchecked upload)",
+                            )
+                        } else {
+                            VerificationResult::failed(
+                                "stored content SHA-256 mismatch on read-back",
+                            )
+                        }
+                    }
+                }
+                "blake3" => {
+                    let actual = vtop_core::checksum::blake3_bytes(&stored.data);
+                    if actual.eq_ignore_ascii_case(expected.hex) {
+                        VerificationResult::passed("mock s3: read-back BLAKE3 verified")
+                    } else {
+                        VerificationResult::failed("mock s3: read-back BLAKE3 mismatch")
+                    }
+                }
+                other => VerificationResult::failed(format!(
+                    "mock s3: unsupported checksum algorithm {other}"
+                )),
+            });
         }
         if self.backend_limited {
             return Ok(VerificationResult::limited("mock: size-only verification"));
@@ -421,6 +533,9 @@ impl UploadBackend for MockBackend {
     }
     fn supports_multipart(&self) -> bool {
         true
+    }
+    fn min_part_size_bytes(&self) -> u64 {
+        self.min_part_size
     }
 
     async fn create_multipart_upload(
@@ -494,7 +609,11 @@ impl UploadBackend for MockBackend {
             })?;
             body.extend_from_slice(bytes);
         }
-        let version_id = self.store_bytes(object_uri, body, None)?;
+        // A multipart completion records NO service SHA-256 (#482): S3
+        // returns a composite with a part-count suffix, which the real
+        // head-decoding rejects — this None IS that composite, as the
+        // verify path experiences it.
+        let version_id = self.store_bytes(object_uri, body, None, None)?;
         Ok(StoredObject {
             version_id: Some(version_id),
         })
@@ -505,6 +624,9 @@ impl UploadBackend for MockBackend {
         object_uri: &str,
         upload_id: &str,
     ) -> Result<(), VtopError> {
+        if self.fail_abort {
+            return Err(VtopError::Upload("mock: forced abort failure".into()));
+        }
         self.multiparts
             .lock()
             .unwrap()
