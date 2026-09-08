@@ -39,6 +39,9 @@ COMPARE_COLS = [
     # The pipe a shaped run was measured through (#403); empty when unshaped.
     "shaping_proxy", "shaping_bandwidth_kbps", "shaping_latency_ms", "shaping_jitter_ms",
     "shaping_scope", "upload_p95_ms",
+    # Which way the sender ran (#476); a comparison across modes is a
+    # comparison of namespaces, and the matrix must say so.
+    "runner_mode",
 ]
 
 

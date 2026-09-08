@@ -28,6 +28,10 @@ CSV_HEADERS: dict[str, list[str]] = {
         # The pipe the run was measured through (#403); empty when unshaped.
         "shaping_proxy", "shaping_bandwidth_kbps", "shaping_latency_ms",
         "shaping_jitter_ms", "shaping_scope",
+        # Which way the sender ran (#476): host process or containerized.
+        # Recorded on EVERY run, host mode included, so no number is ever
+        # read without knowing which namespace produced it.
+        "runner_mode",
     ],
     "batch_metrics.csv": [
         "run_id", "batch_id", "scenario_name", "batch_start_time", "batch_end_time",
@@ -188,6 +192,10 @@ def _summary_md(s: dict) -> str:
         f"| CPU avg / max | {g('cpu_avg_percent')}% / {g('cpu_max_percent')}% |",
         f"| Memory avg / max | {g('memory_avg_mb')} / {g('memory_max_mb')} MB |",
         f"| Upload backend | {g('backend')} |",
+        # Which namespace produced these numbers (#476, review): the JSON
+        # carried it while the human-facing table did not, and summary.md is
+        # the file the runner prints a path to at the end of every run.
+        f"| Runner mode (#476) | {g('runner_mode') or 'host'} |",
         f"| Shaped pipe (#403) | {_shaping_cell(s)} |",
         "",
         "## Bottleneck observations",

@@ -53,6 +53,14 @@ DEFAULTS: dict[str, Any] = {
     # for everything else — see lib/engine.py). Provisioning a bucket against
     # a real endpoint is a scenario's explicit opt-in, never an inference.
     "create_bucket": "",
+    # Where the SENDER runs (#476): "host" launches target/release/vtopctl
+    # as a host process, today's behaviour; "container" execs the same
+    # mounted binary inside the compose stack's vtop-engine service (profile
+    # `containerized`), where a middlebox can later sit in its L3 path.
+    # Host stays the default: it is the cheaper way to run every unshaped
+    # scenario, and rewriting the bundled scenarios would make their
+    # historical numbers incomparable to their future ones.
+    "runner_mode": "host",
     # Bandwidth shaping between the engine and the store (#403), see
     # lib/shaping.py. "" = unshaped; the rest matter only when it is set.
     "shaping_api_url": "",

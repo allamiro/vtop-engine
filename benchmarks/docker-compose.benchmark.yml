@@ -100,5 +100,72 @@ services:
       minio:
         condition: service_healthy
 
+  # The containerized sender (#476): the SAME release binary the host runner
+  # builds, mounted read-only — never rebuilt in an image, so host and
+  # container runs measure an identical artifact — parked in the lab's
+  # network where a middlebox can later sit in its L3 path. `sleep infinity`
+  # plus per-cycle `exec` rather than a per-run container: a soak's cycles
+  # must share one network namespace, or the pipe being shaped changes
+  # identity mid-measurement.
+  #
+  # The run root is mounted at the SAME path it has on the host, because the
+  # runner's generated config names absolute paths (state db, work dir, seed
+  # glob) and rewriting them per mode would make the config another thing
+  # that differs between the modes. Default /tmp, overridable via
+  # VTOP_BENCH_RUN_ROOT for a runner that keeps its temp dirs elsewhere
+  # (export TMPDIR to match).
+  #
+  # Linux-only for shaping purposes: on macOS the host-to-VM hop that
+  # carries this traffic is outside tc, and the profile the engine
+  # experiences is not the profile a middlebox installs.
+  #   docker compose -f benchmarks/docker-compose.benchmark.yml --profile containerized up -d
+  vtop-engine:
+    image: ubuntu:24.04
+    container_name: vtop-bench-engine
+    profiles: ["containerized"]
+    command: ["sleep", "infinity"]
+    init: true
+    # The BUILDING user's uid, not root: cargo writes the binary 0700, and
+    # root with CAP_DAC_OVERRIDE dropped (cap_drop ALL, below) cannot
+    # execute another user's 0700 file — found the hard way on first exec.
+    # Non-root is also simply the container baseline (SECURITY_MODEL §12).
+    # Override when the host uid is not 1000.
+    user: "${VTOP_BENCH_UID:-1000}:${VTOP_BENCH_GID:-1000}"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    pids_limit: 512
+    mem_limit: 2g
+    read_only: true
+    tmpfs: [/scratch]
+    environment:
+      # The engine writes nothing outside the mounted run root; HOME points
+      # at scratch so nothing in the image is asked to be writable.
+      HOME: /scratch
+    volumes:
+      # VTOPCTL_BIN follows the runner's own selection knob (review): a
+      # custom build must be the binary BOTH modes measure, or the modes
+      # compare different artifacts under one name. The preflight verifies
+      # the mounted bytes match the selected file by hash.
+      #
+      # Long syntax with create_host_path:false ON PURPOSE: the short
+      # `src:dst` form makes Compose MKDIR a missing source, so a clean
+      # checkout with no target/release/vtopctl yet would get a *directory*
+      # bind-mounted where the binary belongs, and `vtopctl_path()` would
+      # then see it exist and skip its build (review). Refusing to create the
+      # path makes `up` fail loudly on a missing binary instead — build it
+      # first (`cargo build --release --bin vtopctl`, or let a host-mode run
+      # do it once).
+      - type: bind
+        source: ${VTOPCTL_BIN:-../target/release/vtopctl}
+        target: /usr/local/bin/vtopctl
+        read_only: true
+        bind:
+          create_host_path: false
+      - ${VTOP_BENCH_RUN_ROOT:-/tmp}:${VTOP_BENCH_RUN_ROOT:-/tmp}
+    depends_on:
+      minio:
+        condition: service_healthy
+
 volumes:
   bench-minio-data:

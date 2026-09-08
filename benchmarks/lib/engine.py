@@ -17,12 +17,17 @@ def repo_root() -> str:
 
 
 def vtopctl_path(build_if_missing: bool = True) -> str:
+    # isfile, not exists (review): a container run whose compose step ran
+    # before the binary was built can leave a *directory* at this path (the
+    # short bind-mount form mkdirs a missing source). `exists` would treat
+    # that directory as the binary and skip the build; `isfile` rebuilds so
+    # the runner self-heals even if the mount got created empty.
     env = os.environ.get("VTOPCTL_BIN")
-    if env and os.path.exists(env):
+    if env and os.path.isfile(env):
         return env
     root = repo_root()
     path = os.path.join(root, "target", "release", "vtopctl")
-    if not os.path.exists(path) and build_if_missing:
+    if not os.path.isfile(path) and build_if_missing:
         subprocess.run(["cargo", "build", "--release", "--bin", "vtopctl"],
                        cwd=root, check=True)
     return path
@@ -33,6 +38,282 @@ def effective_endpoint(scenario) -> str:
     override when set, else the scenario's. Public so a shaped run can check
     it is the proxy's (#403)."""
     return _effective_endpoint(scenario)
+
+
+# --- runner mode (#476) ------------------------------------------------------
+#
+# The engine can run as a host process (today's behaviour, the default) or
+# inside the lab's compose network, where a middlebox can later sit in its
+# L3 path. Everything below exists so the two modes stay the same
+# measurement: same binary (mounted in, never rebuilt in an image), same
+# credential resolution, same config — only the namespace changes.
+
+RUNNER_MODES = ("host", "container")
+
+# The compose service that wraps the mounted binary, and the file that
+# defines it. `exec` into a standing service rather than `run --rm` per
+# invocation: a soak calls the engine once per cycle, and the network
+# namespace a middlebox shapes must be the SAME one across cycles, not a
+# fresh one per process.
+CONTAINER_SERVICE = "vtop-engine"
+COMPOSE_FILE = os.path.join(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))), "docker-compose.benchmark.yml")
+
+# The environment the engine's credential/endpooint resolution consumes —
+# the exact keys _backend_env manages. A container run forwards these and
+# ONLY these through `exec -e`: forwarding the whole host environment would
+# leak host paths and credentials into a namespace that needs neither.
+_ENGINE_ENV_KEYS = (
+    "VTOP_S3_ENDPOINT_URL", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+    # The session token rides with temporary credentials (review): the SDK's
+    # credential chain treats key+secret without it as long-lived and fails
+    # auth, so omitting it broke external stores in container mode only.
+    "AWS_SESSION_TOKEN",
+    # The SDK's own endpoint overrides (review): the backend consumes both,
+    # the host runner honors them, and dropping them at the boundary made
+    # container mode silently aim at a different store. Operator topology —
+    # never translated.
+    "AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3",
+    "AWS_REGION", "VTOP_S3_FORCE_PATH_STYLE", "VTOP_S3_VERIFY_TLS",
+)
+
+
+def runner_mode(scenario) -> str:
+    """The scenario's launch mode, refused loudly when it names neither mode:
+    a typo that fell back to `host` would run an unshaped measurement and
+    record it as whatever the scenario claimed."""
+    raw = scenario.get("runner_mode", "host")
+    # A bool or other non-string is a scenario error, not a silent host
+    # default (review): `runner_mode: false` in YAML arrives as False, and
+    # `False or "host"` would quietly coerce it. Only a string names a mode.
+    if raw is None or raw == "":
+        raw = "host"
+    if not isinstance(raw, str) or raw not in RUNNER_MODES:
+        raise ValueError(
+            f"runner_mode must be one of {RUNNER_MODES}, got {raw!r}")
+    return raw
+
+
+def container_wire_endpoint(endpoint: str, shaped: bool = False) -> str:
+    """The lab endpoint as the CONTAINERIZED engine reaches it.
+
+    The compose stack publishes MinIO on the host's loopback at :9000, and
+    loopback inside the engine container is the engine container. On the
+    compose network the same store is `minio:9000` — the service name — so
+    exactly the lab loopback endpoint is rewritten and nothing else is: an
+    external store's address means the operator brought their own topology,
+    and rewriting it would point the engine somewhere the operator never
+    named. The credential decision (`_is_lab_endpoint`) keeps judging the
+    HOST-view endpoint, so the lab fallbacks follow the store, not the
+    spelling of its address.
+    """
+    if _is_lab_endpoint(endpoint, shaped=shaped):
+        parts = urlsplit(endpoint)
+        # A SHAPED scenario goes through the proxy service, not around it
+        # (review): 9100 is the same lab store behind toxiproxy, and
+        # translating it to the store's own name would send the engine
+        # around the toxics while the summary said shaped — the exact
+        # bypass require_endpoint_through_proxy exists to refuse.
+        if parts.port == 9100:
+            return f"{parts.scheme or 'http'}://toxiproxy:9100"
+        return f"{parts.scheme or 'http'}://minio:9000"
+    return endpoint
+
+
+def preflight_container(config_path: str, input_dir: str, binary: str,
+                        scenario=None) -> str | None:
+    """Prove the engine container can see this run's files, BEFORE the run.
+
+    The run root reaches the container through a compose variable
+    (VTOP_BENCH_RUN_ROOT), and a container recreated without it silently
+    mounts the default instead — after which every cycle fails with a
+    config-not-found the runner can only count, not explain. Found the hard
+    way: a 300-second soak recorded 267 buried errors and a clean exit.
+    One exec up front turns that into an immediate refusal naming the knob.
+
+    Returns None when the container sees the file, else the failure text.
+    """
+    remount = (
+        "Bring the stack up with VTOP_BENCH_RUN_ROOT set to the directory "
+        "your TMPDIR (and any --seed-dir) lives under, plus the "
+        "containerized profile, e.g.\n"
+        "  VTOP_BENCH_RUN_ROOT=$TMPDIR docker compose -f "
+        "benchmarks/docker-compose.benchmark.yml --profile containerized up -d")
+    # Probes are argv, never a shell string (review): a path with a single
+    # quote in a `sh -c` program is arbitrary command execution in the
+    # engine container. `test` takes the path as one positional argument,
+    # so no quoting question arises.
+    #
+    # The permission the engine actually needs, not mere existence (review,
+    # three findings): the config must be READABLE; the input directory
+    # readable AND searchable (-r -x, or the engine stats it and sees
+    # nothing); a localfs destination must be a WRITABLE directory, or its
+    # parent writable when the root does not exist yet.
+    probes = [
+        (f"read this run's config at {config_path}", ["test", "-r", config_path]),
+        (f"read and search this run's input directory {input_dir}",
+         ["test", "-r", input_dir, "-a", "-x", input_dir]),
+    ]
+    if scenario is not None and scenario.get("backend") == "localfs":
+        local_path = str(scenario.get("local_path", "") or "")
+        if local_path:
+            if not os.path.isabs(local_path):
+                return (
+                    f"localfs local_path {local_path!r} is relative, and would "
+                    "resolve against a different working directory in each "
+                    "namespace; make it absolute, under the mounted run root")
+            parent = os.path.dirname(local_path.rstrip("/")) or "/"
+            # An existing root must be a writable directory; a missing root
+            # needs a writable parent to be created in. `sh -c` avoided by
+            # expressing the either-or as two probes and accepting the run
+            # if EITHER holds — checked in Python, not the shell.
+            root_exists = subprocess.run(
+                ["docker", "compose", "-f", COMPOSE_FILE, "exec", "-T",
+                 CONTAINER_SERVICE, "test", "-e", local_path],
+                capture_output=True, text=True).returncode == 0
+            if root_exists:
+                # An EXISTING root must itself be a writable directory
+                # (review): a read-only directory, or a regular file where a
+                # directory is meant, refuses.
+                probe_dir = local_path
+                is_dir = subprocess.run(
+                    ["docker", "compose", "-f", COMPOSE_FILE, "exec", "-T",
+                     CONTAINER_SERVICE, "test", "-d", local_path],
+                    capture_output=True, text=True).returncode == 0
+                if not is_dir:
+                    return (
+                        f"the localfs destination {local_path} exists in the "
+                        "container but is a file where a directory is meant. "
+                        f"{remount}")
+            else:
+                # A MISSING root is created with create_dir_all, so ANY
+                # not-yet-existing depth is fine as long as the FIRST
+                # existing ancestor is a writable directory (review, two
+                # findings): walk up until something exists, then probe
+                # that. LocalFsBackend::store creates the rest.
+                probe_dir = parent
+                walk = subprocess.run(
+                    ["docker", "compose", "-f", COMPOSE_FILE, "exec", "-T",
+                     CONTAINER_SERVICE, "sh", "-c",
+                     'd="$1"; while [ ! -e "$d" ] && [ "$d" != "/" ] '
+                     '&& [ "$d" != "." ]; do d=$(dirname "$d"); done; '
+                     'printf %s "$d"', "vtopbench", local_path],
+                    capture_output=True, text=True)
+                if walk.returncode == 0 and walk.stdout.strip():
+                    probe_dir = walk.stdout.strip()
+            # An ACTUAL WRITE, not a permission-bit read (review): test -w
+            # passes on a directory whose filesystem is mounted read-only,
+            # or under other mount-level denials that the bits do not show.
+            # Create and remove a probe file; success is the only proof
+            # that matters before a soak commits to this destination.
+            probe_name = f".vtop-bench-writeprobe-{os.getpid()}"
+            write_ok = subprocess.run(
+                ["docker", "compose", "-f", COMPOSE_FILE, "exec", "-T",
+                 CONTAINER_SERVICE, "sh", "-c",
+                 'p="$1/$2"; (set -C; : > "$p") 2>/dev/null && rm -f "$p"',
+                 "vtopbench", probe_dir, probe_name],
+                capture_output=True, text=True).returncode == 0
+            if not write_ok:
+                return (
+                    f"the localfs destination {local_path} is not writable in "
+                    f"the container (probed a real write under {probe_dir}; it "
+                    "may be a read-only mount, not just permission bits). The "
+                    "container runs read-only except the mounted run root; put "
+                    f"local_path under it. {remount}")
+    for what, args in probes:
+        probe = subprocess.run(
+            ["docker", "compose", "-f", COMPOSE_FILE, "exec", "-T",
+             CONTAINER_SERVICE] + args,
+            capture_output=True, text=True)
+        if probe.returncode != 0:
+            return (
+                f"the engine container cannot {what}: the run root is not "
+                "mounted where this run expects it — or the container user "
+                "cannot traverse it (the service runs as VTOP_BENCH_UID, "
+                "default 1000; set it to your uid when yours differs, since "
+                f"mkdtemp directories are 0700). {remount}\n"
+                f"compose said: "
+                f"{probe.stderr.strip() or probe.stdout.strip() or 'nothing'}")
+    # AND THE BYTES MUST RUN THERE (review): a hash match proves identity,
+    # not executability — a macOS host binary mounts and matches and then
+    # cannot exec in a Linux container, and a no-outcome cycle would bury
+    # that. One --version exec proves the platform before anything is
+    # measured.
+    probe = subprocess.run(
+        ["docker", "compose", "-f", COMPOSE_FILE, "exec", "-T",
+         CONTAINER_SERVICE, "vtopctl", "--version"],
+        capture_output=True, text=True)
+    if probe.returncode != 0:
+        return (
+            "the container cannot execute the mounted vtopctl (a host binary "
+            "built for another platform mounts and hash-matches but will not "
+            "run — container mode needs a Linux build): "
+            f"{probe.stderr.strip() or probe.stdout.strip() or 'no output'}")
+    # THE SAME BYTES IN BOTH NAMESPACES (review): the compose mount defaults
+    # to target/release/vtopctl, so a VTOPCTL_BIN override — or a rebuild
+    # that replaced the file after the container mounted its old inode,
+    # found live — would measure a different artifact while the results
+    # claimed one binary. The hashes must match or the run refuses.
+    host_hash = ""
+    try:
+        with open(binary, "rb") as fh:
+            import hashlib
+            host_hash = hashlib.sha256(fh.read()).hexdigest()
+    except OSError as error:
+        return f"cannot hash the host binary {binary}: {error}"
+    probe = subprocess.run(
+        ["docker", "compose", "-f", COMPOSE_FILE, "exec", "-T",
+         CONTAINER_SERVICE, "sha256sum", "/usr/local/bin/vtopctl"],
+        capture_output=True, text=True)
+    container_hash = probe.stdout.split()[0] if probe.returncode == 0 and probe.stdout else ""
+    if container_hash != host_hash:
+        return (
+            "the container's vtopctl is not the binary this run selected "
+            f"({binary}): host sha256 {host_hash[:16]}…, container "
+            f"{container_hash[:16] or 'unreadable'}…. Recreate the service so "
+            "the mount follows the current file (a bind mount keeps the OLD "
+            "inode across a rebuild), and export VTOPCTL_BIN before `up` if "
+            f"you are selecting a custom build. {remount}")
+    return None
+
+
+def invocation(binary: str, args: list[str], scenario) -> tuple[list[str], dict[str, str]]:
+    """The exact (argv, env) a run of the engine uses, in either mode.
+
+    Public and pure so the default path is pinned by a test rather than by
+    hope: `host` mode must produce today's command line unchanged, or the
+    second mode's existence has already drifted the first.
+    """
+    env = _backend_env(scenario)
+    if runner_mode(scenario) == "host":
+        return [binary] + args, env
+    # Container mode: the engine's environment crosses the boundary through
+    # explicit -e flags — the six keys resolution consumes, with the wire
+    # endpoint swapped in for the lab's loopback address. The config file's
+    # endpoint line gets the same translation in write_engine_config, so the
+    # two channels can never name different stores.
+    # SECRETS NEVER RIDE THE COMMAND LINE (review): `-e KEY=VALUE` puts the
+    # secret in /proc/*/cmdline for any local observer. `-e KEY` alone tells
+    # the docker client to propagate the value from ITS OWN environment, so
+    # the value travels through the returned env dict instead.
+    argv = ["docker", "compose", "-f", COMPOSE_FILE, "exec", "-T"]
+    exec_env = dict(os.environ)
+    for key in _ENGINE_ENV_KEYS:
+        value = env.get(key, "")
+        # EVERY forwarded endpoint variable gets the same view translation
+        # (review): the SDK honors its own AWS_ENDPOINT_URL family, and a
+        # lab-loopback value forwarded verbatim aims the container at
+        # itself — the exact hole the VTOP_S3_ENDPOINT_URL translation
+        # closed, one variable over. Operator endpoints pass through.
+        if value and key in (
+                "VTOP_S3_ENDPOINT_URL", "AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3"):
+            value = container_wire_endpoint(
+                value, shaped=_shaped_by_the_bundled_proxy(scenario))
+        if value:
+            argv += ["-e", key]
+            exec_env[key] = value
+    argv += [CONTAINER_SERVICE, "vtopctl"] + args
+    return argv, exec_env
 
 
 def _effective_endpoint(scenario) -> str:
@@ -167,6 +448,15 @@ def write_engine_config(scenario, work_dir: str, state_db: str,
         root = scenario.get("local_path", "") or os.path.join(os.path.dirname(state_db), "objects")
         lines.append(f'  local_path: "{root}"')
     if endpoint:
+        # The config the CONTAINERIZED engine reads must name the store as
+        # that engine reaches it (#476): loopback inside the container is
+        # the container. Same translation, same single place, as the
+        # environment override in `invocation` — resolved through
+        # `_effective_endpoint` first in both, so the two can never name
+        # different stores.
+        if runner_mode(scenario) == "container":
+            endpoint = container_wire_endpoint(
+                endpoint, shaped=_shaped_by_the_bundled_proxy(scenario))
         lines.append(f"  endpoint_url: {endpoint}")
     with open(config_path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
@@ -282,9 +572,10 @@ def _backend_env(scenario) -> dict[str, str]:
 def process_once(binary: str, config_path: str, scenario,
                  source: str = "file") -> tuple[int, list[dict], str]:
     """Run `vtopctl process-once --json` and parse the batch outcomes."""
-    proc = subprocess.run(
-        [binary, "--json", "process-once", "--source", source, "--config", config_path],
-        capture_output=True, text=True, env=_backend_env(scenario))
+    argv, env = invocation(
+        binary, ["--json", "process-once", "--source", source, "--config", config_path],
+        scenario)
+    proc = subprocess.run(argv, capture_output=True, text=True, env=env)
     outcomes: list[dict] = []
     try:
         outcomes = json.loads(proc.stdout) if proc.stdout.strip() else []
@@ -294,7 +585,6 @@ def process_once(binary: str, config_path: str, scenario,
 
 
 def replay(binary: str, config_path: str, scenario) -> tuple[int, str]:
-    proc = subprocess.run(
-        [binary, "replay", "--config", config_path],
-        capture_output=True, text=True, env=_backend_env(scenario))
+    argv, env = invocation(binary, ["replay", "--config", config_path], scenario)
+    proc = subprocess.run(argv, capture_output=True, text=True, env=env)
     return proc.returncode, proc.stdout + proc.stderr
