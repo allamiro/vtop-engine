@@ -199,7 +199,7 @@ def main() -> int:
     # can surface WHY in the results dir instead of leaving an all-zeros summary
     # with the reason on a discarded stderr (#499).
     engine_stderr = ""
-    no_outcome_cycles = 0
+    fail_stderr_set = False
     comp_ratios = []
     files_seen = 0
     # Seeded bytes, tracked alongside the archived ones so the backlog is a
@@ -321,13 +321,26 @@ def main() -> int:
             if not outcomes:
                 if rc != 0:
                     errors += 1
-                # Keep the FIRST no-outcome cycle's stderr, keyed on the cycle
-                # COUNT rather than on the buffer being empty (review): a first
-                # empty-stderr cycle must still be the one preserved, and a
-                # cycle that exited 0 after every seeded file failed to read
-                # (logged and skipped) carries its diagnostic here too (#499).
-                no_outcome_cycles += 1
-                if no_outcome_cycles == 1:
+                    # A GENUINE failure's diagnostic takes priority and wins
+                    # over any provisional one (review): the first nonzero-exit
+                    # cycle is the real reason the run went nowhere, so a benign
+                    # non-empty stderr from an earlier idle poll must not bury
+                    # it, and a later failure must not replace the first.
+                    # Only a NON-EMPTY failure diagnostic latches, though: an
+                    # empty one carries no reason, so it must neither lock out a
+                    # later failure that DOES have a message nor erase a
+                    # provisional rc-0 read-error message we are still holding
+                    # (review). We keep counting the error either way.
+                    if stderr and not fail_stderr_set:
+                        engine_stderr = stderr
+                        fail_stderr_set = True
+                elif not fail_stderr_set and not engine_stderr and stderr:
+                    # No genuine failure yet: hold the first non-empty stderr as
+                    # a PROVISIONAL diagnostic, for the case where every seeded
+                    # file fails the adapter read and the engine still exits 0
+                    # (its read-error log is all we have). A real failure later
+                    # overrides this; if none comes and it stays empty, the
+                    # empty-file fallback below still records the refusal.
                     engine_stderr = stderr
             produced = 0
             cycle_success = 0
