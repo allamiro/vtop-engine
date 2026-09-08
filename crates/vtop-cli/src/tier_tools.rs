@@ -1064,6 +1064,74 @@ mod tests {
         assert_eq!(std::fs::read(&out).unwrap(), data);
     }
 
+    /// One config construction, two callers (#482): the engine builds its
+    /// MultipartUploadConfig with MultipartUploadConfig::from_upload, and
+    /// so does the tier path — before its CLI overrides — so with no
+    /// overrides the two are byte-for-byte equal. Part sizes and fencing
+    /// cannot drift between the telemetry path and the operator tool.
+    #[test]
+    fn the_engine_and_tier_build_the_same_multipart_config_from_one_upload() {
+        let upload = vtop_core::config::UploadConfig {
+            backend: "s3_native".into(),
+            bucket: "telemetry-data".into(),
+            prefix: "telemetry-data".into(),
+            endpoint_url: None,
+            region: "us-east-1".into(),
+            force_path_style: true,
+            verify_tls: false,
+            profile: None,
+            command_binary: None,
+            command_timeout_seconds: 300,
+            command_max_output_bytes: 1024 * 1024,
+            command_env_allowlist: Vec::new(),
+            create_bucket: false,
+            local_path: None,
+            require_strong_verification: true,
+            require_object_versioning: false,
+            multipart_part_size_bytes: 16 * 1024 * 1024,
+            multipart_threshold_bytes: 8 * 1024 * 1024,
+            multipart_max_parallelism: 4,
+            multipart_abandon_after_secs: 86_400,
+        };
+        let state_dir = PathBuf::from("/work");
+        // The engine path: from_upload, no overrides.
+        let engine_cfg =
+            vtop_upload::multipart::MultipartUploadConfig::from_upload(&upload, state_dir.clone());
+        // The tier path: multipart_config_from_args with a state dir and NO
+        // size/parallelism overrides is the same from_upload underneath.
+        let args = TierCopyArgs {
+            upload_config: PathBuf::from("upload.yaml"),
+            meta_config: PathBuf::from("meta.yaml"),
+            segment: PathBuf::from("bundle.segment"),
+            topic_uuid: TOPIC,
+            range_uuid: RANGE,
+            segment_uuid: SEGMENT_ID,
+            expected_generation: 1,
+            fencing_epoch: 3,
+            expected_root: "ab".repeat(32),
+            object_uri: "s3://tier/bundle.segment".to_owned(),
+            require_versioning: true,
+            commit_key_env: None,
+            commit_key_id: String::new(),
+            verifier_node_uuid: NODE,
+            verified_term: 7,
+            issued_at_ms: 0,
+            request_id: Some(Uuid::from_u128(1)),
+            multipart_state_dir: Some(state_dir.clone()),
+            multipart_part_size_bytes: None,
+            multipart_threshold_bytes: None,
+            multipart_max_parallelism: None,
+        };
+        let tier_cfg = multipart_config_from_args(&args, &upload)
+            .unwrap()
+            .expect("a state dir was supplied");
+        assert_eq!(
+            engine_cfg, tier_cfg,
+            "the two callers must build the same config from one UploadConfig, or \
+             part sizes and fencing drift between the engine and vtopctl tier"
+        );
+    }
+
     #[test]
     fn build_request_maps_arguments_and_rejects_bad_hex() {
         let mut args = TierCopyArgs {

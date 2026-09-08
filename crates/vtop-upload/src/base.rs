@@ -111,6 +111,29 @@ impl VerificationResult {
     }
 }
 
+/// The SHA-256 service-checksum judgment, in exactly one place (#482): the
+/// S3-native backend consults it for the real head, and the S3-semantics
+/// mock consults it for the simulated one, so the mock that reproduces the
+/// composite-checksum gap can never drift from the code whose gap it
+/// reproduces. A `None` is DELIBERATELY limited, not failed: S3 returns no
+/// whole-object SHA-256 for a multipart upload (only a composite with a
+/// part-count suffix), and absence of service evidence is weaker than
+/// contradiction.
+pub(crate) fn judge_service_sha256(
+    service: Option<&str>,
+    expected_hex: &str,
+) -> VerificationResult {
+    match service {
+        Some(stored) if stored.eq_ignore_ascii_case(expected_hex) => {
+            VerificationResult::passed("S3 service-computed SHA-256 verified")
+        }
+        Some(_) => VerificationResult::failed("S3 service-computed SHA-256 mismatch"),
+        None => VerificationResult::limited(
+            "object size matches; S3 returned no service-computed SHA-256",
+        ),
+    }
+}
+
 /// Verify a downloaded/local file by hashing the bytes read from its open file
 /// handle. This is intentionally independent of sidecars and user metadata.
 pub(crate) async fn verify_file_content(
@@ -556,6 +579,15 @@ pub trait UploadBackend: Send + Sync {
     /// internally inside a single `put_object` still return `false` here —
     /// resume across process restart requires an explicit upload id.
     fn supports_multipart(&self) -> bool;
+
+    /// The smallest part size this backend accepts for a non-final part, in
+    /// bytes (#482). S3 rejects a non-final part below 5 MiB, so an engine
+    /// path configured with a smaller part size must NOT route multipart to
+    /// it — every non-final part would fail. Zero means no minimum (the
+    /// in-process mock). The default is 0; a real S3 backend overrides it.
+    fn min_part_size_bytes(&self) -> u64 {
+        0
+    }
 
     /// Start a resumable multipart upload. Returns the backend upload id.
     async fn create_multipart_upload(
