@@ -302,3 +302,47 @@ def test_every_bundled_scenario_survives_the_fallback_parser():
                 f"{os.path.basename(path)}: {key} parsed as a bare block "
                 "indicator — the fallback parser dropped its content"
             )
+
+
+def test_fallback_parse_reads_a_nested_transport_tuning_map():
+    # The fallback parser must handle nested maps so a transports block survives
+    # when PyYAML is absent (#480), instead of being dropped to "".
+    parsed = _fallback_parse(
+        "transport: tcp_tls\n"
+        "transports:\n"
+        "  tcp_tls:\n"
+        "    max_concurrency: 4\n"
+        "    part_size_bytes: 8388608\n"
+        "after: 1\n"
+    )
+    assert parsed["transports"] == {
+        "tcp_tls": {"max_concurrency": 4, "part_size_bytes": 8388608}
+    }
+    # Keys after the nested block still parse.
+    assert parsed["after"] == 1
+    assert parsed["transport"] == "tcp_tls"
+
+
+def test_a_flow_style_mapping_is_refused_by_name_not_crashed_into():
+    # PyYAML reads `transports: {tcp_tls: {max_concurrency: 4}}`; this parser
+    # does not, and the difference used to be SILENT — the value stayed a
+    # string, and write_engine_config then called .items() on it and died with
+    # an AttributeError naming neither the key nor the reason. The subset this
+    # parser handles is a deliberate choice, so its boundary is stated.
+    from lib.scenario import _fallback_parse
+
+    with pytest.raises(ValueError) as exc:
+        _fallback_parse("name: x\ntransports: {tcp_tls: {max_concurrency: 4}}\n")
+    message = str(exc.value)
+    assert "flow-style mapping" in message, (
+        "the refusal must say what the shape was, or the operator reads it as a typo"
+    )
+    assert "transports:" in message and "PyYAML" in message, (
+        "and it must give both ways out — the block spelling both loaders read, and the "
+        "dependency that would have read this one — because a refusal the reader cannot "
+        "act on is only a crash with better manners"
+    )
+
+    # The block spelling is unaffected, and is what the bundled scenarios use.
+    parsed = _fallback_parse("name: x\ntransports:\n  tcp_tls:\n    max_concurrency: 4\n")
+    assert parsed["transports"] == {"tcp_tls": {"max_concurrency": 4}}

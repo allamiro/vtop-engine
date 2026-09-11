@@ -46,6 +46,12 @@ COMPARE_COLS = [
     # comparison of wires, so the matrix must carry it beside runner_mode.
     # Blank for backends that route through no EgressTransport seam.
     "transport",
+    # ... and how it was TUNED (#480, review): a matrix that varies only the
+    # tuning otherwise shows every row with identical visible conditions, so
+    # the reader cannot see the one thing the runs differ in. Serialized as
+    # sorted key=value pairs, so the same tuning always renders the same
+    # string and two matrices diff cleanly.
+    "transport_tuning_flat",
 ]
 
 

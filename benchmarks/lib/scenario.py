@@ -160,6 +160,20 @@ def _coerce(value: str) -> Any:
     # "[AWS_..." / "...]" names the engine cannot resolve (review).
     if len(v) >= 2 and v[0] == "[" and v[-1] == "]":
         return [_coerce(item) for item in _split_flow_items(v[1:-1])]
+    # Flow-style MAPPING: "{a: 1}". PyYAML reads it; this parser does not, and
+    # the difference used to be silent — the value stayed a string, and
+    # write_engine_config then called .items() on it and died with an
+    # AttributeError that named neither the key nor the reason (review). The
+    # subset this parser handles is a deliberate choice, so the boundary is
+    # stated rather than crashed into: a scenario is either readable by both
+    # loaders or refused by name.
+    if len(v) >= 2 and v[0] == "{" and v[-1] == "}":
+        raise ValueError(
+            f"flow-style mapping {v!r} is not supported by the dependency-free scenario "
+            "parser, and reading it as a string would fail later with no mention of this "
+            "line. Write it as an indented block:\n"
+            "    transports:\n      tcp_tls:\n        max_concurrency: 4\n"
+            "— which both loaders read identically — or install PyYAML")
     if v.startswith('"') and v.endswith('"'):
         return v[1:-1]
     if v.startswith("'") and v.endswith("'"):
@@ -296,6 +310,32 @@ def _fallback_parse(text: str) -> dict[str, Any]:
                     out[key_part.strip()] = seq
                     i = j
                     continue
+                # Not a sequence: more-indented "key: value" children form a
+                # NESTED MAP (e.g. upload.transports.<name>.<knob>, #480). Collect
+                # the child block and recurse on it dedented, so nested maps
+                # survive when PyYAML is absent instead of being dropped to "".
+                child_end = i
+                while child_end < len(lines):
+                    nxt = lines[child_end]
+                    if not nxt.strip() or nxt.lstrip().startswith("#"):
+                        child_end += 1
+                        continue
+                    if (len(nxt) - len(nxt.lstrip())) <= key_indent:
+                        break
+                    child_end += 1
+                child_block = lines[i:child_end]
+                non_blank = [
+                    cl for cl in child_block
+                    if cl.strip() and not cl.lstrip().startswith("#")
+                ]
+                if non_blank:
+                    base = min(len(cl) - len(cl.lstrip()) for cl in non_blank)
+                    dedented = "\n".join(cl[base:] for cl in child_block)
+                    nested = _fallback_parse(dedented)
+                    if nested:
+                        out[key_part.strip()] = nested
+                        i = child_end
+                        continue
         line = raw.split("#", 1)[0].rstrip()
         if not line.strip():
             continue

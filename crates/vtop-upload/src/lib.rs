@@ -32,6 +32,15 @@ use vtop_core::errors::VtopError;
 /// Construct the upload backend named in config. Returns a trait object so the
 /// engine is backend-agnostic.
 pub async fn build_backend(cfg: &UploadConfig) -> Result<Arc<dyn UploadBackend>, VtopError> {
+    // The tuning map is validated HERE, not only in `VtopConfig::validate`
+    // (review): this is the one door every consumer of an UploadConfig goes
+    // through. `vtopctl tier` reads a bare UploadConfig from its
+    // --upload-config file and never builds a VtopConfig at all, so while the
+    // checks lived only in the outer validate a typo such as
+    // `transports.tcp_tsl.part_size_bytes` was accepted and the copy ran on the
+    // legacy multipart defaults — tuning recorded and applied by nothing. The
+    // method is backend-gated, so this costs nothing for the other backends.
+    cfg.validate_transports()?;
     let backend: Arc<dyn UploadBackend> = match cfg.backend.as_str() {
         "s3_native" => {
             let s3cfg = s3_native::config_from_upload(cfg);

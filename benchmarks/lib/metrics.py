@@ -36,6 +36,10 @@ CSV_HEADERS: dict[str, list[str]] = {
         # throughput number is never read without knowing the transport that
         # produced it. Defaults to tcp_tls, the shipping path.
         "transport",
+        # And its tuning, flattened (#480, review): the nested dict lives in
+        # summary.json, and a per-run CSV that omits it cannot distinguish two
+        # runs that differ only in how the transport was tuned.
+        "transport_tuning_flat",
     ],
     "batch_metrics.csv": [
         "run_id", "batch_id", "scenario_name", "batch_start_time", "batch_end_time",
@@ -205,6 +209,11 @@ def _summary_md(s: dict) -> str:
         # it. Blank (not tcp_tls) when the backend routes through no
         # EgressTransport seam, matching the blank in metrics.csv/summary.json.
         f"| Transport (#479) | {g('transport')} |",
+        # And its TUNING (#480, review): summary.md is the artifact the runner
+        # prints at the end of a run, so two experiments differing only in how
+        # the transport was tuned would otherwise be presented here as having
+        # identical conditions — in the one place a human actually reads.
+        f"| Transport tuning (#480) | {g('transport_tuning_flat') or 'none'} |",
         f"| Shaped pipe (#403) | {_shaping_cell(s)} |",
         "",
         "## Bottleneck observations",
