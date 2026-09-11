@@ -290,3 +290,16 @@ def test_a_malformed_endpoint_is_not_the_lab_and_does_not_crash(
         "the broken endpoint must still reach the engine: the configuration "
         "error is the engine's to report, and dropping it here would hide it"
     )
+
+
+def test_the_transport_override_crosses_the_container_boundary():
+    # VTOP_S3_TRANSPORT is consumed by the engine (#479). Host mode inherits it
+    # from the runner's environment, so container mode must forward it too via
+    # _ENGINE_ENV_KEYS, or an override that fails the host run would silently
+    # succeed in a container over a different wire once a second transport
+    # exists — the two modes must measure the same wire.
+    from lib import engine
+    assert "VTOP_S3_TRANSPORT" in engine._ENGINE_ENV_KEYS, (
+        "container mode forwards only _ENGINE_ENV_KEYS; the transport override "
+        "must be in that list or host and container modes can diverge"
+    )

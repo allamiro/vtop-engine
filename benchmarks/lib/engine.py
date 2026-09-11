@@ -75,6 +75,12 @@ _ENGINE_ENV_KEYS = (
     # never translated.
     "AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3",
     "AWS_REGION", "VTOP_S3_FORCE_PATH_STYLE", "VTOP_S3_VERIFY_TLS",
+    # The transport override (#479): host mode inherits it from the runner's
+    # environment, so container mode must forward it too, or an override that
+    # fails the host run would silently succeed in a container over a different
+    # wire once a second transport is registered. Operator topology — never
+    # translated.
+    "VTOP_S3_TRANSPORT",
 )
 
 
@@ -443,6 +449,11 @@ def write_engine_config(scenario, work_dir: str, state_db: str,
         "  region: us-east-1",
         "  force_path_style: true",
         "  verify_tls: false",
+        # The egress transport is threaded to the engine (#479), not just
+        # recorded: a scenario asking for a transport the engine does not have
+        # must FAIL at config load, not run over tcp_tls while the summary
+        # claims the requested wire. The engine validates this name at load.
+        f"  transport: {scenario.get('transport', 'tcp_tls')}",
     ]
     if backend == "localfs":
         root = scenario.get("local_path", "") or os.path.join(os.path.dirname(state_db), "objects")

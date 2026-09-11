@@ -32,6 +32,10 @@ CSV_HEADERS: dict[str, list[str]] = {
         # Recorded on EVERY run, host mode included, so no number is ever
         # read without knowing which namespace produced it.
         "runner_mode",
+        # Which WIRE carried the bytes (#479): recorded on every run so a
+        # throughput number is never read without knowing the transport that
+        # produced it. Defaults to tcp_tls, the shipping path.
+        "transport",
     ],
     "batch_metrics.csv": [
         "run_id", "batch_id", "scenario_name", "batch_start_time", "batch_end_time",
@@ -196,6 +200,11 @@ def _summary_md(s: dict) -> str:
         # carried it while the human-facing table did not, and summary.md is
         # the file the runner prints a path to at the end of every run.
         f"| Runner mode (#476) | {g('runner_mode') or 'host'} |",
+        # Which wire carried the bytes (#479): the same reasoning as runner mode
+        # — a number is never read without knowing the transport that produced
+        # it. Blank (not tcp_tls) when the backend routes through no
+        # EgressTransport seam, matching the blank in metrics.csv/summary.json.
+        f"| Transport (#479) | {g('transport')} |",
         f"| Shaped pipe (#403) | {_shaping_cell(s)} |",
         "",
         "## Bottleneck observations",

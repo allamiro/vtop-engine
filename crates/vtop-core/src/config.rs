@@ -456,6 +456,15 @@ pub struct UploadConfig {
     pub force_path_style: bool,
     #[serde(default = "default_true")]
     pub verify_tls: bool,
+    /// The egress TRANSPORT that carries objects to the store — a choice made
+    /// here, not a branch in the upload path (#479). The default `tcp_tls` is
+    /// the shipping path (kernel TCP inside TLS through the AWS SDK); its
+    /// installer is a strict no-op over the S3 client config, so the default
+    /// stays byte-identical while the seam exists. Validated at config LOAD (see
+    /// [`VtopConfig::validate`]) against [`BUILTIN_TRANSPORTS`]; an unknown name
+    /// is refused there, not at first upload. `VTOP_S3_TRANSPORT` overrides it.
+    #[serde(default = "default_transport")]
+    pub transport: String,
     /// Optional named profile / alias for command-based backends.
     #[serde(default)]
     pub profile: Option<String>,
@@ -519,8 +528,35 @@ pub struct UploadConfig {
     pub multipart_abandon_after_secs: u64,
 }
 
+/// The built-in egress transport names (#479). This is the ONE list the config
+/// validator and the upload-side transport registry
+/// (`vtop_upload::s3_native::transport`) both read, so the set of valid names
+/// cannot drift the way `build_backend`'s literal at `lib.rs` can. Core keeps
+/// only the names; the registry maps each to the S3-client installer that
+/// realizes it, because that installer touches the AWS SDK client builder and
+/// core sits below that dependency.
+pub const BUILTIN_TRANSPORTS: &[&str] = &["tcp_tls"];
+
 fn default_backend() -> String {
     "s3_native".to_string()
+}
+fn default_transport() -> String {
+    "tcp_tls".to_string()
+}
+
+/// The effective egress transport name: a non-empty override (from
+/// `VTOP_S3_TRANSPORT`) wins over the config-file value, matching the
+/// precedence `vtop_upload::s3_native::config_from_upload` applies at
+/// construction (#479). Pure — the override is passed in, not read from the
+/// environment here — so the precedence is unit-tested without touching
+/// process-global env and `VtopConfig::validate` checks the value the engine
+/// will actually resolve, not one the override will replace.
+pub fn resolve_effective_transport(config_value: &str, override_value: Option<&str>) -> String {
+    override_value
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| config_value.to_string())
 }
 fn default_region() -> String {
     "us-east-1".to_string()
@@ -609,6 +645,37 @@ impl VtopConfig {
         }
         if self.upload.bucket.trim().is_empty() {
             return Err(VtopError::Config("upload.bucket must not be empty".into()));
+        }
+        // An unknown transport is refused HERE, at config load, not at first
+        // upload (#479): the operator learns of a typo before a byte moves. The
+        // valid set is named from BUILTIN_TRANSPORTS — the same list the
+        // registry seeds from — so this message cannot drift from the arms.
+        //
+        // Only the s3_native backend routes through the EgressTransport seam
+        // (review): mock, localfs and the command backends never consult the
+        // transport in build_backend, so an irrelevant `upload.transport` or a
+        // stale `VTOP_S3_TRANSPORT` must not reject their configuration — and a
+        // benchmark matrix that varies the backend while carrying a transport
+        // knob (recorded blank for non-s3_native runs) must not fail here.
+        //
+        // The EFFECTIVE transport is validated, not the raw config value: a
+        // non-empty VTOP_S3_TRANSPORT overrides the config file (the same
+        // precedence config_from_upload applies), so an older binary run against
+        // a newer config while forcing a transport it does have must not be
+        // rejected for the config value it will never use — and conversely a bad
+        // override is caught here at load rather than at first upload (review).
+        if self.upload.backend == "s3_native" {
+            let effective_transport = resolve_effective_transport(
+                &self.upload.transport,
+                std::env::var("VTOP_S3_TRANSPORT").ok().as_deref(),
+            );
+            if !BUILTIN_TRANSPORTS.contains(&effective_transport.as_str()) {
+                return Err(VtopError::Config(format!(
+                    "upload.transport {:?} is not a known transport; valid transports are: {}",
+                    effective_transport,
+                    BUILTIN_TRANSPORTS.join(", ")
+                )));
+            }
         }
         if self.upload.multipart_part_size_bytes == 0 {
             return Err(VtopError::Config(
@@ -855,6 +922,77 @@ upload:
             .unwrap_err()
             .to_string()
             .contains("work_max_bytes"));
+    }
+
+    #[test]
+    fn transport_defaults_to_tcp_tls_and_an_unknown_name_is_refused_at_load() {
+        // Absent, the transport is the shipping default (#479).
+        let base = r#"
+engine:
+  name: vtop-engine
+  state_store: "sqlite::memory:"
+  work_dir: /tmp/work
+batching: {}
+compression: {}
+sources:
+  file:
+    enabled: true
+    paths: ["/data/*.log"]
+upload:
+  bucket: telemetry-data
+"#;
+        let cfg: VtopConfig = serde_yaml::from_str(base).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.upload.transport, "tcp_tls");
+
+        // Explicit tcp_tls validates too — the shipping path named on purpose.
+        let explicit = format!("{base}  transport: tcp_tls\n");
+        let cfg: VtopConfig = serde_yaml::from_str(&explicit).unwrap();
+        cfg.validate().unwrap();
+
+        // An unknown transport is refused AT LOAD (validate), before any upload,
+        // with a message that names the registered set from BUILTIN_TRANSPORTS.
+        let unknown = format!("{base}  transport: nope\n");
+        let cfg: VtopConfig = serde_yaml::from_str(&unknown).unwrap();
+        let err = cfg.validate().unwrap_err();
+        assert!(matches!(err, VtopError::Config(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("nope"), "names the bad value: {msg}");
+        assert!(msg.contains("tcp_tls"), "names the valid set: {msg}");
+
+        // Only s3_native routes through the seam: a non-s3_native backend never
+        // consults the transport, so an irrelevant unknown transport must NOT
+        // reject its configuration (review). localfs needs a local_path.
+        let non_s3 =
+            format!("{base}  backend: localfs\n  local_path: /tmp/objects\n  transport: nope\n");
+        let cfg: VtopConfig = serde_yaml::from_str(&non_s3).unwrap();
+        cfg.validate()
+            .expect("a non-s3_native backend must not be rejected for an unused transport");
+    }
+
+    #[test]
+    fn a_nonempty_transport_override_wins_over_the_config_value() {
+        // The override precedence validate() applies, tested purely (#479):
+        // a non-empty override selects the effective transport, so an unavailable
+        // config value paired with a valid override validates, and a bad override
+        // is what gets rejected. Empty / whitespace / absent override falls back
+        // to the config value.
+        assert_eq!(
+            resolve_effective_transport("quic", Some("tcp_tls")),
+            "tcp_tls"
+        );
+        assert_eq!(resolve_effective_transport("tcp_tls", Some("quic")), "quic");
+        assert_eq!(resolve_effective_transport("tcp_tls", Some("")), "tcp_tls");
+        assert_eq!(
+            resolve_effective_transport("tcp_tls", Some("  ")),
+            "tcp_tls"
+        );
+        assert_eq!(resolve_effective_transport("tcp_tls", None), "tcp_tls");
+        // The override is trimmed, matching config_from_upload.
+        assert_eq!(
+            resolve_effective_transport("quic", Some(" tcp_tls ")),
+            "tcp_tls"
+        );
     }
 
     #[test]

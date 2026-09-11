@@ -408,6 +408,7 @@ mod tests {
             region: "us-east-1".into(),
             force_path_style: false,
             verify_tls: true,
+            transport: "tcp_tls".into(),
             profile: None,
             command_binary: Some(path.to_string_lossy().into_owned()),
             command_timeout_seconds: 2,

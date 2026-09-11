@@ -36,6 +36,15 @@ use vtop_core::checksum::digest_reader;
 use vtop_core::errors::VtopError;
 use vtop_core::types::ChecksumAlgorithm;
 
+// The egress transport seam (#479) lives at `src/transport.rs` and is declared
+// HERE, as a submodule of the seam file, rather than in `lib.rs`: the issue
+// requires `lib.rs` (and `build_backend`) to stay byte-for-byte unmodified, and
+// the seam this module realizes is inside `S3NativeBackend::new` below. The
+// public path is `vtop_upload::s3_native::transport`.
+#[path = "transport.rs"]
+pub mod transport;
+use transport::{EgressTransport, TransportRegistry};
+
 const CHECKSUM_META_KEY: &str = "vtop-checksum";
 
 /// Convert a lowercase-hex SHA-256 into the base64 form S3 uses for
@@ -65,6 +74,10 @@ pub struct S3NativeConfig {
     pub endpoint_url: Option<String>,
     pub force_path_style: bool,
     pub verify_tls: bool,
+    /// The registered egress transport name (#479). `tcp_tls` (the default) is
+    /// a strict no-op over the client config; the name is resolved against the
+    /// registry in [`S3NativeBackend::new`], failing closed on an unknown name.
+    pub transport: String,
 }
 
 pub struct S3NativeBackend {
@@ -83,11 +96,30 @@ pub struct S3NativeBackend {
 /// `https://` endpoints — the AWS SDK always verifies against the system
 /// trust store. A self-signed or private-CA endpoint needs its CA in the
 /// system trust store; skipping verification is deliberately unsupported.
-fn validate_endpoint_scheme(endpoint_url: Option<&str>, verify_tls: bool) -> Result<(), VtopError> {
+fn validate_endpoint_scheme(
+    endpoint_url: Option<&str>,
+    verify_tls: bool,
+    transport: &dyn EgressTransport,
+) -> Result<(), VtopError> {
     let Some(ep) = endpoint_url else {
         return Ok(()); // default AWS endpoints are always https
     };
-    let plaintext = ep.trim().to_ascii_lowercase().starts_with("http://");
+    let ep_trim = ep.trim();
+    // A transport that admits a different scheme spelling is the single most
+    // likely place a transport change quietly weakens the verify_tls promise
+    // (#479): refuse a scheme the resolved transport does not carry, BY NAME,
+    // before the plaintext check. tcp_tls admits only http/https, so this is a
+    // no-op for the shipping path and a real gate for any future wire.
+    if let Some((scheme, _)) = ep_trim.split_once("://") {
+        let scheme = scheme.to_ascii_lowercase();
+        if !transport.permits_scheme(&scheme) {
+            return Err(VtopError::Config(format!(
+                "endpoint_url {ep} uses scheme {scheme}:// which the {} transport does not carry",
+                transport.name()
+            )));
+        }
+    }
+    let plaintext = ep_trim.to_ascii_lowercase().starts_with("http://");
     if plaintext && verify_tls {
         return Err(VtopError::Config(format!(
             "endpoint_url {ep} is plaintext http:// while verify_tls is true; refusing to send \
@@ -113,7 +145,15 @@ impl S3NativeBackend {
     /// Build the backend from config, resolving credentials via the standard
     /// AWS credential chain (env vars, profile, instance metadata).
     pub async fn new(cfg: &S3NativeConfig) -> Result<Self, VtopError> {
-        validate_endpoint_scheme(cfg.endpoint_url.as_deref(), cfg.verify_tls)?;
+        // Resolve the transport FIRST (#479): an unknown name fails closed here,
+        // and the resolved transport drives both the scheme policy below and the
+        // client-config install just before construction.
+        let transport = TransportRegistry::with_builtins().resolve(&cfg.transport)?;
+        validate_endpoint_scheme(
+            cfg.endpoint_url.as_deref(),
+            cfg.verify_tls,
+            transport.as_ref(),
+        )?;
         if !cfg.verify_tls {
             tracing::warn!(
                 "verify_tls is false: plaintext endpoints are permitted (lab use only). \
@@ -131,7 +171,7 @@ impl S3NativeBackend {
         // SdkConfig below.
         for var in ["AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL"] {
             if let Ok(ep) = std::env::var(var) {
-                validate_endpoint_scheme(Some(&ep), cfg.verify_tls)
+                validate_endpoint_scheme(Some(&ep), cfg.verify_tls, transport.as_ref())
                     .map_err(|e| VtopError::Config(format!("{var}: {e}")))?;
             }
         }
@@ -145,11 +185,15 @@ impl S3NativeBackend {
         // Whatever endpoint actually resolved (explicit config, env, or the
         // shared config file) is what the client will talk to — validate THAT,
         // not only the value we passed in.
-        validate_endpoint_scheme(shared.endpoint_url(), cfg.verify_tls)?;
+        validate_endpoint_scheme(shared.endpoint_url(), cfg.verify_tls, transport.as_ref())?;
 
-        let s3_conf = aws_sdk_s3::config::Builder::from(&shared)
-            .force_path_style(cfg.force_path_style)
-            .build();
+        // THE SEAM (#479): the transport installs itself into the client config
+        // here, after endpoint validation and before the client is built. The
+        // default tcp_tls install is a strict no-op, so this is byte-identical
+        // to the previous `Builder::from(&shared).force_path_style(..).build()`.
+        let builder =
+            aws_sdk_s3::config::Builder::from(&shared).force_path_style(cfg.force_path_style);
+        let s3_conf = transport.install(builder)?.build();
 
         Ok(Self {
             client: Client::from_conf(s3_conf),
@@ -711,12 +755,24 @@ pub fn config_from_upload(upload: &vtop_core::config::UploadConfig) -> S3NativeC
         .ok()
         .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
         .unwrap_or(upload.verify_tls);
+    // VTOP_S3_TRANSPORT follows the same VTOP_S3_* precedent as the fields
+    // above (#479), resolved through the SAME helper VtopConfig::validate uses
+    // so the two cannot diverge: a non-empty override is trimmed and wins, so a
+    // " tcp_tls " that passed load-time validation resolves to the same trimmed
+    // name here rather than being rejected at backend construction (review).
+    // The result is still resolved against the registry in `new`, so an
+    // override typo fails closed there just as a config typo does.
+    let transport = vtop_core::config::resolve_effective_transport(
+        &upload.transport,
+        std::env::var("VTOP_S3_TRANSPORT").ok().as_deref(),
+    );
 
     S3NativeConfig {
         region: upload.region.clone(),
         endpoint_url,
         force_path_style,
         verify_tls,
+        transport,
     }
 }
 
@@ -759,7 +815,10 @@ mod tests {
     fn plaintext_endpoint_policy() {
         // The hole this closes: verify_tls promised encryption but plaintext
         // was accepted anyway.
-        let err = validate_endpoint_scheme(Some("http://minio:9000"), true)
+        // The default transport carries http/https, so this exercises the same
+        // plaintext policy as before the seam (#479).
+        let t = transport::TcpTlsTransport;
+        let err = validate_endpoint_scheme(Some("http://minio:9000"), true, &t)
             .expect_err("plaintext + verify_tls=true must fail");
         assert!(matches!(err, VtopError::Config(_)));
         let msg = err.to_string();
@@ -770,14 +829,14 @@ mod tests {
         assert!(msg.contains("verify_tls"), "names the fix: {msg}");
 
         // Explicit lab opt-out still works (the compose lab is plaintext).
-        assert!(validate_endpoint_scheme(Some("http://minio:9000"), false).is_ok());
+        assert!(validate_endpoint_scheme(Some("http://minio:9000"), false, &t).is_ok());
         // Scheme check is case-insensitive and trims whitespace.
-        assert!(validate_endpoint_scheme(Some("  HTTP://minio:9000"), true).is_err());
+        assert!(validate_endpoint_scheme(Some("  HTTP://minio:9000"), true, &t).is_err());
         // https endpoints pass under either setting.
-        assert!(validate_endpoint_scheme(Some("https://s3.example.com"), true).is_ok());
-        assert!(validate_endpoint_scheme(Some("https://s3.example.com"), false).is_ok());
+        assert!(validate_endpoint_scheme(Some("https://s3.example.com"), true, &t).is_ok());
+        assert!(validate_endpoint_scheme(Some("https://s3.example.com"), false, &t).is_ok());
         // No custom endpoint = default AWS https endpoints.
-        assert!(validate_endpoint_scheme(None, true).is_ok());
+        assert!(validate_endpoint_scheme(None, true, &t).is_ok());
     }
 }
 

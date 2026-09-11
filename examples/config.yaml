@@ -131,6 +131,11 @@ sources:
 
 upload:
   backend: s3_native            # s3_native | s3cmd | awscli | minio | mock
+  # The egress TRANSPORT that carries objects to the store (#479). tcp_tls (the
+  # default) is the shipping path: kernel TCP inside TLS through the AWS SDK.
+  # A transport is a choice made here, not a branch in the upload path; an
+  # unknown name is refused at config load. VTOP_S3_TRANSPORT overrides it.
+  transport: tcp_tls            # tcp_tls (default)
   # One bucket per data format: "{format}" resolves to cef/leef/json/jsonl/
   # syslog/raw. Use a plain name (e.g. "telemetry-data") for a single bucket.
   bucket: "telemetry-{format}"

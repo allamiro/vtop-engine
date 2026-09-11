@@ -1079,6 +1079,7 @@ mod tests {
             region: "us-east-1".into(),
             force_path_style: true,
             verify_tls: false,
+            transport: "tcp_tls".into(),
             profile: None,
             command_binary: None,
             command_timeout_seconds: 300,
