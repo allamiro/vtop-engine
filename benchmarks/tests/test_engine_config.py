@@ -217,3 +217,23 @@ def test_a_scenario_transport_reaches_the_engine_config(tmp_path):
                             "endpoint_url": "http://localhost:9000",
                             "transport": "quic_experimental"})
     assert "  transport: quic_experimental" in text
+
+
+def test_scenario_transport_tuning_reaches_the_engine_config(tmp_path):
+    # A scenario that tunes a transport must have that block written into the
+    # engine config (#480), so the engine actually runs with it rather than the
+    # tuning being recorded in the summary while the engine uses defaults.
+    text = write(tmp_path, {"backend": "s3_native",
+                            "endpoint_url": "http://localhost:9000",
+                            "transport": "tcp_tls",
+                            "transports": {"tcp_tls": {"max_concurrency": 3}}})
+    assert "  transports:" in text
+    assert "    tcp_tls:" in text
+    assert "      max_concurrency: 3" in text
+
+
+def test_no_transports_block_when_the_scenario_has_none(tmp_path):
+    # An empty / absent tuning map keeps today's behaviour: no transports block.
+    text = write(tmp_path, {"backend": "s3_native",
+                            "endpoint_url": "http://localhost:9000"})
+    assert "transports:" not in text

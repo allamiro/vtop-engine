@@ -561,6 +561,17 @@ def main() -> int:
     end = time.time()
     duration_s = round(end - start, 3)
     in_mb = in_bytes / 1e6
+    # The wire the run used and its tuning (#479, #480), recorded together so a
+    # number is read with both. Only s3_native routes through the seam; the
+    # effective transport follows the engine's precedence (VTOP_S3_TRANSPORT
+    # over the scenario value).
+    if sc.get("backend") == "s3_native":
+        eff_transport = (os.environ.get("VTOP_S3_TRANSPORT", "").strip()
+                         or sc.get("transport", "tcp_tls"))
+        transport_tuning = (sc.get("transports", {}) or {}).get(eff_transport, {})
+    else:
+        eff_transport = ""
+        transport_tuning = {}
     summary = {
         "run_id": run_id, "scenario_name": sc.name, "scenario": sc.values,
         "start_time": start_iso, "end_time": iso_now(),
@@ -608,10 +619,11 @@ def main() -> int:
         # the engine's own precedence (config_from_upload): a non-empty
         # VTOP_S3_TRANSPORT override outranks the scenario value, so recording
         # the scenario value would mislabel an overridden run.
-        "transport": (
-            (os.environ.get("VTOP_S3_TRANSPORT", "").strip()
-             or sc.get("transport", "tcp_tls"))
-            if sc.get("backend") == "s3_native" else ""),
+        "transport": eff_transport,
+        # The active transport's resolved egress tuning (#480), so a comparison
+        # knows not just the wire but how it was tuned. Empty when no tuning is
+        # configured or the backend routes through no seam.
+        "transport_tuning": transport_tuning,
     }
     # CPU/mem summary from the system-metrics samples written during the run.
     summary.update(_sys_summary(writer.dir))

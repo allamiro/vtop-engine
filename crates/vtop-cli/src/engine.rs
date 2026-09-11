@@ -1418,10 +1418,18 @@ impl Engine {
 
         prime_source_counters(&config, &streams, adapters.keys());
 
-        let width = WidthController::new(
-            config.batching.max_concurrent_batches,
-            config.batching.adaptive_width.min_width,
-        );
+        // The active transport's max_concurrency narrows the batch ceiling by
+        // MINIMUM (#480): the WidthController ceiling is the RESOLVED value, so
+        // an accepted upload.transports.<t>.max_concurrency actually bounds
+        // object concurrency at runtime rather than being recorded and ignored.
+        // Gated on the backend — only s3_native routes through the seam, so a
+        // stray tuning block on a mock/localfs/command backend never alters the
+        // global batch pipeline (resolved_upload_ceiling).
+        let resolved_ceiling = config
+            .upload
+            .resolved_upload_ceiling(config.batching.max_concurrent_batches);
+        let width =
+            WidthController::new(resolved_ceiling, config.batching.adaptive_width.min_width);
         Ok(Self {
             config,
             streams,
@@ -1468,7 +1476,13 @@ impl Engine {
         if self.config.batching.adaptive_width.enabled {
             self.width.width()
         } else {
-            self.config.batching.max_concurrent_batches.max(1)
+            // Fixed width: the RESOLVED ceiling (#480), so the active
+            // transport's max_concurrency narrows it here too — not just when
+            // adaptive width is on. Backend-gated (s3_native only).
+            self.config
+                .upload
+                .resolved_upload_ceiling(self.config.batching.max_concurrent_batches)
+                .max(1)
         }
     }
 
@@ -2585,6 +2599,46 @@ mod tests {
             "default",
             "a source with no stream override falls back to the engine \
              default, exactly where its batches land"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_concurrency_tuning_narrows_the_upload_width() {
+        // The active transport's max_concurrency actually bounds runtime object
+        // concurrency (#480), not just the summary: with the default batch
+        // ceiling of 8, a tuning of 2 resolves the fixed width to 2, and no
+        // tuning leaves it at 8. This pins that resolved_max_concurrency is
+        // WIRED into the width, closing the "recorded but not applied" gap.
+        // A mock backend does NOT route through the EgressTransport seam, so a
+        // stray transport tuning block must not narrow its width — it stays at
+        // the batch ceiling of 8. (The s3_native narrowing itself is covered by
+        // the pure resolved_upload_ceiling test in vtop-core.) This pins that
+        // the engine reads the backend-gated resolved_upload_ceiling.
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.log");
+        std::fs::write(&input, "one line\n").unwrap();
+        let paths = vec![input.to_string_lossy().into_owned()];
+
+        let mut mock_with_stray_tuning = file_config(
+            dir.path().join("w1").to_str().unwrap(),
+            "sqlite::memory:",
+            paths,
+            "mock",
+        );
+        mock_with_stray_tuning.upload.transports.insert(
+            "tcp_tls".into(),
+            vtop_core::config::EgressTuning {
+                max_concurrency: Some(2),
+                ..Default::default()
+            },
+        );
+        let engine = Engine::new(mock_with_stray_tuning, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.upload_width(),
+            8,
+            "a non-s3_native backend must not be narrowed by a transport tuning block"
         );
     }
 

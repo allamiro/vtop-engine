@@ -296,6 +296,32 @@ def _fallback_parse(text: str) -> dict[str, Any]:
                     out[key_part.strip()] = seq
                     i = j
                     continue
+                # Not a sequence: more-indented "key: value" children form a
+                # NESTED MAP (e.g. upload.transports.<name>.<knob>, #480). Collect
+                # the child block and recurse on it dedented, so nested maps
+                # survive when PyYAML is absent instead of being dropped to "".
+                child_end = i
+                while child_end < len(lines):
+                    nxt = lines[child_end]
+                    if not nxt.strip() or nxt.lstrip().startswith("#"):
+                        child_end += 1
+                        continue
+                    if (len(nxt) - len(nxt.lstrip())) <= key_indent:
+                        break
+                    child_end += 1
+                child_block = lines[i:child_end]
+                non_blank = [
+                    cl for cl in child_block
+                    if cl.strip() and not cl.lstrip().startswith("#")
+                ]
+                if non_blank:
+                    base = min(len(cl) - len(cl.lstrip()) for cl in non_blank)
+                    dedented = "\n".join(cl[base:] for cl in child_block)
+                    nested = _fallback_parse(dedented)
+                    if nested:
+                        out[key_part.strip()] = nested
+                        i = child_end
+                        continue
         line = raw.split("#", 1)[0].rstrip()
         if not line.strip():
             continue

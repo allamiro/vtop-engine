@@ -8,6 +8,7 @@ use crate::manifest::ManifestMacKey;
 use crate::types::{ChecksumAlgorithm, CompressionType, SourceType, TelemetryFormat};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize, Serializer};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
 
@@ -526,6 +527,74 @@ pub struct UploadConfig {
     /// abandoned and safe to abort + delete from the state directory.
     #[serde(default = "default_multipart_abandon_after_secs")]
     pub multipart_abandon_after_secs: u64,
+    /// Per-transport egress tuning (#480): ONE shape, keyed by transport name,
+    /// so the two paths are tuned with the identical struct rather than each
+    /// growing its own knobs. Defaults to an empty map — all-`None` tuning,
+    /// today's behaviour. Only the active [`transport`](Self::transport) may
+    /// carry a non-empty block; keys must be registered transports; a knob the
+    /// active transport cannot honour is refused at CONSTRUCTION, never ignored.
+    #[serde(default)]
+    pub transports: BTreeMap<String, EgressTuning>,
+}
+
+/// Redundancy / forward-error-correction policy for an egress path (#480).
+///
+/// Only `none` is accepted this milestone; `reed_solomon` names the future
+/// value so the shape is complete and a config that asks for it gets a clear
+/// "not implemented on either path" refusal at validation rather than a serde
+/// error on an unknown variant. Redundancy is implemented on neither path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RedundancyPolicy {
+    #[default]
+    None,
+    ReedSolomon,
+}
+
+/// The ONE egress-tuning shape, applied to both transports (#480).
+///
+/// Symmetry is the point: both paths read this identical struct, so a
+/// comparison between them is not a tuned-vs-untuned strawman. A field a
+/// transport cannot honour is a construction error naming the field and the
+/// transport (see `EgressTransport::tuning_support`), never a silent ignore.
+/// This issue defines the shape and refuses the unhonourable; enforcement of
+/// `target_rate_bytes_per_second` is the ceiling issue (#481).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EgressTuning {
+    /// The sender's intended egress rate for this path, in bytes per second.
+    #[serde(default)]
+    pub target_rate_bytes_per_second: Option<u64>,
+    /// Objects in flight on this path. Composes with
+    /// `batching.max_concurrent_batches` by taking the MINIMUM of the two (see
+    /// [`UploadConfig::resolved_max_concurrency`]): the tuning narrows the
+    /// batch ceiling for this path, it never widens it.
+    #[serde(default)]
+    pub max_concurrency: Option<usize>,
+    /// Byte size of each part. Maps onto `multipart_part_size_bytes` for the
+    /// tcp_tls path (the older key stays working, deprecated in docs only).
+    #[serde(default)]
+    pub part_size_bytes: Option<u64>,
+    /// Parts in flight per object. Maps onto `multipart_max_parallelism` for
+    /// the tcp_tls path.
+    #[serde(default)]
+    pub parts_in_flight: Option<usize>,
+    /// Forward-error-correction policy. `none` on both paths today.
+    #[serde(default)]
+    pub redundancy: RedundancyPolicy,
+}
+
+impl EgressTuning {
+    /// Whether every field is unset — an empty block that changes nothing.
+    /// A non-empty block for a transport that is not the active one, or that
+    /// the active transport cannot honour, is refused (see validation).
+    pub fn is_empty(&self) -> bool {
+        self.target_rate_bytes_per_second.is_none()
+            && self.max_concurrency.is_none()
+            && self.part_size_bytes.is_none()
+            && self.parts_in_flight.is_none()
+            && self.redundancy == RedundancyPolicy::None
+    }
 }
 
 /// The built-in egress transport names (#479). This is the ONE list the config
@@ -557,6 +626,65 @@ pub fn resolve_effective_transport(config_value: &str, override_value: Option<&s
         .filter(|v| !v.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| config_value.to_string())
+}
+
+impl UploadConfig {
+    /// The EFFECTIVE active transport: a non-empty `VTOP_S3_TRANSPORT` override
+    /// wins over the config value, matching the precedence `config_from_upload`
+    /// and `validate` apply (#479). Tuning must be selected by THIS name, not
+    /// the raw config value, or an overridden run reads the wrong transport's
+    /// block and silently falls back to defaults (review).
+    pub fn effective_transport(&self) -> String {
+        resolve_effective_transport(
+            &self.transport,
+            std::env::var("VTOP_S3_TRANSPORT").ok().as_deref(),
+        )
+    }
+
+    /// The egress tuning for a given transport name, or an all-`None` default
+    /// when no block is configured for it (#480). Both paths read the same
+    /// [`EgressTuning`] type; callers pass the resolved transport name.
+    pub fn tuning_for(&self, transport_name: &str) -> EgressTuning {
+        self.transports
+            .get(transport_name)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The objects-in-flight ceiling for a path: the MINIMUM of that transport's
+    /// `max_concurrency` and `batching.max_concurrent_batches` (#480). The tuning
+    /// narrows the batch ceiling for this path, never widens it, so an operator
+    /// cannot use it to exceed the batch limit — composition by minimum,
+    /// documented here so it is not discovered by surprise. Pass the EFFECTIVE
+    /// transport (see [`effective_transport`](Self::effective_transport)).
+    pub fn resolved_max_concurrency(
+        &self,
+        transport_name: &str,
+        batching_max_concurrent_batches: usize,
+    ) -> usize {
+        match self.tuning_for(transport_name).max_concurrency {
+            Some(width) => width.min(batching_max_concurrent_batches),
+            None => batching_max_concurrent_batches,
+        }
+    }
+
+    /// The upload concurrency ceiling the ENGINE should use, gated on backend
+    /// (#480): only `s3_native` routes through the EgressTransport seam, so its
+    /// active transport's `max_concurrency` narrows the batch ceiling. Every
+    /// other backend (mock, localfs, the command backends) never consults
+    /// transport tuning — validation treats it as irrelevant for them and
+    /// benchmark summaries record blank tuning — so their concurrency is the
+    /// batch ceiling unchanged, never silently altered by a stray tuning block.
+    pub fn resolved_upload_ceiling(&self, batching_max_concurrent_batches: usize) -> usize {
+        if self.backend == "s3_native" {
+            self.resolved_max_concurrency(
+                &self.effective_transport(),
+                batching_max_concurrent_batches,
+            )
+        } else {
+            batching_max_concurrent_batches
+        }
+    }
 }
 fn default_region() -> String {
     "us-east-1".to_string()
@@ -676,6 +804,58 @@ impl VtopConfig {
                     BUILTIN_TRANSPORTS.join(", ")
                 )));
             }
+            // Per-transport egress tuning (#480). This validates the SHAPE; a
+            // knob the active transport cannot honour is refused at construction
+            // (it needs the transport's TuningSupport, which lives in
+            // vtop-upload), and target-rate enforcement is the ceiling issue.
+            for (name, tuning) in &self.upload.transports {
+                // The key must be a registered transport, named from the same
+                // list — not at first upload (#480).
+                if !BUILTIN_TRANSPORTS.contains(&name.as_str()) {
+                    return Err(VtopError::Config(format!(
+                        "upload.transports has an unknown transport {name:?}; valid transports are: {}",
+                        BUILTIN_TRANSPORTS.join(", ")
+                    )));
+                }
+                // Redundancy exists as a slot but is implemented nowhere yet.
+                if tuning.redundancy != RedundancyPolicy::None {
+                    return Err(VtopError::Config(format!(
+                        "upload.transports.{name}.redundancy is not implemented on either \
+                         transport path; only 'none' is accepted"
+                    )));
+                }
+                // A configured numeric knob must be positive — zero is a mistake
+                // a silent acceptance would hide.
+                if tuning.target_rate_bytes_per_second == Some(0) {
+                    return Err(VtopError::Config(format!(
+                        "upload.transports.{name}.target_rate_bytes_per_second must be > 0"
+                    )));
+                }
+                if tuning.max_concurrency == Some(0) {
+                    return Err(VtopError::Config(format!(
+                        "upload.transports.{name}.max_concurrency must be > 0"
+                    )));
+                }
+                if tuning.part_size_bytes == Some(0) {
+                    return Err(VtopError::Config(format!(
+                        "upload.transports.{name}.part_size_bytes must be > 0"
+                    )));
+                }
+                if tuning.parts_in_flight == Some(0) {
+                    return Err(VtopError::Config(format!(
+                        "upload.transports.{name}.parts_in_flight must be > 0"
+                    )));
+                }
+                // A knob on a transport that is not the active one cannot appear
+                // to be in effect while doing nothing (#480).
+                if name != &effective_transport && !tuning.is_empty() {
+                    return Err(VtopError::Config(format!(
+                        "upload.transports.{name} is tuned, but the active transport is \
+                         {effective_transport:?}; tuning a transport that is not selected \
+                         would appear to be in effect while doing nothing"
+                    )));
+                }
+            }
         }
         if self.upload.multipart_part_size_bytes == 0 {
             return Err(VtopError::Config(
@@ -759,6 +939,24 @@ impl VtopConfig {
                  backs off to, checked whether or not the controller is enabled — a config is \
                  valid whole, not knob by knob",
                 self.batching.max_concurrent_batches
+            )));
+        }
+        // The adaptive floor cannot exceed the RESOLVED upload ceiling (#480):
+        // if the active transport's max_concurrency narrows the ceiling below
+        // min_width, the width controller would silently clamp the floor and the
+        // operator's "never below N" promise would be broken. Refuse the
+        // contradiction, naming both. (resolved_upload_ceiling is backend-gated,
+        // so for a non-s3_native backend or no tuning it equals
+        // max_concurrent_batches, already checked above — no double rejection.)
+        let resolved_ceiling = self
+            .upload
+            .resolved_upload_ceiling(self.batching.max_concurrent_batches);
+        if self.batching.adaptive_width.min_width > resolved_ceiling {
+            return Err(VtopError::Config(format!(
+                "batching.adaptive_width.min_width ({}) exceeds the resolved upload concurrency \
+                 ceiling ({}): the active transport's max_concurrency narrows the ceiling below \
+                 the floor, so adaptive width could never honour the floor",
+                self.batching.adaptive_width.min_width, resolved_ceiling
             )));
         }
         if self.batching.max_concurrent_batches == 0 {
@@ -992,6 +1190,242 @@ upload:
         assert_eq!(
             resolve_effective_transport("quic", Some(" tcp_tls ")),
             "tcp_tls"
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // Per-transport egress tuning shape (#480)
+    // ----------------------------------------------------------------------
+
+    fn tuning_base() -> &'static str {
+        r#"
+engine:
+  name: vtop-engine
+  state_store: "sqlite::memory:"
+  work_dir: /tmp/work
+batching: {}
+compression: {}
+sources:
+  file:
+    enabled: true
+    paths: ["/data/*.log"]
+upload:
+  bucket: telemetry-data
+"#
+    }
+
+    #[test]
+    fn empty_transports_is_todays_behaviour() {
+        // The default is an empty map: all-None tuning, no composition change.
+        let cfg: VtopConfig = serde_yaml::from_str(tuning_base()).unwrap();
+        cfg.validate().unwrap();
+        assert!(cfg.upload.transports.is_empty());
+        assert!(cfg.upload.tuning_for("tcp_tls").is_empty());
+        // With no tuning, the resolved concurrency is exactly the batch ceiling.
+        assert_eq!(cfg.upload.resolved_max_concurrency("tcp_tls", 8), 8);
+    }
+
+    #[test]
+    fn resolved_max_concurrency_takes_the_minimum() {
+        // The tuning narrows the batch ceiling for this path, never widens it.
+        let narrow = format!(
+            "{}  transports:\n    tcp_tls:\n      max_concurrency: 2\n",
+            tuning_base()
+        );
+        let cfg: VtopConfig = serde_yaml::from_str(&narrow).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.upload.resolved_max_concurrency("tcp_tls", 8),
+            2,
+            "min narrows"
+        );
+
+        let wide = format!(
+            "{}  transports:\n    tcp_tls:\n      max_concurrency: 20\n",
+            tuning_base()
+        );
+        let cfg: VtopConfig = serde_yaml::from_str(&wide).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.upload.resolved_max_concurrency("tcp_tls", 8),
+            8,
+            "tuning cannot widen past the batch ceiling"
+        );
+    }
+
+    #[test]
+    fn resolved_upload_ceiling_is_gated_on_s3_native() {
+        // Only s3_native routes through the seam (#480): its tuning narrows the
+        // ceiling; every other backend ignores a stray tuning block so its
+        // concurrency is never silently altered.
+        let tuned = "  transports:\n    tcp_tls:\n      max_concurrency: 2\n";
+        let s3: VtopConfig = serde_yaml::from_str(&format!("{}{tuned}", tuning_base())).unwrap();
+        assert_eq!(s3.upload.resolved_upload_ceiling(8), 2, "s3_native narrows");
+
+        let mock: VtopConfig =
+            serde_yaml::from_str(&format!("{}  backend: mock\n{tuned}", tuning_base())).unwrap();
+        assert_eq!(
+            mock.upload.resolved_upload_ceiling(8),
+            8,
+            "a non-s3_native backend is never narrowed by transport tuning"
+        );
+    }
+
+    #[test]
+    fn an_adaptive_floor_above_the_narrowed_ceiling_is_refused() {
+        // min_width is valid against the batch ceiling (8) but the transport's
+        // max_concurrency narrows the resolved ceiling to 2, below the floor of
+        // 6 — a contradiction the controller would silently clamp (#480). Refuse.
+        let yaml = r#"
+engine:
+  name: vtop-engine
+  state_store: "sqlite::memory:"
+  work_dir: /tmp/work
+batching:
+  adaptive_width:
+    enabled: true
+    min_width: 6
+compression: {}
+sources:
+  file:
+    enabled: true
+    paths: ["/data/*.log"]
+upload:
+  bucket: telemetry-data
+  transports:
+    tcp_tls:
+      max_concurrency: 2
+"#;
+        let cfg: VtopConfig = serde_yaml::from_str(yaml).unwrap();
+        let err = cfg.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("min_width"), "names the floor: {msg}");
+        assert!(
+            msg.contains("ceiling"),
+            "explains the narrowed ceiling: {msg}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_transport_in_the_tuning_map_is_refused_at_load() {
+        // A tuning block keyed by a name that is not a registered transport is
+        // refused at validation, with the registered set — not at first upload.
+        let yaml = format!(
+            "{}  transports:\n    datagram:\n      target_rate_bytes_per_second: 1000\n",
+            tuning_base()
+        );
+        let cfg: VtopConfig = serde_yaml::from_str(&yaml).unwrap();
+        let err = cfg.validate().unwrap_err();
+        assert!(matches!(err, VtopError::Config(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("datagram"), "names the bad key: {msg}");
+        assert!(msg.contains("tcp_tls"), "names the valid set: {msg}");
+    }
+
+    #[test]
+    fn a_typo_in_a_tuning_knob_is_refused_not_ignored() {
+        // deny_unknown_fields (#480): a misspelled knob must fail loudly, or the
+        // operator silently gets default behaviour instead of the tuning they
+        // asked for. serde rejects the unknown field at deserialization.
+        let yaml = format!(
+            "{}  transports:\n    tcp_tls:\n      max_concurrancy: 4\n",
+            tuning_base()
+        );
+        let err = serde_yaml::from_str::<VtopConfig>(&yaml)
+            .expect_err("a misspelled tuning knob must be refused, not ignored");
+        assert!(
+            err.to_string().contains("max_concurrancy")
+                || err.to_string().contains("unknown field"),
+            "the error names the unknown field: {err}"
+        );
+    }
+
+    #[test]
+    fn reed_solomon_redundancy_is_refused() {
+        // The slot exists; the capability does not, on either path.
+        let yaml = format!(
+            "{}  transports:\n    tcp_tls:\n      redundancy: reed_solomon\n",
+            tuning_base()
+        );
+        let cfg: VtopConfig = serde_yaml::from_str(&yaml).unwrap();
+        let err = cfg.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("redundancy"), "names the field: {msg}");
+        assert!(msg.contains("not implemented"), "states why: {msg}");
+    }
+
+    #[test]
+    fn a_zero_tuning_knob_is_refused() {
+        for (field, line) in [
+            (
+                "target_rate_bytes_per_second",
+                "target_rate_bytes_per_second: 0",
+            ),
+            ("max_concurrency", "max_concurrency: 0"),
+            ("part_size_bytes", "part_size_bytes: 0"),
+            ("parts_in_flight", "parts_in_flight: 0"),
+        ] {
+            let yaml = format!(
+                "{}  transports:\n    tcp_tls:\n      {line}\n",
+                tuning_base()
+            );
+            let cfg: VtopConfig = serde_yaml::from_str(&yaml).unwrap();
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                err.to_string().contains(field),
+                "a zero {field} must be refused naming the field: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_example_config_documents_both_transport_blocks_with_the_same_keys() {
+        // The two egress-tuning blocks in examples/config.yaml must list the
+        // IDENTICAL key set, so an operator reading the file sees the symmetry
+        // the shape is built for (#480). The blocks are illustrative comments
+        // (datagram is not a registered transport yet), so the keys are parsed
+        // from the commented section.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/config.yaml");
+        let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {path}: {e}"));
+        let mut current: Option<bool> = None; // Some(true)=tcp_tls, Some(false)=datagram
+        let mut tcp = std::collections::BTreeSet::new();
+        let mut dgram = std::collections::BTreeSet::new();
+        for line in text.lines() {
+            let t = line.trim_start();
+            if let Some(inner) = t.strip_prefix('#') {
+                let inner = inner.trim();
+                if inner.starts_with("tcp_tls:") {
+                    current = Some(true);
+                    continue;
+                }
+                if inner.starts_with("datagram:") {
+                    current = Some(false);
+                    continue;
+                }
+                if let (Some(is_tcp), Some((key, _))) = (current, inner.split_once(':')) {
+                    let key = key.trim();
+                    // Only real identifier keys — prose comments are skipped.
+                    if !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    {
+                        if is_tcp {
+                            tcp.insert(key.to_string());
+                        } else {
+                            dgram.insert(key.to_string());
+                        }
+                    }
+                }
+            } else if !t.is_empty() {
+                // A real (non-comment) line ends the illustrative block.
+                current = None;
+            }
+        }
+        assert!(
+            tcp.contains("redundancy") && tcp.len() == 5,
+            "expected the five EgressTuning keys under tcp_tls, got {tcp:?}"
+        );
+        assert_eq!(
+            tcp, dgram,
+            "the two transport tuning blocks must document the same key set"
         );
     }
 

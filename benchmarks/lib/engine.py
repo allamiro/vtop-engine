@@ -455,6 +455,23 @@ def write_engine_config(scenario, work_dir: str, state_db: str,
         # claims the requested wire. The engine validates this name at load.
         f"  transport: {scenario.get('transport', 'tcp_tls')}",
     ]
+    # Thread the scenario's per-transport egress tuning into the engine config
+    # (#480), not just the summary: a scenario that tunes a transport must run
+    # with that tuning (and be validated/refused by the engine like an
+    # operator's config would), never record it while the engine uses defaults.
+    # Only non-empty blocks are written, so an empty map keeps today's behaviour.
+    transports = scenario.get("transports", {}) or {}
+    emitted_transports = False
+    for tname, ttuning in transports.items():
+        kv = {k: v for k, v in (ttuning or {}).items() if v is not None}
+        if not kv:
+            continue
+        if not emitted_transports:
+            lines.append("  transports:")
+            emitted_transports = True
+        lines.append(f"    {tname}:")
+        for key, value in kv.items():
+            lines.append(f"      {key}: {value}")
     if backend == "localfs":
         root = scenario.get("local_path", "") or os.path.join(os.path.dirname(state_db), "objects")
         lines.append(f'  local_path: "{root}"')
