@@ -33,10 +33,24 @@ pub struct MultipartUploadConfig {
 
 impl MultipartUploadConfig {
     pub fn from_upload(upload: &vtop_core::config::UploadConfig, state_dir: PathBuf) -> Self {
+        // The active transport's egress tuning maps onto the multipart knobs
+        // (#480): `part_size_bytes` / `parts_in_flight` are the symmetric names
+        // both paths share, and for tcp_tls they ARE the multipart part size and
+        // parallelism. When set, the tuning wins; otherwise the older
+        // `multipart_*` keys still work unchanged, so no existing deployment
+        // changes behaviour. The two spellings are equivalent, and the older one
+        // is deprecated in documentation only. Tuning is selected by the
+        // EFFECTIVE transport (VTOP_S3_TRANSPORT over the config value), so an
+        // overridden run reads the right block rather than falling to defaults.
+        let tuning = upload.tuning_for(&upload.effective_transport());
         Self {
-            part_size_bytes: upload.multipart_part_size_bytes,
+            part_size_bytes: tuning
+                .part_size_bytes
+                .unwrap_or(upload.multipart_part_size_bytes),
             threshold_bytes: upload.multipart_threshold_bytes,
-            max_parallelism: upload.multipart_max_parallelism,
+            max_parallelism: tuning
+                .parts_in_flight
+                .unwrap_or(upload.multipart_max_parallelism),
             abandon_after_secs: upload.multipart_abandon_after_secs,
             state_dir,
         }
@@ -615,6 +629,31 @@ mod tests {
             content_digest_algorithm: "blake3".to_owned(),
             byte_length: len,
         }
+    }
+
+    #[test]
+    fn tuning_maps_onto_the_old_multipart_keys_equivalently() {
+        // The old multipart keys still work (#480): a config using only
+        // multipart_part_size_bytes / multipart_max_parallelism resolves to the
+        // SAME part size and parallelism as the equivalent upload.transports
+        // .tcp_tls block, so no existing deployment changes behaviour and the
+        // two spellings are interchangeable.
+        use vtop_core::config::UploadConfig;
+        let old: UploadConfig = serde_json::from_str(
+            r#"{"bucket":"b","multipart_part_size_bytes":12345678,"multipart_max_parallelism":7}"#,
+        )
+        .unwrap();
+        let new: UploadConfig = serde_json::from_str(
+            r#"{"bucket":"b","transports":{"tcp_tls":{"part_size_bytes":12345678,"parts_in_flight":7}}}"#,
+        )
+        .unwrap();
+        let dir = PathBuf::from("/tmp/x");
+        let old_cfg = MultipartUploadConfig::from_upload(&old, dir.clone());
+        let new_cfg = MultipartUploadConfig::from_upload(&new, dir);
+        assert_eq!(old_cfg.part_size_bytes, new_cfg.part_size_bytes);
+        assert_eq!(old_cfg.max_parallelism, new_cfg.max_parallelism);
+        assert_eq!(new_cfg.part_size_bytes, 12_345_678);
+        assert_eq!(new_cfg.max_parallelism, 7);
     }
 
     fn cfg(dir: &Path, part_size: u64) -> MultipartUploadConfig {

@@ -85,6 +85,7 @@ pub fn file_config(
             multipart_threshold_bytes: 8 * 1024 * 1024,
             multipart_max_parallelism: 4,
             multipart_abandon_after_secs: 24 * 60 * 60,
+            transports: Default::default(),
         },
         partitioning: PartitioningConfig {
             template: DEFAULT_TEMPLATE.into(),

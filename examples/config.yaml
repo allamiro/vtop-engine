@@ -136,6 +136,26 @@ upload:
   # A transport is a choice made here, not a branch in the upload path; an
   # unknown name is refused at config load. VTOP_S3_TRANSPORT overrides it.
   transport: tcp_tls            # tcp_tls (default)
+  # Per-transport egress TUNING (#480): ONE shape, keyed by transport name, so
+  # both paths are tuned with the IDENTICAL set of keys — a comparison between
+  # them is not tuned-vs-untuned. Only the active `transport` may carry a
+  # non-empty block; a knob a transport cannot honour is refused at startup,
+  # never ignored. Default is empty (all-unset). Shown here for both paths so
+  # the symmetry is visible; leave it out unless you are tuning. The datagram
+  # path is not yet a registered transport — its block is illustrative only.
+  # transports:
+  #   tcp_tls:                        # the active, shipping path
+  #     target_rate_bytes_per_second: # intended egress rate (enforced via #481)
+  #     max_concurrency:              # objects in flight; min() with batching.max_concurrent_batches
+  #     part_size_bytes:              # part size (maps onto multipart_part_size_bytes)
+  #     parts_in_flight:              # parts per object (maps onto multipart_max_parallelism)
+  #     redundancy: none              # only 'none' is implemented on either path
+  #   datagram:                       # the second path — same keys, illustrative
+  #     target_rate_bytes_per_second: #
+  #     max_concurrency:              #
+  #     part_size_bytes:              #
+  #     parts_in_flight:              #
+  #     redundancy: none              #
   # One bucket per data format: "{format}" resolves to cef/leef/json/jsonl/
   # syslog/raw. Use a plain name (e.g. "telemetry-data") for a single bucket.
   bucket: "telemetry-{format}"

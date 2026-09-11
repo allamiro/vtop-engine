@@ -78,6 +78,11 @@ pub struct S3NativeConfig {
     /// a strict no-op over the client config; the name is resolved against the
     /// registry in [`S3NativeBackend::new`], failing closed on an unknown name.
     pub transport: String,
+    /// The egress tuning for the active transport (#480). A field the resolved
+    /// transport cannot honour (per its `tuning_support`) is refused at
+    /// construction in [`S3NativeBackend::new`], naming the field and the
+    /// transport — never silently ignored.
+    pub tuning: vtop_core::config::EgressTuning,
 }
 
 pub struct S3NativeBackend {
@@ -136,6 +141,68 @@ fn validate_endpoint_scheme(
     Ok(())
 }
 
+/// Refuse any configured egress-tuning field the transport cannot honour (#480),
+/// naming the field and the transport. This is what makes the symmetric shape
+/// honest: a knob set on a path that cannot apply it fails loudly at
+/// construction rather than being silently dropped. The support flags map to
+/// fields as: `rate_control` → `target_rate_bytes_per_second`; `parallelism` →
+/// `max_concurrency` / `part_size_bytes` / `parts_in_flight`; `redundancy` →
+/// a non-`none` `redundancy` policy.
+fn reject_unsupported_tuning(
+    transport: &dyn EgressTransport,
+    tuning: &vtop_core::config::EgressTuning,
+) -> Result<(), VtopError> {
+    use vtop_core::config::RedundancyPolicy;
+    let support = transport.tuning_support();
+    let name = transport.name();
+    let refuse = |field: &str| {
+        Err(VtopError::Config(format!(
+            "the {name} transport cannot honour upload.transports.{name}.{field}; \
+             it is configured but this transport does not support it"
+        )))
+    };
+    if tuning.target_rate_bytes_per_second.is_some() && !support.rate_control {
+        return refuse("target_rate_bytes_per_second");
+    }
+    if tuning.max_concurrency.is_some() && !support.parallelism {
+        return refuse("max_concurrency");
+    }
+    if tuning.part_size_bytes.is_some() && !support.parallelism {
+        return refuse("part_size_bytes");
+    }
+    if tuning.parts_in_flight.is_some() && !support.parallelism {
+        return refuse("parts_in_flight");
+    }
+    if tuning.redundancy != RedundancyPolicy::None && !support.redundancy {
+        return refuse("redundancy");
+    }
+    Ok(())
+}
+
+/// Refuse a tuned `part_size_bytes` below the backend's non-final-part floor
+/// (#480). Such a size passes the generic tuning check but `should_multipart`
+/// would reject it against the floor and silently fall back to a whole-object
+/// PUT, so the recorded tuning would never actually apply — refuse it at
+/// construction rather than accept-and-bypass. The legacy
+/// `multipart_part_size_bytes` keeps its `should_multipart` fallback (mock and
+/// local backends use sub-floor sizes in tests); only the tuning knob is strict.
+fn reject_subfloor_part_size(
+    floor: u64,
+    tuning: &vtop_core::config::EgressTuning,
+    transport_name: &str,
+) -> Result<(), VtopError> {
+    if let Some(size) = tuning.part_size_bytes {
+        if size < floor {
+            return Err(VtopError::Config(format!(
+                "upload.transports.{transport_name}.part_size_bytes = {size} is below S3's \
+                 {floor}-byte minimum for a non-final multipart part; a smaller size cannot be \
+                 honoured (it would fall back to a whole-object PUT)"
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl S3NativeBackend {
     /// S3's hard minimum for a non-final multipart part (#482).
     pub const fn part_size_floor() -> u64 {
@@ -149,6 +216,11 @@ impl S3NativeBackend {
         // and the resolved transport drives both the scheme policy below and the
         // client-config install just before construction.
         let transport = TransportRegistry::with_builtins().resolve(&cfg.transport)?;
+        // A tuning knob the resolved transport cannot honour is refused HERE,
+        // naming the field and the transport (#480) — never silently ignored.
+        // The shape is symmetric across paths; what each path can honour is not.
+        reject_unsupported_tuning(transport.as_ref(), &cfg.tuning)?;
+        reject_subfloor_part_size(Self::part_size_floor(), &cfg.tuning, &cfg.transport)?;
         validate_endpoint_scheme(
             cfg.endpoint_url.as_deref(),
             cfg.verify_tls,
@@ -766,6 +838,14 @@ pub fn config_from_upload(upload: &vtop_core::config::UploadConfig) -> S3NativeC
         &upload.transport,
         std::env::var("VTOP_S3_TRANSPORT").ok().as_deref(),
     );
+    // The tuning for the RESOLVED transport (#480): tuning follows the wire the
+    // engine will actually use, so an override that changes the transport also
+    // selects that transport's block. Absent, the default is all-None tuning.
+    let tuning = upload
+        .transports
+        .get(&transport)
+        .cloned()
+        .unwrap_or_default();
 
     S3NativeConfig {
         region: upload.region.clone(),
@@ -773,6 +853,7 @@ pub fn config_from_upload(upload: &vtop_core::config::UploadConfig) -> S3NativeC
         force_path_style,
         verify_tls,
         transport,
+        tuning,
     }
 }
 
@@ -837,6 +918,108 @@ mod tests {
         assert!(validate_endpoint_scheme(Some("https://s3.example.com"), false, &t).is_ok());
         // No custom endpoint = default AWS https endpoints.
         assert!(validate_endpoint_scheme(None, true, &t).is_ok());
+    }
+
+    #[test]
+    fn a_subfloor_tuned_part_size_is_refused() {
+        // A tuned part size below the S3 floor must be refused, not accepted and
+        // silently bypassed to a whole-object PUT (#480).
+        use vtop_core::config::EgressTuning;
+        let floor = super::S3NativeBackend::part_size_floor();
+        let below = EgressTuning {
+            part_size_bytes: Some(floor - 1),
+            ..Default::default()
+        };
+        let err = reject_subfloor_part_size(floor, &below, "tcp_tls")
+            .expect_err("a sub-floor part size must be refused");
+        assert!(err.to_string().contains("part_size_bytes"), "{err}");
+        // At or above the floor is accepted.
+        let ok = EgressTuning {
+            part_size_bytes: Some(floor),
+            ..Default::default()
+        };
+        assert!(reject_subfloor_part_size(floor, &ok, "tcp_tls").is_ok());
+        // Absent is always fine.
+        assert!(reject_subfloor_part_size(floor, &EgressTuning::default(), "tcp_tls").is_ok());
+    }
+
+    #[test]
+    fn an_unsupported_tuning_knob_fails_at_construction_over_every_transport() {
+        // For every registered transport, set each EgressTuning field in turn:
+        // it is either honoured (the transport's tuning_support says so) or
+        // rejected with an error naming BOTH the field and the transport — no
+        // field is ever silently ignored (#480).
+        use vtop_core::config::{EgressTuning, RedundancyPolicy};
+        for name in transport::TransportRegistry::with_builtins().names() {
+            let t = transport::TransportRegistry::with_builtins()
+                .resolve(&name)
+                .unwrap();
+            let support = t.tuning_support();
+            let cases: [(&str, EgressTuning, bool); 5] = [
+                (
+                    "target_rate_bytes_per_second",
+                    EgressTuning {
+                        target_rate_bytes_per_second: Some(1000),
+                        ..Default::default()
+                    },
+                    support.rate_control,
+                ),
+                (
+                    "max_concurrency",
+                    EgressTuning {
+                        max_concurrency: Some(4),
+                        ..Default::default()
+                    },
+                    support.parallelism,
+                ),
+                (
+                    "part_size_bytes",
+                    EgressTuning {
+                        part_size_bytes: Some(8 << 20),
+                        ..Default::default()
+                    },
+                    support.parallelism,
+                ),
+                (
+                    "parts_in_flight",
+                    EgressTuning {
+                        parts_in_flight: Some(4),
+                        ..Default::default()
+                    },
+                    support.parallelism,
+                ),
+                (
+                    "redundancy",
+                    EgressTuning {
+                        redundancy: RedundancyPolicy::ReedSolomon,
+                        ..Default::default()
+                    },
+                    support.redundancy,
+                ),
+            ];
+            for (field, tuning, supported) in cases {
+                let result = reject_unsupported_tuning(t.as_ref(), &tuning);
+                if supported {
+                    assert!(
+                        result.is_ok(),
+                        "[{name}] honours {field}, so it must not be rejected"
+                    );
+                } else {
+                    let err = result.expect_err(&format!(
+                        "[{name}] does not support {field}; it must be refused"
+                    ));
+                    let msg = err.to_string();
+                    assert!(
+                        msg.contains(field),
+                        "[{name}] refusal names the field: {msg}"
+                    );
+                    assert!(
+                        msg.contains(&name),
+                        "[{name}] refusal names the transport: {msg}"
+                    );
+                }
+            }
+        }
     }
 }
 
