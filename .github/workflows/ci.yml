@@ -197,6 +197,16 @@ jobs:
               # added here, so a PR touching only the collector would have
               # skipped the lint it was added for (review).
               - 'scripts/traffic-snapshot.sh'
+              # The naming/substantiation checkers and their bats suite
+              # (#490) — the third time this exact hole was found in review,
+              # now with its own precedent paragraph above to point at: a
+              # checker-only PR must run the lint and the tests that prove
+              # the checker can fail. The term list rides along because the
+              # bats suite reads it.
+              - 'scripts/check-naming.sh'
+              - 'scripts/check-egress-claims.sh'
+              - 'scripts/naming-denylist.txt'
+              - 'scripts/tests/**'
               # The test-progress runner: developer tooling, but shell that people
               # will paste and rely on, so it is linted like the rest — listed here
               # AND in the shellcheck step, for the reason the comment above gives.
@@ -1020,7 +1030,8 @@ jobs:
           docker run --rm -v "$PWD:/mnt" -w /mnt \
             koalaman/shellcheck:v0.11.0 docker/*.sh scripts/release-notes.sh \
             scripts/k8s-smoke.sh scripts/e2e-smoke.sh scripts/upgrade-compat.sh \
-            scripts/traffic-snapshot.sh scripts/test-progress.sh
+            scripts/traffic-snapshot.sh scripts/test-progress.sh \
+            scripts/check-naming.sh scripts/check-egress-claims.sh
 
       # `-P scripts/live-chaos/scenarios` resolves the scenarios' dynamic
       # `source "$(dirname …)/../lib.sh"`. Without it every scenario reports
@@ -1038,7 +1049,26 @@ jobs:
       - name: bats
         run: |
           docker run --rm -v "$PWD:/code" -w /code \
-            bats/bats:1.13.0 docker/tests/
+            bats/bats:1.13.0 docker/tests/ scripts/tests/
+
+  # The naming and substantiation rules (#490), enforced mechanically —
+  # judgement does not survive a deadline. Deliberately unfiltered: the scan
+  # takes a second, and a rule whose check can be skipped by a path filter
+  # has a blind spot exactly where a rename lands. The checks are proven
+  # capable of failing by scripts/tests/naming-and-claims.bats in the shell
+  # job; this job is the enforcement itself.
+  claims:
+    name: naming + substantiation
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+
+      - name: naming check (no commercial mark outside the prior-art files)
+        run: bash scripts/check-naming.sh
+
+      - name: substantiation lint (every measurement row carries its conditions)
+        run: bash scripts/check-egress-claims.sh
 
   # Kafka was entirely untested in CI, which is how a P0 shipped: every read
   # returned zero records (a subscribe() per read forced a rebalance that

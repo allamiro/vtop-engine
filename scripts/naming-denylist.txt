@@ -1,0 +1,36 @@
+# The naming rule's term list (#490): commercial transport-product marks that
+# must not appear anywhere the product describes itself — crate names, module
+# names, feature flags, config keys, CLI flags, metric labels, transport
+# variants, scenario names, README, docs — because there they are
+# source-identifying uses, not references. The ONLY files allowed to carry
+# them are the two prior-art/disclosure documents, exempted by explicit path
+# in scripts/check-naming.sh, where citing published and commercial systems
+# by name is normal engineering practice.
+#
+# One term per line; blank lines and lines starting with '#' are ignored.
+# Terms are matched case-insensitively as SUBSTRINGS — an identifier like
+# `mark_shim` has no word boundary at the underscore, and identifiers are
+# the uses the rule most cares about — so every term here must be
+# distinctive enough that a substring hit is a real reference. Adding a term
+# is a one-line change here; removing one is visible in review.
+aspera
+fasp
+signiant
+expedat
+# Every multi-word mark carries ALL FOUR identifier spellings (review): the
+# checker matches fixed substrings without normalization, so the space form,
+# the concatenated form (camelCase), the snake_case form, AND the kebab-case
+# form (a CLI flag like --file-catalyst-mode, --media-shuttle) each need their
+# own line, or the spelling not listed slips straight past the gate.
+file catalyst
+filecatalyst
+file_catalyst
+file-catalyst
+data expedition
+dataexpedition
+data_expedition
+data-expedition
+media shuttle
+mediashuttle
+media_shuttle
+media-shuttle

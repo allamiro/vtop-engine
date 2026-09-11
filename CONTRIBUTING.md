@@ -78,6 +78,41 @@ before you write rather than after review:
 - **Do not weaken an assertion to make a run pass.** If an assertion is wrong,
   fix the assertion and say why in the commit message.
 
+## Naming and claims
+
+Two rules, often conflated, kept separate here on purpose.
+
+**The naming rule.** Prior-art and disclosure documents cite published and
+commercial systems by name — that is normal engineering practice, and
+`docs/PRIOR_ART_SEARCH_PLAN.md` and `docs/INVENTION_DISCLOSURE_DRAFT.md` do
+it. The product's own description of itself must not. No commercial
+product's mark may appear in `README.md`, in `docs/` outside those two
+files, or — the part that gets missed — in a crate name, module name,
+feature flag, config key, CLI flag, metric label, transport variant,
+scenario name or branch name. Those are source-identifying uses, not
+references. Internal shorthand is in scope too, because internal shorthand
+leaks into READMEs. CI enforces the tree half of this
+(`scripts/check-naming.sh` scans file contents AND file names) against the
+term list in `scripts/naming-denylist.txt`; adding a term is a one-line
+change there, and the two prior-art files are exempt by exact path — never
+by directory, so a new document under `docs/` is scanned by default.
+Branch names are refs, outside the tree `check-naming.sh` scans, so THIS
+check never sees them — a job reading `GITHUB_REF` could, but none does:
+that part of the rule is enforced in review, and is stated here so the
+guarantee reads exactly as strong as it is.
+
+**The substantiation rule.** Every number carries its conditions, the
+baseline is named and is the tuned one, and no claim is made about a system
+we have not measured. A similarity or parity claim about a product with no
+public specification is unverifiable by construction, so it cannot be
+substantiated — and making one frames independent work as an attempted
+reproduction. The measurement record for egress transports lives in
+`docs/EGRESS_TRANSPORT_RESEARCH.md`, whose table is linted
+(`scripts/check-egress-claims.sh`): a row missing a condition fails CI
+naming the missing column. The standing list of what may and may not be
+said is a section of that document; read it before writing a sentence that
+compares anything to anything.
+
 ## Commit messages
 
 The subject names the areas touched and what changed, e.g.
