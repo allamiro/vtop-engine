@@ -599,6 +599,19 @@ def main() -> int:
         # measurement, and a number read without knowing the namespace is a
         # number compared against the wrong baseline.
         "runner_mode": engine.runner_mode(sc),
+        # The wire that carried the bytes (#479): recorded so a throughput
+        # number is never read without knowing its transport. Only the
+        # s3_native backend routes through the EgressTransport seam, so the
+        # value is blank for backends that use no such wire (mock, localfs, and
+        # the command backends that shell out) rather than mislabeling a run
+        # that no transport carried. The RESOLVED value is recorded, matching
+        # the engine's own precedence (config_from_upload): a non-empty
+        # VTOP_S3_TRANSPORT override outranks the scenario value, so recording
+        # the scenario value would mislabel an overridden run.
+        "transport": (
+            (os.environ.get("VTOP_S3_TRANSPORT", "").strip()
+             or sc.get("transport", "tcp_tls"))
+            if sc.get("backend") == "s3_native" else ""),
     }
     # CPU/mem summary from the system-metrics samples written during the run.
     summary.update(_sys_summary(writer.dir))

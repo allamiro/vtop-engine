@@ -188,3 +188,32 @@ def test_no_allowlist_emits_no_block(tmp_path):
     assert "command_env_allowlist" not in text, (
         "absent must stay absent so the engine keeps its empty-allowlist default"
     )
+
+
+# --------------------------------------------------------------------------
+# The egress transport is threaded to the engine, not just recorded (#479)
+# --------------------------------------------------------------------------
+
+
+def test_transport_defaults_to_tcp_tls_in_the_engine_config(tmp_path):
+    text = write(tmp_path, {"backend": "s3_native",
+                            "endpoint_url": "http://localhost:9000"})
+    assert "  transport: tcp_tls" in text, (
+        "the engine config must name the transport so the run is over the wire "
+        "the summary reports, not the engine's implicit default"
+    )
+
+
+def test_a_scenario_transport_reaches_the_engine_config(tmp_path):
+    # A scenario asking for a transport must have it written to the config, so
+    # the engine actually uses it (and rejects an unavailable one at load)
+    # rather than running tcp_tls while the summary claims otherwise (#479).
+    # A DISTINCT non-default name is used deliberately (review): asserting the
+    # default would pass even if the value were hardcoded to tcp_tls and the
+    # scenario input ignored — the exact "recorded but not applied" bug this
+    # guards against. The engine then refuses this unknown name at load, which
+    # is the correct behaviour for an unavailable transport.
+    text = write(tmp_path, {"backend": "s3_native",
+                            "endpoint_url": "http://localhost:9000",
+                            "transport": "quic_experimental"})
+    assert "  transport: quic_experimental" in text

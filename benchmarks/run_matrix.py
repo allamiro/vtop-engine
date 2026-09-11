@@ -42,6 +42,10 @@ COMPARE_COLS = [
     # Which way the sender ran (#476); a comparison across modes is a
     # comparison of namespaces, and the matrix must say so.
     "runner_mode",
+    # Which WIRE carried the bytes (#479); a comparison across transports is a
+    # comparison of wires, so the matrix must carry it beside runner_mode.
+    # Blank for backends that route through no EgressTransport seam.
+    "transport",
 ]
 
 
