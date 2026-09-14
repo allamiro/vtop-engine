@@ -20,7 +20,14 @@
 # was started with.
 services:
   minio:
-    image: minio/minio:latest
+    # quay.io, and PINNED (#507): MinIO withdrew both repositories from Docker
+    # Hub between 2026-09-11 and 2026-09-14, and every `compose up` then failed
+    # in its pull phase before creating a container. quay.io serves the same
+    # images bit-for-bit. The tag is explicit rather than `latest` because
+    # Dependabot's docker-compose ecosystem cannot bump a floating tag — a
+    # pinned one turns the next withdrawal into a failed bump instead of a
+    # broken lab, which is the whole point of the ecosystem entry.
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
     container_name: vtop-bench-minio
     command: server /data --console-address ":9001"
     ports:
@@ -45,7 +52,7 @@ services:
       - bench-minio-data:/data
 
   minio-init:
-    image: minio/mc:latest
+    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
     security_opt:
       - no-new-privileges:true
     cap_drop: [ALL]

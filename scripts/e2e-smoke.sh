@@ -78,14 +78,25 @@ info "2/6  Bringing up the lab"
 # ---------------------------------------------------------------------------
 # kafka-ui is excluded: it binds 8080, which collides on many machines and is
 # irrelevant to whether telemetry flows.
-if ! "${COMPOSE[@]}" up -d --wait kafka minio minio-init kafka-init vtop-engine >/dev/null 2>&1; then
+# Compose's own output is KEPT, not discarded (#507). It is the only place the
+# real reason appears — a withdrawn image, a bound port, a failed build — and
+# discarding it is precisely how "minio/minio no longer exists on Docker Hub"
+# reached CI as the bare line "engine container did not start", accusing the
+# engine of a registry's decision. Captured rather than streamed so a passing
+# run stays quiet.
+up_out="$("${COMPOSE[@]}" up -d --wait kafka minio minio-init kafka-init vtop-engine 2>&1)" || {
   # --wait fails if a one-shot init container exits, which is expected; only a
-  # missing engine is fatal.
-  "${COMPOSE[@]}" up -d kafka minio minio-init kafka-init vtop-engine >/dev/null 2>&1 || true
-fi
+  # missing engine is fatal. Retry without --wait and keep BOTH transcripts: if
+  # the first failure was real rather than the init container, the second says
+  # so again, and the pair is what tells them apart.
+  up_out="${up_out}"$'\n'"$("${COMPOSE[@]}" up -d kafka minio minio-init kafka-init vtop-engine 2>&1 || true)"
+}
 if [ -z "$("${COMPOSE[@]}" ps -q vtop-engine 2>/dev/null)" ]; then
   fail "engine container did not start"
-  "${COMPOSE[@]}" logs --tail=30 vtop-engine || true
+  printf '%s\n' "--- what compose reported ---" "$up_out" "--- end compose output ---" | sed 's/^/  /'
+  # Usually empty when the failure was a pull: there is no container to log.
+  # Printed anyway, because when there IS one this is the whole diagnosis.
+  "${COMPOSE[@]}" logs --tail=30 vtop-engine 2>&1 | sed 's/^/  /' || true
   exit 1
 fi
 pass "stack is up"
@@ -201,12 +212,35 @@ if [ -f .env ]; then
   MINIO_ROOT_USER="${MINIO_ROOT_USER-$(env_default MINIO_ROOT_USER)}"
   MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD-$(env_default MINIO_ROOT_PASSWORD)}"
 fi
+# The mc image comes from the COMPOSE FILE, never a second literal (#507,
+# review). Dependabot's docker-compose ecosystem scans the manifests under /
+# and /benchmarks and nothing else, so a tag written here too would sit still
+# while the manifest advanced — and the next withdrawal would break this
+# helper alone, in the step that reports on the upload path. `--images
+# <service>` also lists that service's dependencies, so the mc one is selected
+# by name; an empty answer is a refusal, because falling back to a literal is
+# how the two drift apart in the first place.
+MC_IMAGE=$("${COMPOSE[@]}" config --images minio-init 2>/dev/null | grep '/mc:' | head -1)
+if [ -z "$MC_IMAGE" ]; then
+  fail "could not read the mc image from the compose file; object counts would be meaningless"
+  exit 1
+fi
 listing=$(docker run --rm --network "$NET" \
   -e "MINIO_ROOT_USER=${MINIO_ROOT_USER:-minioadmin}" \
   -e "MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-minioadmin}" \
   -e HOME=/tmp \
-  --entrypoint /bin/sh minio/mc:latest -c \
-  'mc alias set local http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null 2>&1; mc ls --recursive local' 2>/dev/null || true)
+  --entrypoint /bin/sh "$MC_IMAGE" -c \
+  'mc alias set local http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null 2>&1; mc ls --recursive local' 2>/tmp/vtop-smoke-mc.err || true)
+# A `docker run` that never ran is not an empty bucket (#507). Swallowing this
+# one turned a pull failure into "no data objects in MinIO" — the listing came
+# back empty and the report blamed the upload path for a registry's decision.
+if [ ! -s /tmp/vtop-smoke-mc.err ]; then
+  : # nothing on stderr: a real, possibly empty, listing
+elif [ -z "$listing" ]; then
+  fail "could not list MinIO at all, so the object counts below mean nothing"
+  sed 's/^/  /' /tmp/vtop-smoke-mc.err
+fi
+rm -f /tmp/vtop-smoke-mc.err
 
 # Count DATA objects only: a manifest ends in `.manifest.json`, so a naive
 # extension match counts it twice and makes objects == 2x manifests.
