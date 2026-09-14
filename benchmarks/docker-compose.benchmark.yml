@@ -206,7 +206,7 @@ services:
   #   docker compose -f benchmarks/docker-compose.benchmark.yml \
   #     --profile netem --profile containerized up -d
   netem:
-    image: nicolaka/netshoot:v0.13
+    image: nicolaka/netshoot:v0.16
     container_name: vtop-bench-netem
     profiles: ["netem"]
     # tc, ifb and the forwarding rules need NET_ADMIN; iptables additionally
@@ -259,7 +259,7 @@ services:
   # rather than recorded. Separate from the engine container on purpose — the
   # number must not be measured beside VTOP's own traffic.
   netem-probe:
-    image: nicolaka/netshoot:v0.13
+    image: nicolaka/netshoot:v0.16
     container_name: vtop-bench-netem-probe
     profiles: ["netem"]
     cap_drop: [ALL]
