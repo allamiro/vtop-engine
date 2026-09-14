@@ -56,7 +56,35 @@ COMPARE_COLS = [
     # sorted key=value pairs, so the same tuning always renders the same
     # string and two matrices diff cleanly.
     "transport_tuning_flat",
+    # Whether the store was reached through the lab's h3 proxy (#484). The
+    # matrix is exactly where this matters: scenario 17 against scenario 12 IS
+    # the proxy hop's price, and the two rows are otherwise indistinguishable.
+    "h3_proxy",
 ]
+
+# The columns a RUN RESOLVES, which the scenario's own keys may never fill in
+# over. Each of these has a scenario key of the same name saying what was
+# ASKED for, and a summary key of the same name saying what the run actually
+# did; `matrix_row` copies the scenario in to supply what the summary lacks,
+# so without this list the request quietly wins.
+RESOLVED_COLUMNS = (
+    # #477: every scenario carries the loader's default `shaping_driver:
+    # toxiproxy`, so a blanket update stamps it onto unshaped rows too.
+    *SHAPING_COLUMNS,
+    # #479, #480: a non-empty VTOP_S3_TRANSPORT outranks the scenario's
+    # `transport`, and the summary records the wire the bytes went over —
+    # taking the scenario's here would relabel an overridden run as the wire it
+    # asked for, and the tuning beside it belongs to the transport that ran.
+    "transport", "transport_tuning_flat",
+    # #476: the summary's value is the NORMALIZED mode, so a scenario that
+    # leaves it blank is filed as the `host` it ran in rather than as nothing.
+    "runner_mode",
+    # #484 (review): the summary says "h3-proxy" or "", the scenario says True
+    # or False, and the scenario was winning — so the column added to tell
+    # scenario 17 from scenario 12 carried the declaration rather than the
+    # topology, in a spelling the other rows do not even use.
+    "h3_proxy",
+)
 
 
 # Defaults for --sweep (#90): a moderate, representative grid. Formats span
@@ -152,9 +180,14 @@ def matrix_row(summary: dict) -> dict:
     on the one comparison it is written to allow: a netem run beside its own
     unshaped baseline. The summary's value is what the run DID; the scenario's
     is what it asked for, and where they differ the former wins.
+
+    That rule is a list (RESOLVED_COLUMNS), not a shaping special case, and it
+    grew because every column added since has needed it: a transport chosen by
+    VTOP_S3_TRANSPORT, and the proxy hop, whose column read `True` from the
+    scenario where every other row reads `h3-proxy` or blank.
     """
     row = dict(summary)
-    resolved = {key: row[key] for key in SHAPING_COLUMNS if key in row}
+    resolved = {key: row[key] for key in RESOLVED_COLUMNS if key in row}
     row.update(summary.get("scenario", {}))
     row.update(resolved)
     # An unshaped run carries no shaping columns at all, and blank is what the
