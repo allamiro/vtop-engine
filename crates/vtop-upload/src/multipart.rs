@@ -33,10 +33,33 @@ pub struct MultipartUploadConfig {
 
 impl MultipartUploadConfig {
     pub fn from_upload(upload: &vtop_core::config::UploadConfig, state_dir: PathBuf) -> Self {
+        // The active transport's egress tuning maps onto the multipart knobs
+        // (#480): `part_size_bytes` / `parts_in_flight` are the symmetric names
+        // both paths share, and for tcp_tls they ARE the multipart part size and
+        // parallelism. When set, the tuning wins; otherwise the older
+        // `multipart_*` keys still work unchanged, so no existing deployment
+        // changes behaviour. The two spellings are equivalent, and the older one
+        // is deprecated in documentation only.
+        //
+        // `active_egress_tuning` is the ONE gate: it selects by the EFFECTIVE
+        // transport (VTOP_S3_TRANSPORT over the config value), so an overridden
+        // run reads the right block rather than falling to defaults, and it
+        // returns all-`None` unless the backend is s3_native. That second half
+        // matters here as much as on the width path (review): a mock backend
+        // also advertises `supports_multipart()`, and validation skips the
+        // `transports` map entirely for a non-s3_native backend — so without the
+        // gate, a benchmark matrix that switches to mock while keeping one
+        // tcp_tls block would chunk at a part size nobody validated and the
+        // summary records as blank, or fail outright on `parts_in_flight: 0`.
+        let tuning = upload.active_egress_tuning();
         Self {
-            part_size_bytes: upload.multipart_part_size_bytes,
+            part_size_bytes: tuning
+                .part_size_bytes
+                .unwrap_or(upload.multipart_part_size_bytes),
             threshold_bytes: upload.multipart_threshold_bytes,
-            max_parallelism: upload.multipart_max_parallelism,
+            max_parallelism: tuning
+                .parts_in_flight
+                .unwrap_or(upload.multipart_max_parallelism),
             abandon_after_secs: upload.multipart_abandon_after_secs,
             state_dir,
         }
@@ -615,6 +638,73 @@ mod tests {
             content_digest_algorithm: "blake3".to_owned(),
             byte_length: len,
         }
+    }
+
+    #[test]
+    fn tuning_maps_onto_the_old_multipart_keys_equivalently() {
+        // The old multipart keys still work (#480): a config using only
+        // multipart_part_size_bytes / multipart_max_parallelism resolves to the
+        // SAME part size and parallelism as the equivalent upload.transports
+        // .tcp_tls block, so no existing deployment changes behaviour and the
+        // two spellings are interchangeable.
+        use vtop_core::config::UploadConfig;
+        let old: UploadConfig = serde_json::from_str(
+            r#"{"bucket":"b","multipart_part_size_bytes":12345678,"multipart_max_parallelism":7}"#,
+        )
+        .unwrap();
+        let new: UploadConfig = serde_json::from_str(
+            r#"{"bucket":"b","transports":{"tcp_tls":{"part_size_bytes":12345678,"parts_in_flight":7}}}"#,
+        )
+        .unwrap();
+        let dir = PathBuf::from("/tmp/x");
+        let old_cfg = MultipartUploadConfig::from_upload(&old, dir.clone());
+        let new_cfg = MultipartUploadConfig::from_upload(&new, dir);
+        assert_eq!(old_cfg.part_size_bytes, new_cfg.part_size_bytes);
+        assert_eq!(old_cfg.max_parallelism, new_cfg.max_parallelism);
+        assert_eq!(new_cfg.part_size_bytes, 12_345_678);
+        assert_eq!(new_cfg.max_parallelism, 7);
+    }
+
+    #[test]
+    fn a_tuning_block_on_a_non_s3_native_backend_never_reaches_the_multipart_knobs() {
+        // Only s3_native routes through the EgressTransport seam (#480,
+        // review), and validation skips the whole `transports` map for any
+        // other backend — so a mock run carrying a stray tcp_tls block must
+        // keep the plain multipart_* knobs. The mock backend advertises
+        // supports_multipart(), so without the gate this run would chunk at a
+        // part size nobody validated while the benchmark summary records the
+        // tuning as blank. The zero parallelism is deliberate: it is a value
+        // validation would have refused for s3_native but never sees here, and
+        // applying it would fail the upload outright.
+        use vtop_core::config::UploadConfig;
+        let mock: UploadConfig = serde_json::from_str(
+            r#"{"bucket":"b","backend":"mock","multipart_part_size_bytes":12345678,
+                "multipart_max_parallelism":7,
+                "transports":{"tcp_tls":{"part_size_bytes":999,"parts_in_flight":0}}}"#,
+        )
+        .unwrap();
+        let cfg = MultipartUploadConfig::from_upload(&mock, PathBuf::from("/tmp/x"));
+        assert_eq!(
+            cfg.part_size_bytes, 12_345_678,
+            "a mock run must keep multipart_part_size_bytes, not the unvalidated tuning"
+        );
+        assert_eq!(
+            cfg.max_parallelism, 7,
+            "a mock run must keep multipart_max_parallelism, not a parallelism of zero"
+        );
+
+        // The same block on s3_native — the backend that does route through the
+        // seam — is honoured, so the gate is on the backend and not on the block.
+        let s3: UploadConfig = serde_json::from_str(
+            r#"{"bucket":"b","multipart_part_size_bytes":12345678,
+                "transports":{"tcp_tls":{"part_size_bytes":999}}}"#,
+        )
+        .unwrap();
+        let cfg = MultipartUploadConfig::from_upload(&s3, PathBuf::from("/tmp/x"));
+        assert_eq!(
+            cfg.part_size_bytes, 999,
+            "s3_native does read the tuning block"
+        );
     }
 
     fn cfg(dir: &Path, part_size: u64) -> MultipartUploadConfig {

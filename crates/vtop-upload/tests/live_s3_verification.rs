@@ -22,6 +22,7 @@ async fn native_s3_verifies_service_sha256_and_streamed_blake3() {
         force_path_style: true,
         verify_tls: false,
         transport: "tcp_tls".into(),
+        tuning: Default::default(),
     })
     .await
     .unwrap();

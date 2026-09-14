@@ -1093,6 +1093,7 @@ mod tests {
             multipart_threshold_bytes: 8 * 1024 * 1024,
             multipart_max_parallelism: 4,
             multipart_abandon_after_secs: 86_400,
+            transports: Default::default(),
         };
         let state_dir = PathBuf::from("/work");
         // The engine path: from_upload, no overrides.

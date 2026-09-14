@@ -217,3 +217,111 @@ def test_a_scenario_transport_reaches_the_engine_config(tmp_path):
                             "endpoint_url": "http://localhost:9000",
                             "transport": "quic_experimental"})
     assert "  transport: quic_experimental" in text
+
+
+def test_scenario_transport_tuning_reaches_the_engine_config(tmp_path):
+    # A scenario that tunes a transport must have that block written into the
+    # engine config (#480), so the engine actually runs with it rather than the
+    # tuning being recorded in the summary while the engine uses defaults.
+    text = write(tmp_path, {"backend": "s3_native",
+                            "endpoint_url": "http://localhost:9000",
+                            "transport": "tcp_tls",
+                            "transports": {"tcp_tls": {"max_concurrency": 3}}})
+    assert "  transports:" in text
+    assert "    tcp_tls:" in text
+    assert "      max_concurrency: 3" in text
+
+
+def test_no_transports_block_when_the_scenario_has_none(tmp_path):
+    # An empty / absent tuning map keeps today's behaviour: no transports block.
+    text = write(tmp_path, {"backend": "s3_native",
+                            "endpoint_url": "http://localhost:9000"})
+    assert "transports:" not in text
+
+
+def test_no_transports_block_for_a_non_s3_native_backend(tmp_path):
+    # Only s3_native routes through the EgressTransport seam (#480, review):
+    # the engine returns all-None tuning for any other backend and the summary
+    # records the tuning blank, so writing the block for a mock run would put a
+    # knob in the config that nothing honours — a matrix that varies the
+    # backend over one tuning block would read as tuned when it is not.
+    text = write(tmp_path, {"backend": "mock",
+                            "transports": {"tcp_tls": {"max_concurrency": 3}}})
+    assert "transports:" not in text, (
+        "a non-s3_native run must not carry a tuning block the engine ignores"
+    )
+
+
+# --------------------------------------------------------------------------
+# The tuning a run RECORDS must be the tuning it applied (#480)
+# --------------------------------------------------------------------------
+
+
+def test_a_requested_concurrency_above_the_batch_ceiling_is_recorded_as_what_ran():
+    # max_concurrency composes with max_concurrent_batches by MINIMUM, so a
+    # scenario asking for 20 against a ceiling of 8 RUNS at 8. Recording the
+    # request labels the benchmark with a concurrency it never used, and a
+    # comparison grouped by tuning then groups two identical runs apart — or
+    # two different runs together.
+    from lib import engine
+
+    sc = {"backend": "s3_native",
+          "transports": {"tcp_tls": {"max_concurrency": 20, "part_size_bytes": 8388608}}}
+    assert engine.resolved_transport_tuning(sc, "tcp_tls")["max_concurrency"] == 8, (
+        "the engine's default batch ceiling narrows it to 8; the summary must say 8"
+    )
+
+    # A scenario that raises the ceiling gets its request, because nothing
+    # narrows it any more.
+    widened = dict(sc, max_concurrent_batches=32)
+    assert engine.resolved_transport_tuning(widened, "tcp_tls")["max_concurrency"] == 20
+
+    # Knobs nothing narrows pass through untouched.
+    assert engine.resolved_transport_tuning(sc, "tcp_tls")["part_size_bytes"] == 8388608
+    # A transport with no block of its own is untuned, not defaulted.
+    assert engine.resolved_transport_tuning(sc, "datagram") == {}
+
+
+def test_the_tuning_reaches_the_comparison_tables_as_one_stable_column():
+    # The nested dict survives in summary.json and vanishes from matrix.csv and
+    # metrics.csv, so a matrix varying ONLY the tuning showed every row with
+    # identical visible conditions.
+    from lib import engine
+
+    flat = engine.format_transport_tuning({"part_size_bytes": 8388608, "max_concurrency": 4})
+    assert flat == "max_concurrency=4;part_size_bytes=8388608", (
+        "sorted key=value pairs: the same tuning must always render the same string, or a "
+        "diff of two matrices reports changes that did not happen"
+    )
+    assert engine.format_transport_tuning({}) == "", "an untuned run's column is blank"
+    assert engine.format_transport_tuning({"max_concurrency": None}) == "", (
+        "an unset knob is not a value; recording 'max_concurrency=None' would read as a "
+        "setting somebody chose"
+    )
+
+
+def test_both_comparison_tables_carry_the_tuning_column():
+    # Asserted against the real header lists, because the failure mode is a
+    # column added to one artifact and forgotten in the other.
+    import run_matrix
+    from lib.metrics import CSV_HEADERS
+
+    assert "transport_tuning_flat" in run_matrix.COMPARE_COLS
+    assert "transport_tuning_flat" in CSV_HEADERS["metrics.csv"]
+
+
+def test_the_human_facing_summary_shows_the_tuning_too():
+    # summary.md is what the runner prints at the end of a run, so a reader
+    # comparing two experiments that differ only in tuning would see identical
+    # conditions in the one artifact they actually look at.
+    from lib.metrics import _summary_md
+
+    tuned = _summary_md({"transport": "tcp_tls",
+                         "transport_tuning_flat": "max_concurrency=4;part_size_bytes=8388608"})
+    assert "max_concurrency=4" in tuned, (
+        "the tuning must appear beside the transport, or the primary human-facing summary "
+        "presents differently tuned runs as having the same conditions"
+    )
+    # An untuned run says so rather than showing a blank cell, which reads as
+    # a missing measurement instead of an absent setting.
+    assert "| none |" in _summary_md({"transport": "tcp_tls"})

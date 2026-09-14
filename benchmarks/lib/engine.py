@@ -340,6 +340,47 @@ def _effective_endpoint(scenario) -> str:
     return os.environ.get("VTOP_S3_ENDPOINT_URL", "") or scenario.get("endpoint_url", "")
 
 
+# The engine's own default batch ceiling (vtop-core config.rs
+# `default_max_concurrent_batches`). Named here because the benchmark has to
+# resolve `max_concurrency` the same way the engine does, and a scenario that
+# does not set the knob gets the engine's default rather than no ceiling.
+DEFAULT_MAX_CONCURRENT_BATCHES = 8
+
+
+def resolved_transport_tuning(scenario, effective_transport: str) -> dict:
+    """The active transport's tuning AS THE ENGINE WILL APPLY IT (#480).
+
+    The scenario states a request; the engine resolves it. `max_concurrency`
+    composes with `batching.max_concurrent_batches` by MINIMUM
+    (UploadConfig::resolved_max_concurrency), so a scenario asking for 20
+    against a batch ceiling of 8 RUNS at 8 — and recording the 20 labels the
+    benchmark with a concurrency it never used, which is exactly the corruption
+    a comparison grouped by tuning cannot survive (review). Every other knob
+    passes through unchanged, because nothing narrows them.
+    """
+    tuning = dict((scenario.get("transports", {}) or {}).get(effective_transport, {}) or {})
+    requested = tuning.get("max_concurrency")
+    if requested is not None:
+        # The engine's own default when the scenario does not say (vtop-core
+        # BatchingConfig); kept in step with it, and a scenario that sets the
+        # knob overrides it here exactly as it does there.
+        ceiling = scenario.get("max_concurrent_batches")
+        ceiling = DEFAULT_MAX_CONCURRENT_BATCHES if ceiling in (None, "") else int(ceiling)
+        tuning["max_concurrency"] = min(int(requested), ceiling)
+    return tuning
+
+
+def format_transport_tuning(tuning: dict) -> str:
+    """The tuning as ONE stable column for the comparison tables (#480).
+
+    Sorted `key=value` pairs joined by `;`, so two rows differing only in their
+    tuning differ visibly and deterministically in this column — and so the
+    same tuning always renders the same string, which a diff of two matrices
+    depends on. Empty for an untuned or non-s3_native run.
+    """
+    return ";".join(f"{key}={tuning[key]}" for key in sorted(tuning) if tuning[key] is not None)
+
+
 def _shaped_by_the_bundled_proxy(scenario) -> bool:
     """True only for a scenario shaped through the bundled `minio` proxy
     (review): the lab credential fallback follows that proxy's name, and
@@ -479,6 +520,30 @@ def write_engine_config(scenario, work_dir: str, state_db: str,
         # claims the requested wire. The engine validates this name at load.
         f"  transport: {scenario.get('transport', 'tcp_tls')}",
     ]
+    # Thread the scenario's per-transport egress tuning into the engine config
+    # (#480), not just the summary: a scenario that tunes a transport must run
+    # with that tuning (and be validated/refused by the engine like an
+    # operator's config would), never record it while the engine uses defaults.
+    # Only non-empty blocks are written, so an empty map keeps today's behaviour.
+    #
+    # Gated on s3_native, the same gate the engine and the summary apply
+    # (review): only that backend routes through the EgressTransport seam, the
+    # engine's active_egress_tuning returns all-None for any other, and the
+    # summary records blank tuning for it. Writing the block for a mock or
+    # localfs run would put a knob in the config file that nothing honours —
+    # a matrix varying the backend over one tuning block would read as tuned.
+    transports = (scenario.get("transports", {}) or {}) if backend == "s3_native" else {}
+    emitted_transports = False
+    for tname, ttuning in transports.items():
+        kv = {k: v for k, v in (ttuning or {}).items() if v is not None}
+        if not kv:
+            continue
+        if not emitted_transports:
+            lines.append("  transports:")
+            emitted_transports = True
+        lines.append(f"    {tname}:")
+        for key, value in kv.items():
+            lines.append(f"      {key}: {value}")
     if backend == "localfs":
         root = scenario.get("local_path", "") or os.path.join(os.path.dirname(state_db), "objects")
         lines.append(f'  local_path: "{root}"')
