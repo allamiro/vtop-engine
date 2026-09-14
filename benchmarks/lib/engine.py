@@ -10,6 +10,8 @@ import os
 import subprocess
 from urllib.parse import urlsplit
 
+from . import netem
+
 
 def repo_root() -> str:
     # benchmarks/lib/engine.py -> repo root is two levels up.
@@ -346,6 +348,28 @@ def _shaped_by_the_bundled_proxy(scenario) -> bool:
         scenario.get("shaping_proxy", "minio") or "minio") == "minio"
 
 
+def _shaped_by_the_bundled_middlebox(scenario) -> bool:
+    """True only for a scenario shaped by the bundled netem middlebox (#477).
+
+    Same reasoning as the proxy above, one hop further out: the middlebox
+    forwards at L3 to the lab's own MinIO, so the pipe changes and the store
+    and its lab credentials do not. It is recognised by the middlebox's
+    service name and port rather than by a loopback address, because a netem
+    scenario runs INSIDE the lab network — the port is deliberately not
+    published, since docker's userland proxy for a published port would
+    terminate TCP and put a second TCP hop in a path whose whole purpose is
+    to be L3. lib/netem.py refuses an endpoint that does not name this box,
+    so the two checks cannot disagree about which store is being reached.
+    """
+    if str(scenario.get("shaping_driver", "") or "") != netem.NETEM_DRIVER:
+        return False
+    try:
+        parts = urlsplit(_effective_endpoint(scenario))
+        return parts.hostname == netem.NETEM_SERVICE and parts.port == netem.NETEM_PORT
+    except ValueError:
+        return False
+
+
 def _is_lab_endpoint(endpoint: str, shaped: bool = False) -> bool:
     # The compose stack publishes MinIO on the loopback interface at the
     # FIXED host port 9000 (docker-compose.benchmark.yml pins it; only the
@@ -578,7 +602,8 @@ def _backend_env(scenario) -> dict[str, str]:
     # credentials (already in the environment) winning over the fallbacks.
     if scenario.get("backend") == "minio" or (
             scenario.get("backend") == "s3_native" and endpoint
-            and _is_lab_endpoint(endpoint, shaped=_shaped_by_the_bundled_proxy(scenario))):
+            and (_is_lab_endpoint(endpoint, shaped=_shaped_by_the_bundled_proxy(scenario))
+                 or _shaped_by_the_bundled_middlebox(scenario))):
         # The benchmark compose lets an operator override the SERVER's
         # credentials via MINIO_ROOT_USER / MINIO_ROOT_PASSWORD (issue #81).
         # The client must follow the same variables THROUGH THE SAME
