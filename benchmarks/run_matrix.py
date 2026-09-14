@@ -29,7 +29,8 @@ from datetime import datetime, timezone
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-from lib.shaping import SHAPING_COLUMNS  # noqa: E402
+from lib.scenario import load_scenario  # noqa: E402
+from lib.shaping import SHAPING_COLUMNS, selected_driver  # noqa: E402
 
 COMPARE_COLS = [
     "scenario_name", "run_id", "format", "file_size", "volume", "compression",
@@ -142,6 +143,147 @@ def run_one(scenario_path, results_dir):
     return run_dir
 
 
+def refuse_mixed_drivers_in_scenarios(paths: list) -> None:
+    """Refuse an incomparable scenario list before anything is run.
+
+    The same rule as `refuse_mixed_drivers`, applied to what the scenario FILES
+    ask for rather than to what the runs produced. A scenario that cannot be
+    read is not a refusal — the runner reports that far better, per scenario,
+    and a matrix that would not start because one file has a typo in an
+    unrelated key would be worse than the problem.
+    """
+    declared = []
+    for path in paths:
+        try:
+            scenario = load_scenario(path)
+            # NORMALISED first (review): `selected_driver` strips whitespace,
+            # so a scenario carrying `shaping_driver: " netem "` runs as netem
+            # while a raw comparison here calls it unshaped and skips it —
+            # and a netem scenario has no `shaping_api_url` to be caught by
+            # instead. Deciding shaped-ness on a different reading of the key
+            # from the one the runner uses is how a driver goes uncounted.
+            driver = selected_driver(scenario)
+            if not str(scenario.get("shaping_api_url", "") or "").strip() and \
+                    driver != "netem":
+                continue
+            # A scenario that cannot produce a row must not contribute a driver
+            # (review). `load_scenario` only parses and applies defaults, so a
+            # scenario with `volume: nope` loads fine, fails in the runner, and
+            # is excluded from the matrix by `run_one` — but counting its
+            # driver here would abort a matrix that previously wrote the other
+            # scenarios' rows perfectly well. Predicting a conflict must never
+            # be worse than discovering one.
+            if not _would_produce_a_row(scenario):
+                continue
+            declared.append({"shaping_driver": driver})
+        except Exception:  # noqa: BLE001 - see the docstring
+            continue
+    refuse_mixed_drivers(declared)
+
+
+def _would_produce_a_row(scenario) -> bool:
+    """Whether this scenario looks capable of completing a run.
+
+    A PREDICTION, and a deliberately shallow one: the authority on whether a
+    scenario runs is the runner, and duplicating its judgement here would be a
+    second implementation to drift. What this rules out is the case that made
+    the preflight worse than the check it replaced — a scenario that declares a
+    driver and then cannot run, taking the whole matrix down with it. So it
+    asks only the questions that are cheap and certain: does the shape build,
+    does the run go through the shape, and do the knobs that have to be numbers
+    parse as numbers FOR WHOEVER READS THEM. That last qualifier is load-bearing
+    (review): a knob the runner consumes is judged by what Python makes of it,
+    while a knob written through verbatim into the engine's config file is
+    judged by what the ENGINE makes of it, and the two disagree — Python's
+    `int()` happily takes a float or a bool that serde refuses outright.
+
+    The asymmetry is what decides what belongs here. A wrong "will not run"
+    costs nothing — the post-run refusal still fires on a real conflict, on the
+    rows that actually exist — while a wrong "will run" costs the whole matrix.
+    So every check the runner makes DETERMINISTICALLY, before it writes
+    anything, is worth repeating; nothing that depends on the run itself is.
+    """
+    from lib.shaping import require_endpoint_reaches_the_shape, shape_from_scenario
+    try:
+        shape = shape_from_scenario(scenario)
+    except Exception:  # noqa: BLE001 - a shape that will not build will not run
+        return False
+    # runner_mode is validated by the runner before it creates a row, and it
+    # is exactly as cheap and deterministic to check here (review).
+    from lib.engine import effective_endpoint, runner_mode
+    try:
+        runner_mode(scenario)
+    except Exception:  # noqa: BLE001 - an unrunnable mode will not produce a row
+        return False
+    if shape is not None:
+        # The runner's very next question, and the one this preflight was
+        # missing (review): a netem scenario left in the default
+        # `runner_mode: host` builds its shape and names a valid mode, yet
+        # `require_endpoint_reaches_the_shape` refuses EVERY host-mode netem
+        # run — the middlebox has nothing to sit between — and it does so
+        # before the results writer exists. Counting that scenario's driver
+        # aborted a matrix whose toxiproxy scenarios beside it would have
+        # produced perfectly good rows.
+        #
+        # Deterministic and free: the endpoint is resolved from the
+        # environment and the scenario, exactly as the runner resolves it, and
+        # nothing here dials anything.
+        try:
+            require_endpoint_reaches_the_shape(scenario, effective_endpoint(scenario))
+        except Exception:  # noqa: BLE001 - a run that bypasses its shape is refused
+            return False
+    # The combinations the runner refuses outright, for the same reason as
+    # runner_mode: deterministic, decided before any row exists, and cheap to
+    # ask here (review). Concurrent seeding writes to the final path, so a
+    # whole-file format lets the engine commit a half-written object — the
+    # runner exits 2 on it, and a scenario that exits 2 contributes no driver.
+    # A zero pipeline width is preserved into the engine config on purpose, so
+    # the engine's own validation refuses it — deliberately, so the mistake is
+    # named rather than clamped. A scenario the engine refuses produces no row
+    # (review).
+    width = scenario.get("max_concurrent_batches")
+    if width not in (None, ""):
+        # Judged as the ENGINE will read it, not as Python will coerce it
+        # (review). `write_engine_config` renders this knob verbatim —
+        # `f"  max_concurrent_batches: {value}"` — into a YAML file serde
+        # deserializes into a `usize`, and the loader hands a scenario's
+        # `1.5` over as a float and its `true` as a bool. `int()` takes both
+        # (1 either way), so the old check counted a driver for a scenario the
+        # engine refuses at config load with "invalid type: floating point
+        # `1.5`, expected usize" — before a row exists, which is the whole
+        # family this preflight is meant to exclude.
+        #
+        # So ask the question the written file will ask: render the value the
+        # way that line renders it, and read THAT as an integer. "1.5", "2.0"
+        # and "True" are not integers and the engine refuses all three; the
+        # string "3" is, and lands in the file unquoted as `3`, which the
+        # engine reads perfectly well.
+        rendered = str(width).strip()
+        try:
+            if int(rendered) <= 0:
+                return False
+        except ValueError:
+            return False
+    if scenario.get("duration_seconds") and scenario.get("seed_concurrently", False):
+        if scenario.get("whole_file", False) or scenario.get("format") == "binary":
+            return False
+        try:
+            if float(scenario.get("seed_interval_seconds", 1.0)) <= 0:
+                return False
+        except (TypeError, ValueError):
+            return False
+    for key, cast in (("volume", int), ("duration_seconds", int),
+                      ("backlog_multiplier", float), ("seed_interval_seconds", float)):
+        value = scenario.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            cast(value)
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
 def matrix_row(summary: dict) -> dict:
     """One summary flattened into one comparison row.
 
@@ -234,6 +376,14 @@ def main() -> int:
     if not scenarios:
         print("no scenarios found", file=sys.stderr)
         return 2
+
+    # BEFORE a single scenario runs (review). The drivers are readable from the
+    # scenario files, so a combination that is deterministically incomparable
+    # is knowable up front — and the bundled soaks it would waste are 20+
+    # minutes of wall clock. Refusing after the last run finishes is correct
+    # and useless; `--all` spans toxiproxy and netem today, so this is the
+    # ordinary path, not a corner.
+    refuse_mixed_drivers_in_scenarios(scenarios)
 
     rows = []
     for sc in scenarios:

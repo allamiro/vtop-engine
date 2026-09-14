@@ -362,6 +362,13 @@ profile chain does not.
 | `shaping_buffer_bdp` | multiples of the BDP | bottleneck queue depth; requires both a rate and a latency, since the bandwidth-delay product is their product |
 | `shaping_policer_kbps` | **kilobits/s** | token-bucket policer on the ingress hook: drops above its rate, queues nothing |
 
+`shaping_buffer_bdp` is the **congestion** queue, and only that. netem's own
+packet limit sits above it with room for the packets still riding out their
+delay — including the deep samples a jittered, normally distributed delay
+produces — so the queue a run gets is the depth recorded beside its result. A
+limit sized to the buffer alone would drop inside the emulator before that
+buffer was full, and a scenario would read the emulator's drops as the link's.
+
 > **The two rate keys disagree, and the disagreement is inherited.**
 > `shaping_bandwidth_kbps` — the toxiproxy driver's — is **KILOBYTES** per
 > second, because that is what toxiproxy's bandwidth toxic takes. Every netem

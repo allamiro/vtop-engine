@@ -55,11 +55,13 @@ injectable, so the tests never need a container or a capability.
 from __future__ import annotations
 
 import json
+import math
 import shlex
 import subprocess
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from fractions import Fraction
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -120,6 +122,14 @@ TBF_MIN_BURST_BYTES = 1600
 # The ethernet MTU the buffer depth is converted at, tbf's bytes into netem's
 # packets. See `netem_limit_packets`.
 MTU_BYTES = 1500
+
+# How deep into the jitter distribution the delay line is sized for, in
+# standard deviations. netem's `distribution normal` draws the delay around
+# the configured mean with the jitter as its sigma, so half of every draw is
+# above the mean and the delay line holds more than the mean says. Three
+# sigma covers all but roughly one draw in a thousand; see
+# `delay_occupancy_bytes` for what the uncovered ones cost.
+JITTER_HEADROOM_SIGMAS = 3
 
 COMMAND_TIMEOUT_SECONDS = 40.0
 # The calibration probe: long enough for the bottleneck's queue to fill and
@@ -287,8 +297,82 @@ class NetemShape:
         mixed-size flow, exact for the full-size segments a bulk upload is made
         of, and stated here rather than discovered from a result nobody could
         explain.
+
+        AND the delay line is counted (review). netem's `limit` bounds every
+        packet the qdisc holds, and on a shape that also delays, packets still
+        waiting out their delay occupy it before a single byte of congestion
+        backlog does. On the bundled 10 Mbit/s, 100 ms link that is 62.5 kB —
+        half of a 1-BDP limit — so the first fix left scenarios 14 and 16 with
+        about HALF the bottleneck buffer they record. The limit is therefore
+        the configured buffer PLUS the delay occupancy, which makes
+        `shaping_buffer_bdp` mean the congestion queue, which is what a reader
+        of the column believes it means.
         """
-        return max(1, self.buffer_bytes() // MTU_BYTES)
+        # CEILING, not floor (review): flooring loses up to one MTU, and the
+        # loss comes out of the congestion buffer rather than the delay line,
+        # so a 10 Mbit/s / 50 ms / 1-BDP link recorded 62500 bytes of queue and
+        # had 61750. Rounding up can only ever add a fraction of a packet more
+        # queue than asked for, which is the harmless direction.
+        #
+        # This ceiling rounds the SUM and nothing else, so it cannot repair a
+        # fraction already discarded from either term (review): it is
+        # `delay_occupancy_bytes` rounding UP that makes the delay line a
+        # strict over-estimate, and only together do the two guarantee that at
+        # least `buffer_bytes()` survives behind it. Re-flooring the occupancy
+        # would silently re-open the gap this pair closes.
+        total = self.buffer_bytes() + self.delay_occupancy_bytes()
+        return max(1, -(-total // MTU_BYTES))
+
+    def delay_occupancy_bytes(self) -> int:
+        """Bytes in flight inside the upload delay line at the bottleneck rate,
+        at the deep end of its jitter.
+
+        Not buffer: this is data the link is carrying, not data queued behind a
+        full link. It occupies netem's packet limit all the same, so the limit
+        has to make room for it or the configured buffer is silently smaller
+        than the number recorded beside every result.
+
+        Sized for the DEEP samples and not for the mean (review). `_netem_args`
+        configures the upload delay as `distribution normal` with the jitter as
+        its standard deviation, so half of every draw is longer than the mean
+        and the line holds more than `rate x upload_delay_ms` while those
+        packets wait. Reserving only the mean hands the difference to the
+        congestion buffer's permits, and netem drops on its own `limit` before
+        tbf's queue is anywhere near full. Those drops are the EMULATOR's, they
+        appear in no column, and a jitter-plus-bottleneck scenario would read
+        them as the link's — which on this driver, whose headline subject is
+        loss, is the one mistake a result cannot recover from.
+
+        `JITTER_HEADROOM_SIGMAS` deep, therefore: three standard deviations of
+        the upload half of the jitter, which a normal draw exceeds about once in
+        a thousand packets. Over-reserving costs a slightly deeper packet limit
+        and nothing else — the same harmless direction `netem_limit_packets`
+        rounds in, and for the same reason: too much queue is a number you can
+        read, while too little is loss nobody recorded.
+
+        ROUNDED UP, and that is the fourth defect found in this one number
+        (review). `netem_limit_packets` divides the sum up to whole packets, and
+        it is tempting to read that ceiling as absorbing any fraction dropped
+        here. It does not — it rounds the SUM — so a floored occupancy hands its
+        remainder straight to the congestion buffer, and on a shape whose sum
+        happens to land on a packet boundary the ceiling has nothing left to
+        round: a 1006 kbit/s, 334 ms, 1-BDP link has a 42000-byte buffer and
+        21000.25 bytes in flight, floors to 21000, and 63000 / 1500 is exactly
+        42 packets — 41999.75 bytes of buffer behind the delay line, under a
+        column reading 42000. Rounding the occupancy up instead makes the
+        reserve a strict over-estimate of what the line can hold, so what
+        remains is at least the configured buffer at EVERY rate and round trip.
+        That invariant is the thing being defended; the example is only how it
+        was found, and a fix aimed at the example would be the fifth defect.
+
+        Computed exactly, too. An error of a quarter of a byte is what this is
+        about, so the arithmetic deciding it must not be approximate: the count
+        is the single fraction `kbps x held_ms / 8` bytes — the kilo and the
+        milli cancel — taken to a ceiling once, rather than accumulated through
+        binary floating point and rounded at the end.
+        """
+        held_ms = self.upload_delay_ms() + JITTER_HEADROOM_SIGMAS * self._upload_jitter_ms()
+        return math.ceil(Fraction(self.bottleneck_kbps * held_ms) / 8)
 
     def _netem_args(self, delay_ms: int, jitter_ms: int, with_loss: bool,
                     limit_packets: int | None = None) -> list[str]:
