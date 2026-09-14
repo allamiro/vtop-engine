@@ -25,3 +25,9 @@ blake3 = { workspace = true }
 futures = { workspace = true }
 # CLI-exec backends download to a temp file for get_object (verify-manifest).
 tempfile = { workspace = true }
+
+[dev-dependencies]
+# The trait-surface guard in s3_native.rs parses this crate's src/ rather than
+# scanning its text: layout-independent, and a macro is a node it can refuse.
+syn = { workspace = true }
+quote = { workspace = true }

@@ -32,6 +32,7 @@ use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use bytes::Bytes;
 use std::path::Path;
+use std::sync::Arc;
 use vtop_core::checksum::digest_reader;
 use vtop_core::errors::VtopError;
 use vtop_core::types::ChecksumAlgorithm;
@@ -101,6 +102,253 @@ pub struct S3NativeBackend {
 /// `https://` endpoints — the AWS SDK always verifies against the system
 /// trust store. A self-signed or private-CA endpoint needs its CA in the
 /// system trust store; skipping verification is deliberately unsupported.
+/// The endpoint variables the SDK resolves from the environment, in the order
+/// it applies them (#488). Named as data rather than written inline at the one
+/// call site, so the "every source is checked" claim is something a test can
+/// enumerate rather than a promise a reader has to take on trust.
+pub(crate) const ENDPOINT_ENV_VARS: &[&str] = &["AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL"];
+
+/// The last word on the scheme, at the moment the URI is finally knowable
+/// (#488).
+///
+/// Enumerating endpoint SOURCES can only ever be as complete as the list, and
+/// the list was not complete: a shared-profile `[services]` section can carry
+/// an S3-specific `endpoint_url` that `SdkConfig::endpoint_url()` does not
+/// expose, because the service config applies it later (review). Rather than
+/// grow the list again and hope, this refuses at the point where guessing
+/// stops — the request's own URI, immediately before it is transmitted.
+///
+/// It runs for EVERY request, so it also covers a transport's `install` having
+/// redirected the client, and any future source nobody has thought of. The
+/// source-level checks stay: they fail at construction, which is where an
+/// operator wants to hear about a typo, while this one cannot be out-run.
+///
+/// It enforces BOTH halves of the scheme policy, because for the source it was
+/// written for they are the only halves there are (review): a scheme the
+/// resolved transport does not carry is refused whatever `verify_tls` says, and
+/// plaintext `http://` is refused while `verify_tls` is true.
+struct RefusePlaintextTransmit {
+    verify_tls: bool,
+    /// The RESOLVED transport, not its name (review). An endpoint that comes
+    /// only from an S3-specific shared-profile `[services]` section is invisible
+    /// to every source validator, which makes this interceptor the SOLE policy
+    /// gate for it — so it has to be able to ask what the source doors ask. A
+    /// name can only be printed; the transport itself answers `permits_scheme`,
+    /// and holding the very one the client was built from is what keeps the
+    /// request-time answer and the construction-time answer from drifting.
+    transport: Arc<dyn EgressTransport>,
+}
+
+// `Intercept` requires `Debug`, and a transport is a trait object carrying no
+// such bound. Render it by the name it registered under: that is the part of it
+// an operator would recognise in a log line, and the rest is a client builder.
+impl std::fmt::Debug for RefusePlaintextTransmit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RefusePlaintextTransmit")
+            .field("verify_tls", &self.verify_tls)
+            .field("transport", &self.transport.name())
+            .finish()
+    }
+}
+
+impl aws_smithy_runtime_api::client::interceptors::Intercept for RefusePlaintextTransmit {
+    fn name(&self) -> &'static str {
+        "vtop::refuse_plaintext_transmit"
+    }
+
+    fn read_before_transmit(
+        &self,
+        context: &aws_smithy_runtime_api::client::interceptors::context::BeforeTransmitInterceptorContextRef<'_>,
+        _runtime_components: &aws_smithy_runtime_api::client::runtime_components::RuntimeComponents,
+        _cfg: &mut aws_smithy_types::config_bag::ConfigBag,
+    ) -> Result<(), aws_smithy_runtime_api::box_error::BoxError> {
+        refuse_plaintext_uri(
+            context.request().uri(),
+            self.verify_tls,
+            self.transport.as_ref(),
+        )
+        .map_err(Into::into)
+    }
+}
+
+/// The transport's `install`, and THEN the last gate — in that order, because
+/// the order is the whole guarantee (#488, review).
+///
+/// [`EgressTransport::install`] takes a `Builder` by value and returns one, so a
+/// transport that honours the contract may legitimately return a FRESH builder
+/// rather than the one it was handed; and even on the handed-in one,
+/// `Builder::set_interceptors` replaces the interceptor list outright. Either
+/// discards anything installed before the call. Installing the gate first — and
+/// asserting in a comment that this prevented its removal, which was the
+/// previous shape here — was therefore backwards: a transport introducing a
+/// plaintext endpoint would have dropped the one check that would have caught
+/// it, and the bytes would have reached the wire. Installing after `install` has
+/// already returned leaves a transport nothing to remove it with.
+///
+/// Ordering alone is not the whole answer, so it is not the whole mechanism.
+/// The gate is registered as a PERMANENT interceptor: an ordinary one carries a
+/// per-request `DisableInterceptor<T>` lookup in the config bag, and permanence
+/// removes that lookup rather than relying on nobody ever reaching the bag. No
+/// route to it exists today — the S3 builder's `push_runtime_plugin` is crate
+/// private and `RefusePlaintextTransmit` is not exported — but both of those
+/// are accidents of other crates' visibility, and a policy gate should not rest
+/// on an accident. Turning this one off now takes editing this line.
+///
+/// Position WITHIN the interceptor list is deliberately not relied on. The
+/// orchestrator runs every `modify_before_transmit` hook before any
+/// `read_before_transmit` hook, so this gate reads the URI after every other
+/// interceptor has finished changing it wherever it sits in the list; what
+/// matters here is only that it is on the builder the client is built from.
+///
+/// RESIDUAL GAP, stated rather than implied. This gates the URI the
+/// orchestrator hands to the HTTP client; it does not gate the socket that
+/// client opens. Installing an HTTP client is exactly what the seam exists for,
+/// and a connector that dials somewhere other than the URI it was given is
+/// beyond anything the client-config builder can prevent — no ordering and no
+/// permanence closes that. It is the trusted-code boundary described in
+/// SECURITY_MODEL.md §2, and it is why "a registered transport is trusted code"
+/// is the accurate claim rather than "a transport cannot reach the wire
+/// unchecked".
+fn install_transport_then_the_last_gate(
+    builder: aws_sdk_s3::config::Builder,
+    transport: &Arc<dyn EgressTransport>,
+    verify_tls: bool,
+) -> Result<aws_sdk_s3::config::Builder, VtopError> {
+    let mut gated = transport.install(builder)?;
+    // The gate carries the RESOLVED transport, not the configured name, so the
+    // one door a shared-profile [services] endpoint reaches asks the full scheme
+    // policy rather than just the plaintext half of it (#488, review).
+    gated.push_interceptor(aws_sdk_s3::config::SharedInterceptor::permanent(
+        RefusePlaintextTransmit {
+            verify_tls,
+            transport: Arc::clone(transport),
+        },
+    ));
+    Ok(gated)
+}
+
+/// The scheme a URI carries, lowercased — or `None` when it carries none.
+///
+/// Strict about the spelling on purpose: RFC 3986 says a scheme is a letter
+/// followed by letters, digits, `+`, `-` or `.`, so a relative URI whose PATH
+/// happens to contain `://` is not mistaken for a scheme and refused for one it
+/// never had. One helper for the construction-time doors and the request-time
+/// interceptor, because two spellings of "what is a scheme" would be two
+/// policies, and the weaker one would be the one that decided.
+fn uri_scheme(uri: &str) -> Option<String> {
+    let (candidate, _) = uri.trim_start().split_once("://")?;
+    let mut chars = candidate.chars();
+    let first = chars.next()?;
+    if !first.is_ascii_alphabetic()
+        || !chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    {
+        return None;
+    }
+    Some(candidate.to_ascii_lowercase())
+}
+
+/// The decision the interceptor makes, as a pure function.
+///
+/// Separated so it is testable: constructing a real interceptor context means
+/// standing up a request, a runtime and a config bag, and the thing worth
+/// pinning is the RULE — which URIs are refused, and that the lab's deliberate
+/// opt-out still works.
+///
+/// TWO questions, deliberately kept apart (review). `permits_scheme` asks what
+/// wire the transport carries at all; `verify_tls` asks whether plaintext is
+/// permitted on it. Answering only the second is how a future HTTPS-only
+/// transport would be handed a hidden `http://` endpoint under the lab opt-out,
+/// and how any scheme nobody admitted would travel unremarked: the opt-out
+/// speaks to plaintext and has no standing to speak to capability. So the
+/// admission check runs FIRST and regardless of `verify_tls`, exactly as it does
+/// on the source doors, and only then does `verify_tls: false` return early.
+fn refuse_plaintext_uri(
+    uri: &str,
+    verify_tls: bool,
+    transport: &dyn EgressTransport,
+) -> Result<(), String> {
+    if let Some(scheme) = uri_scheme(uri) {
+        if !transport.permits_scheme(&scheme) {
+            return Err(format!(
+                "refusing to transmit to {uri}: the {} transport does not carry {scheme}:// \
+                 endpoints. The endpoint did not come from the configuration or the \
+                 environment — a shared-profile [services] section or a transport can supply \
+                 one that no source check sees — and a wire nobody admitted is a wire nobody \
+                 chose, so it is refused here, at the request itself",
+                transport.name()
+            ));
+        }
+    }
+    if !verify_tls {
+        // The deliberate, warned lab opt-out — of PLAINTEXT, and of nothing
+        // else. Refusing here would break the compose lab, which is the one
+        // configuration that asks for plaintext on purpose; widening it to the
+        // scheme check above would let it excuse a wire the transport never
+        // claimed to speak.
+        return Ok(());
+    }
+    if uri.trim_start().to_ascii_lowercase().starts_with("http://") {
+        return Err(format!(
+            "refusing to transmit to plaintext {uri} while verify_tls is true (transport \
+             {}). The endpoint did not come from the configuration or the \
+             environment — a shared-profile [services] section or a transport can supply one \
+             that no source check sees — so it is refused here, at the request itself",
+            transport.name()
+        ));
+    }
+    Ok(())
+}
+
+/// Apply the scheme policy to EVERY endpoint source, in one place (#488).
+///
+/// One unit rather than three call sites, because the property that matters is
+/// not "each validator refuses" but "the constructor still consults all of
+/// them" — and three calls are three things that can be deleted individually
+/// while the tests stay green (review). With one call, deleting it removes ALL
+/// validation, which no test survives.
+///
+/// The sources are parameters, not lookups: the environment doors read fixed
+/// variable names that a test cannot set without racing every other test in
+/// the process, and the SDK-resolved endpoint is only known after the loader
+/// has run. Passing all three in is what makes the cross product a table.
+pub(crate) fn validate_every_endpoint_source(
+    explicit: Option<&str>,
+    read_env: impl Fn(&str) -> Option<String>,
+    sdk_resolved: Option<&str>,
+    verify_tls: bool,
+    transport: &dyn EgressTransport,
+) -> Result<(), VtopError> {
+    validate_endpoint_scheme(explicit, verify_tls, transport)?;
+    validate_env_endpoint_schemes(read_env, verify_tls, transport)?;
+    // Whatever endpoint actually resolved — explicit config, environment, or
+    // the SDK's shared config file — is what the client will talk to.
+    validate_endpoint_scheme(sdk_resolved, verify_tls, transport)
+}
+
+/// Apply the scheme policy to every endpoint the ENVIRONMENT can supply.
+///
+/// The reader is injected rather than calling `std::env::var` directly (#488):
+/// these are fixed variable names, so a test that set them for real would race
+/// every other test in the process, and the security property most worth
+/// pinning would be the one property left untested. With the reader as a
+/// parameter the cross product of transport × source is a table.
+///
+/// A refusal names the VARIABLE, because "plaintext endpoint refused" sends an
+/// operator to their config file when the value came from their shell.
+pub(crate) fn validate_env_endpoint_schemes(
+    read: impl Fn(&str) -> Option<String>,
+    verify_tls: bool,
+    transport: &dyn EgressTransport,
+) -> Result<(), VtopError> {
+    for var in ENDPOINT_ENV_VARS {
+        if let Some(ep) = read(var) {
+            validate_endpoint_scheme(Some(&ep), verify_tls, transport)
+                .map_err(|e| VtopError::Config(format!("{var}: {e}")))?;
+        }
+    }
+    Ok(())
+}
+
 fn validate_endpoint_scheme(
     endpoint_url: Option<&str>,
     verify_tls: bool,
@@ -115,8 +363,7 @@ fn validate_endpoint_scheme(
     // (#479): refuse a scheme the resolved transport does not carry, BY NAME,
     // before the plaintext check. tcp_tls admits only http/https, so this is a
     // no-op for the shipping path and a real gate for any future wire.
-    if let Some((scheme, _)) = ep_trim.split_once("://") {
-        let scheme = scheme.to_ascii_lowercase();
+    if let Some(scheme) = uri_scheme(ep_trim) {
         if !transport.permits_scheme(&scheme) {
             return Err(VtopError::Config(format!(
                 "endpoint_url {ep} uses scheme {scheme}:// which the {} transport does not carry",
@@ -238,8 +485,14 @@ impl S3NativeBackend {
     pub async fn new(cfg: &S3NativeConfig) -> Result<Self, VtopError> {
         // Resolve the transport FIRST (#479): an unknown name fails closed here,
         // and the resolved transport drives both the scheme policy below and the
-        // client-config install just before construction.
-        let transport = TransportRegistry::with_builtins().resolve(&cfg.transport)?;
+        // client-config install just before construction. It is shared rather
+        // than owned because the request-time gate outlives this function and
+        // must consult the SAME transport the doors here consulted (#488,
+        // review) — two answers to "does this transport carry that scheme" is
+        // one answer too many.
+        let transport: Arc<dyn EgressTransport> = TransportRegistry::with_builtins()
+            .resolve(&cfg.transport)?
+            .into();
         // A tuning knob the resolved transport cannot honour is refused HERE,
         // naming the field and the transport (#480) — never silently ignored.
         // The shape is symmetric across paths; what each path can honour is not.
@@ -249,11 +502,6 @@ impl S3NativeBackend {
             Self::part_size_ceiling(),
             &cfg.tuning,
             &cfg.transport,
-        )?;
-        validate_endpoint_scheme(
-            cfg.endpoint_url.as_deref(),
-            cfg.verify_tls,
-            transport.as_ref(),
         )?;
         if !cfg.verify_tls {
             tracing::warn!(
@@ -266,35 +514,38 @@ impl S3NativeBackend {
         // The SDK resolves endpoints from its OWN configuration too —
         // AWS_ENDPOINT_URL / AWS_ENDPOINT_URL_S3 and the shared config file —
         // and those must not bypass the policy the explicit config obeys.
-        // The service-specific variable is checked here because it is applied
-        // at service-config construction, where no resolved value is
-        // observable; the globally-resolved endpoint is checked on the loaded
-        // SdkConfig below.
-        for var in ["AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL"] {
-            if let Ok(ep) = std::env::var(var) {
-                validate_endpoint_scheme(Some(&ep), cfg.verify_tls, transport.as_ref())
-                    .map_err(|e| VtopError::Config(format!("{var}: {e}")))?;
-            }
-        }
-
         let mut loader =
             aws_config::defaults(BehaviorVersion::latest()).region(Region::new(cfg.region.clone()));
         if let Some(ep) = &cfg.endpoint_url {
             loader = loader.endpoint_url(ep.clone());
         }
         let shared = loader.load().await;
-        // Whatever endpoint actually resolved (explicit config, env, or the
-        // shared config file) is what the client will talk to — validate THAT,
-        // not only the value we passed in.
-        validate_endpoint_scheme(shared.endpoint_url(), cfg.verify_tls, transport.as_ref())?;
+        // EVERY endpoint source, in ONE call (#488, review). Three separate
+        // calls were three things that could be deleted individually while the
+        // tests stayed green; this one cannot be removed without removing all
+        // validation, which no test survives. It runs after the loader because
+        // the SDK-resolved endpoint is the last source to become knowable —
+        // the loader only resolves configuration, it sends nothing, so nothing
+        // has left the process before the policy is applied.
+        validate_every_endpoint_source(
+            cfg.endpoint_url.as_deref(),
+            |var| std::env::var(var).ok(),
+            shared.endpoint_url(),
+            cfg.verify_tls,
+            transport.as_ref(),
+        )?;
 
         // THE SEAM (#479): the transport installs itself into the client config
         // here, after endpoint validation and before the client is built. The
-        // default tcp_tls install is a strict no-op, so this is byte-identical
-        // to the previous `Builder::from(&shared).force_path_style(..).build()`.
-        let builder =
-            aws_sdk_s3::config::Builder::from(&shared).force_path_style(cfg.force_path_style);
-        let s3_conf = transport.install(builder)?.build();
+        // default tcp_tls install is a strict no-op, so the shipping client is
+        // `Builder::from(&shared).force_path_style(..)` carrying the #488 scheme
+        // gate and nothing else — the seam itself contributes no difference.
+        let s3_conf = install_transport_then_the_last_gate(
+            aws_sdk_s3::config::Builder::from(&shared).force_path_style(cfg.force_path_style),
+            &transport,
+            cfg.verify_tls,
+        )?
+        .build();
 
         Ok(Self {
             client: Client::from_conf(s3_conf),
@@ -950,6 +1201,1336 @@ mod tests {
     }
 
     #[test]
+    fn plaintext_is_refused_on_every_endpoint_source_for_every_transport() {
+        // The cross product, because the scheme policy is only as good as its
+        // WEAKEST call site (#488). `validate_endpoint_scheme` is applied to
+        // the explicit config value, to both endpoint environment variables,
+        // and to whatever the SDK finally resolved — four doors, and a policy
+        // enforced on three of them is not a policy. The env doors go through
+        // `validate_env_endpoint_schemes` with an injected reader, so this can
+        // enumerate them without racing every other test in the process over
+        // real environment variables.
+        use super::TransportRegistry as Reg;
+        let registry = Reg::with_builtins();
+        // Spellings a careless endpoint could arrive in. Case and surrounding
+        // whitespace must not be a way past the check.
+        let plaintext = [
+            "http://minio:9000",
+            "HTTP://minio:9000",
+            "  http://minio:9000  ",
+        ];
+
+        for name in registry.names() {
+            let transport = registry.resolve(&name).expect("a registered name resolves");
+            for ep in plaintext {
+                // Door 1: the explicit config value.
+                let err = validate_endpoint_scheme(Some(ep), true, transport.as_ref())
+                    .expect_err("plaintext with verify_tls must be refused at the config door");
+                assert!(
+                    err.to_string().contains("plaintext"),
+                    "the refusal must say what it objected to: {err}"
+                );
+
+                // ALL FOUR DOORS, through the ONE unit the constructor calls
+                // (review). Each source in turn, with the others clean, so a
+                // policy that stopped consulting any single one fails here —
+                // and because `new` makes exactly this call, a deletion there
+                // removes every door at once rather than one quietly.
+                for (label, explicit, env_var, resolved) in [
+                    ("explicit config", Some(ep), None, None),
+                    (
+                        "AWS_ENDPOINT_URL_S3",
+                        None,
+                        Some("AWS_ENDPOINT_URL_S3"),
+                        None,
+                    ),
+                    ("AWS_ENDPOINT_URL", None, Some("AWS_ENDPOINT_URL"), None),
+                    ("the SDK-resolved endpoint", None, None, Some(ep)),
+                ] {
+                    let err = validate_every_endpoint_source(
+                        explicit,
+                        |var| env_var.filter(|v| *v == var).map(|_| ep.to_string()),
+                        resolved,
+                        true,
+                        transport.as_ref(),
+                    )
+                    .expect_err("plaintext must be refused whichever door it arrives through");
+                    assert!(
+                        err.to_string().contains("plaintext"),
+                        "{label} let a plaintext endpoint past with verify_tls: true: {err}"
+                    );
+                }
+
+                // Doors 2 and 3: the endpoint environment variables. The
+                // refusal must name the VARIABLE — "plaintext endpoint
+                // refused" sends an operator to their config file when the
+                // value came from their shell.
+                for var in ENDPOINT_ENV_VARS {
+                    let err = validate_env_endpoint_schemes(
+                        |v| (v == *var).then(|| ep.to_string()),
+                        true,
+                        transport.as_ref(),
+                    )
+                    .expect_err("plaintext from the environment must be refused too");
+                    assert!(
+                        err.to_string().contains(var),
+                        "the refusal must name the source that supplied it, or the operator \
+                         looks in the wrong place: {err}"
+                    );
+                }
+            }
+
+            // Door 4 is the SDK-resolved endpoint, validated in `new` with the
+            // same function against whatever actually resolved; it shares this
+            // implementation, so what is pinned here is that the function
+            // refuses. That the CONSTRUCTOR still calls it is a separate
+            // claim, and a separate test below makes it for the door that can
+            // be reached without the SDK.
+
+            // ... and the deliberate lab opt-out still works, on every
+            // transport: verify_tls: false is how the compose lab runs, and a
+            // policy that broke it would be discovered by every developer.
+            assert!(
+                validate_endpoint_scheme(Some("http://minio:9000"), false, transport.as_ref())
+                    .is_ok(),
+                "verify_tls: false is the explicit plaintext opt-in the lab depends on"
+            );
+            assert!(
+                validate_endpoint_scheme(Some("https://s3.example.com"), true, transport.as_ref())
+                    .is_ok(),
+                "https must pass on every transport, or nothing can upload"
+            );
+        }
+    }
+
+    #[test]
+    fn a_plaintext_request_is_refused_at_the_moment_it_would_be_transmitted() {
+        // Enumerating endpoint SOURCES is only ever as complete as the list,
+        // and the list was not: a shared-profile [services] section can carry
+        // an S3-specific endpoint_url that SdkConfig::endpoint_url() does not
+        // expose, because the service config applies it later (review). This
+        // is the check that cannot be out-run — it reads the request's own URI
+        // immediately before transmission, so it covers that source, a
+        // transport that redirected the client, and any source nobody has
+        // thought of yet.
+        let t = transport::TcpTlsTransport;
+        let err = refuse_plaintext_uri("http://minio:9000/bucket/key", true, &t)
+            .expect_err("plaintext with verify_tls must never reach the wire");
+        assert!(
+            err.contains("plaintext") && err.contains("tcp_tls"),
+            "the refusal must name what it saw and which transport carried it: {err}"
+        );
+
+        // https is the ordinary case and must not be disturbed.
+        assert!(refuse_plaintext_uri("https://s3.example.com/b/k", true, &t).is_ok());
+        // Case is not a way past it.
+        assert!(refuse_plaintext_uri("HTTP://minio:9000/b/k", true, &t).is_err());
+
+        // And the lab's deliberate opt-out still works: verify_tls: false is
+        // how the compose stack runs, and refusing here would break the one
+        // configuration that asks for plaintext on purpose.
+        assert!(
+            refuse_plaintext_uri("http://minio:9000/b/k", false, &t).is_ok(),
+            "verify_tls: false is the explicit, warned opt-in the lab depends on"
+        );
+    }
+
+    /// A transport that carries HTTPS and nothing else — the shape an
+    /// HTTPS-only or datagram-over-TLS wire would have. It lives in the tests
+    /// because no such transport ships yet, and that is the point: the property
+    /// it pins is one a transport would weaken, and a test written before the
+    /// transport is a test the transport has to pass.
+    struct HttpsOnlyTransport;
+
+    impl EgressTransport for HttpsOnlyTransport {
+        fn name(&self) -> &str {
+            "https_only_test"
+        }
+        fn install(
+            &self,
+            builder: aws_sdk_s3::config::Builder,
+        ) -> Result<aws_sdk_s3::config::Builder, VtopError> {
+            Ok(builder)
+        }
+        fn permits_scheme(&self, scheme: &str) -> bool {
+            scheme == "https"
+        }
+        fn tuning_support(&self) -> transport::TuningSupport {
+            transport::TuningSupport {
+                rate_control: false,
+                parallelism: true,
+                redundancy: false,
+            }
+        }
+    }
+
+    #[test]
+    fn a_scheme_the_transport_does_not_carry_is_refused_at_both_doors_whatever_verify_tls_says() {
+        // Capability and policy are different questions, and the request-time
+        // gate used to answer only the second (review): it checked `http://`
+        // against verify_tls and returned the moment verification was off,
+        // without ever consulting the resolved transport's `permits_scheme`. So
+        // an HTTPS-only transport could be handed a plaintext endpoint under the
+        // lab opt-out, and any unadmitted scheme sailed past on every
+        // transport — and this is the ONE gate an endpoint from an S3-specific
+        // shared-profile [services] section ever meets, because no source
+        // validator can see that endpoint at all.
+        //
+        // Both doors are walked with the same table, because a policy that two
+        // doors answer differently is two policies, and the operator meets
+        // whichever one is weaker.
+        let tcp_tls = transport::TcpTlsTransport;
+        let https_only = HttpsOnlyTransport;
+        let cases: [(&str, &str, &dyn EgressTransport, bool, bool); 6] = [
+            (
+                "an unadmitted scheme under the lab opt-out",
+                "quic://minio:9000/b/k",
+                &tcp_tls,
+                false,
+                false,
+            ),
+            (
+                "an unadmitted scheme with verification on",
+                "quic://minio:9000/b/k",
+                &tcp_tls,
+                true,
+                false,
+            ),
+            (
+                "plaintext handed to an HTTPS-only transport under the lab opt-out",
+                "http://minio:9000/b/k",
+                &https_only,
+                false,
+                false,
+            ),
+            (
+                "the compose lab's own plaintext opt-in",
+                "http://minio:9000/b/k",
+                &tcp_tls,
+                false,
+                true,
+            ),
+            (
+                "https on an HTTPS-only transport",
+                "https://s3.example.com/b/k",
+                &https_only,
+                true,
+                true,
+            ),
+            (
+                "https on the shipping transport",
+                "https://s3.example.com/b/k",
+                &tcp_tls,
+                true,
+                true,
+            ),
+        ];
+
+        for (label, uri, transport, verify_tls, permitted) in cases {
+            let at_construction = validate_endpoint_scheme(Some(uri), verify_tls, transport);
+            let at_transmit = refuse_plaintext_uri(uri, verify_tls, transport);
+            assert_eq!(
+                at_construction.is_ok(),
+                permitted,
+                "[{label}] the construction-time door decided wrongly: {at_construction:?}"
+            );
+            assert_eq!(
+                at_transmit.is_ok(),
+                permitted,
+                "[{label}] the request-time gate decided wrongly, and for an endpoint only a \
+                 shared-profile [services] section supplies it is the only gate there is: \
+                 {at_transmit:?}"
+            );
+        }
+
+        // The refusal names the transport and the scheme, because an operator
+        // reading "refused" has to know whether to change the endpoint or the
+        // transport — they are different mistakes with different fixes.
+        let err = refuse_plaintext_uri("http://minio:9000/b/k", false, &https_only)
+            .expect_err("an HTTPS-only transport must not receive a plaintext endpoint");
+        assert!(
+            err.contains("https_only_test") && err.contains("http://"),
+            "the refusal must name the transport and the scheme it would not carry: {err}"
+        );
+
+        // A URI that names no wire is not refused for a wire it never named:
+        // the scheme spelling is strict, so a relative URI whose path contains
+        // "://" is not read as a scheme. Refusing those would refuse every
+        // request the moment the SDK handed us a path-only URI.
+        assert!(
+            refuse_plaintext_uri("/bucket/a://b", true, &tcp_tls).is_ok(),
+            "a path that merely contains \"://\" carries no scheme, and must not be judged \
+             as though it did"
+        );
+    }
+
+    /// What a transport's `install` does to the builder it is handed.
+    type InstallShape = fn(aws_sdk_s3::config::Builder) -> aws_sdk_s3::config::Builder;
+
+    /// A transport whose only interesting behaviour is what its `install` does
+    /// to the builder it is handed. Both shapes exercised below are permitted
+    /// by the contract — `install` takes a `Builder` by value and returns one —
+    /// and both discard whatever was already on it.
+    struct DiscardingTransport {
+        install_fn: InstallShape,
+    }
+
+    impl EgressTransport for DiscardingTransport {
+        fn name(&self) -> &str {
+            "discarding_test"
+        }
+        fn install(
+            &self,
+            builder: aws_sdk_s3::config::Builder,
+        ) -> Result<aws_sdk_s3::config::Builder, VtopError> {
+            Ok((self.install_fn)(builder))
+        }
+        fn permits_scheme(&self, _scheme: &str) -> bool {
+            true
+        }
+        fn tuning_support(&self) -> transport::TuningSupport {
+            transport::TuningSupport {
+                rate_control: false,
+                parallelism: true,
+                redundancy: false,
+            }
+        }
+    }
+
+    #[test]
+    fn a_transport_cannot_discard_the_last_gate_by_replacing_the_builder() {
+        // The gate used to be installed BEFORE `transport.install`, under a
+        // comment claiming that ordering stopped a transport removing it. It
+        // was backwards (review). `install` takes a `Builder` by value and
+        // returns one, so returning a fresh builder is a CONFORMING
+        // implementation, not a misbehaving one — and `set_interceptors`
+        // replaces the list even on the builder that was handed over. Either
+        // way the gate went with it, and for an endpoint only a shared-profile
+        // [services] section supplies — which no construction-time door can
+        // see — that gate is the only one there is, so a transport-introduced
+        // plaintext endpoint would have reached the wire.
+        //
+        // Read through `Debug`, because the built config exposes no public
+        // accessor for its interceptors and the property under test is
+        // "survived into the config the client is built from". The existing
+        // identity test reads the same rendering for the same reason.
+        let marker = "RefusePlaintextTransmit";
+
+        // The shipping transport first: the reordering must not have cost the
+        // gate on the path every real run takes.
+        let shipping: Arc<dyn EgressTransport> = Arc::new(transport::TcpTlsTransport);
+        let built = install_transport_then_the_last_gate(
+            aws_sdk_s3::config::Builder::new().force_path_style(true),
+            &shipping,
+            true,
+        )
+        .expect("tcp_tls install never fails")
+        .build();
+        let rendered = format!("{built:?}");
+        assert!(
+            rendered.contains(marker),
+            "the default transport's client must carry the last gate, or every ordinary run \
+             transmits with no scheme policy at all"
+        );
+        // ... and it must be PERMANENT. An ordinary interceptor consults
+        // `DisableInterceptor<T>` in the config bag before every request, and a
+        // scheme policy with a runtime off switch is one some unrelated config
+        // change can silence. Nothing in tree can reach that switch today, but
+        // that is a fact about two other crates' visibility, not a property of
+        // this gate.
+        let from_gate = rendered
+            .split_once(marker)
+            .expect("the gate was just asserted present")
+            .1;
+        assert!(
+            from_gate
+                .split_once("permanent: ")
+                .is_some_and(|(_, rest)| rest.starts_with("true")),
+            "the last gate must be registered permanent, so no config-bag entry can switch \
+             the scheme policy off for a request: {rendered}"
+        );
+
+        let shapes: [(&str, InstallShape); 2] = [
+            ("install returns a fresh builder", |_handed| {
+                aws_sdk_s3::config::Builder::new()
+            }),
+            (
+                "install clears the interceptor list it was handed",
+                |handed| {
+                    let mut kept = handed;
+                    kept.set_interceptors(
+                        std::iter::empty::<aws_sdk_s3::config::SharedInterceptor>(),
+                    );
+                    kept
+                },
+            ),
+        ];
+
+        for (label, install_fn) in shapes {
+            let transport: Arc<dyn EgressTransport> = Arc::new(DiscardingTransport { install_fn });
+            let gated = install_transport_then_the_last_gate(
+                aws_sdk_s3::config::Builder::new().force_path_style(true),
+                &transport,
+                true,
+            )
+            .expect("these installs never fail")
+            .build();
+            assert!(
+                format!("{gated:?}").contains(marker),
+                "[{label}] the last gate must survive the transport's install, because it is \
+                 the only check a shared-profile [services] endpoint ever meets"
+            );
+
+            // Proof the assertion above is not a decoration: the ordering it
+            // replaced loses the gate on this very transport. If this stops
+            // holding, the case has stopped being reachable and the assertion
+            // above has stopped proving anything.
+            let old_ordering = transport
+                .install(
+                    aws_sdk_s3::config::Builder::new().interceptor(RefusePlaintextTransmit {
+                        verify_tls: true,
+                        transport: Arc::clone(&transport),
+                    }),
+                )
+                .expect("these installs never fail")
+                .build();
+            assert!(
+                !format!("{old_ordering:?}").contains(marker),
+                "[{label}] this case must still DISCARD a gate installed before the transport, \
+                 or it no longer exercises the defect the ordering above exists to prevent"
+            );
+        }
+    }
+
+    /// Every reason the `EgressTransport` surface is not the reviewed one, found
+    /// by PARSING the given sources as Rust — empty when the surface is exactly
+    /// what [`a_transport_has_no_route_to_the_evidence_it_would_be_tempted_to_forge`]
+    /// pins.
+    ///
+    /// WHY A PARSER (review). This guard began as a text scan of the trait body,
+    /// and three review rounds in a row found a spelling it could not see: two
+    /// declarations on one line, a trait-item macro whose `!` and delimiter sat
+    /// on different lines, then `fn\nexpose_evidence(&self) {}` and an outer
+    /// `#[add_transport_methods]` attribute macro above the `pub trait` token the
+    /// scan started from. Each patch taught the scanner one more layout, and
+    /// the next finding was always another. `syn` reads the item the way rustc's
+    /// parser does, so layout stops being a question: a method is a
+    /// `TraitItem::Fn` however its tokens are spaced, and what `syn` cannot
+    /// classify as one — a macro, an attribute that could be one, verbatim
+    /// tokens — is refused rather than guessed at.
+    ///
+    /// Takes `(path, source)` pairs so it can judge the whole crate at once: a
+    /// SUBTRAIT (`trait X: EgressTransport`) or a second declaration of the name
+    /// elsewhere widens what a transport implements without touching this trait,
+    /// and neither is visible from the declaration alone. The pairs are also
+    /// how it judges the trait's ANCESTRY (review): an attribute macro on any
+    /// item enclosing the declaration — an inline module, a function, an impl,
+    /// the `mod` declaration that loads its file, an inner attribute of any
+    /// file on the way up from `lib.rs` — receives the trait's tokens and can
+    /// widen it, so every ancestor's attributes must be built-in and inert.
+    fn egress_transport_surface_refusals(sources: &[(&str, &str)]) -> Vec<String> {
+        use quote::ToTokens;
+        use std::collections::BTreeMap;
+        use std::path::{Component, Path, PathBuf};
+        use syn::punctuated::Punctuated;
+        use syn::visit::Visit;
+
+        const TRAIT: &str = "EgressTransport";
+        // What rustc treats as inert on the trait and its methods: documentation.
+        // Anything else in attribute position may be a proc-macro attribute,
+        // which can emit items this parse never sees — refused, not allowlisted
+        // by guesswork.
+        let inert = |attr: &syn::Attribute| attr.path().is_ident("doc");
+        let mentions_trait = |tokens: String| {
+            tokens
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .any(|word| word == TRAIT)
+        };
+
+        /// An attribute, with the words a refusal uses to say where it sits.
+        type Placed = (String, syn::Attribute);
+
+        /// An out-of-line `mod name;` — the edge by which one FILE becomes
+        /// another's child, and therefore part of the trait's ancestry.
+        struct ModDecl {
+            name: String,
+            path_attr: Option<String>,
+            /// The directory components of the inline modules around it, which
+            /// is where rustc looks for its file.
+            inline_dirs: Vec<String>,
+            /// Every attribute from the top of its file down to, and including,
+            /// the declaration's own.
+            chain: Vec<Placed>,
+        }
+
+        /// One file's traits and module declarations, each with the attributes
+        /// of EVERY item enclosing it (review): an attribute macro on an
+        /// enclosing module, function or impl receives the whole item's tokens,
+        /// the trait's among them, and can hand rustc a trait with a fifth
+        /// method while the source this walk reads shows four.
+        #[derive(Default)]
+        struct Walk {
+            ancestors: Vec<(String, Vec<syn::Attribute>)>,
+            inline_dirs: Vec<String>,
+            traits: Vec<(syn::ItemTrait, Vec<Placed>)>,
+            mod_decls: Vec<ModDecl>,
+        }
+        impl Walk {
+            fn chain(&self) -> Vec<Placed> {
+                self.ancestors
+                    .iter()
+                    .flat_map(|(label, attrs)| attrs.iter().map(|a| (label.clone(), a.clone())))
+                    .collect()
+            }
+            fn enter(
+                &mut self,
+                label: String,
+                attrs: &[syn::Attribute],
+                descend: impl FnOnce(&mut Self),
+            ) {
+                self.ancestors.push((label, attrs.to_vec()));
+                descend(self);
+                self.ancestors.pop();
+            }
+        }
+        fn path_attr(attrs: &[syn::Attribute]) -> Option<String> {
+            attrs
+                .iter()
+                .find(|a| a.path().is_ident("path"))
+                .and_then(|a| match &a.meta {
+                    syn::Meta::NameValue(syn::MetaNameValue {
+                        value:
+                            syn::Expr::Lit(syn::ExprLit {
+                                lit: syn::Lit::Str(value),
+                                ..
+                            }),
+                        ..
+                    }) => Some(value.value()),
+                    _ => None,
+                })
+        }
+        impl<'ast> Visit<'ast> for Walk {
+            fn visit_item(&mut self, item: &'ast syn::Item) {
+                use syn::Item;
+                let (label, attrs): (String, &[syn::Attribute]) = match item {
+                    Item::Mod(m) if m.content.is_some() => (format!("mod {}", m.ident), &m.attrs),
+                    Item::Mod(m) => (format!("the `mod {};` declaration", m.ident), &m.attrs),
+                    Item::Fn(f) => (format!("fn {}", f.sig.ident), &f.attrs),
+                    Item::Impl(i) => (
+                        format!("the impl block `impl {}`", i.self_ty.to_token_stream()),
+                        &i.attrs,
+                    ),
+                    Item::Trait(t) => (format!("trait {}", t.ident), &t.attrs),
+                    Item::Const(c) => (format!("const {}", c.ident), &c.attrs),
+                    Item::Static(s) => (format!("static {}", s.ident), &s.attrs),
+                    Item::Enum(e) => (format!("enum {}", e.ident), &e.attrs),
+                    Item::Struct(s) => (format!("struct {}", s.ident), &s.attrs),
+                    Item::Union(u) => (format!("union {}", u.ident), &u.attrs),
+                    Item::Type(t) => (format!("type {}", t.ident), &t.attrs),
+                    Item::ForeignMod(f) => ("an extern block".to_string(), &f.attrs),
+                    Item::Macro(m) => ("a macro item".to_string(), &m.attrs),
+                    Item::TraitAlias(t) => (format!("trait alias {}", t.ident), &t.attrs),
+                    Item::ExternCrate(e) => (format!("extern crate {}", e.ident), &e.attrs),
+                    Item::Use(u) => ("a use item".to_string(), &u.attrs),
+                    _ => ("an item syn does not classify".to_string(), &[]),
+                };
+                match item {
+                    Item::Trait(t) => self.traits.push((t.clone(), self.chain())),
+                    Item::Mod(m) if m.content.is_none() => {
+                        let mut chain = self.chain();
+                        chain.extend(m.attrs.iter().map(|a| (label.clone(), a.clone())));
+                        self.mod_decls.push(ModDecl {
+                            name: m.ident.to_string(),
+                            path_attr: path_attr(&m.attrs),
+                            inline_dirs: self.inline_dirs.clone(),
+                            chain,
+                        });
+                    }
+                    _ => {}
+                }
+                let inline_dir = match item {
+                    Item::Mod(m) if m.content.is_some() => {
+                        Some(path_attr(&m.attrs).unwrap_or_else(|| m.ident.to_string()))
+                    }
+                    _ => None,
+                };
+                self.enter(label, attrs, |walk| {
+                    walk.inline_dirs.extend(inline_dir.clone());
+                    syn::visit::visit_item(walk, item);
+                    if inline_dir.is_some() {
+                        walk.inline_dirs.pop();
+                    }
+                });
+            }
+            fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
+                let (label, attrs): (String, &[syn::Attribute]) = match item {
+                    syn::ImplItem::Fn(f) => (format!("fn {}", f.sig.ident), &f.attrs),
+                    syn::ImplItem::Const(c) => (format!("const {}", c.ident), &c.attrs),
+                    syn::ImplItem::Type(t) => (format!("type {}", t.ident), &t.attrs),
+                    syn::ImplItem::Macro(m) => ("a macro in an impl".to_string(), &m.attrs),
+                    _ => ("an impl item syn does not classify".to_string(), &[]),
+                };
+                self.enter(label, attrs, |walk| syn::visit::visit_impl_item(walk, item));
+            }
+            fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
+                let (label, attrs): (String, &[syn::Attribute]) = match item {
+                    syn::TraitItem::Fn(f) => (format!("fn {}", f.sig.ident), &f.attrs),
+                    syn::TraitItem::Const(c) => (format!("const {}", c.ident), &c.attrs),
+                    syn::TraitItem::Type(t) => (format!("type {}", t.ident), &t.attrs),
+                    syn::TraitItem::Macro(m) => ("a macro in a trait".to_string(), &m.attrs),
+                    _ => ("a trait item syn does not classify".to_string(), &[]),
+                };
+                self.enter(label, attrs, |walk| {
+                    syn::visit::visit_trait_item(walk, item)
+                });
+            }
+        }
+
+        /// Why an attribute on an ANCESTOR of the trait is not known inert, or
+        /// `None` when it is. An explicit allowlist of BUILT-IN attributes,
+        /// because an ancestor legitimately carries some and a proc-macro
+        /// attribute there sees the trait's tokens. Each is inert for the
+        /// surface: `doc` is text; `cfg` can only REMOVE the item (a trait
+        /// configured away has no surface to widen); the lint levels `allow`,
+        /// `warn`, `deny`, `forbid`, `expect` change diagnostics, never code;
+        /// `path` only chooses which FILE a module loads, and the resolver below
+        /// follows it. rustc refuses to let an imported macro shadow a built-in
+        /// attribute name — it is an ambiguity error — so the names cannot be
+        /// borrowed by a macro. `cfg_attr` is NOT inert on its own terms (it
+        /// expands to any attribute at all), so its expansion is judged by the
+        /// same list, recursively; a `path` behind one is refused, because
+        /// which file the module loads would then depend on a predicate this
+        /// walk does not evaluate.
+        fn ancestor_meta_refusal(meta: &syn::Meta, under_cfg_attr: bool) -> Option<String> {
+            const INERT: [&str; 8] = [
+                "doc", "cfg", "allow", "warn", "deny", "forbid", "expect", "path",
+            ];
+            let path = meta.path();
+            if path.is_ident("cfg_attr") {
+                let syn::Meta::List(list) = meta else {
+                    return Some("a cfg_attr with no attribute list".to_string());
+                };
+                let Ok(args) =
+                    list.parse_args_with(Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated)
+                else {
+                    return Some("a cfg_attr whose expansion does not parse".to_string());
+                };
+                // The first argument is the predicate: it selects, it adds nothing.
+                return args
+                    .iter()
+                    .skip(1)
+                    .find_map(|expanded| ancestor_meta_refusal(expanded, true));
+            }
+            if under_cfg_attr && path.is_ident("path") {
+                return Some(format!(
+                    "`{}` behind a cfg_attr, so which file the module loads is not followable",
+                    meta.to_token_stream()
+                ));
+            }
+            if INERT.iter().any(|name| path.is_ident(name)) {
+                None
+            } else {
+                Some(format!(
+                    "`{}`, which is not a built-in inert attribute",
+                    meta.to_token_stream()
+                ))
+            }
+        }
+
+        fn lexical(path: &Path) -> PathBuf {
+            let mut out = PathBuf::new();
+            for component in path.components() {
+                match component {
+                    Component::CurDir => {}
+                    Component::ParentDir => {
+                        out.pop();
+                    }
+                    other => out.push(other.as_os_str()),
+                }
+            }
+            out
+        }
+        let parent = |path: &Path| path.parent().map(Path::to_path_buf).unwrap_or_default();
+
+        let mut refusals = Vec::new();
+        let mut files: Vec<(&str, PathBuf, syn::File, Walk)> = Vec::new();
+        for (path, source) in sources {
+            let file = match syn::parse_file(source) {
+                Ok(file) => file,
+                Err(err) => {
+                    refusals.push(format!(
+                        "{path} does not parse as Rust ({err}), so its traits cannot be judged"
+                    ));
+                    continue;
+                }
+            };
+            let mut walk = Walk::default();
+            walk.visit_file(&file);
+            files.push((*path, lexical(Path::new(path)), file, walk));
+        }
+
+        let mut declarations = Vec::new();
+        for (index, (path, _, _, walk)) in files.iter().enumerate() {
+            for (item, chain) in &walk.traits {
+                if item.ident == TRAIT {
+                    declarations.push((*path, index, item, chain));
+                } else if mentions_trait(item.supertraits.to_token_stream().to_string())
+                    || mentions_trait(item.generics.to_token_stream().to_string())
+                    || mentions_trait(
+                        item.generics
+                            .where_clause
+                            .as_ref()
+                            .map(|w| w.to_token_stream().to_string())
+                            .unwrap_or_default(),
+                    )
+                {
+                    refusals.push(format!(
+                        "{path}: trait {} builds on {TRAIT}, so whatever it declares is surface a \
+                         transport implements, outside the declaration this guard reviews",
+                        item.ident
+                    ));
+                }
+            }
+        }
+
+        let (declared_in, file_index, declaration, in_file_chain) = match declarations.as_slice() {
+            [one] => *one,
+            [] => {
+                refusals.push(format!(
+                    "no `trait {TRAIT}` was found, so this guard is guarding nothing"
+                ));
+                return refusals;
+            }
+            many => {
+                let at: Vec<&str> = many.iter().map(|(path, ..)| *path).collect();
+                refusals.push(format!(
+                    "`trait {TRAIT}` is declared {} times ({at:?}); the guard reviews one surface",
+                    many.len()
+                ));
+                return refusals;
+            }
+        };
+
+        // THE FILE-MODULE CHAIN. An enclosing item is not only what surrounds
+        // the trait in its own file: the file is a module some `mod x;` loads,
+        // that declaration sits in a file with its own inner attributes and
+        // enclosing items, and so on up to the crate root. Resolved the way
+        // rustc resolves it — `x.rs` or `x/mod.rs` under the declaring module's
+        // directory (a non-mod-rs file `a.rs` owns `a/`), `#[path]` relative to
+        // the declaring file's directory outside inline modules and to the
+        // module directory inside them. A trait file the walk cannot reach from
+        // `lib.rs` is refused rather than assumed to have a clean ancestry.
+        let roots: Vec<usize> = files
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, path, ..))| path.file_name().is_some_and(|name| name == "lib.rs"))
+            .map(|(index, _)| index)
+            .collect();
+        let mut chains_to: Vec<Vec<Vec<Placed>>> = files.iter().map(|_| Vec::new()).collect();
+        if let [root] = roots.as_slice() {
+            let mut queue = vec![(*root, parent(&files[*root].1), Vec::<Placed>::new())];
+            // A module tree cannot contain itself, but a malformed one can
+            // spell a cycle; the bound turns that into a refusal, not a hang.
+            let mut budget = 4096usize;
+            while let Some((index, module_dir, inherited)) = queue.pop() {
+                if budget == 0 {
+                    refusals
+                        .push("the module tree did not terminate within 4096 files".to_string());
+                    break;
+                }
+                budget -= 1;
+                let (display, path, file, walk) = &files[index];
+                let mut chain = inherited;
+                chain.extend(
+                    file.attrs
+                        .iter()
+                        .map(|a| (format!("the inner attributes of {display}"), a.clone())),
+                );
+                for decl in &walk.mod_decls {
+                    let mut dir = module_dir.clone();
+                    dir.extend(&decl.inline_dirs);
+                    let (candidates, child_dir) = match &decl.path_attr {
+                        Some(relative) => {
+                            let base = if decl.inline_dirs.is_empty() {
+                                parent(path)
+                            } else {
+                                dir
+                            };
+                            let target = lexical(&base.join(relative));
+                            let child_dir = parent(&target);
+                            (vec![target], child_dir)
+                        }
+                        None => (
+                            vec![
+                                lexical(&dir.join(format!("{}.rs", decl.name))),
+                                lexical(&dir.join(&decl.name).join("mod.rs")),
+                            ],
+                            lexical(&dir.join(&decl.name)),
+                        ),
+                    };
+                    let Some(child) = candidates
+                        .iter()
+                        .find_map(|candidate| files.iter().position(|(_, p, ..)| p == candidate))
+                    else {
+                        continue;
+                    };
+                    let mut child_chain = chain.clone();
+                    child_chain.extend(decl.chain.iter().cloned());
+                    queue.push((child, child_dir, child_chain));
+                }
+                chains_to[index].push(chain);
+            }
+        } else {
+            refusals.push(format!(
+                "the sources hold {} crate roots named lib.rs, so the modules enclosing the trait \
+                 cannot be followed",
+                roots.len()
+            ));
+        }
+        if chains_to[file_index].is_empty() && roots.len() == 1 {
+            refusals.push(format!(
+                "{declared_in}, which declares the trait, is not reached from the crate root, so \
+                 the attributes of the modules that load it cannot be judged"
+            ));
+        }
+        for chain in &chains_to[file_index] {
+            for (label, attr) in chain.iter().chain(in_file_chain.iter()) {
+                if let Some(why) = ancestor_meta_refusal(&attr.meta, false) {
+                    let refusal = format!(
+                        "{label}, an ancestor of the trait, carries {why}. An attribute macro on an \
+                         enclosing item receives the trait's tokens and can emit methods no parse \
+                         of the source will ever see"
+                    );
+                    if !refusals.contains(&refusal) {
+                        refusals.push(refusal);
+                    }
+                }
+            }
+        }
+
+        for attr in declaration.attrs.iter().filter(|a| !inert(a)) {
+            refusals.push(format!(
+                "the trait carries `{}`. An attribute macro there can emit methods no parse of \
+                 the source will ever see",
+                attr.to_token_stream()
+            ));
+        }
+        if declaration.unsafety.is_some() || declaration.auto_token.is_some() {
+            refusals.push("the trait's qualifiers changed from a plain `pub trait`".to_string());
+        }
+        if !declaration.generics.params.is_empty() || declaration.generics.where_clause.is_some() {
+            refusals.push(format!(
+                "the trait gained generics or a where clause (`{} {}`); `where Self: X` is a \
+                 supertrait by another spelling",
+                declaration.generics.to_token_stream(),
+                declaration.generics.where_clause.to_token_stream()
+            ));
+        }
+        let supertraits = declaration.supertraits.to_token_stream().to_string();
+        if supertraits != "Send + Sync" {
+            refusals.push(format!(
+                "the supertraits are `{supertraits}`, not `Send + Sync`: every method of a new \
+                 supertrait is surface a transport implements"
+            ));
+        }
+
+        let mut methods = BTreeMap::new();
+        for item in &declaration.items {
+            match item {
+                syn::TraitItem::Fn(method) => {
+                    for attr in method.attrs.iter().filter(|a| !inert(a)) {
+                        refusals.push(format!(
+                            "method {} carries `{}`, which could rewrite or add to it",
+                            method.sig.ident,
+                            attr.to_token_stream()
+                        ));
+                    }
+                    methods.insert(
+                        method.sig.ident.to_string(),
+                        method.sig.to_token_stream().to_string(),
+                    );
+                }
+                syn::TraitItem::Macro(invocation) => refusals.push(format!(
+                    "the trait body invokes `{}!`, which can expand to methods no parse of the \
+                     source will see",
+                    invocation.mac.path.to_token_stream()
+                )),
+                other => refusals.push(format!(
+                    "the trait declares `{}`, which is not a method: an associated type or \
+                     const is surface too, and tokens syn cannot classify are unreviewable",
+                    other.to_token_stream()
+                )),
+            }
+        }
+        // Signatures, not only names: `install(&self, builder, manifest)` keeps
+        // the name and hands a transport the very thing the boundary withholds.
+        let expected: BTreeMap<String, String> = [
+            "fn name(&self) -> &str;",
+            "fn install(&self, builder: Builder) -> Result<Builder, VtopError>;",
+            "fn permits_scheme(&self, scheme: &str) -> bool;",
+            "fn tuning_support(&self) -> TuningSupport;",
+        ]
+        .into_iter()
+        .map(|declared| {
+            let method: syn::TraitItemFn = syn::parse_str(declared).expect("a valid signature");
+            (
+                method.sig.ident.to_string(),
+                method.sig.to_token_stream().to_string(),
+            )
+        })
+        .collect();
+        if methods != expected {
+            refusals.push(format!(
+                "the methods are {methods:#?}, where the reviewed surface is {expected:#?}"
+            ));
+        }
+        let rendered = declaration.to_token_stream().to_string();
+        for forbidden in ["verify_object", "head_object", "manifest"] {
+            if rendered.contains(forbidden) {
+                refusals.push(format!(
+                    "the trait mentions {forbidden}: the evidence boundary is that a transport \
+                     cannot reach it"
+                ));
+            }
+        }
+        refusals
+    }
+
+    /// Every `.rs` file of this crate's `src/`, read at test time so a module
+    /// added later is judged without anyone remembering to list it.
+    fn this_crates_sources() -> Vec<(String, String)> {
+        fn walk(dir: &std::path::Path, into: &mut Vec<(String, String)>) {
+            let mut entries: Vec<_> = std::fs::read_dir(dir)
+                .unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()))
+                .map(|entry| entry.expect("a directory entry").path())
+                .collect();
+            entries.sort();
+            for path in entries {
+                if path.is_dir() {
+                    walk(&path, into);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    let source = std::fs::read_to_string(&path)
+                        .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+                    into.push((path.display().to_string(), source));
+                }
+            }
+        }
+        let mut sources = Vec::new();
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut sources,
+        );
+        sources
+    }
+
+    #[test]
+    fn a_transport_has_no_route_to_the_evidence_it_would_be_tempted_to_forge() {
+        // A fast transport is the component most tempted to report a pass from
+        // its own acknowledgements, and #479 placed the seam BELOW
+        // UploadBackend so it cannot CALL verification, see its results, or
+        // report an outcome. That is what this pins: the trait's surface.
+        //
+        // It is NOT an adversarial boundary, and the security model says so
+        // (review): `install` returns the builder the ONE S3 client is built
+        // from, and that client also serves head_object and the stored-body
+        // read-back, so a transport written to deceive could influence the
+        // requests verification travels over without touching verification
+        // code. A registered transport is TRUSTED code — in-tree, reviewed,
+        // and listed in BUILTIN_TRANSPORTS, with no plug-in mechanism. This
+        // test bounds what a transport can do by ACCIDENT.
+        //
+        // A source-level check, deliberately: Rust has no runtime reflection
+        // over a trait's methods, and the property being defended is exactly
+        // "no fifth method appeared". Adding one now fails here, which is the
+        // review this is standing in for.
+        let sources = this_crates_sources();
+        assert!(
+            sources
+                .iter()
+                .any(|(path, _)| path.ends_with("transport.rs")),
+            "the walk must reach transport.rs, or the acceptance below proves nothing"
+        );
+        let borrowed: Vec<(&str, &str)> = sources
+            .iter()
+            .map(|(path, source)| (path.as_str(), source.as_str()))
+            .collect();
+        let refusals = egress_transport_surface_refusals(&borrowed);
+        assert!(
+            refusals.is_empty(),
+            "the EgressTransport surface changed:\n  {}\n\nA transport is handed the S3 client \
+             config builder and nothing else — no route to CALL verify_object, head_object or \
+             the manifest read-back, and no way to see their results. If a method belongs \
+             here, add it deliberately and update this guard; if it hands the transport \
+             anything from the verification path, or any way to report an outcome, it does \
+             not belong here at all. Note this bounds ACCIDENT, not malice: the client a \
+             transport configures is the client verification reads through, so a transport is \
+             trusted code — see SECURITY_MODEL.md",
+            refusals.join("\n  ")
+        );
+    }
+
+    #[test]
+    fn every_spelling_that_widened_the_transport_surface_past_a_text_scan_is_refused() {
+        // REGRESSION (review, five rounds): each of these compiled and slipped a
+        // method past an earlier version of the guard, or would have —
+        // same-line declarations, `fn` and its name split by a newline, a
+        // trait-item macro spread over lines, an outer attribute macro above
+        // the declaration, and then an attribute macro on something ENCLOSING
+        // it, which the parser-based guard descended through unread. The guard is only worth having if none of them
+        // is a way around it, so each is run through the same function the
+        // real crate is, beside the untouched surface it must still accept.
+        const REVIEWED: &str = "\
+            pub trait EgressTransport: Send + Sync {
+                /// The registered name.
+                fn name(&self) -> &str;
+                fn install(&self, builder: Builder) -> Result<Builder, VtopError>;
+                fn permits_scheme(&self, scheme: &str) -> bool;
+                fn tuning_support(&self) -> TuningSupport;
+            }";
+        let with_body = |extra: &str| {
+            REVIEWED.replace(
+                "fn tuning_support(&self) -> TuningSupport;",
+                &format!("fn tuning_support(&self) -> TuningSupport;\n{extra}"),
+            )
+        };
+        assert_eq!(
+            egress_transport_surface_refusals(&[("lib.rs", REVIEWED)]),
+            Vec::<String>::new(),
+            "the reviewed surface itself must be accepted, or every refusal below could be \
+             the guard refusing everything"
+        );
+
+        // The ANCESTRY half must not refuse the crate it guards (review): the
+        // real seam is reached through `pub mod s3_native;` in lib.rs and a
+        // `#[path = "transport.rs"]` declaration inside s3_native.rs, and
+        // ancestors legitimately carry built-in attributes. Each layout rustc
+        // resolves a module file by is here too, because a resolver that got
+        // one wrong would report a clean trait as unreachable — or, worse,
+        // judge the wrong file's ancestry.
+        let accepted: Vec<(&str, Vec<(&str, String)>)> = vec![
+            (
+                "the real seam's shape: a #[path] declaration inside a non-mod-rs file",
+                vec![
+                    ("src/lib.rs", "pub mod s3_native;".to_string()),
+                    (
+                        "src/s3_native.rs",
+                        "#[path = \"transport.rs\"]\npub mod transport;".to_string(),
+                    ),
+                    ("src/transport.rs", REVIEWED.to_string()),
+                ],
+            ),
+            (
+                "ancestors carrying only built-in inert attributes, cfg_attr included",
+                vec![
+                    (
+                        "lib.rs",
+                        "#![deny(unsafe_code)]\n#![cfg_attr(docsrs, allow(unused))]\n\
+                         /// The seam.\n#[cfg(not(any()))]\n#[allow(dead_code)]\npub mod seam;"
+                            .to_string(),
+                    ),
+                    (
+                        "seam.rs",
+                        format!(
+                            "#![warn(missing_docs)]\n#[cfg_attr(test, expect(unused))]\n\
+                             pub mod inner {{ #![forbid(unsafe_code)] {REVIEWED} }}"
+                        ),
+                    ),
+                ],
+            ),
+            (
+                "a mod.rs module file",
+                vec![
+                    ("lib.rs", "mod a;".to_string()),
+                    ("a/mod.rs", "mod b;".to_string()),
+                    ("a/b.rs", REVIEWED.to_string()),
+                ],
+            ),
+            (
+                "a module under a non-mod-rs file",
+                vec![
+                    ("lib.rs", "mod a;".to_string()),
+                    ("a.rs", "pub mod b;".to_string()),
+                    ("a/b.rs", REVIEWED.to_string()),
+                ],
+            ),
+            (
+                "a #[path] declaration inside an inline module of a non-mod-rs file",
+                vec![
+                    ("lib.rs", "mod a;".to_string()),
+                    (
+                        "a.rs",
+                        "mod inline { #[path = \"x.rs\"] pub mod seam; }".to_string(),
+                    ),
+                    ("a/inline/x.rs", REVIEWED.to_string()),
+                ],
+            ),
+        ];
+        for (label, files) in accepted {
+            let borrowed: Vec<(&str, &str)> = files.iter().map(|(p, s)| (*p, s.as_str())).collect();
+            assert_eq!(
+                egress_transport_surface_refusals(&borrowed),
+                Vec::<String>::new(),
+                "{label} must be accepted: a guard that refuses an innocent ancestry is one \
+                 somebody switches off, and then refuses nothing"
+            );
+        }
+
+        // (what the spelling is, the refusal it must draw, the files it lives in)
+        type Bypass = (&'static str, &'static str, Vec<(&'static str, String)>);
+        let bypasses: Vec<Bypass> = vec![
+            (
+                "two declarations on one line",
+                "the methods are",
+                vec![(
+                    "lib.rs",
+                    REVIEWED.replace(
+                        "fn name(&self) -> &str;",
+                        "fn name(&self) -> &str; fn expose_evidence(&self);",
+                    ),
+                )],
+            ),
+            (
+                "`fn` and its name split by a newline",
+                "the methods are",
+                vec![("lib.rs", with_body("fn\nexpose_evidence(&self) {}"))],
+            ),
+            (
+                "a qualified declaration",
+                "the methods are",
+                vec![("lib.rs", with_body("unsafe fn expose_evidence(&self);"))],
+            ),
+            (
+                "a trait-item macro spread over lines",
+                "invokes `transport_methods!`",
+                vec![(
+                    "lib.rs",
+                    with_body("transport_methods!(\n    expose_evidence,\n);"),
+                )],
+            ),
+            (
+                "a trait-item macro with brace delimiters",
+                "invokes `transport_methods!`",
+                vec![("lib.rs", with_body("transport_methods! {\n}"))],
+            ),
+            (
+                "an outer attribute macro on the trait",
+                "the trait carries",
+                vec![("lib.rs", format!("#[add_transport_methods]\n{REVIEWED}"))],
+            ),
+            (
+                "an attribute macro on a method",
+                "method name carries",
+                vec![(
+                    "lib.rs",
+                    REVIEWED.replace(
+                        "fn name(&self) -> &str;",
+                        "#[also_emit(expose_evidence)]\nfn name(&self) -> &str;",
+                    ),
+                )],
+            ),
+            (
+                "an associated type",
+                "which is not a method",
+                vec![("lib.rs", with_body("type Evidence;"))],
+            ),
+            (
+                "a changed signature under a reviewed name",
+                "seen : & Outcome",
+                vec![(
+                    "lib.rs",
+                    REVIEWED.replace(
+                        "fn install(&self, builder: Builder)",
+                        "fn install(&self, builder: Builder, seen: &Outcome)",
+                    ),
+                )],
+            ),
+            (
+                "an added supertrait",
+                "the supertraits are",
+                vec![(
+                    "lib.rs",
+                    REVIEWED.replace("Send + Sync {", "Send + Sync + EvidenceSink {"),
+                )],
+            ),
+            (
+                "a supertrait spelled as a where clause",
+                "where Self : EvidenceSink",
+                vec![(
+                    "lib.rs",
+                    REVIEWED.replace("Send + Sync {", "Send + Sync where Self: EvidenceSink {"),
+                )],
+            ),
+            (
+                "a subtrait declared in another file",
+                "trait Forging builds on",
+                vec![
+                    ("lib.rs", REVIEWED.to_string()),
+                    (
+                        "other.rs",
+                        "mod deep { pub trait Forging: super::EgressTransport { \
+                         fn expose_evidence(&self); } }"
+                            .to_string(),
+                    ),
+                ],
+            ),
+            (
+                "a second declaration of the name",
+                "declared 2 times",
+                vec![
+                    ("lib.rs", REVIEWED.to_string()),
+                    (
+                        "other.rs",
+                        format!(
+                            "mod shadow {{ {} }}",
+                            with_body("fn expose_evidence(&self);")
+                        ),
+                    ),
+                ],
+            ),
+            // REGRESSION (review, fifth round): an attribute macro on ANY item
+            // enclosing the trait receives the trait's tokens with its own, and
+            // can hand rustc a fifth method while the source shows four. The
+            // earlier guard read the trait's attributes and descended through
+            // everything around it without looking.
+            (
+                "an attribute macro on an enclosing inline module, re-exported",
+                "mod inner, an ancestor of the trait, carries `add_transport_methods`",
+                vec![(
+                    "lib.rs",
+                    format!(
+                        "#[add_transport_methods]\npub mod inner {{ {REVIEWED} }}\n\
+                         pub use inner::EgressTransport;"
+                    ),
+                )],
+            ),
+            (
+                "an inner attribute macro inside an enclosing inline module",
+                "mod inner, an ancestor of the trait, carries `add_transport_methods`",
+                vec![(
+                    "lib.rs",
+                    format!("pub mod inner {{ #![add_transport_methods] {REVIEWED} }}"),
+                )],
+            ),
+            (
+                "a path-qualified attribute macro on an enclosing inline module",
+                "carries `my_macros :: add_transport_methods`",
+                vec![(
+                    "lib.rs",
+                    format!("#[my_macros::add_transport_methods]\npub mod inner {{ {REVIEWED} }}"),
+                )],
+            ),
+            (
+                "an attribute macro on the `mod` declaration that loads the trait's file",
+                "the `mod seam;` declaration, an ancestor of the trait, carries",
+                vec![
+                    ("lib.rs", "#[add_transport_methods]\npub mod seam;".to_string()),
+                    ("seam.rs", REVIEWED.to_string()),
+                ],
+            ),
+            (
+                "an attribute macro on a grandparent `mod` declaration, in the real seam's shape",
+                "the `mod s3_native;` declaration, an ancestor of the trait, carries",
+                vec![
+                    (
+                        "src/lib.rs",
+                        "#[add_transport_methods]\npub mod s3_native;".to_string(),
+                    ),
+                    (
+                        "src/s3_native.rs",
+                        "#[path = \"transport.rs\"]\npub mod transport;".to_string(),
+                    ),
+                    ("src/transport.rs", REVIEWED.to_string()),
+                ],
+            ),
+            (
+                "a crate-level inner attribute macro",
+                "the inner attributes of lib.rs, an ancestor of the trait, carries",
+                vec![
+                    ("lib.rs", "#![add_transport_methods]\npub mod seam;".to_string()),
+                    ("seam.rs", REVIEWED.to_string()),
+                ],
+            ),
+            (
+                "an inner attribute macro at the top of the trait's own module file",
+                "the inner attributes of seam.rs, an ancestor of the trait, carries",
+                vec![
+                    ("lib.rs", "pub mod seam;".to_string()),
+                    ("seam.rs", format!("#![add_transport_methods]\n{REVIEWED}")),
+                ],
+            ),
+            (
+                "a cfg_attr that expands to an attribute macro",
+                "mod inner, an ancestor of the trait, carries `add_transport_methods`",
+                vec![(
+                    "lib.rs",
+                    format!("#[cfg_attr(all(), add_transport_methods)]\npub mod inner {{ {REVIEWED} }}"),
+                )],
+            ),
+            (
+                "a cfg_attr nested in a cfg_attr, expanding to an attribute macro",
+                "mod inner, an ancestor of the trait, carries `add_transport_methods`",
+                vec![(
+                    "lib.rs",
+                    format!(
+                        "#[cfg_attr(all(), allow(unused), cfg_attr(all(), add_transport_methods))]\n\
+                         pub mod inner {{ {REVIEWED} }}"
+                    ),
+                )],
+            ),
+            (
+                "a #[path] behind a cfg_attr, choosing the trait's file by a predicate",
+                "behind a cfg_attr",
+                vec![
+                    (
+                        "lib.rs",
+                        "#[cfg_attr(all(), path = \"seam.rs\")]\npub mod seam;".to_string(),
+                    ),
+                    ("seam.rs", REVIEWED.to_string()),
+                ],
+            ),
+            (
+                "an attribute macro on an enclosing function",
+                "fn wrap, an ancestor of the trait, carries `add_transport_methods`",
+                vec![(
+                    "lib.rs",
+                    format!("#[add_transport_methods]\nfn wrap() {{ {REVIEWED} }}"),
+                )],
+            ),
+            (
+                "an attribute macro on an enclosing impl block",
+                "the impl block `impl S`, an ancestor of the trait, carries",
+                vec![(
+                    "lib.rs",
+                    format!(
+                        "struct S;\n#[add_transport_methods]\nimpl S {{ fn wrap() {{ {REVIEWED} }} }}"
+                    ),
+                )],
+            ),
+            (
+                "a trait file no module declaration reaches",
+                "is not reached from the crate root",
+                vec![
+                    ("lib.rs", "pub mod other;".to_string()),
+                    ("seam.rs", REVIEWED.to_string()),
+                ],
+            ),
+        ];
+        for (label, reason, files) in bypasses {
+            let borrowed: Vec<(&str, &str)> = files.iter().map(|(p, s)| (*p, s.as_str())).collect();
+            let refusals = egress_transport_surface_refusals(&borrowed);
+            // The REASON, not merely a refusal: a fixture refused for something
+            // incidental — a typo that stopped it parsing — would stay green
+            // while proving nothing about the spelling it is named for.
+            assert!(
+                refusals.iter().any(|refusal| refusal.contains(reason)),
+                "{label} was not refused for what it does ({reason:?}), so the transport \
+                 surface can grow past the guard that exists to force its review. Refusals: \
+                 {refusals:#?}; sources: {files:#?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_tuned_part_size_outside_s3s_range_is_refused() {
         // BOTH ends of the range, because they fail differently (#480, review).
         // Below the floor the size is accepted here and then bypassed by
@@ -989,6 +2570,45 @@ mod tests {
         assert!(
             reject_out_of_range_part_size(floor, ceiling, &EgressTuning::default(), "tcp_tls")
                 .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_constructor_itself_refuses_a_plaintext_endpoint() {
+        // The cross-product test above proves the VALIDATOR refuses; it does
+        // not prove the constructor still calls it (review). Deleting the
+        // validate_endpoint_scheme call from `new` would leave that test
+        // green, and the property everyone actually depends on is that
+        // building a backend against a plaintext endpoint fails.
+        //
+        // This drives the real constructor. It refuses before the SDK loader
+        // runs, so the test needs no network and no credentials — which is
+        // also why it can only cover the explicit door: the environment doors
+        // read fixed variable names that a test cannot set without racing
+        // every other test in the process, and the SDK-resolved door needs the
+        // loader. Those two are covered through the injected reader above and
+        // by the call sites, and that difference is stated rather than papered
+        // over.
+        let cfg = S3NativeConfig {
+            region: "us-east-1".to_string(),
+            endpoint_url: Some("http://minio:9000".to_string()),
+            force_path_style: true,
+            verify_tls: true,
+            transport: "tcp_tls".to_string(),
+            tuning: Default::default(),
+        };
+        let err = match S3NativeBackend::new(&cfg).await {
+            Err(err) => err,
+            Ok(_) => panic!(
+                "the constructor built a backend against a plaintext endpoint with \
+                 verify_tls: true — the scheme policy is no longer wired into `new`, and \
+                 every caller that trusts it is now unprotected"
+            ),
+        };
+        assert!(
+            err.to_string().contains("plaintext"),
+            "the constructor must refuse for the scheme, not incidentally for something \
+             else: {err}"
         );
     }
 
