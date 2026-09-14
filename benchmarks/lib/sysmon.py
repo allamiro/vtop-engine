@@ -119,8 +119,28 @@ class SystemMonitor:
         self.samples: list[dict] = []
         self._base_disk = None
         self._base_net = None
+        # _counters is called from the sampler thread AND from counters_now();
+        # the first call on either side sets the baseline, so it is serialised.
+        self._counter_lock = threading.Lock()
+
+    def counters_now(self) -> dict[str, float]:
+        """The cumulative counters as of THIS instant, on the samples' own basis.
+
+        A caller that needs a boundary the sampler did not happen to land on
+        (#478: the moment the engine's window opens) reads it here instead of
+        taking the nearest earlier row, which can be a whole sampling interval
+        stale — long enough to carry a solo competitor's traffic into the
+        engine's network columns (review).
+        """
+        disk_r, disk_w, net_tx, net_rx = self._counters()
+        return {"disk_read_mb": disk_r, "disk_write_mb": disk_w,
+                "network_tx_mb": net_tx, "network_rx_mb": net_rx}
 
     def _counters(self):
+        with self._counter_lock:
+            return self._counters_locked()
+
+    def _counters_locked(self):
         disk_r = disk_w = net_tx = net_rx = 0.0
         if _HAS_PSUTIL:
             try:
