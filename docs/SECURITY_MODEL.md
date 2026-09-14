@@ -143,6 +143,136 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are used as normat
   closed unanswered adds the same hint to its own error.
 
 
+### The egress transport seam (#479, reviewed under #488)
+
+The archive upload path selects its wire through a registered transport
+(`upload.transport`, `crates/vtop-upload/src/transport.rs`). Exactly one
+transport ships today.
+
+| Transport | What it is | Schemes it admits | Status |
+|---|---|---|---|
+| `tcp_tls` (default) | kernel TCP inside TLS through the AWS SDK | `http`, `https` | shipping |
+
+A datagram transport is *planned* behind the gate the egress epic defines. No
+QUIC or HTTP/3 implementation ships in this tree today, and no statement may
+imply otherwise.
+
+**The scheme policy is transport-aware, and applied at every door — but the
+doors do not all open at the same time.** An endpoint can reach the client from
+five places:
+
+1. the explicit `upload.endpoint_url`;
+2. `AWS_ENDPOINT_URL_S3`;
+3. `AWS_ENDPOINT_URL`;
+4. whatever the SDK resolved and exposes as `SdkConfig::endpoint_url()`,
+   including a profile-wide `endpoint_url` from its shared config file;
+5. an S3-SPECIFIC `endpoint_url` in a shared-profile `[services]` section,
+   which `SdkConfig::endpoint_url()` does not expose at all, because the
+   service config is applied after the shared config is read.
+
+Sources 1–4 are checked by one function before any client is built, so an
+endpoint from any of them that the policy refuses fails `S3NativeBackend::new`
+— which is where an operator wants to hear about a typo.
+
+**Source 5 is not checked there, and cannot be**: nothing in the resolved
+configuration reveals it. `S3NativeBackend::new` therefore SUCCEEDS for a
+plaintext S3-specific profile endpoint, and the refusal arrives later — on the
+first request the backend makes, from the interceptor described below. The
+guarantee for that source is that such an endpoint is never transmitted to. It
+is *not* that construction failed, and an operator who reads a successful
+startup as proof that the endpoint passed the policy has read it wrong.
+
+What either door refuses is the same, and it is two separate questions. First,
+a scheme the resolved transport does not carry is refused by name, whatever
+`verify_tls` says: a transport introducing a new scheme spelling is the single
+most likely place a transport change quietly weakens the `verify_tls` promise,
+so admission is explicit rather than implied, and the plaintext opt-out has no
+standing to widen it. Second, plaintext `http://` with `verify_tls: true` is
+refused; `verify_tls: false` remains the deliberate, warned opt-in the compose
+lab uses, and is the only way plaintext is ever carried. A refusal from an
+environment door names the VARIABLE, because "plaintext endpoint refused" would
+otherwise send an operator to their config file for a value that came from
+their shell.
+
+Enforced by a cross-product test over every registered transport, all four
+construction-time sources and several plaintext spellings including case and
+whitespace variants; by a test that drives the constructor itself, so the
+policy cannot be left un-called; and by a test that walks both doors with one
+table, so they cannot answer the same endpoint differently.
+
+**And once more where guessing stops.** Enumerating sources is only ever as
+complete as the list, and the list was not complete — source 5 is the proof of
+that, and the reason for what follows. A client interceptor reads the REQUEST'S
+OWN URI immediately before transmission and asks the same two questions there:
+the resolved transport must carry the scheme, and plaintext `http://` is
+refused while `verify_tls` is true. It holds the resolved transport itself
+rather than a copy of its name, so it consults the one policy the
+construction-time doors consulted instead of a second, weaker one. That check
+runs for every request, so it covers source 5, a transport's `install` having
+redirected the client, and any source nobody has thought of yet. The
+source-level checks remain, because they fail at construction where a typo is
+cheap to fix — but they are the convenience and this is the guarantee.
+
+**The gate is installed LAST, after the transport, and the order is the
+guarantee** (review). `install` takes the client-config builder by value and
+returns one, so a transport that honours the contract may return a *fresh*
+builder — and `set_interceptors` replaces the list even on the builder it was
+handed. Either discards an interceptor installed before the call, so installing
+the gate first would have let a transport-introduced plaintext endpoint travel
+with no check at all; installing it after `install` has returned leaves a
+transport nothing to remove it with. Position within the interceptor list is
+not relied on: the orchestrator runs every `modify_before_transmit` hook before
+any `read_before_transmit` hook, so the gate reads the URI after every other
+interceptor has finished changing it. It is also registered as a PERMANENT
+interceptor, which drops the per-request `DisableInterceptor` lookup an ordinary
+one carries: no route to that switch exists today, but that is a fact about two
+other crates' visibility rather than a property of this gate, and a policy check
+should not rest on one. What the gate reads is the URI the
+orchestrator produced, NOT the socket the transport's HTTP client opens — a
+connector that dials somewhere else is outside anything the client-config
+builder can reach, and falls under the trusted-code statement below rather than
+being closed here.
+
+**The evidence boundary: what the seam does and does not guarantee.** A fast
+transport is the component most tempted to report a pass from its own
+acknowledgements. The seam is placed BELOW `UploadBackend`, and the whole
+surface a transport is given is:
+
+```rust
+fn name(&self) -> &str;
+fn install(&self, builder: Builder) -> Result<Builder, VtopError>;
+fn permits_scheme(&self, scheme: &str) -> bool;
+fn tuning_support(&self) -> TuningSupport;
+```
+
+It receives the S3 client-config builder and nothing else. A transport
+therefore cannot CALL `verify_object`, `head_object` or the manifest read-back,
+cannot see their results, and cannot report a verification outcome; the
+verification logic is not reachable from a transport implementation. A test
+pins the method set so a fifth method cannot appear without this paragraph
+being revisited.
+
+**That is not an adversarial boundary, and it must not be read as one**
+(review). `install` returns the client-config builder that `S3NativeBackend`
+then builds its ONE client from, and that same client serves `head_object` and
+the stored-body read-back. A transport that wanted to could therefore influence
+the requests verification travels over — caching a body and answering a later
+read from it, for instance — without ever touching the verification code.
+
+So the accurate statement is: **a registered transport is trusted code.** The
+seam bounds what a transport can do by ACCIDENT — it cannot mistake a transport
+ACK for a verification result, because it never sees one — and it does not
+defend against a transport written to deceive. Transports are in-tree, reviewed,
+and registered in `BUILTIN_TRANSPORTS`; there is no plug-in mechanism and no way
+for a deployment to load one. If that ever changes, this paragraph is the thing
+that has to change with it, and an independently configured client for the
+verification path becomes a requirement rather than an option.
+
+**What is NOT settled here.** The fallback rule, the datagram path's TLS
+posture and its egress-policy requirements are reviewed when that path exists;
+there is nothing to fall back from while one transport is registered.
+
+
 ## 3. Credential handling
 
 Normative rules:
