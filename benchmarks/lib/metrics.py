@@ -46,6 +46,13 @@ CSV_HEADERS: dict[str, list[str]] = {
         # summary.json, and a per-run CSV that omits it cannot distinguish two
         # runs that differ only in how the transport was tuned.
         "transport_tuning_flat",
+        # Whether the lab's HTTP/3-terminating proxy sat in front of the store
+        # (#484); the service name when it did, empty when the engine dialled
+        # MinIO directly. Same reasoning as runner_mode: the extra process, TLS
+        # termination and byte copy are part of the measurement, and the whole
+        # point of the proxied baseline is that it is NOT comparable to the
+        # direct one.
+        "h3_proxy",
     ],
     "batch_metrics.csv": [
         "run_id", "batch_id", "scenario_name", "batch_start_time", "batch_end_time",
@@ -222,6 +229,9 @@ def _summary_md(s: dict) -> str:
         # identical conditions — in the one place a human actually reads.
         f"| Transport tuning (#480) | {g('transport_tuning_flat') or 'none'} |",
         f"| Shaped pipe (#403) | {_shaping_cell(s)} |",
+        # summary.md is the file the runner prints a path to, so the topology
+        # has to be legible there too, not only in the JSON.
+        f"| Proxy hop (#484) | {g('h3_proxy') or 'none (direct to the store)'} |",
         "",
         "## Bottleneck observations",
         "",

@@ -1,0 +1,60 @@
+name: proxy-hop-tcp-baseline
+description: >-
+  Scenario 12 with one thing changed: the upload path runs through the lab's
+  HTTP/3-terminating proxy instead of straight at MinIO (#484). Nothing here
+  measures HTTP/3 — the engine takes the shipped TCP path — and that is the
+  entire point. A proxy in front of the store is a change of PATH: an extra
+  process, an extra TLS termination, an extra bridge hop, a second copy of
+  every byte. A later datagram run compared against scenario 12 would credit
+  the wire with all of it, so it must be compared against this run instead,
+  and that comparison is clean because both of its sides cross this same
+  proxy. Every knob below is scenario 12's, so the two scenario files differ
+  only where the topology does. What that costs — throughput and
+  object_upload p95, proxied against direct — is the pair 17-against-12.
+  Read that difference for what it is, and it is NOT the hop alone: scenario
+  12 reaches the lab store over plaintext HTTP/1.1, and a proxy that can serve
+  HTTP/3 cannot be plaintext, so this run also pays TLS termination and
+  whatever ALPN the shipped SDK then negotiates against it (observed on the
+  lab stack: HTTP/2). That is a property of the control rather than a defect
+  in it — HTTP/3 has no plaintext form, so no proxied baseline can avoid it —
+  and it is one more reason the datagram comparison belongs against this
+  number. Requires the material and the profile, in that order —
+  benchmarks/gen-h3-certs.sh, then docker compose -f
+  benchmarks/docker-compose.benchmark.yml --profile h3 up -d — plus
+  benchmarks/verify-h3.sh to establish that the proxy really is serving
+  HTTP/3, since a proxy that had silently downgraded would still serve this
+  scenario perfectly and make every later measurement a measurement of TCP
+  under another name.
+volume: 400
+file_size: small
+format: jsonl
+compression: gzip
+checksum: sha256
+backend: s3_native
+bucket: "vtop-bench-soak"
+# The proxy, not the store: the h3 proxy listens on 9443 and forwards to MinIO
+# on 9000. https:// because HTTP/3 has no plaintext form, so the proxy is
+# TLS-only; the runner points SSL_CERT_FILE at the lab CA that gen-h3-certs.sh
+# mints, because the engine verifies certificates even when verify_tls is
+# false (vtop-upload/src/s3_native.rs).
+endpoint_url: https://localhost:9443
+# The DECLARATION that makes the hop legible to the harness: it is what lets
+# the lab credentials follow the store to port 9443, and what makes a run that
+# went around the proxy refusable instead of silently mislabelled.
+h3_proxy: true
+# Stated, not inherited. This scenario's job is to be the TCP baseline, so the
+# wire it measures is named in the file rather than left to a default that a
+# later issue may change out from under the comparison.
+transport: tcp_tls
+batch_max_records: 50
+batch_max_bytes: 1048576
+batch_max_age_seconds: 5
+# Scenario 12 leaves this at the engine default and so does this file: the
+# pair must differ in topology and nothing else, and a width set here would
+# also change how many TLS sessions the proxy holds at once.
+backlog_multiplier: 1.5
+seed_concurrently: true
+seed_interval_seconds: 1.0
+duration_seconds: 300
+fault: none
+sys_sample_interval: 2.0
