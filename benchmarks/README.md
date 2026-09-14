@@ -280,7 +280,13 @@ side by side in one table get compared whatever the `shaping_driver` column
 says. `run_matrix.py` raises `IncomparableRuns` — before a single row is
 written — when a comparison spans two shaped drivers. A shaped row beside an
 *unshaped* one is fine: that is the comparison shaping exists for, and the
-columns say which is which.
+columns say which is which. The refusal is decided by the rows the runs
+actually produce, never by a prediction from the scenario files — a scenario
+that fails to run contributes no row and so no driver, whatever it declares.
+To make a real conflict cheap, the runs are ordered so that one scenario of
+each declared shaped driver goes first, and the matrix is refused the moment
+two drivers have produced rows, before the rest of the list starts. `--all`
+spans toxiproxy and netem, so with both labs up it stops after two runs.
 
 #### The middlebox, and why the shaping is not on the sender
 
@@ -299,8 +305,9 @@ without inspecting a single packet:
 - **Upload** — packets *arriving* on the engine-facing interface. A
   `tc police` action on that ingress hook drops everything above the policer's
   rate and holds nothing; what survives is redirected with `act_mirred` onto
-  an `ifb` device, where the bottleneck (`tbf`: the rate and the queue depth)
-  and the impairment (`netem`: half the delay, all of the loss) live.
+  an `ifb` device, where the impairment (`netem`: half the delay, all of the
+  loss) and, beneath it, the bottleneck (`tbf`: the rate and the queue depth)
+  live.
 - **Download** — packets *leaving* on that same interface: the other half of
   the round trip, carrying no loss and no rate limit.
 
@@ -362,6 +369,19 @@ profile chain does not.
 | `shaping_buffer_bdp` | multiples of the BDP | bottleneck queue depth; requires both a rate and a latency, since the bandwidth-delay product is their product |
 | `shaping_policer_kbps` | **kilobits/s** | token-bucket policer on the ingress hook: drops above its rate, queues nothing |
 
+`shaping_buffer_bdp` is the **congestion** queue, and only that — enforced as
+`tbf`'s own byte `limit`, on a queue nothing else shares. The upload's `netem`
+sits at the root and `tbf` is its child: a packet waits out its delay in
+netem's delay line and only then joins tbf's queue, so the delay line and the
+congestion queue are two qdiscs with two limits. (The other way round, a netem
+child replaces tbf's byte-limited queue with its own packet limit, which then
+has to hold the delay line too; whatever the line was not using at a given
+instant — every jitter draw short of its worst case — became congestion buffer
+no column records.) The delay line's packet limit is set far out of reach of
+what the line can hold, because a delay line is a length of wire, not a queue
+the emulated link has. Packet timing, where loss applies and jitter's
+reordering are the same in both layouts.
+
 > **The two rate keys disagree, and the disagreement is inherited.**
 > `shaping_bandwidth_kbps` — the toxiproxy driver's — is **KILOBYTES** per
 > second, because that is what toxiproxy's bandwidth toxic takes. Every netem
@@ -395,7 +415,12 @@ traffic beside it — and tears the shape down again so the measured block
 installs its own. The result is recorded as `emulator_validation_mbps` in
 `metrics.csv` and `summary.json`, and it is a **gate**: outside ±10% of the
 configured `shaping_bottleneck_kbps` the run is refused with a
-`CalibrationError` rather than recorded. A scenario with no bottleneck — the
+`CalibrationError` rather than recorded. The probe runs on the shape's
+impairment-free twin — the same rate, buffer and mean delay, without loss, the
+policer or jitter — because each of those lowers a TCP flow's goodput by
+design: jitter reorders packets, and on an honestly one-BDP queue a flow
+reading that reordering as loss measured below the 9.0 floor of a 10 Mbit/s
+link whose bucket was delivering its rate. A scenario with no bottleneck — the
 policer in scenario 15 — still records the probe but is not gated on it, since
 a TCP flow through a policer lands well below the token rate by design and a
 band around that rate would refuse every policed run.

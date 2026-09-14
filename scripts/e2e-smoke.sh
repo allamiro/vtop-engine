@@ -220,7 +220,12 @@ fi
 # <service>` also lists that service's dependencies, so the mc one is selected
 # by name; an empty answer is a refusal, because falling back to a literal is
 # how the two drift apart in the first place.
-MC_IMAGE=$("${COMPOSE[@]}" config --images minio-init 2>/dev/null | grep '/mc:' | head -1)
+# `|| true` is load-bearing (review): the script runs under `set -e` with
+# `pipefail`, so a failing `compose config` — or a grep that simply matches
+# nothing — makes the whole pipeline non-zero and the shell exits HERE, before
+# the check below can say why. The diagnostic added to stop a silent failure
+# would then itself be silenced, in exactly the case it exists for.
+MC_IMAGE=$("${COMPOSE[@]}" config --images minio-init 2>/dev/null | grep '/mc:' | head -1 || true)
 if [ -z "$MC_IMAGE" ]; then
   fail "could not read the mc image from the compose file; object counts would be meaningless"
   exit 1
