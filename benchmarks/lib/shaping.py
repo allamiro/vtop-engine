@@ -23,6 +23,16 @@ proxies), so the aggregate pipe is the shape times the connections in flight.
 A scenario that wants a fixed pipe keeps one upload in flight
 (`max_concurrent_batches: 1`); scenario 13 does. The recorded shape says so.
 
+toxiproxy is ONE driver, and since #477 it is one of two: `shaping_driver`
+selects it (the default, unchanged) or the netem middlebox in `lib/netem.py`,
+which can do what a TCP-terminating proxy cannot — drop packets, police a
+rate, and give two flows a queue to share. This module holds the driver the
+scenarios have always used, plus the dispatch both go through, so a caller
+asks for "the shape this scenario wants" and never for a driver by name.
+
+The two are NOT comparable and the matrix refuses to place them in one table:
+a per-connection bandwidth toxic and an L3 token bucket are different links.
+
 Nothing here imports the engine: it drives toxiproxy's HTTP API with the
 standard library, the way the rest of the harness drives the binary.
 """
@@ -36,6 +46,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
+
+from .scenario import DEFAULTS as _SCENARIO_DEFAULTS
 
 # Every toxic this harness installs is named `vtop_<run token>_<kind>`: the
 # prefix marks it as ours, the token marks it as THIS run's (review). A proxy
@@ -89,8 +101,69 @@ def _non_negative_int(value: Any, key: str) -> int:
     return out
 
 
+# The shaping drivers, and the one a scenario gets when it names none. The
+# default is toxiproxy for a reason that outlives the choice: rewriting the
+# bundled scenarios onto a new driver would make their recorded numbers
+# incomparable to their future ones.
+DRIVERS = ("toxiproxy", "netem")
+DEFAULT_DRIVER = "toxiproxy"
+
+# The scenario keys only the netem driver reads. Named here so that setting
+# one while leaving the driver at toxiproxy is REFUSED rather than ignored:
+# a knob that is recorded and not applied is the failure this harness spends
+# most of its refusals preventing.
+NETEM_ONLY_KEYS = ("shaping_loss_pct", "shaping_loss_model", "shaping_bottleneck_kbps",
+                   "shaping_buffer_bdp", "shaping_policer_kbps")
+
+# And the keys only the toxiproxy driver reads (review). The mirror image, and
+# the direction a scenario is actually converted in: somebody copies a shaped
+# toxiproxy scenario, changes `shaping_driver` to netem, and leaves the rate
+# behind. Nothing here reads it, so the link comes out unlimited while
+# `summary.scenario` still shows the rate that was asked for — a corrupted
+# experiment with no refusal anywhere in it.
+TOXIPROXY_ONLY_KEYS = ("shaping_api_url", "shaping_proxy", "shaping_bandwidth_kbps")
+
+# Their defaults, read from the schema rather than restated here: the test
+# for "did the scenario SET this" is "does it differ from the default", and
+# a default restated in two files drifts. `shaping_loss_model` is why this
+# matters — its default is the non-empty string "random", so an emptiness
+# test would call every unshaped scenario in the tree a netem scenario, and
+# `shaping_proxy` (default "minio") is the same trap on the other side.
+NETEM_ONLY_DEFAULTS = {key: _SCENARIO_DEFAULTS[key] for key in NETEM_ONLY_KEYS}
+TOXIPROXY_ONLY_DEFAULTS = {key: _SCENARIO_DEFAULTS[key] for key in TOXIPROXY_ONLY_KEYS}
+
+# One lookup for both directions, so the "did the author choose this" rule is
+# written once and cannot answer differently depending on which way it is asked.
+_DRIVER_ONLY_DEFAULTS = {**NETEM_ONLY_DEFAULTS, **TOXIPROXY_ONLY_DEFAULTS}
+
+
+def _left_at_default(key: str, value: Any) -> bool:
+    default = _DRIVER_ONLY_DEFAULTS[key]
+    if isinstance(default, str):
+        return str(value if value is not None else default).strip() == default
+    try:
+        return float(str(value).strip() or 0) == float(default)
+    except (TypeError, ValueError):
+        # Not a number at all: the driver that reads it will say so far more
+        # precisely than this guard could, so it is not "left at default".
+        return False
+
+
+def _set_but_unread(scenario, keys: tuple[str, ...]) -> list[str]:
+    """Which of `keys` this scenario actually chose a value for.
+
+    "Chose" is "differs from the schema default", never "is non-empty": the
+    loader stamps every scenario with all of `DEFAULTS`, and two of these keys
+    default to a non-empty string, so an emptiness test would report the
+    loader's own values as the author's on every file in the tree.
+    """
+    return [key for key in keys
+            if not _left_at_default(key, scenario.get(key, _DRIVER_ONLY_DEFAULTS[key]))]
+
+
 @dataclass(frozen=True)
 class Shape:
+    driver = "toxiproxy"
     api_url: str
     proxy: str
     bandwidth_kbps: int
@@ -167,21 +240,39 @@ class Shape:
         without the pipe it was measured through — and its scope, because
         toxiproxy's bandwidth toxic limits each CONNECTION, so the aggregate
         is this times the connections in flight."""
-        return {"proxy": self.proxy, "bandwidth_kbps": self.bandwidth_kbps,
+        return {"driver": self.driver,
+                "proxy": self.proxy, "bandwidth_kbps": self.bandwidth_kbps,
                 "latency_ms": self.latency_ms, "jitter_ms": self.jitter_ms,
+                # KILOBYTES per second, because that is what toxiproxy's
+                # bandwidth toxic takes. The netem driver's rate keys are
+                # KILOBITS; the unit travels with the number so a reader of
+                # two rows never has to remember which driver used which.
+                "rate_unit": "kilobytes_per_second",
                 "scope": "per_connection", "run_token": self.run_token}
 
     def flat_columns(self) -> dict[str, Any]:
         """The shape as flat `shaping_*` columns for metrics.csv, the summary
         table and the matrix comparison (review): a p95 in any view carries
         the pipe it was measured through."""
-        return {"shaping_proxy": self.proxy, "shaping_bandwidth_kbps": self.bandwidth_kbps,
+        return {"shaping_driver": self.driver,
+                "shaping_proxy": self.proxy, "shaping_bandwidth_kbps": self.bandwidth_kbps,
                 "shaping_latency_ms": self.latency_ms, "shaping_jitter_ms": self.jitter_ms,
-                "shaping_scope": "per_connection"}
+                "shaping_scope": "per_connection",
+                # The netem columns exist on every row, blank here (#477):
+                # a column that appears only for the runs that set it makes a
+                # results directory two shapes of file.
+                "shaping_loss_pct": "", "shaping_loss_model": "",
+                "shaping_bottleneck_kbps": "", "shaping_buffer_bdp": "",
+                "shaping_policer_kbps": ""}
 
 
-SHAPING_COLUMNS = ("shaping_proxy", "shaping_bandwidth_kbps", "shaping_latency_ms",
-                   "shaping_jitter_ms", "shaping_scope")
+# Every shaping column, in the order the results files carry them. One tuple
+# for BOTH drivers (#477): the columns do not depend on which driver ran, so a
+# results directory holding runs from each is still one shape of file.
+SHAPING_COLUMNS = ("shaping_driver", "shaping_proxy", "shaping_bandwidth_kbps",
+                   "shaping_latency_ms", "shaping_jitter_ms", "shaping_scope",
+                   "shaping_loss_pct", "shaping_loss_model", "shaping_bottleneck_kbps",
+                   "shaping_buffer_bdp", "shaping_policer_kbps")
 
 # The bundled stack's proxy: this name, forwarding to the compose MinIO. The
 # lab credential fallback is tied to it (review) — a custom proxy under any
@@ -404,3 +495,166 @@ def shaped(scenario, client_factory: Callable[[str], ToxiproxyClient] = Toxiprox
     finally:
         clear(shape, client)
         log(f"[bench] shaping removed from {shape.proxy}")
+
+
+# --------------------------------------------------------------- the dispatch
+#
+# One entry point per question, so a caller asks "what shape does this
+# scenario want" and never "which driver is this". The netem module is
+# imported inside the functions: it imports this one for ShapingError and the
+# shapeable-backend list, and a module-level import either way would be a
+# cycle.
+
+
+def selected_driver(scenario) -> str:
+    """The driver a scenario asks for, validated."""
+    driver = str(scenario.get("shaping_driver", "") or DEFAULT_DRIVER).strip()
+    if driver not in DRIVERS:
+        raise ValueError(
+            f"shaping_driver {driver!r} is not one of {list(DRIVERS)}")
+    return driver
+
+
+def shape_from_scenario(scenario):
+    """The shape this scenario wants, or None for an unshaped run.
+
+    Validated when the scenario is loaded, not when the shape is installed: a
+    bad knob must fail before the seed data exists.
+    """
+    driver = selected_driver(scenario)
+    if driver == "netem":
+        # The mirror of the refusal below, and the one a real edit walks into
+        # (review): a toxiproxy scenario is converted by changing ONE line, and
+        # its `shaping_bandwidth_kbps` stays behind reading as an intent nothing
+        # here honours. The rate is not translated on the author's behalf,
+        # either — the two drivers' rate units differ by a factor of eight, and
+        # a harness that guessed would file a measurement against a pipe nobody
+        # configured, which is the same failure as ignoring the key with extra
+        # confidence.
+        set_but_unread = _set_but_unread(scenario, TOXIPROXY_ONLY_KEYS)
+        if set_but_unread:
+            raise ValueError(
+                f"{set_but_unread} only the toxiproxy driver reads, and shaping_driver is "
+                f"{driver!r}: the run would record a shape it never applied. The rate is not "
+                "translated for you — shaping_bandwidth_kbps is KILOBYTES per second, "
+                "toxiproxy's unit, while every netem rate is KILOBITS per second, tc's unit, "
+                "and converting between them here would file a number under a pipe nobody "
+                "configured. Say what the netem link should be with shaping_bottleneck_kbps "
+                "(and shaping_buffer_bdp), or remove the keys")
+        from . import netem
+        return netem.NetemShape.from_scenario(scenario)
+    # toxiproxy, the default. A netem-only knob set here would be recorded in
+    # the summary and applied by nothing, so it is refused by name rather than
+    # ignored — the scenario meant to shape something.
+    set_but_unread = _set_but_unread(scenario, NETEM_ONLY_KEYS)
+    if set_but_unread:
+        raise ValueError(
+            f"{set_but_unread} only the netem driver reads, and shaping_driver is "
+            f"{driver!r}: the run would record a shape it never applied. Set "
+            "shaping_driver: netem, or remove the keys")
+    return Shape.from_scenario(scenario)
+
+
+def require_endpoint_reaches_the_shape(scenario, effective_endpoint: str) -> None:
+    """The engine must reach the store THROUGH whatever is shaping it. Each
+    driver's own bypass looks different, so each answers this itself."""
+    if selected_driver(scenario) == "netem":
+        from . import netem
+        netem.require_endpoint_reaches_the_middlebox(scenario, effective_endpoint)
+        return
+    require_endpoint_through_proxy(scenario, effective_endpoint)
+
+
+@contextmanager
+def shaped_run(scenario, shape=None, endpoint: str | None = None,
+               log: Callable[[str], None] = print,
+               client_factory: Callable[[str], ToxiproxyClient] = ToxiproxyClient,
+               runner: Callable[..., Any] | None = None) -> Iterator[Any]:
+    """Shape the pipe for the block on whichever driver the scenario names,
+    and unshape it after — on a failed run, on a keyboard interrupt, on any
+    way out."""
+    shape = shape if shape is not None else shape_from_scenario(scenario)
+    if shape is None:
+        yield None
+        return
+    if getattr(shape, "driver", DEFAULT_DRIVER) == "netem":
+        from . import netem
+        with netem.shaped(shape, run=runner, log=log) as active:
+            yield active
+        return
+    with shaped(scenario, client_factory=client_factory, log=log,
+                endpoint=endpoint, shape=shape) as active:
+        yield active
+
+
+# ------------------------------------------------------- the human-facing line
+#
+# The last place a shape is read is the one place it was not driver-aware
+# (review): summary.md's shaped-pipe row named toxiproxy's keys directly, so
+# every netem run printed `None: unlimited KB/s` — no driver, no rate, and a
+# unit belonging to the other driver — in the artifact the runner points an
+# operator at when the run ends.
+
+# How a recorded `rate_unit` is spelled for a human. There is no per-driver
+# default here on purpose: toxiproxy's rate is KILOBYTES per second because
+# that is what its bandwidth toxic takes, every netem rate is KILOBITS because
+# that is what `tc` takes, and a renderer that assumed either one would be
+# wrong by a factor of eight on the other half of the results directory.
+RATE_UNIT_LABELS = {"kilobytes_per_second": "KB/s", "kilobits_per_second": "kbit/s"}
+
+
+def _recorded_rate(record: dict, key: str) -> str:
+    """A rate out of a shape record, carrying the unit the record recorded.
+
+    A unit this table does not know is printed exactly as it was recorded: a
+    cell that reads oddly can be traced back to the run that wrote it, while a
+    cell that confidently names the wrong unit cannot be told from a correct
+    one.
+    """
+    unit = str(record.get("rate_unit", "") or "")
+    return f"{record.get(key) or 'unlimited'} {RATE_UNIT_LABELS.get(unit, unit or '(unit unrecorded)')}"
+
+
+def describe_shape_line(record: dict | None) -> str:
+    """A recorded shape as one line of prose, for the human-facing views.
+
+    Takes `describe()`'s dict — what lands in summary.json — rather than a
+    shape object, because a results directory outlives the process that wrote
+    it and summary.md is rendered from the summary document.
+
+    One line, because its caller is a table cell; and it names its DRIVER,
+    because two of them write these rows now and a reader holding two
+    summaries cannot be asked to infer which emulator produced which.
+    """
+    if not record:
+        return "none (unshaped)"
+    driver = str(record.get("driver", "") or DEFAULT_DRIVER)
+    # The scope qualifies the rate — toxiproxy's is per connection, netem's is
+    # the whole L3 link — so it sits beside it rather than at the end.
+    scope = str(record.get("scope", "") or "").replace("_", " ")
+    round_trip = f"{record.get('latency_ms', 0)} ms RTT ±{record.get('jitter_ms', 0)} ms"
+    if driver != "netem":
+        # toxiproxy, and any record old enough to predate the driver key: the
+        # line it has always been, with the driver now in front of it.
+        rate = _recorded_rate(record, "bandwidth_kbps")
+        return f"{driver} {record.get('proxy')}: {f'{rate} {scope}'.strip()}, {round_trip}"
+    # netem's rate is a bottleneck rather than a per-connection toxic, and its
+    # loss and policer have no toxiproxy equivalent at all, so the parts differ
+    # even where the shape of the line does not. Each is stated only when it
+    # was asked for: a cell listing "0% loss" on every row buries the rows that
+    # do lose packets, which are the ones the netem driver exists for.
+    parts = [f"{_recorded_rate(record, 'bottleneck_kbps')} bottleneck {scope}".strip()]
+    if record.get("bottleneck_kbps"):
+        # The buffer only means something under a bottleneck: it IS tbf's
+        # queue, and it is recorded in BDP multiples because that is the
+        # number that decides whether a link buffers or drops.
+        parts.append(f"{record.get('buffer_bdp')}x BDP buffer")
+    parts.append(round_trip)
+    if record.get("loss_pct"):
+        # The MODEL travels with the percentage: a gemodel row and a random row
+        # at the same average loss are the same number and a different link.
+        parts.append(f"{record.get('loss_pct')}% loss ({record.get('loss_model')}) "
+                     f"on {record.get('loss_direction', 'upload')}")
+    if record.get("policer_kbps"):
+        parts.append(f"policed at {_recorded_rate(record, 'policer_kbps')}")
+    return f"{driver}: " + ", ".join(parts)

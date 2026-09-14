@@ -27,6 +27,9 @@ import sys
 from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+from lib.shaping import SHAPING_COLUMNS  # noqa: E402
 
 COMPARE_COLS = [
     "scenario_name", "run_id", "format", "file_size", "volume", "compression",
@@ -36,9 +39,10 @@ COMPARE_COLS = [
     "throughput_files_per_sec", "throughput_mb_per_sec", "avg_latency_ms",
     "p95_latency_ms", "p99_latency_ms", "successful_batches", "failed_batches",
     "replayed_files", "cpu_max_percent", "memory_max_mb",
-    # The pipe a shaped run was measured through (#403); empty when unshaped.
-    "shaping_proxy", "shaping_bandwidth_kbps", "shaping_latency_ms", "shaping_jitter_ms",
-    "shaping_scope", "upload_p95_ms",
+    # The pipe a shaped run was measured through (#403, #477); empty when
+    # unshaped. Spliced from lib/shaping.py so the matrix cannot fall behind a
+    # driver that adds a column.
+    *SHAPING_COLUMNS, "emulator_validation_mbps", "upload_p95_ms",
     # Which way the sender ran (#476); a comparison across modes is a
     # comparison of namespaces, and the matrix must say so.
     "runner_mode",
@@ -132,6 +136,58 @@ def run_one(scenario_path, results_dir):
     return run_dir
 
 
+def matrix_row(summary: dict) -> dict:
+    """One summary flattened into one comparison row.
+
+    The scenario's own keys fill in what the summary does not carry — but they
+    must NOT overwrite a column the run RESOLVED (#477). Every scenario carries
+    the loader's default `shaping_driver: toxiproxy`, so a blanket update
+    stamps that onto unshaped rows too, and `refuse_mixed_drivers` then fires
+    on the one comparison it is written to allow: a netem run beside its own
+    unshaped baseline. The summary's value is what the run DID; the scenario's
+    is what it asked for, and where they differ the former wins.
+    """
+    row = dict(summary)
+    resolved = {key: row[key] for key in SHAPING_COLUMNS if key in row}
+    row.update(summary.get("scenario", {}))
+    row.update(resolved)
+    # An unshaped run carries no shaping columns at all, and blank is what the
+    # refusal reads as "not shaped" — spell it, rather than leaving the
+    # scenario's request showing.
+    for key in SHAPING_COLUMNS:
+        row.setdefault(key, "")
+    return row
+
+
+class IncomparableRuns(RuntimeError):
+    """Two shaping drivers in one comparison table.
+
+    Not a warning and not a label (#477): a per-connection bandwidth toxic
+    and an L3 token bucket with a real buffer are different links, and a
+    reader who sees two rows side by side in one table will compare them
+    whatever the driver column says. The refusal names both drivers, because
+    the fix is to run the comparison on one of them.
+    """
+
+
+def refuse_mixed_drivers(rows: list[dict]) -> None:
+    """Refuse a row set spanning two shaping drivers.
+
+    Unshaped rows do not count: a shaped run against an unshaped one is the
+    comparison shaping exists FOR, and its two rows differ in a column that
+    says so. Two SHAPED rows on different drivers differ in the emulator
+    itself, which no column can make comparable.
+    """
+    drivers = sorted({str(r.get("shaping_driver", "") or "").strip()
+                      for r in rows} - {""})
+    if len(drivers) > 1:
+        raise IncomparableRuns(
+            f"this matrix spans {len(drivers)} shaping drivers ({', '.join(drivers)}): "
+            "a per-connection proxy toxic and an L3 qdisc are different links, so their "
+            "rows cannot share a comparison table. Run the comparison on one driver — "
+            "split the scenario list, or point them all at the same shaping_driver")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("scenarios", nargs="*")
@@ -184,9 +240,11 @@ def main() -> int:
             continue
         with open(summ_path) as fh:
             summ = json.load(fh)
-        flat = dict(summ)
-        flat.update(summ.get("scenario", {}))
-        rows.append(flat)
+        rows.append(matrix_row(summ))
+
+    # Before a single row is written (#477): a table that exists is a table
+    # somebody reads, so the refusal has to land before the file does.
+    refuse_mixed_drivers(rows)
 
     # matrix.csv
     with open(os.path.join(matrix_dir, "matrix.csv"), "w", newline="") as fh:

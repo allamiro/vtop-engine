@@ -13,6 +13,8 @@ import random
 import string
 from datetime import datetime, timezone
 
+from .shaping import SHAPING_COLUMNS, describe_shape_line
+
 CSV_HEADERS: dict[str, list[str]] = {
     "metrics.csv": [
         "run_id", "scenario_name", "start_time", "end_time", "duration_seconds",
@@ -25,9 +27,13 @@ CSV_HEADERS: dict[str, list[str]] = {
         "upload_p50_ms", "upload_p95_ms", "cpu_avg_percent",
         "cpu_max_percent", "memory_avg_mb", "memory_max_mb", "disk_read_mb",
         "disk_write_mb", "network_tx_mb", "network_rx_mb", "error_count",
-        # The pipe the run was measured through (#403); empty when unshaped.
-        "shaping_proxy", "shaping_bandwidth_kbps", "shaping_latency_ms",
-        "shaping_jitter_ms", "shaping_scope",
+        # The pipe the run was measured through (#403, #477); empty when
+        # unshaped. Spliced from ONE tuple in lib/shaping.py so a driver that
+        # adds a column cannot add it to the summary and forget metrics.csv.
+        *SHAPING_COLUMNS,
+        # What the emulator itself produced, alone, through the shaped path
+        # (#477): blank unless a netem run measured it.
+        "emulator_validation_mbps",
         # Which way the sender ran (#476): host process or containerized.
         # Recorded on EVERY run, host mode included, so no number is ever
         # read without knowing which namespace produced it.
@@ -145,14 +151,15 @@ def _md_cell(v) -> str:
 
 def _shaping_cell(s: dict) -> str:
     """The pipe a shaped run was measured through, or 'none': a p95 in the
-    human view is never read without it (review)."""
-    shape = s.get("shaping")
-    if not shape:
-        return "none (unshaped)"
-    return _md_cell(
-        f"{shape.get('proxy')}: {shape.get('bandwidth_kbps') or 'unlimited'} KB/s "
-        f"{shape.get('scope', 'per_connection').replace('_', ' ')}, "
-        f"{shape.get('latency_ms')} ms RTT ±{shape.get('jitter_ms')} ms")
+    human view is never read without it (review).
+
+    The prose comes from lib/shaping.py, which owns both drivers' vocabulary
+    (#477). This file used to spell out toxiproxy's keys and toxiproxy's unit
+    here, which is how every netem summary came to report a 10 Mbit/s
+    bottleneck as `None: unlimited KB/s` — naming neither the rate nor the
+    driver, in the artifact the runner prints a path to when a run ends.
+    """
+    return _md_cell(describe_shape_line(s.get("shaping")))
 
 
 def _summary_md(s: dict) -> str:

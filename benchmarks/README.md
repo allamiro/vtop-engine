@@ -250,6 +250,179 @@ What the run answers, and where to read it:
 | what does the controller see? | the raw signal #102's width controller consumes — the per-batch `object_upload_ms`, summarized as `upload_p50_ms` / `upload_p95_ms`, against the pipe. The controller itself lives in the engine process, and this harness runs one `process-once` per cycle, so its width resets every cycle: observing the back-off (and the throttle counter it reacts to) needs a long-lived `vtopctl run` against the same shaped stack with its `/metrics` scraped, which is where the #102 measurement belongs |
 | what is the control? | the runner unshapes the pipe on every way out, so a following unshaped run of scenario 12 is the comparison — same seeder, same store, no pipe |
 
+### The netem middlebox: loss, policing and a real queue (#477)
+
+toxiproxy makes the pipe thin and long, and that is the whole of what it can
+make it. It terminates TCP — bytes are read out of one connection and written
+into another — so there is no packet to drop, no token bucket to overrun, and
+no queue for two flows to share. Those are exactly the conditions under which
+one transport beats another, so the egress work (#475) needs a second shaper
+rather than a wider toxic. `shaping_driver` chooses which one a scenario gets:
+
+| `shaping_driver` | what it is | what it can produce |
+|---|---|---|
+| `toxiproxy` (the default) | a TCP-terminating proxy, shaping each **connection** it proxies | rate, round-trip delay, jitter |
+| `netem` | an L3 forwarding **middlebox** shaped with `tc`, on the **aggregate** path | the same three, plus packet **loss** (independent or bursty), a token-bucket **policer**, and a real bottleneck **queue** of a chosen depth |
+
+toxiproxy stays the default for a reason that outlives the choice: rewriting
+the bundled scenarios onto a new driver would make their recorded numbers
+incomparable to their future ones. Naming the driver **is** the opt-in — a
+netem scenario has no `shaping_api_url` to switch on — and a netem-only key
+left on a toxiproxy scenario (`shaping_loss_pct`, `shaping_loss_model`,
+`shaping_bottleneck_kbps`, `shaping_buffer_bdp`, `shaping_policer_kbps`) is
+refused by name rather than ignored: a knob that is recorded and applied by
+nothing is the failure this harness spends most of its refusals preventing.
+
+**The two drivers are not comparable, and the matrix refuses rather than
+labels.** A per-connection bandwidth toxic inside a proxy and an aggregate L3
+token bucket with a queue in front of it are different links, and two rows
+side by side in one table get compared whatever the `shaping_driver` column
+says. `run_matrix.py` raises `IncomparableRuns` — before a single row is
+written — when a comparison spans two shaped drivers. A shaped row beside an
+*unshaped* one is fine: that is the comparison shaping exists for, and the
+columns say which is which.
+
+#### The middlebox, and why the shaping is not on the sender
+
+The `netem` compose profile adds one container, `vtop-bench-netem`, which
+forwards at L3 between the engine and the store. It is the only service in the
+lab file that holds `CAP_NET_ADMIN`; the engine and the store keep
+`cap_drop: [ALL]`. `netem` and `tbf` run **there** and never on the sender,
+because a qdisc on the sender queues on the transmit side and reshapes the
+very traffic being measured — the sender's own backpressure becomes part of
+the number, and the result is a property of the harness rather than of the
+link.
+
+The box has two interfaces, which is what makes the directions separable
+without inspecting a single packet:
+
+- **Upload** — packets *arriving* on the engine-facing interface. A
+  `tc police` action on that ingress hook drops everything above the policer's
+  rate and holds nothing; what survives is redirected with `act_mirred` onto
+  an `ifb` device, where the bottleneck (`tbf`: the rate and the queue depth)
+  and the impairment (`netem`: half the delay, all of the loss) live.
+- **Download** — packets *leaving* on that same interface: the other half of
+  the round trip, carrying no loss and no rate limit.
+
+Loss therefore lands on the **upload direction only**, so `shaping_loss_pct`
+means exactly "loss on the data path" instead of a number whose end-to-end
+effect depends on which way a packet happened to be going;
+`summary.json` records `loss_direction: upload` beside it.
+
+The engine reaches the store by dialling the middlebox at `http://netem:9200`,
+which DNATs to MinIO on its own store-side network, so every byte crosses the
+qdiscs. That port is deliberately **not** published on the host: Docker's
+userland proxy for a published port terminates TCP, which would put a second
+TCP-terminating hop in a path whose entire purpose is to be L3 — the defect
+that makes toxiproxy unable to answer this question in the first place. So a
+netem scenario is container-mode only, and `lib/netem.py` refuses
+`runner_mode: host`, a backend that never dials `endpoint_url`, and an
+`endpoint_url` (or a `VTOP_S3_ENDPOINT_URL` override) that does not name the
+middlebox.
+
+#### Running one
+
+```bash
+docker compose -f benchmarks/docker-compose.benchmark.yml --profile netem up -d
+```
+
+That is the middlebox and its calibration probe. Every netem scenario is also
+a **container-mode** scenario, so the engine needs the `containerized` profile
+beside it — with its binary built first, and the run root mounted, exactly as
+in §3:
+
+```bash
+cargo build --release --bin vtopctl
+docker compose -f benchmarks/docker-compose.benchmark.yml \
+  --profile netem --profile containerized up -d
+python3 benchmarks/run_benchmark.py benchmarks/scenarios/14-lossy-wan.yaml
+docker compose -f benchmarks/docker-compose.benchmark.yml \
+  --profile netem --profile containerized down
+```
+
+The bundled stack needs no keys of your own: the lab credential fallback
+follows the middlebox exactly as it follows the toxiproxy proxy —
+`lib/engine.py` reads a netem scenario aimed at `netem:9200` as the lab's own
+store, because that is the only store the box forwards to, and supplies the
+same `MINIO_ROOT_*` values the stack itself honors (#81). Real environment
+credentials still outrank them, and the rest of §3's container-mode rule
+stands: keys and SDK endpoint overrides cross the boundary by name, the AWS
+profile chain does not.
+
+#### The keys, and their units
+
+| key | unit | what it does |
+|---|---|---|
+| `shaping_driver` | — | `toxiproxy` (default) or `netem` |
+| `shaping_latency_ms` | milliseconds | the **round trip**, split across the two directions |
+| `shaping_jitter_ms` | milliseconds | spread on that round trip, normally distributed; needs a latency to spread |
+| `shaping_loss_pct` | percent | loss on the upload direction; 100 or more is refused, since a run through it measures nothing |
+| `shaping_loss_model` | — | `random` (independent per packet) or `gemodel` (Gilbert-Elliott: bursty, mean burst two packets); a non-random model with no loss is refused |
+| `shaping_bottleneck_kbps` | **kilobits/s** | the `tbf` rate; requires a `shaping_buffer_bdp`, because tbf's queue *is* the bottleneck buffer and nobody should inherit a default one |
+| `shaping_buffer_bdp` | multiples of the BDP | bottleneck queue depth; requires both a rate and a latency, since the bandwidth-delay product is their product |
+| `shaping_policer_kbps` | **kilobits/s** | token-bucket policer on the ingress hook: drops above its rate, queues nothing |
+
+> **The two rate keys disagree, and the disagreement is inherited.**
+> `shaping_bandwidth_kbps` — the toxiproxy driver's — is **KILOBYTES** per
+> second, because that is what toxiproxy's bandwidth toxic takes. Every netem
+> rate key (`shaping_bottleneck_kbps`, `shaping_policer_kbps`) is **KILOBITS**
+> per second, because that is what `tc` takes. The same 10 Mbit/s WAN is
+> `shaping_bandwidth_kbps: 1250` on toxiproxy and
+> `shaping_bottleneck_kbps: 10000` on netem — an eightfold difference in the
+> spelling of one link. Each recorded shape carries its own `rate_unit` so the
+> unit travels with the number; a reader comparing the raw columns has to
+> convert deliberately.
+
+The three bundled netem scenarios all shape the same 10 Mbit/s, 100 ms link,
+so that they differ in what the middlebox does with a burst and in nothing
+else. Their workload is scenario 13's (400 small JSONL files, 50-record
+batches, a 1.5x concurrent seeder, 300 s), so the numbers can be read beside
+it — the toxiproxy row's caveats included:
+
+| scenario | the link | what it measures |
+|---|---|---|
+| `14-lossy-wan` | 0.5% bursty (`gemodel`) loss, one BDP of buffer | non-congestive loss, where a loss-based control law settles near the inverse square root of the loss rate. Acceptance criterion: `object_upload` p95 at least **3x** the same file at zero loss — and the zero-loss control is that file with `shaping_loss_pct: 0` **and the `shaping_loss_model` line removed**, which the driver requires |
+| `15-policed-uplink` | a 10 Mbit/s policer, no queue at all | the edge-uplink case with **no queueing-delay signal**: the round trip stays flat while the link shreds bursts, so a delay-based control law degrades silently. The drops are the policer's, so the loss columns read 0 |
+| `16-contended-bottleneck` | four BDP of buffer, no loss | queue depth: what a batch waits behind when the buffer is deep (4 BDP = 400 ms of standing queue at this rate). **Not** fairness or contention — nothing here starts a second flow; that half is #478 |
+
+#### The calibration gate
+
+An emulator that is not producing the link it was configured for files numbers
+against a link that does not exist. So before a seed byte is written, a netem
+run installs its shape, measures it with **iperf3 alone** — from a separate
+probe container, across the same ingress hook the upload crosses, with no VTOP
+traffic beside it — and tears the shape down again so the measured block
+installs its own. The result is recorded as `emulator_validation_mbps` in
+`metrics.csv` and `summary.json`, and it is a **gate**: outside ±10% of the
+configured `shaping_bottleneck_kbps` the run is refused with a
+`CalibrationError` rather than recorded. A scenario with no bottleneck — the
+policer in scenario 15 — still records the probe but is not gated on it, since
+a TCP flow through a policer lands well below the token rate by design and a
+band around that rate would refuse every policed run.
+
+#### What netem itself cannot tell you
+
+Absolute measurement is a **non-goal** here, and the emulator is the reason:
+
+- it is bounded by **kernel timer granularity** — delay and rate are enforced
+  at the resolution the timer offers, and the finer the interval a link
+  implies, the more the emulator quantizes it;
+- rate throttling **compresses packets artificially**: throttled traffic is
+  released in bursts that a real link of the same average rate would have
+  spaced out, so the arrival pattern is emulator-shaped even when the average
+  is right;
+- published testbeds run netem from roughly **100 Mbit/s upward**, and the
+  upper end of that range is not clearly sound — the faster the configured
+  link, the more of the result belongs to the emulator;
+- and this is **one host**: the middlebox, the engine and the store share a
+  CPU, a scheduler and a clock with each other and with whatever else runs.
+
+So a netem number is a **comparison and never an absolute**: this scenario
+against that one, on the same driver, on the same machine, close together in
+time. It does not say what the engine would do over a real WAN of the same
+nominal rate, and the ±10% calibration band bounds the emulator's error, not
+the claim.
+
 ## 8. Clean benchmark data
 
 ```bash

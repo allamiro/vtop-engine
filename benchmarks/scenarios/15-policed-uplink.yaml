@@ -1,0 +1,73 @@
+name: policed-uplink
+description: >-
+  The same 10 Mbit/s uplink as scenario 14, enforced by a token-bucket
+  POLICER instead of a queue (#477). This is the normal condition on an
+  edge uplink — a carrier or a CPE meters the customer's rate and destroys
+  what exceeds it — and it is a different link from scenario 14's
+  bottleneck, not a restatement of it. There, excess bytes WAIT: tbf holds
+  a one-BDP queue, so the round trip inflates, the sender is told something
+  by the delay, and every byte eventually arrives. Here there is no buffer
+  at all: `tc police` sits on the ingress hook ahead of the redirect, drops
+  everything above its rate on arrival, and the round trip stays flat at
+  its propagation value however hard the sender pushes. The signal is that
+  ABSENCE. A delay-based control law — including this harness's own
+  object_upload_ms, the raw signal #102's width controller consumes —
+  reads a healthy, unloaded path while the link is quietly shredding the
+  uplink's bursts, so goodput collapses with nothing in the latency series
+  to explain it. Read this run against scenario 14: same rate, same round
+  trip, same workload; queue there, no queue here. Requires the netem
+  stack, docker compose -f benchmarks/docker-compose.benchmark.yml
+  --profile netem --profile containerized up -d, and unshapes the middlebox
+  when it ends.
+volume: 400
+file_size: small
+format: jsonl
+compression: gzip
+checksum: sha256
+backend: s3_native
+bucket: "vtop-bench-soak"
+# As in scenario 14: the engine dials the middlebox and it forwards at L3
+# to MinIO. A host-mode run would reach the store without crossing a single
+# qdisc, and lib/netem.py refuses one.
+runner_mode: container
+endpoint_url: http://netem:9200
+shaping_driver: netem
+# The same continental round trip scenarios 13 and 14 use, so the three sit
+# on one distance and differ in what the middlebox does with a burst.
+shaping_latency_ms: 100
+# No jitter: a FLAT round trip is the finding. Any variation this run shows
+# is the network stack's own, and fabricating some here would put exactly
+# the signal a policer withholds back into the series.
+shaping_jitter_ms: 0
+# 10 Mbit/s of tokens and no queue behind them, the same rate scenario 14
+# shapes with a queue. There is deliberately no shaping_bottleneck_kbps: a
+# bottleneck IS a buffer (tbf's limit), and adding one would give the run
+# the queueing-delay signal whose absence is the point.
+#
+# Two consequences worth knowing before reading the numbers. The drops are
+# the POLICER's, so shaping_loss_pct stays 0 and the loss columns read 0
+# while the link is dropping — netem loss is a different mechanism, filed
+# in a different column. And lib/netem.py's calibration gate keys on
+# shaping_bottleneck_kbps, so it does not fire here: the iperf3 probe still
+# runs and its number is still recorded as emulator_validation_mbps, but it
+# is not gated, because a TCP flow through a policer lands well under the
+# token rate by design and a +/-10% band around that rate would refuse
+# every policed run.
+shaping_policer_kbps: 10000
+batch_max_records: 50
+batch_max_bytes: 1048576
+batch_max_age_seconds: 5
+# One upload in flight, as in scenario 14, so the pair differs in the
+# middlebox and in nothing else. A second connection would change the
+# offered burst structure at the same time as the shape, and a policer's
+# whole behaviour is a response to burst structure.
+max_concurrent_batches: 1
+# Scenario 13's seeding, unchanged: the offered load must exceed what the
+# link passes, or the run never reaches the rate being policed and the
+# policer never drops anything.
+backlog_multiplier: 1.5
+seed_concurrently: true
+seed_interval_seconds: 1.0
+duration_seconds: 300
+fault: none
+sys_sample_interval: 2.0

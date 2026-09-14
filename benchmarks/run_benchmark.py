@@ -107,13 +107,24 @@ def main() -> int:
               "compose stack (profile `containerized` must be up)")
     # The shape is judged HERE, before a seed byte exists (#403): a bad knob
     # fails the run before it costs anything, and a shaped scenario never
-    # runs unshaped under its own name.
-    shape = shaping.Shape.from_scenario(sc)
+    # runs unshaped under its own name. Which SHAPER is the scenario's own
+    # choice (#477); the dispatch answers for both.
+    shape = shaping.shape_from_scenario(sc)
+    emulator_validation_mbps = ""
     if shape is not None:
-        # The engine must go THROUGH the proxy the shape is on: an endpoint
+        # The engine must go THROUGH whatever is shaping it: an endpoint
         # override (VTOP_S3_ENDPOINT_URL outranks the scenario) would send it
-        # around the toxics while the summary said shaped.
-        shaping.require_endpoint_through_proxy(sc, engine.effective_endpoint(sc))
+        # around the toxics, or around the middlebox, while the summary said
+        # shaped.
+        shaping.require_endpoint_reaches_the_shape(sc, engine.effective_endpoint(sc))
+        # And the emulator itself is measured before it is trusted (#477): an
+        # emulator that does not produce the link it was configured for files
+        # numbers against a link that does not exist. netem only — toxiproxy
+        # shapes each connection inside the proxy, where an iperf3 run through
+        # the same proxy would measure a different thing than the engine does.
+        if getattr(shape, "driver", "") == "netem":
+            from lib import netem
+            emulator_validation_mbps = netem.calibrate(shape)
     run_id = new_run_id(sc.name)
     writer = ResultsWriter(results_root, run_id)
     print(f"[bench] scenario={sc.name} run_id={run_id}")
@@ -235,7 +246,8 @@ def main() -> int:
     with SystemMonitor(emit_sys, interval=float(sc.get("sys_sample_interval", 1.0)),
                        container="vtop-bench-engine" if mode == "container" else None,
                        proc_name=None if mode == "container" else engine_proc_name), \
-            shaping.shaped(sc, endpoint=engine.effective_endpoint(sc), shape=shape):
+            shaping.shaped_run(sc, shape=shape,
+                               endpoint=engine.effective_endpoint(sc)):
         # initial seed
         # A --seed-dir the caller supplied may already hold input. Those bytes
         # reach `bytes_archived`, so they must reach `bytes_seeded` too or the
@@ -592,8 +604,21 @@ def main() -> int:
         # The pipe the numbers were measured through, or None (#403): a p95
         # is never read without it.
         "shaping": shape.describe() if shape else None,
+        # What the emulator actually produced, alone, through the shaped path
+        # (#477). Blank for an unshaped run and for the toxiproxy driver;
+        # recorded beside every netem number so a result is never read
+        # without the evidence that its link was the configured one.
+        "emulator_validation_mbps": emulator_validation_mbps,
         # And flat, for the CSV, the summary table and the matrix (review).
-        **(shape.flat_columns() if shape else {}),
+        # An UNSHAPED run states its columns blank rather than omitting them
+        # (#477): the matrix fills a missing column from the scenario, and
+        # every scenario carries the loader's default `shaping_driver:
+        # toxiproxy` — so an omitted column made an unshaped baseline claim a
+        # driver it never used, and the mixed-driver refusal then fired on the
+        # one comparison it exists to permit. Blank is a measurement; absent
+        # is a hole somebody else fills in.
+        **(shape.flat_columns() if shape
+           else {column: "" for column in shaping.SHAPING_COLUMNS}),
         # Which way the sender ran (#476), on every run including host-mode
         # ones: a container's veth and its bridge hop are part of the
         # measurement, and a number read without knowing the namespace is a

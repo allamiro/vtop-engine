@@ -65,9 +65,23 @@ DEFAULTS: dict[str, Any] = {
     # lib/shaping.py. "" = unshaped; the rest matter only when it is set.
     "shaping_api_url": "",
     "shaping_proxy": "minio",
-    "shaping_bandwidth_kbps": 0,
+    "shaping_bandwidth_kbps": 0,      # KILOBYTES/s — toxiproxy's own unit
     "shaping_latency_ms": 0,
     "shaping_jitter_ms": 0,
+    # WHICH shaper (#477): "toxiproxy" is the TCP-terminating proxy above and
+    # stays the default, so every recorded scenario keeps the link it was
+    # measured on. "netem" is the L3 middlebox in lib/netem.py — the one that
+    # can drop packets, police a rate and share a queue. Naming it IS the
+    # opt-in: a netem scenario has no api_url to switch on.
+    "shaping_driver": "toxiproxy",
+    # netem only. Loss lands on the DATA direction; the model names how it
+    # arrives, not how much. The rate keys are KILOBITS/s, tc's unit — not the
+    # kilobytes shaping_bandwidth_kbps above takes.
+    "shaping_loss_pct": 0,
+    "shaping_loss_model": "random",   # random | gemodel (bursty)
+    "shaping_bottleneck_kbps": 0,
+    "shaping_buffer_bdp": 0,          # bottleneck buffer, in BDP multiples
+    "shaping_policer_kbps": 0,        # a policer holds no queue
 }
 
 

@@ -1,0 +1,75 @@
+name: contended-bottleneck
+description: >-
+  The same 10 Mbit/s bottleneck as scenario 14, given a DEEP buffer
+  (#477): four bandwidth-delay products of queue in front of the link, the
+  bufferbloat an ordinary edge device ships with. Queue depth is the
+  variable. A full 4-BDP queue holds 500 KB, which is 400 ms of
+  transmission at this rate, so a batch that arrives behind a standing
+  queue waits five times the idle path's 100 ms before its first byte
+  reaches the store — and it waits without a single packet being dropped,
+  which is what makes a deep buffer worse than a shallow one for anything
+  that reads latency. The signal is the spread: object_upload p95 against
+  p50, and both against scenario 14's zero-loss control, which is this same
+  link at one BDP. Compare it to THAT rather than to scenario 14 as
+  committed, which also carries loss — two variables in one comparison
+  measure neither. What this file does NOT measure is contention: the
+  competing-flow half of the picture is #478's job, and nothing here starts
+  a second flow, so no number from this run says anything about fairness or
+  about how two flows divide a queue. The name is where the scenario sits
+  on that axis; what it measures today is the engine alone against a deep
+  one. Requires the netem stack, docker compose -f
+  benchmarks/docker-compose.benchmark.yml --profile netem --profile
+  containerized up -d, and unshapes the middlebox when it ends.
+volume: 400
+file_size: small
+format: jsonl
+compression: gzip
+checksum: sha256
+backend: s3_native
+bucket: "vtop-bench-soak"
+# As in scenarios 14 and 15: the engine dials the middlebox and it forwards
+# at L3 to MinIO, and lib/netem.py refuses a host-mode run, which would
+# reach the store without crossing a qdisc at all.
+runner_mode: container
+endpoint_url: http://netem:9200
+shaping_driver: netem
+# The same continental round trip as scenarios 13, 14 and 15 — and the base
+# every queueing delay below is measured ON TOP of.
+shaping_latency_ms: 100
+# No jitter: the delay variation this scenario is about must come from the
+# queue filling and draining, and netem's own would be indistinguishable
+# from it in the series.
+shaping_jitter_ms: 0
+# The same 10 Mbit/s pipe as scenario 14, so depth is the only difference.
+shaping_bottleneck_kbps: 10000
+# Four BDP = 500 KB = 400 ms of standing queue at this rate: deep enough
+# that the queue and not the link dominates what a batch waits for, shallow
+# enough to be a buffer a real edge device ships rather than a pathological
+# one. Scenario 14 holds the one-BDP end of the axis.
+shaping_buffer_bdp: 4.0
+# No loss keys, deliberately: the only drops here are tbf's tail drops when
+# that queue overflows, which is congestive loss and part of what a deep
+# buffer does. netem loss would mix a NON-CONGESTIVE drop into a
+# measurement of a queue — that is scenario 14's variable, not this one's.
+batch_max_records: 50
+batch_max_bytes: 1048576
+batch_max_age_seconds: 5
+# FOUR uploads in flight, where scenarios 14 and 15 keep one. A queue only
+# reaches its bound if the bottleneck is offered work continuously, and
+# with a single batch in flight the pipe idles through batch assembly,
+# compression and checksumming while the queue drains — the depth measured
+# would then be the harness's pauses rather than the buffer's. netem shapes
+# the AGGREGATE L3 path, so unlike scenario 13's per-connection toxic these
+# four connections do not widen the pipe; they only keep it occupied. Four
+# is also the middle of the 1/4/8 width grid #102 runs scenario 12 at, so
+# the upload percentiles here can be put beside those.
+max_concurrent_batches: 4
+# Scenario 13's seeding, unchanged: a deep queue only fills if the offered
+# load exceeds what the link drains, and an engine that is caught up
+# measures an empty buffer.
+backlog_multiplier: 1.5
+seed_concurrently: true
+seed_interval_seconds: 1.0
+duration_seconds: 300
+fault: none
+sys_sample_interval: 2.0

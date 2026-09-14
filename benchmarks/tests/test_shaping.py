@@ -2,21 +2,29 @@
 the toxics it becomes, and the apply/remove discipline around a run — all
 against a scripted client, so no socket is ever opened."""
 
+import os
 import textwrap
 
 import pytest
 
 from lib.engine import _is_lab_endpoint
-from lib.scenario import Scenario, load_scenario
+from lib.metrics import _shaping_cell
+from lib.netem import NetemShape
+from lib.scenario import DEFAULTS, Scenario, load_scenario
 from lib.shaping import (
     LOCK_TOXIC,
+    SHAPING_COLUMNS,
     TOXIC_KINDS,
     Shape,
     ShapingError,
     apply,
+    describe_shape_line,
     require_endpoint_through_proxy,
+    shape_from_scenario,
     shaped,
 )
+
+SCENARIO_DIR = os.path.join(os.path.dirname(__file__), "..", "scenarios")
 
 
 def scenario(**values):
@@ -60,12 +68,28 @@ def test_the_shape_is_read_from_flat_keys_and_the_api_url_is_normalized():
     assert (shape.api_url, shape.proxy, shape.bandwidth_kbps, shape.latency_ms, shape.jitter_ms) == (
         "http://127.0.0.1:8474", "minio", 1250, 100, 20)
     assert len(shape.run_token) == 8, "a token per run"
-    assert shape.describe() == {"proxy": "minio", "bandwidth_kbps": 1250,
+    # The record names its DRIVER and its UNIT since #477: two drivers now
+    # write these rows, their rate keys disagree about kilobytes versus
+    # kilobits, and a reader with two summaries in front of them cannot be
+    # asked to remember which was which.
+    assert shape.describe() == {"driver": "toxiproxy",
+                                "proxy": "minio", "bandwidth_kbps": 1250,
                                 "latency_ms": 100, "jitter_ms": 20,
+                                "rate_unit": "kilobytes_per_second",
                                 "scope": "per_connection", "run_token": shape.run_token}
-    assert shape.flat_columns() == {"shaping_proxy": "minio", "shaping_bandwidth_kbps": 1250,
+    # The netem columns are present and BLANK on a toxiproxy row: a column
+    # that appears only for the runs that set it makes a results directory
+    # two shapes of file, and the matrix reads one.
+    assert shape.flat_columns() == {"shaping_driver": "toxiproxy",
+                                    "shaping_proxy": "minio", "shaping_bandwidth_kbps": 1250,
                                     "shaping_latency_ms": 100, "shaping_jitter_ms": 20,
-                                    "shaping_scope": "per_connection"}
+                                    "shaping_scope": "per_connection",
+                                    "shaping_loss_pct": "", "shaping_loss_model": "",
+                                    "shaping_bottleneck_kbps": "", "shaping_buffer_bdp": "",
+                                    "shaping_policer_kbps": ""}
+    assert set(shape.flat_columns()) == set(SHAPING_COLUMNS), (
+        "every shaping column exists on every shaped row, whichever driver wrote it — "
+        "a results directory with two shapes of header is not one comparison")
     assert shape.toxic_names() == [f"vtop_{shape.run_token}_{k}" for k in TOXIC_KINDS]
 
 
@@ -401,3 +425,189 @@ def test_the_shaped_proxy_port_is_the_lab_only_when_shaped():
     assert _is_lab_endpoint("http://127.0.0.1:9000")
     assert _is_lab_endpoint("http://127.0.0.1:9000", shaped=True)
     assert not _is_lab_endpoint("http://localhost:4566", shaped=True)
+
+
+# --------------------------------------------------------------------------
+# The human-facing cell (#477): summary.md's shaped-pipe row, now that two
+# drivers write it
+# --------------------------------------------------------------------------
+
+
+def full_netem_shape(**overrides) -> NetemShape:
+    """A netem shape with every knob turned on, so a renderer that silently
+    drops one is caught here rather than by an operator wondering why a run
+    that was policed does not say so."""
+    return NetemShape(**{"latency_ms": 100, "jitter_ms": 20, "loss_pct": 1.0,
+                         "loss_model": "gemodel", "bottleneck_kbps": 10000,
+                         "buffer_bdp": 1.0, "policer_kbps": 5000, **overrides})
+
+
+def test_the_netem_cell_names_its_driver_and_its_rate_in_the_unit_it_was_recorded_in():
+    # The bug this pins: the cell used to read toxiproxy's `proxy` and
+    # `bandwidth_kbps` off a netem record, which carries neither, and label the
+    # result KB/s. A 10 Mbit/s bottleneck therefore printed as
+    # `None: unlimited KB/s aggregate l3, 100 ms RTT ±20 ms` — no driver, no
+    # rate, and the other driver's unit — in the one artifact the runner points
+    # an operator at when the run finishes.
+    cell = _shaping_cell({"shaping": full_netem_shape().describe()})
+    assert cell == ("netem: 10000 kbit/s bottleneck aggregate l3, 1.0x BDP buffer, "
+                    "100 ms RTT ±20 ms, 1.0% loss (gemodel) on upload, "
+                    "policed at 5000 kbit/s"), (
+        "the summary's shaped-pipe row is where a p95 is read together with the link that "
+        "produced it; every part of the link a netem scenario can ask for has to be in it, "
+        "or the number is read against a pipe the reader has to guess at")
+    assert "unlimited" not in cell, (
+        "a configured bottleneck reported as unlimited is the original defect: it hides the "
+        "constraint the whole run was measuring against")
+    assert "KB/s" not in cell, (
+        "tc's rates are KILOBITS; labelling them KB/s reads the link as eight times its "
+        "real size, which is worse than printing no unit at all")
+
+
+def test_the_netem_cell_states_only_the_impairments_the_scenario_asked_for():
+    # A cell that printed "0% loss" and "unlimited kbit/s" on every row would
+    # bury the rows that DO lose packets, and those are the rows the netem
+    # driver exists to produce. Scenario 15 is the real shape here: a policer
+    # and no bottleneck, so no queue and no BDP buffer to report.
+    policed = _shaping_cell({"shaping": NetemShape(latency_ms=100,
+                                                   policer_kbps=10000).describe()})
+    assert policed == ("netem: unlimited kbit/s bottleneck aggregate l3, 100 ms RTT ±0 ms, "
+                       "policed at 10000 kbit/s"), (
+        "a policer holds no queue, so there is no buffer depth to name; saying '0.0x BDP' "
+        "would describe a bottleneck the scenario deliberately did not configure")
+    assert "loss" not in policed, (
+        "scenario 15's drops are the POLICER's, not netem's loss model; a '0% loss' phrase "
+        "here invites the reader to conclude nothing was dropped")
+    lossy = _shaping_cell({"shaping": NetemShape(latency_ms=100, loss_pct=0.5,
+                                                 loss_model="gemodel").describe()})
+    assert "0.5% loss (gemodel) on upload" in lossy, (
+        "the MODEL travels with the percentage: a gemodel row and a random row at the same "
+        "average loss are the same number and a different link, and the direction is stated "
+        "because loss is applied to the data path alone")
+
+
+def test_the_cell_reads_its_unit_off_the_record_and_never_assumes_one():
+    # The two drivers disagree about what a "kbps" is, so the unit is data, not
+    # a constant in the renderer. Swapping only `rate_unit` must move the label
+    # — if it does not, some branch is hardcoding a unit and will eventually
+    # hardcode the wrong one.
+    record = full_netem_shape().describe()
+    assert "10000 kbit/s" in describe_shape_line(record)
+    assert "10000 KB/s" in describe_shape_line({**record, "rate_unit": "kilobytes_per_second"}), (
+        "the label follows the recorded unit, or the renderer is deciding the unit itself "
+        "and a third driver would be mislabelled the day it is added")
+    # An unknown unit is printed as recorded rather than guessed at: a cell that
+    # reads oddly can be traced back to the run that wrote it, while a cell that
+    # confidently names the wrong unit cannot be told from a correct one.
+    assert "furlongs_per_fortnight" in describe_shape_line(
+        {**record, "rate_unit": "furlongs_per_fortnight"})
+
+
+def test_the_toxiproxy_cell_still_says_everything_it_said_before_and_now_names_its_driver():
+    cell = _shaping_cell({"shaping": Shape("http://x", "minio", 1250, 100, 20).describe()})
+    assert cell.endswith("minio: 1250 KB/s per connection, 100 ms RTT ±20 ms"), (
+        "every shaped run recorded since #403 reads this way, and a results directory is "
+        "compared across releases: the toxiproxy row must not be reworded out from under "
+        "the numbers already filed against it")
+    assert cell.startswith("toxiproxy "), (
+        "two drivers write this row now, and toxiproxy's KB/s and netem's kbit/s look "
+        "identical in a column; the driver is what tells a reader which one to read")
+
+
+def test_an_unshaped_run_still_renders_as_unshaped():
+    # Most scenarios in the suite are unshaped, so this is the cell that
+    # appears most often; a driver name or a rate here would claim a pipe that
+    # was never in the path.
+    assert _shaping_cell({}) == "none (unshaped)"
+    assert _shaping_cell({"shaping": None}) == "none (unshaped)"
+
+
+# --------------------------------------------------------------------------
+# Knobs the selected driver does not read (#477)
+# --------------------------------------------------------------------------
+
+
+def netem_scenario(**overrides) -> Scenario:
+    """A netem scenario the way the loader produces one: every key in the
+    schema present, because that is what makes "did the author set this" a
+    question about defaults rather than about emptiness."""
+    return Scenario({**DEFAULTS, "shaping_driver": "netem",
+                     "shaping_latency_ms": 100, **overrides})
+
+
+def test_a_toxiproxy_knob_under_the_netem_driver_is_refused_rather_than_ignored():
+    # The conversion this refusal is about: a 1250 KB/s toxiproxy scenario is
+    # copied, `shaping_driver` is changed to netem, and the rate is left behind.
+    # Nothing in the netem driver reads it, so the link came out UNLIMITED while
+    # summary.scenario still showed the rate that was asked for and the resolved
+    # shaping column was blank — a corrupted experiment with no refusal in it.
+    with pytest.raises(ValueError, match="only the toxiproxy driver reads") as exc:
+        shape_from_scenario(netem_scenario(shaping_bandwidth_kbps=1250))
+    assert "shaping_bandwidth_kbps" in str(exc.value), (
+        "the refusal names the key to move or remove, or the author has to bisect their own "
+        "scenario file to find out which line was ignored")
+    assert "KILOBYTES" in str(exc.value) and "KILOBITS" in str(exc.value), (
+        "the message must say why the harness will not just convert the number: the two "
+        "drivers' rates differ by a factor of eight, and a silent conversion would file a "
+        "measurement against a pipe nobody configured")
+    # The other two toxiproxy-only keys carry the same hazard: an api_url points
+    # at a shaper this run never contacts, and a proxy name that is not the
+    # default says the author believed a proxy was in the path.
+    with pytest.raises(ValueError, match="shaping_api_url"):
+        shape_from_scenario(netem_scenario(shaping_api_url="http://127.0.0.1:8474"))
+    with pytest.raises(ValueError, match="shaping_proxy"):
+        shape_from_scenario(netem_scenario(shaping_proxy="other"))
+
+
+def test_a_toxiproxy_key_left_at_its_default_is_not_a_choice_the_author_made():
+    # The trap this guard was written around, and the reason it compares
+    # against the SCHEMA rather than testing for emptiness: `shaping_proxy`
+    # defaults to the non-empty string "minio", so an emptiness test would read
+    # the loader's own stamp as the author's intent and refuse every netem
+    # scenario in the tree before it seeded a byte.
+    assert DEFAULTS["shaping_proxy"] == "minio", (
+        "if this default ever becomes empty the guard still works, but the test below stops "
+        "proving the thing it was written to prove")
+    assert shape_from_scenario(netem_scenario()) is not None, (
+        "a netem scenario carrying the loader's defaults for the toxiproxy keys must load; "
+        "it named no proxy, it just failed to delete keys it never wrote")
+    assert shape_from_scenario(netem_scenario(shaping_proxy="minio",
+                                              shaping_api_url="",
+                                              shaping_bandwidth_kbps=0)) is not None, (
+        "and spelling the defaults out by hand is the same statement as leaving them out")
+
+
+def test_a_netem_knob_under_the_toxiproxy_driver_is_still_refused():
+    # The original direction, re-pinned here because both guards now share
+    # `_left_at_default` and a change to one can silently break the other.
+    with pytest.raises(ValueError, match="only the netem driver reads") as exc:
+        shape_from_scenario(Scenario({**DEFAULTS,
+                                      "shaping_api_url": "http://127.0.0.1:8474",
+                                      "shaping_bandwidth_kbps": 1250,
+                                      "shaping_loss_pct": 1.0}))
+    assert "shaping_loss_pct" in str(exc.value)
+    assert shape_from_scenario(Scenario({**DEFAULTS,
+                                         "shaping_api_url": "http://127.0.0.1:8474",
+                                         "shaping_bandwidth_kbps": 1250})) is not None, (
+        "and the defaults may not refuse a toxiproxy shape the harness has been recording "
+        "since #403")
+
+
+def test_every_bundled_scenario_still_loads_under_both_driver_guards():
+    # A guard that reads a default as a choice refuses the whole suite, and it
+    # does so at load time, before a byte is seeded — so the cheapest place to
+    # catch it is here, over every scenario the repository ships.
+    paths = sorted(os.path.join(SCENARIO_DIR, f) for f in os.listdir(SCENARIO_DIR)
+                   if f.endswith((".yaml", ".yml")))
+    assert len(paths) >= 13, (
+        "the sweep found almost no scenarios, so it is proving nothing: the directory moved "
+        "or the suffix filter stopped matching")
+    drivers = set()
+    for path in paths:
+        shape = shape_from_scenario(load_scenario(path))
+        if shape is not None:
+            drivers.add(shape.driver)
+    assert drivers == {"toxiproxy", "netem"}, (
+        f"the sweep exercised {sorted(drivers)}: both guards are only proven harmless once a "
+        "real scenario of each driver has been through them, and the netem scenarios (14-16) "
+        "are the ones the new refusal could break")

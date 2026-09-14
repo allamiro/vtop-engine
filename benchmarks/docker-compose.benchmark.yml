@@ -50,6 +50,16 @@ services:
       retries: 10
     volumes:
       - bench-minio-data:/data
+    # The default lab network, plus the store side of the netem middlebox's
+    # path (#477). A FIXED address on that side because the middlebox DNATs
+    # to it: resolving `minio` from a host that shares two networks with it
+    # would be answerable two ways, and a middlebox that forwards to the
+    # wrong one measures the wrong hop. The engine, which is on the default
+    # network only, still resolves `minio` to the default-network address.
+    networks:
+      default:
+      netem-store:
+        ipv4_address: 10.77.0.10
 
   minio-init:
     image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
@@ -173,6 +183,103 @@ services:
     depends_on:
       minio:
         condition: service_healthy
+
+  # The netem middlebox (#477): the link that BITES.
+  #
+  # toxiproxy above can make the pipe thin and long; it terminates TCP, so it
+  # cannot drop a packet, cannot police a rate, and cannot give two flows a
+  # queue to share — which are exactly the conditions that separate one
+  # transport from another. This container forwards at L3 between the engine
+  # and the store and shapes itself with tc, so netem and tbf run HERE and
+  # never on the sender, where the transmit-side queue and the local qdisc
+  # would reshape the very traffic being measured.
+  #
+  # It is the ONLY service in this file holding CAP_NET_ADMIN, and a compose
+  # lint test asserts that; the engine and the store keep cap_drop: [ALL].
+  #
+  # The port is deliberately NOT published. Docker's userland proxy for a
+  # published port terminates TCP, which would put a second TCP-terminating
+  # hop in a path whose whole purpose is to be L3 — the same defect that
+  # makes toxiproxy unable to answer this question. A netem scenario is
+  # therefore container-mode only, and lib/netem.py refuses a host-mode one.
+  #
+  #   docker compose -f benchmarks/docker-compose.benchmark.yml \
+  #     --profile netem --profile containerized up -d
+  netem:
+    image: nicolaka/netshoot:v0.13
+    container_name: vtop-bench-netem
+    profiles: ["netem"]
+    # tc, ifb and the forwarding rules need NET_ADMIN; iptables additionally
+    # needs NET_RAW. Everything else is dropped, and nothing else in the lab
+    # gains a capability because this service exists.
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN, NET_RAW]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 512m
+    sysctls:
+      # Namespaced, so this forwards packets in THIS container only.
+      net.ipv4.ip_forward: "1"
+    # Two networks: the lab's default one, where the engine is, and the
+    # store-side one it forwards onto. `priority` orders the attachment, but
+    # it does NOT determine device names — Compose's reference says so
+    # explicitly (review) — so lib/netem.py never assumes `eth0`. It DISCOVERS
+    # the engine-facing interface by elimination: the middlebox's addressed
+    # interfaces minus the one on this store subnet. That is why the subnet is
+    # pinned here rather than left to Docker's pool; the driver reads it as the
+    # thing to exclude, and refuses if the answer is not exactly one interface.
+    networks:
+      default:
+        priority: 100
+      netem-store:
+        priority: 10
+        ipv4_address: 10.77.0.2
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        # The store, reached through this box: an engine dialling
+        # netem:9200 has its packets forwarded to MinIO's store-side
+        # address, so every byte crosses the qdiscs.
+        iptables -t nat -A PREROUTING -p tcp --dport 9200 \
+          -j DNAT --to-destination 10.77.0.10:9000
+        iptables -t nat -A POSTROUTING -d 10.77.0.10 -j MASQUERADE
+        # The calibration target (#477): iperf3 traffic to this box arrives
+        # on the same ingress hook the upload does, so a probe run alone
+        # measures the emulator rather than the engine.
+        iperf3 -s -p 5201 -D
+        exec sleep infinity
+    depends_on:
+      minio:
+        condition: service_healthy
+
+  # The calibration probe: iperf3 ALONE through the shaped path, so a run
+  # whose emulator is not producing the link it was configured for is refused
+  # rather than recorded. Separate from the engine container on purpose — the
+  # number must not be measured beside VTOP's own traffic.
+  netem-probe:
+    image: nicolaka/netshoot:v0.13
+    container_name: vtop-bench-netem-probe
+    profiles: ["netem"]
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 256m
+    command: ["sleep", "infinity"]
+    depends_on:
+      netem:
+        condition: service_started
+
+networks:
+  # The store side of the middlebox's path (#477). Its own subnet so the
+  # middlebox's two interfaces are unambiguous and the DNAT target is a fixed
+  # address rather than whichever answer DNS gives.
+  netem-store:
+    ipam:
+      config:
+        - subnet: 10.77.0.0/24
 
 volumes:
   bench-minio-data:

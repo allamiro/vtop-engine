@@ -1,0 +1,87 @@
+name: lossy-wan
+description: >-
+  Scenario 13's WAN with the pipe made LOSSY (#477): the same
+  seeder-outruns-engine deficit against live MinIO, but the upload path
+  crosses the netem middlebox instead of toxiproxy, so the link drops
+  packets rather than merely metering them. The loss here is
+  NON-CONGESTIVE — a bad hop, not a full queue — which is the condition a
+  loss-based control law reads as congestion anyway: it settles near the
+  inverse square root of the loss rate, so at 0.5% over a 100 ms round trip
+  one flow is pinned around a quarter of the 10 Mbit/s bottleneck and a
+  batch waits on retransmission rather than on bandwidth. That is the
+  signal — object_upload p95 against a link whose rate is not the
+  constraint. It is also the issue's headline acceptance criterion: this
+  scenario's object_upload p95 must be at least 3x the same scenario at
+  zero loss, and toxiproxy can produce neither side of that ratio, because
+  it terminates TCP and there is no packet to drop. Requires the netem
+  stack, docker compose -f benchmarks/docker-compose.benchmark.yml
+  --profile netem --profile containerized up -d, and unshapes the middlebox
+  when it ends.
+volume: 400
+file_size: small
+format: jsonl
+compression: gzip
+checksum: sha256
+backend: s3_native
+bucket: "vtop-bench-soak"
+# The middlebox, not the store: the engine dials netem:9200 and the box
+# forwards at L3 to MinIO on the far side of the qdiscs. Container mode is
+# not a preference — tc shapes the interfaces of the namespace it runs in,
+# and a host process reaching a published port never crosses them, so
+# lib/netem.py refuses a host-mode netem scenario rather than record a
+# shape nothing applied.
+runner_mode: container
+endpoint_url: http://netem:9200
+shaping_driver: netem
+# A continent's round trip, the same 100 ms scenario 13 shapes, so the two
+# rows differ in the emulator and the loss rather than in the distance.
+shaping_latency_ms: 100
+# No jitter, deliberately. netem's delay variation reorders packets on the
+# one qdisc, and the duplicate ACKs reordering produces are read by a
+# loss-based control law as loss — which is the single variable this
+# scenario exists to isolate.
+shaping_jitter_ms: 0
+# 0.5%: small enough to be an ordinary bad WAN hop, decisive anyway. A
+# loss-based flow settles near MSS/(RTT * sqrt(p)), so at 0.5% over 100 ms
+# it tops out around 2-3 Mbit/s — a quarter of the bottleneck below it.
+# The link is then LOSS-limited and not rate-limited, which is what makes
+# the 3x acceptance ratio a property of the loss instead of the pipe.
+shaping_loss_pct: 0.5
+# Bursty, because a real link's loss is. gemodel at the mean burst
+# lib/netem.py fixes (two packets) delivers this same 0.5% AVERAGE through
+# a different arrival pattern, and a control law responds to the pattern.
+shaping_loss_model: gemodel
+# The zero-loss control the acceptance criterion compares against is THIS
+# FILE with shaping_loss_pct: 0 and the shaping_loss_model line removed —
+# the driver refuses a named model with no loss to arrive, since the model
+# says how loss arrives and not how much. Everything else, the bottleneck
+# and buffer included, must stay identical, or the ratio compares two links
+# instead of one link twice.
+#
+# 10 Mbit/s: scenario 13's 1250 KB/s written in tc's unit. KILOBITS here,
+# KILOBYTES there — the same pipe, spelled in each driver's own unit.
+shaping_bottleneck_kbps: 10000
+# One BDP (10 Mbit/s x 100 ms = 125 KB), the classical sizing: enough queue
+# for a single flow to keep the link busy, too little to hide the loss
+# behind a standing queue. Scenario 16 is the deep-buffer end of this axis.
+shaping_buffer_bdp: 1.0
+batch_max_records: 50
+batch_max_bytes: 1048576
+batch_max_age_seconds: 5
+# ONE upload in flight — but not for scenario 13's reason. netem shapes the
+# aggregate L3 path, so a second connection would not widen the pipe the
+# way a second toxiproxy connection does; it would instead recover most of
+# what loss takes from a single control loop, because N parallel flows back
+# off independently. The effect this scenario measures would be averaged
+# away by its own concurrency.
+max_concurrent_batches: 1
+# The offered load has to exceed what the pipe drains even after gzip, or
+# object_upload p95 measures the seeder's pauses: 600 files/s of small
+# JSONL is roughly 19 MB/s raw, several times a 10 Mbit/s link's 1.25 MB/s
+# at any plausible compression ratio. Scenario 13's multiplier, unchanged.
+backlog_multiplier: 1.5
+seed_concurrently: true
+seed_interval_seconds: 1.0
+duration_seconds: 300
+fault: none
+sys_sample_interval: 2.0
