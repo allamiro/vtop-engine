@@ -41,6 +41,12 @@ pub async fn build_backend(cfg: &UploadConfig) -> Result<Arc<dyn UploadBackend>,
     // legacy multipart defaults — tuning recorded and applied by nothing. The
     // method is backend-gated, so this costs nothing for the other backends.
     cfg.validate_transports()?;
+    // And the bounds that belong to the MECHANISM rather than to a backend
+    // (review): `vtopctl tier copy` reaches a backend through here with a bare
+    // UploadConfig, so a semaphore ceiling enforced only in VtopConfig::validate
+    // is a ceiling that path does not have — and the value it guards panics
+    // rather than degrading.
+    cfg.validate_multipart_limits()?;
     let backend: Arc<dyn UploadBackend> = match cfg.backend.as_str() {
         "s3_native" => {
             let s3cfg = s3_native::config_from_upload(cfg);

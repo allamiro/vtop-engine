@@ -834,3 +834,94 @@ def test_an_unshaped_baseline_can_sit_beside_a_netem_row():
                           "scenario": {"shaping_driver": "toxiproxy"}})
     with pytest.raises(IncomparableRuns):
         refuse_mixed_drivers([proxied, shaped_row])
+
+
+def test_the_queue_limit_makes_room_for_the_packets_still_in_the_delay_line():
+    # netem's `limit` bounds every packet the qdisc HOLDS, and on a shape that
+    # also delays, packets waiting out their delay occupy it before a byte of
+    # congestion backlog does. The first version of this fix counted only the
+    # buffer, so on the bundled 10 Mbit/s / 100 ms link half of a 1-BDP limit
+    # went to the delay line and scenarios 14 and 16 ran with about HALF the
+    # bottleneck buffer they recorded (review).
+    shape = NetemShape(latency_ms=100, bottleneck_kbps=10_000, buffer_bdp=1.0)
+    assert shape.buffer_bytes() == 125_000, "1 BDP of a 10 Mbit/s, 100 ms link"
+    assert shape.delay_occupancy_bytes() == 62_500, (
+        "50 ms of upload delay at 10 Mbit/s is in flight, not queued"
+    )
+    held = shape.netem_limit_packets() * 1500
+    assert held - shape.delay_occupancy_bytes() >= 125_000, (
+        "what remains after the delay line must be the CONFIGURED buffer; "
+        "shaping_buffer_bdp is read as the congestion queue, and a column that "
+        "says 1.0 while the queue is 0.5 makes the deep-buffer and shallow-buffer "
+        "scenarios differ by less than they claim"
+    )
+
+    # A shape with no delay has no occupancy to make room for, so the limit is
+    # the buffer alone — the earlier behaviour, unchanged where it was right.
+    flat = NetemShape(latency_ms=0, bottleneck_kbps=10_000, buffer_bdp=0.0)
+    assert flat.delay_occupancy_bytes() == 0
+
+
+def test_the_configured_buffer_survives_the_delay_line_at_every_awkward_rate_and_rtt():
+    # The fourth defect in this one number, and the third found by staring at a
+    # single example (review): a 1006 kbit/s, 334 ms, 1-BDP link holds 21000.25
+    # bytes in flight, the old floor recorded 21000, and 42000 + 21000 is
+    # exactly 42 packets — so the sum's ceiling had nothing left to round and
+    # the link ran on 41999.75 bytes of buffer beneath a column reading 42000.
+    #
+    # A test that pinned that example would have been the fifth defect waiting
+    # to happen, so this pins the INVARIANT instead: after the delay line, at
+    # least the configured buffer must remain, at every rate and every round
+    # trip. The occupancy it judges against is computed here — exactly, in
+    # rationals, and independently of the module — because a test that asked
+    # the module how much its own line holds would agree with whatever rounding
+    # the module chose, which is exactly the failure being closed.
+    from fractions import Fraction
+
+    from lib.netem import MTU_BYTES, NetemShape
+
+    # Three sigma, spelled out rather than imported from JITTER_HEADROOM_SIGMAS,
+    # for the reason the jitter test spells it out too: a reserve read out of
+    # the module under test is a reserve nobody checked.
+    sigmas = 3
+
+    # Deliberately unround rates and round trips — nothing divisible by 8, odd
+    # and even millisecond counts, and buffer depths that scale the fraction
+    # differently. The reported case (1006 kbit/s, 334 ms, 1 BDP) is inside it,
+    # but so are ~10,000 others — and eight of them, not one, broke the
+    # invariant under the old floor, which is the point of sweeping.
+    for kbps in range(997, 1061):
+        for rtt in range(299, 341):
+            for jitter, bdp in ((0, 1.0), (7, 1.0), (20, 0.5), (13, 4.0)):
+                shape = NetemShape(latency_ms=rtt, jitter_ms=jitter,
+                                   bottleneck_kbps=kbps, buffer_bdp=bdp)
+                # Half the round trip with the odd millisecond on the upload —
+                # written out here, then checked against the module's own
+                # accessor, so a split that MOVED fails loudly instead of
+                # quietly changing what this sweep reserves against.
+                upload_ms = (rtt + 1) // 2
+                assert upload_ms == shape.upload_delay_ms(), (
+                    "the direction split changed; this sweep is now reserving against a "
+                    "delay line the shape does not install, and would pass while checking "
+                    "the wrong link"
+                )
+                # The kilo and the milli cancel: kbit/s x ms / 8 is bytes, and
+                # as a Fraction it is the exact count, quarter-bytes included.
+                held_ms = upload_ms + sigmas * ((jitter + 1) // 2)
+                in_flight = Fraction(kbps * held_ms, 8)
+                limit = shape.netem_limit_packets()
+                remaining = limit * MTU_BYTES - in_flight
+                assert remaining >= shape.buffer_bytes(), (
+                    f"{kbps} kbit/s, {rtt} ms, {jitter} ms jitter, {bdp} BDP: the delay "
+                    f"line holds {float(in_flight)} bytes and the limit is {limit} packets, "
+                    f"leaving {float(remaining)} behind it for a configured buffer of "
+                    f"{shape.buffer_bytes()}. Short of that, netem drops on its own limit "
+                    "before tbf's queue is anywhere near full: loss the emulator invented, "
+                    "recorded in no column, beside a buffer depth that overstates itself"
+                )
+                assert shape.delay_occupancy_bytes() >= in_flight, (
+                    f"{kbps} kbit/s, {rtt} ms, {jitter} ms jitter: the reported occupancy "
+                    f"{shape.delay_occupancy_bytes()} understates the {float(in_flight)} "
+                    "bytes actually in flight, and every limit derived from it inherits "
+                    "the shortfall"
+                )

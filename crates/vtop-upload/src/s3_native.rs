@@ -993,6 +993,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_tier_style_upload_config_has_its_semaphore_bound_enforced() {
+        // `vtopctl tier copy` deserializes a bare UploadConfig, derives its
+        // MultipartUploadConfig and reaches the backend through build_backend
+        // — never constructing a VtopConfig. A bound that lives only in
+        // VtopConfig::validate is therefore a bound that path does not have,
+        // and the value it guards PANICS in Semaphore::new rather than
+        // degrading (review).
+        let cfg: vtop_core::config::UploadConfig = serde_json::from_str(&format!(
+            r#"{{"bucket":"b","backend":"mock","multipart_max_parallelism":{}}}"#,
+            usize::MAX
+        ))
+        .expect("an absurd parallelism is still valid json");
+        let err = match crate::build_backend(&cfg).await {
+            Err(err) => err,
+            Ok(_) => panic!(
+                "a tier copy would reach Semaphore::new with a permit count above tokio's \
+                 ceiling and take the process down on the first eligible object"
+            ),
+        };
+        assert!(err.to_string().contains("semaphore"), "{err}");
+    }
+
+    #[tokio::test]
     async fn a_tier_style_upload_config_has_its_tuning_map_validated() {
         // `vtopctl tier` deserializes a bare UploadConfig and goes straight to
         // build_backend, never constructing a VtopConfig — so while the map

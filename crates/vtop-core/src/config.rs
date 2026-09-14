@@ -616,6 +616,18 @@ pub const BUILTIN_TRANSPORTS: &[&str] = &["tcp_tls"];
 /// operator's typo rather than refusing the config at load.
 pub const MAX_PARTS_IN_FLIGHT: usize = 10_000;
 
+/// The most parts ANY backend may have in flight, whatever its protocol says.
+///
+/// Two different limits, because they defend against two different things
+/// (review). [`MAX_PARTS_IN_FLIGHT`] is S3's 10,000 parts per upload — a
+/// protocol limit, and so an `s3_native` limit. THIS one is a property of the
+/// mechanism every backend shares: the value becomes a tokio semaphore's
+/// permit count, and tokio panics above `usize::MAX >> 3`. `MockBackend`
+/// advertises multipart too, so gating only the S3 limit would leave the panic
+/// reachable on a mock backend — the fix for one review finding re-opening the
+/// hole another had just closed.
+pub const MAX_SEMAPHORE_PERMITS: usize = usize::MAX >> 3;
+
 fn default_backend() -> String {
     "s3_native".to_string()
 }
@@ -697,6 +709,29 @@ impl UploadConfig {
         } else {
             EgressTuning::default()
         }
+    }
+
+    /// Bounds that belong to the MECHANISM, not to any one backend (#480).
+    ///
+    /// On `UploadConfig` and called from `build_backend`, for the same reason
+    /// `validate_transports` is (review): `vtopctl tier copy` deserializes a
+    /// bare UploadConfig, derives its MultipartUploadConfig and goes straight
+    /// to the backend, never constructing a VtopConfig — so a bound that lives
+    /// only in `VtopConfig::validate` is a bound that path does not have. This
+    /// one is not S3's 10,000 parts (see [`MAX_PARTS_IN_FLIGHT`], which is
+    /// backend-gated in `validate`); it is tokio's permit ceiling, above which
+    /// `Semaphore::new` panics rather than degrading, on every backend that
+    /// does multipart at all.
+    pub fn validate_multipart_limits(&self) -> Result<(), VtopError> {
+        if self.multipart_max_parallelism > MAX_SEMAPHORE_PERMITS {
+            return Err(VtopError::Config(format!(
+                "upload.multipart_max_parallelism = {} exceeds the maximum permits a \
+                 semaphore can hold ({MAX_SEMAPHORE_PERMITS}); the value becomes a permit \
+                 count and an oversized one panics at the first multipart upload",
+                self.multipart_max_parallelism
+            )));
+        }
+        Ok(())
     }
 
     /// Validate the per-transport tuning map (#480).
@@ -937,11 +972,19 @@ impl VtopConfig {
                 "upload.multipart_max_parallelism must be > 0".into(),
             ));
         }
+        self.upload.validate_multipart_limits()?;
         // The legacy spelling reaches the SAME semaphore as the tuning knob
         // (MultipartUploadConfig::max_parallelism), so it carries the same
-        // bound: bounding only the new key would leave the identical panic
-        // one config line away, under the name most deployments still use.
-        if self.upload.multipart_max_parallelism > MAX_PARTS_IN_FLIGHT {
+        // bound — but only where the bound MEANS something (review). The limit
+        // is S3's 10,000 parts per upload, which is a property of S3 and not of
+        // the semaphore: a mock or localfs backend has no such part limit, and
+        // rejecting its config against an S3 number would break configurations
+        // that were valid before this check existed. Every other transport
+        // decision in this file is backend-gated for the same reason; this one
+        // was not, and that was an over-reach.
+        if self.upload.backend == "s3_native"
+            && self.upload.multipart_max_parallelism > MAX_PARTS_IN_FLIGHT
+        {
             return Err(VtopError::Config(format!(
                 "upload.multipart_max_parallelism = {} exceeds the {MAX_PARTS_IN_FLIGHT} parts                  S3 allows in one multipart upload; the value becomes a semaphore's permit                  count, and an oversized one panics at the first upload instead of failing here",
                 self.upload.multipart_max_parallelism
@@ -1382,6 +1425,39 @@ upload:
             err.to_string().contains("multipart_max_parallelism"),
             "{err}"
         );
+
+        // ... but ONLY on s3_native (review). The limit is S3's 10,000 parts
+        // per upload — a property of S3, not of the semaphore — and a mock or
+        // localfs backend has no such limit. Rejecting its configuration
+        // against an S3 number would break setups that were valid before this
+        // check existed, and every other transport decision here is gated the
+        // same way.
+        let other_backend = format!(
+            "{}  backend: mock\n  multipart_max_parallelism: {}\n",
+            tuning_base(),
+            MAX_PARTS_IN_FLIGHT + 1
+        );
+        let cfg: VtopConfig = serde_yaml::from_str(&other_backend).unwrap();
+        cfg.validate().expect(
+            "a non-s3_native backend must not be refused against S3's part-count limit; that \
+             configuration was valid before this check and the limit does not describe it",
+        );
+
+        // ... but the MECHANISM's bound still applies to it (review). Gating
+        // the S3 limit must not re-open the panic on a backend that also does
+        // multipart: MockBackend advertises it, and the permit count is
+        // tokio's constraint, not S3's.
+        let absurd = format!(
+            "{}  backend: mock\n  multipart_max_parallelism: {}\n",
+            tuning_base(),
+            usize::MAX
+        );
+        let cfg: VtopConfig = serde_yaml::from_str(&absurd).unwrap();
+        let err = cfg.validate().expect_err(
+            "a value above tokio's permit ceiling panics at the first multipart upload, on \
+             every backend that does multipart — gating the S3 limit must not restore that",
+        );
+        assert!(err.to_string().contains("semaphore"), "{err}");
 
         // The limit itself is legal on both.
         for line in [
