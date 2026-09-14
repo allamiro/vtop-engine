@@ -137,7 +137,7 @@ services:
   # experiences is not the profile a middlebox installs.
   #   docker compose -f benchmarks/docker-compose.benchmark.yml --profile containerized up -d
   vtop-engine:
-    image: ubuntu:24.04
+    image: ubuntu:26.04
     container_name: vtop-bench-engine
     profiles: ["containerized"]
     command: ["sleep", "infinity"]
