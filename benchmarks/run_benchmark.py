@@ -26,7 +26,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from lib import engine, seed, shaping  # noqa: E402
+from lib import competitor, engine, seed, shaping  # noqa: E402
 from lib.metrics import ResultsWriter, iso_now, new_run_id, percentile  # noqa: E402
 from lib.scenario import load_scenario, reseed_count  # noqa: E402
 from lib.sysmon import SystemMonitor  # noqa: E402
@@ -110,6 +110,12 @@ def main() -> int:
     # runs unshaped under its own name. Which SHAPER is the scenario's own
     # choice (#477); the dispatch answers for both.
     shape = shaping.shape_from_scenario(sc)
+    # The flow beside the upload (#478), judged with the same
+    # before-it-costs-anything timing as the shape — and BEFORE the calibration
+    # probe below, because a typo in a scenario key should not first cost a
+    # shape install and a thirteen-second probe. None means no competitor and
+    # no columns.
+    contention_spec = competitor.CompetitorSpec.from_scenario(sc, shape)
     emulator_validation_mbps = ""
     if shape is not None:
         # The engine must go THROUGH whatever is shaping it: an endpoint
@@ -222,6 +228,11 @@ def main() -> int:
     seeded_bytes = 0
     seed_lock = threading.Lock()
 
+    # Set only by a contended run, where the engine's window ends before the
+    # closing solo one; None leaves the resource summary unbounded, which is
+    # right for every other run because its window IS the monitored period.
+    engine_window_end_iso = None
+
     def emit_sys(sample):
         row = {"run_id": run_id}
         row.update(sample)
@@ -243,11 +254,32 @@ def main() -> int:
     # engine process and report zero. realpath makes both sides name the
     # resolved file.
     engine_proc_name = os.path.basename(os.path.realpath(binary))
+    # The competitor is entered LAST and left FIRST (#478), which is what puts
+    # all three of its windows inside one installation of one shape: a shape
+    # reinstalled between the brackets would measure how reproducible `apply()`
+    # is rather than how steady the link was. It samples the engine's own
+    # committed-bytes counter to get VTOP's share of the contended window;
+    # reading an int under the GIL needs no lock, and the counter is the
+    # runner's own accounting rather than a second measurement of the wire.
     with SystemMonitor(emit_sys, interval=float(sc.get("sys_sample_interval", 1.0)),
                        container="vtop-bench-engine" if mode == "container" else None,
                        proc_name=None if mode == "container" else engine_proc_name), \
             shaping.shaped_run(sc, shape=shape,
-                               endpoint=engine.effective_endpoint(sc)):
+                               endpoint=engine.effective_endpoint(sc)), \
+            competitor.contended(contention_spec,
+                                 vtop_bytes=lambda: out_bytes) as contention:
+        # A CONTENDED RUN'S SOLO WINDOWS BELONG TO THE HARNESS, NOT TO THE
+        # ENGINE (#478). The competitor measures the empty link twice — once as
+        # this block opens, once as it closes — and the engine is deliberately
+        # idle for both. Billing those seconds to the engine would understate
+        # every throughput column by the length of a window in which it was
+        # asked not to work, and the understatement would grow with the window
+        # the scenario chose. So the clock restarts here, after the first one,
+        # and `duration_seconds` subtracts the second below. An uncontended run
+        # keeps the clock it has always been measured on.
+        if contention is not None:
+            start = time.time()
+            start_iso = iso_now()
         # initial seed
         # A --seed-dir the caller supplied may already hold input. Those bytes
         # reach `bytes_archived`, so they must reach `bytes_seeded` too or the
@@ -328,7 +360,24 @@ def main() -> int:
             seeder = threading.Thread(target=_seed_loop, name="seeder", daemon=True)
             seeder.start()
             print(f"[bench] seeding concurrently: {per_round} files every {interval}s")
+
+        # THE CONTENDED WINDOW OPENS HERE (#478): after the seed exists, after
+        # the seeder is running, and after the last refusal this block can
+        # still make. Not at the top of the block — a competitor started before
+        # there was anything to upload would spend its opening seconds alone on
+        # the link and record the average as contended — and not before those
+        # refusals, whose `return` would otherwise leave a window open with
+        # nobody to close it. `close()` refuses if this was never reached.
+        if contention is not None:
+            contention.start_with_vtop()
         while True:
+            # WHERE THE CYCLE BEGAN (#478, review). The engine's committed-byte
+            # total moves in one step when this call returns, so the contended
+            # window can only be charged with a cycle whose WHOLE interval it
+            # contains — and that needs the near edge as well as the far one.
+            # One clock read per cycle, taken unconditionally so the two edges
+            # can never come from different passes of this line.
+            cycle_started_at = time.monotonic()
             rc, outcomes, stderr = engine.process_once(binary, config_path, sc)
             if not outcomes:
                 if rc != 0:
@@ -436,6 +485,16 @@ def main() -> int:
                     })
 
             cycle += 1
+            # NOTED WHERE THE TOTAL HAS JUST MOVED (#478, review). The engine's
+            # committed-byte total is only updated as a cycle's outcomes are
+            # parsed, just above, so the cycle that closes here is the finest
+            # grain VTOP's share of the contended window can be measured at.
+            # Called after EVERY cycle and never conditionally: each cycle's
+            # bytes are a difference against the last one counted, so a skipped
+            # call would fold two cycles into one interval — likely to straddle
+            # an edge of the window and be dropped from the share entirely.
+            if contention is not None:
+                contention.note_progress(cycle_started_at)
             elapsed = time.time() - start
             if duration > 0:
                 # THE DEFICIT, recorded per cycle. Lag is the observable the
@@ -521,6 +580,27 @@ def main() -> int:
                 "replay_success": rc == 0, "error_message": "" if rc == 0 else out[:200],
             })
 
+        # THE BRACKET CLOSES HERE (#478): the engine's last work is done and
+        # the shape is still installed, which is the only moment the second
+        # solo window can measure the same link the first one did. Closing is
+        # the block's own act rather than the context manager's exit, because
+        # this block can also stop with a plain `return` — and a solo window
+        # measured on the way out of a refusal would spend a minute on it and
+        # could then raise a drift complaint that buries the reason the run
+        # actually stopped.
+        if contention is not None:
+            # The engine's window ends HERE, before the closing solo one
+            # (review). SystemMonitor is the outermost context, so it keeps
+            # sampling through both solo windows — during which the engine is
+            # deliberately idle and the competitor is saturating the link. Left
+            # unbounded, cpu_avg_percent was diluted by two windows of
+            # enforced idleness and the host-global network counters carried
+            # the competitor's own traffic, while duration_seconds excluded
+            # exactly those seconds. Recording the boundary lets the resource
+            # summary cover the same interval the duration reports.
+            engine_window_end_iso = iso_now()
+            contention.close()
+
 
     # --- the ledger, and what it costs to open (#98 hypotheses 2 and 3) -----
     # Both are about BATCH count rather than record count, which is why they
@@ -571,7 +651,15 @@ def main() -> int:
         shutil.rmtree(empty_dir, ignore_errors=True)
 
     end = time.time()
-    duration_s = round(end - start, 3)
+    # The second solo window ran as the block above closed, with the engine
+    # already idle (#478), so its seconds are subtracted rather than billed to
+    # the engine: they would otherwise divide every throughput column by a
+    # window in which nothing was uploaded. The first one is excluded by the
+    # clock restarting inside the block; both are recorded in summary.json, so
+    # the wall clock is reconstructible from what is written down. Zero for a
+    # run with no competitor, whose duration is the one it has always had.
+    harness_solo_seconds = contention.solo_after_seconds if contention else 0.0
+    duration_s = round(end - start - harness_solo_seconds, 3)
     in_mb = in_bytes / 1e6
     # The wire the run used and its tuning (#479, #480), recorded together so a
     # number is read with both. Only s3_native routes through the seam; the
@@ -625,6 +713,15 @@ def main() -> int:
         # recorded beside every netem number so a result is never read
         # without the evidence that its link was the configured one.
         "emulator_validation_mbps": emulator_validation_mbps,
+        # What the run cost the flow beside it (#478): every phase, its own
+        # window, and the arithmetic between them, so a reader can rebuild the
+        # fairness index rather than take it. None when the scenario named no
+        # competitor.
+        "competitor": contention.describe() if contention else None,
+        # And flat, for the CSV, the summary table and the matrix — blank when
+        # there was no competitor, for the same reason the shaping columns are
+        # blank rather than absent on an unshaped run.
+        **(contention.flat_columns() if contention else competitor.blank_columns()),
         # And flat, for the CSV, the summary table and the matrix (review).
         # An UNSHAPED run states its columns blank rather than omitting them
         # (#477): the matrix fills a missing column from the scenario, and
@@ -657,7 +754,13 @@ def main() -> int:
         "transport_tuning_flat": transport_tuning_flat,
     }
     # CPU/mem summary from the system-metrics samples written during the run.
-    summary.update(_sys_summary(writer.dir))
+    # Bounded to the engine's own window on a contended run, so the resource
+    # metrics correspond to duration_seconds and stay comparable with an
+    # uncontended run's (#478, review). Unbounded otherwise: an ordinary run's
+    # window IS the whole monitored period.
+    summary.update(_sys_summary(writer.dir,
+                                since_iso=start_iso if contention_spec else None,
+                                until_iso=engine_window_end_iso))
     summary["bottleneck_observations"] = _bottleneck(summary)
 
     writer.row("metrics.csv", {**summary,
@@ -712,19 +815,61 @@ def main() -> int:
     return 0
 
 
-def _sys_summary(result_dir):
+def _sys_summary(result_dir, since_iso=None, until_iso=None):
+    """Summarise the system samples, optionally over one window only.
+
+    A contended run's two solo windows belong to the harness, not to the engine
+    (#478): it is deliberately idle for both while the competitor saturates the
+    link, so samples from them dilute cpu_avg_percent and put the competitor's
+    traffic into host-global network counters. `duration_seconds` already
+    excludes those seconds; without the same bound here the resource columns
+    described a different interval from the one beside them.
+
+    The timestamps are the sampler's own ISO strings, which sort lexically, so
+    the comparison needs no parsing. A row without one is kept: dropping a
+    sample because its timestamp is missing would silently narrow the sample
+    set on exactly the runs where the sampler is already misbehaving.
+    """
     import csv as _csv
     cpu, mem, dr, dw, ntx, nrx = [], [], [], [], [], []
     path = os.path.join(result_dir, "system_metrics.csv")
+
+    def in_window(row) -> bool:
+        stamp = row.get("timestamp") or ""
+        if not stamp:
+            return True
+        if since_iso and stamp < since_iso:
+            return False
+        return not (until_iso and stamp > until_iso)
+
+    # The cumulative counters need REBASING, not just filtering (review).
+    # SystemMonitor takes its baseline when the monitor starts — before the
+    # first solo window — and every row after that is cumulative from it. So
+    # dropping the pre-window rows leaves all of the first solo phase's disk
+    # and network traffic embedded in the maxima that remain, even though the
+    # CPU average is now correct. The last value seen BEFORE the window is
+    # subtracted from the ones inside it, which rebases the counter on the
+    # engine's own boundary. Gauges (cpu, memory) are instantaneous and are
+    # filtered only.
+    cumulative = ("disk_read_mb", "disk_write_mb", "network_tx_mb", "network_rx_mb")
+    base = dict.fromkeys(cumulative, 0.0)
     try:
         with open(path) as fh:
             for r in _csv.DictReader(fh):
+                if not in_window(r):
+                    # Remember where the counters stood on the way in; a row
+                    # AFTER the window cannot move the baseline backwards.
+                    stamp = r.get("timestamp") or ""
+                    if not since_iso or not stamp or stamp < since_iso:
+                        for key in cumulative:
+                            base[key] = float(r.get(key) or 0)
+                    continue
                 cpu.append(float(r.get("cpu_percent") or 0))
                 mem.append(float(r.get("memory_mb") or 0))
-                dr.append(float(r.get("disk_read_mb") or 0))
-                dw.append(float(r.get("disk_write_mb") or 0))
-                ntx.append(float(r.get("network_tx_mb") or 0))
-                nrx.append(float(r.get("network_rx_mb") or 0))
+                dr.append(max(0.0, float(r.get("disk_read_mb") or 0) - base["disk_read_mb"]))
+                dw.append(max(0.0, float(r.get("disk_write_mb") or 0) - base["disk_write_mb"]))
+                ntx.append(max(0.0, float(r.get("network_tx_mb") or 0) - base["network_tx_mb"]))
+                nrx.append(max(0.0, float(r.get("network_rx_mb") or 0) - base["network_rx_mb"]))
     except FileNotFoundError:
         pass
     def avg(xs):
@@ -743,6 +888,24 @@ def _sys_summary(result_dir):
 
 def _bottleneck(s):
     obs = []
+    # What the run cost its neighbour, stated first (#478): it is the finding a
+    # contended scenario exists to produce, and the one a reader of this line
+    # is looking for. A MEASUREMENT and never a verdict — this issue builds the
+    # instrument, and no threshold on it is a shipping gate yet, so the
+    # sentence reports the share and stops.
+    comp = s.get("competitor") or {}
+    if comp.get("with_vtop"):
+        # "in the same window" was a claim this run could not make (review):
+        # VTOP's rate is over the engine cycles the window wholly contained, not
+        # over the window. Both of the index's rates are over THAT span, so the
+        # sentence names the span once and gives both numbers on it.
+        obs.append(
+            f"The competing flow kept {comp.get('share_of_solo_pct')}% of its solo goodput "
+            f"while the engine ran ({comp['with_vtop'].get('goodput_mbps')} vs "
+            f"{comp.get('solo_mean_mbps')} Mbit/s). Over the "
+            f"{comp.get('jain_span_seconds')}s the index is taken on it held "
+            f"{comp.get('competitor_goodput_mbps_over_vtop_window')} Mbit/s against VTOP's "
+            f"{comp.get('vtop_goodput_mbps')} (Jain {comp.get('jain_index')}).")
     if s.get("failed_batches"):
         obs.append(f"{s['failed_batches']} batches failed (fault injection / verification).")
     if s.get("compression_ratio_avg", 0) and s["compression_ratio_avg"] < 1.2:
