@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+from lib.competitor import COMPETITOR_COLUMNS  # noqa: E402
 from lib.shaping import SHAPING_COLUMNS  # noqa: E402
 
 COMPARE_COLS = [
@@ -42,7 +43,11 @@ COMPARE_COLS = [
     # The pipe a shaped run was measured through (#403, #477); empty when
     # unshaped. Spliced from lib/shaping.py so the matrix cannot fall behind a
     # driver that adds a column.
-    *SHAPING_COLUMNS, "emulator_validation_mbps", "upload_p95_ms",
+    *SHAPING_COLUMNS, "emulator_validation_mbps",
+    # What the run cost the flow beside it (#478); blank for the runs that
+    # started none. Spliced from lib/competitor.py so the index can never
+    # reach this table without the two per-flow numbers beside it.
+    *COMPETITOR_COLUMNS, "upload_p95_ms",
     # Which way the sender ran (#476); a comparison across modes is a
     # comparison of namespaces, and the matrix must say so.
     "runner_mode",
@@ -154,13 +159,18 @@ def matrix_row(summary: dict) -> dict:
     is what it asked for, and where they differ the former wins.
     """
     row = dict(summary)
-    resolved = {key: row[key] for key in SHAPING_COLUMNS if key in row}
+    # The competitor columns join the protected set (#478) for the reason the
+    # shaping ones did: what the run MEASURED must outrank what the scenario
+    # asked for. They carry no scenario key of the same name today, and the
+    # rule is written once so the day one appears it is already correct.
+    measured = (*SHAPING_COLUMNS, *COMPETITOR_COLUMNS)
+    resolved = {key: row[key] for key in measured if key in row}
     row.update(summary.get("scenario", {}))
     row.update(resolved)
     # An unshaped run carries no shaping columns at all, and blank is what the
     # refusal reads as "not shaped" — spell it, rather than leaving the
     # scenario's request showing.
-    for key in SHAPING_COLUMNS:
+    for key in measured:
         row.setdefault(key, "")
     return row
 

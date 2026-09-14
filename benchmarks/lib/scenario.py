@@ -82,6 +82,16 @@ DEFAULTS: dict[str, Any] = {
     "shaping_bottleneck_kbps": 0,
     "shaping_buffer_bdp": 0,          # bottleneck buffer, in BDP multiples
     "shaping_policer_kbps": 0,        # a policer holds no queue
+    # THE FLOW BESIDE THE UPLOAD (#478), see lib/competitor.py. A plain-TCP
+    # bulk flow across the same netem bottleneck, measured alone, then beside
+    # VTOP, then alone again — because the number that authorises a
+    # concurrency knob is what the NEIGHBOUR got, not what VTOP got. Absent —
+    # the default — means no competitor and no columns; `<mode>:<seconds>`,
+    # e.g. `bulk:60`, means one. Flat and a single string, because the
+    # dependency-free fallback parser is flat by design. netem only: a
+    # per-connection toxic gives two flows no shared queue, and lib/shaping.py
+    # refuses the combination by name.
+    "shaping_competitor": "",
 }
 
 

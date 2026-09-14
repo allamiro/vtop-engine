@@ -13,6 +13,7 @@ import random
 import string
 from datetime import datetime, timezone
 
+from .competitor import COMPETITOR_COLUMNS, describe_competitor_line
 from .shaping import SHAPING_COLUMNS, describe_shape_line
 
 CSV_HEADERS: dict[str, list[str]] = {
@@ -34,6 +35,12 @@ CSV_HEADERS: dict[str, list[str]] = {
         # What the emulator itself produced, alone, through the shaped path
         # (#477): blank unless a netem run measured it.
         "emulator_validation_mbps",
+        # What the upload did to the flow beside it (#478); blank unless the
+        # scenario named a competitor. Spliced from ONE tuple in
+        # lib/competitor.py for the same reason the shaping columns are: the
+        # fairness index must not be able to reach a file its two per-flow
+        # numbers did not.
+        *COMPETITOR_COLUMNS,
         # Which way the sender ran (#476): host process or containerized.
         # Recorded on EVERY run, host mode included, so no number is ever
         # read without knowing which namespace produced it.
@@ -166,6 +173,18 @@ def _shaping_cell(s: dict) -> str:
     return _md_cell(describe_shape_line(s.get("shaping")))
 
 
+def _competitor_cell(s: dict) -> str:
+    """What the run cost the flow beside it, or 'none' (#478).
+
+    Its own row in the human-facing table because summary.md is the artifact
+    the runner prints a path to when a run ends, and a newly added value has
+    already been left out of it once (#480, review). The prose comes from
+    lib/competitor.py, which owns the vocabulary and puts the two per-flow
+    numbers ahead of the index.
+    """
+    return _md_cell(describe_competitor_line(s.get("competitor")))
+
+
 def _summary_md(s: dict) -> str:
     def g(k):
         return _md_cell(s.get(k, ""))
@@ -222,6 +241,10 @@ def _summary_md(s: dict) -> str:
         # identical conditions — in the one place a human actually reads.
         f"| Transport tuning (#480) | {g('transport_tuning_flat') or 'none'} |",
         f"| Shaped pipe (#403) | {_shaping_cell(s)} |",
+        # The neighbour's number (#478). It sits directly under the pipe
+        # because it is only readable against it: "3.9 Mbit/s with VTOP" means
+        # nothing until the row above says the link was 10.
+        f"| Competing flow (#478) | {_competitor_cell(s)} |",
         "",
         "## Bottleneck observations",
         "",
