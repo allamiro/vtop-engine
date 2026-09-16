@@ -105,6 +105,20 @@ def main() -> int:
     if mode == "container":
         print("[bench] runner_mode=container: the engine runs inside the "
               "compose stack (profile `containerized` must be up)")
+    # The proxy hop is a TOPOLOGY claim (#484), judged with the same
+    # before-it-costs-anything timing: a run that declares the h3 proxy and
+    # then dials the store directly would still be filed as the
+    # topology-controlled baseline a later transport comparison reads from,
+    # and nothing in the numbers would give it away.
+    try:
+        engine.require_endpoint_through_h3_proxy(sc)
+    except ValueError as bad:
+        print(f"[bench] {bad}", file=sys.stderr)
+        return 2
+    if sc.get("h3_proxy"):
+        print("[bench] h3_proxy: the upload path runs through the lab's "
+              f"HTTP/3-terminating proxy at {engine.effective_endpoint(sc)} "
+              "(profile `h3` must be up)")
     # The shape is judged HERE, before a seed byte exists (#403): a bad knob
     # fails the run before it costs anything, and a shaped scenario never
     # runs unshaped under its own name. Which SHAPER is the scenario's own
@@ -655,6 +669,15 @@ def main() -> int:
         # configured or the backend routes through no seam.
         "transport_tuning": transport_tuning,
         "transport_tuning_flat": transport_tuning_flat,
+        # Whether the lab's HTTP/3-terminating proxy sat between the engine
+        # and the store (#484), by the name of the service that did. The
+        # topology is part of the measurement exactly as the namespace and the
+        # wire are: the proxied baseline exists precisely because it is NOT
+        # comparable to the direct one, and a row that does not say which it
+        # was invites the comparison it was built to prevent. The declaration
+        # is what is recorded, and the runner has already refused any run whose
+        # endpoint did not match it.
+        "h3_proxy": engine.H3_PROXY_SERVICE if sc.get("h3_proxy") else "",
     }
     # CPU/mem summary from the system-metrics samples written during the run.
     summary.update(_sys_summary(writer.dir))

@@ -250,6 +250,152 @@ services:
         # measures the emulator rather than the engine.
         iperf3 -s -p 5201 -D
         exec sleep infinity
+  # The HTTP/3 counterparty (#484): a TLS-terminating reverse proxy in front
+  # of MinIO, on its OWN `h3` profile so no existing scenario pays for it.
+  #
+  # WHY IT EXISTS. The datagram half of the egress epic (#475) is HTTP/3 over
+  # QUIC to an S3-compatible endpoint, and neither the lab's MinIO nor AWS S3's
+  # own endpoint answers over HTTP/3. Without something in the lab that does,
+  # every entry criterion in that epic is unmeasurable. This service is the
+  # measurable target — a lab fixture, never a production component.
+  #
+  # WHY NGINX, WHEN CADDY IS THE OBVIOUS PICK. Caddy serves HTTP/3 by default
+  # and was tried first; it cannot hold this lab's hardening baseline. Its
+  # official image ships the binary with the file capability
+  # `cap_net_bind_service=ep`, and a file carrying file capabilities cannot be
+  # exec'd at all under `no-new-privileges` with the capability dropped — the
+  # container dies with `exec /usr/bin/caddy: operation not permitted`, on both
+  # the alpine and the debian variants. Weakening the baseline for one lab
+  # service was the alternative, and the baseline is not the negotiable half.
+  # The official nginx image carries no file capabilities and has been built
+  # `--with-http_v3_module` since 1.25, so it serves HTTP/3 out of the shipped
+  # image; the configuration that takes is in nginx-h3.conf.template, knob by
+  # knob with the reason attached.
+  #
+  # WHY TLS AND NOT PLAINTEXT. HTTP/3 has no plaintext form. The material is
+  # minted by gen-h3-certs.sh into ./tls, git-ignored, 30-day self-signed; the
+  # runner points the engine's SSL_CERT_FILE at that CA, because the engine's
+  # `verify_tls: false` permits plaintext endpoints and does NOT relax
+  # certificate verification (vtop-upload/src/s3_native.rs).
+  #
+  #   benchmarks/gen-h3-certs.sh
+  #   docker compose -f benchmarks/docker-compose.benchmark.yml --profile h3 up -d
+  #   benchmarks/verify-h3.sh          # proves h3 is negotiated, not downgraded
+  h3-proxy:
+    # PINNED, and an explicit tag (#507): a floating tag withdrawn upstream
+    # broke `compose up` in its pull phase, and Dependabot's docker-compose
+    # ecosystem cannot bump a tag that never changes name. Every lab image in
+    # this file is pinned for the same reason.
+    image: nginx:1.29.3-alpine
+    container_name: vtop-bench-h3-proxy
+    profiles: ["h3"]
+    ports:
+      # BOTH transports on the same number, deliberately: `Alt-Svc` names one
+      # port for HTTP/3, so the published UDP port must match the TCP one or
+      # every client is told to retry HTTP/3 somewhere nothing is listening.
+      # 9443 rather than 443 because the lab publishes to an unprivileged
+      # loopback port, and clear of 9000/9001/9100/8474 which this stack
+      # already holds.
+      # The HOST port is overridable, the container's is not. Found the hard
+      # way — 9443 is an unremarkable choice for somebody else's TLS service,
+      # and a collision with an unrelated process on the same machine leaves
+      # the profile unable to start with an error about a port rather than
+      # about the lab. Everything that has to FOLLOW that override reads the
+      # same variable with the same default: the harness endpoints
+      # (lib/engine.py), verify-h3.sh, and the advertised/forwarded authority
+      # below, which is the half that was still naming 9443 (review).
+      - "${VTOP_BIND_ADDR:-127.0.0.1}:${VTOP_H3_PORT:-9443}:9443/tcp"
+      - "${VTOP_BIND_ADDR:-127.0.0.1}:${VTOP_H3_PORT:-9443}:9443/udp"
+    environment:
+      # THE PUBLISHED PORT, HANDED TO NGINX, because nginx cannot find it out
+      # (review). It sees only the container port it bound, so a lab published
+      # on 9543 had it advertising `h3=":9443"` and forwarding an S3 client's
+      # signed authority as "localhost:9443" — which MinIO recomputes the SigV4
+      # signature over and rejects with SignatureDoesNotMatch, a failure that
+      # reads as a credential bug. The SAME expression as the publish above, so
+      # the two cannot drift apart.
+      VTOP_H3_ADVERTISED_PORT: "${VTOP_H3_PORT:-9443}"
+      # The image renders /etc/nginx/templates/*.template through envsubst at
+      # start-up; /etc/nginx/conf.d is its default destination and read_only
+      # makes that unwritable, so the output goes to the tmpfs below and nginx
+      # is pointed at it by `command`.
+      NGINX_ENVSUBST_OUTPUT_DIR: /tmp
+      # Substitute the lab's own placeholders and NOTHING else. envsubst
+      # replaces every variable name it is handed, and unfiltered it is handed
+      # every name in the environment — while the config it is rendering is
+      # made of nginx's own `$host`, `$status`, `$remote_addr`. The filter is
+      # what keeps the templating pass from eating the configuration.
+      NGINX_ENVSUBST_FILTER: "^VTOP_"
+    # The RENDERED config, not the mounted one: nginx must read the file with
+    # the published port substituted in, and `-c` is how it is told which.
+    command: ["nginx", "-c", "/tmp/nginx-h3.conf", "-g", "daemon off;"]
+    # The BUILDING user's uid, for the same two reasons the engine service
+    # gives. Non-root is the container baseline (SECURITY_MODEL §12), and
+    # nginx's master, when it is root, chowns its temp paths to the `nginx`
+    # user at startup — a chown that CAP_CHOWN is required for and cap_drop
+    # has just removed, so a root nginx here fails before it listens. Running
+    # as the host uid also lets it read a 0600 private key that gen-h3-certs.sh
+    # deliberately does not widen. Override when the host uid is not 1000.
+    user: "${VTOP_BENCH_UID:-1000}:${VTOP_BENCH_GID:-1000}"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    pids_limit: 256
+    mem_limit: 512m
+    read_only: true
+    # nginx wants a pid file and five temp paths whatever it is asked to do,
+    # and the rendered config lands here as well. The template points every one
+    # of them at /tmp, which is what lets the filesystem stay read-only instead
+    # of granting a writable volume to a process that has nothing durable to
+    # say.
+    tmpfs: [/tmp]
+    volumes:
+      # A TEMPLATE, mounted where the image's start-up pass looks for one: the
+      # published port is not knowable until `up` runs, and this is how it
+      # reaches the Alt-Svc advertisement and the reconstructed Host header.
+      - ./nginx-h3.conf.template:/etc/nginx/templates/nginx-h3.conf.template:ro
+      # THE LEAF AND ITS KEY, ONE FILE EACH — NOT ./tls (review). That
+      # directory also holds ca-key.pem, the key that signs the CA every
+      # h3-scenario engine trusts through SSL_CERT_FILE. Both keys are 0600
+      # with the same owner and this container runs as that owner (above), so
+      # mounting the directory handed the CA signing key to the one lab
+      # service whose job is accepting connections: a compromised proxy could
+      # mint a certificate for any name the benchmark client would then
+      # believe. nginx needs exactly the two paths nginx-h3.conf.template
+      # names and nothing else — not even ca.pem, since the leaf is served
+      # without a chain and the client already holds the root.
+      # tests/test_compose_h3.py pins both halves: no mount reaches
+      # ca-key.pem, and the mounts supply every path the template reads.
+      #
+      # Long syntax with create_host_path:false, for the reason the engine's
+      # binary mount uses it — and it matters more for a file than it did for
+      # the directory: the short form MKDIRs a missing source, so a checkout
+      # that never ran gen-h3-certs.sh would get an empty directory
+      # bind-mounted where the certificate FILE belongs and nginx would fail
+      # deep in its TLS setup. Refusing to create the path makes `up` say the
+      # material is missing.
+      #
+      # RENEWAL NEEDS A RESTART. gen-h3-certs.sh renews by removing and
+      # reminting the files, and a single-file bind mount is bound to the
+      # inode, not the name: a RUNNING proxy goes on seeing the old leaf
+      # (checked — a container reads the old bytes after the remint and the new
+      # ones after a restart). nginx only reads its certificate at start in any
+      # case, so after a run that says `action=minted`:
+      #   docker compose -f benchmarks/docker-compose.benchmark.yml --profile h3 restart h3-proxy
+      # A stale leaf under a freshly minted CA is a handshake failure that
+      # reads like a transport result.
+      - type: bind
+        source: ./tls/h3-proxy.pem
+        target: /etc/nginx/tls/h3-proxy.pem
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./tls/h3-proxy-key.pem
+        target: /etc/nginx/tls/h3-proxy-key.pem
+        read_only: true
+        bind:
+          create_host_path: false
     depends_on:
       minio:
         condition: service_healthy

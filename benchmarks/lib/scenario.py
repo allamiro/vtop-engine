@@ -61,6 +61,15 @@ DEFAULTS: dict[str, Any] = {
     # scenario, and rewriting the bundled scenarios would make their
     # historical numbers incomparable to their future ones.
     "runner_mode": "host",
+    # The lab's HTTP/3-terminating proxy hop (#484). False = the engine dials
+    # the store directly, as every other scenario does. True DECLARES that this
+    # run goes through the `h3` profile's proxy, which is what lets the harness
+    # treat its loopback port as the lab store — credentials, endpoint
+    # translation, the CA the handshake needs — and refuse a run that claimed
+    # the hop and went around it. A declaration rather than an inference from
+    # the port, for the reason lib/engine.py spells out: loopback 9443 is an
+    # entirely ordinary address for somebody else's TLS service.
+    "h3_proxy": False,
     # Bandwidth shaping between the engine and the store (#403), see
     # lib/shaping.py. "" = unshaped; the rest matter only when it is set.
     "shaping_api_url": "",
