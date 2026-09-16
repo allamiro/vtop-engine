@@ -15,6 +15,11 @@ from datetime import datetime, timezone
 
 from .shaping import SHAPING_COLUMNS, describe_shape_line
 
+# Written by lib/engine_run.py on a long-lived run only; named here for the
+# summary table, and not imported from there because that module imports the
+# engine driver, which this writer has never needed.
+ENGINE_METRICS_FILE = "engine_metrics.csv"
+
 CSV_HEADERS: dict[str, list[str]] = {
     "metrics.csv": [
         "run_id", "scenario_name", "start_time", "end_time", "duration_seconds",
@@ -108,15 +113,26 @@ def percentile(values: list[float], pct: float) -> float:
 
 
 class ResultsWriter:
-    def __init__(self, results_root: str, run_id: str) -> None:
+    def __init__(self, results_root: str, run_id: str,
+                 extra_columns: dict[str, list[str]] | None = None) -> None:
         self.run_id = run_id
         self.dir = os.path.join(results_root, run_id)
+        # Columns a run appends to a file's fixed header — the long-lived
+        # engine's flat counters (#510). Appended, never interleaved, and only
+        # when a run asks: a run that passes none writes exactly CSV_HEADERS,
+        # so no existing scenario's files change shape.
+        extra_columns = extra_columns or {}
+        unknown = sorted(set(extra_columns) - set(CSV_HEADERS))
+        if unknown:
+            raise ValueError(f"extra columns for files this writer does not write: {unknown}")
+        self.headers = {fname: list(header) + list(extra_columns.get(fname, ()))
+                        for fname, header in CSV_HEADERS.items()}
         if os.path.exists(self.dir):
             raise FileExistsError(f"results dir already exists (refusing to overwrite): {self.dir}")
         os.makedirs(self.dir)
         self._files = {}
         self._writers = {}
-        for fname, header in CSV_HEADERS.items():
+        for fname, header in self.headers.items():
             fh = open(os.path.join(self.dir, fname), "w", newline="", encoding="utf-8")
             w = csv.writer(fh)
             w.writerow(header)
@@ -124,7 +140,7 @@ class ResultsWriter:
             self._writers[fname] = w
 
     def row(self, fname: str, data: dict) -> None:
-        header = CSV_HEADERS[fname]
+        header = self.headers[fname]
         self._writers[fname].writerow([data.get(col, "") for col in header])
         self._files[fname].flush()
 
@@ -211,6 +227,13 @@ def _summary_md(s: dict) -> str:
         # carried it while the human-facing table did not, and summary.md is
         # the file the runner prints a path to at the end of every run.
         f"| Runner mode (#476) | {g('runner_mode') or 'host'} |",
+        # Which ENGINE produced them (#510) — one long-lived `vtopctl run` or
+        # a fresh process per cycle — named only on a long-lived run, so a
+        # per-cycle run's summary.md stays exactly what it was.
+        *([f"| Engine mode (#510) | {g('engine_mode')}: {g('engine_samples')} samples over "
+           f"{g('engine_window_seconds')} s, stopped by {g('engine_stopped_by')}, "
+           f"series in {ENGINE_METRICS_FILE} |"]
+          if s.get("engine_mode") else []),
         # Which wire carried the bytes (#479): the same reasoning as runner mode
         # — a number is never read without knowing the transport that produced
         # it. Blank (not tcp_tls) when the backend routes through no

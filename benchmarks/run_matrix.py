@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+from lib import engine_run  # noqa: E402
 from lib.scenario import load_scenario  # noqa: E402
 from lib.shaping import SHAPING_COLUMNS, selected_driver  # noqa: E402
 
@@ -47,6 +48,12 @@ COMPARE_COLS = [
     # Which way the sender ran (#476); a comparison across modes is a
     # comparison of namespaces, and the matrix must say so.
     "runner_mode",
+    # Which ENGINE ran (#510): a fresh `process-once` per cycle or one
+    # long-lived `vtopctl run`. Different execution models — a rate cap's token
+    # bucket and the width controller reset with every fresh process — so a
+    # matrix never mixes them (`refuse_mixed_engine_modes`), and the column
+    # says which one every row in it was.
+    "engine_mode",
     # Which WIRE carried the bytes (#479); a comparison across transports is a
     # comparison of wires, so the matrix must carry it beside runner_mode.
     # Blank for backends that route through no EgressTransport seam.
@@ -58,6 +65,16 @@ COMPARE_COLS = [
     # string and two matrices diff cleanly.
     "transport_tuning_flat",
 ]
+
+
+# The long-lived engine's flat columns (#510), derived from SUMMARY_SERIES so
+# a series surfaced there reaches the matrix without a second list. Written
+# only when the matrix's rows ARE long-lived (see `matrix_columns`): a
+# per-cycle matrix could only ever leave them blank. The metrics address is
+# left out — a fresh loopback port per run is not a condition two rows are
+# compared on — and engine_mode is already in COMPARE_COLS.
+ENGINE_COMPARE_COLS = [column for column in engine_run.summary_column_names()
+                       if column not in ("engine_mode", "engine_metrics_address")]
 
 
 # Defaults for --sweep (#90): a moderate, representative grid. Formats span
@@ -166,6 +183,15 @@ def declared_driver(path: str) -> str:
     return driver
 
 
+def declared_engine_mode(path: str) -> str:
+    """The engine mode a scenario FILE asks for; "" when it cannot be read or
+    names no valid mode. Like `declared_driver`, it only orders the runs."""
+    try:
+        return engine_run.engine_mode(load_scenario(path))
+    except Exception:  # noqa: BLE001 - an unreadable file is the runner's to report
+        return ""
+
+
 def collect_rows(paths: list, load_row) -> list:
     """Run every scenario and return their rows in LIST order, refusing the
     moment the rows that exist span two shaping drivers.
@@ -204,19 +230,29 @@ def collect_rows(paths: list, load_row) -> list:
     written.
     """
     declared = [declared_driver(path) for path in paths]
+    declared_modes = [declared_engine_mode(path) for path in paths]
     pending = list(range(len(paths)))
     produced: list = []  # (index, row)
     while pending:
         seen = {str(row.get("shaping_driver", "") or "").strip() for _i, row in produced}
+        # The engine mode (#510) orders the same way, once a row has named one:
+        # the next run is the first declaring a mode no row has yet, so a
+        # mixed-mode list also costs one run per mode.
+        seen_modes = {row_engine_mode(row) for _i, row in produced}
         index = next((i for i in pending if declared[i] and declared[i] not in seen),
-                     pending[0])
+                     None)
+        if index is None and seen_modes:
+            index = next((i for i in pending
+                          if declared_modes[i] and declared_modes[i] not in seen_modes), None)
+        if index is None:
+            index = pending[0]
         pending.remove(index)
         row = load_row(paths[index])
         if row is None:
             continue
         produced.append((index, row))
         try:
-            refuse_mixed_drivers([row for _i, row in produced])
+            refuse_incomparable([row for _i, row in produced])
         except IncomparableRuns as exc:
             ran = [os.path.basename(paths[i]) for i, _row in produced]
             skipped = [os.path.basename(paths[i]) for i in sorted(pending)]
@@ -249,7 +285,32 @@ def matrix_row(summary: dict) -> dict:
     # scenario's request showing.
     for key in SHAPING_COLUMNS:
         row.setdefault(key, "")
+    # The engine mode is the SUMMARY's too (#510), and its absence is an
+    # answer: a per-cycle run writes no engine column at all (its results are
+    # byte-identical to before #510), and neither did any run recorded before
+    # it — both were one process-once per cycle. The scenario is not asked:
+    # today's loader stamps its default into every scenario, so it would name a
+    # mode for a run that never resolved one. The same for the engine columns,
+    # which only a long-lived run fills.
+    row["engine_mode"] = summary.get("engine_mode") or engine_run.PROCESS_ONCE
+    for key in ENGINE_COMPARE_COLS:
+        row[key] = summary.get(key, "")
     return row
+
+
+def row_engine_mode(row: dict) -> str:
+    """A row's engine mode, absent read as the per-cycle mode every run before
+    #510 used."""
+    return str(row.get("engine_mode", "") or "").strip() or engine_run.PROCESS_ONCE
+
+
+def matrix_columns(rows: list[dict]) -> list[str]:
+    """The table's columns: COMPARE_COLS, plus the engine's flat columns when
+    the rows are long-lived. Called on rows `refuse_incomparable` has passed,
+    so they share one mode."""
+    if any(row_engine_mode(row) == engine_run.LONG_LIVED for row in rows):
+        return COMPARE_COLS + ENGINE_COMPARE_COLS
+    return list(COMPARE_COLS)
 
 
 class IncomparableRuns(RuntimeError):
@@ -279,6 +340,31 @@ def refuse_mixed_drivers(rows: list[dict]) -> None:
             "a per-connection proxy toxic and an L3 qdisc are different links, so their "
             "rows cannot share a comparison table. Run the comparison on one driver — "
             "split the scenario list, or point them all at the same shaping_driver")
+
+
+def refuse_mixed_engine_modes(rows: list[dict]) -> None:
+    """Refuse a row set spanning two engine modes (#510).
+
+    Unlike shaping, there is no baseline exemption: every row ran on SOME
+    engine, and a per-cycle row beside a long-lived one differs in what was
+    running — fresh process state every cycle against state that settles —
+    which no column can make comparable. A row without the column is
+    process-once (see `row_engine_mode`).
+    """
+    modes = sorted({row_engine_mode(row) for row in rows})
+    if len(modes) > 1:
+        raise IncomparableRuns(
+            f"this matrix spans {len(modes)} engine modes ({', '.join(modes)}): a fresh "
+            "`vtopctl process-once` per cycle and one long-lived `vtopctl run` are different "
+            "execution models, so their rows cannot share a comparison table. Run the "
+            "comparison in one mode — split the scenario list, or give them all the same "
+            "engine_mode")
+
+
+def refuse_incomparable(rows: list[dict]) -> None:
+    """Every reason two rows cannot share a table, checked together."""
+    refuse_mixed_drivers(rows)
+    refuse_mixed_engine_modes(rows)
 
 
 def main() -> int:
@@ -347,14 +433,15 @@ def main() -> int:
 
     # Before a single row is written (#477): a table that exists is a table
     # somebody reads, so the refusal has to land before the file does.
-    refuse_mixed_drivers(rows)
+    refuse_incomparable(rows)
+    columns = matrix_columns(rows)
 
     # matrix.csv
     with open(os.path.join(matrix_dir, "matrix.csv"), "w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(COMPARE_COLS)
+        w.writerow(columns)
         for r in rows:
-            w.writerow([r.get(c, "") for c in COMPARE_COLS])
+            w.writerow([r.get(c, "") for c in columns])
 
     # matrix.md (escape Markdown table cells: pipes and newlines)
     def md_cell(v):
@@ -362,10 +449,10 @@ def main() -> int:
 
     with open(os.path.join(matrix_dir, "matrix.md"), "w") as fh:
         fh.write(f"# Benchmark matrix ({stamp})\n\n")
-        fh.write("| " + " | ".join(COMPARE_COLS) + " |\n")
-        fh.write("|" + "|".join(["---"] * len(COMPARE_COLS)) + "|\n")
+        fh.write("| " + " | ".join(columns) + " |\n")
+        fh.write("|" + "|".join(["---"] * len(columns)) + "|\n")
         for r in rows:
-            fh.write("| " + " | ".join(md_cell(r.get(c, "")) for c in COMPARE_COLS) + " |\n")
+            fh.write("| " + " | ".join(md_cell(r.get(c, "")) for c in columns) + " |\n")
 
     print(f"\n[matrix] {len(rows)} runs -> {matrix_dir}/matrix.csv, matrix.md")
     return 0
