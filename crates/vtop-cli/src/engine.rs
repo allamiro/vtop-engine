@@ -1130,7 +1130,26 @@ pub struct WidthController {
 
 impl WidthController {
     pub fn new(ceiling: usize, floor: usize) -> Self {
-        let ceiling = ceiling.max(1);
+        Self::under_operator_ceiling(ceiling, floor, None)
+    }
+
+    /// The controller, with its bounds clamped to the operator's
+    /// `upload.max_concurrency_ceiling` (#481). BOTH bounds are clamped: the
+    /// ceiling so no configured width exceeds the operator's, and the floor
+    /// because a minimum width is a value below which the flow refuses to
+    /// yield — left unclamped it would be the way round the ceiling. Validation
+    /// already refuses either contradiction; this makes the controller hold the
+    /// operator's number by construction rather than by the order of checks
+    /// elsewhere. `None` is exactly [`WidthController::new`]. The AIMD law
+    /// itself is untouched.
+    pub fn under_operator_ceiling(
+        ceiling: usize,
+        floor: usize,
+        operator_ceiling: Option<usize>,
+    ) -> Self {
+        let ceiling = operator_ceiling
+            .map_or(ceiling, |operator| ceiling.min(operator))
+            .max(1);
         let floor = floor.clamp(1, ceiling);
         Self {
             ceiling,
@@ -1428,8 +1447,11 @@ impl Engine {
         let resolved_ceiling = config
             .upload
             .resolved_upload_ceiling(config.batching.max_concurrent_batches);
-        let width =
-            WidthController::new(resolved_ceiling, config.batching.adaptive_width.min_width);
+        let width = WidthController::under_operator_ceiling(
+            resolved_ceiling,
+            config.batching.adaptive_width.min_width,
+            config.upload.max_concurrency_ceiling,
+        );
         Ok(Self {
             config,
             streams,
@@ -1479,9 +1501,16 @@ impl Engine {
             // Fixed width: the RESOLVED ceiling (#480), so the active
             // transport's max_concurrency narrows it here too — not just when
             // adaptive width is on. Backend-gated (s3_native only).
+            // And under the operator's ceiling (#481), for the same reason the
+            // controller is: by construction, not only by validation.
+            let resolved = self
+                .config
+                .upload
+                .resolved_upload_ceiling(self.config.batching.max_concurrent_batches);
             self.config
                 .upload
-                .resolved_upload_ceiling(self.config.batching.max_concurrent_batches)
+                .max_concurrency_ceiling
+                .map_or(resolved, |operator| resolved.min(operator))
                 .max(1)
         }
     }
@@ -2994,6 +3023,76 @@ mod tests {
             WidthController::new(2, 9).width(),
             2,
             "a floor above the ceiling is the ceiling"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_engine_configured_without_either_ceiling_builds_todays_controller() {
+        // The default is unset (#481), asserted on the constructed engine
+        // rather than on the parts: the controller it holds is the one
+        // `WidthController::new` built before the operator ceiling existed,
+        // and the fixed width is the resolved batch ceiling. (That no shaper is
+        // in the upload path is pinned beside the shaper, in vtop-upload.)
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.log");
+        std::fs::write(&input, "one line\n").unwrap();
+        let mut cfg = file_config(
+            dir.path().join("work").to_str().unwrap(),
+            "sqlite::memory:",
+            vec![input.to_string_lossy().into_owned()],
+            "mock",
+        );
+        cfg.batching.max_concurrent_batches = 12;
+        cfg.batching.adaptive_width.min_width = 3;
+        assert_eq!(cfg.upload.max_concurrency_ceiling, None);
+        assert_eq!(cfg.upload.max_egress_bytes_per_second, None);
+        let engine = Engine::new(cfg, StreamsConfig { streams: vec![] })
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.width,
+            WidthController::new(12, 3),
+            "no operator ceiling must mean no clamp on the controller"
+        );
+        assert_eq!(engine.upload_width(), 12);
+    }
+
+    #[test]
+    fn the_operator_ceiling_clamps_the_controllers_ceiling_and_its_floor() {
+        // No operator ceiling is exactly today's controller (#481).
+        assert_eq!(
+            WidthController::under_operator_ceiling(8, 3, None),
+            WidthController::new(8, 3),
+            "an unset ceiling must construct the controller it always did"
+        );
+        // A ceiling below the configured one wins, and climbing stops there.
+        let mut width = WidthController::under_operator_ceiling(8, 1, Some(5));
+        assert_eq!(
+            width.width(),
+            5,
+            "the width starts at the OPERATOR's ceiling"
+        );
+        assert_eq!(width.observe_cycle(true), 2);
+        let climb: Vec<usize> = (0..5).map(|_| width.observe_cycle(false)).collect();
+        assert_eq!(
+            climb,
+            vec![3, 4, 5, 5, 5],
+            "clean cycles climb to the operator ceiling, never past it"
+        );
+        // The floor cannot defeat it: a floor of 6 under a ceiling of 4 is 4,
+        // so even a store that throttles every cycle leaves the width at 4.
+        let mut floored = WidthController::under_operator_ceiling(8, 6, Some(4));
+        assert_eq!(floored.observe_cycle(true), 4);
+        assert_eq!(
+            floored.observe_cycle(false),
+            4,
+            "a floor above the operator ceiling must not hold the width above it"
+        );
+        // An operator ceiling ABOVE the configured one changes nothing: it is
+        // a maximum, not a target.
+        assert_eq!(
+            WidthController::under_operator_ceiling(8, 1, Some(32)),
+            WidthController::new(8, 1)
         );
     }
 

@@ -535,7 +535,44 @@ pub struct UploadConfig {
     /// active transport cannot honour is refused at CONSTRUCTION, never ignored.
     #[serde(default)]
     pub transports: BTreeMap<String, EgressTuning>,
+    /// An OPERATOR ceiling on this process's total upload egress, in bytes per
+    /// second, across every object and part in flight at once — not per object
+    /// (#481). Unset by default, and unset means exactly today's pipeline: no
+    /// shaper is constructed and no request body is wrapped.
+    ///
+    /// Setting it is an aggressiveness decision, not a performance tweak: it is
+    /// how an operator stops a backfill from an edge site taking a whole uplink
+    /// from whatever else shares it. It is application-layer rate policy over
+    /// kernel TCP — a token bucket in front of each request body the native S3
+    /// backend sends — and it infers nothing about the network. Only the
+    /// `s3_native` backend can honour it; any other backend refuses it at
+    /// construction, naming the cap and the backend. Must be at least
+    /// [`MIN_EGRESS_BYTES_PER_SECOND`].
+    #[serde(default)]
+    pub max_egress_bytes_per_second: Option<u64>,
+    /// An OPERATOR maximum on upload concurrency that configuration cannot
+    /// exceed (#481). `batching.max_concurrent_batches`,
+    /// `batching.adaptive_width.min_width` and every
+    /// `upload.transports.*.max_concurrency` must be at or below it, or the
+    /// configuration is refused naming both numbers; the width controller is
+    /// also clamped to it at construction. Unset by default, which is today's
+    /// behaviour: `max_concurrent_batches` is then its own ceiling.
+    ///
+    /// The point is a number ABOVE the knob: a deployment template can pin
+    /// this while leaving the knob to whoever tunes the site, and no tuning
+    /// can raise the width past it.
+    #[serde(default)]
+    pub max_concurrency_ceiling: Option<usize>,
 }
+
+/// The smallest `upload.max_egress_bytes_per_second` accepted (#481).
+///
+/// The shaper's burst allowance is 1/32 of a second of the cap and it admits a
+/// body in pieces of half that; below 1 KiB/s a piece is a handful of bytes, a
+/// single object takes hours per megabyte, and every request's own deadline
+/// would expire long before its body finished. A cap that low is a mistake,
+/// refused here rather than discovered as a stalled engine.
+pub const MIN_EGRESS_BYTES_PER_SECOND: u64 = 1024;
 
 /// Redundancy / forward-error-correction policy for an egress path (#480).
 ///
@@ -557,8 +594,12 @@ pub enum RedundancyPolicy {
 /// comparison between them is not a tuned-vs-untuned strawman. A field a
 /// transport cannot honour is a construction error naming the field and the
 /// transport (see `EgressTransport::tuning_support`), never a silent ignore.
-/// This issue defines the shape and refuses the unhonourable; enforcement of
-/// `target_rate_bytes_per_second` is the ceiling issue (#481).
+/// This issue defines the shape and refuses the unhonourable. The ceiling
+/// issue (#481) did NOT make `target_rate_bytes_per_second` enforceable: an
+/// intended rate a sender aims at is a different promise from a maximum an
+/// operator imposes, and the enforced maximum is the process-wide
+/// [`UploadConfig::max_egress_bytes_per_second`]. tcp_tls still refuses this
+/// field.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EgressTuning {
@@ -718,6 +759,14 @@ impl UploadConfig {
     /// matrix that varies the backend while carrying a transport knob must not
     /// be rejected here.
     pub fn validate_transports(&self) -> Result<(), VtopError> {
+        // The operator ceilings first, and BEFORE the backend gate below (#481):
+        // this method is the door both `VtopConfig::validate` and
+        // `build_backend` cross, so a `vtopctl tier` copy's bare UploadConfig
+        // is held to the same ceiling the engine's is. They are not gated on
+        // the backend because a ceiling is not a transport knob — a zero cap or
+        // a tuning block that contradicts the ceiling is a contradiction in the
+        // file whichever backend reads it.
+        self.validate_operator_ceilings()?;
         if self.backend != "s3_native" {
             return Ok(());
         }
@@ -792,6 +841,53 @@ impl UploadConfig {
                      {effective_transport:?}; tuning a transport that is not selected \
                      would appear to be in effect while doing nothing"
                 )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The upload-side half of the operator ceilings (#481): the values
+    /// themselves, and every `upload.transports.*.max_concurrency` against
+    /// `max_concurrency_ceiling`. The batching half (`max_concurrent_batches`,
+    /// `adaptive_width.min_width`) lives in [`VtopConfig::validate`], because
+    /// batching is not part of an UploadConfig and a tier copy has no batches.
+    ///
+    /// Zeros are refused rather than reinterpreted. A zero rate cap would pace
+    /// every body forever — an engine that silently uploads nothing — and a
+    /// zero concurrency ceiling would refuse every `max_concurrent_batches`,
+    /// which must itself be positive. Neither can mean "disabled": unset is
+    /// how a ceiling is disabled.
+    pub fn validate_operator_ceilings(&self) -> Result<(), VtopError> {
+        if let Some(rate) = self.max_egress_bytes_per_second {
+            if rate < MIN_EGRESS_BYTES_PER_SECOND {
+                return Err(VtopError::Config(format!(
+                    "upload.max_egress_bytes_per_second = {rate} is below the \
+                     {MIN_EGRESS_BYTES_PER_SECOND} bytes/second minimum: a zero cap would pace \
+                     every upload forever, and one this low cannot finish a request within its \
+                     own deadline. Omit the field to leave egress uncapped"
+                )));
+            }
+        }
+        let Some(ceiling) = self.max_concurrency_ceiling else {
+            return Ok(());
+        };
+        if ceiling == 0 {
+            return Err(VtopError::Config(
+                "upload.max_concurrency_ceiling must be > 0: a ceiling of zero admits no upload \
+                 at all, and batching.max_concurrent_batches must itself be at least 1. Omit the \
+                 field to leave concurrency to batching.max_concurrent_batches"
+                    .into(),
+            ));
+        }
+        for (name, tuning) in &self.transports {
+            if let Some(width) = tuning.max_concurrency {
+                if width > ceiling {
+                    return Err(VtopError::Config(format!(
+                        "upload.transports.{name}.max_concurrency = {width} exceeds \
+                         upload.max_concurrency_ceiling = {ceiling}; the ceiling is an operator \
+                         maximum that tuning cannot raise"
+                    )));
+                }
             }
         }
         Ok(())
@@ -1004,6 +1100,36 @@ impl VtopConfig {
                  instead of backing off"
                     .into(),
             ));
+        }
+        // The operator ceiling is ABOVE the knob (#481): today
+        // max_concurrent_batches is its own ceiling, so there was nothing for
+        // an operator to lock. Checked BEFORE the floor's own range check
+        // below, so a contradiction with the ceiling is reported as one —
+        // naming the ceiling — rather than as some other bound it also breaks.
+        if let Some(ceiling) = self.upload.max_concurrency_ceiling {
+            // The floor cannot defeat the ceiling. A minimum width is a value
+            // below which the flow refuses to yield, so a floor above the
+            // ceiling would be a way to run wider than the operator allowed.
+            // First, and by name: it is the defeat mechanism the ceiling
+            // exists to close.
+            if self.batching.adaptive_width.min_width > ceiling {
+                return Err(VtopError::Config(format!(
+                    "batching.adaptive_width.min_width = {} exceeds \
+                     upload.max_concurrency_ceiling = {ceiling}; a floor above the ceiling would \
+                     hold the width above the operator's maximum",
+                    self.batching.adaptive_width.min_width
+                )));
+            }
+            // Both numbers are named, because the fix is a choice between them
+            // and the operator must see which is which.
+            if self.batching.max_concurrent_batches > ceiling {
+                return Err(VtopError::Config(format!(
+                    "batching.max_concurrent_batches = {} exceeds \
+                     upload.max_concurrency_ceiling = {ceiling}; the ceiling is an operator \
+                     maximum that configuration cannot raise",
+                    self.batching.max_concurrent_batches
+                )));
+            }
         }
         if self.batching.adaptive_width.min_width == 0
             || self.batching.adaptive_width.min_width > self.batching.max_concurrent_batches
@@ -1788,6 +1914,160 @@ upload:
             serde_yaml::from_str("source_poll_wait_ms: 50\nidle_poll_interval_ms: 100").unwrap();
         assert_eq!(cfg.source_poll_wait_ms, 50);
         assert_eq!(cfg.idle_poll_interval_ms, 100);
+    }
+
+    fn ceiling_config(batching: &str, upload_extra: &str) -> VtopConfig {
+        let yaml = format!(
+            r#"
+engine:
+  name: vtop-engine
+  state_store: "sqlite::memory:"
+  work_dir: /tmp/work
+batching: {batching}
+compression: {{}}
+sources:
+  file:
+    enabled: true
+    paths: ["/data/*.log"]
+upload:
+  bucket: telemetry-data
+{upload_extra}"#
+        );
+        serde_yaml::from_str(&yaml).expect("the test yaml parses")
+    }
+
+    #[test]
+    fn a_batch_width_above_the_operator_ceiling_is_refused_naming_both_numbers() {
+        let cfg = ceiling_config(
+            "{max_concurrent_batches: 16}",
+            "  max_concurrency_ceiling: 12\n",
+        );
+        let msg = cfg
+            .validate()
+            .expect_err("a knob above the operator's ceiling must not load (#481)")
+            .to_string();
+        assert!(
+            msg.contains("max_concurrent_batches = 16")
+                && msg.contains("max_concurrency_ceiling = 12"),
+            "the refusal must name BOTH numbers — the fix is a choice between them: {msg}"
+        );
+        // The boundary is legal: the ceiling is a maximum, not a strict bound.
+        ceiling_config(
+            "{max_concurrent_batches: 12}",
+            "  max_concurrency_ceiling: 12\n",
+        )
+        .validate()
+        .expect("a width equal to the ceiling is within it");
+    }
+
+    #[test]
+    fn a_config_without_either_ceiling_behaves_exactly_as_today() {
+        // The default is unset (#481): a config that sets only the knob loads,
+        // carries no ceiling and no cap, and resolves the width it did before —
+        // including a width far above anything a ceiling would have allowed.
+        let cfg = ceiling_config("{max_concurrent_batches: 64}", "");
+        cfg.validate()
+            .expect("no ceiling means the knob is its own ceiling, as before");
+        assert_eq!(cfg.upload.max_concurrency_ceiling, None);
+        assert_eq!(cfg.upload.max_egress_bytes_per_second, None);
+        assert_eq!(
+            cfg.upload
+                .resolved_upload_ceiling(cfg.batching.max_concurrent_batches),
+            64,
+            "an unset ceiling must not narrow the width"
+        );
+    }
+
+    #[test]
+    fn an_adaptive_floor_above_the_operator_ceiling_is_refused_naming_both() {
+        // The floor is the defeat mechanism a minimum-rate setting provides in
+        // commercial designs (#481): a width that refuses to fall below N is a
+        // width of at least N, whatever the ceiling says. Refused BY NAME, even
+        // though the same config also breaks another bound, so the operator is
+        // told about the ceiling rather than about something else.
+        let cfg = ceiling_config(
+            "{max_concurrent_batches: 8, adaptive_width: {enabled: true, min_width: 6}}",
+            "  max_concurrency_ceiling: 4\n",
+        );
+        let msg = cfg
+            .validate()
+            .expect_err("a floor above the operator ceiling must not load")
+            .to_string();
+        assert!(
+            msg.contains("min_width = 6") && msg.contains("max_concurrency_ceiling = 4"),
+            "the refusal names the floor and the ceiling: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_transport_width_above_the_ceiling_is_refused_at_the_door_a_tier_copy_crosses() {
+        // `vtopctl tier` builds its backend from a bare UploadConfig and never
+        // runs VtopConfig::validate (a previous review found a bound enforced
+        // only there was bypassed). validate_transports is the door
+        // build_backend crosses, so the check must fire THERE — for every
+        // backend, since a ceiling is not a transport knob.
+        for backend in ["s3_native", "mock"] {
+            let upload: UploadConfig = serde_yaml::from_str(&format!(
+                "bucket: b\nbackend: {backend}\nmax_concurrency_ceiling: 4\n\
+                 transports:\n  tcp_tls:\n    max_concurrency: 9\n"
+            ))
+            .unwrap();
+            let msg = upload
+                .validate_transports()
+                .expect_err("a tuned width above the ceiling must be refused on the tier path")
+                .to_string();
+            assert!(
+                msg.contains("tcp_tls.max_concurrency = 9")
+                    && msg.contains("max_concurrency_ceiling = 4"),
+                "[{backend}] names both numbers: {msg}"
+            );
+        }
+        // And the engine's load refuses it too, via the same door.
+        let cfg = ceiling_config(
+            "{max_concurrent_batches: 4}",
+            "  max_concurrency_ceiling: 4\n  transports:\n    tcp_tls:\n      max_concurrency: 9\n",
+        );
+        let msg = cfg
+            .validate()
+            .expect_err("the engine load crosses the same door")
+            .to_string();
+        assert!(msg.contains("max_concurrency = 9"), "{msg}");
+    }
+
+    #[test]
+    fn a_zero_or_sub_minimum_cap_and_a_zero_ceiling_are_refused_not_reinterpreted() {
+        // Zero must not mean "disabled" — unset is how a ceiling is disabled —
+        // and a zero rate would pace every body forever: an engine that looks
+        // healthy and uploads nothing.
+        for rate in [0, MIN_EGRESS_BYTES_PER_SECOND - 1] {
+            let upload: UploadConfig =
+                serde_yaml::from_str(&format!("bucket: b\nmax_egress_bytes_per_second: {rate}\n"))
+                    .unwrap();
+            let msg = upload
+                .validate_transports()
+                .expect_err("a cap below the minimum must be refused")
+                .to_string();
+            assert!(
+                msg.contains(&format!("max_egress_bytes_per_second = {rate}"))
+                    && msg.contains(&MIN_EGRESS_BYTES_PER_SECOND.to_string()),
+                "names the cap and the minimum: {msg}"
+            );
+        }
+        let at_floor: UploadConfig = serde_yaml::from_str(&format!(
+            "bucket: b\nmax_egress_bytes_per_second: {MIN_EGRESS_BYTES_PER_SECOND}\n"
+        ))
+        .unwrap();
+        at_floor
+            .validate_transports()
+            .expect("the minimum itself is accepted");
+
+        let zero_ceiling: UploadConfig =
+            serde_yaml::from_str("bucket: b\nmax_concurrency_ceiling: 0\n").unwrap();
+        let msg = zero_ceiling
+            .validate_transports()
+            .expect_err("a zero ceiling admits nothing and must be refused")
+            .to_string();
+        assert!(msg.contains("max_concurrency_ceiling"), "{msg}");
     }
 
     #[test]

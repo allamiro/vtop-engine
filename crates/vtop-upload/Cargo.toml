@@ -11,7 +11,14 @@ vtop-core = { workspace = true }
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
-aws-smithy-types = { workspace = true }
+# `http-body-1-x` for `SdkBody::from_body_1_x`, which the egress shaper (#481)
+# wraps request bodies with. The aws-sdk already enables it; naming it here
+# keeps this crate from compiling only by feature unification.
+aws-smithy-types = { workspace = true, features = ["http-body-1-x"] }
+http-body = { workspace = true }
+# The egress shaper exports vtop_upload_egress_bytes_total into vtop-core's
+# registry, whose counter types it has to name.
+prometheus = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
@@ -27,6 +34,9 @@ futures = { workspace = true }
 tempfile = { workspace = true }
 
 [dev-dependencies]
+# `test-util` for paused-clock rate tests of the egress shaper (#481): the
+# bound is checked against tokio's virtual time, deterministically.
+tokio = { workspace = true, features = ["test-util"] }
 # The trait-surface guard in s3_native.rs parses this crate's src/ rather than
 # scanning its text: layout-independent, and a macro is a node it can refuse.
 syn = { workspace = true }

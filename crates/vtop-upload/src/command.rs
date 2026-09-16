@@ -423,6 +423,8 @@ mod tests {
             multipart_max_parallelism: 4,
             multipart_abandon_after_secs: 24 * 60 * 60,
             transports: Default::default(),
+            max_egress_bytes_per_second: None,
+            max_concurrency_ceiling: None,
         }
     }
 

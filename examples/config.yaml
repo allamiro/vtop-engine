@@ -136,6 +136,30 @@ upload:
   # A transport is a choice made here, not a branch in the upload path; an
   # unknown name is refused at config load. VTOP_S3_TRANSPORT overrides it.
   transport: tcp_tls            # tcp_tls (default)
+  # OPERATOR CEILINGS (#481). Both are unset by default, and unset is exactly
+  # the pipeline without them. SETTING EITHER IS AN AGGRESSIVENESS DECISION:
+  # it decides how much of a shared uplink this process may take from whatever
+  # else is on it (a backfill from an edge site will otherwise take all of it).
+  #
+  # max_egress_bytes_per_second: a ceiling on this PROCESS's total upload body
+  # bytes per second, across every object and part in flight — not per object.
+  # Enforced by a token bucket in front of each request body the s3_native
+  # backend sends; it is application-layer rate policy over kernel TCP, and it
+  # infers nothing about the network. No one-second window admits more than
+  # the cap; a saturated run sustains about 97% of it. Minimum 1024. Any backend
+  # other than s3_native refuses it at startup (a CLI backend's bytes never pass
+  # through VTOP). Counted in vtop_upload_egress_bytes_total, which is exported
+  # only when a cap is set. Retries pass the bucket again.
+  #
+  # max_concurrency_ceiling: an operator maximum ABOVE the concurrency knobs.
+  # batching.max_concurrent_batches, batching.adaptive_width.min_width and every
+  # transports.*.max_concurrency must be at or below it or the config is refused
+  # naming both numbers, and the adaptive width controller is clamped to it —
+  # ceiling and floor both. Pin it in a deployment template; tuning cannot
+  # raise the width past it.
+  #
+  # max_egress_bytes_per_second: 12500000     # e.g. 100 Mbit/s of body bytes
+  # max_concurrency_ceiling: 8
   # Per-transport egress TUNING (#480): ONE shape, keyed by transport name, so
   # both paths are tuned with the IDENTICAL set of keys — a comparison between
   # them is not tuned-vs-untuned. Only the active `transport` may carry a
@@ -145,7 +169,7 @@ upload:
   # path is not yet a registered transport — its block is illustrative only.
   # transports:
   #   tcp_tls:                        # the active, shipping path
-  #     target_rate_bytes_per_second: # intended egress rate (enforced via #481)
+  #     target_rate_bytes_per_second: # intended rate; tcp_tls refuses it — the enforced cap is max_egress_bytes_per_second
   #     max_concurrency:              # objects in flight; min() with batching.max_concurrent_batches
   #     part_size_bytes:              # part size (maps onto multipart_part_size_bytes)
   #     parts_in_flight:              # parts per object (maps onto multipart_max_parallelism)

@@ -690,6 +690,8 @@ path needed by the distributed options is already implemented (§6.3).
 | `upload.command_env_allowlist` | exact runtime environment names copied into an otherwise empty command environment |
 | `upload.create_bucket` | auto-create per-format buckets |
 | `upload.require_strong_verification` | defaults true — false explicitly permits size-only commit |
+| `upload.max_egress_bytes_per_second` | operator ceiling on the process's total upload body bytes per second (#481), unset by default. A token bucket in front of every `s3_native` request body — application-layer rate policy over kernel TCP, not a network-aware mechanism; no one-second window admits more than the cap, retries included. Other backends refuse it at startup. Accounted in `vtop_upload_egress_bytes_total`, exported only when set |
+| `upload.max_concurrency_ceiling` | operator maximum above the concurrency knobs (#481), unset by default: `batching.max_concurrent_batches`, `batching.adaptive_width.min_width` and `upload.transports.*.max_concurrency` above it are refused naming both numbers, and the adaptive width controller's ceiling and floor are clamped to it |
 | `partitioning.template` | object key layout |
 
 ### 13.2 Current environment variables — implemented
