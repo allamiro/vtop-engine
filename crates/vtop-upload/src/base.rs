@@ -8,6 +8,7 @@
 use async_trait::async_trait;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
@@ -228,16 +229,18 @@ pub(crate) async fn verify_command_content(
     backend: &str,
     timeout: Duration,
 ) -> Result<VerificationResult, VtopError> {
+    let deadline = command_deadline(timeout);
     let mut child = cmd
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| VtopError::Upload(format!("spawning {backend} verification: {e}")))?;
     let stdout = child
         .stdout
         .take()
         .ok_or_else(|| VtopError::Upload(format!("{backend} verification stdout unavailable")))?;
-    let completed = tokio::time::timeout(timeout, async {
+    let evidence = ReadBackEvidence::collect(&mut child, backend, "verification")?;
+    let completed = tokio::time::timeout_at(deadline, async {
         let (result, oversized) =
             verify_reader_content(stdout, expected_size, expected, backend).await?;
         if oversized {
@@ -248,15 +251,19 @@ pub(crate) async fn verify_command_content(
             .await
             .map_err(|e| VtopError::Upload(format!("waiting for {backend} verification: {e}")))?;
         if !status.success() && !oversized {
-            return Err(VtopError::Upload(format!(
-                "{backend} verification command exited with {status}"
-            )));
+            return Ok(Err(status));
         }
-        Ok::<_, VtopError>(result)
+        Ok::<_, VtopError>(Ok(result))
     })
     .await;
     match completed {
-        Ok(Ok(result)) => Ok(result),
+        Ok(Ok(Ok(result))) => Ok(result),
+        Ok(Ok(Err(status))) => Err(evidence
+            .classify(
+                format!("{backend} verification command exited with {status}"),
+                deadline,
+            )
+            .await),
         Ok(Err(error)) => {
             let _ = child.kill().await;
             let _ = child.wait().await;
@@ -302,31 +309,37 @@ pub(crate) async fn read_command_bounded(
     backend: &str,
     timeout: Duration,
 ) -> Result<Vec<u8>, VtopError> {
+    let deadline = command_deadline(timeout);
     let mut child = cmd
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| VtopError::Upload(format!("spawning {backend} download: {e}")))?;
     let stdout = child
         .stdout
         .take()
         .ok_or_else(|| VtopError::Upload(format!("{backend} download stdout unavailable")))?;
-    let completed = tokio::time::timeout(timeout, async {
+    let evidence = ReadBackEvidence::collect(&mut child, backend, "download")?;
+    let completed = tokio::time::timeout_at(deadline, async {
         let bytes = read_bounded(stdout, max_bytes, object_uri).await?;
         let status = child
             .wait()
             .await
             .map_err(|e| VtopError::Upload(format!("waiting for {backend} download: {e}")))?;
         if !status.success() {
-            return Err(VtopError::Upload(format!(
-                "{backend} download command exited with {status}"
-            )));
+            return Ok(Err(status));
         }
-        Ok::<_, VtopError>(bytes)
+        Ok::<_, VtopError>(Ok(bytes))
     })
     .await;
     match completed {
-        Ok(Ok(bytes)) => Ok(bytes),
+        Ok(Ok(Ok(bytes))) => Ok(bytes),
+        Ok(Ok(Err(status))) => Err(evidence
+            .classify(
+                format!("{backend} download command exited with {status}"),
+                deadline,
+            )
+            .await),
         Ok(Err(error)) => {
             let _ = child.kill().await;
             let _ = child.wait().await;
@@ -340,6 +353,124 @@ pub(crate) async fn read_command_bounded(
                 timeout.as_secs()
             )))
         }
+    }
+}
+
+/// A read-back tool's stderr, kept as evidence of WHY it failed (#481).
+///
+/// REGRESSION: both read-back helpers used to send the tool's stderr to
+/// `/dev/null` and report only the exit status, as a generic `Upload`. So an
+/// `aws s3 cp … -`, `s3cmd get … -` or `mc cat` that the store THROTTLED
+/// during verification or a manifest read-back reached the engine as an
+/// ordinary failure, and `note_store_request` told the width controller the
+/// store was fine while it was asking for less. The write path (`command.rs`)
+/// already classified its evidence; the read path now does the same, on the
+/// same last line, through the same `upload_failure`.
+///
+/// Drained on its own task from the moment the child starts, so a tool that
+/// fills stderr can never stall the stdout read. Dropping it aborts the drain.
+///
+/// The kept tail lives OUTSIDE the task, shared with it, so that a wait for
+/// the drain which runs out of time can still read what was captured. The
+/// case that matters: the tool printed `SlowDown` and exited, but a
+/// grandchild it left behind inherited stderr and holds the pipe open. The
+/// drain never reaches EOF, yet the line the classifier needs is already in
+/// the buffer; waiting on a `JoinHandle<String>` alone would throw it away
+/// with the timeout and report the throttle as an ordinary failure.
+struct ReadBackEvidence {
+    drain: tokio::task::JoinHandle<()>,
+    kept: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Drop for ReadBackEvidence {
+    fn drop(&mut self) {
+        self.drain.abort();
+    }
+}
+
+/// The instant a command invocation must be finished by, fixed BEFORE the
+/// tool is spawned. `upload.command_timeout_seconds` bounds the whole call:
+/// running the tool and then collecting its stderr evidence both spend from
+/// this one deadline, so neither can restart the clock (#529 review). The
+/// setting is an unbounded `u64`, so an absurd value saturates to a
+/// practically-never deadline instead of panicking on `Instant` overflow.
+fn command_deadline(timeout: Duration) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    now.checked_add(timeout)
+        .unwrap_or_else(|| now + Duration::from_secs(30 * 365 * 24 * 60 * 60))
+}
+
+impl ReadBackEvidence {
+    /// The most stderr kept. Enough for any CLI's last error line; the rest
+    /// is drained, not stored, so a chatty tool can neither block on a full
+    /// pipe nor grow this process. The TAIL is what is kept: the classifier
+    /// reads the last line, and a tool that prints progress before failing
+    /// would otherwise have its error discarded as the part past the cap.
+    const MAX_BYTES: usize = 64 * 1024;
+    /// How much of the last line the error message repeats.
+    const MAX_SHOWN_CHARS: usize = 240;
+
+    fn collect(
+        child: &mut tokio::process::Child,
+        backend: &str,
+        operation: &str,
+    ) -> Result<Self, VtopError> {
+        let mut stderr = child.stderr.take().ok_or_else(|| {
+            VtopError::Upload(format!("{backend} {operation} stderr unavailable"))
+        })?;
+        let kept = Arc::new(Mutex::new(Vec::new()));
+        let shared = Arc::clone(&kept);
+        let drain = tokio::spawn(async move {
+            let mut chunk = [0_u8; 4096];
+            while let Ok(read) = stderr.read(&mut chunk).await {
+                if read == 0 {
+                    break;
+                }
+                // Held only for the copy, never across the next read.
+                let mut kept = shared.lock().unwrap_or_else(|poison| poison.into_inner());
+                kept.extend_from_slice(&chunk[..read]);
+                if kept.len() > Self::MAX_BYTES {
+                    let excess = kept.len() - Self::MAX_BYTES;
+                    kept.drain(..excess);
+                }
+            }
+        });
+        Ok(Self { drain, kept })
+    }
+
+    /// The error for a tool that EXITED non-zero: its last stderr line, and
+    /// the throttle classification that line supports. Called once the child
+    /// has exited, so the pipe is normally at EOF and the drain finishes at
+    /// once. A grandchild the tool left behind can hold the pipe open, so the
+    /// wait spends only what is left of the command's own `deadline` —
+    /// evidence is worth waiting for, not worth hanging on, and never worth
+    /// stretching the invocation past `upload.command_timeout_seconds`. When
+    /// the deadline has passed, the tail captured so far is classified: the
+    /// tool's error line was written before it exited, so it is already kept.
+    async fn classify(mut self, detail: String, deadline: tokio::time::Instant) -> VtopError {
+        let _ = tokio::time::timeout_at(deadline, &mut self.drain).await;
+        let evidence = {
+            let kept = self
+                .kept
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            String::from_utf8_lossy(&kept).into_owned()
+        };
+        let shown: String = evidence
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or_default()
+            .chars()
+            .take(Self::MAX_SHOWN_CHARS)
+            .collect();
+        let detail = if shown.is_empty() {
+            detail
+        } else {
+            format!("{detail}: {shown}")
+        };
+        upload_failure(detail, &evidence)
     }
 }
 
