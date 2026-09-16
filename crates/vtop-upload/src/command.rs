@@ -522,4 +522,168 @@ mod tests {
         assert!(error.to_string().contains("duplicate"));
         std::env::remove_var(missing);
     }
+
+    #[tokio::test]
+    async fn every_command_backend_reports_a_store_throttle_as_a_throttle_on_every_request_path() {
+        use crate::base::{ObjectChecksum, UploadBackend};
+        type Build = fn(CommandPolicy) -> Box<dyn UploadBackend>;
+        let table: [(&str, Build, &[&str]); 3] = [
+            (
+                "awscli",
+                |policy| Box::new(crate::awscli_backend::AwsCliBackend::new(policy, None, None)),
+                &[
+                    "An error occurred (SlowDown) when calling the PutObject operation (reached max retries: 4): Please reduce your request rate.",
+                    "An error occurred (Throttling) when calling the GetObject operation",
+                    "HTTP 429 Too Many Requests",
+                ],
+            ),
+            (
+                "s3cmd",
+                |policy| Box::new(crate::s3cmd_backend::S3cmdBackend::new(policy, None)),
+                &[
+                    "ERROR: S3 error: 503 (SlowDown): Please reduce your request rate.",
+                    "ERROR: S3 error: 429 (TooManyRequests)",
+                ],
+            ),
+            (
+                "minio",
+                |policy| Box::new(crate::minio_backend::MinioBackend::new(policy, "local")),
+                &[
+                    "mc: <ERROR> Failed to copy `x`. Please reduce your request rate.",
+                    "503 Service Unavailable",
+                ],
+            ),
+        ];
+        let object = tempfile::NamedTempFile::new().unwrap();
+        let digest = vtop_core::checksum::sha256_bytes(b"");
+        for (backend_name, build, throttles) in table {
+            let ordinary = "An error occurred (AccessDenied) when calling the PutObject operation";
+            let cases = throttles
+                .iter()
+                .map(|line| (*line, true))
+                .chain(std::iter::once((ordinary, false)));
+            for (line, is_throttle) in cases {
+                let (_dir, path) =
+                    executable_script(&format!("printf '%s\\n' '{line}' >&2\nexit 1"));
+                let backend = build(CommandPolicy::from_config(&config(&path), "test").unwrap());
+                let uri = "s3://bucket/key";
+                let outcomes = [
+                    (
+                        "put_object",
+                        backend.put_object(object.path(), uri, None).await.err(),
+                    ),
+                    ("head_object", backend.head_object(uri).await.err()),
+                    (
+                        "get_object_bounded",
+                        backend.get_object_bounded(uri, 1024).await.err(),
+                    ),
+                    (
+                        "verify_object",
+                        backend
+                            .verify_object(uri, 0, Some(ObjectChecksum::new("sha256", &digest)))
+                            .await
+                            .err(),
+                    ),
+                ];
+                for (operation, error) in outcomes {
+                    let error = error.unwrap_or_else(|| {
+                        panic!("[{backend_name} {operation}] a failing tool must fail the call")
+                    });
+                    assert_eq!(
+                        error.is_upload_throttle(),
+                        is_throttle,
+                        "[{backend_name} {operation}] {line:?} was classified wrongly: {error}. \
+                         A throttle reported as a plain failure tells the width controller the \
+                         store is fine while it asks for less"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_grandchild_holding_stderr_cannot_stretch_a_read_back_past_its_command_timeout() {
+        // `upload.command_timeout_seconds` bounds the whole invocation. The
+        // stderr evidence is awaited after the tool exits, and a grandchild the
+        // tool left behind keeps the pipe open; giving that wait a FRESH
+        // timeout let a download or verify take nearly twice the configured
+        // bound. The tool here spends most of its 2 s budget before failing,
+        // so a second full wait is plainly visible, while the throttle line it
+        // printed first is already in the kept tail and must still count.
+        use crate::base::{ObjectChecksum, UploadBackend};
+        let (_dir, path) = executable_script(
+            "printf '%s\\n' 'An error occurred (SlowDown) when calling the GetObject operation' >&2\n\
+             sleep 10 >/dev/null &\n\
+             sleep 1.6\n\
+             exit 1",
+        );
+        let policy = CommandPolicy::from_config(&config(&path), "test").unwrap();
+        let bound = policy.timeout();
+        let backend = crate::awscli_backend::AwsCliBackend::new(policy, None, None);
+        let digest = vtop_core::checksum::sha256_bytes(b"");
+        let timed = |operation: &'static str, elapsed: Duration, error: Option<VtopError>| {
+            let error = error.unwrap_or_else(|| panic!("[{operation}] a failing tool must fail"));
+            assert!(
+                elapsed < bound.mul_f64(1.5),
+                "[{operation}] took {elapsed:?} against a {bound:?} command timeout: the evidence \
+                 wait restarted the clock instead of spending what the command left"
+            );
+            assert!(
+                error.is_upload_throttle(),
+                "[{operation}] the SlowDown line was printed before the deadline, yet the \
+                 timed-out evidence wait discarded it: {error}"
+            );
+        };
+        let get = async {
+            let started = std::time::Instant::now();
+            let error = backend
+                .get_object_bounded("s3://bucket/key", 1024)
+                .await
+                .err();
+            (started.elapsed(), error)
+        };
+        let verify = async {
+            let started = std::time::Instant::now();
+            let error = backend
+                .verify_object(
+                    "s3://bucket/key",
+                    0,
+                    Some(ObjectChecksum::new("sha256", &digest)),
+                )
+                .await
+                .err();
+            (started.elapsed(), error)
+        };
+        let ((get_elapsed, get_error), (verify_elapsed, verify_error)) = tokio::join!(get, verify);
+        timed("get_object_bounded", get_elapsed, get_error);
+        timed("verify_object", verify_elapsed, verify_error);
+    }
+
+    #[tokio::test]
+    async fn a_throttle_after_a_flood_of_progress_output_is_still_read_as_a_throttle() {
+        // The read-back keeps a bounded amount of stderr, and the classifier
+        // reads its LAST line. Keeping the first 64 KiB instead would discard
+        // exactly that line for a tool that prints progress before it fails,
+        // and the throttle would reach the controller as an ordinary failure.
+        use crate::base::UploadBackend;
+        let (_dir, path) = executable_script(
+            "i=0; while [ $i -lt 4000 ]; do printf 'progress %060d\\n' $i >&2; i=$((i+1)); done\n\
+             printf '%s\\n' 'An error occurred (SlowDown) when calling the GetObject operation' >&2\n\
+             exit 1",
+        );
+        let backend = crate::awscli_backend::AwsCliBackend::new(
+            CommandPolicy::from_config(&config(&path), "test").unwrap(),
+            None,
+            None,
+        );
+        let error = backend
+            .get_object_bounded("s3://bucket/key", 1024)
+            .await
+            .expect_err("a failing tool must fail the read-back");
+        assert!(
+            error.is_upload_throttle(),
+            "~290 KiB of progress before the SlowDown line pushed it past the kept stderr, \
+             and the throttle was reported as a plain failure: {error}"
+        );
+    }
 }
