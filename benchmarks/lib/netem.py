@@ -136,6 +136,19 @@ JITTER_HEADROOM_SIGMAS = 3
 # into the delay line, measured at twice the rate on the lab's 8-flow link.
 DELAY_LINE_HEADROOM = 4
 
+# The rate a delay line with NO configured rate is sized for (#516): the
+# download direction, which this lab never shapes, and an upload with no tbf.
+# Nothing bounds what enters those lines, so no scenario value can size them,
+# and netem's default of 1000 packets would be a queue nobody chose — one that
+# a fast enough unshaped path (a verify GET on the return path, an unpoliced
+# pure-delay upload) fills and then drops packets the emulated link never lost.
+# One gigabit is the reference because it is the top of what this lab claims
+# anything about: netem's accuracy above it is not established here, and every
+# bundled shape sits two orders of magnitude below it. It sizes a LIMIT, not a
+# rate — nothing is paced to it — so erring high costs only memory the traffic
+# never uses.
+DELAY_LINE_REFERENCE_KBPS = 1_000_000
+
 # netem's own default limit, in packets. The delay line's limit never goes
 # below it: a shape that asks for a bottleneck must not get a SHALLOWER delay
 # line than one that asks for none.
@@ -195,6 +208,21 @@ def gemodel_params(loss_pct: float) -> tuple[float, float]:
     r = 100.0 / GEMODEL_MEAN_BURST_PACKETS
     p = r * loss_pct / (100.0 - loss_pct)
     return round(p, 4), round(r, 4)
+
+
+def delay_line_limit_packets(rate_kbps: int, delay_ms: int, jitter_ms: int) -> int:
+    """A netem delay line's packet limit when no tbf sits under it (#516).
+
+    The same rule the bottlenecked upload's line follows (see
+    `NetemShape.netem_limit_packets`): what the line can hold at `rate_kbps` for
+    the deep end of its delay distribution — `delay + 3 sigma` — converted at
+    `MTU_BYTES`, times `DELAY_LINE_HEADROOM`, floored at netem's own default. A
+    line with no delay holds nothing and gets the floor, explicitly. Exact
+    arithmetic and rounded up, the harmless direction for a limit.
+    """
+    held_ms = delay_ms + JITTER_HEADROOM_SIGMAS * jitter_ms
+    in_flight = math.ceil(Fraction(rate_kbps * held_ms) / 8)
+    return max(NETEM_DEFAULT_LIMIT_PACKETS, -(-DELAY_LINE_HEADROOM * in_flight // MTU_BYTES))
 
 
 def bdp_bytes(bottleneck_kbps: int, latency_ms: int) -> int:
@@ -274,9 +302,11 @@ class NetemShape:
 
     def buffer_bytes(self) -> int:
         """tbf's queue: the bottleneck buffer, in BDP multiples. Floored at
-        one full-size packet, because a queue that cannot hold a segment is a
-        dropper, not a buffer."""
-        return max(1500, int(bdp_bytes(self.bottleneck_kbps, self.latency_ms) * self.buffer_bdp))
+        one full-size packet — `MTU_BYTES`, the same constant the delay line's
+        packet limits convert at, so a changed MTU moves both (#516) — because a
+        queue that cannot hold a segment is a dropper, not a buffer."""
+        return max(MTU_BYTES,
+                   int(bdp_bytes(self.bottleneck_kbps, self.latency_ms) * self.buffer_bdp))
 
     def burst_bytes(self) -> int:
         return max(TBF_MIN_BURST_BYTES,
@@ -371,6 +401,31 @@ class NetemShape:
         held_ms = self.upload_delay_ms() + JITTER_HEADROOM_SIGMAS * self._upload_jitter_ms()
         return math.ceil(Fraction(self.bottleneck_kbps * held_ms) / 8)
 
+    def upload_delay_line_limit_packets(self) -> int:
+        """The upload netem's limit, for EVERY upload shape (#516).
+
+        With a tbf, `netem_limit_packets`: the line is sized from the
+        bottleneck rate, which bounds what the congestion queue lets through.
+        Without one there is no configured buffer and nothing queues behind a
+        rate, so netem is a pure delay line — but it still needs a limit, and
+        the default is a queue nobody chose. It is sized for the fastest thing
+        that can enter it: the policer's rate where a policer drops everything
+        above it before the redirect, the reference ceiling otherwise.
+        """
+        if self.bottleneck_kbps:
+            return self.netem_limit_packets()
+        return delay_line_limit_packets(self.policer_kbps or DELAY_LINE_REFERENCE_KBPS,
+                                        self.upload_delay_ms(), self._upload_jitter_ms())
+
+    def download_delay_line_limit_packets(self) -> int:
+        """The download netem's limit (#516). The return path is never shaped —
+        no bottleneck, no policer — so it carries whatever the store sends back
+        at whatever rate the host path allows: ACKs for the upload, and whole
+        objects when verification reads them back. Sized for the reference
+        ceiling, out of reach of both, and chosen here rather than inherited."""
+        return delay_line_limit_packets(DELAY_LINE_REFERENCE_KBPS, self.download_delay_ms(),
+                                        self._download_jitter_ms())
+
     def _netem_args(self, delay_ms: int, jitter_ms: int, with_loss: bool,
                     limit_packets: int | None = None) -> list[str]:
         args = ["netem"]
@@ -403,6 +458,12 @@ class NetemShape:
         half, odd = divmod(self.jitter_ms, 2)
         return half + odd
 
+    def _download_jitter_ms(self) -> int:
+        """The other half of the jitter, named like the upload's (#516): the
+        install and the teardown both decide from it whether a download qdisc
+        exists, and two inline spellings are two places to change together."""
+        return self.jitter_ms // 2
+
     def tc_program(self, engine_iface: str = ENGINE_IFACE) -> list[list[str]]:
         """Every `tc`/`ip` command that installs this shape, in order.
 
@@ -424,14 +485,20 @@ class NetemShape:
         # delay line is netem's and the congestion queue is tbf's own byte-limited
         # bfifo, so `shaping_buffer_bdp` is enforced exactly and nothing the delay
         # line leaves unused can be borrowed by it — see `netem_limit_packets`.
-        # Without a tbf there is no configured buffer to hold, so netem keeps its
-        # own default (#516 is that gap).
+        # Without a tbf netem is a pure delay line, and it still gets a limit
+        # somebody chose (#516) — see `upload_delay_line_limit_packets`.
+        # WHETHER a netem exists is decided on its impairments alone: the limit
+        # is sizing for a qdisc that is installed, never a reason to install one
+        # — a pure-loss or policer-only shape must not grow a delay line it did
+        # not ask for, nor a teardown that no longer mirrors its install.
+        upload_impaired = len(self._netem_args(
+            self.upload_delay_ms(), self._upload_jitter_ms(), with_loss=True)) > 1
         upload_netem = self._netem_args(
             self.upload_delay_ms(), self._upload_jitter_ms(), with_loss=True,
-            limit_packets=self.netem_limit_packets() if self.bottleneck_kbps else None)
+            limit_packets=self.upload_delay_line_limit_packets())
         bottleneck = ["tbf", "rate", f"{self.bottleneck_kbps}kbit",
                       "burst", str(self.burst_bytes()), "limit", str(self.buffer_bytes())]
-        if len(upload_netem) > 1:
+        if upload_impaired:
             cmds.append(["tc", "qdisc", "add", "dev", IFB_DEV, "root", "handle", "1:"]
                         + upload_netem)
             if self.bottleneck_kbps:
@@ -464,9 +531,11 @@ class NetemShape:
         # DOWNLOAD: the other half of the delay, on the way back to the
         # engine. No loss and no rate — the data direction carries those, and
         # a number is easier to read when only one direction is impaired.
-        download_netem = self._netem_args(self.download_delay_ms(), self.jitter_ms // 2,
-                                          with_loss=False)
-        if len(download_netem) > 1:
+        if len(self._netem_args(self.download_delay_ms(), self._download_jitter_ms(),
+                                with_loss=False)) > 1:
+            download_netem = self._netem_args(
+                self.download_delay_ms(), self._download_jitter_ms(), with_loss=False,
+                limit_packets=self.download_delay_line_limit_packets())
             cmds.append(["tc", "qdisc", "add", "dev", engine_iface, "root", "handle", "2:"]
                         + download_netem)
         return cmds
@@ -488,7 +557,7 @@ class NetemShape:
         qdisc left behind shapes the next run without saying so.
         """
         cmds: list[list[str]] = []
-        if len(self._netem_args(self.download_delay_ms(), self.jitter_ms // 2,
+        if len(self._netem_args(self.download_delay_ms(), self._download_jitter_ms(),
                                 with_loss=False)) > 1:
             cmds.append(["tc", "qdisc", "del", "dev", engine_iface, "root"])
         cmds.append(["tc", "qdisc", "del", "dev", engine_iface, "ingress"])
