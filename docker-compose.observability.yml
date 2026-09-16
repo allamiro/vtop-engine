@@ -47,7 +47,7 @@ services:
   # Without it the Kafka dashboard shows its target as DOWN rather than silently
   # graphing nothing.
   kafka-exporter:
-    image: danielqsj/kafka-exporter:v1.9.0
+    image: danielqsj/kafka-exporter:v1.10.0
     container_name: vtop-kafka-exporter
     security_opt:
       - no-new-privileges:true
