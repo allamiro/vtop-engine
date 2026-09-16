@@ -76,6 +76,33 @@ forward_ns() { # namespace pod localport remoteport
   sleep 4
 }
 
+# A forward that OUTLIVES its pod (#515). `kubectl port-forward` binds to a
+# pod, not a Service, and exits for good when that pod is deleted — which the
+# per-attempt forwards below handle by re-forwarding on every attempt, on a
+# fresh port. A forward named in a CONFIG FILE cannot do that: the port is
+# baked into the file, so the only way to keep that endpoint meaning "this
+# pod" across a restart is to re-attach on the same port whenever kubectl
+# exits. The one-second pause is not a settle: it keeps a pod that does not
+# exist yet from turning the loop into a busy spin of API calls.
+#
+# The subshell's TERM trap takes the current kubectl down with it, so the
+# cleanup's `kill` on the recorded pid still leaves no port-forward behind.
+forward_supervised() { # namespace pod localport remoteport
+  (
+    child=""
+    trap 'kill "$child" 2>/dev/null; exit 0' TERM
+    while :; do
+      kubectl -n "$1" port-forward "pod/$2" "$3:$4" >/dev/null 2>&1 &
+      child=$!
+      wait "$child" || true
+      sleep 1
+    done
+  ) &
+  FORWARDS="$FORWARDS $!"
+  disown 2>/dev/null || true
+  sleep 4
+}
+
 forward() { # pod localport remoteport
   kubectl -n "$NS" port-forward "pod/$1" "$2:$3" >/dev/null 2>&1 &
   FORWARDS="$FORWARDS $!"
@@ -781,11 +808,24 @@ done
 # A forward per metadata pod: needed to find WHICH one leads, and then to reach
 # the leader after a redirect. Allocated before the probe below because that
 # probe queries every pod by port.
+#
+# SUPERVISED, because these ports are written into r-admin-multi.yaml and every
+# lease read after the failover goes through them (#515). In the co-located
+# shape the holder's data pod IS a metadata voter, so deleting it used to kill
+# that voter's forward for the rest of the run. When the recreated pod came
+# back fast enough to keep metadata leadership — no election, same term — every
+# lease read reached a follower, was redirected to the leader's port, and found
+# nothing listening there: "is not the metadata leader; it named node 1",
+# repeated for 180s against a plane whose own status showed a healthy leader.
+# Intermittent because it needed metadata leadership to sit on exactly the pod
+# the test deletes.
 peer_ports=()
+peer_forwards=()
 for ordinal in 0 1 2; do
   alloc_port
   peer_ports+=("$r_port")
-  forward_ns "$R_NS" "$(meta_pod "$ordinal")" "$r_port" 9200
+  forward_supervised "$R_NS" "$(meta_pod "$ordinal")" "$r_port" 9200
+  peer_forwards+=("${FORWARDS##* }")
 done
 
 # Find WHICH pod leads, and then deliberately aim everything at one that does
@@ -1370,6 +1410,11 @@ log "post-failover peer DNS settled"
 # records replicated, and the returned pod caught up from whatever it missed.
 await_all_committed "$R_TOTAL" "$NEW_EPOCH"
 log "failover verified in Kubernetes: the range moved (or recovered) without a re-render, produce resumed, and all $R_TOTAL records are on every replica"
+
+# The supervisors end with the shape they serve (#515). Left running, they
+# would re-dial pods of an uninstalled namespace once a second for the whole
+# of the next pass, on the same kind API server that pass is being judged on.
+for pid in "${peer_forwards[@]}"; do kill "$pid" 2>/dev/null || true; done
 
 }
 
