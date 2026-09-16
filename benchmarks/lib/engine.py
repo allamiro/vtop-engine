@@ -285,14 +285,23 @@ def preflight_container(config_path: str, input_dir: str, binary: str,
     return None
 
 
-def invocation(binary: str, args: list[str], scenario) -> tuple[list[str], dict[str, str]]:
+def invocation(binary: str, args: list[str], scenario,
+               extra_env: dict[str, str] | None = None) -> tuple[list[str], dict[str, str]]:
     """The exact (argv, env) a run of the engine uses, in either mode.
 
     Public and pure so the default path is pinned by a test rather than by
     hope: `host` mode must produce today's command line unchanged, or the
     second mode's existence has already drifted the first.
+
+    `extra_env` carries what only one kind of invocation needs — the
+    long-lived engine's VTOP_METRICS_ADDR (#510). It is set in both modes and,
+    in container mode, forwarded by NAME exactly like the backend keys, so its
+    value cannot differ between the namespaces by accident. None, the default,
+    leaves every existing command line byte-for-byte as it was.
     """
     env = _backend_env(scenario)
+    extra_env = dict(extra_env or {})
+    env.update(extra_env)
     if runner_mode(scenario) == "host":
         return [binary] + args, env
     # Container mode: the engine's environment crosses the boundary through
@@ -320,6 +329,9 @@ def invocation(binary: str, args: list[str], scenario) -> tuple[list[str], dict[
         if value:
             argv += ["-e", key]
             exec_env[key] = value
+    for key, value in extra_env.items():
+        argv += ["-e", key]
+        exec_env[key] = value
     argv += [CONTAINER_SERVICE, "vtopctl"] + args
     return argv, exec_env
 

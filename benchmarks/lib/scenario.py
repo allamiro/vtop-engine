@@ -61,6 +61,17 @@ DEFAULTS: dict[str, Any] = {
     # scenario, and rewriting the bundled scenarios would make their
     # historical numbers incomparable to their future ones.
     "runner_mode": "host",
+    # WHICH ENGINE runs the window (#510), see lib/engine_run.py.
+    # "process-once" is a fresh `vtopctl process-once` per cycle — today's
+    # behaviour, and the default so every recorded scenario keeps the engine it
+    # was measured on. "run" is ONE long-lived `vtopctl run` for
+    # duration_seconds, with its own /metrics scraped into engine_metrics.csv:
+    # the only mode in which anything that lives in the engine process — a rate
+    # cap's token bucket, the width controller, a process-lifetime counter —
+    # survives long enough to be observed.
+    "engine_mode": "process-once",
+    # engine_mode: run only. At most 1.0: the series promises per-second buckets.
+    "engine_scrape_interval_seconds": 1.0,
     # Bandwidth shaping between the engine and the store (#403), see
     # lib/shaping.py. "" = unshaped; the rest matter only when it is set.
     "shaping_api_url": "",

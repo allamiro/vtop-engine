@@ -139,6 +139,144 @@ themselves short. A longer-duration soak amortizes it; so would a
 resident in-container cycle runner, which is #477-adjacent work. Compare
 container runs to container runs until then.
 
+### Which engine runs the window: `engine_mode` (#510)
+
+Every scenario runs the engine one of two ways:
+
+| `engine_mode` | what runs | what it can see |
+|---|---|---|
+| `process-once` (the default) | a fresh `vtopctl --json process-once` per cycle, today's behaviour | per-batch outcomes: stage timings, latency percentiles, per-object upload rows |
+| `run` | ONE `vtopctl run` for `duration_seconds`, started with `VTOP_METRICS_ADDR`, its `/metrics` scraped every `engine_scrape_interval_seconds` (default 1, at most 1) | anything that lives in the engine process: a rate cap's token bucket, the width controller, the engine's own process-lifetime counters |
+
+`process-once` stays the default for the reason `host` and `toxiproxy` do:
+every recorded scenario keeps the engine it was measured on, or its historical
+numbers stop being comparable to its future ones. A scenario that names no
+mode writes byte-for-byte the files and columns it always has.
+
+**When to prefer `run`.** Whenever the question is about state that a fresh
+process resets: a rate cap (#481, which is verified against the engine's own
+egress counter, never against host-wide `psutil` bytes), the adaptive width
+controller backing off (#102), throttles, or a steady-state engine rather
+than a cold start per cycle. Stay on `process-once` for comparisons with
+recorded numbers and for per-batch latency percentiles.
+
+**What it costs, and what it gives up.**
+
+- A scrape per interval over loopback, and about **200 CSV rows per
+  sample** — every series the engine exposes, histogram buckets included:
+  about 40–50 KB of `engine_metrics.csv` per second (measured, mock backend,
+  10 s windows: 402–516 KB), so an hour-long soak writes a file in the
+  hundreds of megabytes.
+- **No per-batch outcomes.** `vtopctl run` prints none, so
+  `batch_metrics.csv`, `upload_metrics.csv`, `state_transition_metrics.csv`
+  and `backlog_metrics.csv` carry headers only, and the columns only outcomes
+  can fill (`avg_latency_ms`, `p50/p95/p99_latency_ms`, `upload_p50_ms`,
+  `upload_p95_ms`, `compression_ratio_avg`, `avg_batch_duration_ms`) are
+  **blank** — unknown, not the 0.0 an empty list would produce. The stage
+  histograms are in the series instead.
+- **Batches seal on thresholds, not at the end of a cycle.** A long-lived
+  engine accumulates across cycles and seals on `batch_max_records`,
+  `batch_max_bytes` or `batch_max_age_seconds`, so a small input under the
+  default 60 s age can commit nothing inside a short window — and a run that
+  committed nothing is refused like any other run that measured nothing.
+  Set the thresholds for the window you give it.
+- **No per-cycle re-seeding.** There are no cycles: the input is seeded once,
+  plus the concurrent seeder if `seed_concurrently: true`.
+- **`duration_seconds` in the summary is still the run's wall clock**
+  (seeding, the window, the stop and the recovery pass), exactly as in the
+  per-cycle mode; the window itself is `engine_window_seconds`.
+- **The window runs from the engine's launch.** The input is seeded before
+  launch, and a small run can commit all of it before the endpoint first
+  answers, so the counters are read against zero at launch — true of the fresh
+  process the runner starts — not against the first answer.
+  `engine_window_seconds` covers the same span: the start, then the configured
+  duration rounded up to whole intervals from the first answer.
+
+**What it writes.** `engine_metrics.csv`, one row per series per sample:
+`timestamp` (the sample's, ISO 8601 UTC), `elapsed_seconds` since launch,
+`interval_seconds` since the previous sample, `metric`, `labels`,
+`type`, `value`, and for counters the interval's `delta` and
+`delta_per_second` — so "was the rate ever exceeded in any one second" is
+answered from the artifact, not from an average. The opening row's interval is
+the launch-to-first-answer span and its delta the increase since launch; that
+span is not a scheduled bucket, so it has no `delta_per_second` and does not
+enter `engine_<name>_max_per_second`. A counter series that first
+appears mid-window counts from zero in the interval it appeared, because the
+engine creates its labelled counters on their first increment. The engine's
+own output goes to `engine-run.log`.
+
+The engine's series, by kind (`vtop_core::telemetry`):
+
+| kind | series | read as |
+|---|---|---|
+| counter | `vtop_batches_total`, `vtop_verified_total`, `vtop_commits_total`, `vtop_verification_failures_total`, `vtop_verification_backend_limited_total`, `vtop_replay_required_total`, `vtop_failed_total`, `vtop_records_total`, `vtop_bytes_in_total`, `vtop_bytes_out_total`, `vtop_source_read_errors_total`, `vtop_retention_lost_records_total`, `vtop_upload_throttled_total` | only ever increase within one process: `delta` / `delta_per_second` per interval |
+| histogram | `vtop_stage_duration_seconds`, `vtop_batch_duration_seconds`, `vtop_compression_ratio` | their `_bucket`, `_sum` and `_count` are monotonic, so they carry deltas like counters |
+| gauge | `vtop_inflight_batches`, `vtop_upload_width` | instantaneous: `value` only, no delta |
+
+The flat columns appended to `metrics.csv` and `summary.json` on a `run`
+scenario only: `engine_mode`, `engine_metrics_address`,
+`engine_window_seconds`, `engine_scrape_interval_seconds`, `engine_samples`,
+`engine_stopped_by`, and per surfaced series — summed across label sets —
+`engine_<name>_window` and `engine_<name>_max_per_second` for a counter,
+`engine_<name>_min` and `engine_<name>_max` for a gauge. Surfaced today:
+`commits_total`, `failed_total`, `records_total`, `bytes_in_total`,
+`bytes_out_total`, `upload_throttled_total` (counters) and
+`inflight_batches`, `upload_width` (gauges). A counter column the endpoint
+never exposed is **blank**: "never incremented" and "this binary does not
+have the series" cannot be told apart from the endpoint. The run-level
+`successful_batches`, `failed_batches`, `total_input_bytes` and
+`total_output_bytes` come from the same counters' increase inside the window.
+
+**Adding a column for a new series is one line**: an entry in
+`SUMMARY_SERIES` in `lib/engine_run.py`, e.g.
+`("vtop_upload_egress_bytes_total", "counter")` when #481 adds it. The
+declared kind is checked against the endpoint's `# TYPE` line, and a mismatch
+refuses the run.
+
+**Refused, never reported partially** (exit 5, the reason on stderr; the
+samples taken so far stay in `engine_metrics.partial.csv` for diagnosis and
+no `summary.json` is written):
+
+- the endpoint never answers within 30 s of launch — the message names the
+  address it tried;
+- something already answers at that address before the engine starts — a
+  leaked engine from an earlier run would otherwise be scraped in this one's
+  place;
+- a scrape fails inside the window, or two samples land more than two
+  intervals apart;
+- a counter goes backwards or a series disappears (a different process is
+  answering, or the engine restarted);
+- the engine exits before the window closes.
+
+**Stopping the engine, on every way out** — a closed window, any refusal
+above, any failure in between, and Ctrl-C. SIGINT (the engine's graceful
+stop, which flushes its buffers) is re-sent for up to 10 s, then SIGKILL, and
+`engine_stopped_by` records which one it took. Expect `sigkill` under
+sustained load: `vtopctl run` only notices a ctrl-c that arrives while its
+loop is idle in `select!` — one delivered during a busy cycle is lost.
+Against the v0.6.0 release binary under a concurrent seeder, three of three
+trials had not exited 15 s after one SIGINT, nor after 75 SIGINTs 0.2 s
+apart; a run still gets `sigint` when a signal happens to land while the
+engine is idle. A SIGKILLed engine can leave batches mid-pipeline in the
+ledger for the recovery pass afterwards to recover, so read `recovery_ms`
+beside `engine_stopped_by`.
+
+**Per runner mode:**
+
+- `host` — the engine is a host process in its own session, listening on a
+  fresh loopback port per run (`engine_metrics_address` records which).
+- `container` — the engine is exec'd in `vtop-engine` listening on
+  `0.0.0.0:9464`, which the compose file publishes on the host's loopback
+  (`VTOP_BENCH_METRICS_PORT` picks the host port, `VTOP_BIND_ADDR` the
+  address, as for every other port there). A `vtop-engine` container created
+  before that port existed does not have it; recreate the `containerized`
+  profile, or the run is refused as never answering. The scrape does not
+  cross the netem middlebox, which shapes the engine-to-store path. Teardown
+  happens **inside** the container: killing a `docker exec` client does not
+  stop the process it started (verified against the lab's hardened image
+  with both SIGTERM and SIGKILL), so the runner finds the `vtopctl` whose
+  argv names this run's config and signals it there.
+
 ## 4. Run the full matrix
 
 ```bash
@@ -164,6 +302,8 @@ Each `results/<run_id>/` contains:
 | `replay_metrics.csv` | one row per replay | failed state, replay duration, success |
 | `backlog_metrics.csv` | one row per sustained-load cycle | bytes seeded vs archived, and the deficit between them |
 | `system_metrics.csv` | one row per sample | cpu%, memory, disk, network |
+| `engine_metrics.csv` | one row per engine series per scrape — `engine_mode: run` only (§3) | timestamp, metric, labels, type, value, per-interval delta and per-second rate for counters |
+| `engine-run.log` | the long-lived engine's own output — `engine_mode: run` only | |
 | `summary.json` / `summary.md` | run rollup | everything above, aggregated + bottleneck notes |
 
 All timestamps are ISO 8601 (UTC).
@@ -245,9 +385,9 @@ What the run answers, and where to read it:
 
 | question | reads on |
 |----------|----------|
-| does a thin pipe grow the **deficit** rather than the process? | `backlog_metrics.csv` should climb while `memory_max_mb` in `metrics.csv` stays bounded — the #98 hypothesis-1 shape, now reachable on purpose. (The engine's own queue gauges, `inflight_batches` and `upload_throttled_total`, are not scraped by this harness; read them off the engine's `/metrics` if you run it with `VTOP_METRICS_ADDR`.) |
+| does a thin pipe grow the **deficit** rather than the process? | `backlog_metrics.csv` should climb while `memory_max_mb` in `metrics.csv` stays bounded — the #98 hypothesis-1 shape, now reachable on purpose. (The engine's own `vtop_inflight_batches` gauge and `vtop_upload_throttled_total` counter are scraped only by an `engine_mode: run` scenario (§3), which has no per-cycle `backlog_metrics.csv` rows.) |
 | is the wait attributed honestly? | `upload_p95_ms` in `summary.json` / `metrics.csv` — the p95 of the per-batch `object_upload_ms`, which `upload_metrics.csv` carries per object as `upload_duration_ms` — grows by the pipe; `p95_latency_ms` (the whole batch) grows by the same, not more |
-| what does the controller see? | the raw signal #102's width controller consumes — the per-batch `object_upload_ms`, summarized as `upload_p50_ms` / `upload_p95_ms`, against the pipe. The controller itself lives in the engine process, and this harness runs one `process-once` per cycle, so its width resets every cycle: observing the back-off (and the throttle counter it reacts to) needs a long-lived `vtopctl run` against the same shaped stack with its `/metrics` scraped, which is where the #102 measurement belongs |
+| what does the controller see? | per cycle, the raw signal #102's width controller consumes — the per-batch `object_upload_ms`, summarized as `upload_p50_ms` / `upload_p95_ms`, against the pipe. The controller itself lives in the engine process and resets with every `process-once`, so the back-off is observed with `engine_mode: run` (§3): one long-lived `vtopctl run` against the same shaped stack, whose `engine_metrics.csv` carries `vtop_upload_width` per second beside the `vtop_upload_throttled_total` it reacts to, summarized as `engine_upload_width_min` / `_max` and `engine_upload_throttled_total_window` / `_max_per_second`. That is where the #102 measurement belongs |
 | what is the control? | the runner unshapes the pipe on every way out, so a following unshaped run of scenario 12 is the comparison — same seeder, same store, no pipe |
 
 ### The netem middlebox: loss, policing and a real queue (#477)
@@ -488,7 +628,8 @@ Copy any file in `scenarios/`, change the knobs, drop it in `scenarios/`.
 Every parameter is configurable (see `lib/scenario.py` `DEFAULTS`):
 volume, file_size, format, batch_max_records/bytes/age, compression(+level),
 checksum, backend, duration_seconds, fault, sys_sample_interval, bucket,
-endpoint_url, and the `shaping_*` keys (§7). `run_matrix.py --all`
+endpoint_url, `runner_mode` and `engine_mode` / `engine_scrape_interval_seconds`
+(§3), and the `shaping_*` keys (§7). `run_matrix.py --all`
 automatically picks it up.
 
 ## Benchmark matrix coverage
@@ -506,6 +647,7 @@ automatically picks it up.
 | Runtime duration | ✅ any (`duration_seconds`) | 5 min / 30 min / 1 h presets easy to add |
 | Sustained backpressure | ✅ `seed_concurrently` + `backlog_multiplier` | a real deficit, not just sustained load — scenario `11-backpressure-soak` (#98) |
 | Bandwidth-shaped upload | ✅ toxiproxy on the `shaped` profile, `shaping_*` keys | the upload link as the bottleneck — scenario `13-backpressure-soak-shaped` (#403) |
+| Engine's own metrics | ✅ `engine_mode: run` | one long-lived `vtopctl run` per window, `/metrics` scraped per second into `engine_metrics.csv` (#510) |
 
 ## Native segment write amp / proof overhead (#189)
 

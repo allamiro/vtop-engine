@@ -159,6 +159,18 @@ services:
       # The engine writes nothing outside the mounted run root; HOME points
       # at scratch so nothing in the image is asked to be writable.
       HOME: /scratch
+    # The long-lived engine's /metrics (#510), published so the HOST-side
+    # runner can scrape it. Nothing listens here unless a scenario runs
+    # `engine_mode: run`, which is the only time the runner sets
+    # VTOP_METRICS_ADDR=0.0.0.0:9464 for the exec'd engine. Loopback-only by
+    # default like every other port in this file. Published rather than read
+    # through a per-sample `docker exec` (100-200 ms of client startup against
+    # a one-second bucket, on the CPU being measured) or through the bridge
+    # address (unroutable from the host on Docker Desktop and rootless docker).
+    # The scrape never crosses the netem middlebox, which shapes the
+    # engine-to-store path, not this interface.
+    ports:
+      - "${VTOP_BIND_ADDR:-127.0.0.1}:${VTOP_BENCH_METRICS_PORT:-9464}:9464"
     volumes:
       # VTOPCTL_BIN follows the runner's own selection knob (review): a
       # custom build must be the binary BOTH modes measure, or the modes

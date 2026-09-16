@@ -15,6 +15,7 @@ Never overwrites a prior run.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import glob
 import os
 import shutil
@@ -26,7 +27,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from lib import engine, seed, shaping  # noqa: E402
+from lib import engine, engine_run, seed, shaping  # noqa: E402
 from lib.metrics import ResultsWriter, iso_now, new_run_id, percentile  # noqa: E402
 from lib.scenario import load_scenario, reseed_count  # noqa: E402
 from lib.sysmon import SystemMonitor  # noqa: E402
@@ -99,6 +100,10 @@ def main() -> int:
     # not fall back to host and record a run as something it was not.
     try:
         mode = engine.runner_mode(sc)
+        # And which ENGINE (#510), with the same timing: a long-lived run with
+        # no window, or a scrape interval coarser than the per-second buckets
+        # it promises, is refused before it costs anything.
+        engine_mode = engine_run.engine_mode(sc)
     except ValueError as bad:
         print(f"[bench] {bad}", file=sys.stderr)
         return 2
@@ -126,7 +131,10 @@ def main() -> int:
             from lib import netem
             emulator_validation_mbps = netem.calibrate(shape)
     run_id = new_run_id(sc.name)
-    writer = ResultsWriter(results_root, run_id)
+    # A long-lived run appends its engine counters to metrics.csv (#510); a
+    # per-cycle run passes nothing and writes exactly the headers it always has.
+    writer = ResultsWriter(results_root, run_id,
+                           extra_columns=engine_run.metrics_columns(engine_mode))
     print(f"[bench] scenario={sc.name} run_id={run_id}")
     print(f"[bench] results -> {writer.dir}")
 
@@ -243,9 +251,36 @@ def main() -> int:
     # engine process and report zero. realpath makes both sides name the
     # resolved file.
     engine_proc_name = os.path.basename(os.path.realpath(binary))
-    with SystemMonitor(emit_sys, interval=float(sc.get("sys_sample_interval", 1.0)),
-                       container="vtop-bench-engine" if mode == "container" else None,
-                       proc_name=None if mode == "container" else engine_proc_name), \
+
+    # Hoisted out of the block below so the cleanup can stop the seeder too.
+    stop_seeding = threading.Event()
+    seeder = None
+
+    @contextlib.contextmanager
+    def _owned_scratch_removed_if_it_raises():
+        # A refusal that RAISES out of the measured block — a long-lived
+        # window that was refused (#510), above all — used to leave main()
+        # past the cleanup at its bottom: the seed, work and state directories
+        # leaked on every refused run and the writer stayed open. Entered
+        # FIRST in the `with` below so it exits LAST, after the monitor has
+        # stopped writing rows and the link is unshaped, and only on an
+        # exception: the normal path still needs the state dir for the ledger
+        # and recovery measurements after the block. The seeder is stopped
+        # before its directory goes. The writer's directory stays — a refused
+        # window's partial series and engine log are its only diagnosis.
+        try:
+            yield
+        except BaseException:
+            stop_seeding.set()
+            if seeder is not None:
+                seeder.join()
+            _cleanup_owned_scratch()
+            raise
+
+    with _owned_scratch_removed_if_it_raises(), \
+            SystemMonitor(emit_sys, interval=float(sc.get("sys_sample_interval", 1.0)),
+                          container="vtop-bench-engine" if mode == "container" else None,
+                          proc_name=None if mode == "container" else engine_proc_name), \
             shaping.shaped_run(sc, shape=shape,
                                endpoint=engine.effective_endpoint(sc)):
         # initial seed
@@ -278,8 +313,6 @@ def main() -> int:
         # not wait, and that — not the record rate — is what put the engine
         # hopelessly behind in #98. A thread seeding on a wall-clock interval
         # restores the property at whatever scale the disk can afford.
-        stop_seeding = threading.Event()
-        seeder = None
         seeder_error: list[BaseException] = []
         if duration > 0 and sc.get("seed_concurrently", False):
             per_round = reseed_count(int(sc.volume),
@@ -328,7 +361,28 @@ def main() -> int:
             seeder = threading.Thread(target=_seed_loop, name="seeder", daemon=True)
             seeder.start()
             print(f"[bench] seeding concurrently: {per_round} files every {interval}s")
-        while True:
+        # ONE LONG-LIVED ENGINE INSTEAD OF THE CYCLES (#510). `vtopctl run`
+        # holds the window, its own /metrics is the record, and everything the
+        # loop below would have counted is read off the engine's counters
+        # instead. lib/engine_run.py refuses a partial series, and stops the
+        # engine on every way out of the call — the seeder is stopped here on
+        # the same ways out, so a refusal does not leave it writing into a seed
+        # directory the cleanup is about to remove.
+        window = None
+        if engine_mode == engine_run.LONG_LIVED:
+            try:
+                window = engine_run.measure_window(binary, config_path, sc, writer.dir)
+            except BaseException:
+                stop_seeding.set()
+                if seeder is not None:
+                    seeder.join()
+                raise
+            totals = window.run_totals()
+            success, failed = totals["success"], totals["failed"]
+            in_bytes, out_bytes, out_objects = totals["in_bytes"], totals["out_bytes"], totals["success"]
+            engine_stderr = window.log_tail()
+        # The per-cycle loop, today's default; a long-lived run skips it whole.
+        while window is None:
             rc, outcomes, stderr = engine.process_once(binary, config_path, sc)
             if not outcomes:
                 if rc != 0:
@@ -656,6 +710,11 @@ def main() -> int:
         "transport_tuning": transport_tuning,
         "transport_tuning_flat": transport_tuning_flat,
     }
+    # The long-lived engine's flat counters (#510), and blanks for the columns
+    # only per-cycle outcomes can fill. Absent on a per-cycle run, whose
+    # summary keeps exactly the keys it always had.
+    if window is not None:
+        summary.update(window.summary_columns())
     # CPU/mem summary from the system-metrics samples written during the run.
     summary.update(_sys_summary(writer.dir))
     summary["bottleneck_observations"] = _bottleneck(summary)
@@ -763,3 +822,9 @@ if __name__ == "__main__":
         # and a non-zero exit — not a traceback for a stack that is not up.
         print(f"[bench] {exc}", file=sys.stderr)
         raise SystemExit(2) from None
+    except engine_run.EngineWindowError as exc:
+        # A long-lived window that measured less than the whole window (#510):
+        # refused with the reason, never filed as a shorter run. The engine is
+        # already stopped; its output is in the run's engine-run.log.
+        print(f"[bench] REFUSED: {exc}", file=sys.stderr)
+        raise SystemExit(5) from None
